@@ -71,20 +71,16 @@ pub trait TargetLoader {
         pk: &[String],
     ) -> Result<u64>;
 
-    /// `CREATE OR REPLACE` the current-state dedup view `<table>` over its change
-    /// log — the adapter builds its warehouse's dialect SQL via
-    /// [`cdc::dedup_view_sql`].
-    fn create_dedup_view(
-        &self,
-        table: &str,
-        pk: &[String],
-        engine: cdc::SourceEngine,
-    ) -> Result<()>;
+    /// The warehouse this adapter targets — lets the shared driver build the
+    /// current-state view SQL (dialect keyword + identifier quoting) in ONE place
+    /// per mode instead of once per adapter.
+    fn warehouse(&self) -> cdc::Warehouse;
 
-    /// `CREATE OR REPLACE` the INCREMENTAL current-state view `<table>` over its
-    /// change log — deduped to the latest row per PK by `cursor_column` (no
-    /// tombstones), via [`cdc::inc_dedup_view_sql`].
-    fn create_inc_dedup_view(&self, table: &str, pk: &[String], cursor_column: &str) -> Result<()>;
+    /// `CREATE OR REPLACE` the current-state view `<table>` from pre-built
+    /// `view_sql` (the driver builds it via [`cdc::dedup_view_sql`] for CDC or
+    /// [`cdc::inc_dedup_view_sql`] for incremental). The adapter only executes it
+    /// its way (e.g. Snowflake prefixes a `QUERY_TAG`).
+    fn create_view(&self, table: &str, view_sql: &str) -> Result<()>;
 }
 
 /// Refuse a load whose specs can't materialize: empty, or any `Fail`-status
@@ -131,8 +127,8 @@ fn maybe_cleanup(cleanup: Option<(&GcsStore, &str)>) -> bool {
 /// (`Some((store, gs_prefix))` to delete, `None` to keep it).
 ///
 /// `#[allow(private_interfaces)]` for the injected `GcsStore` — same rationale as
-/// [`reconcile::fetch_manifests`]: a `pub` public-API root over a deliberately
-/// crate-private `destination` type.
+/// [`reconcile::fetch_manifests_keyed`]: a `pub` public-API root over a
+/// deliberately crate-private `destination` type.
 #[allow(private_interfaces)]
 pub fn run_load(
     loader: &dyn TargetLoader,
@@ -175,21 +171,27 @@ pub fn run_load(
 // gate and cleanup. Bundling them would only move the fields elsewhere.
 // `allow(private_interfaces)` for the injected `GcsStore` — see [`run_load`].
 #[allow(clippy::too_many_arguments, private_interfaces)]
-pub fn run_load_cdc(
+/// The shared append-log + dedup-view driver for the two append modes (CDC and
+/// incremental). They differ ONLY in a label (for error text) and which view the
+/// `build_view` closure creates; everything else — the empty-uris/pk bails, the
+/// `__changes` append, the count gate, cleanup ordering, and the report — is
+/// identical, so it lives here. `label` is `"CDC"` / `"incremental"`.
+fn append_and_view(
     loader: &dyn TargetLoader,
     table: &str,
     specs: &[TargetColumnSpec],
     uris: &[String],
     pk: &[String],
-    engine: cdc::SourceEngine,
     expected_delta: Option<u64>,
     cleanup: Option<(&GcsStore, &str)>,
+    label: &str,
+    build_view: impl FnOnce(&dyn TargetLoader) -> Result<()>,
 ) -> Result<CdcLoadReport> {
     if uris.is_empty() {
         bail!("no Parquet URIs to append into `{table}__changes`");
     }
     if pk.is_empty() {
-        bail!("CDC load of `{table}` needs a primary key for the dedup view (pass --pk)");
+        bail!("{label} load of `{table}` needs a primary key for the dedup view (pass --pk)");
     }
     validate_specs(&format!("{table}__changes"), specs)?;
 
@@ -199,13 +201,13 @@ pub fn run_load_cdc(
         && rows_appended != expected
     {
         bail!(
-            "CDC count validation failed for `{}__changes`: appended {rows_appended} rows, \
+            "{label} count validation failed for `{}__changes`: appended {rows_appended} rows, \
              expected {expected} from the run manifests — investigate before trusting the view",
             table
         );
     }
 
-    loader.create_dedup_view(table, pk, engine)?;
+    build_view(loader)?;
     // Cleanup runs here (inside the driver, after the gate), BEFORE the caller
     // records the ledger in `execute_load`. A crash between the two re-appends
     // this run next load — an at-least-once double-append the dedup view absorbs
@@ -219,6 +221,40 @@ pub fn run_load_cdc(
         view: loader.fqtn(table),
         source_cleaned,
     })
+}
+
+#[allow(clippy::too_many_arguments, private_interfaces)]
+pub fn run_load_cdc(
+    loader: &dyn TargetLoader,
+    table: &str,
+    specs: &[TargetColumnSpec],
+    uris: &[String],
+    pk: &[String],
+    engine: cdc::SourceEngine,
+    expected_delta: Option<u64>,
+    cleanup: Option<(&GcsStore, &str)>,
+) -> Result<CdcLoadReport> {
+    append_and_view(
+        loader,
+        table,
+        specs,
+        uris,
+        pk,
+        expected_delta,
+        cleanup,
+        "CDC",
+        |l| {
+            let pk_refs: Vec<&str> = pk.iter().map(String::as_str).collect();
+            let sql = cdc::dedup_view_sql(
+                l.warehouse(),
+                &l.fqtn(table),
+                &l.fqtn(&format!("{table}__changes")),
+                &pk_refs,
+                engine,
+            );
+            l.create_view(table, &sql)
+        },
+    )
 }
 
 /// Load an INCREMENTAL export's delta: APPEND the parquet into `<table>__changes`
@@ -240,12 +276,7 @@ pub fn run_load_incremental(
     expected_delta: Option<u64>,
     cleanup: Option<(&GcsStore, &str)>,
 ) -> Result<CdcLoadReport> {
-    if uris.is_empty() {
-        bail!("no Parquet URIs to append into `{table}__changes`");
-    }
-    if pk.is_empty() {
-        bail!("incremental load of `{table}` needs a primary key for the dedup view (pass --pk)");
-    }
+    // uris + pk are checked by `append_and_view`; the cursor guards are incremental-only.
     if cursor_column.is_empty() {
         bail!(
             "incremental load of `{table}` needs a cursor column (the export's `cursor_column:`) \
@@ -267,31 +298,27 @@ pub fn run_load_incremental(
             cols.join(", ")
         );
     }
-    validate_specs(&format!("{table}__changes"), specs)?;
-
-    let rows_appended = loader.append_changelog(table, specs, uris, pk)?;
-
-    if let Some(expected) = expected_delta
-        && rows_appended != expected
-    {
-        bail!(
-            "incremental count validation failed for `{}__changes`: appended {rows_appended} rows, \
-             expected {expected} from the run manifests — investigate before trusting the view",
-            table
-        );
-    }
-
-    loader.create_inc_dedup_view(table, pk, cursor_column)?;
-    // Cleanup before the ledger record (see run_load_cdc): a crash between
-    // re-appends this run next load, absorbed by the dedup view.
-    let source_cleaned = maybe_cleanup(cleanup);
-
-    Ok(CdcLoadReport {
-        rows_appended,
-        changes_table: loader.fqtn(&format!("{table}__changes")),
-        view: loader.fqtn(table),
-        source_cleaned,
-    })
+    append_and_view(
+        loader,
+        table,
+        specs,
+        uris,
+        pk,
+        expected_delta,
+        cleanup,
+        "incremental",
+        |l| {
+            let pk_refs: Vec<&str> = pk.iter().map(String::as_str).collect();
+            let sql = cdc::inc_dedup_view_sql(
+                l.warehouse(),
+                &l.fqtn(table),
+                &l.fqtn(&format!("{table}__changes")),
+                &pk_refs,
+                cursor_column,
+            );
+            l.create_view(table, &sql)
+        },
+    )
 }
 
 /// Split a `gs://bucket/path` URI into `(bucket, bucket-relative path)` — the
@@ -321,7 +348,7 @@ pub(crate) fn delete_under(store: &GcsStore, gs_prefix: &str) -> Result<()> {
 /// the binary-only dispatch: it re-anchors `GcsStore`'s real-GCS constructor in
 /// the lib compilation unit, which no longer reaches it through a load adapter.
 /// `#[allow(private_interfaces)]` for the crate-private return — same rationale
-/// as [`reconcile::fetch_manifests`].
+/// as [`reconcile::fetch_manifests_keyed`].
 #[allow(private_interfaces)]
 pub fn open_store(dest: &crate::config::DestinationConfig) -> Result<GcsStore> {
     GcsStore::new(dest)
@@ -401,11 +428,10 @@ mod tests {
             self.appended.borrow_mut().push(table.into());
             Ok(self.rows)
         }
-        fn create_dedup_view(&self, table: &str, _: &[String], _: cdc::SourceEngine) -> Result<()> {
-            self.views.borrow_mut().push(table.into());
-            Ok(())
+        fn warehouse(&self) -> cdc::Warehouse {
+            cdc::Warehouse::BigQuery
         }
-        fn create_inc_dedup_view(&self, table: &str, _: &[String], _: &str) -> Result<()> {
+        fn create_view(&self, table: &str, _view_sql: &str) -> Result<()> {
             self.views.borrow_mut().push(table.into());
             Ok(())
         }

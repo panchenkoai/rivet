@@ -198,11 +198,7 @@ pub fn dedup_view_sql(
     pk: &[&str],
     engine: SourceEngine,
 ) -> String {
-    let partition = pk
-        .iter()
-        .map(|c| warehouse.quote_ident(c))
-        .collect::<Vec<_>>()
-        .join(", ");
+    let partition = quote_partition(warehouse, pk);
     // `initial: snapshot` backfill rows load as a plain full-snapshot parquet —
     // no `__op`/`__pos`/`__seq` — so they land in `__changes` with those NULL.
     // `__pos IS NOT NULL DESC` FIRST in the order ranks any real change above the
@@ -214,14 +210,46 @@ pub fn dedup_view_sql(
         .map(|e| format!("{e} DESC"))
         .collect::<Vec<_>>()
         .join(", ");
+    build_dedup_view(
+        warehouse,
+        view_fqtn,
+        changes_fqtn,
+        &partition,
+        &order,
+        "COALESCE(__op = 'delete', FALSE)",
+    )
+}
+
+/// Quote each PK column for `warehouse` and join for a `PARTITION BY`.
+fn quote_partition(warehouse: Warehouse, pk: &[&str]) -> String {
+    pk.iter()
+        .map(|c| warehouse.quote_ident(c))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The shared current-state view envelope: keep the winning row per PK
+/// (`ROW_NUMBER … WHERE __rn = 1`), drop the meta columns from `*`, and project
+/// `delete_flag` into [`DELETE_FLAG_COLUMN`]. The two public builders differ only
+/// in `order_by` (how "winning" is decided) and `delete_flag` — everything else,
+/// including the `EXCEPT`/`EXCLUDE` dialect keyword and identifier quoting, lives
+/// here so CDC and incremental can never drift on the view shape.
+fn build_dedup_view(
+    warehouse: Warehouse,
+    view_fqtn: &str,
+    changes_fqtn: &str,
+    partition: &str,
+    order_by: &str,
+    delete_flag: &str,
+) -> String {
     format!(
         "CREATE OR REPLACE VIEW {view} AS\n\
          SELECT * {except} (__op, __pos, __seq, __rn),\n\
-         \x20      COALESCE(__op = 'delete', FALSE) AS {flag}\n\
+         \x20      {delete_flag} AS {flag}\n\
          FROM (\n\
          \x20 SELECT *, ROW_NUMBER() OVER (\n\
          \x20   PARTITION BY {partition}\n\
-         \x20   ORDER BY {order}\n\
+         \x20   ORDER BY {order_by}\n\
          \x20 ) AS __rn\n\
          \x20 FROM {changes}\n\
          )\n\
@@ -247,28 +275,15 @@ pub fn inc_dedup_view_sql(
     pk: &[&str],
     cursor_column: &str,
 ) -> String {
-    let partition = pk
-        .iter()
-        .map(|c| warehouse.quote_ident(c))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!(
-        "CREATE OR REPLACE VIEW {view} AS\n\
-         SELECT * {except} (__op, __pos, __seq, __rn),\n\
-         \x20      FALSE AS {flag}\n\
-         FROM (\n\
-         \x20 SELECT *, ROW_NUMBER() OVER (\n\
-         \x20   PARTITION BY {partition}\n\
-         \x20   ORDER BY {cursor} DESC\n\
-         \x20 ) AS __rn\n\
-         \x20 FROM {changes}\n\
-         )\n\
-         WHERE __rn = 1;",
-        view = warehouse.quote_fqtn(view_fqtn),
-        changes = warehouse.quote_fqtn(changes_fqtn),
-        except = warehouse.except_keyword(),
-        cursor = warehouse.quote_ident(cursor_column),
-        flag = DELETE_FLAG_COLUMN,
+    let partition = quote_partition(warehouse, pk);
+    let order = format!("{} DESC", warehouse.quote_ident(cursor_column));
+    build_dedup_view(
+        warehouse,
+        view_fqtn,
+        changes_fqtn,
+        &partition,
+        &order,
+        "FALSE",
     )
 }
 

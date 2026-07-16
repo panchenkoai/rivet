@@ -264,45 +264,13 @@ impl TargetLoader for SnowflakeLoader {
         Ok(after.saturating_sub(before))
     }
 
-    fn create_dedup_view(
-        &self,
-        table: &str,
-        pk: &[String],
-        engine: crate::load::cdc::SourceEngine,
-    ) -> Result<()> {
-        use crate::load::cdc::Warehouse;
-        let changes_fqtn = self.fqtn(&format!("{table}__changes"));
-        let view_fqtn = self.fqtn(table);
-        let pk_refs: Vec<&str> = pk.iter().map(String::as_str).collect();
-        let view_sql = crate::load::cdc::dedup_view_sql(
-            Warehouse::Snowflake,
-            &view_fqtn,
-            &changes_fqtn,
-            &pk_refs,
-            engine,
-        );
-        // Fully-qualified DDL; a QUERY_TAG keeps it cost-attributable. CREATE VIEW
-        // is metadata — no warehouse compute needed.
-        let sql = format!(
-            "ALTER SESSION SET QUERY_TAG = '{tag}';\n{view_sql}",
-            tag = self.query_tag(table),
-        );
-        self.run_snow(&sql)?;
-        Ok(())
+    fn warehouse(&self) -> crate::load::cdc::Warehouse {
+        crate::load::cdc::Warehouse::Snowflake
     }
 
-    fn create_inc_dedup_view(&self, table: &str, pk: &[String], cursor_column: &str) -> Result<()> {
-        use crate::load::cdc::Warehouse;
-        let changes_fqtn = self.fqtn(&format!("{table}__changes"));
-        let view_fqtn = self.fqtn(table);
-        let pk_refs: Vec<&str> = pk.iter().map(String::as_str).collect();
-        let view_sql = crate::load::cdc::inc_dedup_view_sql(
-            Warehouse::Snowflake,
-            &view_fqtn,
-            &changes_fqtn,
-            &pk_refs,
-            cursor_column,
-        );
+    fn create_view(&self, table: &str, view_sql: &str) -> Result<()> {
+        // Fully-qualified DDL; a QUERY_TAG keeps it cost-attributable. CREATE VIEW
+        // is metadata — no warehouse compute needed.
         let sql = format!(
             "ALTER SESSION SET QUERY_TAG = '{tag}';\n{view_sql}",
             tag = self.query_tag(table),

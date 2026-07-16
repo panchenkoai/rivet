@@ -56,7 +56,10 @@ impl LoadIntegrity {
     }
 }
 
-/// Fetch and parse every `manifest.json` under `gcs_prefix` (recursive).
+/// Fetch and parse every `manifest.json` under `gcs_prefix` (recursive), keeping
+/// each manifest's bucket-relative storage key — needed to resolve a manifest's
+/// (relative) part paths back to full object keys for per-run loading (see
+/// [`select_load_uris`]).
 ///
 /// A rivet export writes one manifest per `run_id`; a prefix that has
 /// accumulated several incremental / CDC runs holds several. Transport is the
@@ -69,20 +72,6 @@ impl LoadIntegrity {
 /// injected `GcsStore` is deliberately an internal (`pub(crate)`) type — the
 /// `destination` module stays crate-private. Same rationale as the `preflight`
 /// module note in `lib.rs`.
-// dead_code: `prepare_load` now goes through `fetch_manifests_keyed`; this
-// key-dropping wrapper survives for its own manifest-parse/error tests — a
-// deletion candidate for the ponytail cleanup.
-#[allow(private_interfaces, dead_code)]
-pub fn fetch_manifests(store: &GcsStore, gcs_prefix: &str) -> Result<Vec<RunManifest>> {
-    Ok(fetch_manifests_keyed(store, gcs_prefix)?
-        .into_iter()
-        .map(|(_, m)| m)
-        .collect())
-}
-
-/// Like [`fetch_manifests`] but keeps each manifest's bucket-relative storage
-/// key — needed to resolve a manifest's (relative) part paths back to full
-/// object keys for per-run incremental loading (see [`select_load_uris`]).
 #[allow(private_interfaces)]
 pub fn fetch_manifests_keyed(
     store: &GcsStore,
@@ -838,7 +827,7 @@ mod tests {
     }
 
     #[test]
-    fn fetch_manifests_reads_and_parses_every_run_copy_under_the_prefix() {
+    fn fetch_manifests_keyed_reads_and_parses_every_run_copy_under_the_prefix() {
         // Two runs' copies plus a canonical pointer to the latest: fetch returns
         // exactly the two run copies, parsed — so reconcile sums 100 + 40 = 140
         // without double-counting the pointer.
@@ -850,7 +839,11 @@ mod tests {
             ),
             ("base/manifest-r2.json", manifest_bytes("r2", 40, Some(40))),
         ]);
-        let manifests = fetch_manifests(&store, "gs://my-bucket/base").unwrap();
+        let manifests: Vec<_> = fetch_manifests_keyed(&store, "gs://my-bucket/base")
+            .unwrap()
+            .into_iter()
+            .map(|(_, m)| m)
+            .collect();
         assert_eq!(manifests.len(), 2);
         let integrity = reconcile(&manifests, false).unwrap();
         assert_eq!(integrity.file_rows, 140);
@@ -858,9 +851,9 @@ mod tests {
     }
 
     #[test]
-    fn fetch_manifests_names_the_key_when_a_manifest_is_unparseable() {
+    fn fetch_manifests_keyed_names_the_key_when_a_manifest_is_unparseable() {
         let (store, _g) = fs_store(&[("base/manifest.json", b"{ not json".to_vec())]);
-        let err = fetch_manifests(&store, "gs://my-bucket/base")
+        let err = fetch_manifests_keyed(&store, "gs://my-bucket/base")
             .unwrap_err()
             .to_string();
         assert!(

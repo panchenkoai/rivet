@@ -900,15 +900,16 @@ fn prepare_load(
     }))
 }
 
-/// The inputs every load shares; the batch/CDC specifics are the three closures
-/// [`execute_load`] takes. `mode` is the ledger's `"batch"`/`"cdc"` discriminator.
+/// The inputs every load shares; the full/incremental/CDC specifics are the three
+/// closures [`execute_load`] takes. `mode` is the load strategy — its
+/// [`LoadMode::ledger_str`] is the ledger's `mode` discriminator.
 struct LoadJob<'a> {
     plan: &'a load::plan::LoadPlan,
     run_id: &'a str,
     state: Option<&'a StateStore>,
     load_id: &'a str,
     allow_source_drift: bool,
-    mode: &'a str,
+    mode: load::plan::LoadMode,
 }
 
 /// The audit + skip-ledger writer for one load. A struct (not a bare closure) so
@@ -920,7 +921,7 @@ struct LoadCtx<'a> {
     export_name: &'a str,
     target_fqtn: &'a str,
     warehouse: &'a str,
-    mode: &'a str,
+    mode: load::plan::LoadMode,
 }
 
 impl LoadCtx<'_> {
@@ -932,7 +933,7 @@ impl LoadCtx<'_> {
             export_name: self.export_name.to_string(),
             target_table: self.target_fqtn.to_string(),
             warehouse: self.warehouse.to_string(),
-            mode: self.mode.to_string(),
+            mode: self.mode.ledger_str().to_string(),
             source_run_ids: source_run_ids.to_vec(),
             rows_loaded,
             status: status.to_string(),
@@ -992,7 +993,7 @@ fn execute_load<R>(
     )? {
         Some(i) => i,
         None => {
-            let label = if job.mode == "cdc" {
+            let label = if job.mode == load::plan::LoadMode::Cdc {
                 "cdc load"
             } else {
                 "load"
@@ -1024,6 +1025,23 @@ fn execute_load<R>(
 /// dedup view over it. The manifests' summed `row_count` gates the rows *this*
 /// load appends (before/after the append) — the file→warehouse leg for an
 /// accumulating, at-least-once log.
+/// The success trace shared by the CDC + incremental loads (byte-identical): the
+/// integrity chain, the appended rows, the change-log table, and the view.
+fn append_done_trace(inputs: &LoadInputs, report: &load::CdcLoadReport) {
+    eprintln!(
+        "  integrity ✓ {} → appended {} to {} | current-state view {}{}",
+        inputs.integrity.chain_prefix(),
+        report.rows_appended,
+        report.changes_table,
+        report.view,
+        if report.source_cleaned {
+            " (source cleaned)"
+        } else {
+            ""
+        },
+    );
+}
+
 fn load_one_cdc(
     plan: &load::plan::LoadPlan,
     run_id: &str,
@@ -1039,7 +1057,7 @@ fn load_one_cdc(
         state,
         load_id,
         allow_source_drift,
-        mode: "cdc",
+        mode: plan.mode,
     };
     execute_load(
         job,
@@ -1074,20 +1092,7 @@ fn load_one_cdc(
             )?;
             Ok((report.rows_appended, report))
         },
-        |inputs, report| {
-            eprintln!(
-                "  integrity ✓ {} → appended {} to {} | current-state view {}{}",
-                inputs.integrity.chain_prefix(),
-                report.rows_appended,
-                report.changes_table,
-                report.view,
-                if report.source_cleaned {
-                    " (source cleaned)"
-                } else {
-                    ""
-                },
-            );
-        },
+        append_done_trace,
     )
 }
 
@@ -1117,7 +1122,7 @@ fn load_one_incremental(
         state,
         load_id,
         allow_source_drift,
-        mode: "incremental",
+        mode: plan.mode,
     };
     execute_load(
         job,
@@ -1150,20 +1155,7 @@ fn load_one_incremental(
             )?;
             Ok((report.rows_appended, report))
         },
-        |inputs, report| {
-            eprintln!(
-                "  integrity ✓ {} → appended {} to {} | current-state view {}{}",
-                inputs.integrity.chain_prefix(),
-                report.rows_appended,
-                report.changes_table,
-                report.view,
-                if report.source_cleaned {
-                    " (source cleaned)"
-                } else {
-                    ""
-                },
-            );
-        },
+        append_done_trace,
     )
 }
 
@@ -1191,7 +1183,7 @@ fn load_one(
         state,
         load_id,
         allow_source_drift,
-        mode: "full",
+        mode: plan.mode,
     };
     execute_load(
         job,
@@ -1267,7 +1259,7 @@ mod load_ledger_tests {
             export_name: "orders",
             target_fqtn: TARGET,
             warehouse: "bigquery",
-            mode: "cdc",
+            mode: load::plan::LoadMode::Cdc,
         }
     }
 
@@ -1341,7 +1333,7 @@ mod load_ledger_tests {
             export_name: "orders",
             target_fqtn: TARGET,
             warehouse: "bigquery",
-            mode: "batch",
+            mode: load::plan::LoadMode::Full,
         };
         c.record_success(&["r1".into()], 3);
         c.record_skip();

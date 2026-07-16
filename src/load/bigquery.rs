@@ -269,38 +269,12 @@ impl TargetLoader for BigQueryLoader {
         Ok(after.saturating_sub(before))
     }
 
-    fn create_dedup_view(
-        &self,
-        table: &str,
-        pk: &[String],
-        engine: crate::load::cdc::SourceEngine,
-    ) -> Result<()> {
-        let changes_fqtn = self.fqtn(&format!("{table}__changes"));
-        let view_fqtn = self.fqtn(table);
-        let pk_refs: Vec<&str> = pk.iter().map(String::as_str).collect();
-        let view_sql = crate::load::cdc::dedup_view_sql(
-            crate::load::cdc::Warehouse::BigQuery,
-            &view_fqtn,
-            &changes_fqtn,
-            &pk_refs,
-            engine,
-        );
-        self.run_sql(&view_sql, "view", table)?;
-        Ok(())
+    fn warehouse(&self) -> crate::load::cdc::Warehouse {
+        crate::load::cdc::Warehouse::BigQuery
     }
 
-    fn create_inc_dedup_view(&self, table: &str, pk: &[String], cursor_column: &str) -> Result<()> {
-        let changes_fqtn = self.fqtn(&format!("{table}__changes"));
-        let view_fqtn = self.fqtn(table);
-        let pk_refs: Vec<&str> = pk.iter().map(String::as_str).collect();
-        let view_sql = crate::load::cdc::inc_dedup_view_sql(
-            crate::load::cdc::Warehouse::BigQuery,
-            &view_fqtn,
-            &changes_fqtn,
-            &pk_refs,
-            cursor_column,
-        );
-        self.run_sql(&view_sql, "view", table)?;
+    fn create_view(&self, table: &str, view_sql: &str) -> Result<()> {
+        self.run_sql(view_sql, "view", table)?;
         Ok(())
     }
 }
