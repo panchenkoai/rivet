@@ -52,7 +52,12 @@ pub struct LoadSection {
 /// `None` inherits the top-level value. `target` is present ONLY to reject it:
 /// the warehouse is shared (`plan_loads` runs one `rivet check --target`), so it
 /// stays top-level.
+// `deny_unknown_fields` so a per-export `load:` typo (`gc_orphan`, `cleanupsrc`)
+// fails loudly instead of silently deserializing to the default and dropping the
+// override. (LoadOverride has no `#[serde(flatten)]`, so unlike LoadSection this
+// works directly.)
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct LoadOverride {
     #[serde(default)]
     pk: Option<Vec<String>>,
@@ -177,6 +182,44 @@ struct ColReport {
 /// destination / native schema. `rivet check --json` emits one JSON document
 /// per export, so a multi-table config produces a plan per table, all pointed
 /// at the same warehouse target.
+/// Every key a `load:` block may carry — the [`LoadSection`] fields plus the
+/// flattened [`LoadTarget`] variant fields. The top-level block can't use serde
+/// `deny_unknown_fields` (incompatible with the flattened `target` enum), so we
+/// check its keys by hand — else a typo (`gc_orphan`, `cleanupsource`) silently
+/// deserializes to the default and the setting never applies.
+const LOAD_KEYS: &[&str] = &[
+    "target",
+    "cleanup_source",
+    "pk",
+    "allow_source_drift",
+    "gc_orphans",
+    "cluster_by",
+    // LoadTarget::{Bigquery, Snowflake} variant fields (flattened in).
+    "project",
+    "dataset",
+    "connection",
+    "warehouse",
+    "database",
+    "schema",
+    "storage_integration",
+];
+
+/// Reject any key in a `load:` block that isn't in [`LOAD_KEYS`] — turns a
+/// silently-ignored typo into a loud error naming the valid keys.
+fn check_load_keys(value: &serde_json::Value, whose: &str) -> Result<()> {
+    if let Some(obj) = value.as_object() {
+        for k in obj.keys() {
+            if !LOAD_KEYS.contains(&k.as_str()) {
+                bail!(
+                    "unknown key `{k}` in the {whose} `load:` block — valid keys are: {}",
+                    LOAD_KEYS.join(", ")
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn plan_loads(config_path: &str, rivet_bin: &str) -> Result<Vec<LoadPlan>> {
     let yaml = std::fs::read_to_string(config_path)
         .with_context(|| format!("reading config {config_path}"))?;
@@ -190,6 +233,7 @@ pub fn plan_loads(config_path: &str, rivet_bin: &str) -> Result<Vec<LoadPlan>> {
     let load_value = cfg.load.clone().context(
         "config has no top-level `load:` block — add `load: { target, ... }` to load into a warehouse",
     )?;
+    check_load_keys(&load_value, "top-level")?;
     let load: LoadSection =
         serde_json::from_value(load_value).context("parsing the top-level `load:` block")?;
 
@@ -480,6 +524,36 @@ mod tests {
             o.target.is_some(),
             "target captured for the plan_loads guard"
         );
+    }
+
+    #[test]
+    fn unknown_top_level_load_key_is_rejected() {
+        // A typo (`gc_orphan` for `gc_orphans`) must fail loudly, not silently
+        // deserialize to the default so the setting never applies.
+        let typo = serde_json::json!({
+            "target": "bigquery", "project": "p", "dataset": "d", "gc_orphan": true
+        });
+        let err = check_load_keys(&typo, "top-level").unwrap_err().to_string();
+        assert!(err.contains("gc_orphan"), "{err}");
+        // Every valid LoadSection + LoadTarget key passes.
+        let ok = serde_json::json!({
+            "target": "bigquery", "project": "p", "dataset": "d",
+            "gc_orphans": true, "cleanup_source": false, "pk": ["id"],
+            "allow_source_drift": true, "cluster_by": ["a"]
+        });
+        assert!(check_load_keys(&ok, "top-level").is_ok());
+    }
+
+    #[test]
+    fn unknown_per_export_override_key_is_rejected() {
+        // `deny_unknown_fields` on LoadOverride catches per-export typos.
+        let typo = serde_json::json!({ "pk": ["id"], "cluster_bye": ["x"] });
+        assert!(
+            serde_json::from_value::<LoadOverride>(typo).is_err(),
+            "a typo'd override key must fail to parse"
+        );
+        let ok = serde_json::json!({ "pk": ["id"], "cleanup_source": true });
+        assert!(serde_json::from_value::<LoadOverride>(ok).is_ok());
     }
 
     #[test]
