@@ -734,18 +734,6 @@ fn dispatch_load(args: LoadArgs) -> Result<()> {
     // One run id for the whole invocation, shared across every table — so warehouse
     // cost slices per load run (all tables together) as well as per table.
     let run_id = args.run_id.clone().unwrap_or_else(generate_run_id);
-    // The load ledger: log every load + skip extraction runs already loaded. A
-    // state-DB problem must never fail a load — degrade to the stateless path.
-    let state = match StateStore::open(&args.config) {
-        Ok(s) => Some(s),
-        Err(e) => {
-            eprintln!(
-                "  warning: state store unavailable ({e:#}); loading without a ledger \
-                 (no incremental skip / audit log)"
-            );
-            None
-        }
-    };
     let tables: Vec<&str> = plans.iter().map(|p| p.table.as_str()).collect();
     eprintln!(
         "{}: resolved {} table(s) → {} [run_id={}]: {}",
@@ -762,6 +750,19 @@ fn dispatch_load(args: LoadArgs) -> Result<()> {
                 "`--cdc` needs `--pk <col>[,<col>]` — the change log's primary key for the dedup view"
             );
         }
+        // The load ledger is CDC-only: it makes the append-log incremental (skip
+        // runs already loaded) and audits each load. A state-DB problem must never
+        // fail a load — degrade to the stateless path.
+        let state = match StateStore::open(&args.config) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                eprintln!(
+                    "  warning: state store unavailable ({e:#}); loading without a ledger \
+                     (no incremental skip / audit log)"
+                );
+                None
+            }
+        };
         let engine = load::plan::source_engine(&args.config)?;
         for plan in &plans {
             let load_id = format!("{run_id}:{}", plan.table);
@@ -781,15 +782,9 @@ fn dispatch_load(args: LoadArgs) -> Result<()> {
         return Ok(());
     }
 
+    // Batch: full-replace, stateless — the load ledger is CDC-only (see load_one).
     for plan in &plans {
-        let load_id = format!("{run_id}:{}", plan.table);
-        match load_one(
-            plan,
-            &run_id,
-            args.allow_source_drift,
-            state.as_ref(),
-            &load_id,
-        )? {
+        match load_one(plan, &run_id, args.allow_source_drift)? {
             Some(report) => println!("LOAD OK [{}]: {report:#?}", plan.table),
             None => println!("LOAD SKIP [{}]: up to date", plan.table),
         }
@@ -1053,14 +1048,15 @@ fn load_one(
     plan: &load::plan::LoadPlan,
     run_id: &str,
     allow_source_drift: bool,
-    state: Option<&StateStore>,
-    load_id: &str,
 ) -> Result<Option<load::LoadReport>> {
+    // Batch loads are full-replace by design, so they stay stateless: the load
+    // ledger (incremental skip + audit) is CDC-only. state=None ⇒ prepare_load
+    // reconciles every manifest and LoadCtx records nothing.
     let job = LoadJob {
         plan,
         run_id,
-        state,
-        load_id,
+        state: None,
+        load_id: run_id, // unused when state is None (LoadCtx is a no-op)
         allow_source_drift,
         mode: "batch",
     };
