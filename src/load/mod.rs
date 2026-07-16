@@ -38,6 +38,10 @@ pub struct CdcLoadReport {
     pub rows_appended: u64,
     pub changes_table: String,
     pub view: String,
+    /// Whether `cleanup_source` wiped the staged Parquet after this load — mirrors
+    /// [`LoadReport::source_cleaned`] so the report + logs reflect it for CDC/
+    /// incremental too, instead of discarding it.
+    pub source_cleaned: bool,
 }
 
 /// A warehouse **adapter** — the small, warehouse-specific seam the
@@ -202,12 +206,18 @@ pub fn run_load_cdc(
     }
 
     loader.create_dedup_view(table, pk, engine)?;
-    let _ = maybe_cleanup(cleanup);
+    // Cleanup runs here (inside the driver, after the gate), BEFORE the caller
+    // records the ledger in `execute_load`. A crash between the two re-appends
+    // this run next load — an at-least-once double-append the dedup view absorbs
+    // (and the count gate still guards) — accepted rather than ordering the
+    // irreversible delete after the durable record.
+    let source_cleaned = maybe_cleanup(cleanup);
 
     Ok(CdcLoadReport {
         rows_appended,
         changes_table: loader.fqtn(&format!("{table}__changes")),
         view: loader.fqtn(table),
+        source_cleaned,
     })
 }
 
@@ -272,12 +282,15 @@ pub fn run_load_incremental(
     }
 
     loader.create_inc_dedup_view(table, pk, cursor_column)?;
-    let _ = maybe_cleanup(cleanup);
+    // Cleanup before the ledger record (see run_load_cdc): a crash between
+    // re-appends this run next load, absorbed by the dedup view.
+    let source_cleaned = maybe_cleanup(cleanup);
 
     Ok(CdcLoadReport {
         rows_appended,
         changes_table: loader.fqtn(&format!("{table}__changes")),
         view: loader.fqtn(table),
+        source_cleaned,
     })
 }
 

@@ -1076,11 +1076,16 @@ fn load_one_cdc(
         },
         |inputs, report| {
             eprintln!(
-                "  integrity ✓ {} → appended {} to {} | current-state view {}",
+                "  integrity ✓ {} → appended {} to {} | current-state view {}{}",
                 inputs.integrity.chain_prefix(),
                 report.rows_appended,
                 report.changes_table,
                 report.view,
+                if report.source_cleaned {
+                    " (source cleaned)"
+                } else {
+                    ""
+                },
             );
         },
     )
@@ -1147,11 +1152,16 @@ fn load_one_incremental(
         },
         |inputs, report| {
             eprintln!(
-                "  integrity ✓ {} → appended {} to {} | current-state view {}",
+                "  integrity ✓ {} → appended {} to {} | current-state view {}{}",
                 inputs.integrity.chain_prefix(),
                 report.rows_appended,
                 report.changes_table,
                 report.view,
+                if report.source_cleaned {
+                    " (source cleaned)"
+                } else {
+                    ""
+                },
             );
         },
     )

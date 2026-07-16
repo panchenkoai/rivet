@@ -339,6 +339,13 @@ pub(super) fn run_export_job(
             // the GCS `snapshot/_SUCCESS` marker: once here, `cleanup_source`
             // wiping the bucket no longer re-snapshots. Best-effort — a state
             // write failure must not fail an otherwise-successful snapshot.
+            //
+            // Degradation on that rare failure: the durable signal is lost, so if
+            // `cleanup_source` later wipes the GCS `snapshot/_SUCCESS` too, the
+            // NEXT run finds no evidence and re-snapshots the whole table —
+            // wasteful (a fresh full re-read + re-load), NOT data loss: the
+            // checkpoint survived, so `snapshot_plan`'s `resume_expected` keeps the
+            // anchor and no changes are skipped.
             if let Some(table) = synth.table.as_deref()
                 && let Err(e) =
                     state.mark_snapshot_done(&export.name, table, &summary.journal.run_id)
