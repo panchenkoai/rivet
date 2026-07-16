@@ -39,7 +39,12 @@ impl StateStore {
         let mark_loaded = rec.status == "success";
         match &self.conn {
             StateConn::Sqlite(c) => {
-                c.execute(
+                // One transaction: the audit row + the skip-set rows commit
+                // together, so a crash mid-write never leaves a `success` load_run
+                // with a PARTIAL loaded_source_run (which would re-select the
+                // unmarked runs next load).
+                let tx = c.unchecked_transaction()?;
+                tx.execute(
                     "INSERT OR REPLACE INTO load_run
                        (load_id, export_name, target_table, warehouse, mode,
                         source_run_ids, rows_loaded, status, finished_at)
@@ -58,7 +63,7 @@ impl StateStore {
                 )?;
                 if mark_loaded {
                     for rid in &rec.source_run_ids {
-                        c.execute(
+                        tx.execute(
                             "INSERT OR REPLACE INTO loaded_source_run
                                (target_table, source_run_id, load_id, loaded_at)
                              VALUES (?1, ?2, ?3, ?4)",
@@ -66,10 +71,14 @@ impl StateStore {
                         )?;
                     }
                 }
+                tx.commit()?;
             }
             StateConn::Postgres(client) => {
+                // One transaction (mirrors the SQLite arm): the audit row and the
+                // skip-set rows commit atomically.
                 let mut c = client.borrow_mut();
-                c.execute(
+                let mut tx = c.transaction()?;
+                tx.execute(
                     "INSERT INTO load_run
                        (load_id, export_name, target_table, warehouse, mode,
                         source_run_ids, rows_loaded, status, finished_at)
@@ -97,7 +106,7 @@ impl StateStore {
                 )?;
                 if mark_loaded {
                     for rid in &rec.source_run_ids {
-                        c.execute(
+                        tx.execute(
                             "INSERT INTO loaded_source_run
                                (target_table, source_run_id, load_id, loaded_at)
                              VALUES ($1, $2, $3, $4)
@@ -108,6 +117,7 @@ impl StateStore {
                         )?;
                     }
                 }
+                tx.commit()?;
             }
         }
         Ok(())

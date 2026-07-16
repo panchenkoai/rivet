@@ -892,6 +892,50 @@ mod tests {
     use super::*;
 
     #[test]
+    fn sqlite_and_postgres_migrations_define_the_same_tables_per_version() {
+        // `migrate`/`migrate_pg` only check the final version NUMBER; nothing
+        // catches a same-version, divergent-DDL edit between the two arrays. This
+        // asserts that for every version present in BOTH, the set of tables each
+        // CREATEs matches — so a table added to one backend but not the other
+        // (a query that works on SQLite and errors on PG) fails loudly here.
+        use std::collections::{BTreeSet, HashMap};
+        fn table_names(sql: &str) -> BTreeSet<String> {
+            let lower = sql.to_lowercase();
+            let mut rest = lower.as_str();
+            let mut out = BTreeSet::new();
+            while let Some(i) = rest.find("create table") {
+                rest = &rest[i + "create table".len()..];
+                let after = rest
+                    .trim_start()
+                    .strip_prefix("if not exists")
+                    .unwrap_or_else(|| rest.trim_start())
+                    .trim_start();
+                let name: String = after
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                if !name.is_empty() {
+                    out.insert(name);
+                }
+            }
+            out
+        }
+        let mut pg: HashMap<i64, BTreeSet<String>> = HashMap::new();
+        for &(v, sql) in PG_MIGRATIONS {
+            pg.entry(v).or_default().extend(table_names(sql));
+        }
+        for &(v, sql) in MIGRATIONS {
+            if let Some(pg_tables) = pg.get(&v) {
+                assert_eq!(
+                    &table_names(sql),
+                    pg_tables,
+                    "migration v{v}: SQLite and Postgres define different tables"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn fresh_db_reaches_latest_version() {
         let s = StateStore::open_in_memory().unwrap();
         let ver = match &s.conn {
