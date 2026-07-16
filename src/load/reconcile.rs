@@ -118,29 +118,42 @@ pub fn select_load_uris(
         .collect())
 }
 
+/// The bucket-relative part keys a manifest declares, each resolved against the
+/// manifest's own directory: `<dir(manifest_key)>/<part.path>`. Shared by
+/// [`select_load_keys`] (which intersects them with what's present) and
+/// [`gc_orphans`] (which treats them as the keep-set), so the two can't drift on
+/// how a manifest maps to its files.
+fn resolve_parts<'a>(
+    manifest_key: &'a str,
+    m: &'a RunManifest,
+) -> impl Iterator<Item = String> + 'a {
+    let dir = manifest_key.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+    m.parts.iter().map(move |p| {
+        if dir.is_empty() {
+            p.path.clone()
+        } else {
+            format!("{dir}/{}", p.path)
+        }
+    })
+}
+
 /// Pure selection: which bucket-relative parquet keys to load for the given
 /// (not-yet-loaded) run manifests.
 ///
-/// Prefers each manifest's own parts, resolved as `<dir(manifest_key)>/<part>`
-/// and intersected with `all_parquet` — so a load pulls exactly the new runs'
-/// files, not every object under the prefix (the key to incremental loads once
-/// `cleanup_source` no longer wipes the bucket). Falls back to the whole
-/// `all_parquet` listing when ANY new manifest resolves to no present part
-/// (legacy/part-less manifests still load, at the cost of not pruning); the
-/// row-count gate then still guards correctness.
+/// Prefers each manifest's own parts (via [`resolve_parts`]) intersected with
+/// `all_parquet` — so a load pulls exactly the new runs' files, not every object
+/// under the prefix (the key to incremental loads once `cleanup_source` no
+/// longer wipes the bucket). Falls back to the whole `all_parquet` listing when
+/// ANY new manifest resolves to no present part (legacy/part-less manifests
+/// still load, at the cost of not pruning); the row-count gate then still guards
+/// correctness.
 pub fn select_load_keys(new: &[(String, RunManifest)], all_parquet: &[String]) -> Vec<String> {
     use std::collections::BTreeSet;
     let present: std::collections::HashSet<&str> = all_parquet.iter().map(String::as_str).collect();
     let mut selected: BTreeSet<String> = BTreeSet::new();
     for (key, m) in new {
-        let dir = key.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
         let mut resolved_any = false;
-        for p in &m.parts {
-            let full = if dir.is_empty() {
-                p.path.clone()
-            } else {
-                format!("{dir}/{}", p.path)
-            };
+        for full in resolve_parts(key, m) {
             if present.contains(full.as_str()) {
                 selected.insert(full);
                 resolved_any = true;
@@ -152,6 +165,38 @@ pub fn select_load_keys(new: &[(String, RunManifest)], all_parquet: &[String]) -
         }
     }
     selected.into_iter().collect()
+}
+
+/// Delete every `.parquet` under `gcs_prefix` that no **`Success`** manifest
+/// references — crash leftovers from an interrupted extract (a run killed before
+/// it wrote its manifest leaves orphan parts the load already ignores, but which
+/// accumulate). Keeps every manifest, `_SUCCESS`, and every manifested part
+/// (including a `snapshot/` sub-prefix's, since `keyed` is fetched recursively).
+/// Strictly gentler than `cleanup_source`, which wipes the whole prefix; safe
+/// under the same assumption — a load follows a completed extract, so it never
+/// races a live writer. Returns `(removed_count, removed_bytes)`.
+#[allow(private_interfaces)]
+pub fn gc_orphans(
+    store: &GcsStore,
+    gcs_prefix: &str,
+    keyed: &[(String, RunManifest)],
+) -> Result<(usize, u64)> {
+    let (_bucket, base) = crate::load::split_gs_uri(gcs_prefix)?;
+    let keep: std::collections::HashSet<String> = keyed
+        .iter()
+        .filter(|(_, m)| m.status == ManifestStatus::Success)
+        .flat_map(|(key, m)| resolve_parts(key, m))
+        .collect();
+    let mut removed = 0usize;
+    let mut removed_bytes = 0u64;
+    for key in store.list_files(base)? {
+        if key.ends_with(".parquet") && !keep.contains(&key) {
+            removed_bytes += store.stat_size(&key).unwrap_or(0);
+            store.remove(&key)?;
+            removed += 1;
+        }
+    }
+    Ok((removed, removed_bytes))
 }
 
 /// Full/chunked loads care only about the LATEST snapshot: from `keyed` (all run
@@ -507,6 +552,64 @@ mod tests {
             select_load_keys(&[], &all).is_empty(),
             "no new runs ⇒ load nothing, not everything"
         );
+    }
+
+    #[test]
+    fn gc_orphans_removes_unmanifested_parquet_only() {
+        let (store, _g) = fs_store(&[
+            ("base/r1-000.parquet", b"aa".to_vec()),   // manifested
+            ("base/orphan.parquet", b"junk".to_vec()), // crash leftover — no manifest
+            ("base/manifest.json", b"{}".to_vec()),    // kept — not a .parquet
+            ("base/_SUCCESS", b"".to_vec()),           // kept — not a .parquet
+        ]);
+        let keyed = vec![keyed("base/manifest-r1.json", "r1", "r1-000.parquet")];
+        let (removed, bytes) = gc_orphans(&store, "gs://b/base", &keyed).unwrap();
+        assert_eq!(removed, 1, "only the unmanifested part is removed");
+        assert_eq!(bytes, 4, "'junk' is 4 bytes");
+        let mut left = store.list_files("base").unwrap();
+        left.sort();
+        assert_eq!(
+            left,
+            vec![
+                "base/_SUCCESS".to_string(),
+                "base/manifest.json".to_string(),
+                "base/r1-000.parquet".to_string(),
+            ],
+            "the manifested part, the manifest, and _SUCCESS all survive"
+        );
+    }
+
+    #[test]
+    fn gc_orphans_of_an_all_manifested_prefix_removes_nothing() {
+        let (store, _g) = fs_store(&[("base/r1-000.parquet", b"a".to_vec())]);
+        let keyed = vec![keyed("base/manifest-r1.json", "r1", "r1-000.parquet")];
+        assert_eq!(gc_orphans(&store, "gs://b/base", &keyed).unwrap().0, 0);
+    }
+
+    #[test]
+    fn gc_orphans_keeps_a_snapshot_subprefix_manifested_part() {
+        let (store, _g) = fs_store(&[
+            ("base/snapshot/s-000.parquet", b"a".to_vec()), // manifested under snapshot/
+            ("base/orphan.parquet", b"x".to_vec()),         // top-level orphan
+        ]);
+        let keyed = vec![keyed("base/snapshot/manifest-s.json", "s", "s-000.parquet")];
+        let (removed, _) = gc_orphans(&store, "gs://b/base", &keyed).unwrap();
+        assert_eq!(removed, 1, "the top-level orphan goes");
+        assert_eq!(
+            store.list_files("base/snapshot").unwrap(),
+            vec!["base/snapshot/s-000.parquet".to_string()],
+            "the snapshot-subprefix manifested part is kept"
+        );
+    }
+
+    #[test]
+    fn gc_orphans_does_not_protect_a_failed_runs_parts() {
+        // Only a Success manifest keeps its parts — a Failed/Interrupted run's
+        // files are themselves crash leftovers.
+        let (store, _g) = fs_store(&[("base/f-000.parquet", b"x".to_vec())]);
+        let mut kv = keyed("base/manifest-f.json", "f", "f-000.parquet");
+        kv.1.status = ManifestStatus::Failed;
+        assert_eq!(gc_orphans(&store, "gs://b/base", &[kv]).unwrap().0, 1);
     }
 
     fn keyed_at(run: &str, finished_at: &str) -> (String, RunManifest) {

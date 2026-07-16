@@ -24,6 +24,13 @@ pub struct LoadSection {
     pub target: LoadTarget,
     #[serde(default)]
     pub cleanup_source: bool,
+    /// After a successful load, delete staged Parquet under the export prefix
+    /// that no `Success` manifest references — crash leftovers from an
+    /// interrupted extract. Keeps the current run's files, manifests, and
+    /// `_SUCCESS`; strictly gentler than `cleanup_source`, which wipes the whole
+    /// prefix. Off by default.
+    #[serde(default)]
+    pub gc_orphans: bool,
     /// Clustering key column(s) — BigQuery `CLUSTER BY` / Snowflake `CLUSTER BY`.
     /// Empty = none. Applies at table creation.
     #[serde(default)]

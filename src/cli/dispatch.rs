@@ -779,6 +779,9 @@ fn dispatch_load(args: LoadArgs) -> Result<()> {
                 Some(report) => println!("CDC LOAD OK [{}]: {report:#?}", plan.table),
                 None => println!("CDC LOAD SKIP [{}]: up to date", plan.table),
             }
+            if plan.load.gc_orphans {
+                maybe_gc_orphans(plan);
+            }
         }
         return Ok(());
     }
@@ -820,8 +823,51 @@ fn dispatch_load(args: LoadArgs) -> Result<()> {
                 None => println!("LOAD SKIP [{}]: up to date", plan.table),
             },
         }
+        if plan.load.gc_orphans {
+            maybe_gc_orphans(plan);
+        }
     }
     Ok(())
+}
+
+/// Best-effort orphan-Parquet GC for one table's prefix (config `gc_orphans`):
+/// delete staged `.parquet` no `Success` manifest references — an interrupted
+/// extract's leftovers. A GC failure only warns; it NEVER fails the load, which
+/// already succeeded before this runs.
+fn maybe_gc_orphans(plan: &load::plan::LoadPlan) {
+    let store = match load::open_store(&plan.destination) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!(
+                "  gc-orphans [{}]: skipped (store unavailable): {e:#}",
+                plan.table
+            );
+            return;
+        }
+    };
+    let keyed = match load::reconcile::fetch_manifests_keyed(&store, &plan.gcs_prefix) {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!(
+                "  gc-orphans [{}]: skipped (manifest fetch failed): {e:#}",
+                plan.table
+            );
+            return;
+        }
+    };
+    match load::reconcile::gc_orphans(&store, &plan.gcs_prefix, &keyed) {
+        Ok((0, _)) => {}
+        Ok((n, bytes)) => {
+            println!(
+                "  gc-orphans [{}]: removed {n} orphan part(s) ({bytes} bytes)",
+                plan.table
+            )
+        }
+        Err(e) => eprintln!(
+            "  gc-orphans [{}]: failed (load unaffected): {e:#}",
+            plan.table
+        ),
+    }
 }
 
 /// What a load will consume: the reconciled integrity, the parquet URIs to load,

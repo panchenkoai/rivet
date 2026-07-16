@@ -68,6 +68,12 @@ impl GcsStore {
             .collect())
     }
 
+    /// Byte size of the single object at the bucket-relative `path` — a metadata
+    /// `stat` (a recursive `list` does not reliably carry each object's length).
+    pub(crate) fn stat_size(&self, path: &str) -> Result<u64> {
+        Ok(self.op.stat(path)?.content_length())
+    }
+
     /// Raw bytes of the object at the bucket-relative `path`.
     pub(crate) fn read(&self, path: &str) -> Result<Vec<u8>> {
         Ok(self.op.read(path)?.to_vec())
@@ -76,6 +82,13 @@ impl GcsStore {
     /// Recursively delete everything under the bucket-relative `path`.
     pub(crate) fn remove_all(&self, path: &str) -> Result<()> {
         self.op.remove_all(path)?;
+        Ok(())
+    }
+
+    /// Delete the single object at the bucket-relative `path`. Deleting a missing
+    /// object is a no-op `Ok` — opendal's delete is idempotent.
+    pub(crate) fn remove(&self, path: &str) -> Result<()> {
+        self.op.delete(path)?;
         Ok(())
     }
 
@@ -194,6 +207,32 @@ mod tests {
         write_at(dir.path(), "p/hello.bin", b"payload");
         let store = GcsStore::open_fs(dir.path().to_str().unwrap()).unwrap();
         assert_eq!(store.read("p/hello.bin").unwrap(), b"payload");
+    }
+
+    #[test]
+    fn remove_deletes_one_object_and_missing_is_a_no_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_at(root, "p/a.parquet", b"a");
+        write_at(root, "p/b.parquet", b"b");
+        let store = GcsStore::open_fs(root.to_str().unwrap()).unwrap();
+
+        store.remove("p/a.parquet").unwrap();
+        assert_eq!(
+            store.list_files("p").unwrap(),
+            vec!["p/b.parquet".to_string()],
+            "only the named object is gone; its sibling survives"
+        );
+        // A crash/retry can call remove on an already-gone key — must be Ok.
+        store.remove("p/a.parquet").unwrap();
+    }
+
+    #[test]
+    fn stat_size_reports_the_object_length() {
+        let dir = tempfile::tempdir().unwrap();
+        write_at(dir.path(), "p/a.parquet", b"abcd"); // 4 bytes
+        let store = GcsStore::open_fs(dir.path().to_str().unwrap()).unwrap();
+        assert_eq!(store.stat_size("p/a.parquet").unwrap(), 4);
     }
 
     #[test]
