@@ -362,16 +362,13 @@ pub fn build_loader(plan: &plan::LoadPlan, run_id: &str) -> Box<dyn TargetLoader
     use plan::LoadTarget;
     let load = &plan.load;
     match &load.target {
-        LoadTarget::Bigquery { project, dataset } => {
-            let mut l = BigQueryLoader::new(project.clone(), dataset.clone()).run_id(run_id);
-            if let Some(part) = plan.partition_by.clone() {
-                l = l.partition_by(part);
-            }
-            if !load.cluster_by.is_empty() {
-                l = l.cluster_by(load.cluster_by.clone());
-            }
-            Box::new(l)
-        }
+        LoadTarget::Bigquery { project, dataset } => Box::new(build_bigquery_loader(
+            project,
+            dataset,
+            plan.partition_by.as_deref(),
+            &load.cluster_by,
+            run_id,
+        )),
         LoadTarget::Snowflake {
             connection,
             warehouse,
@@ -393,6 +390,28 @@ pub fn build_loader(plan: &plan::LoadPlan, run_id: &str) -> Box<dyn TargetLoader
             Box::new(l)
         }
     }
+}
+
+/// Wire a [`BigQueryLoader`] from a resolved plan's fields — `partition_by` and
+/// `cluster_by` applied ONLY when set. A concrete return (not the boxed trait)
+/// so the wiring is unit-testable: a mis-guarded key would silently DROP the
+/// clustering/partitioning the config asked for — a degradation invisible
+/// through `Box<dyn TargetLoader>`.
+fn build_bigquery_loader(
+    project: &str,
+    dataset: &str,
+    partition_by: Option<&str>,
+    cluster_by: &[String],
+    run_id: &str,
+) -> BigQueryLoader {
+    let mut l = BigQueryLoader::new(project, dataset).run_id(run_id);
+    if let Some(part) = partition_by {
+        l = l.partition_by(part);
+    }
+    if !cluster_by.is_empty() {
+        l = l.cluster_by(cluster_by.to_vec());
+    }
+    l
 }
 
 #[cfg(test)]
@@ -627,6 +646,28 @@ mod tests {
             !prefix_populated(&store, REL),
             "delete_under recursively removes the bucket-relative prefix behind the gs:// URI"
         );
+    }
+
+    #[test]
+    fn build_bigquery_loader_wires_partition_and_cluster_keys() {
+        // A non-empty cluster/partition MUST reach the loader; if the guard
+        // inverts, a real key is silently dropped and the load omits the
+        // clustering the config asked for. Reading cluster_by/partition_by pins
+        // the wiring that `Box<dyn TargetLoader>` hides.
+        let l = build_bigquery_loader(
+            "proj",
+            "ds",
+            Some("day"),
+            &["customer_id".to_string(), "region".to_string()],
+            "run-1",
+        );
+        assert_eq!(l.cluster_by, ["customer_id", "region"]);
+        assert_eq!(l.partition_by.as_deref(), Some("day"));
+
+        // No keys set → neither clause (the default), never a spurious one.
+        let bare = build_bigquery_loader("proj", "ds", None, &[], "run-1");
+        assert!(bare.cluster_by.is_empty());
+        assert!(bare.partition_by.is_none());
     }
 
     #[test]
