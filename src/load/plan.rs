@@ -48,6 +48,52 @@ pub struct LoadSection {
     pub cluster_by: Vec<String>,
 }
 
+/// Per-export overrides of the top-level [`LoadSection`] — every field optional,
+/// `None` inherits the top-level value. `target` is present ONLY to reject it:
+/// the warehouse is shared (`plan_loads` runs one `rivet check --target`), so it
+/// stays top-level.
+#[derive(Debug, Deserialize)]
+struct LoadOverride {
+    #[serde(default)]
+    pk: Option<Vec<String>>,
+    #[serde(default)]
+    cleanup_source: Option<bool>,
+    #[serde(default)]
+    gc_orphans: Option<bool>,
+    #[serde(default)]
+    cluster_by: Option<Vec<String>>,
+    #[serde(default)]
+    allow_source_drift: Option<bool>,
+    /// Only to REJECT — a per-export `load:` cannot re-target the warehouse.
+    #[serde(default)]
+    target: Option<serde_json::Value>,
+}
+
+impl LoadSection {
+    /// The effective load config for one export: this top-level section with the
+    /// export's [`LoadOverride`] applied — each `Some` field replaces, each
+    /// `None` inherits. `target` is never overridden.
+    fn with_override(&self, o: &LoadOverride) -> LoadSection {
+        let mut eff = self.clone();
+        if let Some(pk) = &o.pk {
+            eff.pk = pk.clone();
+        }
+        if let Some(c) = o.cleanup_source {
+            eff.cleanup_source = c;
+        }
+        if let Some(g) = o.gc_orphans {
+            eff.gc_orphans = g;
+        }
+        if let Some(cb) = &o.cluster_by {
+            eff.cluster_by = cb.clone();
+        }
+        if let Some(d) = o.allow_source_drift {
+            eff.allow_source_drift = d;
+        }
+        eff
+    }
+}
+
 /// A warehouse and its connection config. `target:` is the serde discriminator.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "target", rename_all = "lowercase")]
@@ -221,13 +267,32 @@ pub fn plan_loads(config_path: &str, rivet_bin: &str) -> Result<Vec<LoadPlan>> {
             crate::config::ExportMode::Incremental => LoadMode::Incremental,
             _ => LoadMode::Full,
         };
+        // Effective load config: the shared top-level `load:`, with this export's
+        // own `load:` block overriding the table-specific fields (pk, cleanup, …).
+        // The warehouse `target` is shared and cannot be re-targeted per export.
+        let eff_load = match &export.load {
+            Some(v) => {
+                let o: LoadOverride = serde_json::from_value(v.clone()).with_context(|| {
+                    format!("parsing export `{}` `load:` override", export.name)
+                })?;
+                if o.target.is_some() {
+                    bail!(
+                        "export `{}`: a per-export `load:` cannot override `target:` — the \
+                         warehouse is shared; set `target:` in the top-level `load:` block only",
+                        export.name
+                    );
+                }
+                load.with_override(&o)
+            }
+            None => load.clone(),
+        };
         plans.push(LoadPlan {
             table,
             partition_by: export.partition_by.clone(),
             specs,
             gcs_prefix,
             destination: export.destination.clone(),
-            load: load.clone(),
+            load: eff_load,
             mode,
             cursor_column: export.cursor_column.clone(),
         });
@@ -345,6 +410,74 @@ mod tests {
     fn unknown_target_is_rejected_at_deserialize() {
         let value = serde_json::json!({ "target": "redshift", "project": "p" });
         assert!(serde_json::from_value::<LoadSection>(value).is_err());
+    }
+
+    fn top_level_load() -> LoadSection {
+        serde_json::from_value(serde_json::json!({
+            "target": "bigquery", "project": "p", "dataset": "d",
+            "pk": ["top"], "cleanup_source": true, "gc_orphans": false,
+            "cluster_by": ["c0"], "allow_source_drift": false,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn with_override_replaces_some_fields_and_inherits_the_rest() {
+        let top = top_level_load();
+        // Override ONLY pk + gc_orphans; the rest must inherit the top-level.
+        let o: LoadOverride =
+            serde_json::from_value(serde_json::json!({ "pk": ["id"], "gc_orphans": true }))
+                .unwrap();
+        let eff = top.with_override(&o);
+        assert_eq!(eff.pk, vec!["id"], "pk replaced");
+        assert!(eff.gc_orphans, "gc_orphans replaced");
+        assert!(
+            eff.cleanup_source,
+            "cleanup_source inherited (top-level true)"
+        );
+        assert_eq!(eff.cluster_by, vec!["c0"], "cluster_by inherited");
+        assert!(!eff.allow_source_drift, "allow_source_drift inherited");
+    }
+
+    #[test]
+    fn override_parsing_leaves_omitted_fields_none() {
+        let o: LoadOverride = serde_json::from_value(serde_json::json!({ "pk": ["id"] })).unwrap();
+        assert_eq!(o.pk.as_deref(), Some(&["id".to_string()][..]));
+        assert!(o.cleanup_source.is_none());
+        assert!(o.gc_orphans.is_none());
+        assert!(o.cluster_by.is_none());
+        assert!(o.allow_source_drift.is_none());
+        assert!(o.target.is_none());
+    }
+
+    #[test]
+    fn empty_override_is_distinct_from_inherit() {
+        let top = top_level_load();
+        // An EXPLICIT empty pk clears the inherited one; a missing pk keeps it.
+        let cleared: LoadOverride =
+            serde_json::from_value(serde_json::json!({ "pk": [] })).unwrap();
+        assert!(
+            top.with_override(&cleared).pk.is_empty(),
+            "explicit [] clears"
+        );
+        let inherit: LoadOverride = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(
+            top.with_override(&inherit).pk,
+            vec!["top"],
+            "omitted inherits"
+        );
+    }
+
+    #[test]
+    fn override_carrying_target_is_detected() {
+        // The plan_loads guard rejects a per-export `load:` that re-targets the
+        // warehouse; the override captures `target:` so the guard can see it.
+        let o: LoadOverride =
+            serde_json::from_value(serde_json::json!({ "target": "snowflake" })).unwrap();
+        assert!(
+            o.target.is_some(),
+            "target captured for the plan_loads guard"
+        );
     }
 
     #[test]

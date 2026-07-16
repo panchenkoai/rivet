@@ -759,6 +759,10 @@
           ],
           "default": null
         },
+        "load": {
+          "description": "Per-export overrides for the top-level `load:` block (`pk`,\n`cleanup_source`, `gc_orphans`, `cluster_by`, `allow_source_drift`); any\nfield omitted here inherits the top-level value. The warehouse `target`\nis shared and stays in the top-level `load:` — it cannot be overridden\nper export.\n\n```yaml\nload: { target: bigquery, project: p, dataset: d }   # shared default\nexports:\n  - name: orders\n    table: orders\n    mode: cdc\n    load: { pk: [id] }                                # this table's pk\n```\n\nRaw JSON (parsed by the load module) so `config` carries no load types —\nmirrors the top-level [`crate::config::Config::load`].",
+          "default": null
+        },
         "on_schema_drift": {
           "description": "Policy applied when structural schema drift is detected (column added, removed, or retyped).\nDefaults to `warn`: log a warning and continue.",
           "$ref": "#/$defs/SchemaDriftPolicy",

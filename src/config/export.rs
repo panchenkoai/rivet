@@ -260,6 +260,26 @@ pub struct ExportConfig {
     #[serde(default)]
     pub target: Option<String>,
 
+    /// Per-export overrides for the top-level `load:` block (`pk`,
+    /// `cleanup_source`, `gc_orphans`, `cluster_by`, `allow_source_drift`); any
+    /// field omitted here inherits the top-level value. The warehouse `target`
+    /// is shared and stays in the top-level `load:` — it cannot be overridden
+    /// per export.
+    ///
+    /// ```yaml
+    /// load: { target: bigquery, project: p, dataset: d }   # shared default
+    /// exports:
+    ///   - name: orders
+    ///     table: orders
+    ///     mode: cdc
+    ///     load: { pk: [id] }                                # this table's pk
+    /// ```
+    ///
+    /// Raw JSON (parsed by the load module) so `config` carries no load types —
+    /// mirrors the top-level [`crate::config::Config::load`].
+    #[serde(default)]
+    pub load: Option<serde_json::Value>,
+
     /// Policy applied when structural schema drift is detected (column added, removed, or retyped).
     /// Defaults to `warn`: log a warning and continue.
     #[serde(default)]
@@ -574,6 +594,7 @@ pub(crate) fn sample_export(name: &str) -> ExportConfig {
     ExportConfig {
         name: name.into(),
         target: None,
+        load: None,
         verify: VerifyMode::Size,
         query: Some("SELECT 1".into()),
         query_file: None,
