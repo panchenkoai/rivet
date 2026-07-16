@@ -538,6 +538,25 @@ mod tests {
     }
 
     #[test]
+    fn select_load_uris_lists_and_re_prefixes_selected_keys_with_the_source_bucket() {
+        // select_load_keys (the pure selection) is unit-tested throughout; this
+        // pins the store WRAPPER around it — list `.parquet` under the base, then
+        // reconstruct each `gs://<bucket>/<key>` the loader COPYs from. A mangled
+        // wrapper (empty/garbage URIs) would send the warehouse load at nothing,
+        // or the wrong object — invisible to the pure-selection tests.
+        let (store, _g) = fs_store(&[
+            ("base/r1-000.parquet", b"a".to_vec()),
+            ("base/manifest-r1.json", b"{}".to_vec()), // not .parquet — must be skipped
+        ]);
+        let new = vec![keyed("base/manifest-r1.json", "r1", "r1-000.parquet")];
+        assert_eq!(
+            select_load_uris(&store, "gs://my-bucket/base", &new).unwrap(),
+            vec!["gs://my-bucket/base/r1-000.parquet".to_string()],
+            "the selected key, re-prefixed with the source bucket — never the manifest"
+        );
+    }
+
+    #[test]
     fn select_load_keys_resolves_a_snapshot_subprefix_manifest() {
         // A snapshot manifest lives under `base/snapshot/`; its part is relative
         // to that dir. Resolution must reconstruct the full key.

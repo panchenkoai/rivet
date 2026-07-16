@@ -412,6 +412,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn ledger_str_names_each_mode_stably() {
+        // The state DB's `load_run.mode` discriminator — every mode must map to
+        // its exact stable string, since retry/skip logic keys off it. A drifted
+        // value would mislabel loads in the ledger.
+        assert_eq!(LoadMode::Full.ledger_str(), "full");
+        assert_eq!(LoadMode::Incremental.ledger_str(), "incremental");
+        assert_eq!(LoadMode::Cdc.ledger_str(), "cdc");
+    }
+
+    #[test]
     fn reject_duplicate_target_tables_catches_a_collision() {
         // Two exports resolving to the same warehouse table would clobber each
         // other — caught at plan time, not silently at load time.

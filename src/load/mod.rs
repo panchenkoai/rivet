@@ -630,6 +630,29 @@ mod tests {
     }
 
     #[test]
+    fn split_gs_uri_parses_bucket_and_bucket_relative_key() {
+        // The parse every load op addresses through: (bucket, bucket-relative
+        // key). The `delete_under` test above can't pin this — it drains by REL
+        // regardless of what split returns — so a mangled split (wrong bucket, or
+        // an empty key that lists/deletes the whole bucket root) is invisible
+        // there. Pin it directly.
+        assert_eq!(split_gs_uri("gs://b/p").unwrap(), ("b", "p"));
+        assert_eq!(
+            split_gs_uri("gs://bucket/a/b/c.parquet").unwrap(),
+            ("bucket", "a/b/c.parquet"),
+            "only the FIRST '/' splits bucket from key; the rest is the key"
+        );
+        assert!(
+            split_gs_uri("s3://b/p").is_err(),
+            "a non-gs scheme is rejected"
+        );
+        assert!(
+            split_gs_uri("gs://bucket-only").is_err(),
+            "a bucket with no '/' has no (bucket, key) split"
+        );
+    }
+
+    #[test]
     fn cdc_empty_pk_bails() {
         let f = FakeLoader::default();
         assert!(
