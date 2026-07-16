@@ -242,6 +242,21 @@ pub fn run_load_incremental(
              for the dedup view's latest-per-PK ordering"
         );
     }
+    // The cursor must be an EXPORTED column: the dedup view orders `__changes` by
+    // it (`ORDER BY <cursor> DESC`). A cursor used only in the extract's WHERE and
+    // not projected (e.g. `SELECT id, v` with `cursor_column: updated_at`, or
+    // incremental-coalesce which strips its synthetic cursor) is absent from
+    // `__changes`, so the view creation would fail AFTER the append — turn that
+    // into a loud pre-append bail instead of a broken view + a retried re-append.
+    if !specs.iter().any(|s| s.column_name == cursor_column) {
+        let cols: Vec<&str> = specs.iter().map(|s| s.column_name.as_str()).collect();
+        bail!(
+            "incremental load of `{table}`: cursor_column `{cursor_column}` is not one of the \
+             exported columns [{}] — add it to the export's SELECT so the dedup view can order \
+             the change log by it",
+            cols.join(", ")
+        );
+    }
     validate_specs(&format!("{table}__changes"), specs)?;
 
     let rows_appended = loader.append_changelog(table, specs, uris, pk)?;
@@ -592,5 +607,34 @@ mod tests {
             .is_err()
         );
         assert!(f.appended.borrow().is_empty());
+    }
+
+    #[test]
+    fn incremental_cursor_not_in_specs_bails_before_append() {
+        let f = FakeLoader::default();
+        // The exported columns are just `id`; a cursor `updated_at` used only in
+        // the extract's WHERE (not projected) is absent from `__changes`. The
+        // driver must bail BEFORE appending — else the view creation fails after
+        // the append and every retry re-appends (bloat).
+        let err = run_load_incremental(
+            &f,
+            "t",
+            &spec(TargetStatus::Ok),
+            &uris(),
+            &["id".to_string()],
+            "updated_at",
+            None,
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("updated_at") && err.contains("not one of the exported columns"),
+            "{err}"
+        );
+        assert!(
+            f.appended.borrow().is_empty(),
+            "nothing appended before the bail"
+        );
     }
 }
