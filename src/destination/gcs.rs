@@ -98,6 +98,16 @@ impl GcsStore {
     pub(crate) fn open_fs(root: &str) -> Result<Self> {
         Self::wrap(Operator::new(opendal::services::Fs::default().root(root))?.finish())
     }
+
+    /// Write `bytes` to the bucket-relative `path`. The load store is otherwise
+    /// read/list/delete-only; this is a test-only seam for STAGING objects into a
+    /// live/emulated bucket (the fake-gcs-server contract test seeds manifests +
+    /// parts through it, then exercises the real list/read/remove path).
+    #[cfg(test)]
+    pub(crate) fn put(&self, path: &str, bytes: &[u8]) -> Result<()> {
+        self.op.write(path, bytes.to_vec())?;
+        Ok(())
+    }
 }
 
 /// GCS object-store destination. The retry policy, blocking wrap, and ADR-0013

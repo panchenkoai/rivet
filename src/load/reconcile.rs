@@ -861,4 +861,135 @@ mod tests {
             "error should name the offending key: {err}"
         );
     }
+
+    // ── fake-gcs-server: the storage contract over the REAL opendal-GCS transport
+    //
+    // Every test above runs the storage-contract fns over an Fs-backed GcsStore —
+    // proving the LOGIC, but not that opendal's GCS client speaks the same
+    // list/read/remove semantics a real bucket answers with. This cell closes that
+    // gap against fsouza/fake-gcs-server (the GCS JSON API emulator the extract
+    // side already uses), so a GCS-only regression — listing pagination, prefix
+    // handling, `remove_all` recursion — fails HERE, not in production. The
+    // warehouse half (bq/snow COPY) can't be emulated; it stays the live BigQuery
+    // matrix (`smoke_batch_mysql` / `StagingWiped`). This owns the BUCKET half.
+    const FAKE_GCS_ENDPOINT: &str = "http://127.0.0.1:4443";
+    const FAKE_GCS_BUCKET: &str = "rivet-load-emulator";
+
+    /// A real GCS-transport [`GcsStore`] against the local emulator, scoped to
+    /// `FAKE_GCS_BUCKET`. Ensures the bucket first via the emulator's JSON API
+    /// (fake-gcs does not auto-create on write) — an idempotent POST, so a re-run
+    /// needs no teardown. curl, not a new HTTP dep: this is a dev-only cell.
+    fn fake_gcs_store() -> GcsStore {
+        let created = std::process::Command::new("curl")
+            .args([
+                "-s",
+                "-X",
+                "POST",
+                &format!("{FAKE_GCS_ENDPOINT}/storage/v1/b?project=rivet-test"),
+                "-H",
+                "Content-Type: application/json",
+                "-d",
+                &format!("{{\"name\":\"{FAKE_GCS_BUCKET}\"}}"),
+            ])
+            .output();
+        assert!(
+            created.is_ok_and(|o| o.status.success()),
+            "could not reach fake-gcs to create the bucket — is `docker compose up -d fake-gcs` running on :4443?"
+        );
+        let cfg = crate::config::DestinationConfig {
+            destination_type: crate::config::DestinationType::Gcs,
+            bucket: Some(FAKE_GCS_BUCKET.into()),
+            endpoint: Some(FAKE_GCS_ENDPOINT.into()),
+            allow_anonymous: true,
+            ..Default::default()
+        };
+        GcsStore::new(&cfg).expect("build GcsStore against fake-gcs")
+    }
+
+    /// Per-object drain of `prefix` — list + single `remove` each. fake-gcs
+    /// implements single-object DELETE but NOT the GCS batch-delete endpoint that
+    /// opendal's `remove_all` issues for 2+ objects (that 400s with `deleted: 0`),
+    /// so the emulator can't run the `cleanup_source` batch wipe. That wipe
+    /// (`delete_under` → `remove_all`) is verified against a REAL bucket by the
+    /// live BigQuery `StagingWiped` matrix, and over the Fs seam above; here we
+    /// drain per-object for idempotent setup/teardown.
+    fn drain(store: &GcsStore, prefix: &str) {
+        for key in store.list_files(prefix).unwrap() {
+            store.remove(&key).unwrap();
+        }
+    }
+
+    #[test]
+    #[ignore = "emulator: needs `docker compose up -d fake-gcs` (fsouza/fake-gcs-server :4443)"]
+    fn storage_contract_over_fake_gcs() {
+        let store = fake_gcs_store();
+        // Test-owned prefix, drained first so a re-run starts clean even though the
+        // emulator bucket persists (no cross-run bleed).
+        let prefix = "load-contract/orders";
+        drain(&store, prefix);
+        let gs = format!("gs://{FAKE_GCS_BUCKET}/{prefix}");
+
+        // Seed one Success run (its manifest + committed part) plus a crash orphan
+        // — an unmanifested `.parquet` an interrupted extract would leave behind.
+        store
+            .put(
+                &format!("{prefix}/manifest-r1.json"),
+                &manifest_bytes("r1", 100, Some(100)),
+            )
+            .unwrap();
+        store
+            .put(&format!("{prefix}/part-000000.parquet"), b"rows-of-r1")
+            .unwrap();
+        store
+            .put(&format!("{prefix}/orphan.parquet"), b"crash-leftover")
+            .unwrap();
+
+        // 1. fetch + parse the manifest back over real GCS list+read.
+        let keyed = fetch_manifests_keyed(&store, &gs).unwrap();
+        assert_eq!(keyed.len(), 1, "the run's manifest, read back over GCS");
+
+        // 2. reconcile → file_rows, the value the warehouse COUNT(*) gate enforces.
+        let manifests: Vec<_> = keyed.iter().map(|(_, m)| m.clone()).collect();
+        assert_eq!(
+            reconcile(&manifests, false).unwrap().file_rows,
+            100,
+            "file_rows drives the count-gate; a bad GCS read would corrupt it"
+        );
+
+        // 3. select_load_uris resolves the MANIFESTED part only — never the orphan.
+        assert_eq!(
+            select_load_uris(&store, &gs, &keyed).unwrap(),
+            vec![format!(
+                "gs://{FAKE_GCS_BUCKET}/{prefix}/part-000000.parquet"
+            )],
+            "load pulls the manifested part, not the unmanifested crash orphan"
+        );
+
+        // 4. gc_orphans deletes the orphan over real GCS — a REAL single-object
+        // DELETE against the emulator — keeping the manifested part + manifest.
+        let (removed, _bytes) = gc_orphans(&store, &gs, &keyed).unwrap();
+        assert_eq!(
+            removed, 1,
+            "exactly the orphan parquet is GC'd over real GCS"
+        );
+        let mut left = store.list_files(prefix).unwrap();
+        left.sort();
+        assert_eq!(
+            left,
+            vec![
+                format!("{prefix}/manifest-r1.json"),
+                format!("{prefix}/part-000000.parquet"),
+            ],
+            "the manifested part + its manifest survive the orphan GC"
+        );
+
+        // cleanup_source's batch wipe (`remove_all`) is NOT emulatable here — see
+        // `drain`. Teardown per-object; the empty listing confirms the deletes
+        // landed over real GCS transport.
+        drain(&store, prefix);
+        assert!(
+            store.list_files(prefix).unwrap().is_empty(),
+            "teardown left the prefix clean over real GCS"
+        );
+    }
 }
