@@ -16,6 +16,16 @@ cargo fmt --all -- --check
 echo "pre-commit: cargo clippy --all-targets -- -D warnings"
 cargo clippy --all-targets -- -D warnings
 
+# Keep the checked-in config JSON schema in sync with the Config types + the
+# crate version. The schema title embeds CARGO_PKG_VERSION, so a version bump
+# (or any Config change) would otherwise only surface at push time as a
+# `schema_drift` test failure. Regenerate + stage it here so every commit carries
+# a current schema. The binary is already built above, so this is ~a run.
+echo "pre-commit: rivet schema config → schemas/"
+cargo run --quiet --bin rivet -- schema config > schemas/rivet.schema.json
+cp schemas/rivet.schema.json schemas/latest/rivet.schema.json
+git add schemas/rivet.schema.json schemas/latest/rivet.schema.json
+
 # Dependency vulnerability gate — mirrors the CI `audit` job and honors the
 # accepted-advisory list in `.cargo/audit.toml`. Hard gate when `cargo-audit`
 # is installed; otherwise prints an install hint and continues (CI still
