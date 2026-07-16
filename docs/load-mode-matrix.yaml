@@ -15,12 +15,12 @@
 #   4. a FAILED load marked its runs loaded → the next load skipped their
 #      never-loaded data. Fixed: only a successful load marks runs loaded.
 #
-# Coverage note: full + cdc are live-verified end-to-end on the devbox
-# (smoke_batch_mysql, cdc_backfill_snapshot_{mysql,pg,mongo}); incremental is
-# offline-verified through the dedup-view + ledger unit tests and was
-# hand-verified live (no-loss + cursor dedup) — a dedicated live incremental
-# cell is the next ratchet target. `na` marks a contract that mode does not have
-# (full has no dedup view; incremental/cdc never OVERWRITE, so never truncate).
+# Coverage note: all three modes are live-verified end-to-end on the devbox —
+# full (smoke_batch_mysql), cdc (cdc_backfill_snapshot_{mysql,pg,mongo}), and
+# incremental (incremental_dedup_mysql: no-loss + cursor dedup + never-tombstones
+# + staging wiped), backed by the dedup-view + ledger unit tests. `na` marks a
+# contract that mode does not have (full has no dedup view; incremental/cdc never
+# OVERWRITE, so never truncate).
 
 engines: [full, incremental, cdc]
 
@@ -94,5 +94,5 @@ scenarios:
   - id: cleanup_source_safe_end_to_end
     what: "cleanup_source: true wipes the staged Parquet after a recorded load without losing data — proven live end to end"
     full:        { test: smoke_batch_mysql }
-    incremental: { gap: "no committed live incremental cell yet — hand-verified live (source 200 → view 200 with cleanup on); add a run_incremental harness cell" }
+    incremental: { test: incremental_dedup_mysql }
     cdc:         { test: cdc_backfill_snapshot_mysql }

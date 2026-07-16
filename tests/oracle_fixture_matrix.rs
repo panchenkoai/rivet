@@ -96,9 +96,24 @@ fn smoke_batch_mysql() {
             WarehouseOracle::DistinctId,
             WarehouseOracle::NullProfile,
             WarehouseOracle::TypeFidelity,
+            // The cleanup side-effect: this cell loads with cleanup_source: true,
+            // so the staging bucket must be empty afterward.
+            WarehouseOracle::StagingWiped,
         ])
         .expect("pipeline"),
     );
+}
+
+// ── Incremental: cursor-delta append + a cursor-ordered current-state view,
+// with cleanup_source (the matrix's incremental leg — no-loss, cursor dedup,
+// never-tombstones, staging wiped). MySQL batch source (no binlog needed).
+#[test]
+#[ignore = "live: needs devbox mysql stack + BigQuery creds"]
+fn incremental_dedup_mysql() {
+    // Mode::Batch is a placeholder — run_incremental builds its own incremental
+    // config (like run_mongo_cdc_delete); it does not route through the Mode enum.
+    let v = Verification::new(Engine::Mysql, Mode::Batch, Fixture::smoke("inc_matrix"));
+    assert_all_pass(v.run_incremental().expect("incremental"));
 }
 
 #[test]

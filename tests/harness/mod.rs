@@ -216,6 +216,11 @@ pub enum WarehouseOracle {
     DistinctId,
     /// Warehouse column type family == the resolved source semantic type.
     TypeFidelity,
+    /// After a `cleanup_source` load, the GCS staging prefix holds NO objects —
+    /// the cleanup side-effect (bucket wiped), not just that the data survived
+    /// it. A cleanup that silently didn't run passes the data oracles but fails
+    /// this one.
+    StagingWiped,
 }
 
 /// A CDC-soak truth check — a process metric over the churn, evaluated only by
@@ -406,7 +411,15 @@ impl Verification {
         let _ = &env; // preconditions checked; stages already consumed it.
         oracles
             .iter()
-            .map(|o| Ok((*o, self.evaluate(&bq_table, *o)?)))
+            .map(|o| {
+                // StagingWiped checks the GCS prefix (known here), not the
+                // warehouse — every other oracle re-reads the loaded table.
+                let outcome = match o {
+                    WarehouseOracle::StagingWiped => self.staging_wiped(&gcs_prefix)?,
+                    _ => self.evaluate(&bq_table, *o)?,
+                };
+                Ok((*o, outcome))
+            })
             .collect()
     }
 
@@ -652,6 +665,112 @@ impl Verification {
                 "untouched_backfill_row_live".into(),
                 compare("mid-row-live", mid_live, 1),
             ),
+            // The cleanup side-effect: `cleanup_source: true` wiped the staging.
+            ("staging_wiped".into(), self.staging_wiped(&full_prefix)?),
+        ])
+    }
+
+    /// A focused live INCREMENTAL cell (MySQL batch source — no binlog): a
+    /// cursor-based delta load into `<t>__changes` + a cursor-ordered
+    /// current-state view, with `cleanup_source`. Proves the incremental
+    /// contract end to end — no-loss, cursor dedup, never-tombstones, and the
+    /// staging wiped — the matrix's incremental leg.
+    ///
+    /// Timeline: seed N rows at `ver = 1` → run + load (first pull = all N) →
+    /// update `id=1` to `v='CHANGED', ver=2` and insert `id=N+1, ver=2` → run +
+    /// load (the delta). The view must show **N+1** live rows, `id=1` at the
+    /// ver-2 value (the cursor-ordered dedup), zero tombstones, and an empty
+    /// bucket.
+    pub fn run_incremental(&self) -> Result<Vec<(String, OracleOutcome)>> {
+        let env = HarnessEnv::load()?;
+        let work = TempWork::new("rivet-incremental")?;
+        let t = self.fixture.table.clone();
+        let n = self.fixture.rows as i64;
+
+        // Seed N rows at ver=1 (the preexisting data; `ver` is the cursor).
+        self.source_raw(&format!(
+            "DROP TABLE IF EXISTS {t}; \
+             CREATE TABLE {t} (id INT PRIMARY KEY, v VARCHAR(16), ver INT); \
+             SET SESSION cte_max_recursion_depth = {depth}; \
+             INSERT INTO {t} (id, v, ver) WITH RECURSIVE seq(n) AS \
+             (SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n < {n}) \
+             SELECT n, CONCAT('r', n), 1 FROM seq;",
+            depth = n + 1,
+        ))?;
+
+        let prefix = format!("matrix/incremental/{t}/");
+        let full_prefix = format!("gs://{}/{}", env.gcs_bucket, prefix);
+        let _ = Command::new("gcloud")
+            .args(["storage", "rm", "-r", &format!("{full_prefix}**")])
+            .status();
+
+        // One config drives both extract (incremental) and load. The state DB is
+        // fresh (TempWork), so run 1 has no cursor and pulls all N rows.
+        let cfg = work.write(
+            "extract.yaml",
+            &format!(
+                "source:\n  type: mysql\n  url: \"{url}\"\n\
+                 exports:\n  - name: {t}\n    query: \"SELECT id, v, ver FROM {t}\"\n    \
+                 mode: incremental\n    cursor_column: ver\n    format: parquet\n    \
+                 destination:\n      type: gcs\n      bucket: {bucket}\n      prefix: {prefix}\n\
+                 load:\n  target: bigquery\n  project: {project}\n  dataset: {dataset}\n  \
+                 pk: [id]\n  cleanup_source: true\n",
+                url = self.lane().url("rivet_bench"),
+                bucket = env.gcs_bucket,
+                project = env.bq_project()?,
+                dataset = MATRIX_DATASET,
+            ),
+        );
+        run(
+            Command::new("rivet").args(["run", "-c"]).arg(&cfg),
+            "rivet run (incremental 1)",
+        )?;
+        run(
+            Command::new("rivet").args(["load", "-c"]).arg(&cfg),
+            "rivet load (incremental 1)",
+        )?;
+        // Delta: bump id=1's cursor (update), add a new row above the watermark.
+        self.source_raw(&format!(
+            "UPDATE {t} SET v='CHANGED', ver=2 WHERE id=1; \
+             INSERT INTO {t} (id, v, ver) VALUES ({}, 'new', 2);",
+            n + 1
+        ))?;
+        run(
+            Command::new("rivet").args(["run", "-c"]).arg(&cfg),
+            "rivet run (incremental 2)",
+        )?;
+        run(
+            Command::new("rivet").args(["load", "-c"]).arg(&cfg),
+            "rivet load (incremental 2)",
+        )?;
+
+        let view = self.warehouse_table_ref(&env, &t)?;
+        let vt = self.wh_table(&view);
+        let live = self.wh_scalar(&format!("SELECT COUNT(*) FROM {vt} WHERE NOT __is_deleted"))?;
+        let tombstoned =
+            self.wh_scalar(&format!("SELECT COUNT(*) FROM {vt} WHERE __is_deleted"))?;
+        let id1_changed = self.wh_scalar(&format!(
+            "SELECT COUNT(*) FROM {vt} WHERE id = 1 AND v = 'CHANGED'"
+        ))?;
+
+        Ok(vec![
+            // N seeded − 0 delete + 1 insert = N+1 live rows (no delta lost).
+            (
+                "incremental_current_state".into(),
+                compare("live-count", live, n + 1),
+            ),
+            // id=1's ver-2 update won over ver-1 via the cursor-ordered view.
+            (
+                "cursor_dedup".into(),
+                compare("id1-ver2-won", id1_changed, 1),
+            ),
+            // Incremental can't observe deletes — the view never tombstones.
+            (
+                "never_tombstones".into(),
+                compare("tombstone-count", tombstoned, 0),
+            ),
+            // The cleanup side-effect: `cleanup_source: true` wiped the staging.
+            ("staging_wiped".into(), self.staging_wiped(&full_prefix)?),
         ])
     }
 
@@ -984,6 +1103,35 @@ impl Verification {
         })
     }
 
+    /// The cleanup side-effect: after a `cleanup_source: true` load, the GCS
+    /// staging prefix must hold no objects. `gcloud storage ls` prints the keys
+    /// to stdout when any exist, and prints nothing (exiting non-zero, "matched
+    /// no objects" on stderr) when the prefix is empty — so an empty stdout is
+    /// the PASS case, non-empty is FAIL with the leftover keys.
+    fn staging_wiped(&self, gcs_prefix: &str) -> Result<OracleOutcome> {
+        let out = Command::new("gcloud")
+            .args(["storage", "ls", &format!("{gcs_prefix}**")])
+            .output()
+            .context("gcloud storage ls (staging_wiped)")?;
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let keys: Vec<&str> = stdout
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect();
+        if keys.is_empty() {
+            Ok(OracleOutcome::Pass)
+        } else {
+            Ok(OracleOutcome::Fail {
+                detail: format!(
+                    "cleanup_source did not wipe the staging: {} object(s) remain under {gcs_prefix} (e.g. {})",
+                    keys.len(),
+                    keys.first().copied().unwrap_or("")
+                ),
+            })
+        }
+    }
+
     // ── stage 4: oracle — re-read the warehouse, compare to source ───────────
     fn evaluate(&self, wh_table: &str, oracle: WarehouseOracle) -> Result<OracleOutcome> {
         let t = self.wh_table(wh_table);
@@ -1056,6 +1204,13 @@ impl Verification {
                     }
                 }
                 Ok(OracleOutcome::Pass)
+            }
+            // StagingWiped inspects the GCS prefix, not the warehouse table, so the
+            // runner dispatches it to `staging_wiped(&gcs_prefix)` directly (it holds
+            // the prefix; `evaluate` does not). Reaching here means a runner forgot
+            // that branch — bail loudly rather than silently pass.
+            WarehouseOracle::StagingWiped => {
+                bail!("StagingWiped must be dispatched via staging_wiped(), not evaluate()")
             }
         }
     }
