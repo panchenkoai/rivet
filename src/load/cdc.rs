@@ -75,6 +75,19 @@ impl Warehouse {
             Warehouse::Snowflake => fqtn.to_string(),
         }
     }
+
+    /// Quote a single column identifier for the view's `PARTITION BY`/`ORDER BY`.
+    /// BigQuery back-ticks (case-preserving, so a reserved-word column like
+    /// `order`/`end` is safe). Snowflake is left BARE — the loader creates its
+    /// columns unquoted (upper-cased), and a case-sensitive `"col"` there would
+    /// miss them; a reserved-word column already fails at the Snowflake `__changes`
+    /// DDL, a narrower pre-existing limitation.
+    fn quote_ident(self, col: &str) -> String {
+        match self {
+            Warehouse::BigQuery => format!("`{col}`"),
+            Warehouse::Snowflake => col.to_string(),
+        }
+    }
 }
 
 impl SourceEngine {
@@ -185,7 +198,11 @@ pub fn dedup_view_sql(
     pk: &[&str],
     engine: SourceEngine,
 ) -> String {
-    let partition = pk.join(", ");
+    let partition = pk
+        .iter()
+        .map(|c| warehouse.quote_ident(c))
+        .collect::<Vec<_>>()
+        .join(", ");
     // `initial: snapshot` backfill rows load as a plain full-snapshot parquet —
     // no `__op`/`__pos`/`__seq` — so they land in `__changes` with those NULL.
     // `__pos IS NOT NULL DESC` FIRST in the order ranks any real change above the
@@ -230,7 +247,11 @@ pub fn inc_dedup_view_sql(
     pk: &[&str],
     cursor_column: &str,
 ) -> String {
-    let partition = pk.join(", ");
+    let partition = pk
+        .iter()
+        .map(|c| warehouse.quote_ident(c))
+        .collect::<Vec<_>>()
+        .join(", ");
     format!(
         "CREATE OR REPLACE VIEW {view} AS\n\
          SELECT * {except} (__op, __pos, __seq, __rn),\n\
@@ -246,7 +267,7 @@ pub fn inc_dedup_view_sql(
         view = warehouse.quote_fqtn(view_fqtn),
         changes = warehouse.quote_fqtn(changes_fqtn),
         except = warehouse.except_keyword(),
-        cursor = cursor_column,
+        cursor = warehouse.quote_ident(cursor_column),
         flag = DELETE_FLAG_COLUMN,
     )
 }
@@ -288,7 +309,10 @@ mod tests {
                     sql.contains("COALESCE(__op = 'delete', FALSE) AS __is_deleted"),
                     "{wh:?}/{engine:?}"
                 );
-                assert!(sql.contains("PARTITION BY id"), "{wh:?}/{engine:?}");
+                assert!(
+                    sql.contains(&format!("PARTITION BY {}", wh.quote_ident("id"))),
+                    "{wh:?}/{engine:?}"
+                );
             }
         }
     }
@@ -358,7 +382,7 @@ mod tests {
         // token (single string key + `__seq` tiebreak, like SQL Server's lsn).
         let bq = dedup_view_sql(Warehouse::BigQuery, "v", "c", &["_id"], SourceEngine::Mongo);
         assert!(bq.contains("JSON_VALUE(__pos,'$._data') DESC, __seq DESC"));
-        assert!(bq.contains("PARTITION BY _id"));
+        assert!(bq.contains("PARTITION BY `_id`"));
         let sf = dedup_view_sql(
             Warehouse::Snowflake,
             "v",
@@ -441,9 +465,15 @@ mod tests {
                 &["id"],
                 "updated_at",
             );
-            assert!(sql.contains("PARTITION BY id"), "{wh:?}: {sql}");
+            assert!(
+                sql.contains(&format!("PARTITION BY {}", wh.quote_ident("id"))),
+                "{wh:?}: {sql}"
+            );
             // Latest-per-PK is the greatest cursor value.
-            assert!(sql.contains("ORDER BY updated_at DESC"), "{wh:?}: {sql}");
+            assert!(
+                sql.contains(&format!("ORDER BY {} DESC", wh.quote_ident("updated_at"))),
+                "{wh:?}: {sql}"
+            );
             // Incremental can't observe deletes → the flag is a constant FALSE,
             // with none of CDC's `__op = 'delete'` logic.
             assert!(sql.contains("FALSE AS __is_deleted"), "{wh:?}: {sql}");
@@ -493,7 +523,29 @@ mod tests {
             &["tenant", "id"],
             SourceEngine::MySql,
         );
-        assert!(sql.contains("PARTITION BY tenant, id"));
+        assert!(sql.contains("PARTITION BY `tenant`, `id`"));
+    }
+
+    #[test]
+    fn identifiers_are_quoted_per_dialect_so_a_reserved_word_column_is_safe() {
+        // BigQuery back-ticks pk + cursor (a column named `order`/`end` would be a
+        // syntax error unquoted); Snowflake leaves them bare (matching its
+        // unquoted/upper-cased loader columns).
+        let bq = inc_dedup_view_sql(Warehouse::BigQuery, "v", "c", &["order"], "end");
+        assert!(bq.contains("PARTITION BY `order`"), "{bq}");
+        assert!(bq.contains("ORDER BY `end` DESC"), "{bq}");
+        let sf = inc_dedup_view_sql(Warehouse::Snowflake, "v", "c", &["order"], "end");
+        assert!(sf.contains("PARTITION BY order"), "{sf}");
+        assert!(sf.contains("ORDER BY end DESC"), "{sf}");
+        // CDC composite pk: each column quoted for BigQuery.
+        let cdc = dedup_view_sql(
+            Warehouse::BigQuery,
+            "v",
+            "c",
+            &["a", "b"],
+            SourceEngine::MySql,
+        );
+        assert!(cdc.contains("PARTITION BY `a`, `b`"), "{cdc}");
     }
 
     #[test]
