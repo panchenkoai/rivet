@@ -175,9 +175,14 @@ pub fn select_load_keys(new: &[(String, RunManifest)], all_parquet: &[String]) -
 /// it wrote its manifest leaves orphan parts the load already ignores, but which
 /// accumulate). Keeps every manifest, `_SUCCESS`, and every manifested part
 /// (including a `snapshot/` sub-prefix's, since `keyed` is fetched recursively).
-/// Strictly gentler than `cleanup_source`, which wipes the whole prefix; safe
-/// under the same assumption — a load follows a completed extract, so it never
-/// races a live writer. Returns `(removed_count, removed_bytes)`.
+/// Strictly gentler than `cleanup_source`, which wipes the whole prefix.
+///
+/// ⚠️ INVARIANT: it cannot distinguish a crash orphan from a *live* extract's
+/// committed-but-not-yet-manifested parts (both are unmanifested `.parquet`), and
+/// there is NO age/lease guard. Only run a load with `gc_orphans` when no extract
+/// is writing the same prefix — the normal pipeline (a load AFTER a completed
+/// extract) satisfies this; a load fired while a `rivet run` streams into the same
+/// prefix would delete its in-flight parts. Returns `(removed_count, removed_bytes)`.
 #[allow(private_interfaces)]
 pub fn gc_orphans(
     store: &GcsStore,
@@ -203,21 +208,29 @@ pub fn gc_orphans(
 }
 
 /// Full/chunked loads care only about the LATEST snapshot: from `keyed` (all run
-/// manifests under the prefix), pick the newest by `finished_at` — unless its
-/// `run_id` is already in `loaded`, in which case the target is current and this
-/// returns empty (a skip). Returns a 0-or-1 element `Vec` so [`prepare_load`]
-/// treats it uniformly with the append modes' "all new runs".
-/// Full loads OVERWRITE, so exactly ONE snapshot may be loaded — the LATEST by
-/// `finished_at` (loading every accumulated run would duplicate rows). It is
-/// deliberately **not** ledger-gated: full re-materializes the latest snapshot
-/// on *every* load, so a re-load self-heals a drifted target and full stays
-/// resilient to hidden in-place source updates — its whole guarantee. An empty
-/// input (no staged run — e.g. the staging was cleaned with no fresh extract)
-/// yields an empty selection, so the caller no-ops WITHOUT truncating the target.
+/// manifests under the prefix) pick the newest by `finished_at`. Full loads
+/// OVERWRITE, so exactly ONE snapshot may be loaded (loading every accumulated
+/// run would duplicate rows). Deliberately **not** ledger-gated: full
+/// re-materializes the latest snapshot on *every* load, so a re-load self-heals a
+/// drifted target and stays resilient to hidden in-place source updates. An empty
+/// input (no staged run — e.g. the staging was cleaned) yields an empty
+/// selection, so the caller no-ops WITHOUT truncating the target.
+///
+/// Ordering parses `finished_at` as an instant — a lexical byte compare mis-picks
+/// on mixed RFC3339 precision (`…00.5Z` sorts before `…00Z`) — and falls back to
+/// lexical only if a timestamp fails to parse, so a malformed manifest can't panic.
 pub fn latest_full(keyed: Vec<(String, RunManifest)>) -> Vec<(String, RunManifest)> {
     keyed
         .into_iter()
-        .max_by(|a, b| a.1.finished_at.cmp(&b.1.finished_at))
+        .max_by(|a, b| {
+            match (
+                chrono::DateTime::parse_from_rfc3339(&a.1.finished_at).ok(),
+                chrono::DateTime::parse_from_rfc3339(&b.1.finished_at).ok(),
+            ) {
+                (Some(x), Some(y)) => x.cmp(&y),
+                _ => a.1.finished_at.cmp(&b.1.finished_at),
+            }
+        })
         .into_iter()
         .collect()
 }
@@ -679,6 +692,22 @@ mod tests {
         // Empty staging (e.g. cleaned, no fresh extract) → empty selection → the
         // caller returns None and never truncates the target to empty.
         assert!(latest_full(Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn latest_full_orders_by_parsed_instant_not_lexical_bytes() {
+        // `…00.500Z` is LATER than `…00Z` but sorts EARLIER lexically ('.' < 'Z').
+        // Parsing to an instant picks the truly-newest run, not the lexical max.
+        let keyed = vec![
+            keyed_at("older", "2026-01-01T00:00:00Z"),
+            keyed_at("newer", "2026-01-01T00:00:00.500Z"),
+        ];
+        let sel = latest_full(keyed);
+        assert_eq!(sel.len(), 1);
+        assert_eq!(
+            sel[0].1.run_id, "newer",
+            "the fractional-second run is the newer instant"
+        );
     }
 
     #[test]

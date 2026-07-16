@@ -39,7 +39,10 @@ pub struct LoadSection {
     /// that no `Success` manifest references — crash leftovers from an
     /// interrupted extract. Keeps the current run's files, manifests, and
     /// `_SUCCESS`; strictly gentler than `cleanup_source`, which wipes the whole
-    /// prefix. Off by default.
+    /// prefix. Off by default. ⚠️ Only enable when no extract writes this prefix
+    /// concurrently — it can't tell a crash orphan from a live run's in-flight
+    /// parts (see `reconcile::gc_orphans`); the normal load-after-extract flow is
+    /// safe.
     #[serde(default)]
     pub gc_orphans: bool,
     /// Clustering key column(s) — BigQuery `CLUSTER BY` / Snowflake `CLUSTER BY`.
@@ -305,11 +308,17 @@ pub fn plan_loads(config_path: &str, rivet_bin: &str) -> Result<Vec<LoadPlan>> {
             })
             .collect();
 
-        // full + chunked are both complete snapshots → overwrite the latest run.
+        // Complete-snapshot modes → overwrite the latest run; delta modes → their
+        // own append path. Exhaustive (no `_`) on purpose: a future delta-style
+        // ExportMode then fails to COMPILE here until someone picks its load
+        // semantics, instead of silently defaulting to OVERWRITE (the
+        // incremental-overwrite data-loss class).
         let mode = match export.mode {
             crate::config::ExportMode::Cdc => LoadMode::Cdc,
             crate::config::ExportMode::Incremental => LoadMode::Incremental,
-            _ => LoadMode::Full,
+            crate::config::ExportMode::Full => LoadMode::Full, // whole result set
+            crate::config::ExportMode::Chunked => LoadMode::Full, // parallel full snapshot
+            crate::config::ExportMode::TimeWindow => LoadMode::Full, // whole rolling window
         };
         // Effective load config: the shared top-level `load:`, with this export's
         // own `load:` block overriding the table-specific fields (pk, cleanup, …).
@@ -341,7 +350,27 @@ pub fn plan_loads(config_path: &str, rivet_bin: &str) -> Result<Vec<LoadPlan>> {
             cursor_column: export.cursor_column.clone(),
         });
     }
+    reject_duplicate_target_tables(&plans.iter().map(|p| p.table.as_str()).collect::<Vec<_>>())?;
     Ok(plans)
+}
+
+/// Reject two exports that resolve to the SAME warehouse table. The `target:` is
+/// shared, so two exports whose `table:` (or `name:`) resolves alike land on one
+/// warehouse object — a full OVERWRITE would clobber what a cdc/incremental
+/// export appends a `<table>__changes` view over, and they'd share one ledger
+/// skip-set. Pure + unit-testable; caught here, not silently at load time.
+fn reject_duplicate_target_tables(tables: &[&str]) -> Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    for t in tables {
+        if !seen.insert(*t) {
+            bail!(
+                "two exports resolve to the same load target table `{t}` — each would clobber \
+                 the other (a full OVERWRITE vs a cdc/incremental append share the table and \
+                 its ledger). Give each export its own `table:` or destination."
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Resolve the config's source engine into the CDC [`SourceEngine`] the dedup
@@ -392,6 +421,15 @@ pub fn list_gcs_uris(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reject_duplicate_target_tables_catches_a_collision() {
+        // Two exports resolving to the same warehouse table would clobber each
+        // other — caught at plan time, not silently at load time.
+        assert!(reject_duplicate_target_tables(&["orders", "events", "orders"]).is_err());
+        assert!(reject_duplicate_target_tables(&["orders", "events"]).is_ok());
+        assert!(reject_duplicate_target_tables(&[]).is_ok());
+    }
 
     #[test]
     fn multi_export_check_json_parses_as_a_stream() {
