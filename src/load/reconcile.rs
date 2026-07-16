@@ -154,6 +154,23 @@ pub fn select_load_keys(new: &[(String, RunManifest)], all_parquet: &[String]) -
     selected.into_iter().collect()
 }
 
+/// Full/chunked loads care only about the LATEST snapshot: from `keyed` (all run
+/// manifests under the prefix), pick the newest by `finished_at` — unless its
+/// `run_id` is already in `loaded`, in which case the target is current and this
+/// returns empty (a skip). Returns a 0-or-1 element `Vec` so [`prepare_load`]
+/// treats it uniformly with the append modes' "all new runs".
+pub fn latest_unloaded_full(
+    keyed: Vec<(String, RunManifest)>,
+    loaded: &std::collections::HashSet<String>,
+) -> Vec<(String, RunManifest)> {
+    keyed
+        .into_iter()
+        .max_by(|a, b| a.1.finished_at.cmp(&b.1.finished_at))
+        .filter(|(_, m)| !loaded.contains(&m.run_id))
+        .into_iter()
+        .collect()
+}
+
 /// Bucket-relative keys of every run manifest under `base` (recursive).
 fn list_manifest_keys(store: &GcsStore, base: &str) -> Result<Vec<String>> {
     let all: Vec<String> = store
@@ -487,6 +504,54 @@ mod tests {
             select_load_keys(&[], &all).is_empty(),
             "no new runs ⇒ load nothing, not everything"
         );
+    }
+
+    fn keyed_at(run: &str, finished_at: &str) -> (String, RunManifest) {
+        let mut m = manifest(run, 100, None);
+        m.finished_at = finished_at.into();
+        (format!("base/manifest-{run}.json"), m)
+    }
+
+    #[test]
+    fn latest_unloaded_full_picks_the_newest_snapshot_not_all() {
+        // Full loads OVERWRITE, so only the LATEST snapshot may be loaded —
+        // selecting all accumulated runs would load duplicate snapshots.
+        let keyed = vec![
+            keyed_at("r1", "2026-01-01T00:00:00Z"),
+            keyed_at("r3", "2026-01-03T00:00:00Z"),
+            keyed_at("r2", "2026-01-02T00:00:00Z"),
+        ];
+        let sel = latest_unloaded_full(keyed, &std::collections::HashSet::new());
+        assert_eq!(sel.len(), 1, "exactly one snapshot, never all");
+        assert_eq!(sel[0].1.run_id, "r3", "the newest by finished_at");
+    }
+
+    #[test]
+    fn latest_unloaded_full_skips_when_the_latest_is_already_loaded() {
+        // The newest run is in the ledger → the target is current → skip (empty),
+        // so a re-load without a fresh extract does not re-OVERWRITE.
+        let keyed = vec![
+            keyed_at("r1", "2026-01-01T00:00:00Z"),
+            keyed_at("r2", "2026-01-02T00:00:00Z"),
+        ];
+        let loaded = std::collections::HashSet::from(["r2".to_string()]);
+        assert!(
+            latest_unloaded_full(keyed, &loaded).is_empty(),
+            "latest already loaded ⇒ skip, not re-overwrite"
+        );
+    }
+
+    #[test]
+    fn latest_unloaded_full_loads_a_newer_run_over_an_older_loaded_one() {
+        // A fresh full extract (r2) after r1 was loaded → load r2 (overwrite).
+        let keyed = vec![
+            keyed_at("r1", "2026-01-01T00:00:00Z"),
+            keyed_at("r2", "2026-01-02T00:00:00Z"),
+        ];
+        let loaded = std::collections::HashSet::from(["r1".to_string()]);
+        let sel = latest_unloaded_full(keyed, &loaded);
+        assert_eq!(sel.len(), 1);
+        assert_eq!(sel[0].1.run_id, "r2");
     }
 
     #[test]

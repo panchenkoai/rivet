@@ -734,6 +734,20 @@ fn dispatch_load(args: LoadArgs) -> Result<()> {
     // One run id for the whole invocation, shared across every table — so warehouse
     // cost slices per load run (all tables together) as well as per table.
     let run_id = args.run_id.clone().unwrap_or_else(generate_run_id);
+    // The load ledger: the state DB — not the file prefix — is the source of
+    // truth for what's loaded, so cleanup is safe for every mode and retry is
+    // DB-driven (the GCS listing is only a fallback). A state-DB problem must
+    // never fail a load — degrade to the stateless path.
+    let state = match StateStore::open(&args.config) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            eprintln!(
+                "  warning: state store unavailable ({e:#}); loading without a ledger \
+                 (no incremental skip / audit log)"
+            );
+            None
+        }
+    };
     let tables: Vec<&str> = plans.iter().map(|p| p.table.as_str()).collect();
     eprintln!(
         "{}: resolved {} table(s) → {} [run_id={}]: {}",
@@ -750,19 +764,6 @@ fn dispatch_load(args: LoadArgs) -> Result<()> {
                 "`--cdc` needs `--pk <col>[,<col>]` — the change log's primary key for the dedup view"
             );
         }
-        // The load ledger is CDC-only: it makes the append-log incremental (skip
-        // runs already loaded) and audits each load. A state-DB problem must never
-        // fail a load — degrade to the stateless path.
-        let state = match StateStore::open(&args.config) {
-            Ok(s) => Some(s),
-            Err(e) => {
-                eprintln!(
-                    "  warning: state store unavailable ({e:#}); loading without a ledger \
-                     (no incremental skip / audit log)"
-                );
-                None
-            }
-        };
         let engine = load::plan::source_engine(&args.config)?;
         for plan in &plans {
             let load_id = format!("{run_id}:{}", plan.table);
@@ -782,9 +783,16 @@ fn dispatch_load(args: LoadArgs) -> Result<()> {
         return Ok(());
     }
 
-    // Batch: full-replace, stateless — the load ledger is CDC-only (see load_one).
     for plan in &plans {
-        match load_one(plan, &run_id, args.allow_source_drift)? {
+        let load_id = format!("{run_id}:{}", plan.table);
+        // Full loads are ledger-driven (latest run + skip re-load + safe cleanup);
+        // incremental still takes the stateless overwrite path until its own
+        // append+dedup path lands (next commit).
+        let st = match plan.mode {
+            load::plan::LoadMode::Full => state.as_ref(),
+            _ => None,
+        };
+        match load_one(plan, &run_id, args.allow_source_drift, st, &load_id)? {
             Some(report) => println!("LOAD OK [{}]: {report:#?}", plan.table),
             None => println!("LOAD SKIP [{}]: up to date", plan.table),
         }
@@ -830,10 +838,16 @@ fn prepare_load(
         Some(s) => {
             let keyed = load::reconcile::fetch_manifests_keyed(store, &plan.gcs_prefix)?;
             let loaded = s.loaded_source_run_ids(target_fqtn).unwrap_or_default();
-            let new: Vec<_> = keyed
-                .into_iter()
-                .filter(|(_, m)| !loaded.contains(&m.run_id))
-                .collect();
+            let new: Vec<_> = match plan.mode {
+                // Full/chunked is a complete snapshot — OVERWRITE with the LATEST
+                // run only, unless it's the one already loaded (→ skip).
+                load::plan::LoadMode::Full => load::reconcile::latest_unloaded_full(keyed, &loaded),
+                // Incremental/CDC accumulate — APPEND every run not yet loaded.
+                _ => keyed
+                    .into_iter()
+                    .filter(|(_, m)| !loaded.contains(&m.run_id))
+                    .collect(),
+            };
             if new.is_empty() {
                 return Ok(None);
             }
@@ -1048,17 +1062,19 @@ fn load_one(
     plan: &load::plan::LoadPlan,
     run_id: &str,
     allow_source_drift: bool,
+    state: Option<&StateStore>,
+    load_id: &str,
 ) -> Result<Option<load::LoadReport>> {
-    // Batch loads are full-replace by design, so they stay stateless: the load
-    // ledger (incremental skip + audit) is CDC-only. state=None ⇒ prepare_load
-    // reconciles every manifest and LoadCtx records nothing.
+    // Full loads OVERWRITE with the latest snapshot; the ledger (when `state`)
+    // selects that single latest run, skips a re-load of it, and makes cleanup
+    // safe. `state = None` ⇒ the stateless fallback (reconcile + load all).
     let job = LoadJob {
         plan,
         run_id,
-        state: None,
-        load_id: run_id, // unused when state is None (LoadCtx is a no-op)
+        state,
+        load_id,
         allow_source_drift,
-        mode: "batch",
+        mode: "full",
     };
     execute_load(
         job,

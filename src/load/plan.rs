@@ -57,6 +57,20 @@ impl LoadTarget {
     }
 }
 
+/// Which load strategy an export's `mode` maps to. Drives BOTH the ledger's
+/// file selection and the warehouse write path:
+/// - `Full` — the export is a complete snapshot; load the LATEST run only and
+///   OVERWRITE (chunked is a parallel full snapshot, same handling).
+/// - `Incremental` — the export is a delta since a cursor; APPEND it to
+///   `<table>__changes` and dedup to current state ordered by the cursor.
+/// - `Cdc` — a change stream; APPEND + dedup by `(__pos, __seq)` with tombstones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadMode {
+    Full,
+    Incremental,
+    Cdc,
+}
+
 /// What a rivet config resolves to for a BigQuery load.
 #[derive(Debug, Clone)]
 pub struct LoadPlan {
@@ -71,6 +85,14 @@ pub struct LoadPlan {
     pub destination: crate::config::DestinationConfig,
     /// The `load:` target from the same config.
     pub load: LoadSection,
+    /// The export's mode → the load strategy (see [`LoadMode`]).
+    pub mode: LoadMode,
+    /// The incremental cursor column (from `cursor_column:`) — the dedup view's
+    /// latest-per-PK ordering key. `Some` only for [`LoadMode::Incremental`].
+    // Read by the incremental load path (next commit); populated here so the
+    // plan is complete.
+    #[allow(dead_code)]
+    pub cursor_column: Option<String>,
 }
 
 /// One export's slice of `rivet check --target X --json`. The tool emits one
@@ -178,6 +200,12 @@ pub fn plan_loads(config_path: &str, rivet_bin: &str) -> Result<Vec<LoadPlan>> {
             })
             .collect();
 
+        // full + chunked are both complete snapshots → overwrite the latest run.
+        let mode = match export.mode {
+            crate::config::ExportMode::Cdc => LoadMode::Cdc,
+            crate::config::ExportMode::Incremental => LoadMode::Incremental,
+            _ => LoadMode::Full,
+        };
         plans.push(LoadPlan {
             table,
             partition_by: export.partition_by.clone(),
@@ -185,6 +213,8 @@ pub fn plan_loads(config_path: &str, rivet_bin: &str) -> Result<Vec<LoadPlan>> {
             gcs_prefix,
             destination: export.destination.clone(),
             load: load.clone(),
+            mode,
+            cursor_column: export.cursor_column.clone(),
         });
     }
     Ok(plans)
