@@ -47,13 +47,10 @@ pub(crate) struct PgChangeStream {
     /// batch, has drained everything past the ack frontier — the stream ends
     /// (a non-acking consumer, e.g. NDJSON, ends here after its one big peek).
     exhausted: bool,
-    /// Open-time COMMIT-LSN ceiling for a bounded (`until_current`) run: the
-    /// first transaction committing PAST it ends the stream, so the run's work
-    /// is O(backlog at open) even when writers outpace the drain — the catch-up
-    /// exit alone (short/empty peek) never fires under sustained writes ≥ one
-    /// full batch per roll cycle. `None` (daemon / anchor-only open) keeps the
-    /// pure catch-up behaviour. The excluded tail is never lost: the checkpoint
-    /// stops at the last in-bound commit and the next run resumes there.
+    /// Open-time COMMIT-LSN ceiling for a bounded run — the first transaction
+    /// committing past it ends the stream; `None` (daemon / anchor-only open)
+    /// keeps the pure catch-up exit. The contract lives on
+    /// [`crate::source::cdc::CdcConfig::until_current`].
     bound: Option<u64>,
 }
 
@@ -134,17 +131,10 @@ impl PgChangeStream {
             client,
             slot: slot.to_string(),
             pending: VecDeque::new(),
-            // `PeekBound::Sized` carries the sink's part rollover; `Unbounded`
-            // is the i32 ceiling. ×3: `upto_nchanges` counts EVERY decoded row
-            // — the BEGIN/COMMIT markers too — so a single-row transaction eats
-            // 3 rows of budget for 1 change. A budget equal to the rollover
-            // then yields < rollover data rows per peek, the sink never reaches
-            // its ack boundary, the refill re-reads the same window, and the
-            // stream exhausts with the backlog only PARTIALLY drained — a
-            // bounded run claiming "caught up" after a third of the backlog
-            // (RED-caught by roast_pg_until_current_open_bound_two_runs_lose_
-            // nothing at rollover 5: two runs captured 4 ids of ~600). ×3
-            // covers the worst marker ratio; RSS stays O(rollover).
+            // ×3 the ack cadence: `upto_nchanges` counts the BEGIN/COMMIT
+            // marker rows, so a single-row transaction is 3 wire rows for 1
+            // change — the starvation story lives on
+            // [`crate::source::cdc::PeekBound`]. RSS stays O(rollover).
             batch_limit: peek.rows_capped().saturating_mul(3).min(i32::MAX as usize) as i32,
             frontier: 0,
             exhausted: false,

@@ -56,16 +56,12 @@ pub(crate) struct MysqlChangeStream {
     /// whole transaction is released atomically with the commit position.
     tx: Vec<ChangeEvent>,
     file: String,
-    /// Open-time `(binlog_file, pos)` ceiling for a bounded (`non_block`) run:
-    /// the first commit PAST it ends the stream, so the run's work is
-    /// O(backlog at open) even when the sink drains slower than writers append
-    /// — the `BINLOG_DUMP_NON_BLOCK` EOF alone only fires on catch-up, which
-    /// backpressure can push out indefinitely. `None` (daemon) streams forever.
-    /// The excluded tail is never lost: the checkpoint stops at the last
-    /// in-bound commit and the next run resumes there.
+    /// Open-time `(binlog_file, pos)` ceiling for a bounded (`non_block`) run —
+    /// the first commit past it ends the stream (`BINLOG_DUMP_NON_BLOCK`'s EOF
+    /// stays as the catch-up backstop, which backpressure alone can push out
+    /// indefinitely); `None` (daemon) streams forever. The contract lives on
+    /// [`crate::source::cdc::CdcConfig::until_current`].
     bound: Option<(String, u64)>,
-    /// Bound tripped — subsequent `fill` calls read no further binlog events.
-    done: bool,
 }
 
 impl MysqlChangeStream {
@@ -107,7 +103,6 @@ impl MysqlChangeStream {
             tx: Vec::new(),
             file,
             bound,
-            done: false,
         })
     }
 
@@ -201,9 +196,6 @@ impl MysqlChangeStream {
     /// Pull one binlog event and expand it into `pending`. `Ok(false)` ⇒ stream
     /// ended; `Ok(true)` ⇒ consumed an event.
     fn fill(&mut self) -> Result<bool> {
-        if self.done {
-            return Ok(false);
-        }
         let ev = match self.stream.next() {
             Some(ev) => ev?,
             None => return Ok(false),
@@ -275,10 +267,11 @@ impl MysqlChangeStream {
                 // A commit past the open-time ceiling belongs to the next run:
                 // end the stream WITHOUT releasing the transaction — the
                 // checkpoint never advances past it, so the resume re-reads it
-                // in full (at-least-once, never a partial transaction).
+                // in full. (`tx.clear()` keeps a hypothetical re-poll from
+                // growing a stale buffer; every real driver stops at the first
+                // `None`.)
                 if commit_past_bound(&self.file, log_pos, self.bound.as_ref()) {
                     self.tx.clear();
-                    self.done = true;
                     return Ok(false);
                 }
                 let commit = Position(json!({ "file": self.file, "pos": log_pos }));

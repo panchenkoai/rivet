@@ -102,12 +102,11 @@ pub(crate) struct MssqlChangeStream {
     /// A poll that returns no rows has drained the window up to the current max
     /// LSN — the stream ends (the next scheduler run resumes from the checkpoint).
     exhausted: bool,
-    /// Open-time max-LSN ceiling (bare hex) for a bounded (`until_current`) run:
-    /// every poll's `@max` is pinned here instead of re-reading
-    /// `fn_cdc_get_max_lsn()`, so the window cannot recede under sustained
-    /// writes and the run's work is O(backlog at open). `None` (daemon) keeps
-    /// the chase-the-head behaviour. The excluded tail is never lost: the
-    /// checkpoint stops at the last in-bound part and the next run resumes there.
+    /// Open-time max-LSN ceiling (bare hex) for a bounded run: every poll's
+    /// `@max` pins here instead of re-reading `fn_cdc_get_max_lsn()`, so the
+    /// window cannot recede under sustained writes; `None` (daemon) keeps the
+    /// chase-the-head behaviour. The contract lives on
+    /// [`crate::source::cdc::CdcConfig::until_current`].
     bound: Option<String>,
 }
 

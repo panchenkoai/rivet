@@ -86,11 +86,18 @@ scenarios:
     mongo:    { na: "every change-stream event carries a distinct order-preserving resume token, so __seq is always 0; total order is __pos alone (mongo_cdc_soak_dedup_matches_source_current_state)" }
 
   - id: cdc_until_current_bounded
-    what: "until_current: true — a bounded run TERMINATES when caught up, even under sustained concurrent writes"
+    what: "until_current: true — a bounded run TERMINATES at the open-time bound (position current when the stream opened), even under sustained concurrent writes"
     postgres: { test: pg_cdc_until_current_terminates_under_sustained_writes }
     mysql:    { test: cdc_until_current_terminates_under_sustained_writes }
     mssql:    { test: mssql_cdc_until_current_terminates_under_sustained_writes }
     mongo:    { test: roast_until_current_terminates_under_sustained_writes_and_keeps_backlog }
+
+  - id: cdc_until_current_open_bound_two_runs
+    what: "the open-time bound DEFERS, never drops: a writer commits through run 1 (which must terminate — PG variant runs rollover: 5, the RED shape that hung the pre-bound code); run 2 drains the tail; the distinct-id union re-read from the parquet equals the SOURCE id set"
+    postgres: { test: roast_pg_until_current_open_bound_two_runs_lose_nothing }
+    mysql:    { test: roast_mysql_until_current_open_bound_two_runs_lose_nothing }
+    mssql:    { test: roast_mssql_until_current_open_bound_two_runs_lose_nothing }
+    mongo:    { na: "covered jointly by roast_until_current_terminates_under_sustained_writes_and_keeps_backlog (open-time cluster-time bound + backlog, under a live writer) and mongo_cdc_capture_resume_and_until_current_drain (the next run resumes from the token and captures only the deferred changes) — the same defer-not-drop contract, no third harness needed" }
 
   - id: cdc_type_fidelity
     what: "values captured through CDC match the batch export (timestamps/decimals/uuid/json)"

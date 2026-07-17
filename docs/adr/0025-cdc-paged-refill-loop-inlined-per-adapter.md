@@ -55,3 +55,23 @@ driver.**
   the refill loop's duplication is not.
 
 If a fourth poll adapter appears, or the two `fill()` bodies converge, reopen this.
+
+---
+
+## Amendment (2026-07-17)
+
+The consequence bullet above — "a peek that undershoots the rollover is
+unrepresentable" — was falsified by the open-bound work:
+`pg_logical_slot_peek_changes`' `upto_nchanges` counts the BEGIN/COMMIT marker
+rows too, so `PeekBound::Sized(rollover)` yielded fewer DATA rows than the
+sink's ack boundary per peek, the refill re-read the same window, and a bounded
+run exhausted with the backlog only partially drained (RED:
+`roast_pg_until_current_open_bound_two_runs_lose_nothing` — two runs captured
+4 of ~600 ids at rollover 5).
+
+`PeekBound` stays the correctness seam, with its meaning sharpened: it carries
+the sink's ACK CADENCE (the rollover), and each poll adapter derives its own
+WIRE budget from it — PostgreSQL ×3 (the worst marker ratio,
+`PgChangeStream::open`), SQL Server 1:1 (change-table rows are all data). A new
+poll adapter must state its wire-overhead ratio explicitly. The decision itself
+— no shared refill driver — stands.

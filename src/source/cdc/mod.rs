@@ -267,9 +267,17 @@ pub(crate) struct CdcConfig {
     /// MySQL checkpoint file (PG resumes via the slot; SQL Server via its LSN;
     /// MongoDB via the resume token).
     pub checkpoint: Option<PathBuf>,
-    /// Catch up to the source's current end and exit, instead of streaming
-    /// indefinitely. MySQL sets `BINLOG_DUMP_NON_BLOCK`; PG / SQL Server drain
-    /// their backlog and exit; MongoDB polls with `next_if_any` to "current".
+    /// Bounded run: capture up to the source's position AS OF STREAM OPEN, then
+    /// exit — the scheduler model, and the canonical home of the termination
+    /// contract. Every adapter pins the ceiling at open (PostgreSQL
+    /// `pg_current_wal_lsn()`; MySQL the binlog coordinates, with
+    /// `BINLOG_DUMP_NON_BLOCK`'s EOF as the catch-up backstop; SQL Server
+    /// `fn_cdc_get_max_lsn()`; MongoDB the cluster `operationTime`), so a hot
+    /// table whose writers outpace the drain cannot keep the run alive — the
+    /// run's work is O(backlog at open). The excluded tail is deferred, never
+    /// lost: the checkpoint stops at the last in-bound commit and the next run
+    /// resumes there (per-engine two-run proof:
+    /// `roast_*_until_current_open_bound_two_runs_lose_nothing`).
     pub until_current: bool,
     /// Transport security, applied by every adapter through the same
     /// `require_tls_or_loopback` gate the batch path uses (refuse remote
@@ -279,20 +287,28 @@ pub(crate) struct CdcConfig {
     pub engine: CdcEngineOpts,
 }
 
-/// How many changes a poll adapter pulls per `peek` — the drain's memory bound.
-/// It is NOT a free number: on PostgreSQL the peek is non-consuming and pages
-/// forward only when the sink acks (advances the slot) at a `rollover` boundary,
-/// so a peek SMALLER than the part rollover starves — the second peek re-reads
-/// the same changes, trips `exhausted`, and drops the rest of the backlog. This
-/// enum makes that unrepresentable: the acking sink builds [`PeekBound::Sized`]
-/// **from its own rollover** (so peek == rollover, always ≥), and the NDJSON
-/// driver — which never acks — is [`PeekBound::Unbounded`] (one peek drains
-/// everything; the LSN-frontier check ends the stream). There is no way to hand
-/// the stream a bare "peek 500" that undershoots the rollover.
+/// The sink's ACK CADENCE, handed to a poll adapter so it can size its peeks —
+/// the drain's memory bound. On PostgreSQL the peek is non-consuming and pages
+/// forward only when the sink acks (advances the slot) at a `rollover`
+/// boundary, so an adapter whose peek yields fewer DATA rows than the rollover
+/// starves: the second peek re-reads the same window, trips `exhausted`, and
+/// the run under-drains. `Sized` therefore carries the rollover itself (the
+/// acking sink builds it from its own rollover; the non-acking NDJSON driver is
+/// `Unbounded` — one peek drains everything, the frontier check ends the
+/// stream), and each adapter derives its own WIRE budget from it, because wire
+/// overhead is engine-shaped: PostgreSQL's `upto_nchanges` counts BEGIN/COMMIT
+/// marker rows (a single-row transaction is 3 wire rows for 1 change), so its
+/// adapter peeks ×3 ([`crate::source::postgres::cdc::PgChangeStream::open`]);
+/// SQL Server's change-table rows are all data, so its budget is 1:1. A new
+/// poll adapter must state its wire-overhead ratio explicitly — a bare
+/// "peek == rollover" was proven insufficient by
+/// `roast_pg_until_current_open_bound_two_runs_lose_nothing` (two bounded runs
+/// captured 4 of ~600 ids at rollover 5 before the ×3; see ADR-0025's
+/// amendment).
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum PeekBound {
-    /// Peek at most this many changes per batch — the sink passes its part
-    /// `rollover`, so it is ≥ rollover by construction.
+    /// The sink's part `rollover` — the ack cadence. Adapters scale it up to
+    /// their wire-row budget, never below it.
     Sized(usize),
     /// One peek pulls the whole backlog (the non-acking NDJSON path).
     Unbounded,
@@ -429,7 +445,8 @@ pub(crate) const MONGO_CDC_HINT: &str = "if this is a setup error: MongoDB chang
 
 /// Construct the right [`ChangeStream`] adapter for the source URL's scheme —
 /// dispatching by engine exactly as [`crate::source::create_source`] does for the
-/// batch path.
+/// batch path. `cfg.until_current` reaches every adapter as its bounded-open
+/// flag — the open-time-ceiling contract lives on [`CdcConfig::until_current`].
 pub(crate) fn create_change_stream(
     cfg: &CdcConfig,
     peek: PeekBound,
@@ -465,8 +482,6 @@ pub(crate) fn create_change_stream(
                     resume_expected,
                     tls,
                     peek,
-                    // Bounded run ⇒ pin the stop ceiling at open, so termination
-                    // is O(backlog at open) even under sustained writes.
                     cfg.until_current,
                 )
                 .context(PG_CDC_HINT)?,
@@ -496,8 +511,6 @@ pub(crate) fn create_change_stream(
                     from_lsn,
                     tls,
                     peek,
-                    // Bounded run ⇒ pin @max at open, so termination is
-                    // O(backlog at open) even under sustained writes.
                     cfg.until_current,
                 )
                 .context(MSSQL_CDC_HINT)?,
