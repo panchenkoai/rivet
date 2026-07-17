@@ -103,3 +103,30 @@ pub fn files_with_extension(dir: &std::path::Path, ext: &str) -> Vec<std::path::
         .map(|e| e.path())
         .collect()
 }
+
+/// Like [`run_rivet_bounded`], but for arbitrary CLI args (e.g. the `rivet cdc`
+/// NDJSON driver) with stdout captured — `Some(stdout)` on clean exit within
+/// the ceiling, `None` if it had to be killed (the caller asserts on that).
+pub fn run_rivet_args_bounded(args: &[&str], timeout: std::time::Duration) -> Option<String> {
+    let dir = tempfile::tempdir().expect("stdout tempdir");
+    let path = dir.path().join("stdout");
+    let stdout = std::fs::File::create(&path).expect("stdout capture file");
+    let start = std::time::Instant::now();
+    let mut child = Command::new(RIVET_BIN)
+        .args(args)
+        .stdout(stdout)
+        .spawn()
+        .expect("spawn rivet binary");
+    loop {
+        if let Some(status) = child.try_wait().expect("try_wait rivet") {
+            assert!(status.success(), "bounded rivet run exited non-zero");
+            return Some(std::fs::read_to_string(&path).expect("read captured stdout"));
+        }
+        if start.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}

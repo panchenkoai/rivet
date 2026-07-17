@@ -36,9 +36,15 @@ pub(crate) struct PgChangeStream {
     client: Client,
     slot: String,
     pending: VecDeque<ChangeEvent>,
-    /// Max changes to pull per `peek` — the memory bound of the drain
-    /// (O(batch), not O(total backlog)). See [`crate::source::cdc::PeekBound`].
+    /// Current wire budget per `peek` — the memory bound of the drain
+    /// (O(batch), not O(total backlog)). Starts at [`Self::base_budget`] (the
+    /// ack cadence) and escalates ONCE to [`escalated`] (×3, the worst
+    /// BEGIN/COMMIT marker ratio) when a full window yields nothing new — the
+    /// starvation shape where markers ate the budget before one ack's worth of
+    /// data reached the sink. Common-case RSS stays 1× the documented formula.
     batch_limit: i32,
+    /// The 1× ack cadence ([`wire_budget`]) the escalation is derived from.
+    base_budget: i32,
     /// Largest COMMIT LSN already yielded THIS run. A refill re-peeks from the
     /// slot's (un-acked) `restart_lsn`, so any transaction at/below this was
     /// already delivered — it is dropped, making the refill idempotent.
@@ -51,6 +57,17 @@ pub(crate) struct PgChangeStream {
     /// committing past it ends the stream; `None` (daemon / anchor-only open)
     /// keeps the pure catch-up exit. The contract lives on [`DrainMode`].
     bound: Option<u64>,
+    /// Any DATA event pushed this run. When still `false` at clean exhaust,
+    /// every frontier-covered transaction was EMPTY (DDL churn decodes as
+    /// row-less BEGIN/COMMIT) — the sink has nothing to flush, so it never
+    /// acks, and the slot would pin WAL behind the noise forever on an idle
+    /// database. A zero-yield run releases the span itself
+    /// ([`Self::release_empty_frontier`]): advancing past a data-free span can
+    /// lose nothing by construction.
+    yielded_data: bool,
+    /// Rendered LSN of the last frontier advance — the zero-yield release
+    /// target. `take()`n once at exhaust.
+    frontier_text: Option<String>,
 }
 
 impl PgChangeStream {
@@ -118,25 +135,31 @@ impl PgChangeStream {
         // between the anchor and the ceiling). A malformed rendering falls back
         // to unbounded — pure catch-up — never an early exit.
         let bound = if mode.is_bounded() {
+            use anyhow::Context as _;
             let lsn: String = client
-                .query_one("SELECT pg_current_wal_lsn()::text", &[])?
+                .query_one("SELECT pg_current_wal_lsn()::text", &[])
+                .context(
+                    "bounded (until_current) CDC pins its ceiling with pg_current_wal_lsn(), \
+                     which is unavailable during recovery — on a standby, stream continuously \
+                     (until_current: false) or point the source at the primary",
+                )?
                 .get(0);
             parse_lsn(&lsn)
         } else {
             None
         };
+        let base = wire_budget(peek);
         Ok(Self {
             client,
             slot: slot.to_string(),
             pending: VecDeque::new(),
-            // ×3 the ack cadence: `upto_nchanges` counts the BEGIN/COMMIT
-            // marker rows, so a single-row transaction is 3 wire rows for 1
-            // change — the starvation story lives on
-            // [`crate::source::cdc::PeekBound`]. RSS stays O(rollover).
-            batch_limit: peek.rows_capped().saturating_mul(3).min(i32::MAX as usize) as i32,
+            batch_limit: base,
+            base_budget: base,
             frontier: 0,
             exhausted: false,
             bound,
+            yielded_data: false,
+            frontier_text: None,
         })
     }
 
@@ -172,12 +195,16 @@ impl PgChangeStream {
                 let commit_lsn = parse_lsn(&lsn).unwrap_or(0);
                 match tx_disposition(commit_lsn, self.frontier, self.bound) {
                     TxDisposition::Yield => {
+                        if !tx.is_empty() {
+                            self.yielded_data = true;
+                        }
                         let commit = Position(json!({ "lsn": lsn }));
                         for mut ev in tx.drain(..) {
                             ev.position = commit.clone();
                             self.pending.push_back(ev);
                         }
                         self.frontier = commit_lsn;
+                        self.frontier_text = Some(lsn.clone());
                         yielded_any = true;
                     }
                     // Already yielded on a prior (un-acked) peek ⇒ drop, idempotent.
@@ -197,11 +224,64 @@ impl PgChangeStream {
                 tx.push(ev);
             }
         }
-        // No new transaction (a non-acking consumer's second peek re-reads the
-        // same rows) or a short batch (backlog fit in one peek) ⇒ drained.
-        if !yielded_any || n_rows < self.batch_limit as usize {
+        if n_rows < self.batch_limit as usize {
+            // Short window: the remaining backlog fit in one peek ⇒ drained.
             self.exhausted = true;
+        } else if !yielded_any && !self.exhausted {
+            // A FULL window with nothing new: either the budget is starved by
+            // marker rows (`upto_nchanges` counts BEGIN/COMMIT too, so a
+            // single-row transaction is 3 wire rows for 1 change — fewer data
+            // rows than one ack's worth reach the sink, no ack advances the
+            // slot, and the refill re-reads the same window), or the drain
+            // genuinely ended on a full window of un-acked re-reads. Escalate
+            // ONCE to the worst marker ratio and retry; a full window still
+            // yielding nothing new after that is drained. RED-caught by
+            // roast_pg_until_current_open_bound_two_runs_lose_nothing at
+            // rollover 5: without this, two runs captured 4 of ~600 ids while
+            // claiming success. Common-case RSS stays at the 1× formula in
+            // docs/reference/cdc.md.
+            let esc = escalated(self.base_budget);
+            if self.batch_limit < esc {
+                self.batch_limit = esc;
+            } else {
+                self.exhausted = true;
+            }
         }
+        Ok(())
+    }
+
+    /// Zero-yield release: called at clean exhaust. A run whose every
+    /// frontier-covered transaction was EMPTY (see [`Self::yielded_data`])
+    /// advances the slot itself — the sink will never ack (it has nothing to
+    /// flush), and a data-free span has nothing to lose. A run that yielded
+    /// data leaves acking to the sink (the flush→checkpoint→ack durability
+    /// order); its trailing empty span becomes the NEXT run's zero-yield case
+    /// and is released then. Failure here only delays WAL release — warn, never
+    /// fail an otherwise-clean run.
+    fn release_empty_frontier(&mut self) {
+        if self.yielded_data {
+            return;
+        }
+        let Some(lsn) = self.frontier_text.take() else {
+            return;
+        };
+        if let Err(e) = self.advance_slot(&lsn) {
+            log::warn!("pg cdc: could not release the empty-transaction span at {lsn}: {e:#}");
+        }
+    }
+
+    /// Advance the slot's `confirmed_flush_lsn` to `lsn`, validated to the
+    /// pg_lsn charset before interpolation — never trust a value into SQL
+    /// unchecked, even the slot's own output.
+    fn advance_slot(&mut self, lsn: &str) -> Result<()> {
+        if lsn.is_empty() || !lsn.bytes().all(|b| b.is_ascii_hexdigit() || b == b'/') {
+            anyhow::bail!("pg cdc: refusing to advance to a malformed LSN {lsn:?}");
+        }
+        // The postgres crate can't bind `&str` → `pg_lsn`, so the LSN is inlined.
+        self.client.execute(
+            &format!("SELECT pg_replication_slot_advance($1, '{lsn}'::pg_lsn)"),
+            &[&self.slot],
+        )?;
         Ok(())
     }
 }
@@ -232,6 +312,20 @@ fn tx_disposition(commit_lsn: u64, frontier: u64, bound: Option<u64>) -> TxDispo
     }
 }
 
+/// Base wire budget per peek: the sink's ack cadence (1× the part rollover),
+/// clamped to the `pg_logical_slot_peek_changes` int4 arg. Pure — the
+/// starvation contract's offline mutation guard, with [`escalated`].
+fn wire_budget(peek: crate::source::cdc::PeekBound) -> i32 {
+    peek.rows_capped().min(i32::MAX as usize) as i32
+}
+
+/// Starvation escalation: ×3 the base — the worst BEGIN/COMMIT marker ratio
+/// (a single-row transaction is 3 wire rows for 1 change), saturating within
+/// the int4 arg. Applied ONCE, only when a full window yields nothing new.
+fn escalated(base: i32) -> i32 {
+    base.saturating_mul(3)
+}
+
 /// Parse a `pg_lsn` rendering `X/Y` (two hex halves of a 64-bit position) into a
 /// comparable `u64`. `None` on a malformed value — the frontier check then treats
 /// it as `0` (never drops a real transaction on a parse miss).
@@ -252,6 +346,11 @@ impl ChangeStream for PgChangeStream {
                 return Some(Err(e));
             }
         }
+        if self.pending.is_empty() {
+            // Clean exhaust: a zero-yield run releases its empty span (no-op
+            // when any data was yielded — the sink owns acking then).
+            self.release_empty_frontier();
+        }
         self.pending.pop_front().map(Ok)
     }
 
@@ -263,19 +362,9 @@ impl ChangeStream for PgChangeStream {
             .0
             .get("lsn")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("pg cdc ack: position missing 'lsn'"))?;
-        // The postgres crate can't bind `&str` → `pg_lsn`, so the LSN is inlined.
-        // It comes from the slot's own output; still validate it to the pg_lsn
-        // charset (`[0-9A-Fa-f]+/[0-9A-Fa-f]+`) before interpolating — never trust
-        // a value into SQL unchecked.
-        if lsn.is_empty() || !lsn.bytes().all(|b| b.is_ascii_hexdigit() || b == b'/') {
-            anyhow::bail!("pg cdc ack: refusing to advance to a malformed LSN {lsn:?}");
-        }
-        self.client.execute(
-            &format!("SELECT pg_replication_slot_advance($1, '{lsn}'::pg_lsn)"),
-            &[&self.slot],
-        )?;
-        Ok(())
+            .ok_or_else(|| anyhow::anyhow!("pg cdc ack: position missing 'lsn'"))?
+            .to_string();
+        self.advance_slot(&lsn)
     }
 }
 
@@ -674,6 +763,20 @@ mod tests {
         // frontier path, same as the unbounded stream.
         assert_eq!(tx_disposition(0, 0, Some(10)), AlreadyYielded);
         assert_eq!(tx_disposition(0, 0, None), AlreadyYielded);
+    }
+
+    // The offline mutation guard for the peek-budget contract: the CI mutants
+    // gate runs `--lib` only, and without these a `×3 → ×1` (or dropped
+    // saturation) mutant survives everything but the live two-run test.
+    #[test]
+    fn wire_budget_is_the_ack_cadence_and_escalation_is_x3_saturating() {
+        use crate::source::cdc::PeekBound;
+        assert_eq!(wire_budget(PeekBound::Sized(100_000)), 100_000);
+        assert_eq!(wire_budget(PeekBound::Sized(0)), 1); // rows_capped clamps up
+        assert_eq!(wire_budget(PeekBound::Unbounded), i32::MAX);
+        assert_eq!(escalated(100_000), 300_000);
+        assert_eq!(escalated(1), 3);
+        assert_eq!(escalated(i32::MAX), i32::MAX); // saturates within int4
     }
 
     // Staff class #6 (generative fuzz, stable-toolchain flavour): the parsers

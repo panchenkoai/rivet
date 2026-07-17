@@ -158,11 +158,25 @@ marker rows (a single-row tx = 3 rows for 1 change), so `peek == rollover`
 yielded < rollover data rows, the sink never reached its ack boundary, the
 refill re-read the same window, and the stream exhausted with the backlog only
 PARTIALLY drained — every bounded run claimed success after ~⅓ of the pending
-changes (two runs captured 4 of ~600 ids at rollover 5). The PG budget is now
-×3 (`src/source/postgres/cdc.rs::open`); any new poll adapter must state its
-wire-overhead ratio explicitly, and a starvation fixture needs transactions
-whose framing overhead is ≥ the data rows (single-row transactions), not bulk
-inserts that amortise it away.
+changes (two runs captured 4 of ~600 ids at rollover 5). The PG budget now
+escalates ONCE to ×3 when a full window yields nothing new — the starvation
+shape (`src/source/postgres/cdc.rs::fill`, pure seams `wire_budget`/`escalated`
+so the ×3 is offline-mutation-guarded; common-case RSS stays 1×); any new poll
+adapter must state its wire-overhead ratio explicitly, and a starvation fixture
+needs transactions whose framing overhead is ≥ the data rows (single-row
+transactions), not bulk inserts that amortise it away.
+
+Second sibling, from the adversarial pass over the same branch: **row-less
+transactions starve the ACK, not just the budget**. DDL churn decodes as empty
+BEGIN/COMMIT pairs — no events reach the sink, the sink never acks, and on a
+consume-retention engine (PG slot) the anchor pins WAL behind the noise forever
+on an idle database (RED: `confirmed_flush_lsn` frozen across a DDL-churn run).
+A ZERO-YIELD run must release the data-free span itself (safe by construction
+— `release_empty_frontier`); engines whose retention is reader-independent
+(MySQL binlog, MSSQL change tables, Mongo oplog) need nothing. When adding a
+consume-retention engine, test the DDL-churn case against the SERVER's anchor
+position, never rivet's counters (`roast_pg_cdc_empty_transaction_churn_must_
+not_pin_the_slot`).
 
 ## Sink part names must be run-unique — prove it with a two-run test
 

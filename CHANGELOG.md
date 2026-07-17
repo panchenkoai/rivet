@@ -24,8 +24,22 @@
   window, and the stream exhausted with the backlog only partially drained —
   each bounded run claimed success after roughly a third of the pending
   changes (RED-reproduced: two runs captured 4 of ~600 ids at a small
-  rollover). The peek budget is now 3× the rollover, covering the worst
-  marker ratio; drain RSS stays O(rollover).
+  rollover). The peek budget escalates once to 3× the rollover when a full
+  window yields nothing new (the starvation shape), so the common-case drain
+  RSS stays at the documented 1× formula and the 3× worst case only applies
+  under marker-heavy tiny-transaction churn.
+- **PostgreSQL CDC: row-less transaction churn no longer pins the slot.** DDL
+  churn decodes as empty `BEGIN`/`COMMIT` transactions: nothing reaches the
+  sink, the sink never acks, and on an idle database the slot kept pinning WAL
+  behind the noise indefinitely (RED-reproduced: `confirmed_flush_lsn` frozen
+  across a 20-DDL run). A run that yielded ZERO data events now releases the
+  data-free span itself at clean exhaust — advancing past it can lose nothing
+  by construction; a run that yielded data leaves acking to the sink, and its
+  trailing empty span becomes the next run's zero-yield release. Engines with
+  reader-independent retention (MySQL/SQL Server/MongoDB) need nothing.
+- **Bounded CDC on a PostgreSQL standby now fails with an actionable error**
+  (`pg_current_wal_lsn()` is unavailable during recovery): stream continuously
+  or point the source at the primary.
 
 ## 0.20.0 — 2026-07-16
 

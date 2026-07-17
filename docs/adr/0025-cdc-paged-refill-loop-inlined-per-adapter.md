@@ -71,7 +71,9 @@ run exhausted with the backlog only partially drained (RED:
 
 `PeekBound` stays the correctness seam, with its meaning sharpened: it carries
 the sink's ACK CADENCE (the rollover), and each poll adapter derives its own
-WIRE budget from it — PostgreSQL ×3 (the worst marker ratio,
-`PgChangeStream::open`), SQL Server 1:1 (change-table rows are all data). A new
-poll adapter must state its wire-overhead ratio explicitly. The decision itself
-— no shared refill driver — stands.
+WIRE budget from it — PostgreSQL escalates once to ×3 (the worst marker ratio)
+when a full window yields nothing new, keeping common-case RSS at 1×
+(`PgChangeStream::fill`, pure seams `wire_budget`/`escalated`); SQL Server is
+1:1 (change-table rows are all data). A new poll adapter must state its
+wire-overhead ratio explicitly. The decision itself — no shared refill driver —
+stands.

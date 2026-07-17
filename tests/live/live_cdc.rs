@@ -3045,3 +3045,143 @@ fn roast_mysql_until_current_open_bound_two_runs_lose_nothing() {
          defers the tail to run 2, never drops it"
     );
 }
+
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical)"]
+fn roast_pg_cdc_empty_transaction_churn_must_not_pin_the_slot() {
+    // DDL-only churn decodes as EMPTY transactions (BEGIN/COMMIT, no rows):
+    // nothing reaches the sink, so the sink never acks, and the slot keeps
+    // pinning WAL from before the noise — on an idle database, forever (the
+    // uncaptured-DML case is different: it yields events and acks via the
+    // bug-hunt-K final roll). A run that yields NOTHING must release the
+    // data-free span itself — advancing past it can lose nothing by
+    // construction. Oracle: the slot's confirmed_flush_lsn, asked of PostgreSQL
+    // itself, never rivet's counters.
+    use postgres::NoTls;
+    let tbl = unique_name("rivet_cdc_pgempty");
+    let slot = unique_name("rivet_empty_slot");
+    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v INT)"
+    ))
+    .unwrap();
+    let _tbl = PgTable::adopt(tbl.clone());
+    c.execute(
+        "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+        &[&slot],
+    )
+    .unwrap();
+    let _slot = Slot(slot.clone());
+
+    let rig = Rig::pg_cdc(&tbl, &slot);
+    let cfg = rig.config_path();
+    run_rivet_ok(&cfg); // baseline bounded run (captures nothing)
+    let before: String = c
+        .query_one(
+            "SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = $1",
+            &[&slot],
+        )
+        .unwrap()
+        .get(0);
+
+    // Empty-transaction churn: each DDL pair decodes as row-less transactions.
+    for i in 0..20 {
+        c.batch_execute(&format!(
+            "CREATE TABLE {tbl}_junk_{i} (id INT); DROP TABLE {tbl}_junk_{i}"
+        ))
+        .unwrap();
+    }
+
+    run_rivet_ok(&cfg); // captures nothing — but must release the empty span
+    let advanced: bool = c
+        .query_one(
+            &format!(
+                "SELECT confirmed_flush_lsn > '{before}'::pg_lsn \
+                 FROM pg_replication_slots WHERE slot_name = $1"
+            ),
+            &[&slot],
+        )
+        .unwrap()
+        .get(0);
+    assert!(
+        advanced,
+        "a zero-yield run must advance the slot past the empty-transaction span \
+         (confirmed_flush_lsn stuck at {before} — WAL pinned behind DDL noise)"
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical)"]
+fn roast_pg_cdc_ndjson_until_current_terminates_and_emits_backlog() {
+    // The NDJSON driver (`rivet cdc` without --output) shares
+    // create_change_stream with the file sink, so the open-time bound clips it
+    // too — this anchors the CLI path (matrix: cdc_ndjson_bounded): a bounded
+    // NDJSON run must terminate under a live writer and must emit the whole
+    // pre-open backlog to stdout. No ack by design (stdout is not durable —
+    // ADR-0023): the slot is left for the consumer.
+    use postgres::NoTls;
+    let tbl = unique_name("rivet_cdc_pgnd");
+    let slot = unique_name("rivet_nd_slot");
+    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v INT)"
+    ))
+    .unwrap();
+    let _tbl = PgTable::adopt(tbl.clone());
+    c.execute(
+        "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+        &[&slot],
+    )
+    .unwrap();
+    let _slot = Slot(slot.clone());
+
+    for i in 0..30i64 {
+        c.execute(&format!("INSERT INTO {tbl} VALUES ({i},{i})"), &[])
+            .unwrap();
+    }
+
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_bg = stop.clone();
+    let tbl_bg = tbl.clone();
+    let bg = std::thread::spawn(move || {
+        let mut w = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("bg connect");
+        let mut i = 10_000i64;
+        while !stop_bg.load(std::sync::atomic::Ordering::Relaxed) {
+            let vals: Vec<String> = (i..i + 10).map(|k| format!("({k},{k})")).collect();
+            let _ = w.batch_execute(&format!("INSERT INTO {tbl_bg} VALUES {}", vals.join(",")));
+            i += 10;
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    });
+
+    let out = run_rivet_args_bounded(
+        &[
+            "cdc",
+            "--source",
+            POSTGRES_CDC_URL,
+            "--slot",
+            &slot,
+            "--table",
+            &tbl,
+            "--until-current",
+        ],
+        std::time::Duration::from_secs(30),
+    );
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = bg.join();
+    let stdout = out.expect("bounded NDJSON run must terminate under sustained writes");
+
+    let ids: std::collections::BTreeSet<i64> = stdout
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|v| v.get("table").and_then(|t| t.as_str()) == Some(tbl.as_str()))
+        .filter_map(|v| v.get("after")?.get(0)?.as_i64())
+        .collect();
+    for i in 0..30 {
+        assert!(
+            ids.contains(&i),
+            "backlog id {i} must be emitted to stdout, got {} ids",
+            ids.len()
+        );
+    }
+}

@@ -330,13 +330,13 @@ pub(crate) struct CdcConfig {
 /// stream), and each adapter derives its own WIRE budget from it, because wire
 /// overhead is engine-shaped: PostgreSQL's `upto_nchanges` counts BEGIN/COMMIT
 /// marker rows (a single-row transaction is 3 wire rows for 1 change), so its
-/// adapter peeks ×3 ([`crate::source::postgres::cdc::PgChangeStream::open`]);
-/// SQL Server's change-table rows are all data, so its budget is 1:1. A new
-/// poll adapter must state its wire-overhead ratio explicitly — a bare
+/// adapter escalates the budget ONCE to ×3 when a full window yields nothing
+/// new — the starvation shape (`PgChangeStream::fill`; common-case RSS stays
+/// 1×); SQL Server's change-table rows are all data, so its budget is 1:1. A
+/// new poll adapter must state its wire-overhead ratio explicitly — a bare
 /// "peek == rollover" was proven insufficient by
 /// `roast_pg_until_current_open_bound_two_runs_lose_nothing` (two bounded runs
-/// captured 4 of ~600 ids at rollover 5 before the ×3; see ADR-0025's
-/// amendment).
+/// captured 4 of ~600 ids at rollover 5; see ADR-0025's amendment).
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum PeekBound {
     /// The sink's part `rollover` — the ack cadence. Adapters scale it up to
@@ -737,6 +737,22 @@ pub(crate) fn run_capture(cap: CdcCapture<'_>) -> Result<Vec<crate::manifest::Ru
 
 #[cfg(test)]
 mod tests {
+    // The offline mutation guard for the DrainMode glue: both helpers are
+    // otherwise exercised only through I/O paths (dispatch, cdc_job, adapter
+    // opens), so an inverted mapping would survive the CI mutants gate's
+    // `--lib` run.
+    #[test]
+    fn drain_mode_maps_the_config_bool_and_bounds() {
+        use super::DrainMode;
+        assert_eq!(
+            DrainMode::from_until_current(true),
+            DrainMode::BoundedAtOpen
+        );
+        assert_eq!(DrainMode::from_until_current(false), DrainMode::Continuous);
+        assert!(DrainMode::BoundedAtOpen.is_bounded());
+        assert!(!DrainMode::Continuous.is_bounded());
+    }
+
     /// Finding #43: `rivet init --mode cdc` scaffolds
     /// `checkpoint: ./cdc/<table>.ckpt`; the first save must create the
     /// parent, or every fresh quickstart dies on ENOENT dressed in the
