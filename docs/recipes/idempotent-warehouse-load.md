@@ -24,6 +24,41 @@ deduplicate on the warehouse side.
 
 ---
 
+## The built-in path: `rivet load` (BigQuery + Snowflake)
+
+For BigQuery and Snowflake you do not build any of this — `rivet load` is
+idempotent by construction:
+
+- **Count gate before cleanup.** The load refuses to finish — and refuses to
+  clean the source — unless the warehouse `COUNT(*)` equals the summed manifest
+  `row_count`. A partial or double load fails loudly instead of silently
+  corrupting.
+- **Manifest-driven, not a glob.** It reads the run manifests and loads exactly
+  their committed parts, never "every file under the prefix" — so a repair
+  retry's extra files or a half-finished run can't double-load.
+- **`mode: full` OVERWRITEs.** Re-running a full load re-materialises the latest
+  snapshot; the table lands identical, not doubled (live-verified: two loads of
+  a 3-row table → 3 rows, not 6).
+- **`mode: incremental` / `mode: cdc` append + dedup.** For mutable sources the
+  load appends to `<table>__changes` and exposes a current-state view
+  (latest-per-PK, deletes flagged) — the built-in equivalent of the manual
+  `MERGE` below, no staging table or upsert SQL to write.
+
+```yaml
+load:
+  target: bigquery        # or: snowflake (+ connection/warehouse/database/schema/storage_integration)
+  project: my-proj
+  dataset: analytics
+  pk: [id]                # incremental/cdc: the dedup key
+  cleanup_source: true    # wipe staging only after the count gate passes
+```
+
+The rest of this recipe is the **manual** pattern — what to do for a warehouse
+`rivet load` does not target (Redshift, Trino, Databricks, dbt), or to understand
+the contract `rivet load` itself builds on.
+
+---
+
 ## The contract you build on
 
 Every committed part is recorded in `manifest.json`:
@@ -69,9 +104,10 @@ column projection changes the bytes, hence the fingerprint.)
 
 ---
 
-## Recommended pattern
+## Manual pattern — warehouses `rivet load` doesn't target
 
-The pattern is the same across warehouses:
+For a warehouse `rivet load` doesn't reach (Redshift / Trino / Databricks / dbt),
+the pattern is the same across targets:
 
 1. Read `manifest.json` from the resolved destination prefix.
 2. Verify `_SUCCESS` matches.  If it does not, abort — the export is
@@ -203,8 +239,10 @@ silent data corruption that is invisible until a downstream join breaks.
 
 ## What Rivet does *not* do downstream
 
-- **No warehouse loader.**  Rivet writes files; the operator wires up
-  BigQuery / Snowflake / Redshift / Trino / dbt.
+- **Load targets BigQuery + Snowflake only.**  `rivet load` covers those two
+  (see [the built-in path](#the-built-in-path-rivet-load-bigquery--snowflake)
+  above); for Redshift / Trino / Databricks / dbt the operator wires up the load
+  with the manual pattern here.
 - **No transactional coordination.**  Rivet does not coordinate with a
   downstream `MERGE` / `COMMIT`.  If the export run succeeds and the
   warehouse load fails, the operator is responsible for retry logic.

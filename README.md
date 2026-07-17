@@ -194,8 +194,8 @@ Formats: Parquet (zstd / snappy / gzip / lz4 / none) and CSV.
 **Not for you if you need:**
 - **Always-on streaming / continuous replication** — Rivet *does* capture CDC to files (`mode: cdc` — WAL/binlog inserts/updates/deletes into typed Parquet/CSV, one batch of changes per run), but it is not a continuously-running replication sink. For always-on near-real-time streaming into a live target use [Debezium](https://debezium.io/) or [Estuary](https://estuary.dev/).
 - **Connectors to SaaS sources** — no Salesforce, Stripe, HubSpot, etc. Use [Airbyte](https://airbyte.com/) or [Fivetran](https://www.fivetran.com/).
-- **An integrated extract-and-load product** — Rivet stops at "file in a bucket." Use [dlt](https://dlthub.com/) or [Sling](https://slingdata.io/) if you want the warehouse load included.
-- **Loading or transformation** — bring dbt, Spark, or your own loader.
+- **A managed, always-on extract-and-load platform** — Rivet *does* load: `rivet load` writes a resolved export into BigQuery or Snowflake (a `mode: cdc` config additionally appends a change log and maintains a current-state dedup view). But it runs as a discrete command you schedule, not a continuously-managed EL service like [Fivetran](https://www.fivetran.com/) or [Airbyte](https://airbyte.com/); for warehouses it doesn't target (Redshift, Databricks, …) reach for [dlt](https://dlthub.com/) or [Sling](https://slingdata.io/).
+- **In-warehouse transformation** — Rivet lands raw, faithfully-typed data; modelling, tests, and business logic (the `T` in ELT) are [dbt](https://www.getdbt.com/)'s or Spark's job.
 - **A Kubernetes data platform** — Rivet runs as a single binary in a `Job` or `CronJob`; a full operator is a different architecture.
 
 **Documentation language:** English-only. See [CONTRIBUTING.md](CONTRIBUTING.md).

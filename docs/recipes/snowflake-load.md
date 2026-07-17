@@ -1,21 +1,66 @@
 # Loading rivet Parquet into Snowflake
 
-Snowflake does not yet exist as a rivet `destination` (see
-[ADR-0014](../adr/0014-target-type-materialization.md) §6 for the planned
-resolver work). Operators today land Parquet locally (or in cloud object
-storage) and load it into Snowflake themselves. This recipe is the canonical
-sequence for that load — built around Snowsight's web Worksheets, since the
-`snowsql` CLI requires MFA enrollment that many new accounts do not have
-configured.
+**Use `rivet load`.** As of 0.20.0 Snowflake is a first-class load target: a
+top-level `load:` block plus one command `COPY`s a resolved export off a GCS
+external stage into a native-typed table — no hand-written stage, upload, or
+type-recovery SQL.
 
-It documents the **specific Snowflake autoload quirks** that bite rivet's
-type matrix (binary, JSON, UUID, microsecond Time / Timestamp, UINT64) and the
-minimal set of overrides that recovers fidelity.
+```yaml
+# cfg.yaml — extraction PLUS the load target, one file
+source: { type: postgres, url_env: DATABASE_URL }
+exports:
+  - name: orders
+    table: orders
+    mode: full
+    format: parquet
+    destination: { type: gcs, bucket: my-bucket, prefix: exports/orders/ }
+load:
+  target: snowflake
+  connection: my_conn                # a `snow` CLI connection (key-pair / JWT auth)
+  warehouse: COMPUTE_WH
+  database: ANALYTICS
+  schema: PUBLIC
+  storage_integration: MY_GCS_INT    # a pre-created GCS STORAGE INTEGRATION granting Snowflake read on the bucket
+  cleanup_source: true
+```
 
-> Verified end-to-end against the type-matrix Parquet files produced by
+```console
+$ rivet run  -c cfg.yaml     # extract → gs://my-bucket/exports/orders/
+$ rivet load -c cfg.yaml     # COPY → ANALYTICS.PUBLIC.orders
+  integrity ✓ source ? → files 3 → warehouse 3 rows in ANALYTICS.PUBLIC.orders (source cleaned)
+```
+
+**What it handles for you** — every autoload quirk the by-hand appendix below
+recovers manually, `rivet load` does automatically (live-verified against a
+type-rich Postgres source):
+
+| Source type | Lands as | How `rivet load` gets it right |
+|---|---|---|
+| JSON / `jsonb` | `VARIANT` — navigable (`meta:k`) | `PARSE_JSON($1:col)` in the COPY transform |
+| `timestamptz` | `TIMESTAMP_TZ` — instant preserved (`…Z`) | `ALTER SESSION SET TIMEZONE = 'UTC'` before COPY |
+| binary / `bytea` | `BINARY` — raw bytes, `0xFF`-safe | `BINARY_AS_TEXT = FALSE` in the file format |
+| multi-byte UTF-8 | intact (`日本語 🚀`) | — |
+| `BIGINT UNSIGNED > 2^63-1` | exact `NUMBER` | a `decimal(20,0)` column override at extract |
+
+A CDC export (`mode: cdc`) additionally appends a `<table>__changes` log and
+rebuilds a `(__pos, __seq)`-ordered current-state view (`PARSE_JSON(__pos)` on
+Snowflake). The count gate (manifest rows == warehouse `COUNT(*)`) runs before
+`cleanup_source` wipes the staging prefix.
+
+---
+
+## Appendix — loading Parquet into Snowflake by hand
+
+Everything below is the manual sequence `rivet load` automates: land Parquet in a
+stage yourself and run a two-step `COPY` + `CREATE TABLE AS SELECT` that recovers
+each autoload quirk. Reach for it only when you load Snowflake **outside** rivet,
+or to understand what the loader does under the hood. Built around Snowsight web
+Worksheets (the `snowsql` CLI needs MFA many new accounts lack).
+
+> Verified end-to-end against the type-matrix Parquet from
 > `tests/type_roundtrip/fixtures/{postgres,mysql}_*.sql`. All 28 PG columns and
-> 38 MySQL columns roundtrip with values intact (including microsecond
-> precision, `u64::MAX`, raw binary bytes, canonical UUID, multi-byte UTF-8).
+> 38 MySQL columns roundtrip with values intact (microsecond precision,
+> `u64::MAX`, raw binary bytes, canonical UUID, multi-byte UTF-8).
 
 ## Prerequisites
 

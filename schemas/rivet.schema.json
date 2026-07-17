@@ -32,7 +32,7 @@
       "default": false
     },
     "load": {
-      "description": "Reserved for a downstream, first-party warehouse loader: the load target\nlives here so ONE config can drive both the export and a\ndownstream load. Rivet stops at \"file in a bucket\" and **does not\ninterpret** this block — it is accepted and ignored, present only so\n`rivet check` / `run` / `apply` don't reject a config that carries it.",
+      "description": "The warehouse **load** target — consumed by `rivet load` (and `rivet load\n--cdc`), so ONE config drives both the export and the downstream load. The\nextraction commands (`rivet check` / `run` / `apply`) accept and ignore it:\nit shapes the load, not the extract.",
       "default": null
     }
   },

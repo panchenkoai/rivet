@@ -155,15 +155,34 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+      # Skip the mutation WORK on docs-only PRs — there is no source to mutate, and
+      # a 42-min run for a README edit is pure waste. The job itself still runs and
+      # reports green (so it never blocks a docs merge, and were it ever promoted to
+      # a required check a skipped step would not leave it pending).
+      - name: Any non-docs changes?
+        id: scope
+        run: |
+          git fetch --no-tags origin "${{ github.base_ref }}" >/dev/null 2>&1 || true
+          if git diff --name-only "origin/${{ github.base_ref }}...HEAD" \
+               | grep -qvE '^(docs/|.*\.md$|\.githooks/)'; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "code=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Docs-only PR — skipping mutation testing."
+          fi
       - uses: dtolnay/rust-toolchain@master
+        if: steps.scope.outputs.code == 'true'
         with:
           toolchain: "1.94"
       - uses: Swatinem/rust-cache@v2
+        if: steps.scope.outputs.code == 'true'
         with:
           key: mutants
       - name: Install cargo-mutants
+        if: steps.scope.outputs.code == 'true'
         run: cargo install cargo-mutants --locked
       - name: Mutate the PR diff
+        if: steps.scope.outputs.code == 'true'
         env:
           # Mutants never need debuginfo — halves build dirs, speeds links.
           CARGO_PROFILE_DEV_DEBUG: "0"
