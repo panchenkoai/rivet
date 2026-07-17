@@ -322,7 +322,7 @@ pub(super) fn run_export_job(
         // snapshot (a recursive `mode: full` run into `…/snapshot/`, with its
         // own metric + journal), then the drain below. A failed snapshot fails
         // the export — the anchor stays, so the retry resumes gap-free.
-        let pending = match super::cdc_job::initial_snapshot_pending(config, export) {
+        let pending = match super::cdc_job::initial_snapshot_pending(config, export, state) {
             Ok(p) => p,
             Err(e) => {
                 let summary = synthetic_failed_summary(&export.name, &e);
@@ -334,6 +334,28 @@ pub(super) fn run_export_job(
                 run_export_job(config_path, config, synth, state, config_dir, opts);
             if res.is_err() {
                 return (res, summary);
+            }
+            // Snapshot done → record it in the state DB, the cleanup-proof twin of
+            // the GCS `snapshot/_SUCCESS` marker: once here, `cleanup_source`
+            // wiping the bucket no longer re-snapshots. Best-effort — a state
+            // write failure must not fail an otherwise-successful snapshot.
+            //
+            // Degradation on that rare failure: the durable signal is lost, so if
+            // `cleanup_source` later wipes the GCS `snapshot/_SUCCESS` too, the
+            // NEXT run finds no evidence and re-snapshots the whole table —
+            // wasteful (a fresh full re-read + re-load), NOT data loss: the
+            // checkpoint survived, so `snapshot_plan`'s `resume_expected` keeps the
+            // anchor and no changes are skipped.
+            if let Some(table) = synth.table.as_deref()
+                && let Err(e) =
+                    state.mark_snapshot_done(&export.name, table, &summary.journal.run_id)
+            {
+                log::warn!(
+                    "cdc: snapshot-completion persist failed for '{}' table '{}': {:#}",
+                    export.name,
+                    table,
+                    e
+                );
             }
         }
         return super::cdc_job::run_cdc_export(config_path, config, export, state);

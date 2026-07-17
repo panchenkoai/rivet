@@ -16,6 +16,19 @@ cargo fmt --all -- --check
 echo "pre-commit: cargo clippy --all-targets -- -D warnings"
 cargo clippy --all-targets -- -D warnings
 
+# Keep ALL code-derived docs in sync with the Config/Cli types + crate version.
+# Two CI gates enforce this and both derive from the binary (schemars + clap):
+#   - schema_drift  → schemas/rivet.schema.json
+#   - docs-as-code  → docs/reference/{config,cli}-reference.md + expanded includes
+# A version bump or a Config/CLI change would otherwise only surface as a CI
+# failure. Regenerate + stage them here so every commit carries current docs.
+echo "pre-commit: regenerate code-derived docs (schema + reference)"
+cargo build --quiet --bin rivet
+./target/debug/rivet schema config > schemas/rivet.schema.json
+cp schemas/rivet.schema.json schemas/latest/rivet.schema.json
+RIVET=./target/debug/rivet bash dev/docgen/generate.sh
+git add -u schemas docs   # stage the regenerated (tracked) schema + reference docs
+
 # Dependency vulnerability gate — mirrors the CI `audit` job and honors the
 # accepted-advisory list in `.cargo/audit.toml`. Hard gate when `cargo-audit`
 # is installed; otherwise prints an install hint and continues (CI still

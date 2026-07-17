@@ -1,0 +1,98 @@
+# Load-mode behavior matrix — how `rivet load` writes to the warehouse per
+# export mode. Columns are the three load modes (LoadMode in src/load/plan.rs),
+# NOT source engines. Cell = { test } | { na } | { gap }.
+#
+# The bug class this guards: each mode has a DIFFERENT write contract, and mixing
+# them silently loses or duplicates data. The state DB (ledger) is the source of
+# truth for what is loaded; the bucket listing is a fallback; cleanup is safe in
+# every mode. This matrix codifies + guards the four real data bugs found here:
+#   1. incremental + cleanup_source OVERWROTE and lost prior deltas (source 200
+#      rows → warehouse 100). Fixed: incremental APPENDs + a cursor-ordered view.
+#   2. full without cleanup loaded every accumulated snapshot → duplicate rows.
+#      Fixed: full loads the LATEST run only.
+#   3. full's ledger-skip defeated its self-heal guarantee — a drifted target on
+#      re-load was skipped, never repaired. Fixed: full re-materializes ALWAYS.
+#   4. a FAILED load marked its runs loaded → the next load skipped their
+#      never-loaded data. Fixed: only a successful load marks runs loaded.
+#
+# Coverage note: all three modes are live-verified end-to-end on the devbox —
+# full (smoke_batch_mysql), cdc (cdc_backfill_snapshot_{mysql,pg,mongo}), and
+# incremental (incremental_dedup_mysql: no-loss + cursor dedup + never-tombstones
+# + staging wiped), backed by the dedup-view + ledger unit tests. `na` marks a
+# contract that mode does not have (full has no dedup view; incremental/cdc never
+# OVERWRITE, so never truncate).
+
+engines: [full, incremental, cdc]
+
+scenarios:
+  - id: overwrite_latest_snapshot_only
+    what: "full OVERWRITEs with the LATEST run only — loading every accumulated snapshot would duplicate rows"
+    full:        { test: latest_full_picks_the_newest_snapshot_not_all }
+    incremental: { na: "incremental APPENDs every new delta — it never overwrites" }
+    cdc:         { na: "cdc APPENDs every new run to the change log — it never overwrites" }
+
+  - id: full_self_heals_on_reload
+    what: "full re-materializes the snapshot on EVERY load (never ledger-skipped) — a re-load repairs a drifted target and stays resilient to hidden in-place source updates"
+    full:        { test: latest_full_re_materializes_even_when_the_latest_is_already_loaded }
+    incremental: { na: "append is additive — a re-load cannot self-heal by overwrite; correctness comes from the change log, not re-materialization" }
+    cdc:         { na: "append is additive — the change log + view are the source of truth, not a re-overwrite" }
+
+  - id: empty_staging_never_truncates
+    what: "an empty staging (cleaned, no fresh extract) is a no-op — full must NOT truncate the target to empty"
+    full:        { test: latest_full_of_no_staged_runs_is_empty_so_the_caller_no_ops_without_truncating }
+    incremental: { na: "append never issues a truncate, so an empty delta set is inherently a no-op" }
+    cdc:         { na: "append never issues a truncate, so an empty run set is inherently a no-op" }
+
+  - id: append_selects_only_unloaded_runs
+    what: "append modes load ONLY the runs the ledger has not yet loaded — resolved from manifest parts, with the bucket listing as fallback"
+    full:        { na: "full selects the single latest run, not an unloaded set" }
+    incremental: { test: select_load_keys_picks_only_the_new_runs_parts }
+    cdc:         { test: select_load_keys_picks_only_the_new_runs_parts }
+
+  - id: current_state_dedup_view
+    what: "append modes expose a deduplicated current-state view — latest row per primary key"
+    full:        { na: "the full table IS current state — no view is needed" }
+    incremental: { test: inc_dedup_view_orders_by_cursor_and_never_tombstones_on_every_dialect }
+    cdc:         { test: snapshot_backfill_rows_are_live_and_rank_oldest_on_every_dialect }
+
+  - id: dedup_ordering_key
+    what: "which key orders latest-per-PK: incremental by cursor_column, cdc by the (__pos,__seq) log position"
+    full:        { na: "no view, no ordering key" }
+    incremental: { test: inc_dedup_view_quotes_identifiers_per_dialect }
+    cdc:         { test: every_warehouse_and_engine_orders_by_seq_last_and_drops_meta_columns }
+
+  - id: soft_delete_tombstone
+    what: "a delete: cdc keeps a flagged tombstone (__is_deleted=true); incremental cannot observe deletes and never tombstones"
+    full:        { na: "a full snapshot mirrors the source — a deleted row is simply absent next run" }
+    incremental: { test: inc_dedup_view_orders_by_cursor_and_never_tombstones_on_every_dialect }
+    cdc:         { test: mongo_cdc_delete_flag_bigquery }
+
+  - id: ledger_skips_already_loaded_runs
+    what: "the state DB records each load and skips extraction runs already loaded into a target — the incremental step is DB-driven, not file-driven"
+    full:        { na: "full re-materializes regardless of the ledger — it is audit-only for full, never a skip" }
+    incremental: { test: store_load_records_run_and_marks_source_runs }
+    cdc:         { test: store_load_records_run_and_marks_source_runs }
+
+  - id: failed_load_stays_retryable
+    what: "a failed load records `failed` and marks NO runs loaded, so the next load retries them (no silent data loss)"
+    full:        { na: "full re-materializes every load; a failed full simply re-overwrites next time" }
+    incremental: { test: failed_load_leaves_its_source_runs_retryable }
+    cdc:         { test: failed_load_leaves_its_source_runs_retryable }
+
+  - id: initial_snapshot_backfill
+    what: "cdc.initial: snapshot backfills preexisting rows into the change log, then streams — the view keeps every backfilled row live"
+    full:        { na: "full IS a snapshot — no separate backfill step" }
+    incremental: { na: "incremental has no snapshot phase — the first run exports all rows above the empty cursor" }
+    cdc:         { test: cdc_backfill_snapshot_mysql }
+
+  - id: snapshot_completion_survives_cleanup
+    what: "snapshot completion is recorded in the state DB (not a bucket marker), so cleanup can wipe the bucket without triggering a full re-snapshot"
+    full:        { na: "full has no persistent snapshot anchor to protect" }
+    incremental: { na: "incremental resumes from its cursor in the state DB, not a snapshot marker" }
+    cdc:         { test: snapshot_plan_all_done_snapshots_nothing_but_keeps_resume_evidence }
+
+  - id: cleanup_source_safe_end_to_end
+    what: "cleanup_source: true wipes the staged Parquet after a recorded load without losing data — proven live end to end"
+    full:        { test: smoke_batch_mysql }
+    incremental: { test: incremental_dedup_mysql }
+    cdc:         { test: cdc_backfill_snapshot_mysql }

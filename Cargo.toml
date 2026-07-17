@@ -1,6 +1,6 @@
 [package]
 name = "rivet-cli"
-version = "0.19.2"
+version = "0.20.0"
 edition = "2024"
 rust-version = "1.94"
 license = "MIT"

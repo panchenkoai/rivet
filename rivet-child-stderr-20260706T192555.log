@@ -1,0 +1,360 @@
+
+  child stderr (captured to keep the live card stack stable):
+  ── bench_sparse ──
+    | 
+    | ── bench_sparse ────────────────────────────────────────────
+    |   run_id:    bench_sparse_20260706T192213.344
+    |   status:    success
+    |   tuning:    profile=balanced (default), batch_size=10,000 (batch_size_memory_mb=32MiB → effective FETCH in logs)
+    |   rows:      10,000
+    |   files:     1
+    |   output:    gs://rivet_data_test/exports/bench_sparse/
+    |   bytes:     193.4 KB
+    |   duration:  1.6s
+    |   peak RSS:  27 MB (sampled during run)
+    |   schema:    unchanged
+    |   verify:    not run — add `--reconcile` (count vs source) or `rivet validate` (re-read outputs)
+  ── bench_wide ──
+    | 
+    | ── bench_wide ──────────────────────────────────────────────
+    |   run_id:    bench_wide_20260706T192213.298
+    |   status:    success
+    |   tuning:    profile=balanced (default), batch_size=10,000 (batch_size_memory_mb=32MiB → effective FETCH in logs)
+    |   rows:      100,000
+    |   files:     1
+    |   output:    gs://rivet_data_test/exports/bench_wide/
+    |   bytes:     1.8 MB
+    |   duration:  7.5s
+    |   peak RSS:  99 MB (sampled during run)
+    |   schema:    unchanged
+    |   verify:    not run — add `--reconcile` (count vs source) or `rivet validate` (re-read outputs)
+  ── cdc_demo ──
+    | 
+    | ── cdc_demo ────────────────────────────────────────────────
+    |   run_id:    cdc_demo_20260706T192213.295
+    |   status:    success
+    |   tuning:    profile=balanced (default), batch_size=10,000 (batch_size_memory_mb=32MiB → effective FETCH in logs)
+    |   rows:      1
+    |   files:     1
+    |   output:    gs://rivet_data_test/exports/cdc_demo/
+    |   bytes:     2.1 KB
+    |   duration:  1.1s
+    |   peak RSS:  21 MB (sampled during run)
+    |   schema:    unchanged
+    |   verify:    not run — add `--reconcile` (count vs source) or `rivet validate` (re-read outputs)
+  ── cdc_e2e ──
+    | 
+    | ── cdc_e2e ─────────────────────────────────────────────────
+    |   run_id:    cdc_e2e_20260706T192213.303
+    |   status:    success
+    |   tuning:    profile=balanced (default), batch_size=10,000 (batch_size_memory_mb=32MiB → effective FETCH in logs)
+    |   rows:      0
+    |   files:     0
+    |   duration:  100ms
+    |   peak RSS:  18 MB (sampled during run)
+  ── cdc_f ──
+    | 
+    | ── cdc_f ───────────────────────────────────────────────────
+    |   run_id:    cdc_f_20260706T192213.390
+    |   status:    success
+    |   tuning:    profile=balanced (default), batch_size=10,000 (batch_size_memory_mb=32MiB → effective FETCH in logs)
+    |   rows:      1
+    |   files:     1
+    |   output:    gs://rivet_data_test/exports/cdc_f/
+    |   bytes:     1.7 KB
+    |   duration:  1.1s
+    |   peak RSS:  21 MB (sampled during run)
+    |   schema:    unchanged
+    |   verify:    not run — add `--reconcile` (count vs source) or `rivet validate` (re-read outputs)
+  ── cdc_m ──
+    | 
+    | ── cdc_m ───────────────────────────────────────────────────
+    |   run_id:    cdc_m_20260706T192213.390
+    |   status:    success
+    |   tuning:    profile=balanced (default), batch_size=10,000 (batch_size_memory_mb=32MiB → effective FETCH in logs)
+    |   rows:      2
+    |   files:     1
+    |   output:    gs://rivet_data_test/exports/cdc_m/
+    |   bytes:     1.7 KB
+    |   duration:  1.1s
+    |   peak RSS:  21 MB (sampled during run)
+    |   schema:    unchanged
+    |   verify:    not run — add `--reconcile` (count vs source) or `rivet validate` (re-read outputs)
+  ── cdc_reg ──
+    | 
+    | ── cdc_reg ─────────────────────────────────────────────────
+    |   run_id:    cdc_reg_20260706T192213.389
+    |   status:    success
+    |   tuning:    profile=balanced (default), batch_size=10,000 (batch_size_memory_mb=32MiB → effective FETCH in logs)
+    |   rows:      1
+    |   files:     1
+    |   output:    gs://rivet_data_test/exports/cdc_reg/
+    |   bytes:     1.7 KB
+    |   duration:  1.1s
+    |   peak RSS:  21 MB (sampled during run)
+    |   schema:    unchanged
+    |   verify:    not run — add `--reconcile` (count vs source) or `rivet validate` (re-read outputs)
+  ── cdc_resume ──
+    | 
+    | ── cdc_resume ──────────────────────────────────────────────
+    |   run_id:    cdc_resume_20260706T192213.285
+    |   status:    success
+    |   tuning:    profile=balanced (default), batch_size=10,000 (batch_size_memory_mb=32MiB → effective FETCH in logs)
+    |   rows:      2
+    |   files:     1
+    |   output:    gs://rivet_data_test/exports/cdc_resume/
+    |   bytes:     1.7 KB
+    |   duration:  1.4s
+    |   peak RSS:  21 MB (sampled during run)
+    |   schema:    unchanged
+    |   verify:    not run — add `--reconcile` (count vs source) or `rivet validate` (re-read outputs)
+  ── cdc_sec ──
+    | 
+    | ── cdc_sec ─────────────────────────────────────────────────
+    |   run_id:    cdc_sec_20260706T192213.399
+    |   status:    success
+    |   tuning:    profile=balanced (default), batch_size=10,000 (batch_size_memory_mb=32MiB → effective FETCH in logs)
+    |   rows:      1
+    |   files:     1
+    |   output:    gs://rivet_data_test/exports/cdc_sec/
+    |   bytes:     1.3 KB
+    |   duration:  1.1s
+    |   peak RSS:  21 MB (sampled during run)
+    |   schema:    unchanged
+    |   verify:    not run — add `--reconcile` (count vs source) or `rivet validate` (re-read outputs)
+  ── cdc_tx ──
+    | 
+    | ── cdc_tx ──────────────────────────────────────────────────
+    |   run_id:    cdc_tx_20260706T192213.628
+    |   status:    success
+    |   tuning:    profile=balanced (default), batch_size=10,000 (batch_size_memory_mb=32MiB → effective FETCH in logs)
+    |   rows:      3
+    |   files:     1
+    |   output:    gs://rivet_data_test/exports/cdc_tx/
+    |   bytes:     1.7 KB
+    |   duration:  1.2s
+    |   peak RSS:  21 MB (sampled during run)
+    |   schema:    unchanged
+    |   verify:    not run — add `--reconcile` (count vs source) or `rivet validate` (re-read outputs)
+  ── cdc_typed ──
+    | 
+    | ── cdc_typed ───────────────────────────────────────────────
+    |   run_id:    cdc_typed_20260706T192213.390
+    |   status:    success
+    |   tuning:    profile=balanced (default), batch_size=10,000 (batch_size_memory_mb=32MiB → effective FETCH in logs)
+    |   rows:      1
+    |   files:     1
+    |   output:    gs://rivet_data_test/exports/cdc_typed/
+    |   bytes:     2.6 KB
+    |   duration:  1.2s
+    |   peak RSS:  21 MB (sampled during run)
+    |   schema:    unchanged
+    |   verify:    not run — add `--reconcile` (count vs source) or `rivet validate` (re-read outputs)
+  ── cdc_unit ──
+    | 
+    | ── cdc_unit ────────────────────────────────────────────────
+    |   run_id:    cdc_unit_20260706T192213.389
+    |   status:    success
+    |   tuning:    profile=balanced (default), batch_size=10,000 (batch_size_memory_mb=32MiB → effective FETCH in logs)
+    |   rows:      0
+    |   files:     0
+    |   duration:  204ms
+    |   peak RSS:  19 MB (sampled during run)
+  ── ck_dec_my ──
+    | 
+    | ── ck_dec_my ───────────────────────────────────────────────
+    |   run_id:    ck_dec_my_20260706T192213.290
+    |   status:    success
+    |   tuning:    profile=balanced (default), batch_size=10,000 (batch_size_memory_mb=32MiB → effective FETCH in logs)
+    |   rows:      4
+    |   files:     1
+    |   output:    gs://rivet_data_test/exports/ck_dec_my/
+    |   bytes:     2.7 KB
+    |   duration:  1.0s
+    |   peak RSS:  21 MB (sampled during run)
+    |   schema:    unchanged
+    |   verify:    not run — add `--reconcile` (count vs source) or `rivet validate` (re-read outputs)
+  ── events ──
+    | 
+    | ── events ──────────────────────────────────────────────────
+    |   run_id:    events_20260706T192213.352
+    |   status:    success
+    |   tuning:    profile=balanced (default), batch_size=10,000 (batch_size_memory_mb=32MiB → effective FETCH in logs)
+    |   rows:      5,000
+    |   files:     1
+    |   output:    gs://rivet_data_test/exports/events/
+    |   bytes:     93.2 KB
+    |   duration:  1.5s
+    |   peak RSS:  24 MB (sampled during run)
+    |   schema:    unchanged
+    |   verify:    not run — add `--reconcile` (count vs source) or `rivet validate` (re-read outputs)
+  ── orders ──
+    | [2026-07-06T19:22:13Z WARN rivet::pipeline::finalize] export 'orders': destination prefix 'gs://rivet_data_test/exports/orders/' already has a prior completed run (_SUCCESS present) — re-running WITHOUT --resume appends fresh timestamp-named parts alongside the old ones (nothing is overwritten) and rewrites manifest.json to describe only this run, so a glob reader over the prefix will double-count / orphan the old parts. Use --resume to continue the prior run, or clear the prefix first.
+    | 
+    | ── orders ──────────────────────────────────────────────────
+    |   run_id:    orders_20260706T192213.121
+    |   status:    success
+    |   tuning:    profile=balanced (default), batch_size=10,000 (batch_size_memory_mb=32MiB → effective FETCH in logs)
+    |   rows:      2,500
+    |   files:     1
+    |   output:    gs://rivet_data_test/exports/orders/
+    |   bytes:     65.8 KB
+    |   duration:  1.2s
+    |   peak RSS:  23 MB (sampled during run)
+    |   schema:    unchanged
+    |   verify:    not run — add `--reconcile` (count vs source) or `rivet validate` (re-read outputs)
+  ── orders_coalesce ──
+    | 
+    | ── orders_coalesce ─────────────────────────────────────────
+    |   run_id:    orders_coalesce_20260706T192213.391
+    |   status:    success
+    |   tuning:    profile=balanced (default), batch_size=10,000 (batch_size_memory_mb=32MiB → effective FETCH in logs)
+    |   rows:      0
+    |   files:     0
+    |   duration:  201ms
+    |   peak RSS:  18 MB (sampled during run)
+  ── orders_sparse ──
+    | 
+    | ── orders_sparse ───────────────────────────────────────────
+    |   run_id:    orders_sparse_20260706T192213.389
+    |   status:    success
+    |   tuning:    profile=balanced (default), batch_size=10,000 (batch_size_memory_mb=32MiB → effective FETCH in logs)
+    |   rows:      0
+    |   files:     0
+    |   duration:  200ms
+    |   peak RSS:  18 MB (sampled during run)
+  ── page_views ──
+    | 
+    | ── page_views ──────────────────────────────────────────────
+    |   run_id:    page_views_20260706T192213.399
+    |   status:    success
+    |   tuning:    profile=balanced (default), batch_size=10,000 (batch_size_memory_mb=32MiB → effective FETCH in logs)
+    |   rows:      64,697
+    |   files:     1
+    |   output:    gs://rivet_data_test/exports/page_views/
+    |   bytes:     1.9 MB
+    |   duration:  6.0s
+    |   peak RSS:  57 MB (sampled during run)
+    |   schema:    unchanged
+    |   verify:    not run — add `--reconcile` (count vs source) or `rivet validate` (re-read outputs)
+  ── rivet_harm ──
+    | 
+    | ── rivet_harm ──────────────────────────────────────────────
+    |   run_id:    rivet_harm_20260706T192213.399
+    |   status:    success
+    |   tuning:    profile=balanced (default), batch_size=10,000 (batch_size_memory_mb=32MiB → effective FETCH in logs)
+    |   rows:      7,813
+    |   files:     1
+    |   output:    gs://rivet_data_test/exports/rivet_harm/
+    |   bytes:     3.6 KB
+    |   duration:  1.2s
+    |   peak RSS:  22 MB (sampled during run)
+    |   schema:    unchanged
+    |   verify:    not run — add `--reconcile` (count vs source) or `rivet validate` (re-read outputs)
+  ── rivet_type_matrix ──
+    | 
+    | ── rivet_type_matrix ───────────────────────────────────────
+    |   run_id:    rivet_type_matrix_20260706T192213.297
+    |   status:    success
+    |   tuning:    profile=balanced (default), batch_size=10,000 (batch_size_memory_mb=32MiB → effective FETCH in logs)
+    |   rows:      4
+    |   files:     1
+    |   output:    gs://rivet_data_test/exports/rivet_type_matrix/
+    |   bytes:     5.5 KB
+    |   duration:  1.1s
+    |   peak RSS:  22 MB (sampled during run)
+    |   schema:    unchanged
+    |   verify:    not run — add `--reconcile` (count vs source) or `rivet validate` (re-read outputs)
+  ── rivet_type_matrix_full ──
+    | [2026-07-06T19:22:13Z WARN rivet::pipeline::sink] value checksum covers 10/11 columns; NOT checked: time_col (Time64 not yet matched source↔Arrow)
+    | 
+    | ── rivet_type_matrix_full ──────────────────────────────────
+    |   run_id:    rivet_type_matrix_full_20260706T192213.399
+    |   status:    success
+    |   tuning:    profile=balanced (default), batch_size=10,000 (batch_size_memory_mb=32MiB → effective FETCH in logs)
+    |   rows:      3
+    |   files:     1
+    |   output:    gs://rivet_data_test/exports/rivet_type_matrix_full/
+    |   bytes:     5.7 KB
+    |   duration:  1.1s
+    |   peak RSS:  22 MB (sampled during run)
+    |   schema:    unchanged
+    |   verify:    not run — add `--reconcile` (count vs source) or `rivet validate` (re-read outputs)
+  ── users ──
+    | 
+    | ── users ───────────────────────────────────────────────────
+    |   run_id:    users_20260706T192213.303
+    |   status:    success
+    |   tuning:    profile=balanced (default), batch_size=10,000 (batch_size_memory_mb=32MiB → effective FETCH in logs)
+    |   rows:      500
+    |   files:     1
+    |   output:    gs://rivet_data_test/exports/users/
+    |   bytes:     19.4 KB
+    |   duration:  1.1s
+    |   peak RSS:  23 MB (sampled during run)
+    |   schema:    unchanged
+    |   verify:    not run — add `--reconcile` (count vs source) or `rivet validate` (re-read outputs)
+
+  child stderr (captured to keep the live card stack stable):
+  ── bench_decimal ──
+    | 
+    | ── bench_decimal ───────────────────────────────────────────
+    |   run_id:    bench_decimal_20260706T192222.896
+    |   status:    success
+    |   tuning:    profile=balanced (default), batch_size=10,000 (batch_size_memory_mb=32MiB → effective FETCH in logs)
+    |   rows:      200,000
+    |   files:     2
+    |   output:    gs://rivet_data_test/exports/bench_decimal/
+    |   bytes:     5.7 MB
+    |   duration:  7.4s
+    |   peak RSS:  87 MB (sampled during run)
+    |   schema:    unchanged
+    |   verify:    not run — add `--reconcile` (count vs source) or `rivet validate` (re-read outputs)
+
+  child stderr (captured to keep the live card stack stable):
+  ── bench_hc ──
+    | 
+    | ── bench_hc ────────────────────────────────────────────────
+    |   run_id:    bench_hc_20260706T192232.593
+    |   status:    success
+    |   tuning:    profile=balanced (default), batch_size=10,000 (batch_size_memory_mb=32MiB → effective FETCH in logs)
+    |   rows:      200,000
+    |   files:     2
+    |   output:    gs://rivet_data_test/exports/bench_hc/
+    |   bytes:     8.3 MB
+    |   duration:  16.4s
+    |   peak RSS:  65 MB (sampled during run)
+    |   schema:    unchanged
+    |   verify:    not run — add `--reconcile` (count vs source) or `rivet validate` (re-read outputs)
+
+  child stderr (captured to keep the live card stack stable):
+  ── content_items ──
+    | 
+    | ── content_items ───────────────────────────────────────────
+    |   run_id:    content_items_20260706T192251.179
+    |   status:    success
+    |   tuning:    profile=balanced (default), batch_size=10,000 (batch_size_memory_mb=32MiB → effective FETCH in logs)
+    |   rows:      2,048,576
+    |   files:     11
+    |   output:    gs://rivet_data_test/exports/content_items/
+    |   bytes:     25.8 MB
+    |   duration:  1m 48.1s
+    |   peak RSS:  110 MB (sampled during run)
+    |   schema:    unchanged
+    |   verify:    not run — add `--reconcile` (count vs source) or `rivet validate` (re-read outputs)
+
+  child stderr (captured to keep the live card stack stable):
+  ── bench_narrow ──
+    | 
+    | ── bench_narrow ────────────────────────────────────────────
+    |   run_id:    bench_narrow_20260706T192441.503
+    |   status:    success
+    |   tuning:    profile=balanced (default), batch_size=10,000 (batch_size_memory_mb=32MiB → effective FETCH in logs)
+    |   rows:      10,240,000
+    |   files:     42
+    |   output:    gs://rivet_data_test/exports/bench_narrow/
+    |   bytes:     109.2 MB
+    |   duration:  1m 12.7s
+    |   peak RSS:  208 MB (sampled during run)
+    |   schema:    unchanged
+    |   verify:    not run — add `--reconcile` (count vs source) or `rivet validate` (re-read outputs)

@@ -16,7 +16,8 @@ use super::params::{parse_params, resolve_init_source};
 use super::validate::validate_cli;
 use crate::config::Config;
 use crate::error::Result;
-use crate::{init, pipeline, preflight};
+use crate::state::{LoadRecord, StateStore};
+use crate::{init, load, pipeline, preflight};
 
 /// Validate a `--export <name>` selection against the loaded config and, on a
 /// miss, bail with the sorted list of declared export names — so a typo
@@ -117,6 +118,15 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             slot,
             capture_instance,
             until_current,
+        }),
+        Commands::Load {
+            config,
+            rivet_bin,
+            run_id,
+        } => dispatch_load(LoadArgs {
+            config,
+            rivet_bin,
+            run_id,
         }),
         Commands::Init {
             source,
@@ -665,5 +675,668 @@ fn dispatch_state(action: StateAction) -> Result<()> {
         StateAction::Progression { config, export } => {
             pipeline::show_progression(&config, export.as_deref())
         }
+        StateAction::Loads {
+            config,
+            target,
+            last,
+        } => show_loads(&config, target.as_deref(), last),
+    }
+}
+
+/// `rivet state loads`: print the load ledger — one row per recorded `rivet
+/// load`, newest first.
+fn show_loads(config: &str, target: Option<&str>, last: usize) -> Result<()> {
+    let store = StateStore::open(config)?;
+    let loads = store.recent_loads(target, last)?;
+    if loads.is_empty() {
+        println!("no loads recorded in the state DB yet");
+        return Ok(());
+    }
+    println!(
+        "{:<26} {:<10} {:<6} {:>10} {:<8} {:>4}  target",
+        "finished_at", "warehouse", "mode", "rows", "status", "runs"
+    );
+    for l in &loads {
+        println!(
+            "{:<26} {:<10} {:<6} {:>10} {:<8} {:>4}  {}",
+            l.finished_at,
+            l.warehouse,
+            l.mode,
+            l.rows_loaded,
+            l.status,
+            l.source_run_ids.len(),
+            l.target_table,
+        );
+    }
+    Ok(())
+}
+
+struct LoadArgs {
+    config: String,
+    rivet_bin: String,
+    run_id: Option<String>,
+}
+
+/// `rivet load`: config-driven warehouse load. The top-level `load:` block
+/// declares the target once, and each export resolves to a table. A multi-table
+/// config loads every export into the shared target, one after another.
+fn dispatch_load(args: LoadArgs) -> Result<()> {
+    let plans = load::plan::plan_loads(&args.config, &args.rivet_bin)?;
+    // One run id for the whole invocation, shared across every table — so warehouse
+    // cost slices per load run (all tables together) as well as per table.
+    let run_id = args.run_id.clone().unwrap_or_else(generate_run_id);
+    // The load ledger: the state DB — not the file prefix — is the source of
+    // truth for what's loaded, so cleanup is safe for every mode and retry is
+    // DB-driven (the GCS listing is only a fallback). A state-DB problem must
+    // never fail a load — degrade to the stateless path.
+    let state = match StateStore::open(&args.config) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            eprintln!(
+                "  warning: state store unavailable ({e:#}); loading without a ledger \
+                 (no incremental skip / audit log)"
+            );
+            None
+        }
+    };
+    let tables: Vec<&str> = plans.iter().map(|p| p.table.as_str()).collect();
+    eprintln!(
+        "{}: resolved {} table(s) → {} [run_id={}]: {}",
+        args.config,
+        plans.len(),
+        plans.first().map(|p| p.load.target.name()).unwrap_or("?"),
+        run_id,
+        tables.join(", ")
+    );
+
+    // The `__pos` parse engine is config-level — resolve it once, and only if a
+    // table actually needs it (a `mode: cdc` export).
+    let engine = if plans.iter().any(|p| p.mode == load::plan::LoadMode::Cdc) {
+        Some(load::plan::source_engine(&args.config)?)
+    } else {
+        None
+    };
+    // Route each table by its declared `mode:`; `pk:` and `allow_source_drift:`
+    // come from the `load:` block, so the CLI carries no per-mode flags.
+    for plan in &plans {
+        let load_id = format!("{run_id}:{}", plan.table);
+        let drift = plan.load.allow_source_drift;
+        match plan.mode {
+            // CDC: APPEND the change log + rebuild the current-state dedup view.
+            load::plan::LoadMode::Cdc => {
+                let pk = require_pk(plan, "cdc")?;
+                match load_one_cdc(
+                    plan,
+                    &run_id,
+                    engine.expect("engine resolved above for a cdc plan"),
+                    pk,
+                    drift,
+                    state.as_ref(),
+                    &load_id,
+                )? {
+                    Some(report) => println!("CDC LOAD OK [{}]: {report:#?}", plan.table),
+                    None => println!("CDC LOAD SKIP [{}]: up to date", plan.table),
+                }
+            }
+            // Incremental: APPEND the delta + a cursor-ordered current-state view.
+            load::plan::LoadMode::Incremental => {
+                let pk = require_pk(plan, "incremental")?;
+                match load_one_incremental(plan, &run_id, pk, drift, state.as_ref(), &load_id)? {
+                    Some(report) => println!("INCREMENTAL LOAD OK [{}]: {report:#?}", plan.table),
+                    None => println!("INCREMENTAL LOAD SKIP [{}]: up to date", plan.table),
+                }
+            }
+            // Full/chunked: ledger-driven latest-run OVERWRITE.
+            _ => match load_one(plan, &run_id, drift, state.as_ref(), &load_id)? {
+                Some(report) => println!("LOAD OK [{}]: {report:#?}", plan.table),
+                None => println!("LOAD SKIP [{}]: up to date", plan.table),
+            },
+        }
+        if plan.load.gc_orphans {
+            maybe_gc_orphans(plan);
+        }
+    }
+    Ok(())
+}
+
+/// The dedup view's primary key for an append mode (`cdc` / `incremental`), read
+/// from the export's `load:` block. Bails with a config-fix hint when absent.
+fn require_pk<'a>(plan: &'a load::plan::LoadPlan, mode: &str) -> Result<&'a [String]> {
+    if plan.load.pk.is_empty() {
+        anyhow::bail!(
+            "export `{}` is mode: {mode} but its `load:` block has no `pk:` — the current-state \
+             dedup view needs a primary key (e.g. `pk: [id]`)",
+            plan.table
+        );
+    }
+    Ok(&plan.load.pk)
+}
+
+/// Best-effort orphan-Parquet GC for one table's prefix (config `gc_orphans`):
+/// delete staged `.parquet` no `Success` manifest references — an interrupted
+/// extract's leftovers. A GC failure only warns; it NEVER fails the load, which
+/// already succeeded before this runs.
+fn maybe_gc_orphans(plan: &load::plan::LoadPlan) {
+    let store = match load::open_store(&plan.destination) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!(
+                "  gc-orphans [{}]: skipped (store unavailable): {e:#}",
+                plan.table
+            );
+            return;
+        }
+    };
+    let keyed = match load::reconcile::fetch_manifests_keyed(&store, &plan.gcs_prefix) {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!(
+                "  gc-orphans [{}]: skipped (manifest fetch failed): {e:#}",
+                plan.table
+            );
+            return;
+        }
+    };
+    match load::reconcile::gc_orphans(&store, &plan.gcs_prefix, &keyed) {
+        Ok((0, _)) => {}
+        Ok((n, bytes)) => {
+            println!(
+                "  gc-orphans [{}]: removed {n} orphan part(s) ({bytes} bytes)",
+                plan.table
+            )
+        }
+        Err(e) => eprintln!(
+            "  gc-orphans [{}]: failed (load unaffected): {e:#}",
+            plan.table
+        ),
+    }
+}
+
+/// What a load will consume: the reconciled integrity, the parquet URIs to load,
+/// and the extraction run_ids covered. `None` from [`prepare_load`] means the
+/// ledger already has every run — nothing new to load.
+struct LoadInputs {
+    integrity: load::reconcile::LoadIntegrity,
+    uris: Vec<String>,
+    source_run_ids: Vec<String>,
+}
+
+/// Reconcile the manifests under a load's prefix into its [`LoadInputs`],
+/// mode-aware and ledger-filtered.
+///
+/// The mode→run selection ([`load::reconcile::select_runs`]) runs on BOTH the
+/// stateful and stateless paths — they differ ONLY in whether `loaded` is the
+/// ledger's set or empty. So Full always OVERWRITEs with the LATEST run (a
+/// stateless Full never blanket-loads every accumulated snapshot = the
+/// duplicate-rows bug), and Incremental/Cdc append the not-yet-loaded runs
+/// (all of them when stateless — absorbed by the dedup view). `Ok(None)` = an
+/// empty selection (nothing new / empty staging → the caller no-ops).
+fn prepare_load(
+    store: &crate::destination::gcs::GcsStore,
+    plan: &load::plan::LoadPlan,
+    state: Option<&StateStore>,
+    target_fqtn: &str,
+    allow_source_drift: bool,
+) -> Result<Option<LoadInputs>> {
+    let keyed = load::reconcile::fetch_manifests_keyed(store, &plan.gcs_prefix)?;
+    // The ledger's already-loaded run_ids — empty when stateless (no state DB),
+    // so `select_runs` degrades safely rather than dropping the mode selection.
+    let loaded = match state {
+        Some(s) => s.loaded_source_run_ids(target_fqtn).unwrap_or_default(),
+        None => std::collections::HashSet::new(),
+    };
+    let new = load::reconcile::select_runs(keyed, &loaded, plan.mode);
+    if new.is_empty() {
+        return Ok(None);
+    }
+    let manifests: Vec<_> = new.iter().map(|(_, m)| m.clone()).collect();
+    let integrity = load::reconcile::reconcile(&manifests, allow_source_drift)?;
+    let uris = load::reconcile::select_load_uris(store, &plan.gcs_prefix, &new)?;
+    let source_run_ids = new.iter().map(|(_, m)| m.run_id.clone()).collect();
+    Ok(Some(LoadInputs {
+        integrity,
+        uris,
+        source_run_ids,
+    }))
+}
+
+/// The inputs every load shares; the full/incremental/CDC specifics are the three
+/// closures [`execute_load`] takes. `mode` is the load strategy — its
+/// [`LoadMode::ledger_str`] is the ledger's `mode` discriminator.
+struct LoadJob<'a> {
+    plan: &'a load::plan::LoadPlan,
+    run_id: &'a str,
+    state: Option<&'a StateStore>,
+    load_id: &'a str,
+    allow_source_drift: bool,
+    mode: load::plan::LoadMode,
+}
+
+/// The audit + skip-ledger writer for one load. A struct (not a bare closure) so
+/// the "which exit path writes which ledger row" invariant is unit-testable with
+/// an in-memory [`StateStore`] — no live warehouse or bucket.
+struct LoadCtx<'a> {
+    state: Option<&'a StateStore>,
+    load_id: &'a str,
+    export_name: &'a str,
+    target_fqtn: &'a str,
+    warehouse: &'a str,
+    mode: load::plan::LoadMode,
+}
+
+impl LoadCtx<'_> {
+    /// Best-effort ledger write — a state-DB failure warns but never fails a load.
+    fn record(&self, source_run_ids: &[String], rows_loaded: i64, status: &str) {
+        let Some(s) = self.state else { return };
+        let rec = LoadRecord {
+            load_id: self.load_id.to_string(),
+            export_name: self.export_name.to_string(),
+            target_table: self.target_fqtn.to_string(),
+            warehouse: self.warehouse.to_string(),
+            mode: self.mode.ledger_str().to_string(),
+            source_run_ids: source_run_ids.to_vec(),
+            rows_loaded,
+            status: status.to_string(),
+            finished_at: chrono::Utc::now().to_rfc3339(),
+        };
+        if let Err(e) = s.store_load(&rec) {
+            eprintln!("  warning: load ledger write failed (load itself proceeded): {e:#}");
+        }
+    }
+    /// Nothing new to load — the ledger already covers every run.
+    fn record_skip(&self) {
+        self.record(&[], 0, "success");
+    }
+    /// The load errored after consuming `run_ids`.
+    fn record_failed(&self, run_ids: &[String]) {
+        self.record(run_ids, 0, "failed");
+    }
+    /// The load appended/loaded `rows` from `run_ids`.
+    fn record_success(&self, run_ids: &[String], rows: i64) {
+        self.record(run_ids, rows, "success");
+    }
+}
+
+/// The shared load envelope: open the store, build the loader, reconcile via the
+/// ledger, then run + record. Batch vs CDC differ ONLY in `progress` (the
+/// per-load log line), `run` (the load call, returning its row count + report),
+/// and `done` (the success trace). Every exit path records the load EXACTLY once
+/// — skip ⇒ `success`/0, run-`Err` ⇒ `failed`, run-`Ok` ⇒ `success`/rows — the
+/// ledger invariant in one place instead of copy-pasted across batch and CDC.
+fn execute_load<R>(
+    job: LoadJob<'_>,
+    progress: impl FnOnce(&LoadInputs),
+    run: impl FnOnce(
+        &dyn load::TargetLoader,
+        &crate::destination::gcs::GcsStore,
+        &LoadInputs,
+    ) -> Result<(u64, R)>,
+    done: impl FnOnce(&LoadInputs, &R),
+) -> Result<Option<R>> {
+    let store = load::open_store(&job.plan.destination)?;
+    let loader = load::build_loader(job.plan, job.run_id);
+    let target_fqtn = loader.fqtn(&job.plan.table);
+    let ctx = LoadCtx {
+        state: job.state,
+        load_id: job.load_id,
+        export_name: job.plan.table.as_str(),
+        target_fqtn: target_fqtn.as_str(),
+        warehouse: job.plan.load.target.name(),
+        mode: job.mode,
+    };
+    let inputs = match prepare_load(
+        &store,
+        job.plan,
+        job.state,
+        &target_fqtn,
+        job.allow_source_drift,
+    )? {
+        Some(i) => i,
+        None => {
+            let label = if job.mode == load::plan::LoadMode::Cdc {
+                "cdc load"
+            } else {
+                "load"
+            };
+            eprintln!(
+                "  {label} {} → {}: up to date — every extraction run already loaded",
+                job.plan.table,
+                job.plan.load.target.name(),
+            );
+            ctx.record_skip();
+            return Ok(None);
+        }
+    };
+    progress(&inputs);
+    let (rows, report) = match run(&*loader, &store, &inputs) {
+        Ok(v) => v,
+        Err(e) => {
+            ctx.record_failed(&inputs.source_run_ids);
+            return Err(e);
+        }
+    };
+    ctx.record_success(&inputs.source_run_ids, rows as i64);
+    done(&inputs, &report);
+    Ok(Some(report))
+}
+
+/// Load a single export's CDC change log: reconcile the run manifests, **append**
+/// the change Parquet into `<table>__changes`, and rebuild the current-state
+/// dedup view over it. The manifests' summed `row_count` gates the rows *this*
+/// load appends (before/after the append) — the file→warehouse leg for an
+/// accumulating, at-least-once log.
+/// The success trace shared by the CDC + incremental loads (byte-identical): the
+/// integrity chain, the appended rows, the change-log table, and the view.
+fn append_done_trace(inputs: &LoadInputs, report: &load::CdcLoadReport) {
+    eprintln!(
+        "  integrity ✓ {} → appended {} to {} | current-state view {}{}",
+        inputs.integrity.chain_prefix(),
+        report.rows_appended,
+        report.changes_table,
+        report.view,
+        if report.source_cleaned {
+            " (source cleaned)"
+        } else {
+            ""
+        },
+    );
+}
+
+fn load_one_cdc(
+    plan: &load::plan::LoadPlan,
+    run_id: &str,
+    engine: load::cdc::SourceEngine,
+    pk: &[String],
+    allow_source_drift: bool,
+    state: Option<&StateStore>,
+    load_id: &str,
+) -> Result<Option<load::CdcLoadReport>> {
+    let job = LoadJob {
+        plan,
+        run_id,
+        state,
+        load_id,
+        allow_source_drift,
+        mode: plan.mode,
+    };
+    execute_load(
+        job,
+        |inputs| {
+            eprintln!(
+                "  cdc load {} → {} | engine={:?} pk={} manifests={} parquet_files={} expected_delta={}",
+                plan.table,
+                plan.load.target.name(),
+                engine,
+                pk.join(","),
+                inputs.integrity.manifests,
+                inputs.uris.len(),
+                inputs.integrity.file_rows,
+            );
+        },
+        |loader, store, inputs| {
+            // The driver gates the appended delta against the manifests' summed
+            // `row_count` and cleans up (only) after the gate passes.
+            let cleanup = plan
+                .load
+                .cleanup_source
+                .then_some((store, plan.gcs_prefix.as_str()));
+            let report = load::run_load_cdc(
+                loader,
+                &plan.table,
+                &plan.specs,
+                &inputs.uris,
+                pk,
+                engine,
+                Some(inputs.integrity.file_rows),
+                cleanup,
+            )?;
+            Ok((report.rows_appended, report))
+        },
+        append_done_trace,
+    )
+}
+
+/// Load a single export's INCREMENTAL delta: APPEND the delta Parquet into
+/// `<table>__changes` and (re)build a current-state view deduped to the latest
+/// row per PK by the export's `cursor_column`. Ledger-driven exactly like CDC —
+/// only the not-yet-loaded runs are appended, so re-loads don't double and
+/// `cleanup_source` is safe.
+fn load_one_incremental(
+    plan: &load::plan::LoadPlan,
+    run_id: &str,
+    pk: &[String],
+    allow_source_drift: bool,
+    state: Option<&StateStore>,
+    load_id: &str,
+) -> Result<Option<load::CdcLoadReport>> {
+    let cursor = plan.cursor_column.clone().ok_or_else(|| {
+        anyhow::anyhow!(
+            "incremental load of `{}` needs the export's `cursor_column:` — the current-state \
+             view's latest-per-PK ordering key",
+            plan.table
+        )
+    })?;
+    let job = LoadJob {
+        plan,
+        run_id,
+        state,
+        load_id,
+        allow_source_drift,
+        mode: plan.mode,
+    };
+    execute_load(
+        job,
+        |inputs| {
+            eprintln!(
+                "  incremental load {} → {} | pk={} cursor={} manifests={} parquet_files={} expected_delta={}",
+                plan.table,
+                plan.load.target.name(),
+                pk.join(","),
+                cursor,
+                inputs.integrity.manifests,
+                inputs.uris.len(),
+                inputs.integrity.file_rows,
+            );
+        },
+        |loader, store, inputs| {
+            let cleanup = plan
+                .load
+                .cleanup_source
+                .then_some((store, plan.gcs_prefix.as_str()));
+            let report = load::run_load_incremental(
+                loader,
+                &plan.table,
+                &plan.specs,
+                &inputs.uris,
+                pk,
+                &cursor,
+                Some(inputs.integrity.file_rows),
+                cleanup,
+            )?;
+            Ok((report.rows_appended, report))
+        },
+        append_done_trace,
+    )
+}
+
+/// Load a single resolved table into its warehouse target, reconciling
+/// **source → file → warehouse** row counts end-to-end.
+///
+/// The run manifests under the export prefix are the file-side source of truth:
+/// they must describe a complete, self-consistent `Success` export, and their
+/// summed `row_count` becomes the loader's `expected_rows` gate — so the load
+/// `bail!`s unless the warehouse `COUNT(*)` matches. Loading unverified Parquet
+/// "because it's in the bucket" is exactly what this prevents.
+fn load_one(
+    plan: &load::plan::LoadPlan,
+    run_id: &str,
+    allow_source_drift: bool,
+    state: Option<&StateStore>,
+    load_id: &str,
+) -> Result<Option<load::LoadReport>> {
+    // Full loads OVERWRITE with the latest snapshot; the ledger (when `state`)
+    // selects that single latest run, skips a re-load of it, and makes cleanup
+    // safe. `state = None` ⇒ the stateless fallback (reconcile + load all).
+    let job = LoadJob {
+        plan,
+        run_id,
+        state,
+        load_id,
+        allow_source_drift,
+        mode: plan.mode,
+    };
+    execute_load(
+        job,
+        |inputs| {
+            eprintln!(
+                "  load {} → {} | columns={} partition={:?} manifests={} parquet_files={} expected_rows={}",
+                plan.table,
+                plan.load.target.name(),
+                plan.specs.len(),
+                plan.partition_by,
+                inputs.integrity.manifests,
+                inputs.uris.len(),
+                inputs.integrity.file_rows,
+            );
+        },
+        |loader, store, inputs| {
+            let cleanup = plan
+                .load
+                .cleanup_source
+                .then_some((store, plan.gcs_prefix.as_str()));
+            let report = load::run_load(
+                loader,
+                &plan.table,
+                &plan.specs,
+                &inputs.uris,
+                Some(inputs.integrity.file_rows),
+                cleanup,
+            )?;
+            Ok((report.rows_loaded, report))
+        },
+        |inputs, report| {
+            // The full chain, now that the warehouse leg is known. The loader
+            // already proved `warehouse == file` (its count gate) before
+            // returning, so this is an all-green trace, not an assertion.
+            eprintln!(
+                "  integrity ✓ {} → warehouse {} rows in {}{}",
+                inputs.integrity.chain_prefix(),
+                report.rows_loaded,
+                report.target_table,
+                if report.source_cleaned {
+                    " (source cleaned)"
+                } else {
+                    ""
+                },
+            );
+        },
+    )
+}
+
+/// A per-invocation load-run id: microsecond-since-epoch hex + zero-padded pid
+/// hex. Pure lowercase hex, so it survives both BigQuery's `[a-z0-9_-]` label
+/// charset and Snowflake's alphanumeric `QUERY_TAG` sanitizer unchanged — the
+/// same id reads back identically from either warehouse's cost views.
+fn generate_run_id() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let micros = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_micros())
+        .unwrap_or(0);
+    format!("{micros:x}{:08x}", std::process::id())
+}
+
+#[cfg(test)]
+mod load_ledger_tests {
+    use super::*;
+
+    const TARGET: &str = "proj.ds.orders";
+
+    fn ctx<'a>(state: &'a StateStore, load_id: &'a str) -> LoadCtx<'a> {
+        LoadCtx {
+            state: Some(state),
+            load_id,
+            export_name: "orders",
+            target_fqtn: TARGET,
+            warehouse: "bigquery",
+            mode: load::plan::LoadMode::Cdc,
+        }
+    }
+
+    // The three `record_*` methods ARE the ledger invariant `execute_load`
+    // enforces per exit path — pinned here offline instead of only live.
+
+    #[test]
+    fn record_success_logs_the_load_and_marks_its_runs_loaded() {
+        let s = StateStore::open_in_memory().unwrap();
+        ctx(&s, "L1").record_success(&["r1".into(), "r2".into()], 5);
+        let loads = s.recent_loads(Some(TARGET), 10).unwrap();
+        assert_eq!(loads.len(), 1);
+        assert_eq!(loads[0].status, "success");
+        assert_eq!(loads[0].rows_loaded, 5);
+        let loaded = s.loaded_source_run_ids(TARGET).unwrap();
+        assert!(
+            loaded.contains("r1") && loaded.contains("r2"),
+            "a successful load marks its runs so the next load skips them"
+        );
+    }
+
+    #[test]
+    fn record_success_marks_its_run_even_at_zero_rows() {
+        // A NEW run that legitimately produced 0 rows (an empty CDC drain) still
+        // SUCCEEDED — its run must be marked loaded, or every later load re-picks
+        // it forever. Guards the 0-row *success* (marks its run) vs *skip* (no
+        // new runs, marks nothing) distinction: marking is gated on status, not
+        // on rows > 0.
+        let s = StateStore::open_in_memory().unwrap();
+        ctx(&s, "L1").record_success(&["r_empty".into()], 0);
+        let loads = s.recent_loads(Some(TARGET), 10).unwrap();
+        assert_eq!(loads.len(), 1);
+        assert_eq!(loads[0].status, "success");
+        assert_eq!(loads[0].rows_loaded, 0);
+        assert!(
+            s.loaded_source_run_ids(TARGET).unwrap().contains("r_empty"),
+            "a 0-row successful load still marks its run — not re-processed forever"
+        );
+    }
+
+    #[test]
+    fn record_skip_logs_a_zero_row_success_and_marks_nothing() {
+        let s = StateStore::open_in_memory().unwrap();
+        ctx(&s, "L1").record_skip();
+        let loads = s.recent_loads(Some(TARGET), 10).unwrap();
+        assert_eq!(loads.len(), 1);
+        assert_eq!(loads[0].status, "success");
+        assert_eq!(loads[0].rows_loaded, 0);
+        assert!(
+            s.loaded_source_run_ids(TARGET).unwrap().is_empty(),
+            "an up-to-date no-op consumes no runs"
+        );
+    }
+
+    #[test]
+    fn record_failed_logs_a_failed_audit_row() {
+        let s = StateStore::open_in_memory().unwrap();
+        ctx(&s, "L1").record_failed(&["r1".into()]);
+        let loads = s.recent_loads(Some(TARGET), 10).unwrap();
+        assert_eq!(loads.len(), 1);
+        assert_eq!(loads[0].status, "failed");
+        assert_eq!(loads[0].rows_loaded, 0);
+    }
+
+    #[test]
+    fn record_is_a_noop_without_a_state_store() {
+        // Stateless load (state=None): recording must not panic and writes nothing.
+        let c = LoadCtx {
+            state: None,
+            load_id: "L1",
+            export_name: "orders",
+            target_fqtn: TARGET,
+            warehouse: "bigquery",
+            mode: load::plan::LoadMode::Full,
+        };
+        c.record_success(&["r1".into()], 3);
+        c.record_skip();
+        c.record_failed(&["r2".into()]);
     }
 }

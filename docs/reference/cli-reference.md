@@ -9,6 +9,7 @@ This document contains the help content for the `rivet` command-line program.
 * [`rivet check`↴](#rivet-check)
 * [`rivet doctor`↴](#rivet-doctor)
 * [`rivet cdc`↴](#rivet-cdc)
+* [`rivet load`↴](#rivet-load)
 * [`rivet state`↴](#rivet-state)
 * [`rivet state show`↴](#rivet-state-show)
 * [`rivet state reset`↴](#rivet-state-reset)
@@ -16,6 +17,7 @@ This document contains the help content for the `rivet` command-line program.
 * [`rivet state reset-chunks`↴](#rivet-state-reset-chunks)
 * [`rivet state chunks`↴](#rivet-state-chunks)
 * [`rivet state progression`↴](#rivet-state-progression)
+* [`rivet state loads`↴](#rivet-state-loads)
 * [`rivet completions`↴](#rivet-completions)
 * [`rivet init`↴](#rivet-init)
 * [`rivet plan`↴](#rivet-plan)
@@ -49,6 +51,7 @@ Docs: https://github.com/panchenkoai/rivet/blob/main/docs/getting-started.md
 * `check` — Column-type & schema report for each export (needs a working connection; run `doctor` first if it can't connect)
 * `doctor` — Verify source + destination auth/connectivity (run this first)
 * `cdc` — Stream change data capture (CDC) from a source's transaction log
+* `load` — Load an export's Parquet into a warehouse (BigQuery / Snowflake)
 * `state` — Manage export state
 * `completions` — Generate shell completions
 * `init` — Generate a config scaffold from a live database (connect + introspect)
@@ -156,6 +159,24 @@ The engine is chosen from the URL scheme: `mysql://` (binlog), `postgresql://` (
 
 
 
+## `rivet load`
+
+Load an export's Parquet into a warehouse (BigQuery / Snowflake)
+
+The native column schema, target table, partition, and source URIs are all derived from the config's top-level `load:` block — nothing is hand-typed. A multi-table config loads every export into the shared target, one after another.
+
+**Usage:** `rivet load [OPTIONS] --config <CONFIG>`
+
+###### **Options:**
+
+* `-c`, `--config <CONFIG>` — Path to YAML config file — extraction PLUS a top-level `load:` block. ONE file drives both the export and the load: the mode (`full`/`incremental`/`cdc`), `pk:`, `cleanup_source:`, `gc_orphans:` and `allow_source_drift:` all live in the config, not on the CLI
+* `--rivet-bin <RIVET_BIN>` — Path to the `rivet` binary used for the type-report subprocess
+
+  Default value: `rivet`
+* `--run-id <RUN_ID>` — Correlation id stamped on every warehouse job/query of this load run (BigQuery `rivet_run` label / Snowflake `QUERY_TAG`), so cost slices per run as well as per table. Defaults to a generated id
+
+
+
 ## `rivet state`
 
 Manage export state
@@ -170,6 +191,7 @@ Manage export state
 * `reset-chunks` — Clear persisted chunk checkpoint rows (`chunk_run` / `chunk_task`)
 * `chunks` — Show chunk checkpoint status for an export
 * `progression` — Show committed / verified export boundaries (the last fully-exported cursor position)
+* `loads` — Show the load ledger (`rivet load` runs recorded in the state DB)
 
 
 
@@ -258,6 +280,22 @@ Show committed / verified export boundaries (the last fully-exported cursor posi
 
 * `-c`, `--config <CONFIG>`
 * `-e`, `--export <EXPORT>` — Show progression for a specific export
+
+
+
+## `rivet state loads`
+
+Show the load ledger (`rivet load` runs recorded in the state DB)
+
+**Usage:** `rivet state loads [OPTIONS] --config <CONFIG>`
+
+###### **Options:**
+
+* `-c`, `--config <CONFIG>`
+* `-t`, `--target <TARGET>` — Show only loads into this fully-qualified target (`proj.ds.table`)
+* `-l`, `--last <LAST>` — Number of recent loads to show
+
+  Default value: `50`
 
 
 

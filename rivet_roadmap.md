@@ -432,8 +432,8 @@ Real pain, but infrastructure/security complexity is non-trivial.
 ---
 
 ## Epic 14 — Narrow Warehouse Load Layer
-**Priority:** P3 → **P1 (in progress)**  
-**Status:** ✅ Partial — type system, type report, strict mode, BigQuery compat layer, complex types (M1–M6 complete); **v0.7.8 Type Roundtrip Proof shipped** (Phase 1 of the type/verify/UX track — 4 independent reader validators + native Parquet UUID/JSON logical types + type-fidelity benchmark); load path (Parquet → BQ) = future  
+**Priority:** P3 → **P1**  
+**Status:** ✅ **Shipped** — the type layer (M1–M6 + v0.7.8 Type Roundtrip Proof) **plus** the direct load path: `rivet load` writes a resolved export's Parquet into BigQuery (free native-schema `LOAD DATA`) or Snowflake (`COPY` off a GCS stage), and `rivet load --cdc` appends a CDC change log into `<table>__changes` and rebuilds a current-state dedup view. Source→file→warehouse row counts are reconciled end-to-end; every job carries `rivet_run`/`rivet_table` cost-attribution labels. Lives in `src/load/` (`TargetLoader` seam + `bigquery`/`snowflake`/`plan`/`cdc`/`reconcile`). This layer was previously a private BSL extension and is now MIT/OSS.  
 **Pain coverage:** Pain C, Pain E
 
 ### Goal
@@ -449,10 +449,14 @@ Add a narrow, compatibility-aware path from extracted files into selected wareho
 - ✅ **type roundtrip proof (v0.7.8)** — PG/MySQL → Parquet/CSV matrix tested through 4 independent readers (DuckDB, ClickHouse, pyarrow, BigQuery), 31 live tests in `tests/type_roundtrip/`, `make test-types-validators`. Documented in [`docs/type-mapping.md`](docs/type-mapping.md), [ADR-0014](docs/adr/0014-target-type-materialization.md), and per-tool benchmark reports under [`docs/bench/reports/REPORT_types*.md`](docs/bench/reports/)
 - ✅ **native Parquet logical types (v0.7.8)** — UUID → `FixedSizeBinary(16) + LogicalType::Uuid` via `arrow.uuid` extension; JSON → `LogicalType::Json` via `arrow.json` extension. Downstream engines (DuckDB, ClickHouse 25.x+, pyarrow) recognise UUID/JSON natively without a cast; BigQuery autoload promotes UUID→BYTES exact (one documented gap: BQ does not lift `LogicalType::Json` to native `JSON` without an explicit `--schema=attrs:JSON`)
 - ✅ **MySQL driver fidelity fixes (v0.7.8)** — PG arrays preserve NULL elements; MySQL `ENUM`/`SET` flag detection so `rivet.logical_type=enum` survives; `native_type` distinguishes UNSIGNED, `TINYINT(1)`, `BIT(1)`, CHAR vs VARCHAR, BINARY vs VARBINARY
-- ⏳ direct load path (write Parquet files directly into BigQuery) = future
+- ✅ **direct load path** — `rivet load` (BigQuery free `LOAD DATA` + Snowflake `COPY`), config-driven from the top-level `load:` block; partition/cluster honored; source cleanup; per-job cost-attribution labels (`src/load/{bigquery,snowflake}.rs`)
+- ✅ **CDC → warehouse** — `rivet load --cdc` appends the change log into `<table>__changes` and (re)builds the per-engine current-state dedup view ordered by (`__pos`, `__seq`) (`src/load/cdc.rs`)
+- ✅ **end-to-end integrity** — the run manifests' summed `row_count` gates the warehouse `COUNT(*)` before any source cleanup (`src/load/reconcile.rs`)
 
 ### Why this matters
 Useful, but this opens a new product layer and should follow extraction trust.
+This landed after the trust layer matured; a thin `bq`/`snow` load is not a
+defensible moat, so it ships free in OSS rather than as a paid add-on.
 
 ---
 

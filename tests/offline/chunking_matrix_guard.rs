@@ -54,6 +54,13 @@ const MATRICES: &[(&str, usize)] = &[
     // unrecoverable degradation fails LOUD, not silently. Cross-references the CDC
     // conformance gate + chunking/resilience/warehouse ledgers for the unified view.
     ("docs/fail-loud-matrix.yaml", 0),
+    // Load-mode write contracts — keyed on the 3 LoadMode variants (full /
+    // incremental / cdc), not source engines. Codifies the 4 data bugs found in
+    // the load layer (incremental+cleanup loss, full duplicate snapshots, full
+    // ledger-skip defeating self-heal, failed-load ledger loss). 0 gaps: the last
+    // one (no committed live incremental cell) is filled by incremental_dedup_mysql
+    // — a live run_incremental harness cell (no-loss + cursor dedup + staging wiped).
+    ("docs/load-mode-matrix.yaml", 0),
 ];
 
 #[derive(Deserialize)]

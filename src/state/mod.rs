@@ -2,10 +2,12 @@ use rusqlite::Connection;
 
 use crate::error::Result;
 
+mod cdc_snapshot_store;
 mod checkpoint;
 mod cursor;
 mod file_log;
 mod journal_store;
+mod load_journal_store;
 mod metrics;
 mod progression;
 mod run_aggregate;
@@ -19,6 +21,7 @@ mod shape;
 pub use checkpoint::ChunkTaskInfo;
 #[allow(unused_imports)]
 pub use file_log::FileRecord;
+pub use load_journal_store::LoadRecord;
 #[allow(unused_imports)]
 pub use metrics::ExportMetric;
 pub use metrics::MetricRow;
@@ -241,6 +244,47 @@ const MIGRATIONS: &[(i64, &str)] = &[
     // keyset-paged" signal) needs a run-time PK probe — a follow-up, so no field
     // that would merely restate mode='keyset'.
     (12, "ALTER TABLE export_metrics ADD COLUMN chunk_key TEXT;"),
+    // v13: load ledger. `rivet load` is now stateful — `load_run` is the audit
+    // log (one row per invocation-table), `loaded_source_run` the skip ledger
+    // (which extraction run_ids have landed in which target) that makes loads
+    // incremental + idempotent instead of re-loading whatever sits in the bucket.
+    (
+        13,
+        "CREATE TABLE IF NOT EXISTS load_run (
+            load_id TEXT PRIMARY KEY,
+            export_name TEXT NOT NULL,
+            target_table TEXT NOT NULL,
+            warehouse TEXT NOT NULL,
+            mode TEXT NOT NULL,
+            source_run_ids TEXT NOT NULL,
+            rows_loaded INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            finished_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_load_run_target
+            ON load_run(target_table, finished_at DESC);
+        CREATE TABLE IF NOT EXISTS loaded_source_run (
+            target_table TEXT NOT NULL,
+            source_run_id TEXT NOT NULL,
+            load_id TEXT NOT NULL,
+            loaded_at TEXT NOT NULL,
+            PRIMARY KEY (target_table, source_run_id)
+        );",
+    ),
+    // v14: cdc snapshot completion. `cdc.initial: snapshot` records that an
+    // export/table's backfill finished HERE, not only as a GCS `snapshot/_SUCCESS`
+    // marker — so `cleanup_source: true` wiping the bucket no longer looks like an
+    // un-snapshotted table and re-snapshots the whole thing on every run.
+    (
+        14,
+        "CREATE TABLE IF NOT EXISTS cdc_snapshot (
+            export_name TEXT NOT NULL,
+            table_name TEXT NOT NULL,
+            run_id TEXT NOT NULL,
+            completed_at TEXT NOT NULL,
+            PRIMARY KEY (export_name, table_name)
+        );",
+    ),
 ];
 
 /// PostgreSQL-compatible DDL.  Column types differ from SQLite (BIGSERIAL,
@@ -427,6 +471,41 @@ const PG_MIGRATIONS: &[(i64, &str)] = &[
     ),
     // v12: chunking diagnostics (see the SQLite array for rationale).
     (12, "ALTER TABLE export_metrics ADD COLUMN chunk_key TEXT;"),
+    // v13: load ledger (see the SQLite array for rationale). rows_loaded is BIGINT.
+    (
+        13,
+        "CREATE TABLE IF NOT EXISTS load_run (
+            load_id TEXT PRIMARY KEY,
+            export_name TEXT NOT NULL,
+            target_table TEXT NOT NULL,
+            warehouse TEXT NOT NULL,
+            mode TEXT NOT NULL,
+            source_run_ids TEXT NOT NULL,
+            rows_loaded BIGINT NOT NULL,
+            status TEXT NOT NULL,
+            finished_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_load_run_target
+            ON load_run(target_table, finished_at DESC);
+        CREATE TABLE IF NOT EXISTS loaded_source_run (
+            target_table TEXT NOT NULL,
+            source_run_id TEXT NOT NULL,
+            load_id TEXT NOT NULL,
+            loaded_at TEXT NOT NULL,
+            PRIMARY KEY (target_table, source_run_id)
+        );",
+    ),
+    // v14: cdc snapshot completion (see the SQLite array for rationale).
+    (
+        14,
+        "CREATE TABLE IF NOT EXISTS cdc_snapshot (
+            export_name TEXT NOT NULL,
+            table_name TEXT NOT NULL,
+            run_id TEXT NOT NULL,
+            completed_at TEXT NOT NULL,
+            PRIMARY KEY (export_name, table_name)
+        );",
+    ),
 ];
 
 // ─── SQL helpers ──────────────────────────────────────────────────────────────
@@ -813,6 +892,50 @@ mod tests {
     use super::*;
 
     #[test]
+    fn sqlite_and_postgres_migrations_define_the_same_tables_per_version() {
+        // `migrate`/`migrate_pg` only check the final version NUMBER; nothing
+        // catches a same-version, divergent-DDL edit between the two arrays. This
+        // asserts that for every version present in BOTH, the set of tables each
+        // CREATEs matches — so a table added to one backend but not the other
+        // (a query that works on SQLite and errors on PG) fails loudly here.
+        use std::collections::{BTreeSet, HashMap};
+        fn table_names(sql: &str) -> BTreeSet<String> {
+            let lower = sql.to_lowercase();
+            let mut rest = lower.as_str();
+            let mut out = BTreeSet::new();
+            while let Some(i) = rest.find("create table") {
+                rest = &rest[i + "create table".len()..];
+                let after = rest
+                    .trim_start()
+                    .strip_prefix("if not exists")
+                    .unwrap_or_else(|| rest.trim_start())
+                    .trim_start();
+                let name: String = after
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                if !name.is_empty() {
+                    out.insert(name);
+                }
+            }
+            out
+        }
+        let mut pg: HashMap<i64, BTreeSet<String>> = HashMap::new();
+        for &(v, sql) in PG_MIGRATIONS {
+            pg.entry(v).or_default().extend(table_names(sql));
+        }
+        for &(v, sql) in MIGRATIONS {
+            if let Some(pg_tables) = pg.get(&v) {
+                assert_eq!(
+                    &table_names(sql),
+                    pg_tables,
+                    "migration v{v}: SQLite and Postgres define different tables"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn fresh_db_reaches_latest_version() {
         let s = StateStore::open_in_memory().unwrap();
         let ver = match &s.conn {
@@ -866,6 +989,59 @@ mod tests {
             )
             .unwrap();
         assert!(has_chunk_run);
+    }
+
+    #[test]
+    fn upgrading_from_v12_adds_the_ledger_and_snapshot_tables_and_keeps_data() {
+        // Stage a database at EXACTLY v12 — a user on the release before the load
+        // ledger (v13) and cdc_snapshot (v14). Apply only migrations up to v12,
+        // exactly as the older rivet that wrote their `.rivet_state.db` did.
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_schema_version_table(&conn);
+        for &(ver, sql) in MIGRATIONS {
+            if ver <= 12 {
+                conn.execute_batch(&format!(
+                    "BEGIN;\n{sql}\nINSERT INTO schema_version (version) VALUES ({ver});\nCOMMIT;"
+                ))
+                .unwrap();
+            }
+        }
+        assert_eq!(get_current_version(&conn), 12, "staged at v12");
+        // Pre-existing state that MUST survive the upgrade.
+        conn.execute(
+            "INSERT INTO export_state (export_name, last_cursor_value, last_run_at) \
+             VALUES ('orders', '42', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        // Upgrade the existing DB to the current schema (the v13 + v14 path).
+        migrate(&conn).unwrap();
+        assert_eq!(get_current_version(&conn), SCHEMA_VERSION);
+
+        // The v13/v14 tables now exist on the upgraded-in-place DB.
+        for t in ["load_run", "loaded_source_run", "cdc_snapshot"] {
+            let exists: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name = ?1",
+                    [t],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(
+                exists,
+                "{t} missing after the v12→v{SCHEMA_VERSION} upgrade"
+            );
+        }
+        // The v12 data survived the added migrations (not dropped/recreated).
+        let cursor: String = conn
+            .query_row(
+                "SELECT last_cursor_value FROM export_state WHERE export_name = 'orders'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cursor, "42", "pre-upgrade data must survive");
     }
 
     #[test]
@@ -938,6 +1114,42 @@ mod tests {
             )
             .unwrap();
         assert!(exists, "v5 migration must create the run_aggregate table");
+    }
+
+    #[test]
+    fn v13_creates_the_load_ledger_tables() {
+        let s = StateStore::open_in_memory().unwrap();
+        let conn = match &s.conn {
+            StateConn::Sqlite(c) => c,
+            StateConn::Postgres(_) => unreachable!(),
+        };
+        for table in ["load_run", "loaded_source_run"] {
+            let exists: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name = ?1",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(exists, "v13 migration must create `{table}`");
+        }
+    }
+
+    #[test]
+    fn v14_creates_the_cdc_snapshot_table() {
+        let s = StateStore::open_in_memory().unwrap();
+        let conn = match &s.conn {
+            StateConn::Sqlite(c) => c,
+            StateConn::Postgres(_) => unreachable!(),
+        };
+        let exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='cdc_snapshot'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(exists, "v14 migration must create the cdc_snapshot table");
     }
 
     #[test]

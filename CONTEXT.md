@@ -71,6 +71,36 @@ an operator or future direct loader runs (L5). The stateful **direct load**
 introduced only when the first real connection lands.
 _Avoid_: loading, ingestion.
 
+## Warehouse load (Epic 14)
+
+**TargetLoader**:
+The warehouse **adapter** — one per loading `ExportTarget` (`BigQuery`,
+`Snowflake`). A deliberately *coarse*, warehouse-specific seam: `materialize`
+(overwrite a table from Parquet, returning the rows the load reported),
+`append_changelog` (append a CDC change log, returning rows appended),
+`create_dedup_view` (the current-state view), `cleanup` (delete the source
+prefix). Dialect and CLI (`bq` / `snow`) live *behind* it; every asymmetry —
+Snowflake's external stage, BigQuery's 4,000-partition batch split — stays inside
+the adapter.
+_Avoid_: loader class, connector, sink.
+
+**Load driver**:
+The warehouse-neutral orchestration over a `TargetLoader`: validate specs →
+reconcile the run manifests → `materialize` → the **load-integrity gate** →
+dedup view → cleanup, in that order. It owns the sequence and the gates, so a
+fake adapter exercises those invariants once, not per warehouse.
+_Avoid_: loader, orchestrator, pipeline.
+
+**Load-integrity gate**:
+The driver's refusal to accept a load unless the rows the load *landed* equal the
+reconciled file rows (the manifests' summed `row_count`). The landed count is read
+straight back from the Rivet-owned target — Snowflake's `COPY` `rows_loaded`; a
+0-byte `COUNT(*)` metadata read on BigQuery (swappable for the load job's
+`outputRows` behind the adapter seam). The target is Rivet-owned, so no foreign
+writer can diverge it and that count is authoritative without a second reconciling
+source. Cleanup runs only after the gate passes.
+_Avoid_: count check, verify query.
+
 **Manifest reconciliation**:
 The single pure walk that compares a `RunManifest` against a destination
 listing — per committed part `Present` / `Missing` / `SizeMismatch` /

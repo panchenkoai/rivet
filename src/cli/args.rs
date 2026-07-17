@@ -207,6 +207,28 @@ pub enum Commands {
         #[arg(long)]
         until_current: bool,
     },
+    /// Load an export's Parquet into a warehouse (BigQuery / Snowflake)
+    ///
+    /// The native column schema, target table, partition, and source URIs are
+    /// all derived from the config's top-level `load:` block — nothing is
+    /// hand-typed. A multi-table config loads every export into the shared
+    /// target, one after another.
+    Load {
+        /// Path to YAML config file — extraction PLUS a top-level `load:` block.
+        /// ONE file drives both the export and the load: the mode
+        /// (`full`/`incremental`/`cdc`), `pk:`, `cleanup_source:`, `gc_orphans:`
+        /// and `allow_source_drift:` all live in the config, not on the CLI.
+        #[arg(short = 'c', long)]
+        config: String,
+        /// Path to the `rivet` binary used for the type-report subprocess.
+        #[arg(long, default_value = "rivet")]
+        rivet_bin: String,
+        /// Correlation id stamped on every warehouse job/query of this load run
+        /// (BigQuery `rivet_run` label / Snowflake `QUERY_TAG`), so cost slices
+        /// per run as well as per table. Defaults to a generated id.
+        #[arg(long, env = "RIVET_RUN_ID")]
+        run_id: Option<String>,
+    },
     /// Manage export state
     State {
         #[command(subcommand)]
@@ -570,6 +592,17 @@ pub enum StateAction {
         /// Show progression for a specific export
         #[arg(short, long)]
         export: Option<String>,
+    },
+    /// Show the load ledger (`rivet load` runs recorded in the state DB)
+    Loads {
+        #[arg(short, long)]
+        config: String,
+        /// Show only loads into this fully-qualified target (`proj.ds.table`)
+        #[arg(short, long)]
+        target: Option<String>,
+        /// Number of recent loads to show
+        #[arg(short, long, default_value = "50")]
+        last: usize,
     },
 }
 

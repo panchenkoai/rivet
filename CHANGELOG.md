@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.20.0 — 2026-07-16
+
+### Added
+
+- **`rivet load` / `rivet load --cdc` — warehouse load layer (free, MIT).**
+  Moves the warehouse **load** + CDC **merge/dedup** layer from the private
+  `rivet-pro` (BSL) extension into the OSS engine. One config's top-level
+  `load:` block drives the load — the native column schema, target table,
+  partition, and source URIs are all derived (nothing hand-typed).
+  - **Targets:** BigQuery (free native-schema `LOAD DATA`, `bytes_billed=0`) and
+    Snowflake (`COPY` off a GCS external `STORAGE INTEGRATION` stage). Both
+    live-verified end-to-end on Postgres, MySQL, and MongoDB sources.
+  - **Modes** (from the export's `mode:`): `full` OVERWRITEs the latest snapshot
+    only (self-healing, never ledger-skipped); `incremental` APPENDs a
+    cursor-delta and exposes a cursor-ordered current-state dedup view; `cdc`
+    APPENDs a change log and dedups by `(__pos, __seq)` with soft-delete
+    tombstones. `cdc.initial: snapshot` backfills preexisting rows.
+  - **Data-safety invariants:** a source→file→warehouse reconcile gate (the
+    summed manifest `row_count` must equal the warehouse `COUNT(*)` before any
+    source cleanup); a Rivet state-DB ledger (SQLite or Postgres) records every
+    load and drives retry from the DB (bucket listing is a fallback);
+    `cleanup_source` / `gc_orphans` staging cleanup runs only after a verified
+    load.
+  - Cost-attribution labels (`rivet_run` / `rivet_table`) on every BigQuery job
+    and Snowflake `QUERY_TAG`.
+
+### Fixed
+
+- **Snowflake `COPY FILES` no longer doubles the stage path.** The external
+  stage URL uses `gcs://` (Snowflake's scheme) while the load driver hands
+  `gs://` URIs, so a scheme-blind `strip_prefix` leaked the full URI into
+  `FILES=()`; Snowflake then resolved it relative to the stage
+  (`gcs://…/gs://…` → "file not found"). The relative-path computation is now
+  scheme-agnostic (caught live; BigQuery was unaffected).
+
 ## 0.19.2 — 2026-07-14
 
 ### Fixed

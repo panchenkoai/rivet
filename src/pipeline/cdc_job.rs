@@ -110,6 +110,7 @@ pub(super) fn run_cdc_export(
 pub(super) fn initial_snapshot_pending(
     config: &Config,
     export: &ExportConfig,
+    state: &StateStore,
 ) -> Result<Vec<ExportConfig>> {
     let cdc = export.cdc.clone().unwrap_or_default();
     if cdc.initial != Some(crate::config::CdcInitialMode::Snapshot) {
@@ -118,26 +119,23 @@ pub(super) fn initial_snapshot_pending(
     let url = config.source.resolve_url()?;
     let tls = config.source.tls.as_ref();
 
-    // 1) The anchor — one entry point; the engine's AnchorModel decides the
-    //    mechanism (idempotent: a present anchor is never moved).
     let slot = cdc
         .slot
         .clone()
         .unwrap_or_else(|| crate::config::DEFAULT_PG_SLOT.to_string());
 
-    // 1) Which tables still need their snapshot (no `snapshot/_SUCCESS` yet) —
-    //    scanned BEFORE the anchor step, because a completed marker is resume
-    //    EVIDENCE: it proves a prior run anchored and snapshotted, and a
-    //    missing server-side anchor after that must be a loud failure, never
-    //    a silent re-anchor at the current position (which would skip every
-    //    change since the drop while reporting success — finding #28).
+    // Each table's snapshot destination + whether its snapshot is already done.
+    // Scanned BEFORE the anchor step, because a completed snapshot is resume
+    // EVIDENCE: a missing server-side anchor after one must fail loud, never
+    // silently re-anchor at "current" (which would skip every change since the
+    // drop while reporting success — finding #28).
     let (tables, multi) = match (&export.tables, &export.table) {
         (Some(ts), _) => (ts.clone(), true),
         (None, Some(t)) => (vec![t.clone()], false),
         (None, None) => anyhow::bail!("export '{}': cdc mode requires `table:`", export.name),
     };
-    let mut pending_tables = Vec::new();
-    let mut any_marker = false;
+    let mut table_dests = Vec::with_capacity(tables.len());
+    let mut done_flags = Vec::with_capacity(tables.len());
     for t in &tables {
         let table_dcfg = if multi {
             dest_for_table(&export.destination, t)
@@ -146,39 +144,44 @@ pub(super) fn initial_snapshot_pending(
         };
         let snap_dcfg = dest_for_table(&table_dcfg, "snapshot");
         let dest = crate::destination::create_destination(&snap_dcfg)?;
-        if dest.head("_SUCCESS")?.is_some() {
-            any_marker = true; // this table's snapshot already completed
-        } else {
-            pending_tables.push((t.clone(), snap_dcfg));
-        }
+        // The state DB is authoritative (survives `cleanup_source` wiping the
+        // bucket); the GCS `snapshot/_SUCCESS` marker stays a legacy co-signal so
+        // pre-v14 runs and setups without state still skip correctly.
+        let done = state.snapshot_done(&export.name, t)? || dest.head("_SUCCESS")?.is_some();
+        table_dests.push((t.clone(), snap_dcfg));
+        done_flags.push(done);
     }
 
-    // 2) The anchor — one entry point; the engine's AnchorModel decides the
-    //    mechanism. Resume evidence (a checkpoint position OR any completed
-    //    snapshot marker) makes a missing server-side anchor a LOUD error.
+    // The pure decision: which tables still need a snapshot, and whether prior
+    // evidence forces the fail-loud anchor guard.
     let ckpt_resume = cdc
         .checkpoint
         .as_deref()
         .map(std::path::Path::new)
         .and_then(|p| crate::source::cdc::Position::load(p).ok().flatten())
         .is_some();
+    let (pending_idx, resume_expected) = snapshot_plan(&done_flags, ckpt_resume);
+
+    // The anchor — one entry point; the engine's AnchorModel decides the
+    // mechanism (idempotent: a present anchor is never moved).
     CdcEngine::from_url(&url)?.ensure_anchor(
         &url,
         &slot,
         cdc.checkpoint.as_deref().map(std::path::Path::new),
         tls,
-        ckpt_resume || any_marker,
+        resume_expected,
     )?;
 
     let mut pending = Vec::new();
-    for (t, snap_dcfg) in pending_tables {
+    for idx in pending_idx {
+        let (t, snap_dcfg) = &table_dests[idx];
         let mut synth = export.clone();
         synth.name = format!("{}__snapshot_{t}", export.name);
         synth.mode = crate::config::ExportMode::Full;
-        synth.table = Some(t);
+        synth.table = Some(t.clone());
         synth.tables = None;
         synth.cdc = None;
-        synth.destination = snap_dcfg;
+        synth.destination = snap_dcfg.clone();
         // NEVER inherit skip_empty: an EMPTY table with skip_empty=true would
         // write no snapshot/_SUCCESS, so the marker check re-snapshots on
         // every run forever. An empty snapshot must still complete (manifest +
@@ -187,6 +190,28 @@ pub(super) fn initial_snapshot_pending(
         pending.push(synth);
     }
     Ok(pending)
+}
+
+/// The pure `initial: snapshot` decision, split out of the I/O in
+/// [`initial_snapshot_pending`] so it can be unit-tested. Given, per table in
+/// order, whether its snapshot is already `done` (state DB OR the legacy GCS
+/// marker) and whether a checkpoint position survives (`ckpt_resume`), returns
+/// the indices still PENDING a snapshot and whether the anchor step must treat a
+/// missing server-side anchor as resume evidence.
+///
+/// A `done` snapshot is never re-run — the state DB remembers it even after
+/// `cleanup_source` wiped the bucket marker. `resume_expected` is `true` when
+/// ANY prior evidence exists — a live checkpoint OR any done snapshot — so a
+/// lost server-side anchor fails LOUD instead of silently re-anchoring at
+/// "current" (finding #28).
+fn snapshot_plan(done_flags: &[bool], ckpt_resume: bool) -> (Vec<usize>, bool) {
+    let pending = done_flags
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &done)| (!done).then_some(i))
+        .collect();
+    let resume_expected = ckpt_resume || done_flags.iter().any(|&d| d);
+    (pending, resume_expected)
 }
 
 /// A multi-table stream lands each table under its own sub-prefix of the
@@ -458,5 +483,46 @@ mod tests {
             "/data/cdc/orders",
             "local paths go through the filesystem join — no trailing slash needed"
         );
+    }
+
+    // ── snapshot_plan: the pure `initial: snapshot` decision ─────────────────
+
+    #[test]
+    fn snapshot_plan_first_run_snapshots_all_with_no_resume_evidence() {
+        // Nothing done, no checkpoint → snapshot every table, and this is a
+        // genuine first anchor (resume_expected=false).
+        assert_eq!(snapshot_plan(&[false, false], false), (vec![0, 1], false));
+    }
+
+    #[test]
+    fn snapshot_plan_all_done_snapshots_nothing_but_keeps_resume_evidence() {
+        // Every snapshot already done — the state DB remembers even after
+        // `cleanup_source` wiped the bucket marker → re-snapshot NOTHING; and
+        // that prior evidence forces the fail-loud anchor guard (#28).
+        assert_eq!(
+            snapshot_plan(&[true, true], false),
+            (Vec::<usize>::new(), true)
+        );
+    }
+
+    #[test]
+    fn snapshot_plan_partial_snapshots_only_the_undone() {
+        // One table done, one not → snapshot only the undone; a done sibling is
+        // still resume evidence.
+        assert_eq!(snapshot_plan(&[true, false], false), (vec![1], true));
+    }
+
+    #[test]
+    fn snapshot_plan_checkpoint_alone_is_resume_evidence() {
+        // No snapshot done but a live checkpoint survives → still snapshot (the
+        // marker is gone), yet the checkpoint alone makes a lost anchor fail loud.
+        assert_eq!(snapshot_plan(&[false], true), (vec![0], true));
+    }
+
+    #[test]
+    fn snapshot_plan_no_evidence_is_a_legitimate_first_anchor() {
+        // Nothing done, no checkpoint → snapshot, and no evidence means the
+        // anchor is a legitimate first anchor, not a loud failure.
+        assert_eq!(snapshot_plan(&[false], false), (vec![0], false));
     }
 }

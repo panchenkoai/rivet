@@ -10,6 +10,7 @@ mod error;
 mod format;
 mod init;
 mod journal;
+mod load;
 mod manifest;
 mod notify;
 mod pipeline;

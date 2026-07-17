@@ -17,6 +17,7 @@ pub mod config;
 pub mod error;
 pub mod format;
 pub mod journal;
+pub mod load;
 pub mod manifest;
 pub mod pipeline;
 pub mod resource;
