@@ -33,7 +33,7 @@ use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 use crate::config::{TlsConfig, TlsMode};
 use crate::error::Result;
 use crate::source::cdc::value::RivetValue;
-use crate::source::cdc::{ChangeEvent, ChangeOp, ChangeStream, Position};
+use crate::source::cdc::{ChangeEvent, ChangeOp, ChangeStream, DrainMode, Position};
 use crate::source::require_tls_or_loopback;
 
 /// Build one poll's T-SQL. `bound` pins `@max` to the open-time ceiling
@@ -105,8 +105,7 @@ pub(crate) struct MssqlChangeStream {
     /// Open-time max-LSN ceiling (bare hex) for a bounded run: every poll's
     /// `@max` pins here instead of re-reading `fn_cdc_get_max_lsn()`, so the
     /// window cannot recede under sustained writes; `None` (daemon) keeps the
-    /// chase-the-head behaviour. The contract lives on
-    /// [`crate::source::cdc::CdcConfig::until_current`].
+    /// chase-the-head behaviour. The contract lives on [`DrainMode`].
     bound: Option<String>,
 }
 
@@ -114,14 +113,13 @@ impl MssqlChangeStream {
     /// Connect and bind to a capture instance. Holds the runtime + connection for
     /// the life of the stream (folds the per-poll runtime/connect smell away).
     ///
-    /// `bound_at_open` = a bounded (`until_current`) run: snapshot
-    /// `fn_cdc_get_max_lsn()` once and pin every poll's `@max` to it — see
-    /// [`Self::bound`].
+    /// A [`DrainMode::BoundedAtOpen`] run snapshots `fn_cdc_get_max_lsn()` once
+    /// and pins every poll's `@max` to it — see [`Self::bound`].
     pub(crate) fn open(
         cfg: &MssqlCdcConfig,
         tls: Option<&TlsConfig>,
         peek: crate::source::cdc::PeekBound,
-        bound_at_open: bool,
+        mode: DrainMode,
     ) -> Result<Self> {
         if !cfg
             .capture_instance
@@ -179,7 +177,7 @@ impl MssqlChangeStream {
         // Bounded run: snapshot the ceiling once, at open. A NULL max LSN (CDC
         // not enabled yet) keeps `bound = None` so the first poll surfaces the
         // same loud setup error the daemon path does — never a silent empty run.
-        let bound = if bound_at_open {
+        let bound = if mode.is_bounded() {
             let max: Option<String> = rt.block_on(async {
                 Ok::<_, anyhow::Error>(
                     client
@@ -229,7 +227,7 @@ impl MssqlChangeStream {
         from_lsn: Option<String>,
         tls: Option<&TlsConfig>,
         peek: crate::source::cdc::PeekBound,
-        bound_at_open: bool,
+        mode: DrainMode,
     ) -> Result<Self> {
         // Refuse remote plaintext / unauthenticated TLS before any dial (the gate
         // the batch MssqlSource uses).
@@ -247,7 +245,7 @@ impl MssqlChangeStream {
             },
             tls,
             peek,
-            bound_at_open,
+            mode,
         )
     }
 
@@ -606,7 +604,7 @@ mod tests {
             &cfg("dbo_cdc_unit"),
             None,
             crate::source::cdc::PeekBound::Sized(10_000),
-            false,
+            DrainMode::Continuous,
         )
         .unwrap();
         let mut ops = Vec::new();

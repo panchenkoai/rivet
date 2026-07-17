@@ -28,7 +28,7 @@ use serde_json::json;
 use crate::config::TlsConfig;
 use crate::error::Result;
 use crate::source::cdc::value::RivetValue;
-use crate::source::cdc::{ChangeEvent, ChangeOp, ChangeStream, Position};
+use crate::source::cdc::{ChangeEvent, ChangeOp, ChangeStream, DrainMode, Position};
 use crate::source::require_tls_or_loopback;
 
 /// Polls a logical slot and yields canonical changes.
@@ -49,8 +49,7 @@ pub(crate) struct PgChangeStream {
     exhausted: bool,
     /// Open-time COMMIT-LSN ceiling for a bounded run — the first transaction
     /// committing past it ends the stream; `None` (daemon / anchor-only open)
-    /// keeps the pure catch-up exit. The contract lives on
-    /// [`crate::source::cdc::CdcConfig::until_current`].
+    /// keeps the pure catch-up exit. The contract lives on [`DrainMode`].
     bound: Option<u64>,
 }
 
@@ -63,16 +62,15 @@ impl PgChangeStream {
     /// dropped or invalidated, and a fresh slot would anchor at the *current*
     /// position — silently skipping every change since the drop.
     ///
-    /// `bound_at_open` = a bounded (`until_current`) run: snapshot
-    /// `pg_current_wal_lsn()` once and stop at the first commit past it — see
-    /// [`Self::bound`].
+    /// A [`DrainMode::BoundedAtOpen`] run snapshots `pg_current_wal_lsn()` once
+    /// and stops at the first commit past it — see [`Self::bound`].
     pub(crate) fn open(
         conn_str: &str,
         slot: &str,
         resume_expected: bool,
         tls: Option<&TlsConfig>,
         peek: crate::source::cdc::PeekBound,
-        bound_at_open: bool,
+        mode: DrainMode,
     ) -> Result<Self> {
         // Same gate the batch path uses: refuse remote plaintext (CWE-319), and
         // use a verifying TLS connector when a TlsConfig is enforced.
@@ -119,7 +117,7 @@ impl PgChangeStream {
         // slot creation and this read is ≤ bound (captured this run, not lost
         // between the anchor and the ceiling). A malformed rendering falls back
         // to unbounded — pure catch-up — never an early exit.
-        let bound = if bound_at_open {
+        let bound = if mode.is_bounded() {
             let lsn: String = client
                 .query_one("SELECT pg_current_wal_lsn()::text", &[])?
                 .get(0);
@@ -949,7 +947,7 @@ mod tests {
             false,
             None,
             crate::source::cdc::PeekBound::Sized(10_000),
-            false,
+            DrainMode::Continuous,
         )
         .unwrap();
         admin

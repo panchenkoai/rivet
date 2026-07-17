@@ -28,7 +28,7 @@ use super::{MongoSession, document_to_json, id_to_string};
 use crate::config::TlsConfig;
 use crate::error::Result;
 use crate::source::cdc::value::RivetValue;
-use crate::source::cdc::{ChangeEvent, ChangeOp, ChangeStream, Position};
+use crate::source::cdc::{ChangeEvent, ChangeOp, ChangeStream, DrainMode, Position};
 
 /// The two fixed image columns, matching the batch JSON-blob schema. Built once
 /// (a change stream emits millions of events) and cloned per event — a refcount
@@ -153,8 +153,9 @@ impl MongoChangeStream {
         tls: Option<&TlsConfig>,
         checkpoint: Option<&std::path::Path>,
         canonical: bool,
-        until_current: bool,
+        mode: DrainMode,
     ) -> Result<Self> {
+        let until_current = mode.is_bounded();
         let session = MongoSession::connect(url, tls, true)?;
         let db_name = session.db().to_string();
         // The resume token persisted by a prior run (opaque JSON → driver token).
@@ -275,7 +276,7 @@ pub(crate) fn pin_checkpoint_at_current(
     // first-run anchor). One mechanism, one place — this is the `ensure_anchor`
     // entry into it. (A non-replica-set can't `watch()`, so open fails loudly
     // before any pin.) The stream is opened only to anchor, then dropped.
-    MongoChangeStream::open(url, tls, Some(checkpoint), false, false).map(|_| ())
+    MongoChangeStream::open(url, tls, Some(checkpoint), false, DrainMode::Continuous).map(|_| ())
 }
 
 /// What a MongoDB CDC run actually delivers — probed from the server so the tier

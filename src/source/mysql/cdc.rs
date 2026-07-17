@@ -27,7 +27,7 @@ use serde_json::{Value as Json, json};
 use crate::config::TlsConfig;
 use crate::error::Result;
 use crate::source::cdc::value::RivetValue;
-use crate::source::cdc::{ChangeEvent, ChangeOp, ChangeStream, Position};
+use crate::source::cdc::{ChangeEvent, ChangeOp, ChangeStream, DrainMode, Position};
 use crate::source::require_tls_or_loopback;
 
 /// A blocking iterator of canonical [`ChangeEvent`]s over a MySQL binlog stream.
@@ -56,34 +56,32 @@ pub(crate) struct MysqlChangeStream {
     /// whole transaction is released atomically with the commit position.
     tx: Vec<ChangeEvent>,
     file: String,
-    /// Open-time `(binlog_file, pos)` ceiling for a bounded (`non_block`) run —
-    /// the first commit past it ends the stream (`BINLOG_DUMP_NON_BLOCK`'s EOF
-    /// stays as the catch-up backstop, which backpressure alone can push out
+    /// Open-time `(binlog_file, pos)` ceiling for a bounded run — the first
+    /// commit past it ends the stream (`BINLOG_DUMP_NON_BLOCK`'s EOF stays as
+    /// the catch-up backstop, which backpressure alone can push out
     /// indefinitely); `None` (daemon) streams forever. The contract lives on
-    /// [`crate::source::cdc::CdcConfig::until_current`].
+    /// [`DrainMode`].
     bound: Option<(String, u64)>,
 }
 
 impl MysqlChangeStream {
     /// Open a stream from an explicit `(binlog_file, pos)` coordinate.
     ///
-    /// `non_block` ⇒ set `BINLOG_DUMP_NON_BLOCK`: the server streams all binlog up
-    /// to the current end and then sends EOF instead of blocking for more. That
-    /// turns MySQL into the same drain-and-exit poll model as PostgreSQL / SQL
-    /// Server — a bounded "catch up to now and stop" run, ideal for a scheduler.
-    /// A bounded open also pins the open-time coordinates as the stop ceiling
-    /// (see [`Self::bound`]) — EOF-on-catch-up stays as the backstop.
+    /// A [`DrainMode::BoundedAtOpen`] run sets `BINLOG_DUMP_NON_BLOCK` (the
+    /// server streams to the current end and sends EOF instead of blocking —
+    /// the catch-up backstop) AND pins the open-time coordinates as the stop
+    /// ceiling (see [`Self::bound`]).
     pub(crate) fn open(
         url: &str,
         server_id: u32,
         file: String,
         pos: u64,
-        non_block: bool,
+        mode: DrainMode,
         tls: Option<&TlsConfig>,
     ) -> Result<Self> {
         // Snapshot the ceiling BEFORE the dump starts: every commit already in
         // the log is ≤ it, and anything racing in after is the next run's work.
-        let bound = if non_block {
+        let bound = if mode.is_bounded() {
             Some(Self::current_coordinates(url, tls)?)
         } else {
             None
@@ -92,7 +90,7 @@ impl MysqlChangeStream {
         let mut req = BinlogRequest::new(server_id)
             .with_filename(file.clone().into_bytes())
             .with_pos(pos);
-        if non_block {
+        if mode.is_bounded() {
             req = req.with_flags(BinlogDumpFlags::BINLOG_DUMP_NON_BLOCK);
         }
         let stream = conn.get_binlog_stream(req)?;
@@ -142,26 +140,29 @@ impl MysqlChangeStream {
     }
 
     /// Open a stream from the source's *current* position (`SHOW MASTER STATUS`).
+    /// Test-only convenience: every production path goes through
+    /// [`Self::open_or_resume`].
+    #[cfg(test)]
     pub(crate) fn open_from_current(
         url: &str,
         server_id: u32,
-        non_block: bool,
+        mode: DrainMode,
         tls: Option<&TlsConfig>,
     ) -> Result<Self> {
         let (file, pos) = Self::current_coordinates(url, tls)?;
-        Self::open(url, server_id, file, pos, non_block, tls)
+        Self::open(url, server_id, file, pos, mode, tls)
     }
 
     /// Resume from a persisted [`Position`] checkpoint, or start from the current
     /// position on the first run (no checkpoint yet). The MySQL position shape is
-    /// `{"file": String, "pos": u64}`. `non_block` ⇒ drain to the current end and
-    /// exit (see [`Self::open`]).
+    /// `{"file": String, "pos": u64}`. Bounded/continuous per `mode` (see
+    /// [`Self::open`]).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn open_or_resume(
         url: &str,
         server_id: u32,
         ckpt: Option<&Path>,
-        non_block: bool,
+        mode: DrainMode,
         tls: Option<&TlsConfig>,
     ) -> Result<Self> {
         if let Some(path) = ckpt
@@ -178,7 +179,7 @@ impl MysqlChangeStream {
                 .get("pos")
                 .and_then(Json::as_u64)
                 .ok_or_else(|| anyhow::anyhow!("mysql cdc checkpoint missing 'pos'"))?;
-            return Self::open(url, server_id, file, p, non_block, tls);
+            return Self::open(url, server_id, file, p, mode, tls);
         }
         // First run (no checkpoint yet): anchor at the current position and persist
         // it IMMEDIATELY. PostgreSQL pins its anchor server-side at open (slot
@@ -190,7 +191,7 @@ impl MysqlChangeStream {
         if let Some(path) = ckpt {
             Position(serde_json::json!({ "file": file, "pos": pos })).save(path)?;
         }
-        Self::open(url, server_id, file, pos, non_block, tls)
+        Self::open(url, server_id, file, pos, mode, tls)
     }
 
     /// Pull one binlog event and expand it into `pending`. `Ok(false)` ⇒ stream
@@ -486,7 +487,8 @@ mod tests {
         c.query_drop("CREATE TABLE cdc_unit (id INT PRIMARY KEY, v INT)")
             .unwrap();
 
-        let mut stream = MysqlChangeStream::open_from_current(URL, 4243, false, None).unwrap();
+        let mut stream =
+            MysqlChangeStream::open_from_current(URL, 4243, DrainMode::Continuous, None).unwrap();
         c.query_drop("INSERT INTO cdc_unit VALUES (1, 10)").unwrap();
         c.query_drop("UPDATE cdc_unit SET v = 20 WHERE id = 1")
             .unwrap();
@@ -546,8 +548,15 @@ mod tests {
         let ckpt = dir.path().join("mysql.ckpt.json");
 
         // Run 1: checkpoint path configured, no file yet, nothing to drain
-        // (non_block ⇒ bounded drain-and-exit, the scheduler model).
-        let mut s = MysqlChangeStream::open_or_resume(URL, 4245, Some(&ckpt), true, None).unwrap();
+        // (BoundedAtOpen ⇒ bounded drain-and-exit, the scheduler model).
+        let mut s = MysqlChangeStream::open_or_resume(
+            URL,
+            4245,
+            Some(&ckpt),
+            DrainMode::BoundedAtOpen,
+            None,
+        )
+        .unwrap();
         assert!(
             s.by_ref()
                 .map(|e| e.unwrap())
@@ -566,7 +575,14 @@ mod tests {
             .unwrap();
 
         // Run 2 must resume from the pinned position and capture it.
-        let mut s2 = MysqlChangeStream::open_or_resume(URL, 4245, Some(&ckpt), true, None).unwrap();
+        let mut s2 = MysqlChangeStream::open_or_resume(
+            URL,
+            4245,
+            Some(&ckpt),
+            DrainMode::BoundedAtOpen,
+            None,
+        )
+        .unwrap();
         let got = s2
             .by_ref()
             .map(|e| e.unwrap())
@@ -588,7 +604,8 @@ mod tests {
             .unwrap();
 
         // Read change A and checkpoint at its position.
-        let mut s = MysqlChangeStream::open_from_current(URL, 4244, false, None).unwrap();
+        let mut s =
+            MysqlChangeStream::open_from_current(URL, 4244, DrainMode::Continuous, None).unwrap();
         c.query_drop("INSERT INTO cdc_resume VALUES (1, 100)")
             .unwrap();
         let a = s
@@ -610,7 +627,8 @@ mod tests {
 
         // Resuming from the checkpoint must yield B (id=2), never re-read A.
         let mut s2 =
-            MysqlChangeStream::open_or_resume(URL, 4244, Some(&ckpt), false, None).unwrap();
+            MysqlChangeStream::open_or_resume(URL, 4244, Some(&ckpt), DrainMode::Continuous, None)
+                .unwrap();
         let b = s2
             .by_ref()
             .map(|e| e.unwrap())

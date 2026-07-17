@@ -188,8 +188,8 @@ pub(crate) trait ChangeStream {
 /// position after each (when `checkpoint` is set). Stops at end of stream,
 /// `max_events`, or interruption.
 ///
-/// (Candidate 3 will branch the output here onto the Parquet/CSV sink; today it
-/// is NDJSON only.)
+/// (The typed Parquet/CSV sink is the separate [`sink::run_to_files`] driver —
+/// ADR-0023 keeps the two loops apart on purpose.)
 pub(crate) fn run(
     stream: &mut dyn ChangeStream,
     checkpoint: Option<PathBuf>,
@@ -259,6 +259,47 @@ pub(crate) enum CdcEngineOpts {
     Mongo { canonical: bool },
 }
 
+/// How a capture run ends — ONE name for the concept that used to cross the
+/// adapter seam as three differently-aliased bools (`bound_at_open`,
+/// `non_block`, `until_current`), and the canonical home of the bounded run's
+/// termination contract.
+///
+/// `BoundedAtOpen` (`until_current: true` — the scheduler model): capture up to
+/// the source's position AS OF STREAM OPEN, then exit. Every adapter pins the
+/// ceiling at open (PostgreSQL `pg_current_wal_lsn()`; MySQL the binlog
+/// coordinates, with `BINLOG_DUMP_NON_BLOCK`'s EOF as the catch-up backstop;
+/// SQL Server `fn_cdc_get_max_lsn()`; MongoDB the cluster `operationTime`), so
+/// a hot table whose writers outpace the drain cannot keep the run alive — the
+/// run's work is O(backlog at open). The excluded tail is deferred, never
+/// lost: the checkpoint stops at the last in-bound commit and the next run
+/// resumes there (per-engine two-run proof:
+/// `roast_*_until_current_open_bound_two_runs_lose_nothing`).
+///
+/// `Continuous` (the daemon model): no open-time ceiling. MySQL blocks on the
+/// binlog; the poll adapters still exit on catch-up and an outer loop re-wraps
+/// them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DrainMode {
+    BoundedAtOpen,
+    Continuous,
+}
+
+impl DrainMode {
+    /// The user-facing surface stays a bool (`cdc.until_current` /
+    /// `--until-current`); internally the mode travels under one name.
+    pub(crate) fn from_until_current(until_current: bool) -> Self {
+        if until_current {
+            DrainMode::BoundedAtOpen
+        } else {
+            DrainMode::Continuous
+        }
+    }
+
+    pub(crate) fn is_bounded(self) -> bool {
+        matches!(self, DrainMode::BoundedAtOpen)
+    }
+}
+
 /// Connection + resume parameters for `rivet cdc`, across engines — the CDC
 /// sibling of [`crate::source::create_source`]'s `SourceConfig`. The fields here
 /// are engine-agnostic; per-engine knobs live in [`CdcEngineOpts`].
@@ -267,18 +308,9 @@ pub(crate) struct CdcConfig {
     /// MySQL checkpoint file (PG resumes via the slot; SQL Server via its LSN;
     /// MongoDB via the resume token).
     pub checkpoint: Option<PathBuf>,
-    /// Bounded run: capture up to the source's position AS OF STREAM OPEN, then
-    /// exit — the scheduler model, and the canonical home of the termination
-    /// contract. Every adapter pins the ceiling at open (PostgreSQL
-    /// `pg_current_wal_lsn()`; MySQL the binlog coordinates, with
-    /// `BINLOG_DUMP_NON_BLOCK`'s EOF as the catch-up backstop; SQL Server
-    /// `fn_cdc_get_max_lsn()`; MongoDB the cluster `operationTime`), so a hot
-    /// table whose writers outpace the drain cannot keep the run alive — the
-    /// run's work is O(backlog at open). The excluded tail is deferred, never
-    /// lost: the checkpoint stops at the last in-bound commit and the next run
-    /// resumes there (per-engine two-run proof:
-    /// `roast_*_until_current_open_bound_two_runs_lose_nothing`).
-    pub until_current: bool,
+    /// How this capture run ends — see [`DrainMode`], the canonical home of the
+    /// termination contract.
+    pub drain: DrainMode,
     /// Transport security, applied by every adapter through the same
     /// `require_tls_or_loopback` gate the batch path uses (refuse remote
     /// plaintext / unauthenticated TLS). `None` ⇒ loopback-only (the CLI default).
@@ -392,7 +424,7 @@ impl CdcEngine {
                     resume_expected,
                     tls,
                     PeekBound::Unbounded,
-                    false, // anchor-only open — never read, no bound to pin
+                    DrainMode::Continuous, // anchor-only open — never read, no bound to pin
                 )?);
                 Ok(())
             }
@@ -445,8 +477,8 @@ pub(crate) const MONGO_CDC_HINT: &str = "if this is a setup error: MongoDB chang
 
 /// Construct the right [`ChangeStream`] adapter for the source URL's scheme —
 /// dispatching by engine exactly as [`crate::source::create_source`] does for the
-/// batch path. `cfg.until_current` reaches every adapter as its bounded-open
-/// flag — the open-time-ceiling contract lives on [`CdcConfig::until_current`].
+/// batch path. `cfg.drain` reaches every adapter as-is — the open-time-ceiling
+/// contract lives on [`DrainMode`].
 pub(crate) fn create_change_stream(
     cfg: &CdcConfig,
     peek: PeekBound,
@@ -461,7 +493,7 @@ pub(crate) fn create_change_stream(
                 url,
                 *server_id,
                 cfg.checkpoint.as_deref(),
-                cfg.until_current,
+                cfg.drain,
                 tls,
             )
             .context(MYSQL_CDC_HINT)?,
@@ -482,7 +514,7 @@ pub(crate) fn create_change_stream(
                     resume_expected,
                     tls,
                     peek,
-                    cfg.until_current,
+                    cfg.drain,
                 )
                 .context(PG_CDC_HINT)?,
             ))
@@ -506,12 +538,7 @@ pub(crate) fn create_change_stream(
                 });
             Ok(Box::new(
                 crate::source::mssql::cdc::MssqlChangeStream::from_url(
-                    url,
-                    ci,
-                    from_lsn,
-                    tls,
-                    peek,
-                    cfg.until_current,
+                    url, ci, from_lsn, tls, peek, cfg.drain,
                 )
                 .context(MSSQL_CDC_HINT)?,
             ))
@@ -525,7 +552,7 @@ pub(crate) fn create_change_stream(
                 tls,
                 cfg.checkpoint.as_deref(),
                 *canonical,
-                cfg.until_current,
+                cfg.drain,
             )
             .context(MONGO_CDC_HINT)?,
         )),
