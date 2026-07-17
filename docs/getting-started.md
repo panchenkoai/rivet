@@ -157,6 +157,35 @@ parallel_export_processes: true   # top-level: parallelize the cheap (parallel_s
 
 ---
 
+## Load into BigQuery or Snowflake (optional)
+
+Rivet stops at typed Parquet by default. To load it into a warehouse, add a
+top-level `load:` block to the **same** config and run `rivet load` — the target
+table, column types, and source files are all derived from the export (nothing
+hand-typed):
+
+```yaml
+# rivet.yaml — the export above, plus a load target
+load:
+  target: bigquery          # or: snowflake (+ connection / warehouse / database / schema / storage_integration)
+  project: my-gcp-project
+  dataset: analytics
+  cleanup_source: true      # wipe the staged Parquet once the load is row-count-verified
+```
+
+```bash
+rivet run  -c rivet.yaml    # extract → GCS
+rivet load -c rivet.yaml    # load → warehouse (native types; count-gated before any cleanup)
+```
+
+The load follows the export's `mode:` — `full` overwrites the latest snapshot;
+`incremental` / `cdc` append to `<table>__changes` and expose a current-state
+dedup view (add `pk: [id]` to the `load:` block as the dedup key). Recipes:
+[snowflake-load.md](recipes/snowflake-load.md) ·
+[cdc-bigquery-load.md](cdc-bigquery-load.md).
+
+---
+
 ## When something is wrong
 
 Rivet tries to fail early and say exactly what to fix — most mistakes are caught at `check` / `doctor` time, before a single row is read.
@@ -183,6 +212,7 @@ More failure modes (retries, schema drift, crash/resume) and exactly what rivet 
 |---|---|
 | Pick the right export mode for each table | [modes/](modes/) — full · incremental · chunked · time_window · cdc |
 | Configure S3 / GCS / Azure / stdout destinations | [destinations/](destinations/) |
+| Load exports into BigQuery / Snowflake | [recipes/snowflake-load.md](recipes/snowflake-load.md) · [cdc-bigquery-load.md](cdc-bigquery-load.md) |
 | Look up a YAML field or a CLI flag | [reference/config.md](reference/config.md) · [reference/cli.md](reference/cli.md) |
 | Understand `run_id` / cursor / chunk / manifest / journal | [concepts.md](concepts.md) |
 | Tune for memory, throughput, source pressure | [reference/tuning.md](reference/tuning.md) · [best-practices/](best-practices/) |

@@ -38,7 +38,7 @@ right place.
 |---|---|
 | **Always-on live streaming** — every insert/update/delete pushed continuously into Kafka or Kinesis as it happens | [Debezium](https://debezium.io/), [Estuary](https://estuary.dev/), [Materialize](https://materialize.com/), or your cloud's native CDC (`AWS DMS`, `GCP Datastream`). *(Rivet does capture CDC — inserts/updates/deletes — but to **files**: `mode: cdc`, resumable, per-invocation, not a live stream. See [semantics.md](semantics.md).)* |
 | **A SaaS connector marketplace** — pre-built connectors for Salesforce, Stripe, NetSuite, Shopify, Hubspot, etc. | [Airbyte](https://airbyte.com/), [Fivetran](https://www.fivetran.com/), [Stitch](https://www.stitchdata.com/) |
-| **A managed warehouse loader** — extract from operational DB and load into BigQuery / Snowflake / Redshift / Databricks **as one product** | [Fivetran](https://www.fivetran.com/), [Airbyte](https://airbyte.com/) (cloud), [dlt](https://dlthub.com/) (self-hosted with destinations), [Sling](https://slingdata.io/) |
+| **A *managed* warehouse loader** — a continuously-managed service that loads *every* warehouse (Redshift, Databricks, …) as one product. *(Rivet **does** load BigQuery / Snowflake — `rivet load`, a discrete command you schedule, not a managed service; [recipe](recipes/snowflake-load.md).)* | [Fivetran](https://www.fivetran.com/), [Airbyte](https://airbyte.com/) (cloud), [dlt](https://dlthub.com/) (self-hosted with destinations), [Sling](https://slingdata.io/) |
 | **In-warehouse transformation** — modeling, joins, materializations, lineage | [dbt](https://www.getdbt.com/), [SQLMesh](https://sqlmesh.com/) |
 | **A data orchestrator** — DAGs, retries-with-callbacks, schedule UI, lineage graphs | [Airflow](https://airflow.apache.org/), [Dagster](https://dagster.io/), [Prefect](https://www.prefect.io/) |
 | **A Kubernetes operator / Helm chart for an extraction platform** | Rivet runs as a single binary in a `Job` or `CronJob`; a heavier platform like [Airbyte on Kubernetes](https://docs.airbyte.com/deploying-airbyte/on-kubernetes-via-helm) is a different architecture |
@@ -92,6 +92,7 @@ Need always-on live streaming (into Kafka)?    → Debezium / Estuary
 Need CDC captured to files (resumable)?        → Rivet  (mode: cdc)
 Need a connector for a non-DB SaaS source?     → Airbyte / Fivetran
 Need a managed extract+load product?           → Fivetran / Airbyte Cloud
+Load extracted data into BigQuery / Snowflake? → Rivet  (rivet load)
 Need a SQL-based transformation framework?     → dbt
 Need an orchestrator?                          → Airflow / Dagster
 Need to dump PG/MySQL to Parquet/CSV safely?   → Rivet
