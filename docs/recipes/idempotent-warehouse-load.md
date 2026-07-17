@@ -203,8 +203,11 @@ silent data corruption that is invisible until a downstream join breaks.
 
 ## What Rivet does *not* do downstream
 
-- **No warehouse loader.**  Rivet writes files; the operator wires up
-  BigQuery / Snowflake / Redshift / Trino / dbt.
+- **Load targets BigQuery + Snowflake.**  As of 0.20.0 `rivet load` writes a
+  resolved export into BigQuery or Snowflake, and `rivet load --cdc` maintains a
+  current-state dedup view — the built-in path for the manual `MERGE` this recipe
+  spells out. For other targets (Redshift / Trino / dbt) the operator still wires
+  up the load.
 - **No transactional coordination.**  Rivet does not coordinate with a
   downstream `MERGE` / `COMMIT`.  If the export run succeeds and the
   warehouse load fails, the operator is responsible for retry logic.

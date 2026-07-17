@@ -30,7 +30,7 @@ Positioning for teams that already run a **cursor/watermark ELT pipeline**
 | **Cursor state** | Persisted (`.rivet_state.db`) with drift detection; resume reads the last committed value. | Often recomputed from source `MIN/MAX` each run; the watermark can be an injected run timestamp. | Minor |
 | **Type fidelity** | A per-engine type resolver hardened against the known lossy cases (unsigned 64-bit, decimals, timestamps, JSON, UUIDs). | ODBC type mapping; e.g. `bigint unsigned → INT64` silently overflows above ~9.2e18. | Latent¹ |
 | **Value verification** | Always-on two-ended value checksum (independent source-side fold vs a fold of the built Arrow column) + `rivet validate` re-reads and re-verifies at the destination. | Reconciliation compares two destination datasets (staging vs raw) by row count — an internal count, not a source-vs-target value check. | Latent¹ |
-| **Completeness** | Stops at typed parquet + manifest — the MERGE/dedup is the warehouse's job. | Full cycle: extract → MERGE → dedup → metadata. **More complete.** | — |
+| **Completeness** | Full cycle: extract → typed parquet + manifest → `rivet load` into BigQuery / Snowflake, with `rivet load --cdc` maintaining a current-state dedup view. | Full cycle: extract → MERGE → dedup → metadata. | — |
 
 ¹ *Latent* = real as code, but unexercised by an append-mostly, cursor-always-moves
 workload with in-range values. A long clean run is genuine evidence the shape
