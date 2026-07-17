@@ -376,6 +376,7 @@ impl CdcEngine {
                     resume_expected,
                     tls,
                     PeekBound::Unbounded,
+                    false, // anchor-only open — never read, no bound to pin
                 )?);
                 Ok(())
             }
@@ -464,6 +465,9 @@ pub(crate) fn create_change_stream(
                     resume_expected,
                     tls,
                     peek,
+                    // Bounded run ⇒ pin the stop ceiling at open, so termination
+                    // is O(backlog at open) even under sustained writes.
+                    cfg.until_current,
                 )
                 .context(PG_CDC_HINT)?,
             ))
@@ -487,7 +491,14 @@ pub(crate) fn create_change_stream(
                 });
             Ok(Box::new(
                 crate::source::mssql::cdc::MssqlChangeStream::from_url(
-                    url, ci, from_lsn, tls, peek,
+                    url,
+                    ci,
+                    from_lsn,
+                    tls,
+                    peek,
+                    // Bounded run ⇒ pin @max at open, so termination is
+                    // O(backlog at open) even under sustained writes.
+                    cfg.until_current,
                 )
                 .context(MSSQL_CDC_HINT)?,
             ))

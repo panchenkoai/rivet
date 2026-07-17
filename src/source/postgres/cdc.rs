@@ -47,6 +47,14 @@ pub(crate) struct PgChangeStream {
     /// batch, has drained everything past the ack frontier — the stream ends
     /// (a non-acking consumer, e.g. NDJSON, ends here after its one big peek).
     exhausted: bool,
+    /// Open-time COMMIT-LSN ceiling for a bounded (`until_current`) run: the
+    /// first transaction committing PAST it ends the stream, so the run's work
+    /// is O(backlog at open) even when writers outpace the drain — the catch-up
+    /// exit alone (short/empty peek) never fires under sustained writes ≥ one
+    /// full batch per roll cycle. `None` (daemon / anchor-only open) keeps the
+    /// pure catch-up behaviour. The excluded tail is never lost: the checkpoint
+    /// stops at the last in-bound commit and the next run resumes there.
+    bound: Option<u64>,
 }
 
 impl PgChangeStream {
@@ -57,12 +65,17 @@ impl PgChangeStream {
     /// MISSING slot is a loud error, never a silent re-create: the slot was
     /// dropped or invalidated, and a fresh slot would anchor at the *current*
     /// position — silently skipping every change since the drop.
+    ///
+    /// `bound_at_open` = a bounded (`until_current`) run: snapshot
+    /// `pg_current_wal_lsn()` once and stop at the first commit past it — see
+    /// [`Self::bound`].
     pub(crate) fn open(
         conn_str: &str,
         slot: &str,
         resume_expected: bool,
         tls: Option<&TlsConfig>,
         peek: crate::source::cdc::PeekBound,
+        bound_at_open: bool,
     ) -> Result<Self> {
         // Same gate the batch path uses: refuse remote plaintext (CWE-319), and
         // use a verifying TLS connector when a TlsConfig is enforced.
@@ -105,16 +118,37 @@ impl PgChangeStream {
                 &[&slot],
             )?;
         }
+        // Snapshot the bound AFTER the slot exists, so a commit landing between
+        // slot creation and this read is ≤ bound (captured this run, not lost
+        // between the anchor and the ceiling). A malformed rendering falls back
+        // to unbounded — pure catch-up — never an early exit.
+        let bound = if bound_at_open {
+            let lsn: String = client
+                .query_one("SELECT pg_current_wal_lsn()::text", &[])?
+                .get(0);
+            parse_lsn(&lsn)
+        } else {
+            None
+        };
         Ok(Self {
             client,
             slot: slot.to_string(),
             pending: VecDeque::new(),
-            // `PeekBound::Sized` carries the sink's part rollover (so peek ≥
-            // rollover, never starves); `Unbounded` is the i32 ceiling. Either
-            // way it fits the `pg_logical_slot_peek_changes` int4 arg.
-            batch_limit: peek.rows_capped() as i32,
+            // `PeekBound::Sized` carries the sink's part rollover; `Unbounded`
+            // is the i32 ceiling. ×3: `upto_nchanges` counts EVERY decoded row
+            // — the BEGIN/COMMIT markers too — so a single-row transaction eats
+            // 3 rows of budget for 1 change. A budget equal to the rollover
+            // then yields < rollover data rows per peek, the sink never reaches
+            // its ack boundary, the refill re-reads the same window, and the
+            // stream exhausts with the backlog only PARTIALLY drained — a
+            // bounded run claiming "caught up" after a third of the backlog
+            // (RED-caught by roast_pg_until_current_open_bound_two_runs_lose_
+            // nothing at rollover 5: two runs captured 4 ids of ~600). ×3
+            // covers the worst marker ratio; RSS stays O(rollover).
+            batch_limit: peek.rows_capped().saturating_mul(3).min(i32::MAX as usize) as i32,
             frontier: 0,
             exhausted: false,
+            bound,
         })
     }
 
@@ -148,17 +182,26 @@ impl PgChangeStream {
             let data: String = r.get(1);
             if data.starts_with("COMMIT") {
                 let commit_lsn = parse_lsn(&lsn).unwrap_or(0);
-                // Already yielded on a prior (un-acked) peek ⇒ drop, idempotent.
-                if commit_lsn > self.frontier {
-                    let commit = Position(json!({ "lsn": lsn }));
-                    for mut ev in tx.drain(..) {
-                        ev.position = commit.clone();
-                        self.pending.push_back(ev);
+                match tx_disposition(commit_lsn, self.frontier, self.bound) {
+                    TxDisposition::Yield => {
+                        let commit = Position(json!({ "lsn": lsn }));
+                        for mut ev in tx.drain(..) {
+                            ev.position = commit.clone();
+                            self.pending.push_back(ev);
+                        }
+                        self.frontier = commit_lsn;
+                        yielded_any = true;
                     }
-                    self.frontier = commit_lsn;
-                    yielded_any = true;
-                } else {
-                    tx.clear();
+                    // Already yielded on a prior (un-acked) peek ⇒ drop, idempotent.
+                    TxDisposition::AlreadyYielded => tx.clear(),
+                    // Committed after this bounded run opened — the next run's
+                    // work. Peeks return transactions in commit order, so
+                    // everything after this one is past the bound too: stop.
+                    TxDisposition::PastBound => {
+                        tx.clear();
+                        self.exhausted = true;
+                        break;
+                    }
                 }
             } else if data.starts_with("BEGIN") {
                 tx.clear();
@@ -172,6 +215,32 @@ impl PgChangeStream {
             self.exhausted = true;
         }
         Ok(())
+    }
+}
+
+/// Where one decoded transaction goes, given its COMMIT LSN — the pure heart of
+/// the drain's termination contract (see [`PgChangeStream::bound`]).
+#[derive(Debug, PartialEq)]
+enum TxDisposition {
+    /// New and in-bound — yield it and advance the frontier.
+    Yield,
+    /// At/below the frontier: an un-acked re-read from a prior peek — drop.
+    AlreadyYielded,
+    /// Past the open-time bound: the bounded run stops here; the next run's
+    /// resume (from the un-advanced slot) picks it up.
+    PastBound,
+}
+
+/// Bound check FIRST: a commit past the ceiling must stop the run even on the
+/// very first peek (frontier still 0). A parse-miss `commit_lsn` of 0 can never
+/// test past the bound — a malformed LSN delays termination, never loses data.
+fn tx_disposition(commit_lsn: u64, frontier: u64, bound: Option<u64>) -> TxDisposition {
+    if bound.is_some_and(|b| commit_lsn > b) {
+        TxDisposition::PastBound
+    } else if commit_lsn > frontier {
+        TxDisposition::Yield
+    } else {
+        TxDisposition::AlreadyYielded
     }
 }
 
@@ -597,6 +666,28 @@ mod tests {
     const CONN: &str = "postgresql://rivet:rivet@127.0.0.1:5434/rivet";
     const SLOT: &str = "rivet_cdc_test";
 
+    // The until_current termination contract, as a pure matrix: the bound wins
+    // over the frontier (stop even on the first peek), the frontier dedups
+    // un-acked re-reads, and a parse-miss LSN (0) can never trip the bound —
+    // a malformed rendering delays termination, never loses data.
+    #[test]
+    fn tx_disposition_bound_frontier_matrix() {
+        use TxDisposition::*;
+        // Unbounded (daemon / anchor-only): pure frontier behaviour.
+        assert_eq!(tx_disposition(10, 0, None), Yield);
+        assert_eq!(tx_disposition(10, 10, None), AlreadyYielded);
+        assert_eq!(tx_disposition(9, 10, None), AlreadyYielded);
+        // Bounded: at the bound is IN scope (committed before open), past is not.
+        assert_eq!(tx_disposition(10, 0, Some(10)), Yield);
+        assert_eq!(tx_disposition(11, 0, Some(10)), PastBound);
+        // Bound wins over the frontier — even a would-be re-read stops the run.
+        assert_eq!(tx_disposition(11, 11, Some(10)), PastBound);
+        // Parse-miss commit (0) never trips the bound — it falls through to the
+        // frontier path, same as the unbounded stream.
+        assert_eq!(tx_disposition(0, 0, Some(10)), AlreadyYielded);
+        assert_eq!(tx_disposition(0, 0, None), AlreadyYielded);
+    }
+
     // Staff class #6 (generative fuzz, stable-toolchain flavour): the parsers
     // that face WIRE TEXT must never panic on arbitrary input — they return
     // Option/skip, loudly or silently, but never bring the stream down. The
@@ -860,13 +951,15 @@ mod tests {
             )
             .unwrap();
 
-        // Slot must exist BEFORE the changes for them to be captured.
+        // Slot must exist BEFORE the changes for them to be captured. No bound:
+        // this test's changes are committed AFTER the open.
         let mut s = PgChangeStream::open(
             CONN,
             SLOT,
             false,
             None,
             crate::source::cdc::PeekBound::Sized(10_000),
+            false,
         )
         .unwrap();
         admin

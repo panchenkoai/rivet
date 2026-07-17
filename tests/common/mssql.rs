@@ -90,7 +90,12 @@ fn query_i64_at(port: u16, sql: &str) -> i64 {
             .await
             .expect("mssql: row")
             .expect("mssql: at least one row");
-        i64::from(row.get::<i32, _>(0).unwrap_or(0))
+        // COUNT(*) is int, but SUM/MIN/MAX over a BIGINT column come back as
+        // bigint — accept either width.
+        match row.try_get::<i64, _>(0) {
+            Ok(Some(v)) => v,
+            _ => i64::from(row.get::<i32, _>(0).unwrap_or(0)),
+        }
     })
 }
 

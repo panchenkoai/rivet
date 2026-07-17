@@ -135,6 +135,35 @@ checkpointed open must persist its coordinates immediately
 must state which of the three anchor models it has and test the idle
 variant accordingly.
 
+## A bounded drain stops at an OPEN-TIME snapshot, never "when it catches up"
+
+`until_current` must mean "current as of the moment the run opened" — a
+snapshot taken at open (PG `pg_current_wal_lsn()`, MSSQL `fn_cdc_get_max_lsn()`
+pinned once, MySQL the open-time binlog coordinates, Mongo `operationTime`) with
+the first commit PAST it ending the stream. A termination condition of the form
+"exit when a poll finds nothing new" is a RACE against the writers: three of
+four engines shipped that way, and a paced writer (10-row tx / 5 ms) held the
+PostgreSQL "bounded" run past a 30 s kill ceiling — on a hot table the run
+never exits, silently. The excluded tail is deferred, never lost: checkpoint
+stops at the last in-bound commit, the next cycle resumes there — prove it per
+engine with a two-run union test against the SOURCE id set
+(`roast_*_until_current_open_bound_two_runs_lose_nothing`). Keep the catch-up
+exit only as a backstop, gate the snapshot on `until_current` so the daemon
+mode is untouched, and fail OPEN on an unparseable boundary (delayed
+termination is recoverable; an early exit is a dropped commit).
+
+Sibling trap the same RED test caught: **a peek budget must count the WIRE
+rows, not the logical changes**. PG's `upto_nchanges` counts `BEGIN`/`COMMIT`
+marker rows (a single-row tx = 3 rows for 1 change), so `peek == rollover`
+yielded < rollover data rows, the sink never reached its ack boundary, the
+refill re-read the same window, and the stream exhausted with the backlog only
+PARTIALLY drained — every bounded run claimed success after ~⅓ of the pending
+changes (two runs captured 4 of ~600 ids at rollover 5). The PG budget is now
+×3 (`src/source/postgres/cdc.rs::open`); any new poll adapter must state its
+wire-overhead ratio explicitly, and a starvation fixture needs transactions
+whose framing overhead is ≥ the data rows (single-row transactions), not bulk
+inserts that amortise it away.
+
 ## Sink part names must be run-unique — prove it with a two-run test
 
 A sink that names its output files with only a per-run sequence

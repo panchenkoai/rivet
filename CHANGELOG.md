@@ -1,5 +1,32 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **CDC `until_current` is now bounded at the position current when the run
+  OPENED, on every engine.** Previously only MongoDB pinned an open-time
+  boundary; PostgreSQL / SQL Server / MySQL drained until they *caught up* with
+  a moving log end, so a hot table whose writers outpace the drain could keep a
+  "bounded" run alive indefinitely (live-reproduced on PostgreSQL: a paced
+  writer held the run past a 30 s kill ceiling). Each engine now snapshots its
+  boundary at open — PostgreSQL `pg_current_wal_lsn()`, SQL Server
+  `fn_cdc_get_max_lsn()` (pinned `@max` instead of a per-poll re-read), MySQL
+  the binlog coordinates (with `BINLOG_DUMP_NON_BLOCK` kept as the catch-up
+  backstop) — making a bounded run's work O(backlog at open). The deferred tail
+  is never lost: the checkpoint stops at the last in-bound commit and the next
+  scheduler cycle resumes from it (two-run union live tests per engine).
+- **PostgreSQL CDC no longer under-drains a large backlog of small
+  transactions.** `pg_logical_slot_peek_changes(…, upto_nchanges)` counts the
+  `BEGIN`/`COMMIT` marker rows against the budget (a single-row transaction is
+  3 rows for 1 change), so a peek budget equal to the part rollover yielded
+  fewer data rows than the sink's ack boundary, the refill re-read the same
+  window, and the stream exhausted with the backlog only partially drained —
+  each bounded run claimed success after roughly a third of the pending
+  changes (RED-reproduced: two runs captured 4 of ~600 ids at a small
+  rollover). The peek budget is now 3× the rollover, covering the worst
+  marker ratio; drain RSS stays O(rollover).
+
 ## 0.20.0 — 2026-07-16
 
 ### Added

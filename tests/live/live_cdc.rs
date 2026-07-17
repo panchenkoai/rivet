@@ -2887,3 +2887,161 @@ fn cdc_until_current_terminates_under_sustained_writes() {
         );
     }
 }
+
+// ─── Open-time bound: "until current" means current AS OF OPEN, not a chase ──
+
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical)"]
+fn roast_pg_until_current_open_bound_two_runs_lose_nothing() {
+    // The RED shape for the pinned open-time WAL bound. `rollover: 5` makes the
+    // peek limit 5 while the writer below commits faster than one roll cycle
+    // (encode + part write + ack), so every re-peek returns a FULL batch and
+    // the catch-up exit (short/empty peek) never fires — a drain chasing the
+    // moving head runs to the kill ceiling. With the bound pinned at open,
+    // run 1 is O(backlog at open) and terminates; run 2 (writer stopped)
+    // drains the deferred tail. The distinct id union re-read from the parquet
+    // must equal the SOURCE table's committed id set — the bound defers,
+    // never drops (oracle: the source, not rivet's own counters).
+    use postgres::NoTls;
+    let tbl = unique_name("rivet_cdc_pgob");
+    let slot = unique_name("rivet_ob_slot");
+    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v INT)"
+    ))
+    .unwrap();
+    let _tbl = PgTable::adopt(tbl.clone());
+    c.execute(
+        "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+        &[&slot],
+    )
+    .unwrap();
+    let _slot = Slot(slot.clone());
+
+    // Pre-open backlog: ids 0..30.
+    for i in 0..30i64 {
+        c.execute(&format!("INSERT INTO {tbl} VALUES ({i},{i})"), &[])
+            .unwrap();
+    }
+
+    // A writer committing a 10-row transaction every ~5 ms — each is 12 peek
+    // rows (BEGIN + 10 + COMMIT), so ≥ one roll cycle's worth (the ×3-scaled
+    // peek budget of 15) lands between refills and a chase-the-head drain sees
+    // a FULL peek every time: the catch-up exit (short/empty peek) never
+    // fires. Paced (not flooding) so the pre-open backlog stays small enough
+    // for run 1 to reach its bound inside the kill ceiling at 5-row parts.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_bg = stop.clone();
+    let tbl_bg = tbl.clone();
+    let bg = std::thread::spawn(move || {
+        let mut w = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("bg connect");
+        let mut i = 10_000i64;
+        while !stop_bg.load(std::sync::atomic::Ordering::Relaxed) {
+            let vals: Vec<String> = (i..i + 10).map(|k| format!("({k},{k})")).collect();
+            let _ = w.batch_execute(&format!("INSERT INTO {tbl_bg} VALUES {}", vals.join(",")));
+            i += 10;
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    });
+
+    let rig = Rig::pg_cdc(&tbl, &slot).cdc("rollover: 5");
+    let cfg = rig.config_path();
+    let elapsed = run_rivet_bounded(&cfg, std::time::Duration::from_secs(30));
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = bg.join();
+    assert!(
+        elapsed.is_some(),
+        "run 1 must terminate at the open-time WAL bound under sustained writes \
+         (killed at the 30s ceiling ⇒ the drain chased the moving head)"
+    );
+
+    // Writer stopped ⇒ every committed change predates run 2's own bound.
+    // Run 2 drains the deferred tail at the DEFAULT rollover (5-row parts would
+    // grind through a multi-thousand-row tail one tiny parquet file at a time)
+    // into the SAME prefix — parts are run-unique, both runs' rows accumulate.
+    let rig2 = Rig::pg_cdc(&tbl, &slot).dest_path(rig.out_dir());
+    let elapsed2 = run_rivet_bounded(&rig2.config_path(), std::time::Duration::from_secs(60));
+    assert!(
+        elapsed2.is_some(),
+        "run 2 (no writers) must drain the tail and exit"
+    );
+
+    let got: std::collections::BTreeSet<i64> =
+        dir_parquet_i64(&rig.out_dir(), "id").into_iter().collect();
+    let want: std::collections::BTreeSet<i64> = c
+        .query(&format!("SELECT id FROM {tbl}"), &[])
+        .unwrap()
+        .iter()
+        .map(|r| r.get::<_, i64>(0))
+        .collect();
+    assert_eq!(
+        got, want,
+        "run1 ∪ run2 must hold exactly the source's committed ids — the bound \
+         defers the tail to run 2, never drops it"
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
+fn roast_mysql_until_current_open_bound_two_runs_lose_nothing() {
+    // MySQL peer of roast_pg_until_current_open_bound_two_runs_lose_nothing.
+    // Termination alone is fix-invariant here (the BINLOG_DUMP_NON_BLOCK EOF
+    // ends the dump once it catches up, and a moderate writer cannot outrun a
+    // log-speed reader) — the guarded property is the SPLIT at the pinned
+    // (file, pos) ceiling: nothing between run 1's bound and run 2 may be
+    // lost. Oracle: the source table's id set, never rivet's own counters.
+    let tbl = unique_name("rivet_cdc_myob");
+    let _drop = Table(tbl.clone());
+    let mut c = conn();
+    c.query_drop(format!("CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v INT)"))
+        .unwrap();
+    let rig = Rig::mysql_cdc(&tbl);
+    write_checkpoint(&mut c, &rig.checkpoint()); // pin before the backlog
+
+    // Pre-open backlog: ids 0..30.
+    let vals: Vec<String> = (0..30).map(|i| format!("({i},{i})")).collect();
+    c.query_drop(format!("INSERT INTO {tbl} VALUES {}", vals.join(",")))
+        .unwrap();
+
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_bg = stop.clone();
+    let tbl_bg = tbl.clone();
+    let bg = std::thread::spawn(move || {
+        let mut w = conn();
+        let mut i = 10_000i64;
+        while !stop_bg.load(std::sync::atomic::Ordering::Relaxed) {
+            let _ = w.query_drop(format!("INSERT INTO {tbl_bg} VALUES ({i},{i})"));
+            i += 1;
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    });
+
+    let cfg = rig.config_path();
+    let elapsed = run_rivet_bounded(&cfg, std::time::Duration::from_secs(30));
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = bg.join();
+    assert!(
+        elapsed.is_some(),
+        "run 1 must terminate at the open-time binlog bound under sustained writes"
+    );
+
+    // Writer stopped ⇒ every committed change predates run 2's own bound.
+    let elapsed2 = run_rivet_bounded(&cfg, std::time::Duration::from_secs(60));
+    assert!(
+        elapsed2.is_some(),
+        "run 2 (no writers) must drain the tail and exit"
+    );
+
+    let got: std::collections::BTreeSet<i64> =
+        dir_parquet_i64(&rig.out_dir(), "id").into_iter().collect();
+    let want: std::collections::BTreeSet<i64> = c
+        .query_map(format!("SELECT id FROM {tbl}"), |id: i64| id)
+        .unwrap()
+        .into_iter()
+        .collect();
+    assert_eq!(
+        got, want,
+        "run1 ∪ run2 must hold exactly the source's committed ids — the bound \
+         defers the tail to run 2, never drops it"
+    );
+}

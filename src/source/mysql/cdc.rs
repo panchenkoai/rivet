@@ -56,6 +56,16 @@ pub(crate) struct MysqlChangeStream {
     /// whole transaction is released atomically with the commit position.
     tx: Vec<ChangeEvent>,
     file: String,
+    /// Open-time `(binlog_file, pos)` ceiling for a bounded (`non_block`) run:
+    /// the first commit PAST it ends the stream, so the run's work is
+    /// O(backlog at open) even when the sink drains slower than writers append
+    /// — the `BINLOG_DUMP_NON_BLOCK` EOF alone only fires on catch-up, which
+    /// backpressure can push out indefinitely. `None` (daemon) streams forever.
+    /// The excluded tail is never lost: the checkpoint stops at the last
+    /// in-bound commit and the next run resumes there.
+    bound: Option<(String, u64)>,
+    /// Bound tripped — subsequent `fill` calls read no further binlog events.
+    done: bool,
 }
 
 impl MysqlChangeStream {
@@ -65,6 +75,8 @@ impl MysqlChangeStream {
     /// to the current end and then sends EOF instead of blocking for more. That
     /// turns MySQL into the same drain-and-exit poll model as PostgreSQL / SQL
     /// Server — a bounded "catch up to now and stop" run, ideal for a scheduler.
+    /// A bounded open also pins the open-time coordinates as the stop ceiling
+    /// (see [`Self::bound`]) — EOF-on-catch-up stays as the backstop.
     pub(crate) fn open(
         url: &str,
         server_id: u32,
@@ -73,6 +85,13 @@ impl MysqlChangeStream {
         non_block: bool,
         tls: Option<&TlsConfig>,
     ) -> Result<Self> {
+        // Snapshot the ceiling BEFORE the dump starts: every commit already in
+        // the log is ≤ it, and anything racing in after is the next run's work.
+        let bound = if non_block {
+            Some(Self::current_coordinates(url, tls)?)
+        } else {
+            None
+        };
         let conn = connect_conn(url, tls)?;
         let mut req = BinlogRequest::new(server_id)
             .with_filename(file.clone().into_bytes())
@@ -87,6 +106,8 @@ impl MysqlChangeStream {
             pending: VecDeque::new(),
             tx: Vec::new(),
             file,
+            bound,
+            done: false,
         })
     }
 
@@ -180,6 +201,9 @@ impl MysqlChangeStream {
     /// Pull one binlog event and expand it into `pending`. `Ok(false)` ⇒ stream
     /// ended; `Ok(true)` ⇒ consumed an event.
     fn fill(&mut self) -> Result<bool> {
+        if self.done {
+            return Ok(false);
+        }
         let ev = match self.stream.next() {
             Some(ev) => ev?,
             None => return Ok(false),
@@ -248,6 +272,15 @@ impl MysqlChangeStream {
             // in the transaction and mark the last one committed, then release the
             // whole transaction atomically.
             Some(EventData::XidEvent(_)) => {
+                // A commit past the open-time ceiling belongs to the next run:
+                // end the stream WITHOUT releasing the transaction — the
+                // checkpoint never advances past it, so the resume re-reads it
+                // in full (at-least-once, never a partial transaction).
+                if commit_past_bound(&self.file, log_pos, self.bound.as_ref()) {
+                    self.tx.clear();
+                    self.done = true;
+                    return Ok(false);
+                }
                 let commit = Position(json!({ "file": self.file, "pos": log_pos }));
                 let tx: Vec<ChangeEvent> = self.tx.drain(..).collect();
                 let n = tx.len();
@@ -294,6 +327,29 @@ fn connect_conn(url: &str, tls: Option<&TlsConfig>) -> Result<Conn> {
 /// oversized (or crafted) transaction would grow `tx` unbounded. Cap it and bail
 /// loudly rather than OOM. A real OLTP transaction is far below this.
 const MAX_TX_ROWS: usize = 5_000_000;
+
+/// Is the commit at `(file, pos)` PAST the open-time bound? — the pure heart of
+/// the bounded run's termination contract (see [`MysqlChangeStream::bound`]).
+/// Binlog files order by their numeric suffix (`binlog.000042`); a lexicographic
+/// compare breaks at the 999999 → 1000000 width rollover, so parse the ordinal
+/// (one server has one basename — rotation never changes it mid-stream). Fails
+/// open: an unparseable name is never "past" — the `BINLOG_DUMP_NON_BLOCK` EOF
+/// backstop still ends the run (delayed termination, never a dropped commit).
+fn commit_past_bound(file: &str, pos: u64, bound: Option<&(String, u64)>) -> bool {
+    let Some((bound_file, bound_pos)) = bound else {
+        return false;
+    };
+    let (Some(cur), Some(bnd)) = (binlog_file_ordinal(file), binlog_file_ordinal(bound_file))
+    else {
+        return false;
+    };
+    cur > bnd || (cur == bnd && pos > *bound_pos)
+}
+
+/// The numeric suffix of a binlog file name (`mysql-bin.000042` → 42).
+fn binlog_file_ordinal(name: &str) -> Option<u64> {
+    name.rsplit_once('.')?.1.parse().ok()
+}
 
 /// Decode a binlog row's cells to typed [`RivetValue`]s (structural — no string
 /// reparse of temporals).
@@ -388,6 +444,46 @@ mod tests {
 
     // The `mysql-cdc` instance (cdc profile, :3307) — binlog + a REPLICATION grant.
     const URL: &str = "mysql://rivet:rivet@127.0.0.1:3307/rivet";
+
+    // The until_current termination contract, as a pure matrix: at the bound is
+    // in scope, past it (by pos or by a later file) is not, the file compare is
+    // ordinal (survives the 999999 → 1000000 suffix-width rollover where a
+    // lexicographic compare inverts), and unparseable names fail open.
+    #[test]
+    fn commit_past_bound_matrix() {
+        let bound = ("binlog.000042".to_string(), 1000u64);
+        // Daemon (no bound): never past.
+        assert!(!commit_past_bound("binlog.000099", u64::MAX, None));
+        // Same file: at the bound is in scope, one byte past is not.
+        assert!(!commit_past_bound("binlog.000042", 999, Some(&bound)));
+        assert!(!commit_past_bound("binlog.000042", 1000, Some(&bound)));
+        assert!(commit_past_bound("binlog.000042", 1001, Some(&bound)));
+        // Earlier / later file: pos is irrelevant.
+        assert!(!commit_past_bound("binlog.000041", u64::MAX, Some(&bound)));
+        assert!(commit_past_bound("binlog.000043", 4, Some(&bound)));
+        // Suffix-width rollover: 1000000 > 999999 ordinally, though it is
+        // lexicographically SMALLER ("1…" < "9…").
+        let wide = ("mysql-bin.999999".to_string(), 1000u64);
+        assert!(commit_past_bound("mysql-bin.1000000", 4, Some(&wide)));
+        assert!(!commit_past_bound("mysql-bin.999999", 500, Some(&wide)));
+        // Unparseable names fail open (never end the run early).
+        assert!(!commit_past_bound("garbage", 99, Some(&bound)));
+        assert!(!commit_past_bound(
+            "binlog.000042",
+            99,
+            Some(&("garbage".to_string(), 0))
+        ));
+    }
+
+    #[test]
+    fn binlog_file_ordinal_parses_the_numeric_suffix() {
+        assert_eq!(binlog_file_ordinal("mysql-bin.000042"), Some(42));
+        assert_eq!(binlog_file_ordinal("binlog.1000000"), Some(1000000));
+        // Dotted basenames take the LAST dot (rsplit).
+        assert_eq!(binlog_file_ordinal("my.replica.000007"), Some(7));
+        assert_eq!(binlog_file_ordinal("no-suffix"), None);
+        assert_eq!(binlog_file_ordinal("binlog.notanum"), None);
+    }
 
     #[test]
     #[ignore = "live: requires docker compose mysql (binlog_format=ROW)"]
