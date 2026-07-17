@@ -38,14 +38,13 @@ pub struct Config {
     pub parallel_exports: bool,
     #[serde(default)]
     pub parallel_export_processes: bool,
-    /// Reserved for a downstream, first-party warehouse loader: the load target
-    /// lives here so ONE config can drive both the export and a
-    /// downstream load. Rivet stops at "file in a bucket" and **does not
-    /// interpret** this block — it is accepted and ignored, present only so
-    /// `rivet check` / `run` / `apply` don't reject a config that carries it.
-    // Deliberately never read by OSS — it is a reserved passthrough for a
-    // downstream loader; only serde (accept) and schemars (document) touch it.
-    #[allow(dead_code)]
+    /// The warehouse **load** target — consumed by `rivet load` (and `rivet load
+    /// --cdc`), so ONE config drives both the export and the downstream load. The
+    /// extraction commands (`rivet check` / `run` / `apply`) accept and ignore it:
+    /// it shapes the load, not the extract.
+    // Kept as a raw `serde_json::Value` so the extraction path neither depends on
+    // nor validates the load schema — the load module (`crate::load::plan`) parses
+    // it into a typed `LoadSection`.
     #[serde(default)]
     pub load: Option<serde_json::Value>,
 }
