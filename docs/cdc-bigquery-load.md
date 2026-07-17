@@ -1,8 +1,10 @@
 # Loading rivet CDC into BigQuery — free ingest, cheap dedup
 
-Research note (verified against BigQuery docs + live behavior). Question: can we
-load a rivet **CDC** stream into BigQuery *and* deduplicate to current state,
-for free — the way the batch loader is free?
+`rivet load` on a `mode: cdc` config does this end to end — it appends the change
+log for free and builds a current-state dedup view. This note explains the model
+it implements (verified against BigQuery docs + live behavior): why CDC ingest
+**and** dedup to current state can be free, the way the batch loader is free. The
+[one command](#the-one-command-rivet-load) is at the bottom.
 
 ## What rivet CDC produces
 
@@ -108,16 +110,41 @@ GROUP BY op, tbl ORDER BY bytes_billed DESC;
 The loader's labeling is already op-parameterized (`run_sql(sql, op, table)`),
 so the `merge`/`compact` step just passes its op — no new mechanism needed.
 
-## How this maps to `rivet load --cdc` (proposed)
+## The one command: `rivet load`
 
-`rivet load --cdc -c cfg.yaml --project P --dataset D`:
-1. free `LOAD DATA` the CDC Parquet into `<table>__changes` (reuse the existing
-   native-schema batched loader, with `__op`/`__pos` in the schema);
-2. `CREATE OR REPLACE VIEW <table>` (the dedup view above).
+`rivet load -c cfg.yaml` — where the export is `mode: cdc` and the config carries
+a top-level `load:` block with `target: bigquery` and `pk:` — does both steps
+automatically:
 
-Both steps free. The primary key comes from the config / source introspection
-(rivet already knows it). Count validation and source cleanup work as in the
-batch path.
+1. free `LOAD DATA` of the CDC Parquet into `<table>__changes` (the same
+   native-schema batched loader, with `__op`/`__pos`/`__seq` in the schema);
+2. `CREATE OR REPLACE VIEW <table>` — the exact dedup view above.
+
+```yaml
+exports:
+  - name: orders
+    table: orders
+    mode: cdc
+    cdc: { until_current: true, checkpoint: /var/lib/rivet/orders.ckpt }
+    destination: { type: gcs, bucket: my-bucket, prefix: cdc/orders/ }
+load:
+  target: bigquery      # or: snowflake (+ connection/warehouse/database/schema/storage_integration)
+  project: my-proj
+  dataset: analytics
+  pk: [id]              # the view's PARTITION BY
+  cleanup_source: true
+```
+
+Both steps are free. The count gate (summed manifest rows == warehouse
+`COUNT(*)`) and source cleanup work exactly as in the batch path. **There is no
+`--cdc` flag** — the mode comes from the export's `mode: cdc`; one config drives
+both `rivet run` (extract) and `rivet load`.
+
+Live-verified end to end: this flow builds precisely the dedup view shown above
+(on MySQL the `__pos` parse is `JSON_VALUE(__pos,'$.file')` +
+`CAST(…'$.pos' AS INT64)`), and a deleted PK survives as `__is_deleted = true`
+rather than vanishing. See the matrix cells `cdc_backfill_snapshot_{mysql,pg,mongo}`
+and the Snowflake parity `mongo_cdc_delete_flag_snowflake`.
 
 **Bottom line:** yes — rivet can ingest CDC into BigQuery **and** expose a
 deduplicated current state entirely for free (append + view). The only
