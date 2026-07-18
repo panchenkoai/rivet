@@ -2549,6 +2549,74 @@ fn pg_cdc_crash_after_flush_before_ack_does_not_advance_the_slot() {
     );
 }
 
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical)"]
+fn roast_pg_cdc_large_transaction_is_atomic_across_a_mid_flush_crash() {
+    // A single source transaction LARGER than `rollover` must roll + ack as ONE
+    // unit — the sink's "never split a transaction across parts" invariant. Every
+    // `test_decoding` event carried `committed: true`, so the sink used to roll +
+    // checkpoint + ack MID-transaction (after `rollover` rows); a crash between
+    // that ack and the tail's flush advanced the slot PAST the transaction's
+    // commit, and resume (reading strictly after the slot) never re-read the tail
+    // — an at-least-once break. Fix: the adapter marks only the LAST event of a
+    // transaction committed. RED-proof: one 12-row transaction at rollover 5,
+    // crash at `cdc_after_ack` (the first ack). With the bug that ack lands after
+    // 5 rows and the crash loses 7; atomic, it lands after all 12 and the run's
+    // part holds the whole transaction. Oracle: the union of all parts on disk.
+    use postgres::NoTls;
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("rivet_cdc_pgatomic");
+    let slot = unique_name("rivet_atomic_slot");
+    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v INT)"
+    ))
+    .unwrap();
+    let _tbl = PgTable::adopt(tbl.clone());
+    c.execute(
+        "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+        &[&slot],
+    )
+    .unwrap();
+    let _slot = Slot(slot.clone());
+    // ONE transaction, 12 rows (> 2× the rollover of 5).
+    c.execute(
+        &format!("INSERT INTO {tbl} SELECT g, g FROM generate_series(0, 11) g"),
+        &[],
+    )
+    .unwrap();
+
+    let out = d.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let rig = Rig::pg_cdc(&tbl, &slot)
+        .cdc("rollover: 5")
+        .dest_path(out.clone());
+    // Run 1 crashes right after the FIRST ack.
+    let crashed = std::process::Command::new(RIVET_BIN)
+        .args(["run", "--config", rig.config_path().to_str().unwrap()])
+        .env("RIVET_TEST_PANIC_AT", "cdc_after_ack")
+        .output()
+        .expect("spawn rivet");
+    assert!(
+        !crashed.status.success(),
+        "the injected crash must fail run 1"
+    );
+
+    // Run 2 resumes from the slot (whatever position the crash left it at).
+    let rig2 = Rig::pg_cdc(&tbl, &slot).dest_path(out.clone());
+    run_rivet_ok(&rig2.config_path());
+
+    let got: std::collections::BTreeSet<i64> = dir_parquet_i64(&out, "id").into_iter().collect();
+    let want: std::collections::BTreeSet<i64> = (0..12).collect();
+    assert_eq!(
+        got,
+        want,
+        "the 12-row transaction must survive the mid-flush crash whole — got {} ids \
+         (a mid-transaction ack advanced the slot past the commit and lost the tail)",
+        got.len()
+    );
+}
+
 fn pg_full_config(d: &tempfile::TempDir, tbl: &str, out: &std::path::Path) -> std::path::PathBuf {
     let yaml = format!(
         r#"source: {{type: postgres, url: "{POSTGRES_CDC_URL}"}}

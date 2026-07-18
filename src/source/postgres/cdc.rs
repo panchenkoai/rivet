@@ -199,8 +199,21 @@ impl PgChangeStream {
                             self.yielded_data = true;
                         }
                         let commit = Position(json!({ "lsn": lsn }));
-                        for mut ev in tx.drain(..) {
+                        // `committed` marks the COMMIT BOUNDARY, and the sink
+                        // only rolls (flush → checkpoint → ack) on a committed
+                        // event — "never split a transaction across parts". Every
+                        // event `parse_test_decoding` builds carries
+                        // `committed: true`, but they all belong to ONE source
+                        // transaction here, so mark ONLY THE LAST one committed
+                        // (mirroring MySQL's XID model). Otherwise a transaction
+                        // larger than `rollover` rolls + acks MID-transaction,
+                        // and a crash between that ack and the tail's flush loses
+                        // the un-flushed tail (the slot advanced past the commit,
+                        // so resume never re-reads it — an at-least-once break).
+                        let n = tx.len();
+                        for (i, mut ev) in tx.drain(..).enumerate() {
                             ev.position = commit.clone();
+                            ev.committed = i + 1 == n;
                             self.pending.push_back(ev);
                         }
                         self.frontier = commit_lsn;
@@ -418,8 +431,11 @@ fn parse_test_decoding(lsn: &str, data: &str) -> Option<ChangeEvent> {
         after,
         image_names,
         position: Position(json!({ "lsn": lsn })),
-        // The slot only ever yields already-committed changes.
-        committed: true,
+        // Placeholder — `fill` overrides this, marking only the LAST event of the
+        // transaction as the commit boundary (so the sink never rolls mid-tx).
+        // Default `false` is the safe value: a stray event that bypassed `fill`
+        // would not trigger a premature roll.
+        committed: false,
         seq: 0, // stamped by TxnSeq as the stream is consumed
     })
 }

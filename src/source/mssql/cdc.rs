@@ -282,6 +282,14 @@ impl MssqlChangeStream {
         // Rows are ordered ascending by start LSN, so the last one's `__$start_lsn`
         // is `@to` — the cursor advances there regardless of each row's op.
         let mut max_lsn: Option<String> = None;
+        // Collect this batch's events with their start LSN, then mark ONLY the
+        // last row of each `__$start_lsn` group (a source transaction) as the
+        // commit boundary — the sink rolls only on a committed event, so without
+        // this a transaction larger than `rollover` rolls + checkpoints MID-
+        // transaction, and a crash before the tail flushes loses it (resume reads
+        // strictly after the checkpoint LSN, skipping the rest of the same-LSN
+        // group). Mirrors PostgreSQL's per-transaction commit marking.
+        let mut batch: Vec<(String, ChangeEvent)> = Vec::new();
         for r in &rows {
             let mut op_code = 0i32;
             let mut lsn = String::new();
@@ -318,18 +326,32 @@ impl MssqlChangeStream {
                 ChangeOp::Delete => (Some(values), None),
                 _ => (None, Some(values)),
             };
-            self.pending.push_back(ChangeEvent {
-                op,
-                schema: self.schema.clone(),
-                table: self.table.clone(),
-                before,
-                after,
-                position: Position(json!({ "lsn": lsn })),
-                // The change table only ever holds already-committed changes.
-                committed: true,
-                image_names: Some(std::sync::Arc::from(names)),
-                seq: 0, // stamped by TxnSeq as the stream is consumed
-            });
+            batch.push((
+                lsn.clone(),
+                ChangeEvent {
+                    op,
+                    schema: self.schema.clone(),
+                    table: self.table.clone(),
+                    before,
+                    after,
+                    position: Position(json!({ "lsn": lsn })),
+                    // Overridden below — the last row of each start-LSN group is
+                    // the commit boundary.
+                    committed: false,
+                    image_names: Some(std::sync::Arc::from(names)),
+                    seq: 0, // stamped by TxnSeq as the stream is consumed
+                },
+            ));
+        }
+        // Mark the commit boundary: a row is the last of its transaction when it
+        // is the final row of the batch OR the next row has a different start LSN.
+        let n = batch.len();
+        for i in 0..n {
+            let is_boundary = i + 1 == n || batch[i].0 != batch[i + 1].0;
+            batch[i].1.committed = is_boundary;
+        }
+        for (_, ev) in batch {
+            self.pending.push_back(ev);
         }
         match max_lsn {
             // Advance the internal cursor to @to; the next poll reads past it.

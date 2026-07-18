@@ -120,6 +120,13 @@ scenarios:
     mssql:    { na: "the change-table poll advances its own from-LSN cursor per batch, independent of what the sink captures — no re-read starvation" }
     mongo:    { na: "the change stream advances its own resume token regardless of routing — no re-read starvation" }
 
+  - id: cdc_large_transaction_atomic_across_crash
+    what: "a source transaction LARGER than rollover rolls + checkpoints as ONE unit (never split across parts): a crash mid-flush must not advance the resume position past the transaction and lose its tail — the adapter marks only the LAST event of a transaction committed, so the sink rolls only at the true commit boundary"
+    postgres: { test: roast_pg_cdc_large_transaction_is_atomic_across_a_mid_flush_crash }
+    mysql:    { na: "the binlog adapter already marks only the XID (commit) event committed — every other event is committed:false, so should_roll never fires mid-transaction (the model PG/MSSQL were fixed to match)" }
+    mssql:    { test: roast_mssql_cdc_large_transaction_is_atomic_across_a_mid_flush_crash }
+    mongo:    { na: "one change-stream event = one document = one transaction boundary (Mongo has no multi-row transaction framing in the change stream), so there is no intra-transaction split to guard" }
+
   - id: cdc_type_fidelity
     what: "values captured through CDC match the batch export (timestamps/decimals/uuid/json)"
     postgres: { test: pg_cdc_full_type_matrix_matches_batch }

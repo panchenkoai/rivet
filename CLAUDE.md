@@ -102,6 +102,27 @@ divergence — use `diverge(target, autoload, note, None)` with the true
 autoload when it's lossy. Both were silent: a preflight report confidently
 describing a type the warehouse would reject or silently coerce.
 
+## The `committed` flag marks a TRANSACTION boundary — never every event
+
+The sink rolls (flush → checkpoint → ack) only on a `committed` event, to keep
+the "never split a transaction across parts" invariant. So `committed` must mark
+the LAST event of a source transaction, NOT every event. MySQL got this right
+(only the XID event is `committed`), but PostgreSQL (`test_decoding`) and SQL
+Server (change-table rows) shipped `committed: true` on EVERY event — so a
+transaction larger than `rollover` rolled + checkpointed MID-transaction, and a
+crash between that checkpoint and the tail's flush advanced the resume position
+(PG slot / MSSQL from-LSN) PAST the transaction's commit; resume reads strictly
+after it and skips the tail — an at-least-once break (RED-proven both engines:
+a 12-row transaction at rollover 5, crashed at `cdc_after_ack` (PG) /
+`cdc_after_checkpoint_before_ack` (MSSQL), lost 7 rows). Fix: the adapter frames
+the transaction (PG BEGIN…COMMIT; MSSQL rows sharing `__$start_lsn`) and marks
+only its last event `committed`. Process rule: **any new poll/log CDC adapter
+must mark `committed` at the true commit boundary, and a large-transaction
+mid-flush-crash test (`roast_*_large_transaction_is_atomic_across_a_mid_flush_
+crash`) must RED against a `committed: true`-on-every-event mutant.** The tell
+that this is wrong: `committed` set unconditionally in the per-event constructor
+instead of computed from the transaction framing.
+
 ## CDC resume is per-engine — verify it empirically, twice
 
 A CDC adapter that **captures** correctly can still fail to **resume**:

@@ -48,6 +48,18 @@
 - **Bounded CDC on a PostgreSQL standby now fails with an actionable error**
   (`pg_current_wal_lsn()` is unavailable during recovery): stream continuously
   or point the source at the primary.
+- **PostgreSQL and SQL Server CDC no longer lose the tail of a large
+  transaction across a crash.** Both adapters marked every change event
+  `committed: true`, so a source transaction larger than `rollover` rolled +
+  checkpointed MID-transaction; a crash between that checkpoint and the tail's
+  flush advanced the resume position (PG slot / MSSQL from-LSN) past the
+  transaction's commit, and resume — reading strictly after it — skipped the
+  rest, an at-least-once break (RED-reproduced on both: a 12-row transaction at
+  rollover 5 crashed mid-flush lost 7 rows). Both now mark only the LAST event
+  of a transaction committed (mirroring MySQL's XID model), so the sink rolls
+  only at the true commit boundary and a transaction is always one atomic unit
+  ("never split a transaction across parts"). Pre-existing (not introduced by
+  the `until_current` work); surfaced by an adversarial review.
 
 ## 0.20.0 — 2026-07-16
 
