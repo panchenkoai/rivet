@@ -2984,12 +2984,18 @@ fn roast_pg_until_current_open_bound_two_runs_lose_nothing() {
 #[test]
 #[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
 fn roast_mysql_until_current_open_bound_two_runs_lose_nothing() {
-    // MySQL peer of roast_pg_until_current_open_bound_two_runs_lose_nothing.
-    // Termination alone is fix-invariant here (the BINLOG_DUMP_NON_BLOCK EOF
-    // ends the dump once it catches up, and a moderate writer cannot outrun a
-    // log-speed reader) — the guarded property is the SPLIT at the pinned
-    // (file, pos) ceiling: nothing between run 1's bound and run 2 may be
-    // lost. Oracle: the source table's id set, never rivet's own counters.
+    // MySQL peer of roast_pg_until_current_open_bound_two_runs_lose_nothing, but
+    // a DIFFERENT contract: on MySQL termination comes from the engine, not the
+    // explicit bound. `BINLOG_DUMP_NON_BLOCK` stops the dump at the log end as of
+    // dump-start — empirically it terminates even under a flooding writer with
+    // the (file, pos) bound DISABLED (verified by the disable-bound RED probe:
+    // the run still exited). So the open-time (file, pos) ceiling is a
+    // PRECISE-STOP refinement over NON_BLOCK, not load-bearing for termination —
+    // only PostgreSQL's continuous slot re-peek genuinely needs the bound (see
+    // roast_pg_until_current_open_bound_two_runs_lose_nothing at rollover 5).
+    // What THIS test proves is DEFER-NOT-DROP: run 1 captures a prefix and exits,
+    // run 2 drains the tail, and the union re-read from the parquet equals the
+    // SOURCE id set. Oracle: the source table, never rivet's own counters.
     let tbl = unique_name("rivet_cdc_myob");
     let _drop = Table(tbl.clone());
     let mut c = conn();
@@ -3022,7 +3028,7 @@ fn roast_mysql_until_current_open_bound_two_runs_lose_nothing() {
     let _ = bg.join();
     assert!(
         elapsed.is_some(),
-        "run 1 must terminate at the open-time binlog bound under sustained writes"
+        "run 1 must terminate under sustained writes (NON_BLOCK EOF; killed at 30s)"
     );
 
     // Writer stopped ⇒ every committed change predates run 2's own bound.
@@ -3114,10 +3120,14 @@ fn roast_pg_cdc_empty_transaction_churn_must_not_pin_the_slot() {
 #[ignore = "live: requires docker compose postgres (wal_level=logical)"]
 fn roast_pg_cdc_ndjson_until_current_terminates_and_emits_backlog() {
     // The NDJSON driver (`rivet cdc` without --output) shares
-    // create_change_stream with the file sink, so the open-time bound clips it
-    // too — this anchors the CLI path (matrix: cdc_ndjson_bounded): a bounded
-    // NDJSON run must terminate under a live writer and must emit the whole
-    // pre-open backlog to stdout. No ack by design (stdout is not durable —
+    // create_change_stream with the file sink — this anchors the CLI path
+    // (matrix: cdc_ndjson_bounded). Termination here is the driver's own: the
+    // NDJSON path uses ONE `PeekBound::Unbounded` peek (a single snapshot query),
+    // so it terminates regardless of the open-time bound — the bound only clips
+    // which rows that one snapshot yields, it is not load-bearing for
+    // termination (only PostgreSQL's ACKING file-sink path re-peeks and genuinely
+    // needs it). What THIS test proves: the CLI path terminates and emits the
+    // whole pre-open backlog to stdout. No ack by design (stdout is not durable,
     // ADR-0023): the slot is left for the consumer.
     use postgres::NoTls;
     let tbl = unique_name("rivet_cdc_pgnd");

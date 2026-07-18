@@ -267,13 +267,20 @@ pub(crate) enum CdcEngineOpts {
 /// `BoundedAtOpen` (`until_current: true` — the scheduler model): capture up to
 /// the source's position AS OF STREAM OPEN, then exit. Every adapter pins the
 /// ceiling at open (PostgreSQL `pg_current_wal_lsn()`; MySQL the binlog
-/// coordinates, with `BINLOG_DUMP_NON_BLOCK`'s EOF as the catch-up backstop;
-/// SQL Server `fn_cdc_get_max_lsn()`; MongoDB the cluster `operationTime`), so
-/// a hot table whose writers outpace the drain cannot keep the run alive — the
-/// run's work is O(backlog at open). The excluded tail is deferred, never
-/// lost: the checkpoint stops at the last in-bound commit and the next run
-/// resumes there (per-engine two-run proof:
-/// `roast_*_until_current_open_bound_two_runs_lose_nothing`).
+/// coordinates; SQL Server `fn_cdc_get_max_lsn()`; MongoDB the cluster
+/// `operationTime`), so a hot table whose writers outpace the drain cannot keep
+/// the run alive — the run's work is O(backlog at open). Termination is
+/// LOAD-BEARING on this bound only for PostgreSQL, whose non-consuming slot peek
+/// re-reads from the un-acked position and would otherwise chase a moving log
+/// end; MySQL (`BINLOG_DUMP_NON_BLOCK` EOF), SQL Server (the capture Agent's
+/// scan-gap empty poll), and MongoDB (a single change-stream pass) terminate
+/// NATIVELY, so their bound is a precise-stop refinement (each verified
+/// fix-invariant for termination by a disable-bound probe). The excluded tail is
+/// deferred, never lost: the checkpoint stops at the last in-bound commit and
+/// the next run resumes there — the defer-not-drop contract every engine's
+/// two-run test proves (`roast_*_until_current_open_bound_two_runs_lose_nothing`;
+/// the PG variant, at rollover 5, is the one whose TERMINATION genuinely goes
+/// RED without the bound).
 ///
 /// `Continuous` (the daemon model): no open-time ceiling. MySQL blocks on the
 /// binlog; the poll adapters still exit on catch-up and an outer loop re-wraps

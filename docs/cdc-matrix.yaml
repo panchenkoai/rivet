@@ -93,7 +93,7 @@ scenarios:
     mongo:    { test: roast_until_current_terminates_under_sustained_writes_and_keeps_backlog }
 
   - id: cdc_until_current_open_bound_two_runs
-    what: "the open-time bound DEFERS, never drops: a writer commits through run 1 (which must terminate — PG variant runs rollover: 5, the RED shape that hung the pre-bound code); run 2 drains the tail; the distinct-id union re-read from the parquet equals the SOURCE id set"
+    what: "DEFER-NOT-DROP: a writer commits through run 1, which terminates and captures a prefix; run 2 drains the tail; the distinct-id union re-read from the parquet equals the SOURCE id set. Termination is load-bearing on the open-time bound ONLY for PostgreSQL (continuous slot re-peek — the PG variant runs rollover: 5, the RED shape that hung the pre-bound code); MySQL (NON_BLOCK EOF), SQL Server (Agent scan-gap empty poll), and Mongo (single change-stream pass) terminate natively, so their bound is a precise-stop refinement and their test proves defer-not-drop (each verified fix-invariant for termination by a disable-bound probe)"
     postgres: { test: roast_pg_until_current_open_bound_two_runs_lose_nothing }
     mysql:    { test: roast_mysql_until_current_open_bound_two_runs_lose_nothing }
     mssql:    { test: roast_mssql_until_current_open_bound_two_runs_lose_nothing }

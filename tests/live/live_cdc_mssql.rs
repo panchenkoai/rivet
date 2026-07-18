@@ -1098,12 +1098,17 @@ fn mssql_cdc_until_current_terminates_under_sustained_writes() {
 #[test]
 #[ignore = "live: requires docker compose mssql with SQL Server Agent + CDC"]
 fn roast_mssql_until_current_open_bound_two_runs_lose_nothing() {
-    // MSSQL peer of roast_pg_until_current_open_bound_two_runs_lose_nothing.
-    // Termination alone is fix-invariant here (the Agent's scan gaps hand the
-    // pre-bound code an empty poll sooner or later) — the guarded property is
-    // the SPLIT at the pinned open-time @max: nothing between run 1's ceiling
-    // and run 2 may be lost. Oracle: the source table (count/sum/min/max of
-    // id — the scalar helpers can't fetch a set), never rivet's own counters.
+    // MSSQL peer of roast_pg_until_current_open_bound_two_runs_lose_nothing, but
+    // a DIFFERENT contract: termination comes from the engine, not the pin. The
+    // capture Agent's scan gaps hand the reader an empty poll sooner or later, so
+    // the drain exhausts even with the open-time @max pin DISABLED — verified by
+    // the disable-pin RED probe (the run still exited under a sustained writer).
+    // So the pinned @max is a PRECISE-STOP refinement, not load-bearing for
+    // termination (only PostgreSQL's continuous slot re-peek genuinely needs the
+    // bound). What THIS test proves is DEFER-NOT-DROP: run 1 captures a prefix,
+    // run 2 drains the tail, the union equals the SOURCE. Oracle: the source
+    // table (count/sum/min/max of id — the scalar helpers can't fetch a set),
+    // never rivet's own counters.
     let _serial = CDC_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let table = unique_name("rivet_cdc_msob");
     let ci = format!("dbo_{table}");

@@ -140,17 +140,26 @@ variant accordingly.
 `until_current` must mean "current as of the moment the run opened" — a
 snapshot taken at open (PG `pg_current_wal_lsn()`, MSSQL `fn_cdc_get_max_lsn()`
 pinned once, MySQL the open-time binlog coordinates, Mongo `operationTime`) with
-the first commit PAST it ending the stream. A termination condition of the form
-"exit when a poll finds nothing new" is a RACE against the writers: three of
-four engines shipped that way, and a paced writer (10-row tx / 5 ms) held the
-PostgreSQL "bounded" run past a 30 s kill ceiling — on a hot table the run
-never exits, silently. The excluded tail is deferred, never lost: checkpoint
-stops at the last in-bound commit, the next cycle resumes there — prove it per
-engine with a two-run union test against the SOURCE id set
-(`roast_*_until_current_open_bound_two_runs_lose_nothing`). Keep the catch-up
-exit only as a backstop, gate the snapshot on `until_current` so the daemon
-mode is untouched, and fail OPEN on an unparseable boundary (delayed
-termination is recoverable; an early exit is a dropped commit).
+the first commit PAST it ending the stream. But be honest about WHICH engine
+actually needs it: only PostgreSQL's **non-consuming slot peek** re-reads from
+the un-acked position, so an "exit when a poll finds nothing new" termination
+RACES the writers there — a paced writer (10-row tx / 5 ms) held the PG bounded
+run past a 30 s kill ceiling. The other three terminate NATIVELY (MySQL
+`BINLOG_DUMP_NON_BLOCK` EOF, MSSQL the capture Agent's scan-gap empty poll, Mongo
+a single change-stream pass), so their open-time bound is a precise-stop
+refinement, NOT load-bearing — I over-claimed "three of four shipped chasing";
+an ultracode review showed each of MySQL/MSSQL/Mongo terminates with its bound
+DISABLED under a flooding writer (the disable-bound probe is how you tell
+load-bearing from belt-and-suspenders — do it before claiming a per-engine
+fix). The excluded tail is deferred, never lost: checkpoint stops at the last
+in-bound commit, the next cycle resumes there — the two-run union test against
+the SOURCE id set proves DEFER-NOT-DROP on every engine
+(`roast_*_until_current_open_bound_two_runs_lose_nothing`), but only the PG
+variant's TERMINATION assertion genuinely goes RED without the bound; the others
+are belt-and-suspenders confirmations (say so in the test, don't claim they
+prove the clip). Keep the catch-up exit as the backstop, gate the snapshot on
+`until_current` so the daemon mode is untouched, and fail OPEN on an unparseable
+boundary (delayed termination is recoverable; an early exit is a dropped commit).
 
 Sibling trap this class caught, and a warning about band-aid fixes: **a
 non-consuming peek only slides forward when the consumer ACKS — so slot progress
