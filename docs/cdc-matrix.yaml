@@ -113,6 +113,13 @@ scenarios:
     mssql:    { na: "no consume-retention coupling — change-table retention is the cleanup job's, independent of the reader" }
     mongo:    { na: "no consume-retention coupling — the oplog is a capped collection, trimmed regardless of resume tokens" }
 
+  - id: cdc_bounded_reaches_open_bound_past_foreign_span
+    what: "a bounded run reaches the open-time bound in ONE pass even when a large UNCAPTURED-table transaction sits ahead of the captured data — the sink re-drain loop acks the consumed span so the peek slides past it (the density-below-1/3 gap: an uncaptured/empty span has an unbounded wire:capture ratio, so no fixed peek budget covers it)"
+    postgres: { test: roast_pg_cdc_reaches_open_bound_past_a_large_uncaptured_transaction }
+    mysql:    { na: "the binlog stream advances its own read cursor regardless of routing, so an uncaptured span never re-reads or starves the reader — no slot-style consume coupling" }
+    mssql:    { na: "the change-table poll advances its own from-LSN cursor per batch, independent of what the sink captures — no re-read starvation" }
+    mongo:    { na: "the change stream advances its own resume token regardless of routing — no re-read starvation" }
+
   - id: cdc_type_fidelity
     what: "values captured through CDC match the batch export (timestamps/decimals/uuid/json)"
     postgres: { test: pg_cdc_full_type_matrix_matches_batch }

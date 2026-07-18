@@ -36,22 +36,24 @@ pub(crate) struct PgChangeStream {
     client: Client,
     slot: String,
     pending: VecDeque<ChangeEvent>,
-    /// Current wire budget per `peek` — the memory bound of the drain
-    /// (O(batch), not O(total backlog)). Starts at [`Self::base_budget`] (the
-    /// ack cadence) and escalates ONCE to [`escalated`] (×3, the worst
-    /// BEGIN/COMMIT marker ratio) when a full window yields nothing new — the
-    /// starvation shape where markers ate the budget before one ack's worth of
-    /// data reached the sink. Common-case RSS stays 1× the documented formula.
+    /// Wire budget per `peek` — the memory bound of the drain (O(batch), not
+    /// O(total backlog)). One ack cadence (the part rollover); see
+    /// [`wire_budget`]. Slot progress past a foreign/empty span larger than one
+    /// window is NOT this budget's job — it comes from the sink's re-drain loop
+    /// acking the consumed span so the next peek slides forward (see
+    /// [`crate::source::cdc::sink::run_to_files`]).
     batch_limit: i32,
-    /// The 1× ack cadence ([`wire_budget`]) the escalation is derived from.
-    base_budget: i32,
     /// Largest COMMIT LSN already yielded THIS run. A refill re-peeks from the
     /// slot's (un-acked) `restart_lsn`, so any transaction at/below this was
     /// already delivered — it is dropped, making the refill idempotent.
     frontier: u64,
     /// A peek that yields no NEW transaction, or returns fewer than a full
-    /// batch, has drained everything past the ack frontier — the stream ends
-    /// (a non-acking consumer, e.g. NDJSON, ends here after its one big peek).
+    /// batch, has drained everything readable *from the current slot position*.
+    /// It is NOT terminal for an acking consumer: [`ChangeStream::ack`] (and the
+    /// zero-yield [`Self::release_empty_frontier`]) advance the slot and clear
+    /// this, so the sink's re-drain loop peeks fresh WAL past a consumed
+    /// foreign/empty span. Only a non-acking consumer (NDJSON, one big
+    /// `Unbounded` peek) treats it as the end.
     exhausted: bool,
     /// Open-time COMMIT-LSN ceiling for a bounded run — the first transaction
     /// committing past it ends the stream; `None` (daemon / anchor-only open)
@@ -148,13 +150,11 @@ impl PgChangeStream {
         } else {
             None
         };
-        let base = wire_budget(peek);
         Ok(Self {
             client,
             slot: slot.to_string(),
             pending: VecDeque::new(),
-            batch_limit: base,
-            base_budget: base,
+            batch_limit: wire_budget(peek),
             frontier: 0,
             exhausted: false,
             bound,
@@ -224,28 +224,19 @@ impl PgChangeStream {
                 tx.push(ev);
             }
         }
-        if n_rows < self.batch_limit as usize {
-            // Short window: the remaining backlog fit in one peek ⇒ drained.
+        // Short window (backlog fit in one peek) OR a full window that yielded
+        // nothing new (every transaction in it was already yielded on a prior
+        // un-acked peek — the slot is starved because the sink has not yet acked
+        // past the consumed span): either way there is nothing more readable
+        // from the CURRENT slot position. Mark exhausted and hand control back
+        // to the sink. The sink's re-drain loop then flushes + acks the consumed
+        // span (`run_to_files`), which advances the slot and clears `exhausted`,
+        // so the NEXT peek slides past a foreign/empty span of ANY size — no
+        // budget escalation, no premature "caught up" while in-bound data
+        // remains (the bug the escalation only partially covered: a foreign or
+        // empty span larger than the escalated window still exhausted early).
+        if n_rows < self.batch_limit as usize || !yielded_any {
             self.exhausted = true;
-        } else if !yielded_any && !self.exhausted {
-            // A FULL window with nothing new: either the budget is starved by
-            // marker rows (`upto_nchanges` counts BEGIN/COMMIT too, so a
-            // single-row transaction is 3 wire rows for 1 change — fewer data
-            // rows than one ack's worth reach the sink, no ack advances the
-            // slot, and the refill re-reads the same window), or the drain
-            // genuinely ended on a full window of un-acked re-reads. Escalate
-            // ONCE to the worst marker ratio and retry; a full window still
-            // yielding nothing new after that is drained. RED-caught by
-            // roast_pg_until_current_open_bound_two_runs_lose_nothing at
-            // rollover 5: without this, two runs captured 4 of ~600 ids while
-            // claiming success. Common-case RSS stays at the 1× formula in
-            // docs/reference/cdc.md.
-            let esc = escalated(self.base_budget);
-            if self.batch_limit < esc {
-                self.batch_limit = esc;
-            } else {
-                self.exhausted = true;
-            }
         }
         Ok(())
     }
@@ -272,7 +263,10 @@ impl PgChangeStream {
 
     /// Advance the slot's `confirmed_flush_lsn` to `lsn`, validated to the
     /// pg_lsn charset before interpolation — never trust a value into SQL
-    /// unchecked, even the slot's own output.
+    /// unchecked, even the slot's own output. Advancing frees the WAL up to
+    /// `lsn`, so the next peek starts THERE: clear `exhausted` so the sink's
+    /// re-drain reads the fresh span instead of stopping (the slot moved, there
+    /// may now be readable WAL that a prior starved peek could not reach).
     fn advance_slot(&mut self, lsn: &str) -> Result<()> {
         if lsn.is_empty() || !lsn.bytes().all(|b| b.is_ascii_hexdigit() || b == b'/') {
             anyhow::bail!("pg cdc: refusing to advance to a malformed LSN {lsn:?}");
@@ -282,6 +276,7 @@ impl PgChangeStream {
             &format!("SELECT pg_replication_slot_advance($1, '{lsn}'::pg_lsn)"),
             &[&self.slot],
         )?;
+        self.exhausted = false;
         Ok(())
     }
 }
@@ -312,18 +307,13 @@ fn tx_disposition(commit_lsn: u64, frontier: u64, bound: Option<u64>) -> TxDispo
     }
 }
 
-/// Base wire budget per peek: the sink's ack cadence (1× the part rollover),
-/// clamped to the `pg_logical_slot_peek_changes` int4 arg. Pure — the
-/// starvation contract's offline mutation guard, with [`escalated`].
+/// Wire budget per peek: the sink's ack cadence (the part rollover), clamped to
+/// the `pg_logical_slot_peek_changes` int4 arg. Slot progress past a span larger
+/// than one window is the sink re-drain loop's job (ack → slide), not a bigger
+/// budget's — so this is a flat 1×, and drain RSS stays O(rollover). Pure — an
+/// offline mutation guard for the budget.
 fn wire_budget(peek: crate::source::cdc::PeekBound) -> i32 {
     peek.rows_capped().min(i32::MAX as usize) as i32
-}
-
-/// Starvation escalation: ×3 the base — the worst BEGIN/COMMIT marker ratio
-/// (a single-row transaction is 3 wire rows for 1 change), saturating within
-/// the int4 arg. Applied ONCE, only when a full window yields nothing new.
-fn escalated(base: i32) -> i32 {
-    base.saturating_mul(3)
 }
 
 /// Parse a `pg_lsn` rendering `X/Y` (two hex halves of a 64-bit position) into a
@@ -766,17 +756,14 @@ mod tests {
     }
 
     // The offline mutation guard for the peek-budget contract: the CI mutants
-    // gate runs `--lib` only, and without these a `×3 → ×1` (or dropped
-    // saturation) mutant survives everything but the live two-run test.
+    // gate runs `--lib` only, so without this a clamp/cap mutant survives
+    // everything but a live run.
     #[test]
-    fn wire_budget_is_the_ack_cadence_and_escalation_is_x3_saturating() {
+    fn wire_budget_is_the_ack_cadence_clamped_to_int4() {
         use crate::source::cdc::PeekBound;
         assert_eq!(wire_budget(PeekBound::Sized(100_000)), 100_000);
         assert_eq!(wire_budget(PeekBound::Sized(0)), 1); // rows_capped clamps up
         assert_eq!(wire_budget(PeekBound::Unbounded), i32::MAX);
-        assert_eq!(escalated(100_000), 300_000);
-        assert_eq!(escalated(1), 3);
-        assert_eq!(escalated(i32::MAX), i32::MAX); // saturates within int4
     }
 
     // Staff class #6 (generative fuzz, stable-toolchain flavour): the parsers

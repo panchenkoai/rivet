@@ -69,11 +69,28 @@ run exhausted with the backlog only partially drained (RED:
 `roast_pg_until_current_open_bound_two_runs_lose_nothing` — two runs captured
 4 of ~600 ids at rollover 5).
 
-`PeekBound` stays the correctness seam, with its meaning sharpened: it carries
-the sink's ACK CADENCE (the rollover), and each poll adapter derives its own
-WIRE budget from it — PostgreSQL escalates once to ×3 (the worst marker ratio)
-when a full window yields nothing new, keeping common-case RSS at 1×
-(`PgChangeStream::fill`, pure seams `wire_budget`/`escalated`); SQL Server is
-1:1 (change-table rows are all data). A new poll adapter must state its
-wire-overhead ratio explicitly. The decision itself — no shared refill driver —
-stands.
+`PeekBound` stays the correctness seam, carrying the sink's ACK CADENCE (the
+rollover) — one ack's worth of WAL per peek.
+
+## Amendment (2026-07-19)
+
+An ultracode review found the 2026-07-17 ×3 peek escalation only *partly*
+closed the gap: it covered the captured-marker ratio (a single-row transaction
+is 3 wire rows for 1 change) but NOT an uncaptured-table transaction or an
+empty/DDL span, whose wire:capture ratio is unbounded — a span larger than the
+escalated window still starved the slot and the run still exhausted before the
+open bound (RED: `roast_pg_cdc_reaches_open_bound_past_a_large_uncaptured_
+transaction` — a 200-row uncaptured transaction ahead of the captured backlog
+made a run capture zero in-bound rows at rollover 5).
+
+The real seam is the **sink re-drain loop** ([`sink::run_to_files`]), not the
+peek budget: after each drain pass it flushes + acks the consumed span
+(advancing a consume-on-read slot past uncaptured/empty WAL, whose commit
+boundary is recorded before the routing filter), then re-peeks the fresh WAL
+beyond it, until a pass yields nothing. So the ×3 escalation is REMOVED — the
+peek is a flat 1× rollover (drain RSS back to O(rollover)) and the adapter's
+`ack`/`release_empty_frontier` clear `exhausted` so the next pass slides
+forward. The decision this ADR records — no shared refill driver, the loop
+inlined per adapter — still stands; the re-drain loop lives in the shared sink,
+above the adapters, and non-PG engines (whose read cursor advances on its own)
+fall straight through it.

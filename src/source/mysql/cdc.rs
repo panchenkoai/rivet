@@ -62,6 +62,11 @@ pub(crate) struct MysqlChangeStream {
     /// indefinitely); `None` (daemon) streams forever. The contract lives on
     /// [`DrainMode`].
     bound: Option<(String, u64)>,
+    /// Bound tripped — the stream ended at the open-time ceiling. Sticky, so the
+    /// sink's re-drain pass (which re-calls `next_change` after acking) returns
+    /// `None` at once instead of consuming — and re-deferring — the past-bound
+    /// events the next run will re-read from the checkpoint.
+    past_bound: bool,
 }
 
 impl MysqlChangeStream {
@@ -101,6 +106,7 @@ impl MysqlChangeStream {
             tx: Vec::new(),
             file,
             bound,
+            past_bound: false,
         })
     }
 
@@ -197,6 +203,9 @@ impl MysqlChangeStream {
     /// Pull one binlog event and expand it into `pending`. `Ok(false)` ⇒ stream
     /// ended; `Ok(true)` ⇒ consumed an event.
     fn fill(&mut self) -> Result<bool> {
+        if self.past_bound {
+            return Ok(false); // ended at the open-time ceiling — stay ended
+        }
         let ev = match self.stream.next() {
             Some(ev) => ev?,
             None => return Ok(false),
@@ -268,11 +277,12 @@ impl MysqlChangeStream {
                 // A commit past the open-time ceiling belongs to the next run:
                 // end the stream WITHOUT releasing the transaction — the
                 // checkpoint never advances past it, so the resume re-reads it
-                // in full. (`tx.clear()` keeps a hypothetical re-poll from
-                // growing a stale buffer; every real driver stops at the first
-                // `None`.)
+                // in full. `past_bound` is sticky so the sink's re-drain pass
+                // returns `None` at once rather than consuming (and re-deferring)
+                // more past-bound events.
                 if commit_past_bound(&self.file, log_pos, self.bound.as_ref()) {
                     self.tx.clear();
+                    self.past_bound = true;
                     return Ok(false);
                 }
                 let commit = Position(json!({ "file": self.file, "pos": log_pos }));

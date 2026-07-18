@@ -3185,3 +3185,67 @@ fn roast_pg_cdc_ndjson_until_current_terminates_and_emits_backlog() {
         );
     }
 }
+
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical)"]
+fn roast_pg_cdc_reaches_open_bound_past_a_large_uncaptured_transaction() {
+    // The density-below-1/3 gap (ultracode HIGH): a bounded run captures table A
+    // but the slot decodes the WHOLE database, so an UNCAPTURED table B's large
+    // transaction sits in the WAL ahead of A's in-bound changes. The slot only
+    // advances on a captured-row ack, and B's rows are dropped by the routing
+    // filter — so a peek window smaller than B's transaction re-read the same
+    // span forever, the run exhausted, and it wrote _SUCCESS with ZERO of A's
+    // in-bound rows (deferred to the next run — the O(backlog-at-open) contract
+    // broken). With the sink re-drain loop the end-of-pass ack advances the slot
+    // past B, and the next pass reads A. rollover: 5 makes any B transaction of
+    // >15 rows exceed the old escalated window. Oracle: the SOURCE table A.
+    use postgres::NoTls;
+    // Lowercase names only: PostgreSQL folds unquoted identifiers, so test_decoding
+    // renders (and routing matches) the lowercased table name.
+    let a = unique_name("rivet_cdc_capa");
+    let b = unique_name("rivet_cdc_forgnb");
+    let slot = unique_name("rivet_dens_slot");
+    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {a}; DROP TABLE IF EXISTS {b}; \
+         CREATE TABLE {a} (id BIGINT PRIMARY KEY, v INT); \
+         CREATE TABLE {b} (id BIGINT PRIMARY KEY, v INT)"
+    ))
+    .unwrap();
+    let _ta = PgTable::adopt(a.clone());
+    let _tb = PgTable::adopt(b.clone());
+    c.execute(
+        "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+        &[&slot],
+    )
+    .unwrap();
+    let _slot = Slot(slot.clone());
+
+    // One large UNCAPTURED transaction (200 rows) lands in the WAL BEFORE A's
+    // in-bound data — this is the span the peek window cannot fit at rollover 5.
+    c.execute(
+        &format!("INSERT INTO {b} SELECT g, g FROM generate_series(1, 200) g"),
+        &[],
+    )
+    .unwrap();
+    // A's in-bound backlog: ids 0..30, committed after B's tx, before open.
+    for i in 0..30i64 {
+        c.execute(&format!("INSERT INTO {a} VALUES ({i},{i})"), &[])
+            .unwrap();
+    }
+
+    let rig = Rig::pg_cdc(&a, &slot).cdc("rollover: 5");
+    run_rivet_ok(&rig.config_path());
+
+    let got: std::collections::BTreeSet<i64> =
+        dir_parquet_i64(&rig.out_dir(), "id").into_iter().collect();
+    let want: std::collections::BTreeSet<i64> = (0..30).collect();
+    assert_eq!(
+        got,
+        want,
+        "a single bounded run must capture ALL of A's in-bound rows past the \
+         large uncaptured B transaction — got {} ids (the slot starved on B and \
+         exhausted before reaching A)",
+        got.len()
+    );
+}

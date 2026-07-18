@@ -247,31 +247,77 @@ pub(crate) fn run_to_files(
     // dedup can trust even when a PK is touched twice in one transaction.
     let mut txn_seq = TxnSeq::default();
 
-    while let Some(ev) = stream.next_change() {
-        let mut ev = ev?;
-        txn_seq.stamp(&mut ev);
-        // The commit boundary is a property of the STREAM, not of any routed
-        // table — record it BEFORE the routing filter. MySQL marks only the
-        // LAST event of a transaction committed; if that event lands on an
-        // uncaptured table (audit-log-written-last is a common ORM shape),
-        // filtering first would drop the boundary, stall the checkpoint
-        // forever, and duplicate the captured rows on every scheduler cycle.
-        let committed = ev.committed;
-        if committed {
-            last_commit = Some(ev.position.clone());
-            unacked_commit = true;
+    // Re-drain loop. One inner pass drains everything readable from the stream's
+    // CURRENT position, then rolls (flush → checkpoint → ack). The ack advances a
+    // consume-on-read slot (PostgreSQL) past the whole consumed span — INCLUDING
+    // uncaptured-table transactions and empty (DDL) spans, whose commit boundary
+    // was recorded before the routing filter — so the next inner pass peeks FRESH
+    // WAL beyond it. Without this, a foreign/empty span larger than one peek
+    // window starved the slot: the peek re-read the same window, the run
+    // exhausted, and it wrote `_SUCCESS` with in-bound captured data still
+    // unread (the density-below-1/3 gap the ×3 peek escalation only partly
+    // covered — an uncaptured or empty span has an unbounded wire:capture ratio).
+    // Engines whose read cursor advances on its own (MySQL binlog / MSSQL from-LSN
+    // / Mongo token) never starve: their re-drain pass yields nothing and the loop
+    // exits at once. Termination: each pass that yields ≥1 event advances the slot
+    // toward the open bound (finite WAL); a pass yielding zero has drained to the
+    // bound.
+    let mut hit_max = false;
+    loop {
+        let mut yielded_this_pass = 0usize;
+        while let Some(ev) = stream.next_change() {
+            let mut ev = ev?;
+            yielded_this_pass += 1;
+            txn_seq.stamp(&mut ev);
+            // The commit boundary is a property of the STREAM, not of any routed
+            // table — record it BEFORE the routing filter. MySQL marks only the
+            // LAST event of a transaction committed; if that event lands on an
+            // uncaptured table (audit-log-written-last is a common ORM shape),
+            // filtering first would drop the boundary, stall the checkpoint
+            // forever, and duplicate the captured rows on every scheduler cycle.
+            let committed = ev.committed;
+            if committed {
+                last_commit = Some(ev.position.clone());
+                unacked_commit = true;
+            }
+            let Some(sink) = sinks
+                .iter_mut()
+                .find(|s| table_matches(&s.out.table, &ev.schema, &ev.table))
+            else {
+                continue; // not a captured table
+            };
+            total_bytes += ev.estimated_bytes();
+            sink.buf.push(ev);
+            total_rows += 1;
+            emitted += 1;
+            if policy.should_roll(total_rows, total_bytes, committed) {
+                roll_all(
+                    &mut sinks,
+                    stream,
+                    cfg.engine,
+                    cfg.format,
+                    &run_token,
+                    checkpoint,
+                    &last_commit,
+                    &mut unacked_commit,
+                )?;
+                total_rows = 0;
+                total_bytes = 0;
+            }
+            if cfg.max_events.is_some_and(|m| emitted >= m) {
+                hit_max = true;
+                break;
+            }
         }
-        let Some(sink) = sinks
-            .iter_mut()
-            .find(|s| table_matches(&s.out.table, &ev.schema, &ev.table))
-        else {
-            continue; // not a captured table
-        };
-        total_bytes += ev.estimated_bytes();
-        sink.buf.push(ev);
-        total_rows += 1;
-        emitted += 1;
-        if policy.should_roll(total_rows, total_bytes, committed) {
+        // End-of-pass roll: flush any buffered captured tail AND ack the consumed
+        // span. Fires when a captured table has buffered rows OR when a commit
+        // boundary is unacked — the latter advances the slot past an
+        // uncaptured-only span (bug-hunt K) and, in the re-drain loop, is what
+        // lets the next pass slide forward. `roll_all` flushes nothing when the
+        // buffers are empty; it just persists the checkpoint + acks. The
+        // checkpoint only ever lands on `last_commit` (a transaction boundary),
+        // so a `max_events` stop mid-span still checkpoints a whole transaction.
+        if unacked_commit || sinks.iter().any(|s| !s.buf.is_empty()) {
             roll_all(
                 &mut sinks,
                 stream,
@@ -285,29 +331,11 @@ pub(crate) fn run_to_files(
             total_rows = 0;
             total_bytes = 0;
         }
-        if cfg.max_events.is_some_and(|m| emitted >= m) {
+        // A pass that yielded nothing has drained to the bound; `max_events`
+        // stops the whole run at the cap.
+        if hit_max || yielded_this_pass == 0 {
             break;
         }
-    }
-    // Final roll fires when a captured table has buffered rows OR when a commit
-    // boundary is unacked. The latter is the fix for a stream whose ONLY traffic
-    // was uncaptured tables: `last_commit`/`unacked_commit` advanced (before the
-    // routing filter) but no captured buffer ever triggered a roll, so without
-    // this the checkpoint never moved — every scheduler cycle re-read the whole
-    // uncaptured backlog until the log rolled past it (bug-hunt K, cross-engine).
-    // `roll_all` flushes nothing when the buffers are empty; it just persists the
-    // checkpoint + acks.
-    if unacked_commit || sinks.iter().any(|s| !s.buf.is_empty()) {
-        roll_all(
-            &mut sinks,
-            stream,
-            cfg.engine,
-            cfg.format,
-            &run_token,
-            checkpoint,
-            &last_commit,
-            &mut unacked_commit,
-        )?;
     }
 
     // Fault point: all parts durable + acked, no manifest yet — a crash here

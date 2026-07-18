@@ -152,19 +152,30 @@ exit only as a backstop, gate the snapshot on `until_current` so the daemon
 mode is untouched, and fail OPEN on an unparseable boundary (delayed
 termination is recoverable; an early exit is a dropped commit).
 
-Sibling trap the same RED test caught: **a peek budget must count the WIRE
-rows, not the logical changes**. PG's `upto_nchanges` counts `BEGIN`/`COMMIT`
-marker rows (a single-row tx = 3 rows for 1 change), so `peek == rollover`
-yielded < rollover data rows, the sink never reached its ack boundary, the
-refill re-read the same window, and the stream exhausted with the backlog only
-PARTIALLY drained — every bounded run claimed success after ~⅓ of the pending
-changes (two runs captured 4 of ~600 ids at rollover 5). The PG budget now
-escalates ONCE to ×3 when a full window yields nothing new — the starvation
-shape (`src/source/postgres/cdc.rs::fill`, pure seams `wire_budget`/`escalated`
-so the ×3 is offline-mutation-guarded; common-case RSS stays 1×); any new poll
-adapter must state its wire-overhead ratio explicitly, and a starvation fixture
-needs transactions whose framing overhead is ≥ the data rows (single-row
-transactions), not bulk inserts that amortise it away.
+Sibling trap this class caught, and a warning about band-aid fixes: **a
+non-consuming peek only slides forward when the consumer ACKS — so slot progress
+is the sink's job, not the peek budget's.** PG's `pg_logical_slot_peek_changes`
+re-reads from the slot's un-acked position every call, and the slot advances
+only when the sink acks a captured part. So ANY WAL the run consumes but does
+not capture — an uncaptured-table transaction, the `BEGIN`/`COMMIT` marker rows,
+an empty/DDL span — never moved the slot: the peek re-read the same window, the
+run exhausted, and it wrote `_SUCCESS` with in-bound captured data unread. The
+FIRST fix (a ×3 peek escalation) was a band-aid — it covered the captured-marker
+ratio (3 wire rows : 1 change) but an uncaptured/empty span has an UNBOUNDED
+wire:capture ratio, so a span larger than the escalated window still starved
+(an ultracode review found this: `roast_pg_cdc_reaches_open_bound_past_a_large_
+uncaptured_transaction` — a 200-row uncaptured tx ahead of the backlog captured
+ZERO in-bound rows at rollover 5). The real fix is a **sink re-drain loop**
+(`src/source/cdc/sink.rs::run_to_files`): each pass flushes + acks the consumed
+span (advancing the slot past uncaptured/empty WAL, whose commit boundary is
+recorded before the routing filter), then re-peeks fresh WAL, until a pass
+yields nothing — reaching the bound at any density, RSS back to O(rollover).
+Process rule: **when a re-read/starvation shows up on a non-consuming reader,
+fix it by ACKING the consumed span (advance the cursor), not by peeking more —
+a bigger peek only defers the same starvation to a larger span.** A starvation
+fixture must put UNCAPTURED or empty traffic ahead of the captured data (the
+unbounded-ratio shape), not just single-row captured txs (ratio 3, which a fixed
+budget can cover).
 
 Second sibling, from the adversarial pass over the same branch: **row-less
 transactions starve the ACK, not just the budget**. DDL churn decodes as empty

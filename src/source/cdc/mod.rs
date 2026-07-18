@@ -319,28 +319,20 @@ pub(crate) struct CdcConfig {
     pub engine: CdcEngineOpts,
 }
 
-/// The sink's ACK CADENCE, handed to a poll adapter so it can size its peeks —
-/// the drain's memory bound. On PostgreSQL the peek is non-consuming and pages
-/// forward only when the sink acks (advances the slot) at a `rollover`
-/// boundary, so an adapter whose peek yields fewer DATA rows than the rollover
-/// starves: the second peek re-reads the same window, trips `exhausted`, and
-/// the run under-drains. `Sized` therefore carries the rollover itself (the
-/// acking sink builds it from its own rollover; the non-acking NDJSON driver is
-/// `Unbounded` — one peek drains everything, the frontier check ends the
-/// stream), and each adapter derives its own WIRE budget from it, because wire
-/// overhead is engine-shaped: PostgreSQL's `upto_nchanges` counts BEGIN/COMMIT
-/// marker rows (a single-row transaction is 3 wire rows for 1 change), so its
-/// adapter escalates the budget ONCE to ×3 when a full window yields nothing
-/// new — the starvation shape (`PgChangeStream::fill`; common-case RSS stays
-/// 1×); SQL Server's change-table rows are all data, so its budget is 1:1. A
-/// new poll adapter must state its wire-overhead ratio explicitly — a bare
-/// "peek == rollover" was proven insufficient by
-/// `roast_pg_until_current_open_bound_two_runs_lose_nothing` (two bounded runs
-/// captured 4 of ~600 ids at rollover 5; see ADR-0025's amendment).
+/// The sink's ACK CADENCE, handed to a poll adapter to size one peek — the
+/// drain's memory bound (O(rollover), never O(total backlog)). On PostgreSQL the
+/// peek is non-consuming: it re-reads from the slot's un-acked position every
+/// time, so a peek NEVER slides forward on its own — only an ack (slot advance)
+/// moves it. Reaching the open bound past a foreign/empty span larger than one
+/// window is therefore NOT this budget's job (no budget covers an uncaptured or
+/// empty span, whose wire:capture ratio is unbounded): the sink's re-drain loop
+/// acks the consumed span and re-peeks the fresh WAL beyond it
+/// ([`sink::run_to_files`]). `Sized` just carries the rollover — one ack's worth
+/// per peek; the non-acking NDJSON driver is `Unbounded` (one peek drains
+/// everything, the frontier check ends the stream, no re-drain).
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum PeekBound {
-    /// The sink's part `rollover` — the ack cadence. Adapters scale it up to
-    /// their wire-row budget, never below it.
+    /// The sink's part `rollover` — one ack cadence per peek.
     Sized(usize),
     /// One peek pulls the whole backlog (the non-acking NDJSON path).
     Unbounded,

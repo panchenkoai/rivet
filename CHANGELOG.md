@@ -16,18 +16,22 @@
   backstop) — making a bounded run's work O(backlog at open). The deferred tail
   is never lost: the checkpoint stops at the last in-bound commit and the next
   scheduler cycle resumes from it (two-run union live tests per engine).
-- **PostgreSQL CDC no longer under-drains a large backlog of small
-  transactions.** `pg_logical_slot_peek_changes(…, upto_nchanges)` counts the
-  `BEGIN`/`COMMIT` marker rows against the budget (a single-row transaction is
-  3 rows for 1 change), so a peek budget equal to the part rollover yielded
-  fewer data rows than the sink's ack boundary, the refill re-read the same
-  window, and the stream exhausted with the backlog only partially drained —
-  each bounded run claimed success after roughly a third of the pending
-  changes (RED-reproduced: two runs captured 4 of ~600 ids at a small
-  rollover). The peek budget escalates once to 3× the rollover when a full
-  window yields nothing new (the starvation shape), so the common-case drain
-  RSS stays at the documented 1× formula and the 3× worst case only applies
-  under marker-heavy tiny-transaction churn.
+- **PostgreSQL CDC bounded runs now reach the open bound in one pass, whatever
+  the captured-data density.** The non-consuming `pg_logical_slot_peek_changes`
+  always re-reads from the slot's un-acked position, and the slot only advances
+  when the sink acks a captured-row part — so a span of WAL the run consumes but
+  does not capture (a large uncaptured-table transaction, BEGIN/COMMIT marker
+  rows, or an empty/DDL span) never advanced the slot: the peek re-read the same
+  window, the run exhausted, and it wrote `_SUCCESS` with in-bound captured data
+  still unread (RED-reproduced: with a 200-row uncaptured transaction ahead of
+  the captured backlog at a small rollover, a run captured **zero** in-bound
+  rows). The sink now runs a **re-drain loop** — after each pass it flushes and
+  acks the consumed span (advancing the slot past uncaptured/empty WAL, recorded
+  at its commit boundary before the routing filter), then re-peeks the fresh WAL
+  beyond it, until a pass yields nothing. The run reaches the open bound
+  regardless of density, and drain RSS stays at the documented O(rollover) (the
+  earlier 3× peek escalation, which only covered the captured-marker case, is
+  removed).
 - **PostgreSQL CDC: row-less transaction churn no longer pins the slot.** DDL
   churn decodes as empty `BEGIN`/`COMMIT` transactions: nothing reaches the
   sink, the sink never acks, and on an idle database the slot kept pinning WAL
