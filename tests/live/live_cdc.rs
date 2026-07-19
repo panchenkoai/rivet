@@ -2551,6 +2551,88 @@ fn pg_cdc_crash_after_flush_before_ack_does_not_advance_the_slot() {
 
 #[test]
 #[ignore = "live: requires docker compose postgres (wal_level=logical)"]
+fn roast_pg_cdc_crash_in_a_re_drain_pass_stays_at_least_once() {
+    // The sink re-drain loop calls roll_all (flush → checkpoint → ack) ONCE PER
+    // PASS, so it introduces a new crash window: a crash while acking an
+    // uncaptured span in an EARLY pass, before the captured data of a LATER pass
+    // is read. This must stay at-least-once: the pass-1 ack advances the slot
+    // ONLY over the consumed uncaptured span (never into the not-yet-read
+    // captured transaction), so resume reads the captured transaction WHOLE — no
+    // loss, no duplication. `cdc_after_ack` fires on the first (uncaptured-span)
+    // ack. Oracle: the source table A; assert distinct == count == 12 (no loss,
+    // no dup) after the crash + resume.
+    use postgres::NoTls;
+    let d = tempfile::tempdir().unwrap();
+    let a = unique_name("rivet_cdc_rdcap");
+    let b = unique_name("rivet_cdc_rdforgn");
+    let slot = unique_name("rivet_rd_slot");
+    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {a}; DROP TABLE IF EXISTS {b}; \
+         CREATE TABLE {a} (id BIGINT PRIMARY KEY, v INT); \
+         CREATE TABLE {b} (id BIGINT PRIMARY KEY, v INT)"
+    ))
+    .unwrap();
+    let _ta = PgTable::adopt(a.clone());
+    let _tb = PgTable::adopt(b.clone());
+    c.execute(
+        "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+        &[&slot],
+    )
+    .unwrap();
+    let _slot = Slot(slot.clone());
+    // A large UNCAPTURED transaction (pass 1 consumes + acks it), THEN A's
+    // in-bound data as ONE 12-row transaction (read only after the slot slides).
+    c.execute(
+        &format!("INSERT INTO {b} SELECT g, g FROM generate_series(1, 100) g"),
+        &[],
+    )
+    .unwrap();
+    c.execute(
+        &format!("INSERT INTO {a} SELECT g, g FROM generate_series(0, 11) g"),
+        &[],
+    )
+    .unwrap();
+
+    let out = d.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let rig = Rig::pg_cdc(&a, &slot)
+        .cdc("rollover: 5")
+        .dest_path(out.clone());
+    // Run 1 crashes right after the FIRST ack (the pass-1 uncaptured-span ack).
+    let crashed = std::process::Command::new(RIVET_BIN)
+        .args(["run", "--config", rig.config_path().to_str().unwrap()])
+        .env("RIVET_TEST_PANIC_AT", "cdc_after_ack")
+        .output()
+        .expect("spawn rivet");
+    assert!(
+        !crashed.status.success(),
+        "the injected crash must fail run 1"
+    );
+
+    // Run 2 resumes from wherever the crash left the slot.
+    let rig2 = Rig::pg_cdc(&a, &slot).dest_path(out.clone());
+    run_rivet_ok(&rig2.config_path());
+
+    let ids = dir_parquet_i64(&out, "id");
+    let distinct: std::collections::BTreeSet<i64> = ids.iter().copied().collect();
+    let want: std::collections::BTreeSet<i64> = (0..12).collect();
+    assert_eq!(
+        distinct, want,
+        "A's 12-row transaction must survive the mid-re-drain crash whole — got {:?} \
+         (a pass-1 ack that overshot into A's un-read transaction lost part of it)",
+        distinct
+    );
+    assert_eq!(
+        ids.len(),
+        12,
+        "no duplication across the crash + resume — got {} rows for 12 distinct ids",
+        ids.len()
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical)"]
 fn roast_pg_cdc_large_transaction_is_atomic_across_a_mid_flush_crash() {
     // A single source transaction LARGER than `rollover` must roll + ack as ONE
     // unit — the sink's "never split a transaction across parts" invariant. Every
