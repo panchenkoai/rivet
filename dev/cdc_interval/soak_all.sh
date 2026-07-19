@@ -16,7 +16,7 @@ set -uo pipefail
 
 RIVET_BIN="${RIVET_BIN:-target/release/rivet}"
 [ -x "$RIVET_BIN" ] || RIVET_BIN=target/debug/rivet
-ENGINE="${1:?usage: soak_all.sh <pg|mysql|mssql>}"
+ENGINE="${1:?usage: soak_all.sh <pg|mysql|mssql|mongo>}"
 PHASES="${PHASES:-10 20 30 60 120}"   # minutes, space-separated
 BATCH="${BATCH:-2000}"                # rows per churn tick
 TICK="${TICK:-5}"                     # seconds between churn ticks (~24k rows/min)
@@ -28,11 +28,13 @@ STOP="$WORK/churn.stop"; PAUSE="$WORK/churn.pause"; rm -f "$STOP" "$PAUSE"
 LOG="$WORK/soak.log"
 say() { echo "[$(date +%H:%M:%S)] [$ENGINE] $*" | tee -a "$LOG"; }
 
-PGC=rivet-postgres-cdc-1; MYC=rivet-mysql-cdc-1; MSC=rivet-mssql-cdc-1
+PGC=rivet-postgres-cdc-1; MYC=rivet-mysql-cdc-1; MSC=rivet-mssql-cdc-1; MOC=rivet-mongo-rs-1
 PG()  { docker exec "$PGC" psql -U rivet -d rivet -tAc "$1" 2>/dev/null; }
 MY()  { docker exec "$MYC" mysql -urivet -privet rivet -N -e "$1" 2>/dev/null; }
 MS()  { docker exec "$MSC" /opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa -P 'Rivet_Passw0rd!' -d rivet -h -1 -Q "$1" 2>/dev/null; }
 MSN() { MS "SET NOCOUNT ON; $1" | grep -Eo '[0-9]+' | head -1; }
+# Mongo: the whole db `soakdb` is watched; `sk` is the collection, `_id` the key.
+MO()  { docker exec "$MOC" mongosh --quiet --port 27017 soakdb --eval "$1" 2>/dev/null; }
 
 CFG="$WORK/cdc.yaml"; OUT="$WORK/out"; NEXT="$WORK/next"
 
@@ -70,6 +72,14 @@ exports:
   - { name: sk, table: sk, mode: cdc, format: parquet, cdc: { checkpoint: "$WORK/cdc.ckpt", capture_instance: dbo_sk, until_current: true, rollover: 50000 }, destination: { type: local, path: "$OUT" } }
 EOF
       ;;
+    mongo)
+      MO "db.sk.drop()" >/dev/null
+      cat > "$CFG" <<EOF
+source: { type: mongo, url: "mongodb://127.0.0.1:27018/soakdb?directConnection=true&serverSelectionTimeoutMS=5000" }
+exports:
+  - { name: sk, table: sk, mode: cdc, format: parquet, cdc: { checkpoint: "$WORK/cdc.ckpt", until_current: true, rollover: 50000 }, destination: { type: local, path: "$OUT" } }
+EOF
+      ;;
   esac
   "$R" run -c "$CFG" >/dev/null 2>&1   # pin the anchor, drain 0
 }
@@ -80,6 +90,7 @@ insert_rows() { # a .. b
     pg)    PG "INSERT INTO sk SELECT g,g,'$PAD' FROM generate_series($a,$b) g" >/dev/null ;;
     mysql) MY "SET SESSION cte_max_recursion_depth=1000000; INSERT INTO sk (id,v,pad) SELECT n,n,'$PAD' FROM (WITH RECURSIVE s(n) AS (SELECT $a UNION ALL SELECT n+1 FROM s WHERE n < $b) SELECT n FROM s) q" ;;
     mssql) MS "SET NOCOUNT ON; INSERT INTO dbo.sk (id,v,pad) SELECT TOP ($((b-a+1))) $((a-1))+ROW_NUMBER() OVER (ORDER BY (SELECT NULL)), $((a-1))+ROW_NUMBER() OVER (ORDER BY (SELECT NULL)), '$PAD' FROM sys.all_columns x CROSS JOIN sys.all_columns y;" >/dev/null ;;
+    mongo) MO "var d=[]; for(var i=$a;i<=$b;i++){d.push({_id:i,v:i,pad:'$PAD'}); if(d.length===5000){db.sk.insertMany(d);d.length=0;}} if(d.length)db.sk.insertMany(d)" >/dev/null ;;
   esac
 }
 
@@ -97,6 +108,7 @@ src_count() {
     pg)    PG "SELECT COUNT(*) FROM sk" ;;
     mysql) MY "SELECT COUNT(*) FROM sk" ;;
     mssql) MS "SET NOCOUNT ON; SELECT COUNT_BIG(*) FROM dbo.sk" | grep -Eo '[0-9]+' | head -1 ;;
+    mongo) MO "print(db.sk.countDocuments())" | grep -Eo '[0-9]+' | head -1 ;;
   esac
 }
 
@@ -118,9 +130,11 @@ drain_measure() { # -> "events rssMB"
 }
 
 dest_distinct() {
-  # A single-table export writes parts to the destination path directly.
+  # A single-table export writes parts to the destination path directly. The key
+  # column is `id` for the SQL engines and `_id` for Mongo's JSON-blob model.
   ls "$OUT"/cdc-*.parquet >/dev/null 2>&1 || { echo 0; return; }
-  duckdb -noheader -csv -c "SELECT COUNT(DISTINCT id) FROM read_parquet('$OUT/cdc-*.parquet') WHERE __op='insert'" 2>/dev/null
+  local key=id; [ "$ENGINE" = mongo ] && key='"_id"'
+  duckdb -noheader -csv -c "SELECT COUNT(DISTINCT $key) FROM read_parquet('$OUT/cdc-*.parquet') WHERE __op='insert'" 2>/dev/null
 }
 
 say "=== soak start: phases='$PHASES' min, churn ${BATCH}/${TICK}s, bin=$R ==="
@@ -154,4 +168,5 @@ case "$ENGINE" in
   pg)    PG "SELECT pg_drop_replication_slot('soak_pg') FROM pg_replication_slots WHERE slot_name='soak_pg'" >/dev/null; PG "DROP TABLE IF EXISTS sk" >/dev/null ;;
   mysql) MY "DROP TABLE IF EXISTS sk" ;;
   mssql) MS "EXEC sys.sp_cdc_disable_table @source_schema='dbo',@source_name='sk',@capture_instance='dbo_sk'; DROP TABLE IF EXISTS dbo.sk;" >/dev/null ;;
+  mongo) MO "db.sk.drop()" >/dev/null ;;
 esac
