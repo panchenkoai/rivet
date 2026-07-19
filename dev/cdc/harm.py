@@ -204,6 +204,29 @@ def phase(label: str, with_cdc: bool) -> dict:
     return {"lat": lat, "peak": peak, "drain_runs": drain_stats.get("runs", 0)}
 
 
+def scheduled_phase(interval: int, cycles: int = 3) -> dict:
+    """The SCHEDULER model: writer runs continuously; the drain fires only every
+    `interval`s (until_current on a cron), so WAL ACCUMULATES between runs and the
+    slot pins it — the real disk-fill harm a back-to-back drain hides. Returns the
+    peak retention/lag observed across the accumulate windows."""
+    d = tempfile.mkdtemp(prefix="harm_sched_")
+    cfg = rivet_cdc_config(d)
+    subprocess.run([RIVET_BIN, "run", "--config", cfg], capture_output=True, text=True)  # prime slot
+    writer = PacedWriter()
+    writer.start()
+    peak = {"lag_b": 0, "retained_b": 0, "xmin_age": 0}
+    for _ in range(cycles):
+        end = time.time() + interval
+        while time.time() < end:  # accumulate: writer floods, no drain
+            h = sample_harm()
+            for k in peak:
+                peak[k] = max(peak[k], h[k])
+            time.sleep(1.0)
+        subprocess.run([RIVET_BIN, "run", "--config", cfg], capture_output=True, text=True)  # scheduled drain
+    writer.finish()
+    return peak
+
+
 def main():
     print(f"CDC harm-under-load — {SECONDS}s/phase, {RATE} stmt/s, table {TABLE}, slot {SLOT}\n")
     # fresh table + slot
@@ -212,29 +235,41 @@ def main():
     psql(f"SELECT pg_drop_replication_slot('{SLOT}') "
          f"WHERE EXISTS(SELECT 1 FROM pg_replication_slots WHERE slot_name='{SLOT}')")
 
-    print("Phase 1/2: BASELINE (no CDC drain)")
-    base = phase("baseline", with_cdc=False)
+    # Warmup — a fresh table's first inserts are cold (page allocation / WAL init),
+    # which confounds the baseline-vs-under-cdc latency comparison. Warm the table
+    # so both measured phases reflect steady state (CLAUDE.md: measure warm, not cold).
+    print("Warmup (discarded) ...")
+    w = PacedWriter()
+    w.start()
+    time.sleep(min(8, SECONDS))
+    w.finish()
 
-    print("Phase 2/2: UNDER a looping CDC drain")
-    psql(f"TRUNCATE {TABLE}")
+    print("Phase 1/3: BASELINE (no CDC drain)")
+    base = phase("baseline", with_cdc=False)
+    print("Phase 2/3: UNDER a CONTINUOUS drain (back-to-back — heaviest co-tenant)")
     under = phase("under-cdc", with_cdc=True)
+    interval = max(5, SECONDS // 3)
+    print(f"Phase 3/3: SCHEDULED drain (every {interval}s — WAL accumulates between runs)")
+    sched = scheduled_phase(interval)
 
     b, u = base["lat"], under["lat"]
     p = under["peak"]
-    print("\n" + "=" * 62)
+    print("\n" + "=" * 64)
     print("HARM REPORT")
-    print("=" * 62)
-    print(f"writer statements:   baseline n={b['n']}   under-cdc n={u['n']}")
-    print(f"                     (cdc drain ran {under['drain_runs']} bounded passes)")
-    print("writer latency (ms, server-side):")
-    print(f"  p50   baseline {b['p50']:.2f}   under-cdc {u['p50']:.2f}   x{ratio(u['p50'], b['p50'])}")
-    print(f"  p99   baseline {b['p99']:.2f}   under-cdc {u['p99']:.2f}   x{ratio(u['p99'], b['p99'])}")
-    print(f"  max   baseline {b['max']:.2f}   under-cdc {u['max']:.2f}   x{ratio(u['max'], b['max'])}")
-    print("slot harm under the drain (peak, from pg_replication_slots):")
-    print(f"  replication lag        {mb(p['lag_b'])}  (current - confirmed_flush)")
-    print(f"  WAL retained by slot   {mb(p['retained_b'])}  (current - restart_lsn — disk-fill)")
-    print(f"  catalog_xmin age       {p['xmin_age']}  (vacuum-blocking)")
-    print("=" * 62)
+    print("=" * 64)
+    print(f"writer statements:   baseline n={b['n']}   under-cdc n={u['n']}   (rate-capped by psql round-trip)")
+    print(f"                     (continuous drain ran {under['drain_runs']} bounded passes)")
+    print("co-tenancy — writer latency (ms, server-side) baseline vs continuous drain:")
+    print(f"  p50   {b['p50']:.2f}  ->  {u['p50']:.2f}   x{ratio(u['p50'], b['p50'])}")
+    print(f"  p99   {b['p99']:.2f}  ->  {u['p99']:.2f}   x{ratio(u['p99'], b['p99'])}")
+    print(f"  max   {b['max']:.2f}  ->  {u['max']:.2f}   x{ratio(u['max'], b['max'])}")
+    print("slot harm under a CONTINUOUS drain (peak — drain keeps up, so ~0):")
+    print(f"  replication lag  {mb(p['lag_b'])}   WAL retained  {mb(p['retained_b'])}   xmin_age  {p['xmin_age']}")
+    print(f"slot harm under a SCHEDULED drain (every {interval}s — the disk-fill harm):")
+    print(f"  peak replication lag   {mb(sched['lag_b'])}  (current - confirmed_flush)")
+    print(f"  peak WAL retained      {mb(sched['retained_b'])}  (current - restart_lsn)")
+    print(f"  peak catalog_xmin age  {sched['xmin_age']}  (vacuum-blocking)")
+    print("=" * 64)
 
 
 def ratio(a: float, b: float) -> str:
