@@ -57,7 +57,7 @@ by a disable-bound probe).
 | whole-db multiplex | ✓ | ✓ | ✓ | ✓ |
 | `__seq` total order | ✓ | ✓ | ✓ | na |
 | until_current bounded (termination) | ✓ (load-bearing) | ✓ | ✓ | ✓ (load-bearing) |
-| open-bound two-run defer-not-drop | ✓ | ✓ | ✓ | na (joint) |
+| open-bound two-run defer-not-drop | ✓ | ✓ | ✓ | ✓ |
 | NDJSON bounded | ✓ | na | na | na |
 | empty-transaction churn | ✓ | na | na | na |
 | reach open bound past a foreign span | ✓ | na | na | na |

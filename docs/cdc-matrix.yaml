@@ -97,7 +97,7 @@ scenarios:
     postgres: { test: roast_pg_until_current_open_bound_two_runs_lose_nothing }
     mysql:    { test: roast_mysql_until_current_open_bound_two_runs_lose_nothing }
     mssql:    { test: roast_mssql_until_current_open_bound_two_runs_lose_nothing }
-    mongo:    { na: "covered jointly by roast_until_current_terminates_under_sustained_writes_and_keeps_backlog (open-time cluster-time bound + backlog, under a live writer) and mongo_cdc_capture_resume_and_until_current_drain (the next run resumes from the token and captures only the deferred changes) — the same defer-not-drop contract, no third harness needed" }
+    mongo:    { test: roast_mongo_cdc_until_current_open_bound_two_runs_lose_nothing }
 
   - id: cdc_ndjson_bounded
     what: "the NDJSON driver (rivet cdc without --output) under until_current: terminates at the open-time bound under a live writer and emits the whole pre-open backlog to stdout (no ack by design — stdout is not durable, ADR-0023)"
