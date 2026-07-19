@@ -893,35 +893,29 @@ fn cdc_non_utc_server_timezone_matches_batch_and_utc_instant() {
 #[test]
 #[ignore = "live: requires docker compose postgres (wal_level=logical)"]
 fn pg_cdc_non_utc_database_timezone_matches_batch() {
-    use postgres::NoTls;
     let d = tempfile::tempdir().unwrap();
+    // Isolated DB (see CdcDb): this test ALTERs the DATABASE-level timezone, which
+    // on the shared `rivet` DB would flip the rendering for every parallel test
+    // (and vice versa). Its own DB confines the change — dropped with the DB, so
+    // no RESET guard is needed.
+    let cdc_db = CdcDb::new("cdc_tz");
     let tbl = unique_name("cdc_tz_pg");
     let slot = unique_name("rivet_tz_slot");
-    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
-    c.batch_execute("ALTER DATABASE rivet SET timezone TO 'Asia/Tokyo'")
-        .expect("set db tz");
-    struct DbTzGuard;
-    impl Drop for DbTzGuard {
-        fn drop(&mut self) {
-            if let Ok(mut c) = postgres::Client::connect(POSTGRES_CDC_URL, NoTls) {
-                let _ = c.batch_execute("ALTER DATABASE rivet RESET timezone");
-            }
-        }
-    }
-    let _tz = DbTzGuard;
-
+    let mut c = cdc_db.connect();
     c.batch_execute(&format!(
-        "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (
-           id INT PRIMARY KEY, tstz TIMESTAMPTZ, ts TIMESTAMP)"
+        "ALTER DATABASE {} SET timezone TO 'Asia/Tokyo'",
+        cdc_db.name()
+    ))
+    .expect("set db tz");
+    c.batch_execute(&format!(
+        "CREATE TABLE {tbl} (id INT PRIMARY KEY, tstz TIMESTAMPTZ, ts TIMESTAMP)"
     ))
     .unwrap();
-    let _tbl = PgTable::adopt(tbl.clone());
     c.execute(
         "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
         &[&slot],
     )
     .unwrap();
-    let _slot = Slot(slot.clone());
     c.batch_execute(&format!(
         "INSERT INTO {tbl} VALUES (1, '2024-06-15T03:00:00Z', '2024-06-15 12:00:00')"
     ))
@@ -931,9 +925,12 @@ fn pg_cdc_non_utc_database_timezone_matches_batch() {
     let batch_out = d.path().join("batch");
     std::fs::create_dir_all(&out).unwrap();
     std::fs::create_dir_all(&batch_out).unwrap();
-    run_rivet_ok(&pg_cdc_config(&d, &tbl, &slot, &out));
+    let rig = Rig::pg_cdc(&tbl, &slot)
+        .source_url(cdc_db.url())
+        .dest_path(out.clone());
+    run_rivet_ok(&rig.config_path());
     let batch_yaml = format!(
-        r#"source: {{type: postgres, url: "{POSTGRES_CDC_URL}"}}
+        r#"source: {{type: postgres, url: "{url}"}}
 exports:
   - name: {tbl}_batch
     table: {tbl}
@@ -941,6 +938,7 @@ exports:
     format: parquet
     destination: {{ type: local, path: "{out}" }}
 "#,
+        url = cdc_db.url(),
         out = batch_out.display(),
     );
     run_rivet_ok(&write_config(&d, &batch_yaml));
@@ -980,40 +978,29 @@ fn pg_cdc_non_iso_datestyle_and_escape_bytea_match_batch() {
     // bytea — both silent, found by the source-parity sweep under a flipped
     // session. The CDC reader now pins datestyle/bytea_output on connect, so CDC
     // matches a batch export (binary protocol, format-immune) regardless.
-    use postgres::NoTls;
     let d = tempfile::tempdir().unwrap();
+    // Isolated DB (see CdcDb): ALTERing the DATABASE-level datestyle/bytea_output
+    // on the shared `rivet` DB would corrupt the rendering for every parallel test.
+    // Its own DB confines it — dropped with the DB, no RESET guard needed.
+    let cdc_db = CdcDb::new("cdc_fmt");
     let tbl = unique_name("cdc_fmt_pg");
     let slot = unique_name("rivet_fmt_slot");
-    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
-    c.batch_execute(
-        "ALTER DATABASE rivet SET datestyle TO 'German, DMY'; \
-         ALTER DATABASE rivet SET bytea_output TO 'escape'",
-    )
-    .expect("set db formats");
-    struct DbFmtGuard;
-    impl Drop for DbFmtGuard {
-        fn drop(&mut self) {
-            if let Ok(mut c) = postgres::Client::connect(POSTGRES_CDC_URL, NoTls) {
-                let _ = c.batch_execute(
-                    "ALTER DATABASE rivet RESET datestyle; ALTER DATABASE rivet RESET bytea_output",
-                );
-            }
-        }
-    }
-    let _fmt = DbFmtGuard;
-
+    let mut c = cdc_db.connect();
     c.batch_execute(&format!(
-        "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (
-           id INT PRIMARY KEY, d DATE, ts TIMESTAMP, blob BYTEA)"
+        "ALTER DATABASE {db} SET datestyle TO 'German, DMY'; \
+         ALTER DATABASE {db} SET bytea_output TO 'escape'",
+        db = cdc_db.name()
+    ))
+    .expect("set db formats");
+    c.batch_execute(&format!(
+        "CREATE TABLE {tbl} (id INT PRIMARY KEY, d DATE, ts TIMESTAMP, blob BYTEA)"
     ))
     .unwrap();
-    let _tbl = PgTable::adopt(tbl.clone());
     c.execute(
         "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
         &[&slot],
     )
     .unwrap();
-    let _slot = Slot(slot.clone());
     c.batch_execute(&format!(
         "INSERT INTO {tbl} VALUES (1, '2024-03-05', '2024-03-05 12:00:00', '\\xdeadbeef')"
     ))
@@ -1023,9 +1010,12 @@ fn pg_cdc_non_iso_datestyle_and_escape_bytea_match_batch() {
     let batch_out = d.path().join("batch");
     std::fs::create_dir_all(&out).unwrap();
     std::fs::create_dir_all(&batch_out).unwrap();
-    run_rivet_ok(&pg_cdc_config(&d, &tbl, &slot, &out));
+    let rig = Rig::pg_cdc(&tbl, &slot)
+        .source_url(cdc_db.url())
+        .dest_path(out.clone());
+    run_rivet_ok(&rig.config_path());
     let batch_yaml = format!(
-        r#"source: {{type: postgres, url: "{POSTGRES_CDC_URL}"}}
+        r#"source: {{type: postgres, url: "{url}"}}
 exports:
   - name: {tbl}_batch
     table: {tbl}
@@ -1033,6 +1023,7 @@ exports:
     format: parquet
     destination: {{ type: local, path: "{out}" }}
 "#,
+        url = cdc_db.url(),
         out = batch_out.display(),
     );
     run_rivet_ok(&write_config(&d, &batch_yaml));
@@ -3302,6 +3293,9 @@ impl CdcDb {
     fn url(&self) -> &str {
         &self.url
     }
+    fn name(&self) -> &str {
+        &self.name
+    }
     fn connect(&self) -> postgres::Client {
         postgres::Client::connect(&self.url, postgres::NoTls).expect("connect dedicated cdc db")
     }
@@ -3602,32 +3596,33 @@ fn roast_pg_cdc_drain_releases_pinned_wal_and_advances_xmin() {
     // collapses) and let catalog_xmin move forward. Oracle: the server's own
     // pg_replication_slots, never rivet's counters. RED-able: a drain that
     // captured but did not ack leaves confirmed_flush pinned.
-    use postgres::NoTls;
     let d = tempfile::tempdir().unwrap();
+    // Isolated DB (see CdcDb): the bounded drain must capture the WHOLE 20k backlog
+    // in one pass, which parallel tests' foreign WAL in a shared-DB slot's view
+    // would break (density). Its own DB gives the slot only this test's WAL.
+    let cdc_db = CdcDb::new("cdc_walret");
     let tbl = unique_name("rivet_cdc_walret");
     let slot = unique_name("rivet_walret_slot");
-    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
+    let mut c = cdc_db.connect();
     c.batch_execute(&format!(
-        "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id bigint primary key, v int, pad text)"
+        "CREATE TABLE {tbl} (id bigint primary key, v int, pad text)"
     ))
     .unwrap();
-    let _tbl = PgTable::adopt(tbl.clone());
     c.execute(
         "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
         &[&slot],
     )
     .unwrap();
-    let _slot = Slot(slot.clone());
 
-    let retained = |c: &mut postgres::Client| -> i64 {
+    let confirmed = |c: &mut postgres::Client| -> String {
         c.query_one(
-            "SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)::bigint \
-             FROM pg_replication_slots WHERE slot_name = $1",
+            "SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = $1",
             &[&slot],
         )
         .unwrap()
         .get(0)
     };
+    let cf_before = confirmed(&mut c);
     // Generate a backlog (≈20k rows of WAL) the slot now pins.
     c.execute(
         &format!(
@@ -3636,27 +3631,51 @@ fn roast_pg_cdc_drain_releases_pinned_wal_and_advances_xmin() {
         &[],
     )
     .unwrap();
-    let retained_before = retained(&mut c);
+    // Prove the slot IS pinning a real backlog. (pg_current_wal_lsn is the WHOLE
+    // server's position, so this can be INFLATED by parallel tests' WAL — that
+    // only makes it more clearly > 1 MB, so it stays a valid "is pinning" check.)
+    let pinned_before: i64 = c
+        .query_one(
+            &format!("SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), '{cf_before}'::pg_lsn)::bigint"),
+            &[],
+        )
+        .unwrap()
+        .get(0);
     assert!(
-        retained_before > 1_000_000,
-        "the slot must pin a real amount of WAL before the drain (got {retained_before} bytes)"
+        pinned_before > 1_000_000,
+        "the slot must pin a real amount of WAL before the drain (got {pinned_before} bytes)"
     );
 
     let out = d.path().join("out");
     std::fs::create_dir_all(&out).unwrap();
-    run_rivet_ok(&pg_cdc_config(&d, &tbl, &slot, &out));
+    let rig = Rig::pg_cdc(&tbl, &slot)
+        .source_url(cdc_db.url())
+        .dest_path(out.clone());
+    run_rivet_ok(&rig.config_path());
 
-    let retained_after = retained(&mut c);
     assert_eq!(
         manifest_rows(&out),
         20000,
         "the drain must capture the whole backlog"
     );
+    // The release metric is confirmed_flush's OWN advance (per-slot), NOT
+    // pg_wal_lsn_diff(pg_current_wal_lsn(), ..): pg_current_wal_lsn is the whole
+    // server's WAL, so parallel tests' WAL would swamp a "current - confirmed_flush"
+    // reading (it FAILED that way — retained went UP under load). This advance is
+    // this slot's alone.
+    let cf_after = confirmed(&mut c);
+    let advanced: i64 = c
+        .query_one(
+            &format!("SELECT pg_wal_lsn_diff('{cf_after}'::pg_lsn, '{cf_before}'::pg_lsn)::bigint"),
+            &[],
+        )
+        .unwrap()
+        .get(0);
     assert!(
-        retained_after < retained_before / 4,
-        "the drain must RELEASE the pinned WAL: retained {retained_before} -> {retained_after} bytes \
-         (an un-acked drain leaves it pinned — the disk-fill harm). catalog_xmin (vacuum) is \
-         released by the same confirmed_flush advance, at the next checkpoint."
+        advanced > 1_000_000,
+        "the drain must RELEASE the pinned WAL by advancing confirmed_flush past the multi-MB \
+         backlog — it advanced only {advanced} bytes (an un-acked drain leaves confirmed_flush \
+         pinned: the disk-fill harm; catalog_xmin/vacuum follows the same advance)"
     );
 }
 
