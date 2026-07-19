@@ -893,35 +893,29 @@ fn cdc_non_utc_server_timezone_matches_batch_and_utc_instant() {
 #[test]
 #[ignore = "live: requires docker compose postgres (wal_level=logical)"]
 fn pg_cdc_non_utc_database_timezone_matches_batch() {
-    use postgres::NoTls;
     let d = tempfile::tempdir().unwrap();
+    // Isolated DB (see CdcDb): this test ALTERs the DATABASE-level timezone, which
+    // on the shared `rivet` DB would flip the rendering for every parallel test
+    // (and vice versa). Its own DB confines the change — dropped with the DB, so
+    // no RESET guard is needed.
+    let cdc_db = CdcDb::new("cdc_tz");
     let tbl = unique_name("cdc_tz_pg");
     let slot = unique_name("rivet_tz_slot");
-    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
-    c.batch_execute("ALTER DATABASE rivet SET timezone TO 'Asia/Tokyo'")
-        .expect("set db tz");
-    struct DbTzGuard;
-    impl Drop for DbTzGuard {
-        fn drop(&mut self) {
-            if let Ok(mut c) = postgres::Client::connect(POSTGRES_CDC_URL, NoTls) {
-                let _ = c.batch_execute("ALTER DATABASE rivet RESET timezone");
-            }
-        }
-    }
-    let _tz = DbTzGuard;
-
+    let mut c = cdc_db.connect();
     c.batch_execute(&format!(
-        "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (
-           id INT PRIMARY KEY, tstz TIMESTAMPTZ, ts TIMESTAMP)"
+        "ALTER DATABASE {} SET timezone TO 'Asia/Tokyo'",
+        cdc_db.name()
+    ))
+    .expect("set db tz");
+    c.batch_execute(&format!(
+        "CREATE TABLE {tbl} (id INT PRIMARY KEY, tstz TIMESTAMPTZ, ts TIMESTAMP)"
     ))
     .unwrap();
-    let _tbl = PgTable::adopt(tbl.clone());
     c.execute(
         "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
         &[&slot],
     )
     .unwrap();
-    let _slot = Slot(slot.clone());
     c.batch_execute(&format!(
         "INSERT INTO {tbl} VALUES (1, '2024-06-15T03:00:00Z', '2024-06-15 12:00:00')"
     ))
@@ -931,9 +925,12 @@ fn pg_cdc_non_utc_database_timezone_matches_batch() {
     let batch_out = d.path().join("batch");
     std::fs::create_dir_all(&out).unwrap();
     std::fs::create_dir_all(&batch_out).unwrap();
-    run_rivet_ok(&pg_cdc_config(&d, &tbl, &slot, &out));
+    let rig = Rig::pg_cdc(&tbl, &slot)
+        .source_url(cdc_db.url())
+        .dest_path(out.clone());
+    run_rivet_ok(&rig.config_path());
     let batch_yaml = format!(
-        r#"source: {{type: postgres, url: "{POSTGRES_CDC_URL}"}}
+        r#"source: {{type: postgres, url: "{url}"}}
 exports:
   - name: {tbl}_batch
     table: {tbl}
@@ -941,6 +938,7 @@ exports:
     format: parquet
     destination: {{ type: local, path: "{out}" }}
 "#,
+        url = cdc_db.url(),
         out = batch_out.display(),
     );
     run_rivet_ok(&write_config(&d, &batch_yaml));
@@ -980,40 +978,29 @@ fn pg_cdc_non_iso_datestyle_and_escape_bytea_match_batch() {
     // bytea — both silent, found by the source-parity sweep under a flipped
     // session. The CDC reader now pins datestyle/bytea_output on connect, so CDC
     // matches a batch export (binary protocol, format-immune) regardless.
-    use postgres::NoTls;
     let d = tempfile::tempdir().unwrap();
+    // Isolated DB (see CdcDb): ALTERing the DATABASE-level datestyle/bytea_output
+    // on the shared `rivet` DB would corrupt the rendering for every parallel test.
+    // Its own DB confines it — dropped with the DB, no RESET guard needed.
+    let cdc_db = CdcDb::new("cdc_fmt");
     let tbl = unique_name("cdc_fmt_pg");
     let slot = unique_name("rivet_fmt_slot");
-    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
-    c.batch_execute(
-        "ALTER DATABASE rivet SET datestyle TO 'German, DMY'; \
-         ALTER DATABASE rivet SET bytea_output TO 'escape'",
-    )
-    .expect("set db formats");
-    struct DbFmtGuard;
-    impl Drop for DbFmtGuard {
-        fn drop(&mut self) {
-            if let Ok(mut c) = postgres::Client::connect(POSTGRES_CDC_URL, NoTls) {
-                let _ = c.batch_execute(
-                    "ALTER DATABASE rivet RESET datestyle; ALTER DATABASE rivet RESET bytea_output",
-                );
-            }
-        }
-    }
-    let _fmt = DbFmtGuard;
-
+    let mut c = cdc_db.connect();
     c.batch_execute(&format!(
-        "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (
-           id INT PRIMARY KEY, d DATE, ts TIMESTAMP, blob BYTEA)"
+        "ALTER DATABASE {db} SET datestyle TO 'German, DMY'; \
+         ALTER DATABASE {db} SET bytea_output TO 'escape'",
+        db = cdc_db.name()
+    ))
+    .expect("set db formats");
+    c.batch_execute(&format!(
+        "CREATE TABLE {tbl} (id INT PRIMARY KEY, d DATE, ts TIMESTAMP, blob BYTEA)"
     ))
     .unwrap();
-    let _tbl = PgTable::adopt(tbl.clone());
     c.execute(
         "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
         &[&slot],
     )
     .unwrap();
-    let _slot = Slot(slot.clone());
     c.batch_execute(&format!(
         "INSERT INTO {tbl} VALUES (1, '2024-03-05', '2024-03-05 12:00:00', '\\xdeadbeef')"
     ))
@@ -1023,9 +1010,12 @@ fn pg_cdc_non_iso_datestyle_and_escape_bytea_match_batch() {
     let batch_out = d.path().join("batch");
     std::fs::create_dir_all(&out).unwrap();
     std::fs::create_dir_all(&batch_out).unwrap();
-    run_rivet_ok(&pg_cdc_config(&d, &tbl, &slot, &out));
+    let rig = Rig::pg_cdc(&tbl, &slot)
+        .source_url(cdc_db.url())
+        .dest_path(out.clone());
+    run_rivet_ok(&rig.config_path());
     let batch_yaml = format!(
-        r#"source: {{type: postgres, url: "{POSTGRES_CDC_URL}"}}
+        r#"source: {{type: postgres, url: "{url}"}}
 exports:
   - name: {tbl}_batch
     table: {tbl}
@@ -1033,6 +1023,7 @@ exports:
     format: parquet
     destination: {{ type: local, path: "{out}" }}
 "#,
+        url = cdc_db.url(),
         out = batch_out.display(),
     );
     run_rivet_ok(&write_config(&d, &batch_yaml));
@@ -2549,6 +2540,220 @@ fn pg_cdc_crash_after_flush_before_ack_does_not_advance_the_slot() {
     );
 }
 
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical)"]
+fn roast_pg_cdc_crash_in_a_re_drain_pass_stays_at_least_once() {
+    // The sink re-drain loop calls roll_all (flush → checkpoint → ack) ONCE PER
+    // PASS, so it introduces a new crash window: a crash while acking an
+    // uncaptured span in an EARLY pass, before the captured data of a LATER pass
+    // is read. This must stay at-least-once: the pass-1 ack advances the slot
+    // ONLY over the consumed uncaptured span (never into the not-yet-read
+    // captured transaction), so resume reads the captured transaction WHOLE — no
+    // loss, no duplication. `cdc_after_ack` fires on the first (uncaptured-span)
+    // ack. Oracle: the source table A; assert distinct == count == 12 (no loss,
+    // no dup) after the crash + resume.
+    use postgres::NoTls;
+    let d = tempfile::tempdir().unwrap();
+    let a = unique_name("rivet_cdc_rdcap");
+    let b = unique_name("rivet_cdc_rdforgn");
+    let slot = unique_name("rivet_rd_slot");
+    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {a}; DROP TABLE IF EXISTS {b}; \
+         CREATE TABLE {a} (id BIGINT PRIMARY KEY, v INT); \
+         CREATE TABLE {b} (id BIGINT PRIMARY KEY, v INT)"
+    ))
+    .unwrap();
+    let _ta = PgTable::adopt(a.clone());
+    let _tb = PgTable::adopt(b.clone());
+    c.execute(
+        "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+        &[&slot],
+    )
+    .unwrap();
+    let _slot = Slot(slot.clone());
+    // A large UNCAPTURED transaction (pass 1 consumes + acks it), THEN A's
+    // in-bound data as ONE 12-row transaction (read only after the slot slides).
+    c.execute(
+        &format!("INSERT INTO {b} SELECT g, g FROM generate_series(1, 100) g"),
+        &[],
+    )
+    .unwrap();
+    c.execute(
+        &format!("INSERT INTO {a} SELECT g, g FROM generate_series(0, 11) g"),
+        &[],
+    )
+    .unwrap();
+
+    let out = d.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let rig = Rig::pg_cdc(&a, &slot)
+        .cdc("rollover: 5")
+        .dest_path(out.clone());
+    // Run 1 crashes right after the FIRST ack (the pass-1 uncaptured-span ack).
+    let crashed = std::process::Command::new(RIVET_BIN)
+        .args(["run", "--config", rig.config_path().to_str().unwrap()])
+        .env("RIVET_TEST_PANIC_AT", "cdc_after_ack")
+        .output()
+        .expect("spawn rivet");
+    assert!(
+        !crashed.status.success(),
+        "the injected crash must fail run 1"
+    );
+
+    // Run 2 resumes from wherever the crash left the slot.
+    let rig2 = Rig::pg_cdc(&a, &slot).dest_path(out.clone());
+    run_rivet_ok(&rig2.config_path());
+
+    let ids = dir_parquet_i64(&out, "id");
+    let distinct: std::collections::BTreeSet<i64> = ids.iter().copied().collect();
+    let want: std::collections::BTreeSet<i64> = (0..12).collect();
+    assert_eq!(
+        distinct, want,
+        "A's 12-row transaction must survive the mid-re-drain crash whole — got {:?} \
+         (a pass-1 ack that overshot into A's un-read transaction lost part of it)",
+        distinct
+    );
+    assert_eq!(
+        ids.len(),
+        12,
+        "no duplication across the crash + resume — got {} rows for 12 distinct ids",
+        ids.len()
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical)"]
+fn roast_pg_cdc_large_transaction_is_atomic_across_a_mid_flush_crash() {
+    // A single source transaction LARGER than `rollover` must roll + ack as ONE
+    // unit — the sink's "never split a transaction across parts" invariant. Every
+    // `test_decoding` event carried `committed: true`, so the sink used to roll +
+    // checkpoint + ack MID-transaction (after `rollover` rows); a crash between
+    // that ack and the tail's flush advanced the slot PAST the transaction's
+    // commit, and resume (reading strictly after the slot) never re-read the tail
+    // — an at-least-once break. Fix: the adapter marks only the LAST event of a
+    // transaction committed. RED-proof: one 12-row transaction at rollover 5,
+    // crash at `cdc_after_ack` (the first ack). With the bug that ack lands after
+    // 5 rows and the crash loses 7; atomic, it lands after all 12 and the run's
+    // part holds the whole transaction. Oracle: the union of all parts on disk.
+    use postgres::NoTls;
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("rivet_cdc_pgatomic");
+    let slot = unique_name("rivet_atomic_slot");
+    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v INT)"
+    ))
+    .unwrap();
+    let _tbl = PgTable::adopt(tbl.clone());
+    c.execute(
+        "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+        &[&slot],
+    )
+    .unwrap();
+    let _slot = Slot(slot.clone());
+    // ONE transaction, 12 rows (> 2× the rollover of 5).
+    c.execute(
+        &format!("INSERT INTO {tbl} SELECT g, g FROM generate_series(0, 11) g"),
+        &[],
+    )
+    .unwrap();
+
+    let out = d.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let rig = Rig::pg_cdc(&tbl, &slot)
+        .cdc("rollover: 5")
+        .dest_path(out.clone());
+    // Run 1 crashes right after the FIRST ack.
+    let crashed = std::process::Command::new(RIVET_BIN)
+        .args(["run", "--config", rig.config_path().to_str().unwrap()])
+        .env("RIVET_TEST_PANIC_AT", "cdc_after_ack")
+        .output()
+        .expect("spawn rivet");
+    assert!(
+        !crashed.status.success(),
+        "the injected crash must fail run 1"
+    );
+
+    // Run 2 resumes from the slot (whatever position the crash left it at).
+    let rig2 = Rig::pg_cdc(&tbl, &slot).dest_path(out.clone());
+    run_rivet_ok(&rig2.config_path());
+
+    let got: std::collections::BTreeSet<i64> = dir_parquet_i64(&out, "id").into_iter().collect();
+    let want: std::collections::BTreeSet<i64> = (0..12).collect();
+    assert_eq!(
+        got,
+        want,
+        "the 12-row transaction must survive the mid-flush crash whole — got {} ids \
+         (a mid-transaction ack advanced the slot past the commit and lost the tail)",
+        got.len()
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
+fn roast_mysql_cdc_large_transaction_is_atomic_across_a_mid_flush_crash() {
+    // MySQL sibling of the PG atomicity roast — the matrix cell was `na` on the
+    // reasoning "the binlog adapter marks only the XID event committed", but that
+    // is CURRENT-CORRECTNESS, not immunity: MySQL stamps the shared COMMIT position
+    // on EVERY event of the transaction (`ev.position = commit.clone()`), exactly
+    // like PG's shared commit LSN. The only thing stopping a mid-transaction
+    // roll+checkpoint+ack is `ev.committed = i + 1 == n`. Flip that to `true` (the
+    // committed-on-every-event mutant) and a crash between the first ack and the
+    // tail's flush advances the binlog checkpoint PAST the commit — resume reads
+    // strictly after it and loses the tail. RED-proof: one 12-row transaction at
+    // rollover 5, crash at `cdc_after_ack`. Buggy: first ack after 5 rows → 5 ids
+    // survive; atomic: first ack after all 12 → 12 ids. Oracle: union of parts.
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("rivet_cdc_myatomic");
+    let mut c = conn();
+    c.query_drop(format!("DROP TABLE IF EXISTS {tbl}")).unwrap();
+    c.query_drop(format!("CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v INT)"))
+        .unwrap();
+    let _drop = Table(tbl.clone());
+
+    let out = d.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let rig = Rig::mysql_cdc(&tbl)
+        .cdc("rollover: 5")
+        .dest_path(out.clone());
+    // MySQL has NO server-side anchor — pin the binlog checkpoint at open, BEFORE
+    // the transaction, or the next run re-anchors to the current position and skips.
+    rig.run_ok();
+    // ONE transaction of 12 rows (> 2× the rollover of 5) — a single multi-row
+    // INSERT is one commit.
+    let vals = (0..12)
+        .map(|i| format!("({i},{i})"))
+        .collect::<Vec<_>>()
+        .join(",");
+    c.query_drop(format!("INSERT INTO {tbl} VALUES {vals}"))
+        .unwrap();
+
+    // Run 1 crashes right after the FIRST ack.
+    let crashed = std::process::Command::new(RIVET_BIN)
+        .args(["run", "--config", rig.config_path().to_str().unwrap()])
+        .env("RIVET_TEST_PANIC_AT", "cdc_after_ack")
+        .output()
+        .expect("spawn rivet");
+    assert!(
+        !crashed.status.success(),
+        "the injected crash must fail run 1"
+    );
+
+    // Run 2 resumes from the checkpoint the crash left behind.
+    run_rivet_ok(&rig.config_path());
+
+    let got: std::collections::BTreeSet<i64> = dir_parquet_i64(&out, "id").into_iter().collect();
+    let want: std::collections::BTreeSet<i64> = (0..12).collect();
+    assert_eq!(
+        got,
+        want,
+        "the 12-row transaction must survive the mid-flush crash whole — got {} ids \
+         (a mid-transaction ack advanced the binlog checkpoint past the commit and lost the tail)",
+        got.len()
+    );
+}
+
 fn pg_full_config(d: &tempfile::TempDir, tbl: &str, out: &std::path::Path) -> std::path::PathBuf {
     let yaml = format!(
         r#"source: {{type: postgres, url: "{POSTGRES_CDC_URL}"}}
@@ -2886,4 +3091,775 @@ fn cdc_until_current_terminates_under_sustained_writes() {
             ids.len()
         );
     }
+}
+
+// ─── Open-time bound: "until current" means current AS OF OPEN, not a chase ──
+
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical)"]
+fn roast_pg_until_current_open_bound_two_runs_lose_nothing() {
+    // The RED shape for the pinned open-time WAL bound. `rollover: 5` makes the
+    // peek limit 5 while the writer below commits faster than one roll cycle
+    // (encode + part write + ack), so every re-peek returns a FULL batch and
+    // the catch-up exit (short/empty peek) never fires — a drain chasing the
+    // moving head runs to the kill ceiling. With the bound pinned at open,
+    // run 1 is O(backlog at open) and terminates; run 2 (writer stopped)
+    // drains the deferred tail. The distinct id union re-read from the parquet
+    // must equal the SOURCE table's committed id set — the bound defers,
+    // never drops (oracle: the source, not rivet's own counters).
+    use postgres::NoTls;
+    let tbl = unique_name("rivet_cdc_pgob");
+    let slot = unique_name("rivet_ob_slot");
+    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v INT)"
+    ))
+    .unwrap();
+    let _tbl = PgTable::adopt(tbl.clone());
+    c.execute(
+        "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+        &[&slot],
+    )
+    .unwrap();
+    let _slot = Slot(slot.clone());
+
+    // Pre-open backlog: ids 0..30.
+    for i in 0..30i64 {
+        c.execute(&format!("INSERT INTO {tbl} VALUES ({i},{i})"), &[])
+            .unwrap();
+    }
+
+    // A writer committing a 10-row transaction every ~5 ms — each is 12 peek
+    // rows (BEGIN + 10 + COMMIT), so ≥ one roll cycle's worth (the ×3-scaled
+    // peek budget of 15) lands between refills and a chase-the-head drain sees
+    // a FULL peek every time: the catch-up exit (short/empty peek) never
+    // fires. Paced (not flooding) so the pre-open backlog stays small enough
+    // for run 1 to reach its bound inside the kill ceiling at 5-row parts.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_bg = stop.clone();
+    let tbl_bg = tbl.clone();
+    let bg = std::thread::spawn(move || {
+        let mut w = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("bg connect");
+        let mut i = 10_000i64;
+        while !stop_bg.load(std::sync::atomic::Ordering::Relaxed) {
+            let vals: Vec<String> = (i..i + 10).map(|k| format!("({k},{k})")).collect();
+            let _ = w.batch_execute(&format!("INSERT INTO {tbl_bg} VALUES {}", vals.join(",")));
+            i += 10;
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    });
+
+    let rig = Rig::pg_cdc(&tbl, &slot).cdc("rollover: 5");
+    let cfg = rig.config_path();
+    let elapsed = run_rivet_bounded(&cfg, std::time::Duration::from_secs(30));
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = bg.join();
+    assert!(
+        elapsed.is_some(),
+        "run 1 must terminate at the open-time WAL bound under sustained writes \
+         (killed at the 30s ceiling ⇒ the drain chased the moving head)"
+    );
+
+    // Writer stopped ⇒ every committed change predates run 2's own bound.
+    // Run 2 drains the deferred tail at the DEFAULT rollover (5-row parts would
+    // grind through a multi-thousand-row tail one tiny parquet file at a time)
+    // into the SAME prefix — parts are run-unique, both runs' rows accumulate.
+    let rig2 = Rig::pg_cdc(&tbl, &slot).dest_path(rig.out_dir());
+    let elapsed2 = run_rivet_bounded(&rig2.config_path(), std::time::Duration::from_secs(60));
+    assert!(
+        elapsed2.is_some(),
+        "run 2 (no writers) must drain the tail and exit"
+    );
+
+    let got: std::collections::BTreeSet<i64> =
+        dir_parquet_i64(&rig.out_dir(), "id").into_iter().collect();
+    let want: std::collections::BTreeSet<i64> = c
+        .query(&format!("SELECT id FROM {tbl}"), &[])
+        .unwrap()
+        .iter()
+        .map(|r| r.get::<_, i64>(0))
+        .collect();
+    assert_eq!(
+        got, want,
+        "run1 ∪ run2 must hold exactly the source's committed ids — the bound \
+         defers the tail to run 2, never drops it"
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
+fn roast_mysql_until_current_open_bound_two_runs_lose_nothing() {
+    // MySQL peer of roast_pg_until_current_open_bound_two_runs_lose_nothing, but
+    // a DIFFERENT contract: on MySQL termination comes from the engine, not the
+    // explicit bound. `BINLOG_DUMP_NON_BLOCK` stops the dump at the log end as of
+    // dump-start — empirically it terminates even under a flooding writer with
+    // the (file, pos) bound DISABLED (verified by the disable-bound RED probe:
+    // the run still exited). So the open-time (file, pos) ceiling is a
+    // PRECISE-STOP refinement over NON_BLOCK, not load-bearing for termination —
+    // the load-bearing engines are PostgreSQL (continuous slot re-peek, see
+    // roast_pg_until_current_open_bound_two_runs_lose_nothing at rollover 5) and
+    // MongoDB (tailable stream — disabling its pin hangs the sustained test).
+    // What THIS test proves is DEFER-NOT-DROP: run 1 captures a prefix and exits,
+    // run 2 drains the tail, and the union re-read from the parquet equals the
+    // SOURCE id set. Oracle: the source table, never rivet's own counters.
+    let tbl = unique_name("rivet_cdc_myob");
+    let _drop = Table(tbl.clone());
+    let mut c = conn();
+    c.query_drop(format!("CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v INT)"))
+        .unwrap();
+    let rig = Rig::mysql_cdc(&tbl);
+    write_checkpoint(&mut c, &rig.checkpoint()); // pin before the backlog
+
+    // Pre-open backlog: ids 0..30.
+    let vals: Vec<String> = (0..30).map(|i| format!("({i},{i})")).collect();
+    c.query_drop(format!("INSERT INTO {tbl} VALUES {}", vals.join(",")))
+        .unwrap();
+
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_bg = stop.clone();
+    let tbl_bg = tbl.clone();
+    let bg = std::thread::spawn(move || {
+        let mut w = conn();
+        let mut i = 10_000i64;
+        while !stop_bg.load(std::sync::atomic::Ordering::Relaxed) {
+            let _ = w.query_drop(format!("INSERT INTO {tbl_bg} VALUES ({i},{i})"));
+            i += 1;
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    });
+
+    let cfg = rig.config_path();
+    let elapsed = run_rivet_bounded(&cfg, std::time::Duration::from_secs(30));
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = bg.join();
+    assert!(
+        elapsed.is_some(),
+        "run 1 must terminate under sustained writes (NON_BLOCK EOF; killed at 30s)"
+    );
+
+    // Writer stopped ⇒ every committed change predates run 2's own bound.
+    let elapsed2 = run_rivet_bounded(&cfg, std::time::Duration::from_secs(60));
+    assert!(
+        elapsed2.is_some(),
+        "run 2 (no writers) must drain the tail and exit"
+    );
+
+    let got: std::collections::BTreeSet<i64> =
+        dir_parquet_i64(&rig.out_dir(), "id").into_iter().collect();
+    let want: std::collections::BTreeSet<i64> = c
+        .query_map(format!("SELECT id FROM {tbl}"), |id: i64| id)
+        .unwrap()
+        .into_iter()
+        .collect();
+    assert_eq!(
+        got, want,
+        "run1 ∪ run2 must hold exactly the source's committed ids — the bound \
+         defers the tail to run 2, never drops it"
+    );
+}
+
+/// A throwaway PostgreSQL database on the CDC server, isolating a test's logical
+/// slot from every other test's WAL. A `test_decoding` slot decodes its
+/// database's ENTIRE WAL, so a DENSITY- or slot-state-sensitive CDC test
+/// (reach-the-open-bound-in-one-pass, confirmed_flush advance) FLAKES on the
+/// shared `rivet` DB when parallel tests inject foreign WAL into the same slot's
+/// view (the failing `cargo test --ignored` lanes run these in parallel). Its
+/// own database makes the slot see only this test's WAL — parallel-safe by
+/// construction, no `--test-threads=1` needed. Dropped (backends terminated) on
+/// teardown; the table + slot live inside it, so no separate guards are needed.
+struct CdcDb {
+    name: String,
+    url: String,
+}
+impl CdcDb {
+    fn new(label: &str) -> Self {
+        let name = unique_name(label).to_lowercase();
+        let mut admin = postgres::Client::connect(POSTGRES_CDC_URL, postgres::NoTls)
+            .expect("connect cdc admin");
+        // CREATE DATABASE cannot run inside a transaction — a single simple-query
+        // batch_execute autocommits it.
+        admin
+            .batch_execute(&format!("CREATE DATABASE {name}"))
+            .expect("create dedicated cdc db");
+        let base = POSTGRES_CDC_URL
+            .rsplit_once('/')
+            .expect("cdc url has a /db path")
+            .0;
+        Self {
+            url: format!("{base}/{name}"),
+            name,
+        }
+    }
+    fn url(&self) -> &str {
+        &self.url
+    }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn connect(&self) -> postgres::Client {
+        postgres::Client::connect(&self.url, postgres::NoTls).expect("connect dedicated cdc db")
+    }
+}
+impl Drop for CdcDb {
+    fn drop(&mut self) {
+        if let Ok(mut admin) = postgres::Client::connect(POSTGRES_CDC_URL, postgres::NoTls) {
+            let _ = admin.batch_execute(&format!(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+                 WHERE datname = '{}' AND pid <> pg_backend_pid()",
+                self.name
+            ));
+            let _ = admin.batch_execute(&format!("DROP DATABASE IF EXISTS {}", self.name));
+        }
+    }
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical)"]
+fn roast_pg_cdc_reaches_open_bound_past_a_large_empty_ddl_span() {
+    // Ultracode r2 finding: a pure-EMPTY (DDL) span LARGER than one peek window,
+    // sitting ahead of in-bound captured data, was drained only one window per
+    // run — empty transactions yield NO events to the sink, so the sink's
+    // re-drain ack never fires; only the adapter's `release_empty_frontier`
+    // advances the slot, and it used to release just one window before
+    // `next_change` returned None and the run wrote _SUCCESS with the in-bound
+    // data still unread. Fix: `next_change` now walks the WHOLE empty span in one
+    // call (release → re-peek loop). rollover 5 makes the window ~2 empty
+    // transactions, so a 40-transaction DDL burst is ~20 windows. Oracle: the
+    // SOURCE table A — one bounded run must capture all 12 rows.
+    // Isolated in its OWN database so parallel tests' WAL never enters this slot's
+    // view — the slot decodes the whole DB, the very premise this test exercises.
+    let cdc_db = CdcDb::new("cdc_ddlspan");
+    let a = unique_name("rivet_cdc_ddlspan");
+    let slot = unique_name("rivet_ddl_slot");
+    let mut c = cdc_db.connect();
+    c.batch_execute(&format!("CREATE TABLE {a} (id BIGINT PRIMARY KEY, v INT)"))
+        .unwrap();
+    c.execute(
+        "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+        &[&slot],
+    )
+    .unwrap();
+    // A large EMPTY span: 40 DDL transactions (row-less BEGIN/COMMIT) ≫ one
+    // window at rollover 5 — created AFTER the slot so they are in the WAL ahead
+    // of A's in-bound rows.
+    for i in 0..40 {
+        c.batch_execute(&format!(
+            "CREATE TABLE {a}_ddl_{i} (x int); DROP TABLE {a}_ddl_{i}"
+        ))
+        .unwrap();
+    }
+    // A's in-bound data, behind the empty span.
+    for i in 0..12i64 {
+        c.execute(&format!("INSERT INTO {a} VALUES ({i},{i})"), &[])
+            .unwrap();
+    }
+
+    let d = tempfile::tempdir().unwrap();
+    let out = d.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let rig = Rig::pg_cdc(&a, &slot)
+        .source_url(cdc_db.url())
+        .cdc("rollover: 5")
+        .dest_path(out.clone());
+    run_rivet_ok(&rig.config_path());
+
+    let got: std::collections::BTreeSet<i64> = dir_parquet_i64(&out, "id").into_iter().collect();
+    let want: std::collections::BTreeSet<i64> = (0..12).collect();
+    assert_eq!(
+        got,
+        want,
+        "one bounded run must capture all of A's in-bound rows past the large \
+         empty DDL span — got {} ids (the run stopped after one window of the \
+         empty span and wrote _SUCCESS with in-bound data unread)",
+        got.len()
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical)"]
+fn roast_pg_cdc_empty_transaction_churn_must_not_pin_the_slot() {
+    // DDL-only churn decodes as EMPTY transactions (BEGIN/COMMIT, no rows):
+    // nothing reaches the sink, so the sink never acks, and the slot keeps
+    // pinning WAL from before the noise — on an idle database, forever (the
+    // uncaptured-DML case is different: it yields events and acks via the
+    // bug-hunt-K final roll). A run that yields NOTHING must release the
+    // data-free span itself — advancing past it can lose nothing by
+    // construction. Oracle: the slot's confirmed_flush_lsn, asked of PostgreSQL
+    // itself, never rivet's counters.
+    // Isolated in its OWN database (see CdcDb): this test asserts confirmed_flush_lsn
+    // against PostgreSQL, which a parallel test's WAL on the shared DB would perturb.
+    let cdc_db = CdcDb::new("cdc_empty");
+    let tbl = unique_name("rivet_cdc_pgempty");
+    let slot = unique_name("rivet_empty_slot");
+    let mut c = cdc_db.connect();
+    c.batch_execute(&format!(
+        "CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v INT)"
+    ))
+    .unwrap();
+    c.execute(
+        "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+        &[&slot],
+    )
+    .unwrap();
+
+    let rig = Rig::pg_cdc(&tbl, &slot).source_url(cdc_db.url());
+    let cfg = rig.config_path();
+    run_rivet_ok(&cfg); // baseline bounded run (captures nothing)
+    let before: String = c
+        .query_one(
+            "SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = $1",
+            &[&slot],
+        )
+        .unwrap()
+        .get(0);
+
+    // Empty-transaction churn: each DDL pair decodes as row-less transactions.
+    for i in 0..20 {
+        c.batch_execute(&format!(
+            "CREATE TABLE {tbl}_junk_{i} (id INT); DROP TABLE {tbl}_junk_{i}"
+        ))
+        .unwrap();
+    }
+
+    run_rivet_ok(&cfg); // captures nothing — but must release the empty span
+    let advanced: bool = c
+        .query_one(
+            &format!(
+                "SELECT confirmed_flush_lsn > '{before}'::pg_lsn \
+                 FROM pg_replication_slots WHERE slot_name = $1"
+            ),
+            &[&slot],
+        )
+        .unwrap()
+        .get(0);
+    assert!(
+        advanced,
+        "a zero-yield run must advance the slot past the empty-transaction span \
+         (confirmed_flush_lsn stuck at {before} — WAL pinned behind DDL noise)"
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical)"]
+fn roast_pg_cdc_ndjson_until_current_terminates_and_emits_backlog() {
+    // The NDJSON driver (`rivet cdc` without --output) shares
+    // create_change_stream with the file sink — this anchors the CLI path
+    // (matrix: cdc_ndjson_bounded). Termination here is the driver's own: the
+    // NDJSON path uses ONE `PeekBound::Unbounded` peek (a single snapshot query),
+    // so it terminates regardless of the open-time bound — the bound only clips
+    // which rows that one snapshot yields, it is not load-bearing for
+    // termination (the ACKING file-sink path re-peeks on PostgreSQL, and the
+    // tailable stream on MongoDB, are what genuinely need the bound). What THIS
+    // test proves: the CLI path terminates and emits the
+    // whole pre-open backlog to stdout. No ack by design (stdout is not durable,
+    // ADR-0023): the slot is left for the consumer.
+    use postgres::NoTls;
+    let tbl = unique_name("rivet_cdc_pgnd");
+    let slot = unique_name("rivet_nd_slot");
+    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v INT)"
+    ))
+    .unwrap();
+    let _tbl = PgTable::adopt(tbl.clone());
+    c.execute(
+        "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+        &[&slot],
+    )
+    .unwrap();
+    let _slot = Slot(slot.clone());
+
+    for i in 0..30i64 {
+        c.execute(&format!("INSERT INTO {tbl} VALUES ({i},{i})"), &[])
+            .unwrap();
+    }
+
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_bg = stop.clone();
+    let tbl_bg = tbl.clone();
+    let bg = std::thread::spawn(move || {
+        let mut w = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("bg connect");
+        let mut i = 10_000i64;
+        while !stop_bg.load(std::sync::atomic::Ordering::Relaxed) {
+            let vals: Vec<String> = (i..i + 10).map(|k| format!("({k},{k})")).collect();
+            let _ = w.batch_execute(&format!("INSERT INTO {tbl_bg} VALUES {}", vals.join(",")));
+            i += 10;
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    });
+
+    let out = run_rivet_args_bounded(
+        &[
+            "cdc",
+            "--source",
+            POSTGRES_CDC_URL,
+            "--slot",
+            &slot,
+            "--table",
+            &tbl,
+            "--until-current",
+        ],
+        std::time::Duration::from_secs(30),
+    );
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = bg.join();
+    let stdout = out.expect("bounded NDJSON run must terminate under sustained writes");
+
+    let ids: std::collections::BTreeSet<i64> = stdout
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|v| v.get("table").and_then(|t| t.as_str()) == Some(tbl.as_str()))
+        .filter_map(|v| v.get("after")?.get(0)?.as_i64())
+        .collect();
+    for i in 0..30 {
+        assert!(
+            ids.contains(&i),
+            "backlog id {i} must be emitted to stdout, got {} ids",
+            ids.len()
+        );
+    }
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical)"]
+fn roast_pg_cdc_reaches_open_bound_past_a_large_uncaptured_transaction() {
+    // The density-below-1/3 gap (ultracode HIGH): a bounded run captures table A
+    // but the slot decodes the WHOLE database, so an UNCAPTURED table B's large
+    // transaction sits in the WAL ahead of A's in-bound changes. The slot only
+    // advances on a captured-row ack, and B's rows are dropped by the routing
+    // filter — so a peek window smaller than B's transaction re-read the same
+    // span forever, the run exhausted, and it wrote _SUCCESS with ZERO of A's
+    // in-bound rows (deferred to the next run — the O(backlog-at-open) contract
+    // broken). With the sink re-drain loop the end-of-pass ack advances the slot
+    // past B, and the next pass reads A. rollover: 5 makes any B transaction of
+    // >15 rows exceed the old escalated window. Oracle: the SOURCE table A.
+    // Isolated in its OWN database (see CdcDb): the slot decodes the whole DB, so
+    // table B's large uncaptured transaction — and no parallel test's WAL — sits
+    // ahead of A. Lowercase names only: PostgreSQL folds unquoted identifiers, so
+    // test_decoding renders (and routing matches) the lowercased table name.
+    let cdc_db = CdcDb::new("cdc_dens");
+    let a = unique_name("rivet_cdc_capa");
+    let b = unique_name("rivet_cdc_forgnb");
+    let slot = unique_name("rivet_dens_slot");
+    let mut c = cdc_db.connect();
+    c.batch_execute(&format!(
+        "CREATE TABLE {a} (id BIGINT PRIMARY KEY, v INT); \
+         CREATE TABLE {b} (id BIGINT PRIMARY KEY, v INT)"
+    ))
+    .unwrap();
+    c.execute(
+        "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+        &[&slot],
+    )
+    .unwrap();
+
+    // One large UNCAPTURED transaction (200 rows) lands in the WAL BEFORE A's
+    // in-bound data — this is the span the peek window cannot fit at rollover 5.
+    c.execute(
+        &format!("INSERT INTO {b} SELECT g, g FROM generate_series(1, 200) g"),
+        &[],
+    )
+    .unwrap();
+    // A's in-bound backlog: ids 0..30, committed after B's tx, before open.
+    for i in 0..30i64 {
+        c.execute(&format!("INSERT INTO {a} VALUES ({i},{i})"), &[])
+            .unwrap();
+    }
+
+    let rig = Rig::pg_cdc(&a, &slot)
+        .source_url(cdc_db.url())
+        .cdc("rollover: 5");
+    run_rivet_ok(&rig.config_path());
+
+    let got: std::collections::BTreeSet<i64> =
+        dir_parquet_i64(&rig.out_dir(), "id").into_iter().collect();
+    let want: std::collections::BTreeSet<i64> = (0..30).collect();
+    assert_eq!(
+        got,
+        want,
+        "a single bounded run must capture ALL of A's in-bound rows past the \
+         large uncaptured B transaction — got {} ids (the slot starved on B and \
+         exhausted before reaching A)",
+        got.len()
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical)"]
+fn roast_pg_cdc_drain_releases_pinned_wal_and_advances_xmin() {
+    // Harm metric (the "an abandoned slot fills the disk" caveat): an un-consumed
+    // logical slot pins WAL and holds `catalog_xmin` (blocks vacuum). The
+    // consumer position that governs release is `confirmed_flush_lsn` — the ack
+    // advances it, and `restart_lsn` (the actual WAL floor) follows at the next
+    // checkpoint. A bounded until_current drain must advance confirmed_flush past
+    // the drained span (so `pg_wal_lsn_diff(current, confirmed_flush_lsn)`
+    // collapses) and let catalog_xmin move forward. Oracle: the server's own
+    // pg_replication_slots, never rivet's counters. RED-able: a drain that
+    // captured but did not ack leaves confirmed_flush pinned.
+    let d = tempfile::tempdir().unwrap();
+    // Isolated DB (see CdcDb): the bounded drain must capture the WHOLE 20k backlog
+    // in one pass, which parallel tests' foreign WAL in a shared-DB slot's view
+    // would break (density). Its own DB gives the slot only this test's WAL.
+    let cdc_db = CdcDb::new("cdc_walret");
+    let tbl = unique_name("rivet_cdc_walret");
+    let slot = unique_name("rivet_walret_slot");
+    let mut c = cdc_db.connect();
+    c.batch_execute(&format!(
+        "CREATE TABLE {tbl} (id bigint primary key, v int, pad text)"
+    ))
+    .unwrap();
+    c.execute(
+        "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+        &[&slot],
+    )
+    .unwrap();
+
+    let confirmed = |c: &mut postgres::Client| -> String {
+        c.query_one(
+            "SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = $1",
+            &[&slot],
+        )
+        .unwrap()
+        .get(0)
+    };
+    let cf_before = confirmed(&mut c);
+    // Generate a backlog (≈20k rows of WAL) the slot now pins.
+    c.execute(
+        &format!(
+            "INSERT INTO {tbl} SELECT g, g%1000, repeat('x',80) FROM generate_series(1,20000) g"
+        ),
+        &[],
+    )
+    .unwrap();
+    // Prove the slot IS pinning a real backlog. (pg_current_wal_lsn is the WHOLE
+    // server's position, so this can be INFLATED by parallel tests' WAL — that
+    // only makes it more clearly > 1 MB, so it stays a valid "is pinning" check.)
+    let pinned_before: i64 = c
+        .query_one(
+            &format!("SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), '{cf_before}'::pg_lsn)::bigint"),
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    assert!(
+        pinned_before > 1_000_000,
+        "the slot must pin a real amount of WAL before the drain (got {pinned_before} bytes)"
+    );
+
+    let out = d.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let rig = Rig::pg_cdc(&tbl, &slot)
+        .source_url(cdc_db.url())
+        .dest_path(out.clone());
+    run_rivet_ok(&rig.config_path());
+
+    assert_eq!(
+        manifest_rows(&out),
+        20000,
+        "the drain must capture the whole backlog"
+    );
+    // The release metric is confirmed_flush's OWN advance (per-slot), NOT
+    // pg_wal_lsn_diff(pg_current_wal_lsn(), ..): pg_current_wal_lsn is the whole
+    // server's WAL, so parallel tests' WAL would swamp a "current - confirmed_flush"
+    // reading (it FAILED that way — retained went UP under load). This advance is
+    // this slot's alone.
+    let cf_after = confirmed(&mut c);
+    let advanced: i64 = c
+        .query_one(
+            &format!("SELECT pg_wal_lsn_diff('{cf_after}'::pg_lsn, '{cf_before}'::pg_lsn)::bigint"),
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    assert!(
+        advanced > 1_000_000,
+        "the drain must RELEASE the pinned WAL by advancing confirmed_flush past the multi-MB \
+         backlog — it advanced only {advanced} bytes (an un-acked drain leaves confirmed_flush \
+         pinned: the disk-fill harm; catalog_xmin/vacuum follows the same advance)"
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical)"]
+fn roast_pg_cdc_captures_a_silent_update_a_watermark_sync_would_miss() {
+    // The reason log-based CDC exists: it captures a row change that touches a
+    // value WITHOUT bumping `updated_at` — the exact update a watermark /
+    // incremental sync (`WHERE updated_at > last_seen`) MISSES. Assert (1) the
+    // source's `updated_at` is UNCHANGED by the silent update (so a watermark
+    // sync at that timestamp would never re-read the row), and (2) CDC captured
+    // the update with the NEW value anyway. Oracle: the source row's updated_at
+    // (proves the miss) + the parquet (proves the capture).
+    use postgres::NoTls;
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("rivet_cdc_silent");
+    let slot = unique_name("rivet_silent_slot");
+    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {tbl}; \
+         CREATE TABLE {tbl} (id bigint primary key, v bigint, updated_at timestamptz)"
+    ))
+    .unwrap();
+    let _tbl = PgTable::adopt(tbl.clone());
+    c.execute(
+        "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+        &[&slot],
+    )
+    .unwrap();
+    let _slot = Slot(slot.clone());
+
+    // Insert a row with a fixed watermark.
+    c.execute(
+        &format!("INSERT INTO {tbl} VALUES (1, 0, '2020-01-01T00:00:00Z')"),
+        &[],
+    )
+    .unwrap();
+    let wm_before: chrono::DateTime<chrono::Utc> = c
+        .query_one(&format!("SELECT updated_at FROM {tbl} WHERE id=1"), &[])
+        .unwrap()
+        .get(0);
+
+    // SILENT update — changes view_count, does NOT touch updated_at.
+    c.execute(&format!("UPDATE {tbl} SET v = 42 WHERE id = 1"), &[])
+        .unwrap();
+    let wm_after: chrono::DateTime<chrono::Utc> = c
+        .query_one(&format!("SELECT updated_at FROM {tbl} WHERE id=1"), &[])
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        wm_before, wm_after,
+        "the silent update must NOT bump updated_at — a watermark sync would miss it"
+    );
+
+    let out = d.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    run_rivet_ok(&pg_cdc_config(&d, &tbl, &slot, &out));
+
+    // CDC caught both the insert and the SILENT update, with the new view_count.
+    let ops = cdc_id_ops(&out);
+    assert_eq!(
+        ops,
+        vec![(1, "insert".to_string()), (1, "update".to_string())],
+        "CDC must capture the insert AND the silent update the watermark missed — got {ops:?}"
+    );
+    let vcs: Vec<i64> = dir_parquet_i64(&out, "v");
+    assert_eq!(
+        vcs,
+        vec![0, 42],
+        "the captured after-images must carry the silent update's NEW value (0 then 42) — got {vcs:?}"
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical)"]
+fn roast_pg_cdc_oversized_transaction_bails_loud_not_oom() {
+    // Memory backstop: a transaction is buffered WHOLE (never split across parts),
+    // so an oversized one would grow the buffer unbounded → OOM. The adapter caps
+    // the per-transaction buffer at `max_tx_rows()` and bails LOUDLY instead. The
+    // cap is 5M by default; `RIVET_CDC_MAX_TX_ROWS` lowers it so this is testable
+    // without a 5-million-row transaction. Oracle: the run FAILS with the cap
+    // message (never a silent OOM / partial capture).
+    use postgres::NoTls;
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("rivet_cdc_bigtx");
+    let slot = unique_name("rivet_bigtx_slot");
+    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id bigint primary key, v bigint)"
+    ))
+    .unwrap();
+    let _tbl = PgTable::adopt(tbl.clone());
+    c.execute(
+        "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+        &[&slot],
+    )
+    .unwrap();
+    let _slot = Slot(slot.clone());
+    // ONE transaction of 20 rows — over the cap-of-10 this run sets.
+    c.execute(
+        &format!("INSERT INTO {tbl} SELECT g, g FROM generate_series(1, 20) g"),
+        &[],
+    )
+    .unwrap();
+
+    let out = d.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let rig = Rig::pg_cdc(&tbl, &slot).dest_path(out);
+    let output = rig.run_with_env("RIVET_CDC_MAX_TX_ROWS", "10");
+    assert!(
+        !output.status.success(),
+        "an over-cap transaction must FAIL the run, not OOM or silently truncate"
+    );
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        err.contains("more than 10 rows") && err.contains("buffered whole"),
+        "the failure must name the cap and the never-split-a-transaction reason — got:\n{err}"
+    );
+}
+
+#[test]
+#[ignore = "live: requires the cdc-standby profile — dev/cdc/stand.sh standby (pg-cdc-standby on :5436)"]
+fn roast_pg_cdc_bounded_on_a_standby_fails_loud() {
+    // A bounded (until_current) CDC run against a PostgreSQL STANDBY (in recovery)
+    // must fail LOUD with an actionable message: pg_current_wal_lsn() is
+    // unavailable in recovery and a logical slot cannot be created there. The
+    // adapter checks pg_is_in_recovery() up front and names the escape (stream
+    // continuously, or point at the primary) — not a raw "recovery is in
+    // progress". Oracle: the run fails, stderr names the standby + the fix.
+    //
+    // Opt-in profile: the cdc-standby pair (dev/cdc/stand.sh standby, :5436) is
+    // NOT part of the default `cdc` stack, so a plain `--ignored` live run does
+    // not provision it. Self-gate: SKIP (loudly) when :5436 is unreachable rather
+    // than fail on a Connection-refused that never reaches the recovery check
+    // under test. When the profile IS up, the assertions below run for real.
+    let standby_url = "postgresql://rivet:rivet@127.0.0.1:5436/rivet";
+    if std::net::TcpStream::connect_timeout(
+        &"127.0.0.1:5436".parse().unwrap(),
+        std::time::Duration::from_millis(500),
+    )
+    .is_err()
+    {
+        eprintln!(
+            "SKIP roast_pg_cdc_bounded_on_a_standby_fails_loud: cdc-standby not up on :5436 \
+             (bring it up with `dev/cdc/stand.sh standby`)"
+        );
+        return;
+    }
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("t_standby");
+    let slot = unique_name("standby_slot");
+    let out = d.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    // A standby is just a source_url override on the canonical CDC rig — no
+    // bespoke YAML. run_expect_fail asserts the non-zero exit and returns stderr.
+    let rig = Rig::pg_cdc(&tbl, &slot)
+        .source_url(standby_url)
+        .dest_path(out);
+    let err = rig.run_expect_fail();
+    assert!(
+        err.contains("standby") && err.contains("recovery") && err.contains("until_current: false"),
+        "the failure must name the standby and the escape (stream continuously / point at the \
+         primary) — got:\n{err}"
+    );
+    // The message alone is EQUIVALENT-masked: a fallback guard at the
+    // pg_current_wal_lsn() bound-snapshot emits the same text — but only AFTER
+    // pg_create_logical_replication_slot(), which on a standby BLOCKS for minutes
+    // waiting for a consistent point and then LEAKS a WAL-pinning slot. The
+    // proactive pg_is_in_recovery() check is what fails fast and never touches
+    // the slot. Isolate it: after a bounded run refused a standby, NO slot with
+    // our name may exist there. (Disabling the proactive check regresses this to
+    // a leaked slot — the RED lever for the fast-fail contract.)
+    let mut sc = postgres::Client::connect(standby_url, postgres::NoTls).expect("connect standby");
+    let slot_created: bool = sc
+        .query_one(
+            "SELECT EXISTS(SELECT 1 FROM pg_replication_slots WHERE slot_name = $1)",
+            &[&slot],
+        )
+        .unwrap()
+        .get(0);
+    assert!(
+        !slot_created,
+        "the proactive recovery check must refuse a standby BEFORE creating a slot — a slot \
+         named '{slot}' was left on the standby, meaning the run blocked on slot creation and \
+         leaked a WAL-pinning slot instead of failing fast"
+    );
 }

@@ -629,6 +629,63 @@ exports:
     }
 }
 
+// `validate_non_sql_source_modes` (config/mod.rs) is what makes the SQL-only
+// builders' `unreachable!` arms provably unreachable for a Mongo source — but
+// it was itself untested (the behaviour-matrix `mode_incremental`/`time_window`
+// Mongo `na`s rest entirely on it). A mutant relaxing `matches!(mode, Full|Cdc)`
+// would let `mode: incremental` reach a panic; a mutant dropping the parallel+
+// resume guard would silently re-read the whole collection every run.
+#[test]
+fn mongo_non_full_or_cdc_mode_is_rejected() {
+    for (mode, extra) in [
+        ("incremental", "\n    cursor_column: updated_at"),
+        ("chunked", ""),
+    ] {
+        let yaml = format!(
+            r#"
+source: {{ type: mongo, url: "mongodb://localhost:27017/testdb" }}
+exports:
+  - name: t
+    table: t
+    mode: {mode}{extra}
+    format: parquet
+    destination: {{ type: local, path: ./out }}
+"#
+        );
+        let msg = format!("{:#}", Config::from_yaml(&yaml).unwrap_err());
+        assert!(
+            msg.contains("MongoDB has no SQL") || msg.contains("supports `mode: full`"),
+            "mongo mode:{mode} must be rejected with the mode-unsupported message, got: {msg}"
+        );
+    }
+}
+
+#[test]
+fn mongo_parallel_plus_resume_is_rejected() {
+    // The parallel `_id`-range fan-out keeps NO keyset checkpoint, so `resume: true`
+    // with `parallel > 1` would be silently ignored (whole collection re-read every
+    // run — a bug-hunt find). The guard must bail loud naming the silent-ignore risk.
+    let yaml = r#"
+source:
+  type: mongo
+  url: "mongodb://localhost:27017/testdb"
+  mongo:
+    resume: true
+exports:
+  - name: t
+    table: t
+    mode: full
+    parallel: 2
+    format: parquet
+    destination: { type: local, path: ./out }
+"#;
+    let msg = format!("{:#}", Config::from_yaml(yaml).unwrap_err());
+    assert!(
+        msg.contains("resume") && msg.contains("parallel") && msg.contains("silently ignored"),
+        "mongo parallel+resume must be rejected naming the silent-ignore risk, got: {msg}"
+    );
+}
+
 #[test]
 fn tables_outside_cdc_mode_is_rejected() {
     let yaml = r#"

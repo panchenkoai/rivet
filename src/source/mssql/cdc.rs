@@ -33,8 +33,37 @@ use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 use crate::config::{TlsConfig, TlsMode};
 use crate::error::Result;
 use crate::source::cdc::value::RivetValue;
-use crate::source::cdc::{ChangeEvent, ChangeOp, ChangeStream, Position};
+use crate::source::cdc::{ChangeEvent, ChangeOp, ChangeStream, DrainMode, Position};
 use crate::source::require_tls_or_loopback;
+
+/// Build one poll's T-SQL. `bound` pins `@max` to the open-time ceiling
+/// (`0x{hex}`, a bounded `until_current` run) instead of re-reading
+/// `sys.fn_cdc_get_max_lsn()` per poll (the daemon's chase-the-head mode) — the
+/// termination contract of [`MssqlChangeStream::bound`], pure so the bounded
+/// shape is asserted without a server.
+fn fill_sql(ci: &str, from_expr: &str, batch: i64, bound: Option<&str>) -> String {
+    let max_expr = match bound {
+        Some(hex) => format!("0x{hex}"),
+        None => "sys.fn_cdc_get_max_lsn()".to_string(),
+    };
+    format!(
+        "DECLARE @from binary(10) = {from_expr}; \
+         DECLARE @min binary(10) = sys.fn_cdc_get_min_lsn('{ci}'); \
+         DECLARE @max binary(10) = {max_expr}; \
+         IF @from IS NOT NULL AND @min IS NOT NULL AND @from < @min \
+            THROW 51000, 'rivet cdc: the resume position is older than the SQL Server \
+CDC change-table retention (the cleanup job removed it). Resuming would silently skip changes \
+— re-snapshot the table (mode: full) and restart CDC from a fresh checkpoint.', 1; \
+         DECLARE @to binary(10) = NULL; \
+         IF @from IS NOT NULL AND @max IS NOT NULL AND @from <= @max \
+            SELECT @to = MAX(s) FROM (SELECT TOP ({batch}) __$start_lsn AS s \
+                FROM cdc.fn_cdc_get_all_changes_{ci}(@from, @max, N'all') \
+                ORDER BY __$start_lsn) q; \
+         IF @to IS NOT NULL \
+            SELECT * FROM cdc.fn_cdc_get_all_changes_{ci}(@from, @to, N'all') \
+            ORDER BY __$start_lsn, __$seqval;"
+    )
+}
 
 /// Connection parameters for a SQL Server CDC poll stream.
 pub(crate) struct MssqlCdcConfig {
@@ -73,15 +102,24 @@ pub(crate) struct MssqlChangeStream {
     /// A poll that returns no rows has drained the window up to the current max
     /// LSN — the stream ends (the next scheduler run resumes from the checkpoint).
     exhausted: bool,
+    /// Open-time max-LSN ceiling (bare hex) for a bounded run: every poll's
+    /// `@max` pins here instead of re-reading `fn_cdc_get_max_lsn()`, so the
+    /// window cannot recede under sustained writes; `None` (daemon) keeps the
+    /// chase-the-head behaviour. The contract lives on [`DrainMode`].
+    bound: Option<String>,
 }
 
 impl MssqlChangeStream {
     /// Connect and bind to a capture instance. Holds the runtime + connection for
     /// the life of the stream (folds the per-poll runtime/connect smell away).
+    ///
+    /// A [`DrainMode::BoundedAtOpen`] run snapshots `fn_cdc_get_max_lsn()` once
+    /// and pins every poll's `@max` to it — see [`Self::bound`].
     pub(crate) fn open(
         cfg: &MssqlCdcConfig,
         tls: Option<&TlsConfig>,
         peek: crate::source::cdc::PeekBound,
+        mode: DrainMode,
     ) -> Result<Self> {
         if !cfg
             .capture_instance
@@ -135,6 +173,38 @@ impl MssqlChangeStream {
                 .map(|(s, t)| (s.to_string(), t.to_string()))
                 .unwrap_or_else(|| (String::new(), cfg.capture_instance.clone()))
         });
+
+        // Bounded run: snapshot the ceiling once, at open. A NULL max LSN (CDC
+        // not enabled yet) keeps `bound = None` so the first poll surfaces the
+        // same loud setup error the daemon path does — never a silent empty run.
+        let bound = if mode.is_bounded() {
+            let max: Option<String> = rt.block_on(async {
+                Ok::<_, anyhow::Error>(
+                    client
+                        .query(
+                            "SELECT CONVERT(varchar(24), sys.fn_cdc_get_max_lsn(), 1)",
+                            &[],
+                        )
+                        .await?
+                        .into_row()
+                        .await?
+                        .and_then(|r| r.get::<&str, _>(0).map(|s| s.to_string())),
+                )
+            })?;
+            let max = max.map(|s| s.trim_start_matches("0x").to_string());
+            // The value is inlined into `0x{hex}` in every poll — hold it to the
+            // same charset gate as the resume LSN, even though the server made it.
+            if let Some(hex) = &max
+                && (hex.is_empty()
+                    || hex.len() % 2 != 0
+                    || !hex.bytes().all(|b| b.is_ascii_hexdigit()))
+            {
+                anyhow::bail!("mssql cdc: malformed open-time max LSN {hex:?}");
+            }
+            max
+        } else {
+            None
+        };
         Ok(Self {
             rt,
             client,
@@ -145,6 +215,7 @@ impl MssqlChangeStream {
             pending: VecDeque::new(),
             batch_limit: peek.rows_capped() as i64,
             exhausted: false,
+            bound,
         })
     }
 
@@ -156,6 +227,7 @@ impl MssqlChangeStream {
         from_lsn: Option<String>,
         tls: Option<&TlsConfig>,
         peek: crate::source::cdc::PeekBound,
+        mode: DrainMode,
     ) -> Result<Self> {
         // Refuse remote plaintext / unauthenticated TLS before any dial (the gate
         // the batch MssqlSource uses).
@@ -173,6 +245,7 @@ impl MssqlChangeStream {
             },
             tls,
             peek,
+            mode,
         )
     }
 
@@ -197,24 +270,7 @@ impl MssqlChangeStream {
             Some(hex) => format!("sys.fn_cdc_increment_lsn(0x{hex})"),
             None => format!("sys.fn_cdc_get_min_lsn('{ci}')"),
         };
-        let sql = format!(
-            "DECLARE @from binary(10) = {from_expr}; \
-             DECLARE @min binary(10) = sys.fn_cdc_get_min_lsn('{ci}'); \
-             DECLARE @max binary(10) = sys.fn_cdc_get_max_lsn(); \
-             IF @from IS NOT NULL AND @min IS NOT NULL AND @from < @min \
-                THROW 51000, 'rivet cdc: the resume position is older than the SQL Server \
-CDC change-table retention (the cleanup job removed it). Resuming would silently skip changes \
-— re-snapshot the table (mode: full) and restart CDC from a fresh checkpoint.', 1; \
-             DECLARE @to binary(10) = NULL; \
-             IF @from IS NOT NULL AND @max IS NOT NULL AND @from <= @max \
-                SELECT @to = MAX(s) FROM (SELECT TOP ({batch}) __$start_lsn AS s \
-                    FROM cdc.fn_cdc_get_all_changes_{ci}(@from, @max, N'all') \
-                    ORDER BY __$start_lsn) q; \
-             IF @to IS NOT NULL \
-                SELECT * FROM cdc.fn_cdc_get_all_changes_{ci}(@from, @to, N'all') \
-                ORDER BY __$start_lsn, __$seqval;",
-            batch = self.batch_limit,
-        );
+        let sql = fill_sql(&ci, &from_expr, self.batch_limit, self.bound.as_deref());
         // The most common SQL Server gotcha — "Invalid object name
         // cdc.fn_cdc_get_all_changes_…" — surfaces here, at the first poll, not at
         // connect. Append the setup hint so the missing CDC enable is obvious.
@@ -226,6 +282,14 @@ CDC change-table retention (the cleanup job removed it). Resuming would silently
         // Rows are ordered ascending by start LSN, so the last one's `__$start_lsn`
         // is `@to` — the cursor advances there regardless of each row's op.
         let mut max_lsn: Option<String> = None;
+        // Collect this batch's events with their start LSN, then mark ONLY the
+        // last row of each `__$start_lsn` group (a source transaction) as the
+        // commit boundary — the sink rolls only on a committed event, so without
+        // this a transaction larger than `rollover` rolls + checkpoints MID-
+        // transaction, and a crash before the tail flushes loses it (resume reads
+        // strictly after the checkpoint LSN, skipping the rest of the same-LSN
+        // group). Mirrors PostgreSQL's per-transaction commit marking.
+        let mut batch: Vec<(String, ChangeEvent)> = Vec::new();
         for r in &rows {
             let mut op_code = 0i32;
             let mut lsn = String::new();
@@ -262,18 +326,46 @@ CDC change-table retention (the cleanup job removed it). Resuming would silently
                 ChangeOp::Delete => (Some(values), None),
                 _ => (None, Some(values)),
             };
-            self.pending.push_back(ChangeEvent {
-                op,
-                schema: self.schema.clone(),
-                table: self.table.clone(),
-                before,
-                after,
-                position: Position(json!({ "lsn": lsn })),
-                // The change table only ever holds already-committed changes.
-                committed: true,
-                image_names: Some(std::sync::Arc::from(names)),
-                seq: 0, // stamped by TxnSeq as the stream is consumed
-            });
+            batch.push((
+                lsn.clone(),
+                ChangeEvent {
+                    op,
+                    schema: self.schema.clone(),
+                    table: self.table.clone(),
+                    before,
+                    after,
+                    position: Position(json!({ "lsn": lsn })),
+                    // Overridden below — the last row of each start-LSN group is
+                    // the commit boundary.
+                    committed: false,
+                    image_names: Some(std::sync::Arc::from(names)),
+                    seq: 0, // stamped by TxnSeq as the stream is consumed
+                },
+            ));
+            // Memory backstop (matching MySQL's MAX_TX_ROWS): a transaction is
+            // buffered whole (never split across parts), and a single
+            // `__$start_lsn` group can be arbitrarily large. Bail loudly rather
+            // than OOM. `@to` bounds the batch at a group boundary, so a group
+            // never straddles two polls — the whole group lands in one `batch`.
+            let cap = crate::source::cdc::max_tx_rows();
+            if batch.len() > cap {
+                anyhow::bail!(
+                    "mssql cdc: a single transaction has more than {cap} change rows — \
+                     it must be buffered whole (a transaction is never split across parts), so \
+                     this would exhaust memory. Split the source transaction, or raise the cap \
+                     only if a transaction this large is genuinely expected."
+                );
+            }
+        }
+        // Mark the commit boundary: a row is the last of its transaction when it
+        // is the final row of the batch OR the next row has a different start LSN.
+        let n = batch.len();
+        for i in 0..n {
+            let is_boundary = i + 1 == n || batch[i].0 != batch[i + 1].0;
+            batch[i].1.committed = is_boundary;
+        }
+        for (_, ev) in batch {
+            self.pending.push_back(ev);
         }
         match max_lsn {
             // Advance the internal cursor to @to; the next poll reads past it.
@@ -460,6 +552,37 @@ mod tests {
         assert_eq!(numeric_to_decimal_string(5, 2), "0.05");
     }
 
+    // The until_current termination contract: a bounded poll pins `@max` to the
+    // open-time ceiling — it must never re-read `fn_cdc_get_max_lsn()` (the
+    // moving target that keeps a hot table's drain from ever terminating), and
+    // the daemon poll must keep doing exactly that.
+    #[test]
+    fn fill_sql_bounded_pins_max_and_daemon_chases_it() {
+        let bounded = fill_sql(
+            "dbo_orders",
+            "sys.fn_cdc_get_min_lsn('dbo_orders')",
+            500,
+            Some("0000002f000004d80005"),
+        );
+        assert!(
+            bounded.contains("DECLARE @max binary(10) = 0x0000002f000004d80005;"),
+            "bounded poll must pin @max to the open-time LSN: {bounded}"
+        );
+        assert!(
+            !bounded.contains("fn_cdc_get_max_lsn"),
+            "bounded poll must not consult the moving max LSN: {bounded}"
+        );
+        // The min-LSN retention guard must survive the pinning.
+        assert!(bounded.contains("sys.fn_cdc_get_min_lsn('dbo_orders')"));
+        assert!(bounded.contains("TOP (500)"));
+
+        let daemon = fill_sql("dbo_orders", "sys.fn_cdc_increment_lsn(0xabcd)", 500, None);
+        assert!(
+            daemon.contains("DECLARE @max binary(10) = sys.fn_cdc_get_max_lsn();"),
+            "daemon poll keeps chasing the head: {daemon}"
+        );
+    }
+
     fn cfg(capture_instance: &str) -> MssqlCdcConfig {
         MssqlCdcConfig {
             host: "127.0.0.1".into(),
@@ -517,6 +640,7 @@ mod tests {
             &cfg("dbo_cdc_unit"),
             None,
             crate::source::cdc::PeekBound::Sized(10_000),
+            DrainMode::Continuous,
         )
         .unwrap();
         let mut ops = Vec::new();

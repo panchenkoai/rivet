@@ -183,6 +183,65 @@ services:
       timeout: 3s
       retries: 10
 
+  # Opt-in standby pair (profile `cdc-standby`, separate from the `cdc` stack so
+  # it never touches it): a primary + its streaming replica, for the one scenario
+  # that needs a PostgreSQL IN RECOVERY — asserting bounded CDC on a standby fails
+  # loud. `trust` auth on the primary is what lets the standby's pg_basebackup
+  # connect for replication over the docker network. Brought up by
+  # `dev/cdc/stand.sh standby`.
+  pg-cdc-primary:
+    image: postgres:${POSTGRES_CDC_TAG:-16}
+    profiles: ["cdc-standby"]
+    command: ["-c", "wal_level=logical", "-c", "max_replication_slots=32", "-c", "max_wal_senders=8"]
+    environment:
+      POSTGRES_USER: rivet
+      POSTGRES_PASSWORD: rivet
+      POSTGRES_DB: rivet
+      POSTGRES_HOST_AUTH_METHOD: trust
+    ports:
+      - "5437:5432"
+    # trust auth covers `host all all` but NOT the `replication` pseudo-database;
+    # this init hook adds the replication line so pg_basebackup can connect.
+    volumes:
+      - ./dev/cdc/primary-hba.sh:/docker-entrypoint-initdb.d/00-replication-hba.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rivet"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+  pg-cdc-standby:
+    image: postgres:${POSTGRES_CDC_TAG:-16}
+    profiles: ["cdc-standby"]
+    depends_on:
+      pg-cdc-primary:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: rivet
+    ports:
+      - "5436:5432"
+    user: postgres
+    entrypoint:
+      - bash
+      - -c
+      - |
+        set -e
+        if [ ! -s "$$PGDATA/PG_VERSION" ]; then
+          until pg_basebackup -h pg-cdc-primary -p 5432 -U rivet -D "$$PGDATA" -Fp -Xs -R -P; do
+            echo "waiting for primary to accept replication..."; sleep 2
+          done
+        fi
+        # wal_level=logical matches a real standby of a logical primary — the
+        # primary sets it via a runtime flag (not postgresql.conf), so
+        # pg_basebackup doesn't copy it. Without this the standby boots `replica`
+        # and the fail-loud test hits a wal_level error instead of the true
+        # pg_current_wal_lsn()-in-recovery path the adapter guards.
+        exec docker-entrypoint.sh postgres -c wal_level=logical
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rivet && psql -U rivet -tAc 'SELECT pg_is_in_recovery()' | grep -qx t"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
   mysql-cdc:
     # Version-matrix knob (staff class #3): nightly runs the CDC
     # conformance lane against other tags via MYSQL_CDC_TAG.

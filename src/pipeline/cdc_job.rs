@@ -13,7 +13,7 @@ use super::finalize::finalize_run_report;
 use super::summary::RunSummary;
 use crate::config::{Config, ExportConfig};
 use crate::error::Result;
-use crate::source::cdc::{CdcCapture, CdcConfig, CdcEngine, CdcEngineOpts, run_capture};
+use crate::source::cdc::{CdcCapture, CdcConfig, CdcEngine, CdcEngineOpts, DrainMode, run_capture};
 use crate::state::StateStore;
 
 /// Run one `mode: cdc` export end to end, then record + report it like a batch
@@ -312,7 +312,7 @@ fn run_cdc_inner(
         cdc_cfg: CdcConfig {
             url,
             checkpoint: cdc.checkpoint.as_ref().map(PathBuf::from),
-            until_current: cdc.until_current,
+            drain: DrainMode::from_until_current(cdc.until_current),
             tls: config.source.tls.clone(),
             engine: match config.source.source_type {
                 crate::config::SourceType::Mysql => CdcEngineOpts::Mysql {

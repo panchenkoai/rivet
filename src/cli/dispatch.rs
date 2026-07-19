@@ -262,11 +262,11 @@ struct CdcArgs {
 fn dispatch_cdc(a: CdcArgs) -> Result<()> {
     let (url, _prov) = resolve_init_source(a.source, a.source_env, a.source_file)?;
     let ckpt = a.checkpoint.map(std::path::PathBuf::from);
-    use crate::source::cdc::{CdcEngine, CdcEngineOpts};
+    use crate::source::cdc::{CdcEngine, CdcEngineOpts, DrainMode};
     let cdc_cfg = crate::source::cdc::CdcConfig {
         url: url.clone(),
         checkpoint: ckpt.clone(),
-        until_current: a.until_current,
+        drain: DrainMode::from_until_current(a.until_current),
         // The CLI carries no TlsConfig; `None` ⇒ the require_tls_or_loopback gate
         // refuses a remote host (config-driven `rivet run` supplies source.tls).
         tls: None,

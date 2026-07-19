@@ -81,7 +81,7 @@ scenarios:
     postgres: { test: source_environment_local_runs_fast_profile_by_default }
     mysql:    { test: stand_environment_profile_mysql }
     mssql:    { test: stand_environment_profile_mssql }
-    mongo:    { na: "the tuning-profile governor (Log Flush Waits back-pressure) is SQL-only; no Mongo analogue" }
+    mongo:    { na: "the profile-DEFAULT label this scenario checks is computed engine-agnostically in plan::build (config.source.environment.map(default_profile), src/plan/build.rs:49-59) BEFORE any engine dispatch, and carried into RunSummary — a shared SourceConfig→summary path, identical for Mongo (same as the meta_columns `engine-agnostic — see postgres` na's). (The SQL-only Log-Flush-Waits RUNTIME governor is a different mechanism and not what this row tests.)" }
 
   - id: cross_db_parity
     what: "same seed on two engines → equal row count + equal PK id-set + identical empty-export behaviour"

@@ -1094,3 +1094,171 @@ fn mssql_cdc_until_current_terminates_under_sustained_writes() {
         );
     }
 }
+
+#[test]
+#[ignore = "live: requires docker compose mssql with SQL Server Agent + CDC"]
+fn roast_mssql_until_current_open_bound_two_runs_lose_nothing() {
+    // MSSQL peer of roast_pg_until_current_open_bound_two_runs_lose_nothing, but
+    // a DIFFERENT contract: termination comes from the engine, not the pin. The
+    // capture Agent's scan gaps hand the reader an empty poll sooner or later, so
+    // the drain exhausts even with the open-time @max pin DISABLED — verified by
+    // the disable-pin RED probe (the run still exited under a sustained writer).
+    // So the pinned @max is a PRECISE-STOP refinement, not load-bearing for
+    // termination (the load-bearing engines are PostgreSQL — continuous slot
+    // re-peek — and MongoDB — tailable stream; each hangs with its bound
+    // disabled). What THIS test proves is DEFER-NOT-DROP: run 1 captures a prefix,
+    // run 2 drains the tail, the union equals the SOURCE. Oracle: the source
+    // table (count/sum/min/max of id — the scalar helpers can't fetch a set),
+    // never rivet's own counters.
+    let _serial = CDC_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let table = unique_name("rivet_cdc_msob");
+    let ci = format!("dbo_{table}");
+    mssql_cdc_drop_table(&format!("dbo.{table}"));
+    mssql_cdc_exec(&format!(
+        "CREATE TABLE dbo.{table}(id BIGINT PRIMARY KEY, v INT)"
+    ));
+    enable_cdc(&table, &ci);
+    let _guard = MssqlCdcTable {
+        table: table.clone(),
+        ci: ci.clone(),
+    };
+
+    // Pre-open backlog: ids 0..30 (wait for the async capture job to copy them).
+    let vals: Vec<String> = (0..30).map(|i| format!("({i},{i})")).collect();
+    mssql_cdc_exec(&format!(
+        "INSERT INTO dbo.{table} VALUES {}",
+        vals.join(",")
+    ));
+    wait_for_capture(&ci, 30);
+
+    // A writer committing continuously while the bounded run drains.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_bg = stop.clone();
+    let table_bg = table.clone();
+    let bg = std::thread::spawn(move || {
+        let mut i = 10_000i64;
+        while !stop_bg.load(std::sync::atomic::Ordering::Relaxed) {
+            mssql_cdc_try_exec(&format!("INSERT INTO dbo.{table_bg} VALUES ({i},{i})"));
+            i += 1;
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    });
+
+    let rig = Rig::mssql_cdc(&table, &ci).cdc("until_current: true");
+    let cfg = rig.config_path();
+    let elapsed = run_rivet_bounded(&cfg, Duration::from_secs(30));
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = bg.join();
+    assert!(
+        elapsed.is_some(),
+        "run 1 must terminate at the open-time max-LSN bound under sustained writes"
+    );
+
+    // Let the capture job copy EVERYTHING the writer committed, then run 2
+    // drains the remainder from run 1's checkpoint.
+    let total = mssql_cdc_query_i64(&format!("SELECT COUNT(*) FROM dbo.{table}"));
+    wait_for_capture(&ci, total);
+    let elapsed2 = run_rivet_bounded(&cfg, Duration::from_secs(60));
+    assert!(
+        elapsed2.is_some(),
+        "run 2 (no writers) must drain the tail and exit"
+    );
+
+    let got: std::collections::BTreeSet<i64> =
+        dir_parquet_i64(&rig.out_dir(), "id").into_iter().collect();
+    let sum: i64 = got.iter().sum();
+    assert_eq!(
+        got.len() as i64,
+        total,
+        "distinct dest ids must match the source count"
+    );
+    assert_eq!(
+        sum,
+        mssql_cdc_query_i64(&format!("SELECT ISNULL(SUM(id),0) FROM dbo.{table}")),
+        "dest id sum must match the source"
+    );
+    assert_eq!(
+        got.first().copied(),
+        Some(mssql_cdc_query_i64(&format!(
+            "SELECT MIN(id) FROM dbo.{table}"
+        ))),
+        "dest min id must match the source"
+    );
+    assert_eq!(
+        got.last().copied(),
+        Some(mssql_cdc_query_i64(&format!(
+            "SELECT MAX(id) FROM dbo.{table}"
+        ))),
+        "dest max id must match the source"
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql with SQL Server Agent + CDC"]
+fn roast_mssql_cdc_large_transaction_is_atomic_across_a_mid_flush_crash() {
+    // MSSQL peer of roast_pg_cdc_large_transaction_is_atomic_across_a_mid_flush_
+    // crash. All change rows of one source transaction share `__$start_lsn`;
+    // every row used to carry `committed: true`, so a transaction larger than
+    // `rollover` rolled + CHECKPOINTED mid-group, and a crash before the tail
+    // flushed left the checkpoint at that start LSN — resume reads strictly AFTER
+    // it (`fn_cdc_increment_lsn`), skipping the rest of the same-LSN group and
+    // losing the tail. Fix: mark only the last row of each start-LSN group
+    // committed. RED-proof: one 12-row transaction at rollover 5, crash at
+    // `cdc_after_checkpoint_before_ack`. Oracle: the union of all parts on disk.
+    let _serial = CDC_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let d = tempfile::tempdir().unwrap();
+    let table = unique_name("rivet_cdc_msatomic");
+    let ci = format!("dbo_{table}");
+    mssql_cdc_drop_table(&format!("dbo.{table}"));
+    mssql_cdc_exec(&format!(
+        "CREATE TABLE dbo.{table}(id BIGINT PRIMARY KEY, v INT)"
+    ));
+    enable_cdc(&table, &ci);
+    let _guard = MssqlCdcTable {
+        table: table.clone(),
+        ci: ci.clone(),
+    };
+
+    // ONE transaction, 12 rows (> 2× the rollover of 5) — one `__$start_lsn`.
+    let vals: Vec<String> = (0..12).map(|i| format!("({i},{i})")).collect();
+    mssql_cdc_exec(&format!(
+        "INSERT INTO dbo.{table} VALUES {}",
+        vals.join(",")
+    ));
+    wait_for_capture(&ci, 12);
+
+    let ckpt = d.path().join("cdc.ckpt");
+    let out = d.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let rig = Rig::mssql_cdc(&table, &ci)
+        .cdc("rollover: 5")
+        .checkpoint_path(ckpt.clone())
+        .dest_path(out.clone());
+    // Run 1 crashes right after the checkpoint is persisted (MSSQL ack is a
+    // no-op; the checkpoint is the durable resume position).
+    let crashed = std::process::Command::new(RIVET_BIN)
+        .args(["run", "--config", rig.config_path().to_str().unwrap()])
+        .env("RIVET_TEST_PANIC_AT", "cdc_after_checkpoint_before_ack")
+        .output()
+        .expect("spawn rivet");
+    assert!(
+        !crashed.status.success(),
+        "the injected crash must fail run 1"
+    );
+
+    // Run 2 resumes from the checkpoint the crash left behind.
+    let rig2 = Rig::mssql_cdc(&table, &ci)
+        .checkpoint_path(ckpt.clone())
+        .dest_path(out.clone());
+    run_rivet_ok(&rig2.config_path());
+
+    let got: std::collections::BTreeSet<i64> = dir_parquet_i64(&out, "id").into_iter().collect();
+    let want: std::collections::BTreeSet<i64> = (0..12).collect();
+    assert_eq!(
+        got,
+        want,
+        "the 12-row transaction must survive the mid-flush crash whole — got {} ids \
+         (a mid-transaction checkpoint at the shared start LSN skipped the tail on resume)",
+        got.len()
+    );
+}

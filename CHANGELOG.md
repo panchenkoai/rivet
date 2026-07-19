@@ -1,5 +1,75 @@
 # Changelog
 
+## 0.20.1 — 2026-07-19
+
+### Fixed
+
+- **CDC `until_current` is now bounded at the position current when the run
+  OPENED, on every engine.** The open-time bound is load-bearing for termination
+  on the two engines with a re-reading / tailable reader: **PostgreSQL** (the
+  non-consuming logical-slot peek re-reads from its un-acked position, so a
+  "bounded" run chased a moving log end and never terminated under sustained
+  writes — live-reproduced past a 30 s ceiling; now snapshots
+  `pg_current_wal_lsn()` at open) and **MongoDB** (a tailable change stream whose
+  `next_if_any` keeps returning events under sustained writes, so the empty-poll
+  check never fires — the open-time cluster `operationTime` stops it; disabling
+  the pin hangs the sustained-writes test). MySQL (`BINLOG_DUMP_NON_BLOCK` EOF)
+  and SQL Server (the capture Agent's scan-gap empty poll) terminate natively and
+  now ALSO pin their open-time coordinate (binlog `(file,pos)` /
+  `fn_cdc_get_max_lsn()`) as a precise-stop refinement (verified fix-invariant
+  for termination by a disable-bound probe). Every engine's run is O(backlog at
+  open), and the deferred tail is never lost: the checkpoint stops at the last
+  in-bound commit and the next scheduler cycle resumes from it (per-engine
+  two-run defer-not-drop live tests; the PG variant's termination goes RED
+  without the bound).
+- **PostgreSQL CDC bounded runs now reach the open bound in one pass, whatever
+  the captured-data density.** The non-consuming `pg_logical_slot_peek_changes`
+  always re-reads from the slot's un-acked position, and the slot only advances
+  when the sink acks a captured-row part — so a span of WAL the run consumes but
+  does not capture (a large uncaptured-table transaction, BEGIN/COMMIT marker
+  rows, or an empty/DDL span) never advanced the slot: the peek re-read the same
+  window, the run exhausted, and it wrote `_SUCCESS` with in-bound captured data
+  still unread (RED-reproduced: with a 200-row uncaptured transaction ahead of
+  the captured backlog at a small rollover, a run captured **zero** in-bound
+  rows). The sink now runs a **re-drain loop** — after each pass it flushes and
+  acks the consumed span (advancing the slot past uncaptured/empty WAL, recorded
+  at its commit boundary before the routing filter), then re-peeks the fresh WAL
+  beyond it, until a pass yields nothing. The run reaches the open bound
+  regardless of density, and drain RSS stays at the documented O(rollover) (the
+  earlier 3× peek escalation, which only covered the captured-marker case, is
+  removed).
+- **PostgreSQL CDC: row-less transaction churn no longer pins the slot.** DDL
+  churn decodes as empty `BEGIN`/`COMMIT` transactions: nothing reaches the
+  sink, the sink never acks, and on an idle database the slot kept pinning WAL
+  behind the noise indefinitely (RED-reproduced: `confirmed_flush_lsn` frozen
+  across a 20-DDL run). A run that yielded ZERO data events now releases the
+  data-free span itself at clean exhaust — advancing past it can lose nothing
+  by construction; a run that yielded data leaves acking to the sink, and its
+  trailing empty span becomes the next run's zero-yield release. Engines with
+  reader-independent retention (MySQL/SQL Server/MongoDB) need nothing.
+- **Bounded CDC on a PostgreSQL standby now fails with an actionable error**
+  (`pg_current_wal_lsn()` is unavailable during recovery): stream continuously
+  or point the source at the primary.
+- **PostgreSQL and SQL Server CDC no longer lose the tail of a large
+  transaction across a crash.** Both adapters marked every change event
+  `committed: true`, so a source transaction larger than `rollover` rolled +
+  checkpointed MID-transaction; a crash between that checkpoint and the tail's
+  flush advanced the resume position (PG slot / MSSQL from-LSN) past the
+  transaction's commit, and resume — reading strictly after it — skipped the
+  rest, an at-least-once break (RED-reproduced on both: a 12-row transaction at
+  rollover 5 crashed mid-flush lost 7 rows). Both now mark only the LAST event
+  of a transaction committed (mirroring MySQL's XID model), so the sink rolls
+  only at the true commit boundary and a transaction is always one atomic unit
+  ("never split a transaction across parts"). Pre-existing (not introduced by
+  the `until_current` work); surfaced by an adversarial review.
+- **CDC: an oversized single transaction now bails loudly instead of risking
+  OOM.** A transaction is buffered whole (never split across parts), so an
+  outsized one grew the buffer unbounded. Every log/poll adapter
+  (PostgreSQL/MySQL/SQL Server) now caps its per-transaction buffer at a shared
+  `max_tx_rows()` (default 5,000,000; `RIVET_CDC_MAX_TX_ROWS` overrides) and
+  fails with a clear message naming the cap, rather than OOM-ing or capturing a
+  partial transaction.
+
 ## 0.20.0 — 2026-07-16
 
 ### Added

@@ -188,8 +188,8 @@ pub(crate) trait ChangeStream {
 /// position after each (when `checkpoint` is set). Stops at end of stream,
 /// `max_events`, or interruption.
 ///
-/// (Candidate 3 will branch the output here onto the Parquet/CSV sink; today it
-/// is NDJSON only.)
+/// (The typed Parquet/CSV sink is the separate [`sink::run_to_files`] driver —
+/// ADR-0023 keeps the two loops apart on purpose.)
 pub(crate) fn run(
     stream: &mut dyn ChangeStream,
     checkpoint: Option<PathBuf>,
@@ -259,6 +259,76 @@ pub(crate) enum CdcEngineOpts {
     Mongo { canonical: bool },
 }
 
+/// How a capture run ends — ONE name for the concept that used to cross the
+/// adapter seam as three differently-aliased bools (`bound_at_open`,
+/// `non_block`, `until_current`), and the canonical home of the bounded run's
+/// termination contract.
+///
+/// `BoundedAtOpen` (`until_current: true` — the scheduler model): capture up to
+/// the source's position AS OF STREAM OPEN, then exit. Every adapter pins the
+/// ceiling at open (PostgreSQL `pg_current_wal_lsn()`; MySQL the binlog
+/// coordinates; SQL Server `fn_cdc_get_max_lsn()`; MongoDB the cluster
+/// `operationTime`), so a hot table whose writers outpace the drain cannot keep
+/// the run alive — the run's work is O(backlog at open). Termination is
+/// LOAD-BEARING on this bound for the two engines with a re-reading / tailable
+/// reader: PostgreSQL (the non-consuming slot peek re-reads from the un-acked
+/// position, otherwise chasing a moving log end) and MongoDB (a tailable change
+/// stream whose `next_if_any` keeps returning events under sustained writes, so
+/// the empty-poll target check never fires — the cluster-time bound is what
+/// stops it, verified by disabling the pin: the sustained-writes test then
+/// hangs). MySQL (`BINLOG_DUMP_NON_BLOCK` EOF) and SQL Server (the capture
+/// Agent's scan-gap empty poll) terminate NATIVELY, so their bound is a
+/// precise-stop refinement (verified fix-invariant for termination by a
+/// disable-bound probe). The excluded tail is deferred, never lost: the
+/// checkpoint stops at the last in-bound commit and the next run resumes there —
+/// the defer-not-drop contract every engine's two-run test proves
+/// (`roast_*_until_current_open_bound_two_runs_lose_nothing`; the PG variant, at
+/// rollover 5, is the one whose TERMINATION genuinely goes RED without the
+/// bound).
+///
+/// `Continuous` (the daemon model): no open-time ceiling. MySQL blocks on the
+/// binlog; the poll adapters still exit on catch-up and an outer loop re-wraps
+/// them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DrainMode {
+    BoundedAtOpen,
+    Continuous,
+}
+
+impl DrainMode {
+    /// The user-facing surface stays a bool (`cdc.until_current` /
+    /// `--until-current`); internally the mode travels under one name.
+    pub(crate) fn from_until_current(until_current: bool) -> Self {
+        if until_current {
+            DrainMode::BoundedAtOpen
+        } else {
+            DrainMode::Continuous
+        }
+    }
+
+    pub(crate) fn is_bounded(self) -> bool {
+        matches!(self, DrainMode::BoundedAtOpen)
+    }
+}
+
+/// Memory backstop shared by every log/poll adapter: a transaction is buffered
+/// WHOLE (never split across parts), so an oversized one would grow the tx buffer
+/// unbounded. Each adapter caps its per-transaction buffer at this and bails
+/// loudly rather than OOM. Default 5M rows (a real OLTP transaction is far
+/// below). `RIVET_CDC_MAX_TX_ROWS` overrides it — test-only, so the cap is
+/// reachable without seeding a 5-million-row transaction. Read once.
+pub(crate) fn max_tx_rows() -> usize {
+    use std::sync::OnceLock;
+    static CELL: OnceLock<usize> = OnceLock::new();
+    *CELL.get_or_init(|| {
+        std::env::var("RIVET_CDC_MAX_TX_ROWS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(5_000_000)
+    })
+}
+
 /// Connection + resume parameters for `rivet cdc`, across engines — the CDC
 /// sibling of [`crate::source::create_source`]'s `SourceConfig`. The fields here
 /// are engine-agnostic; per-engine knobs live in [`CdcEngineOpts`].
@@ -267,10 +337,9 @@ pub(crate) struct CdcConfig {
     /// MySQL checkpoint file (PG resumes via the slot; SQL Server via its LSN;
     /// MongoDB via the resume token).
     pub checkpoint: Option<PathBuf>,
-    /// Catch up to the source's current end and exit, instead of streaming
-    /// indefinitely. MySQL sets `BINLOG_DUMP_NON_BLOCK`; PG / SQL Server drain
-    /// their backlog and exit; MongoDB polls with `next_if_any` to "current".
-    pub until_current: bool,
+    /// How this capture run ends — see [`DrainMode`], the canonical home of the
+    /// termination contract.
+    pub drain: DrainMode,
     /// Transport security, applied by every adapter through the same
     /// `require_tls_or_loopback` gate the batch path uses (refuse remote
     /// plaintext / unauthenticated TLS). `None` ⇒ loopback-only (the CLI default).
@@ -279,20 +348,20 @@ pub(crate) struct CdcConfig {
     pub engine: CdcEngineOpts,
 }
 
-/// How many changes a poll adapter pulls per `peek` — the drain's memory bound.
-/// It is NOT a free number: on PostgreSQL the peek is non-consuming and pages
-/// forward only when the sink acks (advances the slot) at a `rollover` boundary,
-/// so a peek SMALLER than the part rollover starves — the second peek re-reads
-/// the same changes, trips `exhausted`, and drops the rest of the backlog. This
-/// enum makes that unrepresentable: the acking sink builds [`PeekBound::Sized`]
-/// **from its own rollover** (so peek == rollover, always ≥), and the NDJSON
-/// driver — which never acks — is [`PeekBound::Unbounded`] (one peek drains
-/// everything; the LSN-frontier check ends the stream). There is no way to hand
-/// the stream a bare "peek 500" that undershoots the rollover.
+/// The sink's ACK CADENCE, handed to a poll adapter to size one peek — the
+/// drain's memory bound (O(rollover), never O(total backlog)). On PostgreSQL the
+/// peek is non-consuming: it re-reads from the slot's un-acked position every
+/// time, so a peek NEVER slides forward on its own — only an ack (slot advance)
+/// moves it. Reaching the open bound past a foreign/empty span larger than one
+/// window is therefore NOT this budget's job (no budget covers an uncaptured or
+/// empty span, whose wire:capture ratio is unbounded): the sink's re-drain loop
+/// acks the consumed span and re-peeks the fresh WAL beyond it
+/// ([`sink::run_to_files`]). `Sized` just carries the rollover — one ack's worth
+/// per peek; the non-acking NDJSON driver is `Unbounded` (one peek drains
+/// everything, the frontier check ends the stream, no re-drain).
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum PeekBound {
-    /// Peek at most this many changes per batch — the sink passes its part
-    /// `rollover`, so it is ≥ rollover by construction.
+    /// The sink's part `rollover` — one ack cadence per peek.
     Sized(usize),
     /// One peek pulls the whole backlog (the non-acking NDJSON path).
     Unbounded,
@@ -376,6 +445,7 @@ impl CdcEngine {
                     resume_expected,
                     tls,
                     PeekBound::Unbounded,
+                    DrainMode::Continuous, // anchor-only open — never read, no bound to pin
                 )?);
                 Ok(())
             }
@@ -428,7 +498,8 @@ pub(crate) const MONGO_CDC_HINT: &str = "if this is a setup error: MongoDB chang
 
 /// Construct the right [`ChangeStream`] adapter for the source URL's scheme —
 /// dispatching by engine exactly as [`crate::source::create_source`] does for the
-/// batch path.
+/// batch path. `cfg.drain` reaches every adapter as-is — the open-time-ceiling
+/// contract lives on [`DrainMode`].
 pub(crate) fn create_change_stream(
     cfg: &CdcConfig,
     peek: PeekBound,
@@ -443,7 +514,7 @@ pub(crate) fn create_change_stream(
                 url,
                 *server_id,
                 cfg.checkpoint.as_deref(),
-                cfg.until_current,
+                cfg.drain,
                 tls,
             )
             .context(MYSQL_CDC_HINT)?,
@@ -464,6 +535,7 @@ pub(crate) fn create_change_stream(
                     resume_expected,
                     tls,
                     peek,
+                    cfg.drain,
                 )
                 .context(PG_CDC_HINT)?,
             ))
@@ -487,7 +559,7 @@ pub(crate) fn create_change_stream(
                 });
             Ok(Box::new(
                 crate::source::mssql::cdc::MssqlChangeStream::from_url(
-                    url, ci, from_lsn, tls, peek,
+                    url, ci, from_lsn, tls, peek, cfg.drain,
                 )
                 .context(MSSQL_CDC_HINT)?,
             ))
@@ -501,7 +573,7 @@ pub(crate) fn create_change_stream(
                 tls,
                 cfg.checkpoint.as_deref(),
                 *canonical,
-                cfg.until_current,
+                cfg.drain,
             )
             .context(MONGO_CDC_HINT)?,
         )),
@@ -686,6 +758,22 @@ pub(crate) fn run_capture(cap: CdcCapture<'_>) -> Result<Vec<crate::manifest::Ru
 
 #[cfg(test)]
 mod tests {
+    // The offline mutation guard for the DrainMode glue: both helpers are
+    // otherwise exercised only through I/O paths (dispatch, cdc_job, adapter
+    // opens), so an inverted mapping would survive the CI mutants gate's
+    // `--lib` run.
+    #[test]
+    fn drain_mode_maps_the_config_bool_and_bounds() {
+        use super::DrainMode;
+        assert_eq!(
+            DrainMode::from_until_current(true),
+            DrainMode::BoundedAtOpen
+        );
+        assert_eq!(DrainMode::from_until_current(false), DrainMode::Continuous);
+        assert!(DrainMode::BoundedAtOpen.is_bounded());
+        assert!(!DrainMode::Continuous.is_bounded());
+    }
+
     /// Finding #43: `rivet init --mode cdc` scaffolds
     /// `checkpoint: ./cdc/<table>.ckpt`; the first save must create the
     /// parent, or every fresh quickstart dies on ENOENT dressed in the

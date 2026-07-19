@@ -406,6 +406,7 @@ fn every_live_cdc_test_asserts_an_outcome() {
                 // must-fail test's NEGATIVE exit assert IS an outcome (below).
                 || chunk.contains("!out.status.success()")
                 || chunk.contains("!res.status.success()")
+                || chunk.contains("!output.status.success()")
                 || chunk.contains("read_cdc_rows(") // replica-suite replay oracle
                 // `rivet validate` re-reads the destination (parts + manifest +
                 // checksums) — an independent read-back, not the capture's exit.

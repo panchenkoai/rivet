@@ -393,6 +393,92 @@ fn roast_until_current_terminates_under_sustained_writes_and_keeps_backlog() {
 
 #[test]
 #[ignore = "live: requires docker compose up -d mongo-rs"]
+fn roast_mongo_cdc_until_current_open_bound_two_runs_lose_nothing() {
+    // The matrix cell cdc_until_current_open_bound_two_runs was `na` on Mongo,
+    // claiming joint coverage by the terminates-under-writes test (which has NO
+    // run 2 and never asserts the live tail) and the resume-drain test (whose
+    // run 2 drains a ZERO tail — no live writer). Neither asserts the DEFER-NOT-
+    // DROP UNION the SQL peers do (roast_{mysql,pg}_until_current_open_bound_two_
+    // runs_lose_nothing): run 1 stops at a PREFIX of a live-writer stream, run 2
+    // drains the deferred tail, and the distinct-id union re-read from the parquet
+    // equals the SOURCE id set. This test completes the per-engine union set the
+    // CLAUDE.md until_current rule names.
+    //
+    // Two contracts here, with different weights (per that rule):
+    //  - TERMINATION is LOAD-BEARING on Mongo: the open-time cluster-time bound
+    //    clips a tailable stream that would otherwise never empty-poll under
+    //    sustained writes. The `run 1 terminates` assert goes RED if the bound is
+    //    disabled (run 1 hangs, killed at 30s) — the real RED lever here.
+    //  - DEFER-NOT-DROP (the union) is a BELT-AND-SUSPENDERS confirmation, NOT a
+    //    silent-loss guard: Mongo's checkpoint is the last EMITTED event's own
+    //    resume token (sink-driven; the idle-anchor pin fires only at a fresh
+    //    open, never over-advancing at close), and the deferred tail is strictly
+    //    AFTER it, so run 2 always recovers it — structural immunity via per-event
+    //    tokens, the same reason cdc_large_transaction_atomic_across_crash is `na`
+    //    on Mongo. The union assert can't go RED against a one-line clip mutant;
+    //    it guards a future refactor away from per-event tokens. Oracle: the
+    //    source collection, never rivet's own counters.
+    require_alive(LiveService::MongoRs);
+    let db = unique_name("cdc_mongoob");
+    let m = MongoTest::connect(PORT, &db);
+    m.drop_collection("t");
+
+    let rig = cdc(&db, "t");
+    rig.run_ok(); // pin over the quiet collection, before the backlog
+
+    // Pre-open backlog: _id 0..29.
+    for i in 0..30 {
+        m.upsert_set("t", i, "v", "backlog");
+    }
+
+    // A writer floods _id 10000+ THROUGH run 1, so run 1's open-time cluster-time
+    // bound falls mid-stream and it must terminate on a PREFIX, deferring the tail.
+    let bg_db = db.clone();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_bg = stop.clone();
+    let bg = std::thread::spawn(move || {
+        let w = MongoTest::connect(PORT, &bg_db);
+        let mut i = 10_000i64;
+        while !stop_bg.load(std::sync::atomic::Ordering::Relaxed) {
+            w.upsert_set("t", i, "v", "live");
+            i += 1;
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        }
+    });
+
+    let cfg = rig.config_path();
+    // Run 1 must TERMINATE under sustained writes (the cluster-time bound clips
+    // it); killed at 30s if it hangs.
+    let elapsed = run_rivet_bounded(&cfg, std::time::Duration::from_secs(30));
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = bg.join();
+    assert!(
+        elapsed.is_some(),
+        "run 1 must terminate at the open-time cluster-time bound under sustained writes (killed at 30s)"
+    );
+
+    // Writer stopped ⇒ every committed change now predates run 2's own bound.
+    let elapsed2 = run_rivet_bounded(&cfg, std::time::Duration::from_secs(60));
+    assert!(
+        elapsed2.is_some(),
+        "run 2 (no writers) must drain the deferred tail and exit"
+    );
+
+    let got = dir_parquet_distinct_strings(&rig.out_dir(), "_id");
+    let want: std::collections::BTreeSet<String> = m
+        .current_state_i64("t", "v")
+        .into_keys()
+        .map(|k| k.to_string())
+        .collect();
+    assert_eq!(
+        got, want,
+        "run1 ∪ run2 must hold exactly the source's committed _ids — the open-time \
+         bound defers the tail to run 2, never drops it"
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mongo-rs"]
 fn roast_uncaptured_collection_drop_does_not_wedge_capture() {
     // A whole-db watch also sees DDL (`drop`/`rename`) for OTHER collections.
     // The op mapping used to `bail!` on any non-row op, so dropping an uncaptured

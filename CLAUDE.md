@@ -102,6 +102,27 @@ divergence — use `diverge(target, autoload, note, None)` with the true
 autoload when it's lossy. Both were silent: a preflight report confidently
 describing a type the warehouse would reject or silently coerce.
 
+## The `committed` flag marks a TRANSACTION boundary — never every event
+
+The sink rolls (flush → checkpoint → ack) only on a `committed` event, to keep
+the "never split a transaction across parts" invariant. So `committed` must mark
+the LAST event of a source transaction, NOT every event. MySQL got this right
+(only the XID event is `committed`), but PostgreSQL (`test_decoding`) and SQL
+Server (change-table rows) shipped `committed: true` on EVERY event — so a
+transaction larger than `rollover` rolled + checkpointed MID-transaction, and a
+crash between that checkpoint and the tail's flush advanced the resume position
+(PG slot / MSSQL from-LSN) PAST the transaction's commit; resume reads strictly
+after it and skips the tail — an at-least-once break (RED-proven both engines:
+a 12-row transaction at rollover 5, crashed at `cdc_after_ack` (PG) /
+`cdc_after_checkpoint_before_ack` (MSSQL), lost 7 rows). Fix: the adapter frames
+the transaction (PG BEGIN…COMMIT; MSSQL rows sharing `__$start_lsn`) and marks
+only its last event `committed`. Process rule: **any new poll/log CDC adapter
+must mark `committed` at the true commit boundary, and a large-transaction
+mid-flush-crash test (`roast_*_large_transaction_is_atomic_across_a_mid_flush_
+crash`) must RED against a `committed: true`-on-every-event mutant.** The tell
+that this is wrong: `committed` set unconditionally in the per-event constructor
+instead of computed from the transaction framing.
+
 ## CDC resume is per-engine — verify it empirically, twice
 
 A CDC adapter that **captures** correctly can still fail to **resume**:
@@ -134,6 +155,73 @@ checkpointed open must persist its coordinates immediately
 (`first_run_with_zero_changes_pins_the_checkpoint_at_open`). A new engine
 must state which of the three anchor models it has and test the idle
 variant accordingly.
+
+## A bounded drain stops at an OPEN-TIME snapshot, never "when it catches up"
+
+`until_current` must mean "current as of the moment the run opened" — a
+snapshot taken at open (PG `pg_current_wal_lsn()`, MSSQL `fn_cdc_get_max_lsn()`
+pinned once, MySQL the open-time binlog coordinates, Mongo `operationTime`) with
+the first commit PAST it ending the stream. But be honest about WHICH engine
+actually needs it, and **run the disable-bound probe PER ENGINE — never
+generalize one engine's result to another** (this bit twice: the first pass
+over-claimed "three of four shipped chasing"; the honesty-correction then
+over-corrected the OTHER way — "only PG is load-bearing" — by generalizing the
+MySQL/MSSQL probe to Mongo WITHOUT probing Mongo, and a round-2 review caught
+that Mongo actually hangs without its bound). The truth, each verified by
+disabling that engine's bound: **load-bearing** on the two engines with a
+re-reading / tailable reader — PostgreSQL (non-consuming slot peek re-reads from
+the un-acked position; a paced 10-row/5 ms writer held it past a 30 s ceiling)
+and MongoDB (a tailable change stream whose `next_if_any` keeps returning events
+under sustained writes, so the empty-poll check never fires — disabling
+`until_current_ts` HANGS the sustained-writes test). **Belt-and-suspenders** on
+the two with native catch-up — MySQL (`BINLOG_DUMP_NON_BLOCK` EOF) and MSSQL (the
+Agent's scan-gap empty poll) terminate with the bound disabled, so their
+open-time pin is only a precise-stop refinement. The excluded tail is deferred,
+never lost: checkpoint stops at the last in-bound commit, the next cycle resumes
+there — the two-run union test proves DEFER-NOT-DROP on every engine
+(`roast_*_until_current_open_bound_two_runs_lose_nothing`), but only the
+load-bearing engines' TERMINATION goes RED without the bound; the others are
+belt-and-suspenders confirmations (say so in the test, don't claim they prove
+the clip). Keep the catch-up exit as the backstop, gate the snapshot on
+`until_current` so the daemon mode is untouched, and fail OPEN on an unparseable
+boundary (delayed termination is recoverable; an early exit is a dropped commit).
+
+Sibling trap this class caught, and a warning about band-aid fixes: **a
+non-consuming peek only slides forward when the consumer ACKS — so slot progress
+is the sink's job, not the peek budget's.** PG's `pg_logical_slot_peek_changes`
+re-reads from the slot's un-acked position every call, and the slot advances
+only when the sink acks a captured part. So ANY WAL the run consumes but does
+not capture — an uncaptured-table transaction, the `BEGIN`/`COMMIT` marker rows,
+an empty/DDL span — never moved the slot: the peek re-read the same window, the
+run exhausted, and it wrote `_SUCCESS` with in-bound captured data unread. The
+FIRST fix (a ×3 peek escalation) was a band-aid — it covered the captured-marker
+ratio (3 wire rows : 1 change) but an uncaptured/empty span has an UNBOUNDED
+wire:capture ratio, so a span larger than the escalated window still starved
+(an ultracode review found this: `roast_pg_cdc_reaches_open_bound_past_a_large_
+uncaptured_transaction` — a 200-row uncaptured tx ahead of the backlog captured
+ZERO in-bound rows at rollover 5). The real fix is a **sink re-drain loop**
+(`src/source/cdc/sink.rs::run_to_files`): each pass flushes + acks the consumed
+span (advancing the slot past uncaptured/empty WAL, whose commit boundary is
+recorded before the routing filter), then re-peeks fresh WAL, until a pass
+yields nothing — reaching the bound at any density, RSS back to O(rollover).
+Process rule: **when a re-read/starvation shows up on a non-consuming reader,
+fix it by ACKING the consumed span (advance the cursor), not by peeking more —
+a bigger peek only defers the same starvation to a larger span.** A starvation
+fixture must put UNCAPTURED or empty traffic ahead of the captured data (the
+unbounded-ratio shape), not just single-row captured txs (ratio 3, which a fixed
+budget can cover).
+
+Second sibling, from the adversarial pass over the same branch: **row-less
+transactions starve the ACK, not just the budget**. DDL churn decodes as empty
+BEGIN/COMMIT pairs — no events reach the sink, the sink never acks, and on a
+consume-retention engine (PG slot) the anchor pins WAL behind the noise forever
+on an idle database (RED: `confirmed_flush_lsn` frozen across a DDL-churn run).
+A ZERO-YIELD run must release the data-free span itself (safe by construction
+— `release_empty_frontier`); engines whose retention is reader-independent
+(MySQL binlog, MSSQL change tables, Mongo oplog) need nothing. When adding a
+consume-retention engine, test the DDL-churn case against the SERVER's anchor
+position, never rivet's counters (`roast_pg_cdc_empty_transaction_churn_must_
+not_pin_the_slot`).
 
 ## Sink part names must be run-unique — prove it with a two-run test
 

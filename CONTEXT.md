@@ -143,3 +143,16 @@ at the destination, via the free listing MD5 — never by re-download. `passed` 
 doesn't count), computed once via `recompute_passed`, not hand-flipped per site.
 _Avoid_: integrity level (removed — a single-variant enum that duplicated the
 md5/size-only counters), validation depth.
+
+## CDC capture
+
+**DrainMode**:
+How a CDC capture run ends — `BoundedAtOpen` (`until_current: true`: capture up
+to the source's position pinned at stream open, then exit; work is O(backlog at
+open); the excluded tail is deferred to the next run's resume, never lost) or
+`Continuous` (daemon: no open-time ceiling). ONE name for the concept across the
+config, `create_change_stream`, and every adapter's `open` — it used to travel
+as three differently-aliased bools (`bound_at_open`, `non_block`,
+`until_current`). The termination contract lives on this enum's doc
+(`src/source/cdc/mod.rs`). _Avoid_: bounded flag, non-block mode, until-current
+mode (as a type name — `until_current` remains the user-facing config key).

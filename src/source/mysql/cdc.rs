@@ -27,7 +27,7 @@ use serde_json::{Value as Json, json};
 use crate::config::TlsConfig;
 use crate::error::Result;
 use crate::source::cdc::value::RivetValue;
-use crate::source::cdc::{ChangeEvent, ChangeOp, ChangeStream, Position};
+use crate::source::cdc::{ChangeEvent, ChangeOp, ChangeStream, DrainMode, Position};
 use crate::source::require_tls_or_loopback;
 
 /// A blocking iterator of canonical [`ChangeEvent`]s over a MySQL binlog stream.
@@ -56,28 +56,46 @@ pub(crate) struct MysqlChangeStream {
     /// whole transaction is released atomically with the commit position.
     tx: Vec<ChangeEvent>,
     file: String,
+    /// Open-time `(binlog_file, pos)` ceiling for a bounded run — the first
+    /// commit past it ends the stream (`BINLOG_DUMP_NON_BLOCK`'s EOF stays as
+    /// the catch-up backstop, which backpressure alone can push out
+    /// indefinitely); `None` (daemon) streams forever. The contract lives on
+    /// [`DrainMode`].
+    bound: Option<(String, u64)>,
+    /// Bound tripped — the stream ended at the open-time ceiling. Sticky, so the
+    /// sink's re-drain pass (which re-calls `next_change` after acking) returns
+    /// `None` at once instead of consuming — and re-deferring — the past-bound
+    /// events the next run will re-read from the checkpoint.
+    past_bound: bool,
 }
 
 impl MysqlChangeStream {
     /// Open a stream from an explicit `(binlog_file, pos)` coordinate.
     ///
-    /// `non_block` ⇒ set `BINLOG_DUMP_NON_BLOCK`: the server streams all binlog up
-    /// to the current end and then sends EOF instead of blocking for more. That
-    /// turns MySQL into the same drain-and-exit poll model as PostgreSQL / SQL
-    /// Server — a bounded "catch up to now and stop" run, ideal for a scheduler.
+    /// A [`DrainMode::BoundedAtOpen`] run sets `BINLOG_DUMP_NON_BLOCK` (the
+    /// server streams to the current end and sends EOF instead of blocking —
+    /// the catch-up backstop) AND pins the open-time coordinates as the stop
+    /// ceiling (see [`Self::bound`]).
     pub(crate) fn open(
         url: &str,
         server_id: u32,
         file: String,
         pos: u64,
-        non_block: bool,
+        mode: DrainMode,
         tls: Option<&TlsConfig>,
     ) -> Result<Self> {
+        // Snapshot the ceiling BEFORE the dump starts: every commit already in
+        // the log is ≤ it, and anything racing in after is the next run's work.
+        let bound = if mode.is_bounded() {
+            Some(Self::current_coordinates(url, tls)?)
+        } else {
+            None
+        };
         let conn = connect_conn(url, tls)?;
         let mut req = BinlogRequest::new(server_id)
             .with_filename(file.clone().into_bytes())
             .with_pos(pos);
-        if non_block {
+        if mode.is_bounded() {
             req = req.with_flags(BinlogDumpFlags::BINLOG_DUMP_NON_BLOCK);
         }
         let stream = conn.get_binlog_stream(req)?;
@@ -87,6 +105,8 @@ impl MysqlChangeStream {
             pending: VecDeque::new(),
             tx: Vec::new(),
             file,
+            bound,
+            past_bound: false,
         })
     }
 
@@ -126,26 +146,29 @@ impl MysqlChangeStream {
     }
 
     /// Open a stream from the source's *current* position (`SHOW MASTER STATUS`).
+    /// Test-only convenience: every production path goes through
+    /// [`Self::open_or_resume`].
+    #[cfg(test)]
     pub(crate) fn open_from_current(
         url: &str,
         server_id: u32,
-        non_block: bool,
+        mode: DrainMode,
         tls: Option<&TlsConfig>,
     ) -> Result<Self> {
         let (file, pos) = Self::current_coordinates(url, tls)?;
-        Self::open(url, server_id, file, pos, non_block, tls)
+        Self::open(url, server_id, file, pos, mode, tls)
     }
 
     /// Resume from a persisted [`Position`] checkpoint, or start from the current
     /// position on the first run (no checkpoint yet). The MySQL position shape is
-    /// `{"file": String, "pos": u64}`. `non_block` ⇒ drain to the current end and
-    /// exit (see [`Self::open`]).
+    /// `{"file": String, "pos": u64}`. Bounded/continuous per `mode` (see
+    /// [`Self::open`]).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn open_or_resume(
         url: &str,
         server_id: u32,
         ckpt: Option<&Path>,
-        non_block: bool,
+        mode: DrainMode,
         tls: Option<&TlsConfig>,
     ) -> Result<Self> {
         if let Some(path) = ckpt
@@ -162,7 +185,7 @@ impl MysqlChangeStream {
                 .get("pos")
                 .and_then(Json::as_u64)
                 .ok_or_else(|| anyhow::anyhow!("mysql cdc checkpoint missing 'pos'"))?;
-            return Self::open(url, server_id, file, p, non_block, tls);
+            return Self::open(url, server_id, file, p, mode, tls);
         }
         // First run (no checkpoint yet): anchor at the current position and persist
         // it IMMEDIATELY. PostgreSQL pins its anchor server-side at open (slot
@@ -174,12 +197,15 @@ impl MysqlChangeStream {
         if let Some(path) = ckpt {
             Position(serde_json::json!({ "file": file, "pos": pos })).save(path)?;
         }
-        Self::open(url, server_id, file, pos, non_block, tls)
+        Self::open(url, server_id, file, pos, mode, tls)
     }
 
     /// Pull one binlog event and expand it into `pending`. `Ok(false)` ⇒ stream
     /// ended; `Ok(true)` ⇒ consumed an event.
     fn fill(&mut self) -> Result<bool> {
+        if self.past_bound {
+            return Ok(false); // ended at the open-time ceiling — stay ended
+        }
         let ev = match self.stream.next() {
             Some(ev) => ev?,
             None => return Ok(false),
@@ -236,9 +262,10 @@ impl MysqlChangeStream {
                         seq: 0, // stamped by TxnSeq as the stream is consumed
                     });
                 }
-                if self.tx.len() > MAX_TX_ROWS {
+                let cap = crate::source::cdc::max_tx_rows();
+                if self.tx.len() > cap {
                     anyhow::bail!(
-                        "mysql cdc: a single transaction buffered more than {MAX_TX_ROWS} rows \
+                        "mysql cdc: a single transaction buffered more than {cap} rows \
                          before its commit — refusing to buffer unbounded (raise the cap only if \
                          a transaction this large is genuinely expected)"
                     );
@@ -248,6 +275,17 @@ impl MysqlChangeStream {
             // in the transaction and mark the last one committed, then release the
             // whole transaction atomically.
             Some(EventData::XidEvent(_)) => {
+                // A commit past the open-time ceiling belongs to the next run:
+                // end the stream WITHOUT releasing the transaction — the
+                // checkpoint never advances past it, so the resume re-reads it
+                // in full. `past_bound` is sticky so the sink's re-drain pass
+                // returns `None` at once rather than consuming (and re-deferring)
+                // more past-bound events.
+                if commit_past_bound(&self.file, log_pos, self.bound.as_ref()) {
+                    self.tx.clear();
+                    self.past_bound = true;
+                    return Ok(false);
+                }
                 let commit = Position(json!({ "file": self.file, "pos": log_pos }));
                 let tx: Vec<ChangeEvent> = self.tx.drain(..).collect();
                 let n = tx.len();
@@ -290,10 +328,28 @@ fn connect_conn(url: &str, tls: Option<&TlsConfig>) -> Result<Conn> {
     Ok(conn)
 }
 
-/// Memory backstop: a single transaction is buffered until its `XID`, so an
-/// oversized (or crafted) transaction would grow `tx` unbounded. Cap it and bail
-/// loudly rather than OOM. A real OLTP transaction is far below this.
-const MAX_TX_ROWS: usize = 5_000_000;
+/// Is the commit at `(file, pos)` PAST the open-time bound? — the pure heart of
+/// the bounded run's termination contract (see [`MysqlChangeStream::bound`]).
+/// Binlog files order by their numeric suffix (`binlog.000042`); a lexicographic
+/// compare breaks at the 999999 → 1000000 width rollover, so parse the ordinal
+/// (one server has one basename — rotation never changes it mid-stream). Fails
+/// open: an unparseable name is never "past" — the `BINLOG_DUMP_NON_BLOCK` EOF
+/// backstop still ends the run (delayed termination, never a dropped commit).
+fn commit_past_bound(file: &str, pos: u64, bound: Option<&(String, u64)>) -> bool {
+    let Some((bound_file, bound_pos)) = bound else {
+        return false;
+    };
+    let (Some(cur), Some(bnd)) = (binlog_file_ordinal(file), binlog_file_ordinal(bound_file))
+    else {
+        return false;
+    };
+    cur > bnd || (cur == bnd && pos > *bound_pos)
+}
+
+/// The numeric suffix of a binlog file name (`mysql-bin.000042` → 42).
+fn binlog_file_ordinal(name: &str) -> Option<u64> {
+    name.rsplit_once('.')?.1.parse().ok()
+}
 
 /// Decode a binlog row's cells to typed [`RivetValue`]s (structural — no string
 /// reparse of temporals).
@@ -389,6 +445,46 @@ mod tests {
     // The `mysql-cdc` instance (cdc profile, :3307) — binlog + a REPLICATION grant.
     const URL: &str = "mysql://rivet:rivet@127.0.0.1:3307/rivet";
 
+    // The until_current termination contract, as a pure matrix: at the bound is
+    // in scope, past it (by pos or by a later file) is not, the file compare is
+    // ordinal (survives the 999999 → 1000000 suffix-width rollover where a
+    // lexicographic compare inverts), and unparseable names fail open.
+    #[test]
+    fn commit_past_bound_matrix() {
+        let bound = ("binlog.000042".to_string(), 1000u64);
+        // Daemon (no bound): never past.
+        assert!(!commit_past_bound("binlog.000099", u64::MAX, None));
+        // Same file: at the bound is in scope, one byte past is not.
+        assert!(!commit_past_bound("binlog.000042", 999, Some(&bound)));
+        assert!(!commit_past_bound("binlog.000042", 1000, Some(&bound)));
+        assert!(commit_past_bound("binlog.000042", 1001, Some(&bound)));
+        // Earlier / later file: pos is irrelevant.
+        assert!(!commit_past_bound("binlog.000041", u64::MAX, Some(&bound)));
+        assert!(commit_past_bound("binlog.000043", 4, Some(&bound)));
+        // Suffix-width rollover: 1000000 > 999999 ordinally, though it is
+        // lexicographically SMALLER ("1…" < "9…").
+        let wide = ("mysql-bin.999999".to_string(), 1000u64);
+        assert!(commit_past_bound("mysql-bin.1000000", 4, Some(&wide)));
+        assert!(!commit_past_bound("mysql-bin.999999", 500, Some(&wide)));
+        // Unparseable names fail open (never end the run early).
+        assert!(!commit_past_bound("garbage", 99, Some(&bound)));
+        assert!(!commit_past_bound(
+            "binlog.000042",
+            99,
+            Some(&("garbage".to_string(), 0))
+        ));
+    }
+
+    #[test]
+    fn binlog_file_ordinal_parses_the_numeric_suffix() {
+        assert_eq!(binlog_file_ordinal("mysql-bin.000042"), Some(42));
+        assert_eq!(binlog_file_ordinal("binlog.1000000"), Some(1000000));
+        // Dotted basenames take the LAST dot (rsplit).
+        assert_eq!(binlog_file_ordinal("my.replica.000007"), Some(7));
+        assert_eq!(binlog_file_ordinal("no-suffix"), None);
+        assert_eq!(binlog_file_ordinal("binlog.notanum"), None);
+    }
+
     #[test]
     #[ignore = "live: requires docker compose mysql (binlog_format=ROW)"]
     fn streams_typed_insert_update_delete() {
@@ -397,7 +493,8 @@ mod tests {
         c.query_drop("CREATE TABLE cdc_unit (id INT PRIMARY KEY, v INT)")
             .unwrap();
 
-        let mut stream = MysqlChangeStream::open_from_current(URL, 4243, false, None).unwrap();
+        let mut stream =
+            MysqlChangeStream::open_from_current(URL, 4243, DrainMode::Continuous, None).unwrap();
         c.query_drop("INSERT INTO cdc_unit VALUES (1, 10)").unwrap();
         c.query_drop("UPDATE cdc_unit SET v = 20 WHERE id = 1")
             .unwrap();
@@ -457,8 +554,15 @@ mod tests {
         let ckpt = dir.path().join("mysql.ckpt.json");
 
         // Run 1: checkpoint path configured, no file yet, nothing to drain
-        // (non_block ⇒ bounded drain-and-exit, the scheduler model).
-        let mut s = MysqlChangeStream::open_or_resume(URL, 4245, Some(&ckpt), true, None).unwrap();
+        // (BoundedAtOpen ⇒ bounded drain-and-exit, the scheduler model).
+        let mut s = MysqlChangeStream::open_or_resume(
+            URL,
+            4245,
+            Some(&ckpt),
+            DrainMode::BoundedAtOpen,
+            None,
+        )
+        .unwrap();
         assert!(
             s.by_ref()
                 .map(|e| e.unwrap())
@@ -477,7 +581,14 @@ mod tests {
             .unwrap();
 
         // Run 2 must resume from the pinned position and capture it.
-        let mut s2 = MysqlChangeStream::open_or_resume(URL, 4245, Some(&ckpt), true, None).unwrap();
+        let mut s2 = MysqlChangeStream::open_or_resume(
+            URL,
+            4245,
+            Some(&ckpt),
+            DrainMode::BoundedAtOpen,
+            None,
+        )
+        .unwrap();
         let got = s2
             .by_ref()
             .map(|e| e.unwrap())
@@ -499,7 +610,8 @@ mod tests {
             .unwrap();
 
         // Read change A and checkpoint at its position.
-        let mut s = MysqlChangeStream::open_from_current(URL, 4244, false, None).unwrap();
+        let mut s =
+            MysqlChangeStream::open_from_current(URL, 4244, DrainMode::Continuous, None).unwrap();
         c.query_drop("INSERT INTO cdc_resume VALUES (1, 100)")
             .unwrap();
         let a = s
@@ -521,7 +633,8 @@ mod tests {
 
         // Resuming from the checkpoint must yield B (id=2), never re-read A.
         let mut s2 =
-            MysqlChangeStream::open_or_resume(URL, 4244, Some(&ckpt), false, None).unwrap();
+            MysqlChangeStream::open_or_resume(URL, 4244, Some(&ckpt), DrainMode::Continuous, None)
+                .unwrap();
         let b = s2
             .by_ref()
             .map(|e| e.unwrap())

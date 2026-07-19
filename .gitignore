@@ -106,3 +106,9 @@ mutants.out/
 
 # cargo-mutants output
 /mutants.out*
+
+# graphify knowledge-graph output
+/graphify-out
+
+# stray child-process stderr logs (a run once committed one by accident)
+/rivet-child-stderr-*.log
