@@ -3735,6 +3735,25 @@ fn roast_pg_cdc_bounded_on_a_standby_fails_loud() {
     // adapter checks pg_is_in_recovery() up front and names the escape (stream
     // continuously, or point at the primary) — not a raw "recovery is in
     // progress". Oracle: the run fails, stderr names the standby + the fix.
+    //
+    // Opt-in profile: the cdc-standby pair (dev/cdc/stand.sh standby, :5436) is
+    // NOT part of the default `cdc` stack, so a plain `--ignored` live run does
+    // not provision it. Self-gate: SKIP (loudly) when :5436 is unreachable rather
+    // than fail on a Connection-refused that never reaches the recovery check
+    // under test. When the profile IS up, the assertions below run for real.
+    let standby_url = "postgresql://rivet:rivet@127.0.0.1:5436/rivet";
+    if std::net::TcpStream::connect_timeout(
+        &"127.0.0.1:5436".parse().unwrap(),
+        std::time::Duration::from_millis(500),
+    )
+    .is_err()
+    {
+        eprintln!(
+            "SKIP roast_pg_cdc_bounded_on_a_standby_fails_loud: cdc-standby not up on :5436 \
+             (bring it up with `dev/cdc/stand.sh standby`)"
+        );
+        return;
+    }
     let d = tempfile::tempdir().unwrap();
     let tbl = unique_name("t_standby");
     let slot = unique_name("standby_slot");
@@ -3742,7 +3761,6 @@ fn roast_pg_cdc_bounded_on_a_standby_fails_loud() {
     std::fs::create_dir_all(&out).unwrap();
     // A standby is just a source_url override on the canonical CDC rig — no
     // bespoke YAML. run_expect_fail asserts the non-zero exit and returns stderr.
-    let standby_url = "postgresql://rivet:rivet@127.0.0.1:5436/rivet";
     let rig = Rig::pg_cdc(&tbl, &slot)
         .source_url(standby_url)
         .dest_path(out);
