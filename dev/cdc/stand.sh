@@ -78,6 +78,10 @@ scenarios() {
 
 perf() { RIVET_BIN="${RIVET_BIN:-target/release/rivet}" bash dev/cdc/perf.sh "$@"; }
 
+# Source-side HARM under load: writer p50/p99 with vs without a looping CDC drain,
+# plus peak replication lag / slot WAL retention / catalog_xmin age (PG only).
+harm() { RIVET_BIN="${RIVET_BIN:-target/release/rivet}" python3 dev/cdc/harm.py "$@"; }
+
 soak() {
   local eng="${1:?usage: stand.sh soak <pg|mysql|mssql|mongo> [phases]}"; shift || true
   RIVET_BIN="${RIVET_BIN:-target/release/rivet}" PHASES="${*:-10 20 30 60 120}" \
@@ -109,8 +113,9 @@ case "${1:-}" in
   scenarios) scenarios ;;
   standby)   standby ;;
   perf)      shift; perf "$@" ;;
+  harm)      shift; harm "$@" ;;
   soak)      shift; soak "$@" ;;
   all)       up && scenarios && perf ;;
   down)      down ;;
-  *) echo "usage: dev/cdc/stand.sh <up|verify|scenarios|standby|perf|soak <engine>|all|down>"; exit 1 ;;
+  *) echo "usage: dev/cdc/stand.sh <up|verify|scenarios|standby|perf|harm [secs] [rate]|soak <engine>|all|down>"; exit 1 ;;
 esac
