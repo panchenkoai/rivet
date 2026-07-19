@@ -46,6 +46,12 @@ up() {
   say "ensuring the mssql-cdc 'rivet' database exists"
   docker exec rivet-mssql-cdc-1 /opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa \
     -P 'Rivet_Passw0rd!' -Q "IF DB_ID('rivet') IS NULL CREATE DATABASE rivet;" 2>/dev/null || true
+  # Wait for fake-gcs (4443) so a following `scenarios` run does not race the
+  # CDC→GCS test before the store is reachable.
+  for _ in $(seq 1 20); do
+    (exec 3<>/dev/tcp/127.0.0.1/4443) 2>/dev/null && { exec 3>&- 3<&-; say "fake-gcs reachable on 4443"; break; }
+    sleep 1
+  done
   verify
 }
 
