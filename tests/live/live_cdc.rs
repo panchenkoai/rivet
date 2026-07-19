@@ -3267,6 +3267,58 @@ fn roast_mysql_until_current_open_bound_two_runs_lose_nothing() {
     );
 }
 
+/// A throwaway PostgreSQL database on the CDC server, isolating a test's logical
+/// slot from every other test's WAL. A `test_decoding` slot decodes its
+/// database's ENTIRE WAL, so a DENSITY- or slot-state-sensitive CDC test
+/// (reach-the-open-bound-in-one-pass, confirmed_flush advance) FLAKES on the
+/// shared `rivet` DB when parallel tests inject foreign WAL into the same slot's
+/// view (the failing `cargo test --ignored` lanes run these in parallel). Its
+/// own database makes the slot see only this test's WAL — parallel-safe by
+/// construction, no `--test-threads=1` needed. Dropped (backends terminated) on
+/// teardown; the table + slot live inside it, so no separate guards are needed.
+struct CdcDb {
+    name: String,
+    url: String,
+}
+impl CdcDb {
+    fn new(label: &str) -> Self {
+        let name = unique_name(label).to_lowercase();
+        let mut admin = postgres::Client::connect(POSTGRES_CDC_URL, postgres::NoTls)
+            .expect("connect cdc admin");
+        // CREATE DATABASE cannot run inside a transaction — a single simple-query
+        // batch_execute autocommits it.
+        admin
+            .batch_execute(&format!("CREATE DATABASE {name}"))
+            .expect("create dedicated cdc db");
+        let base = POSTGRES_CDC_URL
+            .rsplit_once('/')
+            .expect("cdc url has a /db path")
+            .0;
+        Self {
+            url: format!("{base}/{name}"),
+            name,
+        }
+    }
+    fn url(&self) -> &str {
+        &self.url
+    }
+    fn connect(&self) -> postgres::Client {
+        postgres::Client::connect(&self.url, postgres::NoTls).expect("connect dedicated cdc db")
+    }
+}
+impl Drop for CdcDb {
+    fn drop(&mut self) {
+        if let Ok(mut admin) = postgres::Client::connect(POSTGRES_CDC_URL, postgres::NoTls) {
+            let _ = admin.batch_execute(&format!(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+                 WHERE datname = '{}' AND pid <> pg_backend_pid()",
+                self.name
+            ));
+            let _ = admin.batch_execute(&format!("DROP DATABASE IF EXISTS {}", self.name));
+        }
+    }
+}
+
 #[test]
 #[ignore = "live: requires docker compose postgres (wal_level=logical)"]
 fn roast_pg_cdc_reaches_open_bound_past_a_large_empty_ddl_span() {
@@ -3280,21 +3332,19 @@ fn roast_pg_cdc_reaches_open_bound_past_a_large_empty_ddl_span() {
     // call (release → re-peek loop). rollover 5 makes the window ~2 empty
     // transactions, so a 40-transaction DDL burst is ~20 windows. Oracle: the
     // SOURCE table A — one bounded run must capture all 12 rows.
-    use postgres::NoTls;
+    // Isolated in its OWN database so parallel tests' WAL never enters this slot's
+    // view — the slot decodes the whole DB, the very premise this test exercises.
+    let cdc_db = CdcDb::new("cdc_ddlspan");
     let a = unique_name("rivet_cdc_ddlspan");
     let slot = unique_name("rivet_ddl_slot");
-    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
-    c.batch_execute(&format!(
-        "DROP TABLE IF EXISTS {a}; CREATE TABLE {a} (id BIGINT PRIMARY KEY, v INT)"
-    ))
-    .unwrap();
-    let _ta = PgTable::adopt(a.clone());
+    let mut c = cdc_db.connect();
+    c.batch_execute(&format!("CREATE TABLE {a} (id BIGINT PRIMARY KEY, v INT)"))
+        .unwrap();
     c.execute(
         "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
         &[&slot],
     )
     .unwrap();
-    let _slot = Slot(slot.clone());
     // A large EMPTY span: 40 DDL transactions (row-less BEGIN/COMMIT) ≫ one
     // window at rollover 5 — created AFTER the slot so they are in the WAL ahead
     // of A's in-bound rows.
@@ -3314,6 +3364,7 @@ fn roast_pg_cdc_reaches_open_bound_past_a_large_empty_ddl_span() {
     let out = d.path().join("out");
     std::fs::create_dir_all(&out).unwrap();
     let rig = Rig::pg_cdc(&a, &slot)
+        .source_url(cdc_db.url())
         .cdc("rollover: 5")
         .dest_path(out.clone());
     run_rivet_ok(&rig.config_path());
@@ -3341,23 +3392,23 @@ fn roast_pg_cdc_empty_transaction_churn_must_not_pin_the_slot() {
     // data-free span itself — advancing past it can lose nothing by
     // construction. Oracle: the slot's confirmed_flush_lsn, asked of PostgreSQL
     // itself, never rivet's counters.
-    use postgres::NoTls;
+    // Isolated in its OWN database (see CdcDb): this test asserts confirmed_flush_lsn
+    // against PostgreSQL, which a parallel test's WAL on the shared DB would perturb.
+    let cdc_db = CdcDb::new("cdc_empty");
     let tbl = unique_name("rivet_cdc_pgempty");
     let slot = unique_name("rivet_empty_slot");
-    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
+    let mut c = cdc_db.connect();
     c.batch_execute(&format!(
-        "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v INT)"
+        "CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v INT)"
     ))
     .unwrap();
-    let _tbl = PgTable::adopt(tbl.clone());
     c.execute(
         "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
         &[&slot],
     )
     .unwrap();
-    let _slot = Slot(slot.clone());
 
-    let rig = Rig::pg_cdc(&tbl, &slot);
+    let rig = Rig::pg_cdc(&tbl, &slot).source_url(cdc_db.url());
     let cfg = rig.config_path();
     run_rivet_ok(&cfg); // baseline bounded run (captures nothing)
     let before: String = c
@@ -3488,27 +3539,25 @@ fn roast_pg_cdc_reaches_open_bound_past_a_large_uncaptured_transaction() {
     // broken). With the sink re-drain loop the end-of-pass ack advances the slot
     // past B, and the next pass reads A. rollover: 5 makes any B transaction of
     // >15 rows exceed the old escalated window. Oracle: the SOURCE table A.
-    use postgres::NoTls;
-    // Lowercase names only: PostgreSQL folds unquoted identifiers, so test_decoding
-    // renders (and routing matches) the lowercased table name.
+    // Isolated in its OWN database (see CdcDb): the slot decodes the whole DB, so
+    // table B's large uncaptured transaction — and no parallel test's WAL — sits
+    // ahead of A. Lowercase names only: PostgreSQL folds unquoted identifiers, so
+    // test_decoding renders (and routing matches) the lowercased table name.
+    let cdc_db = CdcDb::new("cdc_dens");
     let a = unique_name("rivet_cdc_capa");
     let b = unique_name("rivet_cdc_forgnb");
     let slot = unique_name("rivet_dens_slot");
-    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
+    let mut c = cdc_db.connect();
     c.batch_execute(&format!(
-        "DROP TABLE IF EXISTS {a}; DROP TABLE IF EXISTS {b}; \
-         CREATE TABLE {a} (id BIGINT PRIMARY KEY, v INT); \
+        "CREATE TABLE {a} (id BIGINT PRIMARY KEY, v INT); \
          CREATE TABLE {b} (id BIGINT PRIMARY KEY, v INT)"
     ))
     .unwrap();
-    let _ta = PgTable::adopt(a.clone());
-    let _tb = PgTable::adopt(b.clone());
     c.execute(
         "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
         &[&slot],
     )
     .unwrap();
-    let _slot = Slot(slot.clone());
 
     // One large UNCAPTURED transaction (200 rows) lands in the WAL BEFORE A's
     // in-bound data — this is the span the peek window cannot fit at rollover 5.
@@ -3523,7 +3572,9 @@ fn roast_pg_cdc_reaches_open_bound_past_a_large_uncaptured_transaction() {
             .unwrap();
     }
 
-    let rig = Rig::pg_cdc(&a, &slot).cdc("rollover: 5");
+    let rig = Rig::pg_cdc(&a, &slot)
+        .source_url(cdc_db.url())
+        .cdc("rollover: 5");
     run_rivet_ok(&rig.config_path());
 
     let got: std::collections::BTreeSet<i64> =
