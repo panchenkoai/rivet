@@ -135,12 +135,12 @@ scenarios:
     what: "chunk_by_key on a non-unique / nullable / heterogeneous key → loud refusal, not a filesort/silent-loss"
     postgres: { test: stand_keyset_non_usable_bail_postgres }
     mysql:    { test: stand_keyset_non_usable_bail_mysql }
-    mssql:    { na: "only the ACCEPT side is tested (mssql_keyset_on_non_pk_unique_index); refusal is engine-agnostic plan logic" }
+    mssql:    { test: roast_mssql_chunk_by_key_on_a_nullable_unique_key_bails_loud }
     mongo:    { test: mongo_keyset_on_heterogeneous_id_errors_loudly_full_scan_still_works }
 
   - id: guard_small_table_snapshot_escape
     what: "chunked on a table whose reltuples < chunk_size downgrades to Snapshot (one file), unless an explicit knob pins chunked"
     postgres: { test: roast_small_table_escape_respects_explicit_chunk_checkpoint }
-    mysql:    { na: "escape is PG-only (build.rs step 3, reltuples-based); verified live — a 100-row MySQL table stays mode=chunked" }
-    mssql:    { na: "escape is PG-only; verified live — a 100-row MSSQL table stays mode=chunked" }
-    mongo:    { na: "no reltuples-based escape in the Mongo reader" }
+    mysql:    { na: "the escape + its explicit-knob OVERRIDE are engine-agnostic plan logic (src/plan/build.rs:389-405, NOT source_type-gated), RED-proven on PG (roast_small_table_escape_respects_explicit_chunk_checkpoint). MySQL's row_estimate is TABLE_ROWS-derived (mysql/mod.rs:274-302) but 0 on a fresh un-analyzed InnoDB table, so the escape fires only opportunistically — but a small-table→Snapshot downgrade is INTENDED and the resumability-preserving override (the only loss-risk) is shared + PG-tested. (Prior text 'escape is PG-only / stays chunked' was wrong: the mechanism is shared and MySQL CAN escape once stats populate.)" }
+    mssql:    { na: "same shared escape + override (src/plan/build.rs:389-405, PG-RED-proven). MSSQL's row_estimate is RELIABLE (sys.dm_db_partition_stats, mssql/mod.rs:1023-1034), so a small MSSQL table WITHOUT an explicit knob correctly downgrades chunked→Snapshot (the prior 'stays mode=chunked' text was wrong) — an intended downgrade, no loss; the resumability-preserving override is the shared PG-tested `!explicit_chunk_shape` branch." }
+    mongo:    { na: "the escape lives in chunked_strategy_from_introspection, unreachable for Mongo (chunked mode bails at build.rs:313); no reltuples-based escape in the Mongo reader" }

@@ -26,7 +26,7 @@ scenarios:
     postgres: { test: crash_after_source_read_leaves_state_completely_clean }
     mysql:    { test: mysql_crash_after_source_read_leaves_state_completely_clean }
     mssql:    { test: mssql_crash_after_source_read_leaves_state_completely_clean }
-    mongo:    { na: "after_source_read fires only in src/pipeline/single.rs; the Mongo batch export runs the keyset path (mongo_parallel), whose crash boundaries are the shared pipeline::commit hooks (after_file_write / after_manifest_update, tested below) — it has no single.rs source-read boundary" }
+    mongo:    { na: "a Mongo `mode: full` WITHOUT source.mongo.page_size resolves to Snapshot (src/plan/build.rs:168) and DOES fire after_source_read in single.rs — but that boundary is PRE-WRITE (crash → no file, no manifest, no cursor) and the post-read code (single.rs:266→record_part) is byte-identical across source engines, so it is covered by the shared single.rs path the postgres/mysql/mssql cells test, not immune from it. (With page_size it takes the keyset/mongo_parallel path whose boundaries are the after_file_write cells tested below.)" }
 
   - id: batch_crash_after_file_write
     what: "crash after the part file, before the manifest → file present, no manifest/cursor, recoverable"

@@ -187,3 +187,41 @@ exports:
         .collect();
     assert_eq!(pq.len(), 3, "expected 3 keyset pages (6 rows / size 2)");
 }
+
+#[test]
+#[ignore = "live: requires docker compose mssql (batch stack :1433)"]
+fn roast_mssql_chunk_by_key_on_a_nullable_unique_key_bails_loud() {
+    require_alive(LiveService::Mssql);
+    mssql_drop_table("a2_keyset_nullable");
+    // The REFUSE side of the keyset-key guard, missing until now. A UNIQUE index
+    // on a NULLABLE column passes `is_unique = 1` but MUST be rejected by the
+    // `c.is_nullable = 0` filter in the MSSQL keyset-key introspection
+    // (src/source/mssql/mod.rs:1068) — otherwise keyset `col > cursor` silently
+    // DROPS the NULL rows (NULL comparisons are UNKNOWN). Only the ACCEPT side
+    // (mssql_keyset_on_non_pk_unique_index, NOT NULL unique) was tested, so a
+    // mutant dropping `AND c.is_nullable = 0` survived the whole suite. Through
+    // the canonical Rig (a standby of the batch stack, chunked mode + chunk_by_key
+    // via export_line). RED-proof: drop the nullable filter → the key is accepted
+    // → run succeeds → run_expect_fail's non-zero-exit assert goes RED.
+    mssql_exec(
+        "CREATE TABLE a2_keyset_nullable (\
+           id INT NOT NULL PRIMARY KEY, \
+           email NVARCHAR(200) NULL UNIQUE)",
+    );
+    // One NULL row (id 2) — the row a mutant-accepted keyset would silently lose.
+    mssql_exec("INSERT INTO a2_keyset_nullable VALUES (1,N'a@x.com'),(2,NULL),(3,N'c@x.com')");
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("out");
+    let rig = Rig::mssql_batch("a2_keyset_nullable")
+        .mode("chunked")
+        .export_line("chunk_by_key: email")
+        .export_line("chunk_size: 2")
+        .dest_path(out);
+    let err = rig.run_expect_fail();
+    mssql_drop_table("a2_keyset_nullable");
+    assert!(
+        err.contains("not a usable keyset key") && err.contains("NOT NULL"),
+        "chunk_by_key on a nullable UNIQUE column must bail loud (keyset would silently drop the \
+         NULL rows) — got:\n{err}"
+    );
+}

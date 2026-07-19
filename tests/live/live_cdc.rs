@@ -3740,25 +3740,13 @@ fn roast_pg_cdc_bounded_on_a_standby_fails_loud() {
     let slot = unique_name("standby_slot");
     let out = d.path().join("out");
     std::fs::create_dir_all(&out).unwrap();
-    let yaml = format!(
-        r#"source: {{type: postgres, url: "postgresql://rivet:rivet@127.0.0.1:5436/rivet"}}
-exports:
-  - name: {tbl}
-    table: {tbl}
-    mode: cdc
-    format: parquet
-    cdc: {{ slot: {slot}, until_current: true }}
-    destination: {{ type: local, path: "{out}" }}
-"#,
-        out = out.display(),
-    );
-    let cfg = write_config(&d, &yaml);
-    let output = crate::common::run_rivet(&["run", "--config", cfg.to_str().unwrap()]);
-    assert!(
-        !output.status.success(),
-        "bounded CDC on a standby must FAIL, never proceed"
-    );
-    let err = String::from_utf8_lossy(&output.stderr);
+    // A standby is just a source_url override on the canonical CDC rig — no
+    // bespoke YAML. run_expect_fail asserts the non-zero exit and returns stderr.
+    let standby_url = "postgresql://rivet:rivet@127.0.0.1:5436/rivet";
+    let rig = Rig::pg_cdc(&tbl, &slot)
+        .source_url(standby_url)
+        .dest_path(out);
+    let err = rig.run_expect_fail();
     assert!(
         err.contains("standby") && err.contains("recovery") && err.contains("until_current: false"),
         "the failure must name the standby and the escape (stream continuously / point at the \
@@ -3772,11 +3760,7 @@ exports:
     // the slot. Isolate it: after a bounded run refused a standby, NO slot with
     // our name may exist there. (Disabling the proactive check regresses this to
     // a leaked slot — the RED lever for the fast-fail contract.)
-    let mut sc = postgres::Client::connect(
-        "postgresql://rivet:rivet@127.0.0.1:5436/rivet",
-        postgres::NoTls,
-    )
-    .expect("connect standby");
+    let mut sc = postgres::Client::connect(standby_url, postgres::NoTls).expect("connect standby");
     let slot_created: bool = sc
         .query_one(
             "SELECT EXISTS(SELECT 1 FROM pg_replication_slots WHERE slot_name = $1)",
