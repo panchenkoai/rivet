@@ -204,26 +204,45 @@ def phase(label: str, with_cdc: bool) -> dict:
     return {"lat": lat, "peak": peak, "drain_runs": drain_stats.get("runs", 0)}
 
 
+def heavy_wal_flood(stop: threading.Event):
+    """Tight batch-INSERT loop — floods WAL FAST (the psql-round-trip-capped OLTP
+    writer generates too little WAL to make the slot's retention harm visible).
+    Each statement writes 5000 rows, so a few seconds of this is tens of MB of WAL."""
+    p = subprocess.Popen(
+        ["docker", "exec", "-i", PGC, "psql", "-U", "rivet", "-d", "rivet", "-q"],
+        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True,
+    )
+    while not stop.is_set():
+        p.stdin.write(f"INSERT INTO {TABLE}(v, pad) SELECT g, repeat('x',120) FROM generate_series(1,5000) g;\n")
+        p.stdin.flush()
+    try:
+        p.stdin.write("\\q\n"); p.stdin.flush(); p.wait(timeout=5)
+    except Exception:
+        p.kill()
+
+
 def scheduled_phase(interval: int, cycles: int = 3) -> dict:
-    """The SCHEDULER model: writer runs continuously; the drain fires only every
-    `interval`s (until_current on a cron), so WAL ACCUMULATES between runs and the
-    slot pins it — the real disk-fill harm a back-to-back drain hides. Returns the
-    peak retention/lag observed across the accumulate windows."""
+    """The SCHEDULER model: a sustained writer floods WAL; the drain fires only
+    every `interval`s (until_current on a cron), so WAL ACCUMULATES between runs
+    and the slot pins it — the real disk-fill harm a back-to-back drain hides.
+    Returns the peak retention/lag observed across the accumulate windows."""
     d = tempfile.mkdtemp(prefix="harm_sched_")
     cfg = rivet_cdc_config(d)
     subprocess.run([RIVET_BIN, "run", "--config", cfg], capture_output=True, text=True)  # prime slot
-    writer = PacedWriter()
-    writer.start()
+    stop = threading.Event()
+    flood = threading.Thread(target=heavy_wal_flood, args=(stop,), daemon=True)
+    flood.start()
     peak = {"lag_b": 0, "retained_b": 0, "xmin_age": 0}
     for _ in range(cycles):
         end = time.time() + interval
-        while time.time() < end:  # accumulate: writer floods, no drain
+        while time.time() < end:  # accumulate: writer floods WAL, no drain
             h = sample_harm()
             for k in peak:
                 peak[k] = max(peak[k], h[k])
-            time.sleep(1.0)
+            time.sleep(0.5)
         subprocess.run([RIVET_BIN, "run", "--config", cfg], capture_output=True, text=True)  # scheduled drain
-    writer.finish()
+    stop.set()
+    flood.join(timeout=10)
     return peak
 
 
