@@ -24,11 +24,19 @@ CLOUD_SVCS="minio fake-gcs"
 say() { echo "[cdc-stand] $*"; }
 die() { echo "[cdc-stand] ERROR: $*" >&2; exit 1; }
 
+# Portable compose: the v2 plugin subcommand (`docker compose`) on some hosts,
+# the standalone binary (`docker-compose`) on others (e.g. the devbox).
+DC() {
+  if docker compose version >/dev/null 2>&1; then docker compose "$@";
+  elif command -v docker-compose >/dev/null 2>&1; then docker-compose "$@";
+  else die "neither 'docker compose' nor 'docker-compose' is available"; fi
+}
+
 up() {
-  say "docker compose --profile cdc up -d ($CDC_SVCS)"
-  docker compose --profile cdc up -d $CDC_SVCS || die "compose up failed"
+  say "compose --profile cdc up -d ($CDC_SVCS)"
+  DC --profile cdc up -d $CDC_SVCS || die "compose up failed"
   say "bringing up the cloud-destination stores ($CLOUD_SVCS) for CDC→cloud tests"
-  docker compose up -d $CLOUD_SVCS 2>/dev/null || say "warning: could not start $CLOUD_SVCS (CDC→cloud scenarios will be skipped)"
+  DC up -d $CLOUD_SVCS 2>/dev/null || say "warning: could not start $CLOUD_SVCS (CDC→cloud scenarios will be skipped)"
   say "waiting for containers to be healthy..."
   for _ in $(seq 1 60); do
     local n; n=$(docker inspect -f '{{.State.Health.Status}}' rivet-postgres-cdc-1 rivet-mysql-cdc-1 rivet-mssql-cdc-1 rivet-mongo-rs-1 2>/dev/null | grep -c healthy)
@@ -70,7 +78,7 @@ soak() {
     bash dev/cdc_interval/soak_all.sh "$eng"
 }
 
-down() { say "docker compose --profile cdc stop ($CDC_SVCS)"; docker compose --profile cdc stop $CDC_SVCS; }
+down() { say "compose --profile cdc stop ($CDC_SVCS)"; DC --profile cdc stop $CDC_SVCS; }
 
 case "${1:-}" in
   up)        up ;;
