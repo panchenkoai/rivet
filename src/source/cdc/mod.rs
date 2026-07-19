@@ -311,6 +311,24 @@ impl DrainMode {
     }
 }
 
+/// Memory backstop shared by every log/poll adapter: a transaction is buffered
+/// WHOLE (never split across parts), so an oversized one would grow the tx buffer
+/// unbounded. Each adapter caps its per-transaction buffer at this and bails
+/// loudly rather than OOM. Default 5M rows (a real OLTP transaction is far
+/// below). `RIVET_CDC_MAX_TX_ROWS` overrides it — test-only, so the cap is
+/// reachable without seeding a 5-million-row transaction. Read once.
+pub(crate) fn max_tx_rows() -> usize {
+    use std::sync::OnceLock;
+    static CELL: OnceLock<usize> = OnceLock::new();
+    *CELL.get_or_init(|| {
+        std::env::var("RIVET_CDC_MAX_TX_ROWS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(5_000_000)
+    })
+}
+
 /// Connection + resume parameters for `rivet cdc`, across engines — the CDC
 /// sibling of [`crate::source::create_source`]'s `SourceConfig`. The fields here
 /// are engine-agnostic; per-engine knobs live in [`CdcEngineOpts`].

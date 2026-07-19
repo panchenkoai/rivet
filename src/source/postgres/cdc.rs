@@ -112,6 +112,22 @@ impl PgChangeStream {
         client.batch_execute(
             "SET datestyle = 'ISO, MDY'; SET bytea_output = 'hex'; SET intervalstyle = 'postgres';",
         )?;
+        // A bounded run cannot work on a STANDBY: it pins its ceiling with
+        // pg_current_wal_lsn() (unavailable during recovery) and a fresh run
+        // creates the logical slot (also refused in recovery). Detect recovery
+        // up front so the error names the fix, not whichever operation happens
+        // to fail first (slot-create vs wal_lsn).
+        if mode.is_bounded() {
+            let in_recovery: bool = client.query_one("SELECT pg_is_in_recovery()", &[])?.get(0);
+            if in_recovery {
+                anyhow::bail!(
+                    "bounded (until_current) CDC cannot run on a PostgreSQL standby — it is in \
+                     recovery, where pg_current_wal_lsn() is unavailable and a logical slot cannot \
+                     be created. Stream continuously (until_current: false) or point the source at \
+                     the primary."
+                );
+            }
+        }
         let exists: bool = client
             .query_one(
                 "SELECT EXISTS(SELECT 1 FROM pg_replication_slots WHERE slot_name = $1)",
@@ -241,9 +257,10 @@ impl PgChangeStream {
                 // transaction, so `peek_changes` already materialised the whole
                 // thing into `rows` — this bails loudly instead of compounding it
                 // into `pending` + the sink buffer, and names the (upstream) fix.
-                if tx.len() > MAX_TX_ROWS {
+                let cap = crate::source::cdc::max_tx_rows();
+                if tx.len() > cap {
                     anyhow::bail!(
-                        "pg cdc: a single transaction has more than {MAX_TX_ROWS} rows — \
+                        "pg cdc: a single transaction has more than {cap} rows — \
                          it must be buffered whole (a transaction is never split across parts), \
                          so this would exhaust memory. Split the source transaction, or raise \
                          the cap only if a transaction this large is genuinely expected."
@@ -342,11 +359,6 @@ fn tx_disposition(commit_lsn: u64, frontier: u64, bound: Option<u64>) -> TxDispo
 fn wire_budget(peek: crate::source::cdc::PeekBound) -> i32 {
     peek.rows_capped().min(i32::MAX as usize) as i32
 }
-
-/// Memory backstop: a transaction is buffered whole (never split across parts),
-/// so an oversized one would grow unbounded. Cap it and bail loudly rather than
-/// OOM. Matches the MySQL adapter's cap; a real OLTP transaction is far below it.
-const MAX_TX_ROWS: usize = 5_000_000;
 
 /// Parse a `pg_lsn` rendering `X/Y` (two hex halves of a 64-bit position) into a
 /// comparable `u64`. `None` on a malformed value — the frontier check then treats

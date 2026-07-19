@@ -3474,3 +3474,256 @@ fn roast_pg_cdc_reaches_open_bound_past_a_large_uncaptured_transaction() {
         got.len()
     );
 }
+
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical)"]
+fn roast_pg_cdc_drain_releases_pinned_wal_and_advances_xmin() {
+    // Harm metric (the "an abandoned slot fills the disk" caveat): an un-consumed
+    // logical slot pins WAL and holds `catalog_xmin` (blocks vacuum). The
+    // consumer position that governs release is `confirmed_flush_lsn` — the ack
+    // advances it, and `restart_lsn` (the actual WAL floor) follows at the next
+    // checkpoint. A bounded until_current drain must advance confirmed_flush past
+    // the drained span (so `pg_wal_lsn_diff(current, confirmed_flush_lsn)`
+    // collapses) and let catalog_xmin move forward. Oracle: the server's own
+    // pg_replication_slots, never rivet's counters. RED-able: a drain that
+    // captured but did not ack leaves confirmed_flush pinned.
+    use postgres::NoTls;
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("rivet_cdc_walret");
+    let slot = unique_name("rivet_walret_slot");
+    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id bigint primary key, v int, pad text)"
+    ))
+    .unwrap();
+    let _tbl = PgTable::adopt(tbl.clone());
+    c.execute(
+        "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+        &[&slot],
+    )
+    .unwrap();
+    let _slot = Slot(slot.clone());
+
+    let retained = |c: &mut postgres::Client| -> i64 {
+        c.query_one(
+            "SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)::bigint \
+             FROM pg_replication_slots WHERE slot_name = $1",
+            &[&slot],
+        )
+        .unwrap()
+        .get(0)
+    };
+    // Generate a backlog (≈20k rows of WAL) the slot now pins.
+    c.execute(
+        &format!(
+            "INSERT INTO {tbl} SELECT g, g%1000, repeat('x',80) FROM generate_series(1,20000) g"
+        ),
+        &[],
+    )
+    .unwrap();
+    let retained_before = retained(&mut c);
+    assert!(
+        retained_before > 1_000_000,
+        "the slot must pin a real amount of WAL before the drain (got {retained_before} bytes)"
+    );
+
+    let out = d.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    run_rivet_ok(&pg_cdc_config(&d, &tbl, &slot, &out));
+
+    let retained_after = retained(&mut c);
+    assert_eq!(
+        manifest_rows(&out),
+        20000,
+        "the drain must capture the whole backlog"
+    );
+    assert!(
+        retained_after < retained_before / 4,
+        "the drain must RELEASE the pinned WAL: retained {retained_before} -> {retained_after} bytes \
+         (an un-acked drain leaves it pinned — the disk-fill harm). catalog_xmin (vacuum) is \
+         released by the same confirmed_flush advance, at the next checkpoint."
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical)"]
+fn roast_pg_cdc_captures_a_silent_update_a_watermark_sync_would_miss() {
+    // The reason log-based CDC exists: it captures a row change that touches a
+    // value WITHOUT bumping `updated_at` — the exact update a watermark /
+    // incremental sync (`WHERE updated_at > last_seen`) MISSES. Assert (1) the
+    // source's `updated_at` is UNCHANGED by the silent update (so a watermark
+    // sync at that timestamp would never re-read the row), and (2) CDC captured
+    // the update with the NEW value anyway. Oracle: the source row's updated_at
+    // (proves the miss) + the parquet (proves the capture).
+    use postgres::NoTls;
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("rivet_cdc_silent");
+    let slot = unique_name("rivet_silent_slot");
+    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {tbl}; \
+         CREATE TABLE {tbl} (id bigint primary key, v bigint, updated_at timestamptz)"
+    ))
+    .unwrap();
+    let _tbl = PgTable::adopt(tbl.clone());
+    c.execute(
+        "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+        &[&slot],
+    )
+    .unwrap();
+    let _slot = Slot(slot.clone());
+
+    // Insert a row with a fixed watermark.
+    c.execute(
+        &format!("INSERT INTO {tbl} VALUES (1, 0, '2020-01-01T00:00:00Z')"),
+        &[],
+    )
+    .unwrap();
+    let wm_before: chrono::DateTime<chrono::Utc> = c
+        .query_one(&format!("SELECT updated_at FROM {tbl} WHERE id=1"), &[])
+        .unwrap()
+        .get(0);
+
+    // SILENT update — changes view_count, does NOT touch updated_at.
+    c.execute(&format!("UPDATE {tbl} SET v = 42 WHERE id = 1"), &[])
+        .unwrap();
+    let wm_after: chrono::DateTime<chrono::Utc> = c
+        .query_one(&format!("SELECT updated_at FROM {tbl} WHERE id=1"), &[])
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        wm_before, wm_after,
+        "the silent update must NOT bump updated_at — a watermark sync would miss it"
+    );
+
+    let out = d.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    run_rivet_ok(&pg_cdc_config(&d, &tbl, &slot, &out));
+
+    // CDC caught both the insert and the SILENT update, with the new view_count.
+    let ops = cdc_id_ops(&out);
+    assert_eq!(
+        ops,
+        vec![(1, "insert".to_string()), (1, "update".to_string())],
+        "CDC must capture the insert AND the silent update the watermark missed — got {ops:?}"
+    );
+    let vcs: Vec<i64> = dir_parquet_i64(&out, "v");
+    assert_eq!(
+        vcs,
+        vec![0, 42],
+        "the captured after-images must carry the silent update's NEW value (0 then 42) — got {vcs:?}"
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical)"]
+fn roast_pg_cdc_oversized_transaction_bails_loud_not_oom() {
+    // Memory backstop: a transaction is buffered WHOLE (never split across parts),
+    // so an oversized one would grow the buffer unbounded → OOM. The adapter caps
+    // the per-transaction buffer at `max_tx_rows()` and bails LOUDLY instead. The
+    // cap is 5M by default; `RIVET_CDC_MAX_TX_ROWS` lowers it so this is testable
+    // without a 5-million-row transaction. Oracle: the run FAILS with the cap
+    // message (never a silent OOM / partial capture).
+    use postgres::NoTls;
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("rivet_cdc_bigtx");
+    let slot = unique_name("rivet_bigtx_slot");
+    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id bigint primary key, v bigint)"
+    ))
+    .unwrap();
+    let _tbl = PgTable::adopt(tbl.clone());
+    c.execute(
+        "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+        &[&slot],
+    )
+    .unwrap();
+    let _slot = Slot(slot.clone());
+    // ONE transaction of 20 rows — over the cap-of-10 this run sets.
+    c.execute(
+        &format!("INSERT INTO {tbl} SELECT g, g FROM generate_series(1, 20) g"),
+        &[],
+    )
+    .unwrap();
+
+    let out = d.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let rig = Rig::pg_cdc(&tbl, &slot).dest_path(out);
+    let output = rig.run_with_env("RIVET_CDC_MAX_TX_ROWS", "10");
+    assert!(
+        !output.status.success(),
+        "an over-cap transaction must FAIL the run, not OOM or silently truncate"
+    );
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        err.contains("more than 10 rows") && err.contains("buffered whole"),
+        "the failure must name the cap and the never-split-a-transaction reason — got:\n{err}"
+    );
+}
+
+#[test]
+#[ignore = "live: requires the cdc-standby profile — dev/cdc/stand.sh standby (pg-cdc-standby on :5436)"]
+fn roast_pg_cdc_bounded_on_a_standby_fails_loud() {
+    // A bounded (until_current) CDC run against a PostgreSQL STANDBY (in recovery)
+    // must fail LOUD with an actionable message: pg_current_wal_lsn() is
+    // unavailable in recovery and a logical slot cannot be created there. The
+    // adapter checks pg_is_in_recovery() up front and names the escape (stream
+    // continuously, or point at the primary) — not a raw "recovery is in
+    // progress". Oracle: the run fails, stderr names the standby + the fix.
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("t_standby");
+    let slot = unique_name("standby_slot");
+    let out = d.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let yaml = format!(
+        r#"source: {{type: postgres, url: "postgresql://rivet:rivet@127.0.0.1:5436/rivet"}}
+exports:
+  - name: {tbl}
+    table: {tbl}
+    mode: cdc
+    format: parquet
+    cdc: {{ slot: {slot}, until_current: true }}
+    destination: {{ type: local, path: "{out}" }}
+"#,
+        out = out.display(),
+    );
+    let cfg = write_config(&d, &yaml);
+    let output = crate::common::run_rivet(&["run", "--config", cfg.to_str().unwrap()]);
+    assert!(
+        !output.status.success(),
+        "bounded CDC on a standby must FAIL, never proceed"
+    );
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        err.contains("standby") && err.contains("recovery") && err.contains("until_current: false"),
+        "the failure must name the standby and the escape (stream continuously / point at the \
+         primary) — got:\n{err}"
+    );
+    // The message alone is EQUIVALENT-masked: a fallback guard at the
+    // pg_current_wal_lsn() bound-snapshot emits the same text — but only AFTER
+    // pg_create_logical_replication_slot(), which on a standby BLOCKS for minutes
+    // waiting for a consistent point and then LEAKS a WAL-pinning slot. The
+    // proactive pg_is_in_recovery() check is what fails fast and never touches
+    // the slot. Isolate it: after a bounded run refused a standby, NO slot with
+    // our name may exist there. (Disabling the proactive check regresses this to
+    // a leaked slot — the RED lever for the fast-fail contract.)
+    let mut sc = postgres::Client::connect(
+        "postgresql://rivet:rivet@127.0.0.1:5436/rivet",
+        postgres::NoTls,
+    )
+    .expect("connect standby");
+    let slot_created: bool = sc
+        .query_one(
+            "SELECT EXISTS(SELECT 1 FROM pg_replication_slots WHERE slot_name = $1)",
+            &[&slot],
+        )
+        .unwrap()
+        .get(0);
+    assert!(
+        !slot_created,
+        "the proactive recovery check must refuse a standby BEFORE creating a slot — a slot \
+         named '{slot}' was left on the standby, meaning the run blocked on slot creation and \
+         leaked a WAL-pinning slot instead of failing fast"
+    );
+}

@@ -84,15 +84,33 @@ soak() {
     bash dev/cdc_interval/soak_all.sh "$eng"
 }
 
-down() { say "compose --profile cdc stop ($CDC_SVCS)"; DC --profile cdc stop $CDC_SVCS; }
+standby() {
+  say "compose --profile cdc-standby up -d (primary + streaming replica)"
+  DC --profile cdc-standby up -d pg-cdc-primary pg-cdc-standby || die "standby compose up failed"
+  say "waiting for the standby to reach recovery (pg_is_in_recovery = t)..."
+  for _ in $(seq 1 40); do
+    docker exec rivet-pg-cdc-standby-1 psql -U rivet -tAc "SELECT pg_is_in_recovery()" 2>/dev/null | grep -qx t && { say "standby in recovery on :5436"; break; }
+    sleep 3
+  done
+  say "running the standby fail-loud scenario"
+  cargo test --test live_suite -- --ignored --exact \
+    live_cdc::roast_pg_cdc_bounded_on_a_standby_fails_loud
+}
+
+down() {
+  say "compose --profile cdc stop ($CDC_SVCS); --profile cdc-standby stop"
+  DC --profile cdc stop $CDC_SVCS
+  DC --profile cdc-standby stop pg-cdc-primary pg-cdc-standby 2>/dev/null || true
+}
 
 case "${1:-}" in
   up)        up ;;
   verify)    verify ;;
   scenarios) scenarios ;;
+  standby)   standby ;;
   perf)      shift; perf "$@" ;;
   soak)      shift; soak "$@" ;;
   all)       up && scenarios && perf ;;
   down)      down ;;
-  *) echo "usage: dev/cdc/stand.sh <up|verify|scenarios|perf|soak <engine>|all|down>"; exit 1 ;;
+  *) echo "usage: dev/cdc/stand.sh <up|verify|scenarios|standby|perf|soak <engine>|all|down>"; exit 1 ;;
 esac

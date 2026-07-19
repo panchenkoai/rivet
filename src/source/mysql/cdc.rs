@@ -262,9 +262,10 @@ impl MysqlChangeStream {
                         seq: 0, // stamped by TxnSeq as the stream is consumed
                     });
                 }
-                if self.tx.len() > MAX_TX_ROWS {
+                let cap = crate::source::cdc::max_tx_rows();
+                if self.tx.len() > cap {
                     anyhow::bail!(
-                        "mysql cdc: a single transaction buffered more than {MAX_TX_ROWS} rows \
+                        "mysql cdc: a single transaction buffered more than {cap} rows \
                          before its commit — refusing to buffer unbounded (raise the cap only if \
                          a transaction this large is genuinely expected)"
                     );
@@ -326,11 +327,6 @@ fn connect_conn(url: &str, tls: Option<&TlsConfig>) -> Result<Conn> {
     }
     Ok(conn)
 }
-
-/// Memory backstop: a single transaction is buffered until its `XID`, so an
-/// oversized (or crafted) transaction would grow `tx` unbounded. Cap it and bail
-/// loudly rather than OOM. A real OLTP transaction is far below this.
-const MAX_TX_ROWS: usize = 5_000_000;
 
 /// Is the commit at `(file, pos)` PAST the open-time bound? — the pure heart of
 /// the bounded run's termination contract (see [`MysqlChangeStream::bound`]).

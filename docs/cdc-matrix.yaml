@@ -133,3 +133,32 @@ scenarios:
     mysql:    { test: cdc_full_type_matrix_matches_batch }
     mssql:    { test: mssql_cdc_full_type_matrix_matches_batch }
     mongo:    { na: "CDC and batch share the identical document_to_json serializer, so no per-op typing can diverge them — pinned once on the batch side (mongo_batch_type_fidelity_document_is_verbatim_extjson)" }
+
+  - id: cdc_silent_update_captured
+    what: "the CDC value prop: a column update that does NOT bump updated_at (the change a watermark / incremental `WHERE updated_at > last_seen` sync MISSES) is captured with its NEW after-image. Oracle: the source row's unchanged updated_at (proves the miss) + the parquet (proves the capture)"
+    postgres: { test: roast_pg_cdc_captures_a_silent_update_a_watermark_sync_would_miss }
+    mysql:    { na: "the same log-derived after-image — the binlog records the row change regardless of which columns moved; the update-capture + type-fidelity cells prove the after-image, this cell pins the watermark-miss framing once on PG" }
+    mssql:    { na: "same — the change table records the row change independent of updated_at; proven per-engine by update-capture, framed once on PG" }
+    mongo:    { na: "same — the change stream's full_document is the whole post-image regardless of which fields changed; framed once on PG" }
+
+  - id: cdc_bounded_on_standby_fails_loud
+    what: "bounded until_current CDC on a PostgreSQL STANDBY (in recovery) must fail LOUD with an actionable message — pg_current_wal_lsn() is unavailable and a logical slot cannot be created in recovery; the adapter checks pg_is_in_recovery() up front and names the escape (stream continuously / point at the primary). Requires the opt-in cdc-standby compose profile (dev/cdc/stand.sh standby)"
+    postgres: { test: roast_pg_cdc_bounded_on_a_standby_fails_loud }
+    mysql:    { na: "MySQL replicas are not 'in recovery' in this sense — a replica has its own binlog and SHOW MASTER STATUS works; reading CDC from a MySQL replica is a supported topology, not a fail-loud case" }
+    mssql:    { na: "SQL Server CDC reads change tables, which exist on the primary; an Always On secondary is read-only but CDC capture is a primary concern — no analogous recovery-mode fail" }
+    mongo:    { na: "a MongoDB secondary serves change streams fine (they read the oplog); reading CDC from a secondary is a supported topology, not a fail-loud case" }
+
+  - id: cdc_oversized_transaction_bails_loud
+    what: "a transaction is buffered WHOLE (never split across parts), so an oversized one would OOM — each adapter caps its per-transaction buffer at max_tx_rows() (default 5M, RIVET_CDC_MAX_TX_ROWS overrides for the test) and BAILS LOUDLY naming the cap, never a silent OOM or partial capture. One shared helper, RED-proven once on PG"
+    postgres: { test: roast_pg_cdc_oversized_transaction_bails_loud_not_oom }
+    mysql:    { na: "same shared crate::source::cdc::max_tx_rows() cap, applied to the binlog tx buffer; proven once on PG" }
+    mssql:    { na: "same shared cap, applied to the __$start_lsn group buffer; proven once on PG" }
+    mongo:    { na: "no per-transaction buffering — each change-stream event is one document, flushed independently; there is no whole-transaction buffer to bound" }
+
+  # ── Harm / operational-cost contracts (the price CDC charges the source) ──────
+  - id: cdc_drain_releases_pinned_wal
+    what: "the disk-fill harm: an un-consumed logical slot pins WAL (and holds catalog_xmin, blocking vacuum); a bounded drain must advance confirmed_flush past the drained span so pg_wal_lsn_diff(current, confirmed_flush_lsn) collapses (restart_lsn / catalog_xmin follow at the next checkpoint). Oracle: the server's pg_replication_slots, not rivet's counters"
+    postgres: { test: roast_pg_cdc_drain_releases_pinned_wal_and_advances_xmin }
+    mysql:    { na: "no consume-retention coupling — the binlog is purged on the server's own schedule (expire_logs_days / binlog_expire_logs_seconds) regardless of the reader's position; an unread binlog pins nothing the reader controls" }
+    mssql:    { na: "no consume-retention coupling — the change table is trimmed by the CDC cleanup job on its own schedule; the reader's from-LSN cursor does not pin it" }
+    mongo:    { na: "no consume-retention coupling — the oplog is a fixed-size capped collection, overwritten regardless of any resume token" }
