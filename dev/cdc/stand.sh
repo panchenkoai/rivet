@@ -18,12 +18,17 @@ set -uo pipefail
 cd "$(git rev-parse --show-toplevel 2>/dev/null || echo .)"
 
 CDC_SVCS="postgres-cdc mysql-cdc mssql-cdc mongo-rs"
+# A few scenarios capture CDC straight to a cloud destination (e.g.
+# cdc_multi_table_to_gcs_lands_per_table_prefixes) — bring the object stores up too.
+CLOUD_SVCS="minio fake-gcs"
 say() { echo "[cdc-stand] $*"; }
 die() { echo "[cdc-stand] ERROR: $*" >&2; exit 1; }
 
 up() {
   say "docker compose --profile cdc up -d ($CDC_SVCS)"
   docker compose --profile cdc up -d $CDC_SVCS || die "compose up failed"
+  say "bringing up the cloud-destination stores ($CLOUD_SVCS) for CDC→cloud tests"
+  docker compose up -d $CLOUD_SVCS 2>/dev/null || say "warning: could not start $CLOUD_SVCS (CDC→cloud scenarios will be skipped)"
   say "waiting for containers to be healthy..."
   for _ in $(seq 1 60); do
     local n; n=$(docker inspect -f '{{.State.Health.Status}}' rivet-postgres-cdc-1 rivet-mysql-cdc-1 rivet-mssql-cdc-1 rivet-mongo-rs-1 2>/dev/null | grep -c healthy)

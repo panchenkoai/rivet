@@ -20,7 +20,8 @@ dev/cdc/stand.sh down        # stop the cdc profile
 Prereqs: a release `rivet` for representative perf/soak numbers
 (`cargo build --release --bin rivet`); `duckdb` on PATH for the soak/perf
 completeness re-reads. `mssql-cdc` has no init hook, so `up` creates the `rivet`
-database itself.
+database itself. `up` also starts `minio` + `fake-gcs` — a couple of scenarios
+capture CDC straight to a cloud destination and skip loudly without them.
 
 ## What the three layers check
 
