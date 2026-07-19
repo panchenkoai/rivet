@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.20.1 — 2026-07-19
 
 ### Fixed
 
@@ -62,6 +62,13 @@
   only at the true commit boundary and a transaction is always one atomic unit
   ("never split a transaction across parts"). Pre-existing (not introduced by
   the `until_current` work); surfaced by an adversarial review.
+- **CDC: an oversized single transaction now bails loudly instead of risking
+  OOM.** A transaction is buffered whole (never split across parts), so an
+  outsized one grew the buffer unbounded. Every log/poll adapter
+  (PostgreSQL/MySQL/SQL Server) now caps its per-transaction buffer at a shared
+  `max_tx_rows()` (default 5,000,000; `RIVET_CDC_MAX_TX_ROWS` overrides) and
+  fails with a clear message naming the cap, rather than OOM-ing or capturing a
+  partial transaction.
 
 ## 0.20.0 — 2026-07-16
 
