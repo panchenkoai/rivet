@@ -123,7 +123,7 @@ scenarios:
   - id: cdc_large_transaction_atomic_across_crash
     what: "a source transaction LARGER than rollover rolls + checkpoints as ONE unit (never split across parts): a crash mid-flush must not advance the resume position past the transaction and lose its tail — the adapter marks only the LAST event of a transaction committed, so the sink rolls only at the true commit boundary"
     postgres: { test: roast_pg_cdc_large_transaction_is_atomic_across_a_mid_flush_crash }
-    mysql:    { na: "the binlog adapter already marks only the XID (commit) event committed — every other event is committed:false, so should_roll never fires mid-transaction (the model PG/MSSQL were fixed to match)" }
+    mysql:    { test: roast_mysql_cdc_large_transaction_is_atomic_across_a_mid_flush_crash }
     mssql:    { test: roast_mssql_cdc_large_transaction_is_atomic_across_a_mid_flush_crash }
     mongo:    { na: "each change-stream event carries its OWN unique resume token (cse.id) — even within a multi-document transaction (Mongo 4.0+) — so a mid-transaction roll checkpoints event K's token and resume continues at K+1, never skipping a tail. Unlike PG (all events of a transaction share the commit LSN) and MSSQL (all rows share __$start_lsn), there is no shared position to skip, so no last-of-transaction marking is needed" }
 

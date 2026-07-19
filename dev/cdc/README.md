@@ -61,7 +61,7 @@ by a disable-bound probe).
 | NDJSON bounded | ✓ | na | na | na |
 | empty-transaction churn | ✓ | na | na | na |
 | reach open bound past a foreign span | ✓ | na | na | na |
-| large-transaction atomic across crash | ✓ | na | ✓ | na |
+| large-transaction atomic across crash | ✓ | ✓ | ✓ | na |
 | type fidelity | ✓ | ✓ | ✓ | ✓ |
 | silent-update captured (the CDC value prop) | ✓ | na | na | na |
 | bounded-on-a-standby fails loud | ✓ | na | na | na |

@@ -2699,6 +2699,70 @@ fn roast_pg_cdc_large_transaction_is_atomic_across_a_mid_flush_crash() {
     );
 }
 
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
+fn roast_mysql_cdc_large_transaction_is_atomic_across_a_mid_flush_crash() {
+    // MySQL sibling of the PG atomicity roast — the matrix cell was `na` on the
+    // reasoning "the binlog adapter marks only the XID event committed", but that
+    // is CURRENT-CORRECTNESS, not immunity: MySQL stamps the shared COMMIT position
+    // on EVERY event of the transaction (`ev.position = commit.clone()`), exactly
+    // like PG's shared commit LSN. The only thing stopping a mid-transaction
+    // roll+checkpoint+ack is `ev.committed = i + 1 == n`. Flip that to `true` (the
+    // committed-on-every-event mutant) and a crash between the first ack and the
+    // tail's flush advances the binlog checkpoint PAST the commit — resume reads
+    // strictly after it and loses the tail. RED-proof: one 12-row transaction at
+    // rollover 5, crash at `cdc_after_ack`. Buggy: first ack after 5 rows → 5 ids
+    // survive; atomic: first ack after all 12 → 12 ids. Oracle: union of parts.
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("rivet_cdc_myatomic");
+    let mut c = conn();
+    c.query_drop(format!("DROP TABLE IF EXISTS {tbl}")).unwrap();
+    c.query_drop(format!("CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v INT)"))
+        .unwrap();
+    let _drop = Table(tbl.clone());
+
+    let out = d.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let rig = Rig::mysql_cdc(&tbl)
+        .cdc("rollover: 5")
+        .dest_path(out.clone());
+    // MySQL has NO server-side anchor — pin the binlog checkpoint at open, BEFORE
+    // the transaction, or the next run re-anchors to the current position and skips.
+    rig.run_ok();
+    // ONE transaction of 12 rows (> 2× the rollover of 5) — a single multi-row
+    // INSERT is one commit.
+    let vals = (0..12)
+        .map(|i| format!("({i},{i})"))
+        .collect::<Vec<_>>()
+        .join(",");
+    c.query_drop(format!("INSERT INTO {tbl} VALUES {vals}"))
+        .unwrap();
+
+    // Run 1 crashes right after the FIRST ack.
+    let crashed = std::process::Command::new(RIVET_BIN)
+        .args(["run", "--config", rig.config_path().to_str().unwrap()])
+        .env("RIVET_TEST_PANIC_AT", "cdc_after_ack")
+        .output()
+        .expect("spawn rivet");
+    assert!(
+        !crashed.status.success(),
+        "the injected crash must fail run 1"
+    );
+
+    // Run 2 resumes from the checkpoint the crash left behind.
+    run_rivet_ok(&rig.config_path());
+
+    let got: std::collections::BTreeSet<i64> = dir_parquet_i64(&out, "id").into_iter().collect();
+    let want: std::collections::BTreeSet<i64> = (0..12).collect();
+    assert_eq!(
+        got,
+        want,
+        "the 12-row transaction must survive the mid-flush crash whole — got {} ids \
+         (a mid-transaction ack advanced the binlog checkpoint past the commit and lost the tail)",
+        got.len()
+    );
+}
+
 fn pg_full_config(d: &tempfile::TempDir, tbl: &str, out: &std::path::Path) -> std::path::PathBuf {
     let yaml = format!(
         r#"source: {{type: postgres, url: "{POSTGRES_CDC_URL}"}}
