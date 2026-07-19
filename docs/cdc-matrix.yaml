@@ -149,10 +149,10 @@ scenarios:
     mongo:    { na: "a MongoDB secondary serves change streams fine (they read the oplog); reading CDC from a secondary is a supported topology, not a fail-loud case" }
 
   - id: cdc_oversized_transaction_bails_loud
-    what: "a transaction is buffered WHOLE (never split across parts), so an oversized one would OOM — each adapter caps its per-transaction buffer at max_tx_rows() (default 5M, RIVET_CDC_MAX_TX_ROWS overrides for the test) and BAILS LOUDLY naming the cap, never a silent OOM or partial capture. One shared helper, RED-proven once on PG"
+    what: "a transaction is buffered WHOLE (never split across parts), so an oversized one would OOM — each adapter caps its per-transaction buffer at max_tx_rows() (default 5M, RIVET_CDC_MAX_TX_ROWS overrides for the test) and BAILS LOUDLY naming the cap, never a silent OOM or partial capture. One shared helper but THREE call sites — each adapter's own guard is RED-proven, not just the helper"
     postgres: { test: roast_pg_cdc_oversized_transaction_bails_loud_not_oom }
-    mysql:    { na: "same shared crate::source::cdc::max_tx_rows() cap, applied to the binlog tx buffer; proven once on PG" }
-    mssql:    { na: "same shared cap, applied to the __$start_lsn group buffer; proven once on PG" }
+    mysql:    { test: roast_mysql_cdc_oversized_transaction_bails_loud_not_oom }
+    mssql:    { test: roast_mssql_cdc_oversized_transaction_bails_loud_not_oom }
     mongo:    { na: "no per-transaction buffering — each change-stream event is one document, flushed independently; there is no whole-transaction buffer to bound" }
 
   # ── Harm / operational-cost contracts (the price CDC charges the source) ──────

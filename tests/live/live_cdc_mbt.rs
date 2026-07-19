@@ -1190,6 +1190,82 @@ fn cdc_scenario_smoke_mssql() {
     assert_eq!(rows, 2, "mssql scenario: pin → churn → drain (job-lagged)");
 }
 
+// The oversized-transaction memory backstop is ONE shared cap
+// (crate::source::cdc::max_tx_rows()) but THREE separate call sites — each
+// adapter checks its own per-transaction buffer length. PG is proven in
+// live_cdc.rs; these two prove the MySQL and SQL Server guards, so a mutant that
+// removes any single adapter's check goes RED (not just the helper). Contract:
+// an over-cap transaction FAILS loud (never a silent OOM / partial capture).
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
+fn roast_mysql_cdc_oversized_transaction_bails_loud_not_oom() {
+    // MySQL buffers a transaction WHOLE until its XID, so an oversized one would
+    // grow `tx` unbounded. RIVET_CDC_MAX_TX_ROWS lowers the 5M cap so this is
+    // reachable without a five-million-row transaction. CdcScenario pins the
+    // checkpoint BEFORE the churn (anchor-at-open), so the run reads exactly the
+    // 20-row transaction below.
+    let mut scn = CdcScenario::mysql("rivet_cdc_bigtx_my", "id INT PRIMARY KEY, v BIGINT");
+    // ONE transaction of 20 rows — a single multi-row INSERT is one commit, over
+    // the cap-of-10 this run sets.
+    let vals = (1..=20)
+        .map(|i| format!("({i},{i})"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!("INSERT INTO {} VALUES {vals}", scn.table);
+    scn.sql(&sql);
+    let output = scn.rig.run_with_env("RIVET_CDC_MAX_TX_ROWS", "10");
+    assert!(
+        !output.status.success(),
+        "an over-cap transaction must FAIL the run, not OOM or silently truncate"
+    );
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        err.contains("more than 10 rows") && err.contains("buffer unbounded"),
+        "the failure must name the cap and the refuse-to-buffer-unbounded reason — got:\n{err}"
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mssql-cdc"]
+fn roast_mssql_cdc_oversized_transaction_bails_loud_not_oom() {
+    // SQL Server buffers a `__$start_lsn` group whole; the same shared cap applies
+    // at this adapter's call site. The capture job is ASYNC, so wait for the change
+    // table to fill WITHOUT draining — draining would flush→checkpoint→ack past the
+    // rows, starving the capped run of the very transaction it must reject.
+    let mut scn = CdcScenario::mssql("rivet_cdc_bigtx_ms", "id INT PRIMARY KEY, v BIGINT");
+    let vals = (1..=20)
+        .map(|i| format!("({i},{i})"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!("INSERT INTO dbo.{} VALUES {vals}", scn.table);
+    scn.sql(&sql);
+    // Non-consuming wait: count the change table (cdc.<capture_instance>_CT) rows
+    // directly — a plain read that never advances the from-LSN cursor.
+    let ct = format!("cdc.[dbo_{}_CT]", scn.table);
+    let mut captured = 0i64;
+    for _ in 0..20 {
+        captured = mssql_cdc_query_i64(&format!("SELECT COUNT_BIG(*) FROM {ct}"));
+        if captured >= 20 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+    assert!(
+        captured >= 20,
+        "capture job never populated the change table (got {captured}/20) — cannot test the cap"
+    );
+    let output = scn.rig.run_with_env("RIVET_CDC_MAX_TX_ROWS", "10");
+    assert!(
+        !output.status.success(),
+        "an over-cap transaction must FAIL the run, not OOM or silently truncate"
+    );
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        err.contains("more than 10 change rows") && err.contains("buffered whole"),
+        "the failure must name the cap and the never-split-a-transaction reason — got:\n{err}"
+    );
+}
+
 // Finding #44: a batch and a CDC export sharing one prefix silently
 // destroyed each other's manifest.json (last writer wins — the batch part
 // vanished from validate's view in the GCS walkthrough that surfaced this).
