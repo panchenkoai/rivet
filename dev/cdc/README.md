@@ -13,6 +13,7 @@ dev/cdc/stand.sh verify      # re-check each engine is CDC-ready
 dev/cdc/stand.sh scenarios   # the live_cdc scenario suite (serial — shared DBs race in parallel)
 dev/cdc/stand.sh perf        # capture-throughput matrix, all 4 engines (dev/cdc/perf.sh)
 dev/cdc/stand.sh soak pg     # steady-state memory + completeness soak (dev/cdc_interval/soak_all.sh)
+dev/cdc/stand.sh standby     # opt-in primary+replica pair; bounded-CDC-on-a-standby fails loud
 dev/cdc/stand.sh all         # up + verify + scenarios + perf
 dev/cdc/stand.sh down        # stop the cdc profile
 ```
@@ -39,7 +40,7 @@ capture CDC straight to a cloud destination and skip loudly without them.
 
 ## Coverage map (`docs/cdc-matrix.yaml`, drift-guarded, 0 gaps)
 
-17 scenarios × 4 engines. "gaps=0" means every cell is a test OR a justified
+21 scenarios × 4 engines. "gaps=0" means every cell is a test OR a justified
 `na` — it does NOT mean every bug is caught (two adversarial reviews found six
 real bugs under a green matrix). Load-bearing termination is PostgreSQL +
 MongoDB (re-reading slot / tailable stream); MySQL + SQL Server terminate
@@ -62,19 +63,20 @@ by a disable-bound probe).
 | reach open bound past a foreign span | ✓ | na | na | na |
 | large-transaction atomic across crash | ✓ | na | ✓ | na |
 | type fidelity | ✓ | ✓ | ✓ | ✓ |
+| silent-update captured (the CDC value prop) | ✓ | na | na | na |
+| bounded-on-a-standby fails loud | ✓ | na | na | na |
+| oversized-transaction bails loud (per-adapter cap) | ✓ | ✓ | ✓ | na |
+| drain releases pinned WAL (slot harm) | ✓ | na | na | na |
 
 ## Honest thin spots (not matrix gaps, but real)
 
 - **Daemon / `Continuous` path** — the re-drain loop and commit-marking also run
   when `until_current: false`; every test scopes `until_current`. Nobody has
   checked whether an unbounded PG stream spins extra ack+re-peek cycles.
-- **PostgreSQL standby** — bounded CDC fails loud during recovery
-  (`pg_current_wal_lsn()` unavailable); documented, but there is no replica test
-  stand.
-- **Harm under load** — xmin hold, slot WAL growth, replication lag, co-running
-  OLTP p99: zero tests. Needs the smoke.py harm machinery ported to CDC.
-- **`MAX_TX_ROWS` backstop** (PG/MSSQL, added after the memory review) — a loud
-  bail, untested like MySQL's.
+- **Harm under load** — replication lag and co-running OLTP p99 have zero tests;
+  slot WAL growth + `confirmed_flush` advance is now covered (drain-releases-
+  pinned-WAL), but the *under-concurrent-load* harm still needs the smoke.py
+  machinery ported to CDC.
 - **Multi-pass crash** is proven on PG only; MySQL/Mongo have single-pass crash
   tests but not the re-drain multi-pass window.
 - **Steady-state on Mongo** — `soak_all.sh mongo` now exists but has had less
