@@ -3141,8 +3141,9 @@ fn roast_mysql_until_current_open_bound_two_runs_lose_nothing() {
     // the (file, pos) bound DISABLED (verified by the disable-bound RED probe:
     // the run still exited). So the open-time (file, pos) ceiling is a
     // PRECISE-STOP refinement over NON_BLOCK, not load-bearing for termination —
-    // only PostgreSQL's continuous slot re-peek genuinely needs the bound (see
-    // roast_pg_until_current_open_bound_two_runs_lose_nothing at rollover 5).
+    // the load-bearing engines are PostgreSQL (continuous slot re-peek, see
+    // roast_pg_until_current_open_bound_two_runs_lose_nothing at rollover 5) and
+    // MongoDB (tailable stream — disabling its pin hangs the sustained test).
     // What THIS test proves is DEFER-NOT-DROP: run 1 captures a prefix and exits,
     // run 2 drains the tail, and the union re-read from the parquet equals the
     // SOURCE id set. Oracle: the source table, never rivet's own counters.
@@ -3199,6 +3200,69 @@ fn roast_mysql_until_current_open_bound_two_runs_lose_nothing() {
         got, want,
         "run1 ∪ run2 must hold exactly the source's committed ids — the bound \
          defers the tail to run 2, never drops it"
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical)"]
+fn roast_pg_cdc_reaches_open_bound_past_a_large_empty_ddl_span() {
+    // Ultracode r2 finding: a pure-EMPTY (DDL) span LARGER than one peek window,
+    // sitting ahead of in-bound captured data, was drained only one window per
+    // run — empty transactions yield NO events to the sink, so the sink's
+    // re-drain ack never fires; only the adapter's `release_empty_frontier`
+    // advances the slot, and it used to release just one window before
+    // `next_change` returned None and the run wrote _SUCCESS with the in-bound
+    // data still unread. Fix: `next_change` now walks the WHOLE empty span in one
+    // call (release → re-peek loop). rollover 5 makes the window ~2 empty
+    // transactions, so a 40-transaction DDL burst is ~20 windows. Oracle: the
+    // SOURCE table A — one bounded run must capture all 12 rows.
+    use postgres::NoTls;
+    let a = unique_name("rivet_cdc_ddlspan");
+    let slot = unique_name("rivet_ddl_slot");
+    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {a}; CREATE TABLE {a} (id BIGINT PRIMARY KEY, v INT)"
+    ))
+    .unwrap();
+    let _ta = PgTable::adopt(a.clone());
+    c.execute(
+        "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+        &[&slot],
+    )
+    .unwrap();
+    let _slot = Slot(slot.clone());
+    // A large EMPTY span: 40 DDL transactions (row-less BEGIN/COMMIT) ≫ one
+    // window at rollover 5 — created AFTER the slot so they are in the WAL ahead
+    // of A's in-bound rows.
+    for i in 0..40 {
+        c.batch_execute(&format!(
+            "CREATE TABLE {a}_ddl_{i} (x int); DROP TABLE {a}_ddl_{i}"
+        ))
+        .unwrap();
+    }
+    // A's in-bound data, behind the empty span.
+    for i in 0..12i64 {
+        c.execute(&format!("INSERT INTO {a} VALUES ({i},{i})"), &[])
+            .unwrap();
+    }
+
+    let d = tempfile::tempdir().unwrap();
+    let out = d.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let rig = Rig::pg_cdc(&a, &slot)
+        .cdc("rollover: 5")
+        .dest_path(out.clone());
+    run_rivet_ok(&rig.config_path());
+
+    let got: std::collections::BTreeSet<i64> = dir_parquet_i64(&out, "id").into_iter().collect();
+    let want: std::collections::BTreeSet<i64> = (0..12).collect();
+    assert_eq!(
+        got,
+        want,
+        "one bounded run must capture all of A's in-bound rows past the large \
+         empty DDL span — got {} ids (the run stopped after one window of the \
+         empty span and wrote _SUCCESS with in-bound data unread)",
+        got.len()
     );
 }
 
@@ -3275,8 +3339,9 @@ fn roast_pg_cdc_ndjson_until_current_terminates_and_emits_backlog() {
     // NDJSON path uses ONE `PeekBound::Unbounded` peek (a single snapshot query),
     // so it terminates regardless of the open-time bound — the bound only clips
     // which rows that one snapshot yields, it is not load-bearing for
-    // termination (only PostgreSQL's ACKING file-sink path re-peeks and genuinely
-    // needs it). What THIS test proves: the CLI path terminates and emits the
+    // termination (the ACKING file-sink path re-peeks on PostgreSQL, and the
+    // tailable stream on MongoDB, are what genuinely need the bound). What THIS
+    // test proves: the CLI path terminates and emits the
     // whole pre-open backlog to stdout. No ack by design (stdout is not durable,
     // ADR-0023): the slot is left for the consumer.
     use postgres::NoTls;

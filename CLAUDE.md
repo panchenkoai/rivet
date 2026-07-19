@@ -162,23 +162,27 @@ variant accordingly.
 snapshot taken at open (PG `pg_current_wal_lsn()`, MSSQL `fn_cdc_get_max_lsn()`
 pinned once, MySQL the open-time binlog coordinates, Mongo `operationTime`) with
 the first commit PAST it ending the stream. But be honest about WHICH engine
-actually needs it: only PostgreSQL's **non-consuming slot peek** re-reads from
-the un-acked position, so an "exit when a poll finds nothing new" termination
-RACES the writers there — a paced writer (10-row tx / 5 ms) held the PG bounded
-run past a 30 s kill ceiling. The other three terminate NATIVELY (MySQL
-`BINLOG_DUMP_NON_BLOCK` EOF, MSSQL the capture Agent's scan-gap empty poll, Mongo
-a single change-stream pass), so their open-time bound is a precise-stop
-refinement, NOT load-bearing — I over-claimed "three of four shipped chasing";
-an ultracode review showed each of MySQL/MSSQL/Mongo terminates with its bound
-DISABLED under a flooding writer (the disable-bound probe is how you tell
-load-bearing from belt-and-suspenders — do it before claiming a per-engine
-fix). The excluded tail is deferred, never lost: checkpoint stops at the last
-in-bound commit, the next cycle resumes there — the two-run union test against
-the SOURCE id set proves DEFER-NOT-DROP on every engine
-(`roast_*_until_current_open_bound_two_runs_lose_nothing`), but only the PG
-variant's TERMINATION assertion genuinely goes RED without the bound; the others
-are belt-and-suspenders confirmations (say so in the test, don't claim they
-prove the clip). Keep the catch-up exit as the backstop, gate the snapshot on
+actually needs it, and **run the disable-bound probe PER ENGINE — never
+generalize one engine's result to another** (this bit twice: the first pass
+over-claimed "three of four shipped chasing"; the honesty-correction then
+over-corrected the OTHER way — "only PG is load-bearing" — by generalizing the
+MySQL/MSSQL probe to Mongo WITHOUT probing Mongo, and a round-2 review caught
+that Mongo actually hangs without its bound). The truth, each verified by
+disabling that engine's bound: **load-bearing** on the two engines with a
+re-reading / tailable reader — PostgreSQL (non-consuming slot peek re-reads from
+the un-acked position; a paced 10-row/5 ms writer held it past a 30 s ceiling)
+and MongoDB (a tailable change stream whose `next_if_any` keeps returning events
+under sustained writes, so the empty-poll check never fires — disabling
+`until_current_ts` HANGS the sustained-writes test). **Belt-and-suspenders** on
+the two with native catch-up — MySQL (`BINLOG_DUMP_NON_BLOCK` EOF) and MSSQL (the
+Agent's scan-gap empty poll) terminate with the bound disabled, so their
+open-time pin is only a precise-stop refinement. The excluded tail is deferred,
+never lost: checkpoint stops at the last in-bound commit, the next cycle resumes
+there — the two-run union test proves DEFER-NOT-DROP on every engine
+(`roast_*_until_current_open_bound_two_runs_lose_nothing`), but only the
+load-bearing engines' TERMINATION goes RED without the bound; the others are
+belt-and-suspenders confirmations (say so in the test, don't claim they prove
+the clip). Keep the catch-up exit as the backstop, gate the snapshot on
 `until_current` so the daemon mode is untouched, and fail OPEN on an unparseable
 boundary (delayed termination is recoverable; an early exit is a dropped commit).
 

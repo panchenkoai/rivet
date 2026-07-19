@@ -1104,8 +1104,9 @@ fn roast_mssql_until_current_open_bound_two_runs_lose_nothing() {
     // the drain exhausts even with the open-time @max pin DISABLED — verified by
     // the disable-pin RED probe (the run still exited under a sustained writer).
     // So the pinned @max is a PRECISE-STOP refinement, not load-bearing for
-    // termination (only PostgreSQL's continuous slot re-peek genuinely needs the
-    // bound). What THIS test proves is DEFER-NOT-DROP: run 1 captures a prefix,
+    // termination (the load-bearing engines are PostgreSQL — continuous slot
+    // re-peek — and MongoDB — tailable stream; each hangs with its bound
+    // disabled). What THIS test proves is DEFER-NOT-DROP: run 1 captures a prefix,
     // run 2 drains the tail, the union equals the SOURCE. Oracle: the source
     // table (count/sum/min/max of id — the scalar helpers can't fetch a set),
     // never rivet's own counters.

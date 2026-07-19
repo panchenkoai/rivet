@@ -36,6 +36,11 @@ use crate::source::cdc::value::RivetValue;
 use crate::source::cdc::{ChangeEvent, ChangeOp, ChangeStream, DrainMode, Position};
 use crate::source::require_tls_or_loopback;
 
+/// Memory backstop: a transaction is buffered whole (never split across parts),
+/// so an oversized `__$start_lsn` group would grow unbounded. Cap it and bail
+/// loudly rather than OOM. Matches the MySQL adapter's cap.
+const MAX_TX_ROWS: usize = 5_000_000;
+
 /// Build one poll's T-SQL. `bound` pins `@max` to the open-time ceiling
 /// (`0x{hex}`, a bounded `until_current` run) instead of re-reading
 /// `sys.fn_cdc_get_max_lsn()` per poll (the daemon's chase-the-head mode) — the
@@ -342,6 +347,19 @@ impl MssqlChangeStream {
                     seq: 0, // stamped by TxnSeq as the stream is consumed
                 },
             ));
+            // Memory backstop (matching MySQL's MAX_TX_ROWS): a transaction is
+            // buffered whole (never split across parts), and a single
+            // `__$start_lsn` group can be arbitrarily large. Bail loudly rather
+            // than OOM. `@to` bounds the batch at a group boundary, so a group
+            // never straddles two polls — the whole group lands in one `batch`.
+            if batch.len() > MAX_TX_ROWS {
+                anyhow::bail!(
+                    "mssql cdc: a single transaction has more than {MAX_TX_ROWS} change rows — \
+                     it must be buffered whole (a transaction is never split across parts), so \
+                     this would exhaust memory. Split the source transaction, or raise the cap \
+                     only if a transaction this large is genuinely expected."
+                );
+            }
         }
         // Mark the commit boundary: a row is the last of its transaction when it
         // is the final row of the batch OR the next row has a different start LSN.

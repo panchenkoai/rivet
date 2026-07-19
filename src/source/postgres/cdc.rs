@@ -235,6 +235,20 @@ impl PgChangeStream {
                 tx.clear();
             } else if let Some(ev) = parse_test_decoding(&lsn, &data) {
                 tx.push(ev);
+                // Memory backstop, matching the MySQL adapter's MAX_TX_ROWS: a
+                // transaction is buffered whole (never split across parts), so an
+                // oversized one grows unbounded. `upto_nchanges` cannot split a
+                // transaction, so `peek_changes` already materialised the whole
+                // thing into `rows` — this bails loudly instead of compounding it
+                // into `pending` + the sink buffer, and names the (upstream) fix.
+                if tx.len() > MAX_TX_ROWS {
+                    anyhow::bail!(
+                        "pg cdc: a single transaction has more than {MAX_TX_ROWS} rows — \
+                         it must be buffered whole (a transaction is never split across parts), \
+                         so this would exhaust memory. Split the source transaction, or raise \
+                         the cap only if a transaction this large is genuinely expected."
+                    );
+                }
             }
         }
         // Short window (backlog fit in one peek) OR a full window that yielded
@@ -329,6 +343,11 @@ fn wire_budget(peek: crate::source::cdc::PeekBound) -> i32 {
     peek.rows_capped().min(i32::MAX as usize) as i32
 }
 
+/// Memory backstop: a transaction is buffered whole (never split across parts),
+/// so an oversized one would grow unbounded. Cap it and bail loudly rather than
+/// OOM. Matches the MySQL adapter's cap; a real OLTP transaction is far below it.
+const MAX_TX_ROWS: usize = 5_000_000;
+
 /// Parse a `pg_lsn` rendering `X/Y` (two hex halves of a 64-bit position) into a
 /// comparable `u64`. `None` on a malformed value — the frontier check then treats
 /// it as `0` (never drops a real transaction on a parse miss).
@@ -341,20 +360,37 @@ fn parse_lsn(lsn: &str) -> Option<u64> {
 
 impl ChangeStream for PgChangeStream {
     fn next_change(&mut self) -> Option<Result<ChangeEvent>> {
-        // Refill a bounded batch whenever the buffer drains — the ack (from the
-        // sink, after a durable part) has advanced the slot, so the next peek
-        // reads fresh changes. `fill` marks `exhausted` once nothing new remains.
-        while self.pending.is_empty() && !self.exhausted {
-            if let Err(e) = self.fill() {
-                return Some(Err(e));
+        loop {
+            // Refill a bounded batch whenever the buffer drains — the ack (from
+            // the sink, after a durable part) has advanced the slot, so the next
+            // peek reads fresh changes. `fill` marks `exhausted` once nothing new
+            // remains readable from the current slot position.
+            while self.pending.is_empty() && !self.exhausted {
+                if let Err(e) = self.fill() {
+                    return Some(Err(e));
+                }
+            }
+            if !self.pending.is_empty() {
+                return self.pending.pop_front().map(Ok);
+            }
+            // Exhausted with nothing to yield. A pure-empty span (DDL churn: many
+            // row-less transactions) yields no events to the sink, so the sink's
+            // re-drain loop never acks and would stop here — but the span may be
+            // LARGER than one peek window. Release the empty prefix (advance the
+            // slot past it, which clears `exhausted`), then LOOP to re-peek the
+            // fresh WAL beyond it, walking the WHOLE empty span in one call rather
+            // than one window per scheduler run. `release_empty_frontier` is a
+            // no-op once any data was yielded (the sink owns acking then) or when
+            // there is nothing left to release, and `frontier_text.take()` makes
+            // it advance at most once per new window — so a run that cannot
+            // advance falls through to `None` and the loop terminates.
+            self.release_empty_frontier();
+            if self.exhausted {
+                // Release did not advance the slot (data was yielded, or the span
+                // is fully drained) — genuinely nothing more.
+                return None;
             }
         }
-        if self.pending.is_empty() {
-            // Clean exhaust: a zero-yield run releases its empty span (no-op
-            // when any data was yielded — the sink owns acking then).
-            self.release_empty_frontier();
-        }
-        self.pending.pop_front().map(Ok)
     }
 
     /// Advance the slot's `confirmed_flush_lsn` to the last durably-written change

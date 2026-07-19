@@ -5,21 +5,23 @@
 ### Fixed
 
 - **CDC `until_current` is now bounded at the position current when the run
-  OPENED, on every engine.** PostgreSQL's non-consuming logical-slot peek
-  re-reads from its un-acked position, so a "bounded" run chased a moving log
-  end and never terminated under sustained writes (live-reproduced: a paced
-  writer held it past a 30 s kill ceiling). PostgreSQL now snapshots
-  `pg_current_wal_lsn()` at open and stops at the first commit past it. MySQL
-  (`BINLOG_DUMP_NON_BLOCK` EOF), SQL Server (the capture Agent's scan-gap empty
-  poll), and MongoDB (a single change-stream pass) already terminate natively;
-  they now ALSO pin their open-time coordinate (binlog `(file,pos)` /
-  `fn_cdc_get_max_lsn()` / cluster `operationTime`) as a precise-stop refinement
-  (verified fix-invariant for termination by a disable-bound probe — only
-  PostgreSQL's is load-bearing). Every engine's run is O(backlog at open), and
-  the deferred tail is never lost: the checkpoint stops at the last in-bound
-  commit and the next scheduler cycle resumes from it (per-engine two-run
-  defer-not-drop live tests; the PG variant's termination goes RED without the
-  bound).
+  OPENED, on every engine.** The open-time bound is load-bearing for termination
+  on the two engines with a re-reading / tailable reader: **PostgreSQL** (the
+  non-consuming logical-slot peek re-reads from its un-acked position, so a
+  "bounded" run chased a moving log end and never terminated under sustained
+  writes — live-reproduced past a 30 s ceiling; now snapshots
+  `pg_current_wal_lsn()` at open) and **MongoDB** (a tailable change stream whose
+  `next_if_any` keeps returning events under sustained writes, so the empty-poll
+  check never fires — the open-time cluster `operationTime` stops it; disabling
+  the pin hangs the sustained-writes test). MySQL (`BINLOG_DUMP_NON_BLOCK` EOF)
+  and SQL Server (the capture Agent's scan-gap empty poll) terminate natively and
+  now ALSO pin their open-time coordinate (binlog `(file,pos)` /
+  `fn_cdc_get_max_lsn()`) as a precise-stop refinement (verified fix-invariant
+  for termination by a disable-bound probe). Every engine's run is O(backlog at
+  open), and the deferred tail is never lost: the checkpoint stops at the last
+  in-bound commit and the next scheduler cycle resumes from it (per-engine
+  two-run defer-not-drop live tests; the PG variant's termination goes RED
+  without the bound).
 - **PostgreSQL CDC bounded runs now reach the open bound in one pass, whatever
   the captured-data density.** The non-consuming `pg_logical_slot_peek_changes`
   always re-reads from the slot's un-acked position, and the slot only advances

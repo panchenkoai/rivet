@@ -270,17 +270,21 @@ pub(crate) enum CdcEngineOpts {
 /// coordinates; SQL Server `fn_cdc_get_max_lsn()`; MongoDB the cluster
 /// `operationTime`), so a hot table whose writers outpace the drain cannot keep
 /// the run alive — the run's work is O(backlog at open). Termination is
-/// LOAD-BEARING on this bound only for PostgreSQL, whose non-consuming slot peek
-/// re-reads from the un-acked position and would otherwise chase a moving log
-/// end; MySQL (`BINLOG_DUMP_NON_BLOCK` EOF), SQL Server (the capture Agent's
-/// scan-gap empty poll), and MongoDB (a single change-stream pass) terminate
-/// NATIVELY, so their bound is a precise-stop refinement (each verified
-/// fix-invariant for termination by a disable-bound probe). The excluded tail is
-/// deferred, never lost: the checkpoint stops at the last in-bound commit and
-/// the next run resumes there — the defer-not-drop contract every engine's
-/// two-run test proves (`roast_*_until_current_open_bound_two_runs_lose_nothing`;
-/// the PG variant, at rollover 5, is the one whose TERMINATION genuinely goes
-/// RED without the bound).
+/// LOAD-BEARING on this bound for the two engines with a re-reading / tailable
+/// reader: PostgreSQL (the non-consuming slot peek re-reads from the un-acked
+/// position, otherwise chasing a moving log end) and MongoDB (a tailable change
+/// stream whose `next_if_any` keeps returning events under sustained writes, so
+/// the empty-poll target check never fires — the cluster-time bound is what
+/// stops it, verified by disabling the pin: the sustained-writes test then
+/// hangs). MySQL (`BINLOG_DUMP_NON_BLOCK` EOF) and SQL Server (the capture
+/// Agent's scan-gap empty poll) terminate NATIVELY, so their bound is a
+/// precise-stop refinement (verified fix-invariant for termination by a
+/// disable-bound probe). The excluded tail is deferred, never lost: the
+/// checkpoint stops at the last in-bound commit and the next run resumes there —
+/// the defer-not-drop contract every engine's two-run test proves
+/// (`roast_*_until_current_open_bound_two_runs_lose_nothing`; the PG variant, at
+/// rollover 5, is the one whose TERMINATION genuinely goes RED without the
+/// bound).
 ///
 /// `Continuous` (the daemon model): no open-time ceiling. MySQL blocks on the
 /// binlog; the poll adapters still exit on catch-up and an outer loop re-wraps
