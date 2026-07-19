@@ -204,17 +204,37 @@ def phase(label: str, with_cdc: bool) -> dict:
     return {"lat": lat, "peak": peak, "drain_runs": drain_stats.get("runs", 0)}
 
 
+# Hard ceiling on WAL the flood is allowed to pin — an UNPACED flood filled the
+# devbox colima VM and crashed postgres (the very disk-fill harm, overshot). The
+# flood is PACED to a modest WAL rate and BACKS OFF above this cap so a scheduled-
+# drain gap can never fill the disk. Override with HARM_RETAIN_CAP_MB.
+RETAIN_CAP_B = int(os.environ.get("HARM_RETAIN_CAP_MB", "300")) * 1_048_576
+
+
 def heavy_wal_flood(stop: threading.Event):
-    """Tight batch-INSERT loop — floods WAL FAST (the psql-round-trip-capped OLTP
-    writer generates too little WAL to make the slot's retention harm visible).
-    Each statement writes 5000 rows, so a few seconds of this is tens of MB of WAL."""
+    """PACED batch-INSERT flood — enough WAL to make the slot's retention visible
+    (tens of MB) but rate-limited + capped so it never fills the disk. ~1000 rows
+    every 100 ms ≈ 10k rows/s ≈ a few MB/s of WAL; backs off above RETAIN_CAP_B."""
     p = subprocess.Popen(
         ["docker", "exec", "-i", PGC, "psql", "-U", "rivet", "-d", "rivet", "-q"],
         stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True,
     )
+    i = 0
     while not stop.is_set():
-        p.stdin.write(f"INSERT INTO {TABLE}(v, pad) SELECT g, repeat('x',120) FROM generate_series(1,5000) g;\n")
-        p.stdin.flush()
+        # safety back-off: never let the pinned WAL exceed the cap (checked cheaply
+        # every ~20 batches so the harm reading stays honest without per-batch cost)
+        if i % 20 == 0 and sample_harm()["retained_b"] > RETAIN_CAP_B:
+            time.sleep(0.5)
+            continue
+        try:
+            p.stdin.write(
+                f"INSERT INTO {TABLE}(v, pad) SELECT g, repeat('x',120) FROM generate_series(1,1000) g;\n"
+            )
+            p.stdin.flush()
+        except BrokenPipeError:
+            break
+        i += 1
+        time.sleep(0.1)
     try:
         p.stdin.write("\\q\n"); p.stdin.flush(); p.wait(timeout=5)
     except Exception:
