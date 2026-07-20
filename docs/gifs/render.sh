@@ -674,7 +674,7 @@ fixture_error_connection_teardown() { :; }
 # ----- CDC scenarios --------------------------------------------------------
 
 # Checkpoint at the current binlog position + a deterministic backlog after it,
-# so `rivet cdc --until-current` drains exactly these changes and exits.
+# so `rivet cdc` drains exactly these changes and exits (bounded is the default).
 fixture_cdc_setup() {
     mysql_ -N -B -e 'SHOW MASTER STATUS' \
         | awk 'NR==1{printf "{\"file\":\"%s\",\"pos\":%s}", $1, $2}' > "$work/cdc.ckpt"

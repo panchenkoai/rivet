@@ -103,7 +103,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             rollover,
             slot,
             capture_instance,
-            until_current,
+            stream,
         } => dispatch_cdc(CdcArgs {
             source,
             source_env,
@@ -117,7 +117,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             rollover,
             slot,
             capture_instance,
-            until_current,
+            until_current: !stream,
         }),
         Commands::Load {
             config,

@@ -2,9 +2,17 @@
 
 Rivet exports data from PostgreSQL, MySQL, SQL Server, and MongoDB to Parquet/CSV files on local disk, S3, GCS, Azure Blob Storage, or stdout.
 
-Install from Rust: `cargo install rivet-cli` (crates.io name is `rivet-cli`; the binary is `rivet`). Other install options live in the repo [README](../README.md).
+Install from Rust: `cargo install rivet-cli` (crates.io name is `rivet-cli`; the binary is `rivet`). Other install options live in the repo [README](https://github.com/panchenkoai/rivet/blob/main/README.md).
 
 This folder contains modular guides for running exports, a complete configuration and CLI reference, an architecture overview, and the full set of architecture decision records.
+
+## Why teams pick Rivet
+
+Three properties, each measured, not asserted:
+
+- **[Source-safe under load](why/source-safe-under-load.md)** — the batch export holds **no long-running query** on the source (0.00 s vs 7.7–94.6 s for the field); CDC reads the log, not your tables.
+- **[Flat memory at any scale](why/flat-memory.md)** — a steady **57 MB** peak RSS (2×–63× smaller than the field), flat from 10 k rows to a field-proven **454 M-row** table with no OOM.
+- **[CDC cost, per engine](why/cdc-cost-per-engine.md)** — an honest per-engine account of the one operational hazard (PostgreSQL slot retention) and why MySQL / SQL Server / MongoDB can't fill the source disk.
 
 ## Supported database versions
 
@@ -29,7 +37,7 @@ Pick one — they're ordered shortest to deepest. Read top-to-bottom, then come 
 | [Who is Rivet for?](who-is-this-for.md) | Yes / no fit-check with named alternatives (Debezium / Airbyte / Fivetran / dbt / DuckDB) | ~1 min |
 | [Getting Started](getting-started.md) | Install + your first export from a real table | ~3 min read · ~5 min hands-on |
 | [Concepts glossary](concepts.md) | One-page orientation: `run_id`, `cursor`, `chunk`, `manifest`, `journal`, `progression` | ~3 min |
-| [Pilot guide](pilot/README.md) | Operator runbook — full flow on your own database, production-ready guardrails | 1–2 sessions |
+| [Pilot guide](pilot/) | Operator runbook — full flow on your own database, production-ready guardrails | 1–2 sessions |
 
 Short terminal walkthroughs in [gifs/](gifs/):
 
@@ -85,7 +93,7 @@ Cloud auth & trust: [cloud-auth.md](cloud-auth.md) — per-backend credential-fl
 
 ## Trust contracts
 
-The five surfaces a serious operator inspects before adopting Rivet. Same five rows, same order, are mirrored at the top of the project [README](../README.md).
+The five surfaces a serious operator inspects before adopting Rivet. Same five rows, same order, are mirrored at the top of the project [README](https://github.com/panchenkoai/rivet/blob/main/README.md).
 
 | Topic | Guide |
 |-------|-------|
@@ -94,9 +102,9 @@ The five surfaces a serious operator inspects before adopting Rivet. Same five r
 | **Cloud smoke tests** — last-verified real-cloud matrix per release (S3 / GCS / Azure) | [cloud-smoke-tests.md](cloud-smoke-tests.md) |
 | **Release checklist** — every gate every tag must clear before publish | [release-checklist.md](release-checklist.md) |
 | **Cloud permissions** — least-privilege IAM / RBAC / SAS scopes for each backend | [cloud-permissions.md](cloud-permissions.md) |
-| **Security policy** — what Rivet can access, sensitive artifacts, credential handling, reporting | [../SECURITY.md](../SECURITY.md) |
+| **Security policy** — what Rivet can access, sensitive artifacts, credential handling, reporting | [../SECURITY.md](https://github.com/panchenkoai/rivet/blob/main/SECURITY.md) |
 | **Compatibility matrix** — PG 12–16, MySQL 5.7 / 8.0, SQL Server 2022, MongoDB 4.4–8.0 actually exercised in CI | [reference/compatibility.md](reference/compatibility.md) |
-| **Cross-tool benchmark harness** — reproducible PG/MySQL → Parquet vs sling, dlt, duckdb, clickhouse-local, odbc2parquet (defaults + steelman) | [bench/README.md](bench/README.md) |
+| **Cross-tool benchmark harness** — reproducible PG/MySQL → Parquet vs sling, dlt, duckdb, clickhouse-local, odbc2parquet (defaults + steelman) | [bench/README.md](bench/) |
 
 ## Best Practices
 
@@ -161,4 +169,4 @@ Action-first cookbooks for the most common production scenarios.
 
 ## Example Configs
 
-Ready-to-use YAML templates live in the [`examples/`](../examples/) directory. To scaffold YAML from a live database (`rivet init`), see [reference/init.md](reference/init.md) and the root [`docker-compose.yaml`](../docker-compose.yaml).
+Ready-to-use YAML templates live in the [`examples/`](https://github.com/panchenkoai/rivet/tree/main/examples) directory. To scaffold YAML from a live database (`rivet init`), see [reference/init.md](reference/init.md) and the root [`docker-compose.yaml`](https://github.com/panchenkoai/rivet/blob/main/docker-compose.yaml).

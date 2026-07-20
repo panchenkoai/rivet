@@ -12,8 +12,8 @@
 
 | Engine | File | Use case | Parallel unit |
 |--------|------|----------|---------------|
-| **In-process scoped threads** | [src/pipeline/chunked/exec.rs](../../src/pipeline/chunked/exec.rs) | Chunked export of a single table — split the row range into N chunks, run them concurrently against the same source DB. | `std::thread::scope` + per-thread `Source` connection |
-| **Subprocess fan-out** | [src/pipeline/parallel_children.rs](../../src/pipeline/parallel_children.rs) | `--parallel-export-processes` — run **many independent exports** (different tables, different configs) concurrently as separate `rivet` child processes communicating via IPC. | `std::process::Command` + a JSON event stream |
+| **In-process scoped threads** | [src/pipeline/chunked/exec.rs](https://github.com/panchenkoai/rivet/blob/main/src/pipeline/chunked/exec.rs) | Chunked export of a single table — split the row range into N chunks, run them concurrently against the same source DB. | `std::thread::scope` + per-thread `Source` connection |
+| **Subprocess fan-out** | [src/pipeline/parallel_children.rs](https://github.com/panchenkoai/rivet/blob/main/src/pipeline/parallel_children.rs) | `--parallel-export-processes` — run **many independent exports** (different tables, different configs) concurrently as separate `rivet` child processes communicating via IPC. | `std::process::Command` + a JSON event stream |
 
 ---
 

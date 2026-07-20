@@ -9,7 +9,7 @@ How rivet compares to seven other extraction tools — `duckdb`, `clickhouse-loc
 | File | Role |
 |---|---|
 | [`matrix.yaml`](matrix.yaml) | the SINGLE source — metric catalog, tool set + versions + steelman configs, seed sizes, per-engine harm metrics |
-| [`../../dev/bench/smoke.py`](../../dev/bench/smoke.py) | the runner — reads `matrix.yaml`, runs each tool, prints three matrices; **guards against metric drift** |
+| [`../../dev/bench/smoke.py`](https://github.com/panchenkoai/rivet/blob/main/dev/bench/smoke.py) | the runner — reads `matrix.yaml`, runs each tool, prints three matrices; **guards against metric drift** |
 | [`report.html`](report.html) | the rendered headline report (open in a browser) |
 
 ## What it measures — three matrices, one run per tool

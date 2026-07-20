@@ -74,7 +74,7 @@ The bodies share no extractable implementation logic:
 | Client crate | `postgres` | `mysql` |
 | SQL dialect | PG (`$1`/`$2`, `regclass`) | MySQL (`?`, no `regclass`) |
 
-Per the [deletion test](../../.claude/skills/improve-codebase-architecture/LANGUAGE.md):
+Per the [deletion test](https://github.com/panchenkoai/rivet/blob/main/.claude/skills/improve-codebase-architecture/LANGUAGE.md):
 deleting the hypothetical trait concentrates no complexity — the two
 free functions remain, the shared struct remains, the dispatch match
 remains. The trait was pure ceremony around two functions whose only

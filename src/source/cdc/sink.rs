@@ -1154,7 +1154,7 @@ mod tests {
 
     #[test]
     fn empty_stream_writes_a_zero_row_manifest_and_success() {
-        // A bounded run that drains no changes (`--until-current` with nothing new)
+        // A bounded run that drains no changes (the default drain, nothing new)
         // must still close cleanly: a 0-part manifest + `_SUCCESS`, not an error or a
         // missing marker that would look like a crash to the next run.
         let dir = tempfile::tempdir().unwrap();

@@ -200,12 +200,13 @@ pub enum Commands {
         /// `sqlserver://` sources.
         #[arg(long, value_name = "INSTANCE")]
         capture_instance: Option<String>,
-        /// Catch up to the source's current end and exit, instead of streaming
-        /// indefinitely — the bounded "read to now and stop" model, ideal for a
-        /// scheduler. For MySQL this is a non-blocking binlog dump; PostgreSQL /
-        /// SQL Server already drain their backlog and exit.
+        /// Stream continuously instead of the DEFAULT bounded "read to the log end
+        /// and exit" drain. Continuous streaming is a long-lived daemon; omit this
+        /// for the scheduler-friendly bounded run (the default). For MySQL the
+        /// bounded run is a non-blocking binlog dump; PostgreSQL / SQL Server drain
+        /// their backlog and exit.
         #[arg(long)]
-        until_current: bool,
+        stream: bool,
     },
     /// Load an export's Parquet into a warehouse (BigQuery / Snowflake)
     ///

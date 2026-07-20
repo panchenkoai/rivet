@@ -308,6 +308,17 @@ fn run_cdc_inner(
         .collect();
     let now = chrono::Utc::now().to_rfc3339();
 
+    // `until_current` defaults to `true` (bounded, scheduler-friendly). An explicit
+    // `false` opts into a long-lived continuous stream — surface it so it is a
+    // deliberate choice, never a silent never-terminating run.
+    if !cdc.until_current {
+        log::warn!(
+            "cdc: `until_current: false` runs a CONTINUOUS stream (a long-lived daemon that never \
+             exits on its own). For the scheduler model, omit it or set `until_current: true` (the \
+             default) to drain to the log end and exit."
+        );
+    }
+
     run_capture(CdcCapture {
         cdc_cfg: CdcConfig {
             url,

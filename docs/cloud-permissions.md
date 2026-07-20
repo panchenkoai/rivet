@@ -190,5 +190,5 @@ For a stricter dry-run, follow the manual cloud smoke flow in
 - [docs/cloud-destinations.md](cloud-destinations.md) — the trust
   contract every backend implements.
 - [docs/destinations/](destinations/) — per-backend deep dives.
-- [SECURITY.md](../SECURITY.md) — credential handling and redaction
+- [SECURITY.md](https://github.com/panchenkoai/rivet/blob/main/SECURITY.md) — credential handling and redaction
   guarantees.

@@ -99,7 +99,7 @@ This is the contract `--validate` checks on the metadata-only path: it lists the
 > Runs that completed before 0.7.0 (no manifest at the destination prefix) are not migrated. Operations on legacy prefixes succeed with reduced guarantees and **must** emit an explicit `legacy_run: true` label in operator-facing output.
 
 Per the project decision documented in
-[project-roadmap-0-7-0-legacy-runs](../../.claude/projects/-Users-andriipanchenko-rivet/memory/project_roadmap_0_7_0_legacy_runs.md):
+[project-roadmap-0-7-0-legacy-runs](https://github.com/panchenkoai/rivet/blob/main/.claude/projects/-Users-andriipanchenko-rivet/memory/project_roadmap_0_7_0_legacy_runs.md):
 
 - `--resume` on a legacy prefix uses the pre-0.7.0 file-log-based logic; no manifest-aware skip.
 - `--validate` on a legacy prefix falls back to local-file row-count checks; manifest/M5 checks are skipped and reported as such.

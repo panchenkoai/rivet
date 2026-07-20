@@ -17,7 +17,7 @@ pip install duckdb        # the only dependency; the postgres/mysql scanner
                           # extensions auto-install on first use
 ```
 
-The script lives at [`dev/correctness/verify_export.py`](../../dev/correctness/verify_export.py).
+The script lives at [`dev/correctness/verify_export.py`](https://github.com/panchenkoai/rivet/blob/main/dev/correctness/verify_export.py).
 
 ## Run it
 
@@ -87,10 +87,10 @@ ordering and multi-file output don't matter.
   date/time/blob/boolean *values* directly (only their non-null counts), to stay
   free of cross-engine representation differences. For those, rivet's live test
   suite uses DuckDB/ClickHouse/pyarrow as full-type oracles
-  ([type_roundtrip](../../tests/type_roundtrip/)).
+  ([type_roundtrip](https://github.com/panchenkoai/rivet/tree/main/tests/type_roundtrip)).
 - It verifies the **data**, not your `query:`. A query that selects the wrong
   rows will fingerprint-match a faithful export of those wrong rows.
 
 The same technique runs continuously in rivet's own CI as
-[`tests/live_differential.rs`](../../tests/live_differential.rs) — this script
+[`tests/live_differential.rs`](https://github.com/panchenkoai/rivet/blob/main/tests/live_differential.rs) — this script
 is that test, pointed at *your* database.

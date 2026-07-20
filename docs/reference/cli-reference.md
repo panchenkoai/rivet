@@ -155,7 +155,7 @@ The engine is chosen from the URL scheme: `mysql://` (binlog), `postgresql://` (
 
   Default value: `rivet_slot`
 * `--capture-instance <INSTANCE>` — SQL Server CDC capture instance, e.g. `dbo_orders` — required for `sqlserver://` sources
-* `--until-current` — Catch up to the source's current end and exit, instead of streaming indefinitely — the bounded "read to now and stop" model, ideal for a scheduler. For MySQL this is a non-blocking binlog dump; PostgreSQL / SQL Server already drain their backlog and exit
+* `--stream` — Stream continuously instead of the DEFAULT bounded "read to the log end and exit" drain. Continuous streaming is a long-lived daemon; omit this for the scheduler-friendly bounded run (the default). For MySQL the bounded run is a non-blocking binlog dump; PostgreSQL / SQL Server drain their backlog and exit
 
 
 

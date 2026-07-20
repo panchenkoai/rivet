@@ -1,10 +1,10 @@
 # Rivet type mapping contract
 
 This document describes how Rivet maps source column types to logical
-[`RivetType`](../src/types/rivet_type.rs) values and Arrow/Parquet/CSV
+[`RivetType`](https://github.com/panchenkoai/rivet/blob/main/src/types/rivet_type.rs) values and Arrow/Parquet/CSV
 representations. It is aligned with the automated suite in
-[`tests/type_roundtrip/`](../tests/type_roundtrip/) and
-[`tests/live_type_golden.rs`](../tests/live_type_golden.rs).
+[`tests/type_roundtrip/`](https://github.com/panchenkoai/rivet/tree/main/tests/type_roundtrip) and
+[`tests/live_type_golden.rs`](https://github.com/panchenkoai/rivet/blob/main/tests/live_type_golden.rs).
 
 ## The short version
 
@@ -112,7 +112,7 @@ duckdb in the same container). Each reader catches what the others cannot:
 | pyarrow | Arrow field metadata (`rivet.*` keys) reaches the Parquet footer; row-group statistics (`min`/`max`/`null_count`) are correct; Decimal256 (precision > 38) round-trips exactly where DuckDB downgrades to DOUBLE |
 
 Local-reader type fidelity is now covered by the cross-tool harness'
-**type-loss matrix** ([`dev/bench/smoke.py`](../dev/bench/smoke.py), rendered in
+**type-loss matrix** ([`dev/bench/smoke.py`](https://github.com/panchenkoai/rivet/blob/main/dev/bench/smoke.py), rendered in
 [`report.html`](bench/report.html)): every source column vs each tool's Parquet
 type family. A BigQuery cloud-load type-diff (load each Rivet Parquet via
 `bq load --autodetect`, assert decimal sums round-trip) is **not** currently in
@@ -123,18 +123,18 @@ falls back to `BYTES`/`STRING`; values are valid JSON but operators
 need an explicit `--schema='attrs:JSON,...'` to query the structure).
 
 In addition, two structural-only tests pin the Parquet layout itself —
-[`parquet_schema.rs`](../tests/type_roundtrip/parquet_schema.rs) for
+[`parquet_schema.rs`](https://github.com/panchenkoai/rivet/blob/main/tests/type_roundtrip/parquet_schema.rs) for
 physical + logical types per column, and
-[`parquet_metadata.rs`](../tests/type_roundtrip/parquet_metadata.rs) for the
+[`parquet_metadata.rs`](https://github.com/panchenkoai/rivet/blob/main/tests/type_roundtrip/parquet_metadata.rs) for the
 `rivet.native_type` / `rivet.fidelity` / `rivet.logical_type` field metadata.
 
 Coverage extensions live in dedicated files:
-[`compression_matrix.rs`](../tests/type_roundtrip/compression_matrix.rs)
+[`compression_matrix.rs`](https://github.com/panchenkoai/rivet/blob/main/tests/type_roundtrip/compression_matrix.rs)
 re-runs the export under `zstd` / `snappy` / `gzip` / `none` and asserts
 value parity across all four codecs;
-[`csv_load.rs`](../tests/type_roundtrip/csv_load.rs) replays the matrix
+[`csv_load.rs`](https://github.com/panchenkoai/rivet/blob/main/tests/type_roundtrip/csv_load.rs) replays the matrix
 through DuckDB `read_csv_auto`;
-[`pg_edge_cases.rs`](../tests/type_roundtrip/pg_edge_cases.rs) covers
+[`pg_edge_cases.rs`](https://github.com/panchenkoai/rivet/blob/main/tests/type_roundtrip/pg_edge_cases.rs) covers
 decimal precision boundaries (38, 39 / Decimal128↔Decimal256), tz timestamps
 pre-epoch and far-future, JSON deep nesting + unicode keys + i64 edges,
 arrays with NULL elements, large single-cell strings.
@@ -172,7 +172,7 @@ defects in the PG / MySQL drivers; all have been fixed in v0.7.8:
   `ARRAY[1, NULL, 3]` via `try_get::<Vec<i32>>`, which errors on a NULL
   element; the error was swallowed and a whole-row NULL was written. Fixed
   by deserializing as `Vec<Option<T>>` and pushing nulls through
-  `ListBuilder::append_null` ([`src/source/postgres/arrow_convert.rs`](../src/source/postgres/arrow_convert.rs)).
+  `ListBuilder::append_null` ([`src/source/postgres/arrow_convert.rs`](https://github.com/panchenkoai/rivet/blob/main/src/source/postgres/arrow_convert.rs)).
 * **MySQL ENUM / SET were misclassified as `String`.** They arrive on the
   wire as `MYSQL_TYPE_STRING` / `MYSQL_TYPE_VAR_STRING` with the
   `ENUM_FLAG` / `SET_FLAG` set, not as `MYSQL_TYPE_ENUM`. The mapper now
@@ -360,12 +360,12 @@ definition — no override needed; see the MySQL section.)
 | `lossy` | Rejected in strict mode |
 | `unsupported` | Requires policy override |
 
-See [`src/types/fidelity.rs`](../src/types/fidelity.rs).
+See [`src/types/fidelity.rs`](https://github.com/panchenkoai/rivet/blob/main/src/types/fidelity.rs).
 
 ## CSV serialization
 
 CSV shares the same Arrow `RecordBatch` as Parquet, so values are identical —
-only the text rendering differs ([`src/format/csv.rs`](../src/format/csv.rs)):
+only the text rendering differs ([`src/format/csv.rs`](https://github.com/panchenkoai/rivet/blob/main/src/format/csv.rs)):
 
 | RivetType | CSV rendering |
 |-----------|---------------|

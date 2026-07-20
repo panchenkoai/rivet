@@ -687,6 +687,33 @@ exports:
 }
 
 #[test]
+fn cdc_until_current_defaults_to_true_not_the_streaming_daemon() {
+    // Omitting `until_current` must default to TRUE (bounded / scheduler), never
+    // the continuous-streaming daemon. A hand-written CDC config that forgot the
+    // field used to silently start a never-terminating stream (`#[serde(default)]`
+    // = false); the default is now `default_true`.
+    let yaml = r#"
+source: { type: postgres, url: "postgresql://localhost/test" }
+exports:
+  - name: t
+    table: t
+    mode: cdc
+    format: parquet
+    cdc: { slot: s1 }
+    destination: { type: local, path: ./out }
+"#;
+    let cfg = Config::from_yaml(yaml).expect("valid cdc config");
+    assert!(
+        cfg.exports[0]
+            .cdc
+            .as_ref()
+            .expect("cdc block")
+            .until_current,
+        "omitting until_current must default to true (bounded), not the streaming daemon"
+    );
+}
+
+#[test]
 fn tables_outside_cdc_mode_is_rejected() {
     let yaml = r#"
 source: { type: postgres, url: "postgresql://localhost/test" }

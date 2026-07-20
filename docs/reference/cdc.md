@@ -40,7 +40,7 @@ dev — the URL is otherwise visible in `ps` / shell history.
 | `--rollover N` | rows per output part file (default `100000`); also rolls at a transaction boundary, never splitting one. **This is the file-size ⇄ memory dial**: larger ⇒ fewer, bigger files but more drain memory (the PostgreSQL peek reads a part's worth per batch, so drain RSS is O(rollover) — ≈`28 MB + 1.3 KB × rollover`). Raise it to cut file count on a big host; lower it to cap memory on a small extractor. (Config: `cdc.rollover`.) |
 | `--slot NAME` | PostgreSQL logical slot (default `rivet_slot`; created if absent). |
 | `--capture-instance NAME` | SQL Server CDC capture instance (e.g. `dbo_orders`) — required for `sqlserver://`. |
-| `--until-current` | Catch up to the source's log end **as of the moment the run opened**, then **exit** instead of streaming. Every engine pins that boundary at open (PostgreSQL: `pg_current_wal_lsn()`; MySQL: the binlog coordinates, plus `BINLOG_DUMP_NON_BLOCK` as the catch-up backstop; SQL Server: `fn_cdc_get_max_lsn()`; MongoDB: the cluster `operationTime`), so a hot table whose writers outpace the drain cannot keep the run alive chasing a moving log end — the run's work is O(backlog at open), and everything committed after the boundary is picked up by the next run from the checkpoint. With `--max-events N`, the run stops at the smaller of "N events" or the boundary — so it never blocks waiting for the N-th event. Ideal for a scheduler. On a PostgreSQL **standby** (PG 16+ logical decoding) the ceiling query (`pg_current_wal_lsn()`) is unavailable during recovery, so a bounded run fails loudly at open — stream continuously or point the source at the primary. |
+| `--stream` | **Opt out of the default bounded run and stream continuously** (a long-lived daemon). By default `rivet cdc` catches up to the source's log end **as of the moment the run opened**, then **exits** instead of streaming — this is the scheduler-friendly model, so no flag is needed for it. Every engine pins that boundary at open (PostgreSQL: `pg_current_wal_lsn()`; MySQL: the binlog coordinates, plus `BINLOG_DUMP_NON_BLOCK` as the catch-up backstop; SQL Server: `fn_cdc_get_max_lsn()`; MongoDB: the cluster `operationTime`), so a hot table whose writers outpace the drain cannot keep the run alive chasing a moving log end — the run's work is O(backlog at open), and everything committed after the boundary is picked up by the next run from the checkpoint. With `--max-events N`, the bounded run stops at the smaller of "N events" or the boundary — so it never blocks waiting for the N-th event. Passing `--stream` disables the boundary and tails the log until interrupted (and logs a warning that it is a daemon). On a PostgreSQL **standby** (PG 16+ logical decoding) the ceiling query (`pg_current_wal_lsn()`) is unavailable during recovery, so the default bounded run fails loudly at open — pass `--stream`, or point the source at the primary. |
 
 The engine is chosen from the URL scheme (`mysql://` / `postgresql://` /
 `sqlserver://` / `mongodb://`) by `create_change_stream`, the CDC sibling of the batch
@@ -631,11 +631,13 @@ checkpointing, cloud destinations + `manifest.json`/`_SUCCESS`, and the
 config-driven `rivet run` path with a recorded run are all in place for all three
 engines. What remains:
 
-- **Continuous capture for PostgreSQL / SQL Server** is poll-once-and-exit (they
-  drain their backlog and stop); a long-running daemon reconstructs the stream each
-  cycle. The supported continuous model today is a scheduler running
-  `--until-current` (or `rivet run` with `cdc.until_current`) on an interval, each
-  run resuming from the checkpoint. MySQL streams continuously without `--until-current`.
+- **Continuous capture** is bounded-poll-and-exit by default on every engine (they
+  drain their backlog and stop). The supported continuous model is a scheduler
+  running the default bounded `rivet cdc` (or `rivet run` with
+  `cdc.until_current: true`, now the default) on an interval, each run resuming from
+  the checkpoint. For a genuinely long-lived daemon that tails the log until
+  interrupted, pass `--stream` (config: `cdc.until_current: false`) — it logs a
+  warning, since the bounded run is the intended model.
 - **Schema drift:** the sink schema is frozen at the first flush — a column added
   mid-run is not picked up until the next run re-resolves the table.
 - **No lag metric:** the run records rows / files / bytes / duration / status, but

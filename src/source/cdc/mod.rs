@@ -296,8 +296,9 @@ pub(crate) enum DrainMode {
 }
 
 impl DrainMode {
-    /// The user-facing surface stays a bool (`cdc.until_current` /
-    /// `--until-current`); internally the mode travels under one name.
+    /// The user-facing surface stays a bool (`cdc.until_current`, default true;
+    /// the `rivet cdc` CLI opts OUT with `--stream`); internally the mode
+    /// travels under one name.
     pub(crate) fn from_until_current(until_current: bool) -> Self {
         if until_current {
             DrainMode::BoundedAtOpen

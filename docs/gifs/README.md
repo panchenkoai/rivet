@@ -130,8 +130,8 @@ deterministic regardless of the user's shell rc.
 
 ## Where they appear
 
-- [README.md](../../README.md) — top-level table of contents.
-- [docs/README.md](../README.md) — "Start here" section.
+- [README.md](https://github.com/panchenkoai/rivet/blob/main/README.md) — top-level table of contents.
+- [docs/README.md](../) — "Start here" section.
 - [docs/getting-started.md](../getting-started.md) (current 4-step layout):
   - `basic.gif` in §3 "Preflight & run".
   - `check-verdict.gif` in §3 (right after the `rivet check` block).

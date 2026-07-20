@@ -58,7 +58,7 @@ The exact state-write ordering is defined by **[ADR-0001 — State Update Invari
 
 ## Retry semantics
 
-Retries are classified by error type in [src/pipeline/retry.rs](../src/pipeline/retry.rs):
+Retries are classified by error type in [src/pipeline/retry.rs](https://github.com/panchenkoai/rivet/blob/main/src/pipeline/retry.rs):
 
 The classifier (`RetryClass`) has two outcomes — `Transient` (retry) and `Permanent` (propagate):
 
@@ -188,7 +188,7 @@ Rivet does **not** currently guarantee:
 - **Completeness of incremental cursors that can tie.** Incremental resume uses a strict `WHERE cursor > last_value`. If two rows share the high-watermark value and the second becomes visible only *after* the run that advanced the watermark past it — e.g. a low-resolution `updated_at` (second granularity) or rows committed at the same timestamp after the read snapshot — the next run skips them and they are never exported. (Keyset pagination is unaffected: its key is planner-enforced unique + NOT NULL.) Use a **strictly per-row-distinct, monotonic** cursor (a sequence/identity id, or a timestamp with sub-value uniqueness); when the cursor can tie, re-snapshot the affected window with `full`/`chunked` mode.
 - **Dense-chunking stability on a tied, concurrently-written `chunk_column`.** `chunk_dense: true` pages by `ROW_NUMBER() OVER (ORDER BY chunk_column)`, recomputed in an independent query per chunk. The ordinal partition itself never gaps or overlaps, but the ordinal→row mapping is only stable if the `ORDER BY` is deterministic. On a column with a large **tied** peer group straddling a chunk boundary *while the source is being written concurrently*, two chunk queries could order the tied band differently — duplicating or dropping a boundary row. Against a **static** table this does not occur on any tested engine (PG 16 / MySQL 8 / SQL Server 2022 — verified by `tests/live_chunked_dense.rs`). Prefer a `chunk_column` with no large tied groups, or **keyset** (`chunk_by_key`) on a unique key, when chunking a live-writing table.
 - **Automatic cleanup of partial artifacts** on `Atomic` destinations after a crash mid-write. A partial local file may persist and must be removed manually.
-- **Schema migration handling.** If the source schema changes between runs, Rivet does not migrate the destination; it surfaces a schema-drift error (see [tests/live_schema_drift.rs](../tests/live_schema_drift.rs)).
+- **Schema migration handling.** If the source schema changes between runs, Rivet does not migrate the destination; it surfaces a schema-drift error (see [tests/live_schema_drift.rs](https://github.com/panchenkoai/rivet/blob/main/tests/live_schema_drift.rs)).
 - **Correctness of user-authored SQL.** Rivet executes `query:` verbatim. A query that omits a `WHERE` clause or selects from the wrong table will export the wrong data — there is no semantic validation.
 - **Protection from poorly indexed source queries.** Preflight (`rivet doctor`, `rivet check`) warns about missing cursor indexes and unbounded `ORDER BY`, but it does not refuse to run. The operator decides.
 - **Stdout state safety.** Using stdout with cursor or manifest state is technically allowed but not meaningful; plan validation rejects `stdout + chunked` and `stdout + max_file_size` before execution (ADR-0004 Known Gap).
@@ -201,12 +201,12 @@ Rivet does **not** currently guarantee:
 
 The invariants on this page are exercised by:
 
-- [tests/invariants.rs](../tests/invariants.rs) — ADR-0001 I1–I7 structural contracts.
-- [tests/journal_invariants.rs](../tests/journal_invariants.rs) — RunJournal event ordering.
-- [tests/recovery.rs](../tests/recovery.rs) — chunk checkpoint resume semantics (I5, I6).
-- [tests/live_crash_recovery.rs](../tests/live_crash_recovery.rs) — crash-and-resume against a live database.
-- [tests/live_chunked_recovery.rs](../tests/live_chunked_recovery.rs) — chunked resume after partial completion.
-- [tests/live_retry_and_faults.rs](../tests/live_retry_and_faults.rs) — retry classification under injected faults.
-- [tests/live_reconcile_repair.rs](../tests/live_reconcile_repair.rs) — reconcile / repair end-to-end.
+- [tests/invariants.rs](https://github.com/panchenkoai/rivet/blob/main/tests/invariants.rs) — ADR-0001 I1–I7 structural contracts.
+- [tests/journal_invariants.rs](https://github.com/panchenkoai/rivet/blob/main/tests/journal_invariants.rs) — RunJournal event ordering.
+- [tests/recovery.rs](https://github.com/panchenkoai/rivet/blob/main/tests/recovery.rs) — chunk checkpoint resume semantics (I5, I6).
+- [tests/live_crash_recovery.rs](https://github.com/panchenkoai/rivet/blob/main/tests/live_crash_recovery.rs) — crash-and-resume against a live database.
+- [tests/live_chunked_recovery.rs](https://github.com/panchenkoai/rivet/blob/main/tests/live_chunked_recovery.rs) — chunked resume after partial completion.
+- [tests/live_retry_and_faults.rs](https://github.com/panchenkoai/rivet/blob/main/tests/live_retry_and_faults.rs) — retry classification under injected faults.
+- [tests/live_reconcile_repair.rs](https://github.com/panchenkoai/rivet/blob/main/tests/live_reconcile_repair.rs) — reconcile / repair end-to-end.
 
-Invariants and recovery suites run as **named semantic gates** in PR CI ([.github/workflows/ci.yml](../.github/workflows/ci.yml)). Branch protection blocks merges on regression. See [reliability-matrix.md](reliability-matrix.md) for the full coverage matrix.
+Invariants and recovery suites run as **named semantic gates** in PR CI ([.github/workflows/ci.yml](https://github.com/panchenkoai/rivet/blob/main/.github/workflows/ci.yml)). Branch protection blocks merges on regression. See [reliability-matrix.md](reliability-matrix.md) for the full coverage matrix.
