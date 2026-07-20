@@ -633,7 +633,7 @@
           "minimum": 0
         },
         "partition_by": {
-          "description": "Date/time output partitioning: split this export's rows into one\ndestination sub-prefix per calendar bucket of this **DATE or TIMESTAMP**\ncolumn, bucketed by [`partition_granularity`](Self::partition_granularity)\n(`day` / `month` / `year`), in a Hive-style `col=value/` layout\n(`created_at=2023-01-01/`, `created_at=2023-01/`, `created_at=2023/`).\nRequires a `{partition}` token in `destination.path` /\n`destination.prefix`.\n\nThis is **not** arbitrary value partitioning: the column's min/max is\nread and parsed as a date to generate contiguous calendar buckets, so a\nnon-temporal column (e.g. `partition_by: status`) fails at run time with\n\"could not parse partition min '<value>' from column '<col>' as a date\".\nTo split by a categorical column, write one export per value with a\n`WHERE` filter instead.\n\nOrthogonal to `mode`: each partition runs the export's own mode, so\n`mode: chunked` chunks *within* a day. Rows whose partition column is\nNULL land in `col=__HIVE_DEFAULT_PARTITION__/` (Hive default partition)\nso no row is silently dropped. Not compatible with `mode: time_window`.\n\n```yaml\nexports:\n  - name: events\n    table: events\n    partition_by: created_at        # must be a DATE or TIMESTAMP column\n    partition_granularity: day\n    destination:\n      type: s3\n      bucket: my-bucket\n      prefix: \"events/{partition}/\"   # → events/created_at=2023-01-01/\n```",
+          "description": "Date/time output partitioning: split this export's rows into one\ndestination sub-prefix per calendar bucket of this **DATE or TIMESTAMP**\ncolumn, bucketed by `partition_granularity`\n(`day` / `month` / `year`), in a Hive-style `col=value/` layout\n(`created_at=2023-01-01/`, `created_at=2023-01/`, `created_at=2023/`).\nRequires a `{partition}` token in `destination.path` /\n`destination.prefix`.\n\nThis is **not** arbitrary value partitioning: the column's min/max is\nread and parsed as a date to generate contiguous calendar buckets, so a\nnon-temporal column (e.g. `partition_by: status`) fails at run time with\n\"could not parse partition min `<value>` from column `<col>` as a date\".\nTo split by a categorical column, write one export per value with a\n`WHERE` filter instead.\n\nOrthogonal to `mode`: each partition runs the export's own mode, so\n`mode: chunked` chunks *within* a day. Rows whose partition column is\nNULL land in `col=__HIVE_DEFAULT_PARTITION__/` (Hive default partition)\nso no row is silently dropped. Not compatible with `mode: time_window`.\n\n```yaml\nexports:\n  - name: events\n    table: events\n    partition_by: created_at        # must be a DATE or TIMESTAMP column\n    partition_granularity: day\n    destination:\n      type: s3\n      bucket: my-bucket\n      prefix: \"events/{partition}/\"   # → events/created_at=2023-01-01/\n```",
           "type": [
             "string",
             "null"
@@ -641,7 +641,7 @@
           "default": null
         },
         "partition_granularity": {
-          "description": "Calendar bucket width for [`partition_by`](Self::partition_by):\n`day` (default), `month`, or `year`. Determines how the partition\ncolumn's date/timestamp range is split into contiguous Hive buckets\n(`col=2023-01-01/` / `col=2023-01/` / `col=2023/`). Has no effect\nunless `partition_by` is set.",
+          "description": "Calendar bucket width for `partition_by`:\n`day` (default), `month`, or `year`. Determines how the partition\ncolumn's date/timestamp range is split into contiguous Hive buckets\n(`col=2023-01-01/` / `col=2023-01/` / `col=2023/`). Has no effect\nunless `partition_by` is set.",
           "$ref": "#/$defs/PartitionGranularity",
           "default": "day"
         },
@@ -839,9 +839,9 @@
           ]
         },
         "until_current": {
-          "description": "Catch up to the source's current end and exit (a bounded run), instead of\nstreaming indefinitely — ideal for a scheduler. For MySQL this is a\nnon-blocking binlog dump; PostgreSQL / SQL Server already drain-and-exit.",
+          "description": "Catch up to the source's current end and exit (a bounded run), instead of\nstreaming indefinitely — ideal for a scheduler. For MySQL this is a\nnon-blocking binlog dump; PostgreSQL / SQL Server already drain-and-exit.\n**Defaults to `true`** (bounded): the OSS model is scheduler-driven, and\nomitting this must NOT silently start a never-terminating stream. Set it to\n`false` to opt into continuous streaming explicitly.",
           "type": "boolean",
-          "default": false
+          "default": true
         },
         "max_events": {
           "description": "Stop after N change events (default: until end of stream / interrupted).",

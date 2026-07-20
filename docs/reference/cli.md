@@ -125,7 +125,7 @@ rivet cdc --source-env DATABASE_URL --output ./cdc --format parquet --checkpoint
 ```
 
 The full reference — per-engine prerequisites, `--slot` / `--capture-instance` /
-`--server-id`, `--until-current`, the config-driven `rivet run` + `mode: cdc` path
+`--server-id`, `--stream` (opt into continuous; bounded is the default), the config-driven `rivet run` + `mode: cdc` path
 (the fuller path, all four engines incl. MongoDB), and the failure/recovery
 playbook — is in [cdc.md](cdc.md).
 

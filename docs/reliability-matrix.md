@@ -2,7 +2,7 @@
 
 What Rivet actually tests, where, and how often. This is the operational answer to "is this path covered or am I about to find out the hard way?"
 
-The matrix is derived from the workflows in [.github/workflows/](../.github/workflows/) and the test suites under [tests/](../tests/). It is updated when a coverage tier changes — not on every test addition.
+The matrix is derived from the workflows in [.github/workflows/](https://github.com/panchenkoai/rivet/tree/main/.github/workflows) and the test suites under [tests/](https://github.com/panchenkoai/rivet/tree/main/tests). It is updated when a coverage tier changes — not on every test addition.
 
 ---
 
@@ -142,17 +142,17 @@ runs the right set per gate.
 
 | Matrix | Layer | What it pins | Tier | Trigger |
 |---|---|---|---|---|
-| [`cli`](../dev/cli_matrix/) | Surface | CLI exit codes (88) + 36 stderr/stdout substring assertions per scenario | **PR (mandatory)** | every push |
-| [`cfg`](../dev/cfg_matrix/) | Surface | 83 YAML × 3 probes (doctor/check/plan) + 17 message substrings | **PR (mandatory)** | every push |
-| [`path`](../dev/path_matrix/) | Execution | 7 scenarios × on-disk layout snapshot + `summary.json` row/file accounting | **PR (mandatory)** | every push |
-| [`query`](../dev/query_matrix/) | Execution | 5 representative queries × PG `EXPLAIN (COSTS OFF)` plan shape | **Nightly** | 03:30 UTC cron |
-| [`soak`](../dev/soak_matrix/) | Resources | 3 modes × 10k-row PG × per-scenario `duration_ms`/`peak_rss_mb` thresholds | **Nightly** | 03:30 UTC cron |
-| [`cross_version`](../dev/cross_version_matrix/) | Compatibility | doctor/check/plan rc agreement across PG 12–16 + MySQL 5.7/8.0 | **Release** | before tag |
-| [`legacy`](../dev/legacy/) | Compatibility | Full e2e (83 assertions) per DB version | **Manual** | operator-invoked |
+| [`cli`](https://github.com/panchenkoai/rivet/tree/main/dev/cli_matrix) | Surface | CLI exit codes (88) + 36 stderr/stdout substring assertions per scenario | **PR (mandatory)** | every push |
+| [`cfg`](https://github.com/panchenkoai/rivet/tree/main/dev/cfg_matrix) | Surface | 83 YAML × 3 probes (doctor/check/plan) + 17 message substrings | **PR (mandatory)** | every push |
+| [`path`](https://github.com/panchenkoai/rivet/tree/main/dev/path_matrix) | Execution | 7 scenarios × on-disk layout snapshot + `summary.json` row/file accounting | **PR (mandatory)** | every push |
+| [`query`](https://github.com/panchenkoai/rivet/tree/main/dev/query_matrix) | Execution | 5 representative queries × PG `EXPLAIN (COSTS OFF)` plan shape | **Nightly** | 03:30 UTC cron |
+| [`soak`](https://github.com/panchenkoai/rivet/tree/main/dev/soak_matrix) | Resources | 3 modes × 10k-row PG × per-scenario `duration_ms`/`peak_rss_mb` thresholds | **Nightly** | 03:30 UTC cron |
+| [`cross_version`](https://github.com/panchenkoai/rivet/tree/main/dev/cross_version_matrix) | Compatibility | doctor/check/plan rc agreement across PG 12–16 + MySQL 5.7/8.0 | **Release** | before tag |
+| [`legacy`](https://github.com/panchenkoai/rivet/tree/main/dev/legacy) | Compatibility | Full e2e (83 assertions) per DB version | **Manual** | operator-invoked |
 
 Branch-protection guarantees: the **PR** row must stay green to merge — the
-job is named `cli-matrix` in [.github/workflows/ci.yml](../.github/workflows/ci.yml).
-**Nightly** matrices run from [.github/workflows/nightly-live.yml](../.github/workflows/nightly-live.yml);
+job is named `cli-matrix` in [.github/workflows/ci.yml](https://github.com/panchenkoai/rivet/blob/main/.github/workflows/ci.yml).
+**Nightly** matrices run from [.github/workflows/nightly-live.yml](https://github.com/panchenkoai/rivet/blob/main/.github/workflows/nightly-live.yml);
 a red nightly emails the on-call. **Release** matrices run as part of the
 release checklist; the artifact is the matrix log in
 [docs/release-checklist.md § Cross-version smoke](release-checklist.md).
@@ -181,7 +181,7 @@ release checklist; the artifact is the matrix log in
 | Rustfmt | ✅ gate | `fmt` |
 | Clippy (`-D warnings`) | ✅ gate | `clippy` |
 
-Release-artifact signing and checksums are roadmap (see [SECURITY.md § Supply chain](../SECURITY.md#supply-chain)).
+Release-artifact signing and checksums are roadmap (see [SECURITY.md § Supply chain](https://github.com/panchenkoai/rivet/blob/main/SECURITY.md#supply-chain)).
 
 ---
 
@@ -190,7 +190,7 @@ Release-artifact signing and checksums are roadmap (see [SECURITY.md § Supply c
 These remain operator-driven:
 
 - **Real S3 / GCS / Azure production endpoints** with real IAM / RBAC. CI uses MinIO and fake-gcs containers; the real-cloud path (incl. Azure Blob Storage end-to-end) is exercised manually before each release. The manual matrix and last-verified dates live in [docs/cloud-smoke-tests.md](cloud-smoke-tests.md); the release process gates on it via [docs/release-checklist.md § Cloud smoke](release-checklist.md#3-cloud-smoke-manual).
-- **Cross-platform binaries.** Release builds run on the matrix in [.github/workflows/release.yml](../.github/workflows/release.yml); the **per-PR** `build-release` job only builds for Linux x86_64.
+- **Cross-platform binaries.** Release builds run on the matrix in [.github/workflows/release.yml](https://github.com/panchenkoai/rivet/blob/main/.github/workflows/release.yml); the **per-PR** `build-release` job only builds for Linux x86_64.
 - **Long-horizon soak tests** (24h+ continuous extraction). Not run; planned for future hardware.
 - **Real production-shape datasets** beyond the 60k content_items fixture and operator-seeded fixtures from `dev/`.
 
@@ -216,5 +216,5 @@ Coverage that lives *outside* automated tiers but is gated on the release checkl
 When you add or remove a coverage tier:
 
 1. Edit the relevant row(s) here.
-2. If you add a new semantic gate, also list it in the branch-protection comment at the top of [.github/workflows/ci.yml](../.github/workflows/ci.yml).
+2. If you add a new semantic gate, also list it in the branch-protection comment at the top of [.github/workflows/ci.yml](https://github.com/panchenkoai/rivet/blob/main/.github/workflows/ci.yml).
 3. Note the change in `CHANGELOG.md` under a `### Reliability matrix` sub-section.

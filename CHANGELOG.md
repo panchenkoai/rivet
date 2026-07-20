@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- **CDC `until_current` now defaults to `true` (bounded).** Omitting it in a
+  hand-written CDC config previously started a never-terminating CONTINUOUS
+  stream by default; the default is now the scheduler-friendly bounded "read to
+  the log end and exit" drain. Opt into continuous streaming explicitly with
+  `until_current: false` (config) or `--stream` (the `rivet cdc` CLI flag, which
+  replaces `--until-current`). An explicit continuous run now logs a warning so
+  the streaming choice is deliberate, never silent.
+
+### Documentation
+
+- **The docs are now a navigable mdBook site** (`docs/` + `book.toml`), published
+  to GitHub Pages by `.github/workflows/docs.yml`, replacing the flat Jekyll
+  page. New benefit-led, measurement-backed landing pages seed the "Why Rivet"
+  section: source-safe under load (holds no long-running query on the source),
+  flat memory at any scale (57 MB peak, proven to 454 M rows), and CDC cost per
+  engine (the PostgreSQL slot-retention hazard vs the reader-independent
+  engines). All internal links were made book-safe (directory-index links,
+  repo-file links resolved to GitHub).
+
 ## 0.20.1 — 2026-07-19
 
 ### Fixed

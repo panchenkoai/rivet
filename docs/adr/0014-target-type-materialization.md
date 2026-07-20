@@ -39,7 +39,7 @@ Three layers are often conflated:
 | **Interchange** | What is in the Parquet/CSV file? | Correct bytes, wrong *inferred* type at load |
 | **Materialization** | What type should the **target table** use? | `JSON`/`VARIANT` never created; queries need casts |
 
-Rivet today solves semantic + interchange well (e.g. `jsonb` → `Utf8` + `rivet.logical_type=json`, `fidelity=logical_string`). `schema_fingerprint` in the manifest hashes Arrow `Debug` types only — it does **not** include `rivet.*` metadata ([`schema_fingerprint`](../../src/state/schema.rs) design). Downstream engines that read Parquet schema alone therefore cannot recover JSON vs plain text.
+Rivet today solves semantic + interchange well (e.g. `jsonb` → `Utf8` + `rivet.logical_type=json`, `fidelity=logical_string`). `schema_fingerprint` in the manifest hashes Arrow `Debug` types only — it does **not** include `rivet.*` metadata ([`schema_fingerprint`](https://github.com/panchenkoai/rivet/blob/main/src/state/schema.rs) design). Downstream engines that read Parquet schema alone therefore cannot recover JSON vs plain text.
 
 Industry tools split the same problem differently:
 
@@ -74,7 +74,7 @@ L5  Materialization   (DDL, load schema, cast SQL — operator or future loader)
 
 **T2 — Interchange is target-neutral.** Parquet physical types are chosen for cross-engine fidelity (e.g. `Decimal128`, `Timestamp` with timezone). Target-specific types (BigQuery `JSON`, Snowflake `VARIANT`) appear in L4–L5, not by changing L2 per export unless a separate **target profile** is explicitly enabled (future, opt-in).
 
-**T3 — Metadata is provenance, not autoload.** Keys `rivet.native_type`, `rivet.logical_type`, `rivet.fidelity` ([`src/types/mapping.rs`](../../src/types/mapping.rs)) document intent for tooling and CI. Generic Parquet readers may ignore them.
+**T3 — Metadata is provenance, not autoload.** Keys `rivet.native_type`, `rivet.logical_type`, `rivet.fidelity` ([`src/types/mapping.rs`](https://github.com/panchenkoai/rivet/blob/main/src/types/mapping.rs)) document intent for tooling and CI. Generic Parquet readers may ignore them.
 
 **T4 — Plain strings stay plain.** Columns mapped to `RivetType::String` / `Text` must **not** carry `rivet.logical_type` (tests enforce this). Semantic JSON/UUID/enum must use the corresponding `RivetType` variants.
 
@@ -238,7 +238,7 @@ ADR-0012 manifest invariants (PBM, MBS, PIT) are unchanged. Type materialization
 
 ### Risks
 
-- Resolver drift from warehouse docs — mitigate with contract tests keyed off [expected_contracts.yaml](../../tests/type_roundtrip/fixtures/expected_contracts.yaml) + target-specific rows.
+- Resolver drift from warehouse docs — mitigate with contract tests keyed off [expected_contracts.yaml](https://github.com/panchenkoai/rivet/blob/main/tests/type_roundtrip/fixtures/expected_contracts.yaml) + target-specific rows.
 - Confusing `schema_fingerprint` with semantic schema — document clearly; semantic snapshot is `type_manifest.json` (Phase B), not fingerprint replacement.
 
 ---

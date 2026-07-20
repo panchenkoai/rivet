@@ -120,4 +120,4 @@ If two or more members of the same group land in the **heavy** cost classes, Riv
 
 Historical refinement (Epic I) is in scope and implemented — see the section above.
 
-For future planning work, see [rivet_roadmap.md](../../rivet_roadmap.md) at the repo root.
+For future planning work, see [rivet_roadmap.md](https://github.com/panchenkoai/rivet/blob/main/rivet_roadmap.md) at the repo root.

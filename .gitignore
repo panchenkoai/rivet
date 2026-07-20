@@ -112,3 +112,6 @@ mutants.out/
 
 # stray child-process stderr logs (a run once committed one by accident)
 /rivet-child-stderr-*.log
+
+# Python bytecode (dev/ helper scripts)
+__pycache__/

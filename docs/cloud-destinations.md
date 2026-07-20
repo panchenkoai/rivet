@@ -235,7 +235,7 @@ next resume and the orphan eventually gets moved.
 ## Reporting trust-contract issues
 
 A trust-contract violation is treated as a security-grade bug.  See
-[SECURITY.md](../SECURITY.md) for the disclosure channel.  Examples:
+[SECURITY.md](https://github.com/panchenkoai/rivet/blob/main/SECURITY.md) for the disclosure channel.  Examples:
 
 - `_SUCCESS` present, but a part listed in `manifest.json` is missing.
 - `_SUCCESS` fingerprint disagrees with the bytes of `manifest.json`.

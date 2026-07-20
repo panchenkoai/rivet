@@ -62,4 +62,4 @@ Only when you have **chunked** exports with **`chunk_checkpoint: true`**. Skip t
 | [reconcile-runbook.md](reconcile-runbook.md) | Verify an export against the live source with SQL only |
 | [rivet-vs-cursor-pipeline.md](rivet-vs-cursor-pipeline.md) | Like-for-like vs an existing cursor/watermark ELT pipeline |
 
-Full doc index: [docs/README.md](../README.md). Concept glossary (`run_id`, `cursor`, `chunk`, `manifest`, `journal`, `progression`): [docs/concepts.md](../concepts.md).
+Full doc index: [docs/README.md](../). Concept glossary (`run_id`, `cursor`, `chunk`, `manifest`, `journal`, `progression`): [docs/concepts.md](../concepts.md).

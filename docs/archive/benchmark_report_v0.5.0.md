@@ -47,7 +47,7 @@ Database: PostgreSQL 16 (local docker-compose)
 **Key findings:**
 
 - Smaller row group targets reduce peak RSS with **no wall-time penalty** — latency is identical across all targets.
-- `32 MB` target saves ~7 MB RSS vs `256 MB` on bench_wide (2 KB rows). On wider tables the difference is larger — see the content_items benchmark in [low-memory-runners.md](best-practices/low-memory-runners.md) where it contributes to a 5.7× RSS reduction.
+- `32 MB` target saves ~7 MB RSS vs `256 MB` on bench_wide (2 KB rows). On wider tables the difference is larger — see the content_items benchmark in [low-memory-runners.md](../best-practices/low-memory-runners.md) where it contributes to a 5.7× RSS reduction.
 - `auto` strategy chooses row count dynamically from Arrow schema widths. Users don't need to tune a row count — they specify a memory budget and the writer adapts.
 - Output size is identical across targets (compression ratio is not affected by row group boundaries).
 
@@ -78,7 +78,7 @@ Database: PostgreSQL 16 (local docker-compose)
 | Safe baseline (`max_batch_memory_mb: 64`) | ~2,000 | **154 MB** | 16.6 |
 | Tight (`batch_size: 500`, cap 32 MB) | 500 | **111 MB** | 16.3 |
 
-The 5.7× RSS reduction holds for wide real-world tables. See [low-memory-runners.md](best-practices/low-memory-runners.md) for the full methodology.
+The 5.7× RSS reduction holds for wide real-world tables. See [low-memory-runners.md](../best-practices/low-memory-runners.md) for the full methodology.
 
 ---
 

@@ -1,6 +1,6 @@
 # Demo Quickstart — Pilot Evaluation in ≈10 Minutes
 
-> **Where this fits:** the [Pilot guide](README.md) explains which doc to use first (quickstart vs demo vs full walkthrough).
+> **Where this fits:** the [Pilot guide](./) explains which doc to use first (quickstart vs demo vs full walkthrough).
 
 A scripted, reproducible end-to-end demo that exercises every post-Epic feature against a pre-seeded fixture. Use this when evaluating Rivet for a pilot: you get a 14-table database, a 12-export campaign, partition-level reconcile, targeted repair, and the full committed/verified progression — all wired together.
 

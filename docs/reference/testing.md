@@ -71,7 +71,7 @@ cargo test -- --ignored
 | File | Domain | QA backlog task |
 |------|--------|-----------------|
 | `live_harness_canary.rs` | Reachability probe for every service (Postgres primary + via Toxiproxy, MySQL primary + via Toxiproxy, MinIO, fake-gcs, Toxiproxy admin); harness sanity (`PgTable`/`MysqlTable` RAII guards, `unique_name` no-collision, `CARGO_BIN_EXE_rivet` visibility) | Phase A |
-| [`type_roundtrip`](../tests/type_roundtrip/) (`make test-types` / `make test-types-live`) | 0.18.0 type matrix: offline YAML contracts + live PG/MySQL × Parquet/CSV | [`docs/type-mapping.md`](../type-mapping.md) |
+| [`type_roundtrip`](https://github.com/panchenkoai/rivet/tree/main/tests/type_roundtrip) (`make test-types` / `make test-types-live`) | 0.18.0 type matrix: offline YAML contracts + live PG/MySQL × Parquet/CSV | [`docs/type-mapping.md`](../type-mapping.md) |
 | [`live_type_golden.rs`](#trust-milestone-type-golden-round-trip) | Trust & reproducibility: **paired** Postgres *and* MySQL golden pipelines | Trust milestone §1 (“Golden E2E for type safety”); complements `live_parquet_roundtrip.rs` |
 | `live_parquet_roundtrip.rs` | Postgres → rivet → Parquet → reader; schema/row-count/nullability/unicode/empty-dataset contracts; `--validate` flag | Task 2.2 |
 | `live_cross_db_parity.rs` | Same dataset via Postgres vs MySQL under full and chunked modes; row-count and id-set equivalence | Task 3.3 |
@@ -88,7 +88,7 @@ cargo test -- --ignored
 
 ### Trust milestone: type golden round-trip
 
-[`tests/live_type_golden.rs`](../../tests/live_type_golden.rs) implements the roadmap contract **database → Rivet (`rivet run`) → Parquet → Arrow read-back → exact assertions** so type handling stays provable end-to-end, not only in unit tests (`format_golden.rs` covers writers in isolation).
+[`tests/live_type_golden.rs`](https://github.com/panchenkoai/rivet/blob/main/tests/live_type_golden.rs) implements the roadmap contract **database → Rivet (`rivet run`) → Parquet → Arrow read-back → exact assertions** so type handling stays provable end-to-end, not only in unit tests (`format_golden.rs` covers writers in isolation).
 
 Each test targets **both engines** where the contract applies:
 
@@ -156,7 +156,7 @@ check `.github/workflows/ci.yml` for the exact invocation.
 
 ## Shell regression matrices
 
-Binary-level regression guards under [`dev/matrices/`](../../dev/matrices/README.md)
+Binary-level regression guards under [`dev/matrices/`](https://github.com/panchenkoai/rivet/blob/main/dev/matrices/README.md)
 complement the Rust integration tests above. They drive the release `rivet`
 binary through fixture scenarios and diff stdout/stderr/exit codes, file
 layouts, EXPLAIN plans, and perf thresholds against committed baselines.
@@ -166,15 +166,15 @@ bash dev/matrices/setup_links.sh   # one-time
 dev/matrices/run.sh --tier=pr      # cli + cfg + path (PR CI)
 ```
 
-See [`dev/matrices/README.md`](../../dev/matrices/README.md) for the full taxonomy
+See [`dev/matrices/README.md`](https://github.com/panchenkoai/rivet/blob/main/dev/matrices/README.md) for the full taxonomy
 and tier map.
 
 ## QA / roadmap alignment
 
 Task IDs in tables above are historical QA labels. **Trust & reproducibility**
 (golden DB → Rivet → Parquet → Arrow read-back, Postgres *and* MySQL) lives in
-[`tests/live_type_golden.rs`](../../tests/live_type_golden.rs) and is described
-above. Strategic tracking: [`rivet_roadmap.md`](../../rivet_roadmap.md) §Phase 1
+[`tests/live_type_golden.rs`](https://github.com/panchenkoai/rivet/blob/main/tests/live_type_golden.rs) and is described
+above. Strategic tracking: [`rivet_roadmap.md`](https://github.com/panchenkoai/rivet/blob/main/rivet_roadmap.md) §Phase 1
 (Epic 14 / execution status).
 
 ## CDC conformance gate

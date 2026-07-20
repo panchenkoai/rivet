@@ -32,7 +32,7 @@ do not use `chunk_size_memory_mb`.** Everything else is the usual chunked export
 ## Gentle to the source — what rivet does, and the lever you have
 
 Measured against live SQL Server 2022 (the cross-tool harness —
-[`dev/bench/smoke.py`](../../dev/bench/smoke.py) `--engine mssql`, results in
+[`dev/bench/smoke.py`](https://github.com/panchenkoai/rivet/blob/main/dev/bench/smoke.py) `--engine mssql`, results in
 [`report.html`](../bench/report.html)), a **properly chunked**
 rivet export is a quiet tenant:
 

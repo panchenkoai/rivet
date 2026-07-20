@@ -151,7 +151,7 @@ pub struct ExportConfig {
 
     /// Date/time output partitioning: split this export's rows into one
     /// destination sub-prefix per calendar bucket of this **DATE or TIMESTAMP**
-    /// column, bucketed by [`partition_granularity`](Self::partition_granularity)
+    /// column, bucketed by `partition_granularity`
     /// (`day` / `month` / `year`), in a Hive-style `col=value/` layout
     /// (`created_at=2023-01-01/`, `created_at=2023-01/`, `created_at=2023/`).
     /// Requires a `{partition}` token in `destination.path` /
@@ -160,7 +160,7 @@ pub struct ExportConfig {
     /// This is **not** arbitrary value partitioning: the column's min/max is
     /// read and parsed as a date to generate contiguous calendar buckets, so a
     /// non-temporal column (e.g. `partition_by: status`) fails at run time with
-    /// "could not parse partition min '<value>' from column '<col>' as a date".
+    /// "could not parse partition min `<value>` from column `<col>` as a date".
     /// To split by a categorical column, write one export per value with a
     /// `WHERE` filter instead.
     ///
@@ -183,7 +183,7 @@ pub struct ExportConfig {
     #[serde(default)]
     pub partition_by: Option<String>,
 
-    /// Calendar bucket width for [`partition_by`](Self::partition_by):
+    /// Calendar bucket width for `partition_by`:
     /// `day` (default), `month`, or `year`. Determines how the partition
     /// column's date/timestamp range is split into contiguous Hive buckets
     /// (`col=2023-01-01/` / `col=2023-01/` / `col=2023/`). Has no effect
@@ -484,6 +484,14 @@ fn default_time_column_type() -> TimeColumnType {
     TimeColumnType::Timestamp
 }
 
+/// `until_current` defaults to `true` — the OSS model is the BOUNDED, scheduler-
+/// driven drain ("read to the log end and exit"). Continuous streaming
+/// (`until_current: false`) is an explicit opt-in; making it the default silently
+/// put a hand-written CDC config onto the never-terminating streaming path.
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Deserialize, JsonSchema, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ExportMode {
@@ -535,7 +543,10 @@ pub struct CdcExportConfig {
     /// Catch up to the source's current end and exit (a bounded run), instead of
     /// streaming indefinitely — ideal for a scheduler. For MySQL this is a
     /// non-blocking binlog dump; PostgreSQL / SQL Server already drain-and-exit.
-    #[serde(default)]
+    /// **Defaults to `true`** (bounded): the OSS model is scheduler-driven, and
+    /// omitting this must NOT silently start a never-terminating stream. Set it to
+    /// `false` to opt into continuous streaming explicitly.
+    #[serde(default = "default_true")]
     pub until_current: bool,
     /// Stop after N change events (default: until end of stream / interrupted).
     pub max_events: Option<usize>,

@@ -14,7 +14,7 @@ rivet run -c rivet.yaml --validate
 
 That's the whole flow. The four steps below explain each command, expected output, and where to go from each. Read time: ~3 minutes.
 
-> **Already running it locally?** Jump to [§3 Preflight & run](#3-preflight--run). If you're evaluating it for production, finish this page first, then continue with [docs/pilot/](pilot/README.md).
+> **Already running it locally?** Jump to [§3 Preflight & run](#3-preflight--run). If you're evaluating it for production, finish this page first, then continue with [docs/pilot/](pilot/).
 
 ---
 
@@ -31,7 +31,7 @@ rivet --version
 docker run --rm ghcr.io/panchenkoai/rivet:latest --version
 ```
 
-Other install paths — pre-built binaries for every platform, `cargo install rivet-cli`, build from source, plus the full Docker recipe with database-on-host pointers (`host.docker.internal` vs `--network host`) — live in the project [README § Installation](../README.md#installation). Shell completions: `rivet completions bash|zsh|fish`.
+Other install paths — pre-built binaries for every platform, `cargo install rivet-cli`, build from source, plus the full Docker recipe with database-on-host pointers (`host.docker.internal` vs `--network host`) — live in the project [README § Installation](https://github.com/panchenkoai/rivet/blob/main/README.md#installation). Shell completions: `rivet completions bash|zsh|fish`.
 
 ## 2 · Connect & scaffold a config
 
@@ -50,7 +50,7 @@ rivet init --source-env DATABASE_URL --table orders -o rivet.yaml
 
 Full flag reference: [reference/init.md](reference/init.md). For a manually-authored YAML instead of `rivet init`, see [reference/config.md](reference/config.md).
 
-> **State file.** Rivet creates `.rivet_state.db` next to the config (cursors, chunk checkpoints, run history). Add it to `.gitignore` if the folder is version-controlled — see [SECURITY.md § Sensitive local artifacts](../SECURITY.md#sensitive-local-artifacts).
+> **State file.** Rivet creates `.rivet_state.db` next to the config (cursors, chunk checkpoints, run history). Add it to `.gitignore` if the folder is version-controlled — see [SECURITY.md § Sensitive local artifacts](https://github.com/panchenkoai/rivet/blob/main/SECURITY.md#sensitive-local-artifacts).
 
 ## 3 · Preflight & run
 

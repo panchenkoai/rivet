@@ -39,7 +39,7 @@ Every method takes `&mut self`. A worker that needs a `Source` must own it; shar
 
 2. **`pipeline/chunked/exec.rs` already amortizes connection cost.** Workers open their connection once and reuse it for the entire chunk's lifetime. Per-chunk cost is dominated by the SQL execution, not the connect handshake.
 
-3. **Backend explosion is a non-problem in practice.** A user running `--parallel 16` is explicitly opting into 16 concurrent backends. The exporter has guardrails: `lean_pool_opts()` keeps the MySQL pool at `min=1`, [ADR-0010](0010-two-parallel-engines.md) keeps each child process to one `Source`, and pooler detection ([detect_pg_transaction_pooler](../../src/source/postgres.rs)) warns when a pgBouncer is multiplexing. Operators who want fewer backends can run with lower `--parallel`.
+3. **Backend explosion is a non-problem in practice.** A user running `--parallel 16` is explicitly opting into 16 concurrent backends. The exporter has guardrails: `lean_pool_opts()` keeps the MySQL pool at `min=1`, [ADR-0010](0010-two-parallel-engines.md) keeps each child process to one `Source`, and pooler detection ([detect_pg_transaction_pooler](https://github.com/panchenkoai/rivet/blob/main/src/source/postgres.rs)) warns when a pgBouncer is multiplexing. Operators who want fewer backends can run with lower `--parallel`.
 
 4. **The `Sync` refactor blocks on multiple deps the audit flagged separately.**
    - The `postgres::Client` API is `&mut`-only; making it `Sync` requires either `Mutex` (slow, see #1) or an async client (a much larger surface change).

@@ -18,8 +18,8 @@ and odbc2parquet exporting the same fixture to Parquet, and captures what each
 tool does to the source (a co-running OLTP probe, longest query/txn, locks,
 native engine counters). It is a **single source of truth**: everything is
 driven from [`docs/bench/matrix.yaml`](../bench/matrix.yaml) by the runner
-[`dev/bench/smoke.py`](../../dev/bench/smoke.py), which fails if the yaml declares
-a metric the code doesn't capture. See [`docs/bench/README.md`](../bench/README.md)
+[`dev/bench/smoke.py`](https://github.com/panchenkoai/rivet/blob/main/dev/bench/smoke.py), which fails if the yaml declares
+a metric the code doesn't capture. See [`docs/bench/README.md`](../bench/)
 for prerequisites and [`docs/bench/report.html`](../bench/report.html) for the
 rendered results.
 
@@ -85,7 +85,7 @@ Only the **Criterion micro-benchmark** layer belongs in CI — it compiles and
 smoke-samples the Rust hot paths (a compile/panic check, not a regression gate).
 The cross-tool E2E harness is **run manually**: it needs four live database
 engines and per-engine vendor drivers, so it is not a CI job — reproduce it from
-[`docs/bench/README.md`](../bench/README.md) and publish
+[`docs/bench/README.md`](../bench/) and publish
 [`docs/bench/report.html`](../bench/report.html).
 
 To add a micro-bench regression gate in the future, save a Criterion `--baseline`
@@ -126,6 +126,6 @@ The narrow bound assumes ~200 B/row; the wide bound assumes ~10 KB/row. The E2E 
 - [Parquet tuning](parquet-tuning.md) — row group targets and downstream read implications
 - [Compression profiles](compression-profiles.md) — codec mapping and trade-offs
 - [Low-memory runners](low-memory-runners.md) — settings for constrained environments
-- [`dev/bench/smoke.py`](../../dev/bench/smoke.py) + [`docs/bench/matrix.yaml`](../bench/matrix.yaml) — the unified cross-tool / cross-engine harness
+- [`dev/bench/smoke.py`](https://github.com/panchenkoai/rivet/blob/main/dev/bench/smoke.py) + [`docs/bench/matrix.yaml`](../bench/matrix.yaml) — the unified cross-tool / cross-engine harness
 - [`docs/bench/report.html`](../bench/report.html) — the rendered results
-- [`benches/`](../../benches/) — Criterion micro-benchmark sources (Rust hot paths, separate layer)
+- [`benches/`](https://github.com/panchenkoai/rivet/tree/main/benches) — Criterion micro-benchmark sources (Rust hot paths, separate layer)

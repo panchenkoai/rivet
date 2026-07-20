@@ -1,6 +1,6 @@
 # Pilot Walkthrough — From Discovery to Verified Repair
 
-**How to use this page:** work the sections **in order** (Steps 1 → 9). Each step lists the exact Rivet commands and the contracts they satisfy. For a one-page “what to run in what order” summary, start at [Pilot guide (README)](README.md).
+**How to use this page:** work the sections **in order** (Steps 1 → 9). Each step lists the exact Rivet commands and the contracts they satisfy. For a one-page “what to run in what order” summary, start at [Pilot guide (README)](./).
 
 This is the end-to-end pilot guide that exercises the full contract stack: discovery, plan/apply, prioritization, chunked extraction with checkpoint, partition-level reconcile, targeted repair, and the committed/verified progression boundary.
 
@@ -20,7 +20,7 @@ If you just want to export one table, start with [Getting Started](../getting-st
 - `rivet --version` works.
 - A writeable local path or an S3/GCS bucket for output.
 
-The repo ships a `docker-compose.yaml` with both engines pre-seeded by [`dev/postgres/init.sql`](../../dev/postgres/init.sql) / [`dev/mysql/init.sql`](../../dev/mysql/init.sql) and the bench seed tool (`cargo run --bin seed`). Follow along on that if you don't have a source handy.
+The repo ships a `docker-compose.yaml` with both engines pre-seeded by [`dev/postgres/init.sql`](https://github.com/panchenkoai/rivet/blob/main/dev/postgres/init.sql) / [`dev/mysql/init.sql`](https://github.com/panchenkoai/rivet/blob/main/dev/mysql/init.sql) and the bench seed tool (`cargo run --bin seed`). Follow along on that if you don't have a source handy.
 
 ```bash
 docker compose up -d postgres mysql

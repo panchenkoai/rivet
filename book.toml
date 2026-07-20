@@ -1,0 +1,27 @@
+[book]
+title = "Rivet"
+description = "Fast, safe, zero-copy database exports — PostgreSQL / MySQL / SQL Server / MongoDB to Parquet, CSV, and cloud warehouses, with CDC."
+authors = ["Rivet"]
+language = "en"
+src = "docs"
+
+[build]
+# target/ is already git-ignored, so the rendered book is never committed.
+build-dir = "target/book"
+
+[output.html]
+# Project pages are served under /rivet/ — without this, nav/search assets 404.
+site-url = "/rivet/"
+git-repository-url = "https://github.com/panchenkoai/rivet"
+edit-url-template = "https://github.com/panchenkoai/rivet/edit/main/docs/{path}"
+default-theme = "light"
+preferred-dark-theme = "navy"
+no-section-label = true
+
+[output.html.fold]
+# Collapse the long tail (ADRs, recipes) so the sidebar stays scannable.
+enable = true
+level = 1
+
+[output.html.search]
+enable = true

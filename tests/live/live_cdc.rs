@@ -3497,7 +3497,9 @@ fn roast_pg_cdc_ndjson_until_current_terminates_and_emits_backlog() {
             &slot,
             "--table",
             &tbl,
-            "--until-current",
+            // Bounded (until-current) is the DEFAULT now; `--stream` opts into
+            // continuous. This roast asserts the default terminates + emits the
+            // backlog, so it passes no flag.
         ],
         std::time::Duration::from_secs(30),
     );
