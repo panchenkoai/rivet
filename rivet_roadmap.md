@@ -801,7 +801,7 @@ recovery semantics, quality gates, resource controls, and reliability coverage.
 | Fit / non-fit boundaries | ✅ Done | README + semantics exclude SaaS marketplace, k8s platform, loading, and **continuous/live-streaming replication** — and now correctly distinguish that from **CDC-to-files** (`mode: cdc`, shipped 0.14.0): `README.md:195` + `docs/semantics.md:187` reworded to "CDC captured to files, not a continuously-running replication sink" |
 | Execution semantics contract | ✅ Done | `docs/semantics.md` covers retry, crash, resume, repair, reconcile, non-guarantees |
 | Reliability matrix | ✅ Done | `docs/reliability-matrix.md` separates PR CI, nightly, and manual coverage |
-| Compatibility matrix | ✅ Done | `docs/reference/compatibility.md` covers PG 12-16, MySQL 5.7/8.0, and SQL Server 2022 (Beta) |
+| Compatibility matrix | ✅ Done | `docs/reference/compatibility.md` covers PG 12-16, MySQL 5.7/8.0, and SQL Server 2022 (GA) |
 | Pilot kit | ✅ Done | `docs/pilot/README.md`, quickstarts, demo, walkthrough, production checklist |
 | Benchmark methodology | ✅ Done | `docs/bench/` and best-practices methodology docs capture DB-side signals |
 

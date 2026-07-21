@@ -7,7 +7,7 @@ PostgreSQL and MySQL run the **full end-to-end suite** on each release —
 every output format (CSV / Parquet) with every compression codec, `reconcile`,
 recovery scenarios, state management, date-chunking, and `rivet init` — against
 each version. No version-specific code paths are skipped; the same Rust driver
-builds and the same YAML configs drive every target. **SQL Server** (Beta) and
+builds and the same YAML configs drive every target. **SQL Server** and
 **MongoDB** carry their own scope and CI coverage, detailed below.
 
 **MongoDB** (the OSS JSON-blob source — batch + CDC) rides its own dedicated CI
@@ -26,7 +26,7 @@ time_window modes). See [mongodb.md](mongodb.md).
 | PostgreSQL |       16 | Supported (primary target) |
 | MySQL      |      5.7 | Supported (EOL upstream Oct 2023) |
 | MySQL      |      8.0 | Supported (primary target) |
-| SQL Server |     2022 | **Beta** (source engine; see scope + advisory below) |
+| SQL Server |     2022 | **GA** (source engine; see scope below) |
 | MongoDB    |      4.4 | Supported |
 | MongoDB    |      5.0 | Supported |
 | MongoDB    |      6.0 | Supported |
@@ -39,9 +39,10 @@ local `docker-compose.yaml` top-level `postgres` / `mysql` / `mssql` / `mongo` s
 
 ### SQL Server (MSSQL) — current scope
 
-> **Status: Beta.** The engine is live-validated and feature-complete for the
-> shapes below. The two concrete gaps that previously held it below the primary
-> PG/MySQL targets are now closed; what remains is a soak/promotion decision.
+> **Status: GA.** The engine is live-validated and feature-complete for the
+> shapes below. The two gaps that formerly held it in Beta are now closed: the
+> transitive rustls-webpki advisory (resolved — see below) and `datetimeoffset`
+> roundtrip verification, so it is promoted to the same GA bar as PG/MySQL.
 >
 > **Transitive advisory — RESOLVED.** `tiberius` 0.12 formerly linked `rustls`
 > 0.21 → `rustls-webpki` 0.101, carrying CA name-constraint advisories

@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## 0.21.0 — 2026-07-21
+
+### Added
+
+- **SQL Server is now GA.** The two gaps that formerly held it in Beta are
+  closed: the transitive rustls-webpki advisory is resolved (see Changed), and
+  `datetimeoffset` — the one type that was "mapped but not roundtrip-verified" —
+  is now validated through the DuckDB / ClickHouse / BigQuery Parquet oracles
+  (UTC instant + tz-awareness, positive and negative offsets, and NULL). It is
+  held to the same GA bar as PostgreSQL and MySQL.
+
 ### Changed
 
 - **CDC `until_current` now defaults to `true` (bounded).** Omitting it in a
@@ -9,8 +20,15 @@
   stream by default; the default is now the scheduler-friendly bounded "read to
   the log end and exit" drain. Opt into continuous streaming explicitly with
   `until_current: false` (config) or `--stream` (the `rivet cdc` CLI flag, which
-  replaces `--until-current`). An explicit continuous run now logs a warning so
-  the streaming choice is deliberate, never silent.
+  **replaces** `--until-current`). An explicit continuous run now logs a warning
+  so the streaming choice is deliberate, never silent.
+- **SQL Server TLS backend switched to vendored OpenSSL.** `tiberius` now links
+  its `vendored-openssl` backend instead of the pinned `rustls` 0.21, removing
+  RUSTSEC-2026-0098/0099/0104 (and RUSTSEC-2025-0134) from the dependency tree
+  **entirely** — `cargo audit` is clean for the MSSQL engine, no longer merely
+  suppressed. Strict `verify-ca` / `verify-full` validation is enforced by
+  OpenSSL (a certificate that does not chain to the trusted CA is refused);
+  connection behavior is otherwise unchanged, verified live on macOS and Linux.
 
 ### Documentation
 
