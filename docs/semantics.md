@@ -74,7 +74,7 @@ A retried batch starts from the **same cursor position** as the failed attempt �
 | Destination | `retry_safe` |
 |---|---|
 | S3, GCS, Azure | `true` (no partial visible objects; safe to retry) |
-| Local filesystem | `false` (a failed copy may leave a partial file; manual cleanup) |
+| Local filesystem | `true` (staged temp file + atomic `rename`; a failure leaves nothing at the final path) |
 | stdout | `false` (no commit boundary; retry produces duplicate/corrupt output) |
 
 When retries occur against a non-retry-safe destination, the pipeline logs a `WARN` so operators see the mismatch.
@@ -172,7 +172,7 @@ When `quality:` is configured, the pipeline evaluates row-count, null-ratio, and
 | Destination | Commit protocol | What "Ok" means |
 |---|---|---|
 | S3 / GCS / Azure | `FinalizeOnClose` | Object is committed only after writer close; a mid-upload failure leaves nothing visible |
-| Local filesystem | `Atomic` | `Ok` means the full file is present; a failure may leave a partial file (`partial_write_risk: true`) |
+| Local filesystem | `Atomic` | `Ok` means the full file is present; staged temp file + atomic `rename`, so a failure leaves nothing at the final path (`retry_safe: true`, `partial_write_risk: false`) |
 | stdout | `Streaming` | No atomic commit boundary; partial output may be observable before `write()` returns |
 
 Full per-backend table and rationale: **[ADR-0004 — Destination Write Contracts](adr/0004-destination-write-contracts.md)**.
@@ -187,7 +187,7 @@ Rivet does **not** currently guarantee:
 - **Continuous / near-real-time replication.** Rivet *does* capture CDC to files (`mode: cdc` — inserts/updates/deletes via a Postgres logical replication slot / MySQL binlog / SQL Server CDC change tables / MongoDB change streams, into typed Parquet/CSV — or the JSON-blob document image for MongoDB — resuming from the last committed log position each run), but it is not a continuously-running stream — changes are captured per invocation, not delivered live. For always-on near-real-time replication use Debezium or Estuary.
 - **Completeness of incremental cursors that can tie.** Incremental resume uses a strict `WHERE cursor > last_value`. If two rows share the high-watermark value and the second becomes visible only *after* the run that advanced the watermark past it — e.g. a low-resolution `updated_at` (second granularity) or rows committed at the same timestamp after the read snapshot — the next run skips them and they are never exported. (Keyset pagination is unaffected: its key is planner-enforced unique + NOT NULL.) Use a **strictly per-row-distinct, monotonic** cursor (a sequence/identity id, or a timestamp with sub-value uniqueness); when the cursor can tie, re-snapshot the affected window with `full`/`chunked` mode.
 - **Dense-chunking stability on a tied, concurrently-written `chunk_column`.** `chunk_dense: true` pages by `ROW_NUMBER() OVER (ORDER BY chunk_column)`, recomputed in an independent query per chunk. The ordinal partition itself never gaps or overlaps, but the ordinal→row mapping is only stable if the `ORDER BY` is deterministic. On a column with a large **tied** peer group straddling a chunk boundary *while the source is being written concurrently*, two chunk queries could order the tied band differently — duplicating or dropping a boundary row. Against a **static** table this does not occur on any tested engine (PG 16 / MySQL 8 / SQL Server 2022 — verified by `tests/live_chunked_dense.rs`). Prefer a `chunk_column` with no large tied groups, or **keyset** (`chunk_by_key`) on a unique key, when chunking a live-writing table.
-- **Automatic cleanup of partial artifacts** on `Atomic` destinations after a crash mid-write. A partial local file may persist and must be removed manually.
+- **Automatic cleanup of an interrupted write's temp file.** A crash mid-write on the local destination may leave a dot-prefixed temp file in the target directory — never a partial *final* file (the commit is an atomic `rename`, so the final path is the complete file or absent). The stray temp file is harmless and can be removed manually.
 - **Schema migration handling.** If the source schema changes between runs, Rivet does not migrate the destination; it surfaces a schema-drift error (see [tests/live_schema_drift.rs](https://github.com/panchenkoai/rivet/blob/main/tests/live_schema_drift.rs)).
 - **Correctness of user-authored SQL.** Rivet executes `query:` verbatim. A query that omits a `WHERE` clause or selects from the wrong table will export the wrong data — there is no semantic validation.
 - **Protection from poorly indexed source queries.** Preflight (`rivet doctor`, `rivet check`) warns about missing cursor indexes and unbounded `ORDER BY`, but it does not refuse to run. The operator decides.

@@ -30,10 +30,20 @@ The following files may contain sensitive information even when credentials are 
 |---|---|
 | `rivet.yaml` | Source URL, query bodies, destination credentials (if inlined) |
 | `plan.json` | Table names, query SQL, chunk bounds, row estimates |
-| `.rivet_state.db` | Cursor values, manifest of exported files, run metrics |
-| `*.jsonl` journal | Per-run event timeline; includes export names, run IDs, chunk boundaries |
+| `.rivet_state.db` | Cursor values, manifest of exported files, run metrics, and **failed-run error text** (see the note below) |
+| `*.jsonl` journal | Per-run event timeline; includes export names, run IDs, chunk boundaries, and error text |
+| Run summary (`summary.json` / `summary.md`) | Per-export status, counts, and error text on failure |
 | Parquet / CSV outputs | The actual exported data |
 | Log output (stdout / `--log-format json`) | Query SQL (truncated), table names, row counts; redacted URLs |
+
+> **Redaction covers credentials only.** Rivet redacts connection-URL passwords
+> everywhere error text is persisted or emitted. It does **not** scrub source
+> *cell values* that a driver or library error may embed in its message — for
+> example, a value that violated a constraint, or a row echoed by a decode error.
+> That error text is stored (`.rivet_state.db`, the journal, the run summary) and,
+> if you configure notifications, emitted to the webhook. Treat failed-run error
+> text as potentially data-bearing, and scope your state-file / webhook access
+> accordingly.
 
 ### `.gitignore` recommendations
 
