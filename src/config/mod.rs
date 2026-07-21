@@ -631,6 +631,94 @@ impl Config {
             );
         }
 
+        // V5 (round-2 audit #5): each `tables:` entry becomes a destination path
+        // SEGMENT in dest_for_table (local `<path>/<table>`, cloud `<prefix>/
+        // <table>/`), so an entry with `..`/`/` escapes the configured tree exactly
+        // like an unsafe export.name — the multi-tenant-wrapper threat model V5/V15
+        // defend. The single `table:` shortcut and export.name are guarded; the
+        // `tables:` list was not. Reject an unsafe segment at config-load, before
+        // dest_for_table (or the pre-write manifest FS probe) ever sees it.
+        for t in export.tables.iter().flatten() {
+            if !is_filename_safe_name(t) {
+                anyhow::bail!(
+                    "export '{}': tables entry '{}' is not filename-safe: it must not contain \
+                     '/', '\\', '..', a NUL, or start with '.' (each table becomes a destination \
+                     path segment).",
+                    export.name,
+                    t.escape_default(),
+                );
+            }
+        }
+
+        // Round-2 audit #15/#16/#6: partition_by has purely-static rules (mode
+        // compatibility, the `{partition}` token, a filename-safe column name) that
+        // only lived in the run-time expansion step, so `rivet check` gave a false
+        // green and `rivet run` failed later — after a live DB probe, or (mode: cdc)
+        // with a misleading "requires table:". Enforce them at config-load so check
+        // and run agree, mirroring the chunk_dense/chunk_by_days guards.
+        if let Some(col) = export.partition_by.as_deref() {
+            if col.trim().is_empty() {
+                anyhow::bail!("export '{}': partition_by must name a column", export.name);
+            }
+            // #6: the column name becomes the Hive `col=value` path segment, so a
+            // quoted DB column named `../x` would inject a traversal — filename-gate it.
+            if !is_filename_safe_name(col) {
+                anyhow::bail!(
+                    "export '{}': partition_by column '{}' is not filename-safe: it must not \
+                     contain '/', '\\', '..', a NUL, or start with '.' (it becomes a `col=value` \
+                     destination path segment).",
+                    export.name,
+                    col.escape_default(),
+                );
+            }
+            if matches!(export.mode, ExportMode::TimeWindow | ExportMode::Cdc) {
+                anyhow::bail!(
+                    "export '{}': partition_by is not compatible with `mode: {:?}` — it is a batch \
+                     output-layout feature; partition a full/chunked/incremental export instead.",
+                    export.name,
+                    export.mode,
+                );
+            }
+            if export.chunk_by_key.is_some() {
+                anyhow::bail!(
+                    "export '{}': partition_by is not compatible with chunk_by_key — keyset needs \
+                     the `table:` shortcut to verify the index, but partitioning rewrites the query \
+                     into a subquery. Use a range `chunk_column`, a smaller `partition_granularity`, \
+                     or `mode: full`.",
+                    export.name
+                );
+            }
+            let has_token = export
+                .destination
+                .path
+                .as_deref()
+                .is_some_and(|s| s.contains("{partition}"))
+                || export
+                    .destination
+                    .prefix
+                    .as_deref()
+                    .is_some_and(|s| s.contains("{partition}"));
+            if !has_token {
+                anyhow::bail!(
+                    "export '{}': partition_by requires a '{{partition}}' token in destination.path \
+                     or destination.prefix (otherwise every partition would overwrite the same prefix).",
+                    export.name
+                );
+            }
+        }
+
+        // Round-2 audit #17: chunk_size_memory_mb is documented mutually exclusive
+        // with an explicit chunk_size — build.rs takes the memory budget and
+        // silently drops chunk_size when both are set, mirroring the batch_size pair.
+        if export.chunk_size_memory_mb.is_some() && export.chunk_size != default_chunk_size() {
+            anyhow::bail!(
+                "export '{}': chunk_size and chunk_size_memory_mb are mutually exclusive — \
+                 chunk_size_memory_mb derives the window size from a memory budget, so an explicit \
+                 chunk_size would be silently ignored. Set one or the other.",
+                export.name
+            );
+        }
+
         let merged =
             crate::tuning::merge_tuning_config(self.source.tuning.as_ref(), export.tuning.as_ref());
         if let Some(t) = merged
@@ -1575,9 +1663,14 @@ mod audit_unquoted_template_brace {
     #[test]
     fn config_without_braces_is_untouched() {
         // No brace anywhere: a plain valid config still loads, and an unrelated
-        // YAML error elsewhere must not pick up a spurious quoting hint.
-        Config::from_yaml(&yaml_with_prefix("exports/data/"))
-            .expect("a brace-free prefix must load");
+        // YAML error elsewhere must not pick up a spurious quoting hint. (No
+        // partition_by here — a braceless prefix is invalid WITH partition_by,
+        // which requires a `{partition}` token; this test is about brace
+        // detection, not partitioning.)
+        let yaml = "source:\n  type: postgres\n  url: \"postgresql://localhost/test\"\n\
+                    exports:\n  - name: t\n    query: \"SELECT 1\"\n    format: parquet\n\
+                    \x20   destination:\n      type: local\n      path: ./out\n      prefix: exports/data/\n";
+        Config::from_yaml(yaml).expect("a brace-free prefix must load");
     }
 
     // ── line_has_unquoted_brace_value() unit coverage ──────────────────────

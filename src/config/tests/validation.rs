@@ -124,6 +124,135 @@ exports:
     );
 }
 
+// ─── round-2 audit #5/#6/#15/#16/#17: config-load hoists ─────────────────
+
+#[test]
+fn cdc_tables_entry_with_traversal_rejected_at_load() {
+    // #5: a `tables:` entry becomes a destination path segment — `..` escapes
+    // the configured tree. RED before the is_filename_safe_name gate on tables.
+    let yaml = r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: leak
+    mode: cdc
+    tables: ["../../evil"]
+    format: parquet
+    cdc:
+      slot: s
+    destination:
+      type: local
+      path: ./out
+"#;
+    let msg = format!("{:#}", Config::from_yaml(yaml).unwrap_err());
+    assert!(msg.contains("filename-safe"), "names the class: {msg}");
+}
+
+#[test]
+fn partition_by_with_cdc_mode_rejected_at_load() {
+    // #15: partition_by + mode:cdc previously passed `check`, then died at run
+    // after a live probe with a misleading "requires table:". Reject statically.
+    let yaml = r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: t
+    mode: cdc
+    table: events
+    partition_by: created_at
+    format: parquet
+    cdc:
+      slot: s
+    destination:
+      type: local
+      path: ./out
+      prefix: "p/{partition}/"
+"#;
+    let msg = format!("{:#}", Config::from_yaml(yaml).unwrap_err());
+    assert!(msg.contains("partition_by"), "names the knob: {msg}");
+    assert!(
+        msg.to_lowercase().contains("cdc"),
+        "names the incompatible mode: {msg}"
+    );
+}
+
+#[test]
+fn partition_by_column_name_traversal_rejected_at_load() {
+    // #6: the partition column name becomes the Hive `col=value` segment.
+    let yaml = r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: t
+    mode: full
+    table: events
+    partition_by: "../x"
+    format: parquet
+    destination:
+      type: local
+      path: ./out
+      prefix: "p/{partition}/"
+"#;
+    let msg = format!("{:#}", Config::from_yaml(yaml).unwrap_err());
+    assert!(msg.contains("filename-safe"), "names the class: {msg}");
+}
+
+#[test]
+fn partition_by_without_token_rejected_at_check_time() {
+    // #16: the {partition}-token rule was enforced only in the run pipeline —
+    // `rivet check` gave a false green. Now caught at config-load.
+    let yaml = r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: t
+    mode: full
+    table: events
+    partition_by: created_at
+    format: parquet
+    destination:
+      type: local
+      path: ./out
+"#;
+    let msg = format!("{:#}", Config::from_yaml(yaml).unwrap_err());
+    assert!(
+        msg.contains("{partition}"),
+        "names the missing token: {msg}"
+    );
+}
+
+#[test]
+fn chunk_size_and_memory_mb_both_set_rejected() {
+    // #17: documented mutually exclusive, previously unenforced — chunk_size
+    // was silently dropped in favour of the memory budget.
+    let yaml = r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: t
+    mode: chunked
+    table: events
+    chunk_column: id
+    chunk_size: 5000
+    chunk_size_memory_mb: 256
+    format: parquet
+    destination:
+      type: local
+      path: ./out
+"#;
+    let msg = format!("{:#}", Config::from_yaml(yaml).unwrap_err());
+    assert!(msg.contains("chunk_size"), "names the knob: {msg}");
+    assert!(
+        msg.contains("mutually exclusive"),
+        "explains the rule: {msg}"
+    );
+}
+
 #[test]
 fn misplaced_profile_in_source_rejected() {
     let yaml = r#"
