@@ -183,8 +183,26 @@ pub(super) fn mssql_type_mappings(
                 None,
             );
             let native = format!("{:?}", col.column_type()).to_lowercase();
-            let source = SourceColumn::simple(col.name(), native, true);
-            TypeMapping::from_source(&source, rivet)
+            let source = SourceColumn::simple(col.name(), native.clone(), true);
+            let mapping = TypeMapping::from_source(&source, rivet);
+            // Round-2 audit #19: datetime2 maps to Timestamp(µs); a scale-7 column
+            // (the bare `datetime2` default) silently loses its 100ns sub-microsecond
+            // tick, yet the derived fidelity is a blanket `Exact`. rivet does not read
+            // datetime2's declared scale from sys.columns (only decimal's), so surface
+            // the µs truncation as a warning in the type-report — the honest lever the
+            // finding calls for (Compatible/warn, never Lossy, which would break
+            // --strict for every bare datetime2). Value truncation itself is the
+            // documented "known gap 4" with a `timestamp_ns` opt-in.
+            if native == "datetime2" {
+                mapping.with_warning(
+                    "datetime2 → Timestamp(microsecond): a scale-7 column (the bare `datetime2` \
+                     default) loses its 100ns sub-microsecond tick. Use a `timestamp_ns` column \
+                     override to preserve it (at the cost of the 1677–2262 date range); \
+                     datetime2(0..6) is exact.",
+                )
+            } else {
+                mapping
+            }
         })
         .collect()
 }
