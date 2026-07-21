@@ -103,11 +103,20 @@ pub fn decimal_str_to_scaled_i128(s: &str, scale: i8) -> Option<i128> {
         }
         buf.parse().ok()?
     } else {
-        // Truncate to exactly `scale` digits. If the source column truly has
-        // scale=2 and a DB value arrives with more digits, that is either a
-        // type mismatch or a DB rounding artefact — we preserve the declared
-        // scale rather than silently extending it.
-        frac_part.get(..scale_u as usize)?.parse().ok()?
+        // frac_part.len() >= scale_u. Keep exactly `scale` digits — but a NON-ZERO
+        // dropped digit is a lossy down-scale (a `columns:` override under-declaring
+        // the source scale), so return None and let the caller fail LOUDLY, matching
+        // MSSQL's rescale_i128 (round-2 audit #20) rather than silently truncating
+        // financial digits. Autodetect never trips this (its scale == the value's);
+        // trailing zeros drop harmlessly.
+        // `.get()` (not `split_at`) so a non-char-boundary index on arbitrary
+        // input returns None rather than panicking — the parser stays total.
+        let keep = frac_part.get(..scale_u as usize)?;
+        let dropped = frac_part.get(scale_u as usize..)?;
+        if dropped.bytes().any(|b| b != b'0') {
+            return None;
+        }
+        keep.parse().ok()?
     };
 
     let scale_factor = 10i128.pow(scale_u);
@@ -159,7 +168,15 @@ pub fn decimal_str_to_scaled_i256(s: &str, scale: i8) -> Option<i256> {
         }
         i256::from_string(&buf)?
     } else {
-        i256::from_string(frac_part.get(..scale_u as usize)?)?
+        // See the i128 sibling: a non-zero dropped digit is a lossy down-scale —
+        // return None so the caller fails loudly (round-2 audit #20). `.get()`
+        // keeps the parser total on a non-char-boundary index.
+        let keep = frac_part.get(..scale_u as usize)?;
+        let dropped = frac_part.get(scale_u as usize..)?;
+        if dropped.bytes().any(|b| b != b'0') {
+            return None;
+        }
+        i256::from_string(keep)?
     };
 
     let scale_factor = pow10_i256(scale_u)?;
@@ -287,6 +304,32 @@ mod tests {
     }
 
     #[test]
+    fn lossy_scale_downcast_fails_loudly_lossless_still_ok() {
+        // Round-2 audit #20: a `columns:` override under-declaring the source scale
+        // must NOT silently truncate financial digits — a non-zero dropped digit
+        // returns None (the PG/MySQL builders turn that into a loud error, matching
+        // MSSQL's rescale_i128). RED before the guard (it truncated to Some(123)).
+        assert_eq!(
+            decimal_str_to_scaled_i128("1.234567", 2),
+            None,
+            "i128 lossy"
+        );
+        assert_eq!(
+            decimal_str_to_scaled_i256("1.234567", 2),
+            None,
+            "i256 lossy"
+        );
+        // Lossless: the dropped digits are zeros → keep exactly `scale` digits.
+        assert_eq!(decimal_str_to_scaled_i128("1.2300", 2), Some(123));
+        assert_eq!(
+            decimal_str_to_scaled_i256("1.2300", 2),
+            Some(i256::from_i128(123))
+        );
+        // Exact-scale input (the money path shape) is unaffected.
+        assert_eq!(decimal_str_to_scaled_i128("1.23", 2), Some(123));
+    }
+
+    #[test]
     fn large_precision_near_i128_boundary() {
         // Decimal128 max precision=38, so the largest i128 value is ~1.7e38
         // This just verifies we don't overflow for values within p=18,s=0
@@ -408,21 +451,28 @@ mod fuzz {
                 if frac_width > 0 { "." } else { "" },
                 frac_used
             );
-            // Expected: pad-or-truncate frac_used to exactly 4 digits.
-            let aligned: String = frac_used
-                .chars()
-                .chain(std::iter::repeat('0'))
-                .take(4)
-                .collect();
-            let expect = {
+            // Round-2 audit #20: a NON-ZERO digit dropped beyond scale 4 is a
+            // lossy down-scale → the parsers now return None (loud), not a silently
+            // truncated value. Only a lossless case (frac ≤ 4 digits, or the extra
+            // digits are zeros) yields Some, padded/kept to exactly 4 digits.
+            let dropped = frac_used.get(4..).unwrap_or("");
+            if dropped.bytes().any(|b| b != b'0') {
+                proptest::prop_assert_eq!(decimal_str_to_scaled_i128(&s, 4), None);
+                proptest::prop_assert_eq!(decimal_str_to_scaled_i256(&s, 4), None);
+            } else {
+                let aligned: String = frac_used
+                    .chars()
+                    .chain(std::iter::repeat('0'))
+                    .take(4)
+                    .collect();
                 let mag = int_part as i128 * 10_000 + aligned.parse::<i128>().unwrap();
-                if neg { -mag } else { mag }
-            };
-            proptest::prop_assert_eq!(decimal_str_to_scaled_i128(&s, 4), Some(expect));
-            proptest::prop_assert_eq!(
-                decimal_str_to_scaled_i256(&s, 4),
-                Some(arrow::datatypes::i256::from_i128(expect))
-            );
+                let expect = if neg { -mag } else { mag };
+                proptest::prop_assert_eq!(decimal_str_to_scaled_i128(&s, 4), Some(expect));
+                proptest::prop_assert_eq!(
+                    decimal_str_to_scaled_i256(&s, 4),
+                    Some(arrow::datatypes::i256::from_i128(expect))
+                );
+            }
         }
 
         // scale_int_to_i256 is LIVE in the mysql batch Decimal256 path for
