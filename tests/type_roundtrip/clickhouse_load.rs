@@ -306,6 +306,10 @@ fn clickhouse_validates_mssql_type_matrix_parquet() {
         ("c_float", "Nullable(Float64)"),
         ("c_date", "Nullable(Date32)"),
         ("created_at", "Nullable(DateTime64(6))"),
+        // datetimeoffset → Timestamp(µs, UTC): ClickHouse carries the UTC zone
+        // into the type (vs the naive datetime2 above), so the tz-awareness is
+        // visible in the autoload schema, not just the value.
+        ("created_at_tz", "Nullable(DateTime64(6, 'UTC'))"),
         ("label", "Nullable(String)"),
         ("c_varchar", "Nullable(String)"),
         ("raw_bytes", "Nullable(String)"),
@@ -345,5 +349,37 @@ fn clickhouse_validates_mssql_type_matrix_parquet() {
         txt["an"].as_str().unwrap(),
         "1",
         "note_all_null must be NULL"
+    );
+
+    // 4) datetimeoffset lands as its UTC instant. toUnixTimestamp64Micro is
+    //    tz-independent, so the check is stable regardless of CH's server tz:
+    //    +05:30 13:45:30 → 08:15:30 UTC, negative −08:00 00:00:00 → 08:00:00 UTC,
+    //    NULL stays NULL.
+    let dto1 = ch_one(&format!(
+        "SELECT toString(toUnixTimestamp64Micro(created_at_tz)) AS us
+         FROM file('{glob}', 'Parquet') WHERE id = 1"
+    ));
+    assert_eq!(
+        dto1["us"].as_str().unwrap(),
+        "1768464930123456",
+        "datetimeoffset id=1 (+05:30) must round-trip as its UTC instant"
+    );
+    let dto2 = ch_one(&format!(
+        "SELECT toString(toUnixTimestamp64Micro(created_at_tz)) AS us
+         FROM file('{glob}', 'Parquet') WHERE id = 2"
+    ));
+    assert_eq!(
+        dto2["us"].as_str().unwrap(),
+        "946713600000000",
+        "datetimeoffset id=2 (negative −08:00 offset) must round-trip as its UTC instant"
+    );
+    let dto3 = ch_one(&format!(
+        "SELECT toString(isNull(created_at_tz)) AS n
+         FROM file('{glob}', 'Parquet') WHERE id = 3"
+    ));
+    assert_eq!(
+        dto3["n"].as_str().unwrap(),
+        "1",
+        "datetimeoffset NULL must stay NULL"
     );
 }

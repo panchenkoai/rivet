@@ -16,6 +16,7 @@ CREATE TABLE {table_name} (
     c_date        DATE            NOT NULL,
     c_time        TIME(6)         NOT NULL,
     created_at    DATETIME2       NOT NULL,
+    created_at_tz DATETIMEOFFSET  NULL,
     label         NVARCHAR(200)   NOT NULL,
     c_varchar     VARCHAR(50)     NOT NULL,
     c_char        CHAR(10)        NOT NULL,

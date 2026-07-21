@@ -87,7 +87,7 @@ pub const MATRIX_COLUMN_OVERRIDES_YAML: &str = "    columns:\n      amount: deci
 
 pub const MSSQL_MATRIX_COLUMNS: &str = "\
     id, c_smallint, c_int, c_bigint, c_tinyint, c_bit, amount, fee, price, \
-    c_real, c_float, c_date, c_time, created_at, label, c_varchar, c_char, \
+    c_real, c_float, c_date, c_time, created_at, created_at_tz, label, c_varchar, c_char, \
     raw_bytes, uid, c_nvarchar, note_nullable, note_all_null";
 
 pub fn read_parquet_batches(path: &Path) -> (SchemaRef, Vec<RecordBatch>) {

@@ -69,8 +69,10 @@ default port 1433), driven by the async `tiberius` client. Supported today:
 - **Types** (live-validated through the DuckDB + ClickHouse Parquet oracles):
   `int`/`bigint`/`smallint`/`tinyint`, `bit`, `decimal`/`numeric`,
   `real`/`float`, `money`, `date`, `time`, `datetime2`, `nvarchar`/`varchar`/
-  `char`, `varbinary`, `uniqueidentifier` (→ native Parquet `LogicalType::Uuid`).
-  `datetimeoffset` is mapped but not yet roundtrip-verified.
+  `char`, `varbinary`, `uniqueidentifier` (→ native Parquet `LogicalType::Uuid`),
+  and `datetimeoffset` (→ `Timestamp(µs, UTC)`: the offset is applied and the UTC
+  instant re-read correctly by the DuckDB/ClickHouse oracles — positive and
+  negative offsets and NULL all covered in the type matrix).
 - **TLS**: required on the login handshake (SQL Server always encrypts it).
   Set `tls.ca_file:` for a private CA, or `tls.accept_invalid_certs: true` for a
   self-signed dev cert.
