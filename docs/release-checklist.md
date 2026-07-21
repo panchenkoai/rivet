@@ -112,7 +112,10 @@ For non-major releases:
 - [ ] Docker image (multi-arch via native amd64+arm64 runners) tagged.
 - [ ] Homebrew tap PR opened in
       [`panchenkoai/homebrew-rivet`](https://github.com/panchenkoai/homebrew-rivet).
-- [ ] crates.io publish dry-run: `cargo publish --dry-run`.
+- [ ] crates.io publish dry-run: `cargo publish --dry-run` — **automated**: the
+      `pre-push` hook runs `cargo publish --locked --dry-run` whenever the branch
+      bumps the crate version vs `main`, so a version-bump push already exercised
+      it (this box is the manual backstop if hooks are bypassed).
 
 ---
 
