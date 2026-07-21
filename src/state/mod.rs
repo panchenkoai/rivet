@@ -734,18 +734,29 @@ fn migrate_pg(client: &mut postgres::Client) -> Result<()> {
 /// `postgresql://user:SECRET@host/db` → `postgresql://user:***@host/db`
 /// Uses `rfind('@')` so passwords containing `@` are handled correctly.
 fn redact_pg_url(url: &str) -> String {
-    if let Some(at_pos) = url.rfind('@')
-        && let Some(scheme_end) = url.find("://")
-    {
-        let authority = &url[scheme_end + 3..at_pos];
-        if let Some(colon) = authority.rfind(':') {
-            let user = &authority[..colon];
-            return format!(
-                "{}://{}:***@{}",
-                &url[..scheme_end],
-                user,
-                &url[at_pos + 1..]
-            );
+    // Bound the userinfo search to the AUTHORITY (up to the first '/','?','#'
+    // after '://'), THEN take the last '@' within it — a stray '@' in the path or
+    // query must not extend the match and echo the password (round-2 audit #2).
+    // Mirrors config::source::find_userinfo's bounded logic; fails safe (over-
+    // redacts rather than leaking) on an ambiguous URL.
+    if let Some(scheme_end) = url.find("://") {
+        let after_scheme = &url[scheme_end + 3..];
+        let authority_end = after_scheme
+            .find(['/', '?', '#'])
+            .unwrap_or(after_scheme.len());
+        let authority_region = &after_scheme[..authority_end];
+        if let Some(at_rel) = authority_region.rfind('@') {
+            let authority = &authority_region[..at_rel];
+            let at_pos = scheme_end + 3 + at_rel;
+            if let Some(colon) = authority.rfind(':') {
+                let user = &authority[..colon];
+                return format!(
+                    "{}://{}:***@{}",
+                    &url[..scheme_end],
+                    user,
+                    &url[at_pos + 1..]
+                );
+            }
         }
     }
     url.to_string()
@@ -1184,6 +1195,20 @@ mod tests {
         // URL without a password should come back as-is.
         let url = "postgresql://rivet@localhost/state";
         assert_eq!(redact_pg_url(url), url);
+    }
+
+    #[test]
+    fn redact_pg_url_stray_at_in_query_does_not_leak_password() {
+        // Round-2 audit #2: an unbounded rfind('@') landed on a '@' in the query,
+        // so the redactor treated `u:secret@host…?opt=a` as the userinfo and
+        // echoed `secret` verbatim. Bounding the search to the authority fixes it.
+        // RED before the bound: output contained `secret`.
+        let out = redact_pg_url("postgresql://u:secret@host:5432/db?opt=a@b");
+        assert!(
+            !out.contains("secret"),
+            "password must not survive redaction with a stray '@' in the query: {out}"
+        );
+        assert_eq!(out, "postgresql://u:***@host:5432/db?opt=a@b");
     }
 
     // ── state(pg) sslmode → TlsMode mapping ─────────────────────────────────
