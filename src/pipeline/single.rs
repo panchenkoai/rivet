@@ -404,27 +404,23 @@ pub(super) fn run_single_export(
         );
     }
 
-    // ADR-0001 I3 cursor advance + ADR-0008 PG2 committed boundary — both
-    // go through the shared seam in `super::run_store::RunStore` so the
-    // ordering rule (cursor first, fatal; progression second, warn-on-fail)
-    // is the interface, not a convention. The `after_cursor_commit` fault
-    // hook now fires inside `RunStore::commit()` so every runner that uses
-    // the facade inherits it.
+    // Round-2 audit #12: record the incremental cursor RANGE on the summary but do
+    // NOT advance the state cursor here. Under ADR-0001 the DESTINATION is the
+    // loader's source of truth, so the cursor advance must happen AFTER the
+    // destination manifest is durable (`finalize_manifest`) — otherwise a crash in
+    // the advance→manifest window leaves the cursor past parts the manifest never
+    // recorded, which the manifest-authoritative `rivet load` then silently drops
+    // (an export→load at-least-once break). The caller commits the cursor via
+    // `commit_incremental_cursor` once the manifest is written; the
+    // `after_cursor_commit` fault hook fires there.
     if let (Some(last_val), Some(st)) = (&sink.last_cursor_value, state) {
-        // Capture the value this run resumed FROM (the low) BEFORE the commit
-        // overwrites it with the new high — the cursor RANGE ships to the
-        // manifest for warehouse-side continuity (low..high, next run resumes
-        // from high; a non-contiguous low next time is a skipped range).
+        // Capture the value this run resumed FROM (the low) — the deferred commit
+        // overwrites the stored cursor with the new high; the RANGE (low..high)
+        // ships to the manifest for warehouse-side continuity.
         let prior_low = st
             .get(&plan.export_name)
             .ok()
             .and_then(|e| e.last_cursor_value.clone());
-        super::run_store::RunStore::finalize(st, plan, summary)
-            .with_cursor(last_val.clone())
-            .with_progression(super::run_store::Progression::Incremental {
-                last_value: last_val.clone(),
-            })
-            .commit()?;
         summary.cursor_column = plan
             .strategy
             .incremental_plan()
@@ -509,6 +505,27 @@ pub(super) fn run_single_export(
     }
 
     log::info!("export '{}' completed successfully", plan.export_name);
+    Ok(())
+}
+
+/// Round-2 audit #12: advance the incremental cursor AFTER the destination
+/// manifest is durable. `run_single_export` records the cursor range on the
+/// summary but leaves the state cursor untouched; the caller invokes this once
+/// `finalize_manifest` has written the manifest, so a crash never leaves the
+/// cursor advanced past parts the loader-authoritative manifest doesn't record.
+/// No-op unless an incremental cursor is pending (`summary.cursor_high`). The
+/// `after_cursor_commit` fault hook fires inside `RunStore::commit()` here.
+pub(super) fn commit_incremental_cursor(
+    state: &StateStore,
+    plan: &ResolvedRunPlan,
+    summary: &RunSummary,
+) -> Result<()> {
+    if let Some(cursor) = summary.cursor_high.clone() {
+        super::run_store::RunStore::finalize(state, plan, summary)
+            .with_cursor(cursor.clone())
+            .with_progression(super::run_store::Progression::Incremental { last_value: cursor })
+            .commit()?;
+    }
     Ok(())
 }
 

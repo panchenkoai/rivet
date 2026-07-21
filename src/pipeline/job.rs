@@ -9,7 +9,7 @@ use crate::state::StateStore;
 
 use super::RunOptions;
 use super::chunked::{self, run_chunked_parallel_checkpoint};
-use super::single::run_with_reconnect;
+use super::single::{commit_incremental_cursor, run_with_reconnect};
 use super::summary::RunSummary;
 use crate::journal::RunEvent;
 
@@ -568,6 +568,18 @@ pub(super) fn run_export_job(
     // failed.  The notification fires last so it carries the most complete
     // summary.
     finalize_manifest(&plan, state, &summary, "export");
+    // Round-2 audit #12: advance the incremental cursor now that the destination
+    // manifest is durable — never before. A failure here is at-least-once safe (the
+    // data + manifest are durable; the next run re-exports from the prior cursor),
+    // so log loudly rather than fail a run whose write cycle already succeeded.
+    if let Err(e) = commit_incremental_cursor(state, &plan, &summary) {
+        log::error!(
+            "export '{}': cursor advance failed AFTER the manifest was written — the next run \
+             re-exports from the prior cursor (at-least-once, no loss): {:#}",
+            summary.export_name,
+            e
+        );
+    }
     if plan.validate {
         finalize_validate_manifest(&plan, &mut summary, "export");
     }
@@ -673,6 +685,16 @@ pub(crate) fn run_export_job_with_chunk_source(
 
     summary.print();
     finalize_manifest(plan, state, &summary, "apply");
+    // Round-2 audit #12: incremental cursor advance AFTER the manifest is durable
+    // (see run_export_job). No-op for the chunked/Precomputed apply path.
+    if let Err(e) = commit_incremental_cursor(state, plan, &summary) {
+        log::error!(
+            "apply '{}': cursor advance failed AFTER the manifest was written — the next run \
+             re-exports from the prior cursor (at-least-once, no loss): {:#}",
+            summary.export_name,
+            e
+        );
+    }
     if plan.validate {
         finalize_validate_manifest(plan, &mut summary, "apply");
     }

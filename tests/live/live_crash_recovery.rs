@@ -364,6 +364,128 @@ fn crash_after_cursor_commit_is_recoverable_with_full_state() {
     );
 }
 
+// Round-2 audit #12: the incremental cursor advanced BEFORE the destination
+// manifest was written, so a crash at after_cursor_commit advanced the cursor past
+// parts the manifest never recorded — the next cycle resumes past them, and the
+// manifest-authoritative `rivet load` never sees them (silent export→load loss).
+// The parquet-glob path masks it (the orphan file is physically durable); a
+// MANIFEST-DRIVEN read (only parts a Success manifest declares, as the loader does)
+// exposes it, so this goes RED without the cursor-after-manifest fix.
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn crash_after_cursor_commit_is_recoverable_via_a_manifest_driven_read() {
+    require_alive(LiveService::Postgres);
+    let (table, _guard) = seed_cursor_table(6);
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let out = tempfile::tempdir().unwrap();
+    let export = unique_name("qa11_m12");
+    let cfg = write_cfg(out.path(), &table, &export, &cfg_dir);
+
+    // Cycle 1: crash right after the cursor advances. With the fix the manifest is
+    // already durable (finalize_manifest ran first); without it, the 6 rows are
+    // orphaned from any manifest while the cursor points past them.
+    run_rivet_crash(&cfg, &export, "after_cursor_commit");
+    assert!(
+        cursor_value(&cfg, &export).is_some(),
+        "after_cursor_commit must leave the cursor advanced"
+    );
+
+    // Add 3 rows PAST the advanced cursor, then a clean next cycle captures them.
+    pg_connect()
+        .batch_execute(&format!(
+            "INSERT INTO {table} (id, updated_at)
+             SELECT g, now() + (interval '1 hour') * g FROM generate_series(7, 9) g;"
+        ))
+        .unwrap();
+    let rec = std::process::Command::new(RIVET_BIN)
+        .args([
+            "run",
+            "--config",
+            cfg.to_str().unwrap(),
+            "--export",
+            &export,
+        ])
+        .output()
+        .expect("spawn rivet");
+    assert!(
+        rec.status.success(),
+        "recovery run must succeed: {}",
+        String::from_utf8_lossy(&rec.stderr)
+    );
+
+    // Manifest-driven read (union of Success manifests' parts) must see ALL 9 rows —
+    // the 6 from the crashed cycle plus the 3 new ones.
+    let ids = manifest_driven_bigint_ids(out.path());
+    assert_eq!(
+        ids.len(),
+        9,
+        "every row must be reachable via a Success manifest (round-2 #12), got {} ids: {:?}",
+        ids.len(),
+        {
+            let mut v: Vec<_> = ids.iter().collect();
+            v.sort();
+            v
+        }
+    );
+}
+
+/// Distinct BIGINT `id`s reachable the way `rivet load` reads: ONLY parts declared
+/// by a `Success` manifest (run-unique `manifest-<run_id>.json` copies included),
+/// never an orphan parquet that no manifest references.
+fn manifest_driven_bigint_ids(out: &std::path::Path) -> std::collections::HashSet<i64> {
+    let mut declared: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for e in std::fs::read_dir(out).unwrap() {
+        let p = e.unwrap().path();
+        let name = p
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string();
+        if !(name.starts_with("manifest") && name.ends_with(".json")) {
+            continue;
+        }
+        let m: serde_json::Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+        if m.get("status").and_then(|s| s.as_str()) != Some("success") {
+            continue;
+        }
+        for part in m
+            .get("parts")
+            .and_then(|x| x.as_array())
+            .into_iter()
+            .flatten()
+        {
+            if let Some(path) = part.get("path").and_then(|x| x.as_str()) {
+                declared.insert(path.to_string());
+            }
+        }
+    }
+    let mut ids = std::collections::HashSet::new();
+    for part_name in &declared {
+        let p = out.join(part_name);
+        if !p.exists() {
+            continue;
+        }
+        let f = std::fs::File::open(&p).unwrap();
+        let r = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(f)
+            .unwrap()
+            .build()
+            .unwrap();
+        for b in r {
+            let b = b.unwrap();
+            let col = b
+                .column(b.schema().index_of("id").unwrap())
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .unwrap()
+                .clone();
+            for r in 0..b.num_rows() {
+                ids.insert(col.value(r));
+            }
+        }
+    }
+    ids
+}
+
 // ─── OPT-6 slice 3: the same write-cycle boundaries through the SUBPROCESS engine ─
 //
 // `after_source_read` is covered by `parallel_processes_hard_crash_writes_no_partial_file`
