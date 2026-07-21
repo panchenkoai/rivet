@@ -530,7 +530,7 @@ pub enum CdcInitialMode {
 /// Per-export CDC settings, required when `mode: cdc`. The output `table`,
 /// `destination`, and `format` come from the export itself; this carries only the
 /// CDC-specific knobs (resume + per-engine stream params).
-#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, Default)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone)]
 pub struct CdcExportConfig {
     /// First-run behaviour: `snapshot` = anchor → full snapshot → drain (see
     /// [`CdcInitialMode`]). Omitted ⇒ capture changes only (the default; the
@@ -569,6 +569,31 @@ pub struct CdcExportConfig {
     /// SQL Server CDC capture instance, e.g. `dbo_orders` — required for
     /// `sqlserver://` sources.
     pub capture_instance: Option<String>,
+}
+
+// Hand-written so the Rust `Default` MATCHES the serde default: `until_current`
+// must be `true` (bounded). The derived `Default` would use `bool::default()` =
+// `false`, and serde's `default = "default_true"` only affects Deserialize — so
+// `CdcExportConfig::default()` would silently mean `DrainMode::Continuous`. That
+// default is reached on the drain path (`cdc_job.rs`: `export.cdc.clone()
+// .unwrap_or_default()`) whenever a `mode: cdc` export omits the whole `cdc:`
+// block (valid for PG/MySQL), turning a minimal bounded drain into a
+// never-terminating daemon that persists no resume position — the exact footgun
+// `default_true` was added to kill. Mirrors `MongoConfig`'s hand-written Default.
+impl Default for CdcExportConfig {
+    fn default() -> Self {
+        Self {
+            initial: None,
+            checkpoint: None,
+            until_current: true,
+            max_events: None,
+            rollover: None,
+            rollover_memory_mb: None,
+            server_id: None,
+            slot: None,
+            capture_instance: None,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, Copy, PartialEq, Eq)]

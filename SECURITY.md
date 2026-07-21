@@ -30,10 +30,20 @@ The following files may contain sensitive information even when credentials are 
 |---|---|
 | `rivet.yaml` | Source URL, query bodies, destination credentials (if inlined) |
 | `plan.json` | Table names, query SQL, chunk bounds, row estimates |
-| `.rivet_state.db` | Cursor values, manifest of exported files, run metrics |
-| `*.jsonl` journal | Per-run event timeline; includes export names, run IDs, chunk boundaries |
+| `.rivet_state.db` | Cursor values, manifest of exported files, run metrics, and **failed-run error text** (see the note below) |
+| `*.jsonl` journal | Per-run event timeline; includes export names, run IDs, chunk boundaries, and error text |
+| Run summary (`summary.json` / `summary.md`) | Per-export status, counts, and error text on failure |
 | Parquet / CSV outputs | The actual exported data |
 | Log output (stdout / `--log-format json`) | Query SQL (truncated), table names, row counts; redacted URLs |
+
+> **Redaction covers credentials only.** Rivet redacts connection-URL passwords
+> everywhere error text is persisted or emitted. It does **not** scrub source
+> *cell values* that a driver or library error may embed in its message — for
+> example, a value that violated a constraint, or a row echoed by a decode error.
+> That error text is stored (`.rivet_state.db`, the journal, the run summary) and,
+> if you configure notifications, emitted to the webhook. Treat failed-run error
+> text as potentially data-bearing, and scope your state-file / webhook access
+> accordingly.
 
 ### `.gitignore` recommendations
 
@@ -160,7 +170,7 @@ The pilot guide covers this end-to-end: [docs/pilot/production-checklist.md](doc
 
 | Control | Status | Notes |
 |---|---|---|
-| RustSec advisory audit | **Active** | `audit` job in [.github/workflows/ci.yml](.github/workflows/ci.yml) runs `rustsec/audit-check` on every PR |
+| RustSec advisory audit | **Active** | `audit` job in [.github/workflows/ci.yml](.github/workflows/ci.yml) runs `cargo audit` on every PR — honoring the documented advisory allow-list in [`.cargo/audit.toml`](.cargo/audit.toml) (the same tool the `.githooks/pre-commit` hook runs) |
 | Dependency review | **Active** | Cargo.lock is committed; bumps land in dedicated PRs |
 | Release checksums (`SHA256SUMS`) | **Active** | Every release publishes `SHA256SUMS.txt` as an asset ([`.github/workflows/release.yml`](.github/workflows/release.yml)); verification below |
 | Signed releases (cosign keyless) | **Active** | Every release signs `SHA256SUMS.txt` via Sigstore/cosign keyless (GitHub OIDC — no key to manage), published as `SHA256SUMS.txt.cosign.bundle`; verification below |

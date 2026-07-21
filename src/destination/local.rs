@@ -779,4 +779,19 @@ mod tests {
             "the staging temp is renamed away, leaving no symlink behind"
         );
     }
+
+    /// Pins the shipped OPT-6 temp-then-rename contract that ADR-0004 +
+    /// semantics.md document: local is retry-safe with no partial-write risk. The
+    /// docs had drifted to the OLD `fs::copy` values (retry_safe=false /
+    /// partial_write_risk=true) — audit finding. If the write path ever regresses
+    /// to a non-atomic copy, flip these AND both docs together.
+    #[test]
+    fn local_is_retry_safe_with_no_partial_write() {
+        let caps = dest().capabilities();
+        assert!(caps.retry_safe, "local temp-then-rename must be retry_safe");
+        assert!(
+            !caps.partial_write_risk,
+            "local temp-then-rename must have no partial_write_risk"
+        );
+    }
 }

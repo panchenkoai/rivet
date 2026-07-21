@@ -110,14 +110,15 @@ fn try_redact_at(bytes: &[u8], i: usize) -> Option<(String, usize)> {
         return None;
     }
     let userinfo_start = j + 3;
-    // Walk the authority until the path/query/fragment/whitespace
-    // terminator, tracking the LAST `@` we cross. A password may itself
-    // contain `@` (`user:p@ssw0rd@host`), so splitting at the FIRST `@`
-    // would leak the tail after it; the userinfo terminator is the last
-    // `@` before the path — mirroring `redact_pg_url` in state/mod.rs,
-    // which uses `rfind('@')` for the same reason. `has_colon` must reflect
-    // a `:` *within the userinfo* (before that last `@`), not a host:port
-    // colon after it, so we recompute it from the chosen `@`.
+    // Walk the authority until the path/query/fragment/whitespace terminator,
+    // tracking the LAST `@` we cross. A password may itself contain `@`
+    // (`user:p@ssw0rd@host`), so splitting at the FIRST `@` would leak the tail
+    // after it; the userinfo terminator is the last `@` before the path. A raw
+    // `/` in the password would make the URL ambiguous — which is why a
+    // Rivet-constructed URL percent-encodes the userinfo (`build_url_from_fields`),
+    // so the password's `/`/`?`/`#` never appears raw here. `has_colon` must reflect
+    // a `:` *within the userinfo* (before that last `@`), not a host:port colon
+    // after it, so we recompute it from the chosen `@`.
     let mut k = userinfo_start;
     let mut last_at: Option<usize> = None;
     while k < bytes.len() {

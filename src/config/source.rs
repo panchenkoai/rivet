@@ -1,10 +1,21 @@
 //! Source-database connection config: URL/structured fields, TLS, environment hints.
 
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::resolve::resolve_env_vars;
 use crate::tuning::{TuningConfig, TuningProfile};
+
+/// Chars to percent-encode in a URL userinfo (user / password) component: encode
+/// everything except the RFC 3986 unreserved set (ALPHA / DIGIT / `- . _ ~`), so
+/// no credential byte can be mistaken for a URL delimiter. Over-encoding is
+/// harmless — the driver percent-decodes it back.
+const USERINFO: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~');
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Clone)]
 #[serde(deny_unknown_fields)]
@@ -336,20 +347,19 @@ impl SourceConfig {
             SourceType::Mongo => "mongodb",
         };
 
+        // Percent-encode the userinfo so a credential containing `/ @ : ? #` can't
+        // make the URL ambiguous (breaking the driver) or defeat redaction.
+        let user_enc = utf8_percent_encode(user, USERINFO);
         if password.is_empty() {
             Ok(format!(
                 "{}://{}@{}:{}/{}",
-                scheme, user, host, port, database
+                scheme, user_enc, host, port, database
             ))
         } else {
+            let pw_enc = utf8_percent_encode(password.as_str(), USERINFO);
             Ok(format!(
                 "{}://{}:{}@{}:{}/{}",
-                scheme,
-                user,
-                password.as_str(),
-                host,
-                port,
-                database
+                scheme, user_enc, pw_enc, host, port, database
             ))
         }
     }
@@ -487,14 +497,14 @@ impl SourceType {
 fn find_userinfo(raw: &str) -> Option<(usize, usize)> {
     let scheme = raw.find("://")? + 3;
     let rest = &raw[scheme..];
-    // The authority ends at the first path/query/fragment delimiter; an `@`
-    // after that belongs to the path or query (`?foo=a@b`), not the userinfo.
+    // The userinfo `@` lives in the AUTHORITY, before the first `/ ? #` (a later
+    // `@` belongs to the path/query — e.g. `?filter=a@b` — and must NOT be treated
+    // as userinfo, or a credential-free URL is falsely redacted). Within the
+    // authority, take the LAST `@` (a password may contain `@`). This is correct
+    // for a well-formed URL; a RAW `/` in the password would make the URL
+    // ambiguous — which is why `build_url_from_fields` percent-encodes the userinfo
+    // (a `/` becomes `%2F`), so a Rivet-constructed URL never hits that case.
     let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    // Terminate userinfo at the LAST `@` within the authority: a password may
-    // itself contain `@` (`user:p@ssw0rd@host`), and splitting at the FIRST
-    // `@` would leak the tail after it into the persisted plan artifact.
-    // `rfind` mirrors `redact_pg_url` in state/mod.rs, which strips passwords
-    // the same way for the same reason.
     let at = rest[..authority_end].rfind('@')?;
     Some((scheme + at, scheme))
 }
@@ -712,6 +722,30 @@ mod tests {
         assert!(
             url.contains("@db.example.com:5432/orders"),
             "host and path must be retained: {url}"
+        );
+    }
+
+    #[test]
+    fn build_url_percent_encodes_userinfo_so_delimiters_cant_leak() {
+        // A2 (audit root fix): a password with URL delimiters (`/ @ : ? #` — `/` is
+        // a common base64 char) is percent-encoded when Rivet builds the connection
+        // URL from structured fields. Un-encoded, the raw `/`/`@` made the URL
+        // ambiguous: it broke the driver AND stopped the password-redaction scan
+        // early, leaking the tail. Encoding is the unambiguous root fix (redaction
+        // of a well-formed URL is then correct). RED before the encoding.
+        let mut src = make_source(SourceType::Postgres);
+        src.host = Some("db.example.com".into());
+        src.user = Some("rivet".into());
+        src.password = Some("pa/s:s@w?rd#x".into());
+        src.database = Some("orders".into());
+        let url = src.resolve_url().expect("url built from fields");
+        assert!(
+            !url.contains("pa/s:s@w?rd#x"),
+            "raw password with delimiters must not appear un-encoded: {url}"
+        );
+        assert!(
+            url.contains("pa%2Fs%3As%40w%3Frd%23x"),
+            "userinfo must be percent-encoded: {url}"
         );
     }
 }

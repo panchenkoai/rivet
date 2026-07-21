@@ -7,6 +7,12 @@
 > samples, and the *why*. For the guaranteed-current flag list of any command,
 > trust the generated reference (or run `rivet <command> --help`).
 
+> **Machine-readable output.** Most commands emit JSON via a boolean `--json`
+> flag (`run`, `check`, `doctor`, `metrics`, `state …`); `validate` (and the
+> `reconcile` / `plan` report writers) instead take `--format json`. This split
+> is a known inconsistency to be unified in a future release — until then, pass
+> `--help` to confirm which idiom a given command uses.
+
 ## Global
 
 ```
@@ -338,8 +344,9 @@ By default `validate` resolves the destination prefix the same way `run` does (`
 |------|-------|------|-------------|
 | `--config` | `-c` | string | Path to YAML config file **(required)** |
 | `--export` | `-e` | string | Validate only a specific export by name |
-| `--format` | | string | Override the format used to resolve the part layout |
-| `--output` | `-o` | PATH | Write the verification report to this file as JSON |
+| `--format` | | `pretty`\|`json` | Output format: `pretty` (human summary) or `json` (machine-readable) |
+| `--depth` | | `light`\|`sample`\|`full` | Verification depth: `light` (manifest + `_SUCCESS`), `sample` (+ part reconcile + untracked surplus), `full` (+ value-checksum re-read of every part; **default**) |
+| `--output` | `-o` | PATH | Write the JSON report to this file (only with `--format json`) |
 | `--date` | | YYYY-MM-DD | Resolve `{date}` to this date instead of today (UTC) |
 | `--run-id` | | string | Point at a prior run's prefix by run id |
 | `--prefix` | | string | Point at an explicit destination prefix |

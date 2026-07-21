@@ -522,7 +522,14 @@ pub(super) fn run_single_export(
 /// guidance instead of a bare driver error. `.context()` (not message
 /// replacement) keeps the original error — and the substrings classify_exit /
 /// retry classification rely on — intact underneath.
-fn attach_connect_hint(e: anyhow::Error, source: &crate::config::SourceConfig) -> anyhow::Error {
+// pub(crate) so the chunked/parallel runners attach the same actionable connect
+// hint (doctor pointer + auth/TLS category) their first `create_source` — the
+// single-export path had it, the parallel-chunked path (the default for large
+// tables) leaked the raw driver error. Audit finding.
+pub(crate) fn attach_connect_hint(
+    e: anyhow::Error,
+    source: &crate::config::SourceConfig,
+) -> anyhow::Error {
     let category = crate::preflight::categorize_source_error(&e);
     match crate::preflight::source_error_hint(category, &e, &source.source_type) {
         Some(hint) => e.context(format!("{category} — {hint}")),

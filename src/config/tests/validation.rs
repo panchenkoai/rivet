@@ -714,6 +714,31 @@ exports:
 }
 
 #[test]
+fn cdc_export_config_rust_default_is_bounded_not_a_daemon() {
+    // The serde default (test above) is NOT enough: `cdc_job` builds the effective
+    // CDC config with `export.cdc.clone().unwrap_or_default()`, so a `mode: cdc`
+    // export that omits the whole `cdc:` block (valid for PG/MySQL) reaches the
+    // RUST `Default`, not the serde one. A *derived* Default yields
+    // `until_current = false` (bool::default) = `DrainMode::Continuous` — a
+    // never-terminating daemon on a minimal config. RED before the hand-written
+    // `impl Default`; audit finding.
+    use crate::config::export::CdcExportConfig;
+    use crate::source::cdc::DrainMode;
+    let d = CdcExportConfig::default();
+    assert!(
+        d.until_current,
+        "CdcExportConfig::default().until_current must be true (bounded), not the daemon default"
+    );
+    assert!(
+        matches!(
+            DrainMode::from_until_current(d.until_current),
+            DrainMode::BoundedAtOpen
+        ),
+        "an omitted cdc: block (unwrap_or_default) must resolve to a bounded drain"
+    );
+}
+
+#[test]
 fn tables_outside_cdc_mode_is_rejected() {
     let yaml = r#"
 source: { type: postgres, url: "postgresql://localhost/test" }

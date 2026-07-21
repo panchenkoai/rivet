@@ -149,7 +149,16 @@ pub(crate) fn extract_last_cursor_value(
             ))
         }
         _ => {
-            log::warn!("cannot extract cursor for type {:?}", array.data_type());
+            // Actionable: an unsupported cursor type silently stalls incremental
+            // advancement (the cursor can't move, so every run re-reads from the
+            // last saved value). Name the consequence AND the fix. Audit finding.
+            log::warn!(
+                "incremental cursor: column type {:?} is not supported for cursor \
+                 extraction — the cursor cannot advance, so this export will re-read \
+                 from the last saved value each run. Use an integer or timestamp \
+                 cursor column, or switch this table to `mode: chunked` / `full`.",
+                array.data_type()
+            );
             None
         }
     }
