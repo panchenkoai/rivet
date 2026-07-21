@@ -254,6 +254,53 @@ exports:
 }
 
 #[test]
+fn valid_partition_by_and_tables_configs_are_accepted() {
+    // The false-REJECT guard for the config-validation matrix: the round-2 hoists
+    // (#5/#6/#15/#16/#17) must reject the accept-but-break combos WITHOUT breaking a
+    // legit config. A partition_by full export with a {partition} token, and a
+    // multi-table CDC export with well-formed table names, must both still load.
+    let partitioned = r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: t
+    mode: full
+    table: events
+    partition_by: created_at
+    format: parquet
+    destination:
+      type: local
+      path: ./out
+      prefix: "events/{partition}/"
+"#;
+    assert!(
+        Config::from_yaml(partitioned).is_ok(),
+        "a valid partition_by export must still load"
+    );
+
+    let cdc_tables = r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: t
+    mode: cdc
+    tables: ["orders", "public.customers"]
+    format: parquet
+    cdc:
+      slot: s
+    destination:
+      type: local
+      path: ./out
+"#;
+    assert!(
+        Config::from_yaml(cdc_tables).is_ok(),
+        "a well-formed multi-table CDC export (incl. a schema-qualified name) must still load"
+    );
+}
+
+#[test]
 fn misplaced_profile_in_source_rejected() {
     let yaml = r#"
 source:

@@ -79,6 +79,11 @@ const MATRICES: &[(&str, usize)] = &[
     // crash cells asserted via a parquet GLOB, masking the manifest-orphan class;
     // every `test:` here asserts MANIFEST-DRIVEN (the loader's view). 0 gaps.
     ("docs/durability-ordering-matrix.yaml", 0),
+    // Config-validation — the accept-but-break class (round-2 #14/#15/#16/#17/#5/#6):
+    // a config that passed validation but silently degraded / died at run. Each
+    // scenario asserts the combo is rejected at CONFIG-LOAD (check == run) AND a
+    // legit form is not false-rejected. 0 gaps.
+    ("docs/config-validation-matrix.yaml", 0),
 ];
 
 #[derive(Deserialize)]

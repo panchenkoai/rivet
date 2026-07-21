@@ -1,0 +1,60 @@
+# Config-validation matrix — the ACCEPT-BUT-BREAK class: a config that PASSED
+# validation but then broke, silently degraded, or misbehaved at runtime. Round-2
+# found a cluster (#14/#15/#16/#17/#5/#6): chunk knobs silently ignored outside
+# `mode: chunked` (degrading to an unbounded snapshot — the exact source-pressure
+# footgun chunked mode prevents), partition_by combos that passed `rivet check`
+# then died after a live probe, a documented mutual-exclusion left unenforced.
+#
+# The invariant: every gated knob/combo is REJECTED at CONFIG-LOAD (so `rivet check`
+# and `rivet run` agree and nothing silently degrades) — AND a legit config is NOT
+# false-rejected. This ledger drift-guards both halves (tests/offline/
+# chunking_matrix_guard.rs).
+#
+# Two columns:
+#   rejected_wrong_mode — a test asserts the accept-but-break combo is rejected at
+#                         config-load (Config::from_yaml -> Err), not silently run.
+#   valid_form_accepted — a test asserts the legit form still LOADS (the false-reject
+#                         guard; round-3 specifically probed for false-positives here).
+#
+# A cell is EXACTLY one of test:/na:/gap: as in the sibling ledgers. (The related
+# invariant "the DERIVED CdcExportConfig::default() is bounded, not a daemon" is a
+# Rust-Default correctness property, not a config-load rejection, so it lives in its
+# own test cdc_export_config_rust_default_is_bounded_not_a_daemon rather than here.)
+
+engines: [rejected_wrong_mode, valid_form_accepted]
+
+scenarios:
+  - id: chunk_column_outside_chunked
+    what: "chunk_column set without `mode: chunked` — silently dropped to a single unbounded snapshot before the guard (#14)."
+    rejected_wrong_mode: { test: chunk_column_without_chunked_mode_rejected }
+    valid_form_accepted: { test: chunk_knobs_accepted_under_chunked_mode }
+
+  - id: nondefault_chunk_size_outside_chunked
+    what: "a non-default chunk_size without `mode: chunked` — silently ignored (#14)."
+    rejected_wrong_mode: { test: nondefault_chunk_size_without_chunked_mode_rejected }
+    valid_form_accepted: { test: chunk_knobs_accepted_under_chunked_mode }
+
+  - id: chunk_size_vs_memory_mb_conflict
+    what: "chunk_size + chunk_size_memory_mb both set — documented mutually exclusive; chunk_size was silently dropped for the memory budget (#17)."
+    rejected_wrong_mode: { test: chunk_size_and_memory_mb_both_set_rejected }
+    valid_form_accepted: { test: chunk_knobs_accepted_under_chunked_mode }
+
+  - id: partition_by_incompatible_mode
+    what: "partition_by + mode: cdc — passed `rivet check`, then died at run after a live probe with a misleading 'requires table:' (#15)."
+    rejected_wrong_mode: { test: partition_by_with_cdc_mode_rejected_at_load }
+    valid_form_accepted: { test: valid_partition_by_and_tables_configs_are_accepted }
+
+  - id: partition_by_missing_token
+    what: "partition_by without a {partition} destination token — enforced only in the run pipeline, so `rivet check` gave a false green (#16)."
+    rejected_wrong_mode: { test: partition_by_without_token_rejected_at_check_time }
+    valid_form_accepted: { test: valid_partition_by_and_tables_configs_are_accepted }
+
+  - id: partition_by_unsafe_column
+    what: "partition_by column name that becomes an unsafe Hive col=value path segment (a quoted '../x') — traversal (#6)."
+    rejected_wrong_mode: { test: partition_by_column_name_traversal_rejected_at_load }
+    valid_form_accepted: { na: "the 'valid' counterpart is a filename-safe column name, exercised by partition_by_incompatible_mode's accept cell (a normal partition_by config loads)" }
+
+  - id: cdc_tables_unsafe_entry
+    what: "a CDC tables: entry that becomes a destination path segment — a '..' entry escapes the configured tree (#5)."
+    rejected_wrong_mode: { test: cdc_tables_entry_with_traversal_rejected_at_load }
+    valid_form_accepted: { test: valid_partition_by_and_tables_configs_are_accepted }
