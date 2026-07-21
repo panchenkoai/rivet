@@ -229,7 +229,13 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                                         last_err = Some(e);
                                         continue;
                                     }
-                                    return Err(e);
+                                    // Round-2 audit #3/#4: carry the doctor/auth-TLS
+                                    // connect hint on the final (non-transient) worker
+                                    // connect failure, matching single.rs:93.
+                                    return Err(crate::pipeline::single::attach_connect_hint(
+                                        e,
+                                        &plan_w.source,
+                                    ));
                                 }
                             };
 

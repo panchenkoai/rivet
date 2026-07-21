@@ -150,7 +150,12 @@ fn run_chunk_with_source_retries(
                     last_err = Some(e);
                     continue;
                 }
-                return Err(e);
+                // Round-2 audit #3/#4: doctor/auth-TLS connect hint on the final
+                // (non-transient) worker connect failure, matching single.rs:93.
+                return Err(crate::pipeline::single::attach_connect_hint(
+                    e,
+                    &plan.source,
+                ));
             }
         };
 

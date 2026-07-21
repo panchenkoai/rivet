@@ -362,7 +362,15 @@ pub(crate) fn run_chunked_parallel(
                         plan_for_worker.source.source_type,
                     );
 
-                    let mut thread_src = source::create_source(&plan_for_worker.source)?;
+                    // Round-2 audit #3/#4: attach the doctor/auth-TLS connect hint
+                    // to a worker's create_source failure — the `rivet apply`
+                    // (Precomputed) path has NO earlier hinted connect, and a mid-run
+                    // credential rotation / pooler drop otherwise dead-ends in a raw
+                    // driver error here. Matches single.rs:93.
+                    let mut thread_src =
+                        source::create_source(&plan_for_worker.source).map_err(|e| {
+                            crate::pipeline::single::attach_connect_hint(e, &plan_for_worker.source)
+                        })?;
                     let mut sink = ExportSink::new(&plan_for_worker)?.with_row_progress(
                         pb_thread.clone(),
                         std::sync::Arc::clone(&streamed_rows),
