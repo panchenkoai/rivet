@@ -31,6 +31,99 @@ exports:
     );
 }
 
+// ─── round-2 audit #14: chunk knobs are chunked-only ─────────────────────
+// A config that sets a chunk knob but omits `mode: chunked` silently degrades
+// to a single unbounded snapshot (the source-pressure footgun chunked mode
+// exists to prevent). Gate it at config-load, like chunk_dense/chunk_by_days.
+// RED before the validate_export guard: these all passed validation.
+
+#[test]
+fn chunk_column_without_chunked_mode_rejected() {
+    // `mode` omitted ⇒ defaults to Full; chunk_column is then silently dropped.
+    let yaml = r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: t
+    table: events
+    chunk_column: id
+    format: parquet
+    destination:
+      type: local
+      path: ./out
+"#;
+    let msg = format!("{:#}", Config::from_yaml(yaml).unwrap_err());
+    assert!(msg.contains("chunk_column"), "names the knob: {msg}");
+    assert!(msg.contains("mode: chunked"), "points at the fix: {msg}");
+}
+
+#[test]
+fn nondefault_chunk_size_without_chunked_mode_rejected() {
+    let yaml = r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: t
+    mode: full
+    table: events
+    chunk_size: 5000
+    format: parquet
+    destination:
+      type: local
+      path: ./out
+"#;
+    let msg = format!("{:#}", Config::from_yaml(yaml).unwrap_err());
+    assert!(msg.contains("chunk_size"), "names the knob: {msg}");
+    assert!(msg.contains("mode: chunked"), "points at the fix: {msg}");
+}
+
+#[test]
+fn chunk_knobs_accepted_under_chunked_mode() {
+    // The guard must NOT false-positive: the exact same knobs are valid when
+    // mode IS chunked, and the default chunk_size under a non-chunked mode is
+    // fine (it is indistinguishable from unset and harmless).
+    let chunked = r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: t
+    mode: chunked
+    table: events
+    chunk_column: id
+    chunk_size: 5000
+    chunk_checkpoint: true
+    format: parquet
+    destination:
+      type: local
+      path: ./out
+"#;
+    assert!(
+        Config::from_yaml(chunked).is_ok(),
+        "chunk knobs must be accepted under mode: chunked"
+    );
+
+    let default_size_full = r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: t
+    mode: full
+    table: events
+    format: parquet
+    destination:
+      type: local
+      path: ./out
+"#;
+    assert!(
+        Config::from_yaml(default_size_full).is_ok(),
+        "a full export that never touches chunk knobs must stay valid"
+    );
+}
+
 #[test]
 fn misplaced_profile_in_source_rejected() {
     let yaml = r#"

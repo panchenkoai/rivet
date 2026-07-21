@@ -472,7 +472,7 @@ fn default_mode() -> ExportMode {
     ExportMode::Full
 }
 
-fn default_chunk_size() -> usize {
+pub(crate) fn default_chunk_size() -> usize {
     100_000
 }
 

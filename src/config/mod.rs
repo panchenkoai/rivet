@@ -1039,6 +1039,46 @@ impl Config {
             );
         }
 
+        // Round-2 audit #14: the load-bearing chunk knobs are silently dropped
+        // outside `mode: chunked` — `build_plan` routes Full/Incremental/
+        // TimeWindow to a single-cursor snapshot that never consults them, so a
+        // config that sets them but forgets `mode: chunked` degrades to the
+        // unbounded whole-table snapshot chunking exists to prevent, with no
+        // error or warn. Gate them the same way chunk_dense/chunk_by_days are.
+        // (`parallel` is intentionally excluded — the Mongo full/keyset reader
+        // legitimately fans workers with it, so it is not chunked-only.)
+        if export.mode != ExportMode::Chunked {
+            let offending = if export.chunk_column.is_some() {
+                Some("chunk_column")
+            } else if export.chunk_by_key.is_some() {
+                Some("chunk_by_key")
+            } else if export.chunk_count.is_some() {
+                Some("chunk_count")
+            } else if export.chunk_size_memory_mb.is_some() {
+                Some("chunk_size_memory_mb")
+            } else if export.chunk_max_attempts.is_some() {
+                Some("chunk_max_attempts")
+            } else if export.chunk_checkpoint {
+                Some("chunk_checkpoint")
+            } else if export.chunk_size != default_chunk_size() {
+                Some("chunk_size")
+            } else {
+                None
+            };
+            if let Some(knob) = offending {
+                anyhow::bail!(
+                    "export '{}': `{}` requires `mode: chunked` — it is silently ignored in \
+                     `mode: {:?}`, which runs a single unbounded snapshot over the whole table \
+                     instead of chunking (the source-pressure footgun chunked mode prevents).\n  \
+                     Hint: add `mode: chunked`, or remove the `{}` setting.",
+                    export.name,
+                    knob,
+                    export.mode,
+                    knob,
+                );
+            }
+        }
+
         if export.cdc.is_some() && export.mode != ExportMode::Cdc {
             anyhow::bail!(
                 "export '{}': a `cdc:` block is only valid with `mode: cdc`",
