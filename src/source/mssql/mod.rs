@@ -96,6 +96,16 @@ pub(crate) struct MssqlUrl {
     pub database: String,
 }
 
+/// Percent-decode a URL userinfo component (lossy on invalid UTF-8, which a
+/// well-formed URL never produces). Mirrors the driver-side decode PG/MySQL/
+/// Mongo get for free, so the round-trip with `build_url_from_fields`' encoding
+/// is lossless.
+fn pct_decode(s: &str) -> String {
+    percent_encoding::percent_decode_str(s)
+        .decode_utf8_lossy()
+        .into_owned()
+}
+
 pub(crate) fn parse_mssql_url(url: &str) -> Result<MssqlUrl> {
     let rest = url
         .strip_prefix("sqlserver://")
@@ -106,9 +116,17 @@ pub(crate) fn parse_mssql_url(url: &str) -> Result<MssqlUrl> {
     let (userinfo, hostpart) = rest
         .rsplit_once('@')
         .ok_or_else(|| anyhow::anyhow!("mssql url missing user@host: {url}"))?;
+    // Percent-DECODE the userinfo. `build_url_from_fields` (config/source.rs)
+    // percent-ENCODES user/password for every engine so a credential's
+    // `/ @ : ? #` can't break URL parsing or defeat redaction. PG/MySQL/Mongo
+    // hand the URL to a driver parser that decodes per RFC 3986; this hand-rolled
+    // MSSQL parser is the one that must decode itself, or tiberius receives the
+    // literal `%40`/`%2F` bytes and auth fails for any password outside the
+    // unreserved set — exactly the special chars SQL Server's complexity policy
+    // encourages (regression guarded by `mssql_url_percent_decodes_userinfo`).
     let (user, password) = match userinfo.split_once(':') {
-        Some((u, p)) => (u.to_string(), p.to_string()),
-        None => (userinfo.to_string(), String::new()),
+        Some((u, p)) => (pct_decode(u), pct_decode(p)),
+        None => (pct_decode(userinfo), String::new()),
     };
     let (hostport, database) = hostpart
         .split_once('/')
@@ -1108,8 +1126,32 @@ pub(crate) fn introspect_mssql_table_for_chunking(
 mod tests {
     use super::{
         catalog_decimal_to_params, mssql_find_outer_from_keyword, parse_mssql_simple_from_table,
-        sql_keyword_at,
+        parse_mssql_url, sql_keyword_at,
     };
+
+    // Regression (round-2 audit #1): the shared `build_url_from_fields` percent-
+    // ENCODES userinfo for every engine, but this hand-rolled parser must
+    // percent-DECODE it back (PG/MySQL/Mongo get that from their driver's URL
+    // parser). Without the decode, tiberius receives the literal `%40`/`%2F`
+    // bytes and auth FAILS for any password outside the RFC-3986 unreserved set —
+    // exactly the special chars SQL Server's complexity policy encourages. RED
+    // against the pre-fix `.to_string()` (no decode).
+    #[test]
+    fn mssql_url_percent_decodes_userinfo() {
+        // `P@ss/w0rd!` → encoded `P%40ss%2Fw0rd%21`, and the user `dom\svc` →
+        // `dom%5Csvc` (backslash is a legit SQL Server login char).
+        let parsed =
+            parse_mssql_url("sqlserver://dom%5Csvc:P%40ss%2Fw0rd%21@db.internal:1433/rivet")
+                .expect("well-formed encoded url must parse");
+        assert_eq!(parsed.user, r"dom\svc", "user must be percent-decoded");
+        assert_eq!(
+            parsed.password, "P@ss/w0rd!",
+            "password must be percent-decoded, not passed as literal %-bytes"
+        );
+        assert_eq!(parsed.host, "db.internal");
+        assert_eq!(parsed.port, 1433);
+        assert_eq!(parsed.database, "rivet");
+    }
 
     fn parse(q: &str) -> Option<(String, String)> {
         parse_mssql_simple_from_table(q)

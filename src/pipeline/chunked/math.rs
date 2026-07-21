@@ -10,6 +10,49 @@
 // `chunked::strip_select_star_from` re-export are unchanged.
 pub(crate) use crate::sql::{strip_select_star_from, strip_simple_projection_from};
 
+/// Hard ceiling on range-window count. Above this the window `Vec` alone would
+/// exhaust memory (16 bytes/tuple → 50M ≈ 800 MB) *before* the sparse-plan guard
+/// — which inspects the already-built `chunks.len()` — could bail. So the ceiling
+/// is checked on the span SCALAR before `generate_chunks` allocates. A legitimate
+/// plan never approaches it (the sparse guard bails at a few thousand windows);
+/// this only catches the pathological extreme-key-span OOM (round-2 audit #7:
+/// one row with a maximal bigint PK → ~9e13 windows → instant OOM of `rivet
+/// plan`/`run`).
+pub const MAX_CHUNK_WINDOWS: u128 = 50_000_000;
+
+/// Expected number of inclusive range windows for `min..=max` at `chunk_size`,
+/// computed on the span scalar with NO allocation. Returns 0 for an empty or
+/// invalid range (matching `generate_chunks`' empty-`Vec` case).
+pub fn expected_chunk_count(min: i64, max: i64, chunk_size: i64) -> u128 {
+    if max < min || chunk_size <= 0 {
+        return 0;
+    }
+    // max >= min so the span is non-negative; ceil-divide by chunk_size.
+    let span = (max as i128 - min as i128) as u128;
+    span / chunk_size as u128 + 1
+}
+
+/// `generate_chunks`, but refuses a plan whose window count exceeds
+/// [`MAX_CHUNK_WINDOWS`] BEFORE allocating the `Vec` — so an extreme-sparse key
+/// bails loudly instead of OOMing. Both the runner (`detect`) and the planner
+/// (`plan_cmd`) go through this; the raw `generate_chunks` stays for tests and
+/// already-bounded callers.
+pub fn generate_chunks_checked(
+    min: i64,
+    max: i64,
+    chunk_size: i64,
+) -> anyhow::Result<Vec<(i64, i64)>> {
+    let expected = expected_chunk_count(min, max, chunk_size);
+    if expected > MAX_CHUNK_WINDOWS {
+        anyhow::bail!(
+            "chunk plan would generate {expected} windows (key span {min}..={max} ÷ chunk_size \
+             {chunk_size}), past the {MAX_CHUNK_WINDOWS}-window ceiling — the key is extremely \
+             sparse. Raise chunk_size:, set an explicit chunk_count:, or use mode: full."
+        );
+    }
+    Ok(generate_chunks(min, max, chunk_size))
+}
+
 pub fn generate_chunks(min: i64, max: i64, chunk_size: i64) -> Vec<(i64, i64)> {
     if max < min || chunk_size <= 0 {
         return vec![];
@@ -145,6 +188,51 @@ pub(crate) fn chunk_plan_fingerprint(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── round-2 audit #7: gate the allocation, don't inspect it ──────────────
+    // `expected_chunk_count` must equal the length the eager builder would
+    // produce (else the pre-alloc ceiling gates the wrong number).
+    #[test]
+    fn expected_chunk_count_matches_generated_len() {
+        for (min, max, cs) in [(0, 100, 25), (1, 100, 25), (42, 42, 100), (10, 20, 10_000)] {
+            assert_eq!(
+                expected_chunk_count(min, max, cs),
+                generate_chunks(min, max, cs).len() as u128,
+                "span {min}..={max} / {cs}"
+            );
+        }
+        // Empty/invalid ranges → 0, matching the empty-Vec case.
+        assert_eq!(expected_chunk_count(10, 5, 10), 0);
+        assert_eq!(expected_chunk_count(1, 100, 0), 0);
+    }
+
+    // The extreme-span plan must be REFUSED before the Vec is materialised — a
+    // single maximal-bigint PK over the default chunk_size is ~9e13 windows.
+    // RED against calling the eager `generate_chunks` (which OOMs before any
+    // len-based guard can fire).
+    #[test]
+    fn generate_chunks_checked_bails_before_allocating_on_extreme_span() {
+        let err = generate_chunks_checked(0, i64::MAX, 100_000)
+            .expect_err("an extreme-sparse span must bail, not allocate ~9e13 tuples");
+        let msg = err.to_string();
+        assert!(msg.contains("window"), "actionable message: {msg}");
+        assert!(
+            msg.contains("chunk_count") || msg.contains("mode: full"),
+            "names an escape hatch: {msg}"
+        );
+        // The ceiling is exceeded by exactly one window past MAX_CHUNK_WINDOWS.
+        let just_over = (MAX_CHUNK_WINDOWS as i64).saturating_mul(2);
+        assert!(generate_chunks_checked(0, just_over, 1).is_err());
+    }
+
+    // A legitimate plan (even a large one, well under the ceiling) still passes
+    // through unchanged — the guard must not reject normal chunking.
+    #[test]
+    fn generate_chunks_checked_allows_normal_plans() {
+        let ok = generate_chunks_checked(1, 10_000_000, 100_000).expect("normal plan");
+        assert_eq!(ok, generate_chunks(1, 10_000_000, 100_000));
+        assert_eq!(ok.len(), 100);
+    }
 
     // ── mutation-W4 gap closure ──────────────────────────────────────────────
     // The chunk_by_days date arithmetic had NO test (the BETWEEN branch did):
