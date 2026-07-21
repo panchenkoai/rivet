@@ -203,6 +203,10 @@ impl PgChangeStream {
         // the commit-boundary resume position. Logical decoding only ever emits
         // complete, committed transactions.
         let mut tx: Vec<ChangeEvent> = Vec::new();
+        // Round-2 audit #9: running byte footprint of the buffered transaction —
+        // the row cap alone is a poor bound when cells are large. Reset at BEGIN
+        // (the start of accumulation), summed on each push.
+        let mut tx_bytes = 0usize;
         let mut yielded_any = false;
         for r in rows {
             let lsn: String = r.get(0);
@@ -249,7 +253,9 @@ impl PgChangeStream {
                 }
             } else if data.starts_with("BEGIN") {
                 tx.clear();
+                tx_bytes = 0;
             } else if let Some(ev) = parse_test_decoding(&lsn, &data) {
+                tx_bytes = tx_bytes.saturating_add(ev.estimated_bytes());
                 tx.push(ev);
                 // Memory backstop, matching the MySQL adapter's MAX_TX_ROWS: a
                 // transaction is buffered whole (never split across parts), so an
@@ -264,6 +270,17 @@ impl PgChangeStream {
                          it must be buffered whole (a transaction is never split across parts), \
                          so this would exhaust memory. Split the source transaction, or raise \
                          the cap only if a transaction this large is genuinely expected."
+                    );
+                }
+                // Round-2 audit #9: byte backstop — a few large-cell rows stay
+                // under the row cap yet exhaust memory.
+                let byte_cap = crate::source::cdc::max_tx_bytes();
+                if tx_bytes > byte_cap {
+                    anyhow::bail!(
+                        "pg cdc: a single transaction buffered more than {byte_cap} bytes \
+                         (large cells) before its commit — it must be buffered whole, so this \
+                         would exhaust memory. Split the source transaction, or raise \
+                         RIVET_CDC_MAX_TX_BYTES only if a transaction this large is expected."
                     );
                 }
             }

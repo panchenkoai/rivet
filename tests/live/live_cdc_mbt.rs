@@ -280,6 +280,45 @@ fn cdc_fault_point_sweep_every_phase_boundary_recovers() {
     }
 }
 
+// Round-2 audit #9: the per-transaction buffer was capped by ROW count only, so a
+// few rows with large cells stayed under the 5M-row cap yet exhausted memory. A
+// byte backstop now bails loudly. Cap the per-tx bytes low and insert one large
+// cell → the run must fail with a byte-cap message, not OOM or silently succeed.
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
+fn cdc_oversized_transaction_by_bytes_bails_loudly() {
+    let tbl = unique_name("cdc_bytes");
+    let mut c = mysql::Pool::new(MYSQL_CDC_URL)
+        .expect("pool")
+        .get_conn()
+        .expect("conn");
+    c.query_drop(format!("DROP TABLE IF EXISTS {tbl}")).unwrap();
+    c.query_drop(format!(
+        "CREATE TABLE {tbl} (id INT PRIMARY KEY, payload LONGTEXT)"
+    ))
+    .unwrap();
+    let _guard = Table(tbl.clone());
+
+    let rig = Rig::mysql_cdc(&tbl).cdc("rollover: 100");
+    rig.run_ok(); // pin cleanly
+    // One row whose single cell (~1 MB) is far under the row cap but far over a
+    // 1 KB byte cap.
+    let big = "x".repeat(1_000_000);
+    c.query_drop(format!("INSERT INTO {tbl} VALUES (1, '{big}')"))
+        .unwrap();
+
+    let res = rig.run_with_env("RIVET_CDC_MAX_TX_BYTES", "1000");
+    assert!(
+        !res.status.success(),
+        "an oversized-by-bytes transaction must bail loudly, not OOM or succeed"
+    );
+    let err = String::from_utf8_lossy(&res.stderr);
+    assert!(
+        err.contains("bytes"),
+        "the error must name the byte cap (round-2 #9): {err}"
+    );
+}
+
 // Round-2 audit #11: the CDC slot-ack advanced PAST durable parts before the run
 // manifest was written, so a crash in the ack→terminal-manifest window orphaned
 // the acked parts from the manifest-authoritative loader (`rivet load`) — silent,
