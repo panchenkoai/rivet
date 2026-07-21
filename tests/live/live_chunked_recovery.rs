@@ -208,6 +208,87 @@ fn chunked_crash_after_first_chunk_complete_resume_finishes_export() {
     );
 }
 
+/// Round-4: the DESTINATION manifest.json (the manifest-authoritative `rivet load`
+/// view) must declare EVERY committed chunk after a crash+resume — not just the
+/// resume-processed ones. The sibling test above asserts on file_log + a parquet
+/// glob, which both retain chunk 0 and so MASK the orphan; this reads the actual
+/// destination manifest.json. RED before rehydrate_manifest_parts_from_completed_
+/// chunks (the resume manifest omitted chunk 0 → a silent ~33% loss under load).
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn chunked_crash_resume_writes_a_complete_destination_manifest() {
+    require_alive(LiveService::Postgres);
+    let table = seed_pg_numeric_table(150);
+    let export = unique_name("c1_manifest_complete");
+    let out = tempfile::tempdir().unwrap();
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let yaml = Rig::pg_batch(&export)
+        .query(&format!("SELECT id, name FROM {}", table.name()))
+        .mode("chunked")
+        .export_line("chunk_column: id")
+        .export_line("chunk_size: 50")
+        .export_line("chunk_checkpoint: true")
+        .dest_path(out.path().to_path_buf())
+        .yaml();
+    let cfg = write_config(&cfg_dir, &yaml);
+
+    // Crash after chunk 0 commits (before any destination manifest is written).
+    let crash = std::process::Command::new(RIVET_BIN)
+        .args([
+            "run",
+            "--config",
+            cfg.to_str().unwrap(),
+            "--export",
+            &export,
+        ])
+        .env("RIVET_TEST_PANIC_AT", "after_chunk_complete:0")
+        .output()
+        .expect("spawn rivet");
+    assert!(!crash.status.success(), "crash run must exit non-zero");
+
+    // Resume completes.
+    let resume = std::process::Command::new(RIVET_BIN)
+        .args([
+            "run",
+            "--config",
+            cfg.to_str().unwrap(),
+            "--export",
+            &export,
+            "--resume",
+        ])
+        .output()
+        .expect("spawn rivet resume");
+    assert!(
+        resume.status.success(),
+        "--resume must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&resume.stderr)
+    );
+
+    // MANIFEST-DRIVEN assertion: the destination manifest.json must declare all 3
+    // chunks / 150 rows — chunk 0 must not be orphaned from the loader's view.
+    let m: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(out.path().join("manifest.json")).unwrap())
+            .expect("destination manifest.json must exist + parse");
+    assert_eq!(
+        m["row_count"].as_i64(),
+        Some(150),
+        "destination manifest must declare all 150 rows (chunk 0 not orphaned); got {}",
+        m["row_count"]
+    );
+    assert_eq!(
+        m["part_count"].as_u64(),
+        Some(3),
+        "destination manifest must declare all 3 chunk parts; got {}",
+        m["part_count"]
+    );
+    // And the physical parts on disk match the manifest's declared count.
+    assert_eq!(
+        files_with_extension(out.path(), "parquet").len(),
+        3,
+        "3 physical parquet parts"
+    );
+}
+
 // ─── C2: crash after chunk 0 file (before commit) → resume re-runs chunk 0 ───
 
 #[test]

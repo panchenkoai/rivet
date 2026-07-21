@@ -107,6 +107,75 @@ pub struct M8Stats {
 ///
 /// `run_id` must be the chunk_checkpoint run id (the one
 /// `ensure_chunk_checkpoint_plan` returned for the resume path).
+/// Round-4 fix (durability-ordering-matrix `manifest_driven_recovery` chunked): a
+/// chunked-checkpoint crash BEFORE the terminal manifest write leaves the pre-crash
+/// chunks durably committed (parquet on the destination + `completed` in chunk_task)
+/// but with NO destination manifest. On `--resume`, `claim_next_chunk_task` skips
+/// completed chunks and the M8 preamble finds no manifest to hydrate, so
+/// `finalize_manifest` (built solely from `summary.manifest_parts`) writes a manifest
+/// that OMITS them — the manifest-authoritative `rivet load` then silently drops
+/// their rows. Reconstruct those parts from the state DB's completed chunk_tasks so
+/// the finalize manifest is COMPLETE. The state DB is the export machine's own resume
+/// record (available here during resume); the reconstructed destination manifest
+/// stays the loader's source of truth (ADR-0001). fingerprint/md5 aren't stored in
+/// chunk_task, so the parts are DECLARED (no loss) though not content-re-verified —
+/// strictly better than a silent orphan. Returns the number of parts reconstructed.
+fn rehydrate_manifest_parts_from_completed_chunks(
+    state: &StateStore,
+    run_id: &str,
+    summary: &mut RunSummary,
+) -> Result<usize> {
+    let tasks = state.list_chunk_tasks_for_run(run_id)?;
+    let mut next_id = summary
+        .manifest_parts
+        .iter()
+        .map(|p| p.part_id)
+        .max()
+        .unwrap_or(0);
+    let mut rehydrated = 0usize;
+    let mut rehydrated_rows = 0i64;
+    for t in tasks {
+        if t.status != "completed" {
+            continue;
+        }
+        let (Some(file_name), Some(rows)) = (t.file_name, t.rows_written) else {
+            continue; // an empty chunk wrote no part
+        };
+        if rows <= 0 {
+            continue;
+        }
+        // Don't duplicate a part a fresh record_part already added this run.
+        if summary.manifest_parts.iter().any(|p| p.path == file_name) {
+            continue;
+        }
+        next_id += 1;
+        summary.manifest_parts.push(crate::manifest::ManifestPart {
+            part_id: next_id,
+            path: file_name,
+            rows,
+            size_bytes: 0, // not stored in chunk_task
+            content_fingerprint: String::new(),
+            content_md5: String::new(),
+            status: crate::manifest::PartStatus::Committed,
+        });
+        rehydrated += 1;
+        rehydrated_rows += rows;
+    }
+    if rehydrated > 0 {
+        // Keep the summary aggregates consistent with the reconstructed manifest so
+        // the run card, the reconcile gate, and the coherence invariant all agree.
+        summary.files_committed += rehydrated;
+        summary.files_produced += rehydrated;
+        summary.total_rows += rehydrated_rows;
+        log::info!(
+            "resume: reconstructed {rehydrated} completed-chunk part(s) ({rehydrated_rows} rows) \
+             into the manifest from the state DB (no destination manifest to hydrate from) — \
+             the finalize manifest now covers every committed chunk"
+        );
+    }
+    Ok(rehydrated)
+}
+
 pub(crate) fn apply_m8_resume_decisions(
     state: &StateStore,
     run_id: &str,
@@ -156,6 +225,14 @@ pub(crate) fn apply_m8_resume_decisions(
                  falling back to state-only resume (legacy / fresh prefix)",
                 plan.export_name
             );
+            // Round-4 fix: with NO destination manifest to hydrate from (a first-run
+            // crash before the terminal write), reconstruct the already-committed
+            // parts from the state DB's COMPLETED chunk_tasks — otherwise finalize
+            // writes a manifest containing ONLY the resume-processed chunks, orphaning
+            // the pre-crash chunks' durable parts from the manifest-authoritative
+            // loader (silent row loss). A "fresh prefix" (no completed chunks) rehydr-
+            // ates nothing, so this is safe for the legacy/fresh case too.
+            rehydrate_manifest_parts_from_completed_chunks(state, run_id, summary)?;
             return Ok(M8Stats::default());
         }
         Err(e) => {
