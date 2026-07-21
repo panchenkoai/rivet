@@ -28,15 +28,22 @@ engines: [incremental, chunked, cdc]
 
 scenarios:
   - id: manifest_durable_before_state_advance
-    what: "the destination manifest covering a run's parts is durable BEFORE the delivery position (cursor / slot-ack) advances past them — never the reverse."
+    what: "the destination manifest covering a run's parts is durable BEFORE the delivery position (cursor / slot-ack / chunk_task) advances past them — or, where state advances first (chunked), a resume RECONSTRUCTS a complete manifest before finalize."
     incremental: { test: crash_after_cursor_commit_is_recoverable_via_a_manifest_driven_read }
-    chunked:     { na: "chunked advances per-chunk state (chunk_task), not a single delivery cursor; the destination manifest is written once at finalize AFTER every chunk commits, so there is no advance-past-unmanifested-parts window — chunk-commit ordering is covered by chunked_crash_after_chunk_complete (resilience-matrix)" }
+    # Round-4 corrected a FALSE na here: chunk_task DOES advance (completed) before
+    # any destination manifest, so the advance-past-unmanifested-parts window is real;
+    # the fix reconstructs the committed chunks into the finalize manifest on resume.
+    chunked:     { test: chunked_crash_resume_writes_a_complete_destination_manifest }
     cdc:         { test: roast_manifest_is_durable_before_the_slot_is_acked }
 
   - id: manifest_driven_recovery
-    what: "a crash at the state-advance boundary recovers with ZERO loss when read MANIFEST-DRIVEN (only parts a Success manifest declares, as `rivet load` reads) — the parquet-glob path masks the orphan class."
+    what: "a crash at the state-advance boundary recovers with ZERO loss when read MANIFEST-DRIVEN (only parts a Success manifest declares, as `rivet load` reads) — the parquet-glob / file_log path masks the orphan class."
     incremental: { test: crash_after_cursor_commit_is_recoverable_via_a_manifest_driven_read }
-    chunked:     { na: "a crash mid-chunked leaves no destination manifest at all (written once at finalize); resume re-reads chunk_task and completes the run, so the loader only ever sees a COMPLETE chunked manifest — no mid-run orphan window" }
+    # Round-4: the prior na ("no mid-run orphan window") was live-disproven — a
+    # chunked crash before the terminal manifest + resume orphaned the pre-crash
+    # chunk from the destination manifest (silent ~33% loss). Now fixed + asserted
+    # MANIFEST-DRIVEN (reads manifest.json, not file_log/glob).
+    chunked:     { test: chunked_crash_resume_writes_a_complete_destination_manifest }
     cdc:         { test: cdc_crash_before_manifest_loses_nothing_on_a_manifest_driven_read }
 
   - id: canonical_success_pair_consistent
