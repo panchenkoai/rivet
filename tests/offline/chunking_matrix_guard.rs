@@ -73,6 +73,12 @@ const MATRICES: &[(&str, usize)] = &[
     // round-trip + data-driven redaction sweeps; `na:` cells are driver-owned
     // parses or state-URL seams that don't exist per engine. 0 gaps.
     ("docs/url-safety-matrix.yaml", 0),
+    // Durability ordering — the destination manifest is durable BEFORE the delivery
+    // position advances, and the manifest/_SUCCESS pair stays consistent. This class
+    // regressed twice (round-2 #11/#12) and escaped resilience/cdc because their
+    // crash cells asserted via a parquet GLOB, masking the manifest-orphan class;
+    // every `test:` here asserts MANIFEST-DRIVEN (the loader's view). 0 gaps.
+    ("docs/durability-ordering-matrix.yaml", 0),
 ];
 
 #[derive(Deserialize)]
