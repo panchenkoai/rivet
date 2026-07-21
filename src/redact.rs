@@ -91,18 +91,20 @@ pub fn redact_url_passwords(s: &str) -> String {
 /// If `bytes[i..]` starts a `scheme://userinfo@` pattern with a `:` in
 /// the userinfo (a password segment), return the rewritten prefix and
 /// the new cursor position.  Otherwise return `None`.
-/// Scan from `start` for the LAST `@` that ends the userinfo. `stop_on_path`
-/// bounds the scan at the first `/`,`?`,`#` (the conforming-authority pass);
-/// otherwise it runs to the whitespace boundary (the fail-safe pass that still
-/// finds the `@` when the password held a raw path delimiter).
-fn scan_last_at(bytes: &[u8], start: usize, stop_on_path: bool) -> Option<usize> {
+/// The LAST `@` from `start` up to the whitespace boundary (the log-line URL
+/// terminator), or None. The userinfo may itself contain a raw `/ ? # @ :` (a
+/// non-conforming `url:` passthrough / RIVET_STATE_URL / driver-echoed URL), so the
+/// scan must NOT stop at `/ ? #` — the real userinfo terminator is the last `@`
+/// before whitespace. Stopping earlier (an earlier bounded form) leaked a password
+/// with an internal `@` before a `/` (round-4).
+fn scan_last_at(bytes: &[u8], start: usize) -> Option<usize> {
     let mut k = start;
     let mut last_at = None;
     while k < bytes.len() {
         let b = bytes[k];
         if b == b'@' {
             last_at = Some(k);
-        } else if b.is_ascii_whitespace() || (stop_on_path && matches!(b, b'/' | b'?' | b'#')) {
+        } else if b.is_ascii_whitespace() {
             break;
         }
         k += 1;
@@ -129,21 +131,15 @@ fn try_redact_at(bytes: &[u8], i: usize) -> Option<(String, usize)> {
         return None;
     }
     let userinfo_start = j + 3;
-    // Locate the `@` that ends the userinfo, tracking the LAST `@` (a password may
-    // itself contain `@`: `user:p@ss@host`). Two passes so redaction FAILS SAFE on
-    // a non-conforming URL whose password contains a raw `/`,`?`, or `#` — a `url:`
-    // passthrough, a driver error echoing the raw URL, or a raw RIVET_STATE_URL,
-    // none of which rivet percent-encodes (round-3 regression: bounding at the
-    // first `/?#` stopped BEFORE the real `@` and leaked the cleartext password):
-    //   1. bounded — stop at the first `/?#` (a stray `@` in the path/query is
-    //      excluded and the host display is preserved for a conforming URL);
-    //   2. fail-safe — if that found no `@`, re-scan to the whitespace boundary
-    //      (the log-line URL terminator), so a delimiter-bearing password is still
-    //      masked (over-redacting a pathological host is safe; leaking is not).
-    let at = scan_last_at(bytes, userinfo_start, true)
-        .or_else(|| scan_last_at(bytes, userinfo_start, false))?;
-    // `has_colon` must reflect a `:` *within the userinfo* (before that `@`), not a
-    // host:port colon after it.
+    // The userinfo ends at the LAST `@` before whitespace — DEFAULT-DENY. A password
+    // in a non-conforming URL (raw `url:` / RIVET_STATE_URL / driver-echoed URL, none
+    // percent-encoded) may itself contain `@ / ? #`, so any earlier bound leaks: the
+    // round-3 fix bounded at `/?#` and leaked `pa/ss`; its fail-safe still leaked a
+    // password with an internal `@` before a `/` (round-4). The last `@` before the
+    // whitespace URL-terminator is the one true userinfo boundary. Over-redacts a
+    // pathological host in a rare multi-`@` (query-`@`) URL; never leaks.
+    let at = scan_last_at(bytes, userinfo_start)?;
+    // A `:` before that `@` marks a password segment (bare `user@host` has none).
     let has_colon = bytes[userinfo_start..at].contains(&b':');
     if !has_colon {
         return None;
@@ -200,7 +196,8 @@ mod tests {
         // Every engine scheme rivet builds/logs.
         let schemes = ["postgresql", "mysql", "sqlserver", "mongodb"];
         // Password bodies embedding the secret + a URL delimiter that has
-        // historically defeated a redactor (a raw '/' is in the base64 alphabet).
+        // historically defeated a redactor (a raw '/' is in the base64 alphabet;
+        // '@'-before-'/' defeated round-3's fail-safe; ':' defeated the rfind split).
         let bodies = [
             SECRET.to_string(),
             format!("{SECRET}/x"),
@@ -210,22 +207,32 @@ mod tests {
             format!("{SECRET}:x"),
             format!("pre/{SECRET}"),
             format!("a/b?c#{SECRET}"),
+            format!("Kp@{SECRET}/x"), // '@' BEFORE '/' (round-4)
+            format!("Kp@{SECRET}?x"),
+            format!("Kp@{SECRET}#x"),
+            format!("a:b:{SECRET}"), // ':'-bearing password (round-4)
         ];
         for scheme in schemes {
             for body in &bodies {
-                let url = format!("{scheme}://user:{body}@host:5432/db");
-                // Bare, inside an error prefix, and mid-log-line (the three real
-                // shapes a URL reaches the sink in).
-                for ctx in [
-                    url.clone(),
-                    format!("connect to {url} failed: timeout"),
-                    format!("[2026-07-22 ERROR src] dialing {url} then EOF"),
+                // A plain URL, AND a URL with a stray '@' in the query after the host
+                // (the RFC-legal ?opt=a@b shape — the round-4 stray-@ coverage gap).
+                for url in [
+                    format!("{scheme}://user:{body}@host:5432/db"),
+                    format!("{scheme}://user:{body}@host:5432/db?opt=a@b"),
                 ] {
-                    let out = redact_secrets(&ctx);
-                    assert!(
-                        !out.contains(SECRET),
-                        "SECRET leaked through redact_secrets\n  scheme={scheme} body={body}\n  in:  {ctx}\n  out: {out}"
-                    );
+                    // Bare, inside an error prefix, and mid-log-line (the three real
+                    // shapes a URL reaches the sink in).
+                    for ctx in [
+                        url.clone(),
+                        format!("connect to {url} failed: timeout"),
+                        format!("[2026-07-22 ERROR src] dialing {url} then EOF"),
+                    ] {
+                        let out = redact_secrets(&ctx);
+                        assert!(
+                            !out.contains(SECRET),
+                            "SECRET leaked through redact_secrets\n  scheme={scheme} body={body}\n  in:  {ctx}\n  out: {out}"
+                        );
+                    }
                 }
             }
         }

@@ -782,58 +782,47 @@ fn migrate_pg(client: &mut postgres::Client) -> Result<()> {
 /// `postgresql://user:SECRET@host/db` → `postgresql://user:***@host/db`
 /// Uses `rfind('@')` so passwords containing `@` are handled correctly.
 fn redact_pg_url(url: &str) -> String {
-    // Redact the password in `scheme://user:password@host/...`. RIVET_STATE_URL is
-    // user-supplied and may be NON-conforming (a raw password with '/','?','#','@'
-    // that a well-formed URL would percent-encode), so a redactor must FAIL SAFE —
-    // over-redact, never echo the secret. Two passes:
+    // Mask the password in `scheme://user:password@host/...`. RIVET_STATE_URL is
+    // operator-supplied and may be NON-conforming — a raw password can contain any
+    // of `/ ? # @ :` that a well-formed URL would percent-encode. There is no
+    // unambiguous parse of such a URL, so a redactor MUST default-deny: never leak,
+    // even at the cost of over-redacting a pathological host.
     //
-    // 1. Bounded (the conforming case): the authority ends at the first '/','?','#'
-    //    after '://'; take the last '@' WITHIN it, so a stray '@' in the path/query
-    //    (RFC-legal, e.g. `?opt=a@b`) does not extend the match. Preserves the host
-    //    display. (round-2 audit #2)
-    // 2. Fail-safe (round-3 regression fix): if the bounded region has no '@' but
-    //    one exists LATER, the password itself contained a raw '/','?','#' that
-    //    truncated the region — DO NOT fall through and echo the URL. Mask from the
-    //    first ':' (start of password) to the last '@'. Over-redacts a pathological
-    //    host but never leaks the credential. Bounding alone leaked `pa/ss` before.
+    // Rule (rounds 2/3/4 converged here after the bounded/two-pass forms each leaked
+    // a different shape): the userinfo ends at the LAST '@' before whitespace (the
+    // URL / log-line terminator), and the user is everything up to the FIRST ':'
+    // (the password separator; a ':' inside the password is masked with the rest).
+    //   * one '@' (the normal case): the real terminator → host preserved.
+    //   * a password with a raw '/','?','#','@' (round-3 `pa/ss`, round-4 `Kp@9x/..`):
+    //     the last '@' is still the true terminator → tail masked, no leak.
+    //   * a ':'-bearing password (`a:b:c:secret`): FIRST ':' splits → prefix masked.
+    //   * a stray '@' in a query (`?opt=a@b`) — vanishingly rare for a connection
+    //     URL — over-redacts the host but never leaks (default-deny).
     let Some(scheme_end) = url.find("://") else {
         return url.to_string();
     };
     let after_scheme = &url[scheme_end + 3..];
-    let authority_end = after_scheme
-        .find(['/', '?', '#'])
+    let span_end = after_scheme
+        .find(char::is_whitespace)
         .unwrap_or(after_scheme.len());
-    if let Some(at_rel) = after_scheme[..authority_end].rfind('@') {
-        // Pass 1: '@' is inside the authority (conforming URL).
-        let authority = &after_scheme[..at_rel];
-        if let Some(colon) = authority.rfind(':') {
-            let user = &authority[..colon];
-            let at_pos = scheme_end + 3 + at_rel;
-            return format!(
-                "{}://{}:***@{}",
-                &url[..scheme_end],
-                user,
-                &url[at_pos + 1..]
-            );
-        }
-        // '@' but no ':' → userinfo is user-only, no password to redact.
+    let span = &after_scheme[..span_end];
+    // No '@' → no userinfo to redact.
+    let Some(at_rel) = span.rfind('@') else {
         return url.to_string();
-    }
-    // Pass 2: no '@' in the authority region. Fail SAFE if a password '@' exists
-    // later (a raw delimiter in the password truncated the region).
-    if let Some(at_rel) = after_scheme.rfind('@')
-        && let Some(colon) = after_scheme.find(':')
-        && colon < at_rel
-    {
-        let user = &after_scheme[..colon];
-        return format!(
-            "{}://{}:***@{}",
-            &url[..scheme_end],
-            user,
-            &after_scheme[at_rel + 1..]
-        );
-    }
-    url.to_string()
+    };
+    let userinfo = &span[..at_rel];
+    // No ':' before the '@' → user-only, no password to mask.
+    let Some(colon) = userinfo.find(':') else {
+        return url.to_string();
+    };
+    let user = &userinfo[..colon];
+    let at_pos = scheme_end + 3 + at_rel;
+    format!(
+        "{}://{}:***@{}",
+        &url[..scheme_end],
+        user,
+        &url[at_pos + 1..]
+    )
 }
 
 // ─── SQLite connection helper ─────────────────────────────────────────────────
@@ -1273,16 +1262,55 @@ mod tests {
 
     #[test]
     fn redact_pg_url_stray_at_in_query_does_not_leak_password() {
-        // Round-2 audit #2: an unbounded rfind('@') landed on a '@' in the query,
-        // so the redactor treated `u:secret@host…?opt=a` as the userinfo and
-        // echoed `secret` verbatim. Bounding the search to the authority fixes it.
-        // RED before the bound: output contained `secret`.
+        // Round-2 audit #2: an unbounded rfind('@') landed on a '@' in the query and
+        // echoed `secret`. The SECURITY property is that the secret never survives.
+        // The round-4 default-deny redactor over-redacts this contrived query-'@'
+        // shape (masks to the last '@') rather than risk a leak — the secret is gone,
+        // which is what matters; a '@' in a connection-URL query is vanishingly rare.
         let out = redact_pg_url("postgresql://u:secret@host:5432/db?opt=a@b");
         assert!(
             !out.contains("secret"),
             "password must not survive redaction with a stray '@' in the query: {out}"
         );
-        assert_eq!(out, "postgresql://u:***@host:5432/db?opt=a@b");
+        // A normal single-'@' URL keeps the host visible (no over-redaction).
+        assert_eq!(
+            redact_pg_url("postgresql://u:secret@host:5432/db"),
+            "postgresql://u:***@host:5432/db"
+        );
+    }
+
+    #[test]
+    fn redact_pg_url_at_or_colon_in_password_does_not_leak() {
+        // Round-4: the two-pass redactor leaked when the password held a '@' BEFORE a
+        // raw '/','?','#' (pass 1 caught the internal '@', skipping the fail-safe), and
+        // split the user at the LAST ':' (rfind) so a ':'-bearing password leaked its
+        // prefix. The default-deny form (last '@' before whitespace, FIRST ':') closes
+        // both. RED before the redesign.
+        assert_eq!(
+            redact_pg_url("postgresql://rivet:Kp@9x/Lm2z@db.prod:5432/orders"),
+            "postgresql://rivet:***@db.prod:5432/orders",
+            "'@'-before-'/' password tail must not leak"
+        );
+        assert_eq!(
+            redact_pg_url("postgresql://rivet:a:b:c:secret@host:5432/state"),
+            "postgresql://rivet:***@host:5432/state",
+            "':'-bearing password prefix must not leak (FIRST-colon split)"
+        );
+        for u in [
+            "postgresql://rivet:Kp@9x/Lm2z@db/orders",
+            "postgresql://rivet:a:b:c:secret@host/state",
+            "postgresql://u:p@w?rd@host/db",
+            "postgresql://u:p@w#rd@host/db",
+        ] {
+            let out = redact_pg_url(u);
+            assert!(
+                !out.contains("Lm2z")
+                    && !out.contains("a:b:c")
+                    && !out.contains("w?rd")
+                    && !out.contains("w#rd"),
+                "no password fragment may survive: {out}"
+            );
+        }
     }
 
     #[test]
