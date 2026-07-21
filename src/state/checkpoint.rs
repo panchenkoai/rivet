@@ -571,6 +571,26 @@ mod tests {
     }
 
     #[test]
+    fn two_in_progress_runs_for_one_export_are_rejected_by_the_partial_unique_index() {
+        // Round-2 audit #13: the v15 partial-unique index closes the check-then-act
+        // TOCTOU — two overlapping runs of ONE export cannot both hold an in_progress
+        // row (which would double the destination data). RED before the index (both
+        // creates succeeded).
+        let (_dir, s) = store_on_disk();
+        s.create_chunk_run("run_1", "orders", "h", 1).unwrap();
+        assert!(
+            s.create_chunk_run("run_2", "orders", "h", 1).is_err(),
+            "a second in_progress run for the same export must be rejected"
+        );
+        // A different export is unaffected.
+        assert!(s.create_chunk_run("run_3", "widgets", "h", 1).is_ok());
+        // Once the first finalizes (status leaves in_progress), a fresh run for
+        // `orders` is allowed again.
+        s.finalize_chunk_run_completed("run_1").unwrap();
+        assert!(s.create_chunk_run("run_4", "orders", "h", 1).is_ok());
+    }
+
+    #[test]
     fn chunk_claim_complete_and_finalize() {
         let (_dir, s) = store_on_disk();
         s.create_chunk_run("run_a", "orders", "deadbeef", 2)

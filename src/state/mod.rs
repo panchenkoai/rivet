@@ -285,6 +285,30 @@ const MIGRATIONS: &[(i64, &str)] = &[
             PRIMARY KEY (export_name, table_name)
         );",
     ),
+    // v15: close the chunked-run TOCTOU (round-2 audit #13). ensure_chunk_
+    // checkpoint_plan did check-then-act (find an in_progress run → if None,
+    // create), with no serialization, so two overlapping runs of ONE export both
+    // saw None, both created an in_progress row, and DOUBLED the destination data
+    // (the random part-name nonce made the parts additive, not clobbering). A
+    // partial-unique index makes the second create fail (mapped to the same
+    // 'still in progress' bail). First demote any pre-existing duplicate
+    // in_progress rows — keep the newest (created_at, run_id) per export — so the
+    // index can build on a legacy DB that already raced. Standard SQL: valid for
+    // both SQLite and PostgreSQL (both support partial indexes).
+    (
+        15,
+        "UPDATE chunk_run SET status='interrupted'
+             WHERE status='in_progress' AND run_id NOT IN (
+               SELECT run_id FROM chunk_run c WHERE c.status='in_progress'
+                 AND NOT EXISTS (
+                   SELECT 1 FROM chunk_run c2
+                   WHERE c2.export_name=c.export_name AND c2.status='in_progress'
+                     AND (c2.created_at > c.created_at
+                          OR (c2.created_at = c.created_at AND c2.run_id > c.run_id)))
+             );
+         CREATE UNIQUE INDEX IF NOT EXISTS idx_chunk_run_one_inprogress
+             ON chunk_run(export_name) WHERE status='in_progress';",
+    ),
 ];
 
 /// PostgreSQL-compatible DDL.  Column types differ from SQLite (BIGSERIAL,
@@ -505,6 +529,30 @@ const PG_MIGRATIONS: &[(i64, &str)] = &[
             completed_at TEXT NOT NULL,
             PRIMARY KEY (export_name, table_name)
         );",
+    ),
+    // v15: close the chunked-run TOCTOU (round-2 audit #13). ensure_chunk_
+    // checkpoint_plan did check-then-act (find an in_progress run → if None,
+    // create), with no serialization, so two overlapping runs of ONE export both
+    // saw None, both created an in_progress row, and DOUBLED the destination data
+    // (the random part-name nonce made the parts additive, not clobbering). A
+    // partial-unique index makes the second create fail (mapped to the same
+    // 'still in progress' bail). First demote any pre-existing duplicate
+    // in_progress rows — keep the newest (created_at, run_id) per export — so the
+    // index can build on a legacy DB that already raced. Standard SQL: valid for
+    // both SQLite and PostgreSQL (both support partial indexes).
+    (
+        15,
+        "UPDATE chunk_run SET status='interrupted'
+             WHERE status='in_progress' AND run_id NOT IN (
+               SELECT run_id FROM chunk_run c WHERE c.status='in_progress'
+                 AND NOT EXISTS (
+                   SELECT 1 FROM chunk_run c2
+                   WHERE c2.export_name=c.export_name AND c2.status='in_progress'
+                     AND (c2.created_at > c.created_at
+                          OR (c2.created_at = c.created_at AND c2.run_id > c.run_id)))
+             );
+         CREATE UNIQUE INDEX IF NOT EXISTS idx_chunk_run_one_inprogress
+             ON chunk_run(export_name) WHERE status='in_progress';",
     ),
 ];
 

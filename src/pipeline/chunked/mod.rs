@@ -233,7 +233,27 @@ pub(super) fn ensure_chunk_checkpoint_plan(
         );
     }
 
-    state.create_chunk_run(&summary.run_id, &plan.export_name, &plan_hash, max_att)?;
+    // Round-2 audit #13: the v15 partial-unique index (`idx_chunk_run_one_inprogress`,
+    // one in_progress run per export) is the REAL guard against a concurrent
+    // second run — the check-then-act above has a TOCTOU window two overlapping
+    // scheduler ticks can slip through. When the index rejects this create, another
+    // run won the race: map it to the same 'still in progress' bail, not a raw DB
+    // constraint error.
+    if let Err(e) = state.create_chunk_run(&summary.run_id, &plan.export_name, &plan_hash, max_att)
+    {
+        if let Ok(Some((rid, _))) = state.find_in_progress_chunk_run(&plan.export_name) {
+            anyhow::bail!(
+                "export '{}': chunk checkpoint run '{}' still in progress (a concurrent run won the race); use `rivet run {} --export {} --resume` or `rivet state reset-chunks {} --export {}`",
+                plan.export_name,
+                rid,
+                config_hint(config_path),
+                plan.export_name,
+                config_hint(config_path),
+                plan.export_name
+            );
+        }
+        return Err(e);
+    }
     state.insert_chunk_tasks(&summary.run_id, chunks)?;
     log::info!(
         "export '{}': chunk checkpoint: {} tasks saved (run_id={})",
