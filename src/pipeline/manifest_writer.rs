@@ -329,6 +329,32 @@ pub enum WriteOutcome {
 /// that case so the caller can surface a clear "no manifest produced" note
 /// in the run report.
 pub fn write_manifest(dest: &dyn Destination, manifest: &RunManifest) -> Result<WriteOutcome> {
+    let emit_success_marker = matches!(manifest.status, ManifestStatus::Success);
+    write_manifest_inner(dest, manifest, emit_success_marker)
+}
+
+/// Like [`write_manifest`] but never writes the prefix-level `_SUCCESS` marker,
+/// even for a `Success` manifest. The CDC sink calls this before each slot/
+/// checkpoint ack (round-2 audit #11): the ack advances a consume-on-read slot
+/// PAST the just-flushed parts, so those parts must already be covered by a
+/// durable, loader-acceptable (`Success`) run-unique manifest — otherwise a crash
+/// in the ack→terminal-manifest window orphans them from the manifest-
+/// authoritative `rivet load` (silent, count-gate-invisible row loss). But the
+/// prefix is NOT complete yet, so `_SUCCESS` must not appear until the clean end
+/// (the terminal [`write_manifest`] emits it), or resume/guard would treat a
+/// mid-stream cycle as finished.
+pub fn write_manifest_without_success_marker(
+    dest: &dyn Destination,
+    manifest: &RunManifest,
+) -> Result<WriteOutcome> {
+    write_manifest_inner(dest, manifest, false)
+}
+
+fn write_manifest_inner(
+    dest: &dyn Destination,
+    manifest: &RunManifest,
+    emit_success_marker: bool,
+) -> Result<WriteOutcome> {
     if dest.capabilities().commit_protocol == WriteCommitProtocol::Streaming {
         log::info!(
             "destination is streaming; manifest.json / _SUCCESS not written (ADR-0012 §Artifacts)"
@@ -361,15 +387,16 @@ pub fn write_manifest(dest: &dyn Destination, manifest: &RunManifest) -> Result<
         &run_unique_manifest_name(&manifest.run_id),
     )?;
 
-    let success_marker = matches!(manifest.status, ManifestStatus::Success);
-    if success_marker {
+    if emit_success_marker {
         let marker_body = success_marker_body(&bytes);
         let success_tmp = tempfile::NamedTempFile::new()?;
         std::fs::write(success_tmp.path(), marker_body.as_bytes())?;
         dest.write(success_tmp.path(), SUCCESS_FILENAME)?;
     }
 
-    Ok(WriteOutcome::Written { success_marker })
+    Ok(WriteOutcome::Written {
+        success_marker: emit_success_marker,
+    })
 }
 
 #[cfg(test)]
