@@ -67,6 +67,12 @@ const MATRICES: &[(&str, usize)] = &[
     // (binary protocol decoded by the driver crate, panic-safe field access, or
     // write-only). 0 gaps: the surface Rivet parses is fully covered.
     ("docs/fuzz-matrix.yaml", 0),
+    // URL & credential safety — the userinfo encode/decode/redact class that
+    // regressed THREE times (round-1 MSSQL round-trip, round-3 redact_pg_url, and
+    // the general log redactor), each invisible to point tests. `test:` cells are
+    // round-trip + data-driven redaction sweeps; `na:` cells are driver-owned
+    // parses or state-URL seams that don't exist per engine. 0 gaps.
+    ("docs/url-safety-matrix.yaml", 0),
 ];
 
 #[derive(Deserialize)]
