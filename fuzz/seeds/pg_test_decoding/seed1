@@ -1,0 +1,1 @@
+table public.orders: INSERT: id[integer]:1 name[text]:'hi' updated_at[timestamp with time zone]:'2026-01-15 13:45:30.123456+00'

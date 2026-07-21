@@ -1,0 +1,49 @@
+# Fuzz coverage matrix — the untrusted-input PARSE surface Rivet OWNS, per engine.
+#
+# Coverage-guided (libFuzzer) targets live in `fuzz/`; the nightly workflow
+# `.github/workflows/fuzz.yml` runs each one. Same shape + na-audit discipline as
+# the other coverage ledgers (drift-guarded by tests/offline/chunking_matrix_guard.rs).
+#
+# A cell is EXACTLY one of:
+#   test: <name>  — a cargo-fuzz target guards it. <name> is the `rivet::fuzz`
+#                   entry fn (src/fuzz.rs) AND the fuzz_targets/<name>.rs binary;
+#                   the guard asserts the fn exists.
+#   na:   <why>   — proven STRUCTURALLY immune: no Rivet-owned parser sees the
+#                   untrusted bytes (the driver crate decodes them, or the value
+#                   is read by panic-safe field access, or Rivet only WRITES).
+#   gap:  <why>   — a Rivet-owned untrusted parser that SHOULD be fuzzed, isn't.
+#
+# Honest scope: Rivet's untrusted-parse surface is NARROW. Only PostgreSQL CDC
+# decodes a TEXT wire format in Rivet code (`test_decoding`); MySQL / SQL Server
+# decode the BINARY protocol inside their driver crates; the Parquet path only
+# WRITES from already-typed Arrow. So most cells are `na` — and each says why.
+#
+# Provenance: the `mongo_resume_token` target found a real bug on its first run —
+# a corrupt checkpoint `{"rt":{}}` reached an unguarded `from_value::<ResumeToken>`
+# that PANICS in the bson deserializer (and release is `panic = "abort"`). Fixed
+# with a shape-guard + regression test `decode_resume_token_rejects_malformed_
+# shapes_without_panicking`. This is the matrix earning its keep.
+
+engines: [postgres, mysql, mssql, mongo]
+
+scenarios:
+  - id: fuzz_config_yaml
+    what: "the operator-authored config loader (Config::from_yaml) — engine-agnostic (one parser); a garbled/hostile file must Err, never panic"
+    postgres: { test: config_from_yaml }
+    mysql:    { test: config_from_yaml }
+    mssql:    { test: config_from_yaml }
+    mongo:    { test: config_from_yaml }
+
+  - id: fuzz_cdc_wire_decode
+    what: "decoding a CDC change record off the replication wire into typed cells"
+    postgres: { test: pg_test_decoding }
+    mysql:    { na: "binary binlog events are decoded by the mysql_common crate, not Rivet code — there is no Rivet-owned text/byte parser to fuzz" }
+    mssql:    { na: "change-table rows arrive as tiberius typed ColumnData (binary protocol, driver-decoded); Rivet only maps the enum in cell_to_rivet" }
+    mongo:    { na: "BSON change events are deserialized into typed events by the mongodb driver, not Rivet code" }
+
+  - id: fuzz_checkpoint_token_decode
+    what: "decoding the persisted resume/checkpoint token from an untrusted, corruptible / hand-editable file"
+    postgres: { na: "LSN read by panic-safe field access from the JSON (.get(\"lsn\").as_str()); no bson-backed type deserialization" }
+    mysql:    { na: "binlog coords read by panic-safe field access (.get(\"file\") / .get(\"pos\")); no bson-backed type deserialization" }
+    mssql:    { na: "from-LSN read by panic-safe field access; no bson-backed type deserialization" }
+    mongo:    { test: mongo_resume_token }

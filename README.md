@@ -274,6 +274,10 @@ curl -L https://github.com/panchenkoai/rivet/releases/latest/download/rivet-aarc
 sudo mv rivet-*/rivet /usr/local/bin/
 ```
 
+> **Windows:** a native binary is not currently published — install from source
+> with `cargo install rivet-cli` (needs a Rust toolchain). Linux and macOS are
+> the supported binary targets.
+
 ```bash
 rivet --version
 ```

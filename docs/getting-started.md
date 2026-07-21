@@ -31,7 +31,38 @@ rivet --version
 docker run --rm ghcr.io/panchenkoai/rivet:latest --version
 ```
 
-Other install paths — pre-built binaries for every platform, `cargo install rivet-cli`, build from source, plus the full Docker recipe with database-on-host pointers (`host.docker.internal` vs `--network host`) — live in the project [README § Installation](https://github.com/panchenkoai/rivet/blob/main/README.md#installation). Shell completions: `rivet completions bash|zsh|fish`.
+Pre-built binaries are published for **Linux and macOS** (x86-64 + arm64). On
+**Windows**, install from source with `cargo install rivet-cli` (a native binary
+is not currently published). Other install paths — `cargo install rivet-cli`,
+build from source, plus the full Docker recipe with database-on-host pointers
+(`host.docker.internal` vs `--network host`) — live in the project
+[README § Installation](https://github.com/panchenkoai/rivet/blob/main/README.md#installation).
+Shell completions: `rivet completions bash|zsh|fish`.
+
+### Try it in 60 seconds — no database of your own
+
+Spin up a throwaway PostgreSQL, seed one table, and export it — nothing external
+to configure:
+
+```bash
+docker run -d --name rivet-demo -e POSTGRES_PASSWORD=demo -p 5432:5432 postgres:16
+sleep 3
+docker exec -i rivet-demo psql -U postgres <<'SQL'
+CREATE TABLE orders (id serial PRIMARY KEY, name text, price numeric(10,2),
+                     updated_at timestamptz DEFAULT now());
+INSERT INTO orders (name, price)
+  SELECT 'order-'||g, (random()*500)::numeric(10,2) FROM generate_series(1,500) g;
+SQL
+
+export DATABASE_URL='postgresql://postgres:demo@localhost:5432/postgres'
+rivet init --source-env DATABASE_URL --table orders -o rivet.yaml
+rivet run -c rivet.yaml --validate
+# → 500 rows of typed Parquet in ./output/orders/.  Clean up: docker rm -f rivet-demo
+```
+
+That is the whole flow against a real (throwaway) database. Then jump to
+[§4 Inspect & iterate](#4-inspect--iterate), or read on to point Rivet at your
+own database.
 
 ## 2 · Connect & scaffold a config
 

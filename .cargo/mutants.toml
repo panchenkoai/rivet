@@ -6,6 +6,13 @@
 # reason comment is a review defect. Accepted-but-real behaviours (operator
 # UX, log lines) belong in docs/mutants-baseline.txt, not here.
 
+# `src/fuzz.rs` holds the fuzz-only entry points (behind the `fuzzing` feature).
+# They are exercised by cargo-fuzz (.github/workflows/fuzz.yml), NOT by the
+# `cargo test` suite the mutation gate runs — so a body-stub mutant on them is
+# uncatchable HERE by construction (the parsers they call ARE mutation-covered
+# via their normal code paths).
+exclude_globs = ["src/fuzz.rs"]
+
 exclude_re = [
     # 64*1024 is a streaming READ BUFFER size in compute_part_checksums —
     # any chunking yields byte-identical digests; 64+1024 only changes I/O
