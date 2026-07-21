@@ -280,6 +280,116 @@ fn cdc_fault_point_sweep_every_phase_boundary_recovers() {
     }
 }
 
+// Round-2 audit #11: the CDC slot-ack advanced PAST durable parts before the run
+// manifest was written, so a crash in the ack→terminal-manifest window orphaned
+// the acked parts from the manifest-authoritative loader (`rivet load`) — silent,
+// count-gate-invisible row loss. The sweep above MASKS it by reading a parquet
+// GLOB (`distinct_int_ids`), the one read that also sees orphan parts. This test
+// reads MANIFEST-DRIVEN — only parts a `Success` manifest declares, exactly as
+// the loader does — so it goes RED without the pre-ack `write_manifest_without_
+// success_marker` in `roll_all`, and GREEN with it.
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
+fn cdc_crash_before_manifest_loses_nothing_on_a_manifest_driven_read() {
+    let tbl = unique_name("cdc_m11");
+    let mut c = mysql::Pool::new(MYSQL_CDC_URL)
+        .expect("pool")
+        .get_conn()
+        .expect("conn");
+    c.query_drop(format!("DROP TABLE IF EXISTS {tbl}")).unwrap();
+    c.query_drop(format!("CREATE TABLE {tbl} (id INT PRIMARY KEY, v INT)"))
+        .unwrap();
+    let _guard = Table(tbl.clone());
+
+    let rig = Rig::mysql_cdc(&tbl).cdc("rollover: 10");
+    let out = rig.out_dir();
+    rig.run_ok(); // pin cleanly
+    let vals: Vec<String> = (1..=30).map(|i| format!("({i}, {i})")).collect();
+    c.query_drop(format!("INSERT INTO {tbl} VALUES {}", vals.join(",")))
+        .unwrap();
+
+    // Crash in the ack→terminal-manifest window: the 3 parts are flushed and the
+    // slot acked past them, but the terminal manifest is not yet written.
+    let res = rig.run_with_env("RIVET_TEST_PANIC_AT", "cdc_before_manifest");
+    assert!(
+        !res.status.success(),
+        "the faulted run must fail loudly at cdc_before_manifest"
+    );
+
+    // Clean retries resume from the acked checkpoint (capturing only new changes,
+    // i.e. none). Recovery must come from the crashed run's own durable manifest.
+    for _ in 0..3 {
+        rig.run_ok();
+        if manifest_driven_int_ids(&out).len() >= 30 {
+            break;
+        }
+    }
+    assert_eq!(
+        manifest_driven_int_ids(&out).len(),
+        30,
+        "every acked row must be reachable via a Success manifest (not just a parquet \
+         glob) — the ack advanced past parts the manifest must still declare (#11)"
+    );
+}
+
+/// Distinct `id`s reachable the way `rivet load` reads: ONLY parts declared by a
+/// `Success` manifest (run-unique `manifest-<run_id>.json` copies included), never
+/// an orphan parquet that no manifest references.
+fn manifest_driven_int_ids(out: &std::path::Path) -> std::collections::HashSet<i64> {
+    let mut declared: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for e in std::fs::read_dir(out).unwrap() {
+        let p = e.unwrap().path();
+        let name = p
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string();
+        if !(name.starts_with("manifest") && name.ends_with(".json")) {
+            continue;
+        }
+        let m: serde_json::Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+        // ManifestStatus is snake_case: only a `success` run may be loaded.
+        if m.get("status").and_then(|s| s.as_str()) != Some("success") {
+            continue;
+        }
+        for part in m
+            .get("parts")
+            .and_then(|x| x.as_array())
+            .into_iter()
+            .flatten()
+        {
+            if let Some(path) = part.get("path").and_then(|x| x.as_str()) {
+                declared.insert(path.to_string());
+            }
+        }
+    }
+    let mut ids = std::collections::HashSet::new();
+    for part_name in &declared {
+        let p = out.join(part_name);
+        if !p.exists() {
+            continue;
+        }
+        let f = std::fs::File::open(&p).unwrap();
+        let r = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(f)
+            .unwrap()
+            .build()
+            .unwrap();
+        for b in r {
+            let b = b.unwrap();
+            let id = b
+                .column(b.schema().index_of("id").unwrap())
+                .as_any()
+                .downcast_ref::<arrow::array::Int32Array>()
+                .unwrap()
+                .clone();
+            for r in 0..b.num_rows() {
+                ids.insert(id.value(r) as i64);
+            }
+        }
+    }
+    ids
+}
+
 /// Distinct Int32 `id`s across every part under `out`.
 fn distinct_int_ids(out: &std::path::Path) -> std::collections::HashSet<i64> {
     let mut ids = std::collections::HashSet::new();
