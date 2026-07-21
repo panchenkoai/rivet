@@ -16,6 +16,9 @@
 pub mod config;
 pub mod error;
 pub mod format;
+// Fuzz-only entry points (feature = "fuzzing"); not part of the public API.
+#[cfg(feature = "fuzzing")]
+pub mod fuzz;
 pub mod journal;
 pub mod load;
 pub mod manifest;

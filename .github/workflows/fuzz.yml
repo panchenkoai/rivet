@@ -1,0 +1,53 @@
+name: Fuzz (nightly)
+
+# Coverage-guided fuzzing of Rivet's untrusted-input parsers: the config YAML
+# loader, the PostgreSQL `test_decoding` text decoder (the richest, historically
+# bug-prone parse surface), and the MongoDB resume-token BSON decoder. Runs each
+# target for a few minutes nightly; a crash fails the job and uploads the
+# reproducing input. Fuzzing needs nightly Rust (libFuzzer / -Zsanitizer), so it
+# lives in its own workflow off the stable CI.
+on:
+  schedule:
+    - cron: "0 5 * * *" # nightly, ahead of the working day
+  workflow_dispatch:
+    inputs:
+      max_total_time:
+        description: "seconds to fuzz each target"
+        default: "300"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [config_from_yaml, pg_test_decoding, mongo_resume_token]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nightly + cargo-fuzz
+        run: |
+          rustup toolchain install nightly --profile minimal
+          cargo install cargo-fuzz --locked
+      - name: Seed the corpus
+        run: |
+          mkdir -p "fuzz/corpus/${{ matrix.target }}"
+          cp -n "fuzz/seeds/${{ matrix.target }}"/* "fuzz/corpus/${{ matrix.target }}/" || true
+      - name: Fuzz ${{ matrix.target }}
+        run: |
+          cargo +nightly fuzz run "${{ matrix.target }}" -- \
+            -max_total_time="${{ github.event.inputs.max_total_time || '300' }}" \
+            -rss_limit_mb=4096
+      - name: Upload crash reproducer on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crash-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}/
+          if-no-files-found: ignore

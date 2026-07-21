@@ -423,7 +423,7 @@ impl ChangeStream for PgChangeStream {
 /// `BEGIN`/`COMMIT` transaction markers and anything unrecognised. The line shape
 /// is `table <schema>.<table>: <OP>: <columns…>`; pre-images / typed before-after
 /// are deferred.
-fn parse_test_decoding(lsn: &str, data: &str) -> Option<ChangeEvent> {
+pub(crate) fn parse_test_decoding(lsn: &str, data: &str) -> Option<ChangeEvent> {
     let (qual, tail) = data.strip_prefix("table ")?.split_once(": ")?;
     let (schema, table) = match qual.split_once('.') {
         Some((s, t)) => (s.to_string(), t.to_string()),

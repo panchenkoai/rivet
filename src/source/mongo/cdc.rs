@@ -131,7 +131,7 @@ fn encode_resume_token(token: &mongodb::change_stream::event::ResumeToken) -> Re
 
 /// Inverse of [`encode_resume_token`], with a fallback to the pre-lossless
 /// `serde_json` form so an older checkpoint still resolves.
-fn decode_resume_token(
+pub(crate) fn decode_resume_token(
     v: &serde_json::Value,
 ) -> Result<mongodb::change_stream::event::ResumeToken> {
     if let Some(hex) = v.get("rt").and_then(|x| x.as_str()) {
@@ -141,7 +141,19 @@ fn decode_resume_token(
             doc,
         ))?);
     }
-    Ok(serde_json::from_value(v.clone())?)
+    // Backward-compat: a pre-`rt` checkpoint persisted the raw driver token
+    // `{"_data": "<string>"}`. Deserialize ONLY that exact shape — any other
+    // shape (e.g. `{"rt":{}}`, found by fuzzing) must be a clean error, never
+    // handed to the `ResumeToken`/bson deserializer, which PANICS (not `Err`s)
+    // on a type mismatch. The release build is `panic = "abort"`, so an unguarded
+    // deserialize would abort the whole run on a corrupt/foreign checkpoint.
+    if v.get("_data").and_then(|x| x.as_str()).is_some() {
+        return Ok(serde_json::from_value(v.clone())?);
+    }
+    anyhow::bail!(
+        "mongodb cdc: unrecognized resume-token checkpoint shape \
+         (expected an `rt` hex string or a `_data` string): {v}"
+    )
 }
 
 impl MongoChangeStream {
@@ -504,4 +516,35 @@ impl ChangeStream for MongoChangeStream {
     // ack is a no-op: MongoDB retains changes in the oplog independently of
     // reads, so the persisted resume token (the checkpoint) alone makes resume
     // at-least-once — same as MySQL's binlog / SQL Server's change tables.
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // Fuzzing (`fuzz/fuzz_targets/mongo_resume_token.rs`) found that a corrupt
+    // checkpoint whose `rt` is not a hex string — e.g. `{"rt":{}}` — reached an
+    // unguarded `serde_json::from_value::<ResumeToken>` that PANICS inside the
+    // bson deserializer (a type mismatch, not an `Err`). With `panic = "abort"`
+    // in the release profile that aborts the whole run on a corrupt/foreign
+    // checkpoint. The decoder must return a clean error for any unrecognized
+    // shape. (RED before the shape-guard: `decode_resume_token` panics here.)
+    #[test]
+    fn decode_resume_token_rejects_malformed_shapes_without_panicking() {
+        for bad in [
+            json!({"rt": {}}),    // the fuzz-found crash: `rt` is an object
+            json!({"rt": 5}),     // `rt` is a number
+            json!({"_data": {}}), // `_data` present but not a string
+            json!({"_data": 7}),
+            json!({}), // neither field
+            json!([]), // not even an object
+            json!("scalar"),
+        ] {
+            assert!(
+                decode_resume_token(&bad).is_err(),
+                "malformed resume token must be a clean Err, not a panic: {bad}"
+            );
+        }
+    }
 }

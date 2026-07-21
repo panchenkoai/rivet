@@ -1,0 +1,3 @@
+source: { type: postgres, url_env: DATABASE_URL }
+exports:
+  - { name: orders, table: orders, mode: full, format: parquet, destination: { type: local, path: ./o } }

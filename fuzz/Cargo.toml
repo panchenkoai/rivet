@@ -1,0 +1,39 @@
+[package]
+name = "rivet-cli-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+# `default-features = false` drops jemalloc — libFuzzer/ASan want the system
+# allocator. `fuzzing` exposes the `rivet::fuzz` entry points.
+[dependencies.rivet-cli]
+path = ".."
+default-features = false
+features = ["fuzzing"]
+
+[[bin]]
+name = "config_from_yaml"
+path = "fuzz_targets/config_from_yaml.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pg_test_decoding"
+path = "fuzz_targets/pg_test_decoding.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mongo_resume_token"
+path = "fuzz_targets/mongo_resume_token.rs"
+test = false
+doc = false
+bench = false

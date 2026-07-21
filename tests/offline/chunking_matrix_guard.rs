@@ -61,6 +61,12 @@ const MATRICES: &[(&str, usize)] = &[
     // one (no committed live incremental cell) is filled by incremental_dedup_mysql
     // — a live run_incremental harness cell (no-loss + cursor dedup + staging wiped).
     ("docs/load-mode-matrix.yaml", 0),
+    // Fuzz coverage — the untrusted-input PARSE surface Rivet owns, per engine.
+    // `test:` cells name a cargo-fuzz target (`rivet::fuzz` entry fn in src/fuzz.rs,
+    // run nightly by fuzz.yml); the many `na:` cells prove structural immunity
+    // (binary protocol decoded by the driver crate, panic-safe field access, or
+    // write-only). 0 gaps: the surface Rivet parses is fully covered.
+    ("docs/fuzz-matrix.yaml", 0),
 ];
 
 #[derive(Deserialize)]

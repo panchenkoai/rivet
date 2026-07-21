@@ -8,7 +8,7 @@ repository = "https://github.com/panchenkoai/rivet"
 description = "Rivet: PostgreSQL/MySQL/SQL Server/MongoDB → Parquet/CSV (local, S3, GCS, Azure). Crate name rivet-cli; binary rivet."
 readme = "README.md"
 default-run = "rivet"
-exclude = ["dev/", "USER_TEST_PLAN.md", "tests/", ".github/", "docs/gifs/"]
+exclude = ["dev/", "USER_TEST_PLAN.md", "tests/", ".github/", "docs/gifs/", "fuzz/"]
 
 [lib]
 name = "rivet"
@@ -176,6 +176,11 @@ jemalloc = ["tikv-jemallocator"]
 # Builds the dev-only `seed` test-data generator (see `[[bin]] seed`). Off by
 # default so it is never installed by `cargo install rivet-cli`.
 dev-seed = []
+# Exposes `rivet::fuzz` — thin, panic-only entry points into the untrusted-input
+# parsers (config YAML, the PostgreSQL `test_decoding` text decoder, the MongoDB
+# resume-token BSON decoder) for the cargo-fuzz targets in `fuzz/`. Off by
+# default; NOT part of the public API and never built for `cargo install`.
+fuzzing = []
 
 [profile.release]
 strip = true
