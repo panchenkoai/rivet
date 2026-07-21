@@ -3548,6 +3548,7 @@ dependencies = [
  "native-tls",
  "opendal",
  "parquet",
+ "percent-encoding",
  "postgres",
  "postgres-native-tls",
  "postgres-types",
