@@ -1,6 +1,6 @@
 [package]
 name = "rivet-cli"
-version = "0.20.1"
+version = "0.21.0"
 edition = "2024"
 rust-version = "1.94"
 license = "MIT"
@@ -105,9 +105,20 @@ tikv-jemallocator = { version = "0.7", optional = true }
 tokio = { version = "1.50.0", features = ["rt-multi-thread", "net", "time"] }
 # MSSQL / SQL Server source driver (async). Bridged to the sync `Source` trait
 # via a per-source `tokio` current-thread runtime + `block_on` (ADR-0011 keeps
-# `Source` sync). `native-tls` matches the OpenSSL stack the PG/MySQL drivers
-# already vendor; `rustls` default is disabled to avoid a second TLS tree.
-tiberius = { version = "0.12", default-features = false, features = ["tds73", "chrono", "rustls"] }
+# `Source` sync). TLS backend is `vendored-openssl` (opentls → statically-linked
+# OpenSSL on EVERY platform), chosen over the two alternatives for concrete
+# reasons:
+#   - NOT `rustls`: pulls rustls 0.21 → rustls-webpki 0.101, whose CA
+#     name-constraint / CRL advisories (RUSTSEC-2026-0098/0099/0104) have no fix
+#     (no newer tiberius). vendored-openssl keeps that tree out entirely.
+#   - NOT `native-tls`: on macOS that resolves to SecureTransport, which cannot
+#     complete SQL Server 2022's TDS-wrapped TLS handshake (server closes the
+#     connection mid-handshake even with `trust_cert`); OpenSSL handshakes fine
+#     on macOS and Linux alike. (PG/MySQL use native-tls, but their servers
+#     don't hit this SecureTransport limitation.)
+# The MSSQL TLS config API (`trust_cert`/`trust_cert_ca`/`encryption`) is
+# backend-agnostic, so no source change is needed for the switch.
+tiberius = { version = "0.12", default-features = false, features = ["tds73", "chrono", "vendored-openssl"] }
 # `compat` bridges a tokio `TcpStream` to the `futures-io` traits tiberius'
 # `Client::connect` expects.
 tokio-util = { version = "0.7", features = ["compat"] }
@@ -143,7 +154,7 @@ proptest = "1"
 # MSSQL type-roundtrip harness (tests/common/mssql.rs) needs the async driver
 # directly to seed fixtures — same crates the lib uses, exposed to the
 # integration-test crate.
-tiberius = { version = "0.12", default-features = false, features = ["tds73", "chrono", "rustls"] }
+tiberius = { version = "0.12", default-features = false, features = ["tds73", "chrono", "vendored-openssl"] }
 tokio = { version = "1.50.0", features = ["rt-multi-thread", "net", "time"] }
 tokio-util = { version = "0.7", features = ["compat"] }
 # MongoDB live-test helper (tests/common/mongo.rs) seeds fixtures + drives

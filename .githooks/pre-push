@@ -52,4 +52,22 @@ if ! git diff --quiet -- Cargo.lock; then
   exit 1
 fi
 
+# Release-prep guard: when this branch bumps the crate version vs main, run the
+# EXACT publish the release does (`cargo publish --locked --dry-run`). A packaging
+# break — a `Cargo.toml` field the spec-strict `cargo-manifest`/`cargo chef`
+# parser rejects, an `exclude`d path a build needs, a stale lock — then fails
+# HERE, not half-way through the immutable tag's publish (the 0.16.0 / 0.16.1
+# failure mode: green `cargo build` + tests, broken `cargo publish`). Gated on a
+# version change so ordinary pushes stay fast; skipped when `origin/main` is
+# unavailable (CI + release.yml still run `--locked` publish there).
+_ver_now="$(grep -m1 '^version = ' Cargo.toml || true)"
+_base="$(git merge-base origin/main HEAD 2>/dev/null || true)"
+if [ -n "$_base" ]; then
+  _ver_base="$(git show "$_base:Cargo.toml" 2>/dev/null | grep -m1 '^version = ' || true)"
+  if [ -n "$_ver_now" ] && [ "$_ver_now" != "$_ver_base" ]; then
+    echo "pre-push: crate version changed vs main (${_ver_base:-none} -> $_ver_now) — cargo publish --locked --dry-run"
+    cargo publish --locked --dry-run
+  fi
+fi
+
 echo "pre-push: ok"

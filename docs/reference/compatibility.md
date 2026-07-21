@@ -7,7 +7,7 @@ PostgreSQL and MySQL run the **full end-to-end suite** on each release —
 every output format (CSV / Parquet) with every compression codec, `reconcile`,
 recovery scenarios, state management, date-chunking, and `rivet init` — against
 each version. No version-specific code paths are skipped; the same Rust driver
-builds and the same YAML configs drive every target. **SQL Server** (Beta) and
+builds and the same YAML configs drive every target. **SQL Server** and
 **MongoDB** carry their own scope and CI coverage, detailed below.
 
 **MongoDB** (the OSS JSON-blob source — batch + CDC) rides its own dedicated CI
@@ -26,7 +26,7 @@ time_window modes). See [mongodb.md](mongodb.md).
 | PostgreSQL |       16 | Supported (primary target) |
 | MySQL      |      5.7 | Supported (EOL upstream Oct 2023) |
 | MySQL      |      8.0 | Supported (primary target) |
-| SQL Server |     2022 | **Beta** (source engine; see scope + advisory below) |
+| SQL Server |     2022 | **GA** (source engine; see scope below) |
 | MongoDB    |      4.4 | Supported |
 | MongoDB    |      5.0 | Supported |
 | MongoDB    |      6.0 | Supported |
@@ -39,23 +39,28 @@ local `docker-compose.yaml` top-level `postgres` / `mysql` / `mssql` / `mongo` s
 
 ### SQL Server (MSSQL) — current scope
 
-> **Status: Beta.** The engine is live-validated and feature-complete for the
-> shapes below, but it ships a **tracked transitive advisory** and is held to a
-> lower bar than the primary PG/MySQL targets until a `tiberius` upgrade lands.
+> **Status: GA.** The engine is live-validated and feature-complete for the
+> shapes below. The two gaps that formerly held it in Beta are now closed: the
+> transitive rustls-webpki advisory (resolved — see below) and `datetimeoffset`
+> roundtrip verification, so it is promoted to the same GA bar as PG/MySQL.
 >
-> **Known advisory (procurement note):** `tiberius` 0.12 (latest published)
-> pins `rustls` 0.21 → `rustls-webpki` 0.101, which carries CA name-constraint
-> advisories (RUSTSEC-2026-0098/0099) and a CRL-parse panic (RUSTSEC-2026-0104).
-> A newer `tiberius` does not yet exist, so no dependency bump is possible. The
-> path is **reachable only** when validating a server certificate against a
-> name-constraint-asserting **private CA** with `tls.mode: verify-ca|verify-full`
-> on MSSQL (rivet never configures CRL revocation checking, so the panic is
-> unreachable). Loopback / `accept_invalid_certs` connections do not validate
-> and are unaffected. When strict validation IS enabled rivet emits a one-time
-> runtime warning. The advisories are documented + suppressed in
-> `.cargo/audit.toml` with this reachability rationale; they are dropped the
-> moment `tiberius` ships on a newer `rustls`. Security-sensitive deployments
-> that require a clean `cargo audit` should pin to PG/MySQL until then.
+> **Transitive advisory — RESOLVED.** `tiberius` 0.12 formerly linked `rustls`
+> 0.21 → `rustls-webpki` 0.101, carrying CA name-constraint advisories
+> (RUSTSEC-2026-0098/0099) and a CRL-parse panic (RUSTSEC-2026-0104). Rather than
+> wait for an upstream `tiberius` bump, the driver now uses its `vendored-openssl`
+> TLS backend (OpenSSL, statically linked on every platform), so those advisories
+> are **out of the dependency tree entirely — not suppressed**. This also unifies
+> the TLS stack with the PG/MySQL drivers. Strict validation (`tls.mode:
+> verify-ca | verify-full`) is enforced by OpenSSL and **rejects** a certificate
+> that does not chain to the trusted CA — verified live on macOS and Linux
+> against a private-CA-configured SQL Server (correct CA connects; wrong CA is
+> refused with `certificate verify failed`). `cargo audit` is clean for the MSSQL
+> engine. (`native-tls` is deliberately not used: on macOS it resolves to
+> SecureTransport, which cannot complete SQL Server's TDS-wrapped TLS handshake.)
+>
+> **Type fidelity.** `datetimeoffset`, the one type formerly "mapped but not
+> roundtrip-verified", is now validated through the DuckDB/ClickHouse Parquet
+> oracles (UTC instant + tz-awareness, positive/negative offsets + NULL).
 
 SQL Server is a source engine (`source.type: mssql`, scheme `sqlserver://`,
 default port 1433), driven by the async `tiberius` client. Supported today:
@@ -69,8 +74,10 @@ default port 1433), driven by the async `tiberius` client. Supported today:
 - **Types** (live-validated through the DuckDB + ClickHouse Parquet oracles):
   `int`/`bigint`/`smallint`/`tinyint`, `bit`, `decimal`/`numeric`,
   `real`/`float`, `money`, `date`, `time`, `datetime2`, `nvarchar`/`varchar`/
-  `char`, `varbinary`, `uniqueidentifier` (→ native Parquet `LogicalType::Uuid`).
-  `datetimeoffset` is mapped but not yet roundtrip-verified.
+  `char`, `varbinary`, `uniqueidentifier` (→ native Parquet `LogicalType::Uuid`),
+  and `datetimeoffset` (→ `Timestamp(µs, UTC)`: the offset is applied and the UTC
+  instant re-read correctly by the DuckDB/ClickHouse oracles — positive and
+  negative offsets and NULL all covered in the type matrix).
 - **TLS**: required on the login handshake (SQL Server always encrypts it).
   Set `tls.ca_file:` for a private CA, or `tls.accept_invalid_certs: true` for a
   self-signed dev cert.

@@ -17,13 +17,13 @@ Three properties, each measured, not asserted:
 ## Supported database versions
 
 PostgreSQL and MySQL run the full end-to-end suite on each release; SQL Server
-(Beta) and MongoDB carry their own scope and CI coverage:
+and MongoDB carry their own scope and CI coverage:
 
 | Engine     | Versions covered by CI matrix |
 |------------|-------------------------------|
 | PostgreSQL | **12, 13, 14, 15, 16**        |
 | MySQL      | **5.7, 8.0**                  |
-| SQL Server | **2022** (Beta)               |
+| SQL Server | **2022**                      |
 | MongoDB    | **4.4, 5.0, 6.0, 7.0, 8.0** (dedicated nightly matrix; batch + CDC) |
 
 See [reference/compatibility.md](reference/compatibility.md) for the version-support policy, the exact test matrix, and notes on engine-specific features.

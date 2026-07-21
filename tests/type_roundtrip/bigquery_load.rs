@@ -505,6 +505,9 @@ fn bigquery_validates_mssql_type_matrix_parquet() {
         ("c_date", "DATE"),
         ("c_time", "TIME"),
         ("created_at", "TIMESTAMP"),
+        // datetimeoffset → Timestamp(µs, UTC) → BigQuery TIMESTAMP (a UTC instant,
+        // same as datetime2 here; BQ has no separate tz-aware type).
+        ("created_at_tz", "TIMESTAMP"),
         ("label", "STRING"),
         ("c_varchar", "STRING"),
         ("c_char", "STRING"),
@@ -529,6 +532,7 @@ fn bigquery_validates_mssql_type_matrix_parquet() {
     let r1 = cfg.query_rows(&format!(
         "SELECT FORMAT_TIME('%H:%M:%E6S', c_time)                      AS t,
                 FORMAT_TIMESTAMP('%Y-%m-%d %H:%M:%E6S', created_at)    AS ts,
+                FORMAT_TIMESTAMP('%Y-%m-%d %H:%M:%E6S', created_at_tz) AS ts_tz,
                 TO_HEX(raw_bytes)                                      AS raw_hex,
                 TO_HEX(uid)                                            AS uid_hex,
                 c_nvarchar                                            AS nv
@@ -538,6 +542,9 @@ fn bigquery_validates_mssql_type_matrix_parquet() {
     let r = &r1[0];
     assert_eq!(r["t"], "13:45:30.123456");
     assert_eq!(r["ts"], "2026-01-15 13:45:30.123456");
+    // datetimeoffset id=1 carried +05:30; FORMAT_TIMESTAMP renders in UTC, so the
+    // 13:45:30 +05:30 wall clock reads back as the 08:15:30 UTC instant.
+    assert_eq!(r["ts_tz"], "2026-01-15 08:15:30.123456");
     assert_eq!(r["raw_hex"], "00112233445566ff");
     assert_eq!(r["uid_hex"], "6f9619ff8b86d011b42d00c04fc964ff");
     assert_eq!(r["nv"], "héllo wörld");

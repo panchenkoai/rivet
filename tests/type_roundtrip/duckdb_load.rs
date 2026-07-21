@@ -307,6 +307,10 @@ fn duckdb_validates_mssql_type_matrix_parquet() {
         ("c_date", "DATE"),
         ("c_time", "TIME"),
         ("created_at", "TIMESTAMP"),
+        // datetimeoffset is tz-aware → Arrow Timestamp(µs, UTC) → DuckDB reads
+        // the isAdjustedToUTC flag and lands it as a TIMESTAMPTZ (vs the naive
+        // datetime2 above), proving the tz-awareness survived the Parquet.
+        ("created_at_tz", "TIMESTAMP WITH TIME ZONE"),
         ("label", "VARCHAR"),
         ("c_varchar", "VARCHAR"),
         ("c_char", "VARCHAR"),
@@ -348,4 +352,27 @@ fn duckdb_validates_mssql_type_matrix_parquet() {
     );
     assert_eq!(row[1].as_str().unwrap(), "héllo wörld");
     assert!(row[2].is_null(), "note_all_null must be NULL");
+
+    // 4) datetimeoffset lands as its UTC INSTANT (the offset is applied, not
+    //    dropped). Asserted via epoch_us so the check is independent of DuckDB's
+    //    session timezone (the rendered string would vary; the instant does not):
+    //    +05:30 wall clock 13:45:30 → 08:15:30 UTC, negative −08:00 00:00:00 →
+    //    08:00:00 UTC, and a NULL stays NULL.
+    let dto = q("SELECT id, epoch_us(created_at_tz) AS us
+                 FROM read_parquet('{f}') ORDER BY id");
+    let rows = dto["rows"].as_array().unwrap();
+    assert_eq!(
+        rows[0].as_array().unwrap()[1].as_str().unwrap(),
+        "1768464930123456",
+        "datetimeoffset id=1 (+05:30) must round-trip as its UTC instant"
+    );
+    assert_eq!(
+        rows[1].as_array().unwrap()[1].as_str().unwrap(),
+        "946713600000000",
+        "datetimeoffset id=2 (negative −08:00 offset) must round-trip as its UTC instant"
+    );
+    assert!(
+        rows[2].as_array().unwrap()[1].is_null(),
+        "datetimeoffset NULL must stay NULL"
+    );
 }
