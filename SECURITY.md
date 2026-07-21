@@ -170,7 +170,7 @@ The pilot guide covers this end-to-end: [docs/pilot/production-checklist.md](doc
 
 | Control | Status | Notes |
 |---|---|---|
-| RustSec advisory audit | **Active** | `audit` job in [.github/workflows/ci.yml](.github/workflows/ci.yml) runs `rustsec/audit-check` on every PR |
+| RustSec advisory audit | **Active** | `audit` job in [.github/workflows/ci.yml](.github/workflows/ci.yml) runs `cargo audit` on every PR — honoring the documented advisory allow-list in [`.cargo/audit.toml`](.cargo/audit.toml) (the same tool the `.githooks/pre-commit` hook runs) |
 | Dependency review | **Active** | Cargo.lock is committed; bumps land in dedicated PRs |
 | Release checksums (`SHA256SUMS`) | **Active** | Every release publishes `SHA256SUMS.txt` as an asset ([`.github/workflows/release.yml`](.github/workflows/release.yml)); verification below |
 | Signed releases (cosign keyless) | **Active** | Every release signs `SHA256SUMS.txt` via Sigstore/cosign keyless (GitHub OIDC — no key to manage), published as `SHA256SUMS.txt.cosign.bundle`; verification below |
