@@ -10,7 +10,7 @@
 
 State and manifest writes (ADR-0001 invariants I2–I4) must happen only after the destination write is durably committed. But "committed" means different things for different backends:
 
-- Local `fs::copy` commits atomically from the caller's perspective, but may leave a partial file on failure.
+- Local writes stage into a dot-prefixed temp file in the target directory and commit with an atomic same-filesystem `rename` (OPT-6), so a failure leaves nothing at the final path — retry-safe, no partial-write risk.
 - S3 and GCS object writes are not committed until the writer handle is closed (`dst.close()`); a mid-upload failure leaves nothing at the destination.
 - stdout streams data immediately with no atomic commit point; a retry produces duplicate or corrupt output.
 
@@ -33,7 +33,7 @@ Add a `capabilities()` method to the `Destination` trait so each backend declare
 
 | Backend | `commit_protocol` | `idempotent_overwrite` | `retry_safe` | `partial_write_risk` |
 |---|---|---|---|---|
-| `LocalDestination` | `Atomic` | `true` | `false` | `true` |
+| `LocalDestination` | `Atomic` | `true` | `true` | `false` |
 | `S3Destination` | `FinalizeOnClose` | `true` | `true` | `false` |
 | `GcsDestination` | `FinalizeOnClose` | `true` | `true` | `false` |
 | `AzureDestination` | `FinalizeOnClose` | `true` | `true` | `false` |
@@ -81,7 +81,7 @@ The comment added to `pipeline/single.rs:run_single_export` immediately before t
 `pipeline/single.rs:run_single_export` inspects `dest.capabilities()` at runtime and logs the commit protocol for every run:
 
 ```
-export 'orders': destination commit_protocol=Atomic idempotent=true retry_safe=false partial_risk=true
+export 'orders': destination commit_protocol=Atomic idempotent=true retry_safe=true partial_risk=false
 ```
 
 When a destination that is not retry-safe (`retry_safe = false`) is used on a run that performed one or more retries, a `WARN` is emitted:

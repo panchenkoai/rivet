@@ -143,7 +143,11 @@ pub(super) fn prepare_chunk_plan_fresh(
     state: &StateStore,
     summary: &mut RunSummary,
 ) -> Result<Vec<(i64, i64)>> {
-    let mut src = crate::source::create_source(&plan.source)?;
+    // The chunked run's FIRST connect. Attach the same actionable hint (doctor
+    // pointer + auth/TLS category) the single-export path gives, so a bad-creds /
+    // unreachable / TLS failure here is not a raw driver error (audit finding).
+    let mut src = crate::source::create_source(&plan.source)
+        .map_err(|e| crate::pipeline::single::attach_connect_hint(e, &plan.source))?;
     prepare_chunk_plan(&mut *src, plan, Some(state), summary)
     // `src` drops here, closing the detect connection before workers open theirs.
 }

@@ -54,6 +54,11 @@ csv = "1"
 env_logger = "0.11"
 libc = "0.2"
 log = "0.4"
+# Percent-encode the user/password when building a connection URL from structured
+# `host/user/password` fields, so a credential containing `/ @ : ? #` can't make
+# the URL ambiguous (which both breaks the driver AND defeats password redaction
+# — a `/` in the password used to stop the userinfo scan early and leak the tail).
+percent-encoding = "2"
 # `native-tls` feature wires the same OpenSSL-backed TLS stack the rest of
 # the workspace already vendors (see `native-tls = { ... features = ["vendored"] }`
 # above) so MySQL configs with `tls.mode: require | verify-ca | verify-full`
