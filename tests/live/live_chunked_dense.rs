@@ -162,6 +162,45 @@ fn dense_ties_pg_parallel_no_loss_no_dup() {
     );
 }
 
+// Cross-shape manifest guard (graph-surfaced runner-bypass). The two
+// chunk-checkpoint runners were the ONLY batch runners not calling
+// guard_manifest_mode, so a chunked-checkpoint export into a prefix that
+// already held a CDC manifest would silently overwrite it — destroying the CDC
+// export's audit trail. Both runners must now refuse: parallel=1 exercises the
+// sequential checkpoint runner, parallel=4 the parallel one.
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn chunked_checkpoint_refuses_to_clobber_a_cdc_manifest() {
+    require_alive(LiveService::Postgres);
+    let (name, _g) = seed_pg_tied();
+    for parallel in [1usize, 4] {
+        let out = tempfile::tempdir().unwrap();
+        // A prior CDC run's manifest already sits at the destination prefix.
+        std::fs::write(
+            out.path().join("manifest.json"),
+            br#"{"manifest_version":1,"run_id":"prior-cdc","mode":"cdc","parts":[]}"#,
+        )
+        .unwrap();
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let cfg = write_config(&cfg_dir, &pg_yaml(&name, out.path(), parallel));
+        let run = run_rivet_export(&cfg, &name);
+        assert!(
+            !run.status.success(),
+            "parallel={parallel}: a chunked-checkpoint batch export must REFUSE to \
+             overwrite a CDC manifest"
+        );
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(
+            combined.contains("already holds a 'cdc' manifest"),
+            "parallel={parallel}: must name the cross-shape collision; got:\n{combined}"
+        );
+    }
+}
+
 // ── MySQL ──────────────────────────────────────────────────────────────────
 
 fn seed_mysql_tied() -> (String, MysqlTable) {

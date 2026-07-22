@@ -206,6 +206,16 @@ pub(crate) fn run_chunked_sequential_checkpoint(
 ) -> Result<()> {
     let cp = chunked_plan(plan);
 
+    // Same cross-shape guard as single/keyset/exec: refuse to overwrite a CDC
+    // manifest with this batch export's manifest (they would silently destroy
+    // each other's audit trail). The two checkpoint runners were the ones that
+    // bypassed it — graph-surfaced runner-bypass, same class as the Form B gap.
+    // A resume of our own batch manifest matches mode and passes.
+    {
+        let dest = destination::create_destination(&plan.destination)?;
+        crate::manifest::guard_manifest_mode(dest.as_ref(), "batch")?;
+    }
+
     let chunks = if plan.resume {
         vec![]
     } else {

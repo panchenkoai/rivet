@@ -132,6 +132,57 @@ fn keyset_export_records_form_b_checksums_and_validate_passes() {
     );
 }
 
+/// Cross-shape manifest guard on the KEYSET runner: a batch keyset export must
+/// refuse to overwrite a prior CDC manifest at the same prefix (they would
+/// silently destroy each other's audit trail). Every batch runner calls
+/// guard_manifest_mode; this proves the keyset column of the runner-coverage
+/// matrix, the sibling of the checkpoint gap the graph surfaced.
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn keyset_export_refuses_to_clobber_a_cdc_manifest() {
+    require_alive(LiveService::Postgres);
+    let table = unique_name("keyset_guard");
+    let mut c = pg_connect();
+    c.batch_execute(&format!(
+        "CREATE TABLE {table} (k TEXT PRIMARY KEY, v INT NOT NULL);
+         INSERT INTO {table} SELECT 'k' || lpad(g::text, 6, '0'), g \
+         FROM generate_series(1, 100) g;"
+    ))
+    .unwrap();
+    let _guard = PgTable::adopt(table.clone());
+
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let out_dir = tempfile::tempdir().unwrap();
+    // A prior CDC run's manifest already sits at the destination prefix.
+    std::fs::write(
+        out_dir.path().join("manifest.json"),
+        br#"{"manifest_version":1,"run_id":"prior-cdc","mode":"cdc","parts":[]}"#,
+    )
+    .unwrap();
+    let export = unique_name("keyset_guard_exp");
+    let yaml = format!(
+        "source: {{type: postgres, url: \"{POSTGRES_URL}\"}}\nexports:\n  - name: {export}\n    \
+         table: {table}\n    mode: chunked\n    chunk_by_key: k\n    chunk_size: 50\n    \
+         format: parquet\n    destination: {{type: local, path: {out}}}\n",
+        out = out_dir.path().display(),
+    );
+    let cfg = write_config(&cfg_dir, &yaml);
+    let r = run_rivet_export(&cfg, &export);
+    assert!(
+        !r.status.success(),
+        "keyset export must REFUSE to overwrite a CDC manifest"
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&r.stdout),
+        String::from_utf8_lossy(&r.stderr)
+    );
+    assert!(
+        combined.contains("already holds a 'cdc' manifest"),
+        "must name the cross-shape collision; got:\n{combined}"
+    );
+}
+
 /// Form B on the CHUNKED (range) runner — same round-9 gap + same run-wide XOR
 /// harvest as keyset, but a different runner (exec.rs, sequential + parallel).
 /// An integer chunk_column routes to range chunking, not keyset.

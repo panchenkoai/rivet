@@ -132,6 +132,12 @@ pub(crate) fn run_chunked_parallel_checkpoint(
 
     let shared_destination =
         std::sync::Arc::new(destination::create_destination(&plan.destination)?);
+    // Same cross-shape guard as single/keyset/exec: refuse to overwrite a CDC
+    // manifest with this batch export's manifest (they would silently destroy
+    // each other's audit trail). The two checkpoint runners were the ones that
+    // bypassed it — graph-surfaced runner-bypass, same class as the Form B gap.
+    // A resume of our own batch manifest matches mode and passes.
+    crate::manifest::guard_manifest_mode(&**shared_destination, "batch")?;
     destination::log_capabilities(
         &plan.export_name,
         &**shared_destination,

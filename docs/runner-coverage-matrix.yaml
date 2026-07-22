@@ -45,6 +45,13 @@ scenarios:
     keyset:         { test: keyset_export_records_form_b_checksums_and_validate_passes }
     mongo_parallel: { test: mongo_parallel_export_records_form_b_checksum }
 
+  - id: guard_manifest_mode
+    what: "cross-shape manifest guard — a batch export must REFUSE to overwrite a prior CDC manifest at the same prefix (and vice versa), or the two silently destroy each other's audit trail. Each batch runner calls guard_manifest_mode at run start. Round-11 (graph-surfaced): the TWO chunk-checkpoint runners (run_chunked_{sequential,parallel}_checkpoint — distinct large functions the grep-driven pass folded into 'chunked') were the ONLY batch runners that bypassed it, so a chunked-checkpoint export clobbered a CDC prefix silently."
+    single:         { test: cdc_scaffold_gets_its_own_prefix_and_cross_shape_overwrite_is_refused }
+    chunked:        { test: chunked_checkpoint_refuses_to_clobber_a_cdc_manifest }
+    keyset:         { test: keyset_export_refuses_to_clobber_a_cdc_manifest }
+    mongo_parallel: { test: mongo_parallel_export_refuses_to_clobber_a_cdc_manifest }
+
   - id: meta_columns
     what: "__rivet_* meta columns (plan.meta_columns) injected into the output schema + batches."
     single:         { test: stand_meta_columns_postgres }

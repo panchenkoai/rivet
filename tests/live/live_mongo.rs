@@ -112,6 +112,33 @@ fn mongo_parallel_export_records_form_b_checksum() {
     );
 }
 
+/// Cross-shape manifest guard on the MONGO-PARALLEL runner: a batch parallel
+/// export must refuse to overwrite a prior CDC manifest at the same prefix.
+/// Proves the mongo_parallel column of the runner-coverage matrix — the last
+/// batch runner of the guard sibling-set the graph's checkpoint gap belongs to.
+#[test]
+#[ignore = "live: requires docker compose up -d mongo"]
+fn mongo_parallel_export_refuses_to_clobber_a_cdc_manifest() {
+    require_alive(LiveService::Mongo);
+    let db = unique_name("mguard");
+    MongoTest::connect(PORT, &db).seed_int_id("bench", 200);
+    let rig = batch(&db, "bench")
+        .mongo("page_size: 100")
+        .export_line("parallel: 4");
+    // A prior CDC run's manifest already sits at the destination prefix.
+    std::fs::create_dir_all(rig.out_dir()).unwrap();
+    std::fs::write(
+        rig.out_dir().join("manifest.json"),
+        br#"{"manifest_version":1,"run_id":"prior-cdc","mode":"cdc","parts":[]}"#,
+    )
+    .unwrap();
+    let err = rig.run_expect_fail();
+    assert!(
+        err.contains("already holds a 'cdc' manifest"),
+        "parallel-Mongo export must REFUSE to overwrite a CDC manifest; got:\n{err}"
+    );
+}
+
 #[test]
 #[ignore = "live: requires docker compose up -d mongo"]
 fn mongo_batch_typed_cursor_pages_string_id() {
