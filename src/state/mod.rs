@@ -816,6 +816,12 @@ fn redact_pg_url(url: &str) -> String {
     //   * a ':'-bearing password (`a:b:c:secret`): FIRST ':' splits → prefix masked.
     //   * a stray '@' in a query (`?opt=a@b`) — vanishingly rare for a connection
     //     URL — over-redacts the host but never leaks (default-deny).
+    // Residual limitation (round-4 #4/#5, documented): a raw WHITESPACE in the
+    // password terminates the URL scan (whitespace ends the token in a log line), so
+    // a password containing a literal space/tab may not be fully masked. This is
+    // out of reliable scope — a space in a URL is itself non-conforming (must be
+    // %20-encoded), and treating a whitespace-bounded `:`-bearing span as userinfo
+    // would mangle every common credential-free `scheme://host:port/db ...` log line.
     let Some(scheme_end) = url.find("://") else {
         return url.to_string();
     };
@@ -1294,6 +1300,24 @@ mod tests {
         assert_eq!(
             redact_pg_url("postgresql://u:secret@host:5432/db"),
             "postgresql://u:***@host:5432/db"
+        );
+    }
+
+    #[test]
+    fn redact_pg_url_common_hostport_url_is_not_mangled() {
+        // Round-4 #4/#5 documents that whitespace terminates the scan; the flip side
+        // this test PINS is that we must NOT aggressively redact a whitespace-bounded
+        // `:`-bearing span — a common credential-free `scheme://host:port/db` URL has
+        // exactly that shape and must pass through untouched (no false-positive mangle).
+        let url = "postgresql://db.internal:5432/orders";
+        assert_eq!(
+            redact_pg_url(url),
+            url,
+            "a credential-free host:port URL is untouched"
+        );
+        assert_eq!(
+            redact_pg_url("connecting to postgresql://db:5432/x then retry"),
+            "connecting to postgresql://db:5432/x then retry"
         );
     }
 
