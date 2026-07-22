@@ -319,6 +319,24 @@ rather than guessing the plan. A fix shipped against an unmeasured hypothesis is
 a guess wearing a diff — each of the three wrong guesses above cost a build +
 install + dogfood round-trip that a 20-second cold trace would have skipped.
 
+## Benchmark against the DOWNLOADED latest release binary, never a rebuilt parent
+
+A perf regression check compares the working-tree build against the PREVIOUS
+version. Do NOT `git checkout <parent> && cargo build --release` to get it — the
+release profile is `lto = "fat"` + `codegen-units = 1`, so each build is MINUTES,
+and a before/after wastes two of them (measured: the Form B before/after cost two
+full fat-LTO rebuilds when one download would have done). Instead **download the
+latest already-BUILT release binary** — the artifact the release pipeline already
+published (a GitHub release asset, or the Homebrew bottle `brew install rivet`) —
+and compare the current `cargo build --release` against it. It is faster AND more
+honest: you compare against what users actually run (the release-pipeline binary),
+not a locally-rebuilt approximation. `cargo install rivet-cli@<ver>` does NOT count
+— it rebuilds from source, the exact cost this avoids. Keep the CURRENT side a
+`--release` build (dev/debug is unrepresentative for perf). Baseline reference for
+the macro-export bench (200k-row keyset, 5 cols, zstd, release): ~0.66 s warm
+(~300k rows/s), ~26 MB flat peak RSS — a regression is a wall-clock or RSS move
+past measurement noise on that fixture.
+
 ## Verify the real release build path, not just `cargo build`
 
 A green `cargo build` does not mean the release will build. The release path runs
