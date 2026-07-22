@@ -14,6 +14,19 @@
 //! re-reads the Parquet and recompares ([`validate_manifest_checksums`]), catching
 //! an `Arrow→Parquet` encode / post-write fault Form A cannot see.
 //!
+//! **Form B coverage caveat (scope, honest):** the sink COMPUTES the per-column
+//! checksum on every runner (`track_checksum`), but only the SINGLE-batch runner
+//! and the CDC sink currently HARVEST it into `summary.column_checksums` for
+//! `finalize_manifest` to record. The multi-part runners — chunked, keyset, and
+//! parallel-Mongo — each write through several sinks and do not thread the
+//! run-wide XOR-combine out, so their manifests carry no Form-B checksums and
+//! `rivet validate`'s Form-B re-read is a NO-OP on those paths. This is a
+//! defense-in-depth VERIFICATION gap, not data loss (Form A still runs in-process
+//! on the SQL engines, and per-part content-MD5 still guards raw bytes). The
+//! run-wide harvest for the multi-part runners (threaded via `KeysetPage` /
+//! `PartRecord`) is tracked as a follow-up; see `docs/runner-coverage-matrix.yaml`
+//! (`value_checksum_form_b`).
+//!
 //! The per-column value is `xxh3` of each cell's value **bytes**, XOR-combined
 //! (order-independent, so chunk/parallel order doesn't matter) — keyed to the row
 //! cursor/key column when present (`xxh3(key ‖ value)`, swap-resistant). Hashing

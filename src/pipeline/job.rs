@@ -75,7 +75,17 @@ fn run_chunked_quality_gate(
 ) -> Result<()> {
     result?;
 
-    if !matches!(plan.strategy, ExtractionStrategy::Chunked(_)) {
+    // The MULTI-PART runners — chunked AND keyset (which also backs parallel-Mongo,
+    // routed through the Keyset strategy) — own their own execution loop and never
+    // reach single mode's per-part sink.run_quality_checks(). So the run-wide
+    // row_count completeness gate (row_count_min, Severity::Fail → exit 3) must run
+    // HERE for all of them. It was Chunked-only, so a truncated keyset/parallel
+    // extract (the paths auto-selected for LARGE tables, where completeness matters
+    // most) exited 0/success with the tripwire silently disarmed.
+    if !matches!(
+        plan.strategy,
+        ExtractionStrategy::Chunked(_) | ExtractionStrategy::Keyset(_)
+    ) {
         return Ok(());
     }
     let qc = match &plan.quality {
@@ -89,7 +99,7 @@ fn run_chunked_quality_gate(
 
     if has_unsupported {
         log::warn!(
-            "export '{}': quality checks null_ratio_max and unique_columns are not supported in chunked mode (each chunk processes independently); only row_count bounds are checked",
+            "export '{}': quality checks null_ratio_max and unique_columns are not supported on the multi-part runners (chunked / keyset / parallel-Mongo) — each part processes independently; only row_count bounds are checked",
             plan.export_name
         );
     }
@@ -107,7 +117,7 @@ fn run_chunked_quality_gate(
         let fails: Vec<&str> = row_issues.iter().map(|i| i.message.as_str()).collect();
         return Err(DataIntegrityError::new(crate::quality::failure_message(
             &plan.export_name,
-            Some("chunked aggregate"),
+            Some("multi-part aggregate"),
             &fails,
         ))
         .into());
@@ -908,7 +918,7 @@ mod tests {
             run_chunked_quality_gate(Ok(()), &plan, &mut summary).expect_err("below min must fail");
         let msg = err.to_string();
         assert!(
-            msg.contains("quality check(s) failed") && msg.contains("chunked aggregate"),
+            msg.contains("quality check(s) failed") && msg.contains("multi-part aggregate"),
             "error must name the failed quality gate: {err}"
         );
         assert!(
@@ -921,6 +931,32 @@ mod tests {
             err.downcast_ref::<DataIntegrityError>().is_some(),
             "chunked quality-gate failure must be a typed data-integrity error"
         );
+        assert_eq!(crate::error::classify_exit(&err), 3);
+        assert_eq!(summary.quality_passed, Some(false));
+    }
+
+    #[test]
+    fn keyset_quality_gate_row_count_below_min_fails() {
+        // RED before the guard broadened Chunked → Chunked|Keyset: keyset (and
+        // parallel-Mongo, which is the Keyset strategy) early-returned Ok, so the
+        // row_count_min tripwire was SILENTLY DISARMED on the large-table runners —
+        // a truncated extract exited 0/success. The gate must fire (exit 3) here too.
+        let mut plan = chunked_plan_with_quality(Some(QualityConfig {
+            row_count_min: Some(100),
+            row_count_max: None,
+            null_ratio_max: Default::default(),
+            unique_columns: Vec::new(),
+            unique_max_entries: None,
+        }));
+        plan.strategy = ExtractionStrategy::Keyset(crate::plan::KeysetPlan {
+            key_column: "id".into(),
+            chunk_size: 500,
+            checkpoint: false,
+            parallel: 1,
+        });
+        let mut summary = fresh_summary(&plan, 42);
+        let err = run_chunked_quality_gate(Ok(()), &plan, &mut summary)
+            .expect_err("keyset below-min must FAIL, not silently pass");
         assert_eq!(crate::error::classify_exit(&err), 3);
         assert_eq!(summary.quality_passed, Some(false));
     }

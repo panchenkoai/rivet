@@ -121,11 +121,15 @@ pub fn success_marker_body(manifest_bytes: &[u8]) -> String {
 /// CI checks) to decide whether a cached manifest is still current.
 pub fn parse_success_marker(body: &str) -> Option<&str> {
     let trimmed = body.trim_end_matches(|c: char| c.is_ascii_whitespace());
-    if trimmed.len() != "xxh3:".len() + 16 {
-        return None;
-    }
-    let (prefix, hex) = trimmed.split_at("xxh3:".len());
-    if prefix != "xxh3:" {
+    // `strip_prefix` + a BYTE-length check, NOT `split_at`: split_at panics on a
+    // non-char-boundary index, so a crafted 21-byte valid-UTF-8 `_SUCCESS` body with
+    // a multibyte codepoint straddling byte 5 (`"aaa" + U+0800 + …`) passed the old
+    // length gate and aborted the whole `validate`/`--resume`/repair process under
+    // the release `panic=abort` profile — a DoS of the trust oracle via a
+    // destination-writable planted file (the same threat surface the manifest.json
+    // byte-cap already defends). strip_prefix + byte-len never touch a char boundary.
+    let hex = trimmed.strip_prefix("xxh3:")?;
+    if hex.len() != 16 {
         return None;
     }
     if !hex
@@ -609,6 +613,12 @@ mod tests {
         assert_eq!(parse_success_marker("xxh3:zzzzzzzzzzzzzzzz\n"), None);
         // Missing prefix:
         assert_eq!(parse_success_marker("0123456789abcdef\n"), None);
+        // A crafted 21-byte (== the valid length) body with a MULTIBYTE codepoint
+        // straddling byte 5: passes the byte-length gate, and the old `split_at(5)`
+        // panicked on the non-char-boundary → a DoS of the trust oracle under
+        // panic=abort (a destination-writable planted `_SUCCESS`). Must be `None`,
+        // never a panic. ("aaa" + U+0800 [bytes 3..6] + 15×'a' = 21 bytes.)
+        assert_eq!(parse_success_marker("aaa\u{0800}aaaaaaaaaaaaaaa"), None);
     }
 
     #[test]

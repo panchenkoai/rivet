@@ -4,14 +4,31 @@
 
 ## 0.21.1 — 2026-07-22
 
-A security- and durability-hardening release: eight adversarial audit rounds over the
+A security- and durability-hardening release: nine adversarial audit rounds over the
 OSS surface (find → RED-prove → drift-guard), plus a full live re-validation (3097 tests,
 all four engines × local/S3/GCS/Azure, DuckDB/ClickHouse/BigQuery type oracles), closed
-~45 real issues — several of them silent data-loss, credential-leak, injection, or
-process-abort-DoS classes invisible to the green test suite and the three type oracles.
+~50 real issues — several of them silent data-loss, active data-DESTRUCTION, injection,
+or process-abort-DoS classes invisible to the green test suite and the three type oracles.
 
 ### Fixed
 
+- **Data DESTRUCTION (GCS warehouse-load cleanup): a bucket-root prefix no longer wipes
+  the whole bucket.** A GCS export with no `destination.prefix` — or a prefix that leads
+  with `{partition}` — resolved the load's staging prefix to the bucket ROOT (`gs://bucket/`,
+  an empty key), so `cleanup_source`/`gc_orphans` after a successful load ran an unscoped
+  recursive delete of the ENTIRE bucket, destroying unrelated exports and pre-existing
+  objects. `split_gs_uri` now refuses an empty bucket-relative key, and the guard is proven
+  against a real object store (delete_under/gc_orphans refuse the root, spare siblings, and
+  still drain a scoped prefix). S3/Azure/local exports have no recursive-delete surface and
+  were never exposed.
+- **Silent completeness break (quality gate on keyset / parallel-Mongo):** the
+  `row_count_min` tripwire (exit 3) fired only on single/chunked, so a truncated keyset or
+  parallel-Mongo extract — the runners auto-selected for LARGE tables — exited 0/success
+  with the gate silently disarmed. The gate now runs for the Keyset strategy too.
+- **DoS of the trust oracle (`_SUCCESS`):** `parse_success_marker` no longer panics
+  (`split_at` on a non-char-boundary) on a crafted 21-byte marker, and `rivet validate`
+  now byte-caps the `_SUCCESS` read (CWE-400) the same way it caps `manifest.json` — both
+  hardening the destination-writable control artifact against a planted payload.
 - **Silent-loss (Postgres incremental/keyset cursor on a non-UTC session):** the
   timestamptz cursor boundary was re-injected as an offset-less naive-UTC literal and
   PostgreSQL parses a naive literal in the SESSION TimeZone, so on any non-UTC session

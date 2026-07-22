@@ -71,6 +71,58 @@ exports:
     );
 }
 
+/// #9 e2e: the `row_count_min` tripwire (exit 3) must ALSO fire on the KEYSET
+/// runner (which backs parallel-Mongo too). It was Chunked-only, so a truncated
+/// keyset/parallel extract — the runners auto-selected for LARGE tables, where
+/// completeness matters most — exited 0/success with the quality gate silently
+/// disarmed. A TEXT primary key + `chunk_by_key` routes to the keyset runner.
+#[test]
+#[ignore = "live: postgres"]
+fn keyset_quality_gate_failure_exits_data_integrity_3() {
+    require_alive(LiveService::Postgres);
+    let table_name = unique_name("keyset_quality_3");
+    let mut c = pg_connect();
+    c.batch_execute(&format!(
+        "CREATE TABLE {table_name} (k TEXT PRIMARY KEY, v INT NOT NULL);
+         INSERT INTO {table_name} (k, v) VALUES ('a', 1), ('b', 2), ('c', 3);"
+    ))
+    .unwrap();
+    let _guard = PgTable::adopt(table_name.clone());
+
+    let out = tempfile::tempdir().unwrap();
+    let export_name = unique_name("keyset_quality_3_exp");
+    let yaml = format!(
+        r#"
+source: {{type: postgres, url: "{POSTGRES_URL}"}}
+exports:
+  - name: {export_name}
+    table: {table_name}
+    mode: chunked
+    chunk_by_key: k
+    chunk_size: 2
+    format: parquet
+    destination: {{type: local, path: {dir}}}
+    quality:
+      row_count_min: 100
+"#,
+        dir = out.path().display()
+    );
+    let (_cfgdir, cfgpath) = cfg(&yaml);
+
+    let result = run_rivet_export(&cfgpath, &export_name);
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert_eq!(
+        result.status.code(),
+        Some(3),
+        "keyset quality-gate failure must exit 3 — the row_count_min tripwire must fire on the \
+         keyset runner, not silently pass (3 rows < min 100); stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("quality check(s) failed"),
+        "operator-facing quality message must be present; stderr:\n{stderr}"
+    );
+}
+
 /// A `rivet reconcile` that finds a partition disagreeing with the source must
 /// exit with the **data-integrity** code `3` (the taxonomy's "reconcile
 /// mismatch" row), so a CI gate `rivet reconcile && <deploy>` stops on divergent
