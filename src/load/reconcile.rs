@@ -25,6 +25,7 @@
 
 use crate::destination::gcs::GcsStore;
 use crate::manifest::{MANIFEST_FILENAME, ManifestStatus, RunManifest};
+use crate::pipeline::validate_manifest::MANIFEST_MAX_BYTES;
 use anyhow::{Context, Result, bail};
 
 /// The reconciled row-count chain for one export's load, derived from the run
@@ -81,6 +82,17 @@ pub fn fetch_manifests_keyed(
     let keys = list_manifest_keys(store, base)?;
     keys.into_iter()
         .map(|key| {
+            // Round-5 (CWE-400): cap the manifest body before reading it whole into
+            // memory — a planted multi-GB manifest.json under the load prefix would
+            // otherwise OOM the loader. Mirrors the V21 cap the export-side manifest
+            // readers already enforce; this was the 4th, uncapped, read path.
+            let sz = store.stat_size(&key)?;
+            if sz > MANIFEST_MAX_BYTES {
+                bail!(
+                    "manifest {key} is {sz} bytes, over the {MANIFEST_MAX_BYTES}-byte cap — \
+                     refusing to read a possibly-hostile manifest into memory (CWE-400)"
+                );
+            }
             let bytes = store.read(&key)?;
             let m = serde_json::from_slice::<RunManifest>(&bytes)
                 .with_context(|| format!("parsing manifest {key}"))?;

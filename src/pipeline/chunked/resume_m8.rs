@@ -107,19 +107,21 @@ pub struct M8Stats {
 ///
 /// `run_id` must be the chunk_checkpoint run id (the one
 /// `ensure_chunk_checkpoint_plan` returned for the resume path).
-/// Round-4 fix (durability-ordering-matrix `manifest_driven_recovery` chunked): a
+/// Round-4/5 fix (durability-ordering-matrix `manifest_driven_recovery` chunked): a
 /// chunked-checkpoint crash BEFORE the terminal manifest write leaves the pre-crash
-/// chunks durably committed (parquet on the destination + `completed` in chunk_task)
+/// parts durably committed (parquet on the destination + a `file_log` row per part)
 /// but with NO destination manifest. On `--resume`, `claim_next_chunk_task` skips
 /// completed chunks and the M8 preamble finds no manifest to hydrate, so
 /// `finalize_manifest` (built solely from `summary.manifest_parts`) writes a manifest
 /// that OMITS them — the manifest-authoritative `rivet load` then silently drops
-/// their rows. Reconstruct those parts from the state DB's completed chunk_tasks so
-/// the finalize manifest is COMPLETE. The state DB is the export machine's own resume
-/// record (available here during resume); the reconstructed destination manifest
-/// stays the loader's source of truth (ADR-0001). fingerprint/md5 aren't stored in
-/// chunk_task, so the parts are DECLARED (no loss) though not content-re-verified —
-/// strictly better than a silent orphan. Returns the number of parts reconstructed.
+/// their rows. Reconstruct those parts from the state DB's `file_log` (which records
+/// EVERY committed part — including every `max_file_size` rotation sibling — with its
+/// real byte size), so the finalize manifest is COMPLETE. The state DB is the export
+/// machine's own resume record; the reconstructed destination manifest stays the
+/// loader's source of truth (ADR-0001). fingerprint/md5 aren't in file_log, so the
+/// parts are DECLARED + size-verified (an empty md5 degrades validate to a size-only
+/// check) though not content-re-verified — strictly better than a silent orphan.
+/// Returns the number of parts reconstructed.
 fn rehydrate_manifest_parts_from_completed_chunks(
     state: &StateStore,
     run_id: &str,

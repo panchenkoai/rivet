@@ -83,11 +83,37 @@ pub trait TargetLoader {
     fn create_view(&self, table: &str, view_sql: &str) -> Result<()>;
 }
 
-/// Refuse a load whose specs can't materialize: empty, or any `Fail`-status
-/// column (a silent-loss class — never drop it, name it).
+/// A plain SQL identifier the load layer can safely interpolate into DDL/COPY
+/// without quoting: `[A-Za-z_][A-Za-z0-9_]*`. Round-5: column names are
+/// SOURCE-derived and spliced raw into executed warehouse SQL (build_schema,
+/// build_copy_select, …), so a name outside this set is an injection vector.
+fn is_safe_load_ident(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Refuse a load whose specs can't materialize: empty, any `Fail`-status column
+/// (a silent-loss class — never drop it, name it), or an unsafe column identifier.
 fn validate_specs(table: &str, specs: &[TargetColumnSpec]) -> Result<()> {
     if specs.is_empty() {
         bail!("no column specs for `{table}` — nothing to build a schema from");
+    }
+    // Round-5: refuse a source-derived column name that isn't a plain identifier —
+    // the warehouse drivers interpolate it into executed DDL/COPY with no quoting,
+    // so a hostile/odd name (`x); DROP TABLE …`, an embedded quote/backtick) must
+    // fail LOUDLY here rather than run as SQL. The one gate covers every load target.
+    for s in specs {
+        if !is_safe_load_ident(&s.column_name) {
+            bail!(
+                "cannot load `{table}`: column name `{}` is not a plain SQL identifier \
+                 ([A-Za-z_][A-Za-z0-9_]*) — the warehouse loader splices it into DDL/COPY. \
+                 Rename or alias the column in the export query.",
+                s.column_name.escape_default()
+            );
+        }
     }
     let failed: Vec<&str> = specs
         .iter()

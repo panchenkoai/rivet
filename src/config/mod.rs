@@ -679,6 +679,20 @@ impl Config {
                     export.mode,
                 );
             }
+            // Round-5: partition_by writes N per-partition manifests (one per
+            // col=value/ sub-prefix), but `rivet load` (reconcile.rs select_runs)
+            // picks a SINGLE latest-manifest for the export and would load only ONE
+            // partition, silently dropping the rest. Reject the combo at config-load
+            // until the loader is partition-aware.
+            if export.load.is_some() {
+                anyhow::bail!(
+                    "export '{}': partition_by is not compatible with a `load:` block — a \
+                     partitioned export writes one manifest per partition sub-prefix, but the \
+                     warehouse loader would load only a single partition. Load a non-partitioned \
+                     export, or drop `load:` and run `rivet load` per partition.",
+                    export.name,
+                );
+            }
             if export.chunk_by_key.is_some() {
                 anyhow::bail!(
                     "export '{}': partition_by is not compatible with chunk_by_key — keyset needs \

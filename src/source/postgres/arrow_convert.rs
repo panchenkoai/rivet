@@ -934,17 +934,19 @@ fn build_pg_list_array(
             }
             Ok(Arc::new(lb.finish()))
         }
-        other => {
-            log::warn!(
-                "PG array: unsupported element type {:?}, writing null list",
-                other
-            );
-            let mut lb = ListBuilder::new(StringBuilder::new());
-            for _ in rows {
-                lb.append(false);
-            }
-            Ok(Arc::new(lb.finish()))
-        }
+        // Round-5: a "write null list" fallback here silently NULLed 100% of a
+        // column the TYPE layer promised was supported (pg_type_to_rivet maps every
+        // `x[]` to List{inner}, and rivet_type_to_arrow accepts List(Date32/Time64/
+        // Timestamp/FixedSizeBinary/Binary)), and no integrity gate sees it — the
+        // exact silent-loss class the repo bans. Fail LOUDLY like the scalar
+        // build_array `_ =>` arm, so the operator learns the array element type isn't
+        // decoded yet (cast the column to text[] upstream, or omit it) instead of
+        // shipping an all-null column.
+        other => anyhow::bail!(
+            "PG array column has element type {other:?} which the list builder cannot decode \
+             (temporal/uuid/bytea array elements are not yet supported) — it would export as \
+             100% NULL. Cast the column to text[] in the source query, or exclude it."
+        ),
     }
 }
 
