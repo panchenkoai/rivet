@@ -4,11 +4,13 @@
 
 ## 0.21.1 — 2026-07-22
 
-A security- and durability-hardening release: nine adversarial audit rounds over the
-OSS surface (find → RED-prove → drift-guard), plus a full live re-validation (3097 tests,
-all four engines × local/S3/GCS/Azure, DuckDB/ClickHouse/BigQuery type oracles), closed
-~50 real issues — several of them silent data-loss, active data-DESTRUCTION, injection,
-or process-abort-DoS classes invisible to the green test suite and the three type oracles.
+A security- and durability-hardening release: thirteen adversarial audit rounds over the
+OSS surface (nine grep-driven, then graph-driven via the code-review knowledge graph;
+find → RED-prove → drift-guard), plus a full live re-validation (5229 tests, all four
+engines × local/S3/GCS/Azure, DuckDB/ClickHouse/BigQuery type oracles), closed ~55 real
+issues — several of them silent data-loss, active data-DESTRUCTION, silent value
+CORRUPTION, injection, or process-abort-DoS classes invisible to the green test suite
+and the three type oracles.
 
 ### Fixed
 
@@ -21,6 +23,38 @@ or process-abort-DoS classes invisible to the green test suite and the three typ
   against a real object store (delete_under/gc_orphans refuse the root, spare siblings, and
   still drain a scoped prefix). S3/Azure/local exports have no recursive-delete surface and
   were never exposed.
+- **Data DESTRUCTION #2 (GCS load cleanup, string-prefix over-delete):** `GcsStore::remove_all`
+  passed the raw bucket-relative prefix to opendal, which matches by STRING prefix, so a
+  post-load cleanup of `exports/orders` ALSO deleted `exports/orders_archive/…` and every
+  other object whose key string-starts-with it — destroying unrelated sibling exports.
+  `list_files` already scoped with a trailing slash; `remove_all` (its destructive twin) did
+  not, so the delete scope was wider than the load's list scope. Both now share a
+  `dir_boundary` directory-scoping helper, so cleanup can never delete beyond what the load
+  saw. RED-proven on the fs backend (opendal string-prefixes there too) — the prior test used
+  a non-prefix sibling and never activated it.
+- **Silent CORRUPTION (Postgres CDC unchanged-TOAST datum):** an UPDATE that leaves an
+  externally-stored TOAST column untouched renders it as the unquoted `unchanged-toast-datum`
+  marker (the value is not in the WAL); rivet wrote that literal string into the column. It
+  now recovers the real value from the `REPLICA IDENTITY FULL` pre-image by column name, or —
+  when no pre-image value exists — fails loud naming the exact upstream fix, never fabricating
+  the marker as data. Reproduced live (`SET STORAGE EXTERNAL` + an incompressible value).
+- **Silent-loss (chunked-checkpoint resume, `max_file_size` rotation siblings):** a resume
+  whose prior manifest existed and whose parts were still present (all Skip decisions) orphaned
+  every rotation SIBLING beyond the first from the finalize manifest — because chunk_task
+  records only the first sibling's name — so the manifest-authoritative `rivet load` dropped
+  their rows. A Skip now hydrates the manifest part unconditionally (it needs no chunk_task).
+- **`rivet validate` Form B was a no-op on the two chunk-checkpoint runners**, and the
+  cross-shape CDC-vs-batch **manifest-overwrite guard was absent** on them — the resumable
+  checkpoint runners bypassed both. Both are now wired in (per-runner coverage matrix, 0 gaps).
+- **CDC snapshot/stream schema parity (`meta_columns`):** batch-only `meta_columns`
+  (`exported_at`/`row_hash`) injected on the `initial: snapshot` leg ONLY diverged the two
+  legs' columns — both load into one `<table>__changes` — breaking the merged load view. The
+  snapshot leg no longer inherits them, and a run-start warning notes CDC ignores meta_columns.
+- **CSV fidelity (naive TIMESTAMP vs instant TIMESTAMPTZ):** both rendered identically with no
+  marker, so a consumer loading the instant on a non-UTC session read the UTC wall-clock as
+  local and shifted every value. An instant now carries a trailing `Z`; a naive value stays
+  bare — preserving the distinction rivet keeps in Parquet and the warehouse target types.
+  Verified via DuckDB (`read_csv_auto` now types the instant column `TIMESTAMP WITH TIME ZONE`).
 - **Silent completeness break (quality gate on keyset / parallel-Mongo):** the
   `row_count_min` tripwire (exit 3) fired only on single/chunked, so a truncated keyset or
   parallel-Mongo extract — the runners auto-selected for LARGE tables — exited 0/success
