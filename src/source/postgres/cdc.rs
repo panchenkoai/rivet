@@ -778,7 +778,15 @@ fn parse_pg_time_micros_unbounded(val: &str) -> Option<i64> {
 
 /// Decode an even-length hex string to bytes; `None` on any non-hex input.
 fn decode_hex(s: &str) -> Option<Vec<u8>> {
-    if !s.len().is_multiple_of(2) {
+    // Byte-index slicing (`&s[i..i+2]`) below panics on a non-char-boundary, and
+    // under the release `panic=abort` profile that aborts the whole process. The
+    // uuid/bytea arms of `map_pg_value` feed this arbitrary `test_decoding` wire
+    // text, so a crafted non-ASCII even-byte-length cell (e.g. "€€") would be a
+    // process-abort DoS mid-CDC. Hex is ASCII by definition, so any non-ASCII
+    // input is non-hex → `None` is the correct answer AND makes the slice safe
+    // (mirrors mongo::hex_to_bytes). Length is a BYTE length, which now equals
+    // the char count.
+    if !s.is_ascii() || !s.len().is_multiple_of(2) {
         return None;
     }
     (0..s.len())
@@ -879,6 +887,27 @@ mod tests {
     // Option/skip, loudly or silently, but never bring the stream down. The
     // timestamptz-offset and array-escape bugs were classic fuzz shapes; this
     // keeps a generative net under every future parser edit.
+
+    // Regression: a non-ASCII `uuid`/`bytea` cell must not abort the process.
+    // decode_hex byte-slices `&s[i..i+2]`; before the `!s.is_ascii()` guard a
+    // non-ASCII even-BYTE-length value ("€€" = 6 bytes) sliced mid-char and
+    // panicked → under release `panic=abort` a whole-process DoS mid-CDC, fed
+    // straight from untrusted test_decoding wire text. RED without the guard.
+    #[test]
+    fn map_pg_value_non_ascii_uuid_bytea_never_panics() {
+        // decode_hex itself: non-ASCII even byte length → None (not a panic).
+        assert_eq!(decode_hex("€€"), None); // 6 bytes, even, non-char-boundary
+        assert_eq!(decode_hex("aa"), Some(vec![0xaa]));
+        // The two arms that feed it arbitrary wire text.
+        let _ = map_pg_value("uuid", "€€€€€€€€€€€€€€€€€€", false); // even byte len
+        let _ = map_pg_value("bytea", "\\x€€", false);
+        // A malformed uuid degrades to Null, not a crash (existing contract).
+        assert!(matches!(
+            map_pg_value("uuid", "not-hex", false),
+            RivetValue::Null
+        ));
+    }
+
     proptest::proptest! {
         #![proptest_config(proptest::prelude::ProptestConfig {
             cases: 256, ..Default::default()
@@ -891,7 +920,22 @@ mod tests {
 
         #[test]
         fn map_pg_value_never_panics(
-            typ in "[a-z ]{1,20}(\\[\\])?",
+            // The `typ` generator MUST reach the byte-slicing arms (uuid/bytea →
+            // decode_hex), else the totality claim has a blind spot: a plain
+            // `[a-z ]{1,20}` regex realistically never emits the exact tokens
+            // `uuid`/`bytea`, so a non-ASCII `val` that panics `decode_hex`'s
+            // char-boundary slice slipped past this guard for months. Mix the
+            // random regex with the real PG type-name set so those arms are
+            // actually exercised against arbitrary (incl. non-ASCII) `val`.
+            typ in proptest::prop_oneof![
+                "[a-z ]{1,20}(\\[\\])?",
+                proptest::sample::select(vec![
+                    "uuid".to_string(), "bytea".to_string(), "date".to_string(),
+                    "timestamp".to_string(), "timestamptz".to_string(),
+                    "numeric".to_string(), "json".to_string(), "jsonb".to_string(),
+                    "int4".to_string(), "int8".to_string(), "bool".to_string(),
+                ]),
+            ],
             val in ".{0,120}",
             quoted in proptest::prelude::any::<bool>(),
         ) {

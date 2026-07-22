@@ -4,9 +4,10 @@
 
 ## 0.21.1 — 2026-07-22
 
-A security- and durability-hardening release: five adversarial audit rounds over the
-OSS surface (find → RED-prove → drift-guard) closed ~30 real issues, several of them
-silent data-loss or credential-leak classes invisible to the green test suite.
+A security- and durability-hardening release: six adversarial audit rounds over the
+OSS surface (find → RED-prove → drift-guard) closed ~35 real issues, several of them
+silent data-loss, credential-leak, injection, or process-abort-DoS classes invisible
+to the green test suite.
 
 ### Fixed
 
@@ -23,13 +24,23 @@ silent data-loss or credential-leak classes invisible to the green test suite.
   raw `/ ? # @ :` or a stray query `@` (base64 secrets contain `/`). Both redactors were
   rewritten to a default-deny rule (userinfo ends at the last `@` before whitespace,
   user split on the first `:`) that never leaks.
-- **Security (warehouse load):** source-derived column names are refused unless a plain
-  SQL identifier (DDL/COPY injection); the load-reconcile manifest read is byte-capped
-  (CWE-400); Snowflake append `COPY` now uses `FORCE=TRUE` so at-least-once re-append is
-  not silently deduped away.
+- **Security (warehouse load):** source-derived column, table, and primary-key names are
+  refused unless a plain SQL identifier, and the Parquet URIs (from the live GCS listing)
+  are refused if they carry a quote/backslash/control char — both are DDL/COPY/`FILES=()`
+  injection surfaces spliced unescaped into executed warehouse SQL. The load-reconcile
+  manifest read is byte-capped (CWE-400); Snowflake append `COPY` now uses `FORCE=TRUE` so
+  at-least-once re-append is not silently deduped away.
+- **DoS: the PostgreSQL CDC `test_decoding` text decoder no longer aborts the process on
+  hostile wire text.** Two char-boundary panics — the array-literal parser copying a
+  backslash-escaped multibyte char, and the uuid/bytea hex decoder byte-slicing a
+  non-ASCII value — would panic mid-CDC, and under the release `panic=abort` profile that
+  aborts the whole run. Both are guarded; the `map_pg_value` totality proptest now draws
+  the real type-name set so the uuid/bytea arms are actually exercised.
 - **Silent-loss (types):** a MSSQL `MONEY` past the f64-exact range, a PG/MySQL decimal
   scale under-declaration, and a PG temporal/uuid/bytea array column now FAIL loudly
-  instead of shipping a rounded / truncated / all-NULL column.
+  instead of shipping a rounded / truncated / all-NULL column; a MSSQL `time(7)` column's
+  100ns-tick truncation is now surfaced in the type-report (the honesty sibling of the
+  `datetime2` warning), not silently dropped past the value-checksum.
 - **Regression: MSSQL authentication** with a special-character password (broken by the
   0.21.0-era percent-encoding fix — MSSQL's hand-rolled URL parser never decoded it).
 - **Config validation** now rejects the accept-but-break combinations that formerly

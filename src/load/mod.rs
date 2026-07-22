@@ -95,6 +95,39 @@ fn is_safe_load_ident(s: &str) -> bool {
         && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// Refuse any Parquet URI that can't be splice-safely single-quoted into the
+/// warehouse load statement. The drivers emit each URI as `'{uri}'` into
+/// Snowflake `COPY … FILES=(…)` and BigQuery `LOAD DATA … uris=[…]` with NO
+/// escaping (snowflake::copy_files_clause, bigquery::from_files) — so a URI
+/// carrying the string delimiter `'`, a backslash (Snowflake treats `\` as an
+/// in-string escape), or a control char could break out of the literal and
+/// inject SQL that runs with the warehouse's (broad) role. Unlike the operator-
+/// typed dataset/warehouse names, these URIs come from the LIVE GCS object
+/// listing (reconcile::select_load_uris → store.list_files), and GCS object
+/// names legally permit `'`/`\`/`;` — so a party with staging-bucket write plus
+/// a crafted passing manifest is otherwise an injection vector. This is the
+/// storage-sourced sibling of the column/table/pk gate; rivet names its own
+/// parts run-uniquely and filename-sanitized, so a legitimate URI never trips
+/// it — default-deny, fail loud rather than escape-and-hope.
+fn ensure_safe_load_uris(uris: &[String]) -> Result<()> {
+    for u in uris {
+        if let Some(bad) = u
+            .chars()
+            .find(|&c| c == '\'' || c == '\\' || c.is_control())
+        {
+            bail!(
+                "refusing to load: Parquet URI `{}` contains {:?}, which is unsafe to splice \
+                 into the warehouse load statement — the loader single-quotes URIs without \
+                 escaping. rivet names its own parts safely, so this URI was not produced by a \
+                 normal export; investigate the staging bucket before re-running.",
+                u.escape_default(),
+                bad
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Refuse a load whose specs can't materialize: empty, any `Fail`-status column
 /// (a silent-loss class — never drop it, name it), or an unsafe column identifier.
 fn validate_specs(table: &str, specs: &[TargetColumnSpec]) -> Result<()> {
@@ -177,6 +210,7 @@ pub fn run_load(
     if uris.is_empty() {
         bail!("no Parquet URIs to load into `{table}`");
     }
+    ensure_safe_load_uris(uris)?;
     validate_specs(table, specs)?;
 
     let rows_loaded = loader.materialize(table, specs, uris)?;
@@ -226,6 +260,7 @@ fn append_and_view(
     if uris.is_empty() {
         bail!("no Parquet URIs to append into `{table}__changes`");
     }
+    ensure_safe_load_uris(uris)?;
     if pk.is_empty() {
         bail!("{label} load of `{table}` needs a primary key for the dedup view (pass --pk)");
     }
@@ -757,6 +792,54 @@ mod tests {
             .is_err()
         );
         assert!(f.appended.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_uri_with_a_quote_backslash_or_control_char_bails_before_the_driver_runs() {
+        // Storage-sourced injection: URIs come from the live GCS listing and are
+        // spliced single-quoted, UNESCAPED, into COPY FILES=()/LOAD uris=[]. A
+        // planted object key carrying the delimiter must be REFUSED loudly before
+        // any driver SQL runs — never escaped-and-hoped. The driver must not be
+        // touched (materialize/append never called).
+        for bad in [
+            "gs://b/p/x'; drop table t --.parquet", // breaks out of the '…' literal
+            "gs://b/p/x\\.parquet",                 // backslash: Snowflake in-string escape
+            "gs://b/p/x\n.parquet",                 // control char
+        ] {
+            let f = FakeLoader {
+                rows: 1,
+                ..Default::default()
+            };
+            let uris = vec![bad.to_string()];
+            assert!(
+                run_load(&f, "t", &spec(TargetStatus::Ok), &uris, Some(1), None).is_err(),
+                "run_load must reject the injection URI {bad:?}"
+            );
+            assert!(
+                f.materialized.borrow().is_empty(),
+                "the driver must not be reached for {bad:?}"
+            );
+            assert!(
+                run_load_cdc(
+                    &f,
+                    "t",
+                    &spec(TargetStatus::Ok),
+                    &uris,
+                    &["id".to_string()],
+                    cdc::SourceEngine::MySql,
+                    Some(1),
+                    None,
+                )
+                .is_err(),
+                "run_load_cdc must reject the injection URI {bad:?}"
+            );
+            assert!(
+                f.appended.borrow().is_empty(),
+                "the CDC driver must not be reached for {bad:?}"
+            );
+        }
+        // A normal rivet-produced URI still passes the gate.
+        assert!(ensure_safe_load_uris(&uris()).is_ok());
     }
 
     #[test]

@@ -200,6 +200,21 @@ pub(super) fn mssql_type_mappings(
                      override to preserve it (at the cost of the 1677–2262 date range); \
                      datetime2(0..6) is exact.",
                 )
+            } else if native == "timen" {
+                // Sibling of the datetime2 gap above: `time` maps to Time64(µs), but
+                // MSSQL's default `time` (== time(7)) and time(4..6) carry a 100ns
+                // sub-microsecond tick that the build arm truncates (`nanosecond()/1000`,
+                // build_array Time64 arm). rivet does not read time's declared scale
+                // (only decimal's), so the bare `time` is treated as scale-7. The
+                // value-checksum can't flag it — both sides do the same `/1000` — so
+                // surface the truncation as an honest Compatible/warn (never Lossy,
+                // which would break --strict for every bare time). There is no
+                // narrower target: Parquet Time64 has no 100ns unit.
+                mapping.with_warning(
+                    "time → Time64(microsecond): a scale-7 column (the bare `time` default, and \
+                     time(4..7)) loses its 100ns sub-microsecond tick — Parquet Time64 has no \
+                     100ns unit, so the tick is unrepresentable in the target. time(0..3) is exact.",
+                )
             } else {
                 mapping
             }
