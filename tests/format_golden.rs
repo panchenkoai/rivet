@@ -481,9 +481,36 @@ fn test_parquet_compression_lz4() {
     let data = bytes::Bytes::from(buf);
 
     use parquet::file::reader::FileReader;
-    let reader = parquet::file::reader::SerializedFileReader::new(data).unwrap();
+    let reader = parquet::file::reader::SerializedFileReader::new(data.clone()).unwrap();
     let col_meta = reader.metadata().row_group(0).column(0);
-    assert_eq!(col_meta.compression(), parquet::basic::Compression::LZ4);
+    // LZ4_RAW, not the plain (Hadoop-framed) LZ4: the latter is the deprecated,
+    // non-interoperable variant that DuckDB / Spark / pyarrow refuse or misread,
+    // so rivet maps `Lz4 => LZ4_RAW` (the standard block codec) at create_writer.
+    // (Cross-reader interop of the RAW codec verified live via DuckDB + ClickHouse
+    // oracles — both decode rivet's LZ4_RAW parquet to the exact source values.)
+    assert_eq!(col_meta.compression(), parquet::basic::Compression::LZ4_RAW);
+
+    // Decode the VALUES back, not just the codec byte: this round-trips the row
+    // group THROUGH LZ4_RAW decompression, so a wrong-codec or corrupt-block
+    // regression fails here, not only a metadata mismatch. make_basic_batch's
+    // first column is the id column [1, 2, 3].
+    use arrow::array::Int32Array;
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    let mut rb = ParquetRecordBatchReaderBuilder::try_new(data)
+        .unwrap()
+        .build()
+        .unwrap();
+    let batch = rb.next().expect("a decompressed row group").unwrap();
+    let ids = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .expect("first column is Int32");
+    assert_eq!(
+        ids.values(),
+        &[1, 2, 3],
+        "LZ4_RAW block must decompress back to the source values"
+    );
 }
 
 // ─── Extreme value coverage (QA backlog Task 2.4) ────────────
