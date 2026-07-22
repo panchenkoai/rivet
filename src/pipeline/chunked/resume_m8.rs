@@ -340,27 +340,34 @@ pub(crate) fn apply_m8_resume_decisions(
     }
 
     for (path, decision) in &resume_plan.per_part {
-        let task = match by_file.get(path.as_str()) {
-            Some(t) => *t,
-            None => {
-                stats.orphan_parts += 1;
-                continue;
-            }
-        };
         match decision.decision {
             ResumeDecision::Skip => {
                 stats.skipped += 1;
                 // Hydrate the summary so the end-of-resume manifest carries
                 // this committed part too.  Clone the prior manifest's part
                 // verbatim — the part_id, content_fingerprint, rows, and
-                // size_bytes are all from the previous successful write
-                // and remain valid for the destination object that's still
-                // there.
+                // size_bytes are all from the previous successful write and
+                // remain valid for the destination object that's still there.
+                //
+                // A Skip needs NO chunk_task: it copies a durable, matching
+                // manifest part. Requiring one here silently dropped every
+                // max_file_size ROTATION SIBLING — chunk_task records only the
+                // FIRST sibling's file_name, so `chunk-N-p1…` missed the lookup,
+                // was counted an orphan, and never hydrated. The finalize
+                // manifest (built solely from `manifest_parts`) then omitted it
+                // and the manifest-authoritative `rivet load` lost its rows.
                 if let Some(p) = manifest_part_by_path.get(path.as_str()) {
                     summary.manifest_parts.push((*p).clone());
                 }
             }
+            // Rewrite / Quarantine RE-EXPORT the owning chunk, so they DO need
+            // its chunk_task. A part with no task is a genuine orphan (a foreign
+            // or stale manifest entry) — logged, not acted on, as before.
             ResumeDecision::Rewrite => {
+                let Some(task) = by_file.get(path.as_str()) else {
+                    stats.orphan_parts += 1;
+                    continue;
+                };
                 let n = state.reset_chunk_task_for_re_export(
                     run_id,
                     task.chunk_index,
@@ -371,6 +378,10 @@ pub(crate) fn apply_m8_resume_decisions(
                 }
             }
             ResumeDecision::Quarantine { reason } => {
+                let Some(task) = by_file.get(path.as_str()) else {
+                    stats.orphan_parts += 1;
+                    continue;
+                };
                 let n = state.reset_chunk_task_for_re_export(
                     run_id,
                     task.chunk_index,
@@ -755,6 +766,79 @@ mod tests {
         assert_eq!(status_of(0), "completed");
         assert_eq!(status_of(1), "pending", "rewrite resets the task");
         assert_eq!(status_of(2), "pending", "quarantine resets the task");
+    }
+
+    // RED for the Path-B rotation-sibling silent loss (graph-surfaced). When a
+    // prior-run manifest EXISTS (resume with manifest, not the Path-A "no
+    // manifest" reconstruct), the Skip hydration looked up a chunk_task by the
+    // part's file_name FIRST and `continue`d on a miss. A max_file_size chunk
+    // rotates into siblings but chunk_task records only the FIRST sibling's name,
+    // so every OTHER sibling missed the lookup, was counted an orphan, and was
+    // NOT hydrated into `summary.manifest_parts` — the finalize manifest (built
+    // solely from that vec) then omitted it and the manifest-authoritative
+    // `rivet load` silently dropped its rows. A Skip needs NO chunk_task (it
+    // clones the prior manifest's part verbatim), so it must hydrate regardless.
+    #[test]
+    fn apply_m8_skip_hydrates_rotation_siblings_without_a_chunk_task() {
+        let run_id = "m8rot";
+        let dir = tempfile::tempdir().unwrap();
+
+        // One chunk rotated into two siblings; BOTH still present at the dest
+        // (matching their manifest size) → both are Skip decisions.
+        std::fs::write(dir.path().join("chunk0-p0.parquet"), b"AAAAA").unwrap(); // 5
+        std::fs::write(dir.path().join("chunk0-p1.parquet"), b"BBBBBBB").unwrap(); // 7
+        let mut parts = vec![
+            m8_part("chunk0-p0.parquet", 30, 5),
+            m8_part("chunk0-p1.parquet", 20, 7),
+        ];
+        for (i, p) in parts.iter_mut().enumerate() {
+            p.part_id = (i + 1) as u32;
+        }
+        let manifest = m8_manifest(run_id, parts);
+        std::fs::write(
+            dir.path().join(MANIFEST_FILENAME),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        // ONE chunk_task for chunk 0, recording only the FIRST sibling's name —
+        // exactly how a real rotated chunk is logged.
+        let state_dir = tempfile::tempdir().unwrap();
+        let state =
+            crate::state::StateStore::open_at_path(&state_dir.path().join("state.db")).unwrap();
+        state.insert_chunk_tasks(run_id, &[(0, 50)]).unwrap();
+        state.claim_next_chunk_task(run_id).unwrap();
+        state
+            .complete_chunk_task(run_id, 0, 50, Some("chunk0-p0.parquet"))
+            .unwrap();
+
+        let plan = m8_plan(dir.path());
+        let mut summary =
+            crate::pipeline::summary::RunSummary::stub_for_testing(run_id, String::from("orders"));
+
+        let stats = apply_m8_resume_decisions(&state, run_id, &plan, &mut summary).unwrap();
+
+        assert_eq!(stats.skipped, 2, "BOTH siblings are intact → both skipped");
+        assert_eq!(
+            stats.orphan_parts, 0,
+            "a rotation sibling is NOT an orphan just because chunk_task holds one name"
+        );
+        let mut paths: Vec<&str> = summary
+            .manifest_parts
+            .iter()
+            .map(|p| p.path.as_str())
+            .collect();
+        paths.sort_unstable();
+        assert_eq!(
+            paths,
+            vec!["chunk0-p0.parquet", "chunk0-p1.parquet"],
+            "both siblings must hydrate into the resume manifest — else load drops the second's rows"
+        );
+        assert_eq!(
+            summary.manifest_parts.iter().map(|p| p.rows).sum::<i64>(),
+            50,
+            "all 50 rows across both siblings are carried into the finalize manifest"
+        );
     }
 
     // RED before the file_log guard in step 6: a part durably committed by a
