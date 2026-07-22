@@ -4,12 +4,34 @@
 
 ## 0.21.1 — 2026-07-22
 
-A security- and durability-hardening release: six adversarial audit rounds over the
-OSS surface (find → RED-prove → drift-guard) closed ~35 real issues, several of them
-silent data-loss, credential-leak, injection, or process-abort-DoS classes invisible
-to the green test suite.
+A security- and durability-hardening release: seven adversarial audit rounds over the
+OSS surface (find → RED-prove → drift-guard), plus a full live re-validation (3097 tests,
+all four engines × local/S3/GCS/Azure, DuckDB/ClickHouse/BigQuery type oracles), closed
+~40 real issues — several of them silent data-loss, credential-leak, injection, or
+process-abort-DoS classes invisible to the green test suite and the three type oracles.
 
 ### Fixed
+
+- **Silent-loss (`rivet repair`):** repair rewrote only the canonical `manifest.json`,
+  leaving the immutable run-unique `manifest-<run_id>.json` sidecar — the copy the
+  manifest-authoritative `rivet load` actually reads — stale, so the repaired parts were
+  silently never loaded (and the source then cleaned up). Repair now routes through the
+  shared manifest writer, updating the canonical file, the run-unique copy, and the
+  `_SUCCESS` fingerprint together.
+- **Silent-loss (CSV, pre-1970 timestamps):** a microsecond timestamp before the epoch
+  with a sub-second fraction rendered as an EMPTY cell (a signed-remainder wrap made
+  `from_timestamp` reject it) while Parquet kept the value; fixed with Euclidean division.
+- **Silent-loss (chunked resume):** the M8 resume preamble quarantine-MOVED a part that a
+  prior resume had durably committed (a `file_log` row) but that the stale destination
+  manifest omitted — dropping the exact rows finalize rehydrates. It now consults the
+  state DB (the source of truth) and never quarantines a file_log-recorded part.
+- **Silent-loss (warehouse load, shared prefix):** the load summed EVERY manifest under
+  its prefix and cleanup wiped the prefix recursively, so two exports sharing a base
+  prefix cross-contaminated the row count and could delete a sibling export's un-loaded
+  parts; the load now refuses a prefix holding more than one export loudly.
+- **CSV header** column names are now RFC-4180 quoted like data cells — a curated-query
+  alias containing a comma/quote (`AS "Amount, USD"`) no longer splits the header and
+  mis-aligns every downstream reader.
 
 - **Silent-loss: the destination manifest is now COMPLETE after a crash+resume on
   every export path.** The manifest-authoritative `rivet load` loads only the parts a

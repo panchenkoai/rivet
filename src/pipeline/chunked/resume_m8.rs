@@ -393,7 +393,29 @@ pub(crate) fn apply_m8_resume_decisions(
     // a prior resume that wrote with a different timestamp.  Best-effort
     // move to `_quarantine/<run_id>/<original-name>` — never fatal,
     // never deletes (M9 §"never deletes unknown objects").
+    //
+    // BUT the destination manifest can LAG the state DB: a resume that
+    // committed parts (a `file_log` row + a `completed` chunk_task each) then
+    // crashed before re-finalizing leaves those parts ABSENT from the stale
+    // manifest yet DURABLY committed. The manifest-vs-listing reconcile flags
+    // them as untracked surplus — quarantining (MOVING) them would drop the exact
+    // rows finalize is about to rehydrate from file_log (silent loss AND destroyed
+    // at-least-once recoverability, since a move is not a delete but the part is
+    // gone from its recorded path). The state DB is the export's source of truth
+    // (ADR-0001), so exclude any object file_log records as a committed part for
+    // this run before quarantining. This only ever PREVENTS an erroneous move; a
+    // truly-surplus object has no file_log row and is still quarantined.
+    let committed_parts: std::collections::HashSet<String> = state
+        .list_files_for_run(run_id)?
+        .into_iter()
+        .map(|f| f.file_name)
+        .collect();
+    let mut untracked_surplus = 0usize;
     for key in resume_plan.untracked.keys() {
+        if committed_parts.contains(key.as_str()) {
+            continue; // durably committed per file_log — not surplus, do not move
+        }
+        untracked_surplus += 1;
         quarantine_move(&*dest, key, run_id, &plan.export_name, &mut stats);
     }
 
@@ -409,7 +431,7 @@ pub(crate) fn apply_m8_resume_decisions(
         stats.quarantined_moved,
         stats.quarantine_move_failures,
         stats.orphan_parts,
-        resume_plan.untracked.len(),
+        untracked_surplus,
     );
 
     Ok(stats)
@@ -733,6 +755,80 @@ mod tests {
         assert_eq!(status_of(0), "completed");
         assert_eq!(status_of(1), "pending", "rewrite resets the task");
         assert_eq!(status_of(2), "pending", "quarantine resets the task");
+    }
+
+    // RED before the file_log guard in step 6: a part durably committed by a
+    // prior resume (a file_log row) but ABSENT from the stale destination
+    // manifest was classified untracked surplus and quarantine-MOVED — dropping
+    // the exact rows finalize rehydrates from file_log (silent loss). The guard
+    // must skip any untracked object file_log records for the run.
+    #[test]
+    fn m8_does_not_quarantine_a_part_recorded_in_the_state_file_log() {
+        let run_id = "m8run";
+        let dir = tempfile::tempdir().unwrap();
+
+        // Manifest tracks only part-a. part-x is on disk + in file_log but NOT in
+        // the manifest — a resume committed it, then crashed before re-finalize.
+        std::fs::write(dir.path().join("part-a.parquet"), b"AAAAA").unwrap(); // 5
+        std::fs::write(dir.path().join("part-x.parquet"), b"XXXXXXX").unwrap(); // 7
+        let mut parts = vec![m8_part("part-a.parquet", 10, 5)];
+        parts[0].part_id = 1;
+        let manifest = m8_manifest(run_id, parts);
+        std::fs::write(
+            dir.path().join(MANIFEST_FILENAME),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let state_dir = tempfile::tempdir().unwrap();
+        let state =
+            crate::state::StateStore::open_at_path(&state_dir.path().join("state.db")).unwrap();
+        state.insert_chunk_tasks(run_id, &[(0, 10)]).unwrap();
+        state.claim_next_chunk_task(run_id).unwrap();
+        state
+            .complete_chunk_task(run_id, 0, 10, Some("part-a.parquet"))
+            .unwrap();
+        // file_log records BOTH committed parts — including part-x, which the
+        // stale manifest omits (the crash-before-finalize case).
+        state
+            .record_file(
+                run_id,
+                "orders",
+                "part-a.parquet",
+                10,
+                5,
+                "parquet",
+                Some("zstd"),
+            )
+            .unwrap();
+        state
+            .record_file(
+                run_id,
+                "orders",
+                "part-x.parquet",
+                10,
+                7,
+                "parquet",
+                Some("zstd"),
+            )
+            .unwrap();
+
+        let plan = m8_plan(dir.path());
+        let mut summary =
+            crate::pipeline::summary::RunSummary::stub_for_testing(run_id, String::from("orders"));
+        apply_m8_resume_decisions(&state, run_id, &plan, &mut summary).unwrap();
+
+        // part-x is committed per file_log → left in place, NOT quarantined.
+        assert!(
+            dir.path().join("part-x.parquet").exists(),
+            "a file_log-committed part must stay at its path"
+        );
+        assert!(
+            !dir.path()
+                .join(format!("{QUARANTINE_PREFIX}/{run_id}/part-x.parquet"))
+                .exists(),
+            "a file_log-committed part must NOT be moved to _quarantine (that would be silent loss)"
+        );
     }
 
     /// The fingerprint hydration guard is `summary is None AND manifest is not

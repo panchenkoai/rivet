@@ -300,6 +300,37 @@ fn is_run_unique_manifest(base: &str) -> bool {
     base.starts_with("manifest-") && base.ends_with(".json")
 }
 
+/// Refuse a load whose prefix holds MORE THAN ONE export's manifests. The load
+/// sums EVERY manifest under `gcs_prefix` (fetched recursively) and cleanup
+/// removes the prefix recursively, so a shared base prefix — two `partition_by`
+/// exports whose prefix-before-`{partition}` coincides — would silently cross-
+/// contaminate the reconciled row count AND delete the sibling export's un-loaded
+/// parts. The `LoadPlan` carries no source `export_name` to disambiguate which
+/// export the operator meant, so fail LOUDLY rather than load-and-delete the
+/// wrong data. Legacy manifests with no recorded `export_name` (pre-0.x) are
+/// tolerated — an empty name matches any single named export, so a prefix that
+/// mixes old and new runs of the SAME export still loads.
+pub fn ensure_single_export(keyed: &[(String, RunManifest)]) -> Result<()> {
+    let mut names: std::collections::BTreeSet<&str> = keyed
+        .iter()
+        .map(|(_, m)| m.export_name.as_str())
+        .filter(|n| !n.is_empty())
+        .collect();
+    if names.len() > 1 {
+        let listed: Vec<&str> = std::mem::take(&mut names).into_iter().collect();
+        bail!(
+            "the load prefix holds manifests from {} distinct exports ({}) — the load sums every \
+             manifest under the prefix and cleanup wipes it recursively, so loading a shared \
+             prefix would cross-contaminate the row count and could delete a sibling export's \
+             parts. Give each export a DISTINCT destination prefix (or scope the load prefix to a \
+             single export) and re-run.",
+            listed.len(),
+            listed.join(", ")
+        );
+    }
+    Ok(())
+}
+
 /// Reconcile a run's manifests into the authoritative expected warehouse row
 /// count, refusing to load anything that is not provably complete.
 ///
@@ -462,6 +493,24 @@ mod tests {
         assert_eq!(got.file_rows, 140);
         assert_eq!(got.source_rows, Some(140));
         assert_eq!(got.manifests, 2);
+    }
+
+    #[test]
+    fn ensure_single_export_refuses_a_prefix_shared_by_two_exports() {
+        let keyed = |m: RunManifest| ("gs://b/p/manifest-x.json".to_string(), m);
+        let orders = keyed(manifest("r1", 10, None)); // export_name "orders"
+        let mut cust_m = manifest("r2", 10, None);
+        cust_m.export_name = "customers".into();
+        // Two DISTINCT exports under one load prefix → loud refusal (else the load
+        // sums both and cleanup deletes the sibling's parts).
+        assert!(ensure_single_export(&[orders.clone(), keyed(cust_m)]).is_err());
+        // Many runs of ONE export → fine.
+        assert!(ensure_single_export(&[orders.clone(), keyed(manifest("r3", 5, None))]).is_ok());
+        // A legacy (no export_name) run mixed with the SAME named export → still
+        // one logical export, tolerated (an upgrade mid-prefix must not brick load).
+        let mut legacy = manifest("r0", 3, None);
+        legacy.export_name = String::new();
+        assert!(ensure_single_export(&[orders, keyed(legacy)]).is_ok());
     }
 
     #[test]
