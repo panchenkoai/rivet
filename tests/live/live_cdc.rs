@@ -968,6 +968,128 @@ exports:
     );
 }
 
+// Unchanged-TOAST corruption (graph-surfaced), end to end. An UPDATE that leaves
+// an externally-stored TOAST column untouched renders it as the unquoted
+// `unchanged-toast-datum` marker in the new tuple — the value is NOT in the WAL.
+// With REPLICA IDENTITY FULL the real value rides the `old-key` pre-image; rivet
+// must recover it by NAME and NEVER write the literal marker string as data
+// (the same silent-corruption class as the uuid→null loss caught live on GCS).
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical)"]
+fn pg_cdc_unchanged_toast_recovers_from_replica_identity_full() {
+    use postgres::NoTls;
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("cdc_toast_full");
+    let slot = unique_name("rivet_toast_full_slot");
+    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
+    // EXTERNAL storage forces out-of-line TOAST (no compression); FULL puts the
+    // pre-image value in `old-key`, so the unchanged column is recoverable.
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {tbl}; \
+         CREATE TABLE {tbl} (id INT PRIMARY KEY, small TEXT, big TEXT); \
+         ALTER TABLE {tbl} ALTER COLUMN big SET STORAGE EXTERNAL; \
+         ALTER TABLE {tbl} REPLICA IDENTITY FULL;"
+    ))
+    .unwrap();
+    c.execute(
+        "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+        &[&slot],
+    )
+    .unwrap();
+    // Incompressible >2KB value → genuine external TOAST; then touch only `small`
+    // so `big` decodes as the unchanged-toast marker in the new tuple.
+    c.batch_execute(&format!(
+        "INSERT INTO {tbl} (id, small, big) VALUES \
+           (1, 'a', (SELECT string_agg(md5(g::text || random()::text), '') \
+                     FROM generate_series(1, 200) g)); \
+         UPDATE {tbl} SET small = 'b' WHERE id = 1;"
+    ))
+    .unwrap();
+    let real: String = c
+        .query_one(&format!("SELECT big FROM {tbl} WHERE id = 1"), &[])
+        .unwrap()
+        .get(0);
+
+    let out = d.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let batches = Rig::pg_cdc(&tbl, &slot).dest_path(out).run_and_read();
+
+    use arrow::array::{Array, StringArray};
+    let mut bigs = Vec::new();
+    for b in &batches {
+        let idx = b.schema().index_of("big").expect("big column present");
+        let arr = b
+            .column(idx)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("big is a string column");
+        for i in 0..arr.len() {
+            if !arr.is_null(i) {
+                bigs.push(arr.value(i).to_string());
+            }
+        }
+    }
+    assert!(
+        !bigs.iter().any(|v| v == "unchanged-toast-datum"),
+        "the literal TOAST marker must NEVER be written as data; got {bigs:?}"
+    );
+    assert!(
+        bigs.iter().filter(|v| **v == real).count() >= 2,
+        "both the INSERT and the recovered UPDATE row must carry the real value"
+    );
+
+    let _ = c.execute(&format!("SELECT pg_drop_replication_slot('{slot}')"), &[]);
+    let _ = c.batch_execute(&format!("DROP TABLE IF EXISTS {tbl}"));
+}
+
+// The DEFAULT replica-identity case: the pre-image carries only the key, so the
+// unchanged externally-stored value is nowhere in the WAL. rivet must fail LOUD
+// (never fabricate the marker as data) and name the upstream fix, not silently
+// corrupt or null the column.
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical)"]
+fn pg_cdc_unchanged_toast_without_full_identity_fails_loud() {
+    use postgres::NoTls;
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("cdc_toast_default");
+    let slot = unique_name("rivet_toast_default_slot");
+    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
+    // EXTERNAL storage but DEFAULT replica identity (PK only) — no pre-image value.
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {tbl}; \
+         CREATE TABLE {tbl} (id INT PRIMARY KEY, small TEXT, big TEXT); \
+         ALTER TABLE {tbl} ALTER COLUMN big SET STORAGE EXTERNAL;"
+    ))
+    .unwrap();
+    c.execute(
+        "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+        &[&slot],
+    )
+    .unwrap();
+    c.batch_execute(&format!(
+        "INSERT INTO {tbl} (id, small, big) VALUES \
+           (1, 'a', (SELECT string_agg(md5(g::text || random()::text), '') \
+                     FROM generate_series(1, 200) g)); \
+         UPDATE {tbl} SET small = 'b' WHERE id = 1;"
+    ))
+    .unwrap();
+
+    let out = d.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let err = Rig::pg_cdc(&tbl, &slot).dest_path(out).run_expect_fail();
+    assert!(
+        err.contains("unchanged-TOAST"),
+        "must fail loud on an unrecoverable TOAST datum; got: {err}"
+    );
+    assert!(
+        err.contains("REPLICA IDENTITY FULL"),
+        "must name the upstream fix; got: {err}"
+    );
+
+    let _ = c.execute(&format!("SELECT pg_drop_replication_slot('{slot}')"), &[]);
+    let _ = c.batch_execute(&format!("DROP TABLE IF EXISTS {tbl}"));
+}
+
 #[test]
 #[ignore = "live: requires docker compose postgres (wal_level=logical)"]
 fn pg_cdc_non_iso_datestyle_and_escape_bytea_match_batch() {

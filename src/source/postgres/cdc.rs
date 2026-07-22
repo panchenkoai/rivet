@@ -254,7 +254,7 @@ impl PgChangeStream {
             } else if data.starts_with("BEGIN") {
                 tx.clear();
                 tx_bytes = 0;
-            } else if let Some(ev) = parse_test_decoding(&lsn, &data) {
+            } else if let Some(ev) = parse_test_decoding(&lsn, &data)? {
                 tx_bytes = tx_bytes.saturating_add(ev.estimated_bytes());
                 tx.push(ev);
                 // Memory backstop, matching the MySQL adapter's MAX_TX_ROWS: a
@@ -440,8 +440,10 @@ impl ChangeStream for PgChangeStream {
 /// `BEGIN`/`COMMIT` transaction markers and anything unrecognised. The line shape
 /// is `table <schema>.<table>: <OP>: <columns…>`; pre-images / typed before-after
 /// are deferred.
-pub(crate) fn parse_test_decoding(lsn: &str, data: &str) -> Option<ChangeEvent> {
-    let (qual, tail) = data.strip_prefix("table ")?.split_once(": ")?;
+pub(crate) fn parse_test_decoding(lsn: &str, data: &str) -> Result<Option<ChangeEvent>> {
+    let Some((qual, tail)) = data.strip_prefix("table ").and_then(|s| s.split_once(": ")) else {
+        return Ok(None);
+    };
     let (schema, table) = match qual.split_once('.') {
         Some((s, t)) => (s.to_string(), t.to_string()),
         None => (String::new(), qual.to_string()),
@@ -453,7 +455,7 @@ pub(crate) fn parse_test_decoding(lsn: &str, data: &str) -> Option<ChangeEvent> 
     } else if tail.starts_with("DELETE") {
         ChangeOp::Delete
     } else {
-        return None;
+        return Ok(None);
     };
     // After `<OP>: ` comes the `col[type]:value …` list (all columns for
     // INSERT/UPDATE; the key for DELETE).
@@ -470,10 +472,31 @@ pub(crate) fn parse_test_decoding(lsn: &str, data: &str) -> Option<ChangeEvent> 
         },
         None => (None, body),
     };
-    let named = parse_columns(new_part);
+    let mut named = parse_columns(new_part);
     let old_named = old_key_part.map(parse_columns);
-    let names: std::sync::Arc<[String]> = named.iter().map(|(n, _)| n.clone()).collect();
-    let cols: Vec<RivetValue> = named.into_iter().map(|(_, v)| v).collect();
+
+    // An UPDATE that leaves an externally-stored TOAST column untouched renders
+    // that column as `col[type]:unchanged-toast-datum` in the NEW tuple — the
+    // value itself is NOT in the WAL (logical decoding never re-logs an
+    // unchanged out-of-line datum). REPLICA IDENTITY FULL puts the real value in
+    // the pre-image (`old-key`), so recover it by name; otherwise the value is
+    // genuinely unavailable and we must NOT write the literal marker as data
+    // (silent corruption — same class as the uuid→null loss caught live on GCS).
+    let unrecovered = recover_unchanged_toast(&mut named, old_named.as_deref());
+    if !unrecovered.is_empty() {
+        anyhow::bail!(
+            "pg cdc: {schema}.{table}: column(s) [{}] arrived as an unchanged-TOAST \
+             datum with no pre-image value — logical decoding does not re-log an \
+             externally stored value that an UPDATE leaves unchanged, so rivet cannot \
+             recover it and refuses to write the literal `unchanged-toast-datum` marker \
+             as data. Capture the full pre-image so the value is preserved: \
+             ALTER TABLE {schema}.{table} REPLICA IDENTITY FULL;",
+            unrecovered.join(", ")
+        );
+    }
+
+    let names: std::sync::Arc<[String]> = named.iter().map(|c| c.name.clone()).collect();
+    let cols: Vec<RivetValue> = named.into_iter().map(|c| c.value).collect();
     // The wire text names EVERY column — carry the names for every op, so
     // the sink maps by NAME and the whole positional-corruption class
     // (findings #37/#41/#42) is unrepresentable on PostgreSQL.
@@ -482,13 +505,13 @@ pub(crate) fn parse_test_decoding(lsn: &str, data: &str) -> Option<ChangeEvent> 
         // A PK-changing UPDATE carries its old key too; the after-image is
         // the new tuple (its names). The old key rides `before`.
         ChangeOp::Update => (
-            old_named.map(|o| o.into_iter().map(|(_, v)| v).collect()),
+            old_named.map(|o| o.into_iter().map(|c| c.value).collect()),
             Some(cols),
             Some(names),
         ),
         ChangeOp::Insert => (None, Some(cols), Some(names)),
     };
-    Some(ChangeEvent {
+    Ok(Some(ChangeEvent {
         op,
         schema,
         table,
@@ -502,13 +525,23 @@ pub(crate) fn parse_test_decoding(lsn: &str, data: &str) -> Option<ChangeEvent> 
         // would not trigger a premature roll.
         committed: false,
         seq: 0, // stamped by TxnSeq as the stream is consumed
-    })
+    }))
 }
 
 /// Parse a `test_decoding` column list (`name[type]:value name[type]:value …`)
 /// into typed [`RivetValue`]s, in column order. Values are quoted with `''`
 /// escaping or unquoted (numbers / `t`/`f` / `null`).
-fn parse_columns(s: &str) -> Vec<(String, RivetValue)> {
+/// One parsed `test_decoding` column: name, typed value, and whether the wire
+/// form was the unquoted `unchanged-toast-datum` sentinel. That sentinel is an
+/// externally-stored TOAST value an UPDATE left untouched — the NEW-tuple image
+/// carries only the marker, never the value (see [`recover_unchanged_toast`]).
+struct ParsedColumn {
+    name: String,
+    value: RivetValue,
+    toast_unchanged: bool,
+}
+
+fn parse_columns(s: &str) -> Vec<ParsedColumn> {
     let mut out = Vec::new();
     let mut rest = s.trim_start();
     while !rest.is_empty() {
@@ -522,10 +555,49 @@ fn parse_columns(s: &str) -> Vec<(String, RivetValue)> {
         let typ = &rest[lb + 1..lb + rel];
         let after_colon = &rest[lb + rel + 2..];
         let (val, quoted, consumed) = parse_value(after_colon);
-        out.push((name, map_pg_value(typ, &val, quoted)));
+        // The sentinel is ALWAYS unquoted; a genuine text value equal to the
+        // marker arrives quoted (`'unchanged-toast-datum'`), so the quoted flag
+        // disambiguates — no false positive on real data.
+        let toast_unchanged = !quoted && val == "unchanged-toast-datum";
+        out.push(ParsedColumn {
+            name,
+            value: map_pg_value(typ, &val, quoted),
+            toast_unchanged,
+        });
         rest = after_colon[consumed..].trim_start();
     }
     out
+}
+
+/// Substitute each NEW-tuple `unchanged-toast-datum` column with the real value
+/// from the pre-image (`before`, present under REPLICA IDENTITY FULL), matched
+/// by column NAME. Returns the names of columns still unavailable — the DEFAULT
+/// replica-identity case, where the pre-image carries only the key so the value
+/// is not in the WAL at all and the caller must fail loud (never fabricate).
+/// Pure; unit-tested.
+fn recover_unchanged_toast(
+    after: &mut [ParsedColumn],
+    before: Option<&[ParsedColumn]>,
+) -> Vec<String> {
+    let mut unrecovered = Vec::new();
+    for col in after.iter_mut() {
+        if !col.toast_unchanged {
+            continue;
+        }
+        let recovered = before.and_then(|b| {
+            b.iter()
+                .find(|pre| pre.name == col.name && !pre.toast_unchanged)
+                .map(|pre| pre.value.clone())
+        });
+        match recovered {
+            Some(v) => {
+                col.value = v;
+                col.toast_unchanged = false;
+            }
+            None => unrecovered.push(col.name.clone()),
+        }
+    }
+    unrecovered
 }
 
 /// Parse one value at the start of `s`. Returns `(value, quoted, bytes_consumed)`.
@@ -1007,7 +1079,7 @@ mod tests {
     fn pk_changing_update_splits_old_key_from_new_tuple() {
         let line = "table public.t: UPDATE: old-key: id[integer]:1 \
                     new-tuple: id[integer]:2 v[text]:'a'";
-        let ev = parse_test_decoding("0/ABC", line).unwrap();
+        let ev = parse_test_decoding("0/ABC", line).unwrap().unwrap();
         assert_eq!(
             ev.after,
             Some(vec![RivetValue::Int(2), RivetValue::Bytes(b"a".to_vec())]),
@@ -1020,6 +1092,7 @@ mod tests {
         );
         // A normal (non-PK) update stays a plain after-image.
         let ev = parse_test_decoding("0/ABC", "table public.t: UPDATE: id[integer]:1 v[text]:'b'")
+            .unwrap()
             .unwrap();
         assert_eq!(
             ev.after,
@@ -1074,7 +1147,7 @@ mod tests {
                     iv2[interval]:'-1 years' \
                     iv3[interval]:'00:00:00' \
                     iv4[interval]:'3 days 04:05:06.789'";
-        let ev = parse_test_decoding("0/ABC", line).unwrap();
+        let ev = parse_test_decoding("0/ABC", line).unwrap().unwrap();
         let after = ev.after.unwrap();
         assert_eq!(
             after[0],
@@ -1099,7 +1172,7 @@ mod tests {
         let line = "table public.t: INSERT: \
                     u[uuid]:'0b0e0af9-27ec-4c33-b428-a01b27fdd576' \
                     b[bytea]:'\\x48656c6c6f'";
-        let ev = parse_test_decoding("0/ABC", line).unwrap();
+        let ev = parse_test_decoding("0/ABC", line).unwrap().unwrap();
         let after = ev.after.unwrap();
         let RivetValue::Bytes(u) = &after[0] else {
             panic!("uuid must be Bytes, got {:?}", after[0]);
@@ -1130,7 +1203,7 @@ mod tests {
                     tags[text[]]:'{alpha,\"with,comma\",\"he said \\\"hi\\\"\",NULL}' \
                     nums[integer[]]:'{1,NULL,3}' \
                     empty[text[]]:'{}'";
-        let ev = parse_test_decoding("0/ABC", line).unwrap();
+        let ev = parse_test_decoding("0/ABC", line).unwrap().unwrap();
         let after = ev.after.unwrap();
         assert_eq!(
             after[0],
@@ -1157,7 +1230,7 @@ mod tests {
         let line = "table public.t: INSERT: id[integer]:1 name[text]:'alice o''brien' \
                     amount[numeric]:150.05 ts[timestamp without time zone]:'2026-06-23 11:58:01' \
                     flag[boolean]:t maybe[integer]:null";
-        let ev = parse_test_decoding("0/ABC", line).unwrap();
+        let ev = parse_test_decoding("0/ABC", line).unwrap().unwrap();
         assert_eq!(ev.op, ChangeOp::Insert);
         assert_eq!(ev.table, "t");
         let after = ev.after.unwrap();
@@ -1167,6 +1240,57 @@ mod tests {
         assert!(matches!(after[3], RivetValue::DateTime(_)));
         assert_eq!(after[4], RivetValue::Bool(true));
         assert_eq!(after[5], RivetValue::Null);
+    }
+
+    // RED for the unchanged-TOAST corruption: an UPDATE that leaves an
+    // externally-stored TOAST column untouched renders it as the unquoted
+    // `unchanged-toast-datum` marker in the new tuple. The old parser wrote that
+    // literal string into the column (silent corruption). With REPLICA IDENTITY
+    // FULL the real value rides the `old-key` pre-image — recover it by NAME.
+    // (Wire format proven live: see `docs`/CLAUDE.md; the pre-image carries the
+    // real value under FULL, only the marker under DEFAULT.)
+    #[test]
+    fn unchanged_toast_recovers_from_full_pre_image() {
+        let line = "table public.t: UPDATE: \
+                    old-key: id[integer]:1 small[text]:'a' big[text]:'REAL-VALUE' \
+                    new-tuple: id[integer]:1 small[text]:'b' big[text]:unchanged-toast-datum";
+        let ev = parse_test_decoding("0/ABC", line).unwrap().unwrap();
+        let after = ev.after.unwrap();
+        // The after-image's `big` must be the recovered pre-image value, NOT the
+        // literal marker text.
+        assert_eq!(after[2], RivetValue::Bytes(b"REAL-VALUE".to_vec()));
+        assert_eq!(after[1], RivetValue::Bytes(b"b".to_vec()));
+    }
+
+    // The DEFAULT replica-identity case: no pre-image value for the toasted
+    // column exists anywhere in the WAL, so the parser MUST fail loud (never
+    // fabricate the marker as data) and name the upstream fix.
+    #[test]
+    fn unchanged_toast_without_pre_image_is_refused() {
+        let line = "table public.t: UPDATE: \
+                    id[integer]:1 small[text]:'b' big[text]:unchanged-toast-datum";
+        let err = parse_test_decoding("0/ABC", line).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("unchanged-TOAST"), "got: {msg}");
+        assert!(msg.contains("big"), "must name the column, got: {msg}");
+        assert!(
+            msg.contains("REPLICA IDENTITY FULL"),
+            "must name the upstream fix, got: {msg}"
+        );
+    }
+
+    // A genuine text value that happens to equal the marker is QUOTED on the
+    // wire, so it must survive verbatim — the quoted flag disambiguates the
+    // sentinel from real data (no false-positive corruption/refusal).
+    #[test]
+    fn quoted_marker_text_is_real_data_not_the_sentinel() {
+        let line = "table public.t: INSERT: id[integer]:1 note[text]:'unchanged-toast-datum'";
+        let ev = parse_test_decoding("0/ABC", line).unwrap().unwrap();
+        let after = ev.after.unwrap();
+        assert_eq!(
+            after[1],
+            RivetValue::Bytes(b"unchanged-toast-datum".to_vec())
+        );
     }
 
     #[test]
