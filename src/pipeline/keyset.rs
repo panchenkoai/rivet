@@ -144,6 +144,28 @@ pub(crate) fn run_keyset(
     } else {
         None
     };
+
+    // Round-5 (keyset checkpoint-resume manifest completeness — the sibling of the
+    // chunked fix): a crash mid-keyset leaves pages durably committed (parquet +
+    // file_log) with NO destination manifest; on resume the page loop continues from
+    // the cursor and skips them, so finalize would write a manifest of ONLY this
+    // run's pages, orphaning the pre-crash pages from the manifest-authoritative
+    // loader. export_state now persists the in-progress run_id: REUSE it across
+    // resumes so every page lives under ONE run_id in file_log, and reconstruct the
+    // already-committed pages into this run's manifest. Cleared by the caller once
+    // finalize writes the complete manifest.
+    if kp.checkpoint
+        && let Some(st) = state
+    {
+        match st.get_resume_run_id(&plan.export_name)? {
+            Some(rid) => {
+                summary.run_id = rid.clone();
+                super::chunked::rehydrate_manifest_parts_from_file_log(st, &rid, summary)?;
+            }
+            None => st.set_resume_run_id(&plan.export_name, &summary.run_id)?,
+        }
+    }
+
     let mut pages: usize = 0;
 
     // Destination + manifest-mode guard (Finding #44) + run-unique part stamp are
@@ -200,6 +222,10 @@ pub(crate) fn run_keyset(
         {
             st.update(&plan.export_name, v)?;
         }
+        // Fault point: page durably committed (parts + file_log + cursor advanced),
+        // NO destination manifest yet — a crash here must be resume-recoverable
+        // MANIFEST-DRIVEN (round-5): the resume rehydrates this page from file_log.
+        crate::test_hook::maybe_panic_at(&format!("after_keyset_page:{pages}"));
         log::info!(
             "export '{}': keyset page {} — {} rows",
             plan.export_name,

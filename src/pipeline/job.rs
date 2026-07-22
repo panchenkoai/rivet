@@ -580,6 +580,14 @@ pub(super) fn run_export_job(
             e
         );
     }
+    // Round-5: a keyset checkpoint run has now finalized its COMPLETE destination
+    // manifest — clear the in-progress run_id (persisted for crash rehydration) so a
+    // later run isn't treated as a resume of this finished one. Clearing AFTER the
+    // manifest write is the same ordering as the cursor advance: a crash before here
+    // leaves resume_run_id set, so the next run rehydrates rather than orphans.
+    if !failed && matches!(plan.strategy, ExtractionStrategy::Keyset(_)) {
+        let _ = state.clear_resume_run_id(&summary.export_name);
+    }
     if plan.validate {
         finalize_validate_manifest(&plan, &mut summary, "export");
     }

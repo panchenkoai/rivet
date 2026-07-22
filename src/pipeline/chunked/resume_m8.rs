@@ -122,7 +122,7 @@ pub struct M8Stats {
 /// parts are DECLARED + size-verified (an empty md5 degrades validate to a size-only
 /// check) though not content-re-verified — strictly better than a silent orphan.
 /// Returns the number of parts reconstructed.
-fn rehydrate_manifest_parts_from_completed_chunks(
+pub(crate) fn rehydrate_manifest_parts_from_file_log(
     state: &StateStore,
     run_id: &str,
     summary: &mut RunSummary,
@@ -238,7 +238,7 @@ pub(crate) fn apply_m8_resume_decisions(
             // the pre-crash chunks' durable parts from the manifest-authoritative
             // loader (silent row loss). A "fresh prefix" (no completed chunks) rehydr-
             // ates nothing, so this is safe for the legacy/fresh case too.
-            rehydrate_manifest_parts_from_completed_chunks(state, run_id, summary)?;
+            rehydrate_manifest_parts_from_file_log(state, run_id, summary)?;
             return Ok(M8Stats::default());
         }
         Err(e) => {
@@ -596,8 +596,7 @@ mod tests {
             crate::pipeline::summary::RunSummary::stub_for_testing(run_id, String::from("orders"));
         let rows_before = summary.total_rows;
 
-        let n =
-            rehydrate_manifest_parts_from_completed_chunks(&state, run_id, &mut summary).unwrap();
+        let n = rehydrate_manifest_parts_from_file_log(&state, run_id, &mut summary).unwrap();
 
         assert_eq!(
             n, 2,

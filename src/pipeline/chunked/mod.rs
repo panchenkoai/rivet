@@ -38,6 +38,7 @@ pub(crate) use math::{
 };
 pub(crate) use parallel_checkpoint::run_chunked_parallel_checkpoint;
 pub(crate) use resume_m8::apply_m8_resume_decisions;
+pub(crate) use resume_m8::rehydrate_manifest_parts_from_file_log;
 // `M8Stats` is intentionally not re-exported yet — Phase C-γ keeps it
 // internal until Phase C-δ surfaces it via summary.json.  Listed here
 // in a `#[cfg(test)]` re-export so unit tests in `tests/*` can pin

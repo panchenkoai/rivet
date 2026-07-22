@@ -309,6 +309,15 @@ const MIGRATIONS: &[(i64, &str)] = &[
          CREATE UNIQUE INDEX IF NOT EXISTS idx_chunk_run_one_inprogress
              ON chunk_run(export_name) WHERE status='in_progress';",
     ),
+    // v16: keyset checkpoint-resume manifest completeness (round-5). export_state
+    // holds only the resume cursor, so a keyset crash+resume couldn't reconstruct the
+    // pre-crash pages into the finalize manifest (silent orphan, the sibling of the
+    // chunked fix). Persist the in-progress run_id here so resume can reuse it and
+    // rehydrate every committed page from file_log; cleared when the run finalizes.
+    (
+        16,
+        "ALTER TABLE export_state ADD COLUMN resume_run_id TEXT;",
+    ),
 ];
 
 /// PostgreSQL-compatible DDL.  Column types differ from SQLite (BIGSERIAL,
@@ -553,6 +562,15 @@ const PG_MIGRATIONS: &[(i64, &str)] = &[
              );
          CREATE UNIQUE INDEX IF NOT EXISTS idx_chunk_run_one_inprogress
              ON chunk_run(export_name) WHERE status='in_progress';",
+    ),
+    // v16: keyset checkpoint-resume manifest completeness (round-5). export_state
+    // holds only the resume cursor, so a keyset crash+resume couldn't reconstruct the
+    // pre-crash pages into the finalize manifest (silent orphan, the sibling of the
+    // chunked fix). Persist the in-progress run_id here so resume can reuse it and
+    // rehydrate every committed page from file_log; cleared when the run finalizes.
+    (
+        16,
+        "ALTER TABLE export_state ADD COLUMN resume_run_id TEXT;",
     ),
 ];
 

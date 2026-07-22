@@ -142,6 +142,81 @@ fn keyset_varchar_pk_roundtrips_full_keyset_across_pages() {
 /// re-read would inflate it to 2500. The union-of-keys alone cannot tell the two
 /// apart (a set dedups), so we assert the running row TOTAL, not just the keys —
 /// the exact "capture-works ≠ resume-works" trap the two-run test exists to close.
+/// Round-5: a keyset checkpoint crash before the terminal manifest leaves committed
+/// pages durably on the destination (parquet + file_log) but with NO manifest; the
+/// resume continues from the cursor and skips them, so finalize used to write a
+/// manifest of ONLY the resume's pages — orphaning the pre-crash pages from the
+/// manifest-authoritative loader (silent loss). This reads the DESTINATION
+/// manifest.json (not a parquet glob) and asserts it declares EVERY row. RED before
+/// the resume_run_id + file_log rehydration.
+#[test]
+#[ignore = "live: requires docker compose up -d mysql"]
+fn keyset_checkpoint_crash_resume_writes_a_complete_destination_manifest() {
+    require_alive(LiveService::Mysql);
+    let table = unique_name("keyset_m5");
+    let _guard = DropTable(table.clone());
+    let mut conn = mysql_connect();
+    conn.query_drop(format!("DROP TABLE IF EXISTS {table}"))
+        .unwrap();
+    conn.query_drop(format!(
+        "CREATE TABLE {table} (uid VARCHAR(40) NOT NULL PRIMARY KEY, payload INT NOT NULL)"
+    ))
+    .unwrap();
+    conn.query_drop("SET SESSION cte_max_recursion_depth = 20000")
+        .unwrap();
+    conn.query_drop(format!(
+        "INSERT INTO {table} (uid, payload) \
+         WITH RECURSIVE seq AS (SELECT 1 n UNION ALL SELECT n+1 FROM seq WHERE n < 1000) \
+         SELECT CONCAT('id-', LPAD(n, 6, '0')), n FROM seq"
+    ))
+    .unwrap();
+
+    let export = unique_name("keyset_m5_exp");
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let out_dir = tempfile::tempdir().unwrap();
+    let yaml = format!(
+        "source:\n  type: mysql\n  url: \"{MYSQL_URL}\"\nexports:\n  - name: {export}\n    \
+         table: {table}\n    mode: chunked\n    chunk_by_key: uid\n    chunk_checkpoint: true\n    \
+         chunk_size: 300\n    format: parquet\n    destination:\n      type: local\n      path: {out}\n",
+        out = out_dir.path().display(),
+    );
+    let cfg = write_config(&cfg_dir, &yaml);
+
+    // Crash after page 0 commits (300 rows durable, cursor advanced, no manifest).
+    let crash = std::process::Command::new(RIVET_BIN)
+        .args([
+            "run",
+            "--config",
+            cfg.to_str().unwrap(),
+            "--export",
+            &export,
+        ])
+        .env("RIVET_TEST_PANIC_AT", "after_keyset_page:0")
+        .output()
+        .expect("spawn rivet");
+    assert!(!crash.status.success(), "crash run must exit non-zero");
+
+    // Resume (keyset checkpoint auto-resumes from the cursor).
+    let resume = run_rivet_export(&cfg, &export);
+    assert!(
+        resume.status.success(),
+        "resume must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&resume.stderr)
+    );
+
+    // MANIFEST-DRIVEN: the destination manifest.json must declare all 1000 rows —
+    // page 0 (pre-crash) must be rehydrated, not orphaned.
+    let m: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(out_dir.path().join("manifest.json")).unwrap())
+            .expect("destination manifest.json must exist + parse");
+    assert_eq!(
+        m["row_count"].as_i64(),
+        Some(1000),
+        "destination manifest must declare every row (pre-crash page not orphaned); got {}",
+        m["row_count"]
+    );
+}
+
 #[test]
 #[ignore = "live: requires docker compose up -d mysql"]
 fn keyset_checkpoint_resume_second_run_captures_only_new_keys() {

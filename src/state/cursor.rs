@@ -72,6 +72,59 @@ impl StateStore {
         Ok(())
     }
 
+    /// Round-5 (keyset checkpoint-resume manifest completeness): persist the
+    /// in-progress keyset run_id beside the resume cursor, so a crash+resume reuses
+    /// it and reconstructs every committed page's manifest part from file_log. Set on
+    /// the first checkpointed run, read on resume, cleared when the run finalizes.
+    pub fn set_resume_run_id(&self, export_name: &str, run_id: &str) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let sql = "INSERT INTO export_state (export_name, resume_run_id, last_run_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(export_name) DO UPDATE SET resume_run_id = excluded.resume_run_id";
+        match &self.conn {
+            StateConn::Sqlite(c) => {
+                c.execute(sql, rusqlite::params![export_name, run_id, now])?;
+            }
+            StateConn::Postgres(client) => {
+                let mut c = client.borrow_mut();
+                c.execute(&pg_sql(sql), &[&export_name, &run_id, &now])?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The persisted in-progress keyset run_id, or None when no run is in progress.
+    pub fn get_resume_run_id(&self, export_name: &str) -> Result<Option<String>> {
+        let sql = "SELECT resume_run_id FROM export_state WHERE export_name = ?1";
+        match &self.conn {
+            StateConn::Sqlite(c) => {
+                let mut stmt = c.prepare(sql)?;
+                let mut rows = stmt.query_map([export_name], |r| r.get::<_, Option<String>>(0))?;
+                Ok(rows.next().transpose()?.flatten())
+            }
+            StateConn::Postgres(client) => {
+                let mut c = client.borrow_mut();
+                let rows = c.query(&pg_sql(sql), &[&export_name])?;
+                Ok(rows.first().and_then(|r| r.get::<_, Option<String>>(0)))
+            }
+        }
+    }
+
+    /// Clear the in-progress run_id once a keyset run has finalized its manifest.
+    pub fn clear_resume_run_id(&self, export_name: &str) -> Result<()> {
+        let sql = "UPDATE export_state SET resume_run_id = NULL WHERE export_name = ?1";
+        match &self.conn {
+            StateConn::Sqlite(c) => {
+                c.execute(sql, [export_name])?;
+            }
+            StateConn::Postgres(client) => {
+                let mut c = client.borrow_mut();
+                c.execute(&pg_sql(sql), &[&export_name])?;
+            }
+        }
+        Ok(())
+    }
+
     /// Return an export to a "never ran" state.
     ///
     /// Clears the incremental cursor (`export_state`) **and** the committed /
