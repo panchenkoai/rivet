@@ -1,0 +1,81 @@
+# Runner-coverage matrix — every PER-EXPORT feature must be applied on EVERY export
+# runner, not just the single-batch path. rivet has FOUR runners, and three of them
+# (chunked, keyset, mongo_parallel) own their own execution loop that RETURNS BEFORE
+# reaching run_single_export — so any gate/feature wired only into single is silently
+# absent on the headline large-table paths. Round-8 proved this class is real AND
+# recurring: `on_schema_drift: fail` returned exit 0 on keyset + parallel-Mongo
+# because the drift gate lived only in single/chunked (two HIGH-adjacent misses in
+# one round). Building this ledger then surfaced a bigger one — value-checksum Form B
+# is absent on ALL three large-table runners.
+#
+# Columns are the four RUNNERS. A cell is EXACTLY one of:
+#   test: <fn>  — the feature is applied on this runner AND a test proves it.
+#   na:   <why> — the feature genuinely does not apply to this runner (by design),
+#                 OR it is injected at a SHARED seam (the ExportSink) that no runner
+#                 can bypass, so there is no per-runner divergence to test.
+#   gap:  <why> — the feature is PER-RUNNER wired (a runner can forget it — some did)
+#                 and is either ABSENT here, or applied but has no test proving it.
+#
+# The gap/na split is principled: a feature applied by shared-seam construction
+# (meta_columns via ExportSink) is `na` (runner-agnostic, proven once); a feature
+# each runner must EXPLICITLY re-apply (schema_drift gate, checksum harvest, part
+# stamp) is `gap` when unproven — that is exactly the class that bites.
+
+engines: [single, chunked, keyset, mongo_parallel]
+
+scenarios:
+  - id: schema_drift_gate
+    what: "on_schema_drift enforcement — a drifted schema under `fail` aborts (exit 4). Each runner bypasses run_single_export, so each must re-apply the gate (check_from_sink_schema / check_from_type_mappings). Round-8: keyset + mongo_parallel had SILENTLY dropped it (exit 0 on drift)."
+    single:         { test: schema_drift_removed_column_is_detected }
+    chunked:        { gap: "the gate IS applied (check_from_type_mappings in prepare_chunk_plan) but no range-chunked integration test drives a drifted schema through it — only the runner-agnostic facade unit test + the single/keyset cells" }
+    keyset:         { test: keyset_export_enforces_on_schema_drift_fail }
+    mongo_parallel: { gap: "the gate IS applied (check_from_sink_schema, mongo_parallel.rs) after the round-8 fix, but no parallel-Mongo test drives a drifted schema to prove exit 4" }
+
+  - id: shape_drift_warn
+    what: "detect_shape_drift — advisory warning when a string/binary column's max byte length grows past the factor. Needs the run-wide per-column max-bytes aggregate."
+    single:         { test: growth_above_threshold_warns }
+    chunked:        { na: "advisory, single-batch-only by design (documented on shape_drift_warn_factor): the multi-part runners write through several sinks and never aggregate the run-wide per-column max bytes, so there is nothing to compare" }
+    keyset:         { na: "advisory, single-batch-only by design — no run-wide max-bytes aggregate across pages" }
+    mongo_parallel: { na: "advisory, single-batch-only by design — no run-wide max-bytes aggregate across workers" }
+
+  - id: value_checksum_form_b
+    what: "Form B — the sink's per-column value checksums are harvested into summary.column_checksums so finalize_manifest RECORDS them and `rivet validate` can re-read the parts and verify the Arrow→Parquet encode. The sink COMPUTES them for every runner (track_checksum in on_batch); only the runner that harvests them gets post-write verification."
+    single:         { test: pg_type_matrix_value_checksum_guard }
+    chunked:        { gap: "LOAD-BEARING: the sink computes checksums but chunked never harvests sink.column_checksums into the summary, so finalize records NONE and validate's Form-B re-read is a no-op on the headline large-table path (checksums computed then discarded)" }
+    keyset:         { gap: "LOAD-BEARING: read_keyset_page returns parts/rows/schema/next_cursor and drops sink.column_checksums — Form B absent on a large-table path" }
+    mongo_parallel: { gap: "LOAD-BEARING: reuses read_keyset_page per worker; checksums never surface — Form B absent" }
+
+  - id: meta_columns
+    what: "__rivet_* meta columns (plan.meta_columns) injected into the output schema + batches."
+    single:         { test: stand_meta_columns_postgres }
+    chunked:        { na: "injected at the SHARED ExportSink seam (ExportSink::new copies plan.meta_columns; enrich_schema/enrich_batch inject) — every runner builds an ExportSink, none can bypass it, so injection is runner-agnostic and proven once by the single cell (ExportRequest carries no meta field at all)" }
+    keyset:         { na: "shared ExportSink seam — runner-agnostic (keyset's ExportRequest::unwrapped carries no meta; the sink injects downstream)" }
+    mongo_parallel: { na: "shared ExportSink seam — runner-agnostic (each worker's sink injects)" }
+
+  - id: run_unique_part_naming
+    what: "two runs into ONE destination prefix must not clobber — part filenames carry a run-unique token (millisecond %3f stamp or a random nonce), never a second-granularity stamp that collides."
+    single:         { test: roast_rapid_incremental_runs_into_same_prefix_must_not_clobber_prior_parts }
+    chunked:        { test: chunk_part_filename_is_collision_proof_for_same_chunk }
+    keyset:         { test: mongo_batch_two_rapid_runs_into_same_prefix_do_not_clobber }
+    mongo_parallel: { gap: "the parallel worker stamp (%3f + worker + page) IS run-unique, but no clobber/same-prefix test sets `parallel: N` — the mongo clobber test runs the single keyset path, so the parallel-worker naming is unproven against collision" }
+
+  - id: durable_manifest_before_advance
+    what: "the destination manifest covering a run's parts is durable BEFORE the delivery position advances past them (the silent-loss ordering) — cross-references docs/durability-ordering-matrix.yaml."
+    single:         { test: f2_crash_window_manifest_written_cursor_absent }
+    chunked:        { test: chunked_crash_resume_writes_a_complete_destination_manifest }
+    keyset:         { test: keyset_checkpoint_crash_resume_writes_a_complete_destination_manifest }
+    mongo_parallel: { na: "no mid-run delivery position — mongo_parallel takes a quiescent full scan with no checkpoint/cursor advance; the manifest is written once at finalize and a crash re-runs the whole export (steady-state no-loss/no-dup covered by mongo_batch_parallel_integer_id_no_loss_or_dup)" }
+
+  - id: sparse_chunk_warn
+    what: "run-start sparse-key cost warning (sparse_chunk_action) — a key span that divides into far more windows than the row count justifies is flagged at warn level before the windows execute."
+    single:         { na: "no chunk windows — single mode issues one query, no BETWEEN-window explosion possible" }
+    chunked:        { test: no_estimate_egregious_count_warns_never_bails }
+    keyset:         { na: "index seek advances by `col > cursor` — no min/max range windows to explode, so the sparse-key cost class does not exist" }
+    mongo_parallel: { na: "$sample-derived _id ranges, not (min..max)/chunk_size BETWEEN windows" }
+
+  - id: resume_checkpoint
+    what: "--resume / checkpoint continuation from the last durably-committed position."
+    single:         { na: "no checkpoint — `--resume` is rejected for full mode (full_mode_resume_flag_is_rejected); incremental continues via the persisted cursor, not a chunk/page checkpoint" }
+    chunked:        { test: chunked_crash_after_first_chunk_complete_resume_finishes_export }
+    keyset:         { test: keyset_checkpoint_resume_second_run_captures_only_new_keys }
+    mongo_parallel: { na: "no checkpoint/resume — run_mongo_parallel reads no checkpoint state; a crash re-runs the full quiescent scan" }

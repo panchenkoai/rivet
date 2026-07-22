@@ -84,6 +84,23 @@ const MATRICES: &[(&str, usize)] = &[
     // scenario asserts the combo is rejected at CONFIG-LOAD (check == run) AND a
     // legit form is not false-rejected. 0 gaps.
     ("docs/config-validation-matrix.yaml", 0),
+    // CSV writer-fidelity — the TEXT-writer class round-7 opened: the CSV writer has
+    // its own value rendering AND escaping that Parquet's binary path never exercises,
+    // and two silent losses lived there (pre-1970 timestamp → empty cell; un-escaped
+    // header split off the data). Columns split silent-value-loss vs escape-corruption;
+    // the value cells assert against an INDEPENDENT oracle (hard-coded string / DuckDB
+    // re-read), not the writer's own rendering (the self-oracle that hid the bug). 0 gaps.
+    ("docs/csv-fidelity-matrix.yaml", 0),
+    // Runner-coverage — every PER-EXPORT feature applied on EVERY runner (single /
+    // chunked / keyset / mongo_parallel), not just single. Round-8 proved the class:
+    // keyset + parallel-Mongo silently dropped the on_schema_drift gate (exit 0 on
+    // drift) because it lived only in single/chunked. Building this ledger surfaced a
+    // bigger hole — value-checksum Form B is ABSENT on all three large-table runners
+    // (sink computes checksums, only single harvests them, so validate's Form-B re-read
+    // is a no-op precisely on the highest-volume paths). 6 gaps, visible + un-growable:
+    // value_checksum Form B ×3, schema_drift-test ×2 (chunked-range + mongo), parallel
+    // run-unique-naming test ×1. Fill each by wiring the harvest / writing the test.
+    ("docs/runner-coverage-matrix.yaml", 6),
 ];
 
 #[derive(Deserialize)]
