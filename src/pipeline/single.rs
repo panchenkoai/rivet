@@ -453,17 +453,14 @@ pub(super) fn run_single_export(
     // Form B: harvest the per-column value checksums the sink accumulated into the
     // summary, so the manifest records them. `validate` re-reads the parts to verify
     // the Arrow→Parquet encode + post-write fault the in-process Form A cannot see.
-    if !sink.column_checksums.is_empty() {
-        summary.column_checksums = sink
-            .column_checksums
-            .iter()
-            .map(|(name, sum)| crate::manifest::ColumnChecksum {
-                name: name.clone(),
-                checksum: sum.to_string(),
-            })
-            .collect();
-        summary.checksum_key_column = sink.checksum_key_col.and(sink.cursor_column.clone());
-    }
+    // Single mode has one sink; the multi-part runners XOR-combine per part through
+    // the SAME seam (super::commit::{accumulate,harvest}_column_checksums).
+    let single_key = sink.checksum_key_col.and(sink.cursor_column.clone());
+    super::commit::harvest_column_checksums(
+        summary,
+        std::mem::take(&mut sink.column_checksums),
+        single_key,
+    );
 
     // Epic 8: data shape drift — warn when string/binary columns grow beyond threshold.
     if plan.shape_drift_warn_factor > 0.0

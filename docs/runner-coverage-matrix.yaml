@@ -39,11 +39,11 @@ scenarios:
     mongo_parallel: { na: "advisory, single-batch-only by design — no run-wide max-bytes aggregate across workers" }
 
   - id: value_checksum_form_b
-    what: "Form B — the sink's per-column value checksums are harvested into summary.column_checksums so finalize_manifest RECORDS them and `rivet validate` can re-read the parts and verify the Arrow→Parquet encode. The sink COMPUTES them for every runner (track_checksum in on_batch); only the runner that harvests them gets post-write verification."
+    what: "Form B — the sink's per-column value checksums are harvested into summary.column_checksums so finalize_manifest RECORDS them and `rivet validate` can re-read the parts and verify the Arrow→Parquet encode. The sink COMPUTES them for every runner (track_checksum in on_batch); the multi-part runners XOR-combine per part run-wide through the shared commit::{accumulate,harvest}_column_checksums seam (round-9 fix — previously computed then discarded)."
     single:         { test: pg_type_matrix_value_checksum_guard }
-    chunked:        { gap: "LOAD-BEARING: the sink computes checksums but chunked never harvests sink.column_checksums into the summary, so finalize records NONE and validate's Form-B re-read is a no-op on the headline large-table path (checksums computed then discarded)" }
-    keyset:         { gap: "LOAD-BEARING: read_keyset_page returns parts/rows/schema/next_cursor and drops sink.column_checksums — Form B absent on a large-table path" }
-    mongo_parallel: { gap: "LOAD-BEARING: reuses read_keyset_page per worker; checksums never surface — Form B absent" }
+    chunked:        { test: chunked_export_records_form_b_checksums_and_validate_passes }
+    keyset:         { test: keyset_export_records_form_b_checksums_and_validate_passes }
+    mongo_parallel: { test: mongo_parallel_export_records_form_b_checksum }
 
   - id: meta_columns
     what: "__rivet_* meta columns (plan.meta_columns) injected into the output schema + batches."

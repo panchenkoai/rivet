@@ -60,6 +60,143 @@ fn read_uid_set(dir: &std::path::Path) -> (usize, BTreeSet<String>) {
     (count, keys)
 }
 
+/// Form B on the keyset runner (round-9 gap fix): the manifest must RECORD the
+/// per-column value checksums — previously the sink computed them per page then
+/// DROPPED them, so `rivet validate`'s Form-B re-read was a silent no-op on keyset
+/// (a large-table path). Assert (1) the manifest carries a non-empty
+/// column_checksums array (RED before the run-wide harvest), and (2) `rivet
+/// validate` re-reads the parts and PASSES — proving the recorded XOR-combined
+/// checksums actually match the parquet, not just that the array is populated.
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn keyset_export_records_form_b_checksums_and_validate_passes() {
+    require_alive(LiveService::Postgres);
+    let table = unique_name("keyset_formb");
+    let mut c = pg_connect();
+    c.batch_execute(&format!(
+        "CREATE TABLE {table} (k TEXT PRIMARY KEY, v INT NOT NULL, note TEXT);
+         INSERT INTO {table} SELECT 'k' || lpad(g::text, 6, '0'), g, 'n' || g \
+         FROM generate_series(1, 2000) g;"
+    ))
+    .unwrap();
+    let _guard = PgTable::adopt(table.clone());
+
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let out_dir = tempfile::tempdir().unwrap();
+    let export = unique_name("keyset_formb_exp");
+    // TEXT key + chunk_by_key → keyset, chunk_size 500 → 4 pages (cross-page XOR).
+    let yaml = format!(
+        "source: {{type: postgres, url: \"{POSTGRES_URL}\"}}\nexports:\n  - name: {export}\n    \
+         table: {table}\n    mode: chunked\n    chunk_by_key: k\n    chunk_size: 500\n    \
+         format: parquet\n    destination: {{type: local, path: {out}}}\n",
+        out = out_dir.path().display(),
+    );
+    let cfg = write_config(&cfg_dir, &yaml);
+    let r = run_rivet_export(&cfg, &export);
+    assert!(
+        r.status.success(),
+        "keyset export must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+
+    // (1) The manifest records Form B checksums (RED before the harvest — empty).
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(out_dir.path().join("manifest.json")).expect("manifest.json"),
+    )
+    .expect("parse manifest");
+    let checksums = manifest["column_checksums"].as_array();
+    assert!(
+        checksums.is_some_and(|a| !a.is_empty()),
+        "keyset manifest must record Form B column_checksums, got: {}",
+        manifest["column_checksums"]
+    );
+
+    // (2) validate (default depth Full → runs the Form B re-read) re-reads the
+    // parts; the recorded checksums must MATCH.
+    let v = std::process::Command::new(RIVET_BIN)
+        .args([
+            "validate",
+            "--config",
+            cfg.to_str().unwrap(),
+            "--export",
+            &export,
+        ])
+        .output()
+        .expect("spawn rivet validate");
+    assert!(
+        v.status.success(),
+        "rivet validate must PASS — the recorded Form B checksums must match the re-read parts; \
+         stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&v.stdout),
+        String::from_utf8_lossy(&v.stderr)
+    );
+}
+
+/// Form B on the CHUNKED (range) runner — same round-9 gap + same run-wide XOR
+/// harvest as keyset, but a different runner (exec.rs, sequential + parallel).
+/// An integer chunk_column routes to range chunking, not keyset.
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn chunked_export_records_form_b_checksums_and_validate_passes() {
+    require_alive(LiveService::Postgres);
+    let table = unique_name("chunked_formb");
+    let mut c = pg_connect();
+    c.batch_execute(&format!(
+        "CREATE TABLE {table} (id BIGINT PRIMARY KEY, v INT NOT NULL, note TEXT);
+         INSERT INTO {table} SELECT g, g * 2, 'n' || g FROM generate_series(1, 2000) g;"
+    ))
+    .unwrap();
+    let _guard = PgTable::adopt(table.clone());
+
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let out_dir = tempfile::tempdir().unwrap();
+    let export = unique_name("chunked_formb_exp");
+    // Integer chunk_column → range chunking (the chunked runner), chunk_size 500.
+    let yaml = format!(
+        "source: {{type: postgres, url: \"{POSTGRES_URL}\"}}\nexports:\n  - name: {export}\n    \
+         table: {table}\n    mode: chunked\n    chunk_column: id\n    chunk_size: 500\n    \
+         format: parquet\n    destination: {{type: local, path: {out}}}\n",
+        out = out_dir.path().display(),
+    );
+    let cfg = write_config(&cfg_dir, &yaml);
+    let r = run_rivet_export(&cfg, &export);
+    assert!(
+        r.status.success(),
+        "chunked export must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(out_dir.path().join("manifest.json")).expect("manifest.json"),
+    )
+    .expect("parse manifest");
+    assert!(
+        manifest["column_checksums"]
+            .as_array()
+            .is_some_and(|a| !a.is_empty()),
+        "chunked manifest must record Form B column_checksums, got: {}",
+        manifest["column_checksums"]
+    );
+
+    let v = std::process::Command::new(RIVET_BIN)
+        .args([
+            "validate",
+            "--config",
+            cfg.to_str().unwrap(),
+            "--export",
+            &export,
+        ])
+        .output()
+        .expect("spawn rivet validate");
+    assert!(
+        v.status.success(),
+        "rivet validate must PASS on the chunked export — recorded Form B must match the re-read; \
+         stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&v.stdout),
+        String::from_utf8_lossy(&v.stderr)
+    );
+}
+
 #[test]
 #[ignore = "live: requires docker compose up -d mysql"]
 fn keyset_varchar_pk_roundtrips_full_keyset_across_pages() {

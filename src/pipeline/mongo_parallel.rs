@@ -96,6 +96,12 @@ pub(crate) fn run_mongo_parallel(
     // Drain on the main thread: sum rows + record every part through the shared
     // commit path (single-threaded → the counter/journal ordering is race-free).
     let mut drift_schema: Option<arrow::datatypes::Schema> = None;
+    // Form B: fold each worker's XOR-combined checksums run-wide (order-independent
+    // across workers), then harvest once — so a parallel-Mongo manifest records
+    // Form B like every other runner.
+    let mut checksums_acc: std::collections::BTreeMap<String, u64> =
+        std::collections::BTreeMap::new();
+    let mut checksum_key_column: Option<String> = None;
     for (w, res) in results.into_iter().enumerate() {
         let out = res?;
         summary.total_rows += out.rows;
@@ -104,6 +110,10 @@ pub(crate) fn run_mongo_parallel(
             if drift_schema.is_none() {
                 drift_schema = Some(sc.clone());
             }
+        }
+        super::commit::accumulate_column_checksums(&mut checksums_acc, &out.column_checksums);
+        if checksum_key_column.is_none() {
+            checksum_key_column = out.checksum_key_column;
         }
         if plan.validate && out.rows > 0 {
             summary.validated = Some(true);
@@ -120,6 +130,7 @@ pub(crate) fn run_mongo_parallel(
             );
         }
     }
+    super::commit::harvest_column_checksums(summary, checksums_acc, checksum_key_column);
 
     log::info!(
         "export '{}': parallel complete — {} range(s), {} rows",
@@ -147,6 +158,10 @@ struct WorkerOutput {
     rows: i64,
     parts: Vec<commit::PartRecord>,
     schema: Option<arrow::datatypes::Schema>,
+    /// This worker's XOR-combined per-column Form B checksums (main thread folds
+    /// them run-wide across workers so the finalize manifest records Form B).
+    column_checksums: std::collections::BTreeMap<String, u64>,
+    checksum_key_column: Option<String>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -172,6 +187,8 @@ fn range_worker(
         rows: 0,
         parts: Vec::new(),
         schema: None,
+        column_checksums: std::collections::BTreeMap::new(),
+        checksum_key_column: None,
     };
     let mut last: Option<String> = None;
     let mut page = 0usize;
@@ -202,6 +219,10 @@ fn range_worker(
             out.schema = p.schema;
         }
         out.parts.extend(p.parts);
+        super::commit::accumulate_column_checksums(&mut out.column_checksums, &p.column_checksums);
+        if out.checksum_key_column.is_none() {
+            out.checksum_key_column = p.checksum_key_column;
+        }
         page += 1;
 
         if p.rows < kp.chunk_size {

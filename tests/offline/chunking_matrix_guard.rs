@@ -95,12 +95,14 @@ const MATRICES: &[(&str, usize)] = &[
     // chunked / keyset / mongo_parallel), not just single. Round-8 proved the class:
     // keyset + parallel-Mongo silently dropped the on_schema_drift gate (exit 0 on
     // drift) because it lived only in single/chunked. Building this ledger surfaced a
-    // bigger hole — value-checksum Form B is ABSENT on all three large-table runners
-    // (sink computes checksums, only single harvests them, so validate's Form-B re-read
-    // is a no-op precisely on the highest-volume paths). 6 gaps, visible + un-growable:
-    // value_checksum Form B ×3, schema_drift-test ×2 (chunked-range + mongo), parallel
-    // run-unique-naming test ×1. Fill each by wiring the harvest / writing the test.
-    ("docs/runner-coverage-matrix.yaml", 6),
+    // bigger hole — value-checksum Form B was ABSENT on all three large-table runners.
+    // Round-9 THREADED Form B through every runner (run-wide XOR harvest via the shared
+    // commit::{accumulate,harvest}_column_checksums seam), each with a live test that
+    // asserts the manifest records it AND `rivet validate` re-reads + matches — those 3
+    // gaps are now filled (6 → 3). The remaining 3 are TEST gaps (the feature is wired,
+    // no per-runner test): schema_drift-test ×2 (chunked-range + mongo), parallel
+    // run-unique-naming test ×1. Fill each by writing the test.
+    ("docs/runner-coverage-matrix.yaml", 3),
 ];
 
 #[derive(Deserialize)]

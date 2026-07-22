@@ -47,6 +47,12 @@ pub(crate) struct KeysetPage {
     pub(crate) rows: usize,
     pub(crate) schema: Option<arrow::datatypes::Schema>,
     pub(crate) next_cursor: Option<String>,
+    /// This page's sink's per-column Form B value checksums — XOR-combined
+    /// run-wide by `run_keyset` so the finalize manifest records Form B (previously
+    /// dropped here, making `rivet validate`'s re-read a no-op on keyset exports).
+    pub(crate) column_checksums: std::collections::BTreeMap<String, u64>,
+    /// The key-column name the checksums are keyed on (constant across pages).
+    pub(crate) checksum_key_column: Option<String>,
 }
 
 /// Read ONE seek page: `find`-and-seek from `cursor` (or the range floor), write
@@ -99,6 +105,7 @@ pub(crate) fn read_keyset_page(
         plan.validate.then_some(plan.format),
         |idx, count| super::commit::part_indexed_name(part_base, idx, count),
     )?;
+    let checksum_key_column = sink.checksum_key_col.and(sink.cursor_column.clone());
     Ok(Some(KeysetPage {
         parts,
         rows,
@@ -106,6 +113,8 @@ pub(crate) fn read_keyset_page(
         // The source's own lossless token (Mongo BSON `_id`) when it reported
         // one, else the column-extracted string (every SQL engine).
         next_cursor: sink.effective_cursor(),
+        column_checksums: std::mem::take(&mut sink.column_checksums),
+        checksum_key_column,
     }))
 }
 
@@ -171,6 +180,12 @@ pub(crate) fn run_keyset(
     // gate: keyset owns its runner (run_single_export early-returns here), so the
     // drift check single mode applies must be applied here too.
     let mut drift_schema: Option<arrow::datatypes::Schema> = None;
+    // Form B: XOR-combine each page's per-column checksums run-wide (order-
+    // independent), then harvest once after the loop — so the finalize manifest
+    // records Form B and `rivet validate` can re-verify keyset exports too.
+    let mut checksums_acc: std::collections::BTreeMap<String, u64> =
+        std::collections::BTreeMap::new();
+    let mut checksum_key_column: Option<String> = None;
 
     // Destination + manifest-mode guard (Finding #44) + run-unique part stamp are
     // fixed for the whole run — hoisted out of the page loop. Millisecond stamp:
@@ -204,6 +219,11 @@ pub(crate) fn run_keyset(
             if drift_schema.is_none() {
                 drift_schema = Some(sc.clone());
             }
+        }
+        // Form B: fold this page's checksums into the run-wide XOR accumulator.
+        super::commit::accumulate_column_checksums(&mut checksums_acc, &page.column_checksums);
+        if checksum_key_column.is_none() {
+            checksum_key_column = page.checksum_key_column.clone();
         }
         summary.total_rows += page.rows as i64;
         if plan.validate {
@@ -261,6 +281,9 @@ pub(crate) fn run_keyset(
             ),
         }
     }
+
+    // Form B: record the run-wide XOR-combined checksums so finalize writes them.
+    super::commit::harvest_column_checksums(summary, checksums_acc, checksum_key_column);
 
     log::info!(
         "export '{}': keyset complete — {} page(s), {} rows",

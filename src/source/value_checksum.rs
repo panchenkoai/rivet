@@ -14,18 +14,19 @@
 //! re-reads the Parquet and recompares ([`validate_manifest_checksums`]), catching
 //! an `Arrow→Parquet` encode / post-write fault Form A cannot see.
 //!
-//! **Form B coverage caveat (scope, honest):** the sink COMPUTES the per-column
-//! checksum on every runner (`track_checksum`), but only the SINGLE-batch runner
-//! and the CDC sink currently HARVEST it into `summary.column_checksums` for
-//! `finalize_manifest` to record. The multi-part runners — chunked, keyset, and
-//! parallel-Mongo — each write through several sinks and do not thread the
-//! run-wide XOR-combine out, so their manifests carry no Form-B checksums and
-//! `rivet validate`'s Form-B re-read is a NO-OP on those paths. This is a
-//! defense-in-depth VERIFICATION gap, not data loss (Form A still runs in-process
-//! on the SQL engines, and per-part content-MD5 still guards raw bytes). The
-//! run-wide harvest for the multi-part runners (threaded via `KeysetPage` /
-//! `PartRecord`) is tracked as a follow-up; see `docs/runner-coverage-matrix.yaml`
-//! (`value_checksum_form_b`).
+//! **Form B is recorded on EVERY runner.** The sink computes the per-column
+//! checksum on every runner (`track_checksum`); the MULTI-PART runners (chunked,
+//! keyset, parallel-Mongo) each write through several sinks, so they XOR-combine
+//! the per-part maps run-wide through the shared
+//! `pipeline::commit::{accumulate,harvest}_column_checksums` seam before finalize —
+//! producing the SAME run-wide checksum single mode records from its one sink
+//! (XOR is order- and count-independent). So `rivet validate`'s Form-B re-read
+//! verifies chunked/keyset/parallel-Mongo exports too (round-9 closed the earlier
+//! gap where the multi-part runners computed the checksum then discarded it). One
+//! honest exception remains: **Mongo has no Form A** (the verbatim `document` blob
+//! has no per-column source pass), so a Mongo export's value integrity rests on
+//! Form B + the per-part content-MD5, not the in-process source↔Arrow parity the
+//! SQL engines get. See `docs/runner-coverage-matrix.yaml` (`value_checksum_form_b`).
 //!
 //! The per-column value is `xxh3` of each cell's value **bytes**, XOR-combined
 //! (order-independent, so chunk/parallel order doesn't matter) — keyed to the row

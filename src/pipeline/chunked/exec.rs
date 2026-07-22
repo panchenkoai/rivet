@@ -44,6 +44,11 @@ pub(crate) fn run_chunked_sequential(
     let pb = ChunkProgress::new(&plan.export_name, chunks.len());
     // Per-batch progress feed (single-threaded here, but the sink API is shared).
     let streamed_rows = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
+    // Form B: XOR-combine each chunk's per-column checksums run-wide, harvest once
+    // after the loop — so the finalize manifest records Form B for chunked exports.
+    let mut checksums_acc: std::collections::BTreeMap<String, u64> =
+        std::collections::BTreeMap::new();
+    let mut checksum_key_column: Option<String> = None;
 
     for (i, (start, end)) in chunks.iter().enumerate() {
         if !resource::check_memory(plan.tuning.memory_threshold_mb) {
@@ -148,8 +153,18 @@ pub(crate) fn run_chunked_sequential(
                 file_name: None,
             });
         }
+        // Fold this chunk's Form B checksums into the run-wide accumulator (empty
+        // for a zero-row chunk — a no-op).
+        super::super::commit::accumulate_column_checksums(
+            &mut checksums_acc,
+            &sink.column_checksums,
+        );
+        if checksum_key_column.is_none() {
+            checksum_key_column = sink.checksum_key_col.and(sink.cursor_column.clone());
+        }
     }
 
+    super::super::commit::harvest_column_checksums(summary, checksums_acc, checksum_key_column);
     pb.finish(summary.total_rows);
     log::info!("export '{}': all chunks completed", plan.export_name);
     Ok(())
@@ -201,6 +216,13 @@ pub(crate) fn run_chunked_parallel(
     // accumulated worker-side — record_part bumps them in the drain.
     let file_records: std::sync::Mutex<Vec<(super::super::commit::PartRecord, i64)>> =
         std::sync::Mutex::new(Vec::new());
+    // Form B: each worker pushes its chunk's per-column checksums here; the parent
+    // XOR-combines them run-wide post-join (order-independent) and harvests once, so
+    // a parallel chunked manifest records Form B like single mode.
+    #[allow(clippy::type_complexity)]
+    let checksums_shared: std::sync::Mutex<
+        Vec<(std::collections::BTreeMap<String, u64>, Option<String>)>,
+    > = std::sync::Mutex::new(Vec::new());
     // Schema fingerprint captured by whichever worker resolves the dest
     // schema first.  ADR-0012 M3 — stays None for empty runs (no chunk
     // produced rows so no schema was seen).  Drained into `summary` after
@@ -342,6 +364,7 @@ pub(crate) fn run_chunked_parallel(
             let agg_rows = &agg_rows;
             let errors = &errors;
             let file_records = &file_records;
+            let checksums_shared = &checksums_shared;
             let shared_fingerprint = &shared_fingerprint;
             let semaphore = &semaphore;
             let pb_thread = pb_handle.clone();
@@ -419,6 +442,11 @@ pub(crate) fn run_chunked_parallel(
                         for rec in recs {
                             records.push((rec, i as i64));
                         }
+                        drop(records);
+                        // Form B: hand this chunk's checksums to the parent to XOR-combine.
+                        let key = sink.checksum_key_col.and(sink.cursor_column.clone());
+                        poison::lock_recover(checksums_shared)
+                            .push((std::mem::take(&mut sink.column_checksums), key));
                     }
 
                     let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
@@ -491,6 +519,19 @@ pub(crate) fn run_chunked_parallel(
             errs.join("\n")
         );
     }
+
+    // Form B: XOR-combine every worker's chunk checksums run-wide + harvest once
+    // (order-independent, so worker completion order does not matter).
+    let mut checksums_acc: std::collections::BTreeMap<String, u64> =
+        std::collections::BTreeMap::new();
+    let mut checksum_key_column: Option<String> = None;
+    for (part, key) in poison::into_recover(checksums_shared) {
+        super::super::commit::accumulate_column_checksums(&mut checksums_acc, &part);
+        if checksum_key_column.is_none() {
+            checksum_key_column = key;
+        }
+    }
+    super::super::commit::harvest_column_checksums(summary, checksums_acc, checksum_key_column);
 
     log::info!(
         "export '{}': all {} chunks completed",
