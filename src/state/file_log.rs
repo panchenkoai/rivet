@@ -147,6 +147,58 @@ impl StateStore {
             }
         }
     }
+
+    /// Every `file_log` row for one `run_id`, in write order. Unlike `chunk_task`
+    /// (one `file_name` per chunk, the FIRST rotation sibling only), file_log
+    /// records EVERY committed part — including all `max_file_size` rotation
+    /// siblings — with its real `bytes`, written per-part before `complete_chunk_
+    /// task`. This is the crash-consistent source the chunked resume reconstructs a
+    /// COMPLETE destination manifest from when none exists (round-5 fix).
+    pub fn list_files_for_run(&self, run_id: &str) -> Result<Vec<FileRecord>> {
+        let cols =
+            "run_id, export_name, file_name, row_count, bytes, format, compression, created_at";
+        match &self.conn {
+            StateConn::Sqlite(c) => {
+                let mut stmt = c.prepare(&format!(
+                    "SELECT {cols} FROM file_log WHERE run_id = ?1 ORDER BY id ASC"
+                ))?;
+                let rows = stmt.query_map([run_id], |row| {
+                    Ok(FileRecord {
+                        run_id: row.get(0)?,
+                        export_name: row.get(1)?,
+                        file_name: row.get(2)?,
+                        row_count: row.get(3)?,
+                        bytes: row.get(4)?,
+                        format: row.get(5)?,
+                        compression: row.get(6)?,
+                        created_at: row.get(7)?,
+                    })
+                })?;
+                rows.collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(Into::into)
+            }
+            StateConn::Postgres(client) => {
+                let mut c = client.borrow_mut();
+                let rows = c.query(
+                    &format!("SELECT {cols} FROM file_log WHERE run_id = $1 ORDER BY id ASC"),
+                    &[&run_id],
+                )?;
+                Ok(rows
+                    .iter()
+                    .map(|row| FileRecord {
+                        run_id: row.get(0),
+                        export_name: row.get(1),
+                        file_name: row.get(2),
+                        row_count: row.get(3),
+                        bytes: row.get(4),
+                        format: row.get(5),
+                        compression: row.get(6),
+                        created_at: row.get(7),
+                    })
+                    .collect())
+            }
+        }
+    }
 }
 
 #[cfg(test)]

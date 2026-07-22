@@ -125,7 +125,13 @@ fn rehydrate_manifest_parts_from_completed_chunks(
     run_id: &str,
     summary: &mut RunSummary,
 ) -> Result<usize> {
-    let tasks = state.list_chunk_tasks_for_run(run_id)?;
+    // Reconstruct from file_log, NOT chunk_task: file_log records EVERY committed
+    // part — including every max_file_size rotation sibling — with its real byte
+    // size, whereas chunk_task stores only the FIRST sibling's file_name and the
+    // full-chunk row count. Rehydrating from chunk_task orphaned the other siblings
+    // (silent loss / blocked load) and left size_bytes=0 (a lying PartSizeMismatch
+    // in `rivet validate`) — both closed by using file_log (round-5).
+    let files = state.list_files_for_run(run_id)?;
     let mut next_id = summary
         .manifest_parts
         .iter()
@@ -134,32 +140,28 @@ fn rehydrate_manifest_parts_from_completed_chunks(
         .unwrap_or(0);
     let mut rehydrated = 0usize;
     let mut rehydrated_rows = 0i64;
-    for t in tasks {
-        if t.status != "completed" {
-            continue;
-        }
-        let (Some(file_name), Some(rows)) = (t.file_name, t.rows_written) else {
-            continue; // an empty chunk wrote no part
-        };
-        if rows <= 0 {
-            continue;
-        }
+    let mut rehydrated_bytes = 0u64;
+    for f in files {
         // Don't duplicate a part a fresh record_part already added this run.
-        if summary.manifest_parts.iter().any(|p| p.path == file_name) {
+        if summary.manifest_parts.iter().any(|p| p.path == f.file_name) {
             continue;
         }
         next_id += 1;
         summary.manifest_parts.push(crate::manifest::ManifestPart {
             part_id: next_id,
-            path: file_name,
-            rows,
-            size_bytes: 0, // not stored in chunk_task
+            path: f.file_name,
+            rows: f.row_count,
+            size_bytes: f.bytes.max(0) as u64,
+            // fingerprint/md5 aren't in file_log; an EMPTY md5 degrades `rivet
+            // validate` to a size-only check (the real bytes now match), so the
+            // part is DECLARED + size-verified, never a lying mismatch.
             content_fingerprint: String::new(),
             content_md5: String::new(),
             status: crate::manifest::PartStatus::Committed,
         });
         rehydrated += 1;
-        rehydrated_rows += rows;
+        rehydrated_rows += f.row_count;
+        rehydrated_bytes += f.bytes.max(0) as u64;
     }
     if rehydrated > 0 {
         // Keep the summary aggregates consistent with the reconstructed manifest so
@@ -167,10 +169,12 @@ fn rehydrate_manifest_parts_from_completed_chunks(
         summary.files_committed += rehydrated;
         summary.files_produced += rehydrated;
         summary.total_rows += rehydrated_rows;
+        summary.bytes_written += rehydrated_bytes;
         log::info!(
-            "resume: reconstructed {rehydrated} completed-chunk part(s) ({rehydrated_rows} rows) \
-             into the manifest from the state DB (no destination manifest to hydrate from) — \
-             the finalize manifest now covers every committed chunk"
+            "resume: reconstructed {rehydrated} committed part(s) ({rehydrated_rows} rows, \
+             {rehydrated_bytes} bytes) into the manifest from the state DB file_log (no \
+             destination manifest to hydrate from) — the finalize manifest now covers every \
+             committed part, rotation siblings included"
         );
     }
     Ok(rehydrated)
@@ -550,6 +554,77 @@ mod tests {
             shape_drift_warn_factor: 0.0,
             parquet: None,
         }
+    }
+
+    #[test]
+    fn rehydration_recovers_all_rotation_siblings_from_file_log() {
+        // Round-5: chunk_task stores ONE file_name per chunk (only the FIRST
+        // max_file_size rotation sibling), so rehydrating from it orphaned the other
+        // siblings (silent loss) and left size_bytes=0 (a lying validate mismatch).
+        // file_log records EVERY committed part with its real bytes. RED against the
+        // chunk_task-based rehydration (which recovered 1 of 2 siblings, size 0).
+        let state_dir = tempfile::tempdir().unwrap();
+        let state =
+            crate::state::StateStore::open_at_path(&state_dir.path().join("state.db")).unwrap();
+        let run_id = "r_rot";
+        // Two rotation siblings of ONE chunk, as record_part logs them per-part.
+        state
+            .record_file(
+                run_id,
+                "orders",
+                "orders_chunk0_p0.parquet",
+                30,
+                4096,
+                "parquet",
+                None,
+            )
+            .unwrap();
+        state
+            .record_file(
+                run_id,
+                "orders",
+                "orders_chunk0_p1.parquet",
+                20,
+                2048,
+                "parquet",
+                None,
+            )
+            .unwrap();
+        let mut summary =
+            crate::pipeline::summary::RunSummary::stub_for_testing(run_id, String::from("orders"));
+        let rows_before = summary.total_rows;
+
+        let n =
+            rehydrate_manifest_parts_from_completed_chunks(&state, run_id, &mut summary).unwrap();
+
+        assert_eq!(
+            n, 2,
+            "BOTH rotation siblings must be reconstructed, not just the first"
+        );
+        let paths: Vec<&str> = summary
+            .manifest_parts
+            .iter()
+            .map(|p| p.path.as_str())
+            .collect();
+        assert!(
+            paths.contains(&"orders_chunk0_p0.parquet")
+                && paths.contains(&"orders_chunk0_p1.parquet"),
+            "both sibling files must be declared: {paths:?}"
+        );
+        assert_eq!(
+            summary.manifest_parts.iter().map(|p| p.rows).sum::<i64>(),
+            50,
+            "all 50 rows across both siblings declared"
+        );
+        assert!(
+            summary.manifest_parts.iter().all(|p| p.size_bytes > 0),
+            "parts carry their REAL byte size (not 0) so validate's size check can't lie"
+        );
+        assert_eq!(
+            summary.total_rows - rows_before,
+            50,
+            "row aggregate bumped by the union"
+        );
     }
 
     /// Full-matrix flow: part A intact → Skip (+ summary hydration), part B
