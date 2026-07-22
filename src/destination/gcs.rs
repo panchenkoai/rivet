@@ -15,6 +15,19 @@ pub(crate) fn operator_for(config: &DestinationConfig) -> Result<Operator> {
     GcsBackend::build_operator(config)
 }
 
+/// Scope a bucket-relative path to a DIRECTORY boundary for prefix listing and
+/// recursive delete. opendal (and GCS/S3 under it) match by STRING prefix, so a
+/// non-slash `exports/orders` also matches `exports/orders_archive/…`; the
+/// trailing slash confines the op to the directory. Empty stays empty (the
+/// bucket root is refused upstream by `split_gs_uri`, never reached here).
+fn dir_boundary(path: &str) -> String {
+    if path.is_empty() || path.ends_with('/') {
+        path.to_string()
+    } else {
+        format!("{path}/")
+    }
+}
+
 /// A blocking GCS handle for the load layer's one-off object ops — recursive
 /// list (manifests / parquet), read (manifest bytes), and recursive delete
 /// (source cleanup). Mirrors [`CloudDestination`]'s runtime + blocking wrap,
@@ -49,11 +62,7 @@ impl GcsStore {
 
     /// Bucket-root-relative keys of every FILE recursively under `path`.
     pub(crate) fn list_files(&self, path: &str) -> Result<Vec<String>> {
-        let dir = if path.is_empty() || path.ends_with('/') {
-            path.to_string()
-        } else {
-            format!("{path}/")
-        };
+        let dir = dir_boundary(path);
         let listed = self.op.list_options(
             &dir,
             opendal::options::ListOptions {
@@ -80,8 +89,18 @@ impl GcsStore {
     }
 
     /// Recursively delete everything under the bucket-relative `path`.
+    ///
+    /// Normalise to a DIRECTORY boundary first (`dir_boundary`): opendal — and
+    /// GCS/S3 under it — match by STRING prefix, so `remove_all("exports/orders")`
+    /// would ALSO delete `exports/orders_archive/…`, `exports/orders2/…`, and any
+    /// other object whose key string-starts-with it. `list_files` always scoped
+    /// with a trailing slash; this delete path did NOT, so a post-load source
+    /// cleanup could destroy UNRELATED sibling exports. The fs backend reproduces
+    /// it too (opendal string-prefixes there as well) — the prior "spares
+    /// siblings" test only used a non-prefix sibling (`keep/`), so it never
+    /// activated the bug.
     pub(crate) fn remove_all(&self, path: &str) -> Result<()> {
-        self.op.remove_all(path)?;
+        self.op.remove_all(&dir_boundary(path))?;
         Ok(())
     }
 
@@ -243,6 +262,32 @@ mod tests {
         write_at(dir.path(), "p/a.parquet", b"abcd"); // 4 bytes
         let store = GcsStore::open_fs(dir.path().to_str().unwrap()).unwrap();
         assert_eq!(store.stat_size("p/a.parquet").unwrap(), 4);
+    }
+
+    // RED before dir_boundary in remove_all: opendal matches by STRING prefix,
+    // so `remove_all("p")` (no trailing slash — exactly what the load cleanup
+    // passes for `prefix: "exports/orders"` or a mid-segment `{partition}`) also
+    // deletes `p_archive/…`, a SEPARATE sibling export. Data destruction, and
+    // reproduced on the fs backend (opendal string-prefixes there too). The
+    // prior test used `keep/` — not a string prefix — so it never activated it.
+    #[test]
+    fn remove_all_spares_a_string_prefix_sibling() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_at(root, "p/a.parquet", b"a");
+        write_at(root, "p_archive/b.parquet", b"b"); // key string-starts-with "p"
+        let store = GcsStore::open_fs(root.to_str().unwrap()).unwrap();
+
+        store.remove_all("p").unwrap();
+        assert!(
+            store.list_files("p").unwrap().is_empty(),
+            "the target subtree is drained"
+        );
+        assert_eq!(
+            store.list_files("p_archive").unwrap(),
+            vec!["p_archive/b.parquet".to_string()],
+            "a SEPARATE export sharing the string prefix must NOT be deleted"
+        );
     }
 
     #[test]
