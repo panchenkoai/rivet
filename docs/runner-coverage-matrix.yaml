@@ -27,9 +27,9 @@ scenarios:
   - id: schema_drift_gate
     what: "on_schema_drift enforcement — a drifted schema under `fail` aborts (exit 4). Each runner bypasses run_single_export, so each must re-apply the gate (check_from_sink_schema / check_from_type_mappings). Round-8: keyset + mongo_parallel had SILENTLY dropped it (exit 0 on drift)."
     single:         { test: schema_drift_removed_column_is_detected }
-    chunked:        { gap: "the gate IS applied (check_from_type_mappings in prepare_chunk_plan) but no range-chunked integration test drives a drifted schema through it — only the runner-agnostic facade unit test + the single/keyset cells" }
+    chunked:        { test: chunked_range_export_enforces_on_schema_drift_fail }
     keyset:         { test: keyset_export_enforces_on_schema_drift_fail }
-    mongo_parallel: { gap: "the gate IS applied (check_from_sink_schema, mongo_parallel.rs) after the round-8 fix, but no parallel-Mongo test drives a drifted schema to prove exit 4" }
+    mongo_parallel: { na: "the gate IS applied (check_from_sink_schema, mongo_parallel.rs), but a Mongo export's Arrow schema is a FIXED {_id, document, meta} shape — the document is one verbatim extended-JSON blob column, so adding/dropping a document field does NOT change the Arrow schema and cannot drift. The gate is wired defensively; there is no structural drift to trip it (a meta_columns config change is the only mover, covered by the meta cell)" }
 
   - id: shape_drift_warn
     what: "detect_shape_drift — advisory warning when a string/binary column's max byte length grows past the factor. Needs the run-wide per-column max-bytes aggregate."
@@ -57,7 +57,7 @@ scenarios:
     single:         { test: roast_rapid_incremental_runs_into_same_prefix_must_not_clobber_prior_parts }
     chunked:        { test: chunk_part_filename_is_collision_proof_for_same_chunk }
     keyset:         { test: mongo_batch_two_rapid_runs_into_same_prefix_do_not_clobber }
-    mongo_parallel: { gap: "the parallel worker stamp (%3f + worker + page) IS run-unique, but no clobber/same-prefix test sets `parallel: N` — the mongo clobber test runs the single keyset path, so the parallel-worker naming is unproven against collision" }
+    mongo_parallel: { test: mongo_parallel_two_rapid_runs_into_same_prefix_do_not_clobber }
 
   - id: durable_manifest_before_advance
     what: "the destination manifest covering a run's parts is durable BEFORE the delivery position advances past them (the silent-loss ordering) — cross-references docs/durability-ordering-matrix.yaml."

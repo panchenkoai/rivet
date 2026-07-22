@@ -40,7 +40,11 @@ impl ParquetFormat {
                 let level = self.compression_level.unwrap_or(6);
                 Compression::GZIP(GzipLevel::try_new(level).unwrap_or_default())
             }
-            CompressionType::Lz4 => Compression::LZ4,
+            // LZ4_RAW, the standard ecosystem-supported codec — NOT the deprecated
+            // Hadoop-framed `Compression::LZ4`, which DuckDB/Spark/pyarrow readers
+            // may reject or mis-frame. rivet is pre-1.0, so the on-disk-bytes change
+            // is acceptable; `lz4` means the interoperable codec.
+            CompressionType::Lz4 => Compression::LZ4_RAW,
             CompressionType::None => Compression::UNCOMPRESSED,
         }
     }
@@ -56,6 +60,28 @@ impl super::Format for ParquetFormat {
         schema: &SchemaRef,
         writer: Box<dyn Write + Send>,
     ) -> Result<Box<dyn super::FormatWriter + Send>> {
+        // Parquet's decimal logical type requires scale >= 0. Arrow (and PostgreSQL
+        // `numeric(p,-s)`) allow a NEGATIVE scale, so a negative-scale column resolves
+        // to a valid Arrow type and `rivet check` passes — but the parquet writer then
+        // crashes mid-export on the first batch. Refuse it LOUDLY here (at writer
+        // creation, before any row is written) with an actionable message, so check
+        // and run agree. CSV renders it fine, so this is parquet-specific.
+        if let Some(field) = schema.fields().iter().find(|f| {
+            matches!(
+                f.data_type(),
+                arrow::datatypes::DataType::Decimal128(_, s)
+                | arrow::datatypes::DataType::Decimal256(_, s) if *s < 0
+            )
+        }) {
+            anyhow::bail!(
+                "Parquet cannot write column '{}' ({:?}): a NEGATIVE decimal scale is valid in \
+                 the source and in Arrow but not in the Parquet decimal type (scale must be >= 0). \
+                 Cast the column to a non-negative scale in the query (e.g. \
+                 `round(col)::numeric(p,0)`), or use `format: csv`.",
+                field.name(),
+                field.data_type()
+            );
+        }
         // OPT-5: pin a version-independent `created_by`. By default parquet-rs
         // stamps each file with its own version (e.g. "parquet-rs version
         // 58.0.0"); that string changes on a lib bump, so identical rows would
@@ -215,6 +241,41 @@ mod tests {
             .unwrap();
         writer.write_batch(&one_batch(&schema)).unwrap();
         writer.finish().unwrap();
+    }
+
+    #[test]
+    fn lz4_maps_to_the_standard_raw_codec_not_hadoop_framed() {
+        // RED before the fix: `lz4` mapped to the DEPRECATED Hadoop-framed
+        // Compression::LZ4, which DuckDB/Spark/pyarrow readers may reject. It must
+        // be the standard, interoperable LZ4_RAW.
+        assert_eq!(
+            ParquetFormat::new(CompressionType::Lz4, None, None).build_compression(),
+            Compression::LZ4_RAW
+        );
+    }
+
+    #[test]
+    fn negative_scale_decimal_is_refused_loudly_at_writer_creation() {
+        // RED before the guard: a negative-scale decimal is a valid Arrow type (so
+        // `check` passes) but Parquet's decimal type requires scale >= 0, so the
+        // writer crashed mid-export. It must bail LOUDLY at creation, before any row.
+        use arrow::datatypes::{DataType, Field, Schema};
+        let schema = std::sync::Arc::new(Schema::new(vec![Field::new(
+            "amount",
+            DataType::Decimal128(10, -2),
+            true,
+        )]));
+        let result = ParquetFormat::new(CompressionType::None, None, None)
+            .create_writer(&schema, Box::new(Vec::<u8>::new()));
+        assert!(
+            result.is_err(),
+            "a negative-scale decimal must be refused, not crash mid-export"
+        );
+        let msg = result.err().unwrap().to_string();
+        assert!(
+            msg.contains("NEGATIVE decimal scale") && msg.contains("amount"),
+            "error must name the column + the negative-scale cause: {msg}"
+        );
     }
 
     // ── OPT-5: byte-determinism for the manifest content_fingerprint ──────────

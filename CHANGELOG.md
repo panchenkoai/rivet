@@ -29,6 +29,11 @@ or process-abort-DoS classes invisible to the green test suite and the three typ
   (`split_at` on a non-char-boundary) on a crafted 21-byte marker, and `rivet validate`
   now byte-caps the `_SUCCESS` read (CWE-400) the same way it caps `manifest.json` — both
   hardening the destination-writable control artifact against a planted payload.
+- **Check↔run footguns (fail loud, not crash mid-export):** a negative-scale decimal
+  column (valid in the source + Arrow, unwritable in Parquet) is now refused at parquet
+  writer creation with an actionable message instead of crashing mid-export; a
+  `parquet.row_group_rows: 0` clamps to 1 instead of panicking; and `compression: lz4`
+  emits the standard interoperable `LZ4_RAW` codec, not the deprecated Hadoop-framed LZ4.
 - **Silent-loss (Postgres incremental/keyset cursor on a non-UTC session):** the
   timestamptz cursor boundary was re-injected as an offset-less naive-UTC literal and
   PostgreSQL parses a naive literal in the SESSION TimeZone, so on any non-UTC session

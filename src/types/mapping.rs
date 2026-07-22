@@ -172,8 +172,12 @@ pub fn rivet_type_to_arrow(t: &RivetType) -> Option<DataType> {
 /// Decimal128 vs Decimal256 selection per roadmap §12 ("Exact Decimal Support"):
 /// `Decimal128(p,s)` when `p <= 38`, `Decimal256(p,s)` otherwise.
 ///
-/// Negative scale is allowed by PostgreSQL `numeric(p,-s)` and is forwarded
-/// through unchanged — Arrow / Parquet accept it on Decimal128/256.
+/// Negative scale is allowed by PostgreSQL `numeric(p,-s)` and by ARROW, so it is
+/// forwarded through unchanged here. But the PARQUET decimal logical type requires
+/// `scale >= 0`, so a negative-scale column is NOT Parquet-writable — the parquet
+/// writer refuses it up front (see `ParquetFormat::create_writer`) with a clear
+/// error rather than letting `check` pass and `run` fail mid-export. (CSV renders
+/// it fine as text, so the reject is parquet-format-specific, not a type-level one.)
 fn decimal_arrow_type(precision: u8, scale: i8) -> DataType {
     if precision <= 38 {
         DataType::Decimal128(precision, scale)
