@@ -285,11 +285,22 @@ fn write_csv_value(writer: &mut dyn Write, array: &dyn Array, idx: usize) -> Res
                 frac_us
             )?;
         }
-        DataType::Timestamp(TimeUnit::Microsecond, _) => {
+        DataType::Timestamp(TimeUnit::Microsecond, tz) => {
             let arr = array
                 .as_any()
                 .downcast_ref::<TimestampMicrosecondArray>()
                 .expect("DataType/Array mismatch");
+            // rivet's type model keeps the naive-vs-instant distinction that
+            // every other output (Parquet `isAdjustedToUTC`, the warehouse
+            // target types) preserves: a source TIMESTAMPTZ maps to
+            // `Timestamp(_, Some("UTC"))`, a naive TIMESTAMP to `None`. Without
+            // a marker on the instant, CSV renders BOTH identically — a consumer
+            // loading the instant into a tz-aware column on a NON-UTC session
+            // then reads the UTC wall-clock as local and shifts every value (the
+            // session-state class, on the CSV encode leg). Emit a trailing `Z`
+            // for the instant (rivet normalises to UTC) so it is unambiguous;
+            // the naive value stays bare (its wall-clock IS the value).
+            let is_instant = tz.is_some();
             let micros = arr.value(idx);
             // FLOOR division (div_euclid/rem_euclid), NOT truncating `/`+`%`: for
             // a pre-1970 (negative) micros with a sub-second fraction, `micros %
@@ -323,6 +334,9 @@ fn write_csv_value(writer: &mut dyn Write, array: &dyn Array, idx: usize) -> Res
                     )?;
                 } else {
                     write!(writer, "{}", dt.format("%Y-%m-%dT%H:%M:%S%.6f"))?;
+                }
+                if is_instant {
+                    writer.write_all(b"Z")?;
                 }
             }
         }
@@ -604,6 +618,30 @@ mod tests {
         let result = cell(arr, 0);
         assert!(result.starts_with("2023-01-01T"), "got: {result}");
         assert!(result.contains("00:00:00"), "got: {result}");
+    }
+
+    // rivet keeps the naive-vs-instant distinction in every other output
+    // (Parquet isAdjustedToUTC, the warehouse target types). CSV must too: a
+    // naive TIMESTAMP renders bare (its wall-clock IS the value), an instant
+    // TIMESTAMPTZ (Timestamp(_, Some("UTC"))) gets a trailing `Z` — else a
+    // consumer loading the instant on a NON-UTC session reads the UTC wall-clock
+    // as local and shifts every value.
+    #[test]
+    fn timestamp_marks_instant_utc_but_leaves_naive_bare() {
+        // 2024-06-15T03:00:00.000000 UTC.
+        let micros: i64 = 1_718_420_400 * 1_000_000;
+        let naive = TimestampMicrosecondArray::from(vec![micros]);
+        assert_eq!(
+            cell(naive, 0),
+            "2024-06-15T03:00:00.000000",
+            "a naive TIMESTAMP renders bare — no tz marker"
+        );
+        let instant = TimestampMicrosecondArray::from(vec![micros]).with_timezone("UTC");
+        assert_eq!(
+            cell(instant, 0),
+            "2024-06-15T03:00:00.000000Z",
+            "an instant TIMESTAMPTZ renders an explicit UTC `Z`"
+        );
     }
 
     // ── write_batch via CsvFormat ────────────────────────────────────────────
