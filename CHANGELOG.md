@@ -2,6 +2,50 @@
 
 ## Unreleased
 
+## 0.21.1 — 2026-07-22
+
+A security- and durability-hardening release: five adversarial audit rounds over the
+OSS surface (find → RED-prove → drift-guard) closed ~30 real issues, several of them
+silent data-loss or credential-leak classes invisible to the green test suite.
+
+### Fixed
+
+- **Silent-loss: the destination manifest is now COMPLETE after a crash+resume on
+  every export path.** The manifest-authoritative `rivet load` loads only the parts a
+  `Success` manifest declares, so a crashed run that advanced its delivery position
+  (CDC slot-ack, incremental cursor, chunked chunk_task, keyset cursor) before writing
+  a complete manifest silently dropped the orphaned parts. Fixed across CDC (durable
+  run-unique manifest before each ack), incremental (cursor advances only after the
+  manifest), chunked and keyset (resume reconstructs every committed part from the
+  state `file_log`, rotation siblings included). Each is proven MANIFEST-DRIVEN, not by
+  a parquet glob (the read that masked the class).
+- **Credential leak: the log/state redactors no longer echo a password** containing a
+  raw `/ ? # @ :` or a stray query `@` (base64 secrets contain `/`). Both redactors were
+  rewritten to a default-deny rule (userinfo ends at the last `@` before whitespace,
+  user split on the first `:`) that never leaks.
+- **Security (warehouse load):** source-derived column names are refused unless a plain
+  SQL identifier (DDL/COPY injection); the load-reconcile manifest read is byte-capped
+  (CWE-400); Snowflake append `COPY` now uses `FORCE=TRUE` so at-least-once re-append is
+  not silently deduped away.
+- **Silent-loss (types):** a MSSQL `MONEY` past the f64-exact range, a PG/MySQL decimal
+  scale under-declaration, and a PG temporal/uuid/bytea array column now FAIL loudly
+  instead of shipping a rounded / truncated / all-NULL column.
+- **Regression: MSSQL authentication** with a special-character password (broken by the
+  0.21.0-era percent-encoding fix — MSSQL's hand-rolled URL parser never decoded it).
+- **Config validation** now rejects the accept-but-break combinations that formerly
+  passed `rivet check` then failed or silently degraded at run (chunk knobs outside
+  `mode: chunked`, `partition_by` with `cdc`/`time_window`/a `load:` block/a missing
+  `{partition}` token, `chunk_size` + `chunk_size_memory_mb`, unsafe `tables:` entries).
+- A chunk plan over an extreme-sparse key is refused before it OOMs; a large CDC
+  transaction is bounded by bytes (not just rows); the chunked resume-guard closes a
+  TOCTOU with a partial-unique index.
+
+### Added
+
+- Coverage ledgers (drift-guarded): `url-safety`, `durability-ordering`,
+  `config-validation` — every recurring regression class now fails CI if reopened.
+- Coverage-guided fuzzing (`fuzz/`, nightly) over the untrusted-parse surface.
+
 ## 0.21.0 — 2026-07-21
 
 ### Added
