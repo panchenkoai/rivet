@@ -19,12 +19,35 @@ use crate::state::StateStore;
 /// Run one `mode: cdc` export end to end, then record + report it like a batch
 /// export. The metric row is written here (as `run_export_job` does); the
 /// `RunSummary` is returned for the run aggregate.
+/// The run-start warning for a CDC export that requested batch-only
+/// `meta_columns` (`exported_at` / `row_hash`). CDC has its own sink and schema
+/// (`__op`/`__pos`/`__seq` + the typed after-image), so those columns are NOT
+/// injected — silently, before this. `None` when no meta column was requested.
+/// Pure so it can be unit-tested without a live stream (mirrors
+/// `detect::sparse_chunk_warning`).
+fn cdc_ignored_meta_warning(export: &ExportConfig) -> Option<String> {
+    export.meta_columns.any_enabled().then(|| {
+        format!(
+            "export '{}': mode: cdc ignores meta_columns (exported_at / row_hash) — the CDC \
+             output carries its own __op/__pos/__seq columns plus the typed after-image, and \
+             the batch meta columns are NOT added. Remove meta_columns from this export, or use \
+             a batch mode if you need them.",
+            export.name
+        )
+    })
+}
+
 pub(super) fn run_cdc_export(
     config_path: &str,
     config: &Config,
     export: &ExportConfig,
     state: &StateStore,
 ) -> (Result<()>, RunSummary) {
+    // No-silent-config-drop: warn (don't hard-fail — a shared default may set
+    // meta_columns for a mixed batch+CDC config) that the request has no effect.
+    if let Some(msg) = cdc_ignored_meta_warning(export) {
+        log::warn!("{msg}");
+    }
     let started = std::time::Instant::now();
     let run_id = format!(
         "{}_{}",
@@ -175,21 +198,44 @@ pub(super) fn initial_snapshot_pending(
     let mut pending = Vec::new();
     for idx in pending_idx {
         let (t, snap_dcfg) = &table_dests[idx];
-        let mut synth = export.clone();
-        synth.name = format!("{}__snapshot_{t}", export.name);
-        synth.mode = crate::config::ExportMode::Full;
-        synth.table = Some(t.clone());
-        synth.tables = None;
-        synth.cdc = None;
-        synth.destination = snap_dcfg.clone();
-        // NEVER inherit skip_empty: an EMPTY table with skip_empty=true would
-        // write no snapshot/_SUCCESS, so the marker check re-snapshots on
-        // every run forever. An empty snapshot must still complete (manifest +
-        // _SUCCESS with 0 rows) for the handoff to converge.
-        synth.skip_empty = false;
-        pending.push(synth);
+        pending.push(synth_snapshot_export(export, t, snap_dcfg));
     }
     Ok(pending)
+}
+
+/// Synthesize the `mode: full` snapshot export for one CDC table — the batch
+/// leg run BEFORE the CDC drain. Pure (no I/O) so the schema-consistency
+/// invariants below are unit-testable.
+fn synth_snapshot_export(
+    export: &ExportConfig,
+    table: &str,
+    snap_dcfg: &crate::config::DestinationConfig,
+) -> ExportConfig {
+    let mut synth = export.clone();
+    synth.name = format!("{}__snapshot_{table}", export.name);
+    synth.mode = crate::config::ExportMode::Full;
+    synth.table = Some(table.to_string());
+    synth.tables = None;
+    synth.cdc = None;
+    synth.destination = snap_dcfg.clone();
+    // NEVER inherit skip_empty: an EMPTY table with skip_empty=true would
+    // write no snapshot/_SUCCESS, so the marker check re-snapshots on
+    // every run forever. An empty snapshot must still complete (manifest +
+    // _SUCCESS with 0 rows) for the handoff to converge.
+    synth.skip_empty = false;
+    // NEVER inherit batch meta_columns into the snapshot leg. The snapshot AND
+    // the CDC stream BOTH load into the SAME `<table>__changes` log (the snapshot
+    // rows with __op/__pos/__seq NULL — see load/cdc.rs::dedup_view_sql), and the
+    // current-state view is `SELECT * EXCEPT(__op,__pos,__seq,__rn)` over it. The
+    // CDC sink cannot carry exported_at/row_hash, so injecting them on the
+    // snapshot ONLY gives the snapshot parquet extra columns the CDC parquet
+    // lacks — appending both into one `__changes` table then mismatches, and any
+    // meta column that survived would leak into the current-state view (populated
+    // for backfill rows, NULL for every CDC-updated row). Clearing here keeps both
+    // legs' columns identical; the run-start warn tells the operator the meta
+    // columns are dropped for the whole CDC export.
+    synth.meta_columns = Default::default();
+    synth
 }
 
 /// The pure `initial: snapshot` decision, split out of the I/O in
@@ -440,6 +486,69 @@ fn record_metric(state: &StateStore, config: &Config, export: &ExportConfig, sum
 mod tests {
     use super::*;
     use crate::config::{DestinationConfig, DestinationType};
+
+    // A CDC export that requests batch-only meta_columns must WARN (the CDC sink
+    // never injects them), not silently drop the request. Pure fn so this needs
+    // no live stream.
+    #[test]
+    fn cdc_warns_when_meta_columns_are_requested_on_a_cdc_export() {
+        let mut e = crate::config::sample_export("orders");
+        // No meta columns → no warning.
+        e.meta_columns = Default::default();
+        assert!(
+            cdc_ignored_meta_warning(&e).is_none(),
+            "no warning without meta_columns"
+        );
+        // exported_at requested → warns, naming the export + the CDC-native cols.
+        e.meta_columns.exported_at = true;
+        let msg = cdc_ignored_meta_warning(&e).expect("must warn on exported_at");
+        assert!(msg.contains("orders"), "names the export: {msg}");
+        assert!(
+            msg.contains("meta_columns"),
+            "names the ignored knob: {msg}"
+        );
+        assert!(
+            msg.contains("__op"),
+            "points at the CDC-native columns: {msg}"
+        );
+        // row_hash alone also warns.
+        e.meta_columns.exported_at = false;
+        e.meta_columns.row_hash = true;
+        assert!(
+            cdc_ignored_meta_warning(&e).is_some(),
+            "row_hash alone must warn too"
+        );
+    }
+
+    // The snapshot (batch) leg and the CDC stream are two legs of ONE dataset the
+    // load view merges by PK. batch-only meta_columns injected on the snapshot
+    // ONLY would diverge the two legs' columns (base table has cols the changelog
+    // lacks) and break the load — the exact mismatch a mixed snapshot+CDC load
+    // hits. The synth snapshot must therefore NOT inherit meta_columns.
+    #[test]
+    fn snapshot_leg_does_not_inherit_batch_meta_columns() {
+        let mut e = crate::config::sample_export("orders");
+        e.meta_columns.exported_at = true;
+        e.meta_columns.row_hash = true;
+        let dcfg = DestinationConfig {
+            destination_type: DestinationType::Local,
+            path: Some("/tmp/snap".into()),
+            ..Default::default()
+        };
+        let synth = synth_snapshot_export(&e, "orders", &dcfg);
+        assert!(
+            !synth.meta_columns.any_enabled(),
+            "the snapshot leg must match the CDC leg's columns — no batch meta_columns"
+        );
+        // The other snapshot invariants stay intact.
+        assert_eq!(synth.mode, crate::config::ExportMode::Full);
+        assert!(
+            synth.cdc.is_none(),
+            "snapshot leg is a plain batch, not CDC"
+        );
+        assert!(!synth.skip_empty, "snapshot must complete even when empty");
+        assert_eq!(synth.table.as_deref(), Some("orders"));
+    }
 
     // RED test for the finding: cloud prefixes are LITERAL key prefixes —
     // `cloud.rs` concatenates `prefix + key` with NO separator (hence the

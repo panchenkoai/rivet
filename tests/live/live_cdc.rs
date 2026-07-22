@@ -1681,6 +1681,77 @@ exports:
     assert_eq!(snap_parts(), 1, "run 2 must NOT re-snapshot");
 }
 
+// Load parity: the `initial: snapshot` leg and the CDC stream BOTH feed one
+// `<table>__changes` log (snapshot rows with __op/__pos/__seq NULL), and the
+// current-state view is `SELECT * EXCEPT(__op,__pos,__seq,__rn)`. batch-only
+// meta_columns injected on the snapshot leg ONLY would give it columns the CDC
+// parquet lacks — appending both into one `__changes` table then mismatches
+// (the exact "read CDC, backfill history via batch, load breaks because columns
+// don't match" failure). The synth snapshot must therefore drop meta_columns.
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
+fn cdc_initial_snapshot_leg_drops_batch_meta_columns_for_load_parity() {
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("cdc_init_meta");
+    let mut c = conn();
+    c.query_drop(format!("DROP TABLE IF EXISTS {tbl}")).unwrap();
+    c.query_drop(format!("CREATE TABLE {tbl} (id INT PRIMARY KEY, v INT)"))
+        .unwrap();
+    let _guard = Table(tbl.clone());
+    c.query_drop(format!("INSERT INTO {tbl} VALUES (1,10),(2,20)"))
+        .unwrap();
+
+    let out = d.path().join("out");
+    let ckpt = d.path().join("cdc.ckpt");
+    std::fs::create_dir_all(&out).unwrap();
+    // The CDC export REQUESTS batch meta columns — they must be dropped from the
+    // snapshot leg so its parquet matches the CDC stream's columns.
+    let yaml = format!(
+        r#"source: {{type: mysql, url: "{MYSQL_CDC_URL}"}}
+exports:
+  - name: {tbl}
+    table: {tbl}
+    mode: cdc
+    format: parquet
+    meta_columns: {{ exported_at: true, row_hash: true }}
+    cdc: {{ initial: snapshot, checkpoint: "{ckpt}", until_current: true, server_id: {sid} }}
+    destination: {{ type: local, path: "{out}" }}
+"#,
+        ckpt = ckpt.display(),
+        out = out.display(),
+        sid = server_id_for(&tbl),
+    );
+    let cfg = write_config(&d, &yaml);
+    run_rivet_ok(&cfg);
+
+    let snap = out.join("snapshot");
+    let snap_cols: Vec<String> = parquet_fields(&snap).into_iter().map(|(n, _)| n).collect();
+    assert!(
+        !snap_cols.iter().any(|c| c.starts_with("__rivet")),
+        "snapshot leg must NOT carry batch meta columns (load parity with the CDC \
+         stream's __changes append); got {snap_cols:?}"
+    );
+    assert!(
+        snap_cols.iter().any(|c| c == "id") && snap_cols.iter().any(|c| c == "v"),
+        "snapshot leg still carries the source columns; got {snap_cols:?}"
+    );
+
+    // Stream a post-snapshot change and confirm the CDC parquet's DATA columns
+    // are exactly the snapshot's (the loader adds __op/__pos/__seq on top) — so
+    // the two parquets append into one `__changes` log without a mismatch.
+    c.query_drop(format!("INSERT INTO {tbl} VALUES (3,30)"))
+        .unwrap();
+    run_rivet_ok(&cfg);
+    let cdc_cols: Vec<String> = parquet_fields(&out).into_iter().map(|(n, _)| n).collect();
+    let cdc_data: Vec<&String> = cdc_cols.iter().filter(|c| !c.starts_with("__")).collect();
+    let snap_data: Vec<&String> = snap_cols.iter().filter(|c| !c.starts_with("__")).collect();
+    assert_eq!(
+        cdc_data, snap_data,
+        "the CDC stream's data columns must equal the snapshot's — else the shared \
+         __changes append mismatches"
+    );
+}
+
 // Roast finding #28 (feature composition): ensure_anchor ran with
 // resume_expected=false on EVERY run of an `initial: snapshot` export — so a
 // VANISHED slot was silently recreated at the current position BEFORE the

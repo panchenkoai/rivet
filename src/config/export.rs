@@ -475,6 +475,16 @@ pub struct MetaColumns {
     pub row_hash: bool,
 }
 
+impl MetaColumns {
+    /// True iff the operator asked for at least one meta column. The batch
+    /// runners inject these at the shared `ExportSink` seam; the CDC path has
+    /// its OWN sink (`__op`/`__pos`/`__seq` + typed after-image) and does not,
+    /// so a CDC run uses this to warn that the request has no effect.
+    pub fn any_enabled(&self) -> bool {
+        self.exported_at || self.row_hash
+    }
+}
+
 fn default_mode() -> ExportMode {
     ExportMode::Full
 }
