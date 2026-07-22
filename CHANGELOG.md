@@ -4,13 +4,26 @@
 
 ## 0.21.1 — 2026-07-22
 
-A security- and durability-hardening release: seven adversarial audit rounds over the
+A security- and durability-hardening release: eight adversarial audit rounds over the
 OSS surface (find → RED-prove → drift-guard), plus a full live re-validation (3097 tests,
 all four engines × local/S3/GCS/Azure, DuckDB/ClickHouse/BigQuery type oracles), closed
-~40 real issues — several of them silent data-loss, credential-leak, injection, or
+~45 real issues — several of them silent data-loss, credential-leak, injection, or
 process-abort-DoS classes invisible to the green test suite and the three type oracles.
 
 ### Fixed
+
+- **Silent-loss (Postgres incremental/keyset cursor on a non-UTC session):** the
+  timestamptz cursor boundary was re-injected as an offset-less naive-UTC literal and
+  PostgreSQL parses a naive literal in the SESSION TimeZone, so on any non-UTC session
+  (a common production default) the boundary shifted by the zone offset and every
+  incremental run silently skipped (west of UTC) or duplicated (east) an offset-wide
+  window — invisible under the UTC test session. The read txn now pins
+  `SET LOCAL TimeZone = 'UTC'` (mirroring the MySQL path); a west-of-UTC two-run live
+  test proves the union loses nothing.
+- **Guardrail bypass (keyset / parallel-Mongo `on_schema_drift`):** keyset and
+  parallel-Mongo exports own their own runners and never reached the drift gate, so an
+  opted-in `on_schema_drift: fail` returned exit 0 on a drifted schema for the headline
+  large-table path; the gate is now wired into both runners.
 
 - **Silent-loss (`rivet repair`):** repair rewrote only the canonical `manifest.json`,
   leaving the immutable run-unique `manifest-<run_id>.json` sidecar — the copy the

@@ -95,11 +95,15 @@ pub(crate) fn run_mongo_parallel(
 
     // Drain on the main thread: sum rows + record every part through the shared
     // commit path (single-threaded → the counter/journal ordering is race-free).
+    let mut drift_schema: Option<arrow::datatypes::Schema> = None;
     for (w, res) in results.into_iter().enumerate() {
         let out = res?;
         summary.total_rows += out.rows;
         if let Some(sc) = &out.schema {
             super::manifest_writer::record_run_schema_fingerprint(summary, sc);
+            if drift_schema.is_none() {
+                drift_schema = Some(sc.clone());
+            }
         }
         if plan.validate && out.rows > 0 {
             summary.validated = Some(true);
@@ -123,6 +127,19 @@ pub(crate) fn run_mongo_parallel(
         ranges.len(),
         summary.total_rows
     );
+
+    // on_schema_drift gate — mirror single/keyset: this runner also bypasses
+    // run_single_export, so without this an opted-in `on_schema_drift: fail`
+    // returned exit 0 on a drifted schema for a parallel Mongo export.
+    if let Some(sc) = &drift_schema {
+        super::schema_drift::check_from_sink_schema(
+            state,
+            &plan.export_name,
+            sc,
+            plan.schema_drift_policy,
+            summary,
+        )?;
+    }
     Ok(())
 }
 

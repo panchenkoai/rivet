@@ -434,6 +434,20 @@ fn pg_run_export(
     // Drop will roll back. Without the guard, a failure between BEGIN and the
     // explicit ROLLBACK in the caller would leak a half-set-up txn into the pool.
     let mut guard = PgTxnGuard::begin(client)?;
+    // Pin the read txn's TimeZone to UTC. The row READ is UTC-absolute (the binary
+    // protocol yields instants regardless of session zone), but the incremental /
+    // keyset cursor boundary is re-injected as an OFFSET-LESS naive-UTC literal
+    // into `WHERE col > '<literal>'`; PostgreSQL coerces a naive literal to
+    // `timestamptz` using the SESSION TimeZone, so on any non-UTC session (a common
+    // production default via postgresql.conf or `ALTER ROLE/DATABASE ... SET
+    // timezone`) the boundary shifts by the zone offset and every incremental run
+    // silently SKIPS (west of UTC) or DUPLICATES (east) the offset-wide gap window —
+    // a count-passing data loss invisible under a UTC test session. The MySQL path
+    // pins the equivalent (`SET time_zone='+00:00'`). SET LOCAL is txn-scoped, so it
+    // auto-resets on commit/rollback and never leaks into the pooled connection.
+    guard
+        .client_mut()
+        .batch_execute("SET LOCAL TimeZone = 'UTC'")?;
     if tuning.statement_timeout_s > 0 {
         guard.client_mut().batch_execute(&format!(
             "SET LOCAL statement_timeout = '{}s'",

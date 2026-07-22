@@ -167,6 +167,10 @@ pub(crate) fn run_keyset(
     }
 
     let mut pages: usize = 0;
+    // Captured once from the first non-empty page for the post-run on_schema_drift
+    // gate: keyset owns its runner (run_single_export early-returns here), so the
+    // drift check single mode applies must be applied here too.
+    let mut drift_schema: Option<arrow::datatypes::Schema> = None;
 
     // Destination + manifest-mode guard (Finding #44) + run-unique part stamp are
     // fixed for the whole run — hoisted out of the page loop. Millisecond stamp:
@@ -197,6 +201,9 @@ pub(crate) fn run_keyset(
         // non-empty page; idempotent run-wide.
         if let Some(sc) = &page.schema {
             manifest_writer::record_run_schema_fingerprint(summary, sc);
+            if drift_schema.is_none() {
+                drift_schema = Some(sc.clone());
+            }
         }
         summary.total_rows += page.rows as i64;
         if plan.validate {
@@ -261,5 +268,20 @@ pub(crate) fn run_keyset(
         pages,
         summary.total_rows
     );
+
+    // on_schema_drift gate — run_single_export applies this, but keyset returns
+    // through its own runner and never reached it, so an opted-in
+    // `on_schema_drift: fail` silently returned exit 0 on a drifted schema for the
+    // headline large-table path. Mirror single mode: compare the run's resolved
+    // schema against the stored fingerprint once, post-run.
+    if let (Some(sc), Some(st)) = (&drift_schema, state) {
+        super::schema_drift::check_from_sink_schema(
+            st,
+            &plan.export_name,
+            sc,
+            plan.schema_drift_policy,
+            summary,
+        )?;
+    }
     Ok(())
 }
