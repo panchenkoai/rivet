@@ -578,7 +578,19 @@ pub(crate) fn run_waves(
             .iter()
             .copied()
             .filter(|e| {
-                let done = resume && finalize::destination_has_success(&e.destination);
+                // Probe the EXPANDED destination, not the raw template. A
+                // templated prefix (`{export}`/`{table}`/`{date}`) never matches a
+                // literal `_SUCCESS` path, so a completed templated export was
+                // never skipped and instead re-ran into the resume gate. Resolve
+                // the same way `rivet run` does at write time (today's UTC date, no
+                // `{run_id}` — a run-unique prefix is fresh every run, so there is
+                // nothing to skip and the literal token correctly never matches).
+                let ctx = crate::destination::placeholder::PlaceholderContext::for_today(&e.name);
+                let expanded = crate::destination::placeholder::expand_destination(
+                    e.destination.clone(),
+                    &ctx,
+                );
+                let done = resume && finalize::destination_has_success(&expanded);
                 if done {
                     log::info!(
                         "apply: skipping '{}' — destination already complete (_SUCCESS)",

@@ -24,6 +24,14 @@ process-abort-DoS classes invisible to the green test suite and the three type o
   parallel-Mongo exports own their own runners and never reached the drift gate, so an
   opted-in `on_schema_drift: fail` returned exit 0 on a drifted schema for the headline
   large-table path; the gate is now wired into both runners.
+- **Resource & robustness:** a `tuning:` block that omits `batch_size_memory_mb` no
+  longer silently disables the profile's memory-driven per-batch cap (it was ~3×-ing
+  Postgres per-batch RSS on wide tables); a user `max_batch_memory_mb` is clamped below
+  the Arrow i32 offset ceiling (a `≥ 2048` value could panic the Mongo document builder);
+  `apply --resume` now resolves a templated destination (`{export}`/`{table}`/`{date}`)
+  before probing `_SUCCESS`, so a completed templated export is skipped instead of
+  re-running into the resume gate; and `shape_drift_warn_factor` documents that it is
+  single-batch-only (schema drift is enforced on every path).
 
 - **Silent-loss (`rivet repair`):** repair rewrote only the canonical `manifest.json`,
   leaving the immutable run-unique `manifest-<run_id>.json` sidecar — the copy the

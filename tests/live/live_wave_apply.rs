@@ -169,3 +169,96 @@ exports:
          confirming --resume's skip was the actual difference",
     );
 }
+
+#[test]
+#[ignore = "live: postgres"]
+fn resume_skips_a_completed_export_with_a_templated_destination() {
+    // #4: the apply resume-skip probed the RAW destination, so a templated prefix
+    // (`{export}`/`{table}`/`{date}`) never matched a literal `_SUCCESS` path — a
+    // completed templated export was never skipped and re-ran into the resume gate
+    // (a hard failure / duplicate write). The probe now expands the destination the
+    // way `rivet run` does at write time. RED before that expansion.
+    require_alive(LiveService::Postgres);
+    let out = tempfile::tempdir().unwrap();
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let exp = unique_name("orders_tmpl");
+    // Destination path carries the `{export}` token → writes under `<root>/<exp>/`.
+    let yaml = format!(
+        r#"
+source:
+  type: postgres
+  url_env: DATABASE_URL
+
+exports:
+  - name: {exp}
+    query: "SELECT id FROM orders"
+    mode: full
+    format: parquet
+    wave: 1
+    destination: {{ type: local, path: "{root}/{{export}}" }}
+"#,
+        root = out.path().display(),
+    );
+    let cfg = write_config(&cfg_dir, &yaml);
+    let run = |args: &[&str]| {
+        std::process::Command::new(RIVET_BIN)
+            .arg("apply")
+            .arg(cfg.to_str().unwrap())
+            .args(args)
+            .env("DATABASE_URL", POSTGRES_URL)
+            .output()
+            .expect("spawn rivet apply")
+    };
+    // Detect a skip by the run-unique `manifest-<run_id>.json` copies under the
+    // EXPANDED `<root>/<exp>/` prefix: a SKIP writes none, a re-run adds one. This
+    // is robust to the shared `orders` fixture's row count (a 0-row run still
+    // writes _SUCCESS + a manifest copy, but skip vs re-run is what we assert).
+    let dir = out.path().join(&exp);
+    let manifest_copies = || {
+        std::fs::read_dir(&dir)
+            .map(|rd| {
+                rd.filter_map(Result::ok)
+                    .filter(|e| e.file_name().to_string_lossy().starts_with("manifest-"))
+                    .count()
+            })
+            .unwrap_or(0)
+    };
+
+    assert!(
+        run(&[]).status.success(),
+        "fresh templated apply must succeed"
+    );
+    assert!(
+        dir.join("_SUCCESS").exists(),
+        "fresh apply must write _SUCCESS under the expanded <root>/<export>/ prefix"
+    );
+    let after_first = manifest_copies();
+    assert!(
+        after_first >= 1,
+        "fresh apply must leave a run-unique manifest copy"
+    );
+
+    // --resume must SKIP the completed templated export: no new run, exit 0. Pre-fix
+    // the raw `{export}` path never matched _SUCCESS, so it re-ran into the resume
+    // gate instead of skipping.
+    let resumed = run(&["--resume"]);
+    assert!(
+        resumed.status.success(),
+        "apply --resume of a COMPLETED templated export must succeed by skipping it, not re-run \
+         into the resume gate; stderr:\n{}",
+        String::from_utf8_lossy(&resumed.stderr),
+    );
+    assert_eq!(
+        manifest_copies(),
+        after_first,
+        "apply --resume must SKIP the completed templated export — no new run-unique manifest copy",
+    );
+
+    // Contrast: a plain re-run (no --resume) DOES re-run, adding a manifest copy —
+    // proving the skip above was the real difference, not apply never running.
+    assert!(run(&[]).status.success(), "plain re-run must succeed");
+    assert!(
+        manifest_copies() > after_first,
+        "a plain re-run (no --resume) must re-export, adding a manifest copy",
+    );
+}

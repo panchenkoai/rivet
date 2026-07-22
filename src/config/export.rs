@@ -289,6 +289,13 @@ pub struct ExportConfig {
     /// When a string/binary column's max observed byte length in the current run
     /// exceeds `stored_max * shape_drift_warn_factor`, Rivet logs a warning.
     /// `None` uses the default of 2.0. Set to `0.0` to disable shape tracking.
+    ///
+    /// **Scope: single-batch exports only** (`mode: full` / `incremental`). Shape
+    /// tracking needs the run-wide per-column max byte length, which only the
+    /// single sink accumulates; the multi-part runners (chunked, keyset, and
+    /// parallel-Mongo) each write through several sinks and do not aggregate it,
+    /// so this factor is inert there. (Schema drift — added/dropped/retyped
+    /// columns — IS enforced on every path via `on_schema_drift`.)
     #[serde(default)]
     pub shape_drift_warn_factor: Option<f64>,
 
