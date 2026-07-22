@@ -197,6 +197,72 @@ fn chunked_export_records_form_b_checksums_and_validate_passes() {
     );
 }
 
+/// Form B on the CHECKPOINT (resumable `chunk_checkpoint: true`) chunked runner —
+/// a SEPARATE runner (chunked/sequential_checkpoint.rs) the graph surfaced as a
+/// distinct 300+-line function that the first Form B pass (exec.rs only) MISSED.
+/// The resumable path must record Form B too.
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn chunked_checkpoint_export_records_form_b_checksums_and_validate_passes() {
+    require_alive(LiveService::Postgres);
+    let table = unique_name("ckpt_formb");
+    let mut c = pg_connect();
+    c.batch_execute(&format!(
+        "CREATE TABLE {table} (id BIGINT PRIMARY KEY, v INT NOT NULL, note TEXT);
+         INSERT INTO {table} SELECT g, g * 2, 'n' || g FROM generate_series(1, 2000) g;"
+    ))
+    .unwrap();
+    let _guard = PgTable::adopt(table.clone());
+
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let out_dir = tempfile::tempdir().unwrap();
+    let export = unique_name("ckpt_formb_exp");
+    // chunk_checkpoint: true routes to the CHECKPOINT runner (not exec.rs).
+    let yaml = format!(
+        "source: {{type: postgres, url: \"{POSTGRES_URL}\"}}\nexports:\n  - name: {export}\n    \
+         table: {table}\n    mode: chunked\n    chunk_column: id\n    chunk_size: 500\n    \
+         chunk_checkpoint: true\n    format: parquet\n    destination: {{type: local, path: {out}}}\n",
+        out = out_dir.path().display(),
+    );
+    let cfg = write_config(&cfg_dir, &yaml);
+    let r = run_rivet_export(&cfg, &export);
+    assert!(
+        r.status.success(),
+        "chunked-checkpoint export must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(out_dir.path().join("manifest.json")).expect("manifest.json"),
+    )
+    .expect("parse manifest");
+    assert!(
+        manifest["column_checksums"]
+            .as_array()
+            .is_some_and(|a| !a.is_empty()),
+        "chunked-CHECKPOINT manifest must record Form B column_checksums, got: {}",
+        manifest["column_checksums"]
+    );
+
+    let v = std::process::Command::new(RIVET_BIN)
+        .args([
+            "validate",
+            "--config",
+            cfg.to_str().unwrap(),
+            "--export",
+            &export,
+        ])
+        .output()
+        .expect("spawn rivet validate");
+    assert!(
+        v.status.success(),
+        "rivet validate must PASS on the checkpoint chunked export — recorded Form B must match; \
+         stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&v.stdout),
+        String::from_utf8_lossy(&v.stderr)
+    );
+}
+
 #[test]
 #[ignore = "live: requires docker compose up -d mysql"]
 fn keyset_varchar_pk_roundtrips_full_keyset_across_pages() {

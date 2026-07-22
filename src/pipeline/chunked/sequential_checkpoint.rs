@@ -29,6 +29,17 @@ use crate::{destination, format, resource};
 
 use super::math::build_chunk_query_sql;
 
+/// One chunk's result: (rows, part records, this chunk's Form B per-column
+/// checksums, the checksum key-column name). The runner XOR-combines the checksums
+/// run-wide so the checkpoint (resumable) chunked path records Form B like the
+/// non-checkpoint exec path (the graph-surfaced runner-bypass this closes).
+type ChunkOutcome = (
+    usize,
+    Vec<super::super::commit::PartRecord>,
+    std::collections::BTreeMap<String, u64>,
+    Option<String>,
+);
+
 /// Returns `(rows, parts)` — one [`PartRecord`] per written part: empty for
 /// an empty chunk, several when `max_file_size` rotation split the chunk.
 /// Uses [`commit::write_sink_parts`] for the worker-safe I1 → dest.write →
@@ -48,7 +59,7 @@ fn export_one_chunk_range(
         &crate::pipeline::progress::ChunkProgressHandle,
         &std::sync::Arc<std::sync::atomic::AtomicI64>,
     )>,
-) -> Result<(usize, Vec<super::super::commit::PartRecord>)> {
+) -> Result<ChunkOutcome> {
     let chunk_query = build_chunk_query_sql(
         base_query,
         &cp.column,
@@ -83,7 +94,7 @@ fn export_one_chunk_range(
     }
 
     if sink.total_rows == 0 {
-        return Ok((0, Vec::new()));
+        return Ok((0, Vec::new(), std::collections::BTreeMap::new(), None));
     }
 
     let fmt = format::create_format(plan.format, plan.compression, plan.compression_level, None);
@@ -101,7 +112,9 @@ fn export_one_chunk_range(
         summary.validated = Some(true);
     }
 
-    Ok((sink.total_rows, recs))
+    let key = sink.checksum_key_col.and(sink.cursor_column.clone());
+    let rows = sink.total_rows;
+    Ok((rows, recs, std::mem::take(&mut sink.column_checksums), key))
 }
 
 #[allow(clippy::too_many_arguments)] // mirrors export_one_chunk_range's arity for retry wrapping
@@ -117,7 +130,7 @@ fn run_chunk_with_source_retries(
         &crate::pipeline::progress::ChunkProgressHandle,
         &std::sync::Arc<std::sync::atomic::AtomicI64>,
     )>,
-) -> Result<(usize, Vec<super::super::commit::PartRecord>)> {
+) -> Result<ChunkOutcome> {
     let mut last_err: Option<anyhow::Error> = None;
     for attempt in 0..=plan.tuning.max_retries {
         if attempt > 0 {
@@ -216,6 +229,11 @@ pub(crate) fn run_chunked_sequential_checkpoint(
     let pb_handle = pb.handle();
     // Per-batch progress feed: bar ticks during a chunk's read, not only at end.
     let streamed_rows = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
+    // Form B: XOR-combine each chunk's checksums run-wide (order-independent), then
+    // harvest once — so the CHECKPOINT chunked path records Form B like exec.rs.
+    let mut checksums_acc: std::collections::BTreeMap<String, u64> =
+        std::collections::BTreeMap::new();
+    let mut checksum_key_column: Option<String> = None;
 
     if !plan.resume && !resource::check_memory(plan.tuning.memory_threshold_mb) {
         log::warn!("memory threshold exceeded before chunk export; pausing 5s");
@@ -262,9 +280,16 @@ pub(crate) fn run_chunked_sequential_checkpoint(
             summary,
             Some((&pb_handle, &streamed_rows)),
         ) {
-            Ok((rows, parts)) => {
+            Ok((rows, parts, chunk_checksums, key)) => {
                 summary.total_rows += rows as i64;
                 pb.inc(summary.total_rows);
+                super::super::commit::accumulate_column_checksums(
+                    &mut checksums_acc,
+                    &chunk_checksums,
+                );
+                if checksum_key_column.is_none() {
+                    checksum_key_column = key;
+                }
                 // Shared commit path for the non-empty branch (I2/M1 + counters
                 // + ChunkCompleted journal + I7 file-log + fault hooks).
                 // Empty chunks have no file to record but still need to journal
@@ -327,6 +352,9 @@ pub(crate) fn run_chunked_sequential_checkpoint(
             plan.export_name
         );
     }
+
+    // Form B: record the run-wide checksums before finalize writes the manifest.
+    super::super::commit::harvest_column_checksums(summary, checksums_acc, checksum_key_column);
 
     pb.finish(summary.total_rows);
     state.finalize_chunk_run_completed(&run_id)?;
