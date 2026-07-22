@@ -665,8 +665,15 @@ fn parse_pg_array_literal(inner_type: &str, val: &str) -> Option<Vec<RivetValue>
             i += 1;
             while i < b.len() && b[i] != b'"' {
                 if b[i] == b'\\' && i + 1 < b.len() {
-                    elem.push(b[i + 1] as char);
-                    i += 2;
+                    // The escaped char may be multi-byte UTF-8 — copy the WHOLE char.
+                    // Round-6: `b[i+1] as char` + `i += 2` interpreted one byte as a
+                    // codepoint and left `i` mid-char, so the next `body[i..i+n]` slice
+                    // panicked on a non-char boundary — a process-abort DoS (release is
+                    // panic=abort) on a crafted `test_decoding` quoted array element.
+                    let n = utf8_len(b[i + 1]);
+                    let end = (i + 1 + n).min(b.len());
+                    elem.push_str(&body[i + 1..end]);
+                    i = end;
                 } else {
                     let n = utf8_len(b[i]);
                     elem.push_str(&body[i..i + n]);
@@ -807,6 +814,26 @@ fn parse_pg_timestamp(val: &str) -> RivetValue {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_pg_array_backslash_before_multibyte_does_not_panic() {
+        // Round-6: a quoted array element with a backslash BEFORE a multi-byte UTF-8
+        // char (`\é`, `\🎉`) made the parser advance i by 2 and slice mid-char on the
+        // next iteration — a process-abort DoS (release panic=abort) on a crafted
+        // test_decoding array. It must decode the whole escaped char, not panic.
+        // RED before the utf8-aware backslash handling (the old code panicked here).
+        let got = parse_pg_array_literal("text", "{\"a\\éb\"}").expect("must parse, not panic");
+        assert_eq!(
+            got.len(),
+            1,
+            "one element decoded from the escaped multibyte"
+        );
+        // A backslash before an emoji, and a truncated multi-byte escape at the end —
+        // none may panic.
+        for lit in ["{\"\\🎉\"}", "{\"x\\é\"}", "{\"a\",\"\\é\"}", "{\"z\\"] {
+            let _ = parse_pg_array_literal("text", lit);
+        }
+    }
 
     // URL form (not key=value) so the require_tls_or_loopback gate recognises
     // 127.0.0.1 as loopback.

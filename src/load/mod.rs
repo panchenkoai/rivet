@@ -101,6 +101,16 @@ fn validate_specs(table: &str, specs: &[TargetColumnSpec]) -> Result<()> {
     if specs.is_empty() {
         bail!("no column specs for `{table}` — nothing to build a schema from");
     }
+    // Round-6: the target table name is interpolated raw into the fqtn / DDL / dedup
+    // view too (a sibling injection surface of the column names). Gate it, tolerating
+    // a qualified `dataset.table` — each dot-separated component must be a plain ident.
+    if table.is_empty() || !table.split('.').all(is_safe_load_ident) {
+        bail!(
+            "cannot load: target table `{}` is not a plain (optionally dotted) SQL identifier — \
+             the loader splices it into DDL/COPY.",
+            table.escape_default()
+        );
+    }
     // Round-5: refuse a source-derived column name that isn't a plain identifier —
     // the warehouse drivers interpolate it into executed DDL/COPY with no quoting,
     // so a hostile/odd name (`x); DROP TABLE …`, an embedded quote/backtick) must
@@ -260,6 +270,17 @@ pub fn run_load_cdc(
     expected_delta: Option<u64>,
     cleanup: Option<(&GcsStore, &str)>,
 ) -> Result<CdcLoadReport> {
+    // Round-6: the CDC primary-key columns are interpolated raw into the dedup view's
+    // PARTITION BY — gate them like the column names (source-derived injection surface).
+    for c in pk {
+        if !is_safe_load_ident(c) {
+            bail!(
+                "cannot load `{table}`: CDC primary-key column `{}` is not a plain SQL \
+                 identifier — it is spliced into the dedup view. Rename/alias it.",
+                c.escape_default()
+            );
+        }
+    }
     append_and_view(
         loader,
         table,
