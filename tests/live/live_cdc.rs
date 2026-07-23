@@ -1726,8 +1726,12 @@ exports:
 
     let snap = out.join("snapshot");
     let snap_cols: Vec<String> = parquet_fields(&snap).into_iter().map(|(n, _)| n).collect();
+    // The meta columns are `_rivet_exported_at` / `_rivet_row_hash` (SINGLE
+    // underscore, src/enrich.rs) — a `__rivet` (double) check silently never
+    // matched, so this assertion was VACUOUS (green even if the leg leaked them).
+    // Caught while RED-proving the sibling cdc→warehouse DuckDB-load test.
     assert!(
-        !snap_cols.iter().any(|c| c.starts_with("__rivet")),
+        !snap_cols.iter().any(|c| c.starts_with("_rivet")),
         "snapshot leg must NOT carry batch meta columns (load parity with the CDC \
          stream's __changes append); got {snap_cols:?}"
     );
@@ -4121,5 +4125,130 @@ fn cdc_cross_database_enum_enriches_from_the_tables_own_schema() {
         "off",
         "a cross-database ENUM must enrich to its LABEL from the table's own schema, \
          not the connection's default DATABASE()"
+    );
+}
+
+/// Closes the CDC/incremental → warehouse LOAD quadrant (the coverage-audit HIGH
+/// blind spot: every load suite sourced `mode: full` parquet, so no test ever
+/// LOADED rivet's CDC `__changes` output). DuckDB is the independent-reader proxy
+/// for the warehouse load: `read_parquet(union_by_name=true)` over BOTH the
+/// `initial: snapshot` leg AND the CDC change leg mimics the loader's
+/// declared-schema LOAD-by-name into one `<table>__changes` table (snapshot rows
+/// get `__op`/`__pos`/`__seq` = NULL). It is the exact `fda1653` class: a
+/// snapshot leg that KEPT its batch `meta_columns` would leak a column the CDC
+/// stream lacks — silent under count/sum checks, breaks the warehouse load one
+/// layer up. The current-state dedup is then verified against the SOURCE's actual
+/// rows (an independent oracle, not rivet's own output).
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc + duckdb"]
+fn cdc_changes_parquet_loads_into_a_warehouse_and_dedups_to_current_state() {
+    let d = tempfile::tempdir().unwrap();
+    let (host_dir, container_dir) = duckdb_shared_workdir(&unique_name("cdc_load"));
+    let tbl = unique_name("cdc_load");
+    let mut c = conn();
+    c.query_drop(format!("DROP TABLE IF EXISTS {tbl}")).unwrap();
+    c.query_drop(format!("CREATE TABLE {tbl} (id INT PRIMARY KEY, v INT)"))
+        .unwrap();
+    let _guard = Table(tbl.clone());
+    // Pre-snapshot rows — the initial:snapshot backfill leg.
+    c.query_drop(format!("INSERT INTO {tbl} VALUES (1,10),(2,20)"))
+        .unwrap();
+
+    let ckpt = d.path().join("cdc.ckpt");
+    // meta_columns are REQUESTED: the fda1653 trap. They must be dropped from the
+    // snapshot leg so both legs' data columns match in the shared __changes append.
+    let yaml = format!(
+        r#"source: {{type: mysql, url: "{MYSQL_CDC_URL}"}}
+exports:
+  - name: {tbl}
+    table: {tbl}
+    mode: cdc
+    format: parquet
+    meta_columns: {{ exported_at: true, row_hash: true }}
+    cdc: {{ initial: snapshot, checkpoint: "{ckpt}", until_current: true, server_id: {sid} }}
+    destination: {{ type: local, path: "{out}" }}
+"#,
+        ckpt = ckpt.display(),
+        out = host_dir.display(),
+        sid = server_id_for(&tbl),
+    );
+    let cfg = write_config(&d, &yaml);
+    run_rivet_ok(&cfg); // snapshot leg → host_dir/snapshot/*.parquet
+
+    // Post-snapshot changes: an UPDATE (dedup must pick the new value over the
+    // snapshot baseline) and an INSERT (a PK present ONLY in the change leg).
+    c.query_drop(format!("UPDATE {tbl} SET v = 100 WHERE id = 1"))
+        .unwrap();
+    c.query_drop(format!("INSERT INTO {tbl} VALUES (3,30)"))
+        .unwrap();
+    run_rivet_ok(&cfg); // CDC leg → host_dir/cdc-*.parquet
+
+    // DuckDB = the independent warehouse-load proxy. union_by_name mimics the
+    // loader's declared-schema LOAD-by-name (snapshot's missing __op/__pos/__seq
+    // become NULL). A LIST of globs unions the two legs into one __changes table.
+    let changes = format!(
+        "read_parquet(['{c}/snapshot/*.parquet','{c}/cdc-*.parquet'], union_by_name=true)",
+        c = container_dir,
+    );
+
+    // (1) LOADABILITY / fda1653: the unioned __changes carries EXACTLY the three
+    //     meta columns + the source data columns — NO leaked batch meta_column
+    //     from the snapshot leg (which would break a real warehouse load).
+    let desc = duckdb_run_sql_json(&format!("DESCRIBE SELECT * FROM {changes}"));
+    let cols = duckdb_parse_describe(&desc);
+    // The unioned __changes must be EXACTLY {__op, __pos, __seq} + the source data
+    // columns — any other column is a leaked snapshot-leg meta_column. The meta
+    // columns are `_rivet_exported_at` / `_rivet_row_hash` (SINGLE underscore, see
+    // src/enrich.rs) — a `__rivet` (double) check silently never matches and is
+    // vacuous (which is exactly how the sibling snapshot-parity test's assertion
+    // reads today). Assert the whole set instead of a prefix so any leak is caught.
+    let mut got_cols: Vec<String> = cols.keys().cloned().collect();
+    got_cols.sort();
+    assert_eq!(
+        got_cols,
+        vec![
+            "__op".to_string(),
+            "__pos".to_string(),
+            "__seq".to_string(),
+            "id".to_string(),
+            "v".to_string(),
+        ],
+        "the unioned __changes must carry EXACTLY the 3 meta columns + the source \
+         data columns; an extra column is a leaked snapshot-leg meta_column (fda1653 \
+         — breaks the warehouse load, silent under count/sum checks)"
+    );
+
+    // (2) CURRENT-STATE: an INDEPENDENT dedup (latest change per PK wins; the
+    //     snapshot baseline has __pos NULL = oldest) reconstructs current state.
+    //     The oracle is the SOURCE's actual rows {1:100, 2:20, 3:30}.
+    let sql = format!(
+        "SELECT id, v FROM (
+           SELECT id, v, ROW_NUMBER() OVER (
+             PARTITION BY id ORDER BY (__pos IS NOT NULL) DESC, __seq DESC
+           ) AS rn FROM {changes}
+         ) WHERE rn = 1 ORDER BY id"
+    );
+    let res = duckdb_run_sql_json(&sql);
+    let got: Vec<(String, String)> = res["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            let a = r.as_array().unwrap();
+            (
+                a[0].as_str().unwrap().to_string(),
+                a[1].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            ("1".into(), "100".into()),
+            ("2".into(), "20".into()),
+            ("3".into(), "30".into()),
+        ],
+        "CDC __changes must LOAD (both legs into one table) and DEDUP to the source's \
+         current state — id=1 updated to 100, id=2 unchanged, id=3 insert-only"
     );
 }
