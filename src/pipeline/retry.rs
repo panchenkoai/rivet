@@ -69,6 +69,25 @@ fn transient(needs_reconnect: bool, extra_delay_ms: u64) -> RetryClass {
     }
 }
 
+/// Ceiling on a single retry's exponential backoff. Without a cap the wait
+/// doubles unboundedly, so a `max_retries` set high enough to ride out a
+/// minutes-long flaky-tunnel outage becomes impractical (one retry would sleep
+/// for hours) — and `2u64.pow(attempt - 1)` PANICS once `attempt - 1 >= 64`, so a
+/// large `max_retries` aborted the export outright. Capping each wait keeps a
+/// generous retry budget usable and the arithmetic overflow-free.
+pub const MAX_RETRY_BACKOFF_MS: u64 = 60_000;
+
+/// Backoff (ms) for retry `attempt` (1-based): `base * 2^(attempt-1)`, clamped to
+/// [`MAX_RETRY_BACKOFF_MS`], then `extra` added. Saturating throughout so a large
+/// `attempt` can neither overflow nor panic. Shared by every per-attempt retry
+/// loop (single + parallel-checkpoint) so their backoff can't drift apart.
+pub fn retry_backoff_ms(base_ms: u64, attempt: u32, extra_ms: u64) -> u64 {
+    base_ms
+        .saturating_mul(2u64.saturating_pow(attempt.saturating_sub(1)))
+        .min(MAX_RETRY_BACKOFF_MS)
+        .saturating_add(extra_ms)
+}
+
 /// Classifies transient errors into retry categories.
 ///
 /// Order: a typed [`crate::source::StatementDurationTimeout`] marker
@@ -392,6 +411,24 @@ mod tests {
     fn test_is_transient_matches() {
         assert!(is_transient(&anyhow::anyhow!("statement timed out")));
         assert!(is_transient(&anyhow::anyhow!("connection reset")));
+    }
+
+    #[test]
+    fn retry_backoff_doubles_then_caps_and_never_overflows() {
+        // Exponential doubling below the cap.
+        assert_eq!(retry_backoff_ms(5_000, 1, 0), 5_000);
+        assert_eq!(retry_backoff_ms(5_000, 2, 0), 10_000);
+        assert_eq!(retry_backoff_ms(5_000, 3, 0), 20_000);
+        assert_eq!(retry_backoff_ms(5_000, 4, 0), 40_000);
+        // 5_000 * 2^4 = 80_000 → clamped to the 60s ceiling.
+        assert_eq!(retry_backoff_ms(5_000, 5, 0), MAX_RETRY_BACKOFF_MS);
+        assert_eq!(retry_backoff_ms(5_000, 10, 0), MAX_RETRY_BACKOFF_MS);
+        // extra_delay is added AFTER the cap.
+        assert_eq!(retry_backoff_ms(5_000, 10, 500), MAX_RETRY_BACKOFF_MS + 500);
+        // The load-bearing robustness property: a large attempt must NOT panic
+        // (the old `2u64.pow(attempt - 1)` aborted the export at attempt ≥ 65).
+        assert_eq!(retry_backoff_ms(5_000, 100, 0), MAX_RETRY_BACKOFF_MS);
+        assert_eq!(retry_backoff_ms(u64::MAX, u32::MAX, u64::MAX), u64::MAX);
     }
 
     #[test]

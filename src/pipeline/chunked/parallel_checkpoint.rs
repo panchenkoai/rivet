@@ -238,9 +238,11 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                                     .map(classify_error)
                                     .map(|c| c.extra_delay_ms())
                                     .unwrap_or(0);
-                                let backoff = plan_w.tuning.retry_backoff_ms
-                                    * 2u64.pow(attempt - 1)
-                                    + extra_delay;
+                                let backoff = crate::pipeline::retry::retry_backoff_ms(
+                                    plan_w.tuning.retry_backoff_ms,
+                                    attempt,
+                                    extra_delay,
+                                );
                                 std::thread::sleep(Duration::from_millis(backoff));
                             }
 

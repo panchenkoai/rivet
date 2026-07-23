@@ -263,7 +263,13 @@ impl SourceTuning {
                 batch_size_memory_mb: None,
                 throttle_ms: 500,
                 statement_timeout_s: 120,
-                max_retries: 5,
+                // Safe is the Production-environment default and the profile for
+                // long unattended exports over flaky links (SSH tunnels, VPNs). A
+                // reconnect-class blip can last tens of seconds, so retry patiently:
+                // 10 attempts with the capped backoff (5s,10s,20s,40s,60s×6) rides
+                // out a ~7 min outage instead of giving up in ~2.5 min. The cap
+                // (MAX_RETRY_BACKOFF_MS) is what makes a budget this large practical.
+                max_retries: 10,
                 retry_backoff_ms: 5_000,
                 lock_timeout_s: 10,
                 memory_threshold_mb: 2_048,
@@ -436,7 +442,7 @@ mod tests {
         assert_eq!(t.batch_size, 2_000);
         assert_eq!(t.throttle_ms, 500);
         assert_eq!(t.statement_timeout_s, 120);
-        assert_eq!(t.max_retries, 5);
+        assert_eq!(t.max_retries, 10);
         assert_eq!(t.retry_backoff_ms, 5_000);
         assert_eq!(t.lock_timeout_s, 10);
     }
@@ -457,7 +463,7 @@ mod tests {
             "non-overridden field stays at safe default"
         );
         assert_eq!(
-            t.max_retries, 5,
+            t.max_retries, 10,
             "non-overridden field stays at safe default"
         );
     }

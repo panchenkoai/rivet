@@ -143,8 +143,11 @@ fn run_chunk_with_source_retries(
                 .as_ref()
                 .map(classify_error)
                 .unwrap_or(RetryClass::Permanent);
-            let backoff =
-                plan.tuning.retry_backoff_ms * 2u64.pow(attempt - 1) + class.extra_delay_ms();
+            let backoff = crate::pipeline::retry::retry_backoff_ms(
+                plan.tuning.retry_backoff_ms,
+                attempt,
+                class.extra_delay_ms(),
+            );
             log::warn!(
                 "export '{}': chunk {} retry {}/{} in {}ms",
                 plan.export_name,

@@ -34,8 +34,11 @@ pub(crate) fn run_with_reconnect(
                 .as_ref()
                 .map(classify_error)
                 .unwrap_or(RetryClass::Permanent);
-            let backoff =
-                plan.tuning.retry_backoff_ms * 2u64.pow(attempt - 1) + class.extra_delay_ms();
+            let backoff = super::retry::retry_backoff_ms(
+                plan.tuning.retry_backoff_ms,
+                attempt,
+                class.extra_delay_ms(),
+            );
             log::warn!(
                 "export '{}': retry {}/{} in {}ms{}({})",
                 plan.export_name,
