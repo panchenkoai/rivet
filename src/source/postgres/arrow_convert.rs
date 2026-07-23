@@ -858,11 +858,31 @@ fn build_pg_text_array(
     Ok(Arc::new(b.finish()))
 }
 
+/// A PostgreSQL array cell failed to decode into a 1-D `Vec<Option<T>>` — almost
+/// always a MULTI-dimensional value in a `x[]` column (the OID does not encode
+/// dimensionality). Fail loud, naming the column and the fix, rather than the
+/// old `.ok().flatten()` that wrote a silent whole-cell NULL.
+fn pg_array_decode_error(rows: &[Row], col_idx: usize, e: &postgres::Error) -> anyhow::Error {
+    let col = rows
+        .first()
+        .and_then(|r| r.columns().get(col_idx))
+        .map(|c| c.name())
+        .unwrap_or("?");
+    anyhow::anyhow!(
+        "column '{col}': a PostgreSQL array value could not be decoded as a one-dimensional \
+         Arrow List ({e}). The usual cause is a MULTI-dimensional (nested) array value — an \
+         `integer[]` column may legally hold 2-D+ matrices, but Arrow's List is one-dimensional \
+         and has no flat mapping. Cast the column to text in the export query (e.g. `{col}::text`) \
+         to export the array literal, or flatten it to a 1-D array."
+    )
+}
+
 /// Build an Arrow `ListArray` from a PostgreSQL array column.
 ///
 /// Dispatches to `Vec<T>` deserialization based on the Arrow element type.
-/// Supports: bool, int16/32/64, float32/64, text. Other element types fall
-/// back to a null list.
+/// Supports: bool, int16/32/64, float32/64, text. A decode error (e.g. a
+/// multi-dimensional value) FAILS LOUD via [`pg_array_decode_error`] rather than
+/// silently NULLing the cell; unsupported element types bail in the match tail.
 fn build_pg_list_array(
     target_type: &DataType,
     col_idx: usize,
@@ -874,22 +894,24 @@ fn build_pg_list_array(
         anyhow::bail!("build_pg_list_array called with non-List target type");
     };
 
-    // PG arrays can legally contain NULL elements (`ARRAY[1, NULL, 3]`).
-    // The `postgres` crate's `Vec<T>` deserializer rejects such arrays with
-    // an error; `try_get::<Vec<T>>` then returns `Err`, the `.ok().flatten()`
-    // collapses that to `None`, and a *whole-row NULL* gets written — silent
-    // data loss. The fix is to deserialize as `Vec<Option<T>>` so NULL inner
-    // elements survive into the Arrow `ListBuilder` via `append_null()`.
+    // PG arrays can legally contain NULL elements (`ARRAY[1, NULL, 3]`); the
+    // `Vec<Option<T>>` element type below carries those inner NULLs into the
+    // Arrow `ListBuilder`.
+    //
+    // But a decode ERROR must NOT be conflated with a NULL cell. The `postgres`
+    // crate's `Vec<Option<T>>` deserializer is ONE-DIMENSIONAL: a legal
+    // MULTI-dimensional value (`'{{1,2},{3,4}}'` — the OID `_int4` is shared by
+    // `integer[]` and `integer[][]`, so a 2-D value routes here) fails with
+    // "array contains too many dimensions". Swallowing that Err via
+    // `.ok().flatten()` wrote a WHOLE-CELL NULL — silent data loss the value-
+    // checksum can't catch (its side reads the same `try_get`). So match `Err`
+    // explicitly and FAIL LOUD, naming the fix (Arrow List is 1-D — cast to text).
     macro_rules! list_of {
         ($T:ty, $Builder:ty) => {{
             let mut lb = ListBuilder::new(<$Builder>::new());
             for row in rows {
-                match row
-                    .try_get::<_, Option<Vec<Option<$T>>>>(col_idx)
-                    .ok()
-                    .flatten()
-                {
-                    Some(v) => {
+                match row.try_get::<_, Option<Vec<Option<$T>>>>(col_idx) {
+                    Ok(Some(v)) => {
                         for x in &v {
                             match x {
                                 Some(val) => lb.values().append_value(*val),
@@ -898,7 +920,8 @@ fn build_pg_list_array(
                         }
                         lb.append(true);
                     }
-                    None => lb.append(false),
+                    Ok(None) => lb.append(false),
+                    Err(e) => return Err(pg_array_decode_error(rows, col_idx, &e)),
                 }
             }
             Ok(Arc::new(lb.finish()))
@@ -915,12 +938,8 @@ fn build_pg_list_array(
         DataType::Utf8 => {
             let mut lb = ListBuilder::new(StringBuilder::new());
             for row in rows {
-                match row
-                    .try_get::<_, Option<Vec<Option<String>>>>(col_idx)
-                    .ok()
-                    .flatten()
-                {
-                    Some(v) => {
+                match row.try_get::<_, Option<Vec<Option<String>>>>(col_idx) {
+                    Ok(Some(v)) => {
                         for s in &v {
                             match s {
                                 Some(val) => lb.values().append_value(val),
@@ -929,7 +948,8 @@ fn build_pg_list_array(
                         }
                         lb.append(true);
                     }
-                    None => lb.append(false),
+                    Ok(None) => lb.append(false),
+                    Err(e) => return Err(pg_array_decode_error(rows, col_idx, &e)),
                 }
             }
             Ok(Arc::new(lb.finish()))

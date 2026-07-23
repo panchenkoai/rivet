@@ -333,6 +333,36 @@ fn pg_edge_array_edge_shapes_round_trip() {
     );
 }
 
+// A MULTI-dimensional array in an `int[]` column has no flat Arrow List mapping
+// (the OID doesn't encode dimensionality, so a 2-D value routes to the 1-D list
+// builder). The old `.ok().flatten()` swallowed the postgres decode Err and wrote
+// a silent whole-cell NULL — silent data loss the value-checksum can't catch. It
+// must now FAIL LOUD, naming the column and the cast-to-text remediation.
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn pg_edge_multidim_array_fails_loud_not_silent_null() {
+    let (_glob, out) = pg_edge_export(
+        "CREATE TABLE {table_name} (id INT PRIMARY KEY, grid INT[]);
+         INSERT INTO {table_name} VALUES (1, ARRAY[ARRAY[1,2],ARRAY[3,4]])",
+        "SELECT id, grid FROM {table_name}",
+        "pg_edge_md_arr",
+        "",
+    );
+    assert!(
+        !out.status.success(),
+        "a 2-D array export must FAIL, not silently NULL the cell"
+    );
+    let err = String::from_utf8_lossy(&out.stderr).to_lowercase();
+    assert!(
+        err.contains("multi-dimensional") && err.contains("grid"),
+        "the failure must name the column + the multi-dim cause; got:\n{err}"
+    );
+    assert!(
+        err.contains("::text") || err.contains("flatten"),
+        "the failure must name the cast-to-text remediation; got:\n{err}"
+    );
+}
+
 // ─── String edge cases: empty, whitespace, large single cell ───────────────
 
 #[test]
