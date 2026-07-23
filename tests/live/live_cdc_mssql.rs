@@ -1262,3 +1262,50 @@ fn roast_mssql_cdc_large_transaction_is_atomic_across_a_mid_flush_crash() {
         got.len()
     );
 }
+
+/// MSSQL sibling of the independent CDC-type oracle (option 1): the
+/// `mssql_cdc_full_type_matrix_matches_batch` cell is a DIFFERENTIAL self-oracle
+/// (CDC vs batch, shared decode). This reads the `__changes` parquet with DuckDB —
+/// outside rivet's decode family — and asserts each value vs the SOURCE literal,
+/// catching a shared-decode bug matches_batch misses.
+#[test]
+#[ignore = "live: requires docker compose mssql with SQL Server Agent + CDC + duckdb"]
+fn mssql_cdc_typed_values_match_source_via_duckdb_not_batch() {
+    let _serial = CDC_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let d = tempfile::tempdir().unwrap();
+    let (host_dir, container_dir) = duckdb_shared_workdir(&unique_name("cdc_typed_ms"));
+    let table = unique_name("rivet_cdc_typed");
+    let ci = format!("dbo_{table}");
+    mssql_cdc_drop_table(&format!("dbo.{table}"));
+    mssql_cdc_exec(&format!(
+        "CREATE TABLE dbo.{table} (id INT PRIMARY KEY, big BIGINT, amount DECIMAL(18,4), \
+         label VARCHAR(50), d DATE, vb VARBINARY(4), m MONEY)"
+    ));
+    enable_cdc(&table, &ci);
+    let _guard = MssqlCdcTable {
+        table: table.clone(),
+        ci: ci.clone(),
+    };
+    let ckpt = d.path().join("cdc.ckpt");
+    mssql_cdc_exec(&format!(
+        "INSERT INTO dbo.{table} VALUES (1, 9000000000000, 12345.6789, 'hello', \
+         '2026-06-23', 0xDEADBEEF, 123.4567)"
+    ));
+    wait_for_capture(&ci, 1);
+    run_rivet_ok(&mssql_cdc_config(&d, &table, &ci, &ckpt, &host_dir));
+
+    let res = duckdb_run_sql_json(&format!(
+        "SELECT (big = 9000000000000) AND (amount = 12345.6789) AND (label = 'hello') \
+         AND (d = DATE '2026-06-23') AND (lower(to_hex(vb)) = 'deadbeef') AND (m = 123.4567) \
+         FROM read_parquet('{container_dir}/cdc-*.parquet') WHERE id = 1"
+    ));
+    let rows = res["rows"].as_array().expect("duckdb rows");
+    assert_eq!(rows.len(), 1, "one captured change for id=1; got: {res}");
+    assert!(
+        rows[0][0]
+            .as_str()
+            .is_some_and(|s| s.eq_ignore_ascii_case("true")),
+        "MSSQL CDC typed values must equal the SOURCE literals via DuckDB (independent of \
+         batch): bigint, decimal 12345.6789, text, date, binary (hex), MONEY 123.4567; got: {res}"
+    );
+}

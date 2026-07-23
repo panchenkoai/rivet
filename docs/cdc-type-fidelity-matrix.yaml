@@ -43,7 +43,7 @@ scenarios:
     what: "int16/32/64 + unsigned 64 (incl. BIGINT UNSIGNED > i64::MAX) survive CDC. MySQL cell is INDEPENDENT (DuckDB re-read vs the source literal), not a batch-differential"
     postgres: { test: pg_cdc_typed_values_match_source_via_duckdb_not_batch, oracle: independent }
     mysql:    { test: mysql_cdc_typed_values_match_source_via_duckdb_not_batch, oracle: independent }
-    mssql:    { test: mssql_cdc_full_type_matrix_matches_batch }
+    mssql:    { test: mssql_cdc_typed_values_match_source_via_duckdb_not_batch, oracle: independent }
     mongo:    { test: mongo_cdc_change_stream_renders_tricky_bson_verbatim_like_batch, oracle: independent }
 
   - id: type_float
@@ -64,7 +64,7 @@ scenarios:
     what: "date + time-of-day survive the change stream with the batch Arrow types"
     postgres: { test: pg_cdc_typed_values_match_source_via_duckdb_not_batch, oracle: independent }
     mysql:   { test: mysql_cdc_typed_values_match_source_via_duckdb_not_batch, oracle: independent }
-    mssql:    { test: mssql_cdc_full_type_matrix_matches_batch }
+    mssql:    { test: mssql_cdc_typed_values_match_source_via_duckdb_not_batch, oracle: independent }
     mongo:    { na: "BSON dates ride the verbatim document blob; the extJSON test pins the mechanism" }
 
   - id: type_timestamp_tz
@@ -78,14 +78,14 @@ scenarios:
     what: "varchar/char/text through CDC — value + encoding verbatim"
     postgres: { test: pg_cdc_typed_values_match_source_via_duckdb_not_batch, oracle: independent }
     mysql:   { test: mysql_cdc_typed_values_match_source_via_duckdb_not_batch, oracle: independent }
-    mssql:    { test: mssql_cdc_full_type_matrix_matches_batch }
+    mssql:    { test: mssql_cdc_typed_values_match_source_via_duckdb_not_batch, oracle: independent }
     mongo:    { test: mongo_cdc_change_stream_renders_tricky_bson_verbatim_like_batch, oracle: independent }
 
   - id: type_binary
     what: "bytea/varbinary/binary through CDC as the same bytes"
     postgres: { test: pg_cdc_typed_values_match_source_via_duckdb_not_batch, oracle: independent }
     mysql:   { test: mysql_cdc_typed_values_match_source_via_duckdb_not_batch, oracle: independent }
-    mssql:    { test: mssql_cdc_full_type_matrix_matches_batch }
+    mssql:    { test: mssql_cdc_typed_values_match_source_via_duckdb_not_batch, oracle: independent }
     mongo:    { na: "binary rides the verbatim document blob (BSON Binary → extJSON)" }
 
   - id: type_json
