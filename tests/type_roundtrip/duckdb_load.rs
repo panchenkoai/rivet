@@ -376,3 +376,115 @@ fn duckdb_validates_mssql_type_matrix_parquet() {
         "datetimeoffset NULL must stay NULL"
     );
 }
+
+/// Scalar `i64` out of a one-cell DuckDB JSON result (every value is stringified
+/// by [`duckdb_run_sql_json`]).
+fn dd_scalar_i64(res: &serde_json::Value) -> i64 {
+    res["rows"][0][0]
+        .as_str()
+        .unwrap_or_else(|| panic!("duckdb scalar not a string: {res}"))
+        .parse()
+        .unwrap_or_else(|e| panic!("duckdb scalar not an int: {e} ({res})"))
+}
+
+/// The silent-loss oracle CLAUDE.md prescribes but the cross-product coverage
+/// audit found NOWHERE for pg/mysql/mssql/mongo: a per-column NULL-profile (+
+/// distinct-count on scalars) of the DESTINATION parquet vs the SOURCE table.
+/// Counts/sums of hand-picked columns pass while a column silently degrades to
+/// 100% NULL (the `uuid`→NULL `FixedSizeBinary(16)` class, a dropped Mongo `_id`
+/// bracket, a coarsened list) — the destination still has the right ROW count, so
+/// only a PER-COLUMN null-count vs the source catches it. Two independent readers:
+/// DuckDB re-reads the parquet, Postgres reads the source. This is the batch
+/// SNAPSHOT path — the headline, most-used export — whose only prior oracle was
+/// count/manifest parity.
+#[test]
+#[ignore = "live: requires docker compose postgres + duckdb"]
+fn duckdb_pg_matrix_per_column_null_profile_matches_source() {
+    require_alive(LiveService::Postgres);
+    require_alive(LiveService::DuckDb);
+
+    let table_name = unique_name("dd_pg_np");
+    let enum_type = setup_pg_matrix_table(&table_name);
+    let _guard = PgCleanup {
+        table: table_name.clone(),
+        enum_type,
+    };
+
+    let (host_dir, container_dir) = duckdb_shared_workdir(&unique_name("dd_pg_np_out"));
+    run_pg_matrix_export(&table_name, "parquet", &host_dir);
+    let glob = format!("{container_dir}/*.parquet");
+
+    let mut pg = pg_connect();
+    // Every source column, in physical order.
+    let cols: Vec<String> = pg
+        .query(
+            "SELECT column_name FROM information_schema.columns \
+             WHERE table_name = $1 ORDER BY ordinal_position",
+            &[&table_name],
+        )
+        .unwrap()
+        .iter()
+        .map(|r| r.get::<_, String>(0))
+        .collect();
+    assert!(
+        cols.len() >= 25,
+        "the matrix must present a rich column set to profile; got {} columns",
+        cols.len()
+    );
+
+    // Row-count parity baseline (a wholesale row loss would show here first).
+    let src_rows: i64 = pg
+        .query_one(&format!("SELECT count(*) FROM {table_name}"), &[])
+        .unwrap()
+        .get(0);
+    let dst_rows = dd_scalar_i64(&duckdb_run_sql_json(&format!(
+        "SELECT count(*) FROM read_parquet('{glob}')"
+    )));
+    assert_eq!(
+        src_rows, dst_rows,
+        "row-count parity source vs dest parquet"
+    );
+
+    // Per-column NULL-count parity — the primary silent-loss signal. Works for
+    // EVERY type (count ignores NULLs on both readers), so no column is exempt.
+    for col in &cols {
+        let src_nulls: i64 = pg
+            .query_one(
+                &format!("SELECT count(*) - count(\"{col}\") FROM {table_name}"),
+                &[],
+            )
+            .unwrap()
+            .get(0);
+        let dst_nulls = dd_scalar_i64(&duckdb_run_sql_json(&format!(
+            "SELECT count(*) - count(\"{col}\") FROM read_parquet('{glob}')"
+        )));
+        assert_eq!(
+            src_nulls, dst_nulls,
+            "column '{col}': source has {src_nulls} NULLs, dest parquet has {dst_nulls} — a \
+             silent per-column degradation (column dropped to 100% NULL / values nulled) that \
+             count/sum checks on other columns cannot see"
+        );
+    }
+
+    // Distinct-count parity on a curated scalar set — catches VALUE corruption or
+    // a dropped value-bracket that a matching NULL-count would miss (values wrong
+    // but not null). Compares COUNTS, so the differing physical representation
+    // (uuid text vs 16-byte blob, decimal) does not matter.
+    for col in ["id", "c_integer", "amount", "label", "uid"] {
+        let src_d: i64 = pg
+            .query_one(
+                &format!("SELECT count(DISTINCT \"{col}\") FROM {table_name}"),
+                &[],
+            )
+            .unwrap()
+            .get(0);
+        let dst_d = dd_scalar_i64(&duckdb_run_sql_json(&format!(
+            "SELECT count(DISTINCT \"{col}\") FROM read_parquet('{glob}')"
+        )));
+        assert_eq!(
+            src_d, dst_d,
+            "column '{col}': distinct-count parity — {src_d} in source vs {dst_d} in dest \
+             (value corruption / a lost value-bracket the NULL-count would not reveal)"
+        );
+    }
+}
