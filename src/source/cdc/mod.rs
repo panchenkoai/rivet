@@ -659,11 +659,24 @@ impl CdcSchemaResolver {
         // stay untouched.
         if let Some(conn) = self.enrich.as_mut() {
             use mysql::prelude::Queryable;
-            let bare = table.rsplit('.').next().unwrap_or(table);
+            // A qualified `db.table` carries its OWN schema, which may differ from
+            // the connection's DATABASE() (a cross-database capture), and a db-less
+            // URL has no DATABASE() at all. The old query dropped the qualifier and
+            // pinned `TABLE_SCHEMA = DATABASE()`, so both cases enriched NOTHING —
+            // ENUM/SET columns then kept their raw wire index / bitmask instead of
+            // the `enum('a',…)` / `set('x',…)` labels the binlog cell fixes need,
+            // silently corrupting every such column. Split like the batch path
+            // (mysql::mod) and query the EXPLICIT schema.
+            let default_db: Option<String> = if table.contains('.') {
+                None
+            } else {
+                conn.query_first("SELECT DATABASE()")?
+            };
+            let (schema, bare) = enrich_schema_and_table(table, default_db.as_deref());
             let full: Vec<(String, String)> = conn.exec(
                 "SELECT COLUMN_NAME, COLUMN_TYPE FROM information_schema.COLUMNS \
-                 WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?",
-                (bare,),
+                 WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
+                (&schema, &bare),
             )?;
             for m in &mut mappings {
                 if let Some((_, ct)) = full.iter().find(|(n, _)| *n == m.column_name) {
@@ -672,6 +685,25 @@ impl CdcSchemaResolver {
             }
         }
         Ok(mappings)
+    }
+}
+
+/// Split a possibly-qualified `db.table` into the `(schema, bare_table)` the
+/// MySQL `information_schema.COLUMNS` enrichment query needs. A qualified name
+/// carries its OWN schema — which may differ from the connection's default DB (a
+/// cross-database capture) — so its qualifier wins; an unqualified name falls
+/// back to `default_db` (the connection's `DATABASE()`, `""` when the URL has no
+/// default database). Mirrors the batch introspection split (mysql::mod), so CDC
+/// and batch resolve the same schema for the same table. `default_db` is only
+/// consulted for an unqualified name (the caller passes `None` for a qualified
+/// one to skip the extra `SELECT DATABASE()` round-trip).
+fn enrich_schema_and_table(table: &str, default_db: Option<&str>) -> (String, String) {
+    match table.split_once('.') {
+        Some((s, t)) => (s.to_string(), t.to_string()),
+        None => (
+            default_db.unwrap_or_default().to_string(),
+            table.to_string(),
+        ),
     }
 }
 
@@ -782,6 +814,34 @@ mod tests {
     // otherwise exercised only through I/O paths (dispatch, cdc_job, adapter
     // opens), so an inverted mapping would survive the CI mutants gate's
     // `--lib` run.
+    // Finding #3: MySQL CDC enriched ENUM/SET labels from
+    // information_schema.COLUMNS pinned to `TABLE_SCHEMA = DATABASE()` while
+    // dropping any `db.` qualifier — so a cross-database (or db-less-URL) capture
+    // enriched nothing and every ENUM/SET column kept its raw wire index/bitmask.
+    // enrich_schema_and_table must resolve a qualified name's OWN schema, not the
+    // connection default. RED against the old `rsplit('.').next()` + DATABASE()
+    // pinning (which yielded schema == default_db even for `otherdb.orders`).
+    #[test]
+    fn enrich_uses_the_qualified_schema_not_the_connection_default() {
+        use super::enrich_schema_and_table;
+        // Cross-database capture: the qualifier wins over the connection default.
+        assert_eq!(
+            enrich_schema_and_table("otherdb.orders", Some("conndb")),
+            ("otherdb".to_string(), "orders".to_string())
+        );
+        // Unqualified: falls back to the connection's DATABASE().
+        assert_eq!(
+            enrich_schema_and_table("orders", Some("conndb")),
+            ("conndb".to_string(), "orders".to_string())
+        );
+        // Db-less URL (DATABASE() is NULL) unqualified → empty schema (query
+        // matches nothing, but never the WRONG database's same-named table).
+        assert_eq!(
+            enrich_schema_and_table("orders", None),
+            (String::new(), "orders".to_string())
+        );
+    }
+
     #[test]
     fn drain_mode_maps_the_config_bool_and_bounds() {
         use super::DrainMode;
