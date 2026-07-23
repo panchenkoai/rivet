@@ -88,6 +88,17 @@ pub struct RunSummary {
     pub column_checksums: Vec<crate::manifest::ColumnChecksum>,
     /// The column the Form B checksum is keyed to (cursor/key column); `None` = un-keyed.
     pub checksum_key_column: Option<String>,
+    /// Set when a checkpoint RESUME hydrated pre-crash parts into
+    /// `manifest_parts` whose per-column checksum contribution is unrecoverable
+    /// (file_log stores no per-column checksums, and the prior manifest keeps
+    /// only the run-wide XOR, not per-part). The run-wide Form B XOR this run
+    /// harvests would then cover only the re-exported parts while the manifest
+    /// lists ALL parts, so `harvest_column_checksums` SUPPRESSES Form B entirely
+    /// rather than record a partial XOR that `validate --depth full` would flag
+    /// as a false mismatch — mirroring how a rehydrated part's empty md5 degrades
+    /// to a size-only check. An incomplete integrity record must be ABSENT, not
+    /// partial-and-lying.
+    pub column_checksums_incomplete: bool,
     /// Cursor range this run covered (incremental strategies) — travels to the
     /// manifest's extraction section for warehouse-side continuity checks.
     /// v1 ships column + low + high; cursor_type / source_row_count are
@@ -217,6 +228,7 @@ impl RunSummary {
             manifest_verification: None,
             apply_context: None,
             column_checksums: Vec::new(),
+            column_checksums_incomplete: false,
             checksum_key_column: None,
             cursor_column: None,
             cursor_low: None,
@@ -282,6 +294,7 @@ impl RunSummary {
             manifest_verification: None,
             apply_context: None,
             column_checksums: Vec::new(),
+            column_checksums_incomplete: false,
             checksum_key_column: None,
             cursor_column: None,
             cursor_low: None,

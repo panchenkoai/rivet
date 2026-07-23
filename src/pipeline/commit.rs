@@ -79,6 +79,24 @@ pub(in crate::pipeline) fn harvest_column_checksums(
     if acc.is_empty() {
         return;
     }
+    // A checkpoint resume that hydrated pre-crash parts (Skip clone / file_log
+    // rehydrate) whose per-column checksums are unrecoverable makes the run-wide
+    // XOR cover ONLY the re-exported parts, while the manifest lists ALL parts.
+    // Recording that partial XOR would make `validate --depth full` re-read every
+    // part, recompute the full XOR, and report a FALSE mismatch on correctly
+    // resumed data (and the authoritative manifest's integrity record would be
+    // objectively wrong). Suppress Form B instead — absent, not partial-and-lying,
+    // the same graceful degradation a rehydrated part's empty md5 gets.
+    if summary.column_checksums_incomplete {
+        log::warn!(
+            "export '{}': Form B value-checksums suppressed — a checkpoint resume hydrated \
+             pre-crash parts whose per-column checksums are not recoverable, so the run-wide \
+             checksum would cover only the re-exported parts. `validate` will size-verify parts \
+             but skip the Form B value re-read for this run.",
+            summary.export_name
+        );
+        return;
+    }
     summary.column_checksums = acc
         .into_iter()
         .map(|(name, checksum)| crate::manifest::ColumnChecksum {
@@ -721,6 +739,36 @@ mod tests {
             summary.files_committed,
             summary.manifest_parts.len(),
             "files_committed and manifest_parts.len() locked together by record_part"
+        );
+    }
+
+    // Finding #10: on a checkpoint resume that hydrated pre-crash parts, the
+    // run-wide Form B XOR would cover only the re-exported parts while the
+    // manifest lists ALL parts — a partial XOR that `validate --depth full`
+    // false-flags. harvest_column_checksums must SUPPRESS Form B (leave it empty)
+    // when the summary is flagged incomplete, never record the partial XOR. RED
+    // against a harvest that ignores the flag.
+    #[test]
+    fn harvest_suppresses_form_b_when_resume_left_checksums_incomplete() {
+        let plan = test_plan();
+        let mut acc = std::collections::BTreeMap::new();
+        acc.insert("id".to_string(), 0xdead_beefu64);
+
+        // Normal run: the accumulated checksums are recorded.
+        let mut ok = test_summary(&plan);
+        harvest_column_checksums(&mut ok, acc.clone(), Some("id".into()));
+        assert!(
+            !ok.column_checksums.is_empty(),
+            "a complete run must record Form B"
+        );
+
+        // Resume that hydrated pre-crash parts: Form B is suppressed, not partial.
+        let mut resumed = test_summary(&plan);
+        resumed.column_checksums_incomplete = true;
+        harvest_column_checksums(&mut resumed, acc, Some("id".into()));
+        assert!(
+            resumed.column_checksums.is_empty(),
+            "an incomplete-checksum resume must suppress Form B, never record a partial XOR"
         );
     }
 }

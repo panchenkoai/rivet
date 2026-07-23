@@ -172,6 +172,11 @@ pub(crate) fn rehydrate_manifest_parts_from_file_log(
         summary.files_produced += rehydrated;
         summary.total_rows += rehydrated_rows;
         summary.bytes_written += rehydrated_bytes;
+        // These parts carry NO per-column checksum (file_log stores none), so the
+        // run-wide Form B XOR this run harvests cannot cover them. Mark it
+        // incomplete so harvest_column_checksums suppresses Form B rather than
+        // record a partial XOR that `validate` would flag as a false mismatch.
+        summary.column_checksums_incomplete = true;
         log::info!(
             "resume: reconstructed {rehydrated} committed part(s) ({rehydrated_rows} rows, \
              {rehydrated_bytes} bytes) into the manifest from the state DB file_log (no \
@@ -358,6 +363,12 @@ pub(crate) fn apply_m8_resume_decisions(
                 // and the manifest-authoritative `rivet load` lost its rows.
                 if let Some(p) = manifest_part_by_path.get(path.as_str()) {
                     summary.manifest_parts.push((*p).clone());
+                    // A skipped part's per-column checksum contribution is gone
+                    // (the prior manifest kept only the run-wide XOR, not per-part),
+                    // so this run's harvested XOR would cover only the re-exported
+                    // parts. Mark Form B incomplete → suppressed at harvest, never a
+                    // partial XOR that `validate --depth full` false-flags.
+                    summary.column_checksums_incomplete = true;
                 }
             }
             // Rewrite / Quarantine RE-EXPORT the owning chunk, so they DO need
@@ -658,6 +669,13 @@ mod tests {
             summary.total_rows - rows_before,
             50,
             "row aggregate bumped by the union"
+        );
+        // Finding #10: rehydrated parts carry no per-column checksum, so Form B
+        // must be flagged incomplete — harvest_column_checksums then suppresses it
+        // rather than record a partial XOR that `validate` would false-flag.
+        assert!(
+            summary.column_checksums_incomplete,
+            "rehydrating pre-crash parts must mark Form B incomplete (suppressed at harvest)"
         );
     }
 
