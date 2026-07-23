@@ -255,7 +255,7 @@ impl MongoSource {
             // in the numeric band, so the min probe always sees it (the max
             // probe covers the all-NaN corner).
             for id in [lo_id, hi_id] {
-                if matches!(id, Bson::Double(f) if f.is_nan()) {
+                if is_id_nan(id) {
                     anyhow::bail!(
                         "collection '{collection}' has a NaN `_id`: MongoDB range \
                          operators never match NaN, so keyset paging / parallel \
@@ -434,6 +434,22 @@ fn id_to_string(id: Option<&Bson>) -> String {
 /// guard and silently lost a band (bug-hunt find). `None` = a type we cannot
 /// place (MinKey/MaxKey/JS/DbPointer/…) — the caller refuses keyset rather than
 /// guessing. Two `_id`s in different brackets ⟹ un-keyset-able.
+/// A numeric `_id` that is NaN. MongoDB range operators (`$gt`/`$gte`/`$lt`)
+/// never match NaN against any operand, so a keyset page boundary landing on it
+/// drops the rest of the collection and every parallel range excludes it. BOTH
+/// forms must be caught: a 64-bit-float NaN (`Bson::Double`) AND a Decimal128 NaN
+/// (`NumberDecimal("NaN")`) — the latter lands in the numeric band via
+/// [`id_bracket`] but slipped past a Double-only check and was silently dropped.
+/// A finite decimal renders as digits/sign/`.`/`E`, so a lowercased `"nan"`
+/// substring is an unambiguous NaN test (covers `NaN`, `-NaN`, signaling `sNaN`).
+fn is_id_nan(id: &Bson) -> bool {
+    match id {
+        Bson::Double(f) => f.is_nan(),
+        Bson::Decimal128(d) => d.to_string().to_ascii_lowercase().contains("nan"),
+        _ => false,
+    }
+}
+
 fn id_bracket(v: &Bson) -> Option<u8> {
     Some(match v {
         Bson::Double(_) | Bson::Int32(_) | Bson::Int64(_) | Bson::Decimal128(_) => 0,
@@ -887,6 +903,28 @@ mod tests {
         }
         // The clamp doesn't shrink a safe sub-ceiling value.
         assert_eq!(super::mongo_batch_byte_cap(Some(256)), 256 * 1024 * 1024);
+    }
+
+    // Finding #1: the NaN `_id` guard caught only a Bson::Double NaN, so a
+    // Decimal128 NaN (`NumberDecimal("NaN")`) — which id_bracket places in the
+    // numeric band — slipped past and was silently dropped from every keyset /
+    // parallel range (its $gt/$lt never matches). is_id_nan must catch BOTH.
+    #[test]
+    fn nan_id_detected_for_double_and_decimal128() {
+        use mongodb::bson::Decimal128;
+        // 64-bit-float NaN.
+        assert!(is_id_nan(&Bson::Double(f64::NAN)));
+        // Decimal128 NaN (the form that used to slip past).
+        let dec_nan: Decimal128 = "NaN".parse().expect("bson parses NumberDecimal NaN");
+        assert!(
+            is_id_nan(&Bson::Decimal128(dec_nan)),
+            "a Decimal128 NaN _id must be caught, not silently keyset-dropped"
+        );
+        // Finite numeric _ids are NOT NaN (no false positive).
+        assert!(!is_id_nan(&Bson::Double(1.5)));
+        assert!(!is_id_nan(&Bson::Int64(1001)));
+        let dec_finite: Decimal128 = "1234.5".parse().unwrap();
+        assert!(!is_id_nan(&Bson::Decimal128(dec_finite)));
     }
 
     // ── mutation-W4 gap closure ──────────────────────────────────────────────
