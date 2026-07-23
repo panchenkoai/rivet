@@ -161,6 +161,11 @@ fn full_strategy(config: &Config, export: &ExportConfig) -> ExtractionStrategy {
             chunk_size: page.max(1),
             // Resume is opt-in: default keeps `mode: full` re-reading each run.
             checkpoint: mongo.resume,
+            // Mongo `resume` has always meant "continue from the last _id each
+            // run" (incremental-append on an append-only _id stream), so map it to
+            // the incremental opt-in to preserve that behaviour under the
+            // crash-recovery/incremental split.
+            incremental: mongo.resume,
             // `parallel: N` fans N `_id`-range workers (Mongo reader only).
             parallel: export.parallel,
         });
@@ -429,13 +434,18 @@ fn chunked_strategy_from_introspection(
         return Ok(ExtractionStrategy::Keyset(KeysetPlan {
             key_column: key.to_string(),
             chunk_size,
-            // `chunk_checkpoint: true` makes SQL keyset resumable/incremental-by-key:
-            // the runner persists the last committed key and continues from it next
-            // run (crash-recovery + append). This is engine-agnostic — the same
-            // `keyset.rs` path Mongo uses, keyed off `export_state`. Default false =
-            // full re-read each run (snapshot semantics; a plain re-run must not
-            // silently skip already-exported rows).
-            checkpoint: export.chunk_checkpoint,
+            // `chunk_checkpoint: true` = crash-recovery only: a crashed run resumes
+            // from its last committed key (detected via the in-progress run_id),
+            // but a CLEAN re-run re-reads the whole range — it never silently skips
+            // already-exported rows. The append-only "continue from key on a clean
+            // re-run" behaviour is the separate `keyset_incremental` opt-in.
+            // `keyset_incremental` needs the high-water key persisted across runs,
+            // which IS the checkpoint machinery — so it implies checkpoint. Without
+            // this an incremental-only config (no chunk_checkpoint) would be a
+            // silent no-op: the cursor is never stored and every clean re-run
+            // re-reads the whole table.
+            checkpoint: export.chunk_checkpoint || export.keyset_incremental,
+            incremental: export.keyset_incremental,
             // SQL keyset is sequential; parallel `_id`-range is a Mongo capability.
             parallel: 1,
         }));
@@ -492,9 +502,13 @@ fn chunked_strategy_from_introspection(
                     return Ok(ExtractionStrategy::Keyset(KeysetPlan {
                         key_column: key.to_string(),
                         chunk_size,
-                        // Same as the explicit `chunk_by_key` path: `chunk_checkpoint`
-                        // opts into resumable/incremental-by-key keyset.
-                        checkpoint: export.chunk_checkpoint,
+                        // Same split as the explicit `chunk_by_key` path:
+                        // `chunk_checkpoint` = crash-recovery, `keyset_incremental`
+                        // = append-only continue-on-clean-re-run.
+                        // keyset_incremental implies checkpoint (it needs the
+                        // persisted cursor) — else it is a silent no-op.
+                        checkpoint: export.chunk_checkpoint || export.keyset_incremental,
+                        incremental: export.keyset_incremental,
                         parallel: 1,
                     }));
                 }
@@ -1036,6 +1050,62 @@ mod tests {
         let err =
             resolve(SourceType::Postgres, &e, &i).expect_err("PG must not auto-keyset (ADR-0020)");
         assert!(err.to_string().contains("no safe shape"));
+    }
+
+    #[test]
+    fn keyset_checkpoint_and_incremental_are_independent_plan_flags() {
+        // The crash-recovery ⇄ incremental split: `chunk_checkpoint` sets ONLY
+        // KeysetPlan.checkpoint (safe crash-recovery); the append-only
+        // continue-on-clean-re-run is the separate `keyset_incremental` →
+        // KeysetPlan.incremental. Before the split, checkpoint implied incremental
+        // and this test could not distinguish them.
+        use crate::config::SourceType;
+        let resolve = |export: &ExportConfig, i: &crate::source::TableIntrospection| {
+            chunked_strategy_from_introspection(SourceType::Postgres, export, "public.t", 3, i)
+        };
+        let i = intro(Some("id"), &["uid"], 1_000_000, Some(100));
+
+        // checkpoint on, incremental unset → crash-recovery only, NOT incremental.
+        let mut e = chunked_export();
+        e.chunk_column = None;
+        e.chunk_by_key = Some("uid".into());
+        e.chunk_checkpoint = true;
+        e.keyset_incremental = false;
+        match resolve(&e, &i).unwrap() {
+            ExtractionStrategy::Keyset(k) => {
+                assert!(k.checkpoint, "chunk_checkpoint must set checkpoint");
+                assert!(
+                    !k.incremental,
+                    "chunk_checkpoint alone must NOT imply incremental (the safety fix)"
+                );
+            }
+            other => panic!("expected keyset, got {other:?}"),
+        }
+
+        // incremental opt-in → both flags set.
+        e.keyset_incremental = true;
+        match resolve(&e, &i).unwrap() {
+            ExtractionStrategy::Keyset(k) => {
+                assert!(k.checkpoint && k.incremental, "opt-in must set both");
+            }
+            other => panic!("expected keyset, got {other:?}"),
+        }
+
+        // keyset_incremental WITHOUT chunk_checkpoint must still set checkpoint —
+        // incremental needs the persisted cursor, so it implies checkpoint. Before
+        // the fix this was KeysetPlan{checkpoint:false, incremental:true}, a silent
+        // no-op that re-read the whole table every run.
+        e.chunk_checkpoint = false;
+        e.keyset_incremental = true;
+        match resolve(&e, &i).unwrap() {
+            ExtractionStrategy::Keyset(k) => {
+                assert!(
+                    k.checkpoint && k.incremental,
+                    "keyset_incremental must imply checkpoint (else it is a silent no-op): {k:?}"
+                );
+            }
+            other => panic!("expected keyset, got {other:?}"),
+        }
     }
 
     #[test]

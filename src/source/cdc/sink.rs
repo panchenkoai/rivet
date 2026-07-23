@@ -306,8 +306,16 @@ pub(crate) fn run_to_files(
                 .iter_mut()
                 .find(|s| table_matches(&s.out.table, &ev.schema, &ev.table))
             else {
-                continue; // not a captured table
+                continue; // not a captured table — its deferred poison never applies
             };
+            // Surface a deferred decode error (e.g. PG unchanged-TOAST with no
+            // pre-image) ONLY now that the event is confirmed to route to a
+            // captured table. An uncaptured table's poison was dropped by the
+            // `continue` above, so one mis-configured table can no longer bail
+            // capture of unrelated tables sharing the slot.
+            if let Some(poison) = &ev.poison {
+                anyhow::bail!("{poison}");
+            }
             total_bytes += ev.estimated_bytes();
             sink.buf.push(ev);
             total_rows += 1;
@@ -798,6 +806,54 @@ mod tests {
         assert_eq!(stream.acked.len(), 1, "and the source must be acked");
     }
 
+    // Parallel-CDC contamination fix: a deferred `poison` (e.g. PG unchanged-TOAST
+    // with no pre-image) on a table this run does NOT capture must be dropped WITH
+    // the event, never surfaced. One mis-configured table sharing the slot (a
+    // DEFAULT-replica-identity TOAST table) previously bailed capture of every
+    // unrelated table — the class that RED'd two live PG CDC tests off a foreign
+    // fixture. RED against a pre-fix build: the poison bails at the source.
+    #[test]
+    fn poison_on_an_uncaptured_table_is_dropped_never_bails_the_run() {
+        let d = tempfile::tempdir().unwrap();
+        let dest = local_dest(&d);
+        let cols = int_col();
+        let mut foreign = insert(2);
+        foreign.table = "audit_log".into(); // NOT captured (captured table is "t")
+        foreign.poison = Some("pg cdc: s.audit_log: column [big] unchanged-TOAST".into());
+        let captured = insert(1); // captured table "t", clean
+        let mut stream = FakeStream {
+            events: vec![foreign, captured].into(),
+            acked: Vec::new(),
+        };
+        let cfg = cfg(dest.as_ref(), &cols, FormatType::Parquet, 10);
+        run_to_files(&mut stream, cfg)
+            .expect("poison on an uncaptured table must be dropped, never bail the run");
+    }
+
+    // The safety half: a poison on a CAPTURED table still fails loud (the deferral
+    // must not swallow a real integrity refusal for a table we DO write).
+    #[test]
+    fn poison_on_a_captured_table_bails_with_its_message() {
+        let d = tempfile::tempdir().unwrap();
+        let dest = local_dest(&d);
+        let cols = int_col();
+        let mut poisoned = insert(1); // captured table "t"
+        poisoned.poison = Some(
+            "pg cdc: s.t: column [big] unchanged-TOAST — ALTER TABLE ... REPLICA IDENTITY FULL"
+                .into(),
+        );
+        let mut stream = FakeStream {
+            events: vec![poisoned].into(),
+            acked: Vec::new(),
+        };
+        let cfg = cfg(dest.as_ref(), &cols, FormatType::Parquet, 10);
+        let err = run_to_files(&mut stream, cfg).expect_err("poison on a captured table must bail");
+        assert!(
+            format!("{err:#}").contains("REPLICA IDENTITY FULL"),
+            "must surface the deferred message, got: {err:#}"
+        );
+    }
+
     // Ultrareview bug_004: a schema-qualified config (`table: public.orders`)
     // compared verbatim against the adapter's BARE event table matched zero
     // events — the whole stream silently dropped into a 0-row success.
@@ -939,6 +995,7 @@ mod tests {
             committed: true,
             image_names: None,
             seq: 0,
+            poison: None,
         }
     }
 
@@ -1128,6 +1185,7 @@ mod tests {
             committed: true,
             image_names: None,
             seq: 0,
+            poison: None,
         };
         let mut cols = vec![
             decimal_col("placeholder", 38, 0), // SQL Server: scale unknown at resolve

@@ -341,6 +341,7 @@ impl MssqlChangeStream {
                 committed: false,
                 image_names: Some(std::sync::Arc::from(names)),
                 seq: 0, // stamped by TxnSeq as the stream is consumed
+                poison: None,
             };
             batch_bytes = batch_bytes.saturating_add(ev.estimated_bytes());
             batch.push((lsn.clone(), ev));

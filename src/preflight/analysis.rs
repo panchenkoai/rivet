@@ -3,6 +3,14 @@ use crate::config::{ExportConfig, ExportMode};
 
 /// B1: Human-readable strategy name derived from mode + config.
 pub(crate) fn derive_strategy(export: &ExportConfig) -> String {
+    // `chunk_by_key` pins keyset (seek) pagination regardless of the nominal
+    // mode: page by ROWS on a unique index, not by key-span windows. The planner
+    // (plan::build) turns it into ExtractionStrategy::Keyset, so the diagnostic
+    // must label it keyset — not `chunked(?, …)`, whose `?` is the absent
+    // chunk_column that keyset does not use.
+    if let Some(key) = export.chunk_by_key.as_deref() {
+        return format!("keyset({}, size={})", key, export.chunk_size);
+    }
     match export.mode {
         ExportMode::Full => {
             if export.parallel > 1 {
@@ -49,6 +57,12 @@ pub(crate) fn derive_strategy(export: &ExportConfig) -> String {
 /// etc. Shared verbatim by all three engine `diagnose_*` paths, which differ
 /// only in their probes, not in this label.
 pub(crate) fn diagnose_mode_str(export: &ExportConfig) -> String {
+    // Keyset (chunk_by_key) is its own read strategy — surface the actual seek
+    // key + page size, not `chunked (column: ?, …)` (the `?` = the unused
+    // chunk_column). Mirrors the derive_strategy keyset branch above.
+    if let Some(key) = export.chunk_by_key.as_deref() {
+        return format!("keyset (key: {}, size: {})", key, export.chunk_size);
+    }
     match export.mode {
         ExportMode::Full => "full".to_string(),
         ExportMode::Incremental => format!(
@@ -161,6 +175,12 @@ pub(crate) fn check_sparse_range(
     if export.mode != ExportMode::Chunked {
         return None;
     }
+    // Keyset pages by ROWS on a unique index — immune to a sparse/gappy key by
+    // construction (there are no BETWEEN windows to leave empty). The
+    // sparse-range warning is a range-chunk (chunk_column) concept only.
+    if export.chunk_by_key.is_some() {
+        return None;
+    }
     if export.chunk_dense {
         return None;
     }
@@ -188,7 +208,9 @@ pub(crate) fn check_sparse_range(
     let empty_pct = ((1.0 - info.density).clamp(0.0, 1.0) * 100.0) as u32;
     Some(format!(
         "Sparse key range: ~{}% of chunk windows will be empty (range {}..{}, ~{} rows). \
-         Consider chunking on a dense surrogate (ROW_NUMBER) or switching to incremental mode.",
+         Switch to keyset pagination (`chunk_by_key: <unique key>`) — it pages by ROWS and is \
+         immune to a sparse/gappy key — or chunk on a dense surrogate (ROW_NUMBER), or use \
+         incremental mode.",
         empty_pct, min_val, max_val, rows
     ))
 }
@@ -225,8 +247,10 @@ pub(crate) fn check_oversized_chunk(
         return None;
     }
 
-    let rows_per_chunk: i64 = if export.chunk_dense {
-        // Dense ordinal windows hold exactly chunk_size rows (bar the last).
+    let rows_per_chunk: i64 = if export.chunk_dense || export.chunk_by_key.is_some() {
+        // Dense ordinal windows and keyset (seek) pages both hold exactly
+        // chunk_size rows (bar the last), independent of key density — no
+        // cursor_min/max span math applies.
         export.chunk_size as i64
     } else {
         let min_i: i64 = cursor_min?.parse().ok()?;
@@ -334,6 +358,17 @@ pub(crate) fn recommend_parallelism(
     row_estimate: Option<i64>,
     uses_index: bool,
 ) -> (u32, &'static str) {
+    // Keyset (seek) pagination is strictly sequential: each page's
+    // `WHERE key > $last` depends on the prior page's max key, so workers cannot
+    // be fanned out (KeysetPlan hard-codes parallel = 1). Recommending parallel
+    // for a chunk_by_key export would be misadvice, so answer before the
+    // mode-based ladder (keyset carries mode: chunked).
+    if export.chunk_by_key.is_some() {
+        return (
+            1,
+            "keyset pagination is sequential — parallelism does not apply",
+        );
+    }
     if export.mode != ExportMode::Chunked {
         return (1, "only chunked mode benefits from parallelism");
     }
@@ -404,6 +439,40 @@ impl Warning {
     }
 }
 
+/// A chunked/keyset export with no `chunk_checkpoint: true` cannot resume a
+/// crashed or interrupted run — the next attempt re-reads the whole table from
+/// the start. On the live GCS run this was the concrete cost of a flaky SSH
+/// tunnel: 738K durably-exported rows were only recoverable via a checkpoint the
+/// config had left commented out, so a re-run would have re-pulled everything.
+///
+/// Advisory (a checkpoint is not always wanted — enabling it gives re-runs
+/// incremental-by-key semantics rather than a fresh snapshot), and scoped to
+/// tables large enough for the re-read to hurt: skipped only when the estimate
+/// is KNOWN-small (`Some` below the threshold). An unknown estimate (MySQL) still
+/// nudges — the engine with the weakest stats is where the re-download is least
+/// visible.
+pub(crate) fn check_missing_checkpoint(
+    export: &ExportConfig,
+    row_estimate: Option<i64>,
+) -> Option<String> {
+    let chunked_or_keyset = export.mode == ExportMode::Chunked || export.chunk_by_key.is_some();
+    if !chunked_or_keyset || export.chunk_checkpoint {
+        return None;
+    }
+    if row_estimate.is_some_and(|r| r < SMALL_TABLE_ROW_THRESHOLD) {
+        return None;
+    }
+    Some(
+        "No chunk_checkpoint: a crashed or interrupted run re-reads the whole table \
+         from the start (no resume). Add `chunk_checkpoint: true` for crash-recovery — \
+         safe to enable on any table: it does NOT change your clean re-run semantics (a \
+         clean re-run still does a full pass and picks up updates). Recommended for large \
+         tables or unreliable links. (Keyset append-only incremental is the separate \
+         `keyset_incremental` opt-in.)"
+            .to_string(),
+    )
+}
+
 pub(super) fn collect_warnings(
     export: &ExportConfig,
     row_estimate: Option<i64>,
@@ -426,6 +495,7 @@ pub(super) fn collect_warnings(
             .map(|m| Warning::new(Severity::Medium, m)),
         check_dense_surrogate_cost(export).map(|m| Warning::new(Severity::Low, m)),
         check_parallel_memory_risk(export, row_estimate).map(|m| Warning::new(Severity::High, m)),
+        check_missing_checkpoint(export, row_estimate).map(|m| Warning::new(Severity::Medium, m)),
     ]
     .into_iter()
     .flatten()
@@ -534,7 +604,15 @@ pub(crate) fn build_suggestion(
                 // mysql}::column_has_*_*), so saying "create an index" when
                 // a btree already exists would be a false alarm.
                 ExportMode::Chunked if !uses_index => {
-                    let col = export.chunk_column.as_deref().unwrap_or("chunk_column");
+                    // Name the real read column: chunk_column for range chunking,
+                    // else the keyset key (chunk_by_key). A keyset key that is not
+                    // a unique index is exactly what the planner refuses at run
+                    // time — the check should name it, not the literal placeholder.
+                    let col = export
+                        .chunk_column
+                        .as_deref()
+                        .or(export.chunk_by_key.as_deref())
+                        .unwrap_or("chunk_column");
                     parts.push(format!(
                         "Create an index on '{}' to speed up range scans.",
                         col
@@ -569,11 +647,19 @@ pub(crate) fn build_suggestion(
                     parts.push("Add an indexed cursor column and use incremental mode to avoid full re-reads.".to_string());
                 }
                 ExportMode::Chunked => {
-                    let col = export.chunk_column.as_deref().unwrap_or("chunk_column");
-                    parts.push(format!(
-                        "Create an index on '{}'. Consider reducing chunk_size or adding parallel workers.",
-                        col
-                    ));
+                    let col = export
+                        .chunk_column
+                        .as_deref()
+                        .or(export.chunk_by_key.as_deref())
+                        .unwrap_or("chunk_column");
+                    // Keyset is sequential; only range chunking benefits from
+                    // "add parallel workers", so tailor the fix to the strategy.
+                    let fix = if export.chunk_by_key.is_some() {
+                        "Create an index on '{col}' (keyset needs a unique index), or use mode: full for one snapshot scan."
+                    } else {
+                        "Create an index on '{col}'. Consider reducing chunk_size or adding parallel workers."
+                    };
+                    parts.push(fix.replace("{col}", col));
                 }
                 ExportMode::TimeWindow => {
                     let col = export.time_column.as_deref().unwrap_or("time_column");
@@ -637,6 +723,34 @@ mod tests {
     fn derive_strategy_date_chunked() {
         let e = cfg("mode: chunked\nchunk_column: created_at\nchunk_by_days: 7\n");
         assert_eq!(derive_strategy(&e), "date-chunked(created_at, 7d)");
+    }
+
+    // ── keyset (chunk_by_key) must be labelled keyset, never `chunked(?, …)` ──
+    //
+    // Regression for the preflight keyset-blindness class: a `mode: chunked` +
+    // `chunk_by_key: id` export (the production `table:`-shortcut shape) is
+    // ExtractionStrategy::Keyset. Before the fix, derive_strategy fell through to
+    // the Chunked arm, read the absent chunk_column, and rendered
+    // `chunked(?, size=…)` — the `?` that made 66 production keyset tables read as
+    // misconfigured. The strategy label must name the seek key.
+    #[test]
+    fn derive_strategy_keyset_names_the_seek_key_not_a_question_mark() {
+        let e = cfg("mode: chunked\nchunk_by_key: id\nchunk_size: 250000\n");
+        assert_eq!(derive_strategy(&e), "keyset(id, size=250000)");
+        assert!(
+            !derive_strategy(&e).contains('?'),
+            "keyset must never render the chunk_column '?' placeholder"
+        );
+    }
+
+    #[test]
+    fn diagnose_mode_str_renders_keyset_with_its_key() {
+        assert_eq!(
+            diagnose_mode_str(&cfg(
+                "mode: chunked\nchunk_by_key: ref_id\nchunk_size: 100000\n"
+            )),
+            "keyset (key: ref_id, size: 100000)"
+        );
     }
 
     // ── diagnose_mode_str / resolve_preflight_base_query (hoisted from the
@@ -769,6 +883,30 @@ mod tests {
         assert!(check_sparse_range(&e, Some(10_000), Some("0"), Some("10000")).is_none());
     }
 
+    #[test]
+    fn check_sparse_range_keyset_is_immune_even_on_a_sparse_span() {
+        // Same 100-rows-in-5M-span shape that fires for chunk_column, but under
+        // chunk_by_key: keyset pages by ROWS, so a gappy key can never leave an
+        // empty window. The sparse warning must NOT fire (it is range-only).
+        let e = cfg("mode: chunked\nchunk_by_key: id\nchunk_size: 100000\n");
+        assert!(
+            check_sparse_range(&e, Some(100), Some("1"), Some("5000000")).is_none(),
+            "keyset must be immune to the sparse-range warning"
+        );
+    }
+
+    // ── recommend_parallelism: keyset is sequential ─────────────────────────
+    #[test]
+    fn recommend_parallelism_keyset_is_sequential_never_advises_parallel() {
+        // A ~1M-row keyset export: the old code fell through the chunked ladder
+        // and advised parallel: 2 ("no index"), which is doubly wrong — keyset
+        // is index-backed AND sequential (KeysetPlan pins parallel = 1).
+        let e = cfg("mode: chunked\nchunk_by_key: id\nchunk_size: 250000\n");
+        let (level, reason) = recommend_parallelism(&e, Some(1_000_000), true);
+        assert_eq!(level, 1, "keyset must recommend a single worker: {reason}");
+        assert!(reason.contains("sequential"), "got: {reason}");
+    }
+
     // ── check_oversized_chunk ───────────────────────────────────────────────
 
     #[test]
@@ -862,6 +1000,58 @@ mod tests {
         assert!(check_dense_surrogate_cost(&e).is_none());
     }
 
+    // ── check_missing_checkpoint (resumability nudge) ───────────────────────
+    #[test]
+    fn check_missing_checkpoint_keyset_without_checkpoint_warns() {
+        // The production shape: a large keyset export with chunk_checkpoint left
+        // off — a crash re-reads the whole table (the 738K-row re-download pain).
+        let e = cfg("mode: chunked\nchunk_by_key: id\nchunk_size: 250000\n");
+        let w = check_missing_checkpoint(&e, Some(1_000_000));
+        assert!(w.is_some(), "expected a checkpoint nudge");
+        let msg = w.unwrap();
+        assert!(msg.contains("chunk_checkpoint"), "names the fix");
+        // The message must NOT advise the removed conflated semantics — post-split
+        // chunk_checkpoint is crash-recovery ONLY and does not change clean-re-run
+        // behaviour, so it must never tell operators to OMIT it for a fresh snapshot
+        // (that would disable crash-recovery for the exact case it protects).
+        assert!(
+            !msg.contains("incremental-by-key") && !msg.to_lowercase().contains("omit"),
+            "must not advise the removed incremental semantics: {msg}"
+        );
+        assert!(
+            msg.contains("does NOT change") || msg.contains("full pass"),
+            "must reassure that clean re-run semantics are unchanged: {msg}"
+        );
+    }
+
+    #[test]
+    fn check_missing_checkpoint_range_chunk_unknown_size_warns() {
+        // MySQL has no trustworthy estimate (None) — still nudge, since that is
+        // exactly the engine where the re-download is least visible.
+        let e = cfg("mode: chunked\nchunk_column: ref_id\nchunk_size: 250000\n");
+        assert!(check_missing_checkpoint(&e, None).is_some());
+    }
+
+    #[test]
+    fn check_missing_checkpoint_present_is_silent() {
+        let e = cfg("mode: chunked\nchunk_by_key: id\nchunk_checkpoint: true\n");
+        assert!(check_missing_checkpoint(&e, Some(5_000_000)).is_none());
+    }
+
+    #[test]
+    fn check_missing_checkpoint_known_small_table_is_silent() {
+        // A known-small chunked table re-reads cheaply — no nudge.
+        let e = cfg("mode: chunked\nchunk_column: id\nchunk_size: 1000\n");
+        assert!(check_missing_checkpoint(&e, Some(5_000)).is_none());
+    }
+
+    #[test]
+    fn check_missing_checkpoint_non_chunked_is_silent() {
+        // Full/incremental have no per-chunk progress to checkpoint.
+        let e = cfg("mode: full\n");
+        assert!(check_missing_checkpoint(&e, Some(10_000_000)).is_none());
+    }
+
     // ── check_connection_limit ──────────────────────────────────────────────
 
     #[test]
@@ -918,10 +1108,11 @@ mod tests {
     #[test]
     fn collect_warnings_assembles_applicable_checks_in_registry_order() {
         // The manifest rewrite must keep display order AND aggregate every
-        // applicable check. This config trips three at once: connection-limit
-        // (parallel >= max_connections), sparse-range (density < 0.1), and
-        // parallel-memory (> 5M rows). oversized-chunk and dense-surrogate stay
-        // None, so the survivors must be the other three, in array order.
+        // applicable check. This config trips four at once: connection-limit
+        // (parallel >= max_connections), sparse-range (density < 0.1),
+        // parallel-memory (> 5M rows), and missing-checkpoint (chunked, large, no
+        // chunk_checkpoint). oversized-chunk and dense-surrogate stay None, so the
+        // survivors must be those four, in array order.
         let e = cfg("mode: chunked\nchunk_column: id\nchunk_size: 100000\nparallel: 20\n");
         let warnings = collect_warnings(
             &e,
@@ -931,7 +1122,7 @@ mod tests {
             Some("1000000000"), // wide span → sparse range
             Some(20),           // db max_connections → connection-limit trips
         );
-        assert_eq!(warnings.len(), 3, "three checks apply: {warnings:?}");
+        assert_eq!(warnings.len(), 4, "four checks apply: {warnings:?}");
         assert!(
             warnings[0].message.contains("max_connections")
                 && warnings[0].severity == Severity::High,
@@ -943,7 +1134,12 @@ mod tests {
         );
         assert!(
             warnings[2].message.contains("memory") && warnings[2].severity == Severity::High,
-            "parallel-memory is last, High: {warnings:?}"
+            "parallel-memory is third, High: {warnings:?}"
+        );
+        assert!(
+            warnings[3].message.contains("chunk_checkpoint")
+                && warnings[3].severity == Severity::Medium,
+            "missing-checkpoint is last, Medium: {warnings:?}"
         );
     }
 

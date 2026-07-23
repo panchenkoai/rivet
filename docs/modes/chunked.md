@@ -308,13 +308,30 @@ query.
 **Required privileges:** read-only is sufficient — the introspection probe reads
 `information_schema` index metadata, no elevated grants needed.
 
+**Resumability (`chunk_checkpoint`).** `rivet init` defaults `chunk_checkpoint: true`
+on keyset exports. It is **crash-recovery**: a run that dies mid-stream resumes from
+its last committed key on the next run (its in-progress `run_id` is still open); a
+run that finished CLEANLY clears that marker, so a plain re-run does a full pass and
+never silently skips already-exported rows.
+
+**Append-only incremental (`keyset_incremental`).** Off by default. When set, a
+CLEAN re-run continues from the last exported key — pulling ONLY rows past the
+high-water mark. Correct **only for append-only tables**: on a mutable table a row
+whose key already passed is silently never re-read. For a mutable table use
+`mode: incremental` on a timestamp cursor instead.
+
+```yaml
+    chunk_by_key: event_uuid
+    chunk_checkpoint: true       # crash-recovery (default on for keyset)
+    keyset_incremental: true     # append-only ONLY: clean re-run pulls just new keys
+```
+
 **Limitations (current):**
 
 - **Sequential only** — each page depends on the previous page's last key, so
   keyset does not parallelize (`parallel` is ignored). Range chunking remains the
   parallel path for integer-PK tables.
 - **Single-column keys only** — composite unique keys are not yet supported.
-- **No `--resume` checkpoint yet** — a keyset run restarts from the first page.
 
 ## Troubleshooting
 

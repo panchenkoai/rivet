@@ -617,3 +617,53 @@ the CSV timestamp test recomputed `expected` with the same flawed split, and sid
 A of the value-checksum shares the writer's own rendering). A value-rendering
 test needs an INDEPENDENT oracle: a hard-coded expected string, or a re-read
 through a different reader (DuckDB).
+
+## A diagnostic must understand EVERY read strategy — the diagnostic-bypass class
+
+`rivet check` (preflight) resolves the column it probes from a SUBSET of the
+strategy fields, so a strategy keyed off a field it doesn't read is silently
+mis-analysed — the diagnostic sibling of the runner-bypass class (a feature
+wired into only some of the four runners). `range_col = chunk_column.or(cursor_
+column)` in all three engine `diagnose_*` paths OMITTED `chunk_by_key`, so EVERY
+keyset export rendered `chunked(?, size=…)` (the `?` = the absent chunk_column),
+probed the wrong/absent column for an index, and reported a false `UNSAFE` / "no
+index" / "create an index on chunk_column" — even though the planner GUARANTEES
+a keyset key is a unique index (`plan::build` bails otherwise). A production
+config of ~66 keyset tables emitted 66 false alarms; the real problem (if any)
+was lost in the noise. The fix teaches the shared `analysis.rs` seam AND each
+engine's `range_col` about `chunk_by_key` (correct `keyset(key, size)` label,
+index probe on the real key, keyset=sequential, sparse-warning suppressed since
+keyset is immune). Process rule: **a diagnostic/preflight that resolves its
+subject (the probed column, the row estimate, the strategy label) must enumerate
+EVERY strategy the runner can pick — `chunk_column` (range), `chunk_by_key`
+(keyset), `cursor_column` (incremental), date/dense/count — not a subset.** The
+tell is a `.or()` chain over strategy fields that is shorter than the strategy
+enum; a `?`/`unwrap_or("?")` placeholder surfacing in the output is the smell
+that a strategy fell through. Cross-check the label against `derive_strategy`'s
+arms and the planner's strategy constructors.
+
+## A flag you cannot safely auto-default is often OVERLOADED — split it
+
+When `rivet init` (or a `check --fix`) cannot safely turn a knob on by default,
+the reason is frequently that the knob means two things at once, only one of them
+safe. `chunk_checkpoint: true` on a keyset export meant crash-recovery AND
+incremental-by-key (a clean re-run continues from the last exported key). The
+second silently skips UPDATEd rows on any non–append-only table, so init left it
+OFF — which is why a crashed keyset run stranded ~738K durable rows behind a
+checkpoint most configs never enabled (the live tunnel-drop). The fix is NOT a
+band-aid that auto-enables the overloaded flag (a `--fix` would hit the SAME
+safety wall init did — neither can know append-only-ness) but to SPLIT it:
+`chunk_checkpoint` is now crash-recovery only (clean re-run does a full pass,
+never skipping; crash detected via the in-progress run_id), and the append-only
+"continue-from-key on a clean re-run" is the new off-by-default
+`keyset_incremental`. Now init defaults the SAFE half on (crash-recovery) and the
+738K-row gap closes at the SOURCE — the config is born correct, no `--fix`
+needed. Process rule: **before building a config-patching feature (`--fix`), ask
+why `init` doesn't already birth the config right; if the answer is "that knob
+isn't safe to default", the knob is overloaded — split the safe concern (which
+init CAN default) from the unsafe opt-in, rather than automating the unsafe
+default one layer up.** Every split of a semantic flag needs a three-way live
+proof: crash-recovery still resumes, a CLEAN re-run does NOT skip (RED against
+the old conflation), and the opt-in restores the old behaviour
+(`keyset_checkpoint_without_incremental_rereads_on_a_clean_rerun` +
+`..._second_run_captures_only_new_keys` with the opt-in + `..._crash_resume_...`).

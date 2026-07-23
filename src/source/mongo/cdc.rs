@@ -408,6 +408,7 @@ fn to_change_event(
         committed: true,
         image_names: Some(std::sync::Arc::clone(&IMAGE_NAMES)),
         seq: 0, // stamped by TxnSeq as the stream is consumed
+        poison: None,
     })
 }
 

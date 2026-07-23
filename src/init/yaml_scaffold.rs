@@ -479,7 +479,11 @@ fn export_block_lines(
                 ));
                 lines.push(format!("    chunk_size: {chunk_size}"));
                 lines.push(
-                    "    # add `chunk_checkpoint: true` to resume a crashed run + pull only new keys each run (append-only tables)"
+                    "    chunk_checkpoint: true  # crash-recovery: a crashed run resumes from the last committed key on the next run (a clean re-run still does a full pass — never skips rows)"
+                        .to_string(),
+                );
+                lines.push(
+                    "    # keyset_incremental: true  # append-only ONLY — a clean re-run pulls just NEW keys (skips already-exported). Silently misses updates on a mutable table; use `mode: incremental` there"
                         .to_string(),
                 );
                 lines.push(

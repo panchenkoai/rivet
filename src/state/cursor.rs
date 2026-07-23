@@ -125,6 +125,32 @@ impl StateStore {
         Ok(())
     }
 
+    /// Null ONLY the persisted keyset high-water mark (`last_cursor_value`),
+    /// leaving `resume_run_id` and the progression boundary intact.
+    ///
+    /// Crash-recovery-only (non-incremental) keyset needs this at the start of a
+    /// FRESH run: `last_cursor_value` is a run-independent persistent field, so a
+    /// prior COMPLETED run leaves its final high-water mark behind. If this fresh
+    /// run then crashes BEFORE its first page commits, the recovery run would load
+    /// that stale mark as this run's "resume point" and skip the whole table
+    /// (`WHERE key > <prior-max>` → 0 rows → a successful empty manifest). Clearing
+    /// it here ties crash-recovery to THIS run's committed progress only.
+    /// Incremental keyset deliberately does NOT clear it — continuing from the
+    /// prior high-water mark is the whole point of `keyset_incremental`.
+    pub fn clear_cursor_value(&self, export_name: &str) -> Result<()> {
+        let sql = "UPDATE export_state SET last_cursor_value = NULL WHERE export_name = ?1";
+        match &self.conn {
+            StateConn::Sqlite(c) => {
+                c.execute(sql, [export_name])?;
+            }
+            StateConn::Postgres(client) => {
+                let mut c = client.borrow_mut();
+                c.execute(&pg_sql(sql), &[&export_name])?;
+            }
+        }
+        Ok(())
+    }
+
     /// Return an export to a "never ran" state.
     ///
     /// Clears the incremental cursor (`export_state`) **and** the committed /
@@ -219,6 +245,27 @@ mod tests {
         s.update("orders", "100").unwrap();
         s.reset("orders").unwrap();
         assert!(s.get("orders").unwrap().last_cursor_value.is_none());
+    }
+
+    #[test]
+    fn clear_cursor_value_nulls_the_cursor_but_keeps_the_resume_run_id() {
+        // The keyset stale-cursor fix: a fresh non-incremental run must null the
+        // prior COMPLETED run's high-water mark so a pre-first-commit crash cannot
+        // resume from it (skipping the whole table) — WITHOUT dropping the fresh
+        // resume_run_id it is about to set (crash-recovery needs that).
+        let s = store();
+        s.update("orders", "9000000").unwrap();
+        s.set_resume_run_id("orders", "run_2").unwrap();
+        s.clear_cursor_value("orders").unwrap();
+        assert!(
+            s.get("orders").unwrap().last_cursor_value.is_none(),
+            "cursor must be nulled"
+        );
+        assert_eq!(
+            s.get_resume_run_id("orders").unwrap().as_deref(),
+            Some("run_2"),
+            "resume_run_id must survive"
+        );
     }
 
     #[test]

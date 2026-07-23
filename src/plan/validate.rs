@@ -850,6 +850,7 @@ mod tests {
             key_column: "uuid_pk".into(),
             chunk_size: 10_000,
             checkpoint: false,
+            incremental: false,
             parallel: 1,
         })
     }

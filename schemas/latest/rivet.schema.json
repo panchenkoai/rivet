@@ -708,6 +708,12 @@
           ]
         },
         "chunk_checkpoint": {
+          "description": "Persist per-chunk / per-page progress so a **crashed** run resumes from the\nlast durably committed point instead of re-reading from the start. This is\npure crash-recovery: a *clean* re-run (the prior run finished) still does a\nfull pass — it never silently skips already-exported rows. Safe to enable\non any table; `rivet init` defaults it on for chunked and keyset exports.",
+          "type": "boolean",
+          "default": false
+        },
+        "keyset_incremental": {
+          "description": "Keyset only (`chunk_by_key`): on a **clean** re-run, continue from the last\nexported key — pull ONLY rows with a key past the high-water mark. This is\nincremental-by-key, correct ONLY for APPEND-ONLY tables (a mutable row whose\nkey already passed is silently never re-read). Opt-in and off by default;\ncrash-recovery does not need it (that is `chunk_checkpoint`). For a mutable\ntable use `mode: incremental` on a timestamp cursor instead.",
           "type": "boolean",
           "default": false
         },

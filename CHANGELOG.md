@@ -2,6 +2,43 @@
 
 ## Unreleased
 
+### Changed
+
+- **Keyset checkpoint is now crash-recovery only; append-only incremental is the new
+  opt-in `keyset_incremental`.** Previously `chunk_checkpoint: true` on a keyset
+  (`chunk_by_key`) export did double duty: crash-recovery AND incremental-by-key (a clean
+  re-run continued from the last exported key). The second meaning silently skips UPDATEd
+  rows on any non–append-only table, so `rivet init` could not safely default it on — a
+  crashed keyset run therefore left durable rows only recoverable via a checkpoint most
+  configs left off (the production tunnel-drop that stranded ~738K rows). The two concerns
+  are now split: `chunk_checkpoint` is crash-recovery only (a clean re-run does a full pass,
+  never skipping rows; detected via the in-progress run_id), and the append-only
+  "continue-from-key on a clean re-run" behaviour is the new, off-by-default
+  `keyset_incremental`. `rivet init` now defaults `chunk_checkpoint: true` on keyset exports
+  (safe) and emits `keyset_incremental` as a commented opt-in. **Migration:** a keyset export
+  that relied on `chunk_checkpoint: true` for incremental-by-key on clean re-runs must add
+  `keyset_incremental: true` to keep that behaviour; otherwise clean re-runs now re-read in
+  full (data-safe, but re-reads an append-only table each run). Mongo `source.mongo.resume`
+  is unchanged (it maps to both). RED-proven live on MySQL/PostgreSQL/SQL Server.
+
+### Fixed
+
+- **`rivet check` was blind to keyset (`chunk_by_key`) exports** — it resolved the read
+  column from `chunk_column`/`cursor_column` only, so every keyset table rendered
+  `chunked(?, size=…)`, probed the wrong (absent) column for an index, and reported a false
+  `UNSAFE` / "no index" / "create an index on chunk_column" verdict — even though the planner
+  GUARANTEES a keyset key is a unique index. Preflight now understands `chunk_by_key` across
+  all engines: correct `keyset(key, size=…)` strategy label, the index probe runs on the real
+  keyset key, keyset is reported sequential (no false `parallel` advice), and the sparse-range
+  warning (which keyset is immune to) no longer fires. A large production config of ~66 keyset
+  tables no longer emits 66 false alarms.
+
+### Added
+
+- **`rivet check` warns when a chunked/keyset export lacks `chunk_checkpoint`** (Medium) on a
+  large table — a crash then re-reads the whole table from the start. The sparse-key warning
+  now also leads with keyset (`chunk_by_key`) as the immune escape hatch.
+
 ## 0.21.1 — 2026-07-22
 
 A security- and durability-hardening release: thirteen adversarial audit rounds over the

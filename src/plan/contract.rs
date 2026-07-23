@@ -34,13 +34,23 @@ pub struct ChunkedPlan {
 pub struct KeysetPlan {
     pub key_column: String,
     pub chunk_size: usize,
-    /// Persist the page's max key after each commit and resume from it next run
-    /// (crash-recovery / incremental-append). Opt-in — default `false` keeps
-    /// `mode: full` re-reading the whole key range every run (full semantics).
-    /// Set for a MongoDB source via `source.mongo.resume`. `#[serde(default)]`
-    /// so a pre-existing plan artifact (no field) deserializes as non-resumable.
+    /// Persist the page's max key after each commit so a **crashed** run resumes
+    /// from it (crash-recovery). Detected via the in-progress run_id: a run that
+    /// finished clears it, so a *clean* re-run does NOT continue from the key —
+    /// it re-reads the whole range (full semantics), never silently skipping
+    /// already-exported rows. The clean-re-run "continue from key" behaviour is
+    /// the separate opt-in [`incremental`](Self::incremental). Set for a MongoDB
+    /// source via `source.mongo.resume`. `#[serde(default)]` so a pre-existing
+    /// plan artifact (no field) deserializes as non-resumable.
     #[serde(default)]
     pub checkpoint: bool,
+    /// Append-only opt-in (SQL `keyset_incremental`, or Mongo `source.mongo.resume`):
+    /// on a CLEAN re-run, continue from the last exported key — pull only keys past
+    /// the high-water mark. Distinct from [`checkpoint`](Self::checkpoint) (which is
+    /// crash-recovery only): incremental is correct ONLY for append-only tables, so
+    /// it is off unless explicitly requested. `#[serde(default)]` for old artifacts.
+    #[serde(default)]
+    pub incremental: bool,
     /// Concurrent `_id`-range workers for a MongoDB parallel read (`export.
     /// parallel`): each worker keyset-pages a disjoint `$sample`-bounded slice.
     /// Only the Mongo reader acts on it; SQL keyset stays sequential and ignores

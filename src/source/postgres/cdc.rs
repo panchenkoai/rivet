@@ -487,9 +487,14 @@ pub(crate) fn parse_test_decoding(lsn: &str, data: &str) -> Result<Option<Change
     // the pre-image (`old-key`), so recover it by name; otherwise the value is
     // genuinely unavailable and we must NOT write the literal marker as data
     // (silent corruption — same class as the uuid→null loss caught live on GCS).
+    // An unrecoverable unchanged-TOAST column is a refusal — but a DEFERRED one.
+    // The slot decodes every table in the database, so bailing here would poison
+    // capture of unrelated tables that merely share the slot. Record it as the
+    // event's `poison`; the sink raises it ONLY if this event routes to a captured
+    // table (uncaptured tables are dropped without ever surfacing it).
     let unrecovered = recover_unchanged_toast(&mut named, old_named.as_deref());
-    if !unrecovered.is_empty() {
-        anyhow::bail!(
+    let poison = (!unrecovered.is_empty()).then(|| {
+        format!(
             "pg cdc: {schema}.{table}: column(s) [{}] arrived as an unchanged-TOAST \
              datum with no pre-image value — logical decoding does not re-log an \
              externally stored value that an UPDATE leaves unchanged, so rivet cannot \
@@ -497,8 +502,8 @@ pub(crate) fn parse_test_decoding(lsn: &str, data: &str) -> Result<Option<Change
              as data. Capture the full pre-image so the value is preserved: \
              ALTER TABLE {schema}.{table} REPLICA IDENTITY FULL;",
             unrecovered.join(", ")
-        );
-    }
+        )
+    });
 
     let names: std::sync::Arc<[String]> = named.iter().map(|c| c.name.clone()).collect();
     let cols: Vec<RivetValue> = named.into_iter().map(|c| c.value).collect();
@@ -530,6 +535,7 @@ pub(crate) fn parse_test_decoding(lsn: &str, data: &str) -> Result<Option<Change
         // would not trigger a premature roll.
         committed: false,
         seq: 0, // stamped by TxnSeq as the stream is consumed
+        poison,
     }))
 }
 
@@ -1370,19 +1376,41 @@ mod tests {
     }
 
     // The DEFAULT replica-identity case: no pre-image value for the toasted
-    // column exists anywhere in the WAL, so the parser MUST fail loud (never
-    // fabricate the marker as data) and name the upstream fix.
+    // column exists anywhere in the WAL, so the parser must refuse to fabricate
+    // the marker as data — but as a DEFERRED `poison`, not an immediate bail. The
+    // slot decodes every table in the DB; bailing here would poison capture of
+    // unrelated tables sharing the slot (the parallel-CDC contamination that RED'd
+    // two live PG CDC tests off one un-captured DEFAULT-identity table). The sink
+    // raises the poison only when the event routes to a captured table.
     #[test]
-    fn unchanged_toast_without_pre_image_is_refused() {
+    fn unchanged_toast_without_pre_image_is_deferred_to_poison_not_an_immediate_bail() {
         let line = "table public.t: UPDATE: \
                     id[integer]:1 small[text]:'b' big[text]:unchanged-toast-datum";
-        let err = parse_test_decoding("0/ABC", line).unwrap_err();
-        let msg = format!("{err:#}");
+        let ev = parse_test_decoding("0/ABC", line)
+            .expect("must NOT bail — the refusal is deferred to the sink")
+            .expect("the event is still produced (for commit-boundary tracking)");
+        let msg = ev
+            .poison
+            .expect("an unrecoverable TOAST column must set poison");
         assert!(msg.contains("unchanged-TOAST"), "got: {msg}");
         assert!(msg.contains("big"), "must name the column, got: {msg}");
         assert!(
             msg.contains("REPLICA IDENTITY FULL"),
             "must name the upstream fix, got: {msg}"
+        );
+    }
+
+    // The clean case: a recoverable/absent TOAST column leaves `poison` None, so
+    // the sink never raises anything for this event.
+    #[test]
+    fn recoverable_toast_update_leaves_poison_none() {
+        let line = "table public.t: UPDATE: old-key: id[integer]:1 big[text]:'real' \
+                    new-tuple: id[integer]:1 small[text]:'b' big[text]:unchanged-toast-datum";
+        let ev = parse_test_decoding("0/ABC", line).unwrap().unwrap();
+        assert!(
+            ev.poison.is_none(),
+            "a full pre-image recovers the value → no poison: {:?}",
+            ev.poison
         );
     }
 

@@ -498,14 +498,19 @@ fn keyset_checkpoint_resume_second_run_captures_only_new_keys() {
     };
     seed(&mut conn, 1, 1000);
 
-    // Explicit keyset key + checkpoint. Same cfg dir across runs so the
-    // `.rivet_state.db` (written next to the config) is shared → run 2/3 resume.
+    // Explicit keyset key + checkpoint + keyset_incremental. Same cfg dir across
+    // runs so the `.rivet_state.db` (written next to the config) is shared → run
+    // 2/3 continue. `keyset_incremental: true` is the append-only opt-in: since
+    // the crash-recovery/incremental split, chunk_checkpoint ALONE would re-read
+    // the whole table on a clean re-run; this flag is what makes a clean re-run
+    // pull only new keys (the behaviour this test asserts).
     let export = unique_name("keyset_ckpt_exp");
     let cfg_dir = tempfile::tempdir().unwrap();
     let out_dir = tempfile::tempdir().unwrap();
     let yaml = format!(
         "source:\n  type: mysql\n  url: \"{MYSQL_URL}\"\nexports:\n  - name: {export}\n    \
          table: {table}\n    mode: chunked\n    chunk_by_key: uid\n    chunk_checkpoint: true\n    \
+         keyset_incremental: true\n    \
          chunk_size: 300\n    format: parquet\n    destination:\n      type: local\n      path: {out}\n",
         out = out_dir.path().display(),
     );
@@ -559,6 +564,234 @@ fn keyset_checkpoint_resume_second_run_captures_only_new_keys() {
         dir_manifest_copy_total_rows(out_dir.path()),
         1500,
         "run-unique manifest copies must sum run 1 (1000) + run 3 (500); a clobbered manifest is silent to the parquet re-read"
+    );
+}
+
+/// SAFETY (crash-recovery ⇄ incremental split): keyset `chunk_checkpoint: true`
+/// WITHOUT `keyset_incremental` must FULLY re-read on a CLEAN re-run — never
+/// silently skip already-exported rows. Before the split, chunk_checkpoint
+/// implied incremental-by-key, so a clean re-run of a MUTABLE table skipped every
+/// row whose key had already passed (silent staleness — the production footgun
+/// that kept `init` from defaulting keyset checkpoint on). A crash still resumes
+/// (via the in-progress run_id — see `..._crash_resume_...`); a clean completion
+/// clears that run_id, so a plain re-run starts fresh. This is the RED-proof:
+/// against the old conflated behaviour the second run reads 1000 (skip), not 2000.
+#[test]
+#[ignore = "live: requires docker compose up -d mysql"]
+fn keyset_checkpoint_without_incremental_rereads_on_a_clean_rerun() {
+    require_alive(LiveService::Mysql);
+    let table = unique_name("keyset_safe");
+    let _guard = DropTable(table.clone());
+    let mut conn = mysql_connect();
+    conn.query_drop(format!("DROP TABLE IF EXISTS {table}"))
+        .unwrap();
+    conn.query_drop(format!(
+        "CREATE TABLE {table} (uid VARCHAR(40) NOT NULL PRIMARY KEY, payload INT NOT NULL)"
+    ))
+    .unwrap();
+    conn.query_drop("SET SESSION cte_max_recursion_depth = 20000")
+        .unwrap();
+    conn.query_drop(format!(
+        "INSERT INTO {table} (uid, payload) \
+         WITH RECURSIVE seq AS (SELECT 1 n UNION ALL SELECT n+1 FROM seq WHERE n < 1000) \
+         SELECT CONCAT('id-', LPAD(n, 6, '0')), n FROM seq"
+    ))
+    .unwrap();
+
+    // chunk_checkpoint: true but NO keyset_incremental → crash-recovery ONLY.
+    let export = unique_name("keyset_safe_exp");
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let out_dir = tempfile::tempdir().unwrap();
+    let yaml = format!(
+        "source:\n  type: mysql\n  url: \"{MYSQL_URL}\"\nexports:\n  - name: {export}\n    \
+         table: {table}\n    mode: chunked\n    chunk_by_key: uid\n    chunk_checkpoint: true\n    \
+         chunk_size: 300\n    format: parquet\n    destination:\n      type: local\n      path: {out}\n",
+        out = out_dir.path().display(),
+    );
+    let cfg = write_config(&cfg_dir, &yaml);
+    let run = |label: &str| {
+        let out = run_rivet_export(&cfg, &export);
+        assert!(
+            out.status.success(),
+            "{label} failed; stderr:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+
+    // Run 1 completes cleanly → the in-progress run_id is cleared at finalize.
+    run("run 1");
+    let (count1, _) = read_uid_set(out_dir.path());
+    assert_eq!(count1, 1000, "run 1 must export all seeded rows");
+
+    // Run 2 on the UNCHANGED source: a CLEAN re-run without keyset_incremental
+    // must re-read all 1000 again (full pass) — the parquet re-read total doubles
+    // to 2000. A total of 1000 would mean checkpoint silently implied incremental
+    // (the pre-split staleness bug this test guards).
+    run("run 2 (clean re-run)");
+    let (count2, keys2) = read_uid_set(out_dir.path());
+    assert_eq!(
+        count2, 2000,
+        "clean re-run must FULLY re-read (2000 rows across both runs); {count2} == 1000 would be a silent incremental skip"
+    );
+    let expected: BTreeSet<String> = (1..=1000).map(|n| format!("id-{n:06}")).collect();
+    assert_eq!(
+        keys2, expected,
+        "the key set stays the 1000 source keys (a re-read, not new data)"
+    );
+}
+
+/// #1 (CRITICAL, adversarial-hunt): a FRESH non-incremental keyset run that crashes
+/// AFTER open but BEFORE its first page commit must, on recovery, re-read from the
+/// START — never resume from a PRIOR completed run's stale high-water mark. Before
+/// the cursor-clear fix, Run 2 (fresh) set resume_run_id but left last_cursor_value
+/// at Run 1's final key; a crash before the first commit meant Run 3 loaded that
+/// stale key, issued `WHERE key > <max>`, read 0 rows, and wrote a SUCCESSFUL empty
+/// export — the entire table silently skipped. RED against the pre-fix build.
+#[test]
+#[ignore = "live: requires docker compose up -d mysql"]
+fn keyset_fresh_run_crash_before_first_page_does_not_skip_the_table() {
+    require_alive(LiveService::Mysql);
+    let table = unique_name("keyset_stale");
+    let _guard = DropTable(table.clone());
+    let mut conn = mysql_connect();
+    conn.query_drop(format!("DROP TABLE IF EXISTS {table}"))
+        .unwrap();
+    conn.query_drop(format!(
+        "CREATE TABLE {table} (uid VARCHAR(40) NOT NULL PRIMARY KEY, payload INT NOT NULL)"
+    ))
+    .unwrap();
+    conn.query_drop("SET SESSION cte_max_recursion_depth = 20000")
+        .unwrap();
+    conn.query_drop(format!(
+        "INSERT INTO {table} (uid, payload) \
+         WITH RECURSIVE seq AS (SELECT 1 n UNION ALL SELECT n+1 FROM seq WHERE n < 1000) \
+         SELECT CONCAT('id-', LPAD(n, 6, '0')), n FROM seq"
+    ))
+    .unwrap();
+
+    let export = unique_name("keyset_stale_exp");
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let out_dir = tempfile::tempdir().unwrap();
+    let yaml = format!(
+        "source:\n  type: mysql\n  url: \"{MYSQL_URL}\"\nexports:\n  - name: {export}\n    \
+         table: {table}\n    mode: chunked\n    chunk_by_key: uid\n    chunk_checkpoint: true\n    \
+         chunk_size: 300\n    format: parquet\n    destination:\n      type: local\n      path: {out}\n",
+        out = out_dir.path().display(),
+    );
+    let cfg = write_config(&cfg_dir, &yaml);
+
+    // Run 1: full export of all 1000; on data-completion resume_run_id is cleared
+    // and last_cursor_value = the final key id-001000.
+    let r1 = run_rivet_export(&cfg, &export);
+    assert!(
+        r1.status.success(),
+        "run 1 stderr:\n{}",
+        String::from_utf8_lossy(&r1.stderr)
+    );
+    let (count1, _) = read_uid_set(out_dir.path());
+    assert_eq!(count1, 1000, "run 1 must export all 1000");
+
+    // Run 2: a FRESH run that crashes right after open (no page committed).
+    let crash = std::process::Command::new(RIVET_BIN)
+        .args([
+            "run",
+            "--config",
+            cfg.to_str().unwrap(),
+            "--export",
+            &export,
+        ])
+        .env("RIVET_TEST_PANIC_AT", "keyset_after_open_before_first_page")
+        .output()
+        .expect("spawn rivet");
+    assert!(!crash.status.success(), "crash run must exit non-zero");
+
+    // Run 3: recovery. It MUST re-read all 1000 (total across run1+run3 = 2000).
+    // A total of 1000 means Run 3 resumed from Run 1's stale cursor and skipped the
+    // whole table — the critical silent-loss bug.
+    let r3 = run_rivet_export(&cfg, &export);
+    assert!(
+        r3.status.success(),
+        "run 3 stderr:\n{}",
+        String::from_utf8_lossy(&r3.stderr)
+    );
+    let (count3, keys3) = read_uid_set(out_dir.path());
+    assert_eq!(
+        count3, 2000,
+        "recovery must re-read all 1000 (total 2000); {count3} == 1000 means Run 3 resumed from a STALE cursor and silently skipped the whole table"
+    );
+    let expected: BTreeSet<String> = (1..=1000).map(|n| format!("id-{n:06}")).collect();
+    assert_eq!(keys3, expected, "the full source key set must be present");
+}
+
+/// #3 (MEDIUM, adversarial-hunt): a keyset run that commits ALL its data then fails
+/// (a post-data gate, or any late failure) must NOT leave a resume anchor — the next
+/// run is a fresh full pass, never a crash-recovery that skips rows updated since.
+/// Data-completion clears resume_run_id, so a subsequent failure cannot strand it.
+/// RED against a build that only cleared at finalize (skipped on failure).
+#[test]
+#[ignore = "live: requires docker compose up -d mysql"]
+fn keyset_failure_after_data_complete_does_not_resume_and_skip_on_the_next_run() {
+    require_alive(LiveService::Mysql);
+    let table = unique_name("keyset_gate");
+    let _guard = DropTable(table.clone());
+    let mut conn = mysql_connect();
+    conn.query_drop(format!("DROP TABLE IF EXISTS {table}"))
+        .unwrap();
+    conn.query_drop(format!(
+        "CREATE TABLE {table} (uid VARCHAR(40) NOT NULL PRIMARY KEY, payload INT NOT NULL)"
+    ))
+    .unwrap();
+    conn.query_drop("SET SESSION cte_max_recursion_depth = 20000")
+        .unwrap();
+    conn.query_drop(format!(
+        "INSERT INTO {table} (uid, payload) \
+         WITH RECURSIVE seq AS (SELECT 1 n UNION ALL SELECT n+1 FROM seq WHERE n < 1000) \
+         SELECT CONCAT('id-', LPAD(n, 6, '0')), n FROM seq"
+    ))
+    .unwrap();
+
+    let export = unique_name("keyset_gate_exp");
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let out_dir = tempfile::tempdir().unwrap();
+    let yaml = format!(
+        "source:\n  type: mysql\n  url: \"{MYSQL_URL}\"\nexports:\n  - name: {export}\n    \
+         table: {table}\n    mode: chunked\n    chunk_by_key: uid\n    chunk_checkpoint: true\n    \
+         chunk_size: 300\n    format: parquet\n    destination:\n      type: local\n      path: {out}\n",
+        out = out_dir.path().display(),
+    );
+    let cfg = write_config(&cfg_dir, &yaml);
+
+    // Run 1: commits ALL 1000, then fails AFTER data-completion (a stand-in for a
+    // post-data gate rejection). Data-completion has already cleared resume_run_id.
+    let fail = std::process::Command::new(RIVET_BIN)
+        .args([
+            "run",
+            "--config",
+            cfg.to_str().unwrap(),
+            "--export",
+            &export,
+        ])
+        .env("RIVET_TEST_PANIC_AT", "keyset_after_data_complete")
+        .output()
+        .expect("spawn rivet");
+    assert!(
+        !fail.status.success(),
+        "the post-data failure must exit non-zero"
+    );
+
+    // Run 2: a deliberate full re-run. It MUST re-read all 1000 (total 2000), NOT
+    // resume from the high-water mark. A total of 1000 means Run 1's stale
+    // resume_run_id made Run 2 a crash-recovery that skipped the whole table.
+    let r2 = run_rivet_export(&cfg, &export);
+    assert!(
+        r2.status.success(),
+        "run 2 stderr:\n{}",
+        String::from_utf8_lossy(&r2.stderr)
+    );
+    let (count2, _) = read_uid_set(out_dir.path());
+    assert_eq!(
+        count2, 2000,
+        "the re-run after a post-data failure must FULLY re-read (total 2000); {count2} == 1000 means a stale resume anchor silently skipped the table"
     );
 }
 
@@ -767,6 +1000,7 @@ fn keyset_checkpoint_resume_pg_second_run_captures_only_new_keys() {
     let yaml = format!(
         "source:\n  type: postgres\n  url: \"{POSTGRES_URL}\"\nexports:\n  - name: {export}\n    \
          table: public.{table}\n    mode: chunked\n    chunk_by_key: uid\n    chunk_checkpoint: true\n    \
+         keyset_incremental: true\n    \
          chunk_size: 300\n    format: parquet\n    destination:\n      type: local\n      path: {out}\n",
         out = out_dir.path().display(),
     );
@@ -855,7 +1089,8 @@ fn keyset_checkpoint_resume_mssql_second_run_captures_only_new_keys() {
     let yaml = format!(
         "source:\n  type: mssql\n  url: \"{MSSQL_URL}\"\n  tls:\n    accept_invalid_certs: true\n\
          exports:\n  - name: {export}\n    table: dbo.{table}\n    mode: chunked\n    \
-         chunk_by_key: uid\n    chunk_checkpoint: true\n    chunk_size: 300\n    format: parquet\n    \
+         chunk_by_key: uid\n    chunk_checkpoint: true\n    keyset_incremental: true\n    \
+         chunk_size: 300\n    format: parquet\n    \
          destination:\n      type: local\n      path: {out}\n",
         out = out_dir.path().display(),
     );

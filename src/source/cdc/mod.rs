@@ -115,6 +115,15 @@ pub(crate) struct ChangeEvent {
     /// touched more than once per transaction. `(position, seq)` is the total
     /// order; being log-derived it is identical on an at-least-once re-emit.
     pub(crate) seq: u64,
+    /// A DEFERRED per-event decode error, surfaced by the sink **only when this
+    /// event routes to a captured table**. A single logical stream (one PG
+    /// `test_decoding` slot) decodes EVERY table in the database, so an
+    /// unrecoverable decode on an UN-captured table (e.g. an unchanged-TOAST datum
+    /// with no pre-image) must not bail the whole run — it would poison capture of
+    /// unrelated tables sharing the slot. The source records the error here instead
+    /// of bailing; the sink raises it iff the event matches a captured table (the
+    /// single routing authority), and drops it silently otherwise. `None` = clean.
+    pub(crate) poison: Option<String>,
 }
 
 /// Stamps each change with its intra-transaction ordinal ([`ChangeEvent::seq`]).
@@ -216,6 +225,19 @@ pub(crate) fn run(
                 .any(|t| sink::table_matches(t, &ev.schema, &ev.table))
         {
             continue;
+        }
+        // Surface a deferred decode error (e.g. PG unchanged-TOAST with no
+        // pre-image) only now that the event is confirmed captured — mirrors the
+        // file sink. Without this the NDJSON path would print the raw
+        // `unchanged-toast-datum` sentinel verbatim as the column value (silent
+        // corruption). An uncaptured table's poison was already dropped above.
+        // Surface a deferred decode error (e.g. PG unchanged-TOAST with no
+        // pre-image) only now that the event is confirmed captured — mirrors the
+        // file sink. Without this the NDJSON path would print the raw
+        // `unchanged-toast-datum` sentinel verbatim as the column value (silent
+        // corruption). An uncaptured table's poison was already dropped above.
+        if let Some(poison) = &ev.poison {
+            anyhow::bail!("{poison}");
         }
         let to_json = |img: &Option<Vec<RivetValue>>| {
             img.as_ref()
@@ -947,5 +969,54 @@ mod tests {
         assert_eq!(ts.next(&pb), 2);
         // A new position resets.
         assert_eq!(ts.next(&Position(serde_json::json!({ "lsn": "C" }))), 0);
+    }
+
+    // ── NDJSON driver honours ChangeEvent.poison (silent-corruption guard) ──
+    struct OneShot(Option<super::ChangeEvent>);
+    impl super::ChangeStream for OneShot {
+        fn next_change(&mut self) -> Option<Result<super::ChangeEvent>> {
+            self.0.take().map(Ok)
+        }
+    }
+
+    fn poison_event(table: &str) -> super::ChangeEvent {
+        super::ChangeEvent {
+            op: super::ChangeOp::Update,
+            schema: "public".into(),
+            table: table.into(),
+            before: None,
+            after: Some(vec![RivetValue::Bytes(b"unchanged-toast-datum".to_vec())]),
+            position: Position(serde_json::json!({ "lsn": "0/ABC" })),
+            committed: true,
+            image_names: None,
+            seq: 0,
+            poison: Some(
+                "pg cdc: public.orders: column [big] unchanged-TOAST — REPLICA IDENTITY FULL"
+                    .into(),
+            ),
+        }
+    }
+
+    // The NDJSON path (`rivet cdc` without --output) must surface a deferred poison
+    // for a CAPTURED table — never print the raw `unchanged-toast-datum` sentinel as
+    // data. RED against the pre-fix loop, which had no poison check and emitted it.
+    #[test]
+    fn ndjson_run_raises_poison_for_a_captured_table() {
+        let mut s = OneShot(Some(poison_event("orders")));
+        let err = super::run(&mut s, None, vec!["orders".into()], None)
+            .expect_err("captured poison must bail");
+        assert!(
+            format!("{err:#}").contains("REPLICA IDENTITY FULL"),
+            "got: {err:#}"
+        );
+    }
+
+    // An UNCAPTURED table's poison must be dropped (parallel-slot contamination
+    // fix): the run succeeds, never bailing on a table we do not capture.
+    #[test]
+    fn ndjson_run_drops_poison_for_an_uncaptured_table() {
+        let mut s = OneShot(Some(poison_event("audit_log")));
+        super::run(&mut s, None, vec!["orders".into()], None)
+            .expect("uncaptured poison must not bail the NDJSON run");
     }
 }

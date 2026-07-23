@@ -215,8 +215,21 @@ pub struct ExportConfig {
     /// a fractional value is allowed (`1.5GB`). Units are binary (IEC-style):
     /// `KB` = 1024 bytes, `MB` = 1024 KB, `GB` = 1024 MB. Example: `256MB`.
     pub max_file_size: Option<String>,
+    /// Persist per-chunk / per-page progress so a **crashed** run resumes from the
+    /// last durably committed point instead of re-reading from the start. This is
+    /// pure crash-recovery: a *clean* re-run (the prior run finished) still does a
+    /// full pass — it never silently skips already-exported rows. Safe to enable
+    /// on any table; `rivet init` defaults it on for chunked and keyset exports.
     #[serde(default)]
     pub chunk_checkpoint: bool,
+    /// Keyset only (`chunk_by_key`): on a **clean** re-run, continue from the last
+    /// exported key — pull ONLY rows with a key past the high-water mark. This is
+    /// incremental-by-key, correct ONLY for APPEND-ONLY tables (a mutable row whose
+    /// key already passed is silently never re-read). Opt-in and off by default;
+    /// crash-recovery does not need it (that is `chunk_checkpoint`). For a mutable
+    /// table use `mode: incremental` on a timestamp cursor instead.
+    #[serde(default)]
+    pub keyset_incremental: bool,
     pub chunk_max_attempts: Option<u32>,
     #[serde(default)]
     pub tuning: Option<TuningConfig>,
@@ -687,6 +700,7 @@ pub(crate) fn sample_export(name: &str) -> ExportConfig {
         quality: None,
         max_file_size: None,
         chunk_checkpoint: false,
+        keyset_incremental: false,
         chunk_max_attempts: None,
         tuning: None,
         source_group: None,

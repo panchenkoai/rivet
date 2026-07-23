@@ -92,7 +92,8 @@ Rendered from the JSON Schema `rivet schema config` emits (schemars ← the Rust
 | `meta_columns` | [MetaColumns](#metacolumns) |  |  |
 | `quality` | [QualityConfig](#qualityconfig) |  |  |
 | `max_file_size` | `string` |  | Rotate to a new part when the current file reaches this size. Accepts `B`/`KB`/`MB`/`GB` (case-insensitive) or a bare byte count; a fractional value is allowed (`1.5GB`). Units are binary (IEC-style): `KB` = 1024 bytes, `MB` = 1024 KB, `GB` = 1024 MB. Example: `256MB`. |
-| `chunk_checkpoint` | `boolean` |  |  |
+| `chunk_checkpoint` | `boolean` |  | Persist per-chunk / per-page progress so a **crashed** run resumes from the last durably committed point instead of re-reading from the start. This is pure crash-recovery: a *clean* re-run (the prior run finished) still does a full pass — it never silently skips already-exported rows. Safe to enable on any table; `rivet init` defaults it on for chunked and keyset exports. |
+| `keyset_incremental` | `boolean` |  | Keyset only (`chunk_by_key`): on a **clean** re-run, continue from the last exported key — pull ONLY rows with a key past the high-water mark. This is incremental-by-key, correct ONLY for APPEND-ONLY tables (a mutable row whose key already passed is silently never re-read). Opt-in and off by default; crash-recovery does not need it (that is `chunk_checkpoint`). For a mutable table use `mode: incremental` on a timestamp cursor instead. |
 | `chunk_max_attempts` | `integer` |  |  |
 | `tuning` | [TuningConfig](#tuningconfig) |  |  |
 | `source_group` | `string` |  | Optional logical group for shared source capacity (replica, host). Advisory prioritization only. |

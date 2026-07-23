@@ -140,13 +140,32 @@ pub(crate) fn run_keyset(
         kp.chunk_size
     );
 
-    // RESUME (opt-in via `kp.checkpoint`): continue from the last DURABLY
-    // committed key so a crashed run picks up where it left off instead of
-    // re-reading the whole collection. Reuses the incremental `export_state`
-    // store. Default OFF keeps `mode: full` re-reading the whole key range every
-    // run — resume is only correct when the caller wants it (a plain re-run of a
-    // full export must NOT silently skip already-exported rows).
-    let mut last: Option<String> = if kp.checkpoint {
+    // CRASH-RECOVERY vs INCREMENTAL — two distinct reasons to continue from the
+    // last committed key, kept SEPARATE so a clean re-run of a mutable table can
+    // never silently skip already-exported rows:
+    //
+    //   * Crash-recovery (`chunk_checkpoint`): the prior run died mid-stream, so
+    //     its in-progress run_id (set at open below, cleared at finalize) is still
+    //     present. Continuing from its last committed key picks up exactly where it
+    //     stopped — resuming already-committed data can never skip a row.
+    //   * Incremental (`keyset_incremental`): an append-only opt-in — a CLEAN
+    //     re-run pulls only keys past the high-water mark.
+    //
+    // A clean re-run (prior run finished → run_id cleared) WITHOUT the incremental
+    // opt-in loads no cursor and re-reads the whole range (full/snapshot
+    // semantics). This is the crash-recovery ⇄ incremental split (ADR: keyset
+    // checkpoint no longer implies incremental-by-key).
+    let resume_run_id: Option<String> = if kp.checkpoint {
+        match state {
+            Some(st) => st.get_resume_run_id(&plan.export_name)?,
+            None => None,
+        }
+    } else {
+        None
+    };
+    let recovering_crash = resume_run_id.is_some();
+
+    let mut last: Option<String> = if kp.checkpoint && (recovering_crash || kp.incremental) {
         state
             .and_then(|s| s.get(&plan.export_name).ok())
             .and_then(|cs| cs.last_cursor_value)
@@ -159,21 +178,40 @@ pub(crate) fn run_keyset(
     // file_log) with NO destination manifest; on resume the page loop continues from
     // the cursor and skips them, so finalize would write a manifest of ONLY this
     // run's pages, orphaning the pre-crash pages from the manifest-authoritative
-    // loader. export_state now persists the in-progress run_id: REUSE it across
-    // resumes so every page lives under ONE run_id in file_log, and reconstruct the
-    // already-committed pages into this run's manifest. Cleared by the caller once
-    // finalize writes the complete manifest.
+    // loader. export_state persists the in-progress run_id: REUSE it across resumes
+    // so every page lives under ONE run_id in file_log, and reconstruct the
+    // already-committed pages into this run's manifest. A first/clean run has no
+    // in-progress run_id → record a fresh one. Cleared by the caller once finalize
+    // writes the complete manifest.
     if kp.checkpoint
         && let Some(st) = state
     {
-        match st.get_resume_run_id(&plan.export_name)? {
+        match &resume_run_id {
             Some(rid) => {
                 summary.run_id = rid.clone();
-                super::chunked::rehydrate_manifest_parts_from_file_log(st, &rid, summary)?;
+                super::chunked::rehydrate_manifest_parts_from_file_log(st, rid, summary)?;
             }
-            None => st.set_resume_run_id(&plan.export_name, &summary.run_id)?,
+            None => {
+                // FRESH run. For crash-recovery-only (non-incremental) keyset, null
+                // the persisted high-water mark FIRST: it may still hold a prior
+                // COMPLETED run's final key, and if this fresh run crashes before
+                // its first page commits, the recovery run would load that stale
+                // key as this run's resume point and skip the entire table. Tying
+                // the cursor to this run makes a pre-first-commit crash re-read from
+                // the start. Incremental deliberately keeps it (that IS the point).
+                if !kp.incremental {
+                    st.clear_cursor_value(&plan.export_name)?;
+                }
+                st.set_resume_run_id(&plan.export_name, &summary.run_id)?;
+            }
         }
     }
+
+    // Fault point: a fresh run has opened (resume_run_id set, cursor cleared for
+    // non-incremental) but committed NO page yet. A crash here must, on the next
+    // run, re-read from the START — never resume from a prior completed run's
+    // stale high-water mark (the silent whole-table skip the cursor clear fixes).
+    crate::test_hook::maybe_panic_at("keyset_after_open_before_first_page");
 
     let mut pages: usize = 0;
     // Captured once from the first non-empty page for the post-run on_schema_drift
@@ -284,6 +322,27 @@ pub(crate) fn run_keyset(
 
     // Form B: record the run-wide XOR-combined checksums so finalize writes them.
     super::commit::harvest_column_checksums(summary, checksums_acc, checksum_key_column);
+
+    // DATA COMPLETE: the page loop exhausted the key range, so there is no
+    // uncommitted work left to resume — clear the in-progress run_id NOW, BEFORE
+    // the post-data gates (schema-drift below, and the quality gate in job.rs).
+    // A gate that fails AFTER all data is durable must not leave a resume anchor:
+    // otherwise the operator's intended full re-run would be treated as a
+    // crash-recovery and continue from the high-water mark, silently skipping
+    // rows updated since (the exact silent-skip the crash-recovery/incremental
+    // split exists to prevent). resume_run_id only ever means "a run died with
+    // work still outstanding".
+    if kp.checkpoint
+        && let Some(st) = state
+    {
+        st.clear_resume_run_id(&plan.export_name)?;
+    }
+
+    // Fault point: data is fully committed and the resume anchor is cleared, but a
+    // post-data gate (or any late failure) has not yet run. A crash here must NOT
+    // leave a resume anchor — the next run is a fresh full pass, never a
+    // crash-recovery that skips rows updated since (the #3 gate-failure class).
+    crate::test_hook::maybe_panic_at("keyset_after_data_complete");
 
     log::info!(
         "export '{}': keyset complete — {} page(s), {} rows",

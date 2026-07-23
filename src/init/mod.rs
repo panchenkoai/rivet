@@ -821,7 +821,8 @@ mod tests {
     fn generate_config_chunked_single_pk_uses_keyset() {
         // A single-column PK → keyset (`chunk_by_key`), immune to sparse keys —
         // NOT range `chunk_column` (which blows up on a huge/gappy id). Sequential,
-        // so no `parallel:`; checkpoint is a commented opt-in, not on by default.
+        // so no `parallel:`; chunk_checkpoint is ON by default (safe crash-recovery),
+        // and the append-only incremental behaviour is a commented `keyset_incremental`.
         let info = make_table(
             2_000_000,
             vec![col("id", "bigint", true), col("name", "text", false)],
@@ -841,15 +842,21 @@ mod tests {
             !yaml.contains("\n    chunk_column:"),
             "PK must keyset, not range-chunk:\n{yaml}"
         );
-        // keyset is sequential — no parallel workers emitted, and checkpoint is a
-        // commented opt-in (snapshot semantics by default), never an active knob.
+        // keyset is sequential — no parallel workers emitted.
         assert!(
             !yaml.contains("\n    parallel:"),
             "keyset must not emit parallel:\n{yaml}"
         );
+        // chunk_checkpoint is ON by default now (crash-recovery is safe: a clean
+        // re-run still does a full pass). The append-only incremental behaviour —
+        // the part that CAN skip rows — stays a commented `keyset_incremental` opt-in.
         assert!(
-            yaml.contains("# add `chunk_checkpoint: true`"),
-            "should hint the resume opt-in:\n{yaml}"
+            yaml.contains("\n    chunk_checkpoint: true"),
+            "keyset must default chunk_checkpoint on (safe crash-recovery):\n{yaml}"
+        );
+        assert!(
+            yaml.contains("# keyset_incremental: true"),
+            "append-only incremental must be a commented opt-in:\n{yaml}"
         );
         // Keyset needs the `table:` shortcut (planner introspects the unique index),
         // so the export emits `table:`, not a `SELECT … FROM` query.
@@ -1223,12 +1230,14 @@ mod tests {
         let exp = &parsed["exports"][0];
         assert_eq!(exp["name"].as_str(), Some("orders"));
         assert_eq!(exp["mode"].as_str(), Some("chunked"));
-        // Single-column PK → keyset via the `table:` shortcut; checkpoint is a
-        // commented opt-in, so it is absent from the parsed (active) config.
+        // Single-column PK → keyset via the `table:` shortcut; chunk_checkpoint is
+        // ON by default (safe crash-recovery), while keyset_incremental stays a
+        // commented opt-in (absent from the parsed active config).
         assert_eq!(exp["chunk_by_key"].as_str(), Some("id"));
         assert_eq!(exp["table"].as_str(), Some("orders"));
         assert!(exp["chunk_column"].is_null());
-        assert!(exp["chunk_checkpoint"].is_null());
+        assert_eq!(exp["chunk_checkpoint"].as_bool(), Some(true));
+        assert!(exp["keyset_incremental"].is_null());
         assert_eq!(exp["meta_columns"]["row_hash"].as_bool(), Some(true));
         assert_eq!(exp["destination"]["type"].as_str(), Some("s3"));
         assert_eq!(exp["destination"]["bucket"].as_str(), Some("ok-bucket"));

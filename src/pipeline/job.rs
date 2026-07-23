@@ -953,6 +953,7 @@ mod tests {
             key_column: "id".into(),
             chunk_size: 500,
             checkpoint: false,
+            incremental: false,
             parallel: 1,
         });
         let mut summary = fresh_summary(&plan, 42);

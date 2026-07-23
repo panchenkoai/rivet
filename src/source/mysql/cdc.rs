@@ -264,6 +264,7 @@ impl MysqlChangeStream {
                         committed: false,
                         image_names: image_names.clone(),
                         seq: 0, // stamped by TxnSeq as the stream is consumed
+                        poison: None,
                     };
                     self.tx_bytes = self.tx_bytes.saturating_add(ev.estimated_bytes());
                     self.tx.push(ev);
