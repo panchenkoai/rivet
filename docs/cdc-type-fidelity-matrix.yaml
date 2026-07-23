@@ -19,6 +19,15 @@
 # Every RivetType FAMILY must have a scenario row (enforced generatively by
 # matrix_cdc_type_rows_cover_every_rivet_type in the drift-guard, derived from the
 # RivetType enum): a new type cannot ship without a CDC-fidelity row.
+#
+# ORACLE STRENGTH (matrix_oracle_strength_ratchet): a `test:` cell may carry
+# `oracle: independent|fail_loud|differential|self`. A bare `*_cdc_full_type_matrix_
+# matches_batch` cell is a DIFFERENTIAL self-oracle (CDC decode vs BATCH decode) —
+# it passes a bug both siblings SHARE (the class Form A misses). `oracle:
+# independent` marks a cell verified OUTSIDE rivet's decode family (a DuckDB /
+# source-vs-dest re-read, a hard-coded literal). An un-annotated test cell counts
+# as differential (weak) by default; the ratchet forbids the weak count from
+# growing and shrinks as cells are upgraded to independent.
 
 engines: [postgres, mysql, mssql, mongo]
 
@@ -33,9 +42,9 @@ scenarios:
   - id: type_integer_families
     what: "int16/32/64 + unsigned 64 (incl. BIGINT UNSIGNED > i64::MAX) survive CDC. MySQL cell is INDEPENDENT (DuckDB re-read vs the source literal), not a batch-differential"
     postgres: { test: pg_cdc_full_type_matrix_matches_batch }
-    mysql:    { test: mysql_cdc_typed_values_match_source_via_duckdb_not_batch }
+    mysql:    { test: mysql_cdc_typed_values_match_source_via_duckdb_not_batch, oracle: independent }
     mssql:    { test: mssql_cdc_full_type_matrix_matches_batch }
-    mongo:    { test: mongo_cdc_change_stream_renders_tricky_bson_verbatim_like_batch }
+    mongo:    { test: mongo_cdc_change_stream_renders_tricky_bson_verbatim_like_batch, oracle: independent }
 
   - id: type_float
     what: "real/double through CDC — hostile floats (NaN/Inf) match batch or fail loud"
@@ -47,9 +56,9 @@ scenarios:
   - id: type_decimal
     what: "decimal(p,s) precision + scale through CDC (MySQL cell INDEPENDENT: DuckDB re-read vs source literal); MSSQL MONEY past the f64-exact 2^53 range fails loud, not falsely-exact (finding #2)"
     postgres: { test: pg_cdc_full_type_matrix_matches_batch }
-    mysql:    { test: mysql_cdc_typed_values_match_source_via_duckdb_not_batch }
-    mssql:    { test: cdc_money_past_f64_exact_range_fails_loud_not_a_falsely_exact_decimal }
-    mongo:    { test: mongo_cdc_change_stream_renders_tricky_bson_verbatim_like_batch }
+    mysql:    { test: mysql_cdc_typed_values_match_source_via_duckdb_not_batch, oracle: independent }
+    mssql:    { test: cdc_money_past_f64_exact_range_fails_loud_not_a_falsely_exact_decimal, oracle: fail_loud }
+    mongo:    { test: mongo_cdc_change_stream_renders_tricky_bson_verbatim_like_batch, oracle: independent }
 
   - id: type_date_time
     what: "date + time-of-day survive the change stream with the batch Arrow types"
@@ -60,9 +69,9 @@ scenarios:
 
   - id: type_timestamp_tz
     what: "naive vs tz-aware timestamp — CDC preserves the UTC instant under a non-default session/DB timezone (the +9h render-time trap)"
-    postgres: { test: pg_cdc_non_utc_database_timezone_matches_batch }
-    mysql:    { test: cdc_non_utc_server_timezone_matches_batch_and_utc_instant }
-    mssql:    { test: mssql_cdc_datetimeoffset_value_is_preserved }
+    postgres: { test: pg_cdc_non_utc_database_timezone_matches_batch, oracle: independent }
+    mysql:    { test: cdc_non_utc_server_timezone_matches_batch_and_utc_instant, oracle: independent }
+    mssql:    { test: mssql_cdc_datetimeoffset_value_is_preserved, oracle: independent }
     mongo:    { na: "BSON dates ride the verbatim document blob" }
 
   - id: type_text
@@ -70,7 +79,7 @@ scenarios:
     postgres: { test: pg_cdc_full_type_matrix_matches_batch }
     mysql:    { test: cdc_full_type_matrix_matches_batch }
     mssql:    { test: mssql_cdc_full_type_matrix_matches_batch }
-    mongo:    { test: mongo_cdc_change_stream_renders_tricky_bson_verbatim_like_batch }
+    mongo:    { test: mongo_cdc_change_stream_renders_tricky_bson_verbatim_like_batch, oracle: independent }
 
   - id: type_binary
     what: "bytea/varbinary/binary through CDC as the same bytes"
@@ -84,7 +93,7 @@ scenarios:
     postgres: { test: cdc_captures_json_as_valid_json }
     mysql:    { test: cdc_full_type_matrix_matches_batch }
     mssql:    { na: "SQL Server has no native JSON type; the CDC matrix fixture omits it by design" }
-    mongo:    { test: mongo_cdc_change_stream_renders_tricky_bson_verbatim_like_batch }
+    mongo:    { test: mongo_cdc_change_stream_renders_tricky_bson_verbatim_like_batch, oracle: independent }
 
   - id: type_uuid
     what: "uuid — PG uuid / MySQL CHAR(36) / MSSQL uniqueidentifier → canonical value through CDC"
@@ -96,7 +105,7 @@ scenarios:
   - id: type_enum
     what: "enum label (not the wire index) through CDC — incl. a CROSS-DATABASE MySQL capture enriched from the table's own schema (finding #3)"
     postgres: { test: pg_cdc_full_type_matrix_matches_batch }
-    mysql:    { test: cdc_cross_database_enum_enriches_from_the_tables_own_schema }
+    mysql:    { test: cdc_cross_database_enum_enriches_from_the_tables_own_schema, oracle: independent }
     mssql:    { na: "SQL Server has no ENUM type" }
     mongo:    { na: "no enum type; a string rides the document blob" }
 
@@ -110,7 +119,7 @@ scenarios:
   - id: type_bit
     what: "BIT(n) through CDC — BIT(1) boolean, BIT(n>1) integer; a BIT(64) with bit 63 set fails loud, never a silent NULL (finding #4)"
     postgres: { na: "PG bit/varbit is not in the CDC type fixture; covered as a follow-up" }
-    mysql:    { test: build_column_narrows_int_and_fails_loud_on_overflow }
+    mysql:    { test: build_column_narrows_int_and_fails_loud_on_overflow, oracle: fail_loud }
     mssql:    { test: mssql_cdc_full_type_matrix_matches_batch }
     mongo:    { na: "no BIT type" }
 
@@ -118,7 +127,7 @@ scenarios:
     what: "MSSQL MONEY/SMALLMONEY — the exact scaled value through CDC (f64-delivered by tiberius), fails loud past the 2^53-exact range (finding #2)"
     postgres: { na: "PostgreSQL money is discouraged and not in the CDC fixture" }
     mysql:    { na: "MySQL has no MONEY type" }
-    mssql:    { test: mssql_money_values_survive_batch_and_cdc }
+    mssql:    { test: mssql_money_values_survive_batch_and_cdc, oracle: independent }
     mongo:    { na: "no MONEY type" }
 
   - id: type_interval
@@ -130,7 +139,7 @@ scenarios:
 
   - id: type_list
     what: "PostgreSQL 1-D arrays (int[]/text[]/…) as a real Arrow List through CDC; a multi-dimensional array fails loud, never a flat NULL list (finding #6)"
-    postgres: { test: multidim_array_literal_is_refused_not_flattened_to_bogus_nulls }
+    postgres: { test: multidim_array_literal_is_refused_not_flattened_to_bogus_nulls, oracle: fail_loud }
     mysql:    { na: "MySQL has no array column type" }
     mssql:    { na: "SQL Server has no array column type" }
     mongo:    { na: "arrays ride the verbatim document blob (BSON array → extJSON)" }

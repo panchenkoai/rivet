@@ -28,6 +28,15 @@
 //!    dropped/missing COLUMN (engine/target); #6 stops a dropped/missing ROW
 //!    (type). Together the column AND row axes are product-code-enumerated, so the
 //!    per-type-CDC quadrant (findings #2/#3/#4) can no longer grow a silent hole.
+//! 7. ORACLE-STRENGTH ratchet: #1-#6 ensure a cell EXISTS and names a real test;
+//!    this grades HOW STRONG the oracle is. A `differential` cell (CDC==batch) is a
+//!    self-oracle over the SHARED decode — it passes a bug both siblings share (the
+//!    class that hid #5/#6/#8, and that the value-checksum Form A also misses). The
+//!    ratchet counts the weak (differential/self/un-annotated) `test:` cells per
+//!    oracle-tracked matrix and forbids the count from GROWING; upgrading a cell to
+//!    an INDEPENDENT oracle (a DuckDB/source-vs-dest re-read, outside rivet's decode
+//!    family) lowers the ceiling. So the shared-decode self-oracle debt is visible
+//!    and monotonically shrinks toward 0.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -155,6 +164,14 @@ struct Cell {
     test: Option<String>,
     gap: Option<String>,
     na: Option<String>,
+    /// Oracle STRENGTH of a `test:` cell (guard #7, on oracle-tracked matrices):
+    /// `independent` (a reader OUTSIDE rivet's decode family — foreign reader /
+    /// source-vs-dest / hard-coded literal — catches a SHARED-decode value bug),
+    /// `fail_loud` (asserts the error path, not a value compare), `differential`
+    /// (sibling-vs-sibling, e.g. CDC==batch — the self-oracle that MISSES a shared
+    /// bug), `self`. ABSENT on a `test:` cell defaults to `differential` (weak),
+    /// so a new cell is assumed weak until proven independent.
+    oracle: Option<String>,
 }
 
 impl Cell {
@@ -162,7 +179,27 @@ impl Cell {
     fn kind_count(&self) -> usize {
         self.test.is_some() as usize + self.gap.is_some() as usize + self.na.is_some() as usize
     }
+
+    /// Is this a `test:` cell whose oracle could HIDE a shared-decode value bug?
+    /// (`differential`/`self`, or an un-annotated test — weak by default.) The
+    /// ratchet target: drive these to `independent`/`fail_loud`, never grow them.
+    fn is_weak_oracle(&self) -> bool {
+        self.test.is_some()
+            && !matches!(
+                self.oracle.as_deref(),
+                Some("independent") | Some("fail_loud")
+            )
+    }
 }
+
+/// The valid `oracle:` strengths (typo-guarded).
+const ORACLE_STRENGTHS: &[&str] = &["independent", "differential", "self", "fail_loud"];
+
+/// Oracle-tracked matrices + their weak-oracle (differential/self/un-annotated)
+/// ratchet ceiling. LOWER the ceiling each time a cell is upgraded from a
+/// batch-differential to an INDEPENDENT oracle (a DuckDB/source re-read); never
+/// raise it — the ratchet drives the shared-decode-blind self-oracle debt to 0.
+const ORACLE_TRACKED: &[(&str, usize)] = &[("docs/cdc-type-fidelity-matrix.yaml", 27)];
 
 impl Scenario {
     /// `(column, cell)` for every column the matrix declares; panics if a
@@ -476,6 +513,52 @@ fn matrix_cdc_type_rows_cover_every_rivet_type() {
             ids.contains(scenario),
             "RivetType::{variant} maps to cdc-type row '{scenario}', MISSING from \
              docs/cdc-type-fidelity-matrix.yaml — add the scenario (a test/gap/na cell per engine)."
+        );
+    }
+}
+
+/// Guard #7 — GENERATIVE oracle-strength ratchet. Guards #1-#6 ensure a cell
+/// EXISTS and names a real test; this one grades HOW STRONG that test's oracle is.
+/// A `differential` cell (CDC==batch) is a self-oracle over the SHARED decode — it
+/// passes a bug both siblings share (the class the value-checksum Form A also
+/// misses, and that the audit found hiding #5/#6/#8). The ratchet counts the weak
+/// (differential / self / un-annotated) cells per tracked matrix and forbids the
+/// count from GROWING; upgrading a cell to an INDEPENDENT oracle (a DuckDB /
+/// source-vs-dest re-read, outside rivet's decode family) lowers the ceiling. So
+/// the shared-decode self-oracle debt is visible and can only shrink.
+#[test]
+fn matrix_oracle_strength_ratchet() {
+    for (path, ceiling) in ORACLE_TRACKED {
+        let matrix = load_matrix(path);
+        let mut weak = 0usize;
+        for sc in &matrix.scenarios {
+            for (eng, cell) in sc.resolved_cells(&matrix.engines, path) {
+                // Typo-guard any declared strength.
+                if let Some(o) = cell.oracle.as_deref() {
+                    assert!(
+                        ORACLE_STRENGTHS.contains(&o),
+                        "{path} scenario '{}' column '{}' has oracle: '{o}' — must be one of {ORACLE_STRENGTHS:?}",
+                        sc.id,
+                        eng
+                    );
+                    // `oracle:` only means something on a `test:` cell.
+                    assert!(
+                        cell.test.is_some(),
+                        "{path} scenario '{}' column '{}' declares oracle: '{o}' but is not a `test` cell",
+                        sc.id,
+                        eng
+                    );
+                }
+                weak += cell.is_weak_oracle() as usize;
+            }
+        }
+        assert_eq!(
+            weak, *ceiling,
+            "{path} has {weak} WEAK-oracle cells (differential / self / un-annotated); the \
+             ratchet expects exactly {ceiling}. If {weak} > {ceiling}: you added a weak cell — \
+             give it an INDEPENDENT oracle (DuckDB/source re-read) or fail_loud, not a \
+             batch-differential. If {weak} < {ceiling}: you UPGRADED one — lower the ceiling in \
+             ORACLE_TRACKED to {weak} to lock the win."
         );
     }
 }
