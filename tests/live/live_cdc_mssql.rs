@@ -1279,7 +1279,8 @@ fn mssql_cdc_typed_values_match_source_via_duckdb_not_batch() {
     mssql_cdc_drop_table(&format!("dbo.{table}"));
     mssql_cdc_exec(&format!(
         "CREATE TABLE dbo.{table} (id INT PRIMARY KEY, big BIGINT, amount DECIMAL(18,4), \
-         label VARCHAR(50), d DATE, vb VARBINARY(4), m MONEY)"
+         label VARCHAR(50), d DATE, vb VARBINARY(4), m MONEY, \
+         fl FLOAT, bt BIT, u UNIQUEIDENTIFIER)"
     ));
     enable_cdc(&table, &ci);
     let _guard = MssqlCdcTable {
@@ -1289,7 +1290,8 @@ fn mssql_cdc_typed_values_match_source_via_duckdb_not_batch() {
     let ckpt = d.path().join("cdc.ckpt");
     mssql_cdc_exec(&format!(
         "INSERT INTO dbo.{table} VALUES (1, 9000000000000, 12345.6789, 'hello', \
-         '2026-06-23', 0xDEADBEEF, 123.4567)"
+         '2026-06-23', 0xDEADBEEF, 123.4567, \
+         1.5, 1, '12345678-1234-1234-1234-123456789012')"
     ));
     wait_for_capture(&ci, 1);
     run_rivet_ok(&mssql_cdc_config(&d, &table, &ci, &ckpt, &host_dir));
@@ -1297,6 +1299,8 @@ fn mssql_cdc_typed_values_match_source_via_duckdb_not_batch() {
     let res = duckdb_run_sql_json(&format!(
         "SELECT (big = 9000000000000) AND (amount = 12345.6789) AND (label = 'hello') \
          AND (d = DATE '2026-06-23') AND (lower(to_hex(vb)) = 'deadbeef') AND (m = 123.4567) \
+         AND (fl = 1.5) AND (CAST(bt AS INTEGER) = 1) \
+         AND (lower(CAST(u AS VARCHAR)) = '12345678-1234-1234-1234-123456789012') \
          FROM read_parquet('{container_dir}/cdc-*.parquet') WHERE id = 1"
     ));
     let rows = res["rows"].as_array().expect("duckdb rows");

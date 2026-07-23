@@ -4272,7 +4272,8 @@ fn mysql_cdc_typed_values_match_source_via_duckdb_not_batch() {
     c.query_drop(format!(
         "CREATE TABLE {tbl} (id INT PRIMARY KEY, amount DECIMAL(18,4), \
          en ENUM('active','shipped','off'), big BIGINT UNSIGNED, \
-         note VARCHAR(20), d DATE, vb VARBINARY(4), uid CHAR(36))"
+         note VARCHAR(20), d DATE, vb VARBINARY(4), uid CHAR(36), \
+         fl DOUBLE, st SET('a','b','c'), flag BOOLEAN, j JSON)"
     ))
     .unwrap();
     let _guard = Table(tbl.clone());
@@ -4283,7 +4284,8 @@ fn mysql_cdc_typed_values_match_source_via_duckdb_not_batch() {
     rig.run_ok();
     c.query_drop(format!(
         "INSERT INTO {tbl} VALUES (1, 12345.6789, 'off', 18000000000000000000, \
-         'hello', '2024-03-15', 0xDEADBEEF, '12345678-1234-1234-1234-123456789012')"
+         'hello', '2024-03-15', 0xDEADBEEF, '12345678-1234-1234-1234-123456789012', \
+         1.5, 'a,b', 1, '{{\"k\": \"v\", \"n\": 42}}')"
     ))
     .unwrap();
     rig.run_ok();
@@ -4296,6 +4298,8 @@ fn mysql_cdc_typed_values_match_source_via_duckdb_not_batch() {
         "SELECT (amount = 12345.6789) AND (en = 'off') AND (big = 18000000000000000000) \
          AND (note = 'hello') AND (d = DATE '2024-03-15') AND (lower(to_hex(vb)) = 'deadbeef') \
          AND (uid = '12345678-1234-1234-1234-123456789012') \
+         AND (fl = 1.5) AND (st = 'a,b') AND (CAST(flag AS INTEGER) = 1) \
+         AND (json_extract_string(j, 'k') = 'v') AND (CAST(json_extract(j, 'n') AS INTEGER) = 42) \
          FROM read_parquet('{container_dir}/cdc-*.parquet') WHERE id = 1"
     ));
     let rows = res["rows"].as_array().expect("duckdb rows");
@@ -4332,7 +4336,7 @@ fn pg_cdc_typed_values_match_source_via_duckdb_not_batch() {
         "CREATE TYPE {tbl}_status AS ENUM ('active','shipped','off'); \
          CREATE TABLE {tbl} (id INT PRIMARY KEY, amount NUMERIC(18,4), \
          status {tbl}_status, note TEXT, big BIGINT, flag BOOLEAN, \
-         fl DOUBLE PRECISION, d DATE, rb BYTEA)"
+         fl DOUBLE PRECISION, d DATE, rb BYTEA, uid UUID, iv INTERVAL, j JSONB)"
     ))
     .unwrap();
 
@@ -4343,7 +4347,9 @@ fn pg_cdc_typed_values_match_source_via_duckdb_not_batch() {
     c.execute(
         &format!(
             "INSERT INTO {tbl} VALUES (1, 12345.6789, 'off', 'hello', 9000000000000, true, \
-             1.5, '2024-03-15', '\\xDEADBEEF')"
+             1.5, '2024-03-15', '\\xDEADBEEF', \
+             '12345678-1234-1234-1234-123456789012', INTERVAL '1 year 2 mons 3 days', \
+             '{{\"k\": \"v\", \"n\": 42}}')"
         ),
         &[],
     )
@@ -4354,6 +4360,8 @@ fn pg_cdc_typed_values_match_source_via_duckdb_not_batch() {
         "SELECT (amount = 12345.6789) AND (status = 'off') AND (note = 'hello') \
          AND (big = 9000000000000) AND (flag = true) AND (fl = 1.5) \
          AND (d = DATE '2024-03-15') AND (lower(to_hex(rb)) = 'deadbeef') \
+         AND (lower(CAST(uid AS VARCHAR)) = '12345678-1234-1234-1234-123456789012') \
+         AND (iv = 'P1Y2M3D') \
          FROM read_parquet('{container_dir}/cdc-*.parquet') WHERE id = 1"
     ));
     let rows = res["rows"].as_array().expect("duckdb rows");

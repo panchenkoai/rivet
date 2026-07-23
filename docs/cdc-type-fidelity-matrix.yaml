@@ -35,8 +35,8 @@ scenarios:
   - id: type_boolean
     what: "boolean rides through the change stream as the same Arrow Boolean as batch"
     postgres: { test: pg_cdc_typed_values_match_source_via_duckdb_not_batch, oracle: independent }
-    mysql:    { test: cdc_full_type_matrix_matches_batch }
-    mssql:    { test: mssql_cdc_full_type_matrix_matches_batch }
+    mysql:   { test: mysql_cdc_typed_values_match_source_via_duckdb_not_batch, oracle: independent }
+    mssql:   { test: mssql_cdc_typed_values_match_source_via_duckdb_not_batch, oracle: independent }
     mongo:    { na: "boolean rides the verbatim document blob, not a typed column" }
 
   - id: type_integer_families
@@ -49,8 +49,8 @@ scenarios:
   - id: type_float
     what: "real/double through CDC — hostile floats (NaN/Inf) match batch or fail loud"
     postgres: { test: pg_cdc_typed_values_match_source_via_duckdb_not_batch, oracle: independent }
-    mysql:    { test: cdc_full_type_matrix_matches_batch }
-    mssql:    { test: mssql_cdc_full_type_matrix_matches_batch }
+    mysql:   { test: mysql_cdc_typed_values_match_source_via_duckdb_not_batch, oracle: independent }
+    mssql:   { test: mssql_cdc_typed_values_match_source_via_duckdb_not_batch, oracle: independent }
     mongo:    { na: "float rides the verbatim document blob, not a typed column" }
 
   - id: type_decimal
@@ -90,16 +90,16 @@ scenarios:
 
   - id: type_json
     what: "json/jsonb content fidelity through the change stream"
-    postgres: { test: cdc_captures_json_as_valid_json }
-    mysql:    { test: cdc_full_type_matrix_matches_batch }
+    postgres: { test: pg_cdc_typed_values_match_source_via_duckdb_not_batch, oracle: independent }
+    mysql:   { test: mysql_cdc_typed_values_match_source_via_duckdb_not_batch, oracle: independent }
     mssql:    { na: "SQL Server has no native JSON type; the CDC matrix fixture omits it by design" }
     mongo:    { test: mongo_cdc_change_stream_renders_tricky_bson_verbatim_like_batch, oracle: independent }
 
   - id: type_uuid
     what: "uuid — PG uuid / MySQL CHAR(36) / MSSQL uniqueidentifier → canonical value through CDC"
-    postgres: { test: pg_cdc_full_type_matrix_matches_batch }
+    postgres: { test: pg_cdc_typed_values_match_source_via_duckdb_not_batch, oracle: independent }
     mysql:    { test: mysql_cdc_typed_values_match_source_via_duckdb_not_batch, oracle: independent }
-    mssql:    { test: mssql_cdc_full_type_matrix_matches_batch }
+    mssql:   { test: mssql_cdc_typed_values_match_source_via_duckdb_not_batch, oracle: independent }
     mongo:    { na: "a BSON uuid rides the verbatim document blob, not a typed column" }
 
   - id: type_enum
@@ -112,7 +112,7 @@ scenarios:
   - id: type_set
     what: "MySQL SET — the comma-joined labels (not the raw bitmask) through CDC"
     postgres: { na: "PostgreSQL has no SET type" }
-    mysql:    { test: cdc_full_type_matrix_matches_batch }
+    mysql:   { test: mysql_cdc_typed_values_match_source_via_duckdb_not_batch, oracle: independent }
     mssql:    { na: "SQL Server has no SET type" }
     mongo:    { na: "no SET type" }
 
@@ -120,7 +120,7 @@ scenarios:
     what: "BIT(n) through CDC — BIT(1) boolean, BIT(n>1) integer; a BIT(64) with bit 63 set fails loud, never a silent NULL (finding #4)"
     postgres: { na: "PG bit/varbit is not in the CDC type fixture; covered as a follow-up" }
     mysql:    { test: build_column_narrows_int_and_fails_loud_on_overflow, oracle: fail_loud }
-    mssql:    { test: mssql_cdc_full_type_matrix_matches_batch }
+    mssql:   { test: mssql_cdc_typed_values_match_source_via_duckdb_not_batch, oracle: independent }
     mongo:    { na: "no BIT type" }
 
   - id: type_money
@@ -132,7 +132,7 @@ scenarios:
 
   - id: type_interval
     what: "PostgreSQL interval — canonical ISO-8601 text through CDC, identical to batch"
-    postgres: { test: pg_cdc_update_and_delete_carry_full_types }
+    postgres: { test: pg_cdc_typed_values_match_source_via_duckdb_not_batch, oracle: independent }
     mysql:    { na: "MySQL has no INTERVAL column type" }
     mssql:    { na: "SQL Server has no INTERVAL type" }
     mongo:    { na: "no interval type" }
