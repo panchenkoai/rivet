@@ -4058,3 +4058,68 @@ fn roast_pg_cdc_bounded_on_a_standby_fails_loud() {
          leaked a WAL-pinning slot instead of failing fast"
     );
 }
+
+/// Finding #3: MySQL CDC enriches ENUM/SET labels from information_schema.COLUMNS.
+/// The old query pinned `TABLE_SCHEMA = DATABASE()` and dropped any `db.`
+/// qualifier, so a CROSS-DATABASE capture — a table in a database OTHER than the
+/// connection's default (`rivet`) — enriched NOTHING and every ENUM exported as
+/// its raw integer index (a SET as its bitmask), silently. Capture a qualified
+/// `otherdb.orders` and assert the ENUM lands as its LABEL, from the table's own
+/// schema. RED before the fix: the wire index ('3') leaked through instead of 'off'.
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
+fn cdc_cross_database_enum_enriches_from_the_tables_own_schema() {
+    let d = tempfile::tempdir().unwrap();
+    let dbname = unique_name("rivet_xdb").to_lowercase();
+    let qualified = format!("{dbname}.orders");
+
+    // A SECOND database (NOT the connection's default `rivet`) created via root,
+    // with a SELECT grant so the rivet user can read the table + its catalog.
+    let root_url = MYSQL_CDC_URL.replace("rivet:rivet@", "root:rivet@");
+    let mut admin = mysql::Conn::new(mysql::Opts::from_url(&root_url).unwrap()).unwrap();
+    admin
+        .query_drop(format!("CREATE DATABASE {dbname}"))
+        .expect("create cross db");
+    // Drop guard: tear the whole database down even if the test panics.
+    struct DbGuard(String, String);
+    impl Drop for DbGuard {
+        fn drop(&mut self) {
+            if let Ok(mut c) = mysql::Conn::new(mysql::Opts::from_url(&self.1).unwrap()) {
+                let _ = c.query_drop(format!("DROP DATABASE IF EXISTS {}", self.0));
+            }
+        }
+    }
+    let _guard = DbGuard(dbname.clone(), root_url.clone());
+    admin
+        .query_drop(format!(
+            "CREATE TABLE {dbname}.orders \
+             (id INT PRIMARY KEY, status ENUM('active','shipped','off'))"
+        ))
+        .expect("create cross-db table");
+    admin
+        .query_drop(format!("GRANT SELECT ON {dbname}.* TO 'rivet'@'%'"))
+        .expect("grant select");
+    admin.query_drop("FLUSH PRIVILEGES").unwrap();
+
+    let out = d.path().join("out");
+    let ckpt = d.path().join("cdc.ckpt");
+    std::fs::create_dir_all(&out).unwrap();
+    let cfg = cdc_config(&d, &qualified, &ckpt, &out);
+
+    run_rivet_ok(&cfg); // anchor at the current binlog position
+    admin
+        .query_drop(format!("INSERT INTO {dbname}.orders VALUES (1, 'off')"))
+        .expect("insert enum row");
+    run_rivet_ok(&cfg); // capture the change
+
+    // 'off' is the 3rd ENUM label; the binlog delivers the INDEX (3). Only the
+    // information_schema enrichment — from the table's OWN schema — turns it back
+    // into the label. Pre-fix, cross-db enrichment silently failed and the index
+    // leaked through as text.
+    assert_eq!(
+        parquet_one_string(&out, "status"),
+        "off",
+        "a cross-database ENUM must enrich to its LABEL from the table's own schema, \
+         not the connection's default DATABASE()"
+    );
+}
