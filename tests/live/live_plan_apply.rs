@@ -627,3 +627,91 @@ fn apply_missing_plan_file_exits_nonzero() {
         "stderr must not be empty when plan file is missing"
     );
 }
+
+/// Round-3/4: an INCREMENTAL keyset export through the `rivet apply` wrapper must
+/// clear its resume anchor at finalize — the SAME post-finalize clear `rivet run`
+/// does (`finalize_keyset_anchor`) — so the run_id ROTATES across repeated applies.
+/// Before the two-adapter seam, the apply wrapper forgot the clear: the run_id
+/// froze, both applies wrote the SAME `manifest-<run_id>.json` copy (collision),
+/// and a run_id-deduping loader silently skips the second delta. This is the
+/// apply-wrapper half of the seam, RED-proven on the run-unique manifest COPIES —
+/// a parquet glob cannot see a run_id collision. Applies share `.rivet_state.db`
+/// next to the plan (apply_cmd.rs), so the resume anchor persists across them.
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn incremental_keyset_apply_rotates_run_id_across_repeated_applies() {
+    require_alive(LiveService::Postgres);
+    let table = unique_name("ks_apply_incr");
+    let mut c = pg_connect();
+    c.batch_execute(&format!(
+        "CREATE TABLE {table} (k TEXT PRIMARY KEY, name TEXT NOT NULL); \
+         INSERT INTO {table} SELECT 'k' || lpad(g::text, 6, '0'), 'n' || g \
+         FROM generate_series(1, 100) g;"
+    ))
+    .unwrap();
+    let _guard = PgTable::adopt(table.clone());
+
+    let out_dir = tempfile::tempdir().unwrap();
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let yaml = format!(
+        "source:\n  type: postgres\n  url_env: DATABASE_URL\nexports:\n  - name: {table}\n    \
+         table: {table}\n    mode: chunked\n    chunk_by_key: k\n    chunk_checkpoint: true\n    \
+         keyset_incremental: true\n    chunk_size: 40\n    format: parquet\n    \
+         destination:\n      type: local\n      path: {out}\n",
+        out = out_dir.path().display(),
+    );
+    let cfg = write_config(&cfg_dir, &yaml);
+    let plan_path = cfg_dir.path().join("plan.json");
+
+    let plan = std::process::Command::new(RIVET_BIN)
+        .args([
+            "plan",
+            "--config",
+            cfg.to_str().unwrap(),
+            "--export",
+            &table,
+            "--format",
+            "json",
+            "--output",
+            plan_path.to_str().unwrap(),
+        ])
+        .env("DATABASE_URL", POSTGRES_URL)
+        .output()
+        .expect("spawn plan");
+    assert!(
+        plan.status.success(),
+        "plan stderr:\n{}",
+        String::from_utf8_lossy(&plan.stderr)
+    );
+
+    let apply = |label: &str| {
+        let out = std::process::Command::new(RIVET_BIN)
+            .args(["apply", plan_path.to_str().unwrap()])
+            .env("DATABASE_URL", POSTGRES_URL)
+            .output()
+            .expect("spawn apply");
+        assert!(
+            out.status.success(),
+            "{label} stderr:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+
+    // Apply 1: exports all 100 under run_id R1; finalize must clear the anchor.
+    apply("apply 1");
+    // An append-only batch so apply 2 has data and writes its own manifest.
+    c.batch_execute(&format!(
+        "INSERT INTO {table} SELECT 'k' || lpad(g::text, 6, '0'), 'n' || g \
+         FROM generate_series(101, 150) g;"
+    ))
+    .unwrap();
+    // Apply 2: with the anchor cleared it is a FRESH run (new run_id R2) pulling
+    // only the new keys. With the bug the anchor is frozen → R1 reused → one copy.
+    apply("apply 2");
+
+    assert_eq!(
+        dir_manifest_copy_count(out_dir.path()),
+        2,
+        "each apply must rotate the run_id → two distinct manifest-<run_id>.json copies; 1 means the apply wrapper left the resume anchor frozen (the run_id-collision silent-delta-skip class)"
+    );
+}

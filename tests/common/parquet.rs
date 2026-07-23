@@ -173,6 +173,22 @@ pub fn dir_manifest_copy_total_rows(dir: &Path) -> i64 {
     total
 }
 
+/// Count the DISTINCT run-unique manifest copies (`manifest-<run_id>.json`) in
+/// `dir` — one per run_id. Two runs into the same prefix that each rotate their
+/// run_id leave two files; a run that reuses (freezes) a prior run_id overwrites
+/// the same filename, leaving one. The oracle for "the run_id rotates across
+/// repeated runs" (a frozen run_id collapses the sidecars and a run_id-deduping
+/// loader then skips later deltas). Ignores the canonical `manifest.json` pointer.
+pub fn dir_manifest_copy_count(dir: &Path) -> usize {
+    files_with_extension(dir, "json")
+        .into_iter()
+        .filter(|p| {
+            let name = p.file_name().unwrap_or_default().to_string_lossy();
+            name.starts_with("manifest-") && name.ends_with(".json")
+        })
+        .count()
+}
+
 /// True if any `.parquet` under `dir` carries a column named `col`.
 pub fn dir_parquet_has_column(dir: &Path, col: &str) -> bool {
     files_with_extension(dir, "parquet").iter().any(|p| {
