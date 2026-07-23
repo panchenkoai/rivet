@@ -679,6 +679,86 @@ mod tests {
         );
     }
 
+    // Finding #9: a parallel-checkpoint RESUME must ACCUMULATE this invocation's
+    // rows onto the rehydrated pre-crash base, never clobber it. rehydrate bumps
+    // total_rows + manifest_parts cumulatively; the parallel runner then lands its
+    // workers' rows via commit::accumulate_run_rows and drains new parts via
+    // record_part. The coherence invariant total_rows == sum(manifest_parts.rows)
+    // must survive the whole sequence. RED against a `summary.total_rows = agg`
+    // clobber, which drops the 50-row base and leaves total_rows == 30 while the
+    // manifest lists 80 rows.
+    #[test]
+    fn parallel_resume_accumulates_rows_onto_rehydrated_base_not_clobbers() {
+        use crate::pipeline::commit::{PartKind, PartRecord, accumulate_run_rows, record_part};
+
+        let state_dir = tempfile::tempdir().unwrap();
+        let state =
+            crate::state::StateStore::open_at_path(&state_dir.path().join("state.db")).unwrap();
+        let dest_dir = tempfile::tempdir().unwrap();
+        let plan = m8_plan(dest_dir.path());
+        let run_id = "r_par_resume";
+        // Two pre-crash parts (50 rows) durably committed to file_log, no manifest.
+        state
+            .record_file(
+                run_id,
+                "orders",
+                "orders_chunk0.parquet",
+                30,
+                4096,
+                "parquet",
+                None,
+            )
+            .unwrap();
+        state
+            .record_file(
+                run_id,
+                "orders",
+                "orders_chunk1.parquet",
+                20,
+                2048,
+                "parquet",
+                None,
+            )
+            .unwrap();
+        let mut summary =
+            crate::pipeline::summary::RunSummary::stub_for_testing(run_id, String::from("orders"));
+
+        // ── Resume preamble: rehydrate the 50-row base from file_log.
+        rehydrate_manifest_parts_from_file_log(&state, run_id, &mut summary).unwrap();
+        assert_eq!(
+            summary.total_rows, 50,
+            "rehydrated base is the 50 pre-crash rows"
+        );
+
+        // ── This invocation re-exports one 30-row chunk: the runner lands the
+        // worker rows via accumulate_run_rows, then drains the new part.
+        accumulate_run_rows(&mut summary, 30);
+        record_part(
+            &plan,
+            &mut summary,
+            None,
+            &PartRecord {
+                file_name: "orders_chunk2.parquet".into(),
+                rows: 30,
+                bytes: 4096,
+                fingerprint: "xxh3:abc".into(),
+                md5: String::new(),
+            },
+            PartKind::Chunk { chunk_index: 2 },
+        );
+
+        let parts_rows: i64 = summary.manifest_parts.iter().map(|p| p.rows).sum();
+        assert_eq!(
+            parts_rows, 80,
+            "manifest lists all 80 rows (50 rehydrated + 30 new)"
+        );
+        assert_eq!(
+            summary.total_rows, parts_rows,
+            "resume must accumulate onto the rehydrated base — total_rows must equal \
+             sum(manifest_parts.rows), never under-report only this invocation's rows"
+        );
+    }
+
     /// Full-matrix flow: part A intact → Skip (+ summary hydration), part B
     /// missing → Rewrite (task reset), part C size-diverged → Quarantine
     /// (task reset + object moved), part D with no task → orphan. Also

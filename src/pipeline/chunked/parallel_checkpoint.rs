@@ -443,7 +443,11 @@ pub(crate) fn run_chunked_parallel_checkpoint(
         }
     });
 
-    summary.total_rows = agg_rows.load(Ordering::Relaxed);
+    // Accumulate, never assign: on a checkpoint resume the summary already carries
+    // the rehydrated pre-crash row base (apply_m8_resume_decisions). A bare
+    // `= agg_rows` clobbered it, so total_rows under-reported while parts/bytes/
+    // files stayed cumulative — see accumulate_run_rows.
+    super::super::commit::accumulate_run_rows(summary, agg_rows.load(Ordering::Relaxed));
     summary.retries = summary
         .retries
         .saturating_add(agg_retries.load(Ordering::Relaxed));

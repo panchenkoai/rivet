@@ -50,6 +50,22 @@ use crate::journal::RunEvent;
 use crate::plan::ResolvedRunPlan;
 use crate::state::StateStore;
 
+/// Add this invocation's row count onto the run's cumulative total. The parallel
+/// runners aggregate their workers' rows into an atomic and land it here at the
+/// end; on a checkpoint RESUME the summary already carries the rehydrated
+/// pre-crash base (`rehydrate_manifest_parts_from_file_log` bumps `total_rows`
+/// alongside `files_committed` / `bytes_written` / `manifest_parts`). This MUST
+/// accumulate (`+=`), never assign — a bare `summary.total_rows = agg` clobbers
+/// that base, so on resume `total_rows` under-reports (only this run's rows)
+/// while every other aggregate stays cumulative, breaking the
+/// `total_rows == sum(manifest_parts.rows)` coherence invariant and diverging from
+/// the sequential runner (which already `+=`s). The seam exists so no parallel
+/// runner can reintroduce the clobber — a future `= agg` is obviously wrong next
+/// to this call.
+pub(in crate::pipeline) fn accumulate_run_rows(summary: &mut RunSummary, this_run_rows: i64) {
+    summary.total_rows += this_run_rows;
+}
+
 /// XOR-accumulate one part/page/chunk sink's per-column value checksums into a
 /// run-wide map. Order-independent (XOR), so chunk/page/worker order and count do
 /// not change the result — the MULTI-PART runners (chunked / keyset / mongo_parallel)

@@ -478,7 +478,9 @@ pub(crate) fn run_chunked_parallel(
         }
     });
 
-    summary.total_rows = agg_rows.load(Ordering::Relaxed);
+    // Accumulate onto any pre-existing base (0 for this non-checkpoint path, but
+    // the shared seam keeps every parallel runner clobber-free by construction).
+    super::super::commit::accumulate_run_rows(summary, agg_rows.load(Ordering::Relaxed));
     pb.finish(summary.total_rows);
 
     // Drain governor decisions (recorded off-thread) into the run journal.
