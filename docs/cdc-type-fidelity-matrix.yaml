@@ -98,7 +98,7 @@ scenarios:
   - id: type_uuid
     what: "uuid — PG uuid / MySQL CHAR(36) / MSSQL uniqueidentifier → canonical value through CDC"
     postgres: { test: pg_cdc_full_type_matrix_matches_batch }
-    mysql:    { test: cdc_full_type_matrix_matches_batch }
+    mysql:    { test: mysql_cdc_typed_values_match_source_via_duckdb_not_batch, oracle: independent }
     mssql:    { test: mssql_cdc_full_type_matrix_matches_batch }
     mongo:    { na: "a BSON uuid rides the verbatim document blob, not a typed column" }
 

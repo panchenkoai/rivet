@@ -204,7 +204,7 @@ const ORACLE_TRACKED: &[(&str, usize)] = &[
     // *_cdc_full_type_matrix_matches_batch self-oracle). PG + MySQL + tz/enum/
     // money/mongo cells upgraded to independent so far; MSSQL + the PG float/date/
     // binary/uuid cells are the remaining debt.
-    ("docs/cdc-type-fidelity-matrix.yaml", 12),
+    ("docs/cdc-type-fidelity-matrix.yaml", 11),
     // Batch type fidelity is already oracle-STRONG (24 independent cells: golden
     // hard-coded values + DuckDB/pyarrow foreign readers). The 6 weak are cells
     // whose CITED test is schema-coverage only (no independent VALUE re-read) —

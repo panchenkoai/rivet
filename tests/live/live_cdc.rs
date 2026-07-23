@@ -4272,7 +4272,7 @@ fn mysql_cdc_typed_values_match_source_via_duckdb_not_batch() {
     c.query_drop(format!(
         "CREATE TABLE {tbl} (id INT PRIMARY KEY, amount DECIMAL(18,4), \
          en ENUM('active','shipped','off'), big BIGINT UNSIGNED, \
-         note VARCHAR(20), d DATE, vb VARBINARY(4))"
+         note VARCHAR(20), d DATE, vb VARBINARY(4), uid CHAR(36))"
     ))
     .unwrap();
     let _guard = Table(tbl.clone());
@@ -4283,7 +4283,7 @@ fn mysql_cdc_typed_values_match_source_via_duckdb_not_batch() {
     rig.run_ok();
     c.query_drop(format!(
         "INSERT INTO {tbl} VALUES (1, 12345.6789, 'off', 18000000000000000000, \
-         'hello', '2024-03-15', 0xDEADBEEF)"
+         'hello', '2024-03-15', 0xDEADBEEF, '12345678-1234-1234-1234-123456789012')"
     ))
     .unwrap();
     rig.run_ok();
@@ -4295,6 +4295,7 @@ fn mysql_cdc_typed_values_match_source_via_duckdb_not_batch() {
     let res = duckdb_run_sql_json(&format!(
         "SELECT (amount = 12345.6789) AND (en = 'off') AND (big = 18000000000000000000) \
          AND (note = 'hello') AND (d = DATE '2024-03-15') AND (lower(to_hex(vb)) = 'deadbeef') \
+         AND (uid = '12345678-1234-1234-1234-123456789012') \
          FROM read_parquet('{container_dir}/cdc-*.parquet') WHERE id = 1"
     ));
     let rows = res["rows"].as_array().expect("duckdb rows");
