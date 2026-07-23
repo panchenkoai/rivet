@@ -4271,7 +4271,8 @@ fn mysql_cdc_typed_values_match_source_via_duckdb_not_batch() {
     c.query_drop(format!("DROP TABLE IF EXISTS {tbl}")).unwrap();
     c.query_drop(format!(
         "CREATE TABLE {tbl} (id INT PRIMARY KEY, amount DECIMAL(18,4), \
-         en ENUM('active','shipped','off'), big BIGINT UNSIGNED)"
+         en ENUM('active','shipped','off'), big BIGINT UNSIGNED, \
+         note VARCHAR(20), d DATE, vb VARBINARY(4))"
     ))
     .unwrap();
     let _guard = Table(tbl.clone());
@@ -4281,17 +4282,19 @@ fn mysql_cdc_typed_values_match_source_via_duckdb_not_batch() {
     let rig = Rig::mysql_cdc(&tbl).dest_path(host_dir.clone());
     rig.run_ok();
     c.query_drop(format!(
-        "INSERT INTO {tbl} VALUES (1, 12345.6789, 'off', 18000000000000000000)"
+        "INSERT INTO {tbl} VALUES (1, 12345.6789, 'off', 18000000000000000000, \
+         'hello', '2024-03-15', 0xDEADBEEF)"
     ))
     .unwrap();
     rig.run_ok();
 
     // DuckDB re-reads the __changes parquet and compares each value to the SOURCE
-    // literal — independent of any rivet re-decode. A single boolean: true iff the
-    // decimal, the ENUM LABEL (not the index 3), and the unsigned-64 (> i64::MAX)
-    // all survived the change stream exactly.
+    // literal — independent of any rivet re-decode. A single boolean, true iff the
+    // decimal, the ENUM LABEL (not index 3), the unsigned-64 (> i64::MAX), the text,
+    // the date, and the binary (hex) all survived the change stream exactly.
     let res = duckdb_run_sql_json(&format!(
         "SELECT (amount = 12345.6789) AND (en = 'off') AND (big = 18000000000000000000) \
+         AND (note = 'hello') AND (d = DATE '2024-03-15') AND (lower(to_hex(vb)) = 'deadbeef') \
          FROM read_parquet('{container_dir}/cdc-*.parquet') WHERE id = 1"
     ));
     let rows = res["rows"].as_array().expect("duckdb rows");
@@ -4327,7 +4330,8 @@ fn pg_cdc_typed_values_match_source_via_duckdb_not_batch() {
     c.batch_execute(&format!(
         "CREATE TYPE {tbl}_status AS ENUM ('active','shipped','off'); \
          CREATE TABLE {tbl} (id INT PRIMARY KEY, amount NUMERIC(18,4), \
-         status {tbl}_status, note TEXT, big BIGINT, flag BOOLEAN)"
+         status {tbl}_status, note TEXT, big BIGINT, flag BOOLEAN, \
+         fl DOUBLE PRECISION, d DATE, rb BYTEA)"
     ))
     .unwrap();
 
@@ -4336,7 +4340,10 @@ fn pg_cdc_typed_values_match_source_via_duckdb_not_batch() {
         .dest_path(host_dir.clone());
     rig.run_ok(); // anchor (creates the slot)
     c.execute(
-        &format!("INSERT INTO {tbl} VALUES (1, 12345.6789, 'off', 'hello', 9000000000000, true)"),
+        &format!(
+            "INSERT INTO {tbl} VALUES (1, 12345.6789, 'off', 'hello', 9000000000000, true, \
+             1.5, '2024-03-15', '\\xDEADBEEF')"
+        ),
         &[],
     )
     .unwrap();
@@ -4344,7 +4351,8 @@ fn pg_cdc_typed_values_match_source_via_duckdb_not_batch() {
 
     let res = duckdb_run_sql_json(&format!(
         "SELECT (amount = 12345.6789) AND (status = 'off') AND (note = 'hello') \
-         AND (big = 9000000000000) AND (flag = true) \
+         AND (big = 9000000000000) AND (flag = true) AND (fl = 1.5) \
+         AND (d = DATE '2024-03-15') AND (lower(to_hex(rb)) = 'deadbeef') \
          FROM read_parquet('{container_dir}/cdc-*.parquet') WHERE id = 1"
     ));
     let rows = res["rows"].as_array().expect("duckdb rows");
