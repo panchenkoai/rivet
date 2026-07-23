@@ -840,7 +840,17 @@ fn parse_pg_time_micros(val: &str) -> Option<i64> {
     let h: i64 = parts.next()?.parse().ok()?;
     let m: i64 = parts.next()?.parse().ok()?;
     let s: i64 = parts.next()?.parse().ok()?;
-    if parts.next().is_some() || !(0..24).contains(&h) {
+    // Range-validate EVERY field, not just the hour: `m`/`s` were parsed as
+    // unbounded i64, so an untrusted `12:9999999999999999:00` overflowed `m * 60`
+    // (fuzz-found panic, cdc.rs — a `panic=abort` DoS on the CDC stream). Bounding
+    // h∈0..24, m∈0..60, s∈0..60 both rejects a malformed time (→ None, handled by
+    // the caller) AND makes the arithmetic below unconditionally overflow-free
+    // (max 23*3600+59*60+59 = 86399, ×1e6 = 8.6e10, well within i64).
+    if parts.next().is_some()
+        || !(0..24).contains(&h)
+        || !(0..60).contains(&m)
+        || !(0..60).contains(&s)
+    {
         return None;
     }
     let us: i64 = if frac.is_empty() {
@@ -866,14 +876,17 @@ fn parse_pg_interval(val: &str) -> Option<(i32, i32, i64)> {
                 None => (1i64, tok),
             };
             let t = parse_pg_time_micros_unbounded(rest)?;
-            micros = sign * t;
+            micros = t.checked_mul(sign)?;
             continue;
         }
+        // Checked arithmetic on the untrusted count: `n` is an unbounded i32 from
+        // the wire, so `n * 12` (years→months) and the running accumulation could
+        // overflow — the same fuzz-found panic class as the time parsers above.
         let n: i32 = tok.parse().ok()?;
         match tokens.next()? {
-            u if u.starts_with("year") => months += n * 12,
-            u if u.starts_with("mon") => months += n,
-            u if u.starts_with("day") => days += n,
+            u if u.starts_with("year") => months = months.checked_add(n.checked_mul(12)?)?,
+            u if u.starts_with("mon") => months = months.checked_add(n)?,
+            u if u.starts_with("day") => days = days.checked_add(n)?,
             _ => return None,
         }
     }
@@ -899,7 +912,16 @@ fn parse_pg_time_micros_unbounded(val: &str) -> Option<i64> {
     } else {
         format!("{frac:0<6}").get(..6)?.parse().ok()?
     };
-    Some(((h * 3600 + m * 60 + s) * 1_000_000) + us)
+    // Interval time tails are genuinely unbounded (h may exceed 24: "25:00:00"), so
+    // the fields cannot be range-bounded like a time-of-day. Use CHECKED arithmetic
+    // instead — a value so large its microseconds overflow i64 cannot be
+    // represented, so return None (fail the parse) rather than panic=abort the
+    // stream. Same fuzz-found overflow class as parse_pg_time_micros.
+    let secs = h
+        .checked_mul(3600)?
+        .checked_add(m.checked_mul(60)?)?
+        .checked_add(s)?;
+    secs.checked_mul(1_000_000)?.checked_add(us)
 }
 
 /// Decode an even-length hex string to bytes; `None` on any non-hex input.
@@ -1412,6 +1434,36 @@ mod tests {
             "a full pre-image recovers the value → no poison: {:?}",
             ev.poison
         );
+    }
+
+    // Fuzz-found (nightly pg_test_decoding): an untrusted time/interval with an
+    // out-of-range or huge field overflowed the `* 1_000_000` / `n * 12` arithmetic
+    // → `attempt to multiply with overflow` → panic=abort DoS on the CDC stream.
+    // Every parser must now return None (reject the value), never panic.
+    #[test]
+    fn hostile_time_and_interval_text_never_panics_returns_none() {
+        // time-of-day: m/s out of 0..60 range is rejected before the multiply.
+        assert_eq!(parse_pg_time_micros("12:9999999999999999:00"), None);
+        assert_eq!(parse_pg_time_micros("12:00:9999999999999999"), None);
+        assert_eq!(parse_pg_time_micros("99:00:00"), None); // hour out of range too
+        // A valid time still parses.
+        assert_eq!(parse_pg_time_micros("01:02:03"), Some(3_723_000_000));
+        // Unbounded interval time tail: huge hours can't be range-bounded, so the
+        // checked arithmetic returns None instead of overflowing.
+        assert_eq!(
+            parse_pg_time_micros_unbounded("9999999999999999:00:00"),
+            None
+        );
+        assert_eq!(
+            parse_pg_time_micros_unbounded("25:00:00"),
+            Some(90_000_000_000)
+        ); // valid >24h
+        // Interval count overflow (years→months, and the running accumulation).
+        assert_eq!(parse_pg_interval("9999999999 years"), None);
+        assert_eq!(parse_pg_interval("2 years 3 mons 4 days"), Some((27, 4, 0)));
+        // And the top-level fuzz entry point must not panic on the hostile time.
+        let line = "table public.t: INSERT: id[integer]:1 t[time]:12:9999999999999999:00";
+        let _ = parse_test_decoding("0/ABC", line); // must not panic
     }
 
     // A genuine text value that happens to equal the marker is QUOTED on the
