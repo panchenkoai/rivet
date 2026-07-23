@@ -308,14 +308,9 @@ pub(crate) fn run_to_files(
             else {
                 continue; // not a captured table — its deferred poison never applies
             };
-            // Surface a deferred decode error (e.g. PG unchanged-TOAST with no
-            // pre-image) ONLY now that the event is confirmed to route to a
-            // captured table. An uncaptured table's poison was dropped by the
-            // `continue` above, so one mis-configured table can no longer bail
-            // capture of unrelated tables sharing the slot.
-            if let Some(poison) = &ev.poison {
-                anyhow::bail!("{poison}");
-            }
+            // Confirmed routed to a captured table → surface any deferred decode
+            // error (uncaptured tables' poison was dropped by the `continue`).
+            ev.raise_poison()?;
             total_bytes += ev.estimated_bytes();
             sink.buf.push(ev);
             total_rows += 1;

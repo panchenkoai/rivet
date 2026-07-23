@@ -169,6 +169,20 @@ impl ChangeEvent {
         };
         self.schema.len() + self.table.len() + img(&self.before) + img(&self.after) + 32
     }
+
+    /// Surface this event's DEFERRED decode error ([`poison`](Self::poison)) if it
+    /// carries one. EVERY consumer that turns a captured event into output MUST
+    /// call this right after confirming the event is captured — the deferral only
+    /// holds because an uncaptured table's poison is dropped, so a driver that
+    /// forgets to raise it on a CAPTURED event would emit corrupt data (the class
+    /// the round-1 hunt caught on the NDJSON driver). A discoverable method the
+    /// next sink calls, not a rule two drivers must each remember to inline.
+    pub(crate) fn raise_poison(&self) -> Result<()> {
+        if let Some(poison) = &self.poison {
+            anyhow::bail!("{poison}");
+        }
+        Ok(())
+    }
 }
 
 /// The seam every engine reader satisfies: a blocking pull of canonical changes.
@@ -231,14 +245,9 @@ pub(crate) fn run(
         // file sink. Without this the NDJSON path would print the raw
         // `unchanged-toast-datum` sentinel verbatim as the column value (silent
         // corruption). An uncaptured table's poison was already dropped above.
-        // Surface a deferred decode error (e.g. PG unchanged-TOAST with no
-        // pre-image) only now that the event is confirmed captured — mirrors the
-        // file sink. Without this the NDJSON path would print the raw
-        // `unchanged-toast-datum` sentinel verbatim as the column value (silent
-        // corruption). An uncaptured table's poison was already dropped above.
-        if let Some(poison) = &ev.poison {
-            anyhow::bail!("{poison}");
-        }
+        // Confirmed captured → surface any deferred decode error before emitting
+        // (an uncaptured table's poison was already dropped by the filter above).
+        ev.raise_poison()?;
         let to_json = |img: &Option<Vec<RivetValue>>| {
             img.as_ref()
                 .map(|vs| vs.iter().map(RivetValue::to_json).collect::<Vec<_>>())

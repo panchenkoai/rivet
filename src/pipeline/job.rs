@@ -317,6 +317,29 @@ pub(crate) fn synthetic_failed_summary(export_name: &str, err: &anyhow::Error) -
     }
 }
 
+/// Clear the keyset in-progress resume anchor after a SUCCESSFUL finalize, so the
+/// next run isn't misread as a resume of this finished one.
+///
+/// This is the TWO-ADAPTER seam for the post-finalize clear: BOTH job wrappers
+/// (`run_export_job` and `run_export_job_with_chunk_source`) must call it. An
+/// INCREMENTAL keyset run no longer clears the anchor in `run_keyset` (that clear
+/// must be post-finalize, or a crash between data-complete and the manifest write
+/// orphans the pages), so the responsibility moved up to the wrappers — and a
+/// wrapper that inlined its own copy and forgot it was the round-3 wrapper-bypass
+/// regression. A shared seam makes the wiring structural, not a per-wrapper
+/// checklist. No-op for a non-keyset strategy, and for a FAILED run (the anchor
+/// must survive a failure so the next run rehydrates rather than orphans).
+fn finalize_keyset_anchor(
+    state: &StateStore,
+    plan: &ResolvedRunPlan,
+    export_name: &str,
+    failed: bool,
+) {
+    if !failed && matches!(plan.strategy, ExtractionStrategy::Keyset(_)) {
+        let _ = state.clear_resume_run_id(export_name);
+    }
+}
+
 pub(super) fn run_export_job(
     config_path: &str,
     config: &Config,
@@ -596,9 +619,7 @@ pub(super) fn run_export_job(
     // later run isn't treated as a resume of this finished one. Clearing AFTER the
     // manifest write is the same ordering as the cursor advance: a crash before here
     // leaves resume_run_id set, so the next run rehydrates rather than orphans.
-    if !failed && matches!(plan.strategy, ExtractionStrategy::Keyset(_)) {
-        let _ = state.clear_resume_run_id(&summary.export_name);
-    }
+    finalize_keyset_anchor(state, &plan, &summary.export_name, failed);
     if plan.validate {
         finalize_validate_manifest(&plan, &mut summary, "export");
     }
@@ -721,9 +742,7 @@ pub(crate) fn run_export_job_with_chunk_source(
     // here; a wrapper that skips it strands resume_run_id forever, so the next apply
     // is misread as a resume, reuses the frozen run_id, and the run-unique manifest
     // sidecar collides across runs (round-3 wrapper-bypass regression).
-    if !failed && matches!(plan.strategy, ExtractionStrategy::Keyset(_)) {
-        let _ = state.clear_resume_run_id(&summary.export_name);
-    }
+    finalize_keyset_anchor(state, plan, &summary.export_name, failed);
     if plan.validate {
         finalize_validate_manifest(plan, &mut summary, "apply");
     }
