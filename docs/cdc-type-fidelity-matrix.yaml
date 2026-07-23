@@ -31,9 +31,9 @@ scenarios:
     mongo:    { na: "boolean rides the verbatim document blob, not a typed column" }
 
   - id: type_integer_families
-    what: "int16/32/64 + unsigned 64 (incl. BIGINT UNSIGNED > i64::MAX) survive CDC"
+    what: "int16/32/64 + unsigned 64 (incl. BIGINT UNSIGNED > i64::MAX) survive CDC. MySQL cell is INDEPENDENT (DuckDB re-read vs the source literal), not a batch-differential"
     postgres: { test: pg_cdc_full_type_matrix_matches_batch }
-    mysql:    { test: cdc_full_type_matrix_matches_batch }
+    mysql:    { test: mysql_cdc_typed_values_match_source_via_duckdb_not_batch }
     mssql:    { test: mssql_cdc_full_type_matrix_matches_batch }
     mongo:    { test: mongo_cdc_change_stream_renders_tricky_bson_verbatim_like_batch }
 
@@ -45,9 +45,9 @@ scenarios:
     mongo:    { na: "float rides the verbatim document blob, not a typed column" }
 
   - id: type_decimal
-    what: "decimal(p,s) precision + scale through CDC; MSSQL MONEY past the f64-exact 2^53 range fails loud, not falsely-exact (finding #2)"
+    what: "decimal(p,s) precision + scale through CDC (MySQL cell INDEPENDENT: DuckDB re-read vs source literal); MSSQL MONEY past the f64-exact 2^53 range fails loud, not falsely-exact (finding #2)"
     postgres: { test: pg_cdc_full_type_matrix_matches_batch }
-    mysql:    { test: cdc_full_type_matrix_matches_batch }
+    mysql:    { test: mysql_cdc_typed_values_match_source_via_duckdb_not_batch }
     mssql:    { test: cdc_money_past_f64_exact_range_fails_loud_not_a_falsely_exact_decimal }
     mongo:    { test: mongo_cdc_change_stream_renders_tricky_bson_verbatim_like_batch }
 

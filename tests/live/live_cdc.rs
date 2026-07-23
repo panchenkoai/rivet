@@ -4252,3 +4252,60 @@ exports:
          current state — id=1 updated to 100, id=2 unchanged, id=3 insert-only"
     );
 }
+
+/// Independent CDC per-type oracle (option A's real upgrade, via the canonical
+/// Rig): the workhorse `*_cdc_full_type_matrix_matches_batch` cells are a
+/// DIFFERENTIAL self-oracle — they compare CDC's decode to BATCH's decode, so a
+/// bug SHARED by both (both agree on a wrong value) passes, exactly the class the
+/// value-checksum Form A also misses. This reads the CDC `__changes` parquet with
+/// DuckDB — a reader OUTSIDE rivet's decode family — and asserts each typed value
+/// equals the SOURCE literal, not a batch re-decode. A shared-decode corruption
+/// (enum index instead of label, an unsigned mangle, a decimal float) is caught
+/// here where matches_batch cannot see it.
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc + duckdb"]
+fn mysql_cdc_typed_values_match_source_via_duckdb_not_batch() {
+    let (host_dir, container_dir) = duckdb_shared_workdir(&unique_name("cdc_typed"));
+    let tbl = unique_name("cdc_typed");
+    let mut c = conn();
+    c.query_drop(format!("DROP TABLE IF EXISTS {tbl}")).unwrap();
+    c.query_drop(format!(
+        "CREATE TABLE {tbl} (id INT PRIMARY KEY, amount DECIMAL(18,4), \
+         en ENUM('active','shipped','off'), big BIGINT UNSIGNED)"
+    ))
+    .unwrap();
+    let _guard = Table(tbl.clone());
+
+    // Canonical Rig CDC (until_current + default checkpoint): anchor over the empty
+    // table, then capture the typed insert on the second run.
+    let rig = Rig::mysql_cdc(&tbl).dest_path(host_dir.clone());
+    rig.run_ok();
+    c.query_drop(format!(
+        "INSERT INTO {tbl} VALUES (1, 12345.6789, 'off', 18000000000000000000)"
+    ))
+    .unwrap();
+    rig.run_ok();
+
+    // DuckDB re-reads the __changes parquet and compares each value to the SOURCE
+    // literal — independent of any rivet re-decode. A single boolean: true iff the
+    // decimal, the ENUM LABEL (not the index 3), and the unsigned-64 (> i64::MAX)
+    // all survived the change stream exactly.
+    let res = duckdb_run_sql_json(&format!(
+        "SELECT (amount = 12345.6789) AND (en = 'off') AND (big = 18000000000000000000) \
+         FROM read_parquet('{container_dir}/cdc-*.parquet') WHERE id = 1"
+    ));
+    let rows = res["rows"].as_array().expect("duckdb rows");
+    assert_eq!(
+        rows.len(),
+        1,
+        "exactly one captured change for id=1; got: {res}"
+    );
+    assert!(
+        rows[0][0]
+            .as_str()
+            .is_some_and(|s| s.eq_ignore_ascii_case("true")),
+        "CDC-decoded typed values must equal the SOURCE literals read back by DuckDB \
+         (independent of batch): decimal 12345.6789, ENUM LABEL 'off' (not index 3), \
+         unsigned 18000000000000000000 (> i64::MAX). A shared decode bug shows here; got: {res}"
+    );
+}
