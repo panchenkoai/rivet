@@ -624,6 +624,8 @@ mod tests {
                 validate: false,
                 reconcile: false,
                 resume: false,
+                chunk_key: None,
+                resumable: false,
             },
         ));
         s

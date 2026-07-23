@@ -130,6 +130,8 @@ fn journal_plan_snapshot_helper_returns_the_first_plan_resolved_event() {
         validate: true,
         reconcile: false,
         resume: false,
+        chunk_key: None,
+        resumable: false,
     }));
 
     let snap = j

@@ -522,6 +522,8 @@ mod tests {
                 validate: true,
                 reconcile: false,
                 resume: false,
+                chunk_key: None,
+                resumable: false,
             },
         );
         s.total_rows = 12_345;

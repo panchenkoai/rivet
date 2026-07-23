@@ -140,6 +140,8 @@ mod run_summary_redaction {
                 validate: false,
                 reconcile: false,
                 resume: false,
+                chunk_key: None,
+                resumable: false,
             });
         // The redactor runs at the assignment site in real pipeline
         // code (`summary.error_message = redact_error(&e)`).  Simulate

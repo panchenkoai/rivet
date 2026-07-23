@@ -38,6 +38,8 @@ fn plan_snapshot_from(plan: &ResolvedRunPlan) -> PlanSnapshot {
         validate: plan.validate,
         reconcile: plan.reconcile,
         resume: plan.resume,
+        chunk_key: plan.strategy.chunk_key().map(|c| c.to_string()),
+        resumable: plan.strategy.is_resumable(),
     }
 }
 
@@ -1258,6 +1260,53 @@ mod tests {
             shape_drift_warn_factor: 2.0,
             parquet: None,
         }
+    }
+
+    #[test]
+    fn plan_snapshot_records_chunk_key_and_resumable_for_post_mortem() {
+        use crate::plan::{ExtractionStrategy, KeysetPlan};
+        // A keyset export must persist WHICH column paged (`id`) and that
+        // checkpoint-resume was on, so a post-mortem from the state DB alone
+        // explains the strategy decision without re-querying the source schema.
+        let mut plan = plan_for("statistic_lifetime");
+        plan.strategy = ExtractionStrategy::Keyset(KeysetPlan {
+            key_column: "id".into(),
+            chunk_size: 1_000_000,
+            checkpoint: true,
+            incremental: false,
+            parallel: 1,
+        });
+        let s = RunSummary::new(&plan);
+        let snap = s.journal.plan_snapshot().expect("PlanResolved recorded");
+        assert_eq!(snap.chunk_key.as_deref(), Some("id"));
+        assert!(
+            snap.resumable,
+            "chunk_checkpoint on → resumable must be recorded"
+        );
+
+        // Full (snapshot) export → no paging column, not resumable.
+        let full = RunSummary::new(&plan_for("small"));
+        let fsnap = full.journal.plan_snapshot().unwrap();
+        assert_eq!(fsnap.chunk_key, None);
+        assert!(!fsnap.resumable);
+    }
+
+    #[test]
+    fn plan_snapshot_deserializes_pre_field_journal_as_defaults() {
+        // A journal written before chunk_key/resumable existed (real: the state
+        // DBs already in the field) must still deserialize — the new fields
+        // default to None/false, never a hard error that would break `--resume`
+        // or a post-mortem read of an older run.
+        let legacy = r#"{
+            "export_name":"orders","base_query":"SELECT 1","strategy":"keyset",
+            "format":"parquet","compression":"zstd","destination_type":"gcs",
+            "tuning_profile":"balanced","batch_size":10000,
+            "validate":false,"reconcile":false,"resume":false
+        }"#;
+        let snap: crate::journal::PlanSnapshot = serde_json::from_str(legacy).unwrap();
+        assert_eq!(snap.chunk_key, None);
+        assert!(!snap.resumable);
+        assert_eq!(snap.strategy, "keyset");
     }
 
     #[test]

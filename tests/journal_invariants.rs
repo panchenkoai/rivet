@@ -25,6 +25,8 @@ fn plan_snapshot(name: &str) -> PlanSnapshot {
         validate: false,
         reconcile: false,
         resume: false,
+        chunk_key: None,
+        resumable: false,
     }
 }
 
@@ -99,6 +101,8 @@ fn plan_snapshot_fields_match_recorded_values() {
         validate: true,
         reconcile: false,
         resume: true,
+        chunk_key: None,
+        resumable: false,
     }));
 
     let snap = j.plan_snapshot().unwrap();

@@ -105,6 +105,8 @@ fn summary(
             validate: false,
             reconcile: false,
             resume: false,
+            chunk_key: None,
+            resumable: false,
         })
         .with_manifest_parts(parts);
     s.duration_ms = 100;
@@ -791,6 +793,8 @@ fn plan_snap() -> PlanSnapshot {
         validate: false,
         reconcile: false,
         resume: false,
+        chunk_key: None,
+        resumable: false,
     }
 }
 
@@ -1578,6 +1582,8 @@ fn summary_schema_fingerprint_flows_into_manifest_via_builder() {
             validate: false,
             reconcile: false,
             resume: false,
+            chunk_key: None,
+            resumable: false,
         },
         &s.run_id,
         chrono::Utc::now(),

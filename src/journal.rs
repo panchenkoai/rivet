@@ -47,6 +47,19 @@ pub struct PlanSnapshot {
     pub validate: bool,
     pub reconcile: bool,
     pub resume: bool,
+    /// Column that paged the export — the keyset `chunk_by_key` or the range
+    /// `chunk_column`; `None` for full/incremental. Persisted so a post-mortem
+    /// from the state DB alone knows WHICH column drove the read (the chunk
+    /// tables keep only chunk *values*, never the column name). `#[serde(default)]`
+    /// so a journal written before this field still deserializes as `None`.
+    #[serde(default)]
+    pub chunk_key: Option<String>,
+    /// Whether crash-resume via a checkpoint was enabled for this run (keyset or
+    /// chunked `chunk_checkpoint`). Persisted so a post-mortem knows whether a
+    /// crashed run could have resumed instead of restarting. `#[serde(default)]`
+    /// so a pre-existing journal deserializes as `false`.
+    #[serde(default)]
+    pub resumable: bool,
 }
 
 // ─── Events ──────────────────────────────────────────────────────────────────
@@ -353,6 +366,8 @@ mod tests {
             validate: false,
             reconcile: false,
             resume: false,
+            chunk_key: None,
+            resumable: false,
         }
     }
 
