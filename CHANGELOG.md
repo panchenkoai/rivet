@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+## 0.21.2 — 2026-07-24
+
+### Added
+
+- **`PlanResolved` journal now records `chunk_key` and `resumable`.** A shared
+  `.rivet_state.db` now shows WHICH column paged each export (the keyset
+  `chunk_by_key` / range `chunk_column`) and whether crash-resume was enabled —
+  so a post-mortem from the state DB alone explains the strategy decision
+  without re-querying the source schema. Both are derived from the resolved
+  plan (no new introspection). Backward-compatible: journals written by earlier
+  versions deserialize with the new fields defaulted to `null`/`false`.
+
 ### Changed
 
 - **Keyset checkpoint is now crash-recovery only; append-only incremental is the new
