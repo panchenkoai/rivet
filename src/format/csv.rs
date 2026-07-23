@@ -274,11 +274,20 @@ fn write_csv_value(writer: &mut dyn Write, array: &dyn Array, idx: usize) -> Res
                 .downcast_ref::<Time64MicrosecondArray>()
                 .expect("DataType/Array mismatch");
             let micros = arr.value(idx);
-            let secs = micros / 1_000_000;
-            let frac_us = micros % 1_000_000;
+            // MySQL TIME is a SIGNED duration (-838:59:59 .. 838:59:59), so micros
+            // can be negative. Extract the sign ONCE and format the magnitude: the
+            // old truncating `/`+`%` on a negative value emitted a minus PER FIELD
+            // ("-1:-30:00", "00:00:00.-00001", "00:00:-1.-500000"), corrupt in every
+            // CSV/time reader. Hours are `{:02}` MINIMUM-width, so a >24h duration
+            // (up to 838h) still prints in full.
+            let neg = micros < 0;
+            let abs = micros.unsigned_abs();
+            let secs = abs / 1_000_000;
+            let frac_us = abs % 1_000_000;
             write!(
                 writer,
-                "{:02}:{:02}:{:02}.{:06}",
+                "{}{:02}:{:02}:{:02}.{:06}",
+                if neg { "-" } else { "" },
                 secs / 3600,
                 (secs % 3600) / 60,
                 secs % 60,
@@ -394,6 +403,28 @@ mod tests {
             cell(Time64MicrosecondArray::from(vec![0_i64]), 0),
             "00:00:00.000000"
         );
+    }
+
+    // MySQL TIME is a SIGNED duration; the batch decoder emits negative micros.
+    // The old truncating `/`+`%` put a minus on EVERY field ("-1:-30:00",
+    // "00:00:00.-00001") — corrupt in any reader. One leading sign, magnitude
+    // formatted; a >24h duration still prints in full.
+    #[test]
+    fn negative_time_renders_one_leading_sign_not_a_minus_per_field() {
+        use arrow::array::Time64MicrosecondArray;
+        for (micros, want) in [
+            (-5_400_000_000_i64, "-01:30:00.000000"),      // -1h30m
+            (-1_i64, "-00:00:00.000001"),                  // -1 microsecond
+            (-1_500_000_i64, "-00:00:01.500000"),          // -1.5s
+            (-3_020_399_000_000_i64, "-838:59:59.000000"), // MySQL TIME min (>24h)
+            (5_400_000_000_i64, "01:30:00.000000"),        // positive unaffected
+        ] {
+            assert_eq!(
+                cell(Time64MicrosecondArray::from(vec![micros]), 0),
+                want,
+                "micros={micros}"
+            );
+        }
     }
 
     #[test]

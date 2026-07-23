@@ -36,6 +36,11 @@ scenarios:
     no_silent_loss:          { test: timestamp_marks_instant_utc_but_leaves_naive_bare }
     no_corruption_on_escape: { na: "an ISO-8601 timestamp plus `Z` is `[0-9-T:.Z]` — no delimiter/quote can appear, nothing to escape" }
 
+  - id: negative_time_signed_duration
+    what: "MySQL TIME is a SIGNED duration (-838:59:59..838:59:59); the batch decoder emits negative micros. The old truncating `/`+`%` put a minus on EVERY field (`-1:-30:00`, `00:00:00.-00001`) — corrupt in every reader. One leading sign + magnitude formatting; a >24h duration still prints in full. True oracle: hard-coded expected strings."
+    no_silent_loss:          { test: negative_time_renders_one_leading_sign_not_a_minus_per_field }
+    no_corruption_on_escape: { na: "an HH:MM:SS.ffffff duration (± prefix) is `[-0-9:.]` — no delimiter/quote can appear, nothing to escape" }
+
   - id: float_non_finite
     what: "NaN / Inf / -Inf emit an explicit literal, never an empty cell that reads back as NULL."
     no_silent_loss:          { test: float_special_values_emit_literals_not_empty }
