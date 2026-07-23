@@ -307,9 +307,10 @@ pub(crate) fn build_column(dt: &DataType, cells: &[Option<&RivetValue>]) -> Resu
                         // in a Parquet decimal — fail LOUD, exactly like the
                         // batch export does, never a silent NULL.
                         None => anyhow::bail!(
-                            "cdc: unsupported decimal payload {:?} (NaN/Infinity \
-                             is not representable in a decimal column; batch \
-                             fails identically)",
+                            "cdc: unsupported decimal payload {:?} (NaN/Infinity, \
+                             or a MONEY value past the f64-exact 2^53 range that \
+                             tiberius already rounded, is not representable in a \
+                             decimal column; batch fails identically)",
                             render_str(v)
                         ),
                     },
@@ -327,9 +328,10 @@ pub(crate) fn build_column(dt: &DataType, cells: &[Option<&RivetValue>]) -> Resu
                     Some(v) => match decimal_to_i256(v, *s) {
                         Some(i) => b.append_value(i),
                         None => anyhow::bail!(
-                            "cdc: unsupported decimal payload {:?} (NaN/Infinity \
-                             is not representable in a decimal column; batch \
-                             fails identically)",
+                            "cdc: unsupported decimal payload {:?} (NaN/Infinity, \
+                             or a MONEY value past the f64-exact 2^53 range that \
+                             tiberius already rounded, is not representable in a \
+                             decimal column; batch fails identically)",
                             render_str(v)
                         ),
                     },
@@ -659,15 +661,32 @@ fn build_list_column(
     }
 }
 
+/// The scaled-integer magnitude past which an f64 can no longer hold a
+/// fixed-point value exactly (2^53). A MONEY/SMALLMONEY value (delivered as f64
+/// by tiberius) whose scaled magnitude reaches this was ALREADY rounded by the
+/// driver, so materialising it as an "exact" Decimal would present rounding as
+/// exact. The batch export (`mssql::arrow_convert::f64_to_scaled_i128`) fails
+/// loud at exactly this bound; the CDC path must match it.
+const F64_EXACT_SCALED_LIMIT: f64 = 9_007_199_254_740_992.0; // 2^53
+
+/// A finite fixed-point f64 rendered at `scale` decimal places, or `None` when
+/// its scaled magnitude is past the f64-exact range (already rounded → refuse,
+/// so `build_column` fails loud instead of storing a falsely-exact decimal).
+fn f64_fixed_point_str(f: f64, scale: i8) -> Option<String> {
+    let prec = scale.max(0) as usize;
+    if f.abs() * 10f64.powi(prec as i32) >= F64_EXACT_SCALED_LIMIT {
+        return None;
+    }
+    Some(format!("{f:.prec$}"))
+}
+
 /// As [`decimal_to_i128`] but into `i256` for `Decimal256` columns.
 fn decimal_to_i256(v: &RivetValue, scale: i8) -> Option<arrow::datatypes::i256> {
     let s = match v {
         RivetValue::Bytes(b) => std::str::from_utf8(b).ok()?.trim().to_string(),
         RivetValue::Int(i) => i.to_string(),
         RivetValue::UInt(u) => u.to_string(),
-        RivetValue::Float(f) if f.is_finite() => {
-            format!("{f:.prec$}", prec = scale.max(0) as usize)
-        }
+        RivetValue::Float(f) if f.is_finite() => f64_fixed_point_str(*f, scale)?,
         _ => return None,
     };
     crate::types::decimal::decimal_str_to_scaled_i256(&s, scale)
@@ -682,10 +701,10 @@ fn decimal_to_i128(v: &RivetValue, scale: i8) -> Option<i128> {
         RivetValue::UInt(u) => u.to_string(),
         // Fixed-point values some drivers deliver as floats (SQL Server MONEY
         // via tiberius): render at the column scale first, then the shared
-        // digit-exact parse below.
-        RivetValue::Float(f) if f.is_finite() => {
-            format!("{f:.prec$}", prec = scale.max(0) as usize)
-        }
+        // digit-exact parse below. Past 2^53 the f64 was already rounded by the
+        // driver — f64_fixed_point_str returns None so build_column fails loud,
+        // exactly like the batch export, never a silently-rounded "exact" value.
+        RivetValue::Float(f) if f.is_finite() => f64_fixed_point_str(*f, scale)?,
         _ => return None,
     };
     // ONE decimal-string canon for the whole codebase (types::decimal) — the
@@ -1231,6 +1250,39 @@ mod tests {
         assert_eq!(
             decimal_to_i128(&RivetValue::Bytes(b"42".to_vec()), 0),
             Some(42)
+        );
+    }
+
+    // Finding #2: SQL Server MONEY/SMALLMONEY arrive as f64 (tiberius). The CDC
+    // schema types them Decimal128(19,4), and the Float→decimal conversion had NO
+    // 2^53 guard — so a MONEY value past the f64-exact range (already rounded by
+    // the driver) was stored as a falsely-EXACT decimal, while the batch export
+    // fails loud on the identical value. Parity: refuse it here too. RED against
+    // the pre-fix `format!("{f:.prec$}")` with no guard.
+    #[test]
+    fn cdc_money_past_f64_exact_range_fails_loud_not_a_falsely_exact_decimal() {
+        use arrow::datatypes::DataType;
+        // 2^53 / 10^4 ≈ 9.007e11 — a value just under stays exact, 1e12 is past.
+        assert_eq!(
+            decimal_to_i128(&RivetValue::Float(9.0e11), 4),
+            Some(900_000_000_000_i128 * 10_000)
+        );
+        assert_eq!(decimal_to_i128(&RivetValue::Float(1e12), 4), None);
+        // Decimal256 (wide numeric) carries the same guard.
+        assert!(decimal_to_i256(&RivetValue::Float(1e12), 4).is_none());
+        // A small MONEY value still builds.
+        let small = RivetValue::Float(12.34);
+        let ok = build_column(&DataType::Decimal128(19, 4), &[Some(&small)])
+            .expect("a small MONEY value builds");
+        assert_eq!(ok.len(), 1);
+        // A huge MONEY value in a Decimal column fails loud with the 2^53 message.
+        let huge = RivetValue::Float(1e12);
+        let err = build_column(&DataType::Decimal128(19, 4), &[Some(&huge)])
+            .expect_err("a MONEY value past f64-exact range must fail loud, not round silently");
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("2^53") && msg.contains("money"),
+            "message must name the 2^53 range and MONEY: {msg}"
         );
     }
 
