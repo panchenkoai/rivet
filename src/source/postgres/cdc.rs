@@ -465,9 +465,14 @@ pub(crate) fn parse_test_decoding(lsn: &str, data: &str) -> Result<Option<Change
     // glues them into one over-long image (the arity guard then bricks the
     // stream on a perfectly legal operation, permanently, with a misleading
     // "DDL" diagnosis). Split them: old-key → before, new-tuple → after.
+    // Split at the TOP-LEVEL ` new-tuple: ` — outside any quoted value. Finding
+    // #7: a quote-blind split_once matches the FIRST occurrence, so a text key
+    // whose value literally contains ` new-tuple: ` (e.g. `name[text]:'a new-tuple:
+    // b'`) is cut mid-value, garbling BOTH the before and after images.
+    const SEP: &str = " new-tuple: ";
     let (old_key_part, new_part) = match body.strip_prefix("old-key: ") {
-        Some(rest) => match rest.split_once(" new-tuple: ") {
-            Some((old, new)) => (Some(old), new),
+        Some(rest) => match find_outside_quotes(rest, SEP) {
+            Some(pos) => (Some(&rest[..pos]), &rest[pos + SEP.len()..]),
             None => (None, rest),
         },
         None => (None, body),
@@ -601,6 +606,39 @@ fn recover_unchanged_toast(
 }
 
 /// Parse one value at the start of `s`. Returns `(value, quoted, bytes_consumed)`.
+/// Find `needle` in `haystack` at the TOP LEVEL — outside any single-quoted
+/// value. test_decoding quotes text as `'…'` and doubles an embedded quote
+/// (`''`); the section separator ` new-tuple: ` can appear literally inside such
+/// a value, and a quote-blind `split_once` would cut there (finding #7). Mirrors
+/// [`parse_value`]'s `''`-aware quote scan. `needle` is ASCII (its lead byte
+/// `0x20` can never be a UTF-8 continuation/lead byte), so the byte scan never
+/// false-matches inside a multi-byte column name.
+fn find_outside_quotes(haystack: &str, needle: &str) -> Option<usize> {
+    let (b, nb) = (haystack.as_bytes(), needle.as_bytes());
+    let mut i = 0;
+    let mut in_quote = false;
+    while i < b.len() {
+        if in_quote {
+            if b[i] == b'\'' {
+                if b.get(i + 1) == Some(&b'\'') {
+                    i += 2; // doubled quote → an escaped literal quote
+                    continue;
+                }
+                in_quote = false;
+            }
+            i += 1;
+        } else if b[i] == b'\'' {
+            in_quote = true;
+            i += 1;
+        } else if b[i..].starts_with(nb) {
+            return Some(i);
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
 fn parse_value(s: &str) -> (String, bool, usize) {
     let b = s.as_bytes();
     if b.first() != Some(&b'\'') {
@@ -1109,6 +1147,28 @@ mod tests {
             Some(vec![RivetValue::Int(1), RivetValue::Bytes(b"b".to_vec())])
         );
         assert_eq!(ev.before, None);
+    }
+
+    // Finding #7: the old-key/new-tuple split must be quote-aware. A text key
+    // whose value literally contains ` new-tuple: ` (a legal string) must NOT
+    // split the images there — a quote-blind split_once cut mid-value, garbling
+    // BOTH before and after. The real separator is the top-level one.
+    #[test]
+    fn pk_change_split_ignores_new_tuple_literal_inside_a_quoted_key() {
+        // The old key's text value contains the section-separator substring.
+        let line = "table public.t: UPDATE: old-key: k[text]:'a new-tuple: b' \
+                    new-tuple: k[text]:'c' v[integer]:9";
+        let ev = parse_test_decoding("0/ABC", line).unwrap().unwrap();
+        assert_eq!(
+            ev.before,
+            Some(vec![RivetValue::Bytes(b"a new-tuple: b".to_vec())]),
+            "the old key keeps its FULL text value, separator substring included"
+        );
+        assert_eq!(
+            ev.after,
+            Some(vec![RivetValue::Bytes(b"c".to_vec()), RivetValue::Int(9)]),
+            "the after-image is the real new tuple only, not cut mid-value"
+        );
     }
 
     // RED for finding #24 (non-UTC session): test_decoding renders timestamptz
