@@ -199,7 +199,7 @@ const ORACLE_STRENGTHS: &[&str] = &["independent", "differential", "self", "fail
 /// ratchet ceiling. LOWER the ceiling each time a cell is upgraded from a
 /// batch-differential to an INDEPENDENT oracle (a DuckDB/source re-read); never
 /// raise it — the ratchet drives the shared-decode-blind self-oracle debt to 0.
-const ORACLE_TRACKED: &[(&str, usize)] = &[("docs/cdc-type-fidelity-matrix.yaml", 27)];
+const ORACLE_TRACKED: &[(&str, usize)] = &[("docs/cdc-type-fidelity-matrix.yaml", 22)];
 
 impl Scenario {
     /// `(column, cell)` for every column the matrix declares; panics if a

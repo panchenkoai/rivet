@@ -4309,3 +4309,52 @@ fn mysql_cdc_typed_values_match_source_via_duckdb_not_batch() {
          unsigned 18000000000000000000 (> i64::MAX). A shared decode bug shows here; got: {res}"
     );
 }
+
+/// PG sibling of `mysql_cdc_typed_values_match_source_via_duckdb_not_batch`: the
+/// independent CDC per-type oracle for PostgreSQL. CDC via `Rig::pg_cdc`, the
+/// `__changes` parquet re-read by DuckDB (outside rivet's decode family), each
+/// value asserted vs the SOURCE literal — catching a shared-decode bug (enum
+/// index vs label, a numeric misparse) that the batch-differential misses.
+/// Isolated in its own database (`CdcDb`) so the slot sees only this test's WAL.
+#[test]
+#[ignore = "live: requires docker compose postgres-cdc (wal_level=logical) + duckdb"]
+fn pg_cdc_typed_values_match_source_via_duckdb_not_batch() {
+    let cdc_db = CdcDb::new("cdc_typed_pg");
+    let (host_dir, container_dir) = duckdb_shared_workdir(&unique_name("cdc_typed_pg"));
+    let tbl = unique_name("rivet_cdc_typed").to_lowercase();
+    let slot = unique_name("rivet_typed_slot").to_lowercase();
+    let mut c = cdc_db.connect();
+    c.batch_execute(&format!(
+        "CREATE TYPE {tbl}_status AS ENUM ('active','shipped','off'); \
+         CREATE TABLE {tbl} (id INT PRIMARY KEY, amount NUMERIC(18,4), \
+         status {tbl}_status, note TEXT, big BIGINT, flag BOOLEAN)"
+    ))
+    .unwrap();
+
+    let rig = Rig::pg_cdc(&tbl, &slot)
+        .source_url(cdc_db.url())
+        .dest_path(host_dir.clone());
+    rig.run_ok(); // anchor (creates the slot)
+    c.execute(
+        &format!("INSERT INTO {tbl} VALUES (1, 12345.6789, 'off', 'hello', 9000000000000, true)"),
+        &[],
+    )
+    .unwrap();
+    rig.run_ok(); // capture
+
+    let res = duckdb_run_sql_json(&format!(
+        "SELECT (amount = 12345.6789) AND (status = 'off') AND (note = 'hello') \
+         AND (big = 9000000000000) AND (flag = true) \
+         FROM read_parquet('{container_dir}/cdc-*.parquet') WHERE id = 1"
+    ));
+    let rows = res["rows"].as_array().expect("duckdb rows");
+    assert_eq!(rows.len(), 1, "one captured change for id=1; got: {res}");
+    assert!(
+        rows[0][0]
+            .as_str()
+            .is_some_and(|s| s.eq_ignore_ascii_case("true")),
+        "PG CDC typed values must equal the SOURCE literals via DuckDB (independent of \
+         batch): numeric 12345.6789, enum LABEL 'off' (not an index), text, bigint, bool; \
+         got: {res}"
+    );
+}
