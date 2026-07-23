@@ -44,8 +44,8 @@ scenarios:
 
   - id: type_date_time
     what: "date / time — Date32, Time64(µs)"
-    postgres: { test: pg_golden_full_type_matrix_schema_coverage }
-    mysql:    { test: mysql_golden_full_type_matrix_schema_coverage }
+    postgres: { test: duckdb_pg_matrix_per_column_null_profile_matches_source, oracle: independent }
+    mysql:   { test: duckdb_mysql_matrix_per_column_null_profile_matches_source, oracle: independent }
     mssql:    { test: duckdb_validates_mssql_type_matrix_parquet, oracle: independent }
     mongo:    { na: "date/time ride the verbatim document blob" }
 
@@ -58,15 +58,15 @@ scenarios:
 
   - id: type_boolean
     what: "boolean — incl NULL; MySQL BIT(1)/TINYINT(1) → Boolean, BIT(8) → Int"
-    postgres: { test: pg_golden_full_type_matrix_schema_coverage }
-    mysql:    { test: mysql_golden_full_type_matrix_schema_coverage }
+    postgres: { test: duckdb_pg_matrix_per_column_null_profile_matches_source, oracle: independent }
+    mysql:   { test: duckdb_mysql_matrix_per_column_null_profile_matches_source, oracle: independent }
     mssql:    { test: duckdb_validates_mssql_type_matrix_parquet, oracle: independent }
     mongo:    { na: "booleans ride the verbatim document blob" }
 
   - id: type_integer_families
     what: "int2/4/8 + unsigned widening (u64 > i64::MAX → UInt64, not overflow)"
-    postgres: { test: pg_golden_full_type_matrix_schema_coverage }
-    mysql:    { test: parquet_schema_pins_mysql_matrix_logical_types }
+    postgres: { test: duckdb_pg_matrix_per_column_null_profile_matches_source, oracle: independent }
+    mysql:   { test: duckdb_mysql_matrix_per_column_null_profile_matches_source, oracle: independent }
     mssql:    { test: duckdb_validates_mssql_type_matrix_parquet, oracle: independent }
     mongo:    { test: mongo_batch_type_fidelity_document_is_verbatim_extjson, oracle: independent }
 
