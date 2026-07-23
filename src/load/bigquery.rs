@@ -207,6 +207,21 @@ impl TargetLoader for BigQueryLoader {
                 self.cluster_by.len()
             );
         }
+        // Gate each clustering column: it splices raw into `CLUSTER BY <cols>`
+        // (an identifier list, no quoting) — the same is_safe_load_ident gate the
+        // table / column / pk names get. Config-derived, so operator self-harm,
+        // but gated for consistency with the round-5/6 injection surface.
+        // (`partition_by` is intentionally NOT gated here — it is a BigQuery
+        // partition EXPRESSION, e.g. `DATE(created_at)`, not a bare identifier.)
+        for c in &self.cluster_by {
+            if !super::is_safe_load_ident(c) {
+                bail!(
+                    "BigQuery load: clustering column `{}` is not a plain SQL identifier \
+                     ([A-Za-z_][A-Za-z0-9_]*) — it splices into CLUSTER BY. Rename it.",
+                    c.escape_default()
+                );
+            }
+        }
         let target = self.fqtn(table);
         let schema = build_schema(specs);
 
@@ -705,6 +720,23 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("clustering"), "{err}");
+    }
+
+    #[test]
+    fn materialize_refuses_a_non_identifier_cluster_column() {
+        // A clustering column splices raw into `CLUSTER BY <cols>`; a
+        // non-identifier name is an injection vector and must be refused in
+        // `materialize` before any `bq` call — the sibling of the table/column/pk
+        // gate for the BigQuery shape clause.
+        let l = BigQueryLoader::new("p", "d").cluster_by(vec!["id) FROM secrets; --".into()]);
+        let err = l
+            .materialize("t", &[spec("id", None, TargetStatus::Ok)], &uris())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("not a plain SQL identifier") && err.contains("CLUSTER BY"),
+            "{err}"
+        );
     }
 
     #[test]
