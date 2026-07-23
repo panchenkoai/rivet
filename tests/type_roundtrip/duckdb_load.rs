@@ -488,3 +488,116 @@ fn duckdb_pg_matrix_per_column_null_profile_matches_source() {
         );
     }
 }
+
+/// Assert the destination parquet's per-column NULL-count (and distinct-count for
+/// the `Some` entries) matches the pre-computed SOURCE profile — the shared core
+/// of the null-profile oracle. Each engine test computes the source side with its
+/// own connection (the PG sibling above inlines the same comparison; see it for
+/// the full rationale: this is what count/sum checks on OTHER columns miss).
+fn assert_dest_matches_null_profile(glob: &str, profile: &[(String, i64, Option<i64>)]) {
+    for (col, src_nulls, src_distinct) in profile {
+        let dst_nulls = dd_scalar_i64(&duckdb_run_sql_json(&format!(
+            "SELECT count(*) - count(\"{col}\") FROM read_parquet('{glob}')"
+        )));
+        assert_eq!(
+            *src_nulls, dst_nulls,
+            "column '{col}': null-count parity — source {src_nulls} vs dest {dst_nulls} \
+             (a silent per-column degradation to 100% NULL / nulled values)"
+        );
+        if let Some(d) = src_distinct {
+            let dst_d = dd_scalar_i64(&duckdb_run_sql_json(&format!(
+                "SELECT count(DISTINCT \"{col}\") FROM read_parquet('{glob}')"
+            )));
+            assert_eq!(
+                *d, dst_d,
+                "column '{col}': distinct-count parity — source {d} vs dest {dst_d} \
+                 (value corruption / a lost value-bracket the NULL-count would not reveal)"
+            );
+        }
+    }
+}
+
+/// MySQL sibling of `duckdb_pg_matrix_per_column_null_profile_matches_source`.
+#[test]
+#[ignore = "live: requires docker compose mysql + duckdb"]
+fn duckdb_mysql_matrix_per_column_null_profile_matches_source() {
+    use mysql::prelude::Queryable;
+    require_alive(LiveService::Mysql);
+    require_alive(LiveService::DuckDb);
+
+    let table_name = unique_name("dd_my_np");
+    setup_mysql_matrix_table(&table_name);
+    let _guard = MysqlCleanup(table_name.clone());
+
+    let (host_dir, container_dir) = duckdb_shared_workdir(&unique_name("dd_my_np_out"));
+    run_mysql_matrix_export(&table_name, "parquet", &host_dir);
+    let glob = format!("{container_dir}/*.parquet");
+
+    let mut c = mysql_connect();
+    let distinct: std::collections::HashSet<&str> = ["id", "c_int", "amount", "label", "uid"]
+        .into_iter()
+        .collect();
+    let profile: Vec<(String, i64, Option<i64>)> = super::helpers::MYSQL_MATRIX_COLUMNS
+        .split(',')
+        .map(|s| s.trim())
+        .map(|col| {
+            let nulls: i64 = c
+                .query_first(format!(
+                    "SELECT count(*) - count(`{col}`) FROM {table_name}"
+                ))
+                .unwrap()
+                .unwrap();
+            let dist = distinct.contains(col).then(|| {
+                c.query_first::<i64, _>(format!("SELECT count(DISTINCT `{col}`) FROM {table_name}"))
+                    .unwrap()
+                    .unwrap()
+            });
+            (col.to_string(), nulls, dist)
+        })
+        .collect();
+    assert!(
+        profile.len() >= 30,
+        "MySQL matrix must be rich; got {}",
+        profile.len()
+    );
+    assert_dest_matches_null_profile(&glob, &profile);
+}
+
+/// MSSQL sibling of `duckdb_pg_matrix_per_column_null_profile_matches_source`.
+#[test]
+#[ignore = "live: requires docker compose mssql + duckdb"]
+fn duckdb_mssql_matrix_per_column_null_profile_matches_source() {
+    require_alive(LiveService::Mssql);
+    require_alive(LiveService::DuckDb);
+
+    let table_name = unique_name("dd_ms_np");
+    setup_mssql_matrix_table(&table_name);
+    let _guard = MssqlCleanup(table_name.clone());
+
+    let (host_dir, container_dir) = duckdb_shared_workdir(&unique_name("dd_ms_np_out"));
+    run_mssql_matrix_export(&table_name, "parquet", &host_dir);
+    let glob = format!("{container_dir}/*.parquet");
+
+    let distinct: std::collections::HashSet<&str> = ["id", "c_int", "amount", "label", "uid"]
+        .into_iter()
+        .collect();
+    let profile: Vec<(String, i64, Option<i64>)> = super::helpers::MSSQL_MATRIX_COLUMNS
+        .split(',')
+        .map(|s| s.trim())
+        .map(|col| {
+            let nulls = mssql_query_i64(&format!(
+                "SELECT count(*) - count([{col}]) FROM {table_name}"
+            ));
+            let dist = distinct.contains(col).then(|| {
+                mssql_query_i64(&format!("SELECT count(DISTINCT [{col}]) FROM {table_name}"))
+            });
+            (col.to_string(), nulls, dist)
+        })
+        .collect();
+    assert!(
+        profile.len() >= 20,
+        "MSSQL matrix must be rich; got {}",
+        profile.len()
+    );
+    assert_dest_matches_null_profile(&glob, &profile);
+}
