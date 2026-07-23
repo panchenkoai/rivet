@@ -14,6 +14,14 @@
 //! 4. The number of `gap:` cells MUST NOT exceed the ratchet baseline — you
 //!    cannot ADD a gap. Filling a gap (gap → test) lets you lower the baseline;
 //!    the ratchet only ever tightens.
+//! 5. GENERATIVE column-completeness: a matrix keyed on source engines must
+//!    declare EVERY `SourceType`, one keyed on warehouse targets must declare
+//!    EVERY `ExportTarget` — the required set is derived from the enums THEMSELVES
+//!    (parsed from product source), so a new engine/target, or a silently-dropped
+//!    column, forces a `test`/`gap`/`na` cell instead of an invisible hole. Guards
+//!    1-4 are DESCRIPTIVE (they only check what an author wrote down); this one is
+//!    GENERATIVE (product code enumerates what MUST be there) — the coverage-audit
+//!    meta-fix that stops the un-enumerated-sibling class at CI.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -289,5 +297,107 @@ fn matrix_gaps_do_not_exceed_ratchet() {
              If {gaps} > {ceiling}: you ADDED a gap — fill it with a test (gaps cannot grow). \
              If {gaps} < {ceiling}: you FILLED one — lower the ceiling in MATRICES to {gaps}."
         );
+    }
+}
+
+/// The lowercased variant idents of a UNIT enum, parsed from product source — the
+/// same "derive from authoritative product code" trick [`all_fn_names`] uses.
+/// `SourceType::Postgres` → `"postgres"`, `ExportTarget::DuckDb` → `"duckdb"`: the
+/// lowercase of every variant matches the matrix column labels exactly, so adding
+/// a variant grows the required-column set automatically — no hand-kept list.
+fn enum_variants_lowercased(rel: &str, enum_name: &str) -> HashSet<String> {
+    let text = std::fs::read_to_string(repo_root().join(rel))
+        .unwrap_or_else(|e| panic!("read {rel}: {e}"));
+    let needle = format!("enum {enum_name} {{");
+    let start = text
+        .find(&needle)
+        .unwrap_or_else(|| panic!("`{needle}` not found in {rel}"));
+    let body = &text[start + needle.len()..];
+    // Matching close brace (depth-tracked; these are unit enums, so it stays flat).
+    let mut depth = 1usize;
+    let mut end = body.len();
+    for (i, ch) in body.char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = i;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = HashSet::new();
+    for line in body[..end].lines() {
+        let t = line.trim_start();
+        // Skip doc/line comments (`///`, `//`), attributes (`#[…]`), blanks.
+        if t.is_empty() || t.starts_with("//") || t.starts_with('#') {
+            continue;
+        }
+        // A variant line begins with an UpperCamel ident (a unit enum has no other
+        // Upper-leading top-level line once comments/attrs are stripped).
+        let ident: String = t
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        if ident.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+            out.insert(ident.to_ascii_lowercase());
+        }
+    }
+    out
+}
+
+/// GENERATIVE column-completeness — the coverage-audit meta-fix. The other three
+/// guards are DESCRIPTIVE: they only check the columns an author already wrote
+/// down, so a matrix that silently DROPS an engine/target — or never adds one for
+/// a new enum variant — stays green (the un-enumerated-sibling hole the audit
+/// found). This derives the required column set from the `SourceType` and
+/// `ExportTarget` enums THEMSELVES: a matrix keyed on source engines must declare
+/// EVERY `SourceType`, one keyed on warehouse targets must declare EVERY
+/// `ExportTarget`. Adding a variant to either enum forces a column into every
+/// relevant matrix — a `test`/`gap`/`na` cell, never a silent omission. Composes
+/// with the gaps==0 ratchet: a forced column can be a justified `na`, but can't be
+/// papered over as a growable gap.
+#[test]
+fn matrix_columns_cover_every_source_and_target_enum_variant() {
+    let sources = enum_variants_lowercased("src/config/source.rs", "SourceType");
+    let targets = enum_variants_lowercased("src/types/target.rs", "ExportTarget");
+    // Parse sanity: a drift here would silently UNDER-require, defeating the guard.
+    assert!(
+        sources.len() == 4 && sources.contains("postgres") && sources.contains("mongo"),
+        "SourceType parse produced {sources:?} (expected the 4 source engines)"
+    );
+    assert!(
+        targets.len() == 4 && targets.contains("duckdb") && targets.contains("clickhouse"),
+        "ExportTarget parse produced {targets:?} (expected the 4 warehouse targets)"
+    );
+
+    for (path, _) in MATRICES {
+        let matrix = load_matrix(path);
+        let declared: HashSet<&str> = matrix.engines.iter().map(String::as_str).collect();
+        let keyed_on_sources = matrix.engines.iter().any(|e| sources.contains(e.as_str()));
+        let keyed_on_targets = matrix.engines.iter().any(|e| targets.contains(e.as_str()));
+        if keyed_on_sources {
+            for s in &sources {
+                assert!(
+                    declared.contains(s.as_str()),
+                    "{path} is keyed on source engines but is MISSING the '{s}' column. Every \
+                     SourceType must be a column (a test/gap/na cell per scenario) — a \
+                     silently-absent engine is the un-enumerated-sibling hole the audit found. \
+                     Add it, or n/a it with a reason."
+                );
+            }
+        }
+        if keyed_on_targets {
+            for t in &targets {
+                assert!(
+                    declared.contains(t.as_str()),
+                    "{path} is keyed on warehouse targets but is MISSING the '{t}' column. Every \
+                     ExportTarget must be a column — add it (test/gap/na per scenario)."
+                );
+            }
+        }
     }
 }
