@@ -541,3 +541,82 @@ fn roast_checkpoint_advances_on_uncaptured_only_traffic() {
         "the checkpoint must advance past uncaptured-only traffic, not stall"
     );
 }
+
+/// Audit blind cell (Mongo CDC per-type value fidelity): the only prior CDC
+/// update/delete test seeds plain STRINGS, so a change-stream relaxed-vs-canonical
+/// extJSON drift, or a Decimal128 rounding, on the OP PATH — distinct from the
+/// batch verbatim rendering that `mongo_batch_type_fidelity_document_is_verbatim_
+/// extjson` pins — was un-oracled. Insert a tricky-typed doc WHILE CDC captures it,
+/// then UPDATE it (the change-stream UpdateLookup post-image goes through the same
+/// rendering), and assert every captured `document` carries the SAME verbatim
+/// extJSON the batch oracle requires: a large Int64 > 2^53, a Decimal128, nested
+/// unicode. This is the independent oracle Mongo has no Form A for (the document
+/// is a verbatim blob).
+#[test]
+#[ignore = "live: requires docker compose up -d mongo-rs"]
+fn mongo_cdc_change_stream_renders_tricky_bson_verbatim_like_batch() {
+    require_alive(LiveService::MongoRs);
+    use mongodb::bson::{Bson, doc};
+    let db = unique_name("cdc_types");
+    let m = MongoTest::connect(PORT, &db);
+    m.drop_collection("t");
+
+    let rig = cdc(&db, "t");
+    rig.run_ok(); // anchor over the empty collection (idle first run)
+
+    // Tricky-typed doc inserted AFTER the anchor, so the change stream carries it.
+    m.insert_many(
+        "t",
+        vec![doc! {
+            "_id": 1_i64,
+            "i64_big": 9_007_199_254_740_993_i64, // 2^53 + 1 — an f64 parser would round it
+            "dec": Bson::Decimal128("123456789.987654321012345".parse().unwrap()),
+            "nested": doc! { "k": "v-\u{00e9}\u{4e2d}", "arr": [1_i32, 2_i32, 3_i32] },
+        }],
+    );
+    // Update it too — the UpdateLookup post-image returns the WHOLE doc, so its
+    // rendering of the tricky types is the specific op-path concern.
+    m.upsert_set("t", 1, "note", "changed");
+    rig.run_ok(); // capture insert + update
+
+    let changes = read_mongo_cdc_changes(&rig.out_dir());
+    let with_doc: Vec<&MongoCdcChange> = changes
+        .iter()
+        .filter(|c| c.document.contains("i64_big"))
+        .collect();
+    assert!(
+        !with_doc.is_empty(),
+        "the change stream must capture at least one post-image carrying the tricky \
+         document; captured {} change(s)",
+        changes.len()
+    );
+    // The independent oracle: the SAME relaxed extended JSON the test renders with
+    // the bson library directly (NOT rivet's document_to_json). The CDC op path
+    // must not DRIFT from this default relaxed rendering (the audit's exact
+    // concern) — so the large Int64 stays a bare, verbatim number, never the
+    // canonical `$numberLong` a drifted op path would emit.
+    for ch in with_doc {
+        assert!(
+            ch.document.contains("9007199254740993") && !ch.document.contains("$numberLong"),
+            "large Int64 must render VERBATIM as the default relaxed bare number in the CDC \
+             document (op '{}') — a canonical/relaxed DRIFT on the op path (or f64 rounding) \
+             corrupts it; got: {}",
+            ch.op,
+            ch.document
+        );
+        assert!(
+            ch.document.contains("123456789.987654321012345")
+                && ch.document.contains("$numberDecimal"),
+            "Decimal128 must be VERBATIM + type-tagged (`$numberDecimal`) in the CDC document \
+             (op '{}'); got: {}",
+            ch.op,
+            ch.document
+        );
+        assert!(
+            ch.document.contains("v-\u{00e9}\u{4e2d}") && ch.document.contains("arr"),
+            "nested unicode + array must be VERBATIM in the CDC document (op '{}'); got: {}",
+            ch.op,
+            ch.document
+        );
+    }
+}
