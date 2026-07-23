@@ -80,3 +80,32 @@ scenarios:
     chunked:     { test: m8_does_not_quarantine_a_part_recorded_in_the_state_file_log }
     keyset:      { na: "keyset resumes via its own checkpoint (get_resume_run_id + file_log rehydration), not the chunked M8 destination-vs-listing quarantine preamble" }
     cdc:         { na: "CDC resumes by slot/checkpoint position, not a destination-object quarantine sweep" }
+
+  # ── This session: the keyset crash-recovery cursor lifecycle. The single mid-data
+  #    cell above (manifest_durable_before_state_advance) did NOT enumerate the
+  #    (fault-point × config-variant) sub-cross-product — crash-BEFORE-first-page,
+  #    crash-AFTER-data-complete, and the INCREMENTAL variant — and an adversarial
+  #    hunt found a HIGH silent-loss in (after-data-complete × incremental). These
+  #    three rows raise the keyset column's resolution to that sub-cross-product;
+  #    every cell asserts MANIFEST-DRIVEN (the orphaned parquet survives on disk, so
+  #    a glob masks the loss). `na` for the other shapes documents structural immunity.
+  - id: keyset_fresh_crash_before_first_page_rereads_not_skips
+    what: "a FRESH non-incremental keyset run that crashes after open but before its first page commit must re-read from the start on recovery, never resume from a prior completed run's stale high-water mark (whole-table silent skip)."
+    incremental: { na: "the stale-cursor skip is a NON-incremental keyset hazard; batch incremental (cursor mode) has no per-run keyset anchor to inherit" }
+    chunked:     { na: "chunked resume is --resume-gated over a [min,max] span recomputed each run; a plain re-run ignores the prior checkpoint, so a pre-first-chunk crash cannot inherit a stale cursor" }
+    keyset:      { test: keyset_fresh_run_crash_before_first_page_does_not_skip_the_table }
+    cdc:         { na: "CDC has no keyset cursor; resume is by slot/checkpoint position" }
+
+  - id: keyset_post_data_failure_non_incremental_clears_anchor
+    what: "a NON-incremental keyset run that commits all data then fails a post-data gate must NOT leave a resume anchor — the operator's intended full re-run must re-read, not resume-skip rows updated since."
+    incremental: { na: "for incremental a surviving anchor is by-design (the next run continues from the high-water mark) AND must survive to finalize — see the next row" }
+    chunked:     { na: "chunked clears completed-chunk state at finalize; a post-data gate failure re-runs the whole span, no cursor to strand" }
+    keyset:      { test: keyset_failure_after_data_complete_does_not_resume_and_skip_on_the_next_run }
+    cdc:         { na: "no keyset anchor" }
+
+  - id: keyset_incremental_crash_before_finalize_rehydrates_not_orphans
+    what: "an INCREMENTAL keyset run that commits all pages then crashes BEFORE finalize_manifest must KEEP its resume anchor so recovery rehydrates the committed pages into the manifest; clearing it early orphans them (the manifest-authoritative loader silently drops the rows — the parquet survives, so ONLY a manifest oracle catches it). Round-2-hunt HIGH regression of the crash-recovery/incremental split."
+    incremental: { na: "batch incremental (cursor mode) has no keyset run_id anchor; it re-runs from the persisted cursor" }
+    chunked:     { na: "chunked has no keyset_incremental variant; its anchor is per-chunk-task state cleared at finalize" }
+    keyset:      { test: keyset_incremental_crash_before_finalize_rehydrates_not_orphans_the_manifest }
+    cdc:         { na: "no keyset anchor" }
