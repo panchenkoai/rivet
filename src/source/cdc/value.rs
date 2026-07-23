@@ -191,21 +191,44 @@ pub(crate) fn build_column(dt: &DataType, cells: &[Option<&RivetValue>]) -> Resu
     let cells: &[Option<&RivetValue>] = &normalized;
 
     // Integers: the binlog/driver value is always the widest signed/unsigned, so
-    // narrow to the column's declared width — `try_from` nulls on the (impossible
-    // for a correctly-typed column) overflow rather than silently wrapping.
+    // narrow to the column's declared width. An overflow is NOT silently nulled —
+    // it fails LOUD, exactly like the batch export's `narrow` (mysql::arrow_convert).
+    // The real trigger is a BIT(64) with bit 63 set (BIT(n>1) resolves to Int64,
+    // and the BitUint fix widens it to u64 > i64::MAX) or a BIGINT UNSIGNED past
+    // i64::MAX; the batch export errors and tells the operator to map the column to
+    // decimal(20,0), so a silent NULL here — which the value-checksum could not even
+    // see (int_of agrees and skips) — would drop the value on CDC while batch
+    // surfaced it. A genuine NULL cell still builds a null.
     macro_rules! int_col {
         ($builder:ty, $ty:ty) => {{
             let mut b = <$builder>::with_capacity(cells.len());
             for c in cells {
-                let v = match c {
-                    Some(V::Int(i)) => <$ty>::try_from(*i).ok(),
-                    Some(V::UInt(u)) => <$ty>::try_from(*u).ok(),
-                    Some(V::Bool(x)) => Some(*x as $ty),
-                    _ => None,
-                };
-                match v {
-                    Some(v) => b.append_value(v),
-                    None => b.append_null(),
+                match c {
+                    None | Some(V::Null) => b.append_null(),
+                    Some(V::Bool(x)) => b.append_value(*x as $ty),
+                    Some(V::Int(i)) => match <$ty>::try_from(*i) {
+                        Ok(v) => b.append_value(v),
+                        Err(_) => anyhow::bail!(
+                            "cdc: integer value {i} overflows the declared {} column \
+                             (a BIT(64) with bit 63 set, or a BIGINT UNSIGNED > i64::MAX); \
+                             map the column to decimal(20,0) or a wider type. The batch \
+                             export fails identically, never a silent null.",
+                            stringify!($ty)
+                        ),
+                    },
+                    Some(V::UInt(u)) => match <$ty>::try_from(*u) {
+                        Ok(v) => b.append_value(v),
+                        Err(_) => anyhow::bail!(
+                            "cdc: integer value {u} overflows the declared {} column \
+                             (a BIT(64) with bit 63 set, or a BIGINT UNSIGNED > i64::MAX); \
+                             map the column to decimal(20,0) or a wider type. The batch \
+                             export fails identically, never a silent null.",
+                            stringify!($ty)
+                        ),
+                    },
+                    // A non-integer variant in an integer column is a separate
+                    // type-mismatch case, not an overflow — keep the null fallback.
+                    _ => b.append_null(),
                 }
             }
             Arc::new(b.finish())
@@ -1027,10 +1050,11 @@ mod tests {
             ),
             (
                 DataType::Int16,
-                // 40000 overflows i16 → builder nulls; the fold must too.
+                // In-range narrowing from the wide driver value (20000 fits i16);
+                // an OVERFLOW is a loud error now, covered by the narrows test.
                 vec![
                     Some(V::Int(-5)),
-                    Some(V::Int(40_000)),
+                    Some(V::Int(20_000)),
                     Some(V::UInt(7)),
                     None,
                 ],
@@ -1038,11 +1062,13 @@ mod tests {
             (DataType::Int32, vec![Some(V::Int(-8_388_608)), None]),
             (
                 DataType::Int64,
-                vec![Some(V::Int(i64::MIN)), Some(V::UInt(u64::MAX)), None],
+                // 9e9 fits i64 (narrowed from the u64 driver value); a u64 past
+                // i64::MAX is a loud error (build_column_narrows_int test).
+                vec![Some(V::Int(i64::MIN)), Some(V::UInt(9_000_000_000)), None],
             ),
             (
                 DataType::UInt64,
-                vec![Some(V::UInt(u64::MAX)), Some(V::Int(-1)), None],
+                vec![Some(V::UInt(u64::MAX)), Some(V::UInt(1)), None],
             ),
             (
                 DataType::Float32,
@@ -1301,16 +1327,35 @@ mod tests {
         );
     }
 
+    // Finding #4: an integer that fits the declared width builds; a genuine NULL
+    // stays null; but an OVERFLOW must fail LOUD (batch parity via `narrow`), never
+    // the silent null it used to be — a BIT(64) with bit 63 set was dropped on CDC
+    // while the batch export surfaced it.
     #[test]
-    fn build_column_narrows_int_to_declared_width() {
+    fn build_column_narrows_int_and_fails_loud_on_overflow() {
         use arrow::array::{Array, Int32Array};
-        let (v7, vmax) = (RivetValue::Int(7), RivetValue::Int(i64::MAX));
-        let cells = [Some(&v7), None, Some(&vmax)];
-        let arr = build_column(&DataType::Int32, &cells).unwrap();
+        // In-range values + a genuine null build cleanly.
+        let (v7, vnull_src) = (RivetValue::Int(7), RivetValue::Int(-5));
+        let arr = build_column(&DataType::Int32, &[Some(&v7), None, Some(&vnull_src)]).unwrap();
         let a = arr.as_any().downcast_ref::<Int32Array>().unwrap();
         assert_eq!(a.value(0), 7);
-        assert!(a.is_null(1)); // null stays null
-        assert!(a.is_null(2)); // overflow → null, never a silent wrap
+        assert!(a.is_null(1)); // null cell stays null
+        assert_eq!(a.value(2), -5);
+        // Overflow → loud error, not a silent null wrap.
+        let vmax = RivetValue::Int(i64::MAX);
+        let err = build_column(&DataType::Int32, &[Some(&vmax)])
+            .expect_err("an integer overflowing the declared width must fail loud");
+        assert!(
+            err.to_string().to_lowercase().contains("overflow"),
+            "message names the overflow: {err}"
+        );
+        // The reported case: a BIT(64) with bit 63 set arrives as u64 > i64::MAX
+        // and must fail loud in an Int64 column, exactly like the batch export.
+        let bit64 = RivetValue::UInt(u64::MAX);
+        assert!(
+            build_column(&DataType::Int64, &[Some(&bit64)]).is_err(),
+            "a BIT(64) value past i64::MAX must fail loud, never a silent CDC null"
+        );
     }
 
     // Finding #6: a one-dimensional List column must never silently null a
