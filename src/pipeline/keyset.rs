@@ -324,24 +324,36 @@ pub(crate) fn run_keyset(
     super::commit::harvest_column_checksums(summary, checksums_acc, checksum_key_column);
 
     // DATA COMPLETE: the page loop exhausted the key range, so there is no
-    // uncommitted work left to resume — clear the in-progress run_id NOW, BEFORE
-    // the post-data gates (schema-drift below, and the quality gate in job.rs).
-    // A gate that fails AFTER all data is durable must not leave a resume anchor:
-    // otherwise the operator's intended full re-run would be treated as a
-    // crash-recovery and continue from the high-water mark, silently skipping
-    // rows updated since (the exact silent-skip the crash-recovery/incremental
-    // split exists to prevent). resume_run_id only ever means "a run died with
-    // work still outstanding".
+    // uncommitted work left to resume — for a NON-INCREMENTAL run, clear the
+    // in-progress run_id NOW, BEFORE the post-data gates (schema-drift below, and
+    // the quality gate in job.rs). A gate that fails AFTER all data is durable must
+    // not leave a resume anchor, or the operator's intended full re-run would be
+    // treated as a crash-recovery and continue from the high-water mark, silently
+    // skipping rows updated since (the crash-recovery/incremental split's raison
+    // d'être).
+    //
+    // INCREMENTAL is gated OUT (`!kp.incremental`, mirroring the fresh-run
+    // clear_cursor_value above): its next run continues from the high-water mark
+    // regardless of the anchor, so clearing it yields NO benefit — and clearing it
+    // HERE, before finalize_manifest writes the destination manifest, would strand
+    // this run's committed pages. A crash in the [clear → finalize] window would
+    // then leave a run whose parquet is on the destination + file_log but referenced
+    // by NO manifest: the next incremental run reads only keys past the high-water
+    // mark (0 new rows) and never rehydrates those parts, so the manifest-
+    // authoritative loader silently drops them. The anchor must survive until
+    // finalize for the incremental path (job.rs clears it AFTER the manifest write).
     if kp.checkpoint
+        && !kp.incremental
         && let Some(st) = state
     {
         st.clear_resume_run_id(&plan.export_name)?;
     }
 
-    // Fault point: data is fully committed and the resume anchor is cleared, but a
-    // post-data gate (or any late failure) has not yet run. A crash here must NOT
-    // leave a resume anchor — the next run is a fresh full pass, never a
-    // crash-recovery that skips rows updated since (the #3 gate-failure class).
+    // Fault point: data is fully committed (and, for a non-incremental run, the
+    // resume anchor is cleared), but a post-data gate / late failure has not yet
+    // run. For non-incremental a crash here must leave NO anchor (next run is a
+    // fresh full pass); for incremental the anchor must SURVIVE (next run rehydrates
+    // the committed pages rather than orphaning them).
     crate::test_hook::maybe_panic_at("keyset_after_data_complete");
 
     log::info!(

@@ -795,6 +795,82 @@ fn keyset_failure_after_data_complete_does_not_resume_and_skip_on_the_next_run()
     );
 }
 
+/// Round-2 hunt HIGH: the INCREMENTAL keyset variant must KEEP its resume anchor
+/// at data-complete (unlike non-incremental, which clears it) so a crash in the
+/// [data-complete → finalize_manifest] window rehydrates the committed pages
+/// instead of orphaning them. The committed parquet SURVIVES on disk either way,
+/// so this asserts on the MANIFEST (dir_manifest_copy_total_rows), not a parquet
+/// re-read — the loss is manifest-level and invisible to a data re-read. RED
+/// against an unconditional data-complete clear_resume_run_id (manifest = 0).
+#[test]
+#[ignore = "live: requires docker compose up -d mysql"]
+fn keyset_incremental_crash_before_finalize_rehydrates_not_orphans_the_manifest() {
+    require_alive(LiveService::Mysql);
+    let table = unique_name("keyset_inc_orphan");
+    let _guard = DropTable(table.clone());
+    let mut conn = mysql_connect();
+    conn.query_drop(format!("DROP TABLE IF EXISTS {table}"))
+        .unwrap();
+    conn.query_drop(format!(
+        "CREATE TABLE {table} (uid VARCHAR(40) NOT NULL PRIMARY KEY, payload INT NOT NULL)"
+    ))
+    .unwrap();
+    conn.query_drop("SET SESSION cte_max_recursion_depth = 20000")
+        .unwrap();
+    conn.query_drop(format!(
+        "INSERT INTO {table} (uid, payload) \
+         WITH RECURSIVE seq AS (SELECT 1 n UNION ALL SELECT n+1 FROM seq WHERE n < 1000) \
+         SELECT CONCAT('id-', LPAD(n, 6, '0')), n FROM seq"
+    ))
+    .unwrap();
+
+    // Incremental keyset (append-only opt-in). chunk_checkpoint implied by the
+    // planner, but set explicitly too for clarity.
+    let export = unique_name("keyset_inc_orphan_exp");
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let out_dir = tempfile::tempdir().unwrap();
+    let yaml = format!(
+        "source:\n  type: mysql\n  url: \"{MYSQL_URL}\"\nexports:\n  - name: {export}\n    \
+         table: {table}\n    mode: chunked\n    chunk_by_key: uid\n    chunk_checkpoint: true\n    \
+         keyset_incremental: true\n    \
+         chunk_size: 300\n    format: parquet\n    destination:\n      type: local\n      path: {out}\n",
+        out = out_dir.path().display(),
+    );
+    let cfg = write_config(&cfg_dir, &yaml);
+
+    // Run 1: commits all 1000 pages under R1, then crashes AFTER data-complete but
+    // BEFORE finalize_manifest — so NO destination manifest for R1 is written.
+    let crash = std::process::Command::new(RIVET_BIN)
+        .args([
+            "run",
+            "--config",
+            cfg.to_str().unwrap(),
+            "--export",
+            &export,
+        ])
+        .env("RIVET_TEST_PANIC_AT", "keyset_after_data_complete")
+        .output()
+        .expect("spawn rivet");
+    assert!(!crash.status.success(), "crash run must exit non-zero");
+
+    // Run 2 (incremental): must REHYDRATE R1's committed pages into a complete
+    // manifest (1000 rows), not orphan them. The parquet survives on disk
+    // regardless, so we assert on the run-unique manifest copies. 0 means R1's
+    // committed pages were orphaned — the manifest-authoritative loader would
+    // silently drop them.
+    let r2 = run_rivet_export(&cfg, &export);
+    assert!(
+        r2.status.success(),
+        "run 2 stderr:\n{}",
+        String::from_utf8_lossy(&r2.stderr)
+    );
+    assert_eq!(
+        dir_manifest_copy_total_rows(out_dir.path()),
+        1000,
+        "an incremental crash before finalize must rehydrate all 1000 committed rows into the manifest; 0 means the pages were orphaned (silent manifest-level row loss)"
+    );
+}
+
 /// PostgreSQL UUID PK is the most common non-integer PK in production
 /// (`id UUID PRIMARY KEY DEFAULT gen_random_uuid()` is the canonical
 /// shape after `gen_random_uuid()` landed in core). The documented path

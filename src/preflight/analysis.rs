@@ -456,7 +456,10 @@ pub(crate) fn check_missing_checkpoint(
     row_estimate: Option<i64>,
 ) -> Option<String> {
     let chunked_or_keyset = export.mode == ExportMode::Chunked || export.chunk_by_key.is_some();
-    if !chunked_or_keyset || export.chunk_checkpoint {
+    // `keyset_incremental` implies checkpoint at plan build (it needs the persisted
+    // cursor), so a config that sets it already HAS crash-recovery — do not warn
+    // "no chunk_checkpoint" for it, or the nudge contradicts the plan.
+    if !chunked_or_keyset || export.chunk_checkpoint || export.keyset_incremental {
         return None;
     }
     if row_estimate.is_some_and(|r| r < SMALL_TABLE_ROW_THRESHOLD) {
@@ -1035,6 +1038,14 @@ mod tests {
     #[test]
     fn check_missing_checkpoint_present_is_silent() {
         let e = cfg("mode: chunked\nchunk_by_key: id\nchunk_checkpoint: true\n");
+        assert!(check_missing_checkpoint(&e, Some(5_000_000)).is_none());
+    }
+
+    #[test]
+    fn check_missing_checkpoint_keyset_incremental_implies_checkpoint_is_silent() {
+        // keyset_incremental implies checkpoint at plan build, so the "no
+        // chunk_checkpoint" nudge must NOT fire — it would contradict the plan.
+        let e = cfg("mode: chunked\nchunk_by_key: id\nkeyset_incremental: true\n");
         assert!(check_missing_checkpoint(&e, Some(5_000_000)).is_none());
     }
 
