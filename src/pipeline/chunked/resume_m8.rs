@@ -107,6 +107,81 @@ pub struct M8Stats {
 ///
 /// `run_id` must be the chunk_checkpoint run id (the one
 /// `ensure_chunk_checkpoint_plan` returned for the resume path).
+/// Round-4/5 fix (durability-ordering-matrix `manifest_driven_recovery` chunked): a
+/// chunked-checkpoint crash BEFORE the terminal manifest write leaves the pre-crash
+/// parts durably committed (parquet on the destination + a `file_log` row per part)
+/// but with NO destination manifest. On `--resume`, `claim_next_chunk_task` skips
+/// completed chunks and the M8 preamble finds no manifest to hydrate, so
+/// `finalize_manifest` (built solely from `summary.manifest_parts`) writes a manifest
+/// that OMITS them — the manifest-authoritative `rivet load` then silently drops
+/// their rows. Reconstruct those parts from the state DB's `file_log` (which records
+/// EVERY committed part — including every `max_file_size` rotation sibling — with its
+/// real byte size), so the finalize manifest is COMPLETE. The state DB is the export
+/// machine's own resume record; the reconstructed destination manifest stays the
+/// loader's source of truth (ADR-0001). fingerprint/md5 aren't in file_log, so the
+/// parts are DECLARED + size-verified (an empty md5 degrades validate to a size-only
+/// check) though not content-re-verified — strictly better than a silent orphan.
+/// Returns the number of parts reconstructed.
+pub(crate) fn rehydrate_manifest_parts_from_file_log(
+    state: &StateStore,
+    run_id: &str,
+    summary: &mut RunSummary,
+) -> Result<usize> {
+    // Reconstruct from file_log, NOT chunk_task: file_log records EVERY committed
+    // part — including every max_file_size rotation sibling — with its real byte
+    // size, whereas chunk_task stores only the FIRST sibling's file_name and the
+    // full-chunk row count. Rehydrating from chunk_task orphaned the other siblings
+    // (silent loss / blocked load) and left size_bytes=0 (a lying PartSizeMismatch
+    // in `rivet validate`) — both closed by using file_log (round-5).
+    let files = state.list_files_for_run(run_id)?;
+    let mut next_id = summary
+        .manifest_parts
+        .iter()
+        .map(|p| p.part_id)
+        .max()
+        .unwrap_or(0);
+    let mut rehydrated = 0usize;
+    let mut rehydrated_rows = 0i64;
+    let mut rehydrated_bytes = 0u64;
+    for f in files {
+        // Don't duplicate a part a fresh record_part already added this run.
+        if summary.manifest_parts.iter().any(|p| p.path == f.file_name) {
+            continue;
+        }
+        next_id += 1;
+        summary.manifest_parts.push(crate::manifest::ManifestPart {
+            part_id: next_id,
+            path: f.file_name,
+            rows: f.row_count,
+            size_bytes: f.bytes.max(0) as u64,
+            // fingerprint/md5 aren't in file_log; an EMPTY md5 degrades `rivet
+            // validate` to a size-only check (the real bytes now match), so the
+            // part is DECLARED + size-verified, never a lying mismatch.
+            content_fingerprint: String::new(),
+            content_md5: String::new(),
+            status: crate::manifest::PartStatus::Committed,
+        });
+        rehydrated += 1;
+        rehydrated_rows += f.row_count;
+        rehydrated_bytes += f.bytes.max(0) as u64;
+    }
+    if rehydrated > 0 {
+        // Keep the summary aggregates consistent with the reconstructed manifest so
+        // the run card, the reconcile gate, and the coherence invariant all agree.
+        summary.files_committed += rehydrated;
+        summary.files_produced += rehydrated;
+        summary.total_rows += rehydrated_rows;
+        summary.bytes_written += rehydrated_bytes;
+        log::info!(
+            "resume: reconstructed {rehydrated} committed part(s) ({rehydrated_rows} rows, \
+             {rehydrated_bytes} bytes) into the manifest from the state DB file_log (no \
+             destination manifest to hydrate from) — the finalize manifest now covers every \
+             committed part, rotation siblings included"
+        );
+    }
+    Ok(rehydrated)
+}
+
 pub(crate) fn apply_m8_resume_decisions(
     state: &StateStore,
     run_id: &str,
@@ -156,6 +231,14 @@ pub(crate) fn apply_m8_resume_decisions(
                  falling back to state-only resume (legacy / fresh prefix)",
                 plan.export_name
             );
+            // Round-4 fix: with NO destination manifest to hydrate from (a first-run
+            // crash before the terminal write), reconstruct the already-committed
+            // parts from the state DB's COMPLETED chunk_tasks — otherwise finalize
+            // writes a manifest containing ONLY the resume-processed chunks, orphaning
+            // the pre-crash chunks' durable parts from the manifest-authoritative
+            // loader (silent row loss). A "fresh prefix" (no completed chunks) rehydr-
+            // ates nothing, so this is safe for the legacy/fresh case too.
+            rehydrate_manifest_parts_from_file_log(state, run_id, summary)?;
             return Ok(M8Stats::default());
         }
         Err(e) => {
@@ -257,27 +340,34 @@ pub(crate) fn apply_m8_resume_decisions(
     }
 
     for (path, decision) in &resume_plan.per_part {
-        let task = match by_file.get(path.as_str()) {
-            Some(t) => *t,
-            None => {
-                stats.orphan_parts += 1;
-                continue;
-            }
-        };
         match decision.decision {
             ResumeDecision::Skip => {
                 stats.skipped += 1;
                 // Hydrate the summary so the end-of-resume manifest carries
                 // this committed part too.  Clone the prior manifest's part
                 // verbatim — the part_id, content_fingerprint, rows, and
-                // size_bytes are all from the previous successful write
-                // and remain valid for the destination object that's still
-                // there.
+                // size_bytes are all from the previous successful write and
+                // remain valid for the destination object that's still there.
+                //
+                // A Skip needs NO chunk_task: it copies a durable, matching
+                // manifest part. Requiring one here silently dropped every
+                // max_file_size ROTATION SIBLING — chunk_task records only the
+                // FIRST sibling's file_name, so `chunk-N-p1…` missed the lookup,
+                // was counted an orphan, and never hydrated. The finalize
+                // manifest (built solely from `manifest_parts`) then omitted it
+                // and the manifest-authoritative `rivet load` lost its rows.
                 if let Some(p) = manifest_part_by_path.get(path.as_str()) {
                     summary.manifest_parts.push((*p).clone());
                 }
             }
+            // Rewrite / Quarantine RE-EXPORT the owning chunk, so they DO need
+            // its chunk_task. A part with no task is a genuine orphan (a foreign
+            // or stale manifest entry) — logged, not acted on, as before.
             ResumeDecision::Rewrite => {
+                let Some(task) = by_file.get(path.as_str()) else {
+                    stats.orphan_parts += 1;
+                    continue;
+                };
                 let n = state.reset_chunk_task_for_re_export(
                     run_id,
                     task.chunk_index,
@@ -288,6 +378,10 @@ pub(crate) fn apply_m8_resume_decisions(
                 }
             }
             ResumeDecision::Quarantine { reason } => {
+                let Some(task) = by_file.get(path.as_str()) else {
+                    stats.orphan_parts += 1;
+                    continue;
+                };
                 let n = state.reset_chunk_task_for_re_export(
                     run_id,
                     task.chunk_index,
@@ -310,7 +404,29 @@ pub(crate) fn apply_m8_resume_decisions(
     // a prior resume that wrote with a different timestamp.  Best-effort
     // move to `_quarantine/<run_id>/<original-name>` — never fatal,
     // never deletes (M9 §"never deletes unknown objects").
+    //
+    // BUT the destination manifest can LAG the state DB: a resume that
+    // committed parts (a `file_log` row + a `completed` chunk_task each) then
+    // crashed before re-finalizing leaves those parts ABSENT from the stale
+    // manifest yet DURABLY committed. The manifest-vs-listing reconcile flags
+    // them as untracked surplus — quarantining (MOVING) them would drop the exact
+    // rows finalize is about to rehydrate from file_log (silent loss AND destroyed
+    // at-least-once recoverability, since a move is not a delete but the part is
+    // gone from its recorded path). The state DB is the export's source of truth
+    // (ADR-0001), so exclude any object file_log records as a committed part for
+    // this run before quarantining. This only ever PREVENTS an erroneous move; a
+    // truly-surplus object has no file_log row and is still quarantined.
+    let committed_parts: std::collections::HashSet<String> = state
+        .list_files_for_run(run_id)?
+        .into_iter()
+        .map(|f| f.file_name)
+        .collect();
+    let mut untracked_surplus = 0usize;
     for key in resume_plan.untracked.keys() {
+        if committed_parts.contains(key.as_str()) {
+            continue; // durably committed per file_log — not surplus, do not move
+        }
+        untracked_surplus += 1;
         quarantine_move(&*dest, key, run_id, &plan.export_name, &mut stats);
     }
 
@@ -326,7 +442,7 @@ pub(crate) fn apply_m8_resume_decisions(
         stats.quarantined_moved,
         stats.quarantine_move_failures,
         stats.orphan_parts,
-        resume_plan.untracked.len(),
+        untracked_surplus,
     );
 
     Ok(stats)
@@ -475,6 +591,76 @@ mod tests {
         }
     }
 
+    #[test]
+    fn rehydration_recovers_all_rotation_siblings_from_file_log() {
+        // Round-5: chunk_task stores ONE file_name per chunk (only the FIRST
+        // max_file_size rotation sibling), so rehydrating from it orphaned the other
+        // siblings (silent loss) and left size_bytes=0 (a lying validate mismatch).
+        // file_log records EVERY committed part with its real bytes. RED against the
+        // chunk_task-based rehydration (which recovered 1 of 2 siblings, size 0).
+        let state_dir = tempfile::tempdir().unwrap();
+        let state =
+            crate::state::StateStore::open_at_path(&state_dir.path().join("state.db")).unwrap();
+        let run_id = "r_rot";
+        // Two rotation siblings of ONE chunk, as record_part logs them per-part.
+        state
+            .record_file(
+                run_id,
+                "orders",
+                "orders_chunk0_p0.parquet",
+                30,
+                4096,
+                "parquet",
+                None,
+            )
+            .unwrap();
+        state
+            .record_file(
+                run_id,
+                "orders",
+                "orders_chunk0_p1.parquet",
+                20,
+                2048,
+                "parquet",
+                None,
+            )
+            .unwrap();
+        let mut summary =
+            crate::pipeline::summary::RunSummary::stub_for_testing(run_id, String::from("orders"));
+        let rows_before = summary.total_rows;
+
+        let n = rehydrate_manifest_parts_from_file_log(&state, run_id, &mut summary).unwrap();
+
+        assert_eq!(
+            n, 2,
+            "BOTH rotation siblings must be reconstructed, not just the first"
+        );
+        let paths: Vec<&str> = summary
+            .manifest_parts
+            .iter()
+            .map(|p| p.path.as_str())
+            .collect();
+        assert!(
+            paths.contains(&"orders_chunk0_p0.parquet")
+                && paths.contains(&"orders_chunk0_p1.parquet"),
+            "both sibling files must be declared: {paths:?}"
+        );
+        assert_eq!(
+            summary.manifest_parts.iter().map(|p| p.rows).sum::<i64>(),
+            50,
+            "all 50 rows across both siblings declared"
+        );
+        assert!(
+            summary.manifest_parts.iter().all(|p| p.size_bytes > 0),
+            "parts carry their REAL byte size (not 0) so validate's size check can't lie"
+        );
+        assert_eq!(
+            summary.total_rows - rows_before,
+            50,
+            "row aggregate bumped by the union"
+        );
+    }
+
     /// Full-matrix flow: part A intact → Skip (+ summary hydration), part B
     /// missing → Rewrite (task reset), part C size-diverged → Quarantine
     /// (task reset + object moved), part D with no task → orphan. Also
@@ -580,6 +766,153 @@ mod tests {
         assert_eq!(status_of(0), "completed");
         assert_eq!(status_of(1), "pending", "rewrite resets the task");
         assert_eq!(status_of(2), "pending", "quarantine resets the task");
+    }
+
+    // RED for the Path-B rotation-sibling silent loss (graph-surfaced). When a
+    // prior-run manifest EXISTS (resume with manifest, not the Path-A "no
+    // manifest" reconstruct), the Skip hydration looked up a chunk_task by the
+    // part's file_name FIRST and `continue`d on a miss. A max_file_size chunk
+    // rotates into siblings but chunk_task records only the FIRST sibling's name,
+    // so every OTHER sibling missed the lookup, was counted an orphan, and was
+    // NOT hydrated into `summary.manifest_parts` — the finalize manifest (built
+    // solely from that vec) then omitted it and the manifest-authoritative
+    // `rivet load` silently dropped its rows. A Skip needs NO chunk_task (it
+    // clones the prior manifest's part verbatim), so it must hydrate regardless.
+    #[test]
+    fn apply_m8_skip_hydrates_rotation_siblings_without_a_chunk_task() {
+        let run_id = "m8rot";
+        let dir = tempfile::tempdir().unwrap();
+
+        // One chunk rotated into two siblings; BOTH still present at the dest
+        // (matching their manifest size) → both are Skip decisions.
+        std::fs::write(dir.path().join("chunk0-p0.parquet"), b"AAAAA").unwrap(); // 5
+        std::fs::write(dir.path().join("chunk0-p1.parquet"), b"BBBBBBB").unwrap(); // 7
+        let mut parts = vec![
+            m8_part("chunk0-p0.parquet", 30, 5),
+            m8_part("chunk0-p1.parquet", 20, 7),
+        ];
+        for (i, p) in parts.iter_mut().enumerate() {
+            p.part_id = (i + 1) as u32;
+        }
+        let manifest = m8_manifest(run_id, parts);
+        std::fs::write(
+            dir.path().join(MANIFEST_FILENAME),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        // ONE chunk_task for chunk 0, recording only the FIRST sibling's name —
+        // exactly how a real rotated chunk is logged.
+        let state_dir = tempfile::tempdir().unwrap();
+        let state =
+            crate::state::StateStore::open_at_path(&state_dir.path().join("state.db")).unwrap();
+        state.insert_chunk_tasks(run_id, &[(0, 50)]).unwrap();
+        state.claim_next_chunk_task(run_id).unwrap();
+        state
+            .complete_chunk_task(run_id, 0, 50, Some("chunk0-p0.parquet"))
+            .unwrap();
+
+        let plan = m8_plan(dir.path());
+        let mut summary =
+            crate::pipeline::summary::RunSummary::stub_for_testing(run_id, String::from("orders"));
+
+        let stats = apply_m8_resume_decisions(&state, run_id, &plan, &mut summary).unwrap();
+
+        assert_eq!(stats.skipped, 2, "BOTH siblings are intact → both skipped");
+        assert_eq!(
+            stats.orphan_parts, 0,
+            "a rotation sibling is NOT an orphan just because chunk_task holds one name"
+        );
+        let mut paths: Vec<&str> = summary
+            .manifest_parts
+            .iter()
+            .map(|p| p.path.as_str())
+            .collect();
+        paths.sort_unstable();
+        assert_eq!(
+            paths,
+            vec!["chunk0-p0.parquet", "chunk0-p1.parquet"],
+            "both siblings must hydrate into the resume manifest — else load drops the second's rows"
+        );
+        assert_eq!(
+            summary.manifest_parts.iter().map(|p| p.rows).sum::<i64>(),
+            50,
+            "all 50 rows across both siblings are carried into the finalize manifest"
+        );
+    }
+
+    // RED before the file_log guard in step 6: a part durably committed by a
+    // prior resume (a file_log row) but ABSENT from the stale destination
+    // manifest was classified untracked surplus and quarantine-MOVED — dropping
+    // the exact rows finalize rehydrates from file_log (silent loss). The guard
+    // must skip any untracked object file_log records for the run.
+    #[test]
+    fn m8_does_not_quarantine_a_part_recorded_in_the_state_file_log() {
+        let run_id = "m8run";
+        let dir = tempfile::tempdir().unwrap();
+
+        // Manifest tracks only part-a. part-x is on disk + in file_log but NOT in
+        // the manifest — a resume committed it, then crashed before re-finalize.
+        std::fs::write(dir.path().join("part-a.parquet"), b"AAAAA").unwrap(); // 5
+        std::fs::write(dir.path().join("part-x.parquet"), b"XXXXXXX").unwrap(); // 7
+        let mut parts = vec![m8_part("part-a.parquet", 10, 5)];
+        parts[0].part_id = 1;
+        let manifest = m8_manifest(run_id, parts);
+        std::fs::write(
+            dir.path().join(MANIFEST_FILENAME),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let state_dir = tempfile::tempdir().unwrap();
+        let state =
+            crate::state::StateStore::open_at_path(&state_dir.path().join("state.db")).unwrap();
+        state.insert_chunk_tasks(run_id, &[(0, 10)]).unwrap();
+        state.claim_next_chunk_task(run_id).unwrap();
+        state
+            .complete_chunk_task(run_id, 0, 10, Some("part-a.parquet"))
+            .unwrap();
+        // file_log records BOTH committed parts — including part-x, which the
+        // stale manifest omits (the crash-before-finalize case).
+        state
+            .record_file(
+                run_id,
+                "orders",
+                "part-a.parquet",
+                10,
+                5,
+                "parquet",
+                Some("zstd"),
+            )
+            .unwrap();
+        state
+            .record_file(
+                run_id,
+                "orders",
+                "part-x.parquet",
+                10,
+                7,
+                "parquet",
+                Some("zstd"),
+            )
+            .unwrap();
+
+        let plan = m8_plan(dir.path());
+        let mut summary =
+            crate::pipeline::summary::RunSummary::stub_for_testing(run_id, String::from("orders"));
+        apply_m8_resume_decisions(&state, run_id, &plan, &mut summary).unwrap();
+
+        // part-x is committed per file_log → left in place, NOT quarantined.
+        assert!(
+            dir.path().join("part-x.parquet").exists(),
+            "a file_log-committed part must stay at its path"
+        );
+        assert!(
+            !dir.path()
+                .join(format!("{QUARANTINE_PREFIX}/{run_id}/part-x.parquet"))
+                .exists(),
+            "a file_log-committed part must NOT be moved to _quarantine (that would be silent loss)"
+        );
     }
 
     /// The fingerprint hydration guard is `summary is None AND manifest is not

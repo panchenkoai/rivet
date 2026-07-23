@@ -187,9 +187,16 @@ fn pg_edge_decimal_negative_scale_currently_fails_at_parquet_write() {
          if it now succeeds, update this test and document the new policy"
     );
     let err = String::from_utf8_lossy(&out.stderr);
+    // rivet now refuses this early at create_writer with an ACTIONABLE message
+    // (naming the column + the Parquet scale>=0 rule + the cast/csv remediation),
+    // instead of the raw arrow-parquet "Invalid DECIMAL scale" deeper in the write.
     assert!(
-        err.contains("DECIMAL scale") || err.contains("scale: -2"),
-        "expected an Invalid-DECIMAL-scale error in stderr, got:\n{err}"
+        err.contains("NEGATIVE decimal scale") && err.contains("scale must be >= 0"),
+        "expected the actionable negative-scale refusal in stderr, got:\n{err}"
+    );
+    assert!(
+        err.contains("format: csv") || err.contains("numeric(p,0)"),
+        "the refusal must name a remediation (cast to non-negative scale, or CSV):\n{err}"
     );
 }
 

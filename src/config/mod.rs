@@ -631,6 +631,108 @@ impl Config {
             );
         }
 
+        // V5 (round-2 audit #5): each `tables:` entry becomes a destination path
+        // SEGMENT in dest_for_table (local `<path>/<table>`, cloud `<prefix>/
+        // <table>/`), so an entry with `..`/`/` escapes the configured tree exactly
+        // like an unsafe export.name — the multi-tenant-wrapper threat model V5/V15
+        // defend. The single `table:` shortcut and export.name are guarded; the
+        // `tables:` list was not. Reject an unsafe segment at config-load, before
+        // dest_for_table (or the pre-write manifest FS probe) ever sees it.
+        for t in export.tables.iter().flatten() {
+            if !is_filename_safe_name(t) {
+                anyhow::bail!(
+                    "export '{}': tables entry '{}' is not filename-safe: it must not contain \
+                     '/', '\\', '..', a NUL, or start with '.' (each table becomes a destination \
+                     path segment).",
+                    export.name,
+                    t.escape_default(),
+                );
+            }
+        }
+
+        // Round-2 audit #15/#16/#6: partition_by has purely-static rules (mode
+        // compatibility, the `{partition}` token, a filename-safe column name) that
+        // only lived in the run-time expansion step, so `rivet check` gave a false
+        // green and `rivet run` failed later — after a live DB probe, or (mode: cdc)
+        // with a misleading "requires table:". Enforce them at config-load so check
+        // and run agree, mirroring the chunk_dense/chunk_by_days guards.
+        if let Some(col) = export.partition_by.as_deref() {
+            if col.trim().is_empty() {
+                anyhow::bail!("export '{}': partition_by must name a column", export.name);
+            }
+            // #6: the column name becomes the Hive `col=value` path segment, so a
+            // quoted DB column named `../x` would inject a traversal — filename-gate it.
+            if !is_filename_safe_name(col) {
+                anyhow::bail!(
+                    "export '{}': partition_by column '{}' is not filename-safe: it must not \
+                     contain '/', '\\', '..', a NUL, or start with '.' (it becomes a `col=value` \
+                     destination path segment).",
+                    export.name,
+                    col.escape_default(),
+                );
+            }
+            if matches!(export.mode, ExportMode::TimeWindow | ExportMode::Cdc) {
+                anyhow::bail!(
+                    "export '{}': partition_by is not compatible with `mode: {:?}` — it is a batch \
+                     output-layout feature; partition a full/chunked/incremental export instead.",
+                    export.name,
+                    export.mode,
+                );
+            }
+            // Round-5: partition_by writes N per-partition manifests (one per
+            // col=value/ sub-prefix), but `rivet load` (reconcile.rs select_runs)
+            // picks a SINGLE latest-manifest for the export and would load only ONE
+            // partition, silently dropping the rest. Reject the combo at config-load
+            // until the loader is partition-aware.
+            if export.load.is_some() {
+                anyhow::bail!(
+                    "export '{}': partition_by is not compatible with a `load:` block — a \
+                     partitioned export writes one manifest per partition sub-prefix, but the \
+                     warehouse loader would load only a single partition. Load a non-partitioned \
+                     export, or drop `load:` and run `rivet load` per partition.",
+                    export.name,
+                );
+            }
+            if export.chunk_by_key.is_some() {
+                anyhow::bail!(
+                    "export '{}': partition_by is not compatible with chunk_by_key — keyset needs \
+                     the `table:` shortcut to verify the index, but partitioning rewrites the query \
+                     into a subquery. Use a range `chunk_column`, a smaller `partition_granularity`, \
+                     or `mode: full`.",
+                    export.name
+                );
+            }
+            let has_token = export
+                .destination
+                .path
+                .as_deref()
+                .is_some_and(|s| s.contains("{partition}"))
+                || export
+                    .destination
+                    .prefix
+                    .as_deref()
+                    .is_some_and(|s| s.contains("{partition}"));
+            if !has_token {
+                anyhow::bail!(
+                    "export '{}': partition_by requires a '{{partition}}' token in destination.path \
+                     or destination.prefix (otherwise every partition would overwrite the same prefix).",
+                    export.name
+                );
+            }
+        }
+
+        // Round-2 audit #17: chunk_size_memory_mb is documented mutually exclusive
+        // with an explicit chunk_size — build.rs takes the memory budget and
+        // silently drops chunk_size when both are set, mirroring the batch_size pair.
+        if export.chunk_size_memory_mb.is_some() && export.chunk_size != default_chunk_size() {
+            anyhow::bail!(
+                "export '{}': chunk_size and chunk_size_memory_mb are mutually exclusive — \
+                 chunk_size_memory_mb derives the window size from a memory budget, so an explicit \
+                 chunk_size would be silently ignored. Set one or the other.",
+                export.name
+            );
+        }
+
         let merged =
             crate::tuning::merge_tuning_config(self.source.tuning.as_ref(), export.tuning.as_ref());
         if let Some(t) = merged
@@ -1037,6 +1139,46 @@ impl Config {
                 "export '{}': chunk_dense is only valid with mode: chunked",
                 export.name
             );
+        }
+
+        // Round-2 audit #14: the load-bearing chunk knobs are silently dropped
+        // outside `mode: chunked` — `build_plan` routes Full/Incremental/
+        // TimeWindow to a single-cursor snapshot that never consults them, so a
+        // config that sets them but forgets `mode: chunked` degrades to the
+        // unbounded whole-table snapshot chunking exists to prevent, with no
+        // error or warn. Gate them the same way chunk_dense/chunk_by_days are.
+        // (`parallel` is intentionally excluded — the Mongo full/keyset reader
+        // legitimately fans workers with it, so it is not chunked-only.)
+        if export.mode != ExportMode::Chunked {
+            let offending = if export.chunk_column.is_some() {
+                Some("chunk_column")
+            } else if export.chunk_by_key.is_some() {
+                Some("chunk_by_key")
+            } else if export.chunk_count.is_some() {
+                Some("chunk_count")
+            } else if export.chunk_size_memory_mb.is_some() {
+                Some("chunk_size_memory_mb")
+            } else if export.chunk_max_attempts.is_some() {
+                Some("chunk_max_attempts")
+            } else if export.chunk_checkpoint {
+                Some("chunk_checkpoint")
+            } else if export.chunk_size != default_chunk_size() {
+                Some("chunk_size")
+            } else {
+                None
+            };
+            if let Some(knob) = offending {
+                anyhow::bail!(
+                    "export '{}': `{}` requires `mode: chunked` — it is silently ignored in \
+                     `mode: {:?}`, which runs a single unbounded snapshot over the whole table \
+                     instead of chunking (the source-pressure footgun chunked mode prevents).\n  \
+                     Hint: add `mode: chunked`, or remove the `{}` setting.",
+                    export.name,
+                    knob,
+                    export.mode,
+                    knob,
+                );
+            }
         }
 
         if export.cdc.is_some() && export.mode != ExportMode::Cdc {
@@ -1535,9 +1677,14 @@ mod audit_unquoted_template_brace {
     #[test]
     fn config_without_braces_is_untouched() {
         // No brace anywhere: a plain valid config still loads, and an unrelated
-        // YAML error elsewhere must not pick up a spurious quoting hint.
-        Config::from_yaml(&yaml_with_prefix("exports/data/"))
-            .expect("a brace-free prefix must load");
+        // YAML error elsewhere must not pick up a spurious quoting hint. (No
+        // partition_by here — a braceless prefix is invalid WITH partition_by,
+        // which requires a `{partition}` token; this test is about brace
+        // detection, not partitioning.)
+        let yaml = "source:\n  type: postgres\n  url: \"postgresql://localhost/test\"\n\
+                    exports:\n  - name: t\n    query: \"SELECT 1\"\n    format: parquet\n\
+                    \x20   destination:\n      type: local\n      path: ./out\n      prefix: exports/data/\n";
+        Config::from_yaml(yaml).expect("a brace-free prefix must load");
     }
 
     // ── line_has_unquoted_brace_value() unit coverage ──────────────────────

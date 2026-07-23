@@ -319,6 +319,24 @@ rather than guessing the plan. A fix shipped against an unmeasured hypothesis is
 a guess wearing a diff — each of the three wrong guesses above cost a build +
 install + dogfood round-trip that a 20-second cold trace would have skipped.
 
+## Benchmark against the DOWNLOADED latest release binary, never a rebuilt parent
+
+A perf regression check compares the working-tree build against the PREVIOUS
+version. Do NOT `git checkout <parent> && cargo build --release` to get it — the
+release profile is `lto = "fat"` + `codegen-units = 1`, so each build is MINUTES,
+and a before/after wastes two of them (measured: the Form B before/after cost two
+full fat-LTO rebuilds when one download would have done). Instead **download the
+latest already-BUILT release binary** — the artifact the release pipeline already
+published (a GitHub release asset, or the Homebrew bottle `brew install rivet`) —
+and compare the current `cargo build --release` against it. It is faster AND more
+honest: you compare against what users actually run (the release-pipeline binary),
+not a locally-rebuilt approximation. `cargo install rivet-cli@<ver>` does NOT count
+— it rebuilds from source, the exact cost this avoids. Keep the CURRENT side a
+`--release` build (dev/debug is unrepresentative for perf). Baseline reference for
+the macro-export bench (200k-row keyset, 5 cols, zstd, release): ~0.66 s warm
+(~300k rows/s), ~26 MB flat peak RSS — a regression is a wall-clock or RSS move
+past measurement noise on that fixture.
+
 ## Verify the real release build path, not just `cargo build`
 
 A green `cargo build` does not mean the release will build. The release path runs
@@ -392,8 +410,23 @@ to **pin the formats on the reader's own connection**
 (`SET datestyle='ISO, MDY'; SET bytea_output='hex'; SET intervalstyle='postgres'`
 in `src/source/postgres/cdc.rs::open`), immune to the DB default. Binary
 readers (MySQL binlog, MSSQL CT, the PG *batch* binary protocol) are exempt
-by construction — this class is text-decode-only. Regression:
+by construction on the READ — this class is text-decode-only. Regression:
 `pg_cdc_non_iso_datestyle_and_escape_bytea_match_batch`.
+
+Round-8 corrected the "batch binary protocol is exempt" over-claim: the READ
+is exempt, but the batch **incremental/keyset cursor** is a session-dependent
+text *ENCODE* on the write-back leg. The cursor boundary is re-injected as an
+OFFSET-LESS naive literal into `WHERE col > '<lit>'`, and PostgreSQL parses a
+naive literal in the SESSION TimeZone — so on any non-UTC session (a common
+prod default) the boundary shifts by the zone offset and every incremental run
+silently SKIPS (west) / duplicates (east) the offset window. The READ was
+UTC-absolute, so counts/sums passed under CI's UTC session — the exact blind
+spot. Same fix shape (pin on the connection): `SET LOCAL TimeZone='UTC'` in
+`src/source/postgres/mod.rs::pg_run_export`, mirroring MySQL's `time_zone='+00:00'`.
+Process rule extension: the enumeration covers BOTH legs — a value CROSSING a
+text rendering (decode, exempt for binary) AND a cursor/boundary value
+RE-INJECTED as a text literal (encode, NOT exempt even on a binary reader).
+Regression: `pg_incremental_cursor_survives_a_non_utc_session_timezone`.
 
 ## Keyset seek is type-bracketed — a heterogeneous key silently loses all but one type
 
@@ -539,3 +572,48 @@ invisible to it — an independent-oracle harness caught that), nor a test and
 code that agree on a wrong spec. Layers: matrices (coverage exists) → mutants
 (assertions bite) → live suites (integration) → independent-oracle harness
 (absent behaviour). One layer's green is not another layer's proof.
+
+## A per-export feature must be wired into EVERY runner — the runner-bypass class
+
+rivet has FOUR export runners and three of them — `chunked`, `keyset`,
+`mongo_parallel` — own their own execution loop that RETURNS from `run_export`
+BEFORE reaching `run_single_export`. So any gate/feature wired only into single
+is SILENTLY ABSENT on the headline large-table paths, and every count/sum/oracle
+still passes. Round-8 proved the class recurring: `on_schema_drift: fail`
+returned exit 0 on keyset AND parallel-Mongo because the drift gate lived only
+in single/chunked — two misses in one round. Building the ledger to guard it
+then surfaced a BIGGER one: **value-checksum Form B is absent on all three
+large-table runners** — the sink COMPUTES per-column checksums for every runner
+(`track_checksum` in `sink/mod.rs::on_batch`), but only `single` harvests
+`sink.column_checksums` into `summary.column_checksums`, so `finalize_manifest`
+records none and `rivet validate`'s Form-B re-read is a no-op precisely on the
+paths that move the most data (`read_keyset_page` drops the checksums; chunked
+never reads them).
+
+The systematization (rounds 4-8) is `docs/runner-coverage-matrix.yaml`
+(`feature × {single, chunked, keyset, mongo_parallel}`, drift-guarded like the
+others). Its gap/na split is the load-bearing distinction: a feature applied by
+SHARED-SEAM construction (meta_columns via `ExportSink` — no runner can bypass
+it) is `na` (runner-agnostic, proven once); a feature each runner must
+EXPLICITLY re-apply (the drift gate, the checksum harvest, the part-name stamp)
+is `gap` when unproven — that is exactly the class that bites. Process rule:
+**any new per-export feature (a gate, an integrity record, a stamp, a warning)
+gets a cell PER RUNNER in the runner-coverage matrix — `test` where a per-runner
+test proves it, `na` only when it is shared-seam or structurally inapplicable,
+never a silent omission.** Sibling ledgers strengthened the same rounds:
+`durability-ordering-matrix` grew a `keyset` column + the repair-sidecar /
+M8-quarantine rows; `csv-fidelity-matrix` (new) captures the text-writer class
+(silent value loss vs escape-corruption) Parquet's binary path never exercises.
+
+Two anti-patterns from the same rounds are LINT-shaped, not matrix-shaped — they
+are a LOCAL code smell, so they live here as a review rule, not a cross-product
+cell: (1) **config-clobber** — an unconditional `tuning.X = cfg.X` assignment of
+an `Option` field that has a protective profile DEFAULT treats the field's
+ABSENCE as "disable" (round-8: a bare `tuning: {profile: fast}` clobbered
+Balanced's `Some(32)` memory cap to `None`, ~3× PG RSS). Guard the merge with
+`is_some()` like its siblings. (2) **self-oracle** — a test (or a checksum) that
+derives its `expected` from the SAME code it guards cannot catch the bug (round-7:
+the CSV timestamp test recomputed `expected` with the same flawed split, and side
+A of the value-checksum shares the writer's own rendering). A value-rendering
+test needs an INDEPENDENT oracle: a hard-coded expected string, or a re-read
+through a different reader (DuckDB).

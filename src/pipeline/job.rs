@@ -9,7 +9,7 @@ use crate::state::StateStore;
 
 use super::RunOptions;
 use super::chunked::{self, run_chunked_parallel_checkpoint};
-use super::single::run_with_reconnect;
+use super::single::{commit_incremental_cursor, run_with_reconnect};
 use super::summary::RunSummary;
 use crate::journal::RunEvent;
 
@@ -75,7 +75,17 @@ fn run_chunked_quality_gate(
 ) -> Result<()> {
     result?;
 
-    if !matches!(plan.strategy, ExtractionStrategy::Chunked(_)) {
+    // The MULTI-PART runners — chunked AND keyset (which also backs parallel-Mongo,
+    // routed through the Keyset strategy) — own their own execution loop and never
+    // reach single mode's per-part sink.run_quality_checks(). So the run-wide
+    // row_count completeness gate (row_count_min, Severity::Fail → exit 3) must run
+    // HERE for all of them. It was Chunked-only, so a truncated keyset/parallel
+    // extract (the paths auto-selected for LARGE tables, where completeness matters
+    // most) exited 0/success with the tripwire silently disarmed.
+    if !matches!(
+        plan.strategy,
+        ExtractionStrategy::Chunked(_) | ExtractionStrategy::Keyset(_)
+    ) {
         return Ok(());
     }
     let qc = match &plan.quality {
@@ -89,7 +99,7 @@ fn run_chunked_quality_gate(
 
     if has_unsupported {
         log::warn!(
-            "export '{}': quality checks null_ratio_max and unique_columns are not supported in chunked mode (each chunk processes independently); only row_count bounds are checked",
+            "export '{}': quality checks null_ratio_max and unique_columns are not supported on the multi-part runners (chunked / keyset / parallel-Mongo) — each part processes independently; only row_count bounds are checked",
             plan.export_name
         );
     }
@@ -107,7 +117,7 @@ fn run_chunked_quality_gate(
         let fails: Vec<&str> = row_issues.iter().map(|i| i.message.as_str()).collect();
         return Err(DataIntegrityError::new(crate::quality::failure_message(
             &plan.export_name,
-            Some("chunked aggregate"),
+            Some("multi-part aggregate"),
             &fails,
         ))
         .into());
@@ -568,6 +578,26 @@ pub(super) fn run_export_job(
     // failed.  The notification fires last so it carries the most complete
     // summary.
     finalize_manifest(&plan, state, &summary, "export");
+    // Round-2 audit #12: advance the incremental cursor now that the destination
+    // manifest is durable — never before. A failure here is at-least-once safe (the
+    // data + manifest are durable; the next run re-exports from the prior cursor),
+    // so log loudly rather than fail a run whose write cycle already succeeded.
+    if let Err(e) = commit_incremental_cursor(state, &plan, &summary) {
+        log::error!(
+            "export '{}': cursor advance failed AFTER the manifest was written — the next run \
+             re-exports from the prior cursor (at-least-once, no loss): {:#}",
+            summary.export_name,
+            e
+        );
+    }
+    // Round-5: a keyset checkpoint run has now finalized its COMPLETE destination
+    // manifest — clear the in-progress run_id (persisted for crash rehydration) so a
+    // later run isn't treated as a resume of this finished one. Clearing AFTER the
+    // manifest write is the same ordering as the cursor advance: a crash before here
+    // leaves resume_run_id set, so the next run rehydrates rather than orphans.
+    if !failed && matches!(plan.strategy, ExtractionStrategy::Keyset(_)) {
+        let _ = state.clear_resume_run_id(&summary.export_name);
+    }
     if plan.validate {
         finalize_validate_manifest(&plan, &mut summary, "export");
     }
@@ -673,6 +703,16 @@ pub(crate) fn run_export_job_with_chunk_source(
 
     summary.print();
     finalize_manifest(plan, state, &summary, "apply");
+    // Round-2 audit #12: incremental cursor advance AFTER the manifest is durable
+    // (see run_export_job). No-op for the chunked/Precomputed apply path.
+    if let Err(e) = commit_incremental_cursor(state, plan, &summary) {
+        log::error!(
+            "apply '{}': cursor advance failed AFTER the manifest was written — the next run \
+             re-exports from the prior cursor (at-least-once, no loss): {:#}",
+            summary.export_name,
+            e
+        );
+    }
     if plan.validate {
         finalize_validate_manifest(plan, &mut summary, "apply");
     }
@@ -878,7 +918,7 @@ mod tests {
             run_chunked_quality_gate(Ok(()), &plan, &mut summary).expect_err("below min must fail");
         let msg = err.to_string();
         assert!(
-            msg.contains("quality check(s) failed") && msg.contains("chunked aggregate"),
+            msg.contains("quality check(s) failed") && msg.contains("multi-part aggregate"),
             "error must name the failed quality gate: {err}"
         );
         assert!(
@@ -891,6 +931,32 @@ mod tests {
             err.downcast_ref::<DataIntegrityError>().is_some(),
             "chunked quality-gate failure must be a typed data-integrity error"
         );
+        assert_eq!(crate::error::classify_exit(&err), 3);
+        assert_eq!(summary.quality_passed, Some(false));
+    }
+
+    #[test]
+    fn keyset_quality_gate_row_count_below_min_fails() {
+        // RED before the guard broadened Chunked → Chunked|Keyset: keyset (and
+        // parallel-Mongo, which is the Keyset strategy) early-returned Ok, so the
+        // row_count_min tripwire was SILENTLY DISARMED on the large-table runners —
+        // a truncated extract exited 0/success. The gate must fire (exit 3) here too.
+        let mut plan = chunked_plan_with_quality(Some(QualityConfig {
+            row_count_min: Some(100),
+            row_count_max: None,
+            null_ratio_max: Default::default(),
+            unique_columns: Vec::new(),
+            unique_max_entries: None,
+        }));
+        plan.strategy = ExtractionStrategy::Keyset(crate::plan::KeysetPlan {
+            key_column: "id".into(),
+            chunk_size: 500,
+            checkpoint: false,
+            parallel: 1,
+        });
+        let mut summary = fresh_summary(&plan, 42);
+        let err = run_chunked_quality_gate(Ok(()), &plan, &mut summary)
+            .expect_err("keyset below-min must FAIL, not silently pass");
         assert_eq!(crate::error::classify_exit(&err), 3);
         assert_eq!(summary.quality_passed, Some(false));
     }

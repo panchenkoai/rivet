@@ -47,6 +47,12 @@ pub(crate) struct KeysetPage {
     pub(crate) rows: usize,
     pub(crate) schema: Option<arrow::datatypes::Schema>,
     pub(crate) next_cursor: Option<String>,
+    /// This page's sink's per-column Form B value checksums — XOR-combined
+    /// run-wide by `run_keyset` so the finalize manifest records Form B (previously
+    /// dropped here, making `rivet validate`'s re-read a no-op on keyset exports).
+    pub(crate) column_checksums: std::collections::BTreeMap<String, u64>,
+    /// The key-column name the checksums are keyed on (constant across pages).
+    pub(crate) checksum_key_column: Option<String>,
 }
 
 /// Read ONE seek page: `find`-and-seek from `cursor` (or the range floor), write
@@ -99,6 +105,7 @@ pub(crate) fn read_keyset_page(
         plan.validate.then_some(plan.format),
         |idx, count| super::commit::part_indexed_name(part_base, idx, count),
     )?;
+    let checksum_key_column = sink.checksum_key_col.and(sink.cursor_column.clone());
     Ok(Some(KeysetPage {
         parts,
         rows,
@@ -106,6 +113,8 @@ pub(crate) fn read_keyset_page(
         // The source's own lossless token (Mongo BSON `_id`) when it reported
         // one, else the column-extracted string (every SQL engine).
         next_cursor: sink.effective_cursor(),
+        column_checksums: std::mem::take(&mut sink.column_checksums),
+        checksum_key_column,
     }))
 }
 
@@ -144,7 +153,39 @@ pub(crate) fn run_keyset(
     } else {
         None
     };
+
+    // Round-5 (keyset checkpoint-resume manifest completeness — the sibling of the
+    // chunked fix): a crash mid-keyset leaves pages durably committed (parquet +
+    // file_log) with NO destination manifest; on resume the page loop continues from
+    // the cursor and skips them, so finalize would write a manifest of ONLY this
+    // run's pages, orphaning the pre-crash pages from the manifest-authoritative
+    // loader. export_state now persists the in-progress run_id: REUSE it across
+    // resumes so every page lives under ONE run_id in file_log, and reconstruct the
+    // already-committed pages into this run's manifest. Cleared by the caller once
+    // finalize writes the complete manifest.
+    if kp.checkpoint
+        && let Some(st) = state
+    {
+        match st.get_resume_run_id(&plan.export_name)? {
+            Some(rid) => {
+                summary.run_id = rid.clone();
+                super::chunked::rehydrate_manifest_parts_from_file_log(st, &rid, summary)?;
+            }
+            None => st.set_resume_run_id(&plan.export_name, &summary.run_id)?,
+        }
+    }
+
     let mut pages: usize = 0;
+    // Captured once from the first non-empty page for the post-run on_schema_drift
+    // gate: keyset owns its runner (run_single_export early-returns here), so the
+    // drift check single mode applies must be applied here too.
+    let mut drift_schema: Option<arrow::datatypes::Schema> = None;
+    // Form B: XOR-combine each page's per-column checksums run-wide (order-
+    // independent), then harvest once after the loop — so the finalize manifest
+    // records Form B and `rivet validate` can re-verify keyset exports too.
+    let mut checksums_acc: std::collections::BTreeMap<String, u64> =
+        std::collections::BTreeMap::new();
+    let mut checksum_key_column: Option<String> = None;
 
     // Destination + manifest-mode guard (Finding #44) + run-unique part stamp are
     // fixed for the whole run — hoisted out of the page loop. Millisecond stamp:
@@ -175,6 +216,14 @@ pub(crate) fn run_keyset(
         // non-empty page; idempotent run-wide.
         if let Some(sc) = &page.schema {
             manifest_writer::record_run_schema_fingerprint(summary, sc);
+            if drift_schema.is_none() {
+                drift_schema = Some(sc.clone());
+            }
+        }
+        // Form B: fold this page's checksums into the run-wide XOR accumulator.
+        super::commit::accumulate_column_checksums(&mut checksums_acc, &page.column_checksums);
+        if checksum_key_column.is_none() {
+            checksum_key_column = page.checksum_key_column.clone();
         }
         summary.total_rows += page.rows as i64;
         if plan.validate {
@@ -200,6 +249,10 @@ pub(crate) fn run_keyset(
         {
             st.update(&plan.export_name, v)?;
         }
+        // Fault point: page durably committed (parts + file_log + cursor advanced),
+        // NO destination manifest yet — a crash here must be resume-recoverable
+        // MANIFEST-DRIVEN (round-5): the resume rehydrates this page from file_log.
+        crate::test_hook::maybe_panic_at(&format!("after_keyset_page:{pages}"));
         log::info!(
             "export '{}': keyset page {} — {} rows",
             plan.export_name,
@@ -229,11 +282,29 @@ pub(crate) fn run_keyset(
         }
     }
 
+    // Form B: record the run-wide XOR-combined checksums so finalize writes them.
+    super::commit::harvest_column_checksums(summary, checksums_acc, checksum_key_column);
+
     log::info!(
         "export '{}': keyset complete — {} page(s), {} rows",
         plan.export_name,
         pages,
         summary.total_rows
     );
+
+    // on_schema_drift gate — run_single_export applies this, but keyset returns
+    // through its own runner and never reached it, so an opted-in
+    // `on_schema_drift: fail` silently returned exit 0 on a drifted schema for the
+    // headline large-table path. Mirror single mode: compare the run's resolved
+    // schema against the stored fingerprint once, post-run.
+    if let (Some(sc), Some(st)) = (&drift_schema, state) {
+        super::schema_drift::check_from_sink_schema(
+            st,
+            &plan.export_name,
+            sc,
+            plan.schema_drift_policy,
+            summary,
+        )?;
+    }
     Ok(())
 }

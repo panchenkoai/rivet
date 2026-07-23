@@ -1,0 +1,64 @@
+# URL & credential-safety matrix — the userinfo handling that has regressed
+# THREE times, each invisible to the point tests and caught only by an adversarial
+# audit round:
+#   * round-1: build_url_from_fields percent-ENCODEd userinfo but MSSQL's
+#     hand-rolled parser never DECODEd it → special-char passwords broke auth.
+#   * round-3: redact_pg_url bounded the '@' search to the authority, so a raw
+#     '/','?','#' in the password truncated it and LEAKED the cleartext secret.
+#   * building this matrix: the GENERAL log redactor (redact_secrets →
+#     try_redact_at) had the SAME '/'-in-password leak on every logged URL.
+#
+# The class is now drift-guarded at the infra level (tests/offline/
+# chunking_matrix_guard.rs): a redaction/URL change that reopens the leak, or a
+# new engine/URL-shape that isn't covered, fails CI — cheaper than an audit round.
+#
+# A cell is EXACTLY one of:
+#   test: <fn>  — a unit/integration test guards it; the guard asserts <fn> exists.
+#   na:   <why> — structurally not applicable (a driver crate owns the parse, or
+#                 the seam does not exist for this engine).
+#   gap:  <why> — a rivet-owned invariant that SHOULD be tested, isn't.
+#
+# Honest scope: the ROUND-TRIP parse is rivet-owned only for SQL Server (the
+# other three drivers percent-decode the URL themselves), so those cells are na.
+# REDACTION is engine-agnostic (one redactor per seam handles every scheme), so a
+# single data-driven test (`redact_secrets_url_safety_matrix`) covers all four
+# scheme columns for the general log seam — the cell references it per engine so a
+# dropped scheme is still visible.
+
+engines: [postgres, mysql, mssql, mongo]
+
+scenarios:
+  - id: userinfo_roundtrip
+    what: "a structured user/password survives build_url_from_fields -> the engine's URL parser as EXACT plaintext (/ : @ ? # %). Round-1 regressed MSSQL here."
+    postgres: { na: "tokio-postgres Client::connect(url) percent-decodes the userinfo per RFC-3986; rivet owns no userinfo parser to regress" }
+    mysql:    { na: "mysql Opts::from_url percent-decodes the userinfo; rivet owns no userinfo parser" }
+    mssql:    { test: mssql_url_from_fields_roundtrips_through_parse_mssql_url }
+    mongo:    { na: "mongodb ClientOptions::parse decodes the userinfo per the connection-string spec; rivet owns no userinfo parser" }
+
+  - id: encode_userinfo_at_construction
+    what: "build_url_from_fields percent-encodes userinfo so a raw / @ : ? # cannot make the URL ambiguous (break the driver) or defeat redaction."
+    postgres: { test: build_url_percent_encodes_userinfo_so_delimiters_cant_leak }
+    mysql:    { na: "one shared USERINFO percent-encode set for every scheme (config/source.rs::USERINFO); the postgres cell exercises the shared code path" }
+    mssql:    { test: mssql_url_from_fields_roundtrips_through_parse_mssql_url }
+    mongo:    { na: "shared USERINFO encode; exercised by the postgres cell" }
+
+  - id: redact_delimiter_password_general
+    what: "the GENERAL log redactor (redact_secrets — every log line passes through it) masks a password containing a raw / ? # @ : . Regressed while building this matrix."
+    postgres: { test: redact_secrets_url_safety_matrix }
+    mysql:    { test: redact_secrets_url_safety_matrix }
+    mssql:    { test: redact_secrets_url_safety_matrix }
+    mongo:    { test: redact_secrets_url_safety_matrix }
+
+  - id: redact_delimiter_password_state_url
+    what: "the PG state-backend redactor (redact_pg_url) masks a RIVET_STATE_URL password with a raw / ? # . Round-3 regressed here."
+    postgres: { test: redact_pg_url_password_with_raw_delimiters_does_not_leak }
+    mysql:    { na: "the state backend is SQLite or PostgreSQL only — there is no mysql state URL / redact_pg_url path" }
+    mssql:    { na: "no mssql state URL" }
+    mongo:    { na: "no mongo state URL" }
+
+  - id: redact_stray_at_in_query
+    what: "a stray '@' in the path/query does not extend the userinfo match and echo the password (the RFC-legal ?opt=a@b shape)."
+    postgres: { test: redact_pg_url_stray_at_in_query_does_not_leak_password }
+    mysql:    { test: redact_secrets_url_safety_matrix }
+    mssql:    { test: redact_secrets_url_safety_matrix }
+    mongo:    { test: redact_secrets_url_safety_matrix }

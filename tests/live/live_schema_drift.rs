@@ -174,6 +174,117 @@ exports:
 
 #[test]
 #[ignore = "live: requires docker compose postgres"]
+fn keyset_export_enforces_on_schema_drift_fail() {
+    // run_keyset owns its own runner (run_single_export early-returns into it), so
+    // the on_schema_drift gate single mode applies must be wired here too. Pre-fix
+    // a keyset export — rivet's headline large-table path — with
+    // `on_schema_drift: fail` returned exit 0 on a drifted schema: the opted-in
+    // guardrail was silently absent. RED before the drift check in run_keyset.
+    require_alive(LiveService::Postgres);
+    let table_name = unique_name("keyset_drift");
+    let mut c = pg_connect();
+    // TEXT primary key → chunked mode auto-selects KEYSET (range chunking needs a
+    // numeric key). `tmp_col` is dropped between runs to force structural drift.
+    c.batch_execute(&format!(
+        "CREATE TABLE {table_name} (k TEXT PRIMARY KEY, name TEXT NOT NULL, tmp_col INT DEFAULT 0);
+         INSERT INTO {table_name} (k, name) VALUES ('a','x'), ('b','y'), ('c','z');"
+    ))
+    .unwrap();
+    let _guard = PgCleanup(table_name.clone());
+
+    let export_name = unique_name("keyset_drift_exp");
+    let out = tempfile::tempdir().unwrap();
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let yaml = format!(
+        r#"
+source: {{type: postgres, url: "{POSTGRES_URL}"}}
+exports:
+  - name: {export_name}
+    table: {table_name}
+    mode: chunked
+    chunk_by_key: k
+    chunk_size: 2
+    on_schema_drift: fail
+    format: parquet
+    destination: {{type: local, path: {dir}}}
+"#,
+        dir = out.path().display()
+    );
+    let cfg = write_config(&cfg_dir, &yaml);
+
+    assert!(
+        run_rivet_export(&cfg, &export_name).status.success(),
+        "run 1 (records the schema) must succeed"
+    );
+
+    c.batch_execute(&format!("ALTER TABLE {table_name} DROP COLUMN tmp_col;"))
+        .unwrap();
+
+    let r2 = run_rivet_export(&cfg, &export_name);
+    assert!(
+        !r2.status.success(),
+        "a keyset export with `on_schema_drift: fail` must FAIL (exit 4) on a dropped \
+         column — got success, so the drift gate is not enforced in the keyset runner.\n\
+         stderr:\n{}",
+        String::from_utf8_lossy(&r2.stderr)
+    );
+}
+
+/// Sibling of the keyset case for the CHUNKED (range) runner: an INTEGER
+/// chunk_column routes to range chunking (chunked/exec.rs), a different runner.
+/// `on_schema_drift: fail` must trip (exit 4) on a dropped column there too.
+/// (runner-coverage-matrix schema_drift_gate: chunked-range cell.)
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn chunked_range_export_enforces_on_schema_drift_fail() {
+    require_alive(LiveService::Postgres);
+    let table_name = unique_name("chunked_drift");
+    let mut c = pg_connect();
+    c.batch_execute(&format!(
+        "CREATE TABLE {table_name} (id BIGINT PRIMARY KEY, name TEXT NOT NULL, tmp_col INT DEFAULT 0);
+         INSERT INTO {table_name} (id, name) VALUES (1,'x'), (2,'y'), (3,'z'), (4,'w');"
+    ))
+    .unwrap();
+    let _guard = PgCleanup(table_name.clone());
+
+    let export_name = unique_name("chunked_drift_exp");
+    let out = tempfile::tempdir().unwrap();
+    let cfg_dir = tempfile::tempdir().unwrap();
+    // Integer chunk_column → RANGE chunking (the chunked runner, not keyset).
+    let yaml = format!(
+        r#"
+source: {{type: postgres, url: "{POSTGRES_URL}"}}
+exports:
+  - name: {export_name}
+    table: {table_name}
+    mode: chunked
+    chunk_column: id
+    chunk_size: 2
+    on_schema_drift: fail
+    format: parquet
+    destination: {{type: local, path: {dir}}}
+"#,
+        dir = out.path().display()
+    );
+    let cfg = write_config(&cfg_dir, &yaml);
+
+    assert!(
+        run_rivet_export(&cfg, &export_name).status.success(),
+        "run 1 (records the schema) must succeed"
+    );
+    c.batch_execute(&format!("ALTER TABLE {table_name} DROP COLUMN tmp_col;"))
+        .unwrap();
+    let r2 = run_rivet_export(&cfg, &export_name);
+    assert!(
+        !r2.status.success(),
+        "a chunked (range) export with `on_schema_drift: fail` must FAIL on a dropped column; \
+         stderr:\n{}",
+        String::from_utf8_lossy(&r2.stderr)
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
 fn stable_schema_across_runs_reports_no_drift() {
     // Negative control: no schema change between runs → `schema_changed`
     // must be Some(false) (drift explicitly not detected), NOT None.

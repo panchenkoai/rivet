@@ -968,6 +968,128 @@ exports:
     );
 }
 
+// Unchanged-TOAST corruption (graph-surfaced), end to end. An UPDATE that leaves
+// an externally-stored TOAST column untouched renders it as the unquoted
+// `unchanged-toast-datum` marker in the new tuple — the value is NOT in the WAL.
+// With REPLICA IDENTITY FULL the real value rides the `old-key` pre-image; rivet
+// must recover it by NAME and NEVER write the literal marker string as data
+// (the same silent-corruption class as the uuid→null loss caught live on GCS).
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical)"]
+fn pg_cdc_unchanged_toast_recovers_from_replica_identity_full() {
+    use postgres::NoTls;
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("cdc_toast_full");
+    let slot = unique_name("rivet_toast_full_slot");
+    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
+    // EXTERNAL storage forces out-of-line TOAST (no compression); FULL puts the
+    // pre-image value in `old-key`, so the unchanged column is recoverable.
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {tbl}; \
+         CREATE TABLE {tbl} (id INT PRIMARY KEY, small TEXT, big TEXT); \
+         ALTER TABLE {tbl} ALTER COLUMN big SET STORAGE EXTERNAL; \
+         ALTER TABLE {tbl} REPLICA IDENTITY FULL;"
+    ))
+    .unwrap();
+    c.execute(
+        "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+        &[&slot],
+    )
+    .unwrap();
+    // Incompressible >2KB value → genuine external TOAST; then touch only `small`
+    // so `big` decodes as the unchanged-toast marker in the new tuple.
+    c.batch_execute(&format!(
+        "INSERT INTO {tbl} (id, small, big) VALUES \
+           (1, 'a', (SELECT string_agg(md5(g::text || random()::text), '') \
+                     FROM generate_series(1, 200) g)); \
+         UPDATE {tbl} SET small = 'b' WHERE id = 1;"
+    ))
+    .unwrap();
+    let real: String = c
+        .query_one(&format!("SELECT big FROM {tbl} WHERE id = 1"), &[])
+        .unwrap()
+        .get(0);
+
+    let out = d.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let batches = Rig::pg_cdc(&tbl, &slot).dest_path(out).run_and_read();
+
+    use arrow::array::{Array, StringArray};
+    let mut bigs = Vec::new();
+    for b in &batches {
+        let idx = b.schema().index_of("big").expect("big column present");
+        let arr = b
+            .column(idx)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("big is a string column");
+        for i in 0..arr.len() {
+            if !arr.is_null(i) {
+                bigs.push(arr.value(i).to_string());
+            }
+        }
+    }
+    assert!(
+        !bigs.iter().any(|v| v == "unchanged-toast-datum"),
+        "the literal TOAST marker must NEVER be written as data; got {bigs:?}"
+    );
+    assert!(
+        bigs.iter().filter(|v| **v == real).count() >= 2,
+        "both the INSERT and the recovered UPDATE row must carry the real value"
+    );
+
+    let _ = c.execute(&format!("SELECT pg_drop_replication_slot('{slot}')"), &[]);
+    let _ = c.batch_execute(&format!("DROP TABLE IF EXISTS {tbl}"));
+}
+
+// The DEFAULT replica-identity case: the pre-image carries only the key, so the
+// unchanged externally-stored value is nowhere in the WAL. rivet must fail LOUD
+// (never fabricate the marker as data) and name the upstream fix, not silently
+// corrupt or null the column.
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical)"]
+fn pg_cdc_unchanged_toast_without_full_identity_fails_loud() {
+    use postgres::NoTls;
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("cdc_toast_default");
+    let slot = unique_name("rivet_toast_default_slot");
+    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
+    // EXTERNAL storage but DEFAULT replica identity (PK only) — no pre-image value.
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {tbl}; \
+         CREATE TABLE {tbl} (id INT PRIMARY KEY, small TEXT, big TEXT); \
+         ALTER TABLE {tbl} ALTER COLUMN big SET STORAGE EXTERNAL;"
+    ))
+    .unwrap();
+    c.execute(
+        "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+        &[&slot],
+    )
+    .unwrap();
+    c.batch_execute(&format!(
+        "INSERT INTO {tbl} (id, small, big) VALUES \
+           (1, 'a', (SELECT string_agg(md5(g::text || random()::text), '') \
+                     FROM generate_series(1, 200) g)); \
+         UPDATE {tbl} SET small = 'b' WHERE id = 1;"
+    ))
+    .unwrap();
+
+    let out = d.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let err = Rig::pg_cdc(&tbl, &slot).dest_path(out).run_expect_fail();
+    assert!(
+        err.contains("unchanged-TOAST"),
+        "must fail loud on an unrecoverable TOAST datum; got: {err}"
+    );
+    assert!(
+        err.contains("REPLICA IDENTITY FULL"),
+        "must name the upstream fix; got: {err}"
+    );
+
+    let _ = c.execute(&format!("SELECT pg_drop_replication_slot('{slot}')"), &[]);
+    let _ = c.batch_execute(&format!("DROP TABLE IF EXISTS {tbl}"));
+}
+
 #[test]
 #[ignore = "live: requires docker compose postgres (wal_level=logical)"]
 fn pg_cdc_non_iso_datestyle_and_escape_bytea_match_batch() {
@@ -1557,6 +1679,77 @@ exports:
         "streamed parquet must hold exactly the post-snapshot change (not just a count of 1)"
     );
     assert_eq!(snap_parts(), 1, "run 2 must NOT re-snapshot");
+}
+
+// Load parity: the `initial: snapshot` leg and the CDC stream BOTH feed one
+// `<table>__changes` log (snapshot rows with __op/__pos/__seq NULL), and the
+// current-state view is `SELECT * EXCEPT(__op,__pos,__seq,__rn)`. batch-only
+// meta_columns injected on the snapshot leg ONLY would give it columns the CDC
+// parquet lacks — appending both into one `__changes` table then mismatches
+// (the exact "read CDC, backfill history via batch, load breaks because columns
+// don't match" failure). The synth snapshot must therefore drop meta_columns.
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
+fn cdc_initial_snapshot_leg_drops_batch_meta_columns_for_load_parity() {
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("cdc_init_meta");
+    let mut c = conn();
+    c.query_drop(format!("DROP TABLE IF EXISTS {tbl}")).unwrap();
+    c.query_drop(format!("CREATE TABLE {tbl} (id INT PRIMARY KEY, v INT)"))
+        .unwrap();
+    let _guard = Table(tbl.clone());
+    c.query_drop(format!("INSERT INTO {tbl} VALUES (1,10),(2,20)"))
+        .unwrap();
+
+    let out = d.path().join("out");
+    let ckpt = d.path().join("cdc.ckpt");
+    std::fs::create_dir_all(&out).unwrap();
+    // The CDC export REQUESTS batch meta columns — they must be dropped from the
+    // snapshot leg so its parquet matches the CDC stream's columns.
+    let yaml = format!(
+        r#"source: {{type: mysql, url: "{MYSQL_CDC_URL}"}}
+exports:
+  - name: {tbl}
+    table: {tbl}
+    mode: cdc
+    format: parquet
+    meta_columns: {{ exported_at: true, row_hash: true }}
+    cdc: {{ initial: snapshot, checkpoint: "{ckpt}", until_current: true, server_id: {sid} }}
+    destination: {{ type: local, path: "{out}" }}
+"#,
+        ckpt = ckpt.display(),
+        out = out.display(),
+        sid = server_id_for(&tbl),
+    );
+    let cfg = write_config(&d, &yaml);
+    run_rivet_ok(&cfg);
+
+    let snap = out.join("snapshot");
+    let snap_cols: Vec<String> = parquet_fields(&snap).into_iter().map(|(n, _)| n).collect();
+    assert!(
+        !snap_cols.iter().any(|c| c.starts_with("__rivet")),
+        "snapshot leg must NOT carry batch meta columns (load parity with the CDC \
+         stream's __changes append); got {snap_cols:?}"
+    );
+    assert!(
+        snap_cols.iter().any(|c| c == "id") && snap_cols.iter().any(|c| c == "v"),
+        "snapshot leg still carries the source columns; got {snap_cols:?}"
+    );
+
+    // Stream a post-snapshot change and confirm the CDC parquet's DATA columns
+    // are exactly the snapshot's (the loader adds __op/__pos/__seq on top) — so
+    // the two parquets append into one `__changes` log without a mismatch.
+    c.query_drop(format!("INSERT INTO {tbl} VALUES (3,30)"))
+        .unwrap();
+    run_rivet_ok(&cfg);
+    let cdc_cols: Vec<String> = parquet_fields(&out).into_iter().map(|(n, _)| n).collect();
+    let cdc_data: Vec<&String> = cdc_cols.iter().filter(|c| !c.starts_with("__")).collect();
+    let snap_data: Vec<&String> = snap_cols.iter().filter(|c| !c.starts_with("__")).collect();
+    assert_eq!(
+        cdc_data, snap_data,
+        "the CDC stream's data columns must equal the snapshot's — else the shared \
+         __changes append mismatches"
+    );
 }
 
 // Roast finding #28 (feature composition): ensure_anchor ran with

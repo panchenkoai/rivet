@@ -34,7 +34,7 @@ use crate::manifest::{
     PartStatus, RunManifest,
 };
 use crate::pipeline::commit::{PartRecord, write_part_file};
-use crate::pipeline::manifest_writer::write_manifest;
+use crate::pipeline::manifest_writer::{write_manifest, write_manifest_without_success_marker};
 use crate::source::cdc::value::{self, RivetValue};
 use crate::source::cdc::{ChangeEvent, ChangeOp, ChangeStream, Position, TxnSeq};
 use crate::types::{TypeMapping, build_arrow_field};
@@ -184,6 +184,8 @@ fn roll_all(
     checkpoint: Option<&Path>,
     last_commit: &Option<Position>,
     unacked_commit: &mut bool,
+    run_id: &str,
+    started_at: &str,
 ) -> Result<()> {
     for s in sinks.iter_mut() {
         s.flush_buffered(engine, format, run_token)?;
@@ -192,11 +194,31 @@ fn roll_all(
     // crash here must re-read on resume (at-least-once) — never lose the change.
     crate::test_hook::maybe_panic_at("cdc_after_flush_before_ack");
     if *unacked_commit && let Some(p) = last_commit {
+        // Round-2 audit #11: make the just-flushed parts durably manifest-covered
+        // BEFORE the checkpoint/ack advances past them. The ack advances a consume-
+        // on-read slot (PG) irreversibly; the manifest-authoritative `rivet load`
+        // only loads parts a `Success` manifest declares — so without this, a crash
+        // in the ack→terminal-manifest window would orphan the acked parts (silent,
+        // count-gate-invisible loss). A `Success` run-unique manifest (no `_SUCCESS`
+        // marker yet — the prefix is not complete) is idempotently rewritten as a
+        // superset each roll; the terminal write at clean end adds `_SUCCESS`.
+        for s in sinks.iter() {
+            let manifest = build_manifest(
+                engine,
+                &s.column_sums,
+                &s.out,
+                format,
+                run_id,
+                started_at,
+                &s.parts,
+            );
+            write_manifest_without_success_marker(s.out.dest, &manifest)?;
+        }
         if let Some(ck) = checkpoint {
             p.save(ck)?;
         }
-        // Fault point: checkpoint persisted, source NOT acked — a crash here
-        // must re-read (PG would re-peek; the file checkpoint already moved,
+        // Fault point: manifest + checkpoint persisted, source NOT acked — a crash
+        // here must re-read (PG would re-peek; the file checkpoint already moved,
         // so MySQL resumes from it — both are at-least-once).
         crate::test_hook::maybe_panic_at("cdc_after_checkpoint_before_ack");
         stream.ack(p)?;
@@ -300,6 +322,8 @@ pub(crate) fn run_to_files(
                     checkpoint,
                     &last_commit,
                     &mut unacked_commit,
+                    &cfg.run_id,
+                    &cfg.started_at,
                 )?;
                 total_rows = 0;
                 total_bytes = 0;
@@ -327,6 +351,8 @@ pub(crate) fn run_to_files(
                 checkpoint,
                 &last_commit,
                 &mut unacked_commit,
+                &cfg.run_id,
+                &cfg.started_at,
             )?;
             total_rows = 0;
             total_bytes = 0;
@@ -338,9 +364,12 @@ pub(crate) fn run_to_files(
         }
     }
 
-    // Fault point: all parts durable + acked, no manifest yet — a crash here
-    // leaves a resumable prefix (parts without _SUCCESS), and the retry must
-    // complete it without re-capturing acked data.
+    // Fault point: all parts durable + acked, terminal manifest (+`_SUCCESS`) not
+    // yet written. A crash here is recoverable WITHOUT re-capturing acked data:
+    // `roll_all` already wrote a durable `Success` run-unique manifest covering
+    // every acked part before each ack (round-2 audit #11), so the manifest-
+    // authoritative loader still sees those rows; only the `_SUCCESS` completion
+    // marker is missing, which the next cycle's terminal write supplies.
     crate::test_hook::maybe_panic_at("cdc_before_manifest");
 
     // Clean end → write each table's run manifest + _SUCCESS (bounded-run concept).
@@ -822,6 +851,80 @@ mod tests {
         assert!(
             err.to_string().contains("WRONG columns"),
             "must explain the misalignment: {err}"
+        );
+    }
+
+    // Round-2 audit #11: at the instant the slot is acked, a durable `Success`
+    // run-unique manifest covering the just-acked parts MUST already exist on the
+    // destination — otherwise a crash in the ack→terminal-manifest window orphans
+    // those parts from the manifest-authoritative loader (silent row loss). This
+    // stream asserts the invariant from INSIDE `ack`, the exact moment the slot
+    // advances. RED before the pre-ack `write_manifest_without_success_marker`
+    // in `roll_all` (the manifest was written only at clean end, after the ack).
+    struct ManifestBeforeAckStream {
+        events: VecDeque<ChangeEvent>,
+        dest_dir: std::path::PathBuf,
+        ack_count: usize,
+    }
+    impl ChangeStream for ManifestBeforeAckStream {
+        fn next_change(&mut self) -> Option<Result<ChangeEvent>> {
+            self.events.pop_front().map(Ok)
+        }
+        fn ack(&mut self, _position: &Position) -> Result<()> {
+            self.ack_count += 1;
+            // A run-unique manifest copy (`manifest-<run_id>.json`), distinct from
+            // the canonical `manifest.json`, must be durable BEFORE this ack.
+            let manifest_path = std::fs::read_dir(&self.dest_dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .find(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with("manifest-") && n.ends_with(".json"))
+                })
+                .expect("a run-unique manifest must be durable BEFORE the slot ack (#11)");
+            let m: RunManifest =
+                serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+            assert_eq!(
+                m.status,
+                ManifestStatus::Success,
+                "the pre-ack manifest must be Success — the loader ignores non-Success runs"
+            );
+            assert!(
+                m.row_count >= 1,
+                "the pre-ack manifest must cover the acked part's rows, got {}",
+                m.row_count
+            );
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn roast_manifest_is_durable_before_the_slot_is_acked() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = local_dest(&dir);
+        let cols = int_col();
+        let mut stream = ManifestBeforeAckStream {
+            events: VecDeque::from(vec![insert(1), insert(2), insert(3)]),
+            dest_dir: dir.path().to_path_buf(),
+            ack_count: 0,
+        };
+        // rollover=2 over 3 committed events ⇒ ≥1 mid-stream roll+ack, each of
+        // which the stream's `ack` gates on a durable Success manifest.
+        run_to_files(
+            &mut stream,
+            cfg(dest.as_ref(), &cols, FormatType::Parquet, 2),
+        )
+        .unwrap();
+        assert!(
+            stream.ack_count >= 1,
+            "the fixture must exercise at least one ack"
+        );
+        // The clean end still leaves the terminal manifest + _SUCCESS.
+        assert!(
+            dir.path().join("_SUCCESS").exists(),
+            "_SUCCESS at clean end"
         );
     }
 

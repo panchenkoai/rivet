@@ -1,0 +1,82 @@
+# Durability-ordering matrix — the destination artifact is the loader's source of
+# truth (ADR-0001), so the delivery position (cursor / slot-ack) must advance ONLY
+# AFTER the destination manifest is durable, and the canonical manifest.json +
+# _SUCCESS must stay a consistent pair.
+#
+# This class regressed TWICE and both escaped the existing resilience/cdc ledgers,
+# because those crash-recovery cells asserted recovery via a PARQUET GLOB — which
+# sees an orphan part that no manifest references, exactly MASKING the bug:
+#   * round-2 #11: the CDC slot ack advanced past parts before the run manifest was
+#     written → the manifest-authoritative `rivet load` silently dropped them.
+#   * round-2 #12: the incremental cursor advanced before the destination manifest
+#     → the next run skipped parts no manifest recorded.
+#   * round-3 #11-regression: the mid-roll write overwrote the canonical manifest.json
+#     leaving _SUCCESS stale → `rivet validate` flagged fatal SuccessMarkerStale on
+#     intact data.
+#
+# The fix in every case is asserted MANIFEST-DRIVEN (only parts a Success manifest
+# declares — the loader's view), never a parquet glob. This ledger drift-guards
+# that discipline (tests/offline/chunking_matrix_guard.rs).
+#
+# Columns are PIPELINE SHAPES, not source engines. A cell is EXACTLY one of:
+#   test: <fn>  — a test guards it (the guard asserts <fn> exists in src/ or tests/).
+#   na:   <why> — the invariant is structurally absent for this shape (e.g. no
+#                 mid-run manifest write, or state is re-read from chunk_task).
+#   gap:  <why> — a real invariant for this shape that SHOULD be tested, isn't.
+
+engines: [incremental, chunked, keyset, cdc]
+
+scenarios:
+  - id: manifest_durable_before_state_advance
+    what: "the destination manifest covering a run's parts is durable BEFORE the delivery position (cursor / slot-ack / chunk_task / keyset cursor) advances past them — or, where state advances first (chunked/keyset), a resume RECONSTRUCTS a complete manifest before finalize."
+    incremental: { test: crash_after_cursor_commit_is_recoverable_via_a_manifest_driven_read }
+    # Round-4 corrected a FALSE na here: chunk_task DOES advance (completed) before
+    # any destination manifest, so the advance-past-unmanifested-parts window is real;
+    # the fix reconstructs the committed chunks into the finalize manifest on resume.
+    chunked:     { test: chunked_crash_resume_writes_a_complete_destination_manifest }
+    keyset:      { test: keyset_checkpoint_crash_resume_writes_a_complete_destination_manifest }
+    cdc:         { test: roast_manifest_is_durable_before_the_slot_is_acked }
+
+  - id: manifest_driven_recovery
+    what: "a crash at the state-advance boundary recovers with ZERO loss when read MANIFEST-DRIVEN (only parts a Success manifest declares, as `rivet load` reads) — the parquet-glob / file_log path masks the orphan class."
+    incremental: { test: crash_after_cursor_commit_is_recoverable_via_a_manifest_driven_read }
+    # Round-4: the prior na ("no mid-run orphan window") was live-disproven — a
+    # chunked crash before the terminal manifest + resume orphaned the pre-crash
+    # chunk from the destination manifest (silent ~33% loss). Now fixed + asserted
+    # MANIFEST-DRIVEN (reads manifest.json, not file_log/glob).
+    chunked:     { test: chunked_crash_resume_writes_a_complete_destination_manifest }
+    # Round-5: keyset's checkpoint-resume reconstructs the pre-crash pages from the
+    # file_log into the finalize manifest, same class as chunked (both advance a
+    # cursor / commit parts before the terminal manifest).
+    keyset:      { test: keyset_checkpoint_crash_resume_writes_a_complete_destination_manifest }
+    cdc:         { test: cdc_crash_before_manifest_loses_nothing_on_a_manifest_driven_read }
+
+  - id: canonical_success_pair_consistent
+    what: "a mid-run/mid-roll manifest write never overwrites the canonical manifest.json while leaving _SUCCESS (which fingerprints it) stale — validate must not flag SuccessMarkerStale on intact data."
+    incremental: { na: "the incremental path writes canonical manifest.json + _SUCCESS together exactly once, at finalize_manifest — there is no mid-run canonical write to decouple the pair" }
+    chunked:     { na: "same — canonical + _SUCCESS written together only at finalize" }
+    keyset:      { na: "same — keyset writes canonical + _SUCCESS together only at finalize; per-page commits write ONLY the run-unique copy" }
+    cdc:         { test: mid_roll_manifest_write_does_not_touch_canonical_or_success }
+
+  - id: run_unique_sidecar_survives_shared_prefix
+    what: "repeated runs into ONE destination prefix (the until_current scheduler / rapid-incremental model) each keep their immutable run-unique manifest copy — the sidecar is never clobbered by the next run."
+    incremental: { test: roast_rapid_incremental_runs_into_same_prefix_must_not_clobber_prior_parts }
+    chunked:     { na: "chunked parts carry a random nonce (ADR-0009 RR5) and the run-unique manifest copy is written through the same write_manifest seam the incremental + cdc cells exercise" }
+    keyset:      { na: "keyset parts carry a millisecond run-unique stamp (%3f) and the run-unique manifest copy is written through the same write_manifest seam" }
+    cdc:         { test: roast_second_run_into_same_prefix_must_not_clobber_prior_manifest }
+
+  # ── Round-7 additions: the sidecar-consistency + manifest-completeness class,
+  #    caught on the repair command and the chunked M8 resume preamble ──────────
+  - id: repair_updates_the_run_unique_sidecar
+    what: "`rivet repair` re-exports missing parts and MUST update the run-unique manifest-<run_id>.json copy the loader reads, not just the canonical manifest.json — else the loader (manifest-authoritative, prefers the run-unique copy) reads the pre-repair part list and silently drops the repaired rows (round-7 HIGH)."
+    incremental: { na: "there is no `rivet repair` for an incremental delta — a shortfall re-runs from the persisted cursor, re-exporting the missing window rather than patching a manifest" }
+    chunked:     { test: repair_updates_the_run_unique_manifest_copy_not_just_the_canonical }
+    keyset:      { na: "repair patches through the SAME shape-agnostic record_repair_parts_in_manifest seam the chunked cell's offline test exercises directly (it asserts the run-unique copy, not a shape-specific flow)" }
+    cdc:         { na: "CDC has no repair command — at-least-once replay from the un-acked slot position re-delivers a shortfall" }
+
+  - id: resume_never_quarantines_a_committed_part
+    what: "the chunked M8 resume preamble moves 'untracked surplus' objects to _quarantine, but MUST NOT move a part the state DB's file_log records as committed (a resume that committed then crashed before re-finalizing leaves it absent from the stale manifest yet durable) — quarantining it drops the exact rows finalize rehydrates (round-7 MEDIUM silent-loss)."
+    incremental: { na: "the incremental path has no M8 quarantine preamble — a single-shot cursor run has no prior-run surplus to reconcile against a stale manifest" }
+    chunked:     { test: m8_does_not_quarantine_a_part_recorded_in_the_state_file_log }
+    keyset:      { na: "keyset resumes via its own checkpoint (get_resume_run_id + file_log rehydration), not the chunked M8 destination-vs-listing quarantine preamble" }
+    cdc:         { na: "CDC resumes by slot/checkpoint position, not a destination-object quarantine sweep" }

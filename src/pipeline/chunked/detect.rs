@@ -3,7 +3,7 @@
 //! Queries min/max (and optionally COUNT) from the source to compute chunk ranges,
 //! logs sparsity diagnostics, and returns the final `Vec<(i64, i64)>` chunk list.
 
-use super::math::{generate_chunks, strip_simple_projection_from};
+use super::math::{generate_chunks, generate_chunks_checked, strip_simple_projection_from};
 use crate::error::Result;
 use crate::scalar::{parse_date_flexible, parse_scalar_i64};
 use crate::source::Source;
@@ -342,7 +342,11 @@ pub(crate) fn detect_and_generate_chunks(
         }
     );
 
-    let chunks = generate_chunks(min_val, max_val, effective_chunk_size as i64);
+    // Checked variant: refuse an extreme-sparse plan (window count past the
+    // ceiling) BEFORE the `Vec` allocates — the sparse guard below inspects
+    // `chunks.len()` and so is structurally too late to stop the OOM itself.
+    let chunks = generate_chunks_checked(min_val, max_val, effective_chunk_size as i64)
+        .map_err(|e| anyhow::anyhow!("export '{export_name}': {e}"))?;
 
     // Sparsity diagnostic from a SCAN-FREE row estimate (catalog stats), never a
     // full COUNT(*): a full count on a large production table is exactly the

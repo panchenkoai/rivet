@@ -91,6 +91,27 @@ pub fn redact_url_passwords(s: &str) -> String {
 /// If `bytes[i..]` starts a `scheme://userinfo@` pattern with a `:` in
 /// the userinfo (a password segment), return the rewritten prefix and
 /// the new cursor position.  Otherwise return `None`.
+/// The LAST `@` from `start` up to the whitespace boundary (the log-line URL
+/// terminator), or None. The userinfo may itself contain a raw `/ ? # @ :` (a
+/// non-conforming `url:` passthrough / RIVET_STATE_URL / driver-echoed URL), so the
+/// scan must NOT stop at `/ ? #` — the real userinfo terminator is the last `@`
+/// before whitespace. Stopping earlier (an earlier bounded form) leaked a password
+/// with an internal `@` before a `/` (round-4).
+fn scan_last_at(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut k = start;
+    let mut last_at = None;
+    while k < bytes.len() {
+        let b = bytes[k];
+        if b == b'@' {
+            last_at = Some(k);
+        } else if b.is_ascii_whitespace() {
+            break;
+        }
+        k += 1;
+    }
+    last_at
+}
+
 fn try_redact_at(bytes: &[u8], i: usize) -> Option<(String, usize)> {
     // scheme: must start with an ASCII letter
     if !bytes.get(i).is_some_and(|b| b.is_ascii_alphabetic()) {
@@ -110,27 +131,15 @@ fn try_redact_at(bytes: &[u8], i: usize) -> Option<(String, usize)> {
         return None;
     }
     let userinfo_start = j + 3;
-    // Walk the authority until the path/query/fragment/whitespace terminator,
-    // tracking the LAST `@` we cross. A password may itself contain `@`
-    // (`user:p@ssw0rd@host`), so splitting at the FIRST `@` would leak the tail
-    // after it; the userinfo terminator is the last `@` before the path. A raw
-    // `/` in the password would make the URL ambiguous — which is why a
-    // Rivet-constructed URL percent-encodes the userinfo (`build_url_from_fields`),
-    // so the password's `/`/`?`/`#` never appears raw here. `has_colon` must reflect
-    // a `:` *within the userinfo* (before that last `@`), not a host:port colon
-    // after it, so we recompute it from the chosen `@`.
-    let mut k = userinfo_start;
-    let mut last_at: Option<usize> = None;
-    while k < bytes.len() {
-        let b = bytes[k];
-        if b == b'@' {
-            last_at = Some(k);
-        } else if matches!(b, b'/' | b'?' | b'#') || b.is_ascii_whitespace() {
-            break;
-        }
-        k += 1;
-    }
-    let at = last_at?;
+    // The userinfo ends at the LAST `@` before whitespace — DEFAULT-DENY. A password
+    // in a non-conforming URL (raw `url:` / RIVET_STATE_URL / driver-echoed URL, none
+    // percent-encoded) may itself contain `@ / ? #`, so any earlier bound leaks: the
+    // round-3 fix bounded at `/?#` and leaked `pa/ss`; its fail-safe still leaked a
+    // password with an internal `@` before a `/` (round-4). The last `@` before the
+    // whitespace URL-terminator is the one true userinfo boundary. Over-redacts a
+    // pathological host in a rare multi-`@` (query-`@`) URL; never leaks.
+    let at = scan_last_at(bytes, userinfo_start)?;
+    // A `:` before that `@` marks a password segment (bare `user@host` has none).
     let has_colon = bytes[userinfo_start..at].contains(&b':');
     if !has_colon {
         return None;
@@ -173,6 +182,61 @@ pub fn redacted_log_line(timestamp: &str, level: &str, target: &str, message: &s
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── URL-safety matrix: the recurring credential-leak class, at the infra
+    //    level (docs/url-safety-matrix.yaml). The class has regressed THREE times
+    //    (round-1 MSSQL round-trip, round-3 redact_pg_url, and the general redactor
+    //    here), each invisible to point tests. This data-driven test sweeps every
+    //    scheme × hostile-userinfo shape through the general log redactor and
+    //    asserts the secret NEVER survives. Adding a URL shape here is cheaper than
+    //    another audit round; a redaction change that reopens the leak fails CI. ──
+    #[test]
+    fn redact_secrets_url_safety_matrix() {
+        const SECRET: &str = "S3cr3tPw";
+        // Every engine scheme rivet builds/logs.
+        let schemes = ["postgresql", "mysql", "sqlserver", "mongodb"];
+        // Password bodies embedding the secret + a URL delimiter that has
+        // historically defeated a redactor (a raw '/' is in the base64 alphabet;
+        // '@'-before-'/' defeated round-3's fail-safe; ':' defeated the rfind split).
+        let bodies = [
+            SECRET.to_string(),
+            format!("{SECRET}/x"),
+            format!("{SECRET}?x"),
+            format!("{SECRET}#x"),
+            format!("{SECRET}@x"),
+            format!("{SECRET}:x"),
+            format!("pre/{SECRET}"),
+            format!("a/b?c#{SECRET}"),
+            format!("Kp@{SECRET}/x"), // '@' BEFORE '/' (round-4)
+            format!("Kp@{SECRET}?x"),
+            format!("Kp@{SECRET}#x"),
+            format!("a:b:{SECRET}"), // ':'-bearing password (round-4)
+        ];
+        for scheme in schemes {
+            for body in &bodies {
+                // A plain URL, AND a URL with a stray '@' in the query after the host
+                // (the RFC-legal ?opt=a@b shape — the round-4 stray-@ coverage gap).
+                for url in [
+                    format!("{scheme}://user:{body}@host:5432/db"),
+                    format!("{scheme}://user:{body}@host:5432/db?opt=a@b"),
+                ] {
+                    // Bare, inside an error prefix, and mid-log-line (the three real
+                    // shapes a URL reaches the sink in).
+                    for ctx in [
+                        url.clone(),
+                        format!("connect to {url} failed: timeout"),
+                        format!("[2026-07-22 ERROR src] dialing {url} then EOF"),
+                    ] {
+                        let out = redact_secrets(&ctx);
+                        assert!(
+                            !out.contains(SECRET),
+                            "SECRET leaked through redact_secrets\n  scheme={scheme} body={body}\n  in:  {ctx}\n  out: {out}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     // ── redact_url_passwords ───────────────────────────────────────────────
 

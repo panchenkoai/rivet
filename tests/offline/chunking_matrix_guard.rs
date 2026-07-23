@@ -67,6 +67,44 @@ const MATRICES: &[(&str, usize)] = &[
     // (binary protocol decoded by the driver crate, panic-safe field access, or
     // write-only). 0 gaps: the surface Rivet parses is fully covered.
     ("docs/fuzz-matrix.yaml", 0),
+    // URL & credential safety — the userinfo encode/decode/redact class that
+    // regressed THREE times (round-1 MSSQL round-trip, round-3 redact_pg_url, and
+    // the general log redactor), each invisible to point tests. `test:` cells are
+    // round-trip + data-driven redaction sweeps; `na:` cells are driver-owned
+    // parses or state-URL seams that don't exist per engine. 0 gaps.
+    ("docs/url-safety-matrix.yaml", 0),
+    // Durability ordering — the destination manifest is durable BEFORE the delivery
+    // position advances, and the manifest/_SUCCESS pair stays consistent. This class
+    // regressed twice (round-2 #11/#12) and escaped resilience/cdc because their
+    // crash cells asserted via a parquet GLOB, masking the manifest-orphan class;
+    // every `test:` here asserts MANIFEST-DRIVEN (the loader's view). 0 gaps.
+    ("docs/durability-ordering-matrix.yaml", 0),
+    // Config-validation — the accept-but-break class (round-2 #14/#15/#16/#17/#5/#6):
+    // a config that passed validation but silently degraded / died at run. Each
+    // scenario asserts the combo is rejected at CONFIG-LOAD (check == run) AND a
+    // legit form is not false-rejected. 0 gaps.
+    ("docs/config-validation-matrix.yaml", 0),
+    // CSV writer-fidelity — the TEXT-writer class round-7 opened: the CSV writer has
+    // its own value rendering AND escaping that Parquet's binary path never exercises,
+    // and two silent losses lived there (pre-1970 timestamp → empty cell; un-escaped
+    // header split off the data). Columns split silent-value-loss vs escape-corruption;
+    // the value cells assert against an INDEPENDENT oracle (hard-coded string / DuckDB
+    // re-read), not the writer's own rendering (the self-oracle that hid the bug). 0 gaps.
+    ("docs/csv-fidelity-matrix.yaml", 0),
+    // Runner-coverage — every PER-EXPORT feature applied on EVERY runner (single /
+    // chunked / keyset / mongo_parallel), not just single. Round-8 proved the class:
+    // keyset + parallel-Mongo silently dropped the on_schema_drift gate (exit 0 on
+    // drift) because it lived only in single/chunked. Building this ledger surfaced a
+    // bigger hole — value-checksum Form B was ABSENT on all three large-table runners.
+    // Round-9 THREADED Form B through every runner (run-wide XOR harvest via the shared
+    // commit::{accumulate,harvest}_column_checksums seam), each with a live test that
+    // asserts the manifest records it AND `rivet validate` re-reads + matches (6 → 3).
+    // The last 3 then closed: a chunked-range + a parallel-Mongo drift live test, a
+    // parallel-Mongo clobber live test, and mongo schema_drift reclassified `na` (a
+    // Mongo Arrow schema is a fixed {_id, document, meta} shape — the verbatim-blob
+    // document column cannot structurally drift). 0 gaps — every runner × feature cell
+    // is a test or a justified n/a.
+    ("docs/runner-coverage-matrix.yaml", 0),
 ];
 
 #[derive(Deserialize)]

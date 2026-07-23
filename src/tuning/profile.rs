@@ -162,7 +162,21 @@ impl SourceTuning {
             if let Some(v) = cfg.batch_size {
                 tuning.batch_size = v;
             }
-            tuning.batch_size_memory_mb = cfg.batch_size_memory_mb;
+            // Preserve the profile's memory-driven per-batch cap unless the user
+            // RESTATED it. A bare `tuning: {profile: fast}` — or any block that
+            // omits this field (e.g. `{throttle_ms: 100}`) — must NOT silently
+            // disable Balanced's Some(32) / Fast's Some(64), which is what caps
+            // PostgreSQL's Arrow FETCH memory (source/postgres/mod.rs); an
+            // unconditional assign treated the field's ABSENCE as "disable" and
+            // ~3x'd per-batch RSS on wide tables. Only an explicit `batch_size`
+            // (a row cap) drops it, since effective_batch_size prefers the memory
+            // cap when both are present. Mirrors the is_some()-guarded siblings
+            // (min_parallel, max_value_mb) below.
+            if cfg.batch_size_memory_mb.is_some() {
+                tuning.batch_size_memory_mb = cfg.batch_size_memory_mb;
+            } else if cfg.batch_size.is_some() {
+                tuning.batch_size_memory_mb = None;
+            }
             if let Some(v) = cfg.throttle_ms {
                 tuning.throttle_ms = v;
             }
@@ -534,6 +548,52 @@ mod tests {
         assert!((1_000..=150_000).contains(&bs), "got {bs}");
         // 256MB / 266B ≈ 1_009_022, clamped to 150_000
         assert_eq!(bs, 150_000);
+    }
+
+    #[test]
+    fn a_tuning_block_omitting_batch_size_memory_mb_keeps_the_profile_default() {
+        // RED before the is_some() guard: a `tuning:` block that sets any UNRELATED
+        // field (here throttle_ms) clobbered Balanced's Some(32) / Fast's Some(64)
+        // memory-driven per-batch cap to None — treating the field's ABSENCE as
+        // "disable" — which ~3x'd PostgreSQL per-batch Arrow RSS on wide tables.
+        let only_throttle = TuningConfig {
+            throttle_ms: Some(50),
+            ..Default::default()
+        };
+        assert_eq!(
+            SourceTuning::from_config(Some(&only_throttle)).batch_size_memory_mb,
+            Some(32),
+            "an unrelated tuning field must not disable Balanced's memory cap"
+        );
+        let fast = TuningConfig {
+            profile: Some(TuningProfile::Fast),
+            ..Default::default()
+        };
+        assert_eq!(
+            SourceTuning::from_config(Some(&fast)).batch_size_memory_mb,
+            Some(64),
+            "naming the Fast profile must keep its Some(64) memory cap"
+        );
+        // An explicit row cap (batch_size) DOES drop the memory cap — the two are
+        // mutually exclusive and effective_batch_size prefers the memory cap.
+        let rowcap = TuningConfig {
+            batch_size: Some(5_000),
+            ..Default::default()
+        };
+        assert_eq!(
+            SourceTuning::from_config(Some(&rowcap)).batch_size_memory_mb,
+            None,
+            "an explicit batch_size drops the memory cap so the row cap wins"
+        );
+        // An explicit memory value is honored verbatim.
+        let memcap = TuningConfig {
+            batch_size_memory_mb: Some(16),
+            ..Default::default()
+        };
+        assert_eq!(
+            SourceTuning::from_config(Some(&memcap)).batch_size_memory_mb,
+            Some(16)
+        );
     }
 
     #[test]

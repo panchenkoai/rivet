@@ -748,4 +748,28 @@ mod tests {
             "userinfo must be percent-encoded: {url}"
         );
     }
+
+    #[test]
+    fn mssql_url_from_fields_roundtrips_through_parse_mssql_url() {
+        // Round-2 audit #1: the encoding above is only safe if the consumer
+        // decodes it. PG/MySQL/Mongo delegate to a driver URL parser that
+        // percent-decodes; MSSQL's hand-rolled `parse_mssql_url` is the outlier
+        // that must decode itself. Prove the two halves agree: a password with
+        // every URL delimiter survives encode→parse losslessly. RED before the
+        // decode landed in `parse_mssql_url` (it echoed the literal %-bytes).
+        let mut src = make_source(SourceType::Mssql);
+        src.host = Some("db.internal".into());
+        src.user = Some(r"dom\svc".into());
+        src.password = Some("p:a/s@s?w#d!%x".into());
+        src.database = Some("rivet".into());
+        let url = src.resolve_url().expect("mssql url built from fields");
+        let parsed =
+            crate::source::mssql::parse_mssql_url(&url).expect("built mssql url must parse back");
+        assert_eq!(parsed.user, r"dom\svc", "user round-trips");
+        assert_eq!(
+            parsed.password, "p:a/s@s?w#d!%x",
+            "every URL-delimiter char must survive the encode→decode round-trip"
+        );
+        assert_eq!(parsed.database, "rivet");
+    }
 }

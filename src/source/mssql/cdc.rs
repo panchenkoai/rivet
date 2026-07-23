@@ -290,6 +290,9 @@ impl MssqlChangeStream {
         // strictly after the checkpoint LSN, skipping the rest of the same-LSN
         // group). Mirrors PostgreSQL's per-transaction commit marking.
         let mut batch: Vec<(String, ChangeEvent)> = Vec::new();
+        // Round-2 audit #9: running byte footprint — the row cap is a poor bound
+        // when cells are large.
+        let mut batch_bytes = 0usize;
         for r in &rows {
             let mut op_code = 0i32;
             let mut lsn = String::new();
@@ -326,22 +329,21 @@ impl MssqlChangeStream {
                 ChangeOp::Delete => (Some(values), None),
                 _ => (None, Some(values)),
             };
-            batch.push((
-                lsn.clone(),
-                ChangeEvent {
-                    op,
-                    schema: self.schema.clone(),
-                    table: self.table.clone(),
-                    before,
-                    after,
-                    position: Position(json!({ "lsn": lsn })),
-                    // Overridden below — the last row of each start-LSN group is
-                    // the commit boundary.
-                    committed: false,
-                    image_names: Some(std::sync::Arc::from(names)),
-                    seq: 0, // stamped by TxnSeq as the stream is consumed
-                },
-            ));
+            let ev = ChangeEvent {
+                op,
+                schema: self.schema.clone(),
+                table: self.table.clone(),
+                before,
+                after,
+                position: Position(json!({ "lsn": lsn })),
+                // Overridden below — the last row of each start-LSN group is
+                // the commit boundary.
+                committed: false,
+                image_names: Some(std::sync::Arc::from(names)),
+                seq: 0, // stamped by TxnSeq as the stream is consumed
+            };
+            batch_bytes = batch_bytes.saturating_add(ev.estimated_bytes());
+            batch.push((lsn.clone(), ev));
             // Memory backstop (matching MySQL's MAX_TX_ROWS): a transaction is
             // buffered whole (never split across parts), and a single
             // `__$start_lsn` group can be arbitrarily large. Bail loudly rather
@@ -354,6 +356,17 @@ impl MssqlChangeStream {
                      it must be buffered whole (a transaction is never split across parts), so \
                      this would exhaust memory. Split the source transaction, or raise the cap \
                      only if a transaction this large is genuinely expected."
+                );
+            }
+            // Round-2 audit #9: byte backstop — a few large-cell rows stay under
+            // the row cap yet exhaust memory.
+            let byte_cap = crate::source::cdc::max_tx_bytes();
+            if batch_bytes > byte_cap {
+                anyhow::bail!(
+                    "mssql cdc: a single transaction buffered more than {byte_cap} bytes \
+                     (large cells) before its commit — it must be buffered whole, so this would \
+                     exhaust memory. Split the source transaction, or raise RIVET_CDC_MAX_TX_BYTES \
+                     only if a transaction this large is expected."
                 );
             }
         }

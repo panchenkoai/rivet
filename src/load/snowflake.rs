@@ -246,7 +246,7 @@ impl TargetLoader for SnowflakeLoader {
              SELECT COUNT(*) AS BEFORE_ FROM {changes_fqtn};\n\
              COPY INTO {changes_fqtn} ({columns})\n\
              \x20 FROM (SELECT {select} FROM @{stage})\n\
-             \x20 FILE_FORMAT=(FORMAT_NAME=rivet_pq) {files};\n\
+             \x20 FILE_FORMAT=(FORMAT_NAME=rivet_pq) FORCE=TRUE {files};\n\
              SELECT COUNT(*) AS AFTER_ FROM {changes_fqtn};",
             tag = self.query_tag(&changes),
             wh = self.warehouse,

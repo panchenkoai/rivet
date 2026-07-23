@@ -50,6 +50,45 @@ use crate::journal::RunEvent;
 use crate::plan::ResolvedRunPlan;
 use crate::state::StateStore;
 
+/// XOR-accumulate one part/page/chunk sink's per-column value checksums into a
+/// run-wide map. Order-independent (XOR), so chunk/page/worker order and count do
+/// not change the result — the MULTI-PART runners (chunked / keyset / mongo_parallel)
+/// call this per part so Form B is recorded RUN-WIDE, exactly as single mode records
+/// its one sink's map. Without it, those runners computed the checksum per part then
+/// discarded it, so `rivet validate`'s Form-B re-read was a silent no-op on the
+/// large-table paths (see docs/runner-coverage-matrix.yaml `value_checksum_form_b`).
+pub(in crate::pipeline) fn accumulate_column_checksums(
+    acc: &mut std::collections::BTreeMap<String, u64>,
+    part: &std::collections::BTreeMap<String, u64>,
+) {
+    for (name, sum) in part {
+        *acc.entry(name.clone()).or_insert(0) ^= *sum;
+    }
+}
+
+/// Record the run-wide XOR-combined checksums + key column into the summary, so
+/// `finalize_manifest` writes Form B and `rivet validate` can re-verify the
+/// Arrow→Parquet encode / post-write fault Form A cannot see. The single harvest
+/// seam every runner goes through (single mode passes its one sink's map directly;
+/// the multi-part runners pass the accumulated map).
+pub(in crate::pipeline) fn harvest_column_checksums(
+    summary: &mut RunSummary,
+    acc: std::collections::BTreeMap<String, u64>,
+    key_column: Option<String>,
+) {
+    if acc.is_empty() {
+        return;
+    }
+    summary.column_checksums = acc
+        .into_iter()
+        .map(|(name, checksum)| crate::manifest::ColumnChecksum {
+            name,
+            checksum: checksum.to_string(),
+        })
+        .collect();
+    summary.checksum_key_column = key_column;
+}
+
 /// A part written to the destination, ready to be recorded. Produced by
 /// [`write_part_file`], consumed by [`record_part`].
 pub(crate) struct PartRecord {

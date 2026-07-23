@@ -879,6 +879,13 @@ fn prepare_load(
     allow_source_drift: bool,
 ) -> Result<Option<LoadInputs>> {
     let keyed = load::reconcile::fetch_manifests_keyed(store, &plan.gcs_prefix)?;
+    // Refuse a prefix shared by two exports BEFORE selecting/summing/cleaning:
+    // the load sums every manifest here and cleanup wipes the prefix recursively,
+    // so a shared base prefix would cross-contaminate the count and delete a
+    // sibling export's parts (there is no source export_name on the plan to
+    // disambiguate). Covers Full (wrong-export snapshot pick), incremental, and
+    // CDC in one place, before any irreversible step.
+    load::reconcile::ensure_single_export(&keyed)?;
     // The ledger's already-loaded run_ids — empty when stateless (no state DB),
     // so `select_runs` degrades safely rather than dropping the mode selection.
     let loaded = match state {

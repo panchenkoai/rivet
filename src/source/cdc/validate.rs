@@ -17,6 +17,7 @@ use crate::error::Result;
 use crate::manifest::{MANIFEST_FILENAME, RunManifest, join_key};
 
 /// Outcome of a `__pos` continuity check over one CDC run's output.
+#[derive(Default)]
 pub(crate) struct PositionCheck {
     pub parts: usize,
     pub rows: usize,
@@ -106,6 +107,14 @@ fn read_pos_column(body: Vec<u8>) -> Result<Vec<String>> {
 /// at `dest`/`prefix`. Returns the range covered and any ordering violations.
 pub(crate) fn check_positions(dest: &dyn Destination, prefix: &str) -> Result<PositionCheck> {
     let manifest_key = join_key(prefix, MANIFEST_FILENAME);
+    // Round-4: the canonical manifest.json can be ABSENT on a CDC prefix that
+    // crashed before its terminal write (the per-roll durability write now emits
+    // only the run-unique copy). Skip the position check gracefully — an empty,
+    // violation-free result — rather than propagating an opaque I/O error on a
+    // prefix whose data is intact (the run-unique manifests + parts are still there).
+    if dest.head(&manifest_key)?.is_none() {
+        return Ok(PositionCheck::default());
+    }
     let manifest: RunManifest = serde_json::from_slice(&dest.read(&manifest_key)?)?;
 
     // IO half: read every part's __pos in part→row order.

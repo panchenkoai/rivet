@@ -330,6 +330,25 @@ pub(crate) fn max_tx_rows() -> usize {
     })
 }
 
+/// Byte sibling of [`max_tx_rows`] (round-2 audit #9): the row cap is a poor bound
+/// on the buffered-transaction FOOTPRINT when cells are large — a few thousand
+/// rows of multi-hundred-MB TEXT/BLOB stay far under 5M rows yet exhaust memory.
+/// Each adapter also caps the transaction's running `estimated_bytes` at this and
+/// bails loudly. Default 2 GiB (a real OLTP transaction is far below).
+/// `RIVET_CDC_MAX_TX_BYTES` overrides it — test-only, so the cap is reachable
+/// without seeding a multi-GB transaction. Read once.
+pub(crate) fn max_tx_bytes() -> usize {
+    use std::sync::OnceLock;
+    static CELL: OnceLock<usize> = OnceLock::new();
+    *CELL.get_or_init(|| {
+        std::env::var("RIVET_CDC_MAX_TX_BYTES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(2 * 1024 * 1024 * 1024)
+    })
+}
+
 /// Connection + resume parameters for `rivet cdc`, across engines — the CDC
 /// sibling of [`crate::source::create_source`]'s `SourceConfig`. The fields here
 /// are engine-agnostic; per-engine knobs live in [`CdcEngineOpts`].

@@ -216,6 +216,75 @@ fn roast_rapid_incremental_runs_into_same_prefix_must_not_clobber_prior_parts() 
 
 #[test]
 #[ignore = "live: requires docker compose postgres"]
+fn pg_incremental_cursor_survives_a_non_utc_session_timezone() {
+    // CLAUDE.md session-state rule: the PG timestamptz incremental cursor boundary
+    // is re-injected as an OFFSET-LESS naive-UTC literal into `WHERE col > '<lit>'`
+    // and PostgreSQL parses a naive literal in the SESSION TimeZone. On a non-UTC
+    // session (a common production default) the boundary shifts by the zone offset,
+    // so the run SKIPS (west of UTC) / duplicates (east) the offset-wide gap window
+    // — silent, count-passing loss invisible under the UTC test session CI runs.
+    // Pin the session to a WEST-of-UTC zone via the connection `options` (scoped to
+    // THIS export's own connection, so no `ALTER DATABASE` that would pollute the
+    // shared fixture for parallel tests) and prove the two-run union loses nothing.
+    // RED before the `SET LOCAL TimeZone='UTC'` pin in pg_run_export.
+    require_alive(LiveService::Postgres);
+    let table_name = unique_name("inc_tz");
+    let mut c = pg_connect();
+    c.batch_execute(&format!(
+        "CREATE TABLE {table_name} (id BIGINT PRIMARY KEY, updated_at TIMESTAMPTZ NOT NULL)"
+    ))
+    .unwrap();
+    let _guard = PgTable::adopt(table_name.clone());
+    // Run-1 rows up to a 12:00Z boundary.
+    c.batch_execute(&format!(
+        "INSERT INTO {table_name} VALUES \
+         (1, '2026-07-01 10:00:00+00'), (2, '2026-07-01 12:00:00+00')"
+    ))
+    .unwrap();
+
+    let out = tempfile::tempdir().unwrap();
+    let export_name = unique_name("inc_tz_exp");
+    // America/New_York is UTC-4 in July: a naive '12:00' literal parsed in that
+    // session is 16:00Z — so an un-pinned run 2 compares `> 16:00Z` and skips the
+    // (12:00, 16:00] window. `options=-c timezone=…` sets it for this connection only.
+    let ny_url = format!("{POSTGRES_URL}?options=-c%20timezone%3DAmerica/New_York");
+    let yaml = Rig::pg_batch(&export_name)
+        .source_url(&ny_url)
+        .query(&format!("SELECT id, updated_at FROM {table_name}"))
+        .mode("incremental")
+        .export_line("cursor_column: updated_at")
+        .dest_path(out.path().to_path_buf())
+        .yaml();
+    let (_cfgdir, cfg) = cfg_dir_with(&yaml);
+
+    // Run 1 captures ids 1,2; stores cursor = 12:00Z (the max).
+    assert!(
+        run_rivet_export(&cfg, &export_name).status.success(),
+        "first incremental run failed"
+    );
+    // Insert rows in the exact (12:00, 16:00]Z window a NY-parsed boundary skips.
+    c.batch_execute(&format!(
+        "INSERT INTO {table_name} VALUES \
+         (3, '2026-07-01 13:00:00+00'), (4, '2026-07-01 15:00:00+00')"
+    ))
+    .unwrap();
+    // Run 2 delta must capture 3,4 — pre-fix the NY session parses the '12:00'
+    // boundary as 16:00Z and silently drops them.
+    assert!(
+        run_rivet_export(&cfg, &export_name).status.success(),
+        "second incremental run failed"
+    );
+
+    assert_eq!(
+        dir_parquet_id_set(out.path()),
+        (1..=4).collect::<std::collections::BTreeSet<i64>>(),
+        "a non-UTC session must not skip the offset-window rows (3,4) — the incremental \
+         cursor boundary must be parsed as UTC, not the session zone"
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
 fn incremental_second_run_on_unchanged_source_exports_zero_new_rows() {
     // Contract: rivet persists `last_cursor_value` in SQLite next to the
     // config file.  The second run with the same config must see that

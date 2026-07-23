@@ -1,0 +1,72 @@
+# CSV writer-fidelity matrix — the TEXT-writer class round-7 opened. Six audit
+# rounds pinned Parquet + warehouse type fidelity (type-fidelity-matrix), but the
+# CSV writer has its OWN value rendering AND its OWN escaping that Parquet's binary
+# path never exercises, and two silent losses lived exactly there:
+#   * pre-1970 sub-second timestamps rendered as an EMPTY cell (signed-remainder
+#     wrap → from_timestamp None) while Parquet kept the value (round-7 HIGH).
+#   * the CSV HEADER was emitted un-escaped while data cells were RFC-4180 quoted,
+#     so a curated-query alias with a comma split the header off the data (round-7).
+# The value-checksum can't catch either: side A shares the writer's own rendering
+# (self-oracle) — so this class needs the writer's bytes checked against an
+# INDEPENDENT oracle (a hard-coded expected string, or a DuckDB re-read).
+#
+# rivet ships exactly two formats (Parquet, CSV); there is no NDJSON writer, so the
+# text axis is CSV only. Two columns split the two ways a text writer fails:
+#   no_silent_loss          — the VALUE is never silently dropped / emptied / wrongly
+#                             coerced (a numeric/temporal/binary rendering, or an
+#                             unsupported type that must FAIL LOUD, not skip).
+#   no_corruption_on_escape — a delimiter / quote / CR / LF / column-name never
+#                             breaks column alignment; RFC-4180 quoting is applied to
+#                             BOTH data cells and the header.
+#
+# A rendering with a fixed alphabet (digits, `hex`, ISO timestamp) has nothing to
+# escape → its escape cell is `na`. A concern that is pure escaping (header, cell
+# delimiters) has no value to lose → its loss cell is `na`. Cell = test/na/gap.
+
+engines: [no_silent_loss, no_corruption_on_escape]
+
+scenarios:
+  - id: timestamp_pre_1970
+    what: "a pre-1970 sub-second timestamp renders its real value, never an empty cell — euclidean division so the negative sub-second remainder stays in range (round-7 HIGH; Parquet kept it, CSV dropped it). True oracle: hard-coded expected string, not the recomputed self-oracle that hid the bug."
+    no_silent_loss:          { test: pre_1970_subsecond_timestamp_is_not_dropped_to_an_empty_cell }
+    no_corruption_on_escape: { na: "an ISO-8601 timestamp is `[0-9-T:.]` — no delimiter/quote can appear, so there is nothing to escape" }
+
+  - id: timestamp_naive_vs_instant
+    what: "a naive TIMESTAMP renders bare while an instant TIMESTAMPTZ (Timestamp(_, Some('UTC'))) gets a trailing `Z` — CSV kept the naive-vs-instant distinction rivet preserves everywhere else (Parquet isAdjustedToUTC, target types). Without the marker BOTH render identically, and a consumer loading the instant on a NON-UTC session reads the UTC wall-clock as local and shifts every value (the session-state class on the CSV encode leg). True oracle: hard-coded expected strings (bare vs `…Z`)."
+    no_silent_loss:          { test: timestamp_marks_instant_utc_but_leaves_naive_bare }
+    no_corruption_on_escape: { na: "an ISO-8601 timestamp plus `Z` is `[0-9-T:.Z]` — no delimiter/quote can appear, nothing to escape" }
+
+  - id: float_non_finite
+    what: "NaN / Inf / -Inf emit an explicit literal, never an empty cell that reads back as NULL."
+    no_silent_loss:          { test: float_special_values_emit_literals_not_empty }
+    no_corruption_on_escape: { na: "a float literal is `[0-9.eE+-]`/`NaN`/`inf` — no CSV metacharacter, nothing to escape" }
+
+  - id: null_vs_empty
+    what: "a NULL cell writes the empty field (the CSV convention) — pinned so a future change can't collide NULL with an empty string silently."
+    no_silent_loss:          { test: null_value_writes_empty_string }
+    no_corruption_on_escape: { na: "the empty field has no content to escape" }
+
+  - id: binary_hex
+    what: "binary / bytea renders as lowercase hex (round-trippable), never lossy or as raw bytes that could contain a delimiter."
+    no_silent_loss:          { test: binary_is_written_as_hex }
+    no_corruption_on_escape: { na: "hex output is `[0-9a-f]` only — it can never contain a comma/quote/newline, so no escaping is needed" }
+
+  - id: unsupported_type_fails_loud
+    what: "a type CSV cannot represent (nested list/struct/map) FAILS LOUD at writer construction, never a silently-skipped or mangled column."
+    no_silent_loss:          { test: csv_rejects_array_columns_loudly }
+    no_corruption_on_escape: { na: "the run bails before any row is written — there is no cell to escape" }
+
+  - id: data_cell_delimiters
+    what: "a comma / double-quote / LF / CR inside a text cell is RFC-4180 quoted (quotes doubled) so it never splits or shifts the row — verified end-to-end against an INDEPENDENT DuckDB re-read, not the writer's own rendering."
+    no_silent_loss:          { na: "the value is present in the cell; the risk here is column MISALIGNMENT (escaping), covered by the sibling column" }
+    no_corruption_on_escape: { test: batch_csv_export_complete_and_escaped_via_duckdb }
+
+  - id: header_column_name
+    what: "a column NAME containing a comma/quote (a curated-query alias `AS \"Amount, USD\"`) is RFC-4180 quoted in the header exactly like a data cell — round-7 caught the header emitted as a raw join(\",\"), splitting it off the data columns."
+    no_silent_loss:          { na: "the header is metadata, not a data row; a mis-escaped header misaligns readers (corruption), it does not drop a value" }
+    no_corruption_on_escape: { test: csv_header_quotes_a_column_name_with_a_comma_or_quote }
+
+  - id: formula_injection
+    what: "a cell whose value begins with =/+/-/@ (spreadsheet formula triggers) is written verbatim — RFC-4180-faithful output."
+    no_silent_loss:          { na: "the value is written faithfully and completely — no loss" }
+    no_corruption_on_escape: { na: "faithful RFC-4180 output is CORRECT, not corruption: a leading =/+/-/@ is not injection into rivet's own SQL/command/URI surface, only a downstream-spreadsheet concern (round-7 deferred by-design; documented spreadsheet-unsafe rather than silently prefixed, which would corrupt the real data)" }

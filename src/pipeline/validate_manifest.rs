@@ -54,6 +54,14 @@ use crate::pipeline::manifest_reconcile::{PartPresence, reconcile_manifest_again
 /// `head()` already reports and bails before the read when it exceeds this cap.
 pub(crate) const MANIFEST_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
+/// Same V21/CWE-400 defense for the sibling control artifact `_SUCCESS`, read by
+/// the SAME `verify_at_destination` under the SAME destination-writable threat
+/// model but previously UNCAPPED. A legitimate marker is ~22 bytes
+/// (`xxh3:<16-hex>\n`); a body past this small cap is corrupt or planted, so it
+/// is treated as malformed WITHOUT materialising it into memory. 4 KiB is orders
+/// of magnitude above any real marker yet trivially bounded.
+pub(crate) const SUCCESS_MARKER_MAX_BYTES: u64 = 4096;
+
 /// How deep a `rivet validate` pass goes — a graded verify layer over the
 /// same checks, letting an operator trade thoroughness for latency / cost.
 ///
@@ -694,6 +702,20 @@ pub fn verify_at_destination(
             // manifest legitimately lacks _SUCCESS.  Leave
             // `success_marker_consistent = false` (this is a "no signal"
             // bool, not a "broken" bool) and let the caller decide.
+        }
+        Some(head) if head.size_bytes > SUCCESS_MARKER_MAX_BYTES => {
+            // Refuse to materialise an oversized _SUCCESS: a bare uncapped
+            // dest.read of a multi-GB planted marker OOMs the validate/resume/repair
+            // process (the asymmetry with step 1's manifest.json cap this closes).
+            // success_head already carries the size — no extra round-trip.
+            out.failures.push(Failure::SuccessMarkerMalformed {
+                body_preview: format!(
+                    "(oversized: {} bytes exceeds the {SUCCESS_MARKER_MAX_BYTES}-byte _SUCCESS cap; not read)",
+                    head.size_bytes
+                ),
+            });
+            out.recompute_passed();
+            return Ok(out);
         }
         Some(_) => match dest.read(&success_key) {
             Err(e) => {
@@ -1397,6 +1419,63 @@ mod tests {
                 [Failure::ManifestReadError { detail }] if detail.contains("manifest head failed")
             ),
             "expected one ManifestReadError naming the head step, got: {:?}",
+            v.failures
+        );
+    }
+
+    // #5: a _SUCCESS whose head-reported size exceeds the cap must be flagged
+    // WITHOUT being read — a bare uncapped read of a multi-GB planted marker OOMs
+    // the validate/resume process (asymmetric with the manifest.json cap). The mock
+    // PANICS if read(_SUCCESS) is called, so the test passing proves the read was
+    // short-circuited by the size check.
+    struct SuccessMarkerOversized(LocalDestination);
+    impl crate::destination::Destination for SuccessMarkerOversized {
+        fn write(&self, p: &Path, k: &str) -> Result<crate::destination::WriteOutcome> {
+            self.0.write(p, k)
+        }
+        fn capabilities(&self) -> crate::destination::DestinationCapabilities {
+            self.0.capabilities()
+        }
+        fn head(&self, k: &str) -> Result<Option<crate::destination::ObjectMeta>> {
+            if k.ends_with(crate::manifest::SUCCESS_FILENAME) {
+                return Ok(Some(crate::destination::ObjectMeta {
+                    key: k.to_string(),
+                    size_bytes: SUCCESS_MARKER_MAX_BYTES * 4,
+                    content_md5: None,
+                }));
+            }
+            self.0.head(k)
+        }
+        fn read(&self, k: &str) -> Result<Vec<u8>> {
+            assert!(
+                !k.ends_with(crate::manifest::SUCCESS_FILENAME),
+                "verify must NOT read an oversized _SUCCESS — the size cap must short-circuit \
+                 before materialising it into memory (the OOM this guards)"
+            );
+            self.0.read(k)
+        }
+        fn list_prefix(&self, p: &str) -> Result<Vec<crate::destination::ObjectMeta>> {
+            self.0.list_prefix(p)
+        }
+    }
+
+    #[test]
+    fn oversized_success_marker_is_malformed_and_never_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = build_manifest(
+            vec![part(1, 10, 4, "xxh3:1111111111111111")],
+            ManifestStatus::Success,
+        );
+        write_dataset(dir.path(), &m, &[("part-000001.parquet", b"AAAA")]);
+        let dest = SuccessMarkerOversized(local_dest(dir.path()));
+
+        let v = verify_at_destination(&dest, "", ValidateDepth::Full).unwrap();
+        assert!(
+            v.failures.iter().any(|f| matches!(
+                f,
+                Failure::SuccessMarkerMalformed { body_preview } if body_preview.contains("oversized")
+            )),
+            "an oversized _SUCCESS must yield SuccessMarkerMalformed(oversized) without reading it, got: {:?}",
             v.failures
         );
     }

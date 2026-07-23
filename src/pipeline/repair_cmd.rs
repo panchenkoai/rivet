@@ -41,7 +41,7 @@ use std::path::Path;
 
 use crate::config::Config;
 use crate::error::Result;
-use crate::manifest::{MANIFEST_FILENAME, ManifestPart, ManifestStatus, PartStatus, RunManifest};
+use crate::manifest::{MANIFEST_FILENAME, ManifestPart, PartStatus, RunManifest};
 use crate::plan::{
     ExtractionStrategy, ReconcileReport, RepairAction, RepairOutcome, RepairPlan, RepairReport,
     ResolvedRunPlan, build_plan,
@@ -286,7 +286,7 @@ fn execute_repair(
     //     must not change the repair's exit code — but it is logged loudly so
     //     the operator knows validate may still flag the files.
     if !new_parts.is_empty()
-        && let Err(e) = record_repair_parts_in_manifest(plan, &new_parts)
+        && let Err(e) = record_repair_parts_in_manifest(&plan.destination, &new_parts)
     {
         log::warn!(
             "repair: re-exported parts were written but the destination manifest could not be \
@@ -312,10 +312,10 @@ fn execute_repair(
 /// that was never finalized has nothing to amend) or if the read/write fails;
 /// the caller logs and continues since the data itself is already durable.
 fn record_repair_parts_in_manifest(
-    plan: &ResolvedRunPlan,
+    destination: &crate::config::DestinationConfig,
     new_parts: &[ManifestPart],
 ) -> Result<()> {
-    let dest = crate::destination::create_destination(&plan.destination)?;
+    let dest = crate::destination::create_destination(destination)?;
 
     // Manifests live at the prefix root (manifest_dir == "" for the local/path
     // and bucket-prefix destinations repair supports); parts are recorded with
@@ -355,16 +355,21 @@ fn record_repair_parts_in_manifest(
     manifest.part_count = manifest.committed_part_count() as u32;
     manifest.finished_at = chrono::Utc::now().to_rfc3339();
 
-    // Reuse the standard writer so atomicity / streaming-skip rules stay in one
-    // place. A repaired dataset is not a fresh clean run, so do NOT re-stamp
-    // _SUCCESS here — preserve whatever terminal status the manifest carried
-    // (the writer emits _SUCCESS only for `Success`, which the original clean
-    // run already established).
-    let bytes = serde_json::to_vec_pretty(&manifest)?;
-    let _ = ManifestStatus::Success; // (status unchanged; documented above)
-    let tmp = tempfile::NamedTempFile::new()?;
-    std::fs::write(tmp.path(), &bytes)?;
-    dest.write(tmp.path(), MANIFEST_FILENAME)?;
+    // Route through the shared writer so the canonical `manifest.json`, the
+    // immutable run-unique `manifest-<run_id>.json` copy, and the `_SUCCESS`
+    // fingerprint all update TOGETHER. The old hand-rolled write touched ONLY
+    // the canonical file, leaving the run-unique sidecar stale — and `rivet load`
+    // is manifest-authoritative and reads the run-unique copies preferentially
+    // (`list_manifest_keys`), so it saw the PRE-repair part list, resolved those
+    // parts as present (repair is additive, never deletes), never fell back to
+    // the full listing, and SILENTLY dropped the repaired parts (the exact rows
+    // the operator ran `repair` to recover) with every count/gate green. The
+    // canonical-only write also left `_SUCCESS` fingerprinting the old bytes
+    // (a false `SuccessMarkerStale` on `rivet validate`). `write_manifest`
+    // re-emits `_SUCCESS` only for a `Success` manifest, so a repaired clean run
+    // keeps its marker (re-fingerprinted to the new bytes) and a repaired failed
+    // run stays marker-less — the terminal status is preserved.
+    crate::pipeline::manifest_writer::write_manifest(&*dest, &manifest)?;
     Ok(())
 }
 
@@ -544,5 +549,92 @@ mod tests {
         // A name without the chunk0 token (e.g. an unexpected writer shape) is
         // left alone rather than mangled.
         assert!(relabel_repair_chunk_index("orders_no_chunk_token.parquet", 5).is_none());
+    }
+
+    // ── repair must update the run-unique manifest copy the loader reads ──────
+    //
+    // RED before the fix: repair wrote ONLY the canonical manifest.json, leaving
+    // the immutable `manifest-<run_id>.json` sidecar stale. `rivet load` is
+    // manifest-authoritative and prefers the run-unique copy, so the repaired
+    // parts were silently dropped at load while every count/gate passed. Assert
+    // on the manifest COPY (not a data re-read — a re-read can't see a sidecar
+    // clobber; CLAUDE.md sidecar rule).
+    #[test]
+    fn repair_updates_the_run_unique_manifest_copy_not_just_the_canonical() {
+        use crate::config::{DestinationConfig, DestinationType};
+        use crate::manifest::{
+            MANIFEST_VERSION, ManifestDestination, ManifestSource, ManifestStatus,
+            run_unique_manifest_name,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let dpath = dir.path().to_str().unwrap().to_string();
+        let run_id = "orders_20260722T120000.000";
+        let part = |id: u32, rows: i64| ManifestPart {
+            part_id: id,
+            path: format!("orders_{id}.parquet"),
+            rows,
+            size_bytes: 100,
+            content_fingerprint: "xxh3:0000000000000000".into(),
+            content_md5: String::new(),
+            status: PartStatus::Committed,
+        };
+        // A finalized run: 2 committed parts, 20 rows.
+        let manifest = RunManifest {
+            manifest_version: MANIFEST_VERSION,
+            run_id: run_id.into(),
+            export_name: "public.orders".into(),
+            mode: "chunked".into(),
+            started_at: "2026-07-22T12:00:00Z".into(),
+            finished_at: "2026-07-22T12:00:10Z".into(),
+            status: ManifestStatus::Success,
+            source: ManifestSource {
+                engine: "postgres".into(),
+                schema: Some("public".into()),
+                table: Some("orders".into()),
+                extraction: None,
+            },
+            destination: ManifestDestination {
+                kind: "local".into(),
+                uri: dpath.clone(),
+            },
+            format: "parquet".into(),
+            compression: "zstd".into(),
+            schema_fingerprint: "xxh3:0123456789abcdef".into(),
+            row_count: 20,
+            part_count: 2,
+            parts: vec![part(1, 10), part(2, 10)],
+            column_checksums: None,
+            checksum_key_column: None,
+        };
+        let bytes = serde_json::to_vec_pretty(&manifest).unwrap();
+        // Both files as a real finalize would leave them; the run-unique copy is
+        // the one the loader reads and the one that went stale after repair.
+        std::fs::write(dir.path().join(MANIFEST_FILENAME), &bytes).unwrap();
+        std::fs::write(dir.path().join(run_unique_manifest_name(run_id)), &bytes).unwrap();
+
+        let dest_cfg = DestinationConfig {
+            destination_type: DestinationType::Local,
+            path: Some(dpath),
+            ..Default::default()
+        };
+        // Repair recovers one more part: id 3, 7 rows.
+        record_repair_parts_in_manifest(&dest_cfg, &[part(3, 7)]).unwrap();
+
+        let read = |name: String| -> RunManifest {
+            serde_json::from_slice(&std::fs::read(dir.path().join(name)).unwrap()).unwrap()
+        };
+        let run_unique = read(run_unique_manifest_name(run_id));
+        assert_eq!(
+            run_unique.parts.len(),
+            3,
+            "the loader-authoritative run-unique copy must list the repair part"
+        );
+        assert_eq!(
+            run_unique.row_count, 27,
+            "run-unique row_count must reflect the recovered rows (20 + 7)"
+        );
+        // The canonical stays consistent with it.
+        assert_eq!(read(MANIFEST_FILENAME.to_string()).parts.len(), 3);
     }
 }

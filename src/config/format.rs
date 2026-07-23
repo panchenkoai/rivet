@@ -133,7 +133,12 @@ impl ParquetConfig {
     pub fn effective_row_group_rows(&self, schema: &arrow::datatypes::SchemaRef) -> Option<usize> {
         let strategy = self.row_group_strategy.unwrap_or_default();
         match strategy {
-            RowGroupStrategy::FixedRows => self.row_group_rows,
+            // Clamp to >= 1 like the Auto/FixedMemory arms below: a row group cannot
+            // hold 0 rows, so `row_group_rows: 0` would panic parquet-rs's
+            // set_max_row_group_row_count(0) mid-export (config passed, run crashed).
+            // Any positive count the user pins still stands (this arm is deliberately
+            // unclamped-above so an exact large/small group size is honoured).
+            RowGroupStrategy::FixedRows => self.row_group_rows.map(|n| n.max(1)),
             RowGroupStrategy::Auto | RowGroupStrategy::FixedMemory => {
                 let target_mb = self
                     .target_row_group_mb
@@ -322,6 +327,23 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(pc.effective_row_group_rows(&narrow_schema()), Some(250_000));
+    }
+
+    #[test]
+    fn parquet_config_fixed_rows_zero_is_clamped_to_one_not_a_panic() {
+        // RED before the .max(1) clamp: `row_group_rows: 0` returned Some(0), which
+        // panics parquet-rs's set_max_row_group_row_count(0) mid-export (config
+        // passed `check`, run crashed). A row group needs >= 1 row.
+        let pc = ParquetConfig {
+            row_group_strategy: Some(RowGroupStrategy::FixedRows),
+            row_group_rows: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(
+            pc.effective_row_group_rows(&narrow_schema()),
+            Some(1),
+            "row_group_rows: 0 must clamp to 1, never reach the parquet writer as 0"
+        );
     }
 
     #[test]

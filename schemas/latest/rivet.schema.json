@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "Rivet config (rivet-cli 0.21.0)",
+  "title": "Rivet config (rivet-cli 0.21.1)",
   "description": "Top-level Rivet configuration root.\n\nOperators write this struct as YAML (typically `rivet.yaml`).  The\n`JsonSchema` derive is the source of truth for the `schemas/rivet.schema.json`\nartifact and the `rivet schema config` command's output (v0.7.3 P0).",
   "type": "object",
   "properties": {
@@ -769,7 +769,7 @@
           "default": "warn"
         },
         "shape_drift_warn_factor": {
-          "description": "Growth-factor threshold for data shape drift warnings (Epic 8).\nWhen a string/binary column's max observed byte length in the current run\nexceeds `stored_max * shape_drift_warn_factor`, Rivet logs a warning.\n`None` uses the default of 2.0. Set to `0.0` to disable shape tracking.",
+          "description": "Growth-factor threshold for data shape drift warnings (Epic 8).\nWhen a string/binary column's max observed byte length in the current run\nexceeds `stored_max * shape_drift_warn_factor`, Rivet logs a warning.\n`None` uses the default of 2.0. Set to `0.0` to disable shape tracking.\n\n**Scope: single-batch exports only** (`mode: full` / `incremental`). Shape\ntracking needs the run-wide per-column max byte length, which only the\nsingle sink accumulates; the multi-part runners (chunked, keyset, and\nparallel-Mongo) each write through several sinks and do not aggregate it,\nso this factor is inert there. (Schema drift — added/dropped/retyped\ncolumns — IS enforced on every path via `on_schema_drift`.)",
           "type": [
             "number",
             "null"

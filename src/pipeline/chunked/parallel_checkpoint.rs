@@ -30,6 +30,16 @@ use crate::{destination, format, resource};
 
 use super::math::build_chunk_query_sql;
 
+/// One chunk's worker result: (rows, part records, this chunk's Form B per-column
+/// checksums, the checksum key-column name). Named so the retry/export closures
+/// don't trip clippy::type_complexity on the 4-tuple.
+type ChunkOutcome = (
+    usize,
+    Vec<super::super::commit::PartRecord>,
+    std::collections::BTreeMap<String, u64>,
+    Option<String>,
+);
+
 pub(crate) fn run_chunked_parallel_checkpoint(
     config_path: &str,
     state: &StateStore,
@@ -98,6 +108,13 @@ pub(crate) fn run_chunked_parallel_checkpoint(
     // Tuple second is the chunk_index used by the ChunkCompleted journal.
     let file_records: std::sync::Mutex<Vec<(super::super::commit::PartRecord, i64)>> =
         std::sync::Mutex::new(Vec::new());
+    // Form B: each worker pushes its chunk's checksums here; the parent XOR-combines
+    // them run-wide post-join and harvests once — so the CHECKPOINT parallel path
+    // records Form B like exec.rs's parallel path (graph-surfaced runner-bypass).
+    #[allow(clippy::type_complexity)]
+    let checksums_shared: std::sync::Mutex<
+        Vec<(std::collections::BTreeMap<String, u64>, Option<String>)>,
+    > = std::sync::Mutex::new(Vec::new());
     // ADR-0012 M3: schema fingerprint captured once across workers.  None
     // until any worker exports a non-empty chunk and resolves the dest schema.
     let shared_fingerprint: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -115,6 +132,12 @@ pub(crate) fn run_chunked_parallel_checkpoint(
 
     let shared_destination =
         std::sync::Arc::new(destination::create_destination(&plan.destination)?);
+    // Same cross-shape guard as single/keyset/exec: refuse to overwrite a CDC
+    // manifest with this batch export's manifest (they would silently destroy
+    // each other's audit trail). The two checkpoint runners were the ones that
+    // bypassed it — graph-surfaced runner-bypass, same class as the Form B gap.
+    // A resume of our own batch manifest matches mode and passes.
+    crate::manifest::guard_manifest_mode(&**shared_destination, "batch")?;
     destination::log_capabilities(
         &plan.export_name,
         &**shared_destination,
@@ -131,6 +154,7 @@ pub(crate) fn run_chunked_parallel_checkpoint(
             let agg_retries = &agg_retries;
             let errors = &errors;
             let file_records = &file_records;
+            let checksums_shared = &checksums_shared;
             let shared_fingerprint = &shared_fingerprint;
             let plan_w = plan_for_workers.clone();
             let cp_w = cp_for_workers.clone();
@@ -198,7 +222,7 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                         plan_w.source.source_type,
                     );
 
-                    let result = (|| -> Result<(usize, Vec<super::super::commit::PartRecord>)> {
+                    let result = (|| -> Result<ChunkOutcome> {
                         let mut last_err: Option<anyhow::Error> = None;
                         for attempt in 0..=plan_w.tuning.max_retries {
                             if attempt > 0 {
@@ -229,7 +253,13 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                                         last_err = Some(e);
                                         continue;
                                     }
-                                    return Err(e);
+                                    // Round-2 audit #3/#4: carry the doctor/auth-TLS
+                                    // connect hint on the final (non-transient) worker
+                                    // connect failure, matching single.rs:93.
+                                    return Err(crate::pipeline::single::attach_connect_hint(
+                                        e,
+                                        &plan_w.source,
+                                    ));
                                 }
                             };
 
@@ -239,10 +269,7 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                                     std::sync::Arc::clone(&streamed_rows),
                                 );
 
-                            let export_attempt = (|| -> Result<(
-                                usize,
-                                Vec<super::super::commit::PartRecord>,
-                            )> {
+                            let export_attempt = (|| -> Result<ChunkOutcome> {
                                 thread_src.export(
                                     &source::ExportRequest::wrapped(
                                         &chunk_query,
@@ -264,7 +291,7 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                                         .set(crate::state::schema_fingerprint(&columns));
                                 }
                                 if sink.total_rows == 0 {
-                                    return Ok((0, Vec::new()));
+                                    return Ok((0, Vec::new(), std::collections::BTreeMap::new(), None));
                                 }
                                 let fmt = format::create_format(
                                     plan_w.format,
@@ -290,7 +317,13 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                                         super::super::commit::part_indexed_name(&base, idx, count)
                                     },
                                 )?;
-                                Ok((sink.total_rows, recs))
+                                let key = sink.checksum_key_col.and(sink.cursor_column.clone());
+                                Ok((
+                                    sink.total_rows,
+                                    recs,
+                                    std::mem::take(&mut sink.column_checksums),
+                                    key,
+                                ))
                             })();
 
                             match export_attempt {
@@ -311,7 +344,7 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                     })();
 
                     match result {
-                        Ok((rows, parts)) => {
+                        Ok((rows, parts, chunk_checksums, chunk_key)) => {
                             agg_rows.fetch_add(rows as i64, Ordering::Relaxed);
                             // Non-empty chunk: write file_log NOW (per-chunk
                             // durable manifest — the recovery flows in
@@ -366,6 +399,10 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                                 for rec in parts {
                                     records.push((rec, chunk_index));
                                 }
+                                drop(records);
+                                // Form B: hand this chunk's checksums to the parent.
+                                poison::lock_recover(checksums_shared)
+                                    .push((chunk_checksums, chunk_key));
                                 Some(first)
                             };
                             // Mirror of the sequential checkpoint hooks (search for
@@ -460,6 +497,19 @@ pub(crate) fn run_chunked_parallel_checkpoint(
             plan.export_name
         );
     }
+
+    // Form B: XOR-combine every worker's chunk checksums run-wide + harvest once,
+    // before finalize writes the manifest.
+    let mut checksums_acc: std::collections::BTreeMap<String, u64> =
+        std::collections::BTreeMap::new();
+    let mut checksum_key_column: Option<String> = None;
+    for (part, key) in poison::into_recover(checksums_shared) {
+        super::super::commit::accumulate_column_checksums(&mut checksums_acc, &part);
+        if checksum_key_column.is_none() {
+            checksum_key_column = key;
+        }
+    }
+    super::super::commit::harvest_column_checksums(summary, checksums_acc, checksum_key_column);
 
     state.finalize_chunk_run_completed(&run_id)?;
     // ADR-0008 PG2 committed boundary via the shared finalize seam.

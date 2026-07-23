@@ -427,6 +427,11 @@ fn every_live_cdc_test_asserts_an_outcome() {
                 || chunk.contains("dir_parquet_distinct_strings(")
                 || chunk.contains("read_all(")
                 || chunk.contains("read_all_parts(")
+                // `Rig::run_and_read` runs the capture AND returns every part as
+                // RecordBatches for the caller to assert on (it calls
+                // `read_all_parts` internally) — a read-back oracle, not the
+                // process exit. Same class as `read_all_parts(` above.
+                || chunk.contains("run_and_read(")
                 || chunk.contains("stage_metrics(")
                 || chunk.contains("collect(") && chunk.contains("Metrics")
                 || chunk.contains("all_ok") // doctor --json contract

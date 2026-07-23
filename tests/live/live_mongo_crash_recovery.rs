@@ -98,3 +98,40 @@ fn mongo_batch_two_rapid_runs_into_same_prefix_do_not_clobber() {
         "run-unique manifest copies must sum both rapid runs' rows; a clobbered manifest is silent to the parquet re-read"
     );
 }
+
+/// Run-uniqueness for the PARALLEL Mongo runner (mongo_parallel.rs worker stamp:
+/// `%3f` + `w{worker}` + page). Two rapid `parallel: 4` runs into ONE prefix must
+/// each materialise their files — the later must not overwrite the earlier. The
+/// parallel twin of the test above (which runs the single keyset path, so it does
+/// not exercise the per-worker naming). (runner-coverage-matrix
+/// run_unique_part_naming: mongo_parallel cell.)
+#[test]
+#[ignore = "live: requires docker compose up -d mongo"]
+fn mongo_parallel_two_rapid_runs_into_same_prefix_do_not_clobber() {
+    require_alive(LiveService::Mongo);
+    let db = unique_name("mongo_par_clobber");
+    MongoTest::connect(PORT, &db).seed_int_id("t", 100);
+    let rig = Rig::mongo_batch("t")
+        .source_url(&MongoTest::url(PORT, &db))
+        .mongo("page_size: 30")
+        .export_line("parallel: 4");
+
+    rig.run_ok();
+    rig.run_ok(); // rapid second parallel run into the SAME prefix, no sleep
+
+    assert_eq!(
+        total_parquet_rows(&rig.out_dir()),
+        200,
+        "two rapid parallel:4 runs must each materialise all 100 rows — no worker-part clobber"
+    );
+    assert_eq!(
+        dir_parquet_distinct_strings(&rig.out_dir(), "_id").len(),
+        100,
+        "both parallel snapshots hold every source _id"
+    );
+    assert_eq!(
+        dir_manifest_copy_total_rows(&rig.out_dir()),
+        200,
+        "run-unique manifest copies must sum both parallel runs' rows"
+    );
+}

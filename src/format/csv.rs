@@ -38,11 +38,24 @@ impl super::Format for CsvFormat {
                 field.data_type()
             );
         }
+        // RFC-4180 quote each column NAME with the SAME rule the Utf8 data arm
+        // applies to cells (quote on , " CR LF, double embedded quotes). Data
+        // cells were quoted but the header was a raw `join(",")`, so a curated-
+        // query alias with a comma (`... AS "Amount, USD"`) or quote split the
+        // header across columns and silently mis-aligned EVERY downstream reader
+        // from the data. Built once (not the per-cell hot path), so plain String.
         let header = schema
             .fields()
             .iter()
-            .map(|f| f.name().as_str())
-            .collect::<Vec<_>>()
+            .map(|f| {
+                let n = f.name();
+                if n.bytes().any(|b| matches!(b, b',' | b'"' | b'\n' | b'\r')) {
+                    format!("\"{}\"", n.replace('"', "\"\""))
+                } else {
+                    n.clone()
+                }
+            })
+            .collect::<Vec<String>>()
             .join(",");
         let header_bytes = header.len() as u64 + 1; // +1 for newline
         writeln!(writer, "{}", header)?;
@@ -272,14 +285,33 @@ fn write_csv_value(writer: &mut dyn Write, array: &dyn Array, idx: usize) -> Res
                 frac_us
             )?;
         }
-        DataType::Timestamp(TimeUnit::Microsecond, _) => {
+        DataType::Timestamp(TimeUnit::Microsecond, tz) => {
             let arr = array
                 .as_any()
                 .downcast_ref::<TimestampMicrosecondArray>()
                 .expect("DataType/Array mismatch");
+            // rivet's type model keeps the naive-vs-instant distinction that
+            // every other output (Parquet `isAdjustedToUTC`, the warehouse
+            // target types) preserves: a source TIMESTAMPTZ maps to
+            // `Timestamp(_, Some("UTC"))`, a naive TIMESTAMP to `None`. Without
+            // a marker on the instant, CSV renders BOTH identically — a consumer
+            // loading the instant into a tz-aware column on a NON-UTC session
+            // then reads the UTC wall-clock as local and shifts every value (the
+            // session-state class, on the CSV encode leg). Emit a trailing `Z`
+            // for the instant (rivet normalises to UTC) so it is unambiguous;
+            // the naive value stays bare (its wall-clock IS the value).
+            let is_instant = tz.is_some();
             let micros = arr.value(idx);
-            let secs = micros / 1_000_000;
-            let nsecs = ((micros % 1_000_000) * 1_000) as u32;
+            // FLOOR division (div_euclid/rem_euclid), NOT truncating `/`+`%`: for
+            // a pre-1970 (negative) micros with a sub-second fraction, `micros %
+            // 1_000_000` is NEGATIVE, so `* 1_000 as u32` wraps to a huge value,
+            // `from_timestamp` returns None, and the cell was emitted EMPTY —
+            // silent data loss for every sub-second timestamp before the epoch
+            // (Parquet keeps them). Euclidean rem is always in [0, 1_000_000), so
+            // nsecs stays in range: micros=-1 → secs=-1, nsecs=999_999_000 →
+            // 1969-12-31T23:59:59.999999.
+            let secs = micros.div_euclid(1_000_000);
+            let nsecs = (micros.rem_euclid(1_000_000) * 1_000) as u32;
             if let Some(dt) = chrono::DateTime::from_timestamp(secs, nsecs) {
                 use chrono::{Datelike as _, Timelike as _};
                 let y = dt.year();
@@ -302,6 +334,9 @@ fn write_csv_value(writer: &mut dyn Write, array: &dyn Array, idx: usize) -> Res
                     )?;
                 } else {
                     write!(writer, "{}", dt.format("%Y-%m-%dT%H:%M:%S%.6f"))?;
+                }
+                if is_instant {
+                    writer.write_all(b"Z")?;
                 }
             }
         }
@@ -585,6 +620,30 @@ mod tests {
         assert!(result.contains("00:00:00"), "got: {result}");
     }
 
+    // rivet keeps the naive-vs-instant distinction in every other output
+    // (Parquet isAdjustedToUTC, the warehouse target types). CSV must too: a
+    // naive TIMESTAMP renders bare (its wall-clock IS the value), an instant
+    // TIMESTAMPTZ (Timestamp(_, Some("UTC"))) gets a trailing `Z` — else a
+    // consumer loading the instant on a NON-UTC session reads the UTC wall-clock
+    // as local and shifts every value.
+    #[test]
+    fn timestamp_marks_instant_utc_but_leaves_naive_bare() {
+        // 2024-06-15T03:00:00.000000 UTC.
+        let micros: i64 = 1_718_420_400 * 1_000_000;
+        let naive = TimestampMicrosecondArray::from(vec![micros]);
+        assert_eq!(
+            cell(naive, 0),
+            "2024-06-15T03:00:00.000000",
+            "a naive TIMESTAMP renders bare — no tz marker"
+        );
+        let instant = TimestampMicrosecondArray::from(vec![micros]).with_timezone("UTC");
+        assert_eq!(
+            cell(instant, 0),
+            "2024-06-15T03:00:00.000000Z",
+            "an instant TIMESTAMPTZ renders an explicit UTC `Z`"
+        );
+    }
+
     // ── write_batch via CsvFormat ────────────────────────────────────────────
 
     #[test]
@@ -617,6 +676,31 @@ mod tests {
             writer.bytes_written()
         );
         writer.finish().unwrap();
+    }
+
+    // Regression: a column NAME containing a comma/quote must be RFC-4180 quoted
+    // in the header, exactly as data cells are — else a curated-query alias like
+    // `... AS "Amount, USD"` split the header and silently mis-aligned every
+    // downstream reader from the data columns. RED before the header quoter.
+    #[test]
+    fn csv_header_quotes_a_column_name_with_a_comma_or_quote() {
+        use crate::format::Format;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("Amount, USD", DataType::Int64, false), // comma in the name
+            Field::new("a\"b", DataType::Utf8, true),          // quote in the name
+            Field::new("plain", DataType::Utf8, true),         // untouched
+        ]));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.csv");
+        let w = CsvFormat
+            .create_writer(&schema, Box::new(std::fs::File::create(&path).unwrap()))
+            .unwrap();
+        w.finish().unwrap();
+        let out = std::fs::read_to_string(&path).unwrap();
+        let header = out.lines().next().unwrap();
+        // comma-name quoted; quote-name quoted with the `"` doubled; plain bare —
+        // and crucially still exactly THREE header columns, the comma not a split.
+        assert_eq!(header, r#""Amount, USD","a""b",plain"#);
     }
 
     // ── fail loud on types CSV can't represent ───────────────────────────────
@@ -725,24 +809,50 @@ mod tests {
     fn timestamp_fast_path_matches_chrono_format() {
         // Representative micros: epoch, sub-second, end-of-day, a far-future
         // in-range year, and a value whose year leaves the 0..=9999 fast path
-        // (must hit the chrono fallback and still match).
+        // (must hit the chrono fallback and still match). The recompute uses the
+        // SAME euclidean split the product now uses, so it is a self-consistency
+        // check of the fast-path-vs-chrono rendering — the pre-1970 correctness
+        // is pinned separately below with a HARD-CODED oracle.
         let cases: [i64; 6] = [
             0,
             1_700_000_000_123_456,        // 2023-… with micros
             1_000_000 * 86_399 + 999_999, // 1970-01-01T23:59:59.999999
-            -1, // (negative micros: from_timestamp rejects → empty, both paths)
-            253_402_300_799_000_000, // 9999-12-31T23:59:59 (still fast path)
-            300_000_000_000_000_000, // year > 9999 → chrono fallback
+            -62_135_596_800_000_000,      // 0001-01-01T00:00:00 (negative, fast path)
+            253_402_300_799_000_000,      // 9999-12-31T23:59:59 (still fast path)
+            300_000_000_000_000_000,      // year > 9999 → chrono fallback
         ];
         for micros in cases {
             let got = cell(TimestampMicrosecondArray::from(vec![micros]), 0);
-            let secs = micros / 1_000_000;
-            let nsecs = ((micros % 1_000_000) * 1_000) as u32;
+            let secs = micros.div_euclid(1_000_000);
+            let nsecs = (micros.rem_euclid(1_000_000) * 1_000) as u32;
             let expected = match chrono::DateTime::from_timestamp(secs, nsecs) {
                 Some(dt) => format!("{}", dt.format("%Y-%m-%dT%H:%M:%S%.6f")),
                 None => String::new(),
             };
             assert_eq!(got, expected, "timestamp mismatch for micros={micros}");
+        }
+    }
+
+    // Regression (true oracle, NOT the recomputed self-oracle above): a pre-1970
+    // sub-second timestamp must render its real value, never an empty cell. With
+    // the old truncating `/`+`%` split the negative remainder wrapped `nsecs`,
+    // `from_timestamp` returned None, and the cell was emitted EMPTY — 100%
+    // silent loss for this whole class while Parquet kept the value. Hard-coded
+    // expected strings so the test can never re-derive the bug.
+    #[test]
+    fn pre_1970_subsecond_timestamp_is_not_dropped_to_an_empty_cell() {
+        let expect: [(i64, &str); 4] = [
+            (-1, "1969-12-31T23:59:59.999999"), // one micro before the epoch
+            (-500_000, "1969-12-31T23:59:59.500000"), // half a second before
+            (-86_400_000_000, "1969-12-31T00:00:00.000000"), // whole day before (whole second)
+            (-125_125_000, "1969-12-31T23:57:54.875000"), // multi-second, sub-second frac
+        ];
+        for (micros, want) in expect {
+            let got = cell(TimestampMicrosecondArray::from(vec![micros]), 0);
+            assert_eq!(
+                got, want,
+                "pre-1970 micros={micros} must render {want:?}, not an empty/other cell"
+            );
         }
     }
 }

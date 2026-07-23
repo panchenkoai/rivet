@@ -44,7 +44,7 @@ mod sink;
 mod summary;
 mod validate;
 mod validate_cmd;
-mod validate_manifest;
+pub(crate) mod validate_manifest;
 
 // ── Public API surface (consumed by `src/cli/dispatch.rs` + binaries) ──────
 //

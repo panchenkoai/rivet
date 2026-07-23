@@ -2,6 +2,160 @@
 
 ## Unreleased
 
+## 0.21.1 — 2026-07-22
+
+A security- and durability-hardening release: thirteen adversarial audit rounds over the
+OSS surface (nine grep-driven, then graph-driven via the code-review knowledge graph;
+find → RED-prove → drift-guard), plus a full live re-validation (5229 tests, all four
+engines × local/S3/GCS/Azure, DuckDB/ClickHouse/BigQuery type oracles), closed ~55 real
+issues — several of them silent data-loss, active data-DESTRUCTION, silent value
+CORRUPTION, injection, or process-abort-DoS classes invisible to the green test suite
+and the three type oracles.
+
+### Fixed
+
+- **Data DESTRUCTION (GCS warehouse-load cleanup): a bucket-root prefix no longer wipes
+  the whole bucket.** A GCS export with no `destination.prefix` — or a prefix that leads
+  with `{partition}` — resolved the load's staging prefix to the bucket ROOT (`gs://bucket/`,
+  an empty key), so `cleanup_source`/`gc_orphans` after a successful load ran an unscoped
+  recursive delete of the ENTIRE bucket, destroying unrelated exports and pre-existing
+  objects. `split_gs_uri` now refuses an empty bucket-relative key, and the guard is proven
+  against a real object store (delete_under/gc_orphans refuse the root, spare siblings, and
+  still drain a scoped prefix). S3/Azure/local exports have no recursive-delete surface and
+  were never exposed.
+- **Data DESTRUCTION #2 (GCS load cleanup, string-prefix over-delete):** `GcsStore::remove_all`
+  passed the raw bucket-relative prefix to opendal, which matches by STRING prefix, so a
+  post-load cleanup of `exports/orders` ALSO deleted `exports/orders_archive/…` and every
+  other object whose key string-starts-with it — destroying unrelated sibling exports.
+  `list_files` already scoped with a trailing slash; `remove_all` (its destructive twin) did
+  not, so the delete scope was wider than the load's list scope. Both now share a
+  `dir_boundary` directory-scoping helper, so cleanup can never delete beyond what the load
+  saw. RED-proven on the fs backend (opendal string-prefixes there too) — the prior test used
+  a non-prefix sibling and never activated it.
+- **Silent CORRUPTION (Postgres CDC unchanged-TOAST datum):** an UPDATE that leaves an
+  externally-stored TOAST column untouched renders it as the unquoted `unchanged-toast-datum`
+  marker (the value is not in the WAL); rivet wrote that literal string into the column. It
+  now recovers the real value from the `REPLICA IDENTITY FULL` pre-image by column name, or —
+  when no pre-image value exists — fails loud naming the exact upstream fix, never fabricating
+  the marker as data. Reproduced live (`SET STORAGE EXTERNAL` + an incompressible value).
+- **Silent-loss (chunked-checkpoint resume, `max_file_size` rotation siblings):** a resume
+  whose prior manifest existed and whose parts were still present (all Skip decisions) orphaned
+  every rotation SIBLING beyond the first from the finalize manifest — because chunk_task
+  records only the first sibling's name — so the manifest-authoritative `rivet load` dropped
+  their rows. A Skip now hydrates the manifest part unconditionally (it needs no chunk_task).
+- **`rivet validate` Form B was a no-op on the two chunk-checkpoint runners**, and the
+  cross-shape CDC-vs-batch **manifest-overwrite guard was absent** on them — the resumable
+  checkpoint runners bypassed both. Both are now wired in (per-runner coverage matrix, 0 gaps).
+- **CDC snapshot/stream schema parity (`meta_columns`):** batch-only `meta_columns`
+  (`exported_at`/`row_hash`) injected on the `initial: snapshot` leg ONLY diverged the two
+  legs' columns — both load into one `<table>__changes` — breaking the merged load view. The
+  snapshot leg no longer inherits them, and a run-start warning notes CDC ignores meta_columns.
+- **CSV fidelity (naive TIMESTAMP vs instant TIMESTAMPTZ):** both rendered identically with no
+  marker, so a consumer loading the instant on a non-UTC session read the UTC wall-clock as
+  local and shifted every value. An instant now carries a trailing `Z`; a naive value stays
+  bare — preserving the distinction rivet keeps in Parquet and the warehouse target types.
+  Verified via DuckDB (`read_csv_auto` now types the instant column `TIMESTAMP WITH TIME ZONE`).
+- **Silent completeness break (quality gate on keyset / parallel-Mongo):** the
+  `row_count_min` tripwire (exit 3) fired only on single/chunked, so a truncated keyset or
+  parallel-Mongo extract — the runners auto-selected for LARGE tables — exited 0/success
+  with the gate silently disarmed. The gate now runs for the Keyset strategy too.
+- **DoS of the trust oracle (`_SUCCESS`):** `parse_success_marker` no longer panics
+  (`split_at` on a non-char-boundary) on a crafted 21-byte marker, and `rivet validate`
+  now byte-caps the `_SUCCESS` read (CWE-400) the same way it caps `manifest.json` — both
+  hardening the destination-writable control artifact against a planted payload.
+- **Check↔run footguns (fail loud, not crash mid-export):** a negative-scale decimal
+  column (valid in the source + Arrow, unwritable in Parquet) is now refused at parquet
+  writer creation with an actionable message instead of crashing mid-export; a
+  `parquet.row_group_rows: 0` clamps to 1 instead of panicking; and `compression: lz4`
+  emits the standard interoperable `LZ4_RAW` codec, not the deprecated Hadoop-framed LZ4.
+- **Silent-loss (Postgres incremental/keyset cursor on a non-UTC session):** the
+  timestamptz cursor boundary was re-injected as an offset-less naive-UTC literal and
+  PostgreSQL parses a naive literal in the SESSION TimeZone, so on any non-UTC session
+  (a common production default) the boundary shifted by the zone offset and every
+  incremental run silently skipped (west of UTC) or duplicated (east) an offset-wide
+  window — invisible under the UTC test session. The read txn now pins
+  `SET LOCAL TimeZone = 'UTC'` (mirroring the MySQL path); a west-of-UTC two-run live
+  test proves the union loses nothing.
+- **Guardrail bypass (keyset / parallel-Mongo `on_schema_drift`):** keyset and
+  parallel-Mongo exports own their own runners and never reached the drift gate, so an
+  opted-in `on_schema_drift: fail` returned exit 0 on a drifted schema for the headline
+  large-table path; the gate is now wired into both runners.
+- **Resource & robustness:** a `tuning:` block that omits `batch_size_memory_mb` no
+  longer silently disables the profile's memory-driven per-batch cap (it was ~3×-ing
+  Postgres per-batch RSS on wide tables); a user `max_batch_memory_mb` is clamped below
+  the Arrow i32 offset ceiling (a `≥ 2048` value could panic the Mongo document builder);
+  `apply --resume` now resolves a templated destination (`{export}`/`{table}`/`{date}`)
+  before probing `_SUCCESS`, so a completed templated export is skipped instead of
+  re-running into the resume gate; and `shape_drift_warn_factor` documents that it is
+  single-batch-only (schema drift is enforced on every path).
+
+- **Silent-loss (`rivet repair`):** repair rewrote only the canonical `manifest.json`,
+  leaving the immutable run-unique `manifest-<run_id>.json` sidecar — the copy the
+  manifest-authoritative `rivet load` actually reads — stale, so the repaired parts were
+  silently never loaded (and the source then cleaned up). Repair now routes through the
+  shared manifest writer, updating the canonical file, the run-unique copy, and the
+  `_SUCCESS` fingerprint together.
+- **Silent-loss (CSV, pre-1970 timestamps):** a microsecond timestamp before the epoch
+  with a sub-second fraction rendered as an EMPTY cell (a signed-remainder wrap made
+  `from_timestamp` reject it) while Parquet kept the value; fixed with Euclidean division.
+- **Silent-loss (chunked resume):** the M8 resume preamble quarantine-MOVED a part that a
+  prior resume had durably committed (a `file_log` row) but that the stale destination
+  manifest omitted — dropping the exact rows finalize rehydrates. It now consults the
+  state DB (the source of truth) and never quarantines a file_log-recorded part.
+- **Silent-loss (warehouse load, shared prefix):** the load summed EVERY manifest under
+  its prefix and cleanup wiped the prefix recursively, so two exports sharing a base
+  prefix cross-contaminated the row count and could delete a sibling export's un-loaded
+  parts; the load now refuses a prefix holding more than one export loudly.
+- **CSV header** column names are now RFC-4180 quoted like data cells — a curated-query
+  alias containing a comma/quote (`AS "Amount, USD"`) no longer splits the header and
+  mis-aligns every downstream reader.
+
+- **Silent-loss: the destination manifest is now COMPLETE after a crash+resume on
+  every export path.** The manifest-authoritative `rivet load` loads only the parts a
+  `Success` manifest declares, so a crashed run that advanced its delivery position
+  (CDC slot-ack, incremental cursor, chunked chunk_task, keyset cursor) before writing
+  a complete manifest silently dropped the orphaned parts. Fixed across CDC (durable
+  run-unique manifest before each ack), incremental (cursor advances only after the
+  manifest), chunked and keyset (resume reconstructs every committed part from the
+  state `file_log`, rotation siblings included). Each is proven MANIFEST-DRIVEN, not by
+  a parquet glob (the read that masked the class).
+- **Credential leak: the log/state redactors no longer echo a password** containing a
+  raw `/ ? # @ :` or a stray query `@` (base64 secrets contain `/`). Both redactors were
+  rewritten to a default-deny rule (userinfo ends at the last `@` before whitespace,
+  user split on the first `:`) that never leaks.
+- **Security (warehouse load):** source-derived column, table, and primary-key names are
+  refused unless a plain SQL identifier, and the Parquet URIs (from the live GCS listing)
+  are refused if they carry a quote/backslash/control char — both are DDL/COPY/`FILES=()`
+  injection surfaces spliced unescaped into executed warehouse SQL. The load-reconcile
+  manifest read is byte-capped (CWE-400); Snowflake append `COPY` now uses `FORCE=TRUE` so
+  at-least-once re-append is not silently deduped away.
+- **DoS: the PostgreSQL CDC `test_decoding` text decoder no longer aborts the process on
+  hostile wire text.** Two char-boundary panics — the array-literal parser copying a
+  backslash-escaped multibyte char, and the uuid/bytea hex decoder byte-slicing a
+  non-ASCII value — would panic mid-CDC, and under the release `panic=abort` profile that
+  aborts the whole run. Both are guarded; the `map_pg_value` totality proptest now draws
+  the real type-name set so the uuid/bytea arms are actually exercised.
+- **Silent-loss (types):** a MSSQL `MONEY` past the f64-exact range, a PG/MySQL decimal
+  scale under-declaration, and a PG temporal/uuid/bytea array column now FAIL loudly
+  instead of shipping a rounded / truncated / all-NULL column; a MSSQL `time(7)` column's
+  100ns-tick truncation is now surfaced in the type-report (the honesty sibling of the
+  `datetime2` warning), not silently dropped past the value-checksum.
+- **Regression: MSSQL authentication** with a special-character password (broken by the
+  0.21.0-era percent-encoding fix — MSSQL's hand-rolled URL parser never decoded it).
+- **Config validation** now rejects the accept-but-break combinations that formerly
+  passed `rivet check` then failed or silently degraded at run (chunk knobs outside
+  `mode: chunked`, `partition_by` with `cdc`/`time_window`/a `load:` block/a missing
+  `{partition}` token, `chunk_size` + `chunk_size_memory_mb`, unsafe `tables:` entries).
+- A chunk plan over an extreme-sparse key is refused before it OOMs; a large CDC
+  transaction is bounded by bytes (not just rows); the chunked resume-guard closes a
+  TOCTOU with a partial-unique index.
+
+### Added
+
+- Coverage ledgers (drift-guarded): `url-safety`, `durability-ordering`,
+  `config-validation` — every recurring regression class now fails CI if reopened.
+- Coverage-guided fuzzing (`fuzz/`, nightly) over the untrusted-parse surface.
+
 ## 0.21.0 — 2026-07-21
 
 ### Added

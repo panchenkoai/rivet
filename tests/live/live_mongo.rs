@@ -81,6 +81,64 @@ fn mongo_batch_parallel_integer_id_no_loss_or_dup() {
     );
 }
 
+/// Form B on the parallel-Mongo runner (round-9 gap fix): the manifest must
+/// record the `document` column's per-column value checksum, XOR-combined across
+/// the `_id`-range workers. Mongo has NO Form A (the document is a verbatim blob
+/// with no per-column source pass), so Form B is its main value-integrity check at
+/// validate time — previously the parallel runner dropped it entirely. RED before
+/// the run-wide harvest (manifest column_checksums is null/empty).
+#[test]
+#[ignore = "live: requires docker compose up -d mongo"]
+fn mongo_parallel_export_records_form_b_checksum() {
+    require_alive(LiveService::Mongo);
+    let db = unique_name("mformb");
+    MongoTest::connect(PORT, &db).seed_int_id("bench", 5000);
+    let rig = batch(&db, "bench")
+        .mongo("page_size: 1000")
+        .export_line("parallel: 4");
+    rig.run_ok();
+
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(rig.out_dir().join("manifest.json")).expect("manifest.json"),
+    )
+    .expect("parse manifest");
+    assert!(
+        manifest["column_checksums"]
+            .as_array()
+            .is_some_and(|a| !a.is_empty()),
+        "parallel-Mongo manifest must record Form B column_checksums (XOR-combined across \
+         workers), got: {}",
+        manifest["column_checksums"]
+    );
+}
+
+/// Cross-shape manifest guard on the MONGO-PARALLEL runner: a batch parallel
+/// export must refuse to overwrite a prior CDC manifest at the same prefix.
+/// Proves the mongo_parallel column of the runner-coverage matrix — the last
+/// batch runner of the guard sibling-set the graph's checkpoint gap belongs to.
+#[test]
+#[ignore = "live: requires docker compose up -d mongo"]
+fn mongo_parallel_export_refuses_to_clobber_a_cdc_manifest() {
+    require_alive(LiveService::Mongo);
+    let db = unique_name("mguard");
+    MongoTest::connect(PORT, &db).seed_int_id("bench", 200);
+    let rig = batch(&db, "bench")
+        .mongo("page_size: 100")
+        .export_line("parallel: 4");
+    // A prior CDC run's manifest already sits at the destination prefix.
+    std::fs::create_dir_all(rig.out_dir()).unwrap();
+    std::fs::write(
+        rig.out_dir().join("manifest.json"),
+        br#"{"manifest_version":1,"run_id":"prior-cdc","mode":"cdc","parts":[]}"#,
+    )
+    .unwrap();
+    let err = rig.run_expect_fail();
+    assert!(
+        err.contains("already holds a 'cdc' manifest"),
+        "parallel-Mongo export must REFUSE to overwrite a CDC manifest; got:\n{err}"
+    );
+}
+
 #[test]
 #[ignore = "live: requires docker compose up -d mongo"]
 fn mongo_batch_typed_cursor_pages_string_id() {

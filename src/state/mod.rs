@@ -285,6 +285,39 @@ const MIGRATIONS: &[(i64, &str)] = &[
             PRIMARY KEY (export_name, table_name)
         );",
     ),
+    // v15: close the chunked-run TOCTOU (round-2 audit #13). ensure_chunk_
+    // checkpoint_plan did check-then-act (find an in_progress run → if None,
+    // create), with no serialization, so two overlapping runs of ONE export both
+    // saw None, both created an in_progress row, and DOUBLED the destination data
+    // (the random part-name nonce made the parts additive, not clobbering). A
+    // partial-unique index makes the second create fail (mapped to the same
+    // 'still in progress' bail). First demote any pre-existing duplicate
+    // in_progress rows — keep the newest (created_at, run_id) per export — so the
+    // index can build on a legacy DB that already raced. Standard SQL: valid for
+    // both SQLite and PostgreSQL (both support partial indexes).
+    (
+        15,
+        "UPDATE chunk_run SET status='interrupted'
+             WHERE status='in_progress' AND run_id NOT IN (
+               SELECT run_id FROM chunk_run c WHERE c.status='in_progress'
+                 AND NOT EXISTS (
+                   SELECT 1 FROM chunk_run c2
+                   WHERE c2.export_name=c.export_name AND c2.status='in_progress'
+                     AND (c2.created_at > c.created_at
+                          OR (c2.created_at = c.created_at AND c2.run_id > c.run_id)))
+             );
+         CREATE UNIQUE INDEX IF NOT EXISTS idx_chunk_run_one_inprogress
+             ON chunk_run(export_name) WHERE status='in_progress';",
+    ),
+    // v16: keyset checkpoint-resume manifest completeness (round-5). export_state
+    // holds only the resume cursor, so a keyset crash+resume couldn't reconstruct the
+    // pre-crash pages into the finalize manifest (silent orphan, the sibling of the
+    // chunked fix). Persist the in-progress run_id here so resume can reuse it and
+    // rehydrate every committed page from file_log; cleared when the run finalizes.
+    (
+        16,
+        "ALTER TABLE export_state ADD COLUMN resume_run_id TEXT;",
+    ),
 ];
 
 /// PostgreSQL-compatible DDL.  Column types differ from SQLite (BIGSERIAL,
@@ -505,6 +538,39 @@ const PG_MIGRATIONS: &[(i64, &str)] = &[
             completed_at TEXT NOT NULL,
             PRIMARY KEY (export_name, table_name)
         );",
+    ),
+    // v15: close the chunked-run TOCTOU (round-2 audit #13). ensure_chunk_
+    // checkpoint_plan did check-then-act (find an in_progress run → if None,
+    // create), with no serialization, so two overlapping runs of ONE export both
+    // saw None, both created an in_progress row, and DOUBLED the destination data
+    // (the random part-name nonce made the parts additive, not clobbering). A
+    // partial-unique index makes the second create fail (mapped to the same
+    // 'still in progress' bail). First demote any pre-existing duplicate
+    // in_progress rows — keep the newest (created_at, run_id) per export — so the
+    // index can build on a legacy DB that already raced. Standard SQL: valid for
+    // both SQLite and PostgreSQL (both support partial indexes).
+    (
+        15,
+        "UPDATE chunk_run SET status='interrupted'
+             WHERE status='in_progress' AND run_id NOT IN (
+               SELECT run_id FROM chunk_run c WHERE c.status='in_progress'
+                 AND NOT EXISTS (
+                   SELECT 1 FROM chunk_run c2
+                   WHERE c2.export_name=c.export_name AND c2.status='in_progress'
+                     AND (c2.created_at > c.created_at
+                          OR (c2.created_at = c.created_at AND c2.run_id > c.run_id)))
+             );
+         CREATE UNIQUE INDEX IF NOT EXISTS idx_chunk_run_one_inprogress
+             ON chunk_run(export_name) WHERE status='in_progress';",
+    ),
+    // v16: keyset checkpoint-resume manifest completeness (round-5). export_state
+    // holds only the resume cursor, so a keyset crash+resume couldn't reconstruct the
+    // pre-crash pages into the finalize manifest (silent orphan, the sibling of the
+    // chunked fix). Persist the in-progress run_id here so resume can reuse it and
+    // rehydrate every committed page from file_log; cleared when the run finalizes.
+    (
+        16,
+        "ALTER TABLE export_state ADD COLUMN resume_run_id TEXT;",
     ),
 ];
 
@@ -734,21 +800,53 @@ fn migrate_pg(client: &mut postgres::Client) -> Result<()> {
 /// `postgresql://user:SECRET@host/db` → `postgresql://user:***@host/db`
 /// Uses `rfind('@')` so passwords containing `@` are handled correctly.
 fn redact_pg_url(url: &str) -> String {
-    if let Some(at_pos) = url.rfind('@')
-        && let Some(scheme_end) = url.find("://")
-    {
-        let authority = &url[scheme_end + 3..at_pos];
-        if let Some(colon) = authority.rfind(':') {
-            let user = &authority[..colon];
-            return format!(
-                "{}://{}:***@{}",
-                &url[..scheme_end],
-                user,
-                &url[at_pos + 1..]
-            );
-        }
-    }
-    url.to_string()
+    // Mask the password in `scheme://user:password@host/...`. RIVET_STATE_URL is
+    // operator-supplied and may be NON-conforming — a raw password can contain any
+    // of `/ ? # @ :` that a well-formed URL would percent-encode. There is no
+    // unambiguous parse of such a URL, so a redactor MUST default-deny: never leak,
+    // even at the cost of over-redacting a pathological host.
+    //
+    // Rule (rounds 2/3/4 converged here after the bounded/two-pass forms each leaked
+    // a different shape): the userinfo ends at the LAST '@' before whitespace (the
+    // URL / log-line terminator), and the user is everything up to the FIRST ':'
+    // (the password separator; a ':' inside the password is masked with the rest).
+    //   * one '@' (the normal case): the real terminator → host preserved.
+    //   * a password with a raw '/','?','#','@' (round-3 `pa/ss`, round-4 `Kp@9x/..`):
+    //     the last '@' is still the true terminator → tail masked, no leak.
+    //   * a ':'-bearing password (`a:b:c:secret`): FIRST ':' splits → prefix masked.
+    //   * a stray '@' in a query (`?opt=a@b`) — vanishingly rare for a connection
+    //     URL — over-redacts the host but never leaks (default-deny).
+    // Residual limitation (round-4 #4/#5, documented): a raw WHITESPACE in the
+    // password terminates the URL scan (whitespace ends the token in a log line), so
+    // a password containing a literal space/tab may not be fully masked. This is
+    // out of reliable scope — a space in a URL is itself non-conforming (must be
+    // %20-encoded), and treating a whitespace-bounded `:`-bearing span as userinfo
+    // would mangle every common credential-free `scheme://host:port/db ...` log line.
+    let Some(scheme_end) = url.find("://") else {
+        return url.to_string();
+    };
+    let after_scheme = &url[scheme_end + 3..];
+    let span_end = after_scheme
+        .find(char::is_whitespace)
+        .unwrap_or(after_scheme.len());
+    let span = &after_scheme[..span_end];
+    // No '@' → no userinfo to redact.
+    let Some(at_rel) = span.rfind('@') else {
+        return url.to_string();
+    };
+    let userinfo = &span[..at_rel];
+    // No ':' before the '@' → user-only, no password to mask.
+    let Some(colon) = userinfo.find(':') else {
+        return url.to_string();
+    };
+    let user = &userinfo[..colon];
+    let at_pos = scheme_end + 3 + at_rel;
+    format!(
+        "{}://{}:***@{}",
+        &url[..scheme_end],
+        user,
+        &url[at_pos + 1..]
+    )
 }
 
 // ─── SQLite connection helper ─────────────────────────────────────────────────
@@ -1184,6 +1282,112 @@ mod tests {
         // URL without a password should come back as-is.
         let url = "postgresql://rivet@localhost/state";
         assert_eq!(redact_pg_url(url), url);
+    }
+
+    #[test]
+    fn redact_pg_url_stray_at_in_query_does_not_leak_password() {
+        // Round-2 audit #2: an unbounded rfind('@') landed on a '@' in the query and
+        // echoed `secret`. The SECURITY property is that the secret never survives.
+        // The round-4 default-deny redactor over-redacts this contrived query-'@'
+        // shape (masks to the last '@') rather than risk a leak — the secret is gone,
+        // which is what matters; a '@' in a connection-URL query is vanishingly rare.
+        let out = redact_pg_url("postgresql://u:secret@host:5432/db?opt=a@b");
+        assert!(
+            !out.contains("secret"),
+            "password must not survive redaction with a stray '@' in the query: {out}"
+        );
+        // A normal single-'@' URL keeps the host visible (no over-redaction).
+        assert_eq!(
+            redact_pg_url("postgresql://u:secret@host:5432/db"),
+            "postgresql://u:***@host:5432/db"
+        );
+    }
+
+    #[test]
+    fn redact_pg_url_common_hostport_url_is_not_mangled() {
+        // Round-4 #4/#5 documents that whitespace terminates the scan; the flip side
+        // this test PINS is that we must NOT aggressively redact a whitespace-bounded
+        // `:`-bearing span — a common credential-free `scheme://host:port/db` URL has
+        // exactly that shape and must pass through untouched (no false-positive mangle).
+        let url = "postgresql://db.internal:5432/orders";
+        assert_eq!(
+            redact_pg_url(url),
+            url,
+            "a credential-free host:port URL is untouched"
+        );
+        assert_eq!(
+            redact_pg_url("connecting to postgresql://db:5432/x then retry"),
+            "connecting to postgresql://db:5432/x then retry"
+        );
+    }
+
+    #[test]
+    fn redact_pg_url_at_or_colon_in_password_does_not_leak() {
+        // Round-4: the two-pass redactor leaked when the password held a '@' BEFORE a
+        // raw '/','?','#' (pass 1 caught the internal '@', skipping the fail-safe), and
+        // split the user at the LAST ':' (rfind) so a ':'-bearing password leaked its
+        // prefix. The default-deny form (last '@' before whitespace, FIRST ':') closes
+        // both. RED before the redesign.
+        assert_eq!(
+            redact_pg_url("postgresql://rivet:Kp@9x/Lm2z@db.prod:5432/orders"),
+            "postgresql://rivet:***@db.prod:5432/orders",
+            "'@'-before-'/' password tail must not leak"
+        );
+        assert_eq!(
+            redact_pg_url("postgresql://rivet:a:b:c:secret@host:5432/state"),
+            "postgresql://rivet:***@host:5432/state",
+            "':'-bearing password prefix must not leak (FIRST-colon split)"
+        );
+        for u in [
+            "postgresql://rivet:Kp@9x/Lm2z@db/orders",
+            "postgresql://rivet:a:b:c:secret@host/state",
+            "postgresql://u:p@w?rd@host/db",
+            "postgresql://u:p@w#rd@host/db",
+        ] {
+            let out = redact_pg_url(u);
+            assert!(
+                !out.contains("Lm2z")
+                    && !out.contains("a:b:c")
+                    && !out.contains("w?rd")
+                    && !out.contains("w#rd"),
+                "no password fragment may survive: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn redact_pg_url_password_with_raw_delimiters_does_not_leak() {
+        // Round-3 regression: the #2 authority-bound `find(['/','?','#'])` truncated
+        // BEFORE the real '@' when the password itself contained '/','?', or '#'
+        // (base64 secrets routinely contain '/'), so rfind('@') missed, the redactor
+        // fell through, and echoed the cleartext password. RED before the fail-safe
+        // pass. Each must mask the secret AND keep the user + host visible.
+        assert_eq!(
+            redact_pg_url("postgresql://u:pa/ss@host/db"),
+            "postgresql://u:***@host/db",
+            "'/' in password must be redacted, not leaked"
+        );
+        assert_eq!(
+            redact_pg_url("postgresql://u:pa?ss@host/db"),
+            "postgresql://u:***@host/db",
+            "'?' in password must be redacted"
+        );
+        assert_eq!(
+            redact_pg_url("postgresql://u:pa#ss@host/db"),
+            "postgresql://u:***@host/db",
+            "'#' in password must be redacted"
+        );
+        // Belt-and-suspenders: the secret string never survives, whatever the shape.
+        for u in [
+            "postgresql://rivet:Xy/9Zq@db:5432/state",
+            "postgres://admin:p/a?s#s@db.example.com/state",
+        ] {
+            assert!(
+                !redact_pg_url(u).contains("Xy/9Zq") && !redact_pg_url(u).contains("p/a?s#s"),
+                "no raw-delimiter password may survive: {}",
+                redact_pg_url(u)
+            );
+        }
     }
 
     // ── state(pg) sslmode → TlsMode mapping ─────────────────────────────────

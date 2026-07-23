@@ -83,11 +83,80 @@ pub trait TargetLoader {
     fn create_view(&self, table: &str, view_sql: &str) -> Result<()>;
 }
 
-/// Refuse a load whose specs can't materialize: empty, or any `Fail`-status
-/// column (a silent-loss class — never drop it, name it).
+/// A plain SQL identifier the load layer can safely interpolate into DDL/COPY
+/// without quoting: `[A-Za-z_][A-Za-z0-9_]*`. Round-5: column names are
+/// SOURCE-derived and spliced raw into executed warehouse SQL (build_schema,
+/// build_copy_select, …), so a name outside this set is an injection vector.
+fn is_safe_load_ident(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Refuse any Parquet URI that can't be splice-safely single-quoted into the
+/// warehouse load statement. The drivers emit each URI as `'{uri}'` into
+/// Snowflake `COPY … FILES=(…)` and BigQuery `LOAD DATA … uris=[…]` with NO
+/// escaping (snowflake::copy_files_clause, bigquery::from_files) — so a URI
+/// carrying the string delimiter `'`, a backslash (Snowflake treats `\` as an
+/// in-string escape), or a control char could break out of the literal and
+/// inject SQL that runs with the warehouse's (broad) role. Unlike the operator-
+/// typed dataset/warehouse names, these URIs come from the LIVE GCS object
+/// listing (reconcile::select_load_uris → store.list_files), and GCS object
+/// names legally permit `'`/`\`/`;` — so a party with staging-bucket write plus
+/// a crafted passing manifest is otherwise an injection vector. This is the
+/// storage-sourced sibling of the column/table/pk gate; rivet names its own
+/// parts run-uniquely and filename-sanitized, so a legitimate URI never trips
+/// it — default-deny, fail loud rather than escape-and-hope.
+fn ensure_safe_load_uris(uris: &[String]) -> Result<()> {
+    for u in uris {
+        if let Some(bad) = u
+            .chars()
+            .find(|&c| c == '\'' || c == '\\' || c.is_control())
+        {
+            bail!(
+                "refusing to load: Parquet URI `{}` contains {:?}, which is unsafe to splice \
+                 into the warehouse load statement — the loader single-quotes URIs without \
+                 escaping. rivet names its own parts safely, so this URI was not produced by a \
+                 normal export; investigate the staging bucket before re-running.",
+                u.escape_default(),
+                bad
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Refuse a load whose specs can't materialize: empty, any `Fail`-status column
+/// (a silent-loss class — never drop it, name it), or an unsafe column identifier.
 fn validate_specs(table: &str, specs: &[TargetColumnSpec]) -> Result<()> {
     if specs.is_empty() {
         bail!("no column specs for `{table}` — nothing to build a schema from");
+    }
+    // Round-6: the target table name is interpolated raw into the fqtn / DDL / dedup
+    // view too (a sibling injection surface of the column names). Gate it, tolerating
+    // a qualified `dataset.table` — each dot-separated component must be a plain ident.
+    if table.is_empty() || !table.split('.').all(is_safe_load_ident) {
+        bail!(
+            "cannot load: target table `{}` is not a plain (optionally dotted) SQL identifier — \
+             the loader splices it into DDL/COPY.",
+            table.escape_default()
+        );
+    }
+    // Round-5: refuse a source-derived column name that isn't a plain identifier —
+    // the warehouse drivers interpolate it into executed DDL/COPY with no quoting,
+    // so a hostile/odd name (`x); DROP TABLE …`, an embedded quote/backtick) must
+    // fail LOUDLY here rather than run as SQL. The one gate covers every load target.
+    for s in specs {
+        if !is_safe_load_ident(&s.column_name) {
+            bail!(
+                "cannot load `{table}`: column name `{}` is not a plain SQL identifier \
+                 ([A-Za-z_][A-Za-z0-9_]*) — the warehouse loader splices it into DDL/COPY. \
+                 Rename or alias the column in the export query.",
+                s.column_name.escape_default()
+            );
+        }
     }
     let failed: Vec<&str> = specs
         .iter()
@@ -141,6 +210,7 @@ pub fn run_load(
     if uris.is_empty() {
         bail!("no Parquet URIs to load into `{table}`");
     }
+    ensure_safe_load_uris(uris)?;
     validate_specs(table, specs)?;
 
     let rows_loaded = loader.materialize(table, specs, uris)?;
@@ -190,6 +260,7 @@ fn append_and_view(
     if uris.is_empty() {
         bail!("no Parquet URIs to append into `{table}__changes`");
     }
+    ensure_safe_load_uris(uris)?;
     if pk.is_empty() {
         bail!("{label} load of `{table}` needs a primary key for the dedup view (pass --pk)");
     }
@@ -234,6 +305,17 @@ pub fn run_load_cdc(
     expected_delta: Option<u64>,
     cleanup: Option<(&GcsStore, &str)>,
 ) -> Result<CdcLoadReport> {
+    // Round-6: the CDC primary-key columns are interpolated raw into the dedup view's
+    // PARTITION BY — gate them like the column names (source-derived injection surface).
+    for c in pk {
+        if !is_safe_load_ident(c) {
+            bail!(
+                "cannot load `{table}`: CDC primary-key column `{}` is not a plain SQL \
+                 identifier — it is spliced into the dedup view. Rename/alias it.",
+                c.escape_default()
+            );
+        }
+    }
     append_and_view(
         loader,
         table,
@@ -324,9 +406,27 @@ pub fn run_load_incremental(
 /// Split a `gs://bucket/path` URI into `(bucket, bucket-relative path)` — the
 /// shape opendal's bucket-scoped operator wants.
 pub(crate) fn split_gs_uri(uri: &str) -> Result<(&str, &str)> {
-    uri.strip_prefix("gs://")
+    let (bucket, key) = uri
+        .strip_prefix("gs://")
         .and_then(|rest| rest.split_once('/'))
-        .with_context(|| format!("not a `gs://bucket/path` URI: {uri}"))
+        .with_context(|| format!("not a `gs://bucket/path` URI: {uri}"))?;
+    // Refuse an EMPTY bucket-relative key. It addresses the bucket ROOT, and the
+    // load's recursive cleanup (delete_under → remove_all) and gc_orphans (list +
+    // remove) would then wipe the ENTIRE bucket — including unrelated exports and
+    // pre-existing objects — on a LEGAL config: a GCS export with no
+    // `destination.prefix`, or a prefix that leads with `{partition}` so the
+    // pre-`{partition}` base collapses to "". No load/cleanup lifecycle ever
+    // legitimately targets the bucket root, so fail LOUD here rather than delete
+    // everything. (Trailing/only slashes collapse to empty too.)
+    if key.trim_matches('/').is_empty() {
+        anyhow::bail!(
+            "refusing a bucket-root staging prefix `{uri}`: a GCS load stages into and cleans up a \
+             DEDICATED prefix, so an empty prefix would list/delete the whole bucket. Set a \
+             non-empty `destination.prefix`, and put any `{{partition}}` token AFTER a literal \
+             segment (e.g. `exports/{{partition}}/`, not `{{partition}}/`)."
+        );
+    }
+    Ok((bucket, key))
 }
 
 /// Recursively delete a whole export-dedicated `gs://…/` prefix through an
@@ -470,6 +570,50 @@ mod tests {
     /// Whether the fs store still holds an object under bucket-relative `rel`.
     fn prefix_populated(store: &GcsStore, rel: &str) -> bool {
         !store.list_files(rel).unwrap().is_empty()
+    }
+
+    #[test]
+    fn delete_under_and_gc_orphans_refuse_the_bucket_root_and_spare_siblings() {
+        // #8 e2e against the REAL opendal fs-backed store (the load layer's offline
+        // e2e seam — `delete_under`/`gc_orphans` run their real recursive delete
+        // here). A bucket-ROOT prefix (the empty resolved key a no-`prefix` or
+        // `{partition}`-leading GCS export + cleanup_source produces) must be
+        // REFUSED, never wiped — a real `remove_all("")` destroys UNRELATED exports.
+        let dir = tempfile::tempdir().unwrap();
+        for rel in ["exportA/part.parquet", "innocent-neighbour/keep.parquet"] {
+            let obj = dir.path().join(rel);
+            std::fs::create_dir_all(obj.parent().unwrap()).unwrap();
+            std::fs::write(obj, b"x").unwrap();
+        }
+        let store = GcsStore::open_fs(dir.path().to_str().unwrap()).unwrap();
+
+        // The destructive paths refuse the root — BEFORE touching the store.
+        assert!(
+            delete_under(&store, "gs://bucket/").is_err(),
+            "cleanup_source must REFUSE a bucket-root prefix, not remove_all(\"\")"
+        );
+        assert!(
+            reconcile::gc_orphans(&store, "gs://bucket/", &[]).is_err(),
+            "gc_orphans must REFUSE a bucket-root prefix, not list+delete the whole bucket"
+        );
+        // Nothing was deleted — both independent exports survive intact.
+        assert!(prefix_populated(&store, "exportA"), "exportA must survive");
+        assert!(
+            prefix_populated(&store, "innocent-neighbour"),
+            "an unrelated neighbour export must survive the refused root cleanup"
+        );
+
+        // Contrast — the guard does NOT over-block: a REAL per-export prefix still
+        // drains its own subtree and spares the neighbour.
+        delete_under(&store, "gs://bucket/exportA").unwrap();
+        assert!(
+            !prefix_populated(&store, "exportA"),
+            "a real prefix cleanup still drains its own export"
+        );
+        assert!(
+            prefix_populated(&store, "innocent-neighbour"),
+            "a scoped cleanup spares the sibling"
+        );
     }
 
     fn spec(status: TargetStatus) -> Vec<TargetColumnSpec> {
@@ -691,6 +835,19 @@ mod tests {
             split_gs_uri("gs://bucket-only").is_err(),
             "a bucket with no '/' has no (bucket, key) split"
         );
+        // The bucket-ROOT prefix must be REFUSED, never returned as an empty key:
+        // an empty key sends delete_under → remove_all("") / gc_orphans across the
+        // WHOLE bucket. A GCS export with no prefix, or a `{partition}`-leading
+        // prefix (base collapses to ""), resolves to exactly these — a legal config
+        // that would otherwise wipe unrelated data. (RED before the empty-key guard.)
+        for root in ["gs://bucket/", "gs://bucket//", "gs://bucket///"] {
+            assert!(
+                split_gs_uri(root).is_err(),
+                "bucket-root prefix {root:?} must be refused, not parsed to an empty (root) key"
+            );
+        }
+        // A non-empty key with a trailing slash is still a real prefix.
+        assert_eq!(split_gs_uri("gs://b/exports/").unwrap(), ("b", "exports/"));
     }
 
     #[test]
@@ -710,6 +867,54 @@ mod tests {
             .is_err()
         );
         assert!(f.appended.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_uri_with_a_quote_backslash_or_control_char_bails_before_the_driver_runs() {
+        // Storage-sourced injection: URIs come from the live GCS listing and are
+        // spliced single-quoted, UNESCAPED, into COPY FILES=()/LOAD uris=[]. A
+        // planted object key carrying the delimiter must be REFUSED loudly before
+        // any driver SQL runs — never escaped-and-hoped. The driver must not be
+        // touched (materialize/append never called).
+        for bad in [
+            "gs://b/p/x'; drop table t --.parquet", // breaks out of the '…' literal
+            "gs://b/p/x\\.parquet",                 // backslash: Snowflake in-string escape
+            "gs://b/p/x\n.parquet",                 // control char
+        ] {
+            let f = FakeLoader {
+                rows: 1,
+                ..Default::default()
+            };
+            let uris = vec![bad.to_string()];
+            assert!(
+                run_load(&f, "t", &spec(TargetStatus::Ok), &uris, Some(1), None).is_err(),
+                "run_load must reject the injection URI {bad:?}"
+            );
+            assert!(
+                f.materialized.borrow().is_empty(),
+                "the driver must not be reached for {bad:?}"
+            );
+            assert!(
+                run_load_cdc(
+                    &f,
+                    "t",
+                    &spec(TargetStatus::Ok),
+                    &uris,
+                    &["id".to_string()],
+                    cdc::SourceEngine::MySql,
+                    Some(1),
+                    None,
+                )
+                .is_err(),
+                "run_load_cdc must reject the injection URI {bad:?}"
+            );
+            assert!(
+                f.appended.borrow().is_empty(),
+                "the CDC driver must not be reached for {bad:?}"
+            );
+        }
+        // A normal rivet-produced URI still passes the gate.
+        assert!(ensure_safe_load_uris(&uris()).is_ok());
     }
 
     #[test]

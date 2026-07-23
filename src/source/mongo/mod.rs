@@ -59,8 +59,16 @@ pub(crate) mod cdc;
 /// under the i32 ceiling (bug-hunt: 2300×1 MB docs panicked on the default).
 fn mongo_batch_byte_cap(max_batch_memory_mb: Option<usize>) -> usize {
     const DEFAULT: usize = 256 * 1024 * 1024;
+    // Keep the cap STRICTLY below the i32 offset ceiling. `document` is an Arrow
+    // Utf8 (i32 offsets), so a flush threshold >= 2 GiB lets a batch's cumulative
+    // value buffer overflow i32::MAX on `append_value` and panic ("byte array
+    // offset overflow") BEFORE the byte-cap flush check fires — the exact crash
+    // the cap exists to prevent. The default is already sub-2 GiB, but a user
+    // override (`max_batch_memory_mb: 2048`, a plausible "give it 2 GB") had no
+    // upper clamp. Clamp to 1 GiB so a full batch + one more 16 MB doc still fits.
+    const MAX: usize = 1024 * 1024 * 1024;
     max_batch_memory_mb
-        .map(|mb| mb.saturating_mul(1024 * 1024))
+        .map(|mb| mb.saturating_mul(1024 * 1024).min(MAX))
         .filter(|&b| b > 0)
         .unwrap_or(DEFAULT)
 }
@@ -861,6 +869,24 @@ mod tests {
         assert_eq!(super::mongo_batch_byte_cap(None), 256 * 1024 * 1024);
         // Zero is not a valid budget — falls back to the default.
         assert_eq!(super::mongo_batch_byte_cap(Some(0)), 256 * 1024 * 1024);
+    }
+
+    #[test]
+    fn batch_byte_cap_is_clamped_below_the_i32_offset_ceiling() {
+        // RED before the clamp: `document` is an Arrow Utf8 (i32 offsets), so a cap
+        // >= 2 GiB let a batch overflow i32::MAX on append and PANIC before the
+        // flush check — the exact crash the cap prevents. A user "give it 2 GB"
+        // (max_batch_memory_mb: 2048) must be clamped, not passed through.
+        let ceiling = i32::MAX as usize;
+        for mb in [2048usize, 4096, 65_536, usize::MAX / (1024 * 1024)] {
+            let cap = super::mongo_batch_byte_cap(Some(mb));
+            assert!(
+                cap < ceiling,
+                "max_batch_memory_mb={mb} yields cap {cap} >= i32::MAX ({ceiling}) — would overflow the Utf8 offset builder"
+            );
+        }
+        // The clamp doesn't shrink a safe sub-ceiling value.
+        assert_eq!(super::mongo_batch_byte_cap(Some(256)), 256 * 1024 * 1024);
     }
 
     // ── mutation-W4 gap closure ──────────────────────────────────────────────

@@ -183,8 +183,41 @@ pub(super) fn mssql_type_mappings(
                 None,
             );
             let native = format!("{:?}", col.column_type()).to_lowercase();
-            let source = SourceColumn::simple(col.name(), native, true);
-            TypeMapping::from_source(&source, rivet)
+            let source = SourceColumn::simple(col.name(), native.clone(), true);
+            let mapping = TypeMapping::from_source(&source, rivet);
+            // Round-2 audit #19: datetime2 maps to Timestamp(µs); a scale-7 column
+            // (the bare `datetime2` default) silently loses its 100ns sub-microsecond
+            // tick, yet the derived fidelity is a blanket `Exact`. rivet does not read
+            // datetime2's declared scale from sys.columns (only decimal's), so surface
+            // the µs truncation as a warning in the type-report — the honest lever the
+            // finding calls for (Compatible/warn, never Lossy, which would break
+            // --strict for every bare datetime2). Value truncation itself is the
+            // documented "known gap 4" with a `timestamp_ns` opt-in.
+            if native == "datetime2" {
+                mapping.with_warning(
+                    "datetime2 → Timestamp(microsecond): a scale-7 column (the bare `datetime2` \
+                     default) loses its 100ns sub-microsecond tick. Use a `timestamp_ns` column \
+                     override to preserve it (at the cost of the 1677–2262 date range); \
+                     datetime2(0..6) is exact.",
+                )
+            } else if native == "timen" {
+                // Sibling of the datetime2 gap above: `time` maps to Time64(µs), but
+                // MSSQL's default `time` (== time(7)) and time(4..6) carry a 100ns
+                // sub-microsecond tick that the build arm truncates (`nanosecond()/1000`,
+                // build_array Time64 arm). rivet does not read time's declared scale
+                // (only decimal's), so the bare `time` is treated as scale-7. The
+                // value-checksum can't flag it — both sides do the same `/1000` — so
+                // surface the truncation as an honest Compatible/warn (never Lossy,
+                // which would break --strict for every bare time). There is no
+                // narrower target: Parquet Time64 has no 100ns unit.
+                mapping.with_warning(
+                    "time → Time64(microsecond): a scale-7 column (the bare `time` default, and \
+                     time(4..7)) loses its 100ns sub-microsecond tick — Parquet Time64 has no \
+                     100ns unit, so the tick is unrepresentable in the target. time(0..3) is exact.",
+                )
+            } else {
+                mapping
+            }
         })
         .collect()
 }
@@ -364,9 +397,9 @@ fn build_array(
                     // MONEY / SMALLMONEY: tiberius delivers the fixed-point
                     // 1/10000 value as F64, so the value was silently NULLed
                     // here. Render at the column's declared scale and parse the
-                    // digits exactly — a non-finite value fails LOUDLY. (The
-                    // f64 hop itself is exact up to ~9×10^11 currency units;
-                    // fidelity: compatible.)
+                    // digits exactly — a non-finite OR beyond-2^53 value fails
+                    // LOUDLY (round-2 #18), so every MONEY rivet stores is exactly
+                    // representable and the `Exact` fidelity label stays honest.
                     Some(ColumnData::F64(Some(v))) => b.append_value(
                         f64_to_scaled_i128(*v, scale)
                             .with_context(|| format!("mssql money column {idx} row {r}"))?,
@@ -466,6 +499,24 @@ fn build_array(
 fn f64_to_scaled_i128(v: f64, scale: u8) -> Result<i128> {
     if !v.is_finite() {
         anyhow::bail!("non-finite money value {v:?}");
+    }
+    // Round-2 audit #18: tiberius decodes MONEY as an f64. Above 2^53 the scaled
+    // integer (value·10^scale) is no longer integer-exact in f64, so a value this
+    // large was ALREADY rounded before rivet saw it — persisting it as an exact-
+    // looking DECIMAL(19,4) would be silent corruption under an `Exact` fidelity
+    // label. The loss is upstream (in the driver) and unrecoverable here, so fail
+    // LOUDLY like rescale_i128 rather than store a rounded value. Failing keeps the
+    // `Exact` label honest: every MONEY rivet DOES export is exactly representable.
+    let scaled_abs = v.abs() * 10f64.powi(scale as i32);
+    if scaled_abs >= 9_007_199_254_740_992.0 {
+        anyhow::bail!(
+            "mssql money value {v} exceeds the range representable without precision loss \
+             (|value| ≥ 2^53 ÷ 10^{scale} ≈ {:.3e}). tiberius decodes MONEY as f64, so this \
+             value was already rounded before rivet read it — it cannot be recovered here. \
+             Declare the column as text to preserve the exact digits, e.g. \
+             columns: <name>: string",
+            9_007_199_254_740_992.0 / 10f64.powi(scale as i32),
+        );
     }
     let txt = format!("{v:.prec$}", prec = scale as usize);
     crate::types::decimal::decimal_str_to_scaled_i128(&txt, scale as i8)
@@ -699,6 +750,27 @@ mod tests {
         }
         // Guard-rail: the finite happy path still works (the bail didn't over-reach).
         assert!(f64_to_scaled_i128(12.34, 4).is_ok());
+    }
+
+    #[test]
+    fn money_beyond_f64_exact_range_fails_loudly_not_silently_rounded() {
+        // Round-2 audit #18: above 2^53 the scaled integer (value·10^4) is no
+        // longer integer-exact in f64, so tiberius already rounded the value —
+        // storing it as an exact-looking DECIMAL(19,4) would be silent corruption
+        // under an `Exact` label. It must fail loudly instead. RED before the
+        // magnitude guard (the value was rendered + stored as if exact).
+        // 2^53 / 10^4 ≈ 9.007e11; pick a MONEY value comfortably past it.
+        let huge = 1.0e12_f64; // 1,000,000,000,000 currency units, scale 4 → 1e16 > 2^53
+        assert!(
+            f64_to_scaled_i128(huge, 4).is_err(),
+            "a MONEY value past the f64-exact range must fail loudly, not store a rounded value"
+        );
+        // Just under the threshold still succeeds (the guard doesn't over-reach):
+        // 9.0e11 · 10^4 = 9.0e15 < 2^53 ≈ 9.007e15.
+        assert!(
+            f64_to_scaled_i128(9.0e11, 4).is_ok(),
+            "a MONEY value within the exact range must still export"
+        );
     }
 
     // ROAST-RED mssql-rescale-loud: lossless guards — these already pass and

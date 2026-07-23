@@ -14,6 +14,20 @@
 //! re-reads the Parquet and recompares ([`validate_manifest_checksums`]), catching
 //! an `Arrow→Parquet` encode / post-write fault Form A cannot see.
 //!
+//! **Form B is recorded on EVERY runner.** The sink computes the per-column
+//! checksum on every runner (`track_checksum`); the MULTI-PART runners (chunked,
+//! keyset, parallel-Mongo) each write through several sinks, so they XOR-combine
+//! the per-part maps run-wide through the shared
+//! `pipeline::commit::{accumulate,harvest}_column_checksums` seam before finalize —
+//! producing the SAME run-wide checksum single mode records from its one sink
+//! (XOR is order- and count-independent). So `rivet validate`'s Form-B re-read
+//! verifies chunked/keyset/parallel-Mongo exports too (round-9 closed the earlier
+//! gap where the multi-part runners computed the checksum then discarded it). One
+//! honest exception remains: **Mongo has no Form A** (the verbatim `document` blob
+//! has no per-column source pass), so a Mongo export's value integrity rests on
+//! Form B + the per-part content-MD5, not the in-process source↔Arrow parity the
+//! SQL engines get. See `docs/runner-coverage-matrix.yaml` (`value_checksum_form_b`).
+//!
 //! The per-column value is `xxh3` of each cell's value **bytes**, XOR-combined
 //! (order-independent, so chunk/parallel order doesn't matter) — keyed to the row
 //! cursor/key column when present (`xxh3(key ‖ value)`, swap-resistant). Hashing

@@ -329,6 +329,43 @@ pub enum WriteOutcome {
 /// that case so the caller can surface a clear "no manifest produced" note
 /// in the run report.
 pub fn write_manifest(dest: &dyn Destination, manifest: &RunManifest) -> Result<WriteOutcome> {
+    let emit_success_marker = matches!(manifest.status, ManifestStatus::Success);
+    // Canonical manifest.json + `_SUCCESS` move together (a consistent pair).
+    write_manifest_inner(dest, manifest, emit_success_marker, true)
+}
+
+/// Like [`write_manifest`] but never writes the prefix-level `_SUCCESS` marker,
+/// even for a `Success` manifest. The CDC sink calls this before each slot/
+/// checkpoint ack (round-2 audit #11): the ack advances a consume-on-read slot
+/// PAST the just-flushed parts, so those parts must already be covered by a
+/// durable, loader-acceptable (`Success`) run-unique manifest — otherwise a crash
+/// in the ack→terminal-manifest window orphans them from the manifest-
+/// authoritative `rivet load` (silent, count-gate-invisible row loss). But the
+/// prefix is NOT complete yet, so `_SUCCESS` must not appear until the clean end
+/// (the terminal [`write_manifest`] emits it), or resume/guard would treat a
+/// mid-stream cycle as finished.
+pub fn write_manifest_without_success_marker(
+    dest: &dyn Destination,
+    manifest: &RunManifest,
+) -> Result<WriteOutcome> {
+    // Round-3 regression fix: write ONLY the immutable run-unique copy, NOT the
+    // canonical manifest.json. The CDC sink calls this per-roll (before each ack)
+    // purely for durability, and the manifest-authoritative loader finds the parts
+    // via the run-unique copies (list_manifest_keys prefers them). Overwriting the
+    // canonical manifest.json here left the prefix's `_SUCCESS` (which fingerprints
+    // the LAST completed run's manifest) stale against it, so `rivet validate` fired
+    // a fatal SuccessMarkerStale on fully-intact data during/after a shared-prefix
+    // `until_current` run. The canonical + `_SUCCESS` must stay a consistent pair,
+    // updated together only by the terminal `write_manifest` at clean end.
+    write_manifest_inner(dest, manifest, false, false)
+}
+
+fn write_manifest_inner(
+    dest: &dyn Destination,
+    manifest: &RunManifest,
+    emit_success_marker: bool,
+    write_canonical: bool,
+) -> Result<WriteOutcome> {
     if dest.capabilities().commit_protocol == WriteCommitProtocol::Streaming {
         log::info!(
             "destination is streaming; manifest.json / _SUCCESS not written (ADR-0012 §Artifacts)"
@@ -346,30 +383,33 @@ pub fn write_manifest(dest: &dyn Destination, manifest: &RunManifest) -> Result<
 
     let manifest_tmp = tempfile::NamedTempFile::new()?;
     std::fs::write(manifest_tmp.path(), &bytes)?;
-    dest.write(manifest_tmp.path(), MANIFEST_FILENAME)?;
-    // Immutable per-run copy beside the canonical (last-writer-wins) pointer.
-    // Consecutive runs into one prefix — a CDC soak, incremental batch, the
-    // scheduler's `until_current` model — each clobber `manifest.json`,
-    // orphaning every prior run's manifest from a consumer that sums row counts
-    // ACROSS runs (the Pro loader's reconcile). The parts already carry the run
-    // id in their names (`<export>_<stamp>.parquet`, `cdc-<run_token>-NNNN`);
-    // the manifest sidecar must too. Additive and mode-agnostic: guard / validate
-    // / resume / repair keep reading the canonical name unchanged, so no consumer
-    // moves — this is the ONE seam every pipeline shape writes through.
+    if write_canonical {
+        // The canonical (last-writer-wins) pointer. Updated with `_SUCCESS` only at
+        // a run's clean end so the pair never disagrees (round-3 regression fix).
+        dest.write(manifest_tmp.path(), MANIFEST_FILENAME)?;
+    }
+    // Immutable per-run copy. Consecutive runs into one prefix — a CDC soak,
+    // incremental batch, the scheduler's `until_current` model — each clobber
+    // `manifest.json`, orphaning every prior run's manifest from a consumer that
+    // sums row counts ACROSS runs (the Pro loader's reconcile). The parts already
+    // carry the run id in their names (`<export>_<stamp>.parquet`,
+    // `cdc-<run_token>-NNNN`); the manifest sidecar must too. This is the durable
+    // record the loader reads, so it is ALWAYS written.
     dest.write(
         manifest_tmp.path(),
         &run_unique_manifest_name(&manifest.run_id),
     )?;
 
-    let success_marker = matches!(manifest.status, ManifestStatus::Success);
-    if success_marker {
+    if emit_success_marker {
         let marker_body = success_marker_body(&bytes);
         let success_tmp = tempfile::NamedTempFile::new()?;
         std::fs::write(success_tmp.path(), marker_body.as_bytes())?;
         dest.write(success_tmp.path(), SUCCESS_FILENAME)?;
     }
 
-    Ok(WriteOutcome::Written { success_marker })
+    Ok(WriteOutcome::Written {
+        success_marker: emit_success_marker,
+    })
 }
 
 #[cfg(test)]
@@ -734,6 +774,44 @@ mod tests {
                 .join(run_unique_manifest_name(&m.run_id))
                 .exists(),
             "run-unique copy beside it"
+        );
+    }
+
+    #[test]
+    fn mid_roll_manifest_write_does_not_touch_canonical_or_success() {
+        // Round-3 regression: write_manifest_without_success_marker (the CDC per-roll
+        // durability write) must NOT overwrite the canonical manifest.json, or the
+        // prefix's _SUCCESS (fingerprint of the LAST completed run) goes stale against
+        // it and `rivet validate` raises a fatal SuccessMarkerStale on intact data.
+        // RED before the fix (it overwrote manifest.json every roll).
+        let dir = tempfile::tempdir().unwrap();
+        let dest = local_dest(dir.path());
+
+        // Run A completes: canonical + _SUCCESS + run-unique, all consistent.
+        let a = build_manifest_with_run(ManifestStatus::Success, "run_A");
+        write_manifest(&dest, &a).unwrap();
+        let canonical_after_a = std::fs::read(dir.path().join(MANIFEST_FILENAME)).unwrap();
+        let success_after_a = std::fs::read(dir.path().join(SUCCESS_FILENAME)).unwrap();
+
+        // Run B does a mid-roll durability write into the SAME prefix.
+        let b = build_manifest_with_run(ManifestStatus::Success, "run_B");
+        write_manifest_without_success_marker(&dest, &b).unwrap();
+
+        // The canonical pointer and _SUCCESS must still be run A's (consistent pair).
+        assert_eq!(
+            std::fs::read(dir.path().join(MANIFEST_FILENAME)).unwrap(),
+            canonical_after_a,
+            "mid-roll write must NOT overwrite the canonical manifest.json"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join(SUCCESS_FILENAME)).unwrap(),
+            success_after_a,
+            "_SUCCESS must stay paired with the canonical it fingerprints"
+        );
+        // But run B's durable run-unique copy IS written (the loader reads it).
+        assert!(
+            dir.path().join(run_unique_manifest_name("run_B")).exists(),
+            "run B's run-unique manifest must be durable for the loader"
         );
     }
 

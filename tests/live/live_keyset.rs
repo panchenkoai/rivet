@@ -60,6 +60,260 @@ fn read_uid_set(dir: &std::path::Path) -> (usize, BTreeSet<String>) {
     (count, keys)
 }
 
+/// Form B on the keyset runner (round-9 gap fix): the manifest must RECORD the
+/// per-column value checksums — previously the sink computed them per page then
+/// DROPPED them, so `rivet validate`'s Form-B re-read was a silent no-op on keyset
+/// (a large-table path). Assert (1) the manifest carries a non-empty
+/// column_checksums array (RED before the run-wide harvest), and (2) `rivet
+/// validate` re-reads the parts and PASSES — proving the recorded XOR-combined
+/// checksums actually match the parquet, not just that the array is populated.
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn keyset_export_records_form_b_checksums_and_validate_passes() {
+    require_alive(LiveService::Postgres);
+    let table = unique_name("keyset_formb");
+    let mut c = pg_connect();
+    c.batch_execute(&format!(
+        "CREATE TABLE {table} (k TEXT PRIMARY KEY, v INT NOT NULL, note TEXT);
+         INSERT INTO {table} SELECT 'k' || lpad(g::text, 6, '0'), g, 'n' || g \
+         FROM generate_series(1, 2000) g;"
+    ))
+    .unwrap();
+    let _guard = PgTable::adopt(table.clone());
+
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let out_dir = tempfile::tempdir().unwrap();
+    let export = unique_name("keyset_formb_exp");
+    // TEXT key + chunk_by_key → keyset, chunk_size 500 → 4 pages (cross-page XOR).
+    let yaml = format!(
+        "source: {{type: postgres, url: \"{POSTGRES_URL}\"}}\nexports:\n  - name: {export}\n    \
+         table: {table}\n    mode: chunked\n    chunk_by_key: k\n    chunk_size: 500\n    \
+         format: parquet\n    destination: {{type: local, path: {out}}}\n",
+        out = out_dir.path().display(),
+    );
+    let cfg = write_config(&cfg_dir, &yaml);
+    let r = run_rivet_export(&cfg, &export);
+    assert!(
+        r.status.success(),
+        "keyset export must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+
+    // (1) The manifest records Form B checksums (RED before the harvest — empty).
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(out_dir.path().join("manifest.json")).expect("manifest.json"),
+    )
+    .expect("parse manifest");
+    let checksums = manifest["column_checksums"].as_array();
+    assert!(
+        checksums.is_some_and(|a| !a.is_empty()),
+        "keyset manifest must record Form B column_checksums, got: {}",
+        manifest["column_checksums"]
+    );
+
+    // (2) validate (default depth Full → runs the Form B re-read) re-reads the
+    // parts; the recorded checksums must MATCH.
+    let v = std::process::Command::new(RIVET_BIN)
+        .args([
+            "validate",
+            "--config",
+            cfg.to_str().unwrap(),
+            "--export",
+            &export,
+        ])
+        .output()
+        .expect("spawn rivet validate");
+    assert!(
+        v.status.success(),
+        "rivet validate must PASS — the recorded Form B checksums must match the re-read parts; \
+         stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&v.stdout),
+        String::from_utf8_lossy(&v.stderr)
+    );
+}
+
+/// Cross-shape manifest guard on the KEYSET runner: a batch keyset export must
+/// refuse to overwrite a prior CDC manifest at the same prefix (they would
+/// silently destroy each other's audit trail). Every batch runner calls
+/// guard_manifest_mode; this proves the keyset column of the runner-coverage
+/// matrix, the sibling of the checkpoint gap the graph surfaced.
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn keyset_export_refuses_to_clobber_a_cdc_manifest() {
+    require_alive(LiveService::Postgres);
+    let table = unique_name("keyset_guard");
+    let mut c = pg_connect();
+    c.batch_execute(&format!(
+        "CREATE TABLE {table} (k TEXT PRIMARY KEY, v INT NOT NULL);
+         INSERT INTO {table} SELECT 'k' || lpad(g::text, 6, '0'), g \
+         FROM generate_series(1, 100) g;"
+    ))
+    .unwrap();
+    let _guard = PgTable::adopt(table.clone());
+
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let out_dir = tempfile::tempdir().unwrap();
+    // A prior CDC run's manifest already sits at the destination prefix.
+    std::fs::write(
+        out_dir.path().join("manifest.json"),
+        br#"{"manifest_version":1,"run_id":"prior-cdc","mode":"cdc","parts":[]}"#,
+    )
+    .unwrap();
+    let export = unique_name("keyset_guard_exp");
+    let yaml = format!(
+        "source: {{type: postgres, url: \"{POSTGRES_URL}\"}}\nexports:\n  - name: {export}\n    \
+         table: {table}\n    mode: chunked\n    chunk_by_key: k\n    chunk_size: 50\n    \
+         format: parquet\n    destination: {{type: local, path: {out}}}\n",
+        out = out_dir.path().display(),
+    );
+    let cfg = write_config(&cfg_dir, &yaml);
+    let r = run_rivet_export(&cfg, &export);
+    assert!(
+        !r.status.success(),
+        "keyset export must REFUSE to overwrite a CDC manifest"
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&r.stdout),
+        String::from_utf8_lossy(&r.stderr)
+    );
+    assert!(
+        combined.contains("already holds a 'cdc' manifest"),
+        "must name the cross-shape collision; got:\n{combined}"
+    );
+}
+
+/// Form B on the CHUNKED (range) runner — same round-9 gap + same run-wide XOR
+/// harvest as keyset, but a different runner (exec.rs, sequential + parallel).
+/// An integer chunk_column routes to range chunking, not keyset.
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn chunked_export_records_form_b_checksums_and_validate_passes() {
+    require_alive(LiveService::Postgres);
+    let table = unique_name("chunked_formb");
+    let mut c = pg_connect();
+    c.batch_execute(&format!(
+        "CREATE TABLE {table} (id BIGINT PRIMARY KEY, v INT NOT NULL, note TEXT);
+         INSERT INTO {table} SELECT g, g * 2, 'n' || g FROM generate_series(1, 2000) g;"
+    ))
+    .unwrap();
+    let _guard = PgTable::adopt(table.clone());
+
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let out_dir = tempfile::tempdir().unwrap();
+    let export = unique_name("chunked_formb_exp");
+    // Integer chunk_column → range chunking (the chunked runner), chunk_size 500.
+    let yaml = format!(
+        "source: {{type: postgres, url: \"{POSTGRES_URL}\"}}\nexports:\n  - name: {export}\n    \
+         table: {table}\n    mode: chunked\n    chunk_column: id\n    chunk_size: 500\n    \
+         format: parquet\n    destination: {{type: local, path: {out}}}\n",
+        out = out_dir.path().display(),
+    );
+    let cfg = write_config(&cfg_dir, &yaml);
+    let r = run_rivet_export(&cfg, &export);
+    assert!(
+        r.status.success(),
+        "chunked export must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(out_dir.path().join("manifest.json")).expect("manifest.json"),
+    )
+    .expect("parse manifest");
+    assert!(
+        manifest["column_checksums"]
+            .as_array()
+            .is_some_and(|a| !a.is_empty()),
+        "chunked manifest must record Form B column_checksums, got: {}",
+        manifest["column_checksums"]
+    );
+
+    let v = std::process::Command::new(RIVET_BIN)
+        .args([
+            "validate",
+            "--config",
+            cfg.to_str().unwrap(),
+            "--export",
+            &export,
+        ])
+        .output()
+        .expect("spawn rivet validate");
+    assert!(
+        v.status.success(),
+        "rivet validate must PASS on the chunked export — recorded Form B must match the re-read; \
+         stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&v.stdout),
+        String::from_utf8_lossy(&v.stderr)
+    );
+}
+
+/// Form B on the CHECKPOINT (resumable `chunk_checkpoint: true`) chunked runner —
+/// a SEPARATE runner (chunked/sequential_checkpoint.rs) the graph surfaced as a
+/// distinct 300+-line function that the first Form B pass (exec.rs only) MISSED.
+/// The resumable path must record Form B too.
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn chunked_checkpoint_export_records_form_b_checksums_and_validate_passes() {
+    require_alive(LiveService::Postgres);
+    let table = unique_name("ckpt_formb");
+    let mut c = pg_connect();
+    c.batch_execute(&format!(
+        "CREATE TABLE {table} (id BIGINT PRIMARY KEY, v INT NOT NULL, note TEXT);
+         INSERT INTO {table} SELECT g, g * 2, 'n' || g FROM generate_series(1, 2000) g;"
+    ))
+    .unwrap();
+    let _guard = PgTable::adopt(table.clone());
+
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let out_dir = tempfile::tempdir().unwrap();
+    let export = unique_name("ckpt_formb_exp");
+    // chunk_checkpoint: true routes to the CHECKPOINT runner (not exec.rs).
+    let yaml = format!(
+        "source: {{type: postgres, url: \"{POSTGRES_URL}\"}}\nexports:\n  - name: {export}\n    \
+         table: {table}\n    mode: chunked\n    chunk_column: id\n    chunk_size: 500\n    \
+         chunk_checkpoint: true\n    format: parquet\n    destination: {{type: local, path: {out}}}\n",
+        out = out_dir.path().display(),
+    );
+    let cfg = write_config(&cfg_dir, &yaml);
+    let r = run_rivet_export(&cfg, &export);
+    assert!(
+        r.status.success(),
+        "chunked-checkpoint export must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(out_dir.path().join("manifest.json")).expect("manifest.json"),
+    )
+    .expect("parse manifest");
+    assert!(
+        manifest["column_checksums"]
+            .as_array()
+            .is_some_and(|a| !a.is_empty()),
+        "chunked-CHECKPOINT manifest must record Form B column_checksums, got: {}",
+        manifest["column_checksums"]
+    );
+
+    let v = std::process::Command::new(RIVET_BIN)
+        .args([
+            "validate",
+            "--config",
+            cfg.to_str().unwrap(),
+            "--export",
+            &export,
+        ])
+        .output()
+        .expect("spawn rivet validate");
+    assert!(
+        v.status.success(),
+        "rivet validate must PASS on the checkpoint chunked export — recorded Form B must match; \
+         stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&v.stdout),
+        String::from_utf8_lossy(&v.stderr)
+    );
+}
+
 #[test]
 #[ignore = "live: requires docker compose up -d mysql"]
 fn keyset_varchar_pk_roundtrips_full_keyset_across_pages() {
@@ -142,6 +396,81 @@ fn keyset_varchar_pk_roundtrips_full_keyset_across_pages() {
 /// re-read would inflate it to 2500. The union-of-keys alone cannot tell the two
 /// apart (a set dedups), so we assert the running row TOTAL, not just the keys —
 /// the exact "capture-works ≠ resume-works" trap the two-run test exists to close.
+/// Round-5: a keyset checkpoint crash before the terminal manifest leaves committed
+/// pages durably on the destination (parquet + file_log) but with NO manifest; the
+/// resume continues from the cursor and skips them, so finalize used to write a
+/// manifest of ONLY the resume's pages — orphaning the pre-crash pages from the
+/// manifest-authoritative loader (silent loss). This reads the DESTINATION
+/// manifest.json (not a parquet glob) and asserts it declares EVERY row. RED before
+/// the resume_run_id + file_log rehydration.
+#[test]
+#[ignore = "live: requires docker compose up -d mysql"]
+fn keyset_checkpoint_crash_resume_writes_a_complete_destination_manifest() {
+    require_alive(LiveService::Mysql);
+    let table = unique_name("keyset_m5");
+    let _guard = DropTable(table.clone());
+    let mut conn = mysql_connect();
+    conn.query_drop(format!("DROP TABLE IF EXISTS {table}"))
+        .unwrap();
+    conn.query_drop(format!(
+        "CREATE TABLE {table} (uid VARCHAR(40) NOT NULL PRIMARY KEY, payload INT NOT NULL)"
+    ))
+    .unwrap();
+    conn.query_drop("SET SESSION cte_max_recursion_depth = 20000")
+        .unwrap();
+    conn.query_drop(format!(
+        "INSERT INTO {table} (uid, payload) \
+         WITH RECURSIVE seq AS (SELECT 1 n UNION ALL SELECT n+1 FROM seq WHERE n < 1000) \
+         SELECT CONCAT('id-', LPAD(n, 6, '0')), n FROM seq"
+    ))
+    .unwrap();
+
+    let export = unique_name("keyset_m5_exp");
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let out_dir = tempfile::tempdir().unwrap();
+    let yaml = format!(
+        "source:\n  type: mysql\n  url: \"{MYSQL_URL}\"\nexports:\n  - name: {export}\n    \
+         table: {table}\n    mode: chunked\n    chunk_by_key: uid\n    chunk_checkpoint: true\n    \
+         chunk_size: 300\n    format: parquet\n    destination:\n      type: local\n      path: {out}\n",
+        out = out_dir.path().display(),
+    );
+    let cfg = write_config(&cfg_dir, &yaml);
+
+    // Crash after page 0 commits (300 rows durable, cursor advanced, no manifest).
+    let crash = std::process::Command::new(RIVET_BIN)
+        .args([
+            "run",
+            "--config",
+            cfg.to_str().unwrap(),
+            "--export",
+            &export,
+        ])
+        .env("RIVET_TEST_PANIC_AT", "after_keyset_page:0")
+        .output()
+        .expect("spawn rivet");
+    assert!(!crash.status.success(), "crash run must exit non-zero");
+
+    // Resume (keyset checkpoint auto-resumes from the cursor).
+    let resume = run_rivet_export(&cfg, &export);
+    assert!(
+        resume.status.success(),
+        "resume must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&resume.stderr)
+    );
+
+    // MANIFEST-DRIVEN: the destination manifest.json must declare all 1000 rows —
+    // page 0 (pre-crash) must be rehydrated, not orphaned.
+    let m: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(out_dir.path().join("manifest.json")).unwrap())
+            .expect("destination manifest.json must exist + parse");
+    assert_eq!(
+        m["row_count"].as_i64(),
+        Some(1000),
+        "destination manifest must declare every row (pre-crash page not orphaned); got {}",
+        m["row_count"]
+    );
+}
+
 #[test]
 #[ignore = "live: requires docker compose up -d mysql"]
 fn keyset_checkpoint_resume_second_run_captures_only_new_keys() {

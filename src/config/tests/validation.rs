@@ -31,6 +31,275 @@ exports:
     );
 }
 
+// ─── round-2 audit #14: chunk knobs are chunked-only ─────────────────────
+// A config that sets a chunk knob but omits `mode: chunked` silently degrades
+// to a single unbounded snapshot (the source-pressure footgun chunked mode
+// exists to prevent). Gate it at config-load, like chunk_dense/chunk_by_days.
+// RED before the validate_export guard: these all passed validation.
+
+#[test]
+fn chunk_column_without_chunked_mode_rejected() {
+    // `mode` omitted ⇒ defaults to Full; chunk_column is then silently dropped.
+    let yaml = r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: t
+    table: events
+    chunk_column: id
+    format: parquet
+    destination:
+      type: local
+      path: ./out
+"#;
+    let msg = format!("{:#}", Config::from_yaml(yaml).unwrap_err());
+    assert!(msg.contains("chunk_column"), "names the knob: {msg}");
+    assert!(msg.contains("mode: chunked"), "points at the fix: {msg}");
+}
+
+#[test]
+fn nondefault_chunk_size_without_chunked_mode_rejected() {
+    let yaml = r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: t
+    mode: full
+    table: events
+    chunk_size: 5000
+    format: parquet
+    destination:
+      type: local
+      path: ./out
+"#;
+    let msg = format!("{:#}", Config::from_yaml(yaml).unwrap_err());
+    assert!(msg.contains("chunk_size"), "names the knob: {msg}");
+    assert!(msg.contains("mode: chunked"), "points at the fix: {msg}");
+}
+
+#[test]
+fn chunk_knobs_accepted_under_chunked_mode() {
+    // The guard must NOT false-positive: the exact same knobs are valid when
+    // mode IS chunked, and the default chunk_size under a non-chunked mode is
+    // fine (it is indistinguishable from unset and harmless).
+    let chunked = r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: t
+    mode: chunked
+    table: events
+    chunk_column: id
+    chunk_size: 5000
+    chunk_checkpoint: true
+    format: parquet
+    destination:
+      type: local
+      path: ./out
+"#;
+    assert!(
+        Config::from_yaml(chunked).is_ok(),
+        "chunk knobs must be accepted under mode: chunked"
+    );
+
+    let default_size_full = r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: t
+    mode: full
+    table: events
+    format: parquet
+    destination:
+      type: local
+      path: ./out
+"#;
+    assert!(
+        Config::from_yaml(default_size_full).is_ok(),
+        "a full export that never touches chunk knobs must stay valid"
+    );
+}
+
+// ─── round-2 audit #5/#6/#15/#16/#17: config-load hoists ─────────────────
+
+#[test]
+fn cdc_tables_entry_with_traversal_rejected_at_load() {
+    // #5: a `tables:` entry becomes a destination path segment — `..` escapes
+    // the configured tree. RED before the is_filename_safe_name gate on tables.
+    let yaml = r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: leak
+    mode: cdc
+    tables: ["../../evil"]
+    format: parquet
+    cdc:
+      slot: s
+    destination:
+      type: local
+      path: ./out
+"#;
+    let msg = format!("{:#}", Config::from_yaml(yaml).unwrap_err());
+    assert!(msg.contains("filename-safe"), "names the class: {msg}");
+}
+
+#[test]
+fn partition_by_with_cdc_mode_rejected_at_load() {
+    // #15: partition_by + mode:cdc previously passed `check`, then died at run
+    // after a live probe with a misleading "requires table:". Reject statically.
+    let yaml = r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: t
+    mode: cdc
+    table: events
+    partition_by: created_at
+    format: parquet
+    cdc:
+      slot: s
+    destination:
+      type: local
+      path: ./out
+      prefix: "p/{partition}/"
+"#;
+    let msg = format!("{:#}", Config::from_yaml(yaml).unwrap_err());
+    assert!(msg.contains("partition_by"), "names the knob: {msg}");
+    assert!(
+        msg.to_lowercase().contains("cdc"),
+        "names the incompatible mode: {msg}"
+    );
+}
+
+#[test]
+fn partition_by_column_name_traversal_rejected_at_load() {
+    // #6: the partition column name becomes the Hive `col=value` segment.
+    let yaml = r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: t
+    mode: full
+    table: events
+    partition_by: "../x"
+    format: parquet
+    destination:
+      type: local
+      path: ./out
+      prefix: "p/{partition}/"
+"#;
+    let msg = format!("{:#}", Config::from_yaml(yaml).unwrap_err());
+    assert!(msg.contains("filename-safe"), "names the class: {msg}");
+}
+
+#[test]
+fn partition_by_without_token_rejected_at_check_time() {
+    // #16: the {partition}-token rule was enforced only in the run pipeline —
+    // `rivet check` gave a false green. Now caught at config-load.
+    let yaml = r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: t
+    mode: full
+    table: events
+    partition_by: created_at
+    format: parquet
+    destination:
+      type: local
+      path: ./out
+"#;
+    let msg = format!("{:#}", Config::from_yaml(yaml).unwrap_err());
+    assert!(
+        msg.contains("{partition}"),
+        "names the missing token: {msg}"
+    );
+}
+
+#[test]
+fn chunk_size_and_memory_mb_both_set_rejected() {
+    // #17: documented mutually exclusive, previously unenforced — chunk_size
+    // was silently dropped in favour of the memory budget.
+    let yaml = r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: t
+    mode: chunked
+    table: events
+    chunk_column: id
+    chunk_size: 5000
+    chunk_size_memory_mb: 256
+    format: parquet
+    destination:
+      type: local
+      path: ./out
+"#;
+    let msg = format!("{:#}", Config::from_yaml(yaml).unwrap_err());
+    assert!(msg.contains("chunk_size"), "names the knob: {msg}");
+    assert!(
+        msg.contains("mutually exclusive"),
+        "explains the rule: {msg}"
+    );
+}
+
+#[test]
+fn valid_partition_by_and_tables_configs_are_accepted() {
+    // The false-REJECT guard for the config-validation matrix: the round-2 hoists
+    // (#5/#6/#15/#16/#17) must reject the accept-but-break combos WITHOUT breaking a
+    // legit config. A partition_by full export with a {partition} token, and a
+    // multi-table CDC export with well-formed table names, must both still load.
+    let partitioned = r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: t
+    mode: full
+    table: events
+    partition_by: created_at
+    format: parquet
+    destination:
+      type: local
+      path: ./out
+      prefix: "events/{partition}/"
+"#;
+    assert!(
+        Config::from_yaml(partitioned).is_ok(),
+        "a valid partition_by export must still load"
+    );
+
+    let cdc_tables = r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: t
+    mode: cdc
+    tables: ["orders", "public.customers"]
+    format: parquet
+    cdc:
+      slot: s
+    destination:
+      type: local
+      path: ./out
+"#;
+    assert!(
+        Config::from_yaml(cdc_tables).is_ok(),
+        "a well-formed multi-table CDC export (incl. a schema-qualified name) must still load"
+    );
+}
+
 #[test]
 fn misplaced_profile_in_source_rejected() {
     let yaml = r#"
