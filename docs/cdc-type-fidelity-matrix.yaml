@@ -1,0 +1,136 @@
+# CDC per-type value-fidelity matrix — does a source column TYPE ride through the
+# CHANGE-STREAM path (decode → typed RivetValue sink → Parquet) with correct
+# precision/encoding, per engine? The batch axis is docs/type-fidelity-matrix.yaml;
+# this is its CDC sibling. The audit found the per-type CDC axis un-systematized —
+# the class where findings #2 (MSSQL MONEY>2^53), #3 (MySQL ENUM cross-db) and #4
+# (BIT(64) bit 63) lived: the batch path was correct, the CDC/edge sibling was not.
+# Same shape + drift-guard as the other ledgers. Cell = { test } | { gap } | { na }.
+#
+# The workhorse cells cite each engine's `*_cdc_full_type_matrix_matches_batch`
+# test (a comprehensive type table exported BOTH ways, asserted equal by ArrayData
+# — type AND value). The edge scenarios (money/enum/bit) cite the dedicated tests
+# that cover the value RANGE the full-type tables use small, safe values for.
+#
+# Mongo is a JSON-blob model: a change document rides a verbatim extended-JSON
+# `document` column, so per-column Parquet type fidelity is n/a EXCEPT where a
+# value is explicitly asserted verbatim through the change stream (Int64,
+# Decimal128, text/json) by the CDC extJSON test.
+#
+# Every RivetType FAMILY must have a scenario row (enforced generatively by
+# matrix_cdc_type_rows_cover_every_rivet_type in the drift-guard, derived from the
+# RivetType enum): a new type cannot ship without a CDC-fidelity row.
+
+engines: [postgres, mysql, mssql, mongo]
+
+scenarios:
+  - id: type_boolean
+    what: "boolean rides through the change stream as the same Arrow Boolean as batch"
+    postgres: { test: pg_cdc_full_type_matrix_matches_batch }
+    mysql:    { test: cdc_full_type_matrix_matches_batch }
+    mssql:    { test: mssql_cdc_full_type_matrix_matches_batch }
+    mongo:    { na: "boolean rides the verbatim document blob, not a typed column" }
+
+  - id: type_integer_families
+    what: "int16/32/64 + unsigned 64 (incl. BIGINT UNSIGNED > i64::MAX) survive CDC"
+    postgres: { test: pg_cdc_full_type_matrix_matches_batch }
+    mysql:    { test: cdc_full_type_matrix_matches_batch }
+    mssql:    { test: mssql_cdc_full_type_matrix_matches_batch }
+    mongo:    { test: mongo_cdc_change_stream_renders_tricky_bson_verbatim_like_batch }
+
+  - id: type_float
+    what: "real/double through CDC — hostile floats (NaN/Inf) match batch or fail loud"
+    postgres: { test: pg_cdc_hostile_floats_match_batch_and_nan_numeric_fails_loudly }
+    mysql:    { test: cdc_full_type_matrix_matches_batch }
+    mssql:    { test: mssql_cdc_full_type_matrix_matches_batch }
+    mongo:    { na: "float rides the verbatim document blob, not a typed column" }
+
+  - id: type_decimal
+    what: "decimal(p,s) precision + scale through CDC; MSSQL MONEY past the f64-exact 2^53 range fails loud, not falsely-exact (finding #2)"
+    postgres: { test: pg_cdc_full_type_matrix_matches_batch }
+    mysql:    { test: cdc_full_type_matrix_matches_batch }
+    mssql:    { test: cdc_money_past_f64_exact_range_fails_loud_not_a_falsely_exact_decimal }
+    mongo:    { test: mongo_cdc_change_stream_renders_tricky_bson_verbatim_like_batch }
+
+  - id: type_date_time
+    what: "date + time-of-day survive the change stream with the batch Arrow types"
+    postgres: { test: pg_cdc_full_type_matrix_matches_batch }
+    mysql:    { test: cdc_full_type_matrix_matches_batch }
+    mssql:    { test: mssql_cdc_full_type_matrix_matches_batch }
+    mongo:    { na: "BSON dates ride the verbatim document blob; the extJSON test pins the mechanism" }
+
+  - id: type_timestamp_tz
+    what: "naive vs tz-aware timestamp — CDC preserves the UTC instant under a non-default session/DB timezone (the +9h render-time trap)"
+    postgres: { test: pg_cdc_non_utc_database_timezone_matches_batch }
+    mysql:    { test: cdc_non_utc_server_timezone_matches_batch_and_utc_instant }
+    mssql:    { test: mssql_cdc_datetimeoffset_value_is_preserved }
+    mongo:    { na: "BSON dates ride the verbatim document blob" }
+
+  - id: type_text
+    what: "varchar/char/text through CDC — value + encoding verbatim"
+    postgres: { test: pg_cdc_full_type_matrix_matches_batch }
+    mysql:    { test: cdc_full_type_matrix_matches_batch }
+    mssql:    { test: mssql_cdc_full_type_matrix_matches_batch }
+    mongo:    { test: mongo_cdc_change_stream_renders_tricky_bson_verbatim_like_batch }
+
+  - id: type_binary
+    what: "bytea/varbinary/binary through CDC as the same bytes"
+    postgres: { test: pg_cdc_full_type_matrix_matches_batch }
+    mysql:    { test: cdc_full_type_matrix_matches_batch }
+    mssql:    { test: mssql_cdc_full_type_matrix_matches_batch }
+    mongo:    { na: "binary rides the verbatim document blob (BSON Binary → extJSON)" }
+
+  - id: type_json
+    what: "json/jsonb content fidelity through the change stream"
+    postgres: { test: cdc_captures_json_as_valid_json }
+    mysql:    { test: cdc_full_type_matrix_matches_batch }
+    mssql:    { na: "SQL Server has no native JSON type; the CDC matrix fixture omits it by design" }
+    mongo:    { test: mongo_cdc_change_stream_renders_tricky_bson_verbatim_like_batch }
+
+  - id: type_uuid
+    what: "uuid — PG uuid / MySQL CHAR(36) / MSSQL uniqueidentifier → canonical value through CDC"
+    postgres: { test: pg_cdc_full_type_matrix_matches_batch }
+    mysql:    { test: cdc_full_type_matrix_matches_batch }
+    mssql:    { test: mssql_cdc_full_type_matrix_matches_batch }
+    mongo:    { na: "a BSON uuid rides the verbatim document blob, not a typed column" }
+
+  - id: type_enum
+    what: "enum label (not the wire index) through CDC — incl. a CROSS-DATABASE MySQL capture enriched from the table's own schema (finding #3)"
+    postgres: { test: pg_cdc_full_type_matrix_matches_batch }
+    mysql:    { test: cdc_cross_database_enum_enriches_from_the_tables_own_schema }
+    mssql:    { na: "SQL Server has no ENUM type" }
+    mongo:    { na: "no enum type; a string rides the document blob" }
+
+  - id: type_set
+    what: "MySQL SET — the comma-joined labels (not the raw bitmask) through CDC"
+    postgres: { na: "PostgreSQL has no SET type" }
+    mysql:    { test: cdc_full_type_matrix_matches_batch }
+    mssql:    { na: "SQL Server has no SET type" }
+    mongo:    { na: "no SET type" }
+
+  - id: type_bit
+    what: "BIT(n) through CDC — BIT(1) boolean, BIT(n>1) integer; a BIT(64) with bit 63 set fails loud, never a silent NULL (finding #4)"
+    postgres: { na: "PG bit/varbit is not in the CDC type fixture; covered as a follow-up" }
+    mysql:    { test: build_column_narrows_int_and_fails_loud_on_overflow }
+    mssql:    { test: mssql_cdc_full_type_matrix_matches_batch }
+    mongo:    { na: "no BIT type" }
+
+  - id: type_money
+    what: "MSSQL MONEY/SMALLMONEY — the exact scaled value through CDC (f64-delivered by tiberius), fails loud past the 2^53-exact range (finding #2)"
+    postgres: { na: "PostgreSQL money is discouraged and not in the CDC fixture" }
+    mysql:    { na: "MySQL has no MONEY type" }
+    mssql:    { test: mssql_money_values_survive_batch_and_cdc }
+    mongo:    { na: "no MONEY type" }
+
+  - id: type_interval
+    what: "PostgreSQL interval — canonical ISO-8601 text through CDC, identical to batch"
+    postgres: { test: pg_cdc_update_and_delete_carry_full_types }
+    mysql:    { na: "MySQL has no INTERVAL column type" }
+    mssql:    { na: "SQL Server has no INTERVAL type" }
+    mongo:    { na: "no interval type" }
+
+  - id: type_list
+    what: "PostgreSQL 1-D arrays (int[]/text[]/…) as a real Arrow List through CDC; a multi-dimensional array fails loud, never a flat NULL list (finding #6)"
+    postgres: { test: multidim_array_literal_is_refused_not_flattened_to_bogus_nulls }
+    mysql:    { na: "MySQL has no array column type" }
+    mssql:    { na: "SQL Server has no array column type" }
+    mongo:    { na: "arrays ride the verbatim document blob (BSON array → extJSON)" }

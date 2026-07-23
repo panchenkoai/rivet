@@ -22,6 +22,12 @@
 //!    1-4 are DESCRIPTIVE (they only check what an author wrote down); this one is
 //!    GENERATIVE (product code enumerates what MUST be there) — the coverage-audit
 //!    meta-fix that stops the un-enumerated-sibling class at CI.
+//! 6. GENERATIVE row-completeness (the sibling of #5 on the OTHER axis): every
+//!    `RivetType` variant must map to a `type_*` scenario row in the CDC
+//!    type-fidelity matrix — derived from the `RivetType` enum itself. #5 stops a
+//!    dropped/missing COLUMN (engine/target); #6 stops a dropped/missing ROW
+//!    (type). Together the column AND row axes are product-code-enumerated, so the
+//!    per-type-CDC quadrant (findings #2/#3/#4) can no longer grow a silent hole.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -113,6 +119,14 @@ const MATRICES: &[(&str, usize)] = &[
     // document column cannot structurally drift). 0 gaps — every runner × feature cell
     // is a test or a justified n/a.
     ("docs/runner-coverage-matrix.yaml", 0),
+    // CDC per-type value fidelity — the change-stream sibling of type-fidelity, the
+    // axis where findings #2 (MSSQL MONEY>2^53), #3 (MySQL ENUM cross-db) and #4
+    // (BIT(64) bit 63) lived: batch correct, CDC/edge sibling not. Workhorse cells
+    // cite each engine's *_cdc_full_type_matrix_matches_batch (ArrayData equality
+    // CDC==batch); edge scenarios cite the range-specific tests. Row axis is
+    // GENERATIVELY complete over RivetType (matrix_cdc_type_rows_cover_every_rivet_type).
+    // 0 gaps: every (type × engine) cell is a test or a justified n/a.
+    ("docs/cdc-type-fidelity-matrix.yaml", 0),
 ];
 
 #[derive(Deserialize)]
@@ -300,12 +314,14 @@ fn matrix_gaps_do_not_exceed_ratchet() {
     }
 }
 
-/// The lowercased variant idents of a UNIT enum, parsed from product source — the
-/// same "derive from authoritative product code" trick [`all_fn_names`] uses.
-/// `SourceType::Postgres` → `"postgres"`, `ExportTarget::DuckDb` → `"duckdb"`: the
-/// lowercase of every variant matches the matrix column labels exactly, so adding
-/// a variant grows the required-column set automatically — no hand-kept list.
-fn enum_variants_lowercased(rel: &str, enum_name: &str) -> HashSet<String> {
+/// The CamelCase variant idents of an enum, parsed from product source — the same
+/// "derive from authoritative product code" trick [`all_fn_names`] uses. Handles
+/// unit variants (`Postgres,`) AND struct/tuple variants (`Decimal {`, taking the
+/// leading ident), skipping doc/line comments and attributes. Brace depth is
+/// tracked so a struct variant's OWN field lines (depth 2) aren't mistaken for
+/// variants, and its `{…}` doesn't end the scan early. Adding a variant grows the
+/// derived set automatically — no hand-kept list.
+fn enum_variants(rel: &str, enum_name: &str) -> HashSet<String> {
     let text = std::fs::read_to_string(repo_root().join(rel))
         .unwrap_or_else(|e| panic!("read {rel}: {e}"));
     let needle = format!("enum {enum_name} {{");
@@ -313,40 +329,39 @@ fn enum_variants_lowercased(rel: &str, enum_name: &str) -> HashSet<String> {
         .find(&needle)
         .unwrap_or_else(|| panic!("`{needle}` not found in {rel}"));
     let body = &text[start + needle.len()..];
-    // Matching close brace (depth-tracked; these are unit enums, so it stays flat).
-    let mut depth = 1usize;
-    let mut end = body.len();
-    for (i, ch) in body.char_indices() {
-        match ch {
-            '{' => depth += 1,
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    end = i;
-                    break;
-                }
-            }
-            _ => {}
-        }
-    }
     let mut out = HashSet::new();
-    for line in body[..end].lines() {
+    let mut depth = 1usize; // already inside the enum's `{`
+    for line in body.lines() {
         let t = line.trim_start();
-        // Skip doc/line comments (`///`, `//`), attributes (`#[…]`), blanks.
-        if t.is_empty() || t.starts_with("//") || t.starts_with('#') {
-            continue;
+        let at_variant_depth = depth == 1;
+        // Update depth AFTER classifying this line (an opening `{` affects the NEXT
+        // lines, not this variant's own line). Stop at the enum's closing brace.
+        let opens = t.matches('{').count();
+        let closes = t.matches('}').count();
+        if at_variant_depth && !t.is_empty() && !t.starts_with("//") && !t.starts_with('#') {
+            let ident: String = t
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            if ident.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+                out.insert(ident);
+            }
         }
-        // A variant line begins with an UpperCamel ident (a unit enum has no other
-        // Upper-leading top-level line once comments/attrs are stripped).
-        let ident: String = t
-            .chars()
-            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-            .collect();
-        if ident.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
-            out.insert(ident.to_ascii_lowercase());
+        depth = depth + opens - closes.min(depth);
+        if depth == 0 {
+            break; // enum's closing brace
         }
     }
     out
+}
+
+/// [`enum_variants`] lowercased — `SourceType::Postgres` → `"postgres"`,
+/// `ExportTarget::DuckDb` → `"duckdb"`, matching the matrix column labels exactly.
+fn enum_variants_lowercased(rel: &str, enum_name: &str) -> HashSet<String> {
+    enum_variants(rel, enum_name)
+        .into_iter()
+        .map(|v| v.to_ascii_lowercase())
+        .collect()
 }
 
 /// GENERATIVE column-completeness — the coverage-audit meta-fix. The other three
@@ -399,5 +414,68 @@ fn matrix_columns_cover_every_source_and_target_enum_variant() {
                 );
             }
         }
+    }
+}
+
+/// The RivetType FAMILY → cdc-type scenario id each variant must map to: the
+/// authoritative type enumeration paired with the required matrix row. Parametric
+/// variants (`Decimal{}`, `Time{}`, `Timestamp{}`, `List{}`) map by family;
+/// `Unsupported` is not a real column type (n/a by nature) and is excluded below.
+const RIVET_TYPE_ROWS: &[(&str, &str)] = &[
+    ("Bool", "type_boolean"),
+    ("Int16", "type_integer_families"),
+    ("Int32", "type_integer_families"),
+    ("Int64", "type_integer_families"),
+    ("UInt64", "type_integer_families"),
+    ("Float32", "type_float"),
+    ("Float64", "type_float"),
+    ("Decimal", "type_decimal"),
+    ("Date", "type_date_time"),
+    ("Time", "type_date_time"),
+    ("Timestamp", "type_timestamp_tz"),
+    ("String", "type_text"),
+    ("Text", "type_text"),
+    ("Binary", "type_binary"),
+    ("Json", "type_json"),
+    ("Uuid", "type_uuid"),
+    ("Enum", "type_enum"),
+    ("Interval", "type_interval"),
+    ("List", "type_list"),
+];
+
+/// GENERATIVE row-completeness (the audit's row-axis sibling of the column-axis
+/// guard #5). Guard #5 forces every ENGINE column; this forces every TYPE row. The
+/// required rows are derived from the `RivetType` enum itself: every variant
+/// (except `Unsupported`) must map to a cdc-type scenario in `RIVET_TYPE_ROWS`, and
+/// every mapped scenario must EXIST in the CDC type-fidelity matrix. So a new
+/// `RivetType` cannot ship without a CDC-fidelity row — the per-type-CDC axis where
+/// findings #2/#3/#4 lived can no longer grow a silent hole.
+#[test]
+fn matrix_cdc_type_rows_cover_every_rivet_type() {
+    let variants = enum_variants("src/types/rivet_type.rs", "RivetType");
+    assert!(
+        variants.contains("Decimal") && variants.contains("List") && variants.len() >= 19,
+        "RivetType parse produced {variants:?} (expected the full type universe)"
+    );
+    let mapped: HashSet<&str> = RIVET_TYPE_ROWS.iter().map(|(v, _)| *v).collect();
+    for v in &variants {
+        if v == "Unsupported" {
+            continue; // not a real column type — n/a by nature
+        }
+        assert!(
+            mapped.contains(v.as_str()),
+            "RivetType::{v} has no row mapping in RIVET_TYPE_ROWS. A NEW type must not ship \
+             without a CDC-fidelity row — map it to a `type_*` scenario (add the row to \
+             docs/cdc-type-fidelity-matrix.yaml if it is a new family)."
+        );
+    }
+    let matrix = load_matrix("docs/cdc-type-fidelity-matrix.yaml");
+    let ids: HashSet<&str> = matrix.scenarios.iter().map(|s| s.id.as_str()).collect();
+    for (variant, scenario) in RIVET_TYPE_ROWS {
+        assert!(
+            ids.contains(scenario),
+            "RivetType::{variant} maps to cdc-type row '{scenario}', MISSING from \
+             docs/cdc-type-fidelity-matrix.yaml — add the scenario (a test/gap/na cell per engine)."
+        );
     }
 }
