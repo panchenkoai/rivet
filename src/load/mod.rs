@@ -264,6 +264,23 @@ fn append_and_view(
     if pk.is_empty() {
         bail!("{label} load of `{table}` needs a primary key for the dedup view (pass --pk)");
     }
+    // Gate the PK columns at the SHARED seam: both the CDC and the INCREMENTAL
+    // driver splice them into the dedup view's `PARTITION BY` via quote_ident
+    // (Snowflake emits them bare; BigQuery wraps in backticks WITHOUT escaping an
+    // internal backtick), so a name outside a plain identifier is an injection
+    // vector. Round-6 gated this inline in the CDC path only — the incremental
+    // path (`run_load_incremental`) reached the same splice UNGATED. Hoisting it
+    // here covers both, so no load driver can bypass it (the runner-bypass class).
+    for c in pk {
+        if !is_safe_load_ident(c) {
+            bail!(
+                "cannot load `{table}`: primary-key column `{}` is not a plain SQL identifier \
+                 ([A-Za-z_][A-Za-z0-9_]*) — it is spliced into the dedup view's PARTITION BY. \
+                 Rename or alias it in the export.",
+                c.escape_default()
+            );
+        }
+    }
     validate_specs(&format!("{table}__changes"), specs)?;
 
     let rows_appended = loader.append_changelog(table, specs, uris, pk)?;
@@ -943,6 +960,36 @@ mod tests {
         assert!(
             f.appended.borrow().is_empty(),
             "nothing appended before the bail"
+        );
+    }
+
+    // RED before the pk gate moved into append_and_view: the CDC path gated its
+    // PK columns (round-6), but the INCREMENTAL path spliced pk into the dedup
+    // view's PARTITION BY (via quote_ident — bare on Snowflake, unescaped
+    // backticks on BigQuery) WITHOUT the same gate. A non-identifier PK name is
+    // an injection vector, and it must be refused before the driver runs.
+    #[test]
+    fn incremental_hostile_pk_is_refused_before_the_view_splice() {
+        let f = FakeLoader::default();
+        let err = run_load_incremental(
+            &f,
+            "t",
+            &spec(TargetStatus::Ok), // exported column: `id`
+            &uris(),
+            &["id) OR (1=1) --".to_string()], // hostile PK spliced into PARTITION BY
+            "id",                             // valid cursor (in specs) so we reach the pk gate
+            None,
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("not a plain SQL identifier") && err.contains("PARTITION BY"),
+            "incremental load must refuse a non-identifier PK before splicing it into the view; got: {err}"
+        );
+        assert!(
+            f.appended.borrow().is_empty() && f.views.borrow().is_empty(),
+            "must bail before appending or building the view"
         );
     }
 }
