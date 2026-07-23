@@ -48,7 +48,7 @@ A profile sets sensible defaults for all tuning parameters. Individual fields ov
 | `batch_size` | adaptive: 64 MB/flush¹ | adaptive: 32 MB/flush¹ | 2,000 (static) |
 | `throttle_ms` | 0 | 50 | 500 |
 | `statement_timeout_s` | 0 (none) | 300 | 120 |
-| `max_retries` | 1 | 3 | 5 |
+| `max_retries` | 1 | 3 | 10 |
 | `retry_backoff_ms` | 1,000 | 2,000 | 5,000 |
 | `lock_timeout_s` | 0 (none) | 30 | 10 |
 | `memory_threshold_mb` | 0 (none) | 4,096 | 2,048 |

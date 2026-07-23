@@ -714,6 +714,16 @@ pub(crate) fn run_export_job_with_chunk_source(
             e
         );
     }
+    // Clear the keyset in-progress anchor AFTER the manifest is durable — the SAME
+    // post-finalize clear run_export_job does (job.rs above). An INCREMENTAL keyset
+    // run no longer clears it in run_keyset (the clear must be post-finalize, or a
+    // crash orphans the pages — round-2 fix), so EVERY job wrapper must clear it
+    // here; a wrapper that skips it strands resume_run_id forever, so the next apply
+    // is misread as a resume, reuses the frozen run_id, and the run-unique manifest
+    // sidecar collides across runs (round-3 wrapper-bypass regression).
+    if !failed && matches!(plan.strategy, ExtractionStrategy::Keyset(_)) {
+        let _ = state.clear_resume_run_id(&summary.export_name);
+    }
     if plan.validate {
         finalize_validate_manifest(plan, &mut summary, "apply");
     }
