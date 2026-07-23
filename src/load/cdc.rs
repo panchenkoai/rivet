@@ -276,7 +276,17 @@ pub fn inc_dedup_view_sql(
     cursor_column: &str,
 ) -> String {
     let partition = quote_partition(warehouse, pk);
-    let order = format!("{} DESC", warehouse.quote_ident(cursor_column));
+    // `<cursor> IS NOT NULL DESC` FIRST — the same NULL-baseline guard the CDC
+    // view uses for `__pos` (see dedup_view_sql). A nullable cursor lands NULL
+    // rows in `<table>__changes` (the first incremental run has no cursor bound,
+    // so it extracts every row, NULL cursor included). Without the guard the
+    // order is a bare `<cursor> DESC`, and Snowflake sorts NULLs FIRST in DESC —
+    // so a NULL-cursor baseline row would win ROW_NUMBER=1 and HIDE a later
+    // non-NULL-cursor update (stale current state; BigQuery sorts NULLs last, so
+    // it was correct only by luck). Ranking real cursor values above NULL makes
+    // the dedup deterministic across both dialects.
+    let cur = warehouse.quote_ident(cursor_column);
+    let order = format!("{cur} IS NOT NULL DESC, {cur} DESC");
     build_dedup_view(
         warehouse,
         view_fqtn,
@@ -484,10 +494,15 @@ mod tests {
                 sql.contains(&format!("PARTITION BY {}", wh.quote_ident("id"))),
                 "{wh:?}: {sql}"
             );
-            // Latest-per-PK is the greatest cursor value.
+            // Latest-per-PK is the greatest cursor value — but a NULL-cursor
+            // baseline row must NOT win the dedup. Rank real cursor values above
+            // NULL (the same `IS NOT NULL DESC` guard the CDC view uses for
+            // __pos), else Snowflake (NULLs sort FIRST in DESC) keeps the stale
+            // baseline over a later non-NULL-cursor update.
+            let cur = wh.quote_ident("updated_at");
             assert!(
-                sql.contains(&format!("ORDER BY {} DESC", wh.quote_ident("updated_at"))),
-                "{wh:?}: {sql}"
+                sql.contains(&format!("ORDER BY {cur} IS NOT NULL DESC, {cur} DESC")),
+                "{wh:?}: cursor order must guard NULL-baseline first: {sql}"
             );
             // Incremental can't observe deletes → the flag is a constant FALSE,
             // with none of CDC's `__op = 'delete'` logic.
@@ -548,10 +563,16 @@ mod tests {
         // unquoted/upper-cased loader columns).
         let bq = inc_dedup_view_sql(Warehouse::BigQuery, "v", "c", &["order"], "end");
         assert!(bq.contains("PARTITION BY `order`"), "{bq}");
-        assert!(bq.contains("ORDER BY `end` DESC"), "{bq}");
+        assert!(
+            bq.contains("ORDER BY `end` IS NOT NULL DESC, `end` DESC"),
+            "{bq}"
+        );
         let sf = inc_dedup_view_sql(Warehouse::Snowflake, "v", "c", &["order"], "end");
         assert!(sf.contains("PARTITION BY order"), "{sf}");
-        assert!(sf.contains("ORDER BY end DESC"), "{sf}");
+        assert!(
+            sf.contains("ORDER BY end IS NOT NULL DESC, end DESC"),
+            "{sf}"
+        );
         // CDC composite pk: each column quoted for BigQuery.
         let cdc = dedup_view_sql(
             Warehouse::BigQuery,
