@@ -562,7 +562,22 @@ fn build_list_column(
                         }
                         lb.append(true);
                     }
-                    _ => lb.append(false),
+                    // NULL cell / inner NULL → a null list (empty array stays a
+                    // non-null empty list, handled by the Array arm above).
+                    None | Some(V::Null) => lb.append(false),
+                    // A non-null, non-array cell can only reach a one-dimensional
+                    // List column as a MULTI-dimensional PG array literal
+                    // (`{{1,2},{3,4}}`), which parse_pg_array_literal refuses to
+                    // flatten and preserves as raw text. rivet's List is 1-D and
+                    // cannot hold it — fail LOUD, exactly like the batch export
+                    // (arrow_convert.rs), never a silent null list.
+                    Some(other) => anyhow::bail!(
+                        "cdc: multi-dimensional / non-representable array value {:?} \
+                         cannot be stored in a one-dimensional list column; cast the \
+                         column to text in the source export (e.g. col::text). The \
+                         batch export fails identically.",
+                        render_str(other)
+                    ),
                 }
             }
             Ok(Arc::new(lb.finish()) as ArrayRef)
@@ -1244,6 +1259,29 @@ mod tests {
         assert_eq!(a.value(0), 7);
         assert!(a.is_null(1)); // null stays null
         assert!(a.is_null(2)); // overflow → null, never a silent wrap
+    }
+
+    // Finding #6: a one-dimensional List column must never silently null a
+    // non-array cell. parse_pg_array_literal preserves a multi-dimensional PG
+    // literal as raw text bytes (never a flat Array of NULLs); build_list_column
+    // then fails LOUD on that non-array cell — batch parity — instead of writing
+    // a silent null list. RED against the pre-fix `_ => lb.append(false)`.
+    #[test]
+    fn list_column_fails_loud_on_a_non_array_cell_not_a_silent_null() {
+        use arrow::datatypes::Field;
+        let list_i32 = DataType::List(Arc::new(Field::new("item", DataType::Int32, true)));
+        // A NULL cell is a valid null list — must still succeed.
+        let none: Option<&RivetValue> = None;
+        build_column(&list_i32, &[none]).expect("a null cell builds a null list");
+        // The raw multi-dim literal (as text bytes) must fail loud.
+        let raw = RivetValue::Bytes(b"{{1,2},{3,4}}".to_vec());
+        let err = build_column(&list_i32, &[Some(&raw)])
+            .expect_err("a non-array cell in a list column must fail loud");
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("multi-dimensional") && msg.contains("::text"),
+            "message must name the multi-dim cause and the ::text remediation: {msg}"
+        );
     }
 
     #[test]

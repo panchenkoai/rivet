@@ -759,6 +759,16 @@ fn parse_pg_array_literal(inner_type: &str, val: &str) -> Option<Vec<RivetValue>
             } else {
                 break;
             }
+        } else if b.get(i) == Some(&b'{') {
+            // A top-level `{` where a scalar token is expected is a NESTED
+            // (multi-dimensional) array literal, e.g. `{{1,2},{3,4}}`. rivet's
+            // List column is one-dimensional and cannot hold it, so return None:
+            // the caller preserves the raw literal as text bytes and the sink
+            // fails LOUD (batch parity, src/source/postgres/arrow_convert.rs),
+            // never flattening it to a bogus flat array of NULLs. A `{` inside a
+            // quoted text element is handled by the quoted branch above, so this
+            // arm fires only on genuine nesting.
+            return None;
         } else {
             let end = body[i..].find(',').map(|p| i + p).unwrap_or(body.len());
             let tok = &body[i..end];
@@ -1223,6 +1233,43 @@ mod tests {
             ])
         );
         assert_eq!(after[2], RivetValue::Array(Vec::new()));
+    }
+
+    // Finding #6 (CDC sibling of the batch #5 multi-dim array fix): a nested /
+    // multi-dimensional array literal must NOT flatten into a bogus flat array
+    // of NULLs — rivet's List column is one-dimensional and cannot represent it.
+    // parse_pg_array_literal returns None on nesting so the caller keeps the raw
+    // literal as text bytes and the sink fails LOUD (batch parity), while a
+    // legitimate 1-D array still parses. RED against the pre-fix flatten:
+    // `{{1,2},{3,4}}` used to return Some([Null, Null, Null, Null]).
+    #[test]
+    fn multidim_array_literal_is_refused_not_flattened_to_bogus_nulls() {
+        // Nested integer / text arrays → None (unrepresentable, fail open to text).
+        assert_eq!(parse_pg_array_literal("integer", "{{1,2},{3,4}}"), None);
+        assert_eq!(parse_pg_array_literal("text", "{{a,b},{c,d}}"), None);
+        // A one-dimensional array is unaffected.
+        assert_eq!(
+            parse_pg_array_literal("integer", "{1,2,3}"),
+            Some(vec![
+                RivetValue::Int(1),
+                RivetValue::Int(2),
+                RivetValue::Int(3),
+            ])
+        );
+        // A `{` INSIDE a quoted text element is a literal brace, not nesting.
+        assert_eq!(
+            parse_pg_array_literal("text", "{\"{not nested}\"}"),
+            Some(vec![RivetValue::Bytes(b"{not nested}".to_vec())])
+        );
+        // The full test_decoding row keeps the raw literal (Bytes), never a
+        // flat Array of NULLs, so the sink can fail loud on it.
+        let line = "table public.t: INSERT: grid[integer[]]:'{{1,2},{3,4}}'";
+        let ev = parse_test_decoding("0/ABC", line).unwrap().unwrap();
+        assert_eq!(
+            ev.after.unwrap()[0],
+            RivetValue::Bytes(b"{{1,2},{3,4}}".to_vec()),
+            "multi-dim literal preserved as text, not flattened to Array([Null; 4])"
+        );
     }
 
     #[test]
