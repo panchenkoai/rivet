@@ -199,7 +199,18 @@ const ORACLE_STRENGTHS: &[&str] = &["independent", "differential", "self", "fail
 /// ratchet ceiling. LOWER the ceiling each time a cell is upgraded from a
 /// batch-differential to an INDEPENDENT oracle (a DuckDB/source re-read); never
 /// raise it — the ratchet drives the shared-decode-blind self-oracle debt to 0.
-const ORACLE_TRACKED: &[(&str, usize)] = &[("docs/cdc-type-fidelity-matrix.yaml", 22)];
+const ORACLE_TRACKED: &[(&str, usize)] = &[
+    // CDC value-decode is the youngest, most differential-heavy surface (the
+    // *_cdc_full_type_matrix_matches_batch self-oracle). PG + MySQL + tz/enum/
+    // money/mongo cells upgraded to independent so far; MSSQL + the PG float/date/
+    // binary/uuid cells are the remaining debt.
+    ("docs/cdc-type-fidelity-matrix.yaml", 22),
+    // Batch type fidelity is already oracle-STRONG (24 independent cells: golden
+    // hard-coded values + DuckDB/pyarrow foreign readers). The 6 weak are cells
+    // whose CITED test is schema-coverage only (no independent VALUE re-read) —
+    // upgrade by pointing them at the duckdb_validates_* value test.
+    ("docs/type-fidelity-matrix.yaml", 6),
+];
 
 impl Scenario {
     /// `(column, cell)` for every column the matrix declares; panics if a

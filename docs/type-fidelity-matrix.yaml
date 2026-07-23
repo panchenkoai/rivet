@@ -16,63 +16,63 @@ engines: [postgres, mysql, mssql, mongo]
 scenarios:
   - id: type_decimal
     what: "decimal/numeric(p,s) — precision + scale preserved, never floated"
-    postgres: { test: golden_decimal_payments_exact_sums_and_decimal128_types }
-    mysql:    { test: mysql_golden_decimal_payments_exact_sums_and_decimal128_types }
-    mssql:    { test: roast_mssql_decimal_scale_survives_all_null_first_batch }
-    mongo:    { test: mongo_batch_type_fidelity_document_is_verbatim_extjson }
+    postgres: { test: golden_decimal_payments_exact_sums_and_decimal128_types, oracle: independent }
+    mysql:    { test: mysql_golden_decimal_payments_exact_sums_and_decimal128_types, oracle: independent }
+    mssql:    { test: roast_mssql_decimal_scale_survives_all_null_first_batch, oracle: independent }
+    mongo:    { test: mongo_batch_type_fidelity_document_is_verbatim_extjson, oracle: independent }
 
   - id: type_uuid
     what: "uuid — PG uuid, MySQL CHAR(36), MSSQL uniqueidentifier → canonical value"
-    postgres: { test: golden_uuid_fixed_size_binary_roundtrip_canonical_bytes }
-    mysql:    { test: mysql_golden_uuid_varchar_utf8_expected_canonical_lower }
-    mssql:    { test: duckdb_validates_mssql_type_matrix_parquet }
-    mongo:    { test: mongo_batch_parallel_objectid_and_string_id }
+    postgres: { test: golden_uuid_fixed_size_binary_roundtrip_canonical_bytes, oracle: independent }
+    mysql:    { test: mysql_golden_uuid_varchar_utf8_expected_canonical_lower, oracle: independent }
+    mssql:    { test: duckdb_validates_mssql_type_matrix_parquet, oracle: independent }
+    mongo:    { test: mongo_batch_parallel_objectid_and_string_id, oracle: independent }
 
   - id: type_json
     what: "json/jsonb — byte/content fidelity through Parquet"
-    postgres: { test: roast_pg_json_column_preserves_source_bytes_through_parquet }
-    mysql:    { test: mysql_edge_json_content_round_trip }
+    postgres: { test: roast_pg_json_column_preserves_source_bytes_through_parquet, oracle: independent }
+    mysql:    { test: mysql_edge_json_content_round_trip, oracle: independent }
     mssql:    { na: "SQL Server has no native JSON type; the matrix fixture omits it by design" }
-    mongo:    { test: mongo_batch_type_fidelity_document_is_verbatim_extjson }
+    mongo:    { test: mongo_batch_type_fidelity_document_is_verbatim_extjson, oracle: independent }
 
   - id: type_timestamp_tz
     what: "timestamp / timestamptz — timezone handling (naive vs UTC instant)"
-    postgres: { test: golden_timestamps_naive_vs_timestamptz_parquet_microsecond_semantics }
-    mysql:    { test: mysql_golden_datetime_vs_timestamp_parquet_microsecond_semantics }
-    mssql:    { test: mssql_batch_datetimeoffset_exports_the_utc_instant }
+    postgres: { test: golden_timestamps_naive_vs_timestamptz_parquet_microsecond_semantics, oracle: independent }
+    mysql:    { test: mysql_golden_datetime_vs_timestamp_parquet_microsecond_semantics, oracle: independent }
+    mssql:    { test: mssql_batch_datetimeoffset_exports_the_utc_instant, oracle: independent }
     mongo:    { na: "BSON dates ride the verbatim document blob; the extJSON test pins the mechanism" }
 
   - id: type_date_time
     what: "date / time — Date32, Time64(µs)"
     postgres: { test: pg_golden_full_type_matrix_schema_coverage }
     mysql:    { test: mysql_golden_full_type_matrix_schema_coverage }
-    mssql:    { test: duckdb_validates_mssql_type_matrix_parquet }
+    mssql:    { test: duckdb_validates_mssql_type_matrix_parquet, oracle: independent }
     mongo:    { na: "date/time ride the verbatim document blob" }
 
   - id: type_binary
     what: "binary / bytea / varbinary — stays Arrow Binary, not Utf8"
-    postgres: { test: golden_bytea_exact_binary_roundtrip }
-    mysql:    { test: mysql_golden_fixed_binary_four_is_arrow_binary_not_utf8 }
-    mssql:    { test: duckdb_validates_mssql_type_matrix_parquet }
+    postgres: { test: golden_bytea_exact_binary_roundtrip, oracle: independent }
+    mysql:    { test: mysql_golden_fixed_binary_four_is_arrow_binary_not_utf8, oracle: independent }
+    mssql:    { test: duckdb_validates_mssql_type_matrix_parquet, oracle: independent }
     mongo:    { na: "binary rides the verbatim document blob" }
 
   - id: type_boolean
     what: "boolean — incl NULL; MySQL BIT(1)/TINYINT(1) → Boolean, BIT(8) → Int"
     postgres: { test: pg_golden_full_type_matrix_schema_coverage }
     mysql:    { test: mysql_golden_full_type_matrix_schema_coverage }
-    mssql:    { test: duckdb_validates_mssql_type_matrix_parquet }
+    mssql:    { test: duckdb_validates_mssql_type_matrix_parquet, oracle: independent }
     mongo:    { na: "booleans ride the verbatim document blob" }
 
   - id: type_integer_families
     what: "int2/4/8 + unsigned widening (u64 > i64::MAX → UInt64, not overflow)"
     postgres: { test: pg_golden_full_type_matrix_schema_coverage }
     mysql:    { test: parquet_schema_pins_mysql_matrix_logical_types }
-    mssql:    { test: duckdb_validates_mssql_type_matrix_parquet }
-    mongo:    { test: mongo_batch_type_fidelity_document_is_verbatim_extjson }
+    mssql:    { test: duckdb_validates_mssql_type_matrix_parquet, oracle: independent }
+    mongo:    { test: mongo_batch_type_fidelity_document_is_verbatim_extjson, oracle: independent }
 
   - id: type_text
     what: "text / varchar / nvarchar — empty, whitespace, large (100KB), unicode"
-    postgres: { test: pg_edge_string_extremes_round_trip }
-    mysql:    { test: mysql_edge_string_extremes_round_trip }
-    mssql:    { test: duckdb_validates_mssql_type_matrix_parquet }
+    postgres: { test: pg_edge_string_extremes_round_trip, oracle: independent }
+    mysql:    { test: mysql_edge_string_extremes_round_trip, oracle: independent }
+    mssql:    { test: duckdb_validates_mssql_type_matrix_parquet, oracle: independent }
     mongo:    { na: "text rides the verbatim document blob" }
