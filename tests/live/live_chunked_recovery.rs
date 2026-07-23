@@ -114,6 +114,30 @@ fn latest_metric_validated(cfg: &std::path::Path, export: &str) -> Option<bool> 
         .flatten()
 }
 
+/// `total_rows` from the latest `export_metrics` row — the summary's reported row
+/// count (finding #9). On a checkpoint RESUME this must be the CUMULATIVE total
+/// (rehydrated pre-crash base + this run), not just this invocation's rows.
+fn latest_metric_total_rows(cfg: &std::path::Path, export: &str) -> Option<i64> {
+    open_state_db(cfg)
+        .query_row(
+            "SELECT total_rows FROM export_metrics WHERE export_name = ?1 ORDER BY id DESC LIMIT 1",
+            [export],
+            |r| r.get::<_, i64>(0),
+        )
+        .ok()
+}
+
+/// The destination manifest's `column_checksums` (Form B), or `None` when the
+/// key is absent/null (suppressed). Empty array also reads as "no Form B".
+fn manifest_column_checksums(dir: &std::path::Path) -> Option<Vec<serde_json::Value>> {
+    let raw = std::fs::read_to_string(dir.join("manifest.json")).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    match json.get("column_checksums") {
+        Some(serde_json::Value::Array(a)) if !a.is_empty() => Some(a.clone()),
+        _ => None,
+    }
+}
+
 // ─── C1: crash after chunk 0 complete → resume skips chunk 0 ─────────────────
 
 #[test]
@@ -591,6 +615,248 @@ fn parallel_chunked_crash_after_chunk_complete_resume_finishes_with_no_duplicate
         parquet_files.len() >= EXPECTED_CHUNKS as usize,
         "at least {EXPECTED_CHUNKS} parquet files must exist; found {}: {parquet_files:?}",
         parquet_files.len()
+    );
+}
+
+// ─── Finding #9: parallel-checkpoint resume reports the CUMULATIVE row total ──
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn parallel_chunked_resume_reports_cumulative_total_rows_not_just_this_run() {
+    // A parallel-checkpoint crash before finalize leaves the manifest MISSING, so
+    // resume rehydrates the pre-crash parts from file_log — bumping total_rows,
+    // files, bytes, and manifest_parts together. The parallel runner then landed
+    // its worker rows with `summary.total_rows = agg` (assign), CLOBBERING the
+    // rehydrated base, so the reported total under-counted (only this run's rows,
+    // often 0 when the surviving workers had already drained every chunk). The
+    // manifest's own row_count (sum of parts) stayed correct — this is the SUMMARY
+    // total, recorded to export_metrics. The fix accumulates onto the base.
+    require_alive(LiveService::Postgres);
+
+    const ROW_COUNT: i64 = 400;
+    const CHUNK_SIZE: i64 = 50;
+
+    let table = seed_pg_numeric_table(ROW_COUNT);
+    let export = unique_name("f9_parallel_total_rows");
+    let out = tempfile::tempdir().unwrap();
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let yaml = Rig::pg_batch(&export)
+        .query(&format!("SELECT id, name FROM {}", table.name()))
+        .mode("chunked")
+        .export_line("chunk_column: id")
+        .export_line(&format!("chunk_size: {CHUNK_SIZE}"))
+        .export_line("chunk_checkpoint: true")
+        .export_line("parallel: 4")
+        .dest_path(out.path().to_path_buf())
+        .yaml();
+    let cfg = write_config(&cfg_dir, &yaml);
+
+    let crash = std::process::Command::new(RIVET_BIN)
+        .args([
+            "run",
+            "--config",
+            cfg.to_str().unwrap(),
+            "--export",
+            &export,
+        ])
+        .env("RIVET_TEST_PANIC_AT", "after_chunk_complete:0")
+        .output()
+        .expect("spawn rivet");
+    assert!(
+        !crash.status.success(),
+        "crash run must exit non-zero; stderr:\n{}",
+        String::from_utf8_lossy(&crash.stderr)
+    );
+
+    let resume = std::process::Command::new(RIVET_BIN)
+        .args([
+            "run",
+            "--config",
+            cfg.to_str().unwrap(),
+            "--export",
+            &export,
+            "--resume",
+        ])
+        .output()
+        .expect("spawn rivet resume");
+    assert!(
+        resume.status.success(),
+        "--resume must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&resume.stderr)
+    );
+
+    // The manifest (file_log sum) is correct regardless of the bug — the pin.
+    assert_eq!(
+        manifest_total_rows(&cfg, &export),
+        ROW_COUNT,
+        "manifest row total (file_log sum) must equal the seeded count"
+    );
+    // The SUMMARY's reported total_rows must ALSO be the cumulative total. RED
+    // before the fix: the clobber reported only this invocation's re-exported rows.
+    assert_eq!(
+        latest_metric_total_rows(&cfg, &export),
+        Some(ROW_COUNT),
+        "resume must report the CUMULATIVE row total (rehydrated base + this run), \
+         not just the rows re-exported this invocation"
+    );
+}
+
+// ─── Finding #10: a rehydrating resume SUPPRESSES Form B so validate can't lie ─
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn chunked_checkpoint_resume_suppresses_form_b_so_validate_does_not_false_fail() {
+    // On a checkpoint resume the manifest is rebuilt to list ALL parts, but the
+    // rehydrated pre-crash parts carry no per-column checksum (file_log stores
+    // none). The run-wide Form B XOR this run harvests would then cover only the
+    // re-exported parts while the manifest lists every part — a partial XOR that
+    // `rivet validate` (Full) re-reads and reports as a FALSE mismatch. The fix
+    // suppresses Form B entirely on such a resume (absent, not partial), so
+    // validate size-verifies the parts and skips only the value re-read.
+    require_alive(LiveService::Postgres);
+
+    const ROW_COUNT: i64 = 400;
+    const CHUNK_SIZE: i64 = 50;
+
+    // Both source tables are created HERE so their drop guards outlive the runs
+    // (a table created inside the closure would drop — and DROP the table — before
+    // the export executes).
+    let base_table = seed_pg_numeric_table(ROW_COUNT);
+    let res_table = seed_pg_numeric_table(ROW_COUNT);
+    // `parallel: 1` for the resume path is deliberate: with 4 workers + a deferred
+    // scope-panic the surviving workers drain EVERY chunk before the abort, so the
+    // resume re-exports nothing and the harvest accumulator is empty — the
+    // suppression path (which only matters when SOME parts re-export while others
+    // rehydrate) never fires. One worker completing only chunk 0 leaves the rest
+    // pending, so resume rehydrates chunk 0 (no checksum) AND re-exports the rest
+    // (with checksums) — the exact mixed case Form B suppression guards.
+    let run_checkpoint = |export: &str,
+                          table_name: &str,
+                          out: &std::path::Path,
+                          cfg_dir: &tempfile::TempDir,
+                          parallel: u32| {
+        let yaml = Rig::pg_batch(export)
+            .query(&format!("SELECT id, name FROM {table_name}"))
+            .mode("chunked")
+            .export_line("chunk_column: id")
+            .export_line(&format!("chunk_size: {CHUNK_SIZE}"))
+            .export_line("chunk_checkpoint: true")
+            .export_line(&format!("parallel: {parallel}"))
+            .dest_path(out.to_path_buf())
+            .yaml();
+        write_config(cfg_dir, &yaml)
+    };
+    let validate = |cfg: &std::path::Path, export: &str| {
+        std::process::Command::new(RIVET_BIN)
+            .args([
+                "validate",
+                "--config",
+                cfg.to_str().unwrap(),
+                "--export",
+                export,
+            ])
+            .output()
+            .expect("spawn rivet validate")
+    };
+
+    // ── Baseline: a CLEAN parallel-checkpoint run RECORDS Form B, and validate
+    //    (Full) re-reads + verifies it → passes. Proves Form B is active on this
+    //    path, so the suppression below is not vacuous.
+    let base_export = unique_name("f10_baseline");
+    let base_out = tempfile::tempdir().unwrap();
+    let base_cfg_dir = tempfile::tempdir().unwrap();
+    let base_cfg = run_checkpoint(
+        &base_export,
+        base_table.name(),
+        base_out.path(),
+        &base_cfg_dir,
+        4,
+    );
+    let base_run = std::process::Command::new(RIVET_BIN)
+        .args([
+            "run",
+            "--config",
+            base_cfg.to_str().unwrap(),
+            "--export",
+            &base_export,
+        ])
+        .output()
+        .expect("spawn rivet");
+    assert!(
+        base_run.status.success(),
+        "baseline run must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&base_run.stderr)
+    );
+    assert!(
+        manifest_column_checksums(base_out.path()).is_some(),
+        "a clean parallel-checkpoint run must record Form B column_checksums"
+    );
+    let base_v = validate(&base_cfg, &base_export);
+    assert!(
+        base_v.status.success(),
+        "clean-run validate (Full) must pass; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&base_v.stdout),
+        String::from_utf8_lossy(&base_v.stderr)
+    );
+
+    // ── Resume: crash before finalize (manifest missing) → resume rehydrates.
+    let res_export = unique_name("f10_resume");
+    let res_out = tempfile::tempdir().unwrap();
+    let res_cfg_dir = tempfile::tempdir().unwrap();
+    let res_cfg = run_checkpoint(
+        &res_export,
+        res_table.name(),
+        res_out.path(),
+        &res_cfg_dir,
+        1,
+    );
+    let crash = std::process::Command::new(RIVET_BIN)
+        .args([
+            "run",
+            "--config",
+            res_cfg.to_str().unwrap(),
+            "--export",
+            &res_export,
+        ])
+        .env("RIVET_TEST_PANIC_AT", "after_chunk_complete:0")
+        .output()
+        .expect("spawn rivet");
+    assert!(
+        !crash.status.success(),
+        "crash run must exit non-zero; stderr:\n{}",
+        String::from_utf8_lossy(&crash.stderr)
+    );
+    let resume = std::process::Command::new(RIVET_BIN)
+        .args([
+            "run",
+            "--config",
+            res_cfg.to_str().unwrap(),
+            "--export",
+            &res_export,
+            "--resume",
+        ])
+        .output()
+        .expect("spawn rivet resume");
+    assert!(
+        resume.status.success(),
+        "--resume must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&resume.stderr)
+    );
+    // Form B suppressed: the manifest lists every part but records NO Form B,
+    // because the rehydrated pre-crash parts have no per-column checksum.
+    assert!(
+        manifest_column_checksums(res_out.path()).is_none(),
+        "a rehydrating resume must SUPPRESS Form B (absent), never record a partial XOR"
+    );
+    // validate (Full): with Form B absent it size-verifies + skips the value
+    // re-read → PASSES. RED before the fix: the partial XOR made validate FALSE-fail.
+    let res_v = validate(&res_cfg, &res_export);
+    assert!(
+        res_v.status.success(),
+        "validate must PASS on a correctly-resumed run — no false Form B mismatch; \
+         stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&res_v.stdout),
+        String::from_utf8_lossy(&res_v.stderr)
     );
 }
 
