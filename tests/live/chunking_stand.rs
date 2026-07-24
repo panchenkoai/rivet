@@ -784,6 +784,62 @@ fn stand_non_integer_chunk_column_bail_mssql() {
     run_non_integer_chunk_column_bail(Eng::Ms);
 }
 
+/// #13 bughunt (a regression THIS branch's #103 fix introduced): an explicit
+/// `chunk_column` on an UNQUALIFIED `table:` that lives in a NON-default schema
+/// (reached via `search_path`) sent the introspection probe — which hard-codes
+/// `public`/`dbo` — into a THROWING `regclass` cast, so the plan HARD-BAILED
+/// ("introspection probe failed … Set `chunk_column:` explicitly", which IS set).
+/// On main this fast-pathed and exported fine. The fix degrades a probe FAILURE to
+/// the fast-path Chunked plan + a loud can't-verify warning, so a formerly-working
+/// config keeps working. Verify: all rows export AND the warn fires.
+///
+/// PG-only: this exact shape (non-default schema + unqualified table + session
+/// search_path) is where the probe's hard-coded-schema assumption bites; the URL
+/// carries the search_path so nothing mutates the shared role.
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn stand_chunked_nondefault_schema_probe_degrades_and_exports_all_postgres() {
+    require_alive(LiveService::Postgres);
+    let schema = unique_name("nd_schema");
+    let mut c = pg_connect();
+    c.batch_execute(&format!(
+        "DROP SCHEMA IF EXISTS {schema} CASCADE; CREATE SCHEMA {schema}; \
+         CREATE TABLE {schema}.t (id BIGINT PRIMARY KEY, v text); \
+         INSERT INTO {schema}.t SELECT g, 'r'||g FROM generate_series(1, 40) g;"
+    ))
+    .unwrap();
+    // Session search_path resolves the UNQUALIFIED `table: t` to {schema}.t, but
+    // the introspection probe hard-codes `public` and throws — the degrade path.
+    let url = format!("{POSTGRES_URL}?options=-c%20search_path%3D{schema},public");
+    let rig = Rig::pg_batch("t") // unqualified — NOT public.t
+        .source_url(&url)
+        .mode("chunked")
+        .export_line("chunk_column: id")
+        .export_line("chunk_size: 10");
+    let cfg = rig.config_path();
+    let out = run_rivet_env(
+        &["run", "--config", cfg.to_str().unwrap()],
+        &[("RUST_LOG", "warn")],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // Clean up the schema before asserting, so a failed assert never leaks it.
+    let _ = c.batch_execute(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE;"));
+    assert!(
+        out.status.success(),
+        "a probe-unreachable table with an explicit chunk_column must DEGRADE, not \
+         hard-bail (#13); stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("introspection probe failed"),
+        "the can't-verify degrade warning must fire; stderr:\n{stderr}"
+    );
+    assert_eq!(
+        count_parquet_rows(&rig.out_dir()),
+        40,
+        "all 40 rows must export via the degrade fast-path"
+    );
+}
+
 #[test]
 #[ignore = "live: requires docker compose up -d mysql"]
 fn stand_chunk_count_mysql() {

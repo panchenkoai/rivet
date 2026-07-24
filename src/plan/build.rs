@@ -322,7 +322,7 @@ fn resolve_chunked_strategy(
             export.name
         )
     })?;
-    let introspection = match config.source.source_type {
+    let introspection_result = match config.source.source_type {
         crate::config::SourceType::Postgres => {
             crate::source::postgres::introspect_pg_table_for_chunking(
                 &url,
@@ -348,14 +348,50 @@ fn resolve_chunked_strategy(
             "chunked mode is not supported for MongoDB — use `mode: full` (the whole \
              collection is read as `_id` + `document` JSON)"
         ),
-    }
-    .map_err(|e| {
-        anyhow::anyhow!(
-            "export '{}': chunked-mode introspection probe failed: {e}. \
-             Set `chunk_column:` (and `chunk_size:`) explicitly or check connectivity.",
-            export.name
-        )
-    })?;
+    };
+    let introspection = match introspection_result {
+        Ok(i) => i,
+        // #103-regression fix: the probe here exists only to TYPE-CHECK an explicit
+        // `chunk_column` (and to size memory / auto-resolve the column). When the
+        // column is explicit and no memory-sizing is requested, a probe FAILURE
+        // (table in a non-default schema so `schema.table::regclass` throws, a
+        // transient blip) must NOT newly break a config that worked before #103
+        // routed it through introspection. Can't-verify → warn loudly and emit the
+        // Chunked plan on the explicit column, exactly like the `query:`-only path.
+        // Genuinely need the probe (auto-resolve column / `chunk_size_memory_mb:` /
+        // `chunk_by_key:` index check) → the error stays fatal.
+        Err(e)
+            if export.chunk_column.is_some()
+                && export.chunk_size_memory_mb.is_none()
+                && export.chunk_by_key.is_none() =>
+        {
+            log::warn!(
+                "export '{}': chunked-mode introspection probe failed ({e}) — cannot verify \
+                 chunk_column '{}' is integer-family. Proceeding on the explicit column; if it is \
+                 numeric/decimal/float, range chunking silently drops rows between integer windows. \
+                 Qualify the table as `schema.table` so the probe can reach it, or use `chunk_by_key:`.",
+                export.name,
+                export.chunk_column.as_deref().unwrap_or("")
+            );
+            return Ok(ExtractionStrategy::Chunked(ChunkedPlan {
+                column: export.chunk_column.clone().unwrap(),
+                chunk_size: export.chunk_size,
+                chunk_count: export.chunk_count,
+                parallel: export.parallel,
+                dense: export.chunk_dense,
+                by_days: export.chunk_by_days,
+                checkpoint: export.chunk_checkpoint,
+                max_attempts,
+            }));
+        }
+        Err(e) => {
+            return Err(anyhow::anyhow!(
+                "export '{}': chunked-mode introspection probe failed: {e}. \
+                 Set `chunk_column:` (and `chunk_size:`) explicitly or check connectivity.",
+                export.name
+            ));
+        }
+    };
 
     chunked_strategy_from_introspection(
         config.source.source_type,
