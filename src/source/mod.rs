@@ -423,23 +423,26 @@ pub(crate) fn warn_if_tls_disabled(config: &SourceConfig) {
 /// Fails **closed**: any URL we cannot confidently parse a loopback host out of
 /// is treated as non-loopback, so a parse gap can only ever *tighten* the gate
 /// (refuse a connection), never silently allow plaintext to an unverified host.
-pub(crate) fn host_is_loopback(url: &str) -> bool {
-    // Strip the scheme (`postgresql://`, `mysql://`, `sqlserver://`, …).
+/// The `host[:port][,host:port…]` span of a URL — scheme stripped, path/query
+/// dropped, `user[:pass]@` userinfo removed (rsplit the last `@` so an `@` in a
+/// password stays with the userinfo). Empty when the URL carries no authority.
+pub(crate) fn host_port_span(url: &str) -> &str {
     let after_scheme = match url.split_once("://") {
         Some((_, rest)) => rest,
         None => url,
     };
-    // Authority ends at the first `/`, `?` or `#`.
     let authority = after_scheme
         .split(['/', '?', '#'])
         .next()
         .unwrap_or(after_scheme);
-    // Drop `user[:pass]@` — rsplit the last `@` so an `@` inside a password is
-    // tolerated (it belongs to the userinfo, not the host).
-    let host_port = match authority.rsplit_once('@') {
+    match authority.rsplit_once('@') {
         Some((_, hp)) => hp,
         None => authority,
-    };
+    }
+}
+
+pub(crate) fn host_is_loopback(url: &str) -> bool {
+    let host_port = host_port_span(url);
     // A comma seedlist (`host1:p1,host2:p2` — valid for MongoDB AND multi-host
     // PostgreSQL) is loopback ONLY if EVERY host is: reading just the first host
     // let `127.0.0.1:5432,evil.com:5432` dial evil.com in plaintext under the
@@ -469,6 +472,22 @@ fn one_host_is_loopback(host_port: &str) -> bool {
         .is_ok_and(|ip| ip.is_loopback())
 }
 
+/// Refuse a URL that carries no host authority (`mysql://`, `postgres:///db`)
+/// with a clear parse error, BEFORE any engine-specific setup hint can blanket
+/// it (dogfood LOW: `rivet cdc --source mysql://` reported a binlog-grants
+/// problem for a host that doesn't exist). No URL echo — the userinfo may hold
+/// credentials — and no `user:pass@` pattern in the message (the redactor
+/// mangles it).
+pub(crate) fn require_url_has_host(url: &str) -> Result<()> {
+    if host_port_span(url).is_empty() {
+        anyhow::bail!(
+            "source: invalid URL — no host found. Expected a URL of the form \
+             scheme://host:port/database."
+        );
+    }
+    Ok(())
+}
+
 /// Gate plaintext / trust-any-cert connections by host (CWE-319 / CWE-295).
 ///
 /// When no `tls:` block is configured (`tls == None`) **and** the resolved host
@@ -482,6 +501,10 @@ fn one_host_is_loopback(host_port: &str) -> bool {
 /// `tls: { mode: disable }` is `Some(..)`, so it is the operator's opt-in to
 /// remote plaintext and is **not** refused here.
 pub(crate) fn require_tls_or_loopback(url: &str, tls: Option<&TlsConfig>) -> Result<()> {
+    // A URL with NO host at all (`mysql://`, `postgres:///db`) is not a "remote
+    // host" — it is malformed. Prescribing a TLS block there sends the operator
+    // chasing a security setting for a host that doesn't exist (dogfood LOW).
+    require_url_has_host(url)?;
     if tls.is_none() && !host_is_loopback(url) {
         // The message must name TLS *and* that it is a policy refusal for a
         // remote host. Emit it at `error` level (→ stderr) as well as returning
@@ -504,7 +527,7 @@ pub(crate) fn require_tls_or_loopback(url: &str, tls: Option<&TlsConfig>) -> Res
 
 #[cfg(test)]
 mod tls_gate_tests {
-    use super::{host_is_loopback, require_tls_or_loopback};
+    use super::{host_is_loopback, host_port_span, require_tls_or_loopback};
     use crate::config::{TlsConfig, TlsMode};
 
     #[test]
@@ -583,6 +606,38 @@ mod tls_gate_tests {
         assert!(require_tls_or_loopback(remote, Some(&disable)).is_ok());
         // Enforced TLS to a remote host → allowed (the connect path uses TLS).
         assert!(require_tls_or_loopback(remote, Some(&verify)).is_ok());
+    }
+
+    #[test]
+    fn host_port_span_extracts_the_authority() {
+        assert_eq!(host_port_span("mysql://u:p@host:3306/db"), "host:3306");
+        assert_eq!(
+            host_port_span("postgres://127.0.0.1:5432/db"),
+            "127.0.0.1:5432"
+        );
+        // No authority at all.
+        assert_eq!(host_port_span("mysql://"), "");
+        assert_eq!(host_port_span("postgres:///db"), "");
+    }
+
+    #[test]
+    fn hostless_url_is_a_parse_error_not_a_tls_refusal() {
+        // #dogfood LOW: `mysql://` has NO host, yet the gate reported "remote
+        // (non-loopback) host, TLS required" and prescribed a TLS block for a
+        // host that doesn't exist. It must be a clear parse error instead.
+        for u in ["mysql://", "postgres:///db", "sqlserver://"] {
+            let err = require_tls_or_loopback(u, None)
+                .expect_err("a host-less URL must error, not connect");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("no host found"),
+                "host-less URL must be a parse error: {msg}"
+            );
+            assert!(
+                !msg.contains("TLS required"),
+                "host-less URL must NOT prescribe a TLS block: {msg}"
+            );
+        }
     }
 }
 

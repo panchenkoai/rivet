@@ -105,7 +105,24 @@ impl RivetValue {
             RivetValue::Float(f) => Json::from(*f),
             RivetValue::DateTime(dt) => Json::String(dt.to_string()),
             RivetValue::TimeMicros(us) => Json::from(*us),
-            RivetValue::Bytes(b) => Json::String(String::from_utf8_lossy(b).into_owned()),
+            RivetValue::Bytes(b) => match std::str::from_utf8(b) {
+                // Most `Bytes` carry UTF-8 text (a string/JSON/decimal column, a
+                // Mongo id) — emit verbatim. `from_utf8_lossy` used to run on ALL
+                // of them, so a genuinely-binary column (bytea, uuid-as-bytes,
+                // GUID) had every non-UTF-8 byte replaced with U+FFFD — silent,
+                // unrecoverable corruption. Non-UTF-8 bytes now render losslessly
+                // as PG-style hex (`\x…`), recoverable by the reader.
+                Ok(s) => Json::String(s.to_string()),
+                Err(_) => {
+                    use std::fmt::Write as _;
+                    let mut hex = String::with_capacity(2 + b.len() * 2);
+                    hex.push_str("\\x");
+                    for byte in b {
+                        let _ = write!(hex, "{byte:02x}");
+                    }
+                    Json::String(hex)
+                }
+            },
             RivetValue::Array(v) => Json::Array(v.iter().map(RivetValue::to_json).collect()),
         }
     }
@@ -945,6 +962,28 @@ fn render_str(v: &RivetValue) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn to_json_bytes_are_lossless_utf8_verbatim_binary_hex() {
+        // #dogfood MED: NDJSON `to_json` ran `from_utf8_lossy` on EVERY Bytes
+        // value, so a genuinely-binary column (bytea, uuid/GUID bytes) had every
+        // non-UTF-8 byte replaced with U+FFFD — silent, unrecoverable corruption.
+        // Text-valued Bytes (string/JSON/decimal columns) stay verbatim.
+        assert_eq!(
+            RivetValue::Bytes(b"hello".to_vec()).to_json(),
+            Json::String("hello".to_string())
+        );
+        // Non-UTF-8 binary → PG-style hex, losslessly recoverable (no U+FFFD).
+        let raw = vec![0xDEu8, 0xAD, 0xBE, 0xEF, 0x00, 0xFF];
+        let j = RivetValue::Bytes(raw).to_json();
+        assert_eq!(j, Json::String("\\xdeadbeef00ff".to_string()));
+        if let Json::String(s) = &j {
+            assert!(
+                !s.contains('\u{FFFD}'),
+                "binary must not be lossy-replaced: {s}"
+            );
+        }
+    }
 
     // Finding #39/#39b regression pins: the enum-label parser must be total
     // (trailing '(' / multibyte boundaries panicked) and CHAR-correct —

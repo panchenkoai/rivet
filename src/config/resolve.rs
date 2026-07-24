@@ -148,6 +148,16 @@ pub fn parse_file_size(s: &str) -> crate::error::Result<u64> {
             s
         )
     })?;
+    // Reject zero / negative: the float→u64 cast saturates them to 0, a 0-byte
+    // rotation threshold that splits a part after every row. Fail loud like a
+    // non-numeric value instead of silently coercing.
+    if value <= 0.0 || value.is_nan() {
+        anyhow::bail!(
+            "invalid file size: '{}' — must be a positive size; a zero or negative \
+             rotation threshold would split the output after every row",
+            s
+        );
+    }
     Ok((value * multiplier as f64) as u64)
 }
 
@@ -401,5 +411,21 @@ mod tests {
         assert!(msg.contains("B/KB/MB/GB"), "got: {msg}");
         assert!(msg.contains("fractional"), "got: {msg}");
         assert!(msg.contains("1024"), "got: {msg}");
+    }
+
+    #[test]
+    fn parse_zero_and_negative_rejected_not_coerced_to_zero() {
+        // #dogfood LOW: `0` / `0B` / `-5MB` used to float→u64-saturate to a
+        // 0-byte rotation threshold (a part after every row), silently. They must
+        // fail loud like `banana`/`1PB` do.
+        for bad in ["0", "0B", "0MB", "-5MB", "-1", "-0.5GB"] {
+            let err = parse_file_size(bad).unwrap_err();
+            assert!(
+                err.to_string().contains("must be a positive size"),
+                "'{bad}' must be rejected as non-positive, got: {err}"
+            );
+        }
+        // A tiny positive value is still accepted (only <= 0 is rejected).
+        assert_eq!(parse_file_size("1B").unwrap(), 1);
     }
 }

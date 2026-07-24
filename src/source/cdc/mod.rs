@@ -66,7 +66,10 @@ impl Position {
                 },
             )?))),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e.into()),
+            Err(e) => {
+                Err(anyhow::Error::new(e)
+                    .context(format!("reading checkpoint '{}'", path.display())))
+            }
         }
     }
 
@@ -231,6 +234,12 @@ pub(crate) fn run(
     max_events: Option<usize>,
 ) -> Result<()> {
     let mut emitted = 0usize;
+    // A cap of 0 means emit nothing — check BEFORE consuming the stream. The
+    // post-emit `emitted >= m` check let exactly one event escape at m=0 (it
+    // printed, incremented to 1, then 1 >= 0 broke), an off-by-one.
+    if max_events == Some(0) {
+        return Ok(());
+    }
     let mut txn_seq = TxnSeq::default();
     while let Some(ev) = stream.next_change() {
         let mut ev = ev?;
@@ -568,19 +577,34 @@ pub(crate) fn create_change_stream(
 ) -> Result<Box<dyn ChangeStream>> {
     use anyhow::Context;
     let url = cfg.url.as_str();
+    // A host-less URL is a config/parse error, not a per-engine setup problem —
+    // validate BEFORE the engine match so it never gets blanketed by the binlog/
+    // slot/CDC grants hint below (dogfood LOW).
+    crate::source::require_url_has_host(url)?;
     let tls = cfg.tls.as_ref();
     // The engine identity IS the opts variant — no re-resolution from the URL.
     match &cfg.engine {
-        CdcEngineOpts::Mysql { server_id } => Ok(Box::new(
-            crate::source::mysql::cdc::MysqlChangeStream::open_or_resume(
-                url,
-                *server_id,
-                cfg.checkpoint.as_deref(),
-                cfg.drain,
-                tls,
-            )
-            .context(MYSQL_CDC_HINT)?,
-        )),
+        CdcEngineOpts::Mysql { server_id } => {
+            // Validate the checkpoint BEFORE open_or_resume so a corrupt/truncated
+            // checkpoint (or a directory path) surfaces cleanly, not blanketed by
+            // the MYSQL_CDC_HINT binlog-grants message — the same hoist PG/MSSQL
+            // already do below (dogfood MED: MySQL reported a checkpoint-file
+            // error as a permissions/setup problem). open_or_resume re-reads it;
+            // the double read of a tiny file is cheap.
+            if let Some(p) = cfg.checkpoint.as_deref() {
+                Position::load(std::path::Path::new(p))?;
+            }
+            Ok(Box::new(
+                crate::source::mysql::cdc::MysqlChangeStream::open_or_resume(
+                    url,
+                    *server_id,
+                    cfg.checkpoint.as_deref(),
+                    cfg.drain,
+                    tls,
+                )
+                .context(MYSQL_CDC_HINT)?,
+            ))
+        }
         CdcEngineOpts::Postgres { slot } => {
             // A persisted checkpoint proves a prior run happened — if the slot is
             // then MISSING, it was dropped/invalidated and silently recreating it
@@ -925,6 +949,40 @@ mod tests {
             Position::load(&d.path().join("absent.json"))
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn mysql_corrupt_checkpoint_error_is_not_masked_by_the_grants_hint() {
+        // #dogfood MED: MySQL's `Position::load` lived INSIDE open_or_resume,
+        // wrapped by MYSQL_CDC_HINT — so a corrupt/truncated checkpoint was
+        // reported as a binlog permissions/setup problem. The load is now hoisted
+        // ABOVE the wrap (like PG/MSSQL), so the corrupt-checkpoint error surfaces
+        // cleanly and NO network connect is attempted (the `?` returns first —
+        // hence the unreachable port is never dialed). RED against the old code:
+        // without the hoist the error carries the REPLICATION-SLAVE grants hint.
+        let d = tempfile::tempdir().unwrap();
+        let ckpt = d.path().join("ck.json");
+        std::fs::write(&ckpt, b"{not valid json").unwrap();
+        let cfg = CdcConfig {
+            url: "mysql://rivet:rivet@127.0.0.1:1/rivet".into(),
+            checkpoint: Some(ckpt),
+            drain: DrainMode::BoundedAtOpen,
+            tls: None,
+            engine: CdcEngineOpts::Mysql { server_id: 4321 },
+        };
+        let err = match create_change_stream(&cfg, PeekBound::Unbounded) {
+            Ok(_) => panic!("a corrupt checkpoint must error, not open a stream"),
+            Err(e) => e,
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("corrupt or truncated"),
+            "the error must be the clean corrupt-checkpoint message: {msg}"
+        );
+        assert!(
+            !msg.contains("REPLICATION SLAVE") && !msg.contains("binlog_format"),
+            "a checkpoint-file error must NOT carry the binlog-grants hint: {msg}"
         );
     }
 
