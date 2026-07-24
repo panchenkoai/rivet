@@ -69,7 +69,9 @@ pub(crate) fn run_chunked_parallel_checkpoint(
     // so the worker loop below re-exports them.  No-op for fresh prefixes
     // and pre-0.7.0 destinations.  See `pipeline/chunked/resume_m8.rs`.
     if plan.resume {
-        let _stats = super::apply_m8_resume_decisions(state, &run_id, plan, summary)?;
+        let stats = super::apply_m8_resume_decisions(state, &run_id, plan, summary)?;
+        // #3: crash-recovery resume signal, same as the sequential runner.
+        summary.resumed = stats.adopted_prior_work();
     }
 
     let total_tasks = {
@@ -98,6 +100,9 @@ pub(crate) fn run_chunked_parallel_checkpoint(
     // reflect chunked-parallel retries the same way the sequential path
     // already does.
     let agg_retries = std::sync::atomic::AtomicU32::new(0);
+    // #4: reconnects across worker threads, folded into summary.reconnects after
+    // the scope joins — the parallel analogue of the sequential runner's counter.
+    let agg_reconnects = std::sync::atomic::AtomicU32::new(0);
     let errors = std::sync::Mutex::new(Vec::<String>::new());
     // PartRecords pushed by workers, drained post-scope through
     // `commit::record_part` so I2/M1 + counters + journal + I7 + fault hooks
@@ -152,6 +157,7 @@ pub(crate) fn run_chunked_parallel_checkpoint(
             let run_id_arc = std::sync::Arc::clone(&run_id_arc);
             let agg_rows = &agg_rows;
             let agg_retries = &agg_retries;
+            let agg_reconnects = &agg_reconnects;
             let errors = &errors;
             let file_records = &file_records;
             let checksums_shared = &checksums_shared;
@@ -233,11 +239,15 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                                 // and fold once after the scope joins).
                                 agg_retries
                                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                let extra_delay = last_err
-                                    .as_ref()
-                                    .map(classify_error)
-                                    .map(|c| c.extra_delay_ms())
-                                    .unwrap_or(0);
+                                let class = last_err.as_ref().map(classify_error);
+                                // #4: a reconnect-class retry re-opens the source
+                                // below — count it (folded into summary.reconnects).
+                                if class.is_some_and(|c| c.needs_reconnect()) {
+                                    agg_reconnects
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                }
+                                let extra_delay =
+                                    class.map(|c| c.extra_delay_ms()).unwrap_or(0);
                                 let backoff = crate::pipeline::retry::retry_backoff_ms(
                                     plan_w.tuning.retry_backoff_ms,
                                     attempt,
@@ -453,6 +463,9 @@ pub(crate) fn run_chunked_parallel_checkpoint(
     summary.retries = summary
         .retries
         .saturating_add(agg_retries.load(Ordering::Relaxed));
+    summary.reconnects = summary
+        .reconnects
+        .saturating_add(agg_reconnects.load(Ordering::Relaxed));
     pb_cp.finish(summary.total_rows);
     if plan.validate {
         summary.validated = Some(true);

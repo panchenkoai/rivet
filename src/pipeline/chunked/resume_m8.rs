@@ -89,6 +89,17 @@ pub struct M8Stats {
     pub orphan_parts: usize,
 }
 
+impl M8Stats {
+    /// Whether this resume actually ADOPTED prior-run state — parts it skipped
+    /// (already committed), reset for re-export, or quarantined. True means the
+    /// runner recovered a real crashed run (vs a `--resume` with nothing to
+    /// resume). Feeds `summary.resumed` so the flaky-link / crash-recovery
+    /// DIAGNOSIS line fires on the chunked runners too, not only keyset (#3).
+    pub fn adopted_prior_work(&self) -> bool {
+        self.skipped > 0 || self.reset_for_rewrite > 0 || self.reset_for_quarantine > 0
+    }
+}
+
 /// Apply ADR-0012 M8's decision matrix to the destination state.
 ///
 /// Run order: AFTER `ensure_chunk_checkpoint_plan` (which establishes

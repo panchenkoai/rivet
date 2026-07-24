@@ -142,6 +142,18 @@ impl TableIntrospection {
         // folds unquoted idents to lowercase). A case-sensitive match falsely
         // refused a valid integer key with a "not an integer-family column" error
         // (bughunt MED). A guard should not reject on casing.
+        //
+        // ponytail: #8 narrow, documented non-fix. On PostgreSQL a table could in
+        // principle hold BOTH `id` (int) and a quoted `"ID"` (numeric); the config
+        // `chunk_column: ID` would then pass this guard (matching `id`) yet the
+        // export SQL quotes `"ID"` case-sensitively and range-chunks the NUMERIC
+        // one — the #103 loss. A precise guard needs the FULL column list + the
+        // engine's quoting rule, not just the integer names, so it is not fixed
+        // here. It is vanishingly rare (MySQL cannot hold both spellings; PG needs
+        // deliberately quoted mixed-case twins), and WITHOUT the twin a case
+        // mismatch fails loudly at query time ("column ... does not exist"), never
+        // silently. The case-insensitive match's real, common benefit (MySQL)
+        // outweighs guarding this exotic PG shape.
         self.int_columns.iter().any(|c| c.eq_ignore_ascii_case(col))
     }
 }

@@ -1894,4 +1894,42 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn cdc_position_violation_is_verified_wrong_not_could_not_verify() {
+        // #5 / #104 bughunt: a CDC `__pos` continuity violation (a gap/duplicate in
+        // the exported change stream) is VERIFIED-WRONG — data-integrity, exit 3,
+        // the same class as a value-checksum mismatch — NOT a could-not-verify I/O
+        // error (exit 1). This pins the classification so a future edit that made it
+        // operational (folding it back into hard_failures → exit 1, the pre-fix
+        // behaviour) goes RED.
+        let viol = Failure::CdcPositionViolation {
+            detail: "export 'x': pos gap 5 -> 8".into(),
+        };
+        assert!(
+            !viol.is_could_not_verify(),
+            "a __pos violation is verified-wrong, not could-not-verify"
+        );
+        assert!(viol.is_fatal(), "a __pos violation fails the verdict");
+
+        let mut v = ManifestVerification::empty();
+        v.passed = false;
+        v.failures.push(viol);
+        assert!(
+            v.has_verified_wrong_failure(),
+            "a verdict carrying a __pos violation must classify as verified-wrong (exit 3)"
+        );
+
+        // The read-error siblings are the OTHER side of the same axis: could-not-
+        // verify, so a verdict whose ONLY failure is one of them is NOT verified-wrong.
+        let mut op = ManifestVerification::empty();
+        op.passed = false;
+        op.failures.push(Failure::ManifestReadError {
+            detail: "permission denied".into(),
+        });
+        assert!(
+            !op.has_verified_wrong_failure(),
+            "a read error alone is could-not-verify (exit 1), not verified-wrong"
+        );
+    }
 }
