@@ -25,6 +25,18 @@ pub fn build_plan(
     resume: bool,
     params: Option<&HashMap<String, String>>,
 ) -> Result<ResolvedRunPlan> {
+    // CDC has no batch plan — bail BEFORE resolve_query. A `tables:`-style CDC
+    // export carries no `query`, so resolve_query would fail first and hide this
+    // friendly message behind a confusing "no query" error (bughunt MED: the
+    // dogfood MED-5 message was unreachable for the tables: shape).
+    if export.mode == ExportMode::Cdc {
+        anyhow::bail!(
+            "export '{}': cdc mode has no batch plan — CDC exports stream changes continuously and \
+             are run with `rivet run` (or the `rivet cdc` subcommand), not `rivet plan` / `rivet \
+             apply`. Plan the batch exports separately, or run this one with `rivet run`.",
+            export.name
+        );
+    }
     let base_query = export.resolve_query(config_dir, params)?;
 
     let merged = merge_tuning_config(config.source.tuning.as_ref(), export.tuning.as_ref());
@@ -95,12 +107,8 @@ pub fn build_plan(
                 days_window,
             }
         }
-        ExportMode::Cdc => anyhow::bail!(
-            "export '{}': cdc mode has no batch plan — CDC exports stream changes continuously and \
-             are run with `rivet run` (or the `rivet cdc` subcommand), not `rivet plan` / `rivet \
-             apply`. Plan the batch exports separately, or run this one with `rivet run`.",
-            export.name
-        ),
+        // Unreachable: cdc bails at build_plan entry, before resolve_query.
+        ExportMode::Cdc => unreachable!("cdc mode is refused at build_plan entry"),
     };
 
     let (compression, compression_level) = export.effective_compression();

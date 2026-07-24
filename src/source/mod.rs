@@ -137,7 +137,12 @@ impl TableIntrospection {
     /// windows. A non-integer explicit `chunk_column` silently loses fractional
     /// rows, so the planner refuses it (see `chunked_strategy_from_introspection`).
     pub fn is_integer_column(&self, col: &str) -> bool {
-        self.int_columns.iter().any(|c| c == col)
+        // Case-INSENSITIVE: the config may write `chunk_column: ID` while the
+        // catalog stores `id` (MySQL is case-insensitive for column names; PG
+        // folds unquoted idents to lowercase). A case-sensitive match falsely
+        // refused a valid integer key with a "not an integer-family column" error
+        // (bughunt MED). A guard should not reject on casing.
+        self.int_columns.iter().any(|c| c.eq_ignore_ascii_case(col))
     }
 }
 
@@ -687,5 +692,24 @@ mod wire_guard_tests {
         assert!(verify_wire_columns(&["id", "a", "b"], &["id", "b", "a"]).is_err());
         let err = verify_wire_columns(&["id", "a"], &["id"]).unwrap_err();
         assert!(err.to_string().contains("schema changed"));
+    }
+}
+
+#[cfg(test)]
+mod introspection_tests {
+    use super::TableIntrospection;
+
+    #[test]
+    fn is_integer_column_is_case_insensitive() {
+        // #bughunt MED: a case-sensitive match falsely refused `chunk_column: ID`
+        // when the catalog stores `id` — a guard must not reject on casing.
+        let intro = TableIntrospection {
+            int_columns: vec!["id".into(), "user_id".into()],
+            ..Default::default()
+        };
+        assert!(intro.is_integer_column("id"));
+        assert!(intro.is_integer_column("ID"));
+        assert!(intro.is_integer_column("User_Id"));
+        assert!(!intro.is_integer_column("name"));
     }
 }

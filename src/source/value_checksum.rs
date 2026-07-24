@@ -508,10 +508,17 @@ pub fn validate_recorded_checksums(
 /// no-op (`Ok`) when the manifest records none (older run / non-Parquet). Mirrors
 /// [`crate::source::cdc::validate::check_positions`]; called by `rivet validate`
 /// for Parquet runs.
+/// Re-read the parts and recompare per-column checksums against the manifest.
+/// `Ok(None)` — verified equal (or no checksums recorded). `Ok(Some(detail))` —
+/// a genuine MISMATCH (post-write corruption, verified-wrong → the caller
+/// classifies exit 3). `Err(e)` — an OPERATIONAL failure (could not read the
+/// manifest / a part / a temp file): could-not-verify, NOT corruption, so it must
+/// NOT be labelled a checksum mismatch (bughunt MED: every Err was mislabelled
+/// data-integrity).
 pub fn validate_manifest_checksums(
     dest: &dyn crate::destination::Destination,
     prefix: &str,
-) -> Result<()> {
+) -> Result<Option<String>> {
     use std::io::Write;
 
     use crate::manifest::{MANIFEST_FILENAME, RunManifest, join_key};
@@ -519,7 +526,7 @@ pub fn validate_manifest_checksums(
     let manifest_key = join_key(prefix, MANIFEST_FILENAME);
     let manifest: RunManifest = serde_json::from_slice(&dest.read(&manifest_key)?)?;
     let Some(recorded) = manifest.column_checksums.as_deref() else {
-        return Ok(());
+        return Ok(None);
     };
 
     // Materialise each part to a temp file so the Parquet reader can seek (the
@@ -534,7 +541,12 @@ pub fn validate_manifest_checksums(
     }
     let paths: Vec<std::path::PathBuf> = tmps.iter().map(|t| t.path().to_path_buf()).collect();
 
-    validate_recorded_checksums(recorded, &paths, manifest.checksum_key_column.as_deref())
+    match validate_recorded_checksums(recorded, &paths, manifest.checksum_key_column.as_deref()) {
+        Ok(()) => Ok(None),
+        // The ONLY verified-wrong outcome: the recompare disagreed with the
+        // recorded checksum. Everything above (`?`) is operational.
+        Err(mismatch) => Ok(Some(format!("{mismatch:#}"))),
+    }
 }
 
 #[cfg(test)]

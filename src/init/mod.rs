@@ -718,6 +718,24 @@ fn introspect_all(
         }
         "mysql" => {
             let db = mysql::resolve_database_for_listing(source_url, schema)?;
+            // Guard (bughunt MED, sibling of the single-table HIGH): whole-schema
+            // MySQL lists tables from `db` (which honors --schema) but introspects
+            // via DATABASE() (the URL's db) — and the generated config connects
+            // through the URL, so a --schema pointing at a DIFFERENT database
+            // lists/describes one db and exports another. Refuse: the database
+            // belongs in the URL, which the config actually uses.
+            if schema.map(str::trim).is_some_and(|s| !s.is_empty())
+                && mysql::resolve_database_for_listing(source_url, None)
+                    .ok()
+                    .as_deref()
+                    != Some(db.as_str())
+            {
+                anyhow::bail!(
+                    "init: --schema '{db}' selects a different MySQL database than the source URL — \
+                     `rivet init`/`run` connect via the URL and would list and export the URL's \
+                     database, not '{db}'. Put the database in the URL instead (mysql://…/{db})."
+                );
+            }
             // One pooled connection for the whole scan — a fresh Pool per
             // table would mean N+1 TCP+auth(+TLS) handshakes on large schemas.
             let mut conn = mysql::connect(source_url)?;

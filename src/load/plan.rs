@@ -540,7 +540,6 @@ mod tests {
     #[test]
     fn resolve_load_prefix_expands_deterministic_tokens_and_refuses_run_specific() {
         use crate::config::{DestinationConfig, DestinationType};
-        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
         let dest = |prefix: &str| DestinationConfig {
             destination_type: DestinationType::Gcs,
             bucket: Some("BKT".into()),
@@ -560,11 +559,10 @@ mod tests {
             resolve_load_prefix(&dest("e/{table}/{partition}/"), "orders", "BKT").unwrap(),
             "gs://BKT/e/orders/"
         );
-        // {date} expands to the load's date (matches a same-day export).
-        assert_eq!(
-            resolve_load_prefix(&dest("d/{date}/{export}/"), "orders", "BKT").unwrap(),
-            format!("gs://BKT/d/{today}/orders/")
-        );
+        // {date} in the load base is DAY-specific → refused (bughunt HIGH: it
+        // expanded to the LOAD day, so a cross-midnight load silently listed an
+        // empty prefix). See resolve_load_prefix_refuses_day_specific_date_in_the_base.
+        assert!(resolve_load_prefix(&dest("d/{date}/{export}/"), "orders", "BKT").is_err());
 
         // {run_id} is run-specific and unknowable here → refuse LOUD, never a
         // literal-token listing that silently loads nothing.

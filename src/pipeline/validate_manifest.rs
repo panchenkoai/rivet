@@ -244,6 +244,13 @@ pub enum Failure {
     /// cannot see (a flipped bit inside a data page). Verified-wrong, so it fails
     /// the verdict and classifies as data-integrity (exit 3), not could-not-verify.
     ValueChecksumMismatch { detail: String },
+    /// `--depth full` re-read a CDC export's parts and the `__pos` continuity
+    /// check found a gap/duplicate in the change positions — the exported change
+    /// stream is incomplete or reordered. Verified-wrong (same class as a value
+    /// mismatch), so it fails the verdict and classifies as data-integrity (exit
+    /// 3), not could-not-verify (bughunt MED: it was folded into hard_failures →
+    /// exit 1, inconsistent with the value-checksum path).
+    CdcPositionViolation { detail: String },
     /// `_SUCCESS` exists but its body is malformed (not `xxh3:<16-hex>` after
     /// trim).  ADR-0012 M2 — orchestrators rely on this format being strict.
     SuccessMarkerMalformed { body_preview: String },
@@ -312,6 +319,7 @@ impl Failure {
             Failure::PartSizeMismatch { .. } => "RIVET_VERIFY_PART_SIZE_MISMATCH",
             Failure::PartChecksumMismatch { .. } => "RIVET_VERIFY_PART_CHECKSUM_MISMATCH",
             Failure::ValueChecksumMismatch { .. } => "RIVET_VERIFY_VALUE_CHECKSUM",
+            Failure::CdcPositionViolation { .. } => "RIVET_VERIFY_CDC_POSITION",
             Failure::SuccessMarkerMalformed { .. } => "RIVET_VERIFY_SUCCESS_MALFORMED",
             Failure::SuccessMarkerStale { .. } => "RIVET_VERIFY_SUCCESS_STALE",
             Failure::ManifestSelfInconsistent { .. } => "RIVET_VERIFY_MANIFEST_INCONSISTENT",
@@ -355,6 +363,9 @@ impl std::fmt::Display for Failure {
                     "value checksum mismatch (post-write corruption): {}",
                     detail
                 )
+            }
+            Failure::CdcPositionViolation { detail } => {
+                write!(f, "cdc __pos continuity violation: {}", detail)
             }
             Failure::PartChecksumMismatch {
                 part_id,
@@ -1841,6 +1852,12 @@ mod tests {
                     detail: "flip".into(),
                 },
                 "RIVET_VERIFY_VALUE_CHECKSUM",
+            ),
+            (
+                Failure::CdcPositionViolation {
+                    detail: "gap".into(),
+                },
+                "RIVET_VERIFY_CDC_POSITION",
             ),
         ];
         for (failure, code) in cases {

@@ -654,19 +654,29 @@ pub(crate) fn create_change_stream(
                 .context(MSSQL_CDC_HINT)?,
             ))
         }
-        CdcEngineOpts::Mongo { canonical } => Ok(Box::new(
-            // Whole-database change stream; resumes from the persisted token when
-            // one exists. `document` JSON fidelity follows `source.mongo.json`
-            // (canonical vs relaxed), so CDC and batch render it identically.
-            crate::source::mongo::cdc::MongoChangeStream::open(
-                url,
-                tls,
-                cfg.checkpoint.as_deref(),
-                *canonical,
-                cfg.drain,
-            )
-            .context(MONGO_CDC_HINT)?,
-        )),
+        CdcEngineOpts::Mongo { canonical } => {
+            // Validate the checkpoint BEFORE open so a corrupt/truncated one
+            // surfaces cleanly, not blanketed by MONGO_CDC_HINT — the same hoist
+            // MySQL/PG/MSSQL do (bughunt MED: MongoChangeStream::open loaded it
+            // INSIDE the hint wrap). open re-reads it; a tiny double read is cheap.
+            if let Some(p) = cfg.checkpoint.as_deref() {
+                Position::load(std::path::Path::new(p))?;
+            }
+            Ok(Box::new(
+                // Whole-database change stream; resumes from the persisted token
+                // when one exists. `document` JSON fidelity follows
+                // `source.mongo.json` (canonical vs relaxed), so CDC and batch
+                // render it identically.
+                crate::source::mongo::cdc::MongoChangeStream::open(
+                    url,
+                    tls,
+                    cfg.checkpoint.as_deref(),
+                    *canonical,
+                    cfg.drain,
+                )
+                .context(MONGO_CDC_HINT)?,
+            ))
+        }
     }
 }
 

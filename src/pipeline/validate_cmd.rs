@@ -416,14 +416,26 @@ fn verify_one_prefix(
                         pc.first,
                         pc.last
                     ),
+                    // A __pos VIOLATION is verified-wrong (a gap/dup in the change
+                    // stream) — data-integrity (exit 3), same class as a value
+                    // mismatch. Route it into THIS export's verdict, not
+                    // hard_failures (bughunt MED: it was exit 1, inconsistent).
                     Ok(pc) => {
-                        for viol in &pc.violations {
-                            hard_failures
-                                .push(format!("export '{}': cdc __pos: {}", display_name, viol));
+                        if let Some(ev) = all_results.last_mut() {
+                            ev.verification.passed = false;
+                            for viol in &pc.violations {
+                                ev.verification.failures.push(
+                                    crate::pipeline::validate_manifest::Failure::CdcPositionViolation {
+                                        detail: format!("export '{}': {}", display_name, viol),
+                                    },
+                                );
+                            }
                         }
                     }
+                    // A check-RUN failure (couldn't read the parts) is operational
+                    // could-not-verify → hard failure (exit 1), not corruption.
                     Err(e) => hard_failures.push(format!(
-                        "export '{}': cdc __pos check failed: {:#}",
+                        "export '{}': cdc __pos check could not complete: {:#}",
                         display_name, e
                     )),
                 }
@@ -441,22 +453,31 @@ fn verify_one_prefix(
             if target.depth.runs_part_download()
                 && manifest_verified
                 && export.format == crate::config::FormatType::Parquet
-                && let Err(e) =
-                    crate::source::value_checksum::validate_manifest_checksums(&*dest, "")
             {
-                // A value-checksum mismatch is post-write corruption (verified-wrong),
-                // NOT could-not-verify: fold it into THIS export's verdict so the
-                // headline status reads FAILED and the exit gate classifies it as
-                // data-integrity (exit 3), not a generic operational failure (#104).
-                // The verdict was moved into `all_results` at the push above and
-                // nothing else pushes in between, so the just-pushed entry is last.
-                if let Some(ev) = all_results.last_mut() {
-                    ev.verification.passed = false;
-                    ev.verification.failures.push(
-                        crate::pipeline::validate_manifest::Failure::ValueChecksumMismatch {
-                            detail: format!("export '{}': {:#}", display_name, e),
-                        },
-                    );
+                match crate::source::value_checksum::validate_manifest_checksums(&*dest, "") {
+                    // A value-checksum MISMATCH is post-write corruption
+                    // (verified-wrong): fold it into THIS export's verdict so the
+                    // headline reads FAILED and the exit gate classifies it as
+                    // data-integrity (exit 3), not generic (#104). The verdict is
+                    // the just-pushed `all_results` entry (nothing pushes between).
+                    Ok(Some(detail)) => {
+                        if let Some(ev) = all_results.last_mut() {
+                            ev.verification.passed = false;
+                            ev.verification.failures.push(
+                                crate::pipeline::validate_manifest::Failure::ValueChecksumMismatch {
+                                    detail: format!("export '{}': {}", display_name, detail),
+                                },
+                            );
+                        }
+                    }
+                    // An OPERATIONAL failure (could not read the manifest / a part)
+                    // is could-not-verify, NOT corruption — a hard failure (exit 1),
+                    // never mislabelled data-integrity (bughunt MED).
+                    Err(e) => hard_failures.push(format!(
+                        "export '{}': value-checksum re-read could not complete: {:#}",
+                        display_name, e
+                    )),
+                    Ok(None) => {}
                 }
             }
         }
