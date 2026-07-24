@@ -55,6 +55,49 @@ INSERT INTO ext.no_pk_no_ts (label, amount)
 SELECT CONCAT(N'label', value), value % 100 FROM GENERATE_SERIES(1, 150);
 GO
 
+-- ── The MESSY reality (distilled from a real stuck run's state DB) ───────────
+-- HISTORY/VERSION table: NO `id`, keyed by a non-PK integer `ref_id` (range-
+-- chunked). Non-unique index on ref_id, no PK.
+CREATE TABLE ext.ref_id_history (
+    ref_id BIGINT NOT NULL,
+    field NVARCHAR(200),
+    field_cur NVARCHAR(10),
+    sign SMALLINT NOT NULL DEFAULT 1,
+    status NVARCHAR(50),
+    amount_cur NVARCHAR(10),
+    purchase_type NVARCHAR(50)
+);
+CREATE INDEX ix_ref_id_history_ref_id ON ext.ref_id_history (ref_id);
+INSERT INTO ext.ref_id_history (ref_id, field, field_cur, sign, status, amount_cur, purchase_type)
+SELECT (value % 400) + 1, CONCAT(N'f', value), N'EUR', IIF(value % 2 = 0, 1, -1),
+       CHOOSE(1 + value % 3, N'pending', N'done', N'void'), N'USD', CHOOSE(1 + value % 2, N'a', N'b')
+FROM GENERATE_SERIES(1, 600);
+GO
+
+-- Keyed by `order_id` (NOT `id`): a unique index makes it keyset-able on a
+-- non-`id` key. Wide-ish string columns.
+CREATE TABLE ext.order_keyed (
+    order_id BIGINT NOT NULL,
+    md5 CHAR(32) NOT NULL,
+    currency CHAR(3) NOT NULL,
+    status NVARCHAR(50) NOT NULL,
+    subid NVARCHAR(50),
+    advcampaign_id INT
+);
+CREATE UNIQUE INDEX ux_order_keyed_order_id ON ext.order_keyed (order_id);
+INSERT INTO ext.order_keyed (order_id, md5, currency, status, subid, advcampaign_id)
+SELECT value, CONVERT(CHAR(32), HASHBYTES('MD5', CAST(value AS VARCHAR(20))), 2),
+       CHOOSE(1 + value % 3, 'EUR', 'USD', 'PLN'), CHOOSE(1 + value % 2, N'approved', N'declined'),
+       CONCAT(N'sub', value % 50), (value % 900) + 100
+FROM GENERATE_SERIES(CAST(1 AS BIGINT), CAST(350 AS BIGINT));
+GO
+
+-- HEAP: no PK, no index → full mode only.
+CREATE TABLE ext.heap_no_key (payload NVARCHAR(200) NOT NULL, n INT NOT NULL);
+INSERT INTO ext.heap_no_key (payload, n)
+SELECT REPLICATE('x', 20 + value % 50), value FROM GENERATE_SERIES(1, 400);
+GO
+
 -- WIDE table: 160 int columns of 30-char names. The introspection STRING_AGG of
 -- the names exceeds the nvarchar 4000-byte cap and raised Msg 9829 before the
 -- CONVERT(nvarchar(max)) fix (#21) — every chunked/keyset plan on it failed.
