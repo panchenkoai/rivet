@@ -549,16 +549,18 @@ pub enum StateAction {
         json: bool,
     },
     /// Clear persisted chunk checkpoint rows (`chunk_run` / `chunk_task`).
+    // A required, single-choice ArgGroup renders the usage as
+    // `<--export <EXPORT>|--stuck-checkpoints>` (pick exactly one). The old
+    // paired `conflicts_with` + `required_unless_present` idiom made clap render
+    // BOTH flags as required in the synopsis, then rejected supplying both — a
+    // self-contradictory help line (dogfood LOW). The group keeps the same
+    // runtime contract: neither → MissingRequiredArgument, both → ArgumentConflict.
+    #[command(group = clap::ArgGroup::new("reset_chunks_target").required(true).multiple(false))]
     ResetChunks {
         #[arg(short, long)]
         config: String,
         /// Export whose chunk checkpoints should be cleared (same as `chunk_checkpoint` runs).
-        #[arg(
-            short,
-            long,
-            conflicts_with = "stuck_checkpoints",
-            required_unless_present = "stuck_checkpoints"
-        )]
+        #[arg(short, long, group = "reset_chunks_target")]
         export: Option<String>,
         /// Reset checkpoints for **every export named in this config** that currently has
         /// `chunk_run.status = 'in_progress'` (crash, SIGKILL, stale concurrent worker).
@@ -567,12 +569,7 @@ pub enum StateAction {
         /// database but removed from the YAML are skipped with a printed note.
         ///
         /// Alias `--failed` refers to "checkpoint state stuck", not HTTP-style failures or metric rows.
-        #[arg(
-            long,
-            visible_alias = "failed",
-            conflicts_with = "export",
-            required_unless_present = "export"
-        )]
+        #[arg(long, visible_alias = "failed", group = "reset_chunks_target")]
         stuck_checkpoints: bool,
     },
     /// Show chunk checkpoint status for an export

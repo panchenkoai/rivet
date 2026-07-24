@@ -102,7 +102,13 @@ pub fn show_state(config_path: &str, json: bool) -> Result<()> {
 
 /// Epic G / ADR-0008 — explicit committed / verified boundaries per export.
 pub fn show_progression(config_path: &str, export_name: Option<&str>) -> Result<()> {
-    require_config(config_path)?;
+    let config = require_config(config_path)?;
+    // A typo'd `--export` must not read as "this export has no boundaries yet"
+    // (dogfood MED — files/chunks/progression accepted an unknown name silently
+    // while metrics/journal/reset rejected it). Validate against the config.
+    if let Some(name) = export_name {
+        require_known_export(&config, config_path, name)?;
+    }
     let state = StateStore::open(config_path)?;
     let entries = match export_name {
         Some(name) => vec![state.get_progression(name)?],
@@ -186,7 +192,10 @@ pub fn show_files(
     limit: usize,
     json: bool,
 ) -> Result<()> {
-    require_config(config_path)?;
+    let config = require_config(config_path)?;
+    if let Some(name) = export_name {
+        require_known_export(&config, config_path, name)?;
+    }
     let state = StateStore::open(config_path)?;
     let files = state.get_files(export_name, limit)?;
     if json {
@@ -196,7 +205,11 @@ pub fn show_files(
         return Ok(());
     }
     if files.is_empty() {
-        println!("No files recorded yet.");
+        // `--last 0` legitimately asks for zero rows — do not conflate it with an
+        // empty ledger (dogfood LOW; the --json path already returns `[]`).
+        if limit != 0 {
+            println!("No files recorded yet.");
+        }
         return Ok(());
     }
     // run_ids are `{export}_{%Y%m%dT%H%M%S%3f}` (timestamp alone is 18 chars),
@@ -235,7 +248,23 @@ pub fn show_metrics(
         require_known_export(&config, config_path, name)?;
     }
     let state = StateStore::open(config_path)?;
-    let metrics = state.get_metrics(export_name, limit)?;
+    let metrics = match export_name {
+        Some(name) => state.get_metrics(Some(name), limit)?,
+        None => {
+            // The state DB is shared across configs in a directory, so an
+            // unscoped `get_metrics(None, ..)` leaks OTHER configs' runs — while
+            // `-e <foreign>` rejects them as "not defined" (dogfood LOW, a
+            // contradictory scope). Union each declared export's scoped history
+            // and take the most recent `limit` across them.
+            let mut all = Vec::new();
+            for e in &config.exports {
+                all.extend(state.get_metrics(Some(&e.name), limit)?);
+            }
+            all.sort_by(|a, b| b.run_at.cmp(&a.run_at));
+            all.truncate(limit);
+            all
+        }
+    };
     if json {
         // Reuse the run aggregate's serializable DTO so `metrics --json` and the
         // run summary's `--json` agree field-for-field. Empty → `[]` (valid JSON),
@@ -248,7 +277,10 @@ pub fn show_metrics(
         return Ok(());
     }
     if metrics.is_empty() {
-        println!("No metrics recorded yet.");
+        // `--last 0` asks for zero rows — not the same as an empty ledger.
+        if limit != 0 {
+            println!("No metrics recorded yet.");
+        }
         return Ok(());
     }
     println!(
@@ -386,7 +418,9 @@ pub fn reset_chunk_checkpoints_stuck(config_path: &str) -> Result<()> {
 }
 
 pub fn show_chunk_checkpoint(config_path: &str, export_name: &str, json: bool) -> Result<()> {
-    require_config(config_path)?;
+    let config = require_config(config_path)?;
+    // A typo'd `--export` must not read as "no chunk checkpoint data" (dogfood MED).
+    require_known_export(&config, config_path, export_name)?;
     let state = StateStore::open(config_path)?;
     if json {
         // Composite (run header + per-chunk tasks) built inline so no state-layer
@@ -471,18 +505,23 @@ pub fn show_journal(
     run_id: Option<&str>,
 ) -> Result<()> {
     let config = require_config(config_path)?;
-    // Same gap as `metrics`: when querying by export name (no `--run-id`), a
-    // typo would print "No journal entries for export 'X' yet." as if the
-    // export were merely unrun. Validate the name against the config first.
-    // The `--run-id` path looks up by id directly, so the export name is not
-    // the lookup key there and is left unchecked.
-    if run_id.is_none() {
-        require_known_export(&config, config_path, export_name)?;
-    }
+    // Validate `-e` against the config ALWAYS — including on the `--run-id`
+    // path, which used to ignore it entirely (printing whatever export owned
+    // that run_id, even a nonexistent `-e`) (dogfood LOW).
+    require_known_export(&config, config_path, export_name)?;
     let state = StateStore::open(config_path)?;
 
     let journals = if let Some(rid) = run_id {
         match state.load_journal(rid)? {
+            // The run_id must belong to `-e`, else `-e` was silently ignored.
+            Some(j) if j.export_name != export_name => anyhow::bail!(
+                "run_id '{}' belongs to export '{}', not '{}' (the -e/--export you passed). \
+                 Pass the matching -e, or omit --run-id to list '{}'s recent runs.",
+                rid,
+                j.export_name,
+                export_name,
+                export_name
+            ),
             Some(j) => vec![j],
             None => {
                 println!("No journal found for run_id '{rid}'.");
@@ -494,8 +533,11 @@ pub fn show_journal(
     };
 
     if journals.is_empty() {
-        println!("No journal entries for export '{export_name}' yet.");
-        println!("Journals are recorded after each `rivet run`.");
+        // `--last 0` asks for zero rows — not the same as an unrun export.
+        if limit != 0 {
+            println!("No journal entries for export '{export_name}' yet.");
+            println!("Journals are recorded after each `rivet run`.");
+        }
         return Ok(());
     }
 
@@ -851,13 +893,32 @@ exports:
         );
     }
 
-    // Querying by --run-id looks up by id, not export name, so an unfamiliar
-    // export name must NOT be rejected there (the id is the lookup key).
+    // #dogfood LOW: `--run-id` used to look up purely by id and IGNORE `-e` —
+    // so a typo'd (or nonexistent) `-e` printed whatever export owned the run_id.
+    // Now `-e` is validated even on the run_id path, AND the run_id must belong
+    // to that export. (This test previously PINNED the buggy skip.)
     #[test]
-    fn show_journal_by_run_id_skips_export_name_check() {
+    fn show_journal_run_id_validates_export_and_cross_checks_ownership() {
         let (dir, config_path) = setup_dir();
-        let _ = open_state(&dir);
-        assert!(show_journal(&config_path, "ghost", 5, Some("no_such_run")).is_ok());
+        let state = open_state(&dir);
+        // An unknown -e is rejected even with --run-id.
+        let err = show_journal(&config_path, "ghost", 5, Some("run_xyz")).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("export 'ghost' is not defined"),
+            "unknown -e must be rejected even with --run-id: {err:#}"
+        );
+        // A run_id owned by a DIFFERENT (valid) export than -e is a mismatch.
+        state
+            .store_journal(&make_journal("run_owned_by_orders", "orders"))
+            .unwrap();
+        drop(state);
+        let err2 =
+            show_journal(&config_path, "transactions", 5, Some("run_owned_by_orders")).unwrap_err();
+        let m = format!("{err2:#}");
+        assert!(
+            m.contains("belongs to export 'orders'") && m.contains("not 'transactions'"),
+            "a run_id/-e mismatch must be a loud error: {m}"
+        );
     }
 
     #[test]
@@ -902,6 +963,31 @@ exports:
             .unwrap();
         drop(state);
         assert!(show_files(&config_path, Some("orders"), 10, false).is_ok());
+    }
+
+    // #dogfood MED: files / progression / chunks used to accept a typo'd -e
+    // silently (empty-state output, exit 0) while metrics/journal/reset rejected
+    // it. All three now validate the name against the config like their siblings.
+    #[test]
+    fn inspect_handlers_reject_an_unknown_export() {
+        let (dir, config_path) = setup_dir();
+        let _ = open_state(&dir);
+        let unknown = [
+            show_files(&config_path, Some("ghost"), 10, false),
+            show_progression(&config_path, Some("ghost")),
+            show_chunk_checkpoint(&config_path, "ghost", false),
+        ];
+        for r in unknown {
+            let err = r.unwrap_err();
+            assert!(
+                format!("{err:#}").contains("export 'ghost' is not defined"),
+                "a typo'd -e must be rejected, not read as empty-state: {err:#}"
+            );
+        }
+        // A declared export is NOT falsely rejected.
+        assert!(show_files(&config_path, Some("orders"), 10, false).is_ok());
+        assert!(show_progression(&config_path, Some("orders")).is_ok());
+        assert!(show_chunk_checkpoint(&config_path, "orders", false).is_ok());
     }
 
     // ── show_metrics ─────────────────────────────────────────────────────────

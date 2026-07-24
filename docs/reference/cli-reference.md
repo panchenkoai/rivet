@@ -242,7 +242,7 @@ Show file manifest (files produced by exports)
 
 Clear persisted chunk checkpoint rows (`chunk_run` / `chunk_task`)
 
-**Usage:** `rivet state reset-chunks [OPTIONS] --config <CONFIG>`
+**Usage:** `rivet state reset-chunks --config <CONFIG> <--export <EXPORT>|--stuck-checkpoints>`
 
 ###### **Options:**
 

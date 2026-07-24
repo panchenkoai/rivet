@@ -105,6 +105,12 @@ pub fn doctor(config_path: &str, json: bool) -> Result<()> {
     };
 
     let mut all_ok = true;
+    // A transient/connectivity probe failure (connection refused/reset/timeout)
+    // must exit Retryable (2) like `check`/`run`, not Generic (1) — doctor used
+    // to stringify+drop the typed error and re-bail generically, so classify_exit
+    // could no longer see it was transient (dogfood LOW). Carry the original
+    // transient message so the final bail stays classifiable.
+    let mut transient_detail: Option<String> = None;
 
     match check_source_auth(&config) {
         Ok(()) => {
@@ -126,6 +132,11 @@ pub fn doctor(config_path: &str, json: bool) -> Result<()> {
         }
         Err(e) => {
             all_ok = false;
+            if crate::pipeline::retry::classify_error(&e).is_transient() {
+                // Keep the FULL chain (not trim_probe_error) so the transient
+                // keyword survives into the final bail for classify_exit.
+                transient_detail = Some(format!("{e:#}"));
+            }
             let category = categorize_source_error(&e);
             let hint =
                 source_error_hint(category, &e, &config.source.source_type).map(|h| h.to_string());
@@ -246,6 +257,10 @@ pub fn doctor(config_path: &str, json: bool) -> Result<()> {
     }
     if all_ok {
         Ok(())
+    } else if let Some(detail) = transient_detail {
+        // Preserve the original transient text so classify_exit (string-based)
+        // returns Retryable (2), matching `check`/`run` on the same failure.
+        anyhow::bail!("doctor: preflight failed on a transient error (see output above): {detail}")
     } else {
         anyhow::bail!("doctor: one or more preflight checks failed (see output above)")
     }

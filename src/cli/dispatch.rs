@@ -689,7 +689,15 @@ fn show_loads(config: &str, target: Option<&str>, last: usize) -> Result<()> {
     let store = StateStore::open(config)?;
     let loads = store.recent_loads(target, last)?;
     if loads.is_empty() {
-        println!("no loads recorded in the state DB yet");
+        // Don't conflate a zero-row request (`--last 0`) or an unmatched
+        // `--target` filter with an empty ledger (dogfood LOW): the old message
+        // claimed "the state DB is empty" even when it held other rows.
+        if last != 0 {
+            match target {
+                Some(t) => println!("no loads match --target '{t}'"),
+                None => println!("no loads recorded in the state DB yet"),
+            }
+        }
         return Ok(());
     }
     println!(
