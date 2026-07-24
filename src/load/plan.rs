@@ -236,6 +236,38 @@ fn check_load_keys(value: &serde_json::Value, whose: &str) -> Result<()> {
     Ok(())
 }
 
+/// Resolve a load's staging prefix from an export destination.
+///
+/// Expands the same `{date}`/`{export}`/`{table}` placeholders the export wrote
+/// with (`PlaceholderContext::for_today`) so the load lists the ACTUAL prefix
+/// (`exports/orders/`) rather than the literal config token (`exports/{export}/`)
+/// — without this the load found no manifests under the unexpanded path and
+/// reported "up to date" having loaded nothing (#100). `{partition}` is stripped
+/// (its per-partition sub-prefixes live below). A run-specific token that cannot
+/// be resolved here (`{run_id}`, or a `{date}` for a past run) fails LOUD rather
+/// than silently loading nothing.
+fn resolve_load_prefix(
+    dest: &crate::config::DestinationConfig,
+    export_name: &str,
+    bucket: &str,
+) -> Result<String> {
+    let ctx = crate::destination::placeholder::PlaceholderContext::for_today(export_name);
+    let expanded = crate::destination::placeholder::expand_destination(dest.clone(), &ctx);
+    let prefix = expanded.prefix.as_deref().unwrap_or("");
+    let base = prefix.split("{partition}").next().unwrap_or(prefix);
+    if base.contains('{') {
+        bail!(
+            "export `{}`: load prefix `{}` still has an unresolved placeholder after expansion — \
+             `rivet load` cannot reconstruct which run's output to load (a `{{run_id}}` or a \
+             past-`{{date}}` prefix is run-specific). Drop the run-specific token from \
+             `destination.prefix`, or run `rivet load` from the context that wrote the export.",
+            export_name,
+            base
+        );
+    }
+    Ok(format!("gs://{bucket}/{base}"))
+}
+
 pub fn plan_loads(config_path: &str, rivet_bin: &str) -> Result<Vec<LoadPlan>> {
     let yaml = std::fs::read_to_string(config_path)
         .with_context(|| format!("reading config {config_path}"))?;
@@ -317,9 +349,7 @@ fn build_plans(
                 export.name
             )
         })?;
-        let prefix = dest.prefix.as_deref().unwrap_or("");
-        let base = prefix.split("{partition}").next().unwrap_or(prefix);
-        let gcs_prefix = format!("gs://{bucket}/{base}");
+        let gcs_prefix = resolve_load_prefix(dest, &export.name, bucket)?;
 
         let specs = report
             .columns
@@ -436,6 +466,44 @@ mod tests {
         assert_eq!(LoadMode::Full.ledger_str(), "full");
         assert_eq!(LoadMode::Incremental.ledger_str(), "incremental");
         assert_eq!(LoadMode::Cdc.ledger_str(), "cdc");
+    }
+
+    #[test]
+    fn resolve_load_prefix_expands_deterministic_tokens_and_refuses_run_specific() {
+        use crate::config::{DestinationConfig, DestinationType};
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let dest = |prefix: &str| DestinationConfig {
+            destination_type: DestinationType::Gcs,
+            bucket: Some("BKT".into()),
+            prefix: Some(prefix.into()),
+            ..Default::default()
+        };
+
+        // {export}/{table} are deterministic → the load must list the ACTUAL
+        // prefix, not the literal token. (#100: the load listed `exports/{export}/`
+        // verbatim, found no manifests, and reported "up to date" — loaded nothing.)
+        assert_eq!(
+            resolve_load_prefix(&dest("exports/{export}/"), "orders", "BKT").unwrap(),
+            "gs://BKT/exports/orders/"
+        );
+        // {partition} is stripped; {table} is an alias for {export}.
+        assert_eq!(
+            resolve_load_prefix(&dest("e/{table}/{partition}/"), "orders", "BKT").unwrap(),
+            "gs://BKT/e/orders/"
+        );
+        // {date} expands to the load's date (matches a same-day export).
+        assert_eq!(
+            resolve_load_prefix(&dest("d/{date}/{export}/"), "orders", "BKT").unwrap(),
+            format!("gs://BKT/d/{today}/orders/")
+        );
+
+        // {run_id} is run-specific and unknowable here → refuse LOUD, never a
+        // literal-token listing that silently loads nothing.
+        let err = resolve_load_prefix(&dest("e/{run_id}/"), "orders", "BKT").unwrap_err();
+        assert!(
+            err.to_string().contains("unresolved placeholder"),
+            "a run-specific token must be refused, not silently listed: {err}"
+        );
     }
 
     /// A `ColReport` with an explicit `target_status`.
