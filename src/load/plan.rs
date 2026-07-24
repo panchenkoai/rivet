@@ -289,14 +289,35 @@ fn reject_foreign_target_fields(
 /// (`exports/orders/`) rather than the literal config token (`exports/{export}/`)
 /// — without this the load found no manifests under the unexpanded path and
 /// reported "up to date" having loaded nothing (#100). `{partition}` is stripped
-/// (its per-partition sub-prefixes live below). A run-specific token that cannot
-/// be resolved here (`{run_id}`, or a `{date}` for a past run) fails LOUD rather
-/// than silently loading nothing.
+/// (its per-partition sub-prefixes live below).
+///
+/// A `{date}` in the load-listed BASE is refused up front: it expands to the
+/// LOAD day, so a nightly export + an after-midnight load list DIFFERENT prefixes
+/// and the load silently reports "up to date" (bughunt HIGH — the same #100
+/// silent-no-load class the expansion above closes for the static tokens, left
+/// open for the day-specific one). `{run_id}` (and any token still unresolved
+/// after expansion) fails loud the same way.
 fn resolve_load_prefix(
     dest: &crate::config::DestinationConfig,
     export_name: &str,
     bucket: &str,
 ) -> Result<String> {
+    // Refuse a day-specific `{date}` in the load base BEFORE expansion — once
+    // expanded to the load day, the `contains('{')` guard below can never see it,
+    // so an export written on a different UTC day is silently missed.
+    let raw_prefix = dest.prefix.as_deref().unwrap_or("");
+    let raw_base = raw_prefix.split("{partition}").next().unwrap_or(raw_prefix);
+    if raw_base.contains("{date}") {
+        bail!(
+            "export `{}`: destination.prefix `{}` puts a day-specific `{{date}}` in the load base. \
+             `rivet load` lists the LOAD-day prefix, so an export written on a different day (a \
+             nightly export + an after-midnight load) lands under a different, EMPTY prefix and is \
+             silently reported 'up to date'. Remove `{{date}}` from the load base, or place it \
+             BELOW `{{partition}}` so the load can list a stable prefix.",
+            export_name,
+            raw_base
+        );
+    }
     let ctx = crate::destination::placeholder::PlaceholderContext::for_today(export_name);
     let expanded = crate::destination::placeholder::expand_destination(dest.clone(), &ctx);
     let prefix = expanded.prefix.as_deref().unwrap_or("");
@@ -304,9 +325,9 @@ fn resolve_load_prefix(
     if base.contains('{') {
         bail!(
             "export `{}`: load prefix `{}` still has an unresolved placeholder after expansion — \
-             `rivet load` cannot reconstruct which run's output to load (a `{{run_id}}` or a \
-             past-`{{date}}` prefix is run-specific). Drop the run-specific token from \
-             `destination.prefix`, or run `rivet load` from the context that wrote the export.",
+             `rivet load` cannot reconstruct which run's output to load (a `{{run_id}}` prefix is \
+             run-specific). Drop the run-specific token from `destination.prefix`, or run \
+             `rivet load` from the context that wrote the export.",
             export_name,
             base
         );
@@ -829,6 +850,34 @@ load:
         );
         let ok = serde_json::json!({ "pk": ["id"], "cleanup_source": true });
         assert!(serde_json::from_value::<LoadOverride>(ok).is_ok());
+    }
+
+    #[test]
+    fn resolve_load_prefix_refuses_day_specific_date_in_the_base() {
+        // #bughunt HIGH: {date} expands to the LOAD day, so a nightly export + an
+        // after-midnight load list DIFFERENT prefixes → silent "up to date". Refuse
+        // {date} in the load base; a static base (or {date} below {partition}) is ok.
+        let dest = |p: &str| crate::config::DestinationConfig {
+            prefix: Some(p.to_string()),
+            ..Default::default()
+        };
+        let err = resolve_load_prefix(&dest("exports/{date}/{export}/"), "orders", "bkt")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("{date}") && err.contains("load base"),
+            "must refuse a day-specific date base: {err}"
+        );
+        assert!(resolve_load_prefix(&dest("exports/{export}/"), "orders", "bkt").is_ok());
+        // {date} BELOW {partition} is not in the listed base — allowed.
+        assert!(
+            resolve_load_prefix(
+                &dest("exports/{export}/{partition}/{date}/"),
+                "orders",
+                "bkt"
+            )
+            .is_ok()
+        );
     }
 
     #[test]

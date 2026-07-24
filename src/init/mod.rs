@@ -546,6 +546,27 @@ fn introspect_single_table(
         "mysql" => {
             let mut conn = mysql::connect(source_url)?;
             if let Some(db) = eff_schema.as_deref() {
+                // Guard (bughunt HIGH): `--schema` selecting a DIFFERENT database
+                // than the URL would introspect THAT db (via USE), but the
+                // scaffold connects through the URL and emits an UNQUALIFIED
+                // `table:` — so `rivet run` reads the URL's database instead, a
+                // silent wrong-database export (dbA has a `users` too → wrong
+                // data with dbB-derived columns; else run fails right after init
+                // "verified" it). The config can't carry a cross-db table today,
+                // so refuse: the database belongs in the URL.
+                let url_db = mysql::resolve_database_for_listing(source_url, None).ok();
+                if url_db.as_deref() != Some(db) {
+                    anyhow::bail!(
+                        "init: --schema '{db}' selects a different MySQL database than the source \
+                         URL{} — the generated config connects via the URL and would export the \
+                         URL's database, not '{db}'. Put the database in the URL instead \
+                         (mysql://…/{db}).",
+                        url_db
+                            .as_deref()
+                            .map(|u| format!(" ('{u}')"))
+                            .unwrap_or_default()
+                    );
+                }
                 mysql::use_database(&mut conn, db)?;
             }
             mysql::introspect(&mut conn, table_name)?
