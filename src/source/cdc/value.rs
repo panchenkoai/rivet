@@ -105,24 +105,7 @@ impl RivetValue {
             RivetValue::Float(f) => Json::from(*f),
             RivetValue::DateTime(dt) => Json::String(dt.to_string()),
             RivetValue::TimeMicros(us) => Json::from(*us),
-            RivetValue::Bytes(b) => match std::str::from_utf8(b) {
-                // Most `Bytes` carry UTF-8 text (a string/JSON/decimal column, a
-                // Mongo id) — emit verbatim. `from_utf8_lossy` used to run on ALL
-                // of them, so a genuinely-binary column (bytea, uuid-as-bytes,
-                // GUID) had every non-UTF-8 byte replaced with U+FFFD — silent,
-                // unrecoverable corruption. Non-UTF-8 bytes now render losslessly
-                // as PG-style hex (`\x…`), recoverable by the reader.
-                Ok(s) => Json::String(s.to_string()),
-                Err(_) => {
-                    use std::fmt::Write as _;
-                    let mut hex = String::with_capacity(2 + b.len() * 2);
-                    hex.push_str("\\x");
-                    for byte in b {
-                        let _ = write!(hex, "{byte:02x}");
-                    }
-                    Json::String(hex)
-                }
-            },
+            RivetValue::Bytes(b) => Json::String(bytes_to_recoverable_string(b)),
             RivetValue::Array(v) => Json::Array(v.iter().map(RivetValue::to_json).collect()),
         }
     }
@@ -942,6 +925,32 @@ fn enum_label(labels: &[String], idx: i64) -> RivetValue {
         .unwrap_or(RivetValue::Null)
 }
 
+/// Render `Bytes` to a string LOSSLESSLY: verbatim when the bytes are valid UTF-8
+/// (the common case — a text/JSON/decimal column, a Mongo id), else PG-style hex
+/// (`\x…`), which the reader can decode back to the original bytes.
+///
+/// The alternative, `String::from_utf8_lossy`, replaces every non-UTF-8 byte with
+/// U+FFFD — silent, UNRECOVERABLE corruption. That bit both the NDJSON path (fixed
+/// earlier) and the typed Parquet/CSV sink via [`render_str`] (#1 bughunt: a MySQL
+/// CDC `latin1` TEXT column's `é` byte 0xE9 became U+FFFD in every non-ASCII cell,
+/// live-proven `caf‹0xE9›` → `caf‹EF BF BD›`). Hex is a RECOVERABLE interim — the
+/// complete fix for a non-UTF-8 *text* column is charset-aware decoding (transcode
+/// via the binlog table-map charset), which the MySQL CDC reader does not yet do.
+fn bytes_to_recoverable_string(b: &[u8]) -> String {
+    match std::str::from_utf8(b) {
+        Ok(s) => s.to_string(),
+        Err(_) => {
+            use std::fmt::Write as _;
+            let mut hex = String::with_capacity(2 + b.len() * 2);
+            hex.push_str("\\x");
+            for byte in b {
+                let _ = write!(hex, "{byte:02x}");
+            }
+            hex
+        }
+    }
+}
+
 fn render_str(v: &RivetValue) -> String {
     match v {
         RivetValue::Null => String::new(),
@@ -951,7 +960,7 @@ fn render_str(v: &RivetValue) -> String {
         RivetValue::Float(f) => f.to_string(),
         RivetValue::DateTime(dt) => dt.to_string(),
         RivetValue::TimeMicros(us) => us.to_string(),
-        RivetValue::Bytes(b) => String::from_utf8_lossy(b).into_owned(),
+        RivetValue::Bytes(b) => bytes_to_recoverable_string(b),
         RivetValue::Array(v) => {
             let inner: Vec<String> = v.iter().map(render_str).collect();
             format!("[{}]", inner.join(","))
@@ -983,6 +992,26 @@ mod tests {
                 "binary must not be lossy-replaced: {s}"
             );
         }
+    }
+
+    #[test]
+    fn render_str_bytes_are_lossless_like_to_json() {
+        // #1 bughunt: the U+FFFD fix was wired into to_json (NDJSON) only — the
+        // TYPED Parquet/CSV sink's render_str still ran from_utf8_lossy, so a MySQL
+        // CDC latin1 TEXT column's `é` (0xE9) became U+FFFD in the Parquet cell
+        // (live-proven `caf‹E9›` → `caf‹EF BF BD›`). render_str must match to_json:
+        // verbatim UTF-8, else recoverable hex, NEVER U+FFFD.
+        assert_eq!(
+            render_str(&RivetValue::Bytes(b"caf\xc3\xa9".to_vec())),
+            "café"
+        );
+        // The exact live-repro bytes: latin1 "café" = caf + 0xE9. The 0xE9 makes
+        // the WHOLE slice invalid UTF-8, so — matching to_json — it renders as
+        // whole-value hex (`\x636166e9`), which is recoverable; never U+FFFD.
+        let latin1 = vec![b'c', b'a', b'f', 0xE9];
+        let s = render_str(&RivetValue::Bytes(latin1));
+        assert_eq!(s, "\\x636166e9", "non-UTF-8 must render as recoverable hex");
+        assert!(!s.contains('\u{FFFD}'), "must not be lossy-replaced: {s}");
     }
 
     // Finding #39/#39b regression pins: the enum-label parser must be total
