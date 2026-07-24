@@ -52,8 +52,19 @@ pub(crate) struct Position(pub(crate) Json);
 impl Position {
     /// Load a persisted checkpoint, or `None` on first run (absent).
     pub(crate) fn load(path: &Path) -> Result<Option<Self>> {
+        use anyhow::Context as _;
         match std::fs::read_to_string(path) {
-            Ok(s) => Ok(Some(Position(serde_json::from_str(&s)?))),
+            Ok(s) => Ok(Some(Position(serde_json::from_str(&s).with_context(
+                || {
+                    format!(
+                        "checkpoint '{}' is corrupt or truncated (not valid JSON) — refusing to \
+                     silently treat it as absent and re-anchor CDC at 'current', which would \
+                     permanently skip every change since the last checkpoint. Restore the file, \
+                     or delete it to accept a new anchor from a fresh snapshot.",
+                        path.display()
+                    )
+                },
+            )?))),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e.into()),
         }
@@ -574,11 +585,14 @@ pub(crate) fn create_change_stream(
             // A persisted checkpoint proves a prior run happened — if the slot is
             // then MISSING, it was dropped/invalidated and silently recreating it
             // at the current position would skip everything since (a silent gap).
-            let resume_expected = cfg
-                .checkpoint
-                .as_deref()
-                .and_then(|p| Position::load(p).ok().flatten())
-                .is_some();
+            // Propagate a corrupt/truncated checkpoint (#99): `.ok()` swallowed it
+            // into resume_expected=false, so a dropped slot got silently recreated
+            // at 'current' and skipped every change since — the anti-gap guard
+            // (missing slot + resume_expected) never fired.
+            let resume_expected = match cfg.checkpoint.as_deref() {
+                Some(p) => Position::load(p)?.is_some(),
+                None => false,
+            };
             Ok(Box::new(
                 crate::source::postgres::cdc::PgChangeStream::open(
                     url,
@@ -598,16 +612,17 @@ pub(crate) fn create_change_stream(
             // Resume from the checkpoint's LSN if one was persisted (SQL Server has no
             // server-side cursor — the from-LSN is what makes it at-least-once instead
             // of re-reading the whole change table each run).
-            let from_lsn = cfg
-                .checkpoint
-                .as_deref()
-                .and_then(|p| Position::load(p).ok().flatten())
-                .and_then(|pos| {
+            let from_lsn = match cfg.checkpoint.as_deref() {
+                // A corrupt checkpoint must fail loud (#99), not silently drop to
+                // None (a full change-table over-read that re-loads everything).
+                Some(p) => Position::load(p)?.and_then(|pos| {
                     pos.0
                         .get("lsn")
                         .and_then(|v| v.as_str())
                         .map(str::to_string)
-                });
+                }),
+                None => None,
+            };
             Ok(Box::new(
                 crate::source::mssql::cdc::MssqlChangeStream::from_url(
                     url, ci, from_lsn, tls, peek, cfg.drain,
@@ -889,6 +904,30 @@ mod tests {
     /// `checkpoint: ./cdc/<table>.ckpt`; the first save must create the
     /// parent, or every fresh quickstart dies on ENOENT dressed in the
     /// grants hint.
+    #[test]
+    fn corrupt_checkpoint_fails_loud_not_silently_absent() {
+        // #99: a corrupt/truncated checkpoint must ERROR, never silently read as
+        // absent — which let PG CDC treat a dropped slot as a fresh first run,
+        // recreate it at 'current', and permanently skip changes. `.ok().flatten()`
+        // at three sites (cdc_job resume_expected, PG + MSSQL create_change_stream)
+        // swallowed it; Position::load now carries a clear corrupt-checkpoint error.
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("ck.json");
+        std::fs::write(&path, b"{not valid json").unwrap();
+        let err = Position::load(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("corrupt or truncated"),
+            "a corrupt checkpoint must fail loud, not read as absent: {err}"
+        );
+
+        // An absent checkpoint stays a clean first run (None).
+        assert!(
+            Position::load(&d.path().join("absent.json"))
+                .unwrap()
+                .is_none()
+        );
+    }
+
     #[test]
     fn checkpoint_save_creates_missing_parent_directories() {
         let d = tempfile::tempdir().unwrap();

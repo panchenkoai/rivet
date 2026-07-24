@@ -177,12 +177,14 @@ pub(super) fn initial_snapshot_pending(
 
     // The pure decision: which tables still need a snapshot, and whether prior
     // evidence forces the fail-loud anchor guard.
-    let ckpt_resume = cdc
-        .checkpoint
-        .as_deref()
-        .map(std::path::Path::new)
-        .and_then(|p| crate::source::cdc::Position::load(p).ok().flatten())
-        .is_some();
+    // A corrupt/truncated checkpoint must FAIL LOUD here (#99), not be swallowed
+    // by `.ok()` into "no checkpoint" — that let PG CDC treat a run as a fresh
+    // first anchor and re-create a dropped slot at 'current', permanently skipping
+    // every change since the loss (the anti-gap guard never fired).
+    let ckpt_resume = match cdc.checkpoint.as_deref().map(std::path::Path::new) {
+        Some(p) => crate::source::cdc::Position::load(p)?.is_some(),
+        None => false,
+    };
     let (pending_idx, resume_expected) = snapshot_plan(&done_flags, ckpt_resume);
 
     // The anchor — one entry point; the engine's AnchorModel decides the
