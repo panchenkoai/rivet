@@ -212,6 +212,58 @@ fn seed_nullable_key(eng: Eng, rows: i64) -> (String, StandCleanup) {
     (table, guard)
 }
 
+/// Seed a table whose intended chunk key `k` is a TEXT/VARCHAR column (a
+/// NOT NULL `id` BIGINT PK keeps the table otherwise well-formed). Range
+/// chunking derives integer min/max boundaries and slices with `BETWEEN`, so a
+/// text key would silently drop every value between two window boundaries — the
+/// planner must REFUSE it (#103). Small is fine: the integer-family guard fires
+/// at plan time, before any chunk generation.
+fn seed_text_keyed(eng: Eng, rows: i64) -> (String, StandCleanup) {
+    let table = unique_name("stand_textkey");
+    let guard = StandCleanup(eng, table.clone());
+    match eng {
+        Eng::Pg => {
+            let mut c = pg_connect();
+            c.batch_execute(&format!(
+                "CREATE TABLE {table} (id BIGINT PRIMARY KEY, k VARCHAR(20) NOT NULL);
+                 INSERT INTO {table} (id, k) SELECT g, 'v' || g FROM generate_series(1, {rows}) g;
+                 ANALYZE {table};"
+            ))
+            .unwrap();
+        }
+        Eng::My => {
+            let mut c = mysql_connect();
+            c.query_drop(format!(
+                "CREATE TABLE {table} (id BIGINT PRIMARY KEY, k VARCHAR(20) NOT NULL)"
+            ))
+            .unwrap();
+            c.query_drop(format!(
+                "SET SESSION cte_max_recursion_depth = {}",
+                rows + 10
+            ))
+            .unwrap();
+            c.query_drop(format!(
+                "INSERT INTO {table} (id, k) \
+                 WITH RECURSIVE seq AS (SELECT 1 n UNION ALL SELECT n+1 FROM seq WHERE n < {rows}) \
+                 SELECT n, CONCAT('v', n) FROM seq"
+            ))
+            .unwrap();
+        }
+        Eng::Ms => {
+            mssql_exec(&format!(
+                "CREATE TABLE {table} (id BIGINT PRIMARY KEY, k VARCHAR(20) NOT NULL)"
+            ));
+            mssql_exec(&format!(
+                "INSERT INTO {table} (id, k) \
+                 SELECT value, 'v' + CAST(value AS VARCHAR(20)) \
+                 FROM GENERATE_SERIES(CAST(1 AS BIGINT), CAST({rows} AS BIGINT))"
+            ));
+            mssql_exec(&format!("UPDATE STATISTICS {table}"));
+        }
+    }
+    (table, guard)
+}
+
 /// Seed a DENSE contiguous integer-PK table (`id` = 1..rows), the well-behaved
 /// shape for range chunking / chunk_count.
 fn seed_dense(eng: Eng, rows: i64) -> (String, StandCleanup) {
@@ -645,6 +697,56 @@ fn stand_null_keyed_bail_mysql() {
 #[ignore = "live: requires docker compose up -d mssql"]
 fn stand_null_keyed_bail_mssql() {
     run_null_keyed_bail(Eng::Ms);
+}
+
+/// #103 (variant 1): a non-integer (text/varchar) explicit `chunk_column` under
+/// range chunking must be REFUSED on every SQL engine — range slicing derives
+/// integer min/max and `BETWEEN`, silently dropping values between windows.
+/// `chunk_count` puts the config in `explicit_chunk_shape` so the small-table
+/// escape is bypassed and the integer-family guard is what fires. This proves
+/// each engine's `int_columns` introspection query classifies the real column
+/// correctly (PG `pg_type`, MySQL `DATA_TYPE`, MSSQL `sys.types` STRING_AGG) —
+/// the offline unit test runs on a mock introspection, this on the live catalog.
+fn run_non_integer_chunk_column_bail(eng: Eng) {
+    eng.require();
+    let (table, _guard) = seed_text_keyed(eng, 100);
+    let rig = eng
+        .rig(&table)
+        .mode("chunked")
+        .export_line("chunk_column: k")
+        .export_line("chunk_count: 4");
+    let cfg = rig.config_path();
+    let out = run_rivet_env(
+        &["run", "--config", cfg.to_str().unwrap()],
+        &[("RUST_LOG", "warn")],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "a non-integer chunk_column under range chunking must BAIL; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("not an integer-family column"),
+        "bail must be the #103 integer-family refusal; stderr:\n{stderr}"
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn stand_non_integer_chunk_column_bail_postgres() {
+    run_non_integer_chunk_column_bail(Eng::Pg);
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mysql"]
+fn stand_non_integer_chunk_column_bail_mysql() {
+    run_non_integer_chunk_column_bail(Eng::My);
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mssql"]
+fn stand_non_integer_chunk_column_bail_mssql() {
+    run_non_integer_chunk_column_bail(Eng::Ms);
 }
 
 #[test]
