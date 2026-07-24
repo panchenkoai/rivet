@@ -114,11 +114,14 @@ pub(crate) struct TableIntrospection {
     /// the PK type is not an integer family (text, uuid, decimal, …).
     pub single_int_pk: Option<String>,
     /// Single-column, NOT NULL, **unique** index columns usable as a keyset
-    /// (seek) pagination key — PK first (any type), then other UNIQUE indexes
-    /// (OPT-4). Index-backed and unique by construction, so `ORDER BY key
-    /// LIMIT n` is a bounded index range scan (never a filesort) and
-    /// `WHERE key > last` never skips rows with a duplicate key. Empty when the
-    /// table has no such key.
+    /// (seek) pagination key — PK first, then other UNIQUE indexes (OPT-4).
+    /// Index-backed and unique by construction, so `ORDER BY key LIMIT n` is a
+    /// bounded index range scan (never a filesort) and `WHERE key > last` never
+    /// skips a duplicate key. Restricted to types the keyset CURSOR can read
+    /// (`extract_last_cursor_value`: integer / float / string / timestamp / date /
+    /// uuid) — `decimal`/`numeric` keys are EXCLUDED here so the planner refuses
+    /// them up front rather than failing mid-run after a partial write (#dogfood).
+    /// Empty when the table has no such key.
     pub keyset_keys: Vec<String>,
     /// Best-effort row count: PG `reltuples`, MySQL `TABLE_ROWS`. `0` means
     /// the table is empty or stats are unavailable.

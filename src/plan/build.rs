@@ -179,6 +179,19 @@ fn full_strategy(config: &Config, export: &ExportConfig) -> ExtractionStrategy {
             parallel: export.parallel,
         });
     }
+    // #dogfood LOW: `parallel: N` fans out ONLY the Mongo `_id`-range reader, which
+    // needs `source.mongo.page_size` to page by `_id`. Reaching here on Mongo means
+    // page_size is unset, so a mongo full export stays a single cursor and
+    // `parallel: N` is silently dropped — warn instead of a silent no-op.
+    if config.source.source_type == crate::config::SourceType::Mongo && export.parallel > 1 {
+        log::warn!(
+            "export '{}': parallel: {} has no effect on a Mongo full export without \
+             `source.mongo.page_size` — parallelism fans out the `_id`-range reader, which pages \
+             by `_id`. Set `source.mongo.page_size` to enable it, or remove `parallel`.",
+            export.name,
+            export.parallel
+        );
+    }
     ExtractionStrategy::Snapshot
 }
 
@@ -526,9 +539,12 @@ fn chunked_strategy_from_introspection(
         if !introspection.is_usable_keyset_key(key) {
             anyhow::bail!(
                 "export '{}': chunk_by_key '{}' is not a usable keyset key on {} — it must be a \
-                 single-column, NOT NULL, UNIQUE or PRIMARY key. Without a unique index, \
-                 `ORDER BY {} LIMIT n` would full-scan + filesort the table. Add a unique index \
-                 on it, pick another key, or use `mode: full` to accept one long snapshot query.",
+                 single-column, NOT NULL, UNIQUE or PRIMARY key WHOSE TYPE the keyset cursor can \
+                 read (integer / float / string / timestamp / date / uuid). A `decimal`/`numeric` \
+                 key is excluded: the cursor cannot advance past it (it would fail mid-run after a \
+                 partial write). Without a usable key, `ORDER BY {} LIMIT n` would also full-scan + \
+                 filesort. Add a unique index of a supported type, pick another key, use a range \
+                 `chunk_column:` (integer), or `mode: full`.",
                 export.name,
                 key,
                 tbl,

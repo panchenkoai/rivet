@@ -264,6 +264,104 @@ fn seed_text_keyed(eng: Eng, rows: i64) -> (String, StandCleanup) {
     (table, guard)
 }
 
+/// Seed a table whose sole unique PK is a `DECIMAL(15,0)` — a keyset key the
+/// cursor cannot advance (`extract_last_cursor_value` has no decimal arm). The
+/// planner must refuse `chunk_by_key` on it at plan time, not fail mid-run after a
+/// partial write (#dogfood).
+fn seed_decimal_pk(eng: Eng, rows: i64) -> (String, StandCleanup) {
+    let table = unique_name("stand_deckey");
+    let guard = StandCleanup(eng, table.clone());
+    match eng {
+        Eng::Pg => {
+            let mut c = pg_connect();
+            c.batch_execute(&format!(
+                "CREATE TABLE {table} (dkey DECIMAL(15,0) PRIMARY KEY, v TEXT NOT NULL);
+                 INSERT INTO {table} (dkey, v) SELECT g, 'v'||g FROM generate_series(1, {rows}) g;
+                 ANALYZE {table};"
+            ))
+            .unwrap();
+        }
+        Eng::My => {
+            let mut c = mysql_connect();
+            c.query_drop(format!(
+                "CREATE TABLE {table} (dkey DECIMAL(15,0) PRIMARY KEY, v VARCHAR(20) NOT NULL)"
+            ))
+            .unwrap();
+            c.query_drop(format!(
+                "SET SESSION cte_max_recursion_depth = {}",
+                rows + 10
+            ))
+            .unwrap();
+            c.query_drop(format!(
+                "INSERT INTO {table} (dkey, v) \
+                 WITH RECURSIVE seq AS (SELECT 1 n UNION ALL SELECT n+1 FROM seq WHERE n < {rows}) \
+                 SELECT n, CONCAT('v', n) FROM seq"
+            ))
+            .unwrap();
+        }
+        Eng::Ms => {
+            mssql_exec(&format!(
+                "CREATE TABLE {table} (dkey DECIMAL(15,0) PRIMARY KEY, v VARCHAR(20) NOT NULL)"
+            ));
+            mssql_exec(&format!(
+                "INSERT INTO {table} (dkey, v) SELECT value, CONCAT('v', value) \
+                 FROM GENERATE_SERIES(CAST(1 AS BIGINT), CAST({rows} AS BIGINT))"
+            ));
+            mssql_exec(&format!("UPDATE STATISTICS {table}"));
+        }
+    }
+    (table, guard)
+}
+
+/// #dogfood: `chunk_by_key` on a DECIMAL PK must BAIL at plan time (the cursor
+/// can't read a decimal) — a clean refusal naming the type, NOT a partial write
+/// then a mid-run "could not read the key value" failure.
+fn run_keyset_decimal_key_bails(eng: Eng) {
+    eng.require();
+    let (table, _guard) = seed_decimal_pk(eng, 250);
+    let rig = eng
+        .rig(&table)
+        .mode("chunked")
+        .export_line("chunk_by_key: dkey")
+        .export_line("chunk_size: 100");
+    let out = run_rivet_env(
+        &["run", "--config", rig.config_path().to_str().unwrap()],
+        &[("RUST_LOG", "warn")],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "a DECIMAL keyset key must BAIL, not run; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("not a usable keyset key") && stderr.to_lowercase().contains("decimal"),
+        "the bail must name the TYPE reason (decimal), not just 'unique'; stderr:\n{stderr}"
+    );
+    assert_eq!(
+        count_parquet_rows(&rig.out_dir()),
+        0,
+        "the refusal must be at PLAN time — zero rows written, no partial write"
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn stand_keyset_decimal_key_bails_postgres() {
+    run_keyset_decimal_key_bails(Eng::Pg);
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mysql"]
+fn stand_keyset_decimal_key_bails_mysql() {
+    run_keyset_decimal_key_bails(Eng::My);
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mssql"]
+fn stand_keyset_decimal_key_bails_mssql() {
+    run_keyset_decimal_key_bails(Eng::Ms);
+}
+
 /// Seed a DENSE contiguous integer-PK table (`id` = 1..rows), the well-behaved
 /// shape for range chunking / chunk_count.
 fn seed_dense(eng: Eng, rows: i64) -> (String, StandCleanup) {

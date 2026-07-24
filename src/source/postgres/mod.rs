@@ -365,12 +365,20 @@ pub(crate) fn introspect_pg_table_for_chunking(
     // binds to a real column (not an expression index); `attnotnull` removes
     // NULL-ordering ambiguity. Index-backed + unique ⇒ keyset's `ORDER BY key
     // LIMIT n` is a range scan and `WHERE key > last` never skips dup keys.
+    // The keyset cursor (extract_last_cursor_value) reads only integer / float /
+    // string / timestamp / date / uuid keys — NOT `numeric`/`decimal`. Excluding
+    // it here refuses a DECIMAL keyset key at PLAN time (loud bail) instead of
+    // failing at runtime AFTER a partial write, and stops `rivet check` from
+    // green-lighting it (#dogfood: keyset on a DECIMAL PK check=ACCEPTABLE, run
+    // failed after 100/250 rows "could not read the key value … unsupported type").
     let keyset_rows = client.query(
         "SELECT a.attname::text, i.indisprimary \
          FROM pg_index i \
          JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = i.indkey[0] \
+         JOIN pg_type t ON t.oid = a.atttypid \
          WHERE i.indrelid = (($1::text || '.' || $2::text)::regclass) \
-           AND i.indisunique AND i.indnkeyatts = 1 AND a.attnotnull",
+           AND i.indisunique AND i.indnkeyatts = 1 AND a.attnotnull \
+           AND t.typname <> 'numeric'",
         &[&schema, &table],
     )?;
     let mut keyset_keys: Vec<String> = Vec::new();

@@ -365,6 +365,7 @@ pub(crate) fn introspect_mysql_table_for_chunking(
               AND c.COLUMN_NAME = s.COLUMN_NAME \
          WHERE s.TABLE_SCHEMA = ? AND s.TABLE_NAME = ? AND s.NON_UNIQUE = 0 \
            AND s.SEQ_IN_INDEX = 1 \
+           AND c.DATA_TYPE NOT IN ('decimal', 'numeric') \
            AND NOT EXISTS ( \
              SELECT 1 FROM information_schema.STATISTICS s2 \
              WHERE s2.TABLE_SCHEMA = s.TABLE_SCHEMA AND s2.TABLE_NAME = s.TABLE_NAME \
