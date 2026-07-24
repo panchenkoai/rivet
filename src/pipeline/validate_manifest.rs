@@ -239,6 +239,11 @@ pub enum Failure {
         expected: String,
         actual: String,
     },
+    /// `--depth full` re-read the parts and a per-column VALUE checksum (Form B)
+    /// disagreed with the manifest — post-write corruption an MD5/size check
+    /// cannot see (a flipped bit inside a data page). Verified-wrong, so it fails
+    /// the verdict and classifies as data-integrity (exit 3), not could-not-verify.
+    ValueChecksumMismatch { detail: String },
     /// `_SUCCESS` exists but its body is malformed (not `xxh3:<16-hex>` after
     /// trim).  ADR-0012 M2 — orchestrators rely on this format being strict.
     SuccessMarkerMalformed { body_preview: String },
@@ -306,6 +311,7 @@ impl Failure {
             Failure::PartMissing { .. } => "RIVET_VERIFY_PART_MISSING",
             Failure::PartSizeMismatch { .. } => "RIVET_VERIFY_PART_SIZE_MISMATCH",
             Failure::PartChecksumMismatch { .. } => "RIVET_VERIFY_PART_CHECKSUM_MISMATCH",
+            Failure::ValueChecksumMismatch { .. } => "RIVET_VERIFY_VALUE_CHECKSUM",
             Failure::SuccessMarkerMalformed { .. } => "RIVET_VERIFY_SUCCESS_MALFORMED",
             Failure::SuccessMarkerStale { .. } => "RIVET_VERIFY_SUCCESS_STALE",
             Failure::ManifestSelfInconsistent { .. } => "RIVET_VERIFY_MANIFEST_INCONSISTENT",
@@ -343,6 +349,13 @@ impl std::fmt::Display for Failure {
                 "part {} size mismatch at {}: manifest {}, dest {}",
                 part_id, path, expected, actual
             ),
+            Failure::ValueChecksumMismatch { detail } => {
+                write!(
+                    f,
+                    "value checksum mismatch (post-write corruption): {}",
+                    detail
+                )
+            }
             Failure::PartChecksumMismatch {
                 part_id,
                 path,
@@ -1822,6 +1835,12 @@ mod tests {
             (
                 Failure::ManifestRequiredButAbsent { prefix: "p".into() },
                 "RIVET_VERIFY_MANIFEST_REQUIRED",
+            ),
+            (
+                Failure::ValueChecksumMismatch {
+                    detail: "flip".into(),
+                },
+                "RIVET_VERIFY_VALUE_CHECKSUM",
             ),
         ];
         for (failure, code) in cases {

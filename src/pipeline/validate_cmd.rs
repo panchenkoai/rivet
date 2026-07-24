@@ -444,10 +444,20 @@ fn verify_one_prefix(
                 && let Err(e) =
                     crate::source::value_checksum::validate_manifest_checksums(&*dest, "")
             {
-                hard_failures.push(format!(
-                    "export '{}': value checksum: {:#}",
-                    display_name, e
-                ));
+                // A value-checksum mismatch is post-write corruption (verified-wrong),
+                // NOT could-not-verify: fold it into THIS export's verdict so the
+                // headline status reads FAILED and the exit gate classifies it as
+                // data-integrity (exit 3), not a generic operational failure (#104).
+                // The verdict was moved into `all_results` at the push above and
+                // nothing else pushes in between, so the just-pushed entry is last.
+                if let Some(ev) = all_results.last_mut() {
+                    ev.verification.passed = false;
+                    ev.verification.failures.push(
+                        crate::pipeline::validate_manifest::Failure::ValueChecksumMismatch {
+                            detail: format!("export '{}': {:#}", display_name, e),
+                        },
+                    );
+                }
             }
         }
         Err(e) => {
@@ -771,6 +781,45 @@ mod tests {
             ..ManifestVerification::legacy()
         };
         assert!(verdict_fails_exit(&v));
+    }
+
+    #[test]
+    fn value_checksum_mismatch_flips_verdict_and_fails_exit_gate() {
+        // #104: a `--depth full` value-checksum mismatch is post-write
+        // corruption (verified-wrong). The reclassification folds it into the
+        // verdict — sets passed=false + pushes ValueChecksumMismatch — so the
+        // exit gate fires (DataIntegrity / exit 3) instead of leaving a PASSED
+        // headline + a generic exit 1.
+        let reclassified = ManifestVerification {
+            manifest_found: true,
+            legacy_run: false,
+            passed: false,
+            failures: vec![VFailure::ValueChecksumMismatch {
+                detail: "export 'e': column 'id' checksum differs".into(),
+            }],
+            ..ManifestVerification::legacy()
+        };
+        assert!(
+            verdict_fails_exit(&reclassified),
+            "a value-checksum mismatch must fail the exit gate (exit 3), not pass silently"
+        );
+
+        // The bug this closes: as a `hard_failure` the verdict kept passed=true,
+        // so the gate (correctly, for passed=true) did NOT fire — status PASSED,
+        // exit 1. Proven here so a regression that stops flipping `passed` is caught.
+        let not_reclassified = ManifestVerification {
+            manifest_found: true,
+            legacy_run: false,
+            passed: true,
+            failures: vec![VFailure::ValueChecksumMismatch {
+                detail: "same corruption, left in hard_failures".into(),
+            }],
+            ..ManifestVerification::legacy()
+        };
+        assert!(
+            !verdict_fails_exit(&not_reclassified),
+            "with passed still true the gate wrongly passes — this is exactly bug #104"
+        );
     }
 
     // ── run_validate_command end-to-end (local destination; the source URL
