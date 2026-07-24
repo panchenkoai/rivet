@@ -7,8 +7,9 @@
 
 use arrow::array::Array;
 use arrow::array::{
-    Date32Array, FixedSizeBinaryArray, Float64Array, Int16Array, Int32Array, Int64Array,
-    StringArray, TimestampMicrosecondArray, TimestampNanosecondArray,
+    Date32Array, FixedSizeBinaryArray, Float32Array, Float64Array, Int8Array, Int16Array,
+    Int32Array, Int64Array, StringArray, TimestampMicrosecondArray, TimestampNanosecondArray,
+    UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use arrow::record_batch::RecordBatch;
@@ -54,6 +55,57 @@ pub(crate) fn extract_last_cursor_value(
             array
                 .as_any()
                 .downcast_ref::<Int64Array>()?
+                .value(last_row)
+                .to_string(),
+        ),
+        DataType::Int8 => Some(
+            array
+                .as_any()
+                .downcast_ref::<Int8Array>()?
+                .value(last_row)
+                .to_string(),
+        ),
+        // Unsigned integers — MySQL `TINYINT/SMALLINT/MEDIUMINT/INT/BIGINT
+        // UNSIGNED` land here (Arrow UInt*, RivetType::UInt64). Field bug: an
+        // unsigned `id` (common on high-volume append/import tables) has DATA_TYPE
+        // = the signed name, so it PASSES the integer-family keyset/chunk guard,
+        // but had no cursor-extract arm — so keyset bailed "could not read the
+        // 'id' value … unsupported type" on the first multi-page table, and an
+        // incremental cursor silently re-read from the last value every run.
+        // `.to_string()` on a u64 is the full unsigned decimal, which MySQL's
+        // `WHERE id > '<v>'` compares correctly as unsigned (no i64 truncation).
+        DataType::UInt8 => Some(
+            array
+                .as_any()
+                .downcast_ref::<UInt8Array>()?
+                .value(last_row)
+                .to_string(),
+        ),
+        DataType::UInt16 => Some(
+            array
+                .as_any()
+                .downcast_ref::<UInt16Array>()?
+                .value(last_row)
+                .to_string(),
+        ),
+        DataType::UInt32 => Some(
+            array
+                .as_any()
+                .downcast_ref::<UInt32Array>()?
+                .value(last_row)
+                .to_string(),
+        ),
+        DataType::UInt64 => Some(
+            array
+                .as_any()
+                .downcast_ref::<UInt64Array>()?
+                .value(last_row)
+                .to_string(),
+        ),
+        DataType::Float32 => Some(
+            array
+                .as_any()
+                .downcast_ref::<Float32Array>()?
                 .value(last_row)
                 .to_string(),
         ),
@@ -210,6 +262,38 @@ mod tests {
         assert_eq!(
             extract_last_cursor_value(&batch, "id", &schema),
             Some("3".into())
+        );
+    }
+
+    #[test]
+    fn cursor_unsigned_integers_field_bug() {
+        // FIELD BUG (0.21.2, prod affiliate DB): a MySQL `BIGINT UNSIGNED` id
+        // (Arrow UInt64) had NO cursor-extract arm — keyset bailed "could not read
+        // the 'id' value … unsupported type" on ~40 tables, and an incremental
+        // cursor silently re-read from the last value every run. A value ABOVE
+        // i64::MAX must extract as the full unsigned decimal, never truncate/wrap.
+        let big = u64::MAX - 5; // 18446744073709551610, well past i64::MAX
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::UInt64, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(UInt64Array::from(vec![1, big]))],
+        )
+        .unwrap();
+        assert_eq!(
+            extract_last_cursor_value(&batch, "id", &schema),
+            Some(big.to_string())
+        );
+
+        // The rest of the unsigned family + Float32 (the sibling arms added with it).
+        let u32s = Arc::new(Schema::new(vec![Field::new("id", DataType::UInt32, false)]));
+        let b = RecordBatch::try_new(
+            u32s.clone(),
+            vec![Arc::new(UInt32Array::from(vec![7u32, 4_000_000_000]))],
+        )
+        .unwrap();
+        assert_eq!(
+            extract_last_cursor_value(&b, "id", &u32s),
+            Some("4000000000".into())
         );
     }
 
