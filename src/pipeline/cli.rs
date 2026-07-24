@@ -130,10 +130,16 @@ pub fn show_state(config_path: &str, json: bool) -> Result<()> {
         //   - ran chunked  → point at `rivet metrics` / `rivet state files`
         // Anything else here is misleading ("No state" after a successful
         // chunked run sounds like data loss).
-        let any_run = state
-            .get_metrics(None, 1)
-            .map(|m| !m.is_empty())
-            .unwrap_or(false);
+        // Scope the probe to THIS config's declared exports — the state DB is
+        // shared across configs in a directory, so `get_metrics(None, ..)` sees
+        // ANY config's run and would tell a never-run config it "ran chunked"
+        // (#22 bughunt, sibling of the metrics/cursor leak fix above).
+        let any_run = config.exports.iter().any(|e| {
+            state
+                .get_metrics(Some(&e.name), 1)
+                .map(|m| !m.is_empty())
+                .unwrap_or(false)
+        });
         if any_run {
             println!(
                 "No incremental cursor recorded yet.\n  \

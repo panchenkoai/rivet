@@ -634,12 +634,6 @@ pub(super) fn run_export_job(
             );
         }
     }
-    // Self-diagnosing run-health line — makes a log the field team sends back
-    // readable at a glance (reconnects survived, a resume-hit, a source spill).
-    if let Some(line) = run_diagnosis(&summary, &harm_delta_vec) {
-        log::warn!("{line}");
-    }
-
     let tuning_class = plan.tuning.profile_name().to_string();
     let result = run_chunked_quality_gate(result, &plan, &mut summary);
     let failed = result.is_err();
@@ -655,6 +649,15 @@ pub(super) fn run_export_job(
             summary.error_message = Some(redacted.clone());
             log::error!("export '{}' failed: {}", plan.export_name, redacted);
         }
+    }
+
+    // Self-diagnosing run-health line — makes a log the field team sends back
+    // readable at a glance (reconnects survived, a resume-hit, a source spill).
+    // Emitted AFTER the success/failed resolution above so the line reports the
+    // real terminal status, not the transient "running" it was built with (#18
+    // bughunt: it ran before the status was resolved, so it always said running).
+    if let Some(line) = run_diagnosis(&summary, &harm_delta_vec) {
+        log::warn!("{line}");
     }
 
     let mut reconcile_gate: crate::error::Result<()> = Ok(());
@@ -942,6 +945,13 @@ mod tests {
         let line = run_diagnosis(&s, &[]).expect("reconnects must diagnose");
         assert!(line.contains("2 reconnect"), "got: {line}");
         assert!(line.contains("retries=3"), "got: {line}");
+        // #18 bughunt: the line interpolates the run STATUS — the caller must emit
+        // it AFTER the success/failed resolution so this reads `[success]`, not the
+        // transient `[running]` it was previously built with.
+        assert!(
+            line.contains("[success]"),
+            "status must be the resolved one: {line}"
+        );
         // A resume-hit means the prior run crashed → flagged.
         let mut s = base();
         s.resumed = true;

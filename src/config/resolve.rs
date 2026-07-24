@@ -149,17 +149,21 @@ pub fn parse_file_size(s: &str) -> crate::error::Result<u64> {
             s
         )
     })?;
-    // Reject zero / negative: the float→u64 cast saturates them to 0, a 0-byte
-    // rotation threshold that splits a part after every row. Fail loud like a
-    // non-numeric value instead of silently coercing.
-    if value <= 0.0 || value.is_nan() {
+    // Reject anything that lands on 0 bytes: the float→u64 cast saturates zero,
+    // NEGATIVE, NaN, AND sub-byte fractions ("0.5B", "0.0005KB") all to 0 — a
+    // 0-byte rotation threshold that splits a part after every row. The guard
+    // must run on the RESULT (post-multiplier byte count), not the pre-multiplier
+    // float: `0.5 <= 0.0` is false, so a pre-multiplier check let 0.5B through as
+    // 0 bytes (#19 bughunt). Fail loud like a non-numeric value.
+    let bytes = (value * multiplier as f64) as u64;
+    if bytes == 0 {
         anyhow::bail!(
-            "invalid file size: '{}' — must be a positive size; a zero or negative \
-             rotation threshold would split the output after every row",
+            "invalid file size: '{}' — must be at least 1 byte; a zero, negative, or \
+             sub-byte rotation threshold would split the output after every row",
             s
         );
     }
-    Ok((value * multiplier as f64) as u64)
+    Ok(bytes)
 }
 
 #[cfg(test)]
@@ -422,11 +426,29 @@ mod tests {
         for bad in ["0", "0B", "0MB", "-5MB", "-1", "-0.5GB"] {
             let err = parse_file_size(bad).unwrap_err();
             assert!(
-                err.to_string().contains("must be a positive size"),
+                err.to_string().contains("at least 1 byte"),
                 "'{bad}' must be rejected as non-positive, got: {err}"
             );
         }
-        // A tiny positive value is still accepted (only <= 0 is rejected).
+        // A tiny positive value is still accepted (only a <1-byte result is rejected).
         assert_eq!(parse_file_size("1B").unwrap(), 1);
+    }
+
+    #[test]
+    fn parse_sub_byte_fraction_rejected_not_truncated_to_zero() {
+        // #19 bughunt: the positivity guard ran on the PRE-multiplier float, so a
+        // sub-byte value ("0.5B", "0.0005KB" = 0.512 bytes, bare "0.9") passed the
+        // `<= 0.0` check and then truncated to 0 bytes — the same silent 0-byte
+        // rotation threshold. Must reject: the check now runs on the byte result.
+        for bad in ["0.5B", "0.9", "0.0005KB", "0.4"] {
+            let err = parse_file_size(bad).unwrap_err();
+            assert!(
+                err.to_string().contains("at least 1 byte"),
+                "'{bad}' truncates to 0 bytes and must be rejected, got: {err}"
+            );
+        }
+        // Just-at / just-over one byte still parses.
+        assert_eq!(parse_file_size("1.9B").unwrap(), 1);
+        assert_eq!(parse_file_size("1.5KB").unwrap(), 1536);
     }
 }

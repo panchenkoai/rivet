@@ -506,10 +506,18 @@ pub(crate) fn require_url_has_host(url: &str) -> Result<()> {
 /// `tls: { mode: disable }` is `Some(..)`, so it is the operator's opt-in to
 /// remote plaintext and is **not** refused here.
 pub(crate) fn require_tls_or_loopback(url: &str, tls: Option<&TlsConfig>) -> Result<()> {
-    // A URL with NO host at all (`mysql://`, `postgres:///db`) is not a "remote
-    // host" — it is malformed. Prescribing a TLS block there sends the operator
-    // chasing a security setting for a host that doesn't exist (dogfood LOW).
-    require_url_has_host(url)?;
+    // An explicit `tls: {..}` (including `mode: disable`) is the operator's
+    // opt-in and is never refused here — including for a host-LESS URL, which a
+    // driver resolves as a LOCAL unix socket (`postgres:///db?host=/var/run/
+    // postgresql`). The host-presence check must therefore live INSIDE the
+    // no-tls branch: hoisting it above (da7abbf) rejected a valid socket URL that
+    // worked on main whenever `tls: { mode: disable }` was set (#16 bughunt).
+    if tls.is_none() {
+        // A URL with NO host at all (`mysql://`, `postgres:///db`) is not a
+        // "remote host" — it is malformed. Prescribing a TLS block there sends the
+        // operator chasing a security setting for a host that doesn't exist.
+        require_url_has_host(url)?;
+    }
     if tls.is_none() && !host_is_loopback(url) {
         // The message must name TLS *and* that it is a policy refusal for a
         // remote host. Emit it at `error` level (→ stderr) as well as returning
@@ -642,6 +650,28 @@ mod tls_gate_tests {
                 !msg.contains("TLS required"),
                 "host-less URL must NOT prescribe a TLS block: {msg}"
             );
+        }
+    }
+
+    #[test]
+    fn hostless_socket_url_with_explicit_tls_disable_is_allowed() {
+        // #16 bughunt: a unix-socket URL has no authority host (the socket path
+        // lives in `?host=`), so the host-presence check rejected it. But an
+        // explicit `tls: { mode: disable }` is the operator's opt-in for a LOCAL
+        // connection — it must connect, as it did on main (where the gate was
+        // skipped whenever tls was Some). The check now lives inside the no-tls
+        // branch, so tls=Some(disable) is never refused.
+        let disable = TlsConfig {
+            mode: TlsMode::Disable,
+            ..Default::default()
+        };
+        for u in [
+            "postgres:///rivet?host=/var/run/postgresql",
+            "mysql://",
+            "postgres:///db",
+        ] {
+            require_tls_or_loopback(u, Some(&disable))
+                .expect("an explicit tls: { mode: disable } must not be refused for a socket URL");
         }
     }
 }
