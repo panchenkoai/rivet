@@ -385,11 +385,26 @@ pub(crate) fn introspect_mysql_table_for_chunking(
         }
     }
 
+    // Integer-family columns — the safety set for an explicit `chunk_column`
+    // (see TableIntrospection::int_columns). `DATA_TYPE` is unsigned-agnostic
+    // (`int unsigned` still has DATA_TYPE `int`).
+    let int_columns: Vec<String> = conn
+        .exec::<(String,), _, _>(
+            "SELECT COLUMN_NAME FROM information_schema.COLUMNS \
+             WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? \
+               AND DATA_TYPE IN ('tinyint', 'smallint', 'mediumint', 'int', 'bigint')",
+            (&schema, &table),
+        )?
+        .into_iter()
+        .map(|(c,)| c)
+        .collect();
+
     Ok(crate::source::TableIntrospection {
         single_int_pk,
         keyset_keys,
         row_estimate,
         avg_row_bytes,
+        int_columns,
     })
 }
 

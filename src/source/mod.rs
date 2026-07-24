@@ -109,6 +109,14 @@ pub(crate) struct TableIntrospection {
     /// Heap-size-per-row in bytes. `None` for empty / unanalysed tables.
     /// Used to convert `chunk_size_memory_mb` into a row count.
     pub avg_row_bytes: Option<i64>,
+    /// Names of the table's integer-family columns (PG `int2`/`int4`/`int8`,
+    /// MySQL `tinyint`…`bigint`, MSSQL `tinyint`/`smallint`/`int`/`bigint`). An
+    /// explicit `chunk_column:` that is range-`BETWEEN`-sliced MUST be one of
+    /// these: chunking derives integer min/max boundaries, so a non-integer key
+    /// (numeric/decimal/real/float/…) silently DROPS every value that falls
+    /// between two integer window boundaries. Empty when the engine does not
+    /// populate it (e.g. Mongo, which does not SQL-range-chunk).
+    pub int_columns: Vec<String>,
 }
 
 impl TableIntrospection {
@@ -122,6 +130,14 @@ impl TableIntrospection {
     /// index-backed). Used to validate an explicit `chunk_by_key`.
     pub fn is_usable_keyset_key(&self, col: &str) -> bool {
         self.keyset_keys.iter().any(|k| k == col)
+    }
+
+    /// Whether `col` is a known integer-family column — the safety precondition
+    /// for range chunking (`chunk_column`), which slices via integer `BETWEEN`
+    /// windows. A non-integer explicit `chunk_column` silently loses fractional
+    /// rows, so the planner refuses it (see `chunked_strategy_from_introspection`).
+    pub fn is_integer_column(&self, col: &str) -> bool {
+        self.int_columns.iter().any(|c| c == col)
     }
 }
 

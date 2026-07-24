@@ -384,11 +384,28 @@ pub(crate) fn introspect_pg_table_for_chunking(
         }
     }
 
+    // Integer-family columns — the safety set for an explicit `chunk_column`
+    // (range chunking slices with integer `BETWEEN`; a non-integer key silently
+    // loses fractional rows). Cheap catalog read on the already-open connection.
+    let int_columns: Vec<String> = client
+        .query(
+            "SELECT a.attname::text FROM pg_attribute a \
+             JOIN pg_type t ON t.oid = a.atttypid \
+             WHERE a.attrelid = (($1::text || '.' || $2::text)::regclass) \
+               AND a.attnum > 0 AND NOT a.attisdropped \
+               AND t.typname IN ('int2', 'int4', 'int8')",
+            &[&schema, &table],
+        )?
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+
     Ok(crate::source::TableIntrospection {
         single_int_pk,
         keyset_keys,
         row_estimate,
         avg_row_bytes,
+        int_columns,
     })
 }
 

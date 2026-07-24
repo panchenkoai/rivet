@@ -246,10 +246,30 @@ fn resolve_chunked_strategy(
         .chunk_max_attempts
         .unwrap_or_else(|| tuning.max_retries.saturating_add(1).max(1));
 
-    // Fast path: explicit column AND no memory-budget knob → no DB probe at all.
-    // Preserves the no-network plan-build invariant for users who hand-tune
-    // chunked-mode the old way.
-    if export.chunk_column.is_some() && export.chunk_size_memory_mb.is_none() {
+    // Fast path: explicit column AND no memory-budget knob → no DB probe.
+    // Preserves the no-network plan-build invariant for hand-tuned configs.
+    //
+    // Exception (#103): when the column is integer-`BETWEEN`-sliced (the default
+    // range mode — NOT `chunk_dense`/ROW_NUMBER, NOT `chunk_by_days`/date
+    // half-open, both type-safe) AND a `table:` is present to probe, fall through
+    // to introspection so a NON-integer column is refused rather than silently
+    // dropping every fractional row that falls between two window boundaries.
+    // `query:`-only can't be probed (no relation), so it stays on the fast path
+    // with a loud can't-verify warning.
+    let range_sliced = !export.chunk_dense && export.chunk_by_days.is_none();
+    let can_probe_type = range_sliced && export.table.is_some();
+    if export.chunk_column.is_some() && export.chunk_size_memory_mb.is_none() && !can_probe_type {
+        if range_sliced && export.table.is_none() {
+            log::warn!(
+                "export '{}': chunk_column '{}' is range-sliced by integer BETWEEN, but with \
+                 `query:` (no `table:`) the planner cannot verify it is integer-family — a \
+                 numeric/decimal/float key silently drops rows between windows. Use `table:` (so \
+                 the type is checked), `chunk_by_key:` (keyset — any orderable indexed key), or \
+                 ensure the column is integer.",
+                export.name,
+                export.chunk_column.as_deref().unwrap_or("")
+            );
+        }
         return Ok(ExtractionStrategy::Chunked(ChunkedPlan {
             column: export.chunk_column.clone().unwrap(),
             chunk_size: export.chunk_size,
@@ -454,6 +474,24 @@ fn chunked_strategy_from_introspection(
     // (4) Resolve chunk_column for range chunking, with an auto-keyset fallback
     // on MySQL when there is no single-integer PK but a usable unique key exists.
     let column = if let Some(c) = export.chunk_column.clone() {
+        // #103 (variant 1): an explicit chunk_column that is integer-`BETWEEN`-
+        // sliced must be integer-family, or range chunking silently drops rows
+        // between windows. `chunk_dense` (ROW_NUMBER) and `chunk_by_days` (date
+        // half-open) are type-safe and took the fast path above (never reach here).
+        let range_sliced = !export.chunk_dense && export.chunk_by_days.is_none();
+        if range_sliced && !introspection.is_integer_column(&c) {
+            anyhow::bail!(
+                "export '{}': chunk_column '{}' on {} is not an integer-family column — range \
+                 chunking derives integer min/max boundaries and slices with `BETWEEN`, so a \
+                 numeric/decimal/float/text key silently drops every value between two window \
+                 boundaries. Use `chunk_by_key: {}` (keyset — any orderable indexed key), an \
+                 integer column, `chunk_dense: true`, or `mode: full`.",
+                export.name,
+                c,
+                tbl,
+                c
+            );
+        }
         c
     } else {
         match introspection.single_int_pk.clone() {
@@ -811,13 +849,15 @@ mod tests {
 
     #[test]
     fn chunked_explicit_column_skips_auto_resolve_and_no_db_call() {
-        // Sanity: an explicit chunk_column means we never even try to open a
-        // connection — the resolver short-circuits on the explicit value.
-        // (Otherwise this test would have to hit a real Postgres.)
+        // Sanity: an explicit chunk_column with `query:` (no `table:`) short-
+        // circuits without opening a connection. (#103: `table:` + a range-sliced
+        // column now DOES probe the type, so the no-network fast path is
+        // query-only / dense / by_days from here on.)
         let mut export = minimal_export();
         export.mode = ExportMode::Chunked;
         export.chunk_column = Some("explicit_pk".into());
-        export.table = Some("public.something".into());
+        export.table = None;
+        export.query = Some("SELECT explicit_pk, v FROM something".into());
         let plan = build_plan(
             &minimal_config(),
             &export,
@@ -832,6 +872,38 @@ mod tests {
             ExtractionStrategy::Chunked(cp) => assert_eq!(cp.column, "explicit_pk"),
             _ => panic!("expected Chunked"),
         }
+    }
+
+    #[test]
+    fn explicit_non_integer_chunk_column_is_refused_not_silently_range_sliced() {
+        // #103 (variant 1): an explicit chunk_column that is range-BETWEEN-sliced
+        // must be integer-family — a numeric/decimal/float key silently drops
+        // rows between integer windows. The planner refuses it and points at
+        // chunk_by_key (keyset works on any orderable indexed key).
+        use crate::config::SourceType;
+        // introspection: `id` is integer-family, `amount` is not.
+        let i = intro(Some("id"), &["id"], 1_000_000, Some(100), &["id"]);
+
+        let mut bad = chunked_export();
+        bad.chunk_column = Some("amount".into());
+        let err =
+            chunked_strategy_from_introspection(SourceType::Postgres, &bad, "public.t", 3, &i)
+                .unwrap_err();
+        assert!(
+            err.to_string().contains("not an integer-family column"),
+            "a non-integer chunk_column must be refused, not silently range-sliced: {err}"
+        );
+
+        // An integer explicit chunk_column resolves to Chunked as before.
+        let mut good = chunked_export();
+        good.chunk_column = Some("id".into());
+        assert!(
+            matches!(
+                chunked_strategy_from_introspection(SourceType::Postgres, &good, "public.t", 3, &i),
+                Ok(ExtractionStrategy::Chunked(_))
+            ),
+            "an integer chunk_column must still resolve"
+        );
     }
 
     #[test]
@@ -966,12 +1038,14 @@ mod tests {
         keyset_keys: &[&str],
         row_estimate: i64,
         avg_row_bytes: Option<i64>,
+        int_columns: &[&str],
     ) -> crate::source::TableIntrospection {
         crate::source::TableIntrospection {
             single_int_pk: single_int_pk.map(str::to_string),
             keyset_keys: keyset_keys.iter().map(|s| s.to_string()).collect(),
             row_estimate,
             avg_row_bytes,
+            int_columns: int_columns.iter().map(|s| s.to_string()).collect(),
         }
     }
 
@@ -991,7 +1065,7 @@ mod tests {
         // Small-table escape: rows <= chunk_size downgrades to Snapshot —
         // INCLUSIVE boundary (row_estimate == chunk_size still snapshots).
         let e = base();
-        let i = intro(Some("id"), &["id"], e.chunk_size as i64, Some(100));
+        let i = intro(Some("id"), &["id"], e.chunk_size as i64, Some(100), &["id"]);
         assert!(matches!(
             resolve(SourceType::Postgres, &e, &i).unwrap(),
             ExtractionStrategy::Snapshot
@@ -1011,7 +1085,7 @@ mod tests {
         // (deleting the `!` accepts a full-scan+filesort key).
         let mut e = base();
         e.chunk_by_key = Some("uid".into());
-        let i = intro(None, &["uid"], 1_000_000, Some(100));
+        let i = intro(None, &["uid"], 1_000_000, Some(100), &[]);
         match resolve(SourceType::Postgres, &e, &i).unwrap() {
             ExtractionStrategy::Keyset(k) => assert_eq!(k.key_column, "uid"),
             other => panic!("usable chunk_by_key must keyset, got {other:?}"),
@@ -1027,12 +1101,12 @@ mod tests {
         // to the defensive 512 B (100 MB / 512 = 204_800), never divide by 0.
         let mut e = base();
         e.chunk_size_memory_mb = Some(100);
-        let i = intro(Some("id"), &["id"], 10_000_000, Some(1024));
+        let i = intro(Some("id"), &["id"], 10_000_000, Some(1024), &["id"]);
         match resolve(SourceType::Postgres, &e, &i).unwrap() {
             ExtractionStrategy::Chunked(p) => assert_eq!(p.chunk_size, 102_400),
             other => panic!("expected chunked, got {other:?}"),
         }
-        let i = intro(Some("id"), &["id"], 10_000_000, Some(0));
+        let i = intro(Some("id"), &["id"], 10_000_000, Some(0), &["id"]);
         match resolve(SourceType::Postgres, &e, &i).unwrap() {
             ExtractionStrategy::Chunked(p) => assert_eq!(p.chunk_size, 204_800),
             other => panic!("expected chunked, got {other:?}"),
@@ -1042,7 +1116,7 @@ mod tests {
         // introspection on Postgres must refuse with the no-safe-shape error —
         // an `==` -> `!=` mutant flips the gate for every engine.
         let e = base();
-        let i = intro(None, &["uuid_col"], 1_000_000, Some(100));
+        let i = intro(None, &["uuid_col"], 1_000_000, Some(100), &[]);
         match resolve(SourceType::Mysql, &e, &i).unwrap() {
             ExtractionStrategy::Keyset(k) => assert_eq!(k.key_column, "uuid_col"),
             other => panic!("mysql auto-keyset expected, got {other:?}"),
@@ -1063,7 +1137,7 @@ mod tests {
         let resolve = |export: &ExportConfig, i: &crate::source::TableIntrospection| {
             chunked_strategy_from_introspection(SourceType::Postgres, export, "public.t", 3, i)
         };
-        let i = intro(Some("id"), &["uid"], 1_000_000, Some(100));
+        let i = intro(Some("id"), &["uid"], 1_000_000, Some(100), &["id"]);
 
         // checkpoint on, incremental unset → crash-recovery only, NOT incremental.
         let mut e = chunked_export();

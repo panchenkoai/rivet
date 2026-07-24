@@ -1114,11 +1114,34 @@ pub(crate) fn introspect_mssql_table_for_chunking(
         }
     }
 
+    // Integer-family columns — the safety set for an explicit `chunk_column`.
+    // Same CHAR(31)-delimited STRING_AGG pattern as the keyset probe above.
+    let int_sql = format!(
+        "SELECT STRING_AGG(c.name, CHAR(31)) FROM sys.columns c \
+         JOIN sys.types t ON t.user_type_id = c.user_type_id \
+         JOIN sys.objects o ON o.object_id = c.object_id \
+         JOIN sys.schemas s ON s.schema_id = o.schema_id \
+         WHERE s.name = N'{}' AND o.name = N'{}' \
+           AND t.name IN ('tinyint', 'smallint', 'int', 'bigint')",
+        schema.replace('\'', "''"),
+        table.replace('\'', "''")
+    );
+    let int_columns: Vec<String> = src
+        .query_scalar(&int_sql)?
+        .map(|s| {
+            s.split('\u{1f}')
+                .filter(|c| !c.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+
     Ok(TableIntrospection {
         single_int_pk,
         keyset_keys,
         row_estimate,
         avg_row_bytes: None,
+        int_columns,
     })
 }
 
