@@ -7,9 +7,8 @@
 
 use arrow::array::Array;
 use arrow::array::{
-    Date32Array, FixedSizeBinaryArray, Float32Array, Float64Array, Int8Array, Int16Array,
-    Int32Array, Int64Array, StringArray, TimestampMicrosecondArray, TimestampNanosecondArray,
-    UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    Date32Array, FixedSizeBinaryArray, Float32Array, Float64Array, Int16Array, Int32Array,
+    Int64Array, StringArray, TimestampMicrosecondArray, TimestampNanosecondArray, UInt64Array,
 };
 use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use arrow::record_batch::RecordBatch;
@@ -20,9 +19,11 @@ use arrow::record_batch::RecordBatch;
 /// - the column does not exist in the schema,
 /// - the batch is empty,
 /// - the last value is NULL,
-/// - the column's Arrow type is not one of the supported cursor types
-///   (the full integer family int8/16/32/64 + uint8/16/32/64, float32/64, utf8,
-///   timestamp(µs/ns), date32, FixedSizeBinary(16) for PG `uuid` per ADR-0014).
+/// - the column's Arrow type is not one of the supported cursor types — the
+///   closed set the drivers actually produce: int16/32/64, uint64 (MySQL
+///   `BIGINT UNSIGNED`; narrower unsigned is widened to a signed arm),
+///   float32/64, utf8, timestamp(µs/ns), date32, FixedSizeBinary(16) for PG
+///   `uuid` per ADR-0014.
 pub(crate) fn extract_last_cursor_value(
     batch: &RecordBatch,
     cursor_column: &str,
@@ -58,43 +59,17 @@ pub(crate) fn extract_last_cursor_value(
                 .value(last_row)
                 .to_string(),
         ),
-        DataType::Int8 => Some(
-            array
-                .as_any()
-                .downcast_ref::<Int8Array>()?
-                .value(last_row)
-                .to_string(),
-        ),
-        // Unsigned integers — MySQL `TINYINT/SMALLINT/MEDIUMINT/INT/BIGINT
-        // UNSIGNED` land here (Arrow UInt*, RivetType::UInt64). Field bug: an
-        // unsigned `id` (common on high-volume append/import tables) has DATA_TYPE
-        // = the signed name, so it PASSES the integer-family keyset/chunk guard,
-        // but had no cursor-extract arm — so keyset bailed "could not read the
-        // 'id' value … unsupported type" on the first multi-page table, and an
-        // incremental cursor silently re-read from the last value every run.
+        // The ONLY unsigned Arrow type the pipeline can produce: MySQL
+        // `BIGINT UNSIGNED` (RivetType::UInt64). Every NARROWER unsigned is widened
+        // to a signed arm before it reaches Arrow (MySQL SHORT unsigned→Int32,
+        // INT24/LONG unsigned→Int64; PG OID→Int64; MSSQL tinyint→Int64), and
+        // RivetType has no UInt8/16/32 variant — so no narrow-unsigned arm is
+        // reachable. Field bug: an unsigned `id` has a sign-agnostic DATA_TYPE, so
+        // it PASSED the integer-family keyset/chunk guard but had no UInt64 arm →
+        // keyset bailed "could not read the 'id' value … unsupported type" on the
+        // first multi-page table (an incremental cursor silently re-read every run).
         // `.to_string()` on a u64 is the full unsigned decimal, which MySQL's
         // `WHERE id > '<v>'` compares correctly as unsigned (no i64 truncation).
-        DataType::UInt8 => Some(
-            array
-                .as_any()
-                .downcast_ref::<UInt8Array>()?
-                .value(last_row)
-                .to_string(),
-        ),
-        DataType::UInt16 => Some(
-            array
-                .as_any()
-                .downcast_ref::<UInt16Array>()?
-                .value(last_row)
-                .to_string(),
-        ),
-        DataType::UInt32 => Some(
-            array
-                .as_any()
-                .downcast_ref::<UInt32Array>()?
-                .value(last_row)
-                .to_string(),
-        ),
         DataType::UInt64 => Some(
             array
                 .as_any()
@@ -282,18 +257,6 @@ mod tests {
         assert_eq!(
             extract_last_cursor_value(&batch, "id", &schema),
             Some(big.to_string())
-        );
-
-        // The rest of the unsigned family + Float32 (the sibling arms added with it).
-        let u32s = Arc::new(Schema::new(vec![Field::new("id", DataType::UInt32, false)]));
-        let b = RecordBatch::try_new(
-            u32s.clone(),
-            vec![Arc::new(UInt32Array::from(vec![7u32, 4_000_000_000]))],
-        )
-        .unwrap();
-        assert_eq!(
-            extract_last_cursor_value(&b, "id", &u32s),
-            Some("4000000000".into())
         );
     }
 
