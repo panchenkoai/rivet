@@ -258,11 +258,15 @@ fn reconcile_run_gate(summary: &RunSummary) -> crate::error::Result<()> {
 }
 
 fn reconcile_source_count(plan: &ResolvedRunPlan, summary: &mut RunSummary) {
-    if let Some(col) = plan.strategy.cursor_column() {
+    // Skip the full-source COUNT(*) for any SUBSET/DELTA strategy — its exported
+    // count legitimately differs from the table total, and the #102 exit gate
+    // must not turn that STRUCTURAL mismatch into a false exit-3 (which would
+    // break every healthy scheduled keyset_incremental / time_window / incremental
+    // `run --reconcile`). Previously only the Incremental cursor was skipped.
+    if let Some(reason) = plan.strategy.reconcile_subset_skip() {
         log::info!(
-            "reconcile: skipping for incremental export '{}' (cursor column '{}', count may differ)",
-            plan.export_name,
-            col
+            "reconcile: skipping full-count for '{}' ({reason})",
+            plan.export_name
         );
         return;
     }
