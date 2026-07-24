@@ -240,8 +240,17 @@ fn resolve_final_result(
     failed: bool,
     run_result: crate::error::Result<()>,
     reconcile_gate: crate::error::Result<()>,
+    validate_gate: crate::error::Result<()>,
 ) -> crate::error::Result<()> {
-    if failed { run_result } else { reconcile_gate }
+    if failed {
+        return run_result;
+    }
+    // Both post-write gates surface as a non-zero exit — a reconcile MISMATCH or a
+    // `--validate` verified-WRONG verdict. `and` returns the first Err (reconcile
+    // first), so a failure on EITHER fails the run; both being Ok keeps exit 0.
+    // Wiring `validate_gate` here is the fix for the un-wired `--validate` half of
+    // the exit-code class the reconcile gate (#102) closed (dogfood HIGH).
+    reconcile_gate.and(validate_gate)
 }
 
 fn reconcile_run_gate(
@@ -756,8 +765,16 @@ pub(super) fn run_export_job(
     // manifest write is the same ordering as the cursor advance: a crash before here
     // leaves resume_run_id set, so the next run rehydrates rather than orphans.
     finalize_keyset_anchor(state, &plan, &summary.export_name, failed);
-    if plan.validate {
-        finalize_validate_manifest(&plan, &mut summary, "export");
+    // `--validate` (and `--reconcile`, which implies it) verifies the written
+    // manifest/parts; a verified-WRONG verdict must gate the run's exit code, not
+    // just set summary.validated (dogfood HIGH — the un-wired --validate half).
+    let validate_gate = if plan.validate {
+        finalize_validate_manifest(&plan, &mut summary, "export")
+    } else {
+        Ok(())
+    };
+    if validate_gate.is_err() {
+        summary.status = "failed".into();
     }
     if let Err(e) = state.record_metric_full(&build_metric_row(&summary, &plan, &tuning_class)) {
         log::warn!(
@@ -769,7 +786,7 @@ pub(super) fn run_export_job(
     finalize_run_report(config_path, &summary, "export");
     crate::notify::maybe_send(config.notifications.as_ref(), &summary);
 
-    let final_result = resolve_final_result(failed, result, reconcile_gate);
+    let final_result = resolve_final_result(failed, result, reconcile_gate, validate_gate);
     (final_result, summary)
 }
 
@@ -879,8 +896,16 @@ pub(crate) fn run_export_job_with_chunk_source(
     // is misread as a resume, reuses the frozen run_id, and the run-unique manifest
     // sidecar collides across runs (round-3 wrapper-bypass regression).
     finalize_keyset_anchor(state, plan, &summary.export_name, failed);
-    if plan.validate {
-        finalize_validate_manifest(plan, &mut summary, "apply");
+    // `--validate` verified-WRONG verdict gates the apply export's outcome too —
+    // the same fix as run_export_job (dogfood HIGH: an apply export whose written
+    // output failed verification must not report success).
+    let validate_gate = if plan.validate {
+        finalize_validate_manifest(plan, &mut summary, "apply")
+    } else {
+        Ok(())
+    };
+    if validate_gate.is_err() {
+        summary.status = "failed".into();
     }
     // After finalize_validate_manifest: it can downgrade summary.validated,
     // and the metrics row must carry the final verdict (same ordering as
@@ -894,7 +919,7 @@ pub(crate) fn run_export_job_with_chunk_source(
     }
     finalize_run_report(config_path, &summary, "apply");
 
-    if failed { result } else { Ok(()) }
+    if failed { result } else { validate_gate }
 }
 
 #[cfg(test)]
@@ -964,19 +989,30 @@ mod tests {
         // `run --reconcile` actually RETURNS the gate rather than Ok. Un-hooking
         // the fold reopens the bug; this test then goes red.
         let gate: crate::error::Result<()> = Err(DataIntegrityError::new("mismatch").into());
-        let out = resolve_final_result(false, Ok(()), gate);
+        let out = resolve_final_result(false, Ok(()), gate, Ok(()));
         assert!(
             out.is_err(),
             "a reconcile mismatch on a successful export must surface as the run result"
         );
         assert_eq!(crate::error::classify_exit(&out.unwrap_err()), 3);
 
-        // An export/quality failure takes precedence over the reconcile gate.
+        // An export/quality failure takes precedence over both post-write gates.
         let qfail: crate::error::Result<()> = Err(DataIntegrityError::new("quality").into());
-        assert!(resolve_final_result(true, qfail, Ok(())).is_err());
+        assert!(resolve_final_result(true, qfail, Ok(()), Ok(())).is_err());
 
-        // Clean run: no export failure, no reconcile mismatch → Ok.
-        assert!(resolve_final_result(false, Ok(()), Ok(())).is_ok());
+        // Clean run: no export failure, no reconcile mismatch, no validate fail → Ok.
+        assert!(resolve_final_result(false, Ok(()), Ok(()), Ok(())).is_ok());
+
+        // dogfood HIGH: a `--validate` VERIFIED-WRONG verdict on a successful export
+        // must ALSO surface as the run result (exit 3) — the un-wired half. Un-hooking
+        // `validate_gate` from the fold reopens the "run --validate exits 0" bug.
+        let vfail: crate::error::Result<()> = Err(DataIntegrityError::new("part missing").into());
+        let out = resolve_final_result(false, Ok(()), Ok(()), vfail);
+        assert!(
+            out.is_err(),
+            "a --validate verified-wrong verdict on a successful export must surface as the run result"
+        );
+        assert_eq!(crate::error::classify_exit(&out.unwrap_err()), 3);
     }
 
     #[test]

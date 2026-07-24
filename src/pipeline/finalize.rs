@@ -258,7 +258,7 @@ pub(super) fn finalize_validate_manifest(
     plan: &ResolvedRunPlan,
     summary: &mut RunSummary,
     kind: &str,
-) {
+) -> Result<()> {
     use crate::destination::WriteCommitProtocol;
     use crate::pipeline::validate_manifest::{ValidateDepth, verify_at_destination};
 
@@ -271,7 +271,7 @@ pub(super) fn finalize_validate_manifest(
                 summary.export_name,
                 e
             );
-            return;
+            return Ok(());
         }
     };
     if dest.capabilities().commit_protocol == WriteCommitProtocol::Streaming {
@@ -280,7 +280,7 @@ pub(super) fn finalize_validate_manifest(
             kind,
             summary.export_name
         );
-        return;
+        return Ok(());
     }
 
     // Run finalize always does the full manifest pass (the graded `--depth`
@@ -298,6 +298,17 @@ pub(super) fn finalize_validate_manifest(
             if !v.passed && v.manifest_found && summary.validated == Some(true) {
                 summary.validated = Some(false);
             }
+            // The verdict must GATE the run's exit code — `run --validate` /
+            // `--reconcile` promised to "verify the output file manifest" and
+            // "fail on a mismatch", but the exit code only folded the RECONCILE
+            // gate, never this one, so a failed post-write integrity check exited
+            // 0 with status:success (dogfood HIGH: a CI gate on `run --validate`
+            // treated corruption as success — the un-wired half of the exit-code
+            // class the reconcile gate closed). Same classification as `rivet
+            // validate`: verified-WRONG → data-integrity exit 3; could-not-verify
+            // (a read/list error against the fresh write) → operational exit 1.
+            let fails_exit = !v.passed && v.has_failures();
+            let verified_wrong = fails_exit && v.has_verified_wrong_failure();
             log::info!(
                 "{} '{}': --validate manifest pass: {} parts verified, {} failed{}{}",
                 kind,
@@ -318,14 +329,35 @@ pub(super) fn finalize_validate_manifest(
                 },
             );
             summary.manifest_verification = Some(v);
+            if verified_wrong {
+                return Err(crate::error::DataIntegrityError::new(format!(
+                    "{kind} '{}': --validate found the written output VERIFIED-WRONG — the manifest \
+                     verdict above lists the failing part(s); the data at the destination is not \
+                     what was declared",
+                    summary.export_name
+                ))
+                .into());
+            }
+            if fails_exit {
+                anyhow::bail!(
+                    "{kind} '{}': --validate could NOT verify the written output (a read/list error \
+                     against the destination) — see the log above; re-run to obtain the assurance",
+                    summary.export_name
+                );
+            }
+            Ok(())
         }
         Err(e) => {
+            // The validate PASS itself could not run (destination unreadable) —
+            // could-not-verify, kept non-fatal here (the write already succeeded);
+            // a genuine verified-WRONG verdict is gated in the Ok arm above.
             log::warn!(
                 "{} '{}': --validate manifest pass failed (not fatal): {:#}",
                 kind,
                 summary.export_name,
                 e
             );
+            Ok(())
         }
     }
 }
