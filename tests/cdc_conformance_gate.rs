@@ -106,6 +106,20 @@ const CASES: &[(&str, Expect, Expect, Expect, Expect)] = &[
             impractical — the loud failure is the driver's"),
     ),
     (
+        // #99: distinct from vanished_anchor_loud — the checkpoint FILE itself is
+        // corrupt/truncated (not valid JSON), not a valid checkpoint whose
+        // server-side anchor vanished. `.ok().flatten()` swallowed it into "no
+        // checkpoint" → re-anchor at 'current' → silent gap. Every engine loads
+        // the checkpoint through the shared `Position::load` (cdc_job resume-plan)
+        // before anchoring; PG/MSSQL also load it at their own from-position site.
+        // Each per-engine test proves that engine's run reaches the loud guard.
+        "corrupt_checkpoint_loud",
+        Test("fn cdc_corrupt_checkpoint_fails_loud_not_silently_absent"),
+        Test("fn pg_cdc_corrupt_checkpoint_fails_loud_not_silently_absent"),
+        Test("fn mssql_cdc_corrupt_checkpoint_fails_loud_not_silently_absent"),
+        Test("fn roast_corrupt_checkpoint_fails_loudly_not_silent_reanchor"),
+    ),
+    (
         "mixed_transaction_boundary",
         Test("fn cdc_mixed_transaction_ending_on_uncaptured_table"),
         Test("fn pg_cdc_mixed_transaction_ending_on_uncaptured_table"),

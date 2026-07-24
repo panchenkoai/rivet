@@ -955,6 +955,67 @@ fn mssql_cdc_resume_past_retention_errors_not_a_silent_gap() {
     );
 }
 
+#[test]
+#[ignore = "live: requires docker compose mssql with SQL Server Agent + CDC"]
+fn mssql_cdc_corrupt_checkpoint_fails_loud_not_silently_absent() {
+    // #99, SQL Server flavour: a corrupt/truncated checkpoint must fail the run
+    // loudly, never be swallowed into "no checkpoint". The from-LSN resume site
+    // (create_change_stream) and the shared cdc_job resume-plan both route the
+    // read through `Position::load`, which now errors on a corrupt checkpoint
+    // instead of `.ok().flatten()`-ing it into a silent re-anchor.
+    let _serial = CDC_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let d = tempfile::tempdir().unwrap();
+    let table = unique_name("rivet_cdc_corrupt");
+    let ci = format!("dbo_{table}");
+    mssql_cdc_drop_table(&format!("dbo.{table}"));
+    mssql_cdc_exec(&format!(
+        "CREATE TABLE dbo.{table}(id INT PRIMARY KEY, v INT)"
+    ));
+    enable_cdc(&table, &ci);
+    let _guard = MssqlCdcTable {
+        table: table.clone(),
+        ci: ci.clone(),
+    };
+
+    // Run 1 captures one change and pins a valid checkpoint.
+    mssql_cdc_exec(&format!("INSERT INTO dbo.{table} VALUES (1,10)"));
+    wait_for_capture(&ci, 1);
+    let ckpt = d.path().join("cdc.ckpt");
+    let out1 = d.path().join("out1");
+    std::fs::create_dir_all(&out1).unwrap();
+    run_rivet_ok(&mssql_cdc_config(&d, &table, &ci, &ckpt, &out1));
+    assert!(ckpt.exists(), "run 1 pins a checkpoint");
+
+    // The checkpoint is corrupted; a further change lands. The run must refuse to
+    // proceed on a checkpoint it cannot parse, not read it as absent.
+    std::fs::write(&ckpt, b"{ not valid json").unwrap();
+    mssql_cdc_exec(&format!("INSERT INTO dbo.{table} VALUES (2,20)"));
+    wait_for_capture(&ci, 2);
+
+    // Run 2 must FAIL loudly.
+    let out2 = d.path().join("out2");
+    std::fs::create_dir_all(&out2).unwrap();
+    let res = std::process::Command::new(RIVET_BIN)
+        .args([
+            "run",
+            "--config",
+            mssql_cdc_config(&d, &table, &ci, &ckpt, &out2)
+                .to_str()
+                .unwrap(),
+        ])
+        .output()
+        .expect("spawn rivet");
+    assert!(
+        !res.status.success(),
+        "a corrupt checkpoint must fail the run, not be read as absent"
+    );
+    let stderr = String::from_utf8_lossy(&res.stderr);
+    assert!(
+        stderr.contains("corrupt or truncated"),
+        "the failure must name the corrupt checkpoint, got:\n{stderr}"
+    );
+}
+
 // ─── schema drift + bounded-run termination (coverage-matrix gap fills) ──────
 
 #[test]
