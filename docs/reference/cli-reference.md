@@ -324,7 +324,7 @@ Generate a config scaffold from a live database (connect + introspect)
 * `--source-env <ENV_VAR>` — Name of an environment variable holding the database URL (e.g. DATABASE_URL). The URL never touches the command line
 * `--source-file <PATH>` — Path to a file containing just the database URL (one line). Credentials stay on disk instead of entering the process command line
 * `--table <TABLE>` — Single table, optionally schema-qualified (e.g. public.orders, dbo.orders). Omit to emit all tables/views in a Postgres/SQL Server schema or MySQL database
-* `--schema <SCHEMA>` — PostgreSQL: schema to export (default public). SQL Server: schema (default dbo). MySQL: database name if missing from the URL, or override URL database
+* `--schema <SCHEMA>` — PostgreSQL: schema to export (default public). SQL Server: schema (default dbo). MySQL: database name when the URL omits it (a --schema naming a DIFFERENT database than the URL is refused — put the database in the URL)
 * `--include <GLOB>` — Whole-schema only: keep only tables/views matching this glob (`*`/`?`). Repeatable; a table is kept if it matches any `--include`. No `--include` = keep all
 * `--exclude <GLOB>` — Whole-schema only: drop tables/views matching this glob (`*`/`?`). Repeatable; `--exclude` wins over `--include`
 * `-o`, `--output <OUTPUT>` — Write output to this file instead of stdout

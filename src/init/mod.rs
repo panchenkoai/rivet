@@ -554,17 +554,19 @@ fn introspect_single_table(
                 // data with dbB-derived columns; else run fails right after init
                 // "verified" it). The config can't carry a cross-db table today,
                 // so refuse: the database belongs in the URL.
-                let url_db = mysql::resolve_database_for_listing(source_url, None).ok();
-                if url_db.as_deref() != Some(db) {
+                // Only a genuine CROSS-db mismatch is refused: the URL carries a
+                // db AND it differs from --schema. A db-LESS URL (url_db None) is
+                // the documented "database name if missing from the URL" use —
+                // --schema legitimately provides the db there, so it must NOT bail
+                // (#20 bughunt: `None != Some(db)` wrongly refused it).
+                if let Some(url_db) = mysql::resolve_database_for_listing(source_url, None).ok()
+                    && url_db != db
+                {
                     anyhow::bail!(
                         "init: --schema '{db}' selects a different MySQL database than the source \
-                         URL{} — the generated config connects via the URL and would export the \
-                         URL's database, not '{db}'. Put the database in the URL instead \
-                         (mysql://…/{db}).",
-                        url_db
-                            .as_deref()
-                            .map(|u| format!(" ('{u}')"))
-                            .unwrap_or_default()
+                         URL ('{url_db}') — the generated config connects via the URL and would \
+                         export the URL's database, not '{db}'. Put the database in the URL instead \
+                         (mysql://…/{db})."
                     );
                 }
                 mysql::use_database(&mut conn, db)?;
@@ -724,16 +726,17 @@ fn introspect_all(
             // through the URL, so a --schema pointing at a DIFFERENT database
             // lists/describes one db and exports another. Refuse: the database
             // belongs in the URL, which the config actually uses.
+            // Refuse only a genuine CROSS-db mismatch (URL carries a db AND it
+            // differs). A db-LESS URL + --schema is the documented "database name
+            // if missing from the URL" use and must be allowed (#20 bughunt).
             if schema.map(str::trim).is_some_and(|s| !s.is_empty())
-                && mysql::resolve_database_for_listing(source_url, None)
-                    .ok()
-                    .as_deref()
-                    != Some(db.as_str())
+                && let Some(url_db) = mysql::resolve_database_for_listing(source_url, None).ok()
+                && url_db != db
             {
                 anyhow::bail!(
-                    "init: --schema '{db}' selects a different MySQL database than the source URL — \
-                     `rivet init`/`run` connect via the URL and would list and export the URL's \
-                     database, not '{db}'. Put the database in the URL instead (mysql://…/{db})."
+                    "init: --schema '{db}' selects a different MySQL database than the source URL \
+                     ('{url_db}') — `rivet init`/`run` connect via the URL and would list and export \
+                     the URL's database, not '{db}'. Put the database in the URL instead (mysql://…/{db})."
                 );
             }
             // One pooled connection for the whole scan — a fresh Pool per

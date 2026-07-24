@@ -262,7 +262,7 @@ pub enum Commands {
         /// Single table, optionally schema-qualified (e.g. public.orders, dbo.orders). Omit to emit all tables/views in a Postgres/SQL Server schema or MySQL database.
         #[arg(long)]
         table: Option<String>,
-        /// PostgreSQL: schema to export (default public). SQL Server: schema (default dbo). MySQL: database name if missing from the URL, or override URL database.
+        /// PostgreSQL: schema to export (default public). SQL Server: schema (default dbo). MySQL: database name when the URL omits it (a --schema naming a DIFFERENT database than the URL is refused — put the database in the URL).
         #[arg(long)]
         schema: Option<String>,
         /// Whole-schema only: keep only tables/views matching this glob (`*`/`?`). Repeatable; a table is kept if it matches any `--include`. No `--include` = keep all.

@@ -1066,7 +1066,7 @@ pub(crate) fn introspect_mssql_table_for_chunking(
     // delimiter because the introspection seam only exposes `query_scalar`; that
     // byte cannot appear in a real identifier, so the split is unambiguous.
     let keyset_sql = format!(
-        "SELECT STRING_AGG(col, CHAR(31)) WITHIN GROUP (ORDER BY is_pk DESC, col) FROM ( \
+        "SELECT STRING_AGG(CONVERT(nvarchar(max), col), CHAR(31)) WITHIN GROUP (ORDER BY is_pk DESC, col) FROM ( \
            SELECT col, MAX(is_pk) AS is_pk FROM ( \
              SELECT MIN(c.name) AS col, MAX(CONVERT(int, i.is_primary_key)) AS is_pk \
              FROM sys.indexes i \
@@ -1116,8 +1116,11 @@ pub(crate) fn introspect_mssql_table_for_chunking(
 
     // Integer-family columns — the safety set for an explicit `chunk_column`.
     // Same CHAR(31)-delimited STRING_AGG pattern as the keyset probe above.
+    // CONVERT(nvarchar(max), ..) because STRING_AGG over a non-max input caps its
+    // result at 8000 bytes and raises Msg 9829 past it — a wide table (~160 int
+    // columns of 30-char names) then failed EVERY chunked plan (#21 bughunt).
     let int_sql = format!(
-        "SELECT STRING_AGG(c.name, CHAR(31)) FROM sys.columns c \
+        "SELECT STRING_AGG(CONVERT(nvarchar(max), c.name), CHAR(31)) FROM sys.columns c \
          JOIN sys.types t ON t.user_type_id = c.user_type_id \
          JOIN sys.objects o ON o.object_id = c.object_id \
          JOIN sys.schemas s ON s.schema_id = o.schema_id \
