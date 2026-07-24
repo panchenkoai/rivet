@@ -1,5 +1,8 @@
 mod artifact;
 mod candidates;
+/// Offline strategy-decision replay harness — test-only (no runtime caller).
+#[cfg(test)]
+mod catalog_replay;
 mod mongo;
 mod mssql;
 mod mysql;
@@ -13,7 +16,12 @@ pub(crate) use artifact::{
 use crate::error::Result;
 
 /// Column metadata fetched from information_schema.
-#[derive(Debug, Clone)]
+///
+/// `Serialize`/`Deserialize` so a real hostile DB's SCHEMA (types + PK shape, no
+/// row data) can be distilled into a checked-in catalog fixture and replayed
+/// offline against the strategy-decision logic (`catalog_replay`) — the messy DB
+/// becomes a regression oracle with zero customer-data exposure.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ColumnInfo {
     pub name: String,
     pub data_type: String,
@@ -27,7 +35,13 @@ pub(crate) struct ColumnInfo {
 }
 
 /// Table metadata used to generate the config scaffold and discovery artifact.
-#[derive(Debug, Clone)]
+///
+/// This is the ENTIRE input to the strategy decision (init `suggest_mode` +
+/// keyset/chunk resolution) — schema, catalog stats (`row_estimate`,
+/// `total_bytes`), and column shapes. No row data. So a `Vec<TableInfo>`
+/// serialized from a real DB (anonymized) replays every decision the field hit
+/// (see `catalog_replay`).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct TableInfo {
     pub schema: String,
     pub table: String,

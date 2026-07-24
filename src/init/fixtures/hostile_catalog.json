@@ -1,0 +1,100 @@
+[
+  {
+    "expect": "keyset(id)",
+    "note": "large int-PK table (~163M rows) → keyset on the indexed PK",
+    "table": {
+      "schema": "s", "table": "big_int_pk_163m",
+      "row_estimate": 163000000, "total_bytes": 90000000000,
+      "columns": [
+        {"name":"id","data_type":"bigint","is_primary_key":true,"is_nullable":false,"numeric_precision":null,"numeric_scale":null},
+        {"name":"col_a","data_type":"varchar","is_primary_key":false,"is_nullable":true,"numeric_precision":null,"numeric_scale":null}
+      ]
+    }
+  },
+  {
+    "expect": "keyset(id)",
+    "note": "huge int-PK table (~318M rows) → keyset stays flat-memory at any size",
+    "table": {
+      "schema": "s", "table": "huge_int_pk_318m",
+      "row_estimate": 318000000, "total_bytes": 200000000000,
+      "columns": [
+        {"name":"id","data_type":"bigint","is_primary_key":true,"is_nullable":false,"numeric_precision":null,"numeric_scale":null},
+        {"name":"amount","data_type":"decimal","is_primary_key":false,"is_nullable":true,"numeric_precision":11,"numeric_scale":4}
+      ]
+    }
+  },
+  {
+    "expect": "chunked(ref_id)",
+    "note": "history/version table with a non-PK integer key (~823M rows) → range chunk on the integer key (no single PK → not keyset)",
+    "table": {
+      "schema": "s", "table": "version_ref_id_823m",
+      "row_estimate": 823000000, "total_bytes": 400000000000,
+      "columns": [
+        {"name":"ref_id","data_type":"bigint","is_primary_key":false,"is_nullable":false,"numeric_precision":null,"numeric_scale":null},
+        {"name":"version","data_type":"int","is_primary_key":false,"is_nullable":true,"numeric_precision":null,"numeric_scale":null},
+        {"name":"updated_at","data_type":"timestamp","is_primary_key":false,"is_nullable":true,"numeric_precision":null,"numeric_scale":null}
+      ]
+    }
+  },
+  {
+    "expect": "full",
+    "note": "tiny table (~27 rows) → full is correct, no chunking overhead",
+    "table": {
+      "schema": "s", "table": "tiny_27",
+      "row_estimate": 27, "total_bytes": 8192,
+      "columns": [
+        {"name":"id","data_type":"bigint","is_primary_key":true,"is_nullable":false,"numeric_precision":null,"numeric_scale":null},
+        {"name":"col_a","data_type":"varchar","is_primary_key":false,"is_nullable":true,"numeric_precision":null,"numeric_scale":null}
+      ]
+    }
+  },
+  {
+    "expect": "full",
+    "note": "small no-PK, no-cursor table (~50K rows) → full (below the 100k threshold anyway)",
+    "table": {
+      "schema": "s", "table": "small_no_key_50k",
+      "row_estimate": 50000, "total_bytes": 3700000,
+      "columns": [
+        {"name":"col_a","data_type":"varchar","is_primary_key":false,"is_nullable":true,"numeric_precision":null,"numeric_scale":null},
+        {"name":"col_b","data_type":"varchar","is_primary_key":false,"is_nullable":true,"numeric_precision":null,"numeric_scale":null}
+      ]
+    }
+  },
+  {
+    "expect": "keyset(id)",
+    "note": "medium int-PK table just over the 100k threshold (~141K rows) → keyset, fast profile",
+    "table": {
+      "schema": "s", "table": "medium_int_pk_141k",
+      "row_estimate": 141000, "total_bytes": 50000000,
+      "columns": [
+        {"name":"id","data_type":"int","is_primary_key":true,"is_nullable":false,"numeric_precision":null,"numeric_scale":null},
+        {"name":"col_a","data_type":"varchar","is_primary_key":false,"is_nullable":true,"numeric_precision":null,"numeric_scale":null}
+      ]
+    }
+  },
+  {
+    "expect": "incremental(updated_at)",
+    "note": "large table with NO integer key but a timestamp cursor → incremental (suggest_mode falls through chunked→incremental)",
+    "table": {
+      "schema": "s", "table": "large_cursor_only_2m",
+      "row_estimate": 2000000, "total_bytes": 800000000,
+      "columns": [
+        {"name":"uuid","data_type":"char","is_primary_key":true,"is_nullable":false,"numeric_precision":null,"numeric_scale":null},
+        {"name":"updated_at","data_type":"timestamp","is_primary_key":false,"is_nullable":true,"numeric_precision":null,"numeric_scale":null}
+      ]
+    }
+  },
+  {
+    "expect": "full",
+    "note": "KNOWN GAP: small-by-count (~25K rows) but MB-wide rows (large text columns). Scaffolded full because the 100k threshold is row-count-blind to row WIDTH; a full scan of MB rows times out. It has an integer PK, so it SHOULD keyset(id). Flip to keyset(id) when init weighs total_bytes.",
+    "table": {
+      "schema": "s", "table": "wide_short_25k",
+      "row_estimate": 25000, "total_bytes": 21474836480,
+      "columns": [
+        {"name":"id","data_type":"bigint","is_primary_key":true,"is_nullable":false,"numeric_precision":null,"numeric_scale":null},
+        {"name":"wide_text_a","data_type":"longtext","is_primary_key":false,"is_nullable":true,"numeric_precision":null,"numeric_scale":null},
+        {"name":"wide_text_b","data_type":"longtext","is_primary_key":false,"is_nullable":true,"numeric_precision":null,"numeric_scale":null}
+      ]
+    }
+  }
+]
