@@ -923,6 +923,56 @@ fn stand_keyset_unsigned_key_completeness_mysql() {
     );
 }
 
+/// #21 bughunt (garbage profile — a WIDE table): the MSSQL introspection probes
+/// STRING_AGG the column names, whose result caps at 8000 bytes and raises Msg 9829
+/// once the table is wide enough — so EVERY chunked/keyset plan on that table failed
+/// to build. A 160-int-column table (30-char names) crosses the cap. With the
+/// CONVERT(nvarchar(max), ..) fix the probe returns nvarchar(max) (no cap), so the
+/// plan builds and the export completes. RED against the un-CONVERTed query.
+#[test]
+#[ignore = "live: requires docker compose up -d mssql"]
+fn stand_wide_table_introspection_mssql() {
+    require_alive(LiveService::Mssql);
+    let table = unique_name("stand_wide");
+    let guard = StandCleanup(Eng::Ms, table.clone());
+    // 160 int columns of 30-char names — the STRING_AGG of the names exceeds 8000
+    // bytes, the exact shape that raised Msg 9829 before the CONVERT fix.
+    let cols: Vec<String> = (0..160)
+        .map(|i| format!("col_{i:030} int NOT NULL DEFAULT 0"))
+        .collect();
+    mssql_exec(&format!(
+        "CREATE TABLE {table} (id BIGINT PRIMARY KEY, {})",
+        cols.join(", ")
+    ));
+    mssql_exec(&format!(
+        "INSERT INTO {table} (id) VALUES (1),(2),(3),(4),(5)"
+    ));
+    let rig = Rig::mssql_batch(&format!("dbo.{table}"))
+        .mode("chunked")
+        .export_line("chunk_column: id")
+        .export_line("chunk_size: 2");
+    let out = run_rivet_env(
+        &["run", "--config", rig.config_path().to_str().unwrap()],
+        &[("RUST_LOG", "warn")],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    drop(guard); // drop the table before asserting so a failure never leaks it
+    assert!(
+        out.status.success(),
+        "a 160-column table must not fail the STRING_AGG introspection probe (#21, Msg 9829); \
+         stderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("9829"),
+        "STRING_AGG must not hit the 8000-byte cap: {stderr}"
+    );
+    assert_eq!(
+        count_parquet_rows(&rig.out_dir()),
+        5,
+        "all 5 rows must export once the plan builds"
+    );
+}
+
 #[test]
 #[ignore = "live: requires docker compose up -d mysql"]
 fn stand_range_gappy_mysql() {

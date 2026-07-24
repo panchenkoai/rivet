@@ -54,6 +54,13 @@ use serde::Deserialize;
 /// ×2→na) → 0 (chunk_count-Mongo→na).
 const MATRICES: &[(&str, usize)] = &[
     ("docs/chunking-matrix.yaml", 0),
+    // Export-STRATEGY flag × engine, verified on GOLDEN fixtures + a distilled
+    // GARBAGE profile (anonymized shape of a 200+-table field DB). Two layers:
+    // the offline scaffold_strategy oracle (all shapes) + the live chunking_stand
+    // (representative subset). Engine-specific garbage failure modes (unsigned
+    // cursor = MySQL, regclass-throw = PG, STRING_AGG cap = MSSQL) are one test
+    // + justified n/a. 0 gaps — every cell is a test or a justified n/a.
+    ("docs/cli-flag-matrix.yaml", 0),
     ("docs/behaviour-matrix.yaml", 0),
     ("docs/type-fidelity-matrix.yaml", 0),
     // Cross config × db: 15 honest holes on the non-PG engines (cloud dests, codec

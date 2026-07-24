@@ -96,5 +96,60 @@
         {"name":"wide_text_b","data_type":"longtext","is_primary_key":false,"is_nullable":true,"numeric_precision":null,"numeric_scale":null}
       ]
     }
+  },
+
+  {
+    "expect": "keyset(id)",
+    "note": "distilled field-fleet profile: a bigint-PK feed table with BOTH created_at + updated_at, ~3M rows / ~1GB, in a non-default schema. The field tool chose a size-tiered timestamp strategy; rivet picks keyset(id) — the single-column PK beats the timestamp cursor, and keyset stays flat-memory regardless of size. Locks 'PK wins over a present cursor'.",
+    "table": {
+      "schema": "ext", "table": "bigint_pk_dual_ts_3m",
+      "row_estimate": 3000000, "total_bytes": 1000000000,
+      "columns": [
+        {"name":"id","data_type":"bigint","is_primary_key":true,"is_nullable":false,"numeric_precision":null,"numeric_scale":null},
+        {"name":"payload","data_type":"varchar","is_primary_key":false,"is_nullable":true,"numeric_precision":null,"numeric_scale":null},
+        {"name":"created_at","data_type":"timestamp","is_primary_key":false,"is_nullable":false,"numeric_precision":null,"numeric_scale":null},
+        {"name":"updated_at","data_type":"timestamp","is_primary_key":false,"is_nullable":true,"numeric_precision":null,"numeric_scale":null}
+      ]
+    }
+  },
+  {
+    "expect": "keyset(id)",
+    "note": "distilled field-fleet profile: the INT-PK minority (a minority of the fleet's tables are int, not bigint), ~500K rows, dual timestamps. Same decision as the bigint majority — keyset(id) on the integer PK. Locks that int and bigint PKs route identically.",
+    "table": {
+      "schema": "ext", "table": "int_pk_dual_ts_500k",
+      "row_estimate": 500000, "total_bytes": 180000000,
+      "columns": [
+        {"name":"id","data_type":"int","is_primary_key":true,"is_nullable":false,"numeric_precision":null,"numeric_scale":null},
+        {"name":"payload","data_type":"varchar","is_primary_key":false,"is_nullable":true,"numeric_precision":null,"numeric_scale":null},
+        {"name":"created_at","data_type":"timestamp","is_primary_key":false,"is_nullable":false,"numeric_precision":null,"numeric_scale":null},
+        {"name":"updated_at","data_type":"timestamp","is_primary_key":false,"is_nullable":true,"numeric_precision":null,"numeric_scale":null}
+      ]
+    }
+  },
+  {
+    "expect": "keyset(id)",
+    "note": "distilled field-fleet profile: a very large bigint-PK feed table (~200M rows) whose ids run PAST i64::MAX — the field DB CASTs id AS UNSIGNED (BIGINT UNSIGNED). The STRATEGY is keyset(id) like any bigint PK; the unsigned-cursor RUNTIME hazard (extract_last_cursor_value, fixed in bc512a3) is exercised by the live stand, not this offline oracle.",
+    "table": {
+      "schema": "ext", "table": "bigint_unsigned_pk_200m",
+      "row_estimate": 200000000, "total_bytes": 120000000000,
+      "columns": [
+        {"name":"id","data_type":"bigint","is_primary_key":true,"is_nullable":false,"numeric_precision":null,"numeric_scale":null},
+        {"name":"payload","data_type":"varchar","is_primary_key":false,"is_nullable":true,"numeric_precision":null,"numeric_scale":null}
+      ]
+    }
+  },
+  {
+    "expect": "full",
+    "note": "distilled field-fleet profile: a SMALL keyed feed table (~80K rows, below the 100k chunked threshold) with dual timestamps. Even with a bigint PK it scaffolds full — no chunking overhead under the threshold. Locks 'a PK does not force keyset below the row threshold'.",
+    "table": {
+      "schema": "ext", "table": "bigint_pk_small_80k",
+      "row_estimate": 80000, "total_bytes": 24000000,
+      "columns": [
+        {"name":"id","data_type":"bigint","is_primary_key":true,"is_nullable":false,"numeric_precision":null,"numeric_scale":null},
+        {"name":"payload","data_type":"varchar","is_primary_key":false,"is_nullable":true,"numeric_precision":null,"numeric_scale":null},
+        {"name":"created_at","data_type":"timestamp","is_primary_key":false,"is_nullable":false,"numeric_precision":null,"numeric_scale":null},
+        {"name":"updated_at","data_type":"timestamp","is_primary_key":false,"is_nullable":true,"numeric_precision":null,"numeric_scale":null}
+      ]
+    }
   }
 ]
