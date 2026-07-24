@@ -311,6 +311,41 @@ fn seed_dense(eng: Eng, rows: i64) -> (String, StandCleanup) {
     (table, guard)
 }
 
+/// Seed a MySQL table with a `BIGINT UNSIGNED` PK (Arrow UInt64) — the field-bug
+/// shape (0.21.2, prod affiliate DB). `rows` dense low ids PLUS three ids PAST
+/// i64::MAX (up to u64::MAX), so a keyset cursor must page through ALL of them —
+/// advancing across the signed/unsigned boundary — without loss or truncation.
+/// MySQL-only: PostgreSQL has no unsigned integer type, SQL Server has no
+/// unsigned BIGINT. Returns the table + cleanup guard; total rows = `rows + 3`.
+fn seed_mysql_unsigned_key(rows: i64) -> (String, StandCleanup) {
+    let table = unique_name("stand_unsigned");
+    let guard = StandCleanup(Eng::My, table.clone());
+    let mut c = mysql_connect();
+    c.query_drop(format!(
+        "CREATE TABLE {table} (id BIGINT UNSIGNED PRIMARY KEY, payload INT NOT NULL)"
+    ))
+    .unwrap();
+    c.query_drop(format!(
+        "SET SESSION cte_max_recursion_depth = {}",
+        rows + 10
+    ))
+    .unwrap();
+    c.query_drop(format!(
+        "INSERT INTO {table} (id, payload) \
+         WITH RECURSIVE seq AS (SELECT 1 n UNION ALL SELECT n+1 FROM seq WHERE n < {rows}) \
+         SELECT n, n FROM seq"
+    ))
+    .unwrap();
+    // Three ids PAST i64::MAX (9223372036854775807); u64::MAX = 18446744073709551615.
+    // These break any path that reads the key as i64.
+    c.query_drop(format!(
+        "INSERT INTO {table} (id, payload) VALUES \
+         (18446744073709551613, 100), (18446744073709551614, 101), (18446744073709551615, 102)"
+    ))
+    .unwrap();
+    (table, guard)
+}
+
 /// `chunk_count: N` divides the key range into EXACTLY N windows → N part files
 /// on a dense key. Assert the run succeeds and emits exactly N parquet parts.
 fn run_chunk_count(eng: Eng, n: usize) {
@@ -789,6 +824,47 @@ fn stand_keyset_non_usable_bail_postgres() {
 #[ignore = "live: requires docker compose up -d mysql"]
 fn stand_keyset_non_usable_bail_mysql() {
     run_keyset_non_usable_bail(Eng::My);
+}
+
+/// FIELD BUG (0.21.2, prod affiliate DB): keyset over a `BIGINT UNSIGNED` key
+/// bailed "keyset could not read the 'id' value … unsupported type" on the first
+/// MULTI-PAGE table — extract_last_cursor_value (the cursor read-back) had no
+/// UInt arm, so an unsigned id (Arrow UInt64) couldn't advance the cursor. ~37
+/// exports failed. The strategy harness never seeded an unsigned key (every
+/// fixture was signed BIGINT), and the type harness never ran a strategy — the
+/// bug fell in the seam. This closes it end-to-end: a multi-page keyset over an
+/// unsigned key with three ids PAST i64::MAX must export EVERY row (none lost, no
+/// dup, no truncation), where the pre-fix run bailed on page 1. MySQL-only
+/// (unsigned integers don't exist on PG/MSSQL).
+#[test]
+#[ignore = "live: requires docker compose up -d mysql"]
+fn stand_keyset_unsigned_key_completeness_mysql() {
+    require_alive(LiveService::Mysql);
+    let dense = 20i64;
+    let (table, _guard) = seed_mysql_unsigned_key(dense);
+    let expected = (dense + 3) as usize; // dense low ids + 3 past i64::MAX
+    let rig = Rig::mysql_batch(&table)
+        .mode("chunked")
+        .export_line("chunk_by_key: id")
+        .export_line("chunk_size: 5"); // < dense → multi-page → forces the cursor advance
+    let cfg = rig.config_path();
+    let out = run_rivet_env(
+        &["run", "--config", cfg.to_str().unwrap()],
+        &[("RUST_LOG", "warn")],
+    );
+    assert!(
+        out.status.success(),
+        "keyset over a BIGINT UNSIGNED key must succeed (pre-fix it bailed 'could not \
+         read the id value … unsupported type'); stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Completeness: every seeded row present exactly once. A dropped page (the
+    // cursor failing to advance) reads < expected; a re-read page reads > expected.
+    assert_eq!(
+        count_parquet_rows(&rig.out_dir()),
+        expected,
+        "keyset over an unsigned key must export EVERY row, incl. the three ids past i64::MAX"
+    );
 }
 
 #[test]

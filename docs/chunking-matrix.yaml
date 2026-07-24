@@ -138,6 +138,13 @@ scenarios:
     mssql:    { test: roast_mssql_chunk_by_key_on_a_nullable_unique_key_bails_loud }
     mongo:    { test: mongo_keyset_on_heterogeneous_id_errors_loudly_full_scan_still_works }
 
+  - id: keyset_unsigned_key_completeness
+    what: "keyset over an UNSIGNED-integer key (Arrow UInt*) pages through EVERY row, incl. ids past i64::MAX — the strategy × key-TYPE axis the harness never varied (every fixture was signed BIGINT). FIELD BUG (0.21.2 prod): extract_last_cursor_value had no UInt arm, so an unsigned `id` passed the integer-family SELECTION guard (DATA_TYPE unsigned-agnostic) but couldn't advance the cursor — keyset bailed 'could not read the id value … unsupported type' on the first MULTI-PAGE table (~37 exports lost). Unit oracle: cursor_unsigned_integers_field_bug (extraction, up to u64::MAX); live oracle below (end-to-end row-completeness)."
+    postgres: { na: "PostgreSQL has NO unsigned integer type — an unsigned key is unrepresentable, so this cross-product does not exist on PG. The keyset happy-path over signed/text keys is covered by the live_keyset suite." }
+    mysql:    { test: stand_keyset_unsigned_key_completeness_mysql }
+    mssql:    { na: "SQL Server has no unsigned BIGINT (only TINYINT is unsigned 0-255, never a keyset key) — the unsigned-64 key shape does not exist on MSSQL." }
+    mongo:    { na: "Mongo keys on the BSON `_id`, not a SQL unsigned integer; its key-type hazard is the heterogeneous-bracket detector (guard_keyset_non_usable_key_bail's mongo cell), a different axis." }
+
   - id: guard_small_table_snapshot_escape
     what: "chunked on a table whose reltuples < chunk_size downgrades to Snapshot (one file), unless an explicit knob pins chunked"
     postgres: { test: roast_small_table_escape_respects_explicit_chunk_checkpoint }

@@ -21,8 +21,8 @@ use arrow::record_batch::RecordBatch;
 /// - the batch is empty,
 /// - the last value is NULL,
 /// - the column's Arrow type is not one of the supported cursor types
-///   (int16/32/64, float64, utf8, timestamp(µs), date32,
-///   FixedSizeBinary(16) for PG `uuid` per ADR-0014).
+///   (the full integer family int8/16/32/64 + uint8/16/32/64, float32/64, utf8,
+///   timestamp(µs/ns), date32, FixedSizeBinary(16) for PG `uuid` per ADR-0014).
 pub(crate) fn extract_last_cursor_value(
     batch: &RecordBatch,
     cursor_column: &str,
