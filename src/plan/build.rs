@@ -407,6 +407,36 @@ fn resolve_chunked_strategy(
 /// [`crate::source::TableIntrospection`]. The W5 mutation run found its guards
 /// unguarded offline: the keyset-key refusal `!`, the ADR-0020 MySQL-only
 /// auto-keyset gate, the small-table escape, and the memory->rows arithmetic.
+/// Plan-time WIDTH warning: a fixed `chunk_size` on a wide table (`chunk_size ×
+/// avg_row_bytes` ≥ 512 MB per chunk) risks a statement timeout (MySQL ERROR 3024)
+/// or a memory spike — the field's wide `*_version` tables failed this way. Returns
+/// the actionable warning line, or `None` when it does not apply: a memory budget
+/// is set (already width-aware), no row-width estimate, or the chunk is not heavy.
+/// Pure so the threshold + message are unit-tested without a live DB.
+fn heavy_chunk_warning(
+    name: &str,
+    chunk_size: usize,
+    avg_row_bytes: Option<i64>,
+    memory_mb_set: bool,
+) -> Option<String> {
+    const HEAVY_CHUNK_BYTES: i64 = 512 * 1024 * 1024;
+    if memory_mb_set {
+        return None;
+    }
+    let row_bytes = avg_row_bytes.filter(|b| *b > 0)?;
+    let bytes_per_chunk = (chunk_size as i64).saturating_mul(row_bytes);
+    if bytes_per_chunk < HEAVY_CHUNK_BYTES {
+        return None;
+    }
+    Some(format!(
+        "export '{name}': chunk_size {chunk_size} × ~{row_bytes} B/row ≈ {} MB per chunk on a wide \
+         table — a chunk this large can exceed the statement timeout (e.g. MySQL ERROR 3024) or \
+         spike memory. Prefer `chunk_size_memory_mb:` (width-aware — each chunk stays bounded by \
+         BYTES, not row count), or lower `chunk_size`.",
+        bytes_per_chunk / (1024 * 1024),
+    ))
+}
+
 fn chunked_strategy_from_introspection(
     source_type: crate::config::SourceType,
     export: &ExportConfig,
@@ -444,6 +474,21 @@ fn chunked_strategy_from_introspection(
     } else {
         export.chunk_size
     };
+
+    // (1b) Width warning: a FIXED `chunk_size` on a WIDE table makes each chunk
+    // read `chunk_size × avg_row_bytes` of data — a heavy chunk that can exceed the
+    // statement timeout (MySQL ERROR 3024 / PG statement_timeout) or spike memory.
+    // The field's wide `*_version` tables failed exactly this way. Emit BEFORE the
+    // run so the operator switches to `chunk_size_memory_mb:` rather than eating a
+    // multi-minute timeout.
+    if let Some(w) = heavy_chunk_warning(
+        &export.name,
+        chunk_size,
+        introspection.avg_row_bytes,
+        export.chunk_size_memory_mb.is_some(),
+    ) {
+        log::warn!("{w}");
+    }
 
     // (2) Small-table escape: a single chunk/page has no benefit and adds
     // plumbing latency. Downgrade to Snapshot (bounded + simplest). Only fires
@@ -1359,6 +1404,27 @@ mod tests {
             }
             _ => panic!("expected Chunked"),
         }
+    }
+
+    #[test]
+    fn heavy_chunk_warning_fires_only_on_a_wide_fixed_size_chunk() {
+        // Narrow table (512 B/row × 100k = ~49 MB/chunk) → no warning.
+        assert!(heavy_chunk_warning("t", 100_000, Some(512), false).is_none());
+        // Wide table (8 KB/row × 100k = ~763 MB/chunk ≥ 512 MB) → warn, actionably.
+        let w = heavy_chunk_warning("t", 100_000, Some(8192), false)
+            .expect("a wide fixed-size chunk must warn");
+        assert!(w.contains("chunk_size_memory_mb"), "must name the fix: {w}");
+        assert!(
+            w.contains("ERROR 3024"),
+            "must name the field failure mode: {w}"
+        );
+        // A memory budget is already width-aware → never warn, even if wide.
+        assert!(heavy_chunk_warning("t", 100_000, Some(8192), true).is_none());
+        // No catalog width estimate → can't judge → no warning.
+        assert!(heavy_chunk_warning("t", 100_000, None, false).is_none());
+        assert!(heavy_chunk_warning("t", 100_000, Some(0), false).is_none());
+        // A large chunk_size makes even a moderate row width heavy.
+        assert!(heavy_chunk_warning("t", 2_000_000, Some(300), false).is_some());
     }
 
     #[test]
