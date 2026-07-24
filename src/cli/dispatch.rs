@@ -353,7 +353,7 @@ fn dispatch_run(
     json: bool,
     params: Vec<String>,
 ) -> Result<()> {
-    let p = parse_params(&params);
+    let p = parse_params(&params)?;
     let p = if p.is_empty() { None } else { Some(p) };
     if let Some(name) = export.as_deref() {
         check_export_selection(&Config::load_with_params(&config, p.as_ref())?, Some(name))?;
@@ -383,7 +383,7 @@ fn dispatch_check(
     json: bool,
     target: Option<String>,
 ) -> Result<()> {
-    let p = parse_params(&params);
+    let p = parse_params(&params)?;
     let p = if p.is_empty() { None } else { Some(p) };
     // A declared `--target` that doesn't parse is a loud error — never silently
     // dropped to `None` (which would give false target-compat assurance). This
@@ -397,7 +397,7 @@ fn dispatch_check(
     if let Some(name) = export.as_deref() {
         check_export_selection(&Config::load_with_params(&config, p.as_ref())?, Some(name))?;
     }
-    preflight::check(
+    let type_clean = preflight::check(
         &config,
         export.as_deref(),
         p.as_ref(),
@@ -411,7 +411,15 @@ fn dispatch_check(
     // `check` alone. `preflight::check` probes source/destination/types; this
     // adds the mode×destination compatibility gate (`validate_plan`). Skipped
     // under `--json` so NDJSON type-report output stays one object per line.
-    check_plan_compatibility(&config, export.as_deref(), p.as_ref(), json)
+    // This BAILS on a rejection, so the "Looks good" epilogue below only prints
+    // when BOTH gates pass — never alongside a "Rejected: …" line (dogfood MED).
+    check_plan_compatibility(&config, export.as_deref(), p.as_ref(), json)?;
+    if type_clean && !json {
+        println!(
+            "Looks good. Next: rivet run -c {config} --validate   # export, then verify row counts"
+        );
+    }
+    Ok(())
 }
 
 /// Build the resolved plan for each selected export and surface
@@ -545,7 +553,7 @@ fn dispatch_plan(
     output: Option<String>,
     format: PlanFormat,
 ) -> Result<()> {
-    let p = parse_params(&params);
+    let p = parse_params(&params)?;
     let p = if p.is_empty() { None } else { Some(p) };
     if let Some(name) = export.as_deref() {
         check_export_selection(&Config::load_with_params(&config, p.as_ref())?, Some(name))?;
@@ -604,7 +612,7 @@ fn dispatch_reconcile(
     output: Option<String>,
     params: Vec<String>,
 ) -> Result<()> {
-    let p = parse_params(&params);
+    let p = parse_params(&params)?;
     let p = if p.is_empty() { None } else { Some(p) };
     check_export_selection(
         &Config::load_with_params(&config, p.as_ref())?,
@@ -626,7 +634,7 @@ fn dispatch_repair(
     output: Option<String>,
     params: Vec<String>,
 ) -> Result<()> {
-    let p = parse_params(&params);
+    let p = parse_params(&params)?;
     let p = if p.is_empty() { None } else { Some(p) };
     check_export_selection(
         &Config::load_with_params(&config, p.as_ref())?,

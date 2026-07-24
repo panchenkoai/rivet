@@ -177,6 +177,52 @@ exports:
 }
 
 #[test]
+fn chunk_by_key_with_query_is_not_the_generic_pick_a_strategy_error() {
+    // #dogfood MED: `chunk_by_key` + `query:` (no table:) hit the config-level
+    // "chunked mode needs a chunking strategy. Pick one: … chunk_by_key …" — a
+    // dead-end recommending the option already set. `chunk_by_key` IS a strategy,
+    // so config validation must pass (the accurate "needs table:" error fires
+    // later, at plan build). Contrast: a strategy-LESS config still gets it.
+    let with_key = r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: c
+    query: "SELECT id FROM t"
+    mode: chunked
+    chunk_by_key: id
+    format: csv
+    destination:
+      type: local
+      path: ./out
+"#;
+    assert!(
+        Config::from_yaml(with_key).is_ok(),
+        "chunk_by_key+query must pass config validation (table: is a plan-build concern)"
+    );
+
+    let no_strategy = r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: c
+    query: "SELECT id FROM t"
+    mode: chunked
+    format: csv
+    destination:
+      type: local
+      path: ./out
+"#;
+    let err = Config::from_yaml(no_strategy).unwrap_err();
+    assert!(
+        err.to_string().contains("needs a chunking strategy"),
+        "a strategy-less chunked config must still get the pick-one guidance: {err}"
+    );
+}
+
+#[test]
 fn incremental_with_cursor_column_is_accepted() {
     Config::from_yaml(
         r#"
@@ -829,9 +875,11 @@ fn env_var_substitution_missing_var_is_hard_error() {
     }
     let err = resolve_env_vars("prefix_${RIVET_NONEXISTENT_VAR}_suffix").unwrap_err();
     let msg = err.to_string();
+    // Names the missing var AND (dogfood MED) points at `--param` as the
+    // CLI-native resolution, not only the environment variable.
     assert!(
-        msg.contains("RIVET_NONEXISTENT_VAR") && msg.contains("not set"),
-        "expected error to mention the missing var name, got: {msg}"
+        msg.contains("RIVET_NONEXISTENT_VAR") && msg.contains("--param"),
+        "expected error to name the var and mention --param, got: {msg}"
     );
 }
 

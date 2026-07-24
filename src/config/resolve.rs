@@ -41,9 +41,10 @@ pub fn resolve_vars(
             match std::env::var(var_name) {
                 Ok(v) => v,
                 Err(_) => anyhow::bail!(
-                    "environment variable '{}' referenced in config is not set \
-                     (a missing secret silently becomes an empty string — refusing)",
-                    var_name
+                    "'${{{var_name}}}' in the config is unresolved — set it with \
+                     `--param {var_name}=<value>` (`-p`, which wins over the environment) or export \
+                     the environment variable '{var_name}'. (A missing value would silently become \
+                     an empty string, so rivet refuses.)"
                 ),
             }
         };

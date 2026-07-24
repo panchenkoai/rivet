@@ -1015,7 +1015,17 @@ impl Config {
                 // shortcut on a Postgres source — in that case it is auto-resolved
                 // from the table's single-integer PK at plan-build time (see
                 // `crate::plan::build::resolve_chunk_column`).
-                if export.chunk_column.is_none() && export.table.is_none() {
+                // Only fire the "pick a strategy" guidance when NO strategy is set.
+                // `chunk_by_key` (and chunk_count/chunk_by_days) IS a strategy — with
+                // `query:` it fails later for a different, accurate reason (it needs
+                // the `table:` shortcut so the planner can verify the unique index).
+                // Recommending `chunk_by_key` when it is already set was a dead-end
+                // loop (dogfood MED).
+                let has_strategy = export.chunk_column.is_some()
+                    || export.chunk_by_key.is_some()
+                    || export.chunk_count.is_some()
+                    || export.chunk_by_days.is_some();
+                if !has_strategy && export.table.is_none() {
                     anyhow::bail!(
                         "export '{}': chunked mode needs a chunking strategy. Pick one:\n  \
                          chunk_column: <int col>    range chunks on an integer column (most common)\n  \

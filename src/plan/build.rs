@@ -96,8 +96,9 @@ pub fn build_plan(
             }
         }
         ExportMode::Cdc => anyhow::bail!(
-            "export '{}': cdc mode is run by the CDC runner, not batch plan \
-             resolution (internal routing error — dispatch should branch on mode first)",
+            "export '{}': cdc mode has no batch plan — CDC exports stream changes continuously and \
+             are run with `rivet run` (or the `rivet cdc` subcommand), not `rivet plan` / `rivet \
+             apply`. Plan the batch exports separately, or run this one with `rivet run`.",
             export.name
         ),
     };
