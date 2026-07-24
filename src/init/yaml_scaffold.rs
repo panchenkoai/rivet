@@ -543,6 +543,18 @@ fn export_block_lines(
                 yaml_quote_if_needed(cursor)
             ));
         }
+        "time_window" => {
+            // time_window REQUIRES time_column (+ days_window) — omitting them
+            // scaffolds a config that immediately fails `rivet check`
+            // ("time_window mode requires time_column"). Seed from the best
+            // timestamp column (same resolution as incremental's cursor).
+            let ts = info.best_cursor_column().unwrap_or("updated_at");
+            lines.push(format!("    time_column: {}", yaml_quote_if_needed(ts)));
+            lines.push(
+                "    days_window: 7  # export the last N days on each run (half-open window; tune to your retention)"
+                    .to_string(),
+            );
+        }
         _ => {}
     }
 
@@ -1098,6 +1110,39 @@ mod tests {
         );
         // The decimal override still rides (same type pipeline as batch).
         assert!(yaml.contains("amount: decimal(18,2)"), "got:\n{yaml}");
+    }
+
+    #[test]
+    fn time_window_mode_scaffolds_time_column_and_days_window() {
+        // #dogfood MED: `init --mode time_window` used to omit time_column /
+        // days_window (the match had no time_window arm), so the scaffold
+        // immediately failed `rivet check` ("time_window mode requires time_column").
+        let info = make_table(vec![col("id", "bigint"), col("updated_at", "timestamp")]);
+        let dest = InitYamlDestination::default();
+        let yaml = generate_config(
+            &info,
+            "postgresql://rivet:rivet@localhost/rivet",
+            &crate::init::SourceProvenance::Inline,
+            &dest,
+            Some("time_window"),
+        )
+        .unwrap();
+        assert!(yaml.contains("mode: time_window"), "got:\n{yaml}");
+        assert!(
+            yaml.contains("time_column: updated_at"),
+            "time_window must scaffold time_column:\n{yaml}"
+        );
+        assert!(
+            yaml.contains("days_window:"),
+            "time_window must scaffold days_window:\n{yaml}"
+        );
+        let parsed: serde_yaml_ng::Value =
+            serde_yaml_ng::from_str(&yaml).expect("scaffold must be valid YAML");
+        assert_eq!(
+            parsed["exports"][0]["mode"].as_str(),
+            Some("time_window"),
+            "got:\n{yaml}"
+        );
     }
 
     #[test]

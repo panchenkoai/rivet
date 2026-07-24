@@ -322,7 +322,7 @@ Generate a config scaffold from a live database (connect + introspect)
 
 ###### **Options:**
 
-* `--source <SOURCE>` — Database URL (postgresql://, mysql://, or sqlserver://). Visible in shell history / `ps`; prefer `--source-env` or `--source-file` for anything other than local dev
+* `--source <SOURCE>` — Database URL (postgresql://, mysql://, sqlserver://, or mongodb://). Visible in shell history / `ps`; prefer `--source-env` or `--source-file` for anything other than local dev
 * `--source-env <ENV_VAR>` — Name of an environment variable holding the database URL (e.g. DATABASE_URL). The URL never touches the command line
 * `--source-file <PATH>` — Path to a file containing just the database URL (one line). Credentials stay on disk instead of entering the process command line
 * `--table <TABLE>` — Single table, optionally schema-qualified (e.g. public.orders, dbo.orders). Omit to emit all tables/views in a Postgres/SQL Server schema or MySQL database

@@ -244,7 +244,7 @@ pub enum Commands {
     /// Generate a config scaffold from a live database (connect + introspect)
     #[command(group = clap::ArgGroup::new("source_spec").required(true).multiple(false))]
     Init {
-        /// Database URL (postgresql://, mysql://, or sqlserver://). Visible in shell history / `ps`;
+        /// Database URL (postgresql://, mysql://, sqlserver://, or mongodb://). Visible in shell history / `ps`;
         /// prefer `--source-env` or `--source-file` for anything other than local dev.
         #[arg(long, group = "source_spec")]
         source: Option<String>,

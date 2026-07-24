@@ -397,6 +397,15 @@ pub fn init(
                     "rivet: note: --gcs-bucket / --s3-bucket are ignored for --discover (JSON has no destination)"
                 );
             }
+            if mode_override.is_some() {
+                // The discovery artifact reports the DB's shape + a *suggested*
+                // mode; it has no per-export `mode:` to override. Silently
+                // ignoring --mode made `--discover --mode cdc` byte-identical to
+                // `--discover` with no signal.
+                eprintln!(
+                    "rivet: note: --mode is ignored for --discover (the artifact reports a suggested_mode, not a chosen one); run without --discover to scaffold a YAML with that mode"
+                );
+            }
             (
                 init_discovery_json(source_url, table, schema, filter)?,
                 false,
@@ -406,7 +415,12 @@ pub fn init(
 
     match output {
         Some(path) => {
-            std::fs::write(path, &text)?;
+            std::fs::write(path, &text).map_err(|e| {
+                anyhow::anyhow!(
+                    "init: could not write config to '{path}': {e} \
+                     (check the parent directory exists and is writable; `-o` takes a file path, not a directory)"
+                )
+            })?;
             let label_written = match format {
                 InitFormat::Yaml => "Config",
                 InitFormat::DiscoveryJson => "Discovery artifact",
@@ -462,6 +476,89 @@ fn next_steps_block(path: &str, provenance: &SourceProvenance) -> String {
     s
 }
 
+/// The "nothing to scaffold" error, filter-aware. When an `--include`/`--exclude`
+/// glob is active, an empty result usually means the globs filtered everything
+/// out (the schema has tables) — blaming `--schema`/privileges then sends the
+/// operator down the wrong path. Point at the filter first.
+fn no_tables_error(filter: &TableFilter) -> anyhow::Error {
+    if !filter.include.is_empty() || !filter.exclude.is_empty() {
+        anyhow::anyhow!(
+            "No tables/views matched the --include/--exclude globs (or the schema is empty). \
+             Check the globs — the same source without filters may discover tables — and also \
+             verify --schema and privileges."
+        )
+    } else {
+        anyhow::anyhow!("No tables or views found (check --schema and privileges)")
+    }
+}
+
+/// Resolve the effective schema for a single `--table`, honoring `--schema`.
+/// `--table schema.name` embeds the schema; `--schema` supplies it when the
+/// table is bare. Returns `(Some(schema), name)` when a schema is known, or
+/// `(None, name)` to let the engine default apply (PG `public`, MSSQL `dbo`).
+/// Both an embedded schema AND a differing `--schema` is a conflict — silently
+/// dropping one let a nonexistent schema look valid (the config for `x.users`
+/// and `--schema x --table users` came out identical to no-schema).
+fn resolve_single_table_schema<'a>(
+    table: &'a str,
+    schema_flag: Option<&str>,
+) -> Result<(Option<String>, &'a str)> {
+    let (parsed_schema, name) = yaml_scaffold::parse_table(table);
+    let has_embedded = table.contains('.');
+    match schema_flag.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(s) if has_embedded && s != parsed_schema => anyhow::bail!(
+            "init: --table '{table}' already names schema '{parsed_schema}', but --schema is \
+             '{s}' — remove one so they agree"
+        ),
+        // Bare `--table` + `--schema`: the flag supplies the schema.
+        Some(s) if !has_embedded => Ok((Some(s.to_string()), name)),
+        // Embedded schema (matching or no flag), or no flag at all.
+        _ => Ok((has_embedded.then_some(parsed_schema), name)),
+    }
+}
+
+/// Introspect one `--table` (single-table init), honoring `--schema`. Shared by
+/// the YAML and discovery-JSON paths so the schema wiring can't drift between
+/// them. For MySQL, `--schema` selects the database via `USE`; for PG/MSSQL it
+/// is the introspection schema (defaulting to `public`/`dbo`).
+fn introspect_single_table(
+    source_url: &str,
+    table: &str,
+    schema_flag: Option<&str>,
+) -> Result<TableInfo> {
+    let (eff_schema, table_name) = resolve_single_table_schema(table, schema_flag)?;
+    Ok(match source_type(source_url)? {
+        "postgres" => {
+            let mut client = postgres::connect(source_url)?;
+            postgres::introspect(
+                &mut client,
+                eff_schema.as_deref().unwrap_or("public"),
+                table_name,
+            )?
+        }
+        "mysql" => {
+            let mut conn = mysql::connect(source_url)?;
+            if let Some(db) = eff_schema.as_deref() {
+                mysql::use_database(&mut conn, db)?;
+            }
+            mysql::introspect(&mut conn, table_name)?
+        }
+        "mssql" => {
+            let mut conn = mssql::connect(source_url)?;
+            mssql::introspect(
+                &mut conn,
+                &mssql_table_schema(eff_schema.as_deref().unwrap_or("public")),
+                table_name,
+            )?
+        }
+        "mongo" => {
+            let conn = mongo::connect(source_url)?;
+            mongo::introspect(&conn, table_name)?
+        }
+        _ => unreachable!(),
+    })
+}
+
 fn init_yaml(
     source_url: &str,
     provenance: &SourceProvenance,
@@ -472,26 +569,7 @@ fn init_yaml(
     mode_override: Option<&str>,
 ) -> Result<(String, bool)> {
     if let Some(t) = table {
-        let (sch, table_name) = yaml_scaffold::parse_table(t);
-        let info = match source_type(source_url)? {
-            "postgres" => {
-                let mut client = postgres::connect(source_url)?;
-                postgres::introspect(&mut client, &sch, table_name)?
-            }
-            "mysql" => {
-                let mut conn = mysql::connect(source_url)?;
-                mysql::introspect(&mut conn, table_name)?
-            }
-            "mssql" => {
-                let mut conn = mssql::connect(source_url)?;
-                mssql::introspect(&mut conn, &mssql_table_schema(&sch), table_name)?
-            }
-            "mongo" => {
-                let conn = mongo::connect(source_url)?;
-                mongo::introspect(&conn, table_name)?
-            }
-            _ => unreachable!(),
-        };
+        let info = introspect_single_table(source_url, t, schema)?;
         let hint = yaml_scaffold::table_has_unbounded_decimal_columns(&info);
         let yaml =
             yaml_scaffold::generate_config(&info, source_url, provenance, dest, mode_override)?;
@@ -499,7 +577,7 @@ fn init_yaml(
     }
     let infos = introspect_all(source_url, schema, filter)?;
     if infos.is_empty() {
-        anyhow::bail!("No tables or views found (check --schema and privileges)");
+        return Err(no_tables_error(filter));
     }
     let label = schema_scope_label(source_url, schema, infos.len())?;
     let hint = infos
@@ -523,26 +601,7 @@ fn init_discovery_json(
     filter: &TableFilter,
 ) -> Result<String> {
     let (infos, scope) = if let Some(t) = table {
-        let (sch, table_name) = yaml_scaffold::parse_table(t);
-        let info = match source_type(source_url)? {
-            "postgres" => {
-                let mut client = postgres::connect(source_url)?;
-                postgres::introspect(&mut client, &sch, table_name)?
-            }
-            "mysql" => {
-                let mut conn = mysql::connect(source_url)?;
-                mysql::introspect(&mut conn, table_name)?
-            }
-            "mssql" => {
-                let mut conn = mssql::connect(source_url)?;
-                mssql::introspect(&mut conn, &mssql_table_schema(&sch), table_name)?
-            }
-            "mongo" => {
-                let conn = mongo::connect(source_url)?;
-                mongo::introspect(&conn, table_name)?
-            }
-            _ => unreachable!(),
-        };
+        let info = introspect_single_table(source_url, t, schema)?;
         let scope = match source_type(source_url)? {
             "postgres" => format!("table \"{}\".\"{}\"", info.schema, info.table),
             "mysql" => format!("table `{}`", info.table),
@@ -554,7 +613,7 @@ fn init_discovery_json(
     } else {
         let infos = introspect_all(source_url, schema, filter)?;
         if infos.is_empty() {
-            anyhow::bail!("No tables or views found (check --schema and privileges)");
+            return Err(no_tables_error(filter));
         }
         let label = schema_scope_label(source_url, schema, infos.len())?;
         (infos, label)
@@ -1287,6 +1346,71 @@ mod tests {
         assert_eq!(mssql_table_schema("public"), "dbo");
         // An explicitly-qualified schema is honoured verbatim.
         assert_eq!(mssql_table_schema("sales"), "sales");
+    }
+
+    #[test]
+    fn resolve_single_table_schema_honors_schema_flag_and_detects_conflict() {
+        // #dogfood MED: `--schema` was silently dropped when `--table` was given,
+        // so a nonexistent schema looked valid (identical output). Bare table +
+        // --schema now folds the schema in.
+        assert_eq!(
+            resolve_single_table_schema("users", Some("myschema")).unwrap(),
+            (Some("myschema".to_string()), "users")
+        );
+        // No --schema on a bare table → None (engine default applies downstream).
+        assert_eq!(
+            resolve_single_table_schema("users", None).unwrap(),
+            (None, "users")
+        );
+        // Embedded schema wins; a matching --schema is fine.
+        assert_eq!(
+            resolve_single_table_schema("sales.orders", Some("sales")).unwrap(),
+            (Some("sales".to_string()), "orders")
+        );
+        assert_eq!(
+            resolve_single_table_schema("sales.orders", None).unwrap(),
+            (Some("sales".to_string()), "orders")
+        );
+        // Embedded schema AND a DIFFERING --schema is a loud conflict, not a
+        // silent drop.
+        let err = resolve_single_table_schema("sales.orders", Some("other"))
+            .expect_err("conflicting schema must error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("already names schema 'sales'") && msg.contains("--schema is 'other'"),
+            "conflict must name both schemas: {msg}"
+        );
+        // A blank/whitespace --schema is treated as absent, not a conflict.
+        assert_eq!(
+            resolve_single_table_schema("sales.orders", Some("  ")).unwrap(),
+            (Some("sales".to_string()), "orders")
+        );
+    }
+
+    #[test]
+    fn no_tables_error_points_at_the_filter_when_globs_are_active() {
+        // #dogfood LOW: an --include/--exclude that filters everything out used
+        // to emit the schema/privileges message, sending the operator down the
+        // wrong path. With a filter active the error names the globs first.
+        let filtered = no_tables_error(&TableFilter {
+            include: vec!["zzz_nomatch_*".into()],
+            exclude: vec![],
+        });
+        assert!(
+            format!("{filtered}").contains("--include/--exclude"),
+            "filtered-out error must name the globs: {filtered}"
+        );
+        let exclude_all = no_tables_error(&TableFilter {
+            include: vec![],
+            exclude: vec!["*".into()],
+        });
+        assert!(format!("{exclude_all}").contains("--include/--exclude"));
+        // No filter → the original schema/privileges message.
+        let unfiltered = no_tables_error(&TableFilter::default());
+        assert!(
+            format!("{unfiltered}").contains("check --schema and privileges"),
+            "unfiltered error keeps the schema/privileges hint: {unfiltered}"
+        );
     }
 
     #[test]
