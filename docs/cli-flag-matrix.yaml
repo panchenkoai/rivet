@@ -95,3 +95,17 @@ scenarios:
     mysql:    { test: stand_time_window_mysql }
     mssql:    { test: stand_time_window_mssql }
     mongo:    { na: "no SQL time_window on the Mongo reader (it pages _id)." }
+
+  - id: keyset_key_type_extractable
+    what: "GARBAGE (dogfood): `chunk_by_key` must refuse a key type the keyset CURSOR cannot read (`decimal`/`numeric`) at PLAN time — a loud bail naming the type, NOT a partial write then a mid-run 'could not read the key value' failure. The keyset_keys introspection excludes decimal/numeric on every SQL engine so the planner never offers an un-advanceable key."
+    postgres: { test: stand_keyset_decimal_key_bails_postgres }
+    mysql:    { test: stand_keyset_decimal_key_bails_mysql }
+    mssql:    { test: stand_keyset_decimal_key_bails_mssql }
+    mongo:    { na: "Mongo keysets by `_id` (always extractable); no user chunk_by_key type to refuse." }
+
+  - id: mongo_parallel_needs_page_size
+    what: "GARBAGE (dogfood): `parallel: N` on a Mongo `mode: full` export fans out the `_id`-range reader, which requires `source.mongo.page_size`. Without it the export is a single cursor and `parallel: N` is a NO-OP — rivet must WARN, not silently drop it (Mongo-only; the SQL engines fan out via chunk/keyset)."
+    postgres: { na: "SQL parallelism is via chunked/keyset runners, not a Mongo _id-range fan-out." }
+    mysql:    { na: "SQL parallelism is via chunked/keyset runners." }
+    mssql:    { na: "SQL parallelism is via chunked/keyset runners." }
+    mongo:    { test: full_strategy_mongo_parallel_without_page_size_is_snapshot_and_warns }

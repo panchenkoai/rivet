@@ -61,6 +61,11 @@ const MATRICES: &[(&str, usize)] = &[
     // cursor = MySQL, regclass-throw = PG, STRING_AGG cap = MSSQL) are one test
     // + justified n/a. 0 gaps — every cell is a test or a justified n/a.
     ("docs/cli-flag-matrix.yaml", 0),
+    // Destination-backend correctness (local/gcs/s3/azure × scenario): the dogfood
+    // cloud findings (prefix normalization B, --validate-is-advisory A) + the
+    // emulator round-trip + cross-backend parity. 1 gap: no azurite full-round-trip
+    // stand test (the CloudDestination path is shared + proven on S3/GCS).
+    ("docs/destination-matrix.yaml", 1),
     ("docs/behaviour-matrix.yaml", 0),
     ("docs/type-fidelity-matrix.yaml", 0),
     // Cross config × db: 15 honest holes on the non-PG engines (cloud dests, codec

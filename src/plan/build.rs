@@ -1444,6 +1444,37 @@ mod tests {
     }
 
     #[test]
+    fn full_strategy_mongo_parallel_without_page_size_is_snapshot_and_warns() {
+        // #dogfood: `parallel: N` on a Mongo full export fans out the `_id`-range
+        // reader, which needs `source.mongo.page_size`. WITHOUT it the strategy is
+        // Snapshot (a single cursor) — parallel is a no-op — and rivet WARNS rather
+        // than silently dropping the flag. WITH page_size it engages the Keyset
+        // (`_id`-range parallel) runner instead.
+        let base = "source: { type: mongo, url: \"mongodb://127.0.0.1:27017/db\"MONGO }\n\
+                    exports:\n  - name: m\n    table: coll\n    mode: full\n    parallel: 4\n    \
+                    format: parquet\n    destination: { type: local, path: ./o }\n";
+        let cfg_no_page =
+            crate::config::Config::from_yaml(&base.replace("MONGO", "")).expect("parses");
+        assert!(
+            matches!(
+                full_strategy(&cfg_no_page, &cfg_no_page.exports[0]),
+                ExtractionStrategy::Snapshot
+            ),
+            "mongo full + parallel WITHOUT page_size must be Snapshot (parallel is a no-op)"
+        );
+        let cfg_page =
+            crate::config::Config::from_yaml(&base.replace("MONGO", ", mongo: { page_size: 500 }"))
+                .expect("parses");
+        assert!(
+            matches!(
+                full_strategy(&cfg_page, &cfg_page.exports[0]),
+                ExtractionStrategy::Keyset(_)
+            ),
+            "mongo full + parallel WITH page_size must engage the _id-range Keyset runner"
+        );
+    }
+
+    #[test]
     fn expand_destination_templates_no_placeholders_unchanged() {
         let dest = DestinationConfig {
             destination_type: DestinationType::Local,
