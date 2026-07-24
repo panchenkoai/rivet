@@ -582,11 +582,30 @@ fn introspect_single_table(
             )?
         }
         "mongo" => {
+            // #12 bughunt: --schema was silently ignored for Mongo (the cross-db
+            // guard the SQL engines got was absent), so an operator scoping to a
+            // schema got the URL's database instead. Mongo has no schema namespace
+            // — refuse rather than mislead; the database lives in the URL.
+            reject_mongo_schema(schema_flag)?;
             let conn = mongo::connect(source_url)?;
             mongo::introspect(&conn, table_name)?
         }
         _ => unreachable!(),
     })
+}
+
+/// MongoDB has no schema namespace (collections live directly in a database), so
+/// an explicit `--schema` cannot be honoured — it was silently ignored, exporting
+/// the URL's database instead of what the operator asked for (#12 bughunt). Refuse
+/// it loudly; the database belongs in the connection URL.
+fn reject_mongo_schema(schema_flag: Option<&str>) -> Result<()> {
+    if schema_flag.map(str::trim).is_some_and(|s| !s.is_empty()) {
+        anyhow::bail!(
+            "init: --schema is not supported for MongoDB — a collection has no schema \
+             namespace. Put the database in the connection URL instead (mongodb://…/<db>)."
+        );
+    }
+    Ok(())
 }
 
 fn init_yaml(
@@ -770,6 +789,7 @@ fn introspect_all(
             Ok(out)
         }
         "mongo" => {
+            reject_mongo_schema(schema)?;
             let conn = mongo::connect(source_url)?;
             let names = retain_filtered(mongo::list_tables(&conn)?, filter);
             let mut out = Vec::with_capacity(names.len());
@@ -1395,6 +1415,19 @@ mod tests {
         assert_eq!(mssql_table_schema("public"), "dbo");
         // An explicitly-qualified schema is honoured verbatim.
         assert_eq!(mssql_table_schema("sales"), "sales");
+    }
+
+    #[test]
+    fn reject_mongo_schema_refuses_explicit_schema_but_allows_absent() {
+        // #12 bughunt: --schema was silently ignored for Mongo. It must be refused
+        // (a collection has no schema namespace), while absent/blank is fine.
+        assert!(super::reject_mongo_schema(Some("mydb")).is_err());
+        assert!(super::reject_mongo_schema(Some("  ")).is_ok());
+        assert!(super::reject_mongo_schema(None).is_ok());
+        let err = super::reject_mongo_schema(Some("mydb"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not supported for MongoDB"), "got: {err}");
     }
 
     #[test]

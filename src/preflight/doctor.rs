@@ -216,6 +216,16 @@ pub fn doctor(config_path: &str, json: bool) -> Result<()> {
             }
             Err(e) => {
                 all_ok = false;
+                // #15 bughunt: a TRANSIENT destination failure (S3 timeout, network
+                // blip) must exit Retryable (2), same as a transient SOURCE failure
+                // — the typed signal was set only in the source arm, so a healthy
+                // source + transiently-down destination exited Generic (1). Preserve
+                // the first transient detail (source-first) so classify_exit sees it.
+                if transient_detail.is_none()
+                    && crate::pipeline::retry::classify_error(&e).is_transient()
+                {
+                    transient_detail = Some(format!("{e:#}"));
+                }
                 let category = categorize_dest_error(&e, &expanded_dest);
                 let hint = destination_error_hint(category, &expanded_dest).map(|h| h.to_string());
                 emit_check(
@@ -238,6 +248,17 @@ pub fn doctor(config_path: &str, json: bool) -> Result<()> {
     for c in super::cdc_health::collect(&config) {
         if !c.ok {
             all_ok = false;
+            // #15 bughunt: a transient CDC-health failure should also drive
+            // Retryable (2). These checks arrive pre-stringified, so classify the
+            // detail text (best-effort) rather than a typed error. First transient
+            // signal wins (source/destination arms run before this).
+            if transient_detail.is_none()
+                && let Some(detail) = &c.detail
+                && crate::pipeline::retry::classify_error(&anyhow::anyhow!("{detail}"))
+                    .is_transient()
+            {
+                transient_detail = Some(detail.clone());
+            }
         }
         emit_check(&mut checks, json, c);
     }
