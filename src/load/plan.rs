@@ -16,8 +16,11 @@ use std::process::Command;
 ///
 /// `cleanup_source`/`cluster_by` are target-agnostic; the warehouse and its
 /// connection config live in [`LoadTarget`], keyed on the `target:`
-/// discriminator — so a config that names `snowflake` cannot carry BigQuery
-/// fields (invalid combos fail to deserialize; no runtime `validate()`).
+/// discriminator. NOTE: `#[serde(flatten)]` on `target` DISABLES serde's
+/// `deny_unknown_fields`, so cross-warehouse fields do NOT fail to deserialize —
+/// a `target: snowflake` block silently accepted BigQuery's `project:`/`dataset:`
+/// (dogfood LOW). [`reject_foreign_target_fields`] is the runtime guard that
+/// closes that gap; the "invalid combos fail to deserialize" belief was false.
 #[derive(Debug, Clone, Deserialize)]
 pub struct LoadSection {
     #[serde(flatten)]
@@ -159,6 +162,11 @@ impl LoadMode {
 /// What a rivet config resolves to for a BigQuery load.
 #[derive(Debug, Clone)]
 pub struct LoadPlan {
+    /// The declared export NAME (config `name:`), distinct from the warehouse
+    /// `table` — error messages address the export the operator wrote, not the
+    /// table it resolves to (dogfood LOW: require_pk labelled the table as the
+    /// export).
+    pub export_name: String,
     pub table: String,
     pub partition_by: Option<String>,
     pub specs: Vec<TargetColumnSpec>,
@@ -236,6 +244,44 @@ fn check_load_keys(value: &serde_json::Value, whose: &str) -> Result<()> {
     Ok(())
 }
 
+/// Warehouse fields that belong to exactly ONE target.
+const BIGQUERY_ONLY: &[&str] = &["project", "dataset"];
+const SNOWFLAKE_ONLY: &[&str] = &[
+    "connection",
+    "warehouse",
+    "database",
+    "schema",
+    "storage_integration",
+];
+
+/// Reject fields that belong to a DIFFERENT warehouse than the resolved
+/// `target`. `#[serde(flatten)]` on the target enum can't `deny_unknown_fields`,
+/// so `LOAD_KEYS` (the union of all warehouses' fields) let a `target: snowflake`
+/// block silently carry — and ignore — BigQuery's `project:`/`dataset:` (and
+/// vice versa) (dogfood LOW). Name the offending key and its warehouse.
+fn reject_foreign_target_fields(
+    value: &serde_json::Value,
+    target: &str,
+    whose: &str,
+) -> Result<()> {
+    let (foreign, other) = match target {
+        "bigquery" => (SNOWFLAKE_ONLY, "snowflake"),
+        "snowflake" => (BIGQUERY_ONLY, "bigquery"),
+        _ => return Ok(()),
+    };
+    if let Some(obj) = value.as_object() {
+        for k in obj.keys() {
+            if foreign.contains(&k.as_str()) {
+                bail!(
+                    "the {whose} `load:` block targets `{target}` but carries `{k}`, a `{other}` \
+                     field — remove it (it would be silently ignored, masking a mis-configured load)"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Resolve a load's staging prefix from an export destination.
 ///
 /// Expands the same `{date}`/`{export}`/`{table}` placeholders the export wrote
@@ -282,8 +328,9 @@ pub fn plan_loads(config_path: &str, rivet_bin: &str) -> Result<Vec<LoadPlan>> {
         "config has no top-level `load:` block — add `load: { target, ... }` to load into a warehouse",
     )?;
     check_load_keys(&load_value, "top-level")?;
-    let load: LoadSection =
-        serde_json::from_value(load_value).context("parsing the top-level `load:` block")?;
+    let load: LoadSection = serde_json::from_value(load_value.clone())
+        .context("parsing the top-level `load:` block")?;
+    reject_foreign_target_fields(&load_value, load.target.name(), "top-level")?;
 
     // Native schema from rivet's own resolver, for the load target — no
     // hand-typing. One JSON document per export, so parse a stream.
@@ -400,6 +447,7 @@ fn build_plans(
             None => load.clone(),
         };
         plans.push(LoadPlan {
+            export_name: export.name.clone(),
             table,
             partition_by: export.partition_by.clone(),
             specs,
@@ -781,5 +829,32 @@ load:
         );
         let ok = serde_json::json!({ "pk": ["id"], "cleanup_source": true });
         assert!(serde_json::from_value::<LoadOverride>(ok).is_ok());
+    }
+
+    #[test]
+    fn cross_warehouse_load_fields_are_rejected() {
+        // #dogfood LOW: `#[serde(flatten)]` on the target enum disables
+        // deny_unknown_fields, so a `target: snowflake` block silently accepted
+        // (and ignored) BigQuery's `project:`/`dataset:`. Now a loud error.
+        let snow_with_bq = serde_json::json!({
+            "target": "snowflake", "connection": "c", "warehouse": "w",
+            "database": "db", "schema": "s", "storage_integration": "si",
+            "project": "STALE", "dataset": "STALE"
+        });
+        let err = reject_foreign_target_fields(&snow_with_bq, "snowflake", "top-level")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("project") && err.contains("bigquery"),
+            "snowflake+project must name the foreign field and warehouse: {err}"
+        );
+        // The reverse: bigquery target carrying a snowflake-only field.
+        let bq_with_snow = serde_json::json!({
+            "target": "bigquery", "project": "p", "dataset": "d", "warehouse": "WH"
+        });
+        assert!(reject_foreign_target_fields(&bq_with_snow, "bigquery", "top-level").is_err());
+        // A clean, target-matching block passes.
+        let clean = serde_json::json!({ "target": "bigquery", "project": "p", "dataset": "d" });
+        assert!(reject_foreign_target_fields(&clean, "bigquery", "top-level").is_ok());
     }
 }

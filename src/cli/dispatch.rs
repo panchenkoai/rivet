@@ -125,7 +125,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             run_id,
         } => dispatch_load(LoadArgs {
             config,
-            rivet_bin,
+            rivet_bin: resolve_rivet_bin(rivet_bin),
             run_id,
         }),
         Commands::Init {
@@ -733,6 +733,20 @@ struct LoadArgs {
     run_id: Option<String>,
 }
 
+/// Resolve which `rivet` binary the load's `rivet check` subprocess runs.
+/// Defaults to THIS executable (self) so the type report comes from the SAME
+/// version — a `rivet` on `$PATH` may be an older, skewed version that rejects a
+/// valid config (dogfood MED). An explicit `--rivet-bin` always wins; a
+/// `current_exe()` failure falls back to `rivet` (the prior behaviour).
+fn resolve_rivet_bin(explicit: Option<String>) -> String {
+    explicit.unwrap_or_else(|| {
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.to_str().map(str::to_string))
+            .unwrap_or_else(|| "rivet".to_string())
+    })
+}
+
 /// `rivet load`: config-driven warehouse load. The top-level `load:` block
 /// declares the target once, and each export resolves to a table. A multi-table
 /// config loads every export into the shared target, one after another.
@@ -740,7 +754,14 @@ fn dispatch_load(args: LoadArgs) -> Result<()> {
     let plans = load::plan::plan_loads(&args.config, &args.rivet_bin)?;
     // One run id for the whole invocation, shared across every table — so warehouse
     // cost slices per load run (all tables together) as well as per table.
-    let run_id = args.run_id.clone().unwrap_or_else(generate_run_id);
+    // An empty `--run-id ""` / `RIVET_RUN_ID=""` (clap yields `Some("")`) must
+    // NOT become the correlation label verbatim — an empty warehouse tag and an
+    // empty-derived ledger load_id (dogfood LOW). Treat blank as absent.
+    let run_id = args
+        .run_id
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(generate_run_id);
     // The load ledger: the state DB — not the file prefix — is the source of
     // truth for what's loaded, so cleanup is safe for every mode and retry is
     // DB-driven (the GCS listing is only a fallback). A state-DB problem must
@@ -822,7 +843,7 @@ fn require_pk<'a>(plan: &'a load::plan::LoadPlan, mode: &str) -> Result<&'a [Str
         anyhow::bail!(
             "export `{}` is mode: {mode} but its `load:` block has no `pk:` — the current-state \
              dedup view needs a primary key (e.g. `pk: [id]`)",
-            plan.table
+            plan.export_name
         );
     }
     Ok(&plan.load.pk)
@@ -1272,6 +1293,23 @@ fn generate_run_id() -> String {
 #[cfg(test)]
 mod load_ledger_tests {
     use super::*;
+
+    #[test]
+    fn resolve_rivet_bin_defaults_to_self_not_path() {
+        // #dogfood MED: `rivet load` shelled out to `rivet` on $PATH (version
+        // skew). An explicit --rivet-bin wins; the default is THIS executable.
+        assert_eq!(resolve_rivet_bin(Some("/opt/rivet".into())), "/opt/rivet");
+        let self_bin = resolve_rivet_bin(None);
+        assert_ne!(
+            self_bin, "rivet",
+            "the default must be the resolved self-path, not the bare PATH name"
+        );
+        // current_exe() yields an absolute path in the test runner.
+        assert!(
+            self_bin.contains('/') || self_bin.contains('\\'),
+            "expected an absolute exe path, got: {self_bin}"
+        );
+    }
 
     const TARGET: &str = "proj.ds.orders";
 
