@@ -82,6 +82,15 @@ pub struct RunSummary {
     pub duration_ms: i64,
     pub peak_rss_mb: i64,
     pub retries: u32,
+    /// Of `retries`, how many opened a FRESH source connection (a
+    /// reconnect-class error: network reset, "gone away", tunnel drop). The
+    /// field-signal for a flaky link — N reconnects = N blips survived. Distinct
+    /// from a same-connection retry (a lock wait) that `retries` also counts.
+    pub reconnects: u32,
+    /// True when this run picked up a prior CRASHED run instead of starting fresh
+    /// (keyset via the in-progress run_id, chunked via `--resume`). A resume-hit is
+    /// the tell that the previous run died — visible in the run's own log line.
+    pub resumed: bool,
     pub validated: Option<bool>,
     pub schema_changed: Option<bool>,
     pub quality_passed: Option<bool>,
@@ -206,6 +215,8 @@ impl RunSummary {
             duration_ms: 0,
             peak_rss_mb: 0,
             retries: 0,
+            reconnects: 0,
+            resumed: false,
             validated: None,
             schema_changed: None,
             quality_passed: None,
@@ -276,6 +287,8 @@ impl RunSummary {
             duration_ms: 0,
             peak_rss_mb: 0,
             retries: 0,
+            reconnects: 0,
+            resumed: false,
             validated: None,
             schema_changed: None,
             quality_passed: None,

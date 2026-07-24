@@ -176,6 +176,51 @@ fn harm_deltas(before: &[(String, i64)], after: &[(String, i64)]) -> Vec<(String
         .collect()
 }
 
+/// A one-line run-health DIAGNOSIS for the operator's log — the flaky-link /
+/// messy-DB signals a field log must carry so a log the team sends back
+/// self-diagnoses. Returns `Some(line)` only when there is something worth
+/// flagging (a reconnect the run survived, a resume-hit meaning the prior run
+/// crashed, or a source-side tmp-disk spill that `export_harm` records but never
+/// LOGGED before); a clean run returns `None` — its stats already live in the run
+/// card. Emitted at WARN so it is visible at the default log level (INFO is not).
+/// Pure so the wording is unit-tested without a run. PG temp-byte spills are warned
+/// separately (`pg_temp_bytes_delta`), so they are not duplicated here.
+pub(super) fn run_diagnosis(summary: &RunSummary, harm_deltas: &[(String, i64)]) -> Option<String> {
+    let mut flags: Vec<String> = Vec::new();
+    if summary.reconnects > 0 {
+        flags.push(format!(
+            "{} reconnect(s) survived (flaky link)",
+            summary.reconnects
+        ));
+    }
+    if summary.resumed {
+        flags.push("resumed a prior CRASHED run".to_string());
+    }
+    let spills: i64 = harm_deltas
+        .iter()
+        .filter(|(k, _)| k.contains("tmp_disk"))
+        .map(|(_, v)| *v)
+        .sum();
+    if spills >= 100 {
+        flags.push(format!(
+            "{spills} tmp-disk spills — the source spilled to disk; try `mode: chunked`/`chunk_by_key` or a smaller `tuning.batch_size`"
+        ));
+    }
+    if flags.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "export '{}': DIAGNOSIS — {} rows @ {} MB in {} ms [{}] · retries={} · {}",
+        summary.export_name,
+        summary.total_rows,
+        summary.peak_rss_mb,
+        summary.duration_ms,
+        summary.status,
+        summary.retries,
+        flags.join("; "),
+    ))
+}
+
 /// Run `SELECT COUNT(*) FROM ({query})` against the source and compare with exported rows.
 /// Skips reconciliation for incremental exports that used a cursor (moving target).
 fn reconcile_source_count(plan: &ResolvedRunPlan, summary: &mut RunSummary) {
@@ -290,6 +335,8 @@ pub(crate) fn synthetic_failed_summary(export_name: &str, err: &anyhow::Error) -
         duration_ms: 0,
         peak_rss_mb: 0,
         retries: 0,
+        reconnects: 0,
+        resumed: false,
         validated: None,
         schema_changed: None,
         quality_passed: None,
@@ -536,17 +583,23 @@ pub(super) fn run_export_job(
 
     // Tier 2: record the per-counter source-harm delta. A failed or absent probe
     // (e.g. missing VIEW SERVER STATE on MSSQL) leaves no rows — never fatal.
+    let mut harm_delta_vec: Vec<(String, i64)> = Vec::new();
     if let Some(before) = &harm_before
         && let Some(after) = harm_snapshot(&plan)
     {
-        let deltas = harm_deltas(before, &after);
-        if let Err(e) = state.record_harm(&summary.run_id, &summary.export_name, &deltas) {
+        harm_delta_vec = harm_deltas(before, &after);
+        if let Err(e) = state.record_harm(&summary.run_id, &summary.export_name, &harm_delta_vec) {
             log::debug!(
                 "export '{}': harm metrics write failed (informational): {:#}",
                 summary.export_name,
                 e
             );
         }
+    }
+    // Self-diagnosing run-health line — makes a log the field team sends back
+    // readable at a glance (reconnects survived, a resume-hit, a source spill).
+    if let Some(line) = run_diagnosis(&summary, &harm_delta_vec) {
+        log::warn!("{line}");
     }
 
     let tuning_class = plan.tuning.profile_name().to_string();
@@ -764,6 +817,42 @@ pub(crate) fn run_export_job_with_chunk_source(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn run_diagnosis_flags_flaky_link_and_spill_signals_only() {
+        let base = || RunSummary {
+            export_name: "orders".into(),
+            total_rows: 1000,
+            peak_rss_mb: 50,
+            duration_ms: 2000,
+            status: "success".into(),
+            ..Default::default()
+        };
+        // A clean run has nothing to diagnose — its stats are in the run card.
+        assert!(run_diagnosis(&base(), &[]).is_none());
+        // Reconnects survived (the flaky-link signal) → flagged, with the count.
+        let mut s = base();
+        s.reconnects = 2;
+        s.retries = 3;
+        let line = run_diagnosis(&s, &[]).expect("reconnects must diagnose");
+        assert!(line.contains("2 reconnect"), "got: {line}");
+        assert!(line.contains("retries=3"), "got: {line}");
+        // A resume-hit means the prior run crashed → flagged.
+        let mut s = base();
+        s.resumed = true;
+        assert!(
+            run_diagnosis(&s, &[])
+                .unwrap()
+                .contains("resumed a prior CRASHED")
+        );
+        // A source tmp-disk spill (recorded in export_harm but never LOGGED before)
+        // → flagged with the escape hatch.
+        let line = run_diagnosis(&base(), &[("Created_tmp_disk_tables".into(), 2782)])
+            .expect("spills must diagnose");
+        assert!(line.contains("2782 tmp-disk spills"), "got: {line}");
+        // A negligible spill is noise, not a diagnosis on its own.
+        assert!(run_diagnosis(&base(), &[("Created_tmp_disk_tables".into(), 5)]).is_none());
+    }
 
     #[test]
     fn synthetic_failed_summary_fields() {

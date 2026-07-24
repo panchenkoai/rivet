@@ -164,6 +164,9 @@ pub(crate) fn run_keyset(
         None
     };
     let recovering_crash = resume_run_id.is_some();
+    // Surface the recovery in the run's own metrics/log line: a resume-hit is the
+    // tell that the prior run crashed (a flaky-link diagnosis signal).
+    summary.resumed = recovering_crash;
 
     let mut last: Option<String> = if kp.checkpoint && (recovering_crash || kp.incremental) {
         state
