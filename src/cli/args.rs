@@ -658,6 +658,25 @@ mod tests {
         }
     }
 
+    #[test]
+    fn init_source_help_lists_mongodb() {
+        // #dogfood LOW: `init --help` --source text omitted mongodb:// though init
+        // fully supports it (init routes mongodb to a dedicated path, and the
+        // scheme-validation error itself lists it).
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+        let init = cmd.find_subcommand("init").expect("init subcommand exists");
+        let source = init
+            .get_arguments()
+            .find(|a| a.get_id() == "source")
+            .expect("--source arg exists");
+        let help = source.get_help().map(|h| h.to_string()).unwrap_or_default();
+        assert!(
+            help.contains("mongodb"),
+            "init --source help must list mongodb://, got: {help}"
+        );
+    }
+
     fn state_reset_chunks_parse_from(
         extra_after_config: &[&str],
     ) -> std::result::Result<(), clap::error::ErrorKind> {

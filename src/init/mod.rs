@@ -415,12 +415,7 @@ pub fn init(
 
     match output {
         Some(path) => {
-            std::fs::write(path, &text).map_err(|e| {
-                anyhow::anyhow!(
-                    "init: could not write config to '{path}': {e} \
-                     (check the parent directory exists and is writable; `-o` takes a file path, not a directory)"
-                )
-            })?;
+            write_config_output(path, &text)?;
             let label_written = match format {
                 InitFormat::Yaml => "Config",
                 InitFormat::DiscoveryJson => "Discovery artifact",
@@ -490,6 +485,18 @@ fn no_tables_error(filter: &TableFilter) -> anyhow::Error {
     } else {
         anyhow::anyhow!("No tables or views found (check --schema and privileges)")
     }
+}
+
+/// Write the scaffold to `-o <path>`, naming the path + cause on failure. The
+/// bare `std::fs::write` error ("No such file or directory (os error 2)") named
+/// neither the path nor the operation (dogfood LOW).
+fn write_config_output(path: &str, text: &str) -> Result<()> {
+    std::fs::write(path, text).map_err(|e| {
+        anyhow::anyhow!(
+            "init: could not write config to '{path}': {e} \
+             (check the parent directory exists and is writable; `-o` takes a file path, not a directory)"
+        )
+    })
 }
 
 /// Resolve the effective schema for a single `--table`, honoring `--schema`.
@@ -1410,6 +1417,23 @@ mod tests {
         assert!(
             format!("{unfiltered}").contains("check --schema and privileges"),
             "unfiltered error keeps the schema/privileges hint: {unfiltered}"
+        );
+    }
+
+    #[test]
+    fn write_config_output_names_the_path_and_op_on_failure() {
+        // #dogfood LOW: a bad `-o` path emitted a bare "No such file or directory
+        // (os error 2)" naming neither the path nor the failed operation.
+        let err = write_config_output("no_such_dir_xyz/sub/cfg.yaml", "source: {}\n")
+            .expect_err("a missing parent dir must fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("no_such_dir_xyz/sub/cfg.yaml"),
+            "must name the path: {msg}"
+        );
+        assert!(
+            msg.contains("could not write config"),
+            "must name the operation: {msg}"
         );
     }
 

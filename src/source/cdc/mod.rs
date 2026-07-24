@@ -1125,4 +1125,23 @@ mod tests {
         super::run(&mut s, None, vec!["orders".into()], None)
             .expect("uncaptured poison must not bail the NDJSON run");
     }
+
+    // A stream that MUST NOT be consumed — `next_change` panics if polled.
+    struct Forbidden;
+    impl super::ChangeStream for Forbidden {
+        fn next_change(&mut self) -> Option<Result<super::ChangeEvent>> {
+            panic!("run must not poll the stream when --max-events 0");
+        }
+    }
+
+    // #dogfood LOW: `--max-events 0` emitted exactly ONE event — the cap was
+    // checked AFTER the emit (`emitted += 1; if emitted >= 0 break`), an
+    // off-by-one. It is now a true no-op: the early return means the stream is
+    // never even polled. RED against the old loop, which would poll (→ panic).
+    #[test]
+    fn max_events_zero_is_a_true_no_op_never_polls_the_stream() {
+        let mut s = Forbidden;
+        super::run(&mut s, None, vec!["orders".into()], Some(0))
+            .expect("--max-events 0 must be a clean no-op");
+    }
 }

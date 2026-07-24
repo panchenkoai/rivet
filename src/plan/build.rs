@@ -822,6 +822,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cdc_export_plan_gives_a_friendly_message_not_an_internal_invariant() {
+        // #dogfood MED: `rivet plan` on a cdc-mode export leaked "internal routing
+        // error — dispatch should branch on mode first". The bail is now
+        // user-facing (points at `rivet run`), reached before any DB probe.
+        let mut export = minimal_export();
+        export.mode = ExportMode::Cdc;
+        let err = build_plan(
+            &minimal_config(),
+            &export,
+            Path::new("."),
+            false,
+            false,
+            false,
+            None,
+        )
+        .unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("no batch plan") && msg.contains("rivet run"),
+            "must point the user at `rivet run`, got: {msg}"
+        );
+        assert!(
+            !msg.contains("internal routing error"),
+            "must not leak the internal invariant, got: {msg}"
+        );
+    }
+
     // ── auto-resolve chunk_column friendly errors (no DB) ─────────────────
 
     #[test]

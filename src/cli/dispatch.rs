@@ -693,18 +693,27 @@ fn dispatch_state(action: StateAction) -> Result<()> {
 
 /// `rivet state loads`: print the load ledger — one row per recorded `rivet
 /// load`, newest first.
+/// The empty-`state loads` message, or `None` when nothing should print. A
+/// zero-row request (`--last 0`) prints nothing (matching `--json []`); an
+/// unmatched `--target` filter says so rather than claiming the ledger is empty;
+/// an unfiltered empty result keeps the "no loads recorded" line (dogfood LOW —
+/// the old code printed "empty state DB" even for a filter miss on a full ledger).
+fn empty_loads_message(target: Option<&str>, last: usize) -> Option<String> {
+    if last == 0 {
+        return None;
+    }
+    Some(match target {
+        Some(t) => format!("no loads match --target '{t}'"),
+        None => "no loads recorded in the state DB yet".to_string(),
+    })
+}
+
 fn show_loads(config: &str, target: Option<&str>, last: usize) -> Result<()> {
     let store = StateStore::open(config)?;
     let loads = store.recent_loads(target, last)?;
     if loads.is_empty() {
-        // Don't conflate a zero-row request (`--last 0`) or an unmatched
-        // `--target` filter with an empty ledger (dogfood LOW): the old message
-        // claimed "the state DB is empty" even when it held other rows.
-        if last != 0 {
-            match target {
-                Some(t) => println!("no loads match --target '{t}'"),
-                None => println!("no loads recorded in the state DB yet"),
-            }
+        if let Some(msg) = empty_loads_message(target, last) {
+            println!("{msg}");
         }
         return Ok(());
     }
@@ -754,14 +763,7 @@ fn dispatch_load(args: LoadArgs) -> Result<()> {
     let plans = load::plan::plan_loads(&args.config, &args.rivet_bin)?;
     // One run id for the whole invocation, shared across every table — so warehouse
     // cost slices per load run (all tables together) as well as per table.
-    // An empty `--run-id ""` / `RIVET_RUN_ID=""` (clap yields `Some("")`) must
-    // NOT become the correlation label verbatim — an empty warehouse tag and an
-    // empty-derived ledger load_id (dogfood LOW). Treat blank as absent.
-    let run_id = args
-        .run_id
-        .clone()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(generate_run_id);
+    let run_id = resolve_run_id(args.run_id.clone());
     // The load ledger: the state DB — not the file prefix — is the source of
     // truth for what's loaded, so cleanup is safe for every mode and retry is
     // DB-driven (the GCS listing is only a fallback). A state-DB problem must
@@ -1277,6 +1279,17 @@ fn load_one(
     )
 }
 
+/// The correlation run-id for a load: the explicit `--run-id` / `RIVET_RUN_ID`
+/// if it carries a non-blank value, else a generated one. A blank string (clap
+/// yields `Some("")` for `--run-id ""` / `RIVET_RUN_ID=""`) is treated as absent
+/// — otherwise it became an empty warehouse tag + empty-derived ledger load_id
+/// (dogfood LOW).
+fn resolve_run_id(explicit: Option<String>) -> String {
+    explicit
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(generate_run_id)
+}
+
 /// A per-invocation load-run id: microsecond-since-epoch hex + zero-padded pid
 /// hex. Pure lowercase hex, so it survives both BigQuery's `[a-z0-9_-]` label
 /// charset and Snowflake's alphanumeric `QUERY_TAG` sanitizer unchanged — the
@@ -1308,6 +1321,72 @@ mod load_ledger_tests {
         assert!(
             self_bin.contains('/') || self_bin.contains('\\'),
             "expected an absolute exe path, got: {self_bin}"
+        );
+    }
+
+    #[test]
+    fn resolve_run_id_treats_blank_as_absent() {
+        // #dogfood LOW: `--run-id ""` / RIVET_RUN_ID="" (clap → Some("")) must not
+        // become the correlation label verbatim — blank is treated as absent.
+        assert_eq!(resolve_run_id(Some("abc".into())), "abc");
+        for blank in [Some(String::new()), Some("   ".into())] {
+            let id = resolve_run_id(blank.clone());
+            assert!(
+                !id.trim().is_empty(),
+                "blank {blank:?} must yield a generated id, got {id:?}"
+            );
+        }
+        assert!(!resolve_run_id(None).is_empty());
+    }
+
+    #[test]
+    fn empty_loads_message_distinguishes_zero_request_and_filter_miss() {
+        // #dogfood LOW: `--last 0` and an unmatched `--target` were both reported
+        // as "no loads recorded in the state DB yet" on a NON-empty ledger.
+        assert_eq!(empty_loads_message(None, 0), None); // --last 0 → print nothing
+        assert_eq!(empty_loads_message(Some("x"), 0), None);
+        assert_eq!(
+            empty_loads_message(Some("x"), 5).unwrap(),
+            "no loads match --target 'x'"
+        );
+        assert!(
+            empty_loads_message(None, 5)
+                .unwrap()
+                .contains("no loads recorded")
+        );
+    }
+
+    #[test]
+    fn require_pk_error_names_the_export_not_the_table() {
+        // #dogfood LOW: the require_pk message labelled the TABLE as the export
+        // (`export content_items` for an export named `c1`).
+        use load::plan::{LoadMode, LoadPlan, LoadSection, LoadTarget};
+        let plan = LoadPlan {
+            export_name: "c1".into(),
+            table: "content_items".into(),
+            partition_by: None,
+            specs: vec![],
+            gcs_prefix: String::new(),
+            destination: crate::config::DestinationConfig::default(),
+            load: LoadSection {
+                target: LoadTarget::Bigquery {
+                    project: "p".into(),
+                    dataset: "d".into(),
+                },
+                cleanup_source: false,
+                pk: vec![], // empty → require_pk bails
+                allow_source_drift: false,
+                gc_orphans: false,
+                cluster_by: vec![],
+            },
+            mode: LoadMode::Cdc,
+            cursor_column: None,
+        };
+        let err = require_pk(&plan, "cdc").unwrap_err().to_string();
+        assert!(err.contains("export `c1`"), "must name the export: {err}");
+        assert!(
+            !err.contains("content_items"),
+            "must NOT label the table as the export: {err}"
         );
     }
 

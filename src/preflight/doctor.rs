@@ -257,12 +257,22 @@ pub fn doctor(config_path: &str, json: bool) -> Result<()> {
     }
     if all_ok {
         Ok(())
-    } else if let Some(detail) = transient_detail {
-        // Preserve the original transient text so classify_exit (string-based)
-        // returns Retryable (2), matching `check`/`run` on the same failure.
-        anyhow::bail!("doctor: preflight failed on a transient error (see output above): {detail}")
     } else {
-        anyhow::bail!("doctor: one or more preflight checks failed (see output above)")
+        Err(doctor_failure_error(transient_detail))
+    }
+}
+
+/// The doctor's terminal error when a check failed. When a probe failed
+/// transiently, the original transient text is PRESERVED so `classify_exit`
+/// (string-based) returns Retryable (2), matching `check`/`run` on the same
+/// connection failure — doctor used to re-bail generically and drop the signal,
+/// exiting Generic (1) (dogfood LOW).
+fn doctor_failure_error(transient_detail: Option<String>) -> anyhow::Error {
+    match transient_detail {
+        Some(detail) => anyhow::anyhow!(
+            "doctor: preflight failed on a transient error (see output above): {detail}"
+        ),
+        None => anyhow::anyhow!("doctor: one or more preflight checks failed (see output above)"),
     }
 }
 
@@ -693,6 +703,26 @@ pub(super) fn destination_error_hint(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn doctor_transient_failure_classifies_as_retryable_exit_2() {
+        // #dogfood LOW: doctor stringified+dropped the typed transient error and
+        // re-bailed generically, so classify_exit could no longer see it was
+        // transient — it exited 1 (Generic) while check/run exited 2 (Retryable)
+        // on the SAME connection failure. Preserving the transient text keeps it
+        // classifiable.
+        let transient = doctor_failure_error(Some("connection refused (os error 61)".to_string()));
+        assert!(
+            crate::pipeline::retry::classify_error(&transient).is_transient(),
+            "a transient probe failure must classify Retryable (exit 2): {transient:#}"
+        );
+        // A non-transient failure stays Generic (exit 1).
+        let generic = doctor_failure_error(None);
+        assert!(
+            !crate::pipeline::retry::classify_error(&generic).is_transient(),
+            "a non-transient failure must stay Generic (exit 1): {generic:#}"
+        );
+    }
 
     // doctor-dedup-path (regression): doctor's destination dedup key must
     // include `path`, so two local destinations with different `path:` values

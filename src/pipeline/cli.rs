@@ -47,6 +47,36 @@ fn require_known_export(config: &Config, config_path: &str, export_name: &str) -
     );
 }
 
+/// Scope `metrics` to the config's declared exports. The state DB is SHARED
+/// across configs in a directory, so the unscoped `get_metrics(None, ..)` leaks
+/// OTHER configs' runs — while `-e <foreign>` rejects them (dogfood LOW, a
+/// contradictory scope). Union each declared export's scoped history, newest
+/// `limit` across them. An explicit (already-validated) `-e` is passed through.
+fn scoped_metrics(
+    state: &StateStore,
+    config: &Config,
+    export_name: Option<&str>,
+    limit: usize,
+) -> Result<Vec<crate::state::ExportMetric>> {
+    if let Some(name) = export_name {
+        return state.get_metrics(Some(name), limit);
+    }
+    let mut all = Vec::new();
+    for e in &config.exports {
+        all.extend(state.get_metrics(Some(&e.name), limit)?);
+    }
+    all.sort_by(|a, b| b.run_at.cmp(&a.run_at));
+    all.truncate(limit);
+    Ok(all)
+}
+
+/// A `--last 0` asks for ZERO rows — an empty result is then a zero-row request,
+/// NOT an empty ledger, so the "no <X> recorded yet" text is suppressed (the
+/// --json path already returns []). (dogfood LOW: the two were conflated.)
+fn is_zero_row_request(limit: usize) -> bool {
+    limit == 0
+}
+
 pub fn show_state(config_path: &str, json: bool) -> Result<()> {
     require_config(config_path)?;
     let state = StateStore::open(config_path)?;
@@ -205,9 +235,7 @@ pub fn show_files(
         return Ok(());
     }
     if files.is_empty() {
-        // `--last 0` legitimately asks for zero rows — do not conflate it with an
-        // empty ledger (dogfood LOW; the --json path already returns `[]`).
-        if limit != 0 {
+        if !is_zero_row_request(limit) {
             println!("No files recorded yet.");
         }
         return Ok(());
@@ -248,23 +276,7 @@ pub fn show_metrics(
         require_known_export(&config, config_path, name)?;
     }
     let state = StateStore::open(config_path)?;
-    let metrics = match export_name {
-        Some(name) => state.get_metrics(Some(name), limit)?,
-        None => {
-            // The state DB is shared across configs in a directory, so an
-            // unscoped `get_metrics(None, ..)` leaks OTHER configs' runs — while
-            // `-e <foreign>` rejects them as "not defined" (dogfood LOW, a
-            // contradictory scope). Union each declared export's scoped history
-            // and take the most recent `limit` across them.
-            let mut all = Vec::new();
-            for e in &config.exports {
-                all.extend(state.get_metrics(Some(&e.name), limit)?);
-            }
-            all.sort_by(|a, b| b.run_at.cmp(&a.run_at));
-            all.truncate(limit);
-            all
-        }
-    };
+    let metrics = scoped_metrics(&state, &config, export_name, limit)?;
     if json {
         // Reuse the run aggregate's serializable DTO so `metrics --json` and the
         // run summary's `--json` agree field-for-field. Empty → `[]` (valid JSON),
@@ -277,8 +289,7 @@ pub fn show_metrics(
         return Ok(());
     }
     if metrics.is_empty() {
-        // `--last 0` asks for zero rows — not the same as an empty ledger.
-        if limit != 0 {
+        if !is_zero_row_request(limit) {
             println!("No metrics recorded yet.");
         }
         return Ok(());
@@ -533,8 +544,7 @@ pub fn show_journal(
     };
 
     if journals.is_empty() {
-        // `--last 0` asks for zero rows — not the same as an unrun export.
-        if limit != 0 {
+        if !is_zero_row_request(limit) {
             println!("No journal entries for export '{export_name}' yet.");
             println!("Journals are recorded after each `rivet run`.");
         }
@@ -1047,6 +1057,59 @@ exports:
             .unwrap();
         drop(state);
         assert!(show_metrics(&config_path, Some("orders"), 10, false).is_ok());
+    }
+
+    #[test]
+    fn scoped_metrics_excludes_foreign_config_exports() {
+        // #dogfood LOW: the unscoped no-`-e` query leaked runs from OTHER configs
+        // sharing the state DB, while `-e <foreign>` rejected them — a contradiction.
+        let (dir, config_path) = setup_dir(); // declares orders + transactions
+        let state = open_state(&dir);
+        let seed = |s: &StateStore, export: &str, run: &str| {
+            s.record_metric(
+                export,
+                run,
+                100,
+                10,
+                None,
+                "success",
+                None,
+                None,
+                Some("parquet"),
+                Some("full"),
+                1,
+                0,
+                0,
+                None,
+                None,
+            )
+            .unwrap();
+        };
+        seed(&state, "orders", "r1"); // declared in this config
+        seed(&state, "beta_foreign", "r2"); // written by ANOTHER config, same DB
+        let config = crate::config::Config::load(&config_path).unwrap();
+
+        let scoped = scoped_metrics(&state, &config, None, 10).unwrap();
+        assert!(
+            scoped.iter().any(|m| m.export_name == "orders"),
+            "a declared export must appear"
+        );
+        assert!(
+            !scoped.iter().any(|m| m.export_name == "beta_foreign"),
+            "a foreign export must be excluded: {:?}",
+            scoped.iter().map(|m| &m.export_name).collect::<Vec<_>>()
+        );
+        // --last 0 → empty (a zero-row request, not an error).
+        assert!(scoped_metrics(&state, &config, None, 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn is_zero_row_request_only_for_last_zero() {
+        // #dogfood LOW: --last 0 suppresses the "no X recorded yet" empty-state
+        // line (a zero-row request, not an empty ledger; --json already returns []).
+        assert!(is_zero_row_request(0));
+        assert!(!is_zero_row_request(1));
+        assert!(!is_zero_row_request(20));
     }
 
     // ── show_journal ─────────────────────────────────────────────────────────
