@@ -244,20 +244,20 @@ pub(crate) fn run(
     while let Some(ev) = stream.next_change() {
         let mut ev = ev?;
         txn_seq.stamp(&mut ev);
-        // Checkpoint at every commit boundary BEFORE the table filter — the
-        // resume position is a stream property; a transaction whose last
-        // event lands on an unlisted table must still advance it (mirrors
-        // the file sink).
-        if ev.committed
-            && let Some(p) = &checkpoint
-        {
-            ev.position.save(p)?;
-        }
-        if !tables.is_empty()
+        let committed = ev.committed;
+        // A commit boundary on an UNLISTED table produces no output line — advance
+        // the checkpoint past it NOW (before the filter `continue`): the resume
+        // position is a stream property, so a transaction whose last event lands on
+        // an unlisted table must still move it (mirrors the file sink). There is no
+        // data to lose here because nothing is emitted.
+        let filtered = !tables.is_empty()
             && !tables
                 .iter()
-                .any(|t| sink::table_matches(t, &ev.schema, &ev.table))
-        {
+                .any(|t| sink::table_matches(t, &ev.schema, &ev.table));
+        if filtered {
+            if committed && let Some(p) = &checkpoint {
+                ev.position.save(p)?;
+            }
             continue;
         }
         // Surface a deferred decode error (e.g. PG unchanged-TOAST with no
@@ -265,8 +265,6 @@ pub(crate) fn run(
         // file sink. Without this the NDJSON path would print the raw
         // `unchanged-toast-datum` sentinel verbatim as the column value (silent
         // corruption). An uncaptured table's poison was already dropped above.
-        // Confirmed captured → surface any deferred decode error before emitting
-        // (an uncaptured table's poison was already dropped by the filter above).
         ev.raise_poison()?;
         let to_json = |img: &Option<Vec<RivetValue>>| {
             img.as_ref()
@@ -283,6 +281,15 @@ pub(crate) fn run(
         });
         println!("{line}");
         emitted += 1;
+        // Checkpoint AFTER emitting the captured event — never before. A crash in
+        // the window between the checkpoint save and the emit would advance the
+        // resume position past a line that was never printed, so the next run reads
+        // strictly after it and SKIPS the transaction tail (#9 bughunt: an
+        // at-least-once break, the save ran before the println). Emit→checkpoint
+        // means a crash there re-emits on resume (a duplicate, never a loss).
+        if committed && let Some(p) = &checkpoint {
+            ev.position.save(p)?;
+        }
         if max_events.is_some_and(|m| emitted >= m) {
             break;
         }
