@@ -51,6 +51,23 @@ impl StatementDurationTimeout {
             ),
         }
     }
+
+    /// MySQL server-side `max_execution_time` timeout (ER_QUERY_TIMEOUT / 3024).
+    /// Wraps the driver's terse "maximum statement execution time exceeded" with
+    /// the actionable fix — including the WIDE-table case (a chunk that still
+    /// times out), which the field's `*_version` tables hit and the raw driver
+    /// error gave no guidance for.
+    pub fn mysql(seconds: u64) -> Self {
+        Self {
+            message: format!(
+                "mysql: statement timeout after {seconds}s (max_execution_time from \
+                 tuning.statement_timeout_s) — this query exceeded its time budget (ERROR 3024). \
+                 Split it with `mode: chunked` / `chunk_by_key` so per-chunk queries stay under \
+                 the limit; if a CHUNK still times out on a WIDE table, lower `chunk_size` or use \
+                 `chunk_size_memory_mb:` (width-aware chunking); or raise `tuning.statement_timeout_s`"
+            ),
+        }
+    }
 }
 
 impl std::fmt::Display for StatementDurationTimeout {

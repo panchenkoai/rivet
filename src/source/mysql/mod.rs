@@ -499,6 +499,23 @@ impl Drop for MysqlSessionGuard<'_> {
 /// `sample_pool`: when `tuning.adaptive` is true, a clone of the source pool used
 /// to obtain a second connection for extraction-pressure sampling without interfering
 /// with the streaming result set on `conn`.
+/// Whether a MySQL driver error is the server-side `max_execution_time` /
+/// ER_QUERY_TIMEOUT (3024) statement-duration timeout — so the export path can
+/// re-wrap it as an actionable `StatementDurationTimeout` instead of leaking the
+/// terse driver prose. Matched by code AND message so it survives a MariaDB
+/// spelling (`max_statement_time` / 1969) or a reworded server string.
+fn is_statement_timeout(e: &mysql::Error) -> bool {
+    if let mysql::Error::MySqlError(db) = e
+        && (db.code == 3024 || db.code == 1969)
+    {
+        return true;
+    }
+    let msg = e.to_string();
+    msg.contains("max_execution_time")
+        || msg.contains("max_statement_time")
+        || msg.contains("maximum statement execution time exceeded")
+}
+
 fn mysql_run_export(
     conn: &mut mysql::PooledConn,
     sample_pool: Option<Pool>,
@@ -508,12 +525,24 @@ fn mysql_run_export(
     column_overrides: &ColumnOverrides,
     sink: &mut dyn super::BatchSink,
 ) -> Result<usize> {
+    // Re-wrap a server-side `max_execution_time` timeout (ERROR 3024) as an
+    // actionable StatementDurationTimeout (the classifier downcasts the TYPE →
+    // permanent; the Display carries the fix). The raw driver error is terse and
+    // gave the field's `*_version` timeouts no guidance (#field-3024).
+    let wrap_timeout = |e: mysql::Error| -> anyhow::Error {
+        if tuning.statement_timeout_s > 0 && is_statement_timeout(&e) {
+            super::StatementDurationTimeout::mysql(tuning.statement_timeout_s).into()
+        } else {
+            anyhow::Error::new(e)
+        }
+    };
+
     // SecOps: cursor value is bound via exec_iter rather than string-interpolated.
     // Using exec_iter uniformly (even with empty params) keeps match arms
     // type-compatible — query_iter returns a Text-protocol result, exec_iter Binary.
     let mut result = match cursor_param {
-        Some(val) => conn.exec_iter(sql, (val,))?,
-        None => conn.exec_iter(sql, ())?,
+        Some(val) => conn.exec_iter(sql, (val,)).map_err(&wrap_timeout)?,
+        None => conn.exec_iter(sql, ()).map_err(&wrap_timeout)?,
     };
     let columns = result.columns().as_ref().to_vec();
 
@@ -561,7 +590,9 @@ fn mysql_run_export(
     let max_value_bytes = tuning.max_value_bytes();
 
     for row_result in row_set {
-        let row = row_result?;
+        // The timeout usually fires mid-stream (the query runs while rows are
+        // pulled), so wrap here too, not only at exec_iter above.
+        let row = row_result.map_err(&wrap_timeout)?;
         row_buf.push(row);
 
         if row_buf.len() >= ctl.target() {
