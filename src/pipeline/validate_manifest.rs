@@ -305,6 +305,23 @@ impl Failure {
         !matches!(self, Failure::UntrackedObject { .. })
     }
 
+    /// Whether this failure is COULD-NOT-VERIFY (an operational I/O error that
+    /// prevented the check) rather than VERIFIED-WRONG (the check ran and found
+    /// the data bad). Could-not-verify is the operational class — exit 1, retry —
+    /// NOT the data-integrity stop-the-line class (exit 3). A read/list error
+    /// against a healthy prefix (a chmod-000 manifest, a transient S3 list blip)
+    /// must not page a corruption incident (#7 bughunt: these fell into the
+    /// verdict and drove exit 3). Fatal-by-omission the other way: a NEW variant
+    /// is verified-wrong (exit 3) unless it is explicitly an I/O could-not-verify.
+    pub fn is_could_not_verify(&self) -> bool {
+        matches!(
+            self,
+            Failure::ManifestReadError { .. }
+                | Failure::SuccessMarkerReadError { .. }
+                | Failure::ListPrefixError { .. }
+        )
+    }
+
     /// Stable `RIVET_VERIFY_*` error code for this failure variant.
     ///
     /// One code per variant, intended for orchestrators / CI to branch on
@@ -508,6 +525,15 @@ impl ManifestVerification {
     /// `!passed`, which can also mean "legacy / not applicable".
     pub fn has_failures(&self) -> bool {
         !self.failures.is_empty()
+    }
+
+    /// Whether any recorded failure is VERIFIED-WRONG (the check ran and the data
+    /// is bad) as opposed to purely COULD-NOT-VERIFY (an I/O read/list error).
+    /// Drives the exit CLASS: a verdict with a verified-wrong failure is
+    /// data-integrity (exit 3); a verdict whose failures are ALL could-not-verify
+    /// is operational (exit 1). See [`Failure::is_could_not_verify`].
+    pub fn has_verified_wrong_failure(&self) -> bool {
+        self.failures.iter().any(|f| !f.is_could_not_verify())
     }
 }
 

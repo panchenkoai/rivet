@@ -445,11 +445,18 @@ pub fn verify(source: &[u64], arrow: &[u64], schema: &SchemaRef) -> Result<()> {
 /// see. The recorded values are the per-column u64 xxh3 hashes as decimal strings
 /// (JSON-stable in the manifest). Wired via [`validate_manifest_checksums`] (the
 /// destination entry point) into `rivet validate`.
+/// `Ok(None)` — every recorded column re-read and MATCHED. `Ok(Some(detail))` —
+/// a comparison COMPLETED and disagreed (a hash mismatch, or a recorded column
+/// absent from the re-read): verified-wrong, the caller exits 3. `Err(e)` — the
+/// verification could NOT complete (a part would not open/decode, or the
+/// manifest's recorded hash is not a u64): could-not-verify, exit 1 — NEVER
+/// mislabelled corruption (#104 bughunt: operational Errs here were folded into
+/// the mismatch channel and reported as post-write corruption).
 pub fn validate_recorded_checksums(
     recorded: &[crate::manifest::ColumnChecksum],
     part_paths: &[std::path::PathBuf],
     key_col_name: Option<&str>,
-) -> Result<()> {
+) -> Result<Option<String>> {
     use std::collections::BTreeMap;
 
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -459,11 +466,32 @@ pub fn validate_recorded_checksums(
     // match. Name-keyed so a column reorder can't silently misalign the compare.
     let mut actual: BTreeMap<String, u64> = BTreeMap::new();
     for path in part_paths {
+        // File::open failing (EMFILE, a permissions blip) is OPERATIONAL — the
+        // verification could not run, so it must not be reported as corruption.
         let file = std::fs::File::open(path)
             .map_err(|e| anyhow::anyhow!("value checksum: open {}: {e}", path.display()))?;
-        let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
+        // A part the manifest recorded as committed Parquet that will NOT decode
+        // is post-write CORRUPTION — verified-wrong (Ok(Some), exit 3), not an
+        // operational could-not-verify. Distinct from File::open above.
+        let reader = match ParquetRecordBatchReaderBuilder::try_new(file).and_then(|b| b.build()) {
+            Ok(r) => r,
+            Err(e) => {
+                return Ok(Some(format!(
+                    "value checksum: part {} is not readable as Parquet ({e}) — post-write corruption",
+                    path.display()
+                )));
+            }
+        };
         for batch in reader {
-            let batch = batch?;
+            let batch = match batch {
+                Ok(b) => b,
+                Err(e) => {
+                    return Ok(Some(format!(
+                        "value checksum: part {} failed to decode ({e}) — post-write corruption",
+                        path.display()
+                    )));
+                }
+            };
             let key_col = key_col_name.and_then(|n| batch.schema().index_of(n).ok());
             let sums = match key_col {
                 Some(k) => arrow_batch_checksums_keyed(&batch, k),
@@ -487,19 +515,24 @@ pub fn validate_recorded_checksums(
         })?;
         match actual.get(&rec.name) {
             Some(&got) if got == want => {}
-            Some(&got) => anyhow::bail!(
-                "value checksum mismatch in column '{}': manifest={want} re-read={got} \
-                 — the Parquet differs from what was checksummed at write (Arrow→Parquet \
-                 encode fault or post-write corruption)",
-                rec.name
-            ),
-            None => anyhow::bail!(
-                "value checksum: manifest column '{}' was not found when re-reading the exported parts",
-                rec.name
-            ),
+            // A COMPLETED comparison that disagreed → verified-wrong (Ok(Some), exit 3).
+            Some(&got) => {
+                return Ok(Some(format!(
+                    "value checksum mismatch in column '{}': manifest={want} re-read={got} \
+                     — the Parquet differs from what was checksummed at write (Arrow→Parquet \
+                     encode fault or post-write corruption)",
+                    rec.name
+                )));
+            }
+            None => {
+                return Ok(Some(format!(
+                    "value checksum: manifest column '{}' was not found when re-reading the exported parts",
+                    rec.name
+                )));
+            }
         }
     }
-    Ok(())
+    Ok(None)
 }
 
 /// Form B at the destination: read the manifest + every part via `dest`,
@@ -541,12 +574,11 @@ pub fn validate_manifest_checksums(
     }
     let paths: Vec<std::path::PathBuf> = tmps.iter().map(|t| t.path().to_path_buf()).collect();
 
-    match validate_recorded_checksums(recorded, &paths, manifest.checksum_key_column.as_deref()) {
-        Ok(()) => Ok(None),
-        // The ONLY verified-wrong outcome: the recompare disagreed with the
-        // recorded checksum. Everything above (`?`) is operational.
-        Err(mismatch) => Ok(Some(format!("{mismatch:#}"))),
-    }
+    // `validate_recorded_checksums` now classifies for us: Ok(None) clean,
+    // Ok(Some) verified-wrong (exit 3), Err operational (exit 1). Everything
+    // ABOVE this line (`?` on dest.read / tempfile) is likewise operational, so
+    // propagating its result verbatim is correct.
+    validate_recorded_checksums(recorded, &paths, manifest.checksum_key_column.as_deref())
 }
 
 #[cfg(test)]
@@ -822,8 +854,12 @@ mod tests {
                 checksum: (a ^ b).to_string(),
             })
             .collect();
-        validate_recorded_checksums(&recorded, &[p1, p2], None)
-            .expect("two matching parts must validate — the cross-part fold is XOR");
+        let verdict = validate_recorded_checksums(&recorded, &[p1, p2], None)
+            .expect("two matching parts must not raise an OPERATIONAL error");
+        assert_eq!(
+            verdict, None,
+            "two matching parts must validate clean (Ok(None)) — the cross-part fold is XOR"
+        );
     }
 
     #[test]
@@ -1286,8 +1322,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("part.parquet");
         write_parquet(&batch, &p);
-        validate_recorded_checksums(&recorded_of(&batch), &[p], None)
-            .expect("matching parts must validate");
+        let verdict = validate_recorded_checksums(&recorded_of(&batch), &[p], None)
+            .expect("matching parts must not raise an operational error");
+        assert_eq!(
+            verdict, None,
+            "matching parts must validate clean (Ok(None))"
+        );
     }
 
     #[test]
@@ -1298,11 +1338,33 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("part.parquet");
         write_parquet(&batch3(999), &p);
-        let err = validate_recorded_checksums(&recorded, &[p], None)
-            .expect_err("a corrupted re-read must fire");
+        // A COMPLETED re-read that DISAGREES is verified-wrong: Ok(Some(detail)),
+        // NOT an operational Err. (#104 bughunt: the mismatch must reach the caller
+        // as the exit-3 corruption channel, distinct from could-not-verify Errs.)
+        let verdict = validate_recorded_checksums(&recorded, &[p], None)
+            .expect("a corrupted re-read is verified-wrong, not an operational error");
+        let detail = verdict.expect("a corrupted re-read must fire a mismatch");
         assert!(
-            err.to_string().contains("column 'b'"),
-            "must name the diverged column: {err}"
+            detail.contains("column 'b'"),
+            "must name the diverged column: {detail}"
+        );
+    }
+
+    #[test]
+    fn form_b_operational_error_is_not_a_mismatch() {
+        // #104 bughunt regression: a manifest whose recorded hash is not a u64 is a
+        // could-not-verify (operational) condition, NOT post-write corruption. It
+        // must surface as Err (exit 1), never Ok(Some) (exit 3, "corruption").
+        let batch = batch3(2);
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("part.parquet");
+        write_parquet(&batch, &p);
+        let mut recorded = recorded_of(&batch);
+        recorded[0].checksum = "not-a-u64".into();
+        let res = validate_recorded_checksums(&recorded, &[p], None);
+        assert!(
+            res.is_err(),
+            "a non-u64 recorded hash is operational (Err/exit 1), not a mismatch: {res:?}"
         );
     }
 }
