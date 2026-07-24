@@ -47,27 +47,58 @@ fn require_known_export(config: &Config, config_path: &str, export_name: &str) -
     );
 }
 
-/// Scope `metrics` to the config's declared exports. The state DB is SHARED
-/// across configs in a directory, so the unscoped `get_metrics(None, ..)` leaks
-/// OTHER configs' runs — while `-e <foreign>` rejects them (dogfood LOW, a
-/// contradictory scope). Union each declared export's scoped history, newest
-/// `limit` across them. An explicit (already-validated) `-e` is passed through.
+/// Union a per-export scoped query across the config's DECLARED exports, newest
+/// `limit` across them. THE shared-DB scope guard: the state DB is shared across
+/// configs in a directory, so an unscoped `SELECT … FROM <table>` (the `None`
+/// branch) leaks OTHER configs' rows — while `-e <foreign>` rejects them, a
+/// contradictory scope (dogfood LOW). `key` is the newest-first sort field.
+/// ponytail: N indexed point-queries (one per declared export); a
+/// `WHERE export_name IN (…)` pushed into the state layer would collapse it to
+/// one query — do that only if a huge export count makes this measurably slow.
+fn scoped_union<T>(
+    config: &Config,
+    limit: usize,
+    fetch: impl Fn(&str) -> Result<Vec<T>>,
+    key: impl Fn(&T) -> &str,
+) -> Result<Vec<T>> {
+    let mut all = Vec::new();
+    for e in &config.exports {
+        all.extend(fetch(&e.name)?);
+    }
+    all.sort_by(|a, b| key(b).cmp(key(a)));
+    all.truncate(limit);
+    Ok(all)
+}
+
+/// Keep only rows whose export is DECLARED in `config` — the scope guard for the
+/// UNLIMITED list queries (cursors, progression) that carry no `limit` to unify.
+/// Same shared-DB leak as [`scoped_union`], filtered post-fetch since there is no
+/// window to preserve.
+fn retain_declared<T>(rows: Vec<T>, config: &Config, name_of: impl Fn(&T) -> &str) -> Vec<T> {
+    let declared: std::collections::HashSet<&str> =
+        config.exports.iter().map(|e| e.name.as_str()).collect();
+    rows.into_iter()
+        .filter(|r| declared.contains(name_of(r)))
+        .collect()
+}
+
+/// Metrics scoped to the config's exports (an explicit, already-validated `-e`
+/// passes through). See [`scoped_union`] for the shared-DB rationale.
 fn scoped_metrics(
     state: &StateStore,
     config: &Config,
     export_name: Option<&str>,
     limit: usize,
 ) -> Result<Vec<crate::state::ExportMetric>> {
-    if let Some(name) = export_name {
-        return state.get_metrics(Some(name), limit);
+    match export_name {
+        Some(name) => state.get_metrics(Some(name), limit),
+        None => scoped_union(
+            config,
+            limit,
+            |n| state.get_metrics(Some(n), limit),
+            |m| &m.run_at,
+        ),
     }
-    let mut all = Vec::new();
-    for e in &config.exports {
-        all.extend(state.get_metrics(Some(&e.name), limit)?);
-    }
-    all.sort_by(|a, b| b.run_at.cmp(&a.run_at));
-    all.truncate(limit);
-    Ok(all)
 }
 
 /// A `--last 0` asks for ZERO rows — an empty result is then a zero-row request,
@@ -78,9 +109,12 @@ fn is_zero_row_request(limit: usize) -> bool {
 }
 
 pub fn show_state(config_path: &str, json: bool) -> Result<()> {
-    require_config(config_path)?;
+    let config = require_config(config_path)?;
     let state = StateStore::open(config_path)?;
-    let states = state.list_all()?;
+    // Scope to THIS config's exports — the state DB is shared across configs in a
+    // directory, so an unscoped list leaks other configs' cursors (dogfood: the
+    // metrics leak fix, extended to its inspect siblings).
+    let states = retain_declared(state.list_all()?, &config, |s| &s.export_name);
     if json {
         // Incremental-cursor rows; serialize directly. Empty → `[]` (the text
         // path's "no cursor / never ran" guidance is operator help, not data).
@@ -142,7 +176,8 @@ pub fn show_progression(config_path: &str, export_name: Option<&str>) -> Result<
     let state = StateStore::open(config_path)?;
     let entries = match export_name {
         Some(name) => vec![state.get_progression(name)?],
-        None => state.list_progression()?,
+        // Scope to this config's exports (shared-DB leak, same as metrics/state).
+        None => retain_declared(state.list_progression()?, &config, |p| &p.export_name),
     };
     let has_any = entries
         .iter()
@@ -227,7 +262,16 @@ pub fn show_files(
         require_known_export(&config, config_path, name)?;
     }
     let state = StateStore::open(config_path)?;
-    let files = state.get_files(export_name, limit)?;
+    let files = match export_name {
+        Some(name) => state.get_files(Some(name), limit)?,
+        // Scope to this config's exports (shared-DB leak, same as metrics/state).
+        None => scoped_union(
+            &config,
+            limit,
+            |n| state.get_files(Some(n), limit),
+            |f| &f.created_at,
+        )?,
+    };
     if json {
         // FileRecord is a stable inspect row — serialize it directly. Empty → `[]`
         // (valid JSON) so a CI completeness check never special-cases.
@@ -1101,6 +1145,47 @@ exports:
         );
         // --last 0 → empty (a zero-row request, not an error).
         assert!(scoped_metrics(&state, &config, None, 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn inspect_list_queries_scope_to_config_exports() {
+        // #dogfood: the metrics-leak fix, extended to its siblings. A shared
+        // state DB must not surface OTHER configs' cursors/files under `state
+        // show` / `state files` (the None branch) — the wired-into-only-some class.
+        let (dir, config_path) = setup_dir(); // declares orders + transactions
+        let state = open_state(&dir);
+        state.update("orders", "2025-01-01").unwrap();
+        state.update("beta_foreign", "2025-01-02").unwrap(); // another config, same DB
+        let f = |run: &str, export: &str, name: &str| {
+            state
+                .record_file(run, export, name, 10, 100, "parquet", None)
+                .unwrap();
+        };
+        f("r1", "orders", "o.parquet");
+        f("r2", "beta_foreign", "b.parquet");
+        let config = crate::config::Config::load(&config_path).unwrap();
+
+        // cursors (list_all, via retain_declared)
+        let cursors = retain_declared(state.list_all().unwrap(), &config, |s| &s.export_name);
+        assert!(cursors.iter().any(|c| c.export_name == "orders"));
+        assert!(
+            !cursors.iter().any(|c| c.export_name == "beta_foreign"),
+            "list_all leaked a foreign config's cursor"
+        );
+
+        // files (get_files, via scoped_union)
+        let files = scoped_union(
+            &config,
+            100,
+            |n| state.get_files(Some(n), 100),
+            |x| &x.created_at,
+        )
+        .unwrap();
+        assert!(files.iter().any(|x| x.export_name == "orders"));
+        assert!(
+            !files.iter().any(|x| x.export_name == "beta_foreign"),
+            "get_files leaked a foreign config's file"
+        );
     }
 
     #[test]
