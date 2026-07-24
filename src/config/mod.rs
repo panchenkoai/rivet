@@ -684,12 +684,19 @@ impl Config {
             // picks a SINGLE latest-manifest for the export and would load only ONE
             // partition, silently dropping the rest. Reject the combo at config-load
             // until the loader is partition-aware.
-            if export.load.is_some() {
+            // The `load:` block may be per-export OR top-level (`self.load`, which
+            // applies to EVERY export) — both route this partitioned export through
+            // the loader, which loads a single partition. Guard both: #101, only the
+            // per-export form was checked, so a top-level `load:` (the primary
+            // documented pattern) bypassed the guard and `cleanup_source` then wiped
+            // the unloaded partitions.
+            if export.load.is_some() || self.load.is_some() {
                 anyhow::bail!(
                     "export '{}': partition_by is not compatible with a `load:` block — a \
                      partitioned export writes one manifest per partition sub-prefix, but the \
-                     warehouse loader would load only a single partition. Load a non-partitioned \
-                     export, or drop `load:` and run `rivet load` per partition.",
+                     warehouse loader would load only a single partition (and `cleanup_source` \
+                     would then wipe the rest). Load a non-partitioned export, or drop `load:` \
+                     and run `rivet load` per partition.",
                     export.name,
                 );
             }
@@ -1617,6 +1624,46 @@ mod audit_unquoted_template_brace {
 
     const HINT_FRAGMENT: &str =
         "a YAML value containing { } (such as {partition} or {date}) must be quoted";
+
+    #[test]
+    fn top_level_load_with_partition_by_is_rejected() {
+        // #101: partition_by is incompatible with a `load:` block — the loader
+        // loads ONE partition and `cleanup_source` then wipes the rest. The
+        // per-export form was guarded, but a TOP-LEVEL `load:` (the primary
+        // documented pattern) bypassed it. Both must be rejected.
+        let yaml = r#"
+source: { type: postgres, url: "postgresql://rivet:rivet@127.0.0.1:5432/rivet" }
+exports:
+  - name: t1
+    query: "SELECT 1 as id"
+    format: parquet
+    partition_by: id
+    destination: { type: local, path: "./out/{partition}/" }
+load: { target: bigquery, project: p, dataset: d }
+"#;
+        let err = Config::from_yaml(yaml).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("partition_by is not compatible with a `load:` block"),
+            "a top-level `load:` + partition_by must be rejected: {err}"
+        );
+
+        // Without the top-level load, the same partitioned export is accepted —
+        // the guard must not over-fire on a plain partitioned export.
+        let ok_yaml = r#"
+source: { type: postgres, url: "postgresql://rivet:rivet@127.0.0.1:5432/rivet" }
+exports:
+  - name: t1
+    query: "SELECT 1 as id"
+    format: parquet
+    partition_by: id
+    destination: { type: local, path: "./out/{partition}/" }
+"#;
+        assert!(
+            Config::from_yaml(ok_yaml).is_ok(),
+            "partition_by without any load: must stay accepted"
+        );
+    }
 
     #[test]
     fn bare_partition_token_gets_quoting_hint() {
