@@ -71,3 +71,38 @@ scenarios:
     mysql:    { na: "see postgres — UInt64 rides losslessly as decimal(20,0); the note is advisory, not loud" }
     mssql:    { na: "SQL Server has no unsigned-64 type; NA by construction" }
     mongo:    { na: "target-axis condition; tracked in the warehouse-load matrix, not here" }
+
+  # ── CLI-surface fail-loud (0.21.2 dogfood) ──────────────────────────────────
+  # Engine-AGNOSTIC CLI contracts: the source engine never forks these code paths,
+  # so each is `test` (pinned once on the PG-config offline test) + `na` on the
+  # other engines — the same shape as strict_mode_unsafe_type_gates /
+  # remote_plaintext_tls_refused above. Several are CROSS-COMMAND contracts (the
+  # `what` names the span): the dogfood bug was "the guard was wired into only SOME
+  # of the commands that share the contract".
+  - id: cli_unknown_export_loud
+    what: "a typo'd -e/--export on ANY inspect command (state files/chunks/progression, metrics, journal, reset) → loud error naming the known exports, never a silent empty-state exit 0 (dogfood MED: files/chunks/progression accepted an unknown name silently while metrics/journal/reset rejected it — the wired-into-only-some class)"
+    postgres: { test: inspect_handlers_reject_an_unknown_export }
+    mysql:    { na: "CLI inspect validation is engine-agnostic (src/pipeline/cli.rs::require_known_export, reached from every inspect handler regardless of source engine) — pinned once; the sibling commands are covered by show_journal_run_id_validates_export_and_cross_checks_ownership + reset_state_unknown_export_bails_with_hint" }
+    mssql:    { na: "same engine-agnostic require_known_export gate" }
+    mongo:    { na: "same engine-agnostic require_known_export gate" }
+
+  - id: cli_unresolved_placeholder_loud
+    what: "an unresolved ${var} in the config (run / plan / check) → loud error that names --param AND the env var, never a silent empty-string substitution (dogfood MED: the message used to blame only the environment variable)"
+    postgres: { test: env_var_substitution_missing_var_is_hard_error }
+    mysql:    { na: "config placeholder resolution is engine-agnostic (src/config/resolve.rs::resolve_vars), the same text for every source" }
+    mssql:    { na: "same engine-agnostic resolver" }
+    mongo:    { na: "same engine-agnostic resolver" }
+
+  - id: cli_malformed_param_loud
+    what: "a malformed --param foo (no '=') → loud error, never silently dropped and then surfaced downstream as a misleading 'environment variable foo is not set' (dogfood LOW)"
+    postgres: { test: parse_params_no_equals_is_a_loud_error }
+    mysql:    { na: "CLI --param parsing is engine-agnostic (src/cli/params.rs::parse_params)" }
+    mssql:    { na: "same engine-agnostic --param parser" }
+    mongo:    { na: "same engine-agnostic --param parser" }
+
+  - id: cdc_ndjson_binary_lossless
+    what: "a genuinely-binary column (bytea / uuid / GUID bytes) in CDC NDJSON stdout → lossless PG-style hex (\\x…), never a silent from_utf8_lossy U+FFFD replacement that destroys the bytes (dogfood MED)"
+    postgres: { test: to_json_bytes_are_lossless_utf8_verbatim_binary_hex }
+    mysql:    { na: "the NDJSON Bytes renderer is engine-agnostic (src/source/cdc/value.rs::to_json), shared by every CDC adapter — pinned once" }
+    mssql:    { na: "same shared to_json Bytes path" }
+    mongo:    { na: "same shared to_json Bytes path" }

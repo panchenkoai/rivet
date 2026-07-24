@@ -58,3 +58,24 @@ scenarios:
     what: "a CDC tables: entry that becomes a destination path segment — a '..' entry escapes the configured tree (#5)."
     rejected_wrong_mode: { test: cdc_tables_entry_with_traversal_rejected_at_load }
     valid_form_accepted: { test: valid_partition_by_and_tables_configs_are_accepted }
+
+  # ── 0.21.2 dogfood additions ────────────────────────────────────────────────
+  - id: partition_by_top_level_load
+    what: "partition_by + a TOP-LEVEL load: block — the partition guard fired only for a PER-EXPORT load:, so `rivet check` passed and the warehouse loader would load ONE partition while cleanup_source wiped the rest (dogfood HIGH #101). Rejected at config-load like the per-export form."
+    rejected_wrong_mode: { test: top_level_load_with_partition_by_is_rejected }
+    valid_form_accepted: { test: valid_partition_by_and_tables_configs_are_accepted }
+
+  - id: max_file_size_nonpositive
+    what: "max_file_size 0 / negative (\"0\", \"0B\", \"-5MB\") — the float→u64 cast SATURATED it to a 0-byte rotation threshold (a new part after every row), silently (dogfood LOW). Rejected at parse like a non-numeric value; a positive size (\"1B\") still accepted (the false-reject guard is the accept assert in the same test)."
+    rejected_wrong_mode: { test: parse_zero_and_negative_rejected_not_coerced_to_zero }
+    valid_form_accepted: { test: parse_zero_and_negative_rejected_not_coerced_to_zero }
+
+  - id: cross_warehouse_load_field
+    what: "a load: block carrying a field for a DIFFERENT warehouse (target: snowflake + BigQuery's project:/dataset:) — silently accepted and IGNORED because #[serde(flatten)] on the target enum disables deny_unknown_fields (dogfood LOW; the 'invalid combos fail to deserialize' comment was false). Now a loud reject naming the foreign field + its warehouse; a target-matching block still loads (accept assert in the same test)."
+    rejected_wrong_mode: { test: cross_warehouse_load_fields_are_rejected }
+    valid_form_accepted: { test: cross_warehouse_load_fields_are_rejected }
+
+  - id: chunked_needs_a_strategy
+    what: "chunked mode with NO strategy at all (no chunk_column / chunk_by_key / chunk_count / chunk_by_days and no table:) is rejected at config-load — but chunk_by_key IS a strategy, so chunk_by_key + query: LOADS (the table: requirement is a plan-time concern, with an accurate 'needs table:' message). Fixes the dead-end that recommended chunk_by_key when it was already set (dogfood MED)."
+    rejected_wrong_mode: { test: chunk_by_key_with_query_is_not_the_generic_pick_a_strategy_error }
+    valid_form_accepted: { test: chunk_by_key_with_query_is_not_the_generic_pick_a_strategy_error }
