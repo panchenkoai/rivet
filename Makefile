@@ -1,7 +1,7 @@
 # Rivet developer shortcuts.
 # Requires Rust 1.94+ (see rust-toolchain.toml if present).
 
-.PHONY: test-types test-types-live test-types-property test-types-validators test-types-bigquery test-types-snowflake sweep-test-db test-live
+.PHONY: test-types test-types-live test-types-property test-types-validators test-types-bigquery test-types-snowflake sweep-test-db test-live seed-build seed-db seed-postgres seed-mysql seed-mssql seed-mongo
 
 # PR-fast: offline type-mapping contracts (no docker).
 test-types:
@@ -63,3 +63,33 @@ sweep-test-db:
 # Requires `docker compose up -d` (postgres + mysql + the validator containers).
 test-live: sweep-test-db
 	cargo nextest run --run-ignored all
+
+# ── Fixture seed ────────────────────────────────────────────────────────────
+# Regenerate the shared live-test dataset (orders/users/events/page_views/
+# content_items). The SQL seed tool is gated behind the off-by-default
+# `dev-seed` feature (so `cargo install` never ships the destructive TRUNCATE
+# tool); RIVET_SEED_I_KNOW=1 confirms the TRUNCATE…CASCADE. Standard size mirrors
+# nightly-live.yml — 60k content_items (~1 min) is enough to trigger WAL pressure;
+# the 1M-row `max_pressure` test stays manual (override SEED_ARGS to change).
+SEED_ARGS ?= --users 1000 --orders-per-user 5 --events-per-user 5 --page-views 5000 --content-items 60000
+
+seed-build:
+	cargo build --bin seed --features dev-seed
+
+# Seed EVERY live database. A per-DB target below runs one engine at a time.
+seed-db: seed-postgres seed-mysql seed-mssql seed-mongo
+
+seed-postgres: seed-build
+	RIVET_SEED_I_KNOW=1 target/debug/seed --target postgres $(SEED_ARGS)
+
+seed-mysql: seed-build
+	RIVET_SEED_I_KNOW=1 target/debug/seed --target mysql $(SEED_ARGS)
+
+seed-mssql: seed-build
+	RIVET_SEED_I_KNOW=1 target/debug/seed --target sqlserver $(SEED_ARGS)
+
+# Mongo has no shared bench fixture (the live suite self-seeds each collection
+# via the Rig), so this seeds a standard `rivet.orders`/`rivet.users` collection
+# for demos + manual runs. Idempotent (drops + rebuilds). See dev/mongo/seed.js.
+seed-mongo:
+	docker compose exec -T mongo mongosh --quiet "mongodb://127.0.0.1:27017/rivet?directConnection=true" < dev/mongo/seed.js
