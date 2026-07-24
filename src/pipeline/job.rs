@@ -223,6 +223,40 @@ pub(super) fn run_diagnosis(summary: &RunSummary, harm_deltas: &[(String, i64)])
 
 /// Run `SELECT COUNT(*) FROM ({query})` against the source and compare with exported rows.
 /// Skips reconciliation for incremental exports that used a cursor (moving target).
+/// Exit gate for `run --reconcile`: a row-count mismatch is a data-integrity
+/// failure (exit 3), mirroring the `rivet reconcile` subcommand
+/// (`enforce_reconcile_exit`) and `--validate`. Returns `Err(DataIntegrityError)`
+/// when a reconcile pass ran and disagreed with the source, so
+/// `rivet run --reconcile && <next>` does not proceed past a mismatch;
+/// a match or a skipped reconcile (`reconciled == None`) returns `Ok`. The
+/// exported data is already durable — only the gate fails.
+/// Fold the run's outcome into the process result: an export/quality failure
+/// wins; otherwise a `run --reconcile` mismatch (`reconcile_gate`) surfaces so
+/// the run exits non-zero (exit 3). Extracted as a pure fn so the WIRING — not
+/// just the gate logic — is unit-tested: without this seam, un-hooking the gate
+/// from `final_result` would silently reopen the "run --reconcile exits 0" bug
+/// (#102) with every existing test still green.
+fn resolve_final_result(
+    failed: bool,
+    run_result: crate::error::Result<()>,
+    reconcile_gate: crate::error::Result<()>,
+) -> crate::error::Result<()> {
+    if failed { run_result } else { reconcile_gate }
+}
+
+fn reconcile_run_gate(summary: &RunSummary) -> crate::error::Result<()> {
+    if summary.reconciled == Some(false) {
+        return Err(crate::error::DataIntegrityError::new(format!(
+            "reconcile MISMATCH for '{}': the exported dataset disagrees with the source \
+             count {} — see the reconcile log above",
+            summary.export_name,
+            summary.source_count.unwrap_or(-1),
+        ))
+        .into());
+    }
+    Ok(())
+}
+
 fn reconcile_source_count(plan: &ResolvedRunPlan, summary: &mut RunSummary) {
     if let Some(col) = plan.strategy.cursor_column() {
         log::info!(
@@ -619,6 +653,7 @@ pub(super) fn run_export_job(
         }
     }
 
+    let mut reconcile_gate: crate::error::Result<()> = Ok(());
     if plan.reconcile && !failed {
         reconcile_source_count(&plan, &mut summary);
         if let (Some(source_count), Some(matched)) = (summary.source_count, summary.reconciled) {
@@ -627,6 +662,15 @@ pub(super) fn run_export_job(
                 exported_rows: summary.total_rows,
                 matched,
             });
+        }
+        // A reconcile mismatch fails the run (exit 3), like the `reconcile`
+        // subcommand and `--validate`. Record it on the summary NOW so the
+        // report / metrics / RunCompleted event reflect the failure before the
+        // finalize hooks below run; the error is folded into `final_result`.
+        reconcile_gate = reconcile_run_gate(&summary);
+        if let Err(e) = &reconcile_gate {
+            summary.status = "failed".into();
+            summary.error_message = Some(crate::redact::redact_error(e));
         }
     }
 
@@ -686,7 +730,7 @@ pub(super) fn run_export_job(
     finalize_run_report(config_path, &summary, "export");
     crate::notify::maybe_send(config.notifications.as_ref(), &summary);
 
-    let final_result = if failed { result } else { Ok(()) };
+    let final_result = resolve_final_result(failed, result, reconcile_gate);
     (final_result, summary)
 }
 
@@ -817,6 +861,63 @@ pub(crate) fn run_export_job_with_chunk_source(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn run_reconcile_gate_fails_on_mismatch_matches_subcommand() {
+        // `run --reconcile` must exit non-zero (data-integrity, exit 3) on a
+        // row-count mismatch — the same gate the `rivet reconcile` subcommand
+        // enforces via `enforce_reconcile_exit`. Before this, the flag path
+        // logged "reconcile MISMATCH" but returned Ok, so
+        // `rivet run --reconcile && <next>` silently proceeded past a data-loss
+        // mismatch (dogfood issue #102).
+        let mut s = RunSummary {
+            export_name: "orders".into(),
+            source_count: Some(1033),
+            reconciled: Some(false),
+            ..Default::default()
+        };
+        let err = reconcile_run_gate(&s).unwrap_err();
+        assert!(
+            err.downcast_ref::<crate::error::DataIntegrityError>()
+                .is_some(),
+            "a reconcile mismatch must carry the data-integrity marker"
+        );
+        assert_eq!(
+            crate::error::classify_exit(&err),
+            3,
+            "a reconcile mismatch must classify as exit 3"
+        );
+
+        // A match, and a skipped reconcile (reconciled == None), must NOT gate.
+        s.reconciled = Some(true);
+        assert!(reconcile_run_gate(&s).is_ok());
+        s.reconciled = None;
+        assert!(reconcile_run_gate(&s).is_ok());
+    }
+
+    #[test]
+    fn resolve_final_result_surfaces_reconcile_mismatch_when_export_succeeded() {
+        use crate::error::DataIntegrityError;
+        // The WIRING guard for #102: when the export itself succeeded
+        // (failed=false), a reconcile-gate error MUST become the run's result
+        // (exit 3). This is the half the gate-logic test cannot cover — that
+        // `run --reconcile` actually RETURNS the gate rather than Ok. Un-hooking
+        // the fold reopens the bug; this test then goes red.
+        let gate: crate::error::Result<()> = Err(DataIntegrityError::new("mismatch").into());
+        let out = resolve_final_result(false, Ok(()), gate);
+        assert!(
+            out.is_err(),
+            "a reconcile mismatch on a successful export must surface as the run result"
+        );
+        assert_eq!(crate::error::classify_exit(&out.unwrap_err()), 3);
+
+        // An export/quality failure takes precedence over the reconcile gate.
+        let qfail: crate::error::Result<()> = Err(DataIntegrityError::new("quality").into());
+        assert!(resolve_final_result(true, qfail, Ok(())).is_err());
+
+        // Clean run: no export failure, no reconcile mismatch → Ok.
+        assert!(resolve_final_result(false, Ok(()), Ok(())).is_ok());
+    }
 
     #[test]
     fn run_diagnosis_flags_flaky_link_and_spill_signals_only() {
