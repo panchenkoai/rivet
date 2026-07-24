@@ -244,7 +244,11 @@ fn resolve_final_result(
     if failed { run_result } else { reconcile_gate }
 }
 
-fn reconcile_run_gate(summary: &RunSummary) -> crate::error::Result<()> {
+fn reconcile_run_gate(
+    summary: &RunSummary,
+    could_not_verify: Option<&str>,
+) -> crate::error::Result<()> {
+    // VERIFIED-WRONG: the count ran and DISAGREED → data-integrity, exit 3.
     if summary.reconciled == Some(false) {
         return Err(crate::error::DataIntegrityError::new(format!(
             "reconcile MISMATCH for '{}': the exported dataset disagrees with the source \
@@ -254,21 +258,43 @@ fn reconcile_run_gate(summary: &RunSummary) -> crate::error::Result<()> {
         ))
         .into());
     }
+    // COULD-NOT-VERIFY: reconcile was requested but could not run (source
+    // unreachable, count NULL / non-integer / query error). The export itself
+    // succeeded and is durable, but the assurance the operator asked for was not
+    // obtained — an OPERATIONAL failure (exit 1, retry), NOT verified-OK (exit 0)
+    // and NOT corruption (exit 3). Diverged from the `reconcile` subcommand before,
+    // which propagated the same connect error (#10 bughunt).
+    if let Some(reason) = could_not_verify {
+        anyhow::bail!(
+            "reconcile could not be verified for '{}': {reason}. The export completed and is \
+             durable; re-run to obtain the reconcile assurance, or drop `--reconcile`.",
+            summary.export_name
+        );
+    }
     Ok(())
 }
 
-fn reconcile_source_count(plan: &ResolvedRunPlan, summary: &mut RunSummary) {
+/// Run the reconcile COUNT(*) and record `source_count` / `reconciled` on the
+/// summary. Returns `Some(reason)` when reconcile COULD NOT run (the source was
+/// unreachable, the count query failed, or its result was NULL / non-integer) —
+/// a COULD-NOT-VERIFY condition the caller turns into an operational exit 1,
+/// distinct from a genuine MISMATCH (`reconciled == Some(false)` → exit 3) and
+/// from a legitimate SUBSET-strategy skip (`None`, exit 0). Before this a
+/// could-not-verify left `reconciled = None`, indistinguishable from the skip, so
+/// `run --reconcile` exited 0 as if verified-OK (#10 bughunt).
+fn reconcile_source_count(plan: &ResolvedRunPlan, summary: &mut RunSummary) -> Option<String> {
     // Skip the full-source COUNT(*) for any SUBSET/DELTA strategy — its exported
     // count legitimately differs from the table total, and the #102 exit gate
     // must not turn that STRUCTURAL mismatch into a false exit-3 (which would
     // break every healthy scheduled keyset_incremental / time_window / incremental
-    // `run --reconcile`). Previously only the Incremental cursor was skipped.
+    // `run --reconcile`). Previously only the Incremental cursor was skipped. This
+    // is a SKIP, not a could-not-verify — return None (exit 0).
     if let Some(reason) = plan.strategy.reconcile_subset_skip() {
         log::info!(
             "reconcile: skipping full-count for '{}' ({reason})",
             plan.export_name
         );
-        return;
+        return None;
     }
 
     let count_sql = format!(
@@ -284,59 +310,64 @@ fn reconcile_source_count(plan: &ResolvedRunPlan, summary: &mut RunSummary) {
         Ok(s) => s,
         Err(e) => {
             log::warn!("reconcile: could not connect to source: {:#}", e);
-            return;
+            return Some(format!(
+                "could not connect to the source to reconcile: {e:#}"
+            ));
         }
     };
 
     match src.query_scalar(&count_sql) {
         Ok(Some(val)) => {
-            if let Ok(count) = val.parse::<i64>() {
-                summary.source_count = Some(count);
-                // ADR-0012 manifest-aware reconcile: compare source COUNT(*)
-                // against the manifest's *cumulative* row total (sum of
-                // committed parts), not just this run's writes.  In a
-                // resume scenario, `summary.total_rows` reflects only the
-                // chunks that re-ran in this invocation (e.g. 500 for one
-                // chunk), while the on-disk dataset is everything that
-                // ever committed (e.g. 2500 across resume attempts).
-                // Comparing total_rows would falsely report MISMATCH on
-                // every resume.  The manifest_parts accumulator already
-                // holds the cumulative count (Phase C-γ hydration); use
-                // its sum for the comparison.
-                let committed_rows: i64 = summary.manifest_parts.iter().map(|p| p.rows).sum();
-                let exported_total = if committed_rows > 0 {
-                    committed_rows
-                } else {
-                    summary.total_rows
-                };
-                summary.reconciled = Some(exported_total == count);
-                if exported_total != count {
-                    log::warn!(
-                        "reconcile MISMATCH for '{}': committed {} rows, source has {}",
-                        plan.export_name,
-                        exported_total,
-                        count
-                    );
-                } else {
-                    log::info!(
-                        "reconcile MATCH for '{}': {}/{}",
-                        plan.export_name,
-                        exported_total,
-                        count
-                    );
-                }
+            let Ok(count) = val.parse::<i64>() else {
+                // A non-integer COUNT is COULD-NOT-VERIFY (we cannot compare), NOT
+                // a mismatch (#10): operational exit 1, not the exit-3 corruption class.
+                log::warn!("reconcile: could not parse count result '{val}' as integer");
+                return Some(format!("source reconcile count '{val}' is not an integer"));
+            };
+            summary.source_count = Some(count);
+            // ADR-0012 manifest-aware reconcile: compare source COUNT(*)
+            // against the manifest's *cumulative* row total (sum of
+            // committed parts), not just this run's writes.  In a
+            // resume scenario, `summary.total_rows` reflects only the
+            // chunks that re-ran in this invocation (e.g. 500 for one
+            // chunk), while the on-disk dataset is everything that
+            // ever committed (e.g. 2500 across resume attempts).
+            // Comparing total_rows would falsely report MISMATCH on
+            // every resume.  The manifest_parts accumulator already
+            // holds the cumulative count (Phase C-γ hydration); use
+            // its sum for the comparison.
+            let committed_rows: i64 = summary.manifest_parts.iter().map(|p| p.rows).sum();
+            let exported_total = if committed_rows > 0 {
+                committed_rows
             } else {
+                summary.total_rows
+            };
+            summary.reconciled = Some(exported_total == count);
+            if exported_total != count {
                 log::warn!(
-                    "reconcile: could not parse count result '{}' as integer",
-                    val
+                    "reconcile MISMATCH for '{}': committed {} rows, source has {}",
+                    plan.export_name,
+                    exported_total,
+                    count
+                );
+            } else {
+                log::info!(
+                    "reconcile MATCH for '{}': {}/{}",
+                    plan.export_name,
+                    exported_total,
+                    count
                 );
             }
+            // Reconcile RAN — match or mismatch is read off summary.reconciled by
+            // the gate; this is NOT could-not-verify.
+            None
         }
         Ok(None) => {
             log::warn!(
                 "reconcile: COUNT(*) returned NULL for '{}'",
                 plan.export_name
             );
+            Some("source reconcile COUNT(*) returned NULL".to_string())
         }
         Err(e) => {
             log::warn!(
@@ -344,6 +375,7 @@ fn reconcile_source_count(plan: &ResolvedRunPlan, summary: &mut RunSummary) {
                 plan.export_name,
                 e
             );
+            Some(format!("source reconcile count query failed: {e:#}"))
         }
     }
 }
@@ -662,7 +694,7 @@ pub(super) fn run_export_job(
 
     let mut reconcile_gate: crate::error::Result<()> = Ok(());
     if plan.reconcile && !failed {
-        reconcile_source_count(&plan, &mut summary);
+        let could_not_verify = reconcile_source_count(&plan, &mut summary);
         if let (Some(source_count), Some(matched)) = (summary.source_count, summary.reconciled) {
             summary.journal.record(RunEvent::ReconciliationResult {
                 source_count,
@@ -670,15 +702,15 @@ pub(super) fn run_export_job(
                 matched,
             });
         }
-        // A reconcile mismatch fails the run (exit 3), like the `reconcile`
-        // subcommand and `--validate`. Record it on the summary NOW so the
-        // report / metrics / RunCompleted event reflect the failure before the
-        // finalize hooks below run; the error is folded into `final_result`.
-        reconcile_gate = reconcile_run_gate(&summary);
-        if let Err(e) = &reconcile_gate {
-            summary.status = "failed".into();
-            summary.error_message = Some(crate::redact::redact_error(e));
-        }
+        // The reconcile verdict drives the EXIT CODE (folded into `final_result`):
+        // exit 3 on a mismatch, exit 1 on a could-not-verify. It does NOT flip
+        // `summary.status` to "failed" — that would make `finalize_manifest` write
+        // a Failed manifest with no _SUCCESS, so `rivet load` would REFUSE a
+        // COMPLETE, durable export because a post-hoc COUNT(*) raced a concurrent
+        // write on a live source (#2 bughunt). The export succeeded and stays
+        // loadable; the mismatch surfaces via `summary.reconciled` (report +
+        // metrics + the ReconciliationResult journal event) and the non-zero exit.
+        reconcile_gate = reconcile_run_gate(&summary, could_not_verify.as_deref());
     }
 
     summary.journal.record(RunEvent::RunCompleted {
@@ -883,7 +915,7 @@ mod tests {
             reconciled: Some(false),
             ..Default::default()
         };
-        let err = reconcile_run_gate(&s).unwrap_err();
+        let err = reconcile_run_gate(&s, None).unwrap_err();
         assert!(
             err.downcast_ref::<crate::error::DataIntegrityError>()
                 .is_some(),
@@ -895,11 +927,32 @@ mod tests {
             "a reconcile mismatch must classify as exit 3"
         );
 
-        // A match, and a skipped reconcile (reconciled == None), must NOT gate.
+        // A match, and a skipped reconcile (reconciled == None, no could-not-verify
+        // reason), must NOT gate.
         s.reconciled = Some(true);
-        assert!(reconcile_run_gate(&s).is_ok());
+        assert!(reconcile_run_gate(&s, None).is_ok());
         s.reconciled = None;
-        assert!(reconcile_run_gate(&s).is_ok());
+        assert!(reconcile_run_gate(&s, None).is_ok());
+
+        // #10: a COULD-NOT-VERIFY reconcile (reconciled == None BUT a reason is
+        // present) is OPERATIONAL — exit 1, NOT verified-OK (exit 0) and NOT the
+        // data-integrity class (exit 3).
+        let err = reconcile_run_gate(&s, Some("could not connect to the source"))
+            .expect_err("a could-not-verify reconcile must gate non-zero");
+        assert!(
+            err.downcast_ref::<crate::error::DataIntegrityError>()
+                .is_none(),
+            "could-not-verify must NOT be data-integrity (exit 3)"
+        );
+        assert_eq!(
+            crate::error::classify_exit(&err),
+            1,
+            "a could-not-verify reconcile must classify as operational exit 1"
+        );
+        // A genuine MISMATCH wins over a could-not-verify reason (data-integrity).
+        s.reconciled = Some(false);
+        let err = reconcile_run_gate(&s, Some("noise")).unwrap_err();
+        assert_eq!(crate::error::classify_exit(&err), 3);
     }
 
     #[test]
