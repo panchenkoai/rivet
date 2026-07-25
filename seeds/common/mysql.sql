@@ -2,7 +2,7 @@
 -- Assembled from dev/mysql/init.sql (DDL) + a fast-profile CTE fill + dev/garbage/mysql.sql.
 
 SET FOREIGN_KEY_CHECKS=0;
-DROP TABLE IF EXISTS content_items, page_views, events, orders, users, orders_sparse, orders_coalesce, rivet_type_matrix, rivet_type_matrix_full;
+DROP TABLE IF EXISTS content_items, page_views, events, orders, users, orders_sparse, orders_coalesce, rivet_type_matrix;
 SET FOREIGN_KEY_CHECKS=1;
 
 CREATE TABLE users (
@@ -129,70 +129,113 @@ CREATE TABLE orders_coalesce (
 CREATE INDEX idx_orders_coalesce_updated_at ON orders_coalesce(updated_at);
 CREATE INDEX idx_orders_coalesce_created_at ON orders_coalesce(created_at);
 
--- ─── Type-matrix demo (parquet → BigQuery / tooling checks) ───
--- See dev/workbench/mysql_type_matrix.yaml and dev/bigquery/type_matrix_bigquery.md
+-- ─── Type-matrix: the FULL canonical MySQL type matrix ─────────────────────
+-- Ports tests/type_roundtrip/fixtures/mysql_schema.sql + _seed.sql — every
+-- Rivet-mapped MySQL type (tinyint→bigint signed+UNSIGNED, decimal×3, float/
+-- double, date/time(6), datetime(6)/timestamp(6), char/varchar/text/longtext/
+-- mediumtext, binary/varbinary/blob, uuid-as-string, json, enum, set, year,
+-- bit(1)/bit(8), nullable + all-null). The bigint_u/decimal edge cases feed the
+-- warehouse resolver rows; each engine carries its OWN native set.
 CREATE TABLE rivet_type_matrix (
     id BIGINT PRIMARY KEY,
-    label VARCHAR(200) NOT NULL,
+    c_tinyint TINYINT NOT NULL,
+    c_tinyint_u TINYINT UNSIGNED NOT NULL,
+    c_bool TINYINT(1) NOT NULL,
+    c_boolean BOOLEAN NOT NULL,
+    c_smallint SMALLINT NOT NULL,
+    c_smallint_u SMALLINT UNSIGNED NOT NULL,
+    c_int INT NOT NULL,
+    c_int_u INT UNSIGNED NOT NULL,
+    c_bigint BIGINT NOT NULL,
+    c_bigint_u BIGINT UNSIGNED NOT NULL,
     amount DECIMAL(18, 2) NULL,
-    fee DECIMAL(18, 6) NULL,
+    fee DECIMAL(20, 6) NULL,
+    price DECIMAL(10, 2) NULL,
+    c_float FLOAT NOT NULL,
+    c_double DOUBLE NOT NULL,
+    c_date DATE NOT NULL,
+    c_time TIME(6) NOT NULL,
     created_at_dt DATETIME(6) NOT NULL,
     created_at_ts TIMESTAMP(6) NOT NULL,
+    label VARCHAR(200) NOT NULL,
+    c_char CHAR(10) NOT NULL,
+    c_text TEXT NOT NULL,
+    c_varchar VARCHAR(50) NOT NULL,
+    long_text LONGTEXT NOT NULL,
+    medium_text MEDIUMTEXT NOT NULL,
     raw_bytes BINARY(4) NOT NULL,
+    var_bytes VARBINARY(8) NOT NULL,
+    blob_bytes BLOB NOT NULL,
     uid VARCHAR(36) NOT NULL,
-    extras JSON NOT NULL
+    extras JSON NOT NULL,
+    enum_col ENUM('a', 'b', 'c') NOT NULL,
+    set_col SET('x', 'y', 'z') NOT NULL,
+    year_col YEAR NOT NULL,
+    c_bit1 BIT(1) NOT NULL,
+    c_bit8 BIT(8) NOT NULL,
+    note_nullable VARCHAR(500),
+    note_all_null VARCHAR(500)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+SET time_zone = '+00:00';
 INSERT INTO rivet_type_matrix (
-    id, label, amount, fee, created_at_dt, created_at_ts, raw_bytes, uid, extras
+    id, c_tinyint, c_tinyint_u, c_bool, c_boolean,
+    c_smallint, c_smallint_u, c_int, c_int_u, c_bigint, c_bigint_u,
+    amount, fee, price, c_float, c_double, c_date, c_time,
+    created_at_dt, created_at_ts, label, c_char, c_text, c_varchar,
+    long_text, medium_text,
+    raw_bytes, var_bytes, blob_bytes, uid, extras,
+    enum_col, set_col, year_col, c_bit1, c_bit8,
+    note_nullable, note_all_null
 ) VALUES
-  (1, 'payments-like', 0.10, 0.000001,
-      '2035-08-07 09:08:07.987654',
-      '2035-08-07 09:08:07.987654',
-      UNHEX('00ff0123'),
+  (1, 5, 255, 1, TRUE,
+      1, 65535, 2, 4294967295, 9223372036854775807, 18446744073709551615,
+      0.10, 0.000001, 1234.56, 1.5, 2.25,
+      '2035-08-07', '09:08:07.987654',
+      '2035-08-07 09:08:07.987654', '2035-08-07 09:08:07.987654',
+      'payments-like', 'char-a    ', 'text row 1', 'varchar-a',
+      repeat('L', 5000), repeat('M', 3000),
+      UNHEX('00ff0123'), UNHEX('0102030405060708'), UNHEX('cafebabe'),
       'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380011',
-      JSON_OBJECT('tier', 'gold', 'n', 1)),
-  (2, 'payments-like', 0.20, 0.000002,
-      '2019-02-03 03:07:06.554433',
-      '2019-02-03 03:07:06.554433',
-      UNHEX('deadbeef'),
+      JSON_OBJECT('tier', 'gold', 'n', 1),
+      'b', 'x,y', 2024, 1, 255,
+      'line1\nline2', NULL),
+  (2, -5, 0, 0, FALSE,
+      -1, 0, -2, 0, -9223372036854775808, 9223372036854775808,
+      0.20, 0.000002, -99.99, -1.5, -2.25,
+      '2019-02-03', '03:07:06.554433',
+      '2019-02-03 03:07:06.554433', '2019-02-03 03:07:06.554433',
+      'payments-like', 'char-b    ', 'text row 2', 'varchar-b',
+      repeat('L', 4000), repeat('M', 2000),
+      UNHEX('deadbeef'), UNHEX('aabbccddeeff0011'), UNHEX('00'),
       'b0eebc99-9c0b-4ef8-bb6d-6bb9bd380022',
-      JSON_ARRAY('a', 'b')),
-  (3, 'payments-like', 999999999999.99, 10.123456,
-      '2020-01-15 00:00:00.000001',
-      '2020-01-15 00:00:00.000001',
-      UNHEX('cafe'),
+      JSON_ARRAY('a', 'b'),
+      'a', 'x', 2000, 0, 1,
+      'quote \"and\", comma', NULL),
+  (3, 127, 200, 1, TRUE,
+      32767, 60000, 2147483647, 4000000000, 0, 1,
+      999999999999.99, 10.123456, 0.01, 0.0, 1e100,
+      '2020-01-15', '00:00:00.000001',
+      '2020-01-15 00:00:00.000001', '2020-01-15 00:00:00.000001',
+      'payments-like', 'char-c    ', 'text row 3', 'varchar-c',
+      repeat('L', 3000), repeat('M', 1000),
+      UNHEX('cafe'), UNHEX('ff'), UNHEX('dead'),
       'c0eebc99-9c0b-4ef8-bb6d-6bb9bd380033',
-      CAST('{"big":true}' AS JSON)),
-  (4, 'payments-like', -100.05, -0.123456,
-      '2021-06-30 12:59:59.999999',
-      '2021-06-30 12:59:59.999999',
-      UNHEX('00'),
+      JSON_OBJECT('big', true),
+      'c', 'y,z', 1999, 1, 255,
+      NULL, NULL),
+  (4, -128, 1, 0, FALSE,
+      -32768, 1, -2147483648, 1, 42, 0,
+      -100.05, -0.123456, 9999999.99, 3.14, -1e50,
+      '2021-06-30', '12:59:59.999999',
+      '2021-06-30 12:59:59.999999', '2021-06-30 12:59:59.999999',
+      'payments-like', 'char-d    ', 'text row 4', 'varchar-d',
+      repeat('L', 2000), repeat('M', 500),
+      UNHEX('00'), UNHEX('00'), UNHEX(''),
       'd0eebc99-9c0b-4ef8-bb6d-6bb9bd380044',
-      CAST('{}' AS JSON));
-
--- ─── Full type-matrix: covers every Rivet-mapped MySQL type ────────────────
--- See dev/workbench/mysql_type_matrix.yaml and tests/live_type_golden.rs
-CREATE TABLE rivet_type_matrix_full (
-    id            BIGINT PRIMARY KEY,
-    flag          BOOLEAN,                         -- TINYINT(1) → Bool
-    bit1_col      BIT(1),                          -- BIT(1)     → Bool
-    bit8_col      BIT(8),                          -- BIT(8)     → Int64
-    tiny_col      TINYINT,                         -- TINYINT    → Int16
-    date_col      DATE,                            -- DATE       → Date32
-    time_col      TIME(6),                         -- TIME(6)    → Time64(µs)
-    year_col      YEAR,                            -- YEAR       → Int16
-    enum_col      ENUM('a', 'b', 'c'),             -- ENUM       → Utf8
-    varbinary_col VARBINARY(4),                    -- VARBINARY  → Binary
-    blob_col      BLOB                             -- BLOB       → Binary
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-
-INSERT INTO rivet_type_matrix_full
-    (id, flag, bit1_col, bit8_col, tiny_col, date_col, time_col, year_col, enum_col, varbinary_col, blob_col)
-VALUES
-  (1, TRUE,  b'1', b'10101010',  127, '2024-03-15', '14:30:00.123456', 2024, 'b', 0xDEADBEEF, 0x0102030405),
-  (2, FALSE, b'0', b'00000001', -128, '1970-01-01', '00:00:00.000000', 2000, 'a', 0x00000000, 0xCAFE),
-  (3, NULL,  NULL, NULL,           0, '2000-02-29', '23:59:59.999999', NULL, NULL, NULL,       NULL);
+      JSON_OBJECT(),
+      'a', 'z', 1970, 0, 0,
+      'unicode: 日本語 🚀', NULL);
 
 -- ============================================================================
 -- DATA FILL — fast-profile reproduction of the Rust seeder (fast.rs, MySQL path).
@@ -260,7 +303,7 @@ FROM n;
 -- Refresh table stats so `rivet init` sees the TRUE row counts right after a fresh
 -- seed (else every 150K table scaffolds `mode: full` instead of keyset).
 ANALYZE TABLE users, orders, events, page_views, content_items,
-              orders_sparse, orders_coalesce, rivet_type_matrix, rivet_type_matrix_full;
+              orders_sparse, orders_coalesce, rivet_type_matrix;
 
 -- === GARBAGE PROFILE ===
 -- Obfuscated GARBAGE-profile fixture (MySQL) — see dev/garbage/postgres.sql for

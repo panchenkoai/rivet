@@ -7,7 +7,7 @@
 DROP VIEW IF EXISTS orders_sparse_for_export CASCADE;
 DROP TABLE IF EXISTS content_items, page_views, events, orders, users,
                      orders_sparse, orders_coalesce,
-                     rivet_type_matrix, rivet_type_matrix_full CASCADE;
+                     rivet_type_matrix CASCADE;
 DROP TYPE IF EXISTS rivet_status CASCADE;
 
 CREATE TABLE users (
@@ -132,70 +132,122 @@ CREATE TABLE orders_coalesce (
 CREATE INDEX idx_orders_coalesce_updated_at ON orders_coalesce(updated_at);
 CREATE INDEX idx_orders_coalesce_created_at ON orders_coalesce(created_at);
 
--- ─── Type-matrix demo: golden-style columns for parquet → warehouse checks ───
--- See dev/workbench/pg_type_matrix.yaml and dev/bigquery/type_matrix_bigquery.md
+-- ─── Type-matrix: the FULL canonical PostgreSQL type matrix ─────────────────
+-- Ports tests/type_roundtrip/fixtures/postgres_schema.sql + _seed.sql — every
+-- Rivet-mapped PG type (smallint→bigint, numeric×3, real/double, date/time,
+-- timestamp±tz, text/varchar/char, bytea, uuid, jsonb/json, bool, interval,
+-- enum, text[]/int[], wide + unicode text, nullable + all-null). Feeds the
+-- DuckDB + BigQuery golden round-trips. Each engine carries its OWN native set
+-- (MySQL/MSSQL matrices mirror this in their own types).
+CREATE TYPE rivet_status AS ENUM ('active', 'inactive', 'pending');
+
 CREATE TABLE rivet_type_matrix (
     id BIGINT PRIMARY KEY,
-    label TEXT NOT NULL,
+    c_smallint SMALLINT NOT NULL,
+    c_integer INTEGER NOT NULL,
+    c_bigint BIGINT NOT NULL,
     amount NUMERIC(18, 2),
-    fee NUMERIC(18, 6),
+    fee NUMERIC(20, 6),
+    price NUMERIC(10, 2),
+    c_real REAL NOT NULL,
+    c_double DOUBLE PRECISION NOT NULL,
+    c_date DATE NOT NULL,
+    c_time TIME NOT NULL,
     created_at TIMESTAMP NOT NULL,
     created_at_tz TIMESTAMPTZ NOT NULL,
+    label TEXT NOT NULL,
+    c_varchar VARCHAR(50) NOT NULL,
+    c_bpchar CHAR(10) NOT NULL,
     raw_bytes BYTEA NOT NULL,
     uid UUID NOT NULL,
-    attrs JSONB
+    attrs JSONB,
+    attrs_json JSON NOT NULL,
+    c_bool BOOLEAN NOT NULL,
+    interval_col INTERVAL NOT NULL,
+    enum_col rivet_status NOT NULL,
+    tags TEXT[] NOT NULL,
+    nums INTEGER[] NOT NULL,
+    large_text TEXT NOT NULL,
+    note_nullable TEXT,
+    note_all_null TEXT
 );
 
 INSERT INTO rivet_type_matrix (
-    id, label, amount, fee, created_at, created_at_tz, raw_bytes, uid, attrs
+    id, c_smallint, c_integer, c_bigint, amount, fee, price,
+    c_real, c_double, c_date, c_time, created_at, created_at_tz,
+    label, c_varchar, c_bpchar, raw_bytes, uid, attrs, attrs_json, c_bool,
+    interval_col, enum_col, tags, nums, large_text,
+    note_nullable, note_all_null
 ) VALUES
-  (1, 'payments-like', 0.10, 0.000001,
+  (1, 1, 2, 9223372036854775807, 0.10, 0.000001, 1234.56,
+      1.5, 2.25,
+      DATE '2035-08-07', TIME '09:08:07.987654',
       TIMESTAMP '2035-08-07 09:08:07.987654',
       TIMESTAMPTZ '2035-08-07 09:08:07.987654Z',
+      'payments-like', 'varchar-a', 'bpchar-a  ',
       '\x00ff012345'::bytea,
       'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380011'::uuid,
-      '{"tier":"gold","n":1}'::jsonb),
-  (2, 'payments-like', 0.20, 0.000002,
+      '{"tier":"gold","n":1}'::jsonb,
+      '{"k":1}'::json,
+      true,
+      INTERVAL '1 year 2 months 3 days',
+      'active',
+      ARRAY['alpha','beta'],
+      ARRAY[1,2,3],
+      repeat('X', 5000),
+      'line1
+line2', NULL),
+  (2, -1, -2, -9223372036854775808, 0.20, 0.000002, -99.99,
+      -1.5, -2.25,
+      DATE '2019-02-03', TIME '03:07:06.554433',
       TIMESTAMP '2019-02-03 03:07:06.554433',
       TIMESTAMPTZ '2019-02-03 08:07:06.554433+05',
+      'payments-like', 'varchar-b', 'bpchar-b  ',
       '\xdeadbeef'::bytea,
       'b0eebc99-9c0b-4ef8-bb6d-6bb9bd380022'::uuid,
-      '["a","b"]'::jsonb),
-  (3, 'payments-like', 999999999999.99, 10.123456,
+      '["a","b"]'::jsonb,
+      '[]'::json,
+      false,
+      INTERVAL '-1 year',
+      'inactive',
+      ARRAY['gamma'],
+      ARRAY[42],
+      repeat('Y', 4000),
+      'quote "and", comma', NULL),
+  (3, 32767, 2147483647, 0, 999999999999.99, 10.123456, 0.01,
+      0.0, 1e100,
+      DATE '2020-01-15', TIME '00:00:00.000001',
       TIMESTAMP '2020-01-15 00:00:00.000001',
       TIMESTAMPTZ '2020-01-15 00:00:00.000001+00',
+      'payments-like', 'varchar-c', 'bpchar-c  ',
       '\xcafe'::bytea,
       'c0eebc99-9c0b-4ef8-bb6d-6bb9bd380033'::uuid,
-      '{"big":true}'::jsonb),
-  (4, 'payments-like', -100.05, -0.123456,
+      '{"big":true}'::jsonb,
+      '{"x":null}'::json,
+      true,
+      INTERVAL '0',
+      'pending',
+      ARRAY[]::text[],
+      ARRAY[0],
+      repeat('Z', 3000),
+      NULL, NULL),
+  (4, -32768, -2147483648, 42, -100.05, -0.123456, 9999999.99,
+      3.14, -1e50,
+      DATE '2021-06-30', TIME '12:59:59.999999',
       TIMESTAMP '2021-06-30 12:59:59.999999',
       TIMESTAMPTZ '2021-06-30 12:59:59.999999+00',
+      'payments-like', 'varchar-d', 'bpchar-d  ',
       '\x00'::bytea,
       'd0eebc99-9c0b-4ef8-bb6d-6bb9bd380044'::uuid,
-      '{}'::jsonb);
-
--- ─── Full type-matrix: covers every Rivet-mapped PG type ───────────────────
--- See dev/workbench/pg_type_matrix.yaml and tests/live_type_golden.rs
-CREATE TYPE rivet_status AS ENUM ('active', 'inactive', 'pending');
-
-CREATE TABLE rivet_type_matrix_full (
-    id           BIGINT PRIMARY KEY,
-    flag         BOOLEAN,
-    int2_col     SMALLINT,
-    int4_col     INTEGER,
-    float4_col   REAL,
-    date_col     DATE,
-    time_col     TIME,
-    interval_col INTERVAL,
-    enum_col     rivet_status,
-    tags         TEXT[],
-    nums         INTEGER[]
-);
-
-INSERT INTO rivet_type_matrix_full VALUES
-  (1, TRUE,  32767,       2147483647,  3.14::real, '2024-03-15', '14:30:00.123456',  INTERVAL '1 year 2 months 3 days', 'active',   ARRAY['alpha','beta'], ARRAY[1,2,3]),
-  (2, FALSE, -32768,     -2147483648, -1.5::real,  '1970-01-01', '00:00:00',         INTERVAL '-1 year',                'inactive', ARRAY['gamma'],        ARRAY[42]),
-  (3, NULL,  NULL,        0,           0.0::real,  '2000-02-29', '23:59:59.999999',  INTERVAL '0',                      NULL,       ARRAY[]::text[],       NULL);
+      '{}'::jsonb,
+      '{}'::json,
+      false,
+      INTERVAL '42 days',
+      'active',
+      ARRAY['only'],
+      ARRAY[-1, 0, 1],
+      repeat('W', 2000),
+      'unicode: 日本語 🚀', NULL);
 
 -- ============================================================================
 -- DATA FILL — fast-profile reproduction of the Rust seeder (src/bin/seed/fast.rs).
@@ -298,7 +350,7 @@ FROM generate_series(1, 150000) AS i;
 -- scaffolds `mode: full` instead of keyset. Deterministic init depends on it.
 ANALYZE users; ANALYZE orders; ANALYZE events; ANALYZE page_views;
 ANALYZE content_items; ANALYZE orders_sparse; ANALYZE orders_coalesce;
-ANALYZE rivet_type_matrix; ANALYZE rivet_type_matrix_full;
+ANALYZE rivet_type_matrix;
 
 -- ============================================================================
 -- GARBAGE PROFILE (ext.* schema) — the anonymized field-DB shapes.

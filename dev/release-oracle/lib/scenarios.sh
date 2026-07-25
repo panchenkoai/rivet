@@ -136,7 +136,9 @@ sc_integrity_types() {
   #                     fidelity) — the text-writer class the binary parquet path
   #                     never exercises. Regressions fail against a fixed truth.
   if [ "$eng" != mongo ]; then
-    for tmt in rivet_type_matrix rivet_type_matrix_full; do
+    # ONE comprehensive matrix per engine now (the canonical full type set —
+    # `rivet_type_matrix` ports tests/type_roundtrip/fixtures/<eng>_schema.sql).
+    for tmt in rivet_type_matrix; do
       if _export_local "$eng" "$url" "$tmt" "$out/$tmt" full; then
         local got; got="$(duckdb -json -c "SELECT * FROM read_parquet('$out/$tmt/**/*.parquet') ORDER BY id" 2>/dev/null | python3 "$HERE/lib/normalize_bq.py")"
         if [ -z "$got" ]; then fails+="$tmt-readback "; else _fidelity_check "$eng" "$tmt" "$got" || fails+="$tmt-TYPE-DIVERGED "; fi
