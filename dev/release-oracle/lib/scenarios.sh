@@ -91,7 +91,8 @@ sc_integrity_types() {
   [ "$scnt" = "$dcnt" ] || fails+="users src[$scnt]≠parquet[$dcnt] "
   # type values (pg/mysql via scanner: decimal + uuid distinct).
   if [ "$eng" = postgres ] || [ "$eng" = mysql ]; then
-    local tv; tv="$(_type_oracle "$eng" "$tmtable" "$out/tm")"
+    local port; port="$(sed -E 's|.*@[^:]+:([0-9]+)/.*|\1|' <<<"$url")"
+    local tv; tv="$(_type_oracle "$eng" "$tmtable" "$out/tm" "$port")"
     [ "$tv" = ok ] || fails+="type-oracle:$tv "
   fi
   [ -z "$fails" ] && { ok "integrity+types (loss/dup 0, types match)"; add "$eng" "$tag" integrity_types - PASS; } \
@@ -110,10 +111,10 @@ _source_count_distinct() {
 }
 
 _type_oracle() {  # pg/mysql: decimal sum + uuid distinct match source (scanner)
-  local eng=$1 tbl=$2 dir=$3 att
+  local eng=$1 tbl=$2 dir=$3 port=$4 att
   case "$eng" in
-    postgres) att="INSTALL postgres_scanner; LOAD postgres_scanner; ATTACH 'postgresql://rivet:rivet@127.0.0.1:$(_hostport "$eng")/rivet' AS s (TYPE postgres, READ_ONLY);";;
-    mysql)    att="INSTALL mysql_scanner; LOAD mysql_scanner; ATTACH 'host=127.0.0.1 port=$(_hostport "$eng") user=rivet password=rivet database=rivet' AS s (TYPE mysql, READ_ONLY);";;
+    postgres) att="INSTALL postgres_scanner; LOAD postgres_scanner; ATTACH 'postgresql://rivet:rivet@127.0.0.1:$port/rivet' AS s (TYPE postgres, READ_ONLY);";;
+    mysql)    att="INSTALL mysql_scanner; LOAD mysql_scanner; ATTACH 'host=127.0.0.1 port=$port user=rivet password=rivet database=rivet' AS s (TYPE mysql, READ_ONLY);";;
   esac
   local r; r="$(duckdb -noheader -list -c "$att
     CREATE TABLE d AS SELECT * FROM read_parquet('$dir/**/*.parquet');
@@ -129,6 +130,7 @@ _hostport() { docker ps --format '{{.Names}} {{.Ports}}' | grep "rivet-oracle-en
 _export_local() {
   local eng=$1 url=$2 tbl=$3 dir=$4 mode=$5 yaml="$WORK/ex_$$_${tbl//./_}.yaml"
   rm -rf "$dir"; export ORACLE_URL="$url"
+  [ "$eng" = mongo ] && mode=full   # Mongo has no keyset/chunked — full scan only
   local keyline="    mode: full"; [ "$mode" = chunked ] && keyline=$'    mode: chunked\n    chunk_by_key: id\n    chunk_size: 50000'
   local tlsblk=""; [ "$eng" = mssql ] && tlsblk=$'\n  tls: {accept_invalid_certs: true}'
   cat > "$yaml" <<YAML
@@ -156,6 +158,8 @@ sc_load() {
   local yaml="$WORK/load_${eng}_${tag//./_}_${store}.yaml"; export ORACLE_URL="$url"
   export MINIO_ACCESS_KEY=minioadmin MINIO_SECRET_KEY=minioadmin AZURITE_KEY="Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=="
   local tlsblk=""; [ "$eng" = mssql ] && tlsblk=$'\n  tls: {accept_invalid_certs: true}'
+  local modeblk=$'    mode: chunked\n    chunk_by_key: id\n    chunk_size: 50000'
+  [ "$eng" = mongo ] && modeblk="    mode: full"   # Mongo: full scan only
   cat > "$yaml" <<YAML
 source:
   type: $eng
@@ -163,9 +167,7 @@ source:
 exports:
   - name: users
     table: users
-    mode: chunked
-    chunk_by_key: id
-    chunk_size: 50000
+$modeblk
     format: parquet
     destination:
 $dest
