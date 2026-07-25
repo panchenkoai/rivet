@@ -7,8 +7,9 @@
 run_scenarios() {
   local eng=$1 tag=$2 url=$3
   sc_verdicts "$eng" "$tag" "$url"
-  [ "${BLESS_VERDICTS:-0}" = 1 ] && return   # blessing the golden — skip the rest
   sc_integrity_types "$eng" "$tag" "$url"
+  # blessing the local goldens (verdicts + duckdb-type) — skip the store loads.
+  { [ "${BLESS_VERDICTS:-0}" = 1 ] || [ "${BLESS_DUCKDB:-0}" = 1 ]; } && return
   for store in $(cfg stores); do
     sc_load "$eng" "$tag" "$url" "$store"
   done
@@ -50,7 +51,10 @@ sc_verdicts() {
     local c; c="$(_init_cfg mongo "$url" "")" || { skip "mongo init failed"; add mongo "$tag" verdicts - SKIP init; return; }
     checks=("$c")
   else
-    local sc; sc="$(_init_cfg "$eng" "$url" "$( [ "$eng" = mssql ] && echo dbo )")" \
+    # seeds schema is per-engine: PG `public`, MSSQL `dbo`, MySQL none (db from URL).
+    # (init WITHOUT --schema on PG scaffolds nothing usable → an empty check.)
+    local sch=""; case "$eng" in postgres) sch=public;; mssql) sch=dbo;; esac
+    local sc; sc="$(_init_cfg "$eng" "$url" "$sch")" \
       || { skip "$eng init failed"; add "$eng" "$tag" verdicts - SKIP init; return; }
     checks=("$sc")
     # pg/mssql: garbage lives in schema `ext` (separate init); mysql: same DB.
@@ -77,27 +81,51 @@ sc_verdicts() {
   else local d; d="$(python3 "$HERE/lib/verdict_diff.py" "$want" "$got")"; bad "verdicts DIVERGED: $d"; add "$eng" "$tag" verdicts - FAIL "$d"; fi
 }
 
-# ── integrity + types: export → DuckDB oracle vs source ──────────────────────
+# ── integrity + types ────────────────────────────────────────────────────────
+# Two independent oracles:
+#  (1) users 150K loss/dup — source count+distinct vs the DuckDB read of the parts.
+#  (2) TYPE matrices — a DuckDB GOLDEN (golden/duckdb_type_matrix.json, per engine):
+#      rivet exports rivet_type_matrix[_full] → DuckDB reads every value back → the
+#      canonical JSON is compared to the blessed golden. A type regression (decimal
+#      precision, uuid nulling, timestamp shift, enum) fails against a fixed truth,
+#      exactly like the BigQuery golden but on the local independent reader.
+GOLDEN_DUCKDB="$HERE/golden/duckdb_type_matrix.json"
 sc_integrity_types() {
   local eng=$1 tag=$2 url=$3 out="$WORK/it_${eng}_${tag//./_}" fails=""
   mkdir -p "$out"
-  # keyset integrity table (users) + type-rich table.
-  local tmtable="rivet_type_matrix"
-  _export_local "$eng" "$url" users "$out/users" chunked || { skip "$eng users export failed"; add "$eng" "$tag" integrity_types - SKIP export; return; }
-  _export_local "$eng" "$url" "$tmtable" "$out/tm" full  || true
-  # users loss/dup (all engines): source count/distinct vs parquet.
-  local scnt; scnt="$(_source_count_distinct "$eng" "$url" users id)"
-  local dcnt; dcnt="$(duckdb -noheader -list -c "SELECT count(*)||' '||count(DISTINCT id) FROM read_parquet('$out/users/**/*.parquet')" 2>/dev/null)"
-  [ "$scnt" = "$dcnt" ] || fails+="users src[$scnt]≠parquet[$dcnt] "
-  # type values (pg/mysql via scanner: decimal + uuid distinct).
-  if [ "$eng" = postgres ] || [ "$eng" = mysql ]; then
-    local port; port="$(sed -E 's|.*@[^:]+:([0-9]+)/.*|\1|' <<<"$url")"
-    local tv; tv="$(_type_oracle "$eng" "$tmtable" "$out/tm" "$port")"
-    [ "$tv" = ok ] || fails+="type-oracle:$tv "
+  # (1) users loss/dup — all engines.
+  if _export_local "$eng" "$url" users "$out/users" chunked; then
+    local scnt dcnt
+    scnt="$(_source_count_distinct "$eng" "$url" users id)"
+    dcnt="$(duckdb -noheader -list -c "SELECT count(*)||' '||count(DISTINCT $( [ "$eng" = mongo ] && echo _id || echo id )) FROM read_parquet('$out/users/**/*.parquet')" 2>/dev/null)"
+    [ "$scnt" = "$dcnt" ] || fails+="users src[$scnt]≠parquet[$dcnt] "
+  else
+    fails+="users-export-failed "
   fi
-  [ -z "$fails" ] && { ok "integrity+types (loss/dup 0, types match)"; add "$eng" "$tag" integrity_types - PASS; } \
+  # (2) type matrices → DuckDB golden (SQL engines have rivet_type_matrix[_full]).
+  if [ "$eng" != mongo ]; then
+    for tmt in rivet_type_matrix rivet_type_matrix_full; do
+      _export_local "$eng" "$url" "$tmt" "$out/$tmt" full || { fails+="$tmt-export "; continue; }
+      local got; got="$(duckdb -json -c "SELECT * FROM read_parquet('$out/$tmt/**/*.parquet') ORDER BY id" 2>/dev/null | python3 "$HERE/lib/normalize_bq.py")"
+      [ -z "$got" ] && { fails+="$tmt-readback "; continue; }
+      if [ "${BLESS_DUCKDB:-0}" = 1 ]; then
+        _golden_put "$GOLDEN_DUCKDB" "$eng" "$tmt" "$got"
+      else
+        local want; want="$(_golden_get "$GOLDEN_DUCKDB" "$eng" "$tmt")"
+        if [ -z "$want" ]; then fails+="$tmt-no-golden "; \
+        elif [ "$(_json_canon "$got")" != "$want" ]; then fails+="$tmt-TYPE-DIVERGED "; fi
+      fi
+    done
+  fi
+  if [ "${BLESS_DUCKDB:-0}" = 1 ]; then ok "blessed duckdb-types[$eng]"; add "$eng" "$tag" integrity_types - PASS blessed; return; fi
+  [ -z "$fails" ] && { ok "integrity+types (loss/dup 0, type matrices match DuckDB golden)"; add "$eng" "$tag" integrity_types - PASS; } \
                   || { bad "integrity+types: $fails"; add "$eng" "$tag" integrity_types - FAIL "$fails"; }
 }
+
+# ── golden helpers (shared by duckdb + bigquery goldens) ─────────────────────
+_json_canon() { python3 -c "import json,sys;print(json.dumps(json.loads(sys.argv[1]),sort_keys=True))" "$1" 2>/dev/null; }
+_golden_get() { python3 -c "import json,os,sys;g=json.load(open(sys.argv[1])) if os.path.exists(sys.argv[1]) else {};print(json.dumps(g.get(sys.argv[2],{}).get(sys.argv[3]),sort_keys=True) if g.get(sys.argv[2],{}).get(sys.argv[3]) is not None else '')" "$1" "$2" "$3" 2>/dev/null; }
+_golden_put() { mkdir -p "$(dirname "$1")"; python3 -c "import json,os,sys;g=json.load(open(sys.argv[1])) if os.path.exists(sys.argv[1]) else {};g.setdefault(sys.argv[2],{})[sys.argv[3]]=json.loads(sys.argv[4]);open(sys.argv[1],'w').write(json.dumps(g,indent=2,sort_keys=True)+chr(10))" "$1" "$2" "$3" "$4"; }
 
 _source_count_distinct() {
   local eng=$1 url=$2 tbl=$3 idc=$4 name="rivet-oracle-eng-${eng}-*"
