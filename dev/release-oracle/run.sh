@@ -78,7 +78,11 @@ start_stores() {
 # ── per engine×version bring-up ──
 # echoes the resolved connection URL on success, empty on skip.
 bring_up() {
-  local eng=$1 tag=$2 image=$3 port=$4 name="rivet-oracle-eng-${eng}-${tag//./_}"
+  local eng=$1 tag=$2 image=$3 port=$4
+  # own line — macOS bash 3.2 expands a same-line ${eng}/${tag} against the ENCLOSING
+  # scope (the leftover main-loop values), so the BQ stage's `bring_up postgres bq …`
+  # mis-named the container after the last engine. Split so it sees the just-set args.
+  local name="rivet-oracle-eng-${eng}-${tag//./_}"
   docker rm -f "$name" >/dev/null 2>&1 || true
   case "$eng" in
     postgres) docker run -d --name "$name" -e POSTGRES_USER=rivet -e POSTGRES_PASSWORD=rivet -e POSTGRES_DB=rivet -p "$port:5432" "$image" >/dev/null 2>&1 ;;
@@ -102,7 +106,8 @@ bring_up() {
 }
 
 seed_engine() {
-  local eng=$1 name="rivet-oracle-eng-${eng}-${2//./_}" seed; seed="$ROOT/$(cfg seed "$eng")"
+  local eng=$1                                   # own line (bash 3.2 same-line ${eng} gotcha)
+  local name="rivet-oracle-eng-${eng}-${2//./_}" seed; seed="$ROOT/$(cfg seed "$eng")"
   case "$eng" in
     postgres) docker exec -i "$name" psql -U rivet -d rivet -q -v ON_ERROR_STOP=1 < "$seed" 2>&1 | grep -aiE "error" | head -3;;
     mysql)    docker exec -i "$name" mysql -urivet -privet rivet < "$seed" 2>&1 | grep -aiE "error" | head -3;;

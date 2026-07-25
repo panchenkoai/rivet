@@ -1,0 +1,48 @@
+{
+  "rivet_type_matrix": [
+    {
+      "amount": "0.1",
+      "attrs": "{\"n\":1,\"tier\":\"gold\"}",
+      "created_at": "2035-08-07T09:08:07.987654",
+      "created_at_tz": "2035-08-07 09:08:07",
+      "fee": "0.000001",
+      "id": "1",
+      "label": "payments-like",
+      "raw_bytes": "AP8BI0U=",
+      "uid": "\ufffd\uef19\ufffd\u000bN\ufffd\ufffdmk\ufffd\ufffd8\u0000\u0011"
+    },
+    {
+      "amount": "0.2",
+      "attrs": "[\"a\",\"b\"]",
+      "created_at": "2019-02-03T03:07:06.554433",
+      "created_at_tz": "2019-02-03 03:07:06",
+      "fee": "0.000002",
+      "id": "2",
+      "label": "payments-like",
+      "raw_bytes": "3q2+7w==",
+      "uid": "\ufffd\uef19\ufffd\u000bN\ufffd\ufffdmk\ufffd\ufffd8\u0000\""
+    },
+    {
+      "amount": "999999999999.99",
+      "attrs": "{\"big\":true}",
+      "created_at": "2020-01-15T00:00:00.000001",
+      "created_at_tz": "2020-01-15 00:00:00",
+      "fee": "10.123456",
+      "id": "3",
+      "label": "payments-like",
+      "raw_bytes": "yv4=",
+      "uid": "\ufffd\uef19\ufffd\u000bN\ufffd\ufffdmk\ufffd\ufffd8\u00003"
+    },
+    {
+      "amount": "-100.05",
+      "attrs": "{}",
+      "created_at": "2021-06-30T12:59:59.999999",
+      "created_at_tz": "2021-06-30 12:59:59",
+      "fee": "-0.123456",
+      "id": "4",
+      "label": "payments-like",
+      "raw_bytes": "AA==",
+      "uid": "\ufffd\uef19\ufffd\u000bN\ufffd\ufffdmk\ufffd\ufffd8\u0000D"
+    }
+  ]
+}

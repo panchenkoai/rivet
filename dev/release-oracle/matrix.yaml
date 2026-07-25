@@ -91,6 +91,14 @@ final:
   bigquery:
     project_env: BQ_ORACLE_PROJECT
     dataset_env: BQ_ORACLE_DATASET
-    tables: [rivet_type_matrix, rivet_type_matrix_full]
+    # rivet_type_matrix covers the full BQ-LOADABLE type spectrum (decimal, uuid,
+    # timestamp/tz, bytes, json, enum). rivet_type_matrix_full is intentionally
+    # EXCLUDED: it carries PG array columns (text[], integer[]) and `rivet load` →
+    # BigQuery renders an array as `REPEATED <t>` (target.rs::list) — valid only in
+    # BQ's legacy/JSON schema, NOT the standard-SQL `LOAD DATA (schema)` DDL rivet
+    # emits, so BQ rejects it ("Expected ) or , but got identifier STRING"). That is
+    # a real rivet array-load limitation tracked separately; do NOT bless a
+    # syntax-error as a golden. The DuckDB stage still covers the array matrix.
+    tables: [rivet_type_matrix]
     golden: golden/bigquery_type_matrix.json
-    what: "rivet exports each type-matrix table → loads to BigQuery → reads back as JSON and compares EVERY column value to the checked-in golden (decimal precision, TIMESTAMP, BYTES, NUMERIC-widened unsigned, JSON) — deterministic, not a fuzzy count check."
+    what: "rivet run → real GCS, rivet load → BigQuery, bq query reads back as JSON and compares EVERY column value to the checked-in golden (decimal precision, TIMESTAMP, BYTES, NUMERIC-widened unsigned, JSON) — deterministic, not a fuzzy count check."
