@@ -241,6 +241,24 @@ pub fn gc_orphans(
         store.remove(&key)?;
         removed += 1;
     }
+    // Second pass: a SUPERSEDED `running` MARKER manifest (its run was overtaken by
+    // a newer run of the same export) is a dead crash marker — never the live
+    // signal — so its lingering `.json` is safe to remove. gc otherwise never
+    // touches it (the parquet pass above only lists `.parquet`), so a hard-crashed
+    // run's marker would accumulate forever. A NON-superseded running manifest is
+    // the ACTIVE signal and MUST survive — deletion here is gated on SUPERSESSION,
+    // never on `active`.
+    for (key, m) in keyed {
+        if m.status == ManifestStatus::Running
+            && keyed.iter().any(|(_, other)| {
+                other.export_name == m.export_name && other.started_at > m.started_at
+            })
+        {
+            removed_bytes += store.stat_size(key).unwrap_or(0);
+            store.remove(key)?;
+            removed += 1;
+        }
+    }
     Ok((removed, removed_bytes))
 }
 
@@ -887,6 +905,31 @@ mod tests {
         assert_eq!(sel.len(), 1, "only the Success run is selected");
         assert_eq!(sel[0].1.run_id, "r_ok");
         assert!(sel.iter().all(|(_, m)| m.status != ManifestStatus::Running));
+    }
+
+    #[test]
+    fn gc_orphans_removes_a_superseded_running_marker_but_spares_a_live_one() {
+        // r1 crashed leaving a `running` marker; r2 (newer, same export) is the
+        // live run. The DEAD superseded marker must be GC'd (else it accumulates
+        // forever — gc otherwise only lists `.parquet`); the LIVE one must survive
+        // (it is the active signal). Gated on supersession, so `active=true`.
+        let (store, _g) = fs_store(&[
+            ("base/manifest-r1.json", b"{}".to_vec()), // superseded running marker
+            ("base/manifest-r2.json", b"{}".to_vec()), // live running marker (newest)
+        ]);
+        let r1 = running("r1", "2026-01-01T00:00:01Z");
+        let r2 = running("r2", "2026-01-01T00:00:02Z");
+        let (removed, _) = gc_orphans(&store, "gs://b/base", &[r1, r2], true).unwrap();
+        assert_eq!(removed, 1, "only the superseded running marker is removed");
+        let left = store.list_files("base").unwrap();
+        assert!(
+            !left.iter().any(|k| k.ends_with("manifest-r1.json")),
+            "the superseded (dead) running marker is deleted"
+        );
+        assert!(
+            left.iter().any(|k| k.ends_with("manifest-r2.json")),
+            "the live (non-superseded) running marker survives — it is the active signal"
+        );
     }
 
     fn keyed_at(run: &str, finished_at: &str) -> (String, RunManifest) {

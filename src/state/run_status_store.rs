@@ -90,15 +90,20 @@ impl StateStore {
     /// so the stale `running` no longer protects anything). Supersession, not a
     /// clock — the reconciliation is record-vs-record, never record-vs-`now`.
     pub fn has_active_run_on_prefix(&self, prefix: &str) -> Result<bool> {
-        // A running, non-superseded run AT-OR-UNDER this prefix. A run records
-        // its FULL write URI; the load asks about its BASE (truncated at
-        // `{partition}`), so a partitioned run's `…/created_at=…/` must still
-        // match the base `…/` — hence the boundary-safe `LIKE base/%` in addition
-        // to the trailing-slash-agnostic equality. `rtrim(x,'/')` + `||` + `LIKE`
-        // are all portable across the SQLite and Postgres backends.
+        // A running, non-superseded run whose write prefix OVERLAPS this prefix —
+        // either direction, so a query at ANY granularity matches:
+        //   * equal (batch: run and load prefix coincide),
+        //   * run AT-OR-UNDER query (a partitioned run's `…/created_at=…/` vs the
+        //     load's base, truncated at `{partition}`), and
+        //   * query AT-OR-UNDER run (a CDC run records its BASE `…/`, but the load
+        //     gc's a per-TABLE child `…/<table>/`).
+        // Over-matching (a broad run covering an unrelated child) only makes gc
+        // SPARE — the safe direction (defer, never wrong-delete). `rtrim(x,'/')` +
+        // `||` + `LIKE` are all portable across the SQLite and Postgres backends.
         let sql = "SELECT 1 FROM run_status r
                    WHERE (rtrim(r.prefix, '/') = rtrim(?1, '/')
-                          OR r.prefix LIKE rtrim(?1, '/') || '/%')
+                          OR r.prefix LIKE rtrim(?1, '/') || '/%'
+                          OR rtrim(?1, '/') LIKE rtrim(r.prefix, '/') || '/%')
                      AND r.status = 'running'
                      AND NOT EXISTS (
                          SELECT 1 FROM run_status r2
@@ -232,6 +237,24 @@ mod tests {
             s.has_active_run_on_prefix("gs://b/exports/orders/")
                 .unwrap(),
             "a partitioned child run makes its base prefix active"
+        );
+    }
+
+    #[test]
+    fn active_matches_a_load_prefix_under_a_cdc_base() {
+        // A CDC run records its BASE prefix; the load gc's a per-table CHILD under
+        // it. The overlap match (query-under-run direction) must still see it live.
+        let s = StateStore::open_in_memory().unwrap();
+        s.begin_run("cdc1", "cdc", "gs://b/exports/", "2026-01-01T00:00:00Z")
+            .unwrap();
+        assert!(
+            s.has_active_run_on_prefix("gs://b/exports/orders/")
+                .unwrap(),
+            "a per-table child of a live CDC base prefix counts as active"
+        );
+        assert!(
+            !s.has_active_run_on_prefix("gs://b/other/orders/").unwrap(),
+            "an unrelated prefix outside the CDC base is NOT active"
         );
     }
 
