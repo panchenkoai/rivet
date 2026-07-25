@@ -335,6 +335,17 @@ pub trait Source: Send {
     fn sample_pressure(&mut self) -> Option<u64> {
         None
     }
+
+    /// A best-effort JSON snapshot of the source SERVER's forensic context —
+    /// version + the limits/session settings that shape failures (the
+    /// statement-timeout that surfaces as `ERROR 3024`, the sql_mode/timezone that
+    /// shape text rendering). Captured ONCE at run open onto the failed
+    /// `export_metrics` row (`server_context_json`), so a post-mortem can explain a
+    /// failure without re-querying a possibly-transient server. `None` when the
+    /// engine can't cheaply gather it; never fails the run.
+    fn server_context(&mut self) -> Option<String> {
+        None
+    }
 }
 
 pub fn create_source(config: &SourceConfig) -> Result<Box<dyn Source>> {

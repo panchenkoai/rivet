@@ -771,6 +771,33 @@ impl super::Source for MysqlSource {
     fn sample_pressure(&mut self) -> Option<u64> {
         mysql_sample_extraction_pressure(&self.pool)
     }
+
+    fn server_context(&mut self) -> Option<String> {
+        // Best-effort per var (a proxy or older server may omit one).
+        // `@@max_execution_time` (ms) is the query-level limit that surfaces as
+        // ERROR 3024 — the single field that makes a timeout post-mortem possible.
+        let version = self.query_scalar("SELECT @@version").ok().flatten();
+        let max_exec = self
+            .query_scalar("SELECT @@max_execution_time")
+            .ok()
+            .flatten();
+        let sql_mode = self.query_scalar("SELECT @@sql_mode").ok().flatten();
+        let time_zone = self.query_scalar("SELECT @@time_zone").ok().flatten();
+        let wait_timeout = self.query_scalar("SELECT @@wait_timeout").ok().flatten();
+        let max_conns = self.query_scalar("SELECT @@max_connections").ok().flatten();
+        Some(
+            serde_json::json!({
+                "engine": "mysql",
+                "version": version,
+                "max_execution_time_ms": max_exec,
+                "sql_mode": sql_mode,
+                "time_zone": time_zone,
+                "wait_timeout_s": wait_timeout,
+                "max_connections": max_conns,
+            })
+            .to_string(),
+        )
+    }
 }
 
 #[cfg(test)]

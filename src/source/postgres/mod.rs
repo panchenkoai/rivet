@@ -724,6 +724,39 @@ impl super::Source for PostgresSource {
     fn sample_pressure(&mut self) -> Option<u64> {
         pg_sample_checkpoints_req(&mut self.client).map(|v| v.max(0) as u64)
     }
+
+    fn server_context(&mut self) -> Option<String> {
+        // `current_setting()` returns a text scalar (clean for query_scalar);
+        // `statement_timeout` is the limit behind a cancelled long-running query.
+        let version = self.query_scalar("SELECT version()").ok().flatten();
+        let stmt_timeout = self
+            .query_scalar("SELECT current_setting('statement_timeout')")
+            .ok()
+            .flatten();
+        let idle_timeout = self
+            .query_scalar("SELECT current_setting('idle_in_transaction_session_timeout')")
+            .ok()
+            .flatten();
+        let time_zone = self
+            .query_scalar("SELECT current_setting('TimeZone')")
+            .ok()
+            .flatten();
+        let max_conns = self
+            .query_scalar("SELECT current_setting('max_connections')")
+            .ok()
+            .flatten();
+        Some(
+            serde_json::json!({
+                "engine": "postgres",
+                "version": version,
+                "statement_timeout": stmt_timeout,
+                "idle_in_transaction_session_timeout": idle_timeout,
+                "time_zone": time_zone,
+                "max_connections": max_conns,
+            })
+            .to_string(),
+        )
+    }
 }
 
 /// When the query is a single-table `SELECT … FROM rel` (no joins, no subquery

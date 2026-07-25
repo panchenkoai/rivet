@@ -58,6 +58,60 @@ fn key_descriptor_json(plan: &ResolvedRunPlan) -> Option<String> {
     Some(serde_json::json!({ "strategy": strategy, "key": key }).to_string())
 }
 
+/// Capture failure-forensics context at run OPEN, best-effort. `export_schema` is
+/// otherwise SUCCESS-only, so a run that fails before finalize leaves no schema —
+/// the exact case a post-mortem needs (the 0.21.2 field DB had no schema for its 43
+/// failures). From one short-lived open probe this records:
+///  * the source SCHEMA (via `type_mappings`, LIMIT-0 so even a page-0 failure
+///    captures the columns/types) → `store_schema`, keyed by export like the
+///    success path (which OVERWRITES it, so a successful run is unaffected), and
+///  * the source SERVER context (version + limits) → `summary.server_context_json`.
+///
+/// Never fails the run: any probe error is logged at debug and dropped. One extra
+/// lightweight connection per export — cheap relative to the run it forensicates.
+fn capture_open_forensics(plan: &ResolvedRunPlan, state: &StateStore, summary: &mut RunSummary) {
+    let mut src = match crate::source::create_source(&plan.source) {
+        Ok(s) => s,
+        Err(e) => {
+            log::debug!(
+                "open-forensics: source connect failed for '{}': {e}",
+                plan.export_name
+            );
+            return;
+        }
+    };
+    summary.server_context_json = src.server_context();
+    match src.type_mappings(&plan.base_query, &plan.column_overrides) {
+        Ok(mappings) => {
+            // Arrow repr matches the success path's `arrow_schema_to_columns` format
+            // (so a later successful overwrite is consistent), and still names
+            // unsignedness (`UInt64`). Fall back to the source native type only when
+            // Arrow is None (an Unsupported type).
+            let cols: Vec<crate::state::SchemaColumn> = mappings
+                .iter()
+                .map(|m| crate::state::SchemaColumn {
+                    name: m.column_name.clone(),
+                    data_type: m
+                        .arrow_type
+                        .as_ref()
+                        .map(|t| format!("{t:?}"))
+                        .unwrap_or_else(|| m.source_native_type.clone()),
+                })
+                .collect();
+            if let Err(e) = state.store_schema(&summary.export_name, &cols) {
+                log::debug!(
+                    "open-forensics: store_schema failed for '{}': {e}",
+                    summary.export_name
+                );
+            }
+        }
+        Err(e) => log::debug!(
+            "open-forensics: type_mappings failed for '{}': {e}",
+            plan.export_name
+        ),
+    }
+}
+
 /// Assemble the full `export_metrics` row (v9) from the finished run summary +
 /// plan. One builder so the run and apply paths persist an identical shape
 /// rather than each inlining the metric fields. The richer signals
@@ -120,15 +174,11 @@ fn build_metric_row(
         cursor_min: summary.cursor_low.clone(),
         cursor_max: summary.cursor_high.clone(),
         key_descriptor_json: key_descriptor_json(plan),
-        // PRODUCER-PENDING — column ready, defaults None until the upstream write lands:
-        //  * offending_value: enrich the keyset throw (`pipeline/keyset.rs` ~L316 and
-        //    `mongo_parallel.rs`) to carry the raw unreadable value onto the summary,
-        //    then map it here — turns "unsupported type" into the actual u64.
-        //  * server_context_json: fetch source limits at open (`source/<engine>/mod.rs`
-        //    — MySQL `SELECT @@version, @@max_execution_time, @@sql_mode, @@time_zone`)
-        //    onto the summary, then map here — the only signal that explains ERROR 3024.
-        offending_value: None,
-        server_context_json: None,
+        // Producers now wired: offending_value is stamped at the keyset throw
+        // (`pipeline/keyset.rs`); server_context_json is captured at open by
+        // `capture_open_forensics` (source `server_context()`).
+        offending_value: summary.offending_value.clone(),
+        server_context_json: summary.server_context_json.clone(),
     }
 }
 
@@ -459,6 +509,8 @@ pub(crate) fn synthetic_failed_summary(export_name: &str, err: &anyhow::Error) -
         cursor_column: None,
         cursor_low: None,
         cursor_high: None,
+        offending_value: None,
+        server_context_json: None,
         run_id,
         export_name: export_name.to_string(),
         status: "failed".into(),
@@ -684,6 +736,9 @@ pub(super) fn run_export_job(
     // marker manifest — the authority `gc_orphans` reads to spare a live extract's
     // committed-but-not-yet-manifested parts. (finish_run transitions it below.)
     ledger_begin_run(state, &plan, &summary.run_id);
+    // Failure forensics at open: source schema + server limits, so a run that fails
+    // before finalize still explains itself (export_schema is otherwise success-only).
+    capture_open_forensics(&plan, state, &mut summary);
 
     // PG cursor / sort spill probe — captured around the actual run window.
     // Cluster-level counter, so this is a noisy upper bound on a shared host
@@ -1427,6 +1482,9 @@ mod tests {
         summary.error_message = Some("export 'x': keyset could not read the 'id' value".into());
         summary.cursor_low = Some("1".into());
         summary.cursor_high = Some("18446744073709551615".into()); // u64 past i64::MAX
+        summary.offending_value = Some("9223372036854775800".into()); // last-good before overflow
+        summary.server_context_json =
+            Some(r#"{"engine":"mysql","max_execution_time_ms":"30000"}"#.into());
         summary.format = "parquet".into();
         summary.mode = "chunked".into();
         summary.files_produced = 7;
@@ -1560,9 +1618,14 @@ mod tests {
         let kd = key_descriptor_json.expect("chunked strategy carries a key descriptor");
         assert!(kd.contains("\"strategy\":\"chunked\""), "{kd}");
         assert!(kd.contains("\"key\":\"id\""), "{kd}");
-        // producer-pending: columns ready, upstream write not yet landed
-        assert!(offending_value.is_none());
-        assert!(server_context_json.is_none());
+        // producers wired: both pass through from the summary
+        assert_eq!(offending_value.as_deref(), Some("9223372036854775800"));
+        assert!(
+            server_context_json
+                .as_deref()
+                .is_some_and(|s| s.contains("max_execution_time_ms")),
+            "server_context flows from the summary: {server_context_json:?}"
+        );
     }
 
     #[test]

@@ -118,6 +118,15 @@ pub struct RunSummary {
     pub cursor_low: Option<String>,
     pub cursor_high: Option<String>,
     pub error_message: Option<String>,
+    /// v18 failure forensics. `offending_value`: the last key read before an
+    /// unadvanceable keyset row (with `cursor_high` this brackets the value that
+    /// broke advancing — e.g. a u64 above i64::MAX). `server_context_json`: a JSON
+    /// snapshot of the source server's version + limits captured at OPEN (the
+    /// statement-timeout that surfaces as ERROR 3024 is unexplainable without it).
+    /// Both flow onto the failed `export_metrics` row so a post-mortem needs
+    /// neither the source table nor a still-live server.
+    pub offending_value: Option<String>,
+    pub server_context_json: Option<String>,
     /// `profile` from YAML, or `balanced (default)` if omitted.
     pub tuning_profile: String,
     /// Configured `batch_size` from YAML/profile (FETCH cap before `batch_size_memory_mb` override).
@@ -221,6 +230,8 @@ impl RunSummary {
             schema_changed: None,
             quality_passed: None,
             error_message: None,
+            offending_value: None,
+            server_context_json: None,
             tuning_profile: plan.tuning_profile_label.clone(),
             batch_size: plan.tuning.batch_size,
             batch_size_memory_mb: plan.tuning.batch_size_memory_mb,
@@ -293,6 +304,8 @@ impl RunSummary {
             schema_changed: None,
             quality_passed: None,
             error_message: None,
+            offending_value: None,
+            server_context_json: None,
             tuning_profile: "balanced".into(),
             batch_size: 1000,
             batch_size_memory_mb: None,

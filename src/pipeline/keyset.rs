@@ -312,14 +312,23 @@ pub(crate) fn run_keyset(
         // re-read the same page forever.
         match page.next_cursor {
             Some(v) => last = Some(v),
-            None => anyhow::bail!(
-                "export '{}': keyset could not read the '{}' value from the last row of page {} \
-                 (NULL or unsupported type) — cannot advance safely. The key must be NOT NULL and \
-                 one of: integer, float, string, timestamp, date, uuid.",
-                plan.export_name,
-                kp.key_column,
-                pages - 1
-            ),
+            None => {
+                // Failure forensics (v18): stamp the LAST key we did read — the
+                // boundary just before the unadvanceable row. With `cursor_high`
+                // (the table's max key) this brackets the value that broke
+                // advancing (e.g. a u64 in the zone above i64::MAX), so a failed
+                // `export_metrics` row explains itself without the source.
+                summary.offending_value = last.clone();
+                anyhow::bail!(
+                    "export '{}': keyset could not read the '{}' value from the last row of page {} \
+                     (NULL or unsupported type) — cannot advance safely (last readable key: {}). \
+                     The key must be NOT NULL and one of: integer, float, string, timestamp, date, uuid.",
+                    plan.export_name,
+                    kp.key_column,
+                    pages - 1,
+                    last.as_deref().unwrap_or("<none>"),
+                );
+            }
         }
     }
 
