@@ -209,12 +209,17 @@ pub fn gc_orphans(
     let mut keep: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut terminal: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (key, m) in keyed {
-        let set = if m.status == ManifestStatus::Success {
-            &mut keep
-        } else {
-            &mut terminal
-        };
-        set.extend(resolve_parts(key, m));
+        match m.status {
+            ManifestStatus::Success => keep.extend(resolve_parts(key, m)),
+            // A `running` manifest is a LIVE run's marker (schema-less, no parts).
+            // Its parts (if any) must NOT be treated as terminal debris — its
+            // activeness is what makes `active` true (see the callsite), which
+            // spares the run's unmanifested in-flight parts below.
+            ManifestStatus::Running => {}
+            ManifestStatus::Failed | ManifestStatus::Interrupted => {
+                terminal.extend(resolve_parts(key, m))
+            }
+        }
     }
     let mut removed = 0usize;
     let mut removed_bytes = 0u64;
@@ -237,6 +242,24 @@ pub fn gc_orphans(
         removed += 1;
     }
     Ok((removed, removed_bytes))
+}
+
+/// Is a LIVE run's `running` MARKER manifest present under the prefix — the
+/// bucket-side projection of the run-status ledger, for a cross-boundary load
+/// (Airflow / a foreign-host `rivet load`) that cannot read the extract's state
+/// DB? True iff some `running` manifest is NOT superseded by a NEWER manifest
+/// (any status) of the SAME export — the same clock-free supersession the ledger
+/// uses (a newer `started_at` means the old running run crashed and its successor
+/// already re-ran). `gc_orphans`'s `active` is `ledger_active OR this`, so the two
+/// signals are belt-and-suspenders: the ledger is precise co-located, the marker
+/// covers cross-host.
+pub fn has_active_running_manifest(keyed: &[(String, RunManifest)]) -> bool {
+    keyed.iter().any(|(_, m)| {
+        m.status == ManifestStatus::Running
+            && !keyed.iter().any(|(_, other)| {
+                other.export_name == m.export_name && other.started_at > m.started_at
+            })
+    })
 }
 
 /// Full/chunked loads care only about the LATEST snapshot: from `keyed` (all run
@@ -281,6 +304,14 @@ pub fn select_runs(
     loaded: &std::collections::HashSet<String>,
     mode: crate::load::plan::LoadMode,
 ) -> Vec<(String, RunManifest)> {
+    // A `running` manifest is a LIVE run's in-flight marker — never loadable (no
+    // committed parts). Drop it BEFORE selection so it neither becomes the
+    // "latest" full snapshot nor an incremental delta, either of which would
+    // make `reconcile` refuse the whole load on a non-Success run.
+    let keyed: Vec<(String, RunManifest)> = keyed
+        .into_iter()
+        .filter(|(_, m)| m.status != ManifestStatus::Running)
+        .collect();
     match mode {
         crate::load::plan::LoadMode::Full => latest_full(keyed),
         _ => keyed
@@ -797,6 +828,65 @@ mod tests {
             1,
             "with no active run, an unmanifested orphan is collected"
         );
+    }
+
+    /// A `running` MARKER manifest (schema-less, no parts) started at `started_at`.
+    fn running(run: &str, started_at: &str) -> (String, RunManifest) {
+        let mut m = manifest(run, 0, None);
+        m.status = ManifestStatus::Running;
+        m.started_at = started_at.into();
+        m.finished_at = String::new();
+        m.parts.clear();
+        (format!("base/manifest-{run}.json"), m)
+    }
+
+    #[test]
+    fn has_active_running_manifest_true_for_a_lone_running_marker() {
+        assert!(has_active_running_manifest(&[running(
+            "r1",
+            "2026-01-01T00:00:00Z"
+        )]));
+    }
+
+    #[test]
+    fn has_active_running_manifest_false_when_none_is_running() {
+        // A Success manifest is not a live-run marker.
+        assert!(!has_active_running_manifest(&[keyed(
+            "k",
+            "r1",
+            "p.parquet"
+        )]));
+    }
+
+    #[test]
+    fn has_active_running_manifest_false_for_a_superseded_running_marker() {
+        // r1 crashed leaving a `running` marker; r2 (newer started_at, SAME
+        // export) already ran → r1 is stale and must NOT count as active. Same
+        // clock-free supersession the ledger uses.
+        let r1 = running("r1", "2026-01-01T00:00:00Z");
+        let mut r2 = manifest("r2", 10, Some(10)); // Success, same export ("orders")
+        r2.started_at = "2026-01-02T00:00:00Z".into();
+        assert!(!has_active_running_manifest(&[
+            r1,
+            ("base/manifest-r2.json".into(), r2)
+        ]));
+    }
+
+    #[test]
+    fn select_runs_drops_a_running_manifest() {
+        // A `running` (in-flight) manifest must NEVER be selected for load — else
+        // reconcile would refuse the whole load on a non-Success run. Incremental
+        // mode would otherwise include it (not yet loaded).
+        let run_marker = running("r_running", "2026-01-02T00:00:00Z");
+        let ok = keyed("base/manifest-r_ok.json", "r_ok", "r_ok-000.parquet"); // Success
+        let sel = select_runs(
+            vec![run_marker, ok],
+            &std::collections::HashSet::new(),
+            crate::load::plan::LoadMode::Incremental,
+        );
+        assert_eq!(sel.len(), 1, "only the Success run is selected");
+        assert_eq!(sel[0].1.run_id, "r_ok");
+        assert!(sel.iter().all(|(_, m)| m.status != ManifestStatus::Running));
     }
 
     fn keyed_at(run: &str, finished_at: &str) -> (String, RunManifest) {

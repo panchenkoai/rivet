@@ -457,24 +457,23 @@ fn finalize_keyset_anchor(
     }
 }
 
-/// Mark a run `running` in the central run-status ledger at its START. The
-/// `prefix` is the run's write URI (`gs://…`), which `gc_orphans` matches
-/// against its load prefix (at-or-under, so a partitioned child still matches
-/// the base). Best-effort: a ledger miss only makes gc over-defer cleanup, so it
-/// warns rather than failing the export.
-fn ledger_begin_run(
-    state: &StateStore,
-    export_name: &str,
-    dest: &crate::config::DestinationConfig,
-    run_id: &str,
-) {
-    let prefix = super::finalize::destination_uri_for_manifest(dest);
+/// Mark a run `running` at its START — in the central run-status ledger AND (for
+/// a cloud destination) as a `running` marker manifest projected into the bucket.
+/// The ledger is authoritative for a co-located / shared-Postgres load; the bucket
+/// marker lets a cross-boundary reader (Airflow, a foreign-host `rivet load`) see
+/// the live run too. The `prefix` recorded in the ledger is the run's write URI,
+/// which `gc_orphans` matches at-or-under its load prefix. Best-effort: a miss
+/// only makes gc over-defer cleanup, so it warns rather than failing the export.
+fn ledger_begin_run(state: &StateStore, plan: &ResolvedRunPlan, run_id: &str) {
+    let prefix = super::finalize::destination_uri_for_manifest(&plan.destination);
     let started_at = chrono::Utc::now().to_rfc3339();
-    if let Err(e) = state.begin_run(run_id, export_name, &prefix, &started_at) {
+    if let Err(e) = state.begin_run(run_id, &plan.export_name, &prefix, &started_at) {
         log::warn!(
-            "export '{export_name}': run-status begin failed (gc may over-defer orphan cleanup): {e:#}"
+            "export '{}': run-status begin failed (gc may over-defer orphan cleanup): {e:#}",
+            plan.export_name
         );
     }
+    super::finalize::write_running_manifest(plan, run_id, &started_at);
 }
 
 /// Transition a run to its terminal status in the run-status ledger at finalize.
@@ -617,10 +616,10 @@ pub(super) fn run_export_job(
     let rss_before = crate::resource::get_rss_mb();
     let rss_sampler = crate::resource::RssPeakSampler::start(rss_before, 100);
     let mut summary = RunSummary::new(&plan);
-    // Record this run `running` in the central run-status ledger BEFORE any part
-    // lands — the authority `gc_orphans` reads to spare a live extract's
+    // Record this run `running` BEFORE any part lands — in the ledger + a bucket
+    // marker manifest — the authority `gc_orphans` reads to spare a live extract's
     // committed-but-not-yet-manifested parts. (finish_run transitions it below.)
-    ledger_begin_run(state, &plan.export_name, &plan.destination, &summary.run_id);
+    ledger_begin_run(state, &plan, &summary.run_id);
 
     // PG cursor / sort spill probe — captured around the actual run window.
     // Cluster-level counter, so this is a noisy upper bound on a shared host
@@ -862,7 +861,7 @@ pub(crate) fn run_export_job_with_chunk_source(
     let rss_sampler = crate::resource::RssPeakSampler::start(rss_before, 100);
     let mut summary = RunSummary::new(plan);
     summary.apply_context = apply_context;
-    ledger_begin_run(state, &plan.export_name, &plan.destination, &summary.run_id);
+    ledger_begin_run(state, plan, &summary.run_id);
 
     let result = if plan.strategy.requires_parallel_execution() {
         if plan.strategy.is_resumable() {

@@ -856,13 +856,14 @@ fn require_pk<'a>(plan: &'a load::plan::LoadPlan, mode: &str) -> Result<&'a [Str
 /// extract's leftovers. A GC failure only warns; it NEVER fails the load, which
 /// already succeeded before this runs.
 ///
-/// Gated on the central run-status ledger so it never deletes a CONCURRENT
-/// extract's committed-but-not-yet-manifested parts: `has_active_run_on_prefix`
-/// is precise when this load shares the extract's state (co-located / shared
-/// Postgres). With NO ledger (a stateless or foreign-host load) it conservatively
-/// assumes a run MIGHT be active — spare the unmanifested parts rather than risk
-/// a live cross-host extract's in-flight data (the bucket-manifest `running`
-/// projection refines this cross-host).
+/// Gated on whether a run is ACTIVE on the prefix, so it never deletes a
+/// CONCURRENT extract's committed-but-not-yet-manifested parts. Two signals,
+/// belt-and-suspenders: the run-status ledger (`has_active_run_on_prefix`,
+/// precise when this load shares the extract's state — co-located / shared
+/// Postgres) OR a `running` MARKER manifest projected into the bucket
+/// (`has_active_running_manifest`, the cross-boundary signal a stateless /
+/// foreign-host load reads when it cannot see the extract's state DB). Only when
+/// NEITHER says active does a no-manifest part count as dead crash debris.
 fn maybe_gc_orphans(plan: &load::plan::LoadPlan, state: Option<&StateStore>) {
     let store = match load::open_store(&plan.destination) {
         Ok(s) => s,
@@ -884,10 +885,13 @@ fn maybe_gc_orphans(plan: &load::plan::LoadPlan, state: Option<&StateStore>) {
             return;
         }
     };
-    let active = match state {
+    let ledger_active = match state {
+        // A query ERROR stays conservative (assume active → spare); a clean
+        // `false` (no running row) lets the manifest signal decide.
         Some(s) => s.has_active_run_on_prefix(&plan.gcs_prefix).unwrap_or(true),
-        None => true,
+        None => false,
     };
+    let active = ledger_active || load::reconcile::has_active_running_manifest(&keyed);
     match load::reconcile::gc_orphans(&store, &plan.gcs_prefix, &keyed, active) {
         Ok((0, _)) => {}
         Ok((n, bytes)) => {
