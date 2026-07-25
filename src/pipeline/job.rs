@@ -155,9 +155,15 @@ fn capture_open_forensics(plan: &ResolvedRunPlan, state: &StateStore, summary: &
                     .find(|m| m.column_name == key)
                     .map(|m| m.source_native_type.clone());
             }
-            if let Err(e) = state.store_schema(&summary.export_name, &cols) {
+            // store_schema_if_absent, NOT store_schema: a stored baseline is the
+            // drift detector's comparison anchor, read by `detect_schema_change`
+            // DURING the export (after this open probe). Overwriting it here would
+            // blind schema-drift detection — a changed column would compare equal to
+            // the just-stored current schema. A first-run failure (no baseline) is
+            // exactly what this forensics exists for and still captures its schema.
+            if let Err(e) = state.store_schema_if_absent(&summary.export_name, &cols) {
                 log::debug!(
-                    "open-forensics: store_schema failed for '{}': {e}",
+                    "open-forensics: store_schema_if_absent failed for '{}': {e}",
                     summary.export_name
                 );
             }
