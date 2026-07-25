@@ -305,6 +305,12 @@ pub(crate) fn run_keyset(
         // A short page means the index range is exhausted — stop without an
         // extra empty round-trip.
         if page.rows < kp.chunk_size {
+            // Forensics (v18): the final page's max key is the run's true high-water.
+            // Record it BEFORE breaking — the loop stops without advancing `last`, so
+            // a short tail page (e.g. the 3 u64 ids above i64::MAX) is captured yet
+            // would otherwise be invisible in cursor_max. `.or(last)` covers an EMPTY
+            // final page, whose max is the previous full page's key.
+            summary.cursor_high = page.next_cursor.clone().or_else(|| last.clone());
             break;
         }
         // Advance to the page's max key; if it could not be read (NULL or an
@@ -332,11 +338,6 @@ pub(crate) fn run_keyset(
             }
         }
     }
-
-    // Failure forensics (v18): the furthest key successfully paged. On a completed
-    // keyset this is the table's MAX key (cursor_max in export_metrics); cursor_min
-    // stays None — a keyset seeks forward, it records no lower bound.
-    summary.cursor_high = last.clone();
 
     // Form B: record the run-wide XOR-combined checksums so finalize writes them.
     super::commit::harvest_column_checksums(summary, checksums_acc, checksum_key_column);
