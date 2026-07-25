@@ -122,3 +122,6 @@ seed-garbage-mysql:
 
 seed-garbage-mssql:
 	docker compose exec -T mssql /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 'Rivet_Passw0rd!' -C -d rivet -b -i /dev/stdin < dev/garbage/mssql.sql
+
+release-oracle:  ## Release gate: every engine×version × scenario against local MinIO/fake-gcs/Azurite + a BigQuery golden. Green everywhere ⇒ releasable.
+	dev/release-oracle/run.sh
