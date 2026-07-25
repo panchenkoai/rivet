@@ -642,6 +642,24 @@ enum; a `?`/`unwrap_or("?")` placeholder surfacing in the output is the smell
 that a strategy fell through. Cross-check the label against `derive_strategy`'s
 arms and the planner's strategy constructors.
 
+Sibling trap in the same file — a cost diagnostic must not EXTRAPOLATE past
+physical reality. `check_oversized_chunk` (`preflight/analysis.rs`) estimated a
+range chunk's scan as `density × chunk_size` where `density = rows / key_span`;
+on a LOW-cardinality key (few distinct values, many rows each — a real field DB
+had a 150K-row table over 100 distinct `amount` values) the density is huge but
+the span is tiny, so `chunk_size ≥ span` extrapolated **151M rows/chunk on a 150K-
+row table** and phantom-warned "~2167 MB, shrink chunk_size 8×". A single chunk
+can NEVER scan more rows than the table HOLDS: `rows_per_chunk.clamp(1, rows)`
+(the dense/keyset branch has the same bug when `chunk_size > rows`). RED-proven
+both branches (`check_oversized_chunk_low_cardinality_range_key_does_not_phantom_
+warn`, `..._dense_chunk_larger_than_table_...`). Process rule: **any per-chunk /
+per-page cost estimate that multiplies a density or rate by a window size must
+clamp the result to the total it is a fraction OF** — a fraction of the table that
+comes out bigger than the table is the tell. A false "this is slow" alarm is the
+same diagnostic-bypass harm as a false UNSAFE: it drowns the real problem in noise
+(the field config's 66 keyset tables emitted 66 false alarms; this emitted one per
+low-cardinality chunk key).
+
 ## A flag you cannot safely auto-default is often OVERLOADED — split it
 
 When `rivet init` (or a `check --fix`) cannot safely turn a knob on by default,
