@@ -306,6 +306,12 @@ FROM generate_series(1, 2000) AS i;
 -- fleet lives in its own schema, reached via search_path) is itself the profile —
 -- it is the #13 chunked-probe-degrade shape. Seeded via `make seed-garbage`.
 -- The sweep only drops `_<pid>_<counter>` fixtures, so `ext.*` persists.
+--
+-- Scale: 150K rows/table — deliberately PAST `rivet init`'s 100K keyset/chunked
+-- threshold, so init scaffolds the real per-table strategy (keyset on the int/
+-- bigint PKs, range-chunk on the non-unique/keyless shapes) instead of collapsing
+-- every table to `mode: full`. That is what exercises the diagnostic strategy
+-- labels and the chunk-cost warnings end-to-end.
 
 DROP SCHEMA IF EXISTS ext CASCADE;
 CREATE SCHEMA ext;
@@ -320,7 +326,7 @@ CREATE TABLE ext.bigint_pk_dual_ts (
 );
 INSERT INTO ext.bigint_pk_dual_ts (id, payload, updated_at)
 SELECT g, 'row' || g, now() - (g || ' minutes')::interval
-FROM generate_series(1, 500) g;
+FROM generate_series(1, 150000) g;
 
 -- Int-PK minority (the field fleet mixes bigint + int).
 CREATE TABLE ext.int_pk_dual_ts (
@@ -331,7 +337,7 @@ CREATE TABLE ext.int_pk_dual_ts (
 );
 INSERT INTO ext.int_pk_dual_ts (id, payload, updated_at)
 SELECT g, 'row' || g, now() - (g || ' minutes')::interval
-FROM generate_series(1, 300) g;
+FROM generate_series(1, 150000) g;
 
 -- Sparse key: id span vastly exceeds the row count (gappy field ids). Range
 -- chunking would explode into near-empty windows — the sparse-guard shape.
@@ -340,7 +346,8 @@ CREATE TABLE ext.sparse_key (
     payload INT NOT NULL
 );
 INSERT INTO ext.sparse_key (id, payload)
-SELECT 1 + g * 1000000, g FROM generate_series(0, 199) g;
+-- g::bigint: g*1000000 overflows INT past g≈2147; the key must stay BIGINT-wide.
+SELECT 1 + g::bigint * 1000000, g FROM generate_series(0, 149999) g;
 
 -- Scale-0 DECIMAL PK (Oracle/ERP-migration shape). NOT integer-family, so an
 -- explicit range chunk_column on it must LOUDLY bail (#103), not silently drop
@@ -350,7 +357,7 @@ CREATE TABLE ext.decimal_key (
     payload TEXT NOT NULL
 );
 INSERT INTO ext.decimal_key (dkey, payload)
-SELECT g, 'row' || g FROM generate_series(1, 250) g;
+SELECT g, 'row' || g FROM generate_series(1, 150000) g;
 
 -- Keyless, cursorless table → full-mode fallback (no chunk column, no cursor).
 CREATE TABLE ext.no_pk_no_ts (
@@ -358,7 +365,7 @@ CREATE TABLE ext.no_pk_no_ts (
     amount INT NOT NULL
 );
 INSERT INTO ext.no_pk_no_ts (label, amount)
-SELECT 'label' || g, g % 100 FROM generate_series(1, 150) g;
+SELECT 'label' || g, g % 100 FROM generate_series(1, 150000) g;
 
 -- ── The MESSY reality (distilled from a real stuck run's state DB) ───────────
 -- The field DB is NOT all clean `id` PKs. Real shapes below.
@@ -381,7 +388,7 @@ CREATE INDEX ix_ref_id_history_ref_id ON ext.ref_id_history (ref_id);
 INSERT INTO ext.ref_id_history (ref_id, field, field_cur, sign, status, amount_cur, purchase_type)
 SELECT (g % 400) + 1, 'f' || g, 'EUR', CASE WHEN g % 2 = 0 THEN 1 ELSE -1 END,
        (ARRAY['pending','done','void'])[1 + g % 3], 'USD', (ARRAY['a','b'])[1 + g % 2]
-FROM generate_series(1, 600) g;
+FROM generate_series(1, 150000) g;
 
 -- Keyed by `order_id` (NOT `id`): a unique index makes it keyset-able on a
 -- non-`id` key. Wide-ish string columns (md5, currency, subid) — the shape of a
@@ -398,7 +405,7 @@ CREATE UNIQUE INDEX ux_order_keyed_order_id ON ext.order_keyed (order_id);
 INSERT INTO ext.order_keyed (order_id, md5, currency, status, subid, advcampaign_id)
 SELECT g, md5(g::text), (ARRAY['EUR','USD','PLN'])[1 + g % 3],
        (ARRAY['approved','declined'])[1 + g % 2], 'sub' || (g % 50), (g % 900) + 100
-FROM generate_series(1, 350) g;
+FROM generate_series(1, 150000) g;
 
 -- HEAP: no PK, no index at all → full mode is the only safe strategy.
 CREATE TABLE ext.heap_no_key (
@@ -406,7 +413,7 @@ CREATE TABLE ext.heap_no_key (
     n INT NOT NULL
 );
 INSERT INTO ext.heap_no_key (payload, n)
-SELECT repeat('x', 20 + g % 50), g FROM generate_series(1, 400) g;
+SELECT repeat('x', 20 + g % 50), g FROM generate_series(1, 150000) g;
 
 ANALYZE ext.bigint_pk_dual_ts;
 ANALYZE ext.int_pk_dual_ts;
