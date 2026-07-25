@@ -250,6 +250,12 @@ pub(crate) fn run_keyset(
             &base,
         )?
         else {
+            // No further rows (the seek past the last full page came back empty):
+            // the last advanced key is the run's high-water. This is the OTHER exit
+            // from the short-page break below — a table whose size is an exact
+            // multiple of chunk_size leaves via here, so cursor_max must be set on
+            // both paths or an exact-fit keyset records no max.
+            summary.cursor_high = last.clone();
             break;
         };
 
