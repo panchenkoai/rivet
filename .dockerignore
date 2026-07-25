@@ -3,3 +3,7 @@ target
 .git
 .github
 /graphify-out
+# fuzz is workspace-excluded (Cargo.toml `exclude`) so the release build never
+# compiles it; the local corpus/target under fuzz/ is multi-GB and only bloats
+# the build context (10 tracked harness files, gigabytes of untracked corpus).
+fuzz
