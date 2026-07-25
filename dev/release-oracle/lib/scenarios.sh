@@ -55,8 +55,9 @@ sc_verdicts() {
     [ "$(_strategy_of "$seeds_cfg" "$t")" = keyset ] || fails+="$t≠keyset "
   done
   [ "$(_strategy_of "$seeds_cfg" orders_sparse)" = full ] || fails+="orders_sparse≠full "
-  # garbage shapes (ext schema for pg/mssql, ext_-prefixed table names for mysql).
-  local gpref="ext." gsuf=""; [ "$eng" = mysql ] && { gpref="ext_"; }
+  # garbage shapes. Export NAMES: pg/mssql strip the `ext.` schema (name is the bare
+  # table), mysql keeps the `ext_` prefix (that IS the table name).
+  local gpref=""; [ "$eng" = mysql ] && gpref="ext_"
   local gcfg
   if [ "$eng" = mysql ]; then gcfg="$seeds_cfg"; else gcfg="$(_init_cfg "$eng" "$url" ext)"; fi
   local dkey="${gpref}decimal_key" unidx="${gpref}unindexed_id" refh="${gpref}ref_id_history" bpk="${gpref}bigint_pk_dual_ts"
@@ -194,7 +195,7 @@ _store_dest() { local store=$1 bkt=$2 pfx=$3
   case "$store" in
     s3)  printf '      type: s3\n      bucket: %s\n      prefix: %s/\n      region: us-east-1\n      endpoint: http://127.0.0.1:9000\n      access_key_env: MINIO_ACCESS_KEY\n      secret_key_env: MINIO_SECRET_KEY\n' "$bkt" "$pfx";;
     gcs) printf '      type: gcs\n      bucket: %s\n      prefix: %s/\n      endpoint: http://127.0.0.1:4443\n' "$bkt" "$pfx";;
-    azure) printf '      type: azure\n      bucket: %s\n      prefix: %s/\n      account: devstoreaccount1\n      account_key_env: AZURITE_KEY\n      endpoint: http://127.0.0.1:10000/devstoreaccount1\n' "$bkt" "$pfx";;
+    azure) printf '      type: azure\n      bucket: %s\n      prefix: %s/\n      account_name: devstoreaccount1\n      account_key_env: AZURITE_KEY\n      endpoint: http://127.0.0.1:10000/devstoreaccount1\n' "$bkt" "$pfx";;
     *) return 1;;
   esac
 }

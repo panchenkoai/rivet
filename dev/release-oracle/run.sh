@@ -56,13 +56,21 @@ esac; done
 command -v duckdb >/dev/null || { echo "duckdb not on PATH (needed for the integrity oracle)"; exit 2; }
 
 # ── local object stores (reuse the repo compose) ──
+AZURITE_CONN="DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://127.0.0.1:10000/devstoreaccount1;"
 start_stores() {
   log "Local object stores (MinIO / fake-gcs / Azurite)"
   ( cd "$ROOT" && docker compose up -d minio fake-gcs azurite >/dev/null 2>&1 )
+  sleep 3
   # MinIO bucket via mc
   docker run --rm --network host --entrypoint sh minio/mc:latest -c \
     "mc alias set o http://127.0.0.1:9000 minioadmin minioadmin >/dev/null 2>&1 && mc mb -p o/rivet-oracle >/dev/null 2>&1; true" >/dev/null 2>&1 || true
-  ok "stores up (bucket rivet-oracle)"
+  # fake-gcs bucket via the JSON API (404 on upload otherwise)
+  curl -s -X POST "http://127.0.0.1:4443/storage/v1/b?project=oracle" \
+    -H "Content-Type: application/json" -d '{"name":"rivet-oracle"}' >/dev/null 2>&1 || true
+  # Azurite container via az CLI (best-effort; azure cell SKIPs if this is absent)
+  command -v az >/dev/null && az storage container create --name rivet-oracle \
+    --connection-string "$AZURITE_CONN" >/dev/null 2>&1 || true
+  ok "stores up (bucket/container rivet-oracle: minio $(_store_up s3 && echo ✓||echo ✗) gcs $(_store_up gcs && echo ✓||echo ✗) azure $(_store_up azure && echo ✓||echo ✗))"
 }
 
 # ── per engine×version bring-up ──
