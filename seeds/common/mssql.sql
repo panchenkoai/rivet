@@ -41,7 +41,7 @@ INSERT INTO users (name,email,age,balance,is_active,bio,created_at,updated_at)
 SELECT CONCAT(N'User ',value), CONCAT('user',value,'@example.com'), 18+(value%48), ROUND((value%200000)+0.99,2),
        CAST(CASE WHEN value%10<>0 THEN 1 ELSE 0 END AS BIT), CASE WHEN value%3<>0 THEN CONCAT(N'seed bio ',value) ELSE NULL END,
        DATEADD(HOUR,value%730,CONVERT(DATETIME2(6),'2023-01-01')), DATEADD(HOUR,value%910,CONVERT(DATETIME2(6),'2023-01-01'))
-FROM GENERATE_SERIES(CONVERT(BIGINT,1),CONVERT(BIGINT,2000));
+FROM GENERATE_SERIES(CONVERT(BIGINT,1),CONVERT(BIGINT,150000));
 GO
 INSERT INTO orders (user_id,product,quantity,price,status,notes,ordered_at,updated_at)
 SELECT CAST(LEAST(1+(value-1)/10,2000) AS INT),
@@ -50,14 +50,14 @@ SELECT CAST(LEAST(1+(value-1)/10,2000) AS INT),
        CASE value%4 WHEN 0 THEN N'pending' WHEN 1 THEN N'shipped' WHEN 2 THEN N'delivered' ELSE N'cancelled' END,
        CASE WHEN value%3=0 THEN CONCAT(N'note ',value) ELSE NULL END,
        DATEADD(MINUTE,value%730,CONVERT(DATETIME2(6),'2023-01-01')), DATEADD(MINUTE,value%760,CONVERT(DATETIME2(6),'2023-01-01'))
-FROM GENERATE_SERIES(CONVERT(BIGINT,1),CONVERT(BIGINT,20000));
+FROM GENERATE_SERIES(CONVERT(BIGINT,1),CONVERT(BIGINT,150000));
 GO
 INSERT INTO events (user_id,event_type,payload,ip_address,created_at)
 SELECT CAST(LEAST(1+(value-1)/25,2000) AS INT),
        CASE value%10 WHEN 0 THEN N'login' WHEN 1 THEN N'logout' WHEN 2 THEN N'page_view' WHEN 3 THEN N'purchase' WHEN 4 THEN N'signup' WHEN 5 THEN N'settings_change' WHEN 6 THEN N'password_reset' WHEN 7 THEN N'search' WHEN 8 THEN N'export' ELSE N'api_call' END,
        CONCAT(N'{"seed":true,"i":',value,N'}'), CONCAT('10.',value%255,'.',(value*7)%255,'.1'),
        DATEADD(MINUTE,value%730,CONVERT(DATETIME2(6),'2023-01-01'))
-FROM GENERATE_SERIES(CONVERT(BIGINT,1),CONVERT(BIGINT,50000));
+FROM GENERATE_SERIES(CONVERT(BIGINT,1),CONVERT(BIGINT,150000));
 GO
 INSERT INTO page_views (session_id,user_id,url,referrer,user_agent,ip_address,country_code,region,city,device_type,browser,os,screen_width,screen_height,viewport_width,viewport_height,page_load_ms,dom_ready_ms,time_on_page_ms,scroll_depth_pct,click_count,is_bounce,utm_source,utm_medium,utm_campaign,utm_term,utm_content,custom_props,created_at)
 SELECT LOWER(CONVERT(CHAR(36),NEWID())), CASE WHEN value%3=0 THEN NULL ELSE CAST(1+(value%2000) AS INT) END,
@@ -74,11 +74,11 @@ SELECT LOWER(CONVERT(CHAR(36),NEWID())), CASE WHEN value%3=0 THEN NULL ELSE CAST
        CASE WHEN value%4=0 THEN N'google' ELSE NULL END, CASE WHEN value%4=0 THEN N'cpc' ELSE NULL END,
        CASE WHEN value%8=0 THEN N'spring_sale' ELSE NULL END, NULL, NULL,
        CASE WHEN value%5=0 THEN N'{"seed":true}' ELSE NULL END, DATEADD(MINUTE,value%730,CONVERT(DATETIME2(6),'2023-01-01'))
-FROM GENERATE_SERIES(CONVERT(BIGINT,1),CONVERT(BIGINT,20000));
+FROM GENERATE_SERIES(CONVERT(BIGINT,1),CONVERT(BIGINT,150000));
 GO
 INSERT INTO content_items (title,body,raw_html,metadata,tags,author_name,author_email,source_url,category,status,priority,view_count,comment_count,word_count,language,published_at,updated_at,created_at,extra_data)
-SELECT CONCAT(N'Seed title ',value), REPLICATE(CAST(N'lorem ipsum ' AS NVARCHAR(MAX)),200),
-       CONCAT(N'<p>',REPLICATE(CAST(N'lorem ipsum ' AS NVARCHAR(MAX)),200),N'</p>'),
+SELECT CONCAT(N'Seed title ',value), REPLICATE(CAST(N'lorem ipsum ' AS NVARCHAR(MAX)),20),
+       CONCAT(N'<p>',REPLICATE(CAST(N'lorem ipsum ' AS NVARCHAR(MAX)),20),N'</p>'),
        CONCAT(N'{"seed":true,"i":',value,N'}'), N'rust,postgres,data', CONCAT(N'Author ',value%1000), CONCAT('author',value%1000,'@example.com'),
        CONCAT('https://blog.example.com/posts/',value),
        CASE value%3 WHEN 0 THEN N'engineering' WHEN 1 THEN N'product' ELSE N'tutorial' END,
@@ -86,7 +86,7 @@ SELECT CONCAT(N'Seed title ',value), REPLICATE(CAST(N'lorem ipsum ' AS NVARCHAR(
        value%5,value%100000,value%500,200,'en',
        CASE WHEN value%3<>0 THEN DATEADD(DAY,value%365,CONVERT(DATETIME2(6),'2024-01-01')) ELSE NULL END,
        DATEADD(DAY,value%400,CONVERT(DATETIME2(6),'2024-01-01')), DATEADD(DAY,value%730,CONVERT(DATETIME2(6),'2023-01-01')), N'{"revisions":1}'
-FROM GENERATE_SERIES(CONVERT(BIGINT,1),CONVERT(BIGINT,5000));
+FROM GENERATE_SERIES(CONVERT(BIGINT,1),CONVERT(BIGINT,150000));
 GO
 
 -- === GARBAGE PROFILE ===

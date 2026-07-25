@@ -3,7 +3,7 @@
 
 Reproduces the benchmark fixture in Python (the project's scripting language;
 see dev/bench/smoke.py, dev/cdc/harm_mongo.py), sized to mirror the SQL
-`orders`/`users` fixture: rivet.users=1000, rivet.orders=5000. Idempotent —
+`orders`/`users` fixture: rivet.users=150000, rivet.orders=150000. Idempotent —
 each collection is dropped and rebuilt.
 
 Run:   RIVET_MONGO_URI="mongodb://127.0.0.1:27017/rivet" python3 seeds/common/mongo.py
@@ -15,8 +15,8 @@ import os
 from pymongo import MongoClient
 
 URI = os.environ.get("RIVET_MONGO_URI", "mongodb://127.0.0.1:27017/rivet")
-USERS = int(os.environ.get("RIVET_SEED_USERS", "1000"))
-ORDERS = int(os.environ.get("RIVET_SEED_ORDERS", "5000"))
+USERS = int(os.environ.get("RIVET_SEED_USERS", "150000"))
+ORDERS = int(os.environ.get("RIVET_SEED_ORDERS", "150000"))
 PRODUCTS = ["widget", "gadget", "sprocket", "cog", "bearing", "gasket"]
 STATUSES = ["pending", "shipped", "delivered", "cancelled"]
 

@@ -202,14 +202,14 @@ VALUES
 SET SESSION cte_max_recursion_depth = 200000;
 
 INSERT INTO users (name, email, age, balance, is_active, bio, created_at, updated_at)
-WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 2000)
+WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 150000)
 SELECT CONCAT('User ',i), CONCAT('user',i,'@example.com'), 18+(i%48), ROUND(RAND(i)*200000,2),
        (i%10<>0), IF(i%3=0,CONCAT('seed bio ',i),NULL),
        DATE_SUB('2023-01-01', INTERVAL -(i%730) HOUR), DATE_SUB('2023-01-01', INTERVAL -(i%910) HOUR)
 FROM n;
 
 INSERT INTO orders (user_id, product, quantity, price, status, notes, ordered_at, updated_at)
-WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 20000)
+WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 150000)
 SELECT LEAST(1+FLOOR((i-1)/10),2000),
        ELT((i%10)+1,'MacBook Pro','Dell XPS','ThinkPad','Surface','Ergonomic Chair','Standing Desk','Monitor Arm','USB-C Hub','Mechanical Keyboard','Magic Mouse'),
        1+(i%10), ROUND(5+(i%4995),2),
@@ -219,7 +219,7 @@ SELECT LEAST(1+FLOOR((i-1)/10),2000),
 FROM n;
 
 INSERT INTO events (user_id, event_type, payload, ip_address, created_at)
-WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 50000)
+WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 150000)
 SELECT LEAST(1+FLOOR((i-1)/25),2000),
        ELT((i%10)+1,'login','logout','page_view','purchase','signup','settings_change','password_reset','search','export','api_call'),
        JSON_OBJECT('seed',TRUE,'i',i), CONCAT('10.',i MOD 255,'.',(i*7) MOD 255,'.1'),
@@ -227,7 +227,7 @@ SELECT LEAST(1+FLOOR((i-1)/25),2000),
 FROM n;
 
 INSERT INTO page_views (session_id,user_id,url,referrer,user_agent,ip_address,country_code,region,city,device_type,browser,os,screen_width,screen_height,viewport_width,viewport_height,page_load_ms,dom_ready_ms,time_on_page_ms,scroll_depth_pct,click_count,is_bounce,utm_source,utm_medium,utm_campaign,utm_term,utm_content,custom_props,created_at)
-WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 20000)
+WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 150000)
 SELECT LPAD(HEX(i),32,'0'), IF(i%3=0,1+(i%2000),NULL), CONCAT('/page/',i MOD 26),
        IF(i%4=0,'https://google.com',NULL), 'Mozilla/5.0 seed', CONCAT('192.168.',i MOD 255,'.',(i*3) MOD 254 +1),
        ELT((i MOD 5)+1,'US','GB','DE','FR','CA'), CONCAT('Region ',i MOD 10), CONCAT('City ',i MOD 20),
@@ -239,8 +239,8 @@ SELECT LPAD(HEX(i),32,'0'), IF(i%3=0,1+(i%2000),NULL), CONCAT('/page/',i MOD 26)
 FROM n;
 
 INSERT INTO content_items (title,body,raw_html,metadata,tags,author_name,author_email,source_url,category,status,priority,view_count,comment_count,word_count,language,published_at,updated_at,created_at,extra_data)
-WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 5000)
-SELECT CONCAT('Seed title ',i), REPEAT('lorem ipsum ',200), CONCAT('<p>',REPEAT('lorem ipsum ',200),'</p>'),
+WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 150000)
+SELECT CONCAT('Seed title ',i), REPEAT('lorem ipsum ',20), CONCAT('<p>',REPEAT('lorem ipsum ',20),'</p>'),
        JSON_OBJECT('seed',TRUE,'i',i), 'rust,postgres,data', CONCAT('Author ',i MOD 1000), CONCAT('author',i MOD 1000,'@example.com'),
        CONCAT('https://blog.example.com/posts/',i), ELT((i MOD 3)+1,'engineering','product','tutorial'), ELT((i MOD 3)+1,'draft','review','published'),
        i MOD 5, i MOD 100000, i MOD 500, 200, 'en',
@@ -251,7 +251,7 @@ FROM n;
 INSERT INTO orders_sparse (id, payload) VALUES (1,'s0'),(2000001,'s1'),(4000001,'s2');
 
 INSERT INTO orders_coalesce (product, quantity, price, updated_at, created_at)
-WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 2000)
+WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 150000)
 SELECT ELT((i%5)+1,'MacBook Pro','Dell XPS','ThinkPad','Surface','Ergonomic Chair'), 1+(i%10), ROUND(5+(i%4995),2),
        IF(RAND(i)<0.35, NULL, DATE_SUB('2025-01-01', INTERVAL -(i%365) DAY)),
        DATE_SUB('2024-01-01', INTERVAL -(i%365) DAY)

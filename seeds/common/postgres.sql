@@ -200,10 +200,10 @@ INSERT INTO rivet_type_matrix_full VALUES
 -- ============================================================================
 -- DATA FILL — fast-profile reproduction of the Rust seeder (src/bin/seed/fast.rs).
 -- generate_series is the SQL analog of the seeder's `fast` path (deterministic,
--- no Rust binary needed). Row counts are dogfood-sized (enough for chunk_size
--- 1000 to make many windows); edit the N in each generate_series to scale toward
--- the seeder's default (100k users / 1M orders / 5M events / 2M page_views /
--- 200k content_items).
+-- no Rust binary needed). Row counts are 150K/table — deliberately PAST `rivet
+-- init`'s 100K threshold so init scaffolds KEYSET (not full) on every clean-PK
+-- table, uniformly with the ext.* garbage. content_items' body is trimmed at this
+-- scale (repeat 20, not 200) so 150K rows stay ~100 MB, not ~750 MB.
 -- ============================================================================
 
 INSERT INTO users (name, email, age, balance, is_active, bio, created_at, updated_at)
@@ -211,7 +211,7 @@ SELECT 'User '||i, 'user'||i||'@example.com', 18+(i%48), round((random()*200000)
        (random()>0.1), CASE WHEN random()>0.3 THEN 'seed bio '||i ELSE NULL END,
        timestamp '2023-01-01'+((i%730)*interval '1 hour'),
        timestamp '2023-01-01'+((i%910)*interval '1 hour')
-FROM generate_series(1, 2000) AS i;
+FROM generate_series(1, 150000) AS i;
 
 INSERT INTO orders (user_id, product, quantity, price, status, notes, ordered_at, updated_at)
 SELECT 1+((i-1)/10),
@@ -222,7 +222,7 @@ SELECT 1+((i-1)/10),
        CASE WHEN i%3=0 THEN 'note '||i ELSE NULL END,
        timestamp '2023-01-01'+((i%730)*interval '1 minute'),
        timestamp '2023-01-01'+((i%760)*interval '1 minute')
-FROM generate_series(1, 20000) AS i;
+FROM generate_series(1, 150000) AS i;
 
 INSERT INTO events (user_id, event_type, payload, ip_address, created_at)
 SELECT 1+((i-1)/25),
@@ -231,7 +231,7 @@ SELECT 1+((i-1)/25),
        jsonb_build_object('seed',true,'i',i),
        '10.'||(i%255)::text||'.'||((i*7)%255)::text||'.1',
        timestamp '2023-01-01'+((i%730)*interval '1 minute')
-FROM generate_series(1, 50000) AS i;
+FROM generate_series(1, 150000) AS i;
 
 INSERT INTO page_views (
     session_id, user_id, url, referrer, user_agent, ip_address,
@@ -260,13 +260,13 @@ SELECT lpad(to_hex(i),32,'0'),
        NULL, NULL,
        CASE WHEN i%5=0 THEN jsonb_build_object('seed',true) ELSE NULL END,
        timestamp '2023-01-01'+((i%730)*interval '1 minute')
-FROM generate_series(1, 20000) AS i;
+FROM generate_series(1, 150000) AS i;
 
 INSERT INTO content_items (
     title, body, raw_html, metadata, tags, author_name, author_email,
     source_url, category, status, priority, view_count, comment_count,
     word_count, language, published_at, updated_at, created_at, extra_data)
-SELECT 'Seed title '||i, repeat('lorem ipsum ',200), '<p>'||repeat('lorem ipsum ',200)||'</p>',
+SELECT 'Seed title '||i, repeat('lorem ipsum ',20), '<p>'||repeat('lorem ipsum ',20)||'</p>',
        jsonb_build_object('seed',true,'i',i), 'rust,postgres,data',
        'Author '||(i%1000), 'author'||(i%1000)||'@example.com',
        'https://blog.example.com/posts/'||i,
@@ -277,7 +277,7 @@ SELECT 'Seed title '||i, repeat('lorem ipsum ',200), '<p>'||repeat('lorem ipsum 
        timestamp '2024-01-01'+((i%400)*interval '1 day'),
        timestamp '2023-01-01'+((i%730)*interval '1 day'),
        jsonb_build_object('revisions',1)
-FROM generate_series(1, 5000) AS i;
+FROM generate_series(1, 150000) AS i;
 
 -- orders_sparse: a huge min..max span over very few rows (id = 1 + i*gap) — the
 -- sparse-chunk footgun fixture. gap 2,000,000.
@@ -291,7 +291,7 @@ SELECT (ARRAY['MacBook Pro 16"','Dell XPS 15','ThinkPad X1 Carbon','Surface Lapt
        1+(i%10), round((5+(i%4995))::numeric,2),
        CASE WHEN random()<0.35 THEN NULL ELSE timestamp '2025-01-01'+((i%365)*interval '1 day') END,
        timestamp '2024-01-01'+((i%365)*interval '1 day')
-FROM generate_series(1, 2000) AS i;
+FROM generate_series(1, 150000) AS i;
 
 -- ============================================================================
 -- GARBAGE PROFILE (ext.* schema) — the anonymized field-DB shapes.
