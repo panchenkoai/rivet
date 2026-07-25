@@ -77,19 +77,34 @@ SELECT 'label' || g, g % 100 FROM generate_series(1, 150000) g;
 -- keyset — ref_id is not a unique key). In the field these `*_version` tables
 -- were the parallel-checkpoint failures (a heavy chunk hit the statement timeout).
 -- Messy columns: a duplicated concept, `_cur` suffixes, mixed types — as found.
+-- Also the DOMINANT field profile: money as DECIMAL(11,4) VALUE columns (the real
+-- DB carried 177 of them across cart/earning/subtotal/total/amount) — init emits
+-- an explicit `columns:` override for each, so this exercises that decimal path;
+-- `version` + many rows per `ref_id` is the version-table heavy-chunk shape.
 CREATE TABLE ext.ref_id_history (
     ref_id BIGINT NOT NULL,
+    version INT NOT NULL,
     field TEXT,
     field_cur TEXT,
     sign SMALLINT NOT NULL DEFAULT 1,
     status TEXT,
+    cart DECIMAL(11,4),
+    earning DECIMAL(11,4),
+    subtotal DECIMAL(11,4),
+    total DECIMAL(11,4),
     amount_cur TEXT,
-    purchase_type TEXT
+    user_cur CHAR(3),
+    purchase_type TEXT,
+    created_at TIMESTAMP NOT NULL DEFAULT now(),
+    updated_at TIMESTAMP
 );
 CREATE INDEX ix_ref_id_history_ref_id ON ext.ref_id_history (ref_id);
-INSERT INTO ext.ref_id_history (ref_id, field, field_cur, sign, status, amount_cur, purchase_type)
-SELECT (g % 400) + 1, 'f' || g, 'EUR', CASE WHEN g % 2 = 0 THEN 1 ELSE -1 END,
-       (ARRAY['pending','done','void'])[1 + g % 3], 'USD', (ARRAY['a','b'])[1 + g % 2]
+INSERT INTO ext.ref_id_history (ref_id, version, field, field_cur, sign, status, cart, earning, subtotal, total, amount_cur, user_cur, purchase_type, created_at, updated_at)
+SELECT (g % 400) + 1, (g / 400) + 1, 'f' || g, 'EUR', CASE WHEN g % 2 = 0 THEN 1 ELSE -1 END,
+       (ARRAY['pending','done','void'])[1 + g % 3],
+       (g % 900000 + 1) / 100.0, (g % 500000 + 1) / 100.0, (g % 300000 + 1) / 100.0, (g % 1200000 + 1) / 100.0,
+       'USD', (ARRAY['EUR','USD','PLN'])[1 + g % 3], (ARRAY['a','b'])[1 + g % 2],
+       now() - (g || ' minutes')::interval, now() - (g || ' seconds')::interval
 FROM generate_series(1, 150000) g;
 
 -- Keyed by `order_id` (NOT `id`): a unique index makes it keyset-able on a

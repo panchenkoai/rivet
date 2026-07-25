@@ -333,18 +333,31 @@ SELECT CONCAT('label', n), n % 100 FROM seq;
 DROP TABLE IF EXISTS ext_ref_id_history;
 CREATE TABLE ext_ref_id_history (
     ref_id BIGINT NOT NULL,
+    version INT NOT NULL,
     field TEXT,
     field_cur TEXT,
     sign SMALLINT NOT NULL DEFAULT 1,
     status TEXT,
+    -- money as DECIMAL(11,4) VALUE columns — the DOMINANT field profile (177 such
+    -- columns across the real DB); init emits a `columns:` override for each.
+    cart DECIMAL(11,4),
+    earning DECIMAL(11,4),
+    subtotal DECIMAL(11,4),
+    total DECIMAL(11,4),
     amount_cur TEXT,
+    user_cur CHAR(3),
     purchase_type TEXT,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NULL,
     KEY ix_ref_id (ref_id)
 );
-INSERT INTO ext_ref_id_history (ref_id, field, field_cur, sign, status, amount_cur, purchase_type)
+INSERT INTO ext_ref_id_history (ref_id, version, field, field_cur, sign, status, cart, earning, subtotal, total, amount_cur, user_cur, purchase_type, created_at, updated_at)
 WITH RECURSIVE seq AS (SELECT 1 n UNION ALL SELECT n+1 FROM seq WHERE n < 150000)
-SELECT (n % 400) + 1, CONCAT('f', n), 'EUR', IF(n % 2 = 0, 1, -1),
-       ELT(1 + n % 3, 'pending','done','void'), 'USD', ELT(1 + n % 2, 'a','b') FROM seq;
+SELECT (n % 400) + 1, (n DIV 400) + 1, CONCAT('f', n), 'EUR', IF(n % 2 = 0, 1, -1),
+       ELT(1 + n % 3, 'pending','done','void'),
+       (n % 900000 + 1) / 100.0, (n % 500000 + 1) / 100.0, (n % 300000 + 1) / 100.0, (n % 1200000 + 1) / 100.0,
+       'USD', ELT(1 + n % 3, 'EUR','USD','PLN'), ELT(1 + n % 2, 'a','b'),
+       NOW() - INTERVAL n MINUTE, NOW() - INTERVAL n SECOND FROM seq;
 
 -- Keyed by `order_id` (NOT `id`): a unique key makes it keyset-able on a non-`id`
 -- key. Wide-ish string columns (md5/currency/subid).

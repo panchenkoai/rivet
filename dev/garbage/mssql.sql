@@ -60,17 +60,31 @@ GO
 -- chunked). Non-unique index on ref_id, no PK.
 CREATE TABLE ext.ref_id_history (
     ref_id BIGINT NOT NULL,
+    version INT NOT NULL,
     field NVARCHAR(200),
     field_cur NVARCHAR(10),
     sign SMALLINT NOT NULL DEFAULT 1,
     status NVARCHAR(50),
+    -- money as DECIMAL(11,4) VALUE columns — the DOMINANT field profile (177 such
+    -- columns across the real DB); init emits a `columns:` override for each.
+    cart DECIMAL(11,4),
+    earning DECIMAL(11,4),
+    subtotal DECIMAL(11,4),
+    total DECIMAL(11,4),
     amount_cur NVARCHAR(10),
-    purchase_type NVARCHAR(50)
+    user_cur NCHAR(3),
+    purchase_type NVARCHAR(50),
+    created_at DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
+    updated_at DATETIME2
 );
 CREATE INDEX ix_ref_id_history_ref_id ON ext.ref_id_history (ref_id);
-INSERT INTO ext.ref_id_history (ref_id, field, field_cur, sign, status, amount_cur, purchase_type)
-SELECT (value % 400) + 1, CONCAT(N'f', value), N'EUR', IIF(value % 2 = 0, 1, -1),
-       CHOOSE(1 + value % 3, N'pending', N'done', N'void'), N'USD', CHOOSE(1 + value % 2, N'a', N'b')
+INSERT INTO ext.ref_id_history (ref_id, version, field, field_cur, sign, status, cart, earning, subtotal, total, amount_cur, user_cur, purchase_type, created_at, updated_at)
+SELECT (value % 400) + 1, (value / 400) + 1, CONCAT(N'f', value), N'EUR', IIF(value % 2 = 0, 1, -1),
+       CHOOSE(1 + value % 3, N'pending', N'done', N'void'),
+       CAST((value % 900000 + 1) AS DECIMAL(11,4)) / 100, CAST((value % 500000 + 1) AS DECIMAL(11,4)) / 100,
+       CAST((value % 300000 + 1) AS DECIMAL(11,4)) / 100, CAST((value % 1200000 + 1) AS DECIMAL(11,4)) / 100,
+       N'USD', CHOOSE(1 + value % 3, N'EUR', N'USD', N'PLN'), CHOOSE(1 + value % 2, N'a', N'b'),
+       DATEADD(MINUTE, -value, SYSUTCDATETIME()), DATEADD(SECOND, -value, SYSUTCDATETIME())
 FROM GENERATE_SERIES(1, 150000);
 GO
 
