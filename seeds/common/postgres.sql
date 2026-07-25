@@ -293,6 +293,13 @@ SELECT (ARRAY['MacBook Pro 16"','Dell XPS 15','ThinkPad X1 Carbon','Surface Lapt
        timestamp '2024-01-01'+((i%365)*interval '1 day')
 FROM generate_series(1, 150000) AS i;
 
+-- Refresh planner stats so `rivet init` sees the TRUE row counts right after a
+-- fresh seed — reltuples is 0 until ANALYZE, so without this every 150K table
+-- scaffolds `mode: full` instead of keyset. Deterministic init depends on it.
+ANALYZE users; ANALYZE orders; ANALYZE events; ANALYZE page_views;
+ANALYZE content_items; ANALYZE orders_sparse; ANALYZE orders_coalesce;
+ANALYZE rivet_type_matrix; ANALYZE rivet_type_matrix_full;
+
 -- ============================================================================
 -- GARBAGE PROFILE (ext.* schema) — the anonymized field-DB shapes.
 -- ============================================================================

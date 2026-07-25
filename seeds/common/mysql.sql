@@ -257,6 +257,11 @@ SELECT ELT((i%5)+1,'MacBook Pro','Dell XPS','ThinkPad','Surface','Ergonomic Chai
        DATE_SUB('2024-01-01', INTERVAL -(i%365) DAY)
 FROM n;
 
+-- Refresh table stats so `rivet init` sees the TRUE row counts right after a fresh
+-- seed (else every 150K table scaffolds `mode: full` instead of keyset).
+ANALYZE TABLE users, orders, events, page_views, content_items,
+              orders_sparse, orders_coalesce, rivet_type_matrix, rivet_type_matrix_full;
+
 -- === GARBAGE PROFILE ===
 -- Obfuscated GARBAGE-profile fixture (MySQL) — see dev/garbage/postgres.sql for
 -- the rationale. Materialized as `ext_`-prefixed tables in the `rivet` database (the rivet
