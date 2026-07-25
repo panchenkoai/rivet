@@ -57,7 +57,7 @@ sc_verdicts() {
     [ "$eng" != mysql ] && { local gc; gc="$(_init_cfg "$eng" "$url" ext)" && checks+=("$gc"); }
   fi
   for cfg in "${checks[@]}"; do
-    local out; out="$("$RIVET" check -c "$cfg" 2>/dev/null)"
+    local out; out="$("$RIVET" check -c "$cfg" 2>&1)"   # check writes to stderr — capture both
     phantom=$((phantom + $(grep -ac "Heavy chunk" <<<"$out")))
     map="$(python3 "$HERE/lib/parse_verdicts.py" "$map" <<<"$out")"
   done
