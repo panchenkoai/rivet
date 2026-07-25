@@ -231,11 +231,16 @@ fn range_worker(
         match p.next_cursor {
             Some(v) => last = Some(v),
             None => anyhow::bail!(
+                // last-good key carried in the message: range_worker has no &mut
+                // summary (it returns WorkerOutput, errors aggregate upstream), so
+                // the forensic value rides error_message — which error_class reads
+                // as keyset_unreadable_key.
                 "export '{}': parallel worker {} could not read the '{}' value to advance keyset \
-                 (NULL or unsupported type).",
+                 (NULL or unsupported type) — last readable key: {}.",
                 plan.export_name,
                 worker,
-                kp.key_column
+                kp.key_column,
+                last.as_deref().unwrap_or("<none>"),
             ),
         }
     }

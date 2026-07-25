@@ -175,6 +175,10 @@ pub(crate) fn run_keyset(
     } else {
         None
     };
+    // Forensics (v18): a resume's lower bound is the checkpoint it continues from
+    // (None on a fresh run — keyset seeks forward from the start). cursor_high (the
+    // max reached) is set at the loop exits below.
+    summary.cursor_low = last.clone();
 
     // Round-5 (keyset checkpoint-resume manifest completeness — the sibling of the
     // chunked fix): a crash mid-keyset leaves pages durably committed (parquet +

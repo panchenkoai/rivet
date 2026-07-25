@@ -127,6 +127,10 @@ pub struct RunSummary {
     /// neither the source table nor a still-live server.
     pub offending_value: Option<String>,
     pub server_context_json: Option<String>,
+    /// The keyset/chunk key's SOURCE native type (`bigint unsigned`, `numeric(11,4)`),
+    /// resolved by the open probe — folded into `key_descriptor_json` so the "was the
+    /// key unsigned" answer travels on the metric row.
+    pub key_native_type: Option<String>,
     /// `profile` from YAML, or `balanced (default)` if omitted.
     pub tuning_profile: String,
     /// Configured `batch_size` from YAML/profile (FETCH cap before `batch_size_memory_mb` override).
@@ -232,6 +236,7 @@ impl RunSummary {
             error_message: None,
             offending_value: None,
             server_context_json: None,
+            key_native_type: None,
             tuning_profile: plan.tuning_profile_label.clone(),
             batch_size: plan.tuning.batch_size,
             batch_size_memory_mb: plan.tuning.batch_size_memory_mb,
@@ -306,6 +311,7 @@ impl RunSummary {
             error_message: None,
             offending_value: None,
             server_context_json: None,
+            key_native_type: None,
             tuning_profile: "balanced".into(),
             batch_size: 1000,
             batch_size_memory_mb: None,

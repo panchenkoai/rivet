@@ -86,3 +86,10 @@ scenarios:
     chunked:        { test: chunked_crash_after_first_chunk_complete_resume_finishes_export }
     keyset:         { test: keyset_checkpoint_resume_second_run_captures_only_new_keys }
     mongo_parallel: { na: "no checkpoint/resume — run_mongo_parallel reads no checkpoint state; a crash re-runs the full quiescent scan" }
+
+  - id: open_forensics
+    what: "v18 failure forensics captured at run OPEN by capture_open_forensics — server_context_json (source version + limits, so a statement timeout / ERROR 3024 is explainable) + schema-at-open (columns/types via type_mappings LIMIT-0, so a run that fails BEFORE finalize still records its schema; export_schema was success-only, which left the field DB's 43 failures with none). Called once in run_export_job BEFORE the strategy branch, so all four runners share the seam; the runner-bypass risk was the SEPARATE apply entry point (run_export_job_with_chunk_source), now re-calling it explicitly."
+    single:         { na: "shared seam — capture_open_forensics runs in run_export_job before the strategy dispatch, covering all four runners in one call (like meta_columns via ExportSink); no per-runner divergence on the `rivet run` path" }
+    chunked:        { na: "shared seam (run_export_job pre-dispatch)" }
+    keyset:         { test: keyset_export_persists_v18_forensics_columns }
+    mongo_parallel: { na: "shared seam (run_export_job pre-dispatch); the one distinct entry point is APPLY (run_export_job_with_chunk_source), which re-calls capture_open_forensics — job.rs, guarding the runner-bypass class this ledger exists for" }

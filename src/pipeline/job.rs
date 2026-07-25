@@ -25,6 +25,11 @@ pub(crate) fn classify_error_message(msg: &str) -> Option<&'static str> {
         Some("keyset_unreadable_key")
     } else if m.contains("parallel checkpoint worker") {
         Some("parallel_checkpoint")
+    } else if m.contains("deadlock") {
+        Some("deadlock")
+    } else if m.contains("lock wait timeout") || m.contains("could not obtain lock") {
+        // A lock-wait embeds "timeout" — match it before statement_timeout.
+        Some("lock_timeout")
     } else if m.contains("3024")
         || m.contains("maximum statement execution time")
         || m.contains("statement timeout")
@@ -35,27 +40,71 @@ pub(crate) fn classify_error_message(msg: &str) -> Option<&'static str> {
         || m.contains("on_schema_drift")
     {
         Some("schema_drift")
-    } else if m.contains("access denied") || m.contains("authentication failed") {
+    } else if m.contains("doesn't exist")
+        || m.contains("does not exist")
+        || m.contains("no such table")
+        || m.contains("invalid object name")
+        || m.contains("unknown table")
+    {
+        Some("relation_not_found")
+    } else if m.contains("permission denied")
+        || m.contains("command denied")
+        || m.contains("privilege")
+        || m.contains("view server state")
+    {
+        Some("privilege")
+    } else if m.contains("access denied")
+        || m.contains("authentication failed")
+        || m.contains("password authentication")
+    {
         Some("source_auth")
-    } else if m.contains("out of memory") {
+    } else if m.contains("connection reset")
+        || m.contains("connection refused")
+        || m.contains("connection closed")
+        || m.contains("broken pipe")
+        || m.contains("server has gone away")
+        || m.contains("connection timed out")
+    {
+        Some("connection")
+    } else if m.contains("certificate") || m.contains("tls handshake") || m.contains("ssl error") {
+        Some("tls")
+    } else if m.contains("no space left") || m.contains("disk full") || m.contains("quota exceeded")
+    {
+        Some("disk_full")
+    } else if m.contains("out of memory") || m.contains("cannot allocate memory") {
         Some("out_of_memory")
     } else {
         None
     }
 }
 
-/// A compact JSON descriptor of the resolved strategy's KEY (`{strategy, key}`) —
-/// the column the run paged by. The key's TYPE + `is_primary_key` (the "was it
-/// indexed / unsigned" answer) need the introspected schema and are a follow-up
-/// producer at plan build, so they are omitted until wired rather than guessed.
-fn key_descriptor_json(plan: &ResolvedRunPlan) -> Option<String> {
-    let (strategy, key) = match &plan.strategy {
-        ExtractionStrategy::Keyset(k) => ("keyset", &k.key_column),
-        ExtractionStrategy::Chunked(c) => ("chunked", &c.column),
-        ExtractionStrategy::Incremental(i) => ("incremental", &i.primary_column),
-        _ => return None,
-    };
-    Some(serde_json::json!({ "strategy": strategy, "key": key }).to_string())
+/// The resolved strategy's `(label, key column)` — the column the run pages by.
+/// `None` for full/snapshot (no key). Shared by `key_descriptor_json` and the open
+/// probe, which resolves the key's native type against this name.
+fn strategy_key_column(plan: &ResolvedRunPlan) -> Option<(&'static str, &str)> {
+    match &plan.strategy {
+        ExtractionStrategy::Keyset(k) => Some(("keyset", &k.key_column)),
+        ExtractionStrategy::Chunked(c) => Some(("chunked", &c.column)),
+        ExtractionStrategy::Incremental(i) => Some(("incremental", &i.primary_column)),
+        _ => None,
+    }
+}
+
+/// A compact JSON descriptor of the resolved strategy's KEY: `{strategy, key}` plus
+/// `db_type` + an `unsigned` flag when the open probe resolved the key's SOURCE
+/// native type (the "was it unsigned" answer inline, which the Arrow repr elides).
+/// `is_primary_key` is implicit for keyset — the planner requires a unique index —
+/// so it is not restated.
+fn key_descriptor_json(plan: &ResolvedRunPlan, key_native_type: Option<&str>) -> Option<String> {
+    let (strategy, key) = strategy_key_column(plan)?;
+    let mut obj = serde_json::json!({ "strategy": strategy, "key": key });
+    if let Some(t) = key_native_type {
+        obj["db_type"] = serde_json::Value::String(t.to_string());
+        if t.to_ascii_lowercase().contains("unsigned") {
+            obj["unsigned"] = serde_json::Value::Bool(true);
+        }
+    }
+    Some(obj.to_string())
 }
 
 /// Capture failure-forensics context at run OPEN, best-effort. `export_schema` is
@@ -98,6 +147,14 @@ fn capture_open_forensics(plan: &ResolvedRunPlan, state: &StateStore, summary: &
                         .unwrap_or_else(|| m.source_native_type.clone()),
                 })
                 .collect();
+            // Resolve the KEY column's source native type for key_descriptor_json —
+            // it names signedness ("bigint unsigned") that the Arrow repr elides.
+            if let Some((_, key)) = strategy_key_column(plan) {
+                summary.key_native_type = mappings
+                    .iter()
+                    .find(|m| m.column_name == key)
+                    .map(|m| m.source_native_type.clone());
+            }
             if let Err(e) = state.store_schema(&summary.export_name, &cols) {
                 log::debug!(
                     "open-forensics: store_schema failed for '{}': {e}",
@@ -173,7 +230,7 @@ fn build_metric_row(
             .map(str::to_string),
         cursor_min: summary.cursor_low.clone(),
         cursor_max: summary.cursor_high.clone(),
-        key_descriptor_json: key_descriptor_json(plan),
+        key_descriptor_json: key_descriptor_json(plan, summary.key_native_type.as_deref()),
         // Producers now wired: offending_value is stamped at the keyset throw
         // (`pipeline/keyset.rs`); server_context_json is captured at open by
         // `capture_open_forensics` (source `server_context()`).
@@ -511,6 +568,7 @@ pub(crate) fn synthetic_failed_summary(export_name: &str, err: &anyhow::Error) -
         cursor_high: None,
         offending_value: None,
         server_context_json: None,
+        key_native_type: None,
         run_id,
         export_name: export_name.to_string(),
         status: "failed".into(),
@@ -981,6 +1039,11 @@ pub(crate) fn run_export_job_with_chunk_source(
     let mut summary = RunSummary::new(plan);
     summary.apply_context = apply_context;
     ledger_begin_run(state, plan, &summary.run_id);
+    // Runner parity: the apply/chunk-source path is a SEPARATE runner from
+    // run_export_job, so it must re-apply open forensics itself (server_context +
+    // schema-at-open) or an apply-run failure records neither — the runner-bypass
+    // class. See docs/runner-coverage-matrix.yaml.
+    capture_open_forensics(plan, state, &mut summary);
 
     let result = if plan.strategy.requires_parallel_execution() {
         if plan.strategy.is_resumable() {
@@ -1485,6 +1548,7 @@ mod tests {
         summary.offending_value = Some("9223372036854775800".into()); // last-good before overflow
         summary.server_context_json =
             Some(r#"{"engine":"mysql","max_execution_time_ms":"30000"}"#.into());
+        summary.key_native_type = Some("bigint unsigned".into()); // folds into key_descriptor
         summary.format = "parquet".into();
         summary.mode = "chunked".into();
         summary.files_produced = 7;
@@ -1618,6 +1682,9 @@ mod tests {
         let kd = key_descriptor_json.expect("chunked strategy carries a key descriptor");
         assert!(kd.contains("\"strategy\":\"chunked\""), "{kd}");
         assert!(kd.contains("\"key\":\"id\""), "{kd}");
+        // enriched from summary.key_native_type — the "was it unsigned" answer inline
+        assert!(kd.contains("\"db_type\":\"bigint unsigned\""), "{kd}");
+        assert!(kd.contains("\"unsigned\":true"), "{kd}");
         // producers wired: both pass through from the summary
         assert_eq!(offending_value.as_deref(), Some("9223372036854775800"));
         assert!(
@@ -1671,9 +1738,38 @@ mod tests {
             Some("parallel_checkpoint"),
             "the 3024-embedding wrapper must not be mis-bucketed as a bare statement_timeout"
         );
+        // Extended taxonomy: the field's ERROR 1146 (was None before) + the classes
+        // that group the common infra failures.
+        assert_eq!(
+            classify_error_message(
+                "MySqlError { ERROR 1146 (42S02): Table 'rivet.ext_x' doesn't exist }"
+            ),
+            Some("relation_not_found")
+        );
+        assert_eq!(
+            classify_error_message("Lock wait timeout exceeded; try restarting transaction"),
+            Some("lock_timeout"),
+            "a lock-wait embeds 'timeout' — must not fall through to statement_timeout"
+        );
+        assert_eq!(
+            classify_error_message("Deadlock found when trying to get lock"),
+            Some("deadlock")
+        );
+        assert_eq!(
+            classify_error_message("Connection reset by peer"),
+            Some("connection")
+        );
+        assert_eq!(
+            classify_error_message("SELECT command denied to user 'rivet'@'%' for table 't'"),
+            Some("privilege")
+        );
+        assert_eq!(
+            classify_error_message("No space left on device"),
+            Some("disk_full")
+        );
         // An unrecognized error stays honest (None), not force-fit into a bucket.
         assert_eq!(
-            classify_error_message("disk full: no space left on device"),
+            classify_error_message("some entirely novel failure with no known signature"),
             None
         );
     }
