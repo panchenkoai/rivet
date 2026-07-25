@@ -338,6 +338,21 @@ const MIGRATIONS: &[(i64, &str)] = &[
          );
          CREATE INDEX IF NOT EXISTS idx_run_status_prefix ON run_status(prefix);",
     ),
+    // v18: failure-forensics columns on export_metrics. A `status='failed'` row IS
+    // written on failure (unlike export_schema, which is success-only), so the
+    // fields a post-mortem needs — the error CLASS, the key RANGE it died in, the
+    // key's SHAPE, the OFFENDING value, the source SERVER limits — live HERE, making
+    // one failed row self-sufficient to recreate the failure without the source DB.
+    // Populated in `pipeline::job::build_metric_row` (see the write-point map there).
+    (
+        18,
+        "ALTER TABLE export_metrics ADD COLUMN error_class TEXT;
+         ALTER TABLE export_metrics ADD COLUMN cursor_min TEXT;
+         ALTER TABLE export_metrics ADD COLUMN cursor_max TEXT;
+         ALTER TABLE export_metrics ADD COLUMN key_descriptor_json TEXT;
+         ALTER TABLE export_metrics ADD COLUMN offending_value TEXT;
+         ALTER TABLE export_metrics ADD COLUMN server_context_json TEXT;",
+    ),
 ];
 
 /// PostgreSQL-compatible DDL.  Column types differ from SQLite (BIGSERIAL,
@@ -610,6 +625,17 @@ const PG_MIGRATIONS: &[(i64, &str)] = &[
             finished_at TEXT
          );
          CREATE INDEX IF NOT EXISTS idx_run_status_prefix ON run_status(prefix);",
+    ),
+    // v18: failure-forensics columns (see the SQLite v18 comment). Postgres TEXT
+    // holds the same JSON/scalar payloads.
+    (
+        18,
+        "ALTER TABLE export_metrics ADD COLUMN error_class TEXT;
+         ALTER TABLE export_metrics ADD COLUMN cursor_min TEXT;
+         ALTER TABLE export_metrics ADD COLUMN cursor_max TEXT;
+         ALTER TABLE export_metrics ADD COLUMN key_descriptor_json TEXT;
+         ALTER TABLE export_metrics ADD COLUMN offending_value TEXT;
+         ALTER TABLE export_metrics ADD COLUMN server_context_json TEXT;",
     ),
 ];
 

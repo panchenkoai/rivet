@@ -13,6 +13,51 @@ use super::single::{commit_incremental_cursor, run_with_reconnect};
 use super::summary::RunSummary;
 use crate::journal::RunEvent;
 
+/// Classify a raw error message into a STABLE `error_class` so failures group and
+/// trend without `LIKE '%…%'` string-matching (the 0.21.2 field post-mortem grouped
+/// 43 failures into 3 classes by hand). Ordered MOST-SPECIFIC first — the
+/// parallel-checkpoint wrapper embeds the inner `ERROR 3024` text, so it must match
+/// before `statement_timeout`. Returns `None` when nothing matches: an unclassified
+/// error is honest, not force-fit into a bucket.
+pub(crate) fn classify_error_message(msg: &str) -> Option<&'static str> {
+    let m = msg.to_ascii_lowercase();
+    if m.contains("keyset could not read") || m.contains("could not read the key value") {
+        Some("keyset_unreadable_key")
+    } else if m.contains("parallel checkpoint worker") {
+        Some("parallel_checkpoint")
+    } else if m.contains("3024")
+        || m.contains("maximum statement execution time")
+        || m.contains("statement timeout")
+    {
+        Some("statement_timeout")
+    } else if m.contains("schema drift")
+        || m.contains("schema changed")
+        || m.contains("on_schema_drift")
+    {
+        Some("schema_drift")
+    } else if m.contains("access denied") || m.contains("authentication failed") {
+        Some("source_auth")
+    } else if m.contains("out of memory") {
+        Some("out_of_memory")
+    } else {
+        None
+    }
+}
+
+/// A compact JSON descriptor of the resolved strategy's KEY (`{strategy, key}`) —
+/// the column the run paged by. The key's TYPE + `is_primary_key` (the "was it
+/// indexed / unsigned" answer) need the introspected schema and are a follow-up
+/// producer at plan build, so they are omitted until wired rather than guessed.
+fn key_descriptor_json(plan: &ResolvedRunPlan) -> Option<String> {
+    let (strategy, key) = match &plan.strategy {
+        ExtractionStrategy::Keyset(k) => ("keyset", &k.key_column),
+        ExtractionStrategy::Chunked(c) => ("chunked", &c.column),
+        ExtractionStrategy::Incremental(i) => ("incremental", &i.primary_column),
+        _ => return None,
+    };
+    Some(serde_json::json!({ "strategy": strategy, "key": key }).to_string())
+}
+
 /// Assemble the full `export_metrics` row (v9) from the finished run summary +
 /// plan. One builder so the run and apply paths persist an identical shape
 /// rather than each inlining the metric fields. The richer signals
@@ -65,6 +110,25 @@ fn build_metric_row(
         // is already `mode` = strategy.mode_label.) A sparse-key post-mortem is now
         // one SELECT: mode + chunk_key (+ chunk_task for span/windows).
         chunk_key: plan.strategy.chunk_key().map(str::to_string),
+        // ── v18 failure forensics — write-point map ──
+        // WIRED (data already on the summary/plan at this point):
+        error_class: summary
+            .error_message
+            .as_deref()
+            .and_then(classify_error_message)
+            .map(str::to_string),
+        cursor_min: summary.cursor_low.clone(),
+        cursor_max: summary.cursor_high.clone(),
+        key_descriptor_json: key_descriptor_json(plan),
+        // PRODUCER-PENDING — column ready, defaults None until the upstream write lands:
+        //  * offending_value: enrich the keyset throw (`pipeline/keyset.rs` ~L316 and
+        //    `mongo_parallel.rs`) to carry the raw unreadable value onto the summary,
+        //    then map it here — turns "unsupported type" into the actual u64.
+        //  * server_context_json: fetch source limits at open (`source/<engine>/mod.rs`
+        //    — MySQL `SELECT @@version, @@max_execution_time, @@sql_mode, @@time_zone`)
+        //    onto the summary, then map here — the only signal that explains ERROR 3024.
+        offending_value: None,
+        server_context_json: None,
     }
 }
 
@@ -1360,7 +1424,9 @@ mod tests {
         summary.total_rows = 50_000;
         summary.peak_rss_mb = 142;
         summary.status = "success".into();
-        summary.error_message = Some("boom".into());
+        summary.error_message = Some("export 'x': keyset could not read the 'id' value".into());
+        summary.cursor_low = Some("1".into());
+        summary.cursor_high = Some("18446744073709551615".into()); // u64 past i64::MAX
         summary.format = "parquet".into();
         summary.mode = "chunked".into();
         summary.files_produced = 7;
@@ -1434,6 +1500,12 @@ mod tests {
             rivet_version,
             longest_chunk_ms,
             chunk_key,
+            error_class,
+            cursor_min,
+            cursor_max,
+            key_descriptor_json,
+            offending_value,
+            server_context_json,
         } = build_metric_row(&summary, &plan, "safe");
 
         // ── core (v1) ──
@@ -1443,7 +1515,10 @@ mod tests {
         assert_eq!(total_rows, 50_000);
         assert_eq!(peak_rss_mb, Some(142));
         assert_eq!(status, "success");
-        assert_eq!(error_message.as_deref(), Some("boom"));
+        assert_eq!(
+            error_message.as_deref(),
+            Some("export 'x': keyset could not read the 'id' value")
+        );
         assert_eq!(tuning_profile.as_deref(), Some("safe")); // builder arg
         assert_eq!(format.as_deref(), Some("parquet"));
         assert_eq!(mode.as_deref(), Some("chunked"));
@@ -1474,6 +1549,20 @@ mod tests {
         // ── v12: chunking diagnostics — the chunk key column. The plan is a range
         // Chunked on "id"; the resolved strategy is the `mode` column ("chunked").
         assert_eq!(chunk_key.as_deref(), Some("id"));
+        // ── v18: failure forensics ──
+        assert_eq!(
+            error_class.as_deref(),
+            Some("keyset_unreadable_key"),
+            "error_class is DERIVED from error_message, not hardcoded"
+        );
+        assert_eq!(cursor_min.as_deref(), Some("1"));
+        assert_eq!(cursor_max.as_deref(), Some("18446744073709551615"));
+        let kd = key_descriptor_json.expect("chunked strategy carries a key descriptor");
+        assert!(kd.contains("\"strategy\":\"chunked\""), "{kd}");
+        assert!(kd.contains("\"key\":\"id\""), "{kd}");
+        // producer-pending: columns ready, upstream write not yet landed
+        assert!(offending_value.is_none());
+        assert!(server_context_json.is_none());
     }
 
     #[test]
@@ -1492,6 +1581,38 @@ mod tests {
         // The non-chunk dimensions are still populated.
         assert_eq!(row.source_type.as_deref(), Some("postgres"));
         assert_eq!(row.destination_type.as_deref(), Some("local"));
+    }
+
+    #[test]
+    fn classify_error_message_maps_the_field_run_failure_classes() {
+        // The exact three classes the 0.21.2 field post-mortem grouped BY HAND.
+        assert_eq!(
+            classify_error_message(
+                "export 'aa_import_advcake': keyset could not read the 'id' value from the last row of page 0"
+            ),
+            Some("keyset_unreadable_key")
+        );
+        assert_eq!(
+            classify_error_message(
+                "MySqlError { ERROR 3024 (HY000): maximum statement execution time exceeded }"
+            ),
+            Some("statement_timeout")
+        );
+        // The parallel-checkpoint wrapper EMBEDS the inner 3024 text — most-specific-
+        // first ordering must bucket it as parallel_checkpoint, NOT statement_timeout.
+        // (RED if the two arms are reordered.)
+        assert_eq!(
+            classify_error_message(
+                "export 'aa_payouts_version': parallel checkpoint worker errors:\nchunk 3: MySqlError { ERROR 3024 (HY000): maximum statement execution time exceeded }"
+            ),
+            Some("parallel_checkpoint"),
+            "the 3024-embedding wrapper must not be mis-bucketed as a bare statement_timeout"
+        );
+        // An unrecognized error stays honest (None), not force-fit into a bucket.
+        assert_eq!(
+            classify_error_message("disk full: no space left on device"),
+            None
+        );
     }
 
     // ── harm_deltas ─────────────────────────────────────────────────────────
