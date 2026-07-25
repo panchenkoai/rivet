@@ -375,13 +375,20 @@ fn table_shape_clauses(partition_by: &Option<String>, cluster_by: &[String]) -> 
 }
 
 /// A `FROM FILES(...)` Parquet source list.
+///
+/// `enable_list_inference = true` collapses rivet's 3-level Parquet LIST
+/// (`col.list.item`) one level, so an array column loads as the declared
+/// `ARRAY<STRUCT<item T>>` (== REPEATED RECORD{item}) instead of empty. It is a
+/// no-op for non-list columns, so it is always safe to set.
 fn from_files(uris: &[String]) -> String {
     let list = uris
         .iter()
         .map(|u| format!("    '{u}'"))
         .collect::<Vec<_>>()
         .join(",\n");
-    format!("FROM FILES (\n  format = 'PARQUET',\n  uris = [\n{list}\n  ]\n)")
+    format!(
+        "FROM FILES (\n  format = 'PARQUET',\n  enable_list_inference = true,\n  uris = [\n{list}\n  ]\n)"
+    )
 }
 
 /// The BigQuery column schema declared inline in LOAD DATA, from each spec's
