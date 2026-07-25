@@ -140,10 +140,24 @@ impl TableInfo {
                 fmt_row_estimate(self.row_estimate),
                 self.best_cursor_column().unwrap_or("updated_at"),
             ),
-            "full" => format!(
-                "auto: ~{} rows below 100K chunked threshold",
-                fmt_row_estimate(self.row_estimate),
-            ),
+            "full" => {
+                // full is reached TWO ways: below the 100K threshold, OR above it
+                // with no usable chunk key / cursor column (e.g. a keyless table, or
+                // a Mongo collection whose `_id` isn't surfaced as a chunk key). The
+                // message must say WHICH — claiming "below 100K" on a 150K table is a
+                // false diagnostic that hides the real reason (no key to page by).
+                if self.row_estimate > 100_000 {
+                    format!(
+                        "auto: ~{} rows ≥ 100K but no chunk key or cursor column available — full scan",
+                        fmt_row_estimate(self.row_estimate),
+                    )
+                } else {
+                    format!(
+                        "auto: ~{} rows below 100K chunked threshold",
+                        fmt_row_estimate(self.row_estimate),
+                    )
+                }
+            }
             _ => format!("mode={mode}"),
         }
     }
@@ -918,6 +932,29 @@ mod tests {
             !r.contains("mode: incremental"),
             "no cursor column → no hint: {r}"
         );
+    }
+
+    #[test]
+    fn full_rationale_distinguishes_below_threshold_from_no_key_at_scale() {
+        // Below 100K → the honest "below threshold" message.
+        let small = make_table(500, vec![col("id", "bigint", true)]);
+        assert_eq!(small.suggest_mode(), "full");
+        assert!(
+            small.mode_rationale("full").contains("below 100K"),
+            "small table keeps the below-threshold message"
+        );
+        // ABOVE 100K but NO chunk key and NO cursor (a keyless table, or a Mongo
+        // collection whose _id isn't surfaced as a key) → full, but the message must
+        // NOT claim "below 100K" — the dogfooding bug read "~150K rows below 100K
+        // chunked threshold" on a 150K Mongo collection. It must name the real cause.
+        let big_keyless = make_table(150_000, vec![col("label", "text", false)]);
+        assert_eq!(big_keyless.suggest_mode(), "full");
+        let r = big_keyless.mode_rationale("full");
+        assert!(
+            !r.contains("below 100K"),
+            "150K must not say below 100K: {r}"
+        );
+        assert!(r.contains("no chunk key"), "must name the real reason: {r}");
     }
 
     #[test]
