@@ -172,38 +172,69 @@ pub fn select_load_keys(new: &[(String, RunManifest)], all_parquet: &[String]) -
 }
 
 /// Delete every `.parquet` under `gcs_prefix` that no **`Success`** manifest
-/// references — crash leftovers from an interrupted extract (a run killed before
-/// it wrote its manifest leaves orphan parts the load already ignores, but which
-/// accumulate). Keeps every manifest, `_SUCCESS`, and every manifested part
-/// (including a `snapshot/` sub-prefix's, since `keyed` is fetched recursively).
-/// Strictly gentler than `cleanup_source`, which wipes the whole prefix.
+/// references — crash leftovers from an interrupted extract that accumulate.
+/// Keeps every manifest, `_SUCCESS`, and every manifested part (including a
+/// `snapshot/` sub-prefix's, since `keyed` is fetched recursively). Strictly
+/// gentler than `cleanup_source`, which wipes the whole prefix.
 ///
-/// ⚠️ INVARIANT: it cannot distinguish a crash orphan from a *live* extract's
-/// committed-but-not-yet-manifested parts (both are unmanifested `.parquet`), and
-/// there is NO age/lease guard. Only run a load with `gc_orphans` when no extract
-/// is writing the same prefix — the normal pipeline (a load AFTER a completed
-/// extract) satisfies this; a load fired while a `rivet run` streams into the same
-/// prefix would delete its in-flight parts. Returns `(removed_count, removed_bytes)`.
+/// A candidate falls into three classes:
+/// - referenced by a **`Success`** manifest → KEEP (live data).
+/// - referenced by a **`Failed`/`Interrupted`** manifest → DELETE unconditionally.
+///   A run that WROTE a manifest is terminal — no live extract is still streaming
+///   it — so its leftovers are unambiguous crash debris.
+/// - referenced by **NO manifest at all** → AMBIGUOUS: a crash-BEFORE-manifest
+///   orphan (delete) OR a concurrent extract's committed-but-not-yet-manifested
+///   part (must NOT delete). `active` decides — the caller's answer to "is a run
+///   currently WRITING this prefix?", read from the central run-status ledger
+///   (`StateStore::has_active_run_on_prefix`): authoritative and CLOCK-FREE.
+///   `active` → spare every unmanifested part; `!active` → no run is live, so an
+///   unmanifested part is dead crash debris → delete.
+///
+/// The ledger read is the SEAM. A co-located / shared-Postgres load gets a
+/// precise `active`; a stateless or foreign-host load passes `active = true`
+/// (conservative — spare rather than risk a live cross-host extract's parts),
+/// which the bucket-manifest `running`-status projection later refines.
+/// Returns `(removed, bytes)`.
 #[allow(private_interfaces)]
 pub fn gc_orphans(
     store: &GcsStore,
     gcs_prefix: &str,
     keyed: &[(String, RunManifest)],
+    active: bool,
 ) -> Result<(usize, u64)> {
     let (_bucket, base) = crate::load::split_gs_uri(gcs_prefix)?;
-    let keep: std::collections::HashSet<String> = keyed
-        .iter()
-        .filter(|(_, m)| m.status == ManifestStatus::Success)
-        .flat_map(|(key, m)| resolve_parts(key, m))
-        .collect();
+    // Success parts → keep. Failed/Interrupted parts → terminal (their run is
+    // done, so deletable regardless of `active`). A part in NEITHER set has no
+    // manifest at all — the ambiguous case `active` gates.
+    let mut keep: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut terminal: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (key, m) in keyed {
+        let set = if m.status == ManifestStatus::Success {
+            &mut keep
+        } else {
+            &mut terminal
+        };
+        set.extend(resolve_parts(key, m));
+    }
     let mut removed = 0usize;
     let mut removed_bytes = 0u64;
     for key in store.list_files(base)? {
-        if key.ends_with(".parquet") && !keep.contains(&key) {
-            removed_bytes += store.stat_size(&key).unwrap_or(0);
-            store.remove(&key)?;
-            removed += 1;
+        if !key.ends_with(".parquet") || keep.contains(&key) {
+            continue;
         }
+        // A live run on this prefix + a part with NO manifest → maybe its
+        // in-flight write → spare. A terminal-manifested part is deleted even
+        // while a (different) run is active.
+        if active && !terminal.contains(&key) {
+            log::warn!(
+                "gc_orphans: sparing unmanifested `{key}` — a run is active on this prefix \
+                 (run-status ledger); it is GC'd once no run is active or it gets a manifest"
+            );
+            continue;
+        }
+        removed_bytes += store.stat_size(&key).unwrap_or(0);
+        store.remove(&key)?;
+        removed += 1;
     }
     Ok((removed, removed_bytes))
 }
@@ -671,7 +702,8 @@ mod tests {
             ("base/_SUCCESS", b"".to_vec()),           // kept — not a .parquet
         ]);
         let keyed = vec![keyed("base/manifest-r1.json", "r1", "r1-000.parquet")];
-        let (removed, bytes) = gc_orphans(&store, "gs://b/base", &keyed).unwrap();
+        // No run is active on this prefix → the unmanifested part is dead debris.
+        let (removed, bytes) = gc_orphans(&store, "gs://b/base", &keyed, false).unwrap();
         assert_eq!(removed, 1, "only the unmanifested part is removed");
         assert_eq!(bytes, 4, "'junk' is 4 bytes");
         let mut left = store.list_files("base").unwrap();
@@ -691,7 +723,10 @@ mod tests {
     fn gc_orphans_of_an_all_manifested_prefix_removes_nothing() {
         let (store, _g) = fs_store(&[("base/r1-000.parquet", b"a".to_vec())]);
         let keyed = vec![keyed("base/manifest-r1.json", "r1", "r1-000.parquet")];
-        assert_eq!(gc_orphans(&store, "gs://b/base", &keyed).unwrap().0, 0);
+        assert_eq!(
+            gc_orphans(&store, "gs://b/base", &keyed, false).unwrap().0,
+            0
+        );
     }
 
     #[test]
@@ -701,7 +736,7 @@ mod tests {
             ("base/orphan.parquet", b"x".to_vec()),         // top-level orphan
         ]);
         let keyed = vec![keyed("base/snapshot/manifest-s.json", "s", "s-000.parquet")];
-        let (removed, _) = gc_orphans(&store, "gs://b/base", &keyed).unwrap();
+        let (removed, _) = gc_orphans(&store, "gs://b/base", &keyed, false).unwrap();
         assert_eq!(removed, 1, "the top-level orphan goes");
         assert_eq!(
             store.list_files("base/snapshot").unwrap(),
@@ -711,13 +746,57 @@ mod tests {
     }
 
     #[test]
-    fn gc_orphans_does_not_protect_a_failed_runs_parts() {
-        // Only a Success manifest keeps its parts — a Failed/Interrupted run's
-        // files are themselves crash leftovers.
+    fn gc_orphans_deletes_a_terminal_runs_parts_even_while_a_run_is_active() {
+        // A Failed/Interrupted run's parts are terminal crash debris — deleted
+        // regardless of `active`, since no LIVE run is streaming THEM. Passing
+        // active=true proves the `active` gate applies only to UNmanifested parts.
         let (store, _g) = fs_store(&[("base/f-000.parquet", b"x".to_vec())]);
         let mut kv = keyed("base/manifest-f.json", "f", "f-000.parquet");
         kv.1.status = ManifestStatus::Failed;
-        assert_eq!(gc_orphans(&store, "gs://b/base", &[kv]).unwrap().0, 1);
+        assert_eq!(gc_orphans(&store, "gs://b/base", &[kv], true).unwrap().0, 1);
+    }
+
+    #[test]
+    fn gc_orphans_spares_an_unmanifested_part_while_a_run_is_active() {
+        // The concurrent-extract guard. A part with NO manifest, while a run is
+        // ACTIVE on this prefix (the run-status ledger says so), is probably that
+        // run's committed-but-not-yet-manifested write — deleting it would be
+        // silent data loss on the live extract. RED against a mutant that ignores
+        // `active` (deletes every non-Success-manifested `.parquet`).
+        let (store, _g) = fs_store(&[
+            ("base/r1-000.parquet", b"aa".to_vec()),  // manifested (kept)
+            ("base/inflight.parquet", b"x".to_vec()), // unmanifested, a live run's part
+        ]);
+        let keyed = vec![keyed("base/manifest-r1.json", "r1", "r1-000.parquet")];
+        let (removed, _) = gc_orphans(&store, "gs://b/base", &keyed, true).unwrap();
+        assert_eq!(
+            removed, 0,
+            "an unmanifested part is spared while a run is active"
+        );
+        assert!(
+            store
+                .list_files("base")
+                .unwrap()
+                .iter()
+                .any(|k| k.ends_with("inflight.parquet")),
+            "the live run's in-flight part must survive gc_orphans"
+        );
+    }
+
+    #[test]
+    fn gc_orphans_collects_an_unmanifested_part_when_no_run_is_active() {
+        // The other half: with NO run active, an unmanifested part is a dead
+        // crash orphan and IS collected — the gate DEFERS cleanup, never abandons.
+        let (store, _g) = fs_store(&[
+            ("base/r1-000.parquet", b"aa".to_vec()),
+            ("base/dead-orphan.parquet", b"x".to_vec()),
+        ]);
+        let keyed = vec![keyed("base/manifest-r1.json", "r1", "r1-000.parquet")];
+        assert_eq!(
+            gc_orphans(&store, "gs://b/base", &keyed, false).unwrap().0,
+            1,
+            "with no active run, an unmanifested orphan is collected"
+        );
     }
 
     fn keyed_at(run: &str, finished_at: &str) -> (String, RunManifest) {
@@ -1047,7 +1126,7 @@ mod tests {
 
         // 4. gc_orphans deletes the orphan over real GCS — a REAL single-object
         // DELETE against the emulator — keeping the manifested part + manifest.
-        let (removed, _bytes) = gc_orphans(&store, &gs, &keyed).unwrap();
+        let (removed, _bytes) = gc_orphans(&store, &gs, &keyed, false).unwrap();
         assert_eq!(
             removed, 1,
             "exactly the orphan parquet is GC'd over real GCS"

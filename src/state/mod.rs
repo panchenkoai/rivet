@@ -11,6 +11,7 @@ mod load_journal_store;
 mod metrics;
 mod progression;
 mod run_aggregate;
+mod run_status_store;
 mod schema;
 mod shape;
 
@@ -318,6 +319,25 @@ const MIGRATIONS: &[(i64, &str)] = &[
         16,
         "ALTER TABLE export_state ADD COLUMN resume_run_id TEXT;",
     ),
+    // v17: central run-status ledger. The AUTHORITATIVE record of each export
+    // run's lifecycle — `running` at start, terminal at finalize. The bucket
+    // manifest's status is a PROJECTION of this row (written FROM it), so a
+    // cross-boundary reader over the bucket and a rivet process over a shared
+    // state DB agree. gc_orphans reads it to spare a LIVE extract's in-flight
+    // parts (a `running`, non-superseded run on the prefix) rather than guess
+    // from a wall-clock freshness window.
+    (
+        17,
+        "CREATE TABLE IF NOT EXISTS run_status (
+            run_id      TEXT PRIMARY KEY,
+            export_name TEXT NOT NULL,
+            prefix      TEXT NOT NULL,
+            status      TEXT NOT NULL,
+            started_at  TEXT NOT NULL,
+            finished_at TEXT
+         );
+         CREATE INDEX IF NOT EXISTS idx_run_status_prefix ON run_status(prefix);",
+    ),
 ];
 
 /// PostgreSQL-compatible DDL.  Column types differ from SQLite (BIGSERIAL,
@@ -571,6 +591,25 @@ const PG_MIGRATIONS: &[(i64, &str)] = &[
     (
         16,
         "ALTER TABLE export_state ADD COLUMN resume_run_id TEXT;",
+    ),
+    // v17: central run-status ledger. The AUTHORITATIVE record of each export
+    // run's lifecycle — `running` at start, terminal at finalize. The bucket
+    // manifest's status is a PROJECTION of this row (written FROM it), so a
+    // cross-boundary reader over the bucket and a rivet process over a shared
+    // state DB agree. gc_orphans reads it to spare a LIVE extract's in-flight
+    // parts (a `running`, non-superseded run on the prefix) rather than guess
+    // from a wall-clock freshness window.
+    (
+        17,
+        "CREATE TABLE IF NOT EXISTS run_status (
+            run_id      TEXT PRIMARY KEY,
+            export_name TEXT NOT NULL,
+            prefix      TEXT NOT NULL,
+            status      TEXT NOT NULL,
+            started_at  TEXT NOT NULL,
+            finished_at TEXT
+         );
+         CREATE INDEX IF NOT EXISTS idx_run_status_prefix ON run_status(prefix);",
     ),
 ];
 

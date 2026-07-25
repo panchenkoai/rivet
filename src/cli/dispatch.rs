@@ -832,7 +832,7 @@ fn dispatch_load(args: LoadArgs) -> Result<()> {
             },
         }
         if plan.load.gc_orphans {
-            maybe_gc_orphans(plan);
+            maybe_gc_orphans(plan, state.as_ref());
         }
     }
     Ok(())
@@ -855,7 +855,15 @@ fn require_pk<'a>(plan: &'a load::plan::LoadPlan, mode: &str) -> Result<&'a [Str
 /// delete staged `.parquet` no `Success` manifest references — an interrupted
 /// extract's leftovers. A GC failure only warns; it NEVER fails the load, which
 /// already succeeded before this runs.
-fn maybe_gc_orphans(plan: &load::plan::LoadPlan) {
+///
+/// Gated on the central run-status ledger so it never deletes a CONCURRENT
+/// extract's committed-but-not-yet-manifested parts: `has_active_run_on_prefix`
+/// is precise when this load shares the extract's state (co-located / shared
+/// Postgres). With NO ledger (a stateless or foreign-host load) it conservatively
+/// assumes a run MIGHT be active — spare the unmanifested parts rather than risk
+/// a live cross-host extract's in-flight data (the bucket-manifest `running`
+/// projection refines this cross-host).
+fn maybe_gc_orphans(plan: &load::plan::LoadPlan, state: Option<&StateStore>) {
     let store = match load::open_store(&plan.destination) {
         Ok(s) => s,
         Err(e) => {
@@ -876,7 +884,11 @@ fn maybe_gc_orphans(plan: &load::plan::LoadPlan) {
             return;
         }
     };
-    match load::reconcile::gc_orphans(&store, &plan.gcs_prefix, &keyed) {
+    let active = match state {
+        Some(s) => s.has_active_run_on_prefix(&plan.gcs_prefix).unwrap_or(true),
+        None => true,
+    };
+    match load::reconcile::gc_orphans(&store, &plan.gcs_prefix, &keyed, active) {
         Ok((0, _)) => {}
         Ok((n, bytes)) => {
             println!(

@@ -667,3 +667,47 @@ proof: crash-recovery still resumes, a CLEAN re-run does NOT skip (RED against
 the old conflation), and the opt-in restores the old behaviour
 (`keyset_checkpoint_without_incremental_rereads_on_a_clean_rerun` +
 `..._second_run_captures_only_new_keys` with the opt-in + `..._crash_resume_...`).
+
+## An orphan-GC delete path tells a crash orphan from a LIVE in-flight write via the LEDGER, never a clock
+
+`gc_orphans` (opt-in load cleanup, `src/load/reconcile.rs`) deletes every
+`.parquet` under a prefix that no `Success` manifest references. But a manifest
+is written at the END of a run, so a CONCURRENT extract's committed-but-not-yet-
+manifested parts look IDENTICAL to a crash orphan — both are unmanifested
+`.parquet`. With no discriminator, a load fired while a `rivet run` streams into
+the same prefix silently deletes its in-flight parts. The fix is a THREE-way
+classification driven by a run-status SIGNAL: a part in a `Success` manifest →
+KEEP; a part in a `Failed`/`Interrupted` manifest → DELETE (a run that REACHED a
+manifest is terminal — no live writer); a part with NO manifest at all → the ONLY
+ambiguous case, gated on whether a run is ACTIVE on the prefix. "Active" comes
+from the CENTRAL run-status ledger (`StateStore::run_status`, written `running`
+at every run's START via the orchestrator choke point `ledger_begin_run`,
+terminal at finalize via `ledger_finish_run`) — `has_active_run_on_prefix`,
+authoritative and CLOCK-FREE. A stale (hard-crash) `running` row is reconciled by
+SUPERSESSION — a newer run of the same export outranks it by `started_at` — never
+by an age timer.
+
+A first cut REACHED for a wall-clock freshness window (spare parts younger than N
+minutes); it was REJECTED in review as a band-aid — it can't tell a LONG extract's
+OLD in-flight parts from a stale crash orphan, and it compares two clocks (the
+load host's `now` vs the object store's mtime). The ledger is the right signal
+because the state store already records every run's lifecycle; the bucket manifest
+is a PROJECTION of it (its status written FROM the ledger), so a rivet process
+over a shared state DB and a cross-boundary reader over the bucket agree. The
+ledger read is the SEAM: co-located / shared-Postgres loads get a precise
+`active`; a stateless or foreign-host load passes `active = true` (conservative —
+spare rather than risk a live cross-host extract's parts). The state store is
+already backend-pluggable (`StateConn::Sqlite | Postgres`), so a shared-Postgres
+deployment makes the ledger authoritative even cross-host.
+
+Process rule: **any GC/prune that deletes "unreferenced" artifacts under a shared
+prefix must gate the truly-unknown remainder on an AUTHORITATIVE run-status signal
+(the state-store lease, or a projected running-manifest) — never on a wall-clock
+age, and never by blanket-deleting everything the latest completion record doesn't
+yet mention (that races a concurrent writer whose record isn't written yet).**
+When you catch yourself reaching for a freshness timer to tell "live" from "dead",
+the real fix is a lifecycle record that SAYS which it is. RED-proven against a
+mutant that ignores `active` (`gc_orphans_spares_an_unmanifested_part_while_a_run_
+is_active` goes RED) + the defer-not-drop half (`..._collects_an_unmanifested_
+part_when_no_run_is_active`) + the clock-free staleness
+(`a_superseded_running_row_no_longer_counts_as_active`).
