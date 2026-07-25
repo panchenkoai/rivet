@@ -1,0 +1,254 @@
+{
+  "mongo": {
+    "orders": {
+      "strategy": "full",
+      "verdict": "DEGRADED"
+    },
+    "users": {
+      "strategy": "full",
+      "verdict": "DEGRADED"
+    }
+  },
+  "mssql": {
+    "bigint_pk_dual_ts": {
+      "strategy": "keyset",
+      "verdict": "ACCEPTABLE"
+    },
+    "content_items": {
+      "strategy": "keyset",
+      "verdict": "ACCEPTABLE"
+    },
+    "decimal_key": {
+      "strategy": "full",
+      "verdict": "DEGRADED"
+    },
+    "events": {
+      "strategy": "keyset",
+      "verdict": "ACCEPTABLE"
+    },
+    "heap_no_key": {
+      "strategy": "range",
+      "verdict": "DEGRADED"
+    },
+    "int_pk_dual_ts": {
+      "strategy": "keyset",
+      "verdict": "ACCEPTABLE"
+    },
+    "no_pk_no_ts": {
+      "strategy": "range",
+      "verdict": "DEGRADED"
+    },
+    "order_keyed": {
+      "strategy": "range",
+      "verdict": "ACCEPTABLE"
+    },
+    "orders": {
+      "strategy": "keyset",
+      "verdict": "ACCEPTABLE"
+    },
+    "orders_coalesce": {
+      "strategy": "keyset",
+      "verdict": "ACCEPTABLE"
+    },
+    "orders_sparse": {
+      "strategy": "full",
+      "verdict": "ACCEPTABLE"
+    },
+    "orders_sparse_for_export": {
+      "strategy": "full",
+      "verdict": "DEGRADED"
+    },
+    "page_views": {
+      "strategy": "keyset",
+      "verdict": "ACCEPTABLE"
+    },
+    "ref_id_history": {
+      "strategy": "range",
+      "verdict": "ACCEPTABLE"
+    },
+    "rivet_type_matrix": {
+      "strategy": "full",
+      "verdict": "ACCEPTABLE"
+    },
+    "rivet_type_matrix_full": {
+      "strategy": "full",
+      "verdict": "ACCEPTABLE"
+    },
+    "sparse_key": {
+      "strategy": "keyset",
+      "verdict": "ACCEPTABLE"
+    },
+    "unindexed_id": {
+      "strategy": "range",
+      "verdict": "DEGRADED"
+    },
+    "users": {
+      "strategy": "keyset",
+      "verdict": "ACCEPTABLE"
+    },
+    "wide_cols": {
+      "strategy": "full",
+      "verdict": "ACCEPTABLE"
+    }
+  },
+  "mysql": {
+    "content_items": {
+      "strategy": "keyset",
+      "verdict": "ACCEPTABLE"
+    },
+    "events": {
+      "strategy": "keyset",
+      "verdict": "ACCEPTABLE"
+    },
+    "ext_bigint_pk_dual_ts": {
+      "strategy": "keyset",
+      "verdict": "ACCEPTABLE"
+    },
+    "ext_bigint_unsigned_pk": {
+      "strategy": "keyset",
+      "verdict": "ACCEPTABLE"
+    },
+    "ext_decimal_key": {
+      "strategy": "full",
+      "verdict": "DEGRADED"
+    },
+    "ext_heap_no_key": {
+      "strategy": "range",
+      "verdict": "DEGRADED"
+    },
+    "ext_int_pk_dual_ts": {
+      "strategy": "keyset",
+      "verdict": "ACCEPTABLE"
+    },
+    "ext_no_pk_no_ts": {
+      "strategy": "range",
+      "verdict": "DEGRADED"
+    },
+    "ext_order_keyed": {
+      "strategy": "keyset",
+      "verdict": "ACCEPTABLE"
+    },
+    "ext_ref_id_history": {
+      "strategy": "range",
+      "verdict": "ACCEPTABLE"
+    },
+    "ext_sparse_key": {
+      "strategy": "keyset",
+      "verdict": "ACCEPTABLE"
+    },
+    "ext_unindexed_id": {
+      "strategy": "range",
+      "verdict": "DEGRADED"
+    },
+    "orders": {
+      "strategy": "keyset",
+      "verdict": "ACCEPTABLE"
+    },
+    "orders_coalesce": {
+      "strategy": "keyset",
+      "verdict": "ACCEPTABLE"
+    },
+    "orders_sparse": {
+      "strategy": "full",
+      "verdict": "ACCEPTABLE"
+    },
+    "orders_sparse_for_export": {
+      "strategy": "full",
+      "verdict": "ACCEPTABLE"
+    },
+    "page_views": {
+      "strategy": "keyset",
+      "verdict": "ACCEPTABLE"
+    },
+    "rivet_type_matrix": {
+      "strategy": "full",
+      "verdict": "ACCEPTABLE"
+    },
+    "rivet_type_matrix_full": {
+      "strategy": "full",
+      "verdict": "ACCEPTABLE"
+    },
+    "users": {
+      "strategy": "keyset",
+      "verdict": "ACCEPTABLE"
+    }
+  },
+  "postgres": {
+    "bigint_pk_dual_ts": {
+      "strategy": "keyset",
+      "verdict": "ACCEPTABLE"
+    },
+    "content_items": {
+      "strategy": "keyset",
+      "verdict": "ACCEPTABLE"
+    },
+    "decimal_key": {
+      "strategy": "full",
+      "verdict": "DEGRADED"
+    },
+    "events": {
+      "strategy": "keyset",
+      "verdict": "ACCEPTABLE"
+    },
+    "heap_no_key": {
+      "strategy": "range",
+      "verdict": "DEGRADED"
+    },
+    "int_pk_dual_ts": {
+      "strategy": "keyset",
+      "verdict": "ACCEPTABLE"
+    },
+    "no_pk_no_ts": {
+      "strategy": "range",
+      "verdict": "DEGRADED"
+    },
+    "order_keyed": {
+      "strategy": "range",
+      "verdict": "ACCEPTABLE"
+    },
+    "orders": {
+      "strategy": "keyset",
+      "verdict": "ACCEPTABLE"
+    },
+    "orders_coalesce": {
+      "strategy": "keyset",
+      "verdict": "ACCEPTABLE"
+    },
+    "orders_sparse": {
+      "strategy": "full",
+      "verdict": "ACCEPTABLE"
+    },
+    "orders_sparse_for_export": {
+      "strategy": "full",
+      "verdict": "ACCEPTABLE"
+    },
+    "page_views": {
+      "strategy": "keyset",
+      "verdict": "ACCEPTABLE"
+    },
+    "ref_id_history": {
+      "strategy": "range",
+      "verdict": "ACCEPTABLE"
+    },
+    "rivet_type_matrix": {
+      "strategy": "full",
+      "verdict": "ACCEPTABLE"
+    },
+    "rivet_type_matrix_full": {
+      "strategy": "full",
+      "verdict": "ACCEPTABLE"
+    },
+    "sparse_key": {
+      "strategy": "keyset",
+      "verdict": "ACCEPTABLE"
+    },
+    "unindexed_id": {
+      "strategy": "range",
+      "verdict": "DEGRADED"
+    },
+    "users": {
+      "strategy": "keyset",
+      "verdict": "ACCEPTABLE"
+    }
+  }
+}

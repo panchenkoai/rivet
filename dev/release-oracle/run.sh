@@ -127,11 +127,21 @@ for eng in $(cfg engines); do
     log "$eng $tag ($image)"
     url="$(bring_up "$eng" "$tag" "$image" "$port")"
     [ -z "$url" ] && { add "$eng" "$tag" all "-" SKIP "bring-up failed"; continue; }
-    if [ -n "$(seed_engine "$eng" "$tag" "$url")" ]; then
+    # Seed is idempotent (DROP TABLE IF EXISTS …) → retry a transient failure. A
+    # fresh container under load (many accumulated containers on colima) can drop
+    # the seed connection mid-stream; a bounded retry keeps the gate from crying
+    # wolf on a flake rather than a real seed error.
+    serr="RETRY"
+    for st in 1 2 3; do serr="$(seed_engine "$eng" "$tag" "$url")"; [ -z "$serr" ] && break; sleep 3; done
+    if [ -n "$serr" ]; then
       bad "$eng:$tag seed had errors"; add "$eng" "$tag" seed "-" FAIL "seed errors"; continue
     fi
     ok "seeded"
     run_scenarios "$eng" "$tag" "$url"
+    # Tear down this version before the next (unless --keep) so peak container count
+    # stays at one engine + the three store fakes — accumulating all versions on
+    # colima is what starves fresh connects/seeds and flakes the gate.
+    [ "$KEEP" = 1 ] || docker rm -f "rivet-oracle-eng-${eng}-${tag//./_}" >/dev/null 2>&1
   done < <(cfg versions "$eng")
 done
 

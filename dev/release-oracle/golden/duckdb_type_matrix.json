@@ -1,0 +1,508 @@
+{
+  "mssql": {
+    "rivet_type_matrix": [
+      {
+        "amount": 0.1,
+        "attrs": "{\"tier\":\"gold\",\"n\":1}",
+        "created_at": "2035-08-07 09:08:07.987654",
+        "created_at_tz": "2035-08-07 11:08:07.987654+02",
+        "fee": 1e-06,
+        "id": 1,
+        "label": "payments-like",
+        "raw_bytes": "\\x00\\xFF\\x01#",
+        "uid": "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380011"
+      },
+      {
+        "amount": 0.2,
+        "attrs": "[\"a\",\"b\"]",
+        "created_at": "2019-02-03 03:07:06.554433",
+        "created_at_tz": "2019-02-03 04:07:06.554433+01",
+        "fee": 2e-06,
+        "id": 2,
+        "label": "payments-like",
+        "raw_bytes": "\\xDE\\xAD\\xBE\\xEF",
+        "uid": "b0eebc99-9c0b-4ef8-bb6d-6bb9bd380022"
+      },
+      {
+        "amount": 999999999999.99,
+        "attrs": "{\"big\":true}",
+        "created_at": "2020-01-15 00:00:00.000001",
+        "created_at_tz": "2020-01-15 01:00:00.000001+01",
+        "fee": 10.123456,
+        "id": 3,
+        "label": "payments-like",
+        "raw_bytes": "\\xCA\\xFE",
+        "uid": "c0eebc99-9c0b-4ef8-bb6d-6bb9bd380033"
+      },
+      {
+        "amount": -100.05,
+        "attrs": "{}",
+        "created_at": "2021-06-30 12:59:59.999999",
+        "created_at_tz": "2021-06-30 14:59:59.999999+02",
+        "fee": -0.123456,
+        "id": 4,
+        "label": "payments-like",
+        "raw_bytes": "\\x00",
+        "uid": "d0eebc99-9c0b-4ef8-bb6d-6bb9bd380044"
+      }
+    ],
+    "rivet_type_matrix__csv": [
+      {
+        "amount": "0.10",
+        "attrs": "{\"tier\":\"gold\",\"n\":1}",
+        "created_at": "2035-08-07T09:08:07.987654",
+        "created_at_tz": "2035-08-07T09:08:07.987654Z",
+        "fee": "0.000001",
+        "id": "1",
+        "label": "payments-like",
+        "raw_bytes": "00ff0123",
+        "uid": "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380011"
+      },
+      {
+        "amount": "0.20",
+        "attrs": "[\"a\",\"b\"]",
+        "created_at": "2019-02-03T03:07:06.554433",
+        "created_at_tz": "2019-02-03T03:07:06.554433Z",
+        "fee": "0.000002",
+        "id": "2",
+        "label": "payments-like",
+        "raw_bytes": "deadbeef",
+        "uid": "b0eebc99-9c0b-4ef8-bb6d-6bb9bd380022"
+      },
+      {
+        "amount": "999999999999.99",
+        "attrs": "{\"big\":true}",
+        "created_at": "2020-01-15T00:00:00.000001",
+        "created_at_tz": "2020-01-15T00:00:00.000001Z",
+        "fee": "10.123456",
+        "id": "3",
+        "label": "payments-like",
+        "raw_bytes": "cafe",
+        "uid": "c0eebc99-9c0b-4ef8-bb6d-6bb9bd380033"
+      },
+      {
+        "amount": "-100.05",
+        "attrs": "{}",
+        "created_at": "2021-06-30T12:59:59.999999",
+        "created_at_tz": "2021-06-30T12:59:59.999999Z",
+        "fee": "-0.123456",
+        "id": "4",
+        "label": "payments-like",
+        "raw_bytes": "00",
+        "uid": "d0eebc99-9c0b-4ef8-bb6d-6bb9bd380044"
+      }
+    ],
+    "rivet_type_matrix_full": [
+      {
+        "date_col": "2024-03-15",
+        "dto_col": "2024-03-15 13:30:00.123456+01",
+        "flag": true,
+        "id": 1,
+        "int_col": 2147483647,
+        "real_col": 3.14,
+        "small_col": 32767,
+        "time_col": "14:30:00.123456",
+        "tiny_col": 255,
+        "uid_col": "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380011",
+        "vb_col": "\\xDE\\xAD\\xBE\\xEF"
+      },
+      {
+        "date_col": "1970-01-01",
+        "dto_col": "1970-01-01 01:00:00+01",
+        "flag": false,
+        "id": 2,
+        "int_col": -2147483648,
+        "real_col": -1.5,
+        "small_col": -32768,
+        "time_col": "00:00:00",
+        "tiny_col": 0,
+        "uid_col": "b0eebc99-9c0b-4ef8-bb6d-6bb9bd380022",
+        "vb_col": "\\x00\\x00\\x00\\x00"
+      },
+      {
+        "date_col": "2000-02-29",
+        "dto_col": "2000-03-01 05:59:59.999999+01",
+        "flag": null,
+        "id": 3,
+        "int_col": 0,
+        "real_col": 0.0,
+        "small_col": null,
+        "time_col": "23:59:59.999999",
+        "tiny_col": null,
+        "uid_col": null,
+        "vb_col": null
+      }
+    ],
+    "rivet_type_matrix_full__csv": [
+      {
+        "date_col": "2024-03-15",
+        "dto_col": "2024-03-15T12:30:00.123456Z",
+        "flag": "true",
+        "id": "1",
+        "int_col": "2147483647",
+        "real_col": "3.14",
+        "small_col": "32767",
+        "time_col": "14:30:00.123456",
+        "tiny_col": "255",
+        "uid_col": "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380011",
+        "vb_col": "deadbeef"
+      },
+      {
+        "date_col": "1970-01-01",
+        "dto_col": "1970-01-01T00:00:00.000000Z",
+        "flag": "false",
+        "id": "2",
+        "int_col": "-2147483648",
+        "real_col": "-1.5",
+        "small_col": "-32768",
+        "time_col": "00:00:00.000000",
+        "tiny_col": "0",
+        "uid_col": "b0eebc99-9c0b-4ef8-bb6d-6bb9bd380022",
+        "vb_col": "00000000"
+      },
+      {
+        "date_col": "2000-02-29",
+        "dto_col": "2000-03-01T04:59:59.999999Z",
+        "flag": null,
+        "id": "3",
+        "int_col": "0",
+        "real_col": "0",
+        "small_col": null,
+        "time_col": "23:59:59.999999",
+        "tiny_col": null,
+        "uid_col": null,
+        "vb_col": null
+      }
+    ]
+  },
+  "mysql": {
+    "rivet_type_matrix": [
+      {
+        "amount": 0.1,
+        "created_at_dt": "2035-08-07 09:08:07.987654",
+        "created_at_ts": "2035-08-07 11:08:07.987654+02",
+        "extras": {
+          "n": 1,
+          "tier": "gold"
+        },
+        "fee": 1e-06,
+        "id": 1,
+        "label": "payments-like",
+        "raw_bytes": "\\x00\\xFF\\x01#",
+        "uid": "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380011"
+      },
+      {
+        "amount": 0.2,
+        "created_at_dt": "2019-02-03 03:07:06.554433",
+        "created_at_ts": "2019-02-03 04:07:06.554433+01",
+        "extras": [
+          "a",
+          "b"
+        ],
+        "fee": 2e-06,
+        "id": 2,
+        "label": "payments-like",
+        "raw_bytes": "\\xDE\\xAD\\xBE\\xEF",
+        "uid": "b0eebc99-9c0b-4ef8-bb6d-6bb9bd380022"
+      },
+      {
+        "amount": 999999999999.99,
+        "created_at_dt": "2020-01-15 00:00:00.000001",
+        "created_at_ts": "2020-01-15 01:00:00.000001+01",
+        "extras": {
+          "big": true
+        },
+        "fee": 10.123456,
+        "id": 3,
+        "label": "payments-like",
+        "raw_bytes": "\\xCA\\xFE\\x00\\x00",
+        "uid": "c0eebc99-9c0b-4ef8-bb6d-6bb9bd380033"
+      },
+      {
+        "amount": -100.05,
+        "created_at_dt": "2021-06-30 12:59:59.999999",
+        "created_at_ts": "2021-06-30 14:59:59.999999+02",
+        "extras": {},
+        "fee": -0.123456,
+        "id": 4,
+        "label": "payments-like",
+        "raw_bytes": "\\x00\\x00\\x00\\x00",
+        "uid": "d0eebc99-9c0b-4ef8-bb6d-6bb9bd380044"
+      }
+    ],
+    "rivet_type_matrix__csv": [
+      {
+        "amount": "0.10",
+        "created_at_dt": "2035-08-07T09:08:07.987654",
+        "created_at_ts": "2035-08-07T09:08:07.987654Z",
+        "extras": "{\"n\": 1, \"tier\": \"gold\"}",
+        "fee": "0.000001",
+        "id": "1",
+        "label": "payments-like",
+        "raw_bytes": "00ff0123",
+        "uid": "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380011"
+      },
+      {
+        "amount": "0.20",
+        "created_at_dt": "2019-02-03T03:07:06.554433",
+        "created_at_ts": "2019-02-03T03:07:06.554433Z",
+        "extras": "[\"a\", \"b\"]",
+        "fee": "0.000002",
+        "id": "2",
+        "label": "payments-like",
+        "raw_bytes": "deadbeef",
+        "uid": "b0eebc99-9c0b-4ef8-bb6d-6bb9bd380022"
+      },
+      {
+        "amount": "999999999999.99",
+        "created_at_dt": "2020-01-15T00:00:00.000001",
+        "created_at_ts": "2020-01-15T00:00:00.000001Z",
+        "extras": "{\"big\": true}",
+        "fee": "10.123456",
+        "id": "3",
+        "label": "payments-like",
+        "raw_bytes": "cafe0000",
+        "uid": "c0eebc99-9c0b-4ef8-bb6d-6bb9bd380033"
+      },
+      {
+        "amount": "-100.05",
+        "created_at_dt": "2021-06-30T12:59:59.999999",
+        "created_at_ts": "2021-06-30T12:59:59.999999Z",
+        "extras": "{}",
+        "fee": "-0.123456",
+        "id": "4",
+        "label": "payments-like",
+        "raw_bytes": "00000000",
+        "uid": "d0eebc99-9c0b-4ef8-bb6d-6bb9bd380044"
+      }
+    ],
+    "rivet_type_matrix_full": [
+      {
+        "bit1_col": true,
+        "bit8_col": 170,
+        "blob_col": "\\x01\\x02\\x03\\x04\\x05",
+        "date_col": "2024-03-15",
+        "enum_col": "b",
+        "flag": true,
+        "id": 1,
+        "time_col": "14:30:00.123456",
+        "tiny_col": 127,
+        "varbinary_col": "\\xDE\\xAD\\xBE\\xEF",
+        "year_col": 2024
+      },
+      {
+        "bit1_col": false,
+        "bit8_col": 1,
+        "blob_col": "\\xCA\\xFE",
+        "date_col": "1970-01-01",
+        "enum_col": "a",
+        "flag": false,
+        "id": 2,
+        "time_col": "00:00:00",
+        "tiny_col": -128,
+        "varbinary_col": "\\x00\\x00\\x00\\x00",
+        "year_col": 2000
+      },
+      {
+        "bit1_col": null,
+        "bit8_col": null,
+        "blob_col": null,
+        "date_col": "2000-02-29",
+        "enum_col": null,
+        "flag": null,
+        "id": 3,
+        "time_col": "23:59:59.999999",
+        "tiny_col": 0,
+        "varbinary_col": null,
+        "year_col": null
+      }
+    ],
+    "rivet_type_matrix_full__csv": [
+      {
+        "bit1_col": "true",
+        "bit8_col": "170",
+        "blob_col": "0102030405",
+        "date_col": "2024-03-15",
+        "enum_col": "b",
+        "flag": "true",
+        "id": "1",
+        "time_col": "14:30:00.123456",
+        "tiny_col": "127",
+        "varbinary_col": "deadbeef",
+        "year_col": "2024"
+      },
+      {
+        "bit1_col": "false",
+        "bit8_col": "1",
+        "blob_col": "cafe",
+        "date_col": "1970-01-01",
+        "enum_col": "a",
+        "flag": "false",
+        "id": "2",
+        "time_col": "00:00:00.000000",
+        "tiny_col": "-128",
+        "varbinary_col": "00000000",
+        "year_col": "2000"
+      },
+      {
+        "bit1_col": null,
+        "bit8_col": null,
+        "blob_col": null,
+        "date_col": "2000-02-29",
+        "enum_col": null,
+        "flag": null,
+        "id": "3",
+        "time_col": "23:59:59.999999",
+        "tiny_col": "0",
+        "varbinary_col": null,
+        "year_col": null
+      }
+    ]
+  },
+  "postgres": {
+    "rivet_type_matrix": [
+      {
+        "amount": 0.1,
+        "attrs": {
+          "n": 1,
+          "tier": "gold"
+        },
+        "created_at": "2035-08-07 09:08:07.987654",
+        "created_at_tz": "2035-08-07 11:08:07.987654+02",
+        "fee": 1e-06,
+        "id": 1,
+        "label": "payments-like",
+        "raw_bytes": "\\x00\\xFF\\x01#E",
+        "uid": "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380011"
+      },
+      {
+        "amount": 0.2,
+        "attrs": [
+          "a",
+          "b"
+        ],
+        "created_at": "2019-02-03 03:07:06.554433",
+        "created_at_tz": "2019-02-03 04:07:06.554433+01",
+        "fee": 2e-06,
+        "id": 2,
+        "label": "payments-like",
+        "raw_bytes": "\\xDE\\xAD\\xBE\\xEF",
+        "uid": "b0eebc99-9c0b-4ef8-bb6d-6bb9bd380022"
+      },
+      {
+        "amount": 999999999999.99,
+        "attrs": {
+          "big": true
+        },
+        "created_at": "2020-01-15 00:00:00.000001",
+        "created_at_tz": "2020-01-15 01:00:00.000001+01",
+        "fee": 10.123456,
+        "id": 3,
+        "label": "payments-like",
+        "raw_bytes": "\\xCA\\xFE",
+        "uid": "c0eebc99-9c0b-4ef8-bb6d-6bb9bd380033"
+      },
+      {
+        "amount": -100.05,
+        "attrs": {},
+        "created_at": "2021-06-30 12:59:59.999999",
+        "created_at_tz": "2021-06-30 14:59:59.999999+02",
+        "fee": -0.123456,
+        "id": 4,
+        "label": "payments-like",
+        "raw_bytes": "\\x00",
+        "uid": "d0eebc99-9c0b-4ef8-bb6d-6bb9bd380044"
+      }
+    ],
+    "rivet_type_matrix__csv": [
+      {
+        "amount": "0.10",
+        "attrs": "{\"n\": 1, \"tier\": \"gold\"}",
+        "created_at": "2035-08-07T09:08:07.987654",
+        "created_at_tz": "2035-08-07T09:08:07.987654Z",
+        "fee": "0.000001",
+        "id": "1",
+        "label": "payments-like",
+        "raw_bytes": "00ff012345",
+        "uid": "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380011"
+      },
+      {
+        "amount": "0.20",
+        "attrs": "[\"a\", \"b\"]",
+        "created_at": "2019-02-03T03:07:06.554433",
+        "created_at_tz": "2019-02-03T03:07:06.554433Z",
+        "fee": "0.000002",
+        "id": "2",
+        "label": "payments-like",
+        "raw_bytes": "deadbeef",
+        "uid": "b0eebc99-9c0b-4ef8-bb6d-6bb9bd380022"
+      },
+      {
+        "amount": "999999999999.99",
+        "attrs": "{\"big\": true}",
+        "created_at": "2020-01-15T00:00:00.000001",
+        "created_at_tz": "2020-01-15T00:00:00.000001Z",
+        "fee": "10.123456",
+        "id": "3",
+        "label": "payments-like",
+        "raw_bytes": "cafe",
+        "uid": "c0eebc99-9c0b-4ef8-bb6d-6bb9bd380033"
+      },
+      {
+        "amount": "-100.05",
+        "attrs": "{}",
+        "created_at": "2021-06-30T12:59:59.999999",
+        "created_at_tz": "2021-06-30T12:59:59.999999Z",
+        "fee": "-0.123456",
+        "id": "4",
+        "label": "payments-like",
+        "raw_bytes": "00",
+        "uid": "d0eebc99-9c0b-4ef8-bb6d-6bb9bd380044"
+      }
+    ],
+    "rivet_type_matrix_full": [
+      {
+        "date_col": "2024-03-15",
+        "enum_col": "active",
+        "flag": true,
+        "float4_col": 3.14,
+        "id": 1,
+        "int2_col": 32767,
+        "int4_col": 2147483647,
+        "interval_col": "P1Y2M3D",
+        "nums": "[1, 2, 3]",
+        "tags": "[alpha, beta]",
+        "time_col": "14:30:00.123456"
+      },
+      {
+        "date_col": "1970-01-01",
+        "enum_col": "inactive",
+        "flag": false,
+        "float4_col": -1.5,
+        "id": 2,
+        "int2_col": -32768,
+        "int4_col": -2147483648,
+        "interval_col": "P-1Y",
+        "nums": "[42]",
+        "tags": "[gamma]",
+        "time_col": "00:00:00"
+      },
+      {
+        "date_col": "2000-02-29",
+        "enum_col": null,
+        "flag": null,
+        "float4_col": 0.0,
+        "id": 3,
+        "int2_col": null,
+        "int4_col": 0,
+        "interval_col": "PT0S",
+        "nums": null,
+        "tags": "[]",
+        "time_col": "23:59:59.999999"
+      }
+    ],
+    "rivet_type_matrix_full__csv": {
+      "csv_writer": "refused-unrepresentable-column"
+    }
+  }
+}

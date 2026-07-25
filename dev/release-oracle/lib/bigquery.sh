@@ -1,9 +1,11 @@
 # ── BigQuery golden stage (sourced by scenarios.sh) ─────────────────────────
-# The real-cloud final oracle, made DETERMINISTIC by a checked-in golden. rivet
-# exports the type-matrix tables → Parquet → `bq load` → `bq query` reads them back
-# → every column value is compared to golden/bigquery_type_matrix.json (the blessed
-# warehouse-side representation). A divergence fails the release. Re-bless only on
-# purpose with `run.sh --bless-bigquery-golden`.
+# The real-cloud final oracle, made DETERMINISTIC by a checked-in golden. The load
+# goes through rivet on BOTH legs — `rivet run` stages the type-matrix parts to a
+# REAL GCS bucket, `rivet load` loads them GCS → BigQuery — then `bq query` (gcloud,
+# an INDEPENDENT reader) reads them back and every column value is compared to
+# golden/bigquery_type_matrix.json (the blessed warehouse-side representation). A
+# divergence fails the release. Re-bless only on purpose with
+# `run.sh --bless-bigquery-golden`.
 
 GOLDEN="$HERE/golden/bigquery_type_matrix.json"
 
@@ -22,19 +24,37 @@ run_bigquery_golden() {
   seed_engine postgres bq "$url" >/dev/null 2>&1
 
   local tables; IFS=, read -ra tables <<<"$(cfg bq tables)"
+  # BigQuery loads from gs:// — a REAL GCS staging bucket (not fake-gcs). Reuse a
+  # known test bucket; the stage stages parts there, `rivet load`s them, cleans up.
+  local bucket="${BQ_ORACLE_BUCKET:-rivet_data_test}"
   local blessed="{}" fails=""
   for tbl in "${tables[@]}"; do
-    local dir="$WORK/bq_$tbl"; export ORACLE_URL="$url"
-    _export_local postgres "$url" "$tbl" "$dir" full || { fails+="$tbl:export "; continue; }
-    local pq; pq="$(ls "$dir"/**/*.parquet "$dir"/*.parquet 2>/dev/null | head -1)"
-    [ -z "$pq" ] && { fails+="$tbl:no-parquet "; continue; }
-    local bqt="oracle_${tbl}"
-    bq --project_id="$proj" load --replace --source_format=PARQUET "$dset.$bqt" "$pq" >/dev/null 2>&1 \
-      || { fails+="$tbl:bq-load "; continue; }
-    # read back deterministically (ORDER BY id, JSON), normalize with python.
+    export ORACLE_URL="$url"
+    local pfx="release-oracle/bq/${tbl}" cfg="$WORK/bqload_${tbl}.yaml"
+    cat > "$cfg" <<YAML
+source:
+  type: postgres
+  url_env: ORACLE_URL
+exports:
+  - name: $tbl
+    table: $tbl
+    mode: full
+    format: parquet
+    destination: {type: gcs, bucket: $bucket, prefix: $pfx/}
+load:
+  target: bigquery
+  project: $proj
+  dataset: $dset
+YAML
+    gcloud storage rm -r "gs://$bucket/$pfx" >/dev/null 2>&1 || true
+    "$RIVET" run  -c "$cfg" >/dev/null 2>&1 || { fails+="$tbl:export "; continue; }     # rivet → GCS
+    "$RIVET" load -c "$cfg" >/dev/null 2>&1 || { fails+="$tbl:rivet-load "; continue; }  # rivet load GCS → BQ
+    # read back deterministically via bq (gcloud), normalize with python.
     local got; got="$(bq --project_id="$proj" query --nouse_legacy_sql --format=prettyjson \
-      "SELECT * FROM \`$proj.$dset.$bqt\` ORDER BY id" 2>/dev/null \
+      "SELECT * FROM \`$proj.$dset.$tbl\` ORDER BY id" 2>/dev/null \
       | python3 "$HERE/lib/normalize_bq.py")"
+    gcloud storage rm -r "gs://$bucket/$pfx" >/dev/null 2>&1 || true
+    bq --project_id="$proj" rm -f -t "$dset.$tbl" >/dev/null 2>&1 || true
     [ -z "$got" ] && { fails+="$tbl:readback "; continue; }
     if [ "$BLESS" = 1 ]; then
       blessed="$(python3 -c "import json,sys; d=json.loads(sys.argv[1]); d['$tbl']=json.loads(sys.argv[2]); print(json.dumps(d,indent=2,sort_keys=True))" "$blessed" "$got")"

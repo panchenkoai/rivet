@@ -64,7 +64,7 @@ scenarios:
     applies: [postgres, mysql, mssql, mongo]
 
   - id: integrity_types
-    what: "export each type-rich + keyset table (parquet AND csv) → DuckDB independent oracle vs source: row count, distinct-id set (no loss/dup), per-column non-null profile (the uuid cell-nulling class), and typed values (decimal precision, uuid, timestamptz offset, enum). MSSQL/Mongo have no DuckDB scanner → compare vs a source count+distinct query."
+    what: "users 150K loss/dup: source count+distinct == DuckDB read of the parts. PLUS a per-engine DuckDB GOLDEN with TWO fidelity arguments per type matrix: <tmt> = PARQUET readback (binary/typed path — decimal precision, uuid, timestamp, enum) and <tmt>__csv = CSV readback read ALL-VARCHAR (the text-writer path parquet never exercises — escape/quote/unicode/null fidelity), both via DuckDB's own reader, never rivet's. Mongo has no type matrix (full-scan only), so it runs the loss/dup arm only."
     applies: [postgres, mysql, mssql, mongo]
 
   - id: load
