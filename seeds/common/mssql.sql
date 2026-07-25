@@ -6,6 +6,11 @@ DROP TABLE IF EXISTS orders;
 DROP TABLE IF EXISTS page_views;
 DROP TABLE IF EXISTS content_items;
 DROP TABLE IF EXISTS users;
+DROP VIEW IF EXISTS orders_sparse_for_export;
+DROP TABLE IF EXISTS orders_sparse;
+DROP TABLE IF EXISTS orders_coalesce;
+DROP TABLE IF EXISTS rivet_type_matrix;
+DROP TABLE IF EXISTS rivet_type_matrix_full;
 CREATE TABLE users (
     id INT IDENTITY(1,1) PRIMARY KEY, name NVARCHAR(100) NOT NULL, email NVARCHAR(200) NOT NULL,
     age INT NULL, balance DECIMAL(12,2) NULL, is_active BIT NOT NULL, bio NVARCHAR(MAX) NULL,
@@ -87,6 +92,53 @@ SELECT CONCAT(N'Seed title ',value), REPLICATE(CAST(N'lorem ipsum ' AS NVARCHAR(
        CASE WHEN value%3<>0 THEN DATEADD(DAY,value%365,CONVERT(DATETIME2(6),'2024-01-01')) ELSE NULL END,
        DATEADD(DAY,value%400,CONVERT(DATETIME2(6),'2024-01-01')), DATEADD(DAY,value%730,CONVERT(DATETIME2(6),'2023-01-01')), N'{"revisions":1}'
 FROM GENERATE_SERIES(CONVERT(BIGINT,1),CONVERT(BIGINT,150000));
+GO
+
+-- Sparse BIGINT ids — the 3-row sparse-footgun fixture (parity with PG/MySQL).
+CREATE TABLE orders_sparse (id BIGINT PRIMARY KEY, payload NVARCHAR(MAX) NOT NULL);
+GO
+CREATE VIEW orders_sparse_for_export AS
+SELECT id, payload, ROW_NUMBER() OVER (ORDER BY id) AS chunk_rownum FROM orders_sparse;
+GO
+INSERT INTO orders_sparse (id, payload) VALUES (1,N's0'),(2000001,N's1'),(4000001,N's2');
+GO
+-- Composite-cursor fixture (ADR-0007): ~33% NULL updated_at (deterministic value%3)
+-- forces COALESCE(updated_at, created_at) progression.
+CREATE TABLE orders_coalesce (
+    id BIGINT IDENTITY(1,1) PRIMARY KEY, product NVARCHAR(200) NOT NULL, quantity INT NOT NULL,
+    price DECIMAL(10,2) NOT NULL, updated_at DATETIME2(6) NULL, created_at DATETIME2(6) NOT NULL);
+CREATE INDEX idx_orders_coalesce_updated_at ON orders_coalesce(updated_at);
+CREATE INDEX idx_orders_coalesce_created_at ON orders_coalesce(created_at);
+GO
+INSERT INTO orders_coalesce (product,quantity,price,updated_at,created_at)
+SELECT CASE value%5 WHEN 0 THEN N'MacBook Pro 16"' WHEN 1 THEN N'Dell XPS 15' WHEN 2 THEN N'ThinkPad X1 Carbon' WHEN 3 THEN N'Surface Laptop' ELSE N'Ergonomic Chair' END,
+       1+(value%10), ROUND(5+(value%4995)+0.0,2),
+       CASE WHEN value%3=0 THEN NULL ELSE DATEADD(DAY,value%365,CONVERT(DATETIME2(6),'2025-01-01')) END,
+       DATEADD(DAY,value%365,CONVERT(DATETIME2(6),'2024-01-01'))
+FROM GENERATE_SERIES(CONVERT(BIGINT,1),CONVERT(BIGINT,150000));
+GO
+-- Type-matrix demo (parity with PG/MySQL) — SQL Server native types.
+CREATE TABLE rivet_type_matrix (
+    id BIGINT PRIMARY KEY, label NVARCHAR(200) NOT NULL, amount DECIMAL(18,2) NULL, fee DECIMAL(18,6) NULL,
+    created_at DATETIME2(6) NOT NULL, created_at_tz DATETIMEOFFSET(6) NOT NULL,
+    raw_bytes VARBINARY(4) NOT NULL, uid UNIQUEIDENTIFIER NOT NULL, attrs NVARCHAR(MAX) NULL);
+GO
+INSERT INTO rivet_type_matrix (id,label,amount,fee,created_at,created_at_tz,raw_bytes,uid,attrs) VALUES
+  (1,N'payments-like',0.10,0.000001,'2035-08-07 09:08:07.987654','2035-08-07 09:08:07.987654 +00:00',0x00FF0123,'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380011',N'{"tier":"gold","n":1}'),
+  (2,N'payments-like',0.20,0.000002,'2019-02-03 03:07:06.554433','2019-02-03 08:07:06.554433 +05:00',0xDEADBEEF,'B0EEBC99-9C0B-4EF8-BB6D-6BB9BD380022',N'["a","b"]'),
+  (3,N'payments-like',999999999999.99,10.123456,'2020-01-15 00:00:00.000001','2020-01-15 00:00:00.000001 +00:00',0xCAFE,'C0EEBC99-9C0B-4EF8-BB6D-6BB9BD380033',N'{"big":true}'),
+  (4,N'payments-like',-100.05,-0.123456,'2021-06-30 12:59:59.999999','2021-06-30 12:59:59.999999 +00:00',0x00,'D0EEBC99-9C0B-4EF8-BB6D-6BB9BD380044',N'{}');
+GO
+-- Full type-matrix — SQL Server native scalar types (its analogue of PG arrays/
+-- enum and MySQL bit/year: datetimeoffset, uniqueidentifier, varbinary, real).
+CREATE TABLE rivet_type_matrix_full (
+    id BIGINT PRIMARY KEY, flag BIT, tiny_col TINYINT, small_col SMALLINT, int_col INT, real_col REAL,
+    date_col DATE, time_col TIME(6), dto_col DATETIMEOFFSET(6), uid_col UNIQUEIDENTIFIER, vb_col VARBINARY(4));
+GO
+INSERT INTO rivet_type_matrix_full (id,flag,tiny_col,small_col,int_col,real_col,date_col,time_col,dto_col,uid_col,vb_col) VALUES
+  (1,1,255,32767,2147483647,3.14,'2024-03-15','14:30:00.123456','2024-03-15 14:30:00.123456 +02:00','A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380011',0xDEADBEEF),
+  (2,0,0,-32768,-2147483648,-1.5,'1970-01-01','00:00:00.000000','1970-01-01 00:00:00.000000 +00:00','B0EEBC99-9C0B-4EF8-BB6D-6BB9BD380022',0x00000000),
+  (3,NULL,NULL,NULL,0,0.0,'2000-02-29','23:59:59.999999','2000-02-29 23:59:59.999999 -05:00',NULL,NULL);
 GO
 
 -- === GARBAGE PROFILE ===
