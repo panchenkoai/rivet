@@ -430,6 +430,20 @@ CREATE TABLE ext.heap_no_key (
 INSERT INTO ext.heap_no_key (payload, n)
 SELECT repeat('x', 20 + g % 50), g FROM generate_series(1, 150000) g;
 
+-- NAME-TRAP: a column literally named `id` that is NOT a PK and NOT indexed.
+-- init picks keyset ONLY for a catalog single-column PRIMARY KEY (`is_primary_key`,
+-- verified from the catalog — never by the name `id`), so this must NOT scaffold
+-- `chunk_by_key: id`; it falls to range-chunk/full and `check` flags the missing
+-- index. Proves every keyset key is an indexed PK — the answer to "are all the
+-- keyset ids indexed?" is yes, by construction, not by trusting the column name.
+CREATE TABLE ext.unindexed_id (
+    id BIGINT NOT NULL,
+    label TEXT NOT NULL,
+    amount INT NOT NULL
+);
+INSERT INTO ext.unindexed_id (id, label, amount)
+SELECT g, 'row' || g, g % 100 FROM generate_series(1, 150000) g;
+
 ANALYZE ext.bigint_pk_dual_ts;
 ANALYZE ext.int_pk_dual_ts;
 ANALYZE ext.sparse_key;
@@ -437,4 +451,5 @@ ANALYZE ext.decimal_key;
 ANALYZE ext.no_pk_no_ts;
 ANALYZE ext.ref_id_history;
 ANALYZE ext.order_keyed;
+ANALYZE ext.unindexed_id;
 ANALYZE ext.heap_no_key;

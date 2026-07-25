@@ -112,6 +112,16 @@ INSERT INTO ext.heap_no_key (payload, n)
 SELECT REPLICATE('x', 20 + value % 50), value FROM GENERATE_SERIES(1, 150000);
 GO
 
+-- NAME-TRAP: a column literally named `id` that is NOT a PK and NOT indexed.
+-- init picks keyset ONLY for a catalog single-column PRIMARY KEY (never by the
+-- name `id`), so this must NOT scaffold `chunk_by_key: id` — it falls to range/
+-- full and `check` flags the missing index. Proves every keyset key is indexed.
+DROP TABLE IF EXISTS ext.unindexed_id;
+CREATE TABLE ext.unindexed_id (id BIGINT NOT NULL, label NVARCHAR(200) NOT NULL, amount INT NOT NULL);
+INSERT INTO ext.unindexed_id (id, label, amount)
+SELECT value, CONCAT(N'row', value), value % 100 FROM GENERATE_SERIES(CAST(1 AS BIGINT), CAST(150000 AS BIGINT));
+GO
+
 -- WIDE table: 160 int columns of 30-char names. The introspection STRING_AGG of
 -- the names exceeds the nvarchar 4000-byte cap and raised Msg 9829 before the
 -- CONVERT(nvarchar(max)) fix (#21) — every chunked/keyset plan on it failed.

@@ -122,3 +122,13 @@ CREATE TABLE ext_heap_no_key (payload TEXT NOT NULL, n INT NOT NULL);
 INSERT INTO ext_heap_no_key (payload, n)
 WITH RECURSIVE seq AS (SELECT 1 s UNION ALL SELECT s+1 FROM seq WHERE s < 150000)
 SELECT REPEAT('x', 20 + s % 50), s FROM seq;
+
+-- NAME-TRAP: a column literally named `id` that is NOT a PK and NOT indexed.
+-- init picks keyset ONLY for a catalog single-column PRIMARY KEY (never by the
+-- name `id`), so this must NOT scaffold `chunk_by_key: id` — it falls to range/
+-- full and `check` flags the missing index. Proves every keyset key is indexed.
+DROP TABLE IF EXISTS ext_unindexed_id;
+CREATE TABLE ext_unindexed_id (id BIGINT NOT NULL, label TEXT NOT NULL, amount INT NOT NULL);
+INSERT INTO ext_unindexed_id (id, label, amount)
+WITH RECURSIVE seq AS (SELECT 1 n UNION ALL SELECT n+1 FROM seq WHERE n < 150000)
+SELECT n, CONCAT('row', n), n % 100 FROM seq;
