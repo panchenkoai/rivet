@@ -319,6 +319,7 @@ pub(crate) fn run_keyset(
                 // advancing (e.g. a u64 in the zone above i64::MAX), so a failed
                 // `export_metrics` row explains itself without the source.
                 summary.offending_value = last.clone();
+                summary.cursor_high = last.clone();
                 anyhow::bail!(
                     "export '{}': keyset could not read the '{}' value from the last row of page {} \
                      (NULL or unsupported type) — cannot advance safely (last readable key: {}). \
@@ -331,6 +332,11 @@ pub(crate) fn run_keyset(
             }
         }
     }
+
+    // Failure forensics (v18): the furthest key successfully paged. On a completed
+    // keyset this is the table's MAX key (cursor_max in export_metrics); cursor_min
+    // stays None — a keyset seeks forward, it records no lower bound.
+    summary.cursor_high = last.clone();
 
     // Form B: record the run-wide XOR-combined checksums so finalize writes them.
     super::commit::harvest_column_checksums(summary, checksums_acc, checksum_key_column);
