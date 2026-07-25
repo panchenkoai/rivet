@@ -7,6 +7,7 @@
 run_scenarios() {
   local eng=$1 tag=$2 url=$3
   sc_verdicts "$eng" "$tag" "$url"
+  [ "${BLESS_VERDICTS:-0}" = 1 ] && return   # blessing the golden — skip the rest
   sc_integrity_types "$eng" "$tag" "$url"
   for store in $(cfg stores); do
     sc_load "$eng" "$tag" "$url" "$store"
@@ -35,47 +36,45 @@ _strategy_of() {
   else echo full; fi
 }
 
-# ── verdicts: init → strategy per table matches expectation ──────────────────
+# ── verdicts: init+check → {table:{strategy,verdict}} == GOLDEN ──────────────
+# The golden (golden/verdicts.json) fixes the strategy+verdict of EVERY seed and
+# garbage table per engine; a divergence (keyset→full regression, decimal stops
+# bailing, name-trap starts keyset'ing) fails the release against a checked-in
+# truth. Regenerate with --bless-verdicts-golden (intentional).
+GOLDEN_VERDICTS="$HERE/golden/verdicts.json"
 sc_verdicts() {
-  local eng=$1 tag=$2 url=$3 fails=""
+  local eng=$1 tag=$2 url=$3 map="{}" phantom=0
+  # Build the live map by checking every config the engine needs (seeds, +garbage).
+  local checks=()
   if [ "$eng" = mongo ]; then
-    local cfg; cfg="$(_init_cfg mongo "$url" "")" || { skip "mongo init failed"; add mongo "$tag" verdicts - SKIP "init"; return; }
-    # Mongo: no keyset (documented exception) — large collection → full, and the
-    # rationale must be the corrected one (not the false "below 100K").
-    [ "$(_strategy_of "$cfg" users)" = full ] || fails+="users≠full "
-    grep -A3 "name: users" "$cfg" | grep -q "below 100K" && fails+="stale-below-100K-msg "
-    [ -z "$fails" ] && { ok "verdicts (mongo: full + accurate rationale)"; add mongo "$tag" verdicts - PASS; } \
-                    || { bad "verdicts: $fails"; add mongo "$tag" verdicts - FAIL "$fails"; }
-    return
+    local c; c="$(_init_cfg mongo "$url" "")" || { skip "mongo init failed"; add mongo "$tag" verdicts - SKIP init; return; }
+    checks=("$c")
+  else
+    local sc; sc="$(_init_cfg "$eng" "$url" "$( [ "$eng" = mssql ] && echo dbo )")" \
+      || { skip "$eng init failed"; add "$eng" "$tag" verdicts - SKIP init; return; }
+    checks=("$sc")
+    # pg/mssql: garbage lives in schema `ext` (separate init); mysql: same DB.
+    [ "$eng" != mysql ] && { local gc; gc="$(_init_cfg "$eng" "$url" ext)" && checks+=("$gc"); }
   fi
-  # SQL engines: seeds → keyset, orders_sparse → full.
-  local seeds_cfg; seeds_cfg="$(_init_cfg "$eng" "$url" "$( [ "$eng" = mssql ] && echo dbo )")" \
-    || { skip "$eng init failed"; add "$eng" "$tag" verdicts - SKIP init; return; }
-  for t in users orders events page_views content_items orders_coalesce; do
-    [ "$(_strategy_of "$seeds_cfg" "$t")" = keyset ] || fails+="$t≠keyset "
+  for cfg in "${checks[@]}"; do
+    local out; out="$("$RIVET" check -c "$cfg" 2>/dev/null)"
+    phantom=$((phantom + $(grep -ac "Heavy chunk" <<<"$out")))
+    map="$(python3 "$HERE/lib/parse_verdicts.py" "$map" <<<"$out")"
   done
-  [ "$(_strategy_of "$seeds_cfg" orders_sparse)" = full ] || fails+="orders_sparse≠full "
-  # garbage shapes. Export NAMES: pg/mssql strip the `ext.` schema (name is the bare
-  # table), mysql keeps the `ext_` prefix (that IS the table name).
-  local gpref=""; [ "$eng" = mysql ] && gpref="ext_"
-  local gcfg
-  if [ "$eng" = mysql ]; then gcfg="$seeds_cfg"; else gcfg="$(_init_cfg "$eng" "$url" ext)"; fi
-  local dkey="${gpref}decimal_key" unidx="${gpref}unindexed_id" refh="${gpref}ref_id_history" bpk="${gpref}bigint_pk_dual_ts"
-  [ "$(_strategy_of "$gcfg" "$bpk")" = keyset ] || fails+="bigint_pk≠keyset "
-  [ "$(_strategy_of "$gcfg" "$dkey")" = full ] || fails+="decimal_key≠full-bail "
-  [ "$(_strategy_of "$gcfg" "$unidx")" = keyset ] && fails+="unindexed_id-WRONGLY-keyset "   # name-trap: must NOT keyset
-  [ "$(_strategy_of "$gcfg" "$refh")" = range ] || fails+="ref_id_history≠range "
-  # no phantom heavy-chunk warning anywhere.
-  local hc; hc="$(_check_heavy_chunk_count "$eng" "$url" "$seeds_cfg")"
-  [ "$hc" = 0 ] || fails+="phantom-heavy-chunk=$hc "
-  [ -z "$fails" ] && { ok "verdicts (seeds→keyset, garbage shapes, 0 phantom)"; add "$eng" "$tag" verdicts - PASS; } \
-                  || { bad "verdicts: $fails"; add "$eng" "$tag" verdicts - FAIL "$fails"; }
-}
 
-_check_heavy_chunk_count() {
-  local eng=$1 url=$2 cfg=$3; export ORACLE_URL="$url"
-  local tlsflag=""; [ "$eng" = mssql ] && tlsflag=""
-  "$RIVET" check -c "$cfg" 2>&1 | grep -ac "Heavy chunk"
+  if [ "${BLESS_VERDICTS:-0}" = 1 ]; then
+    mkdir -p "$HERE/golden"
+    python3 -c "import json,os,sys; g=json.load(open('$GOLDEN_VERDICTS')) if os.path.exists('$GOLDEN_VERDICTS') else {}; g['$eng']=json.loads(sys.argv[1]); open('$GOLDEN_VERDICTS','w').write(json.dumps(g,indent=2,sort_keys=True)+chr(10))" "$map"
+    ok "blessed verdicts[$eng]"; add "$eng" "$tag" verdicts - PASS blessed; return
+  fi
+  # zero phantom heavy-chunk (a cross-check the strategy/verdict golden can't hold).
+  [ "$phantom" = 0 ] || { bad "verdicts: $phantom phantom heavy-chunk warning(s)"; add "$eng" "$tag" verdicts - FAIL "phantom-heavy-chunk=$phantom"; return; }
+  local want got
+  want="$(python3 -c "import json;print(json.dumps(json.load(open('$GOLDEN_VERDICTS')).get('$eng',{}),sort_keys=True))" 2>/dev/null)"
+  got="$(python3 -c "import json,sys;print(json.dumps(json.loads(sys.argv[1]),sort_keys=True))" "$map")"
+  if [ -z "$want" ] || [ "$want" = "{}" ]; then skip "no golden for $eng (bless first)"; add "$eng" "$tag" verdicts - SKIP "no golden"; return; fi
+  if [ "$want" = "$got" ]; then ok "verdicts match golden (0 phantom)"; add "$eng" "$tag" verdicts - PASS
+  else local d; d="$(python3 "$HERE/lib/verdict_diff.py" "$want" "$got")"; bad "verdicts DIVERGED: $d"; add "$eng" "$tag" verdicts - FAIL "$d"; fi
 }
 
 # ── integrity + types: export → DuckDB oracle vs source ──────────────────────

@@ -43,14 +43,16 @@ cleanup() {
 }
 
 # ── options ──
-ENGINES_FILTER=""; NO_CLOUD=0; KEEP=0; BLESS=0
+ENGINES_FILTER=""; NO_CLOUD=0; KEEP=0; BLESS=0; BLESS_VERDICTS=0
 while [ $# -gt 0 ]; do case "$1" in
   --engines) ENGINES_FILTER="$2"; shift 2;;
   --no-cloud) NO_CLOUD=1; shift;;
   --keep) KEEP=1; shift;;
   --bless-bigquery-golden) BLESS=1; shift;;
+  --bless-verdicts-golden) BLESS_VERDICTS=1; NO_CLOUD=1; shift;;
   *) echo "unknown arg: $1"; exit 2;;
 esac; done
+export BLESS_VERDICTS
 
 [ -x "$RIVET" ] || { echo "rivet binary not found at $RIVET (build --release or set RIVET_BIN)"; exit 2; }
 command -v duckdb >/dev/null || { echo "duckdb not on PATH (needed for the integrity oracle)"; exit 2; }
