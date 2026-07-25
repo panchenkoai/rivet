@@ -4,21 +4,25 @@ use crate::error::Result;
 
 use super::{StateConn, StateStore};
 
-/// The `run_status` ledger — the AUTHORITATIVE record of each export run's
+/// The `run_status` ledger — a best-effort ADVISORY record of each export run's
 /// lifecycle: written `running` at run START (before any part lands) and
 /// transitioned to a terminal status at finalize. The bucket manifest is a
-/// PROJECTION of it (its status written FROM these rows), so a cross-boundary
-/// reader (Airflow over the bucket) and a rivet process over a shared state DB
-/// see one truth. Row columns: `run_id` PK, `export_name`, `prefix` (the run's
-/// write URI — the key `gc_orphans` matches at-or-under `plan.gcs_prefix`),
-/// `status` (`running`|`success`|`failed`|`interrupted`), `started_at`,
-/// `finished_at`.
+/// companion PROJECTION (its status written FROM the same lifecycle), so a
+/// cross-boundary reader (Airflow over the bucket) and a rivet process over a
+/// shared state DB read the same signal. Row columns: `run_id` PK, `export_name`,
+/// `prefix` (the run's write URI — the key `gc_orphans` matches at-or-under
+/// `plan.gcs_prefix`), `status` (`running`|`success`|`failed`|`interrupted`),
+/// `started_at`, `finished_at`.
 ///
-/// `gc_orphans` reads it to tell a LIVE extract (a `running` run NOT superseded
-/// by a newer run of the same export) from a crash orphan — no wall-clock
-/// heuristic. A hard-crashed run leaves a stale `running` row; a later run of the
-/// same export SUPERSEDES it (higher `started_at`), so it stops counting as
-/// active without any age/lease timer.
+/// NOT authoritative, by design: every write is best-effort (a miss only warns)
+/// and `gc_orphans` reads it FAIL-OPEN — an unwritten or unreadable ledger makes
+/// gc `active` (spare everything), the same safe behaviour as no ledger at all.
+/// It only ever REFINES gc toward deleting a dead orphan; it never risks deleting
+/// a live one. `gc_orphans` uses it to tell a LIVE extract (a `running` run NOT
+/// superseded by a newer run of the same export) from a crash orphan — no
+/// wall-clock heuristic. A hard-crashed run leaves a stale `running` row; a later
+/// run of the same export SUPERSEDES it (higher `started_at`), so it stops
+/// counting as active without any age/lease timer.
 impl StateStore {
     /// Record an export run as `running` at its START. Upsert on `run_id` so a
     /// RESUMED run reuses its row and re-arms `running` (clearing any prior

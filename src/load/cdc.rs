@@ -140,6 +140,13 @@ impl SourceEngine {
 /// ahead of the after-image columns (OSS `cdc::sink`); `rivet check` reports
 /// only the data columns, so the loader must prepend these to build the
 /// `<table>__changes` schema.
+/// The reserved CDC meta-column vocabulary — the one home for `__op/__pos/__seq`
+/// so a warehouse adapter can't drift from the view builder. Both `bigquery` and
+/// `snowflake` delegate here.
+pub(crate) fn is_meta_column(name: &str) -> bool {
+    matches!(name, "__op" | "__pos" | "__seq")
+}
+
 pub fn meta_column_specs(warehouse: Warehouse) -> Vec<TargetColumnSpec> {
     let (str_ty, int_ty) = match warehouse {
         Warehouse::BigQuery => ("STRING", "INT64"),

@@ -282,7 +282,7 @@ impl TargetLoader for SnowflakeLoader {
 
 /// Whether a column name is one of rivet's CDC meta columns.
 fn is_meta_column(name: &str) -> bool {
-    matches!(name, "__op" | "__pos" | "__seq")
+    crate::load::cdc::is_meta_column(name)
 }
 
 /// A column is loaded through `PARSE_JSON` iff its native type is `VARIANT`

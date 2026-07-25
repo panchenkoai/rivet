@@ -669,7 +669,10 @@ fn build_manifest(
         run_id: run_id.to_string(),
         export_name: out.table.clone(),
         started_at: started_at.to_string(),
-        finished_at: run_id.to_string(),
+        // A real finish instant (RFC3339) — NOT the run_id. The field is parsed as
+        // a timestamp by the load's `latest_full`; a run_id here was a dormant
+        // landmine (safe only while CDC never sorts by finished_at).
+        finished_at: chrono::Utc::now().to_rfc3339(),
         status: ManifestStatus::Success,
         source: ManifestSource {
             extraction: Some(crate::manifest::ExtractionMetadata {

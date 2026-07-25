@@ -249,11 +249,7 @@ pub fn gc_orphans(
     // the ACTIVE signal and MUST survive — deletion here is gated on SUPERSESSION,
     // never on `active`.
     for (key, m) in keyed {
-        if m.status == ManifestStatus::Running
-            && keyed.iter().any(|(_, other)| {
-                other.export_name == m.export_name && other.started_at > m.started_at
-            })
-        {
+        if m.status == ManifestStatus::Running && is_superseded(m, keyed) {
             removed_bytes += store.stat_size(key).unwrap_or(0);
             store.remove(key)?;
             removed += 1;
@@ -272,12 +268,21 @@ pub fn gc_orphans(
 /// signals are belt-and-suspenders: the ledger is precise co-located, the marker
 /// covers cross-host.
 pub fn has_active_running_manifest(keyed: &[(String, RunManifest)]) -> bool {
-    keyed.iter().any(|(_, m)| {
-        m.status == ManifestStatus::Running
-            && !keyed.iter().any(|(_, other)| {
-                other.export_name == m.export_name && other.started_at > m.started_at
-            })
-    })
+    keyed
+        .iter()
+        .any(|(_, m)| m.status == ManifestStatus::Running && !is_superseded(m, keyed))
+}
+
+/// A `running` manifest is SUPERSEDED when a NEWER run of the SAME export exists
+/// (a higher `started_at`) — it crashed and its successor already re-ran, so it
+/// no longer protects anything. The ONE clock-free staleness predicate, shared by
+/// [`has_active_running_manifest`] (spare the non-superseded) and `gc_orphans`'s
+/// marker-GC sweep (delete the superseded). The ledger enforces the same rule in
+/// SQL — that copy cannot share this Rust.
+fn is_superseded(m: &RunManifest, keyed: &[(String, RunManifest)]) -> bool {
+    keyed
+        .iter()
+        .any(|(_, o)| o.export_name == m.export_name && o.started_at > m.started_at)
 }
 
 /// Full/chunked loads care only about the LATEST snapshot: from `keyed` (all run
@@ -377,7 +382,8 @@ fn is_manifest_key(key: &str) -> bool {
 /// A per-run manifest copy: `manifest-<token>.json` (the sidecar the OSS sink
 /// writes alongside the canonical pointer so cross-run reconcile can sum it).
 fn is_run_unique_manifest(base: &str) -> bool {
-    base.starts_with("manifest-") && base.ends_with(".json")
+    // The sidecar naming scheme lives once, in `manifest.rs` (the writer's home).
+    crate::manifest::is_run_unique_manifest_name(base)
 }
 
 /// Refuse a load whose prefix holds MORE THAN ONE export's manifests. The load

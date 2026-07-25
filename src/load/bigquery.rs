@@ -298,7 +298,7 @@ impl TargetLoader for BigQueryLoader {
 /// the data specs before the meta columns are prepended, so a schema can never
 /// declare `__op`/`__pos`/`__seq` twice.
 fn is_meta_column(name: &str) -> bool {
-    matches!(name, "__op" | "__pos" | "__seq")
+    crate::load::cdc::is_meta_column(name)
 }
 
 /// `CREATE TABLE IF NOT EXISTS` for the change log, clustered on the PK (capped
