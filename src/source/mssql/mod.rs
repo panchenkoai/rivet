@@ -782,6 +782,44 @@ impl Source for MssqlSource {
             row.get::<i64, _>(0).map(|v| v.max(0) as u64)
         })
     }
+
+    fn server_context(&mut self) -> Option<String> {
+        // SERVERPROPERTY + @@ globals — cheap, no elevated permission. SQL Server's
+        // query timeout is CLIENT-side (there is no server "ERROR 3024"), so the
+        // load-bearing forensics here are version/edition plus the lock timeout and
+        // connection cap. Best-effort per field.
+        let version = self
+            .query_scalar("SELECT CAST(SERVERPROPERTY('ProductVersion') AS NVARCHAR(128))")
+            .ok()
+            .flatten();
+        let edition = self
+            .query_scalar("SELECT CAST(SERVERPROPERTY('Edition') AS NVARCHAR(128))")
+            .ok()
+            .flatten();
+        let lock_timeout = self
+            .query_scalar("SELECT CAST(@@LOCK_TIMEOUT AS NVARCHAR(32))")
+            .ok()
+            .flatten();
+        let max_conns = self
+            .query_scalar("SELECT CAST(@@MAX_CONNECTIONS AS NVARCHAR(32))")
+            .ok()
+            .flatten();
+        let collation = self
+            .query_scalar("SELECT CAST(SERVERPROPERTY('Collation') AS NVARCHAR(128))")
+            .ok()
+            .flatten();
+        Some(
+            serde_json::json!({
+                "engine": "mssql",
+                "version": version,
+                "edition": edition,
+                "lock_timeout_ms": lock_timeout,
+                "max_connections": max_conns,
+                "collation": collation,
+            })
+            .to_string(),
+        )
+    }
 }
 
 impl MssqlSource {

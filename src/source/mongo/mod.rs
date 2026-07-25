@@ -752,6 +752,40 @@ impl Source for MongoSource {
             .block_on(async move { coll.count_documents(doc! {}).await })?;
         Ok(Some(n.to_string()))
     }
+
+    fn server_context(&mut self) -> Option<String> {
+        // buildInfo (version) + serverStatus (connections/uptime), block_on'd on the
+        // session runtime like every other Mongo driver call. serverStatus needs the
+        // clusterMonitor role on an authed deployment — best-effort, so a missing
+        // grant just drops those fields (version from buildInfo needs none).
+        let session = &self.session;
+        let (version, current, available, uptime) = session.block_on(async {
+            let db = session.client().database(session.db());
+            let build = db.run_command(doc! { "buildInfo": 1 }).await.ok();
+            let status = db.run_command(doc! { "serverStatus": 1 }).await.ok();
+            let version = build
+                .as_ref()
+                .and_then(|d| d.get_str("version").ok().map(str::to_string));
+            let current = status
+                .as_ref()
+                .and_then(|d| nested_i64(d, &["connections", "current"]));
+            let available = status
+                .as_ref()
+                .and_then(|d| nested_i64(d, &["connections", "available"]));
+            let uptime = status.as_ref().and_then(|d| nested_i64(d, &["uptime"]));
+            (version, current, available, uptime)
+        });
+        Some(
+            serde_json::json!({
+                "engine": "mongodb",
+                "version": version,
+                "connections_current": current,
+                "connections_available": available,
+                "uptime_s": uptime,
+            })
+            .to_string(),
+        )
+    }
 }
 
 /// Pull the collection name out of the innermost `… FROM <ident>` of a SQL
