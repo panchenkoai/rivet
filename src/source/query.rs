@@ -157,13 +157,28 @@ pub(crate) fn build_export_query(
     source_type: SourceType,
 ) -> BuiltQuery {
     match (request.page_limit, request.incremental) {
-        (Some(limit), Some(plan)) => build_keyset_query(
-            request.query,
-            &plan.primary_column,
-            request.cursor.and_then(|c| c.last_cursor_value.as_deref()),
-            limit,
-            source_type,
-        ),
+        (Some(limit), Some(plan)) => {
+            let cursor = request.cursor.and_then(|c| c.last_cursor_value.as_deref());
+            match request.upper_bound {
+                // Sequential single-worker page (the common path).
+                None => build_keyset_query(
+                    request.query,
+                    &plan.primary_column,
+                    cursor,
+                    limit,
+                    source_type,
+                ),
+                // A parallel keyset worker's `(cursor, upper]` range.
+                Some(_) => build_keyset_query_bounded(
+                    request.query,
+                    &plan.primary_column,
+                    cursor,
+                    request.upper_bound,
+                    limit,
+                    source_type,
+                ),
+            }
+        }
         _ => build_incremental_query(
             request.query,
             request.incremental,
@@ -191,25 +206,68 @@ pub(crate) fn build_keyset_query(
     limit: usize,
     source_type: SourceType,
 ) -> BuiltQuery {
+    build_keyset_query_bounded(base_query, key_column, last, None, limit, source_type)
+}
+
+/// Keyset page with an optional INCLUSIVE upper bound `<= upper` — the parallel
+/// keyset runner gives each worker a disjoint `(lower, upper]` range so N workers
+/// page concurrently (feat/parallel-keyset). `upper` is INLINED (never a bind
+/// param) so the single `cursor_param` slot stays free for the `>` cursor value:
+/// `WHERE key > ?bind AND key <= '<inline>'`. Row-count parity is structural —
+/// the half-open intervals partition the key, so the union reads every row once.
+pub(crate) fn build_keyset_query_bounded(
+    base_query: &str,
+    key_column: &str,
+    last: Option<&str>,
+    upper: Option<&str>,
+    limit: usize,
+    source_type: SourceType,
+) -> BuiltQuery {
     let key = quote_ident(source_type, key_column);
     let page = page_limit_clause(source_type, limit);
+    // Upper bound is always an in-SQL literal (implicit-cast to the key type, same
+    // as the cursor RHS on PG/MSSQL), so it never consumes the bind slot.
+    let upper_pred = |joiner: &str| match upper {
+        Some(hi) => format!(
+            "{joiner}{k} <= {lit}",
+            k = key,
+            lit = inline_literal(source_type, hi)
+        ),
+        None => String::new(),
+    };
     match last {
         Some(val) => {
             let (rhs, cursor_param) = cursor_rhs(source_type, val);
             BuiltQuery {
                 sql: format!(
-                    "SELECT * FROM ({base}) AS _rivet WHERE {k} > {rhs} ORDER BY {k} {page}",
+                    "SELECT * FROM ({base}) AS _rivet WHERE {k} > {rhs}{up} ORDER BY {k} {page}",
                     base = base_query,
                     k = key,
+                    up = upper_pred(" AND "),
                 ),
                 cursor_param,
             }
         }
         None => BuiltQuery::without_param(format!(
-            "SELECT * FROM ({base}) AS _rivet ORDER BY {k} {page}",
+            "SELECT * FROM ({base}) AS _rivet{where_up} ORDER BY {k} {page}",
             base = base_query,
             k = key,
+            where_up = upper_pred(" WHERE "),
         )),
+    }
+}
+
+/// In-SQL literal for a key value, per dialect — the injection-safe inline form
+/// (never a bind param). MySQL/PG/MSSQL all implicit-cast a quoted literal to the
+/// key's column type, so a numeric key compares correctly against `'250001'`.
+fn inline_literal(source_type: SourceType, value: &str) -> String {
+    match source_type {
+        SourceType::Mysql => escape_mysql_literal(value),
+        SourceType::Postgres => escape_pg_literal(value),
+        SourceType::Mssql => escape_mssql_literal(value),
+        SourceType::Mongo => unreachable!(
+            "inline_literal: MongoDB keyset paging is not a SQL path (guarded by full-mode-only validation)"
+        ),
     }
 }
 
@@ -261,6 +319,24 @@ pub(crate) fn escape_mssql_literal(s: &str) -> String {
             out.push('\'');
         }
         out.push(c);
+    }
+    out.push('\'');
+    out
+}
+
+/// Quote `s` as a MySQL `'…'` string literal, escaping `\` and `'` the MySQL
+/// default way (`\\`, `\'`). MySQL implicit-casts the literal to the column type,
+/// so a numeric keyset key compares correctly against `'250001'`. Used for the
+/// INLINE upper bound of a parallel keyset range (the cursor still binds via `?`).
+pub(crate) fn escape_mysql_literal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str(r"\\"),
+            '\'' => out.push_str(r"\'"),
+            _ => out.push(c),
+        }
     }
     out.push('\'');
     out
@@ -492,6 +568,61 @@ mod tests {
         assert!(q.sql.contains("ORDER BY \"id\""), "{}", q.sql);
         assert!(q.sql.contains("LIMIT 1000"), "{}", q.sql);
         assert_eq!(q.cursor_param, None);
+    }
+
+    #[test]
+    fn keyset_bounded_upper_is_inline_cursor_stays_the_only_bind() {
+        // Parallel keyset worker: `(cursor, upper]`. On MySQL the cursor binds via
+        // `?` (the single param slot); the upper bound is an INLINE literal so it
+        // does not consume a second bind. MUTANT: bind the upper too → cursor_param
+        // would need to be a pair; this asserts it stays the single cursor value.
+        let q = build_keyset_query_bounded(
+            "SELECT * FROM t",
+            "id",
+            Some("100"),
+            Some("250001"),
+            500,
+            SourceType::Mysql,
+        );
+        assert!(
+            q.sql.contains("WHERE `id` > ? AND `id` <= '250001'"),
+            "cursor bound `?`, upper inline: {}",
+            q.sql
+        );
+        assert_eq!(
+            q.cursor_param.as_deref(),
+            Some("100"),
+            "only the cursor binds; the upper is inline"
+        );
+        // First page of a bounded range (no cursor): WHERE is the upper only.
+        let first = build_keyset_query_bounded(
+            "SELECT * FROM t",
+            "id",
+            None,
+            Some("250001"),
+            500,
+            SourceType::Postgres,
+        );
+        assert!(
+            first.sql.contains("WHERE \"id\" <= E'250001'"),
+            "bounded first page carries only the upper: {}",
+            first.sql
+        );
+        assert_eq!(first.cursor_param, None);
+        // No upper bound → identical to the sequential page (the default path).
+        let seq = build_keyset_query_bounded(
+            "SELECT * FROM t",
+            "id",
+            Some("9"),
+            None,
+            10,
+            SourceType::Postgres,
+        );
+        assert!(
+            !seq.sql.contains("<="),
+            "no upper → no <= clause: {}",
+            seq.sql
+        );
     }
 
     #[test]
