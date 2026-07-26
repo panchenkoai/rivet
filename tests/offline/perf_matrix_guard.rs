@@ -15,8 +15,11 @@ use serde_yaml_ng::Value;
 const PERF_MATRIX: &str = "docs/perf-matrix.yaml";
 const ENGINES: [&str; 4] = ["postgres", "mysql", "mssql", "mongo"];
 
-// Shrink-only: LOWER when a gap is filled with a measured baseline; never raise.
-const GAP_RATCHET: usize = 8;
+// Shrink-only: LOWER when a gap is filled with a measured baseline; never raise. The
+// matrix currently has ZERO `{gap}` cells, so the ratchet is 0 — for usize `<= 0` is
+// exact equality, so ANY measured->gap downgrade (a lost baseline) fails immediately,
+// not after N accumulate (matching the sibling guards' zero-slack convention).
+const GAP_RATCHET: usize = 0;
 
 fn load() -> Value {
     let s = fs::read_to_string(PERF_MATRIX).unwrap_or_else(|e| panic!("read {PERF_MATRIX}: {e}"));
@@ -105,8 +108,11 @@ fn perf_gaps_do_not_exceed_the_ratchet() {
             }
         }
     }
-    assert!(
-        gaps <= GAP_RATCHET,
-        "perf-matrix has {gaps} gaps > ratchet {GAP_RATCHET} — measure the baseline and lower the ratchet"
+    // Exact equality (zero-slack, like chunking_matrix_guard): a NEW gap fails immediately
+    // and a filled one must LOWER the ratchet — no silent measured->gap downgrade window.
+    assert_eq!(
+        gaps, GAP_RATCHET,
+        "perf-matrix gap count changed — a measured->gap downgrade (lost baseline) or a new \
+         unmeasured cell. Measure the baseline, or intentionally set GAP_RATCHET to {gaps}."
     );
 }

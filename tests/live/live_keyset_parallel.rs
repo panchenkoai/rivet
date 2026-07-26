@@ -772,10 +772,22 @@ fn parallel_keyset_worker_error_aborts_cleanly_postgres() {
             "a worker-error abort must leave a Failed/Interrupted manifest, not a Success"
         );
     }
-    // A clean re-run recovers everything (orphaned partial parts are a subset of the
-    // full clean set, so the DISTINCT key set is exactly 1..=2000).
+    // ISOLATE the clean re-run: the failed run left ranges 0/1/3 as orphan parquet
+    // (~75% of the key space). Reading orphans ∪ rerun would let the union hit 1..=2000
+    // even if the clean run DROPPED a range — a vacuous oracle. Delete the orphans first,
+    // so the completeness check sees ONLY run 2's output.
+    for p in files_with_extension(&rig.out_dir(), "parquet") {
+        std::fs::remove_file(&p).unwrap();
+    }
+    // A clean re-run recovers everything: exact count (no dupe/no orphan inflation) AND
+    // the full key set — RED if the clean run drops ANY range (0/1/3 included), not just
+    // range 2.
     rig.run_ok();
-    let (_, keys, _) = id_set_and_fanout(&rig.out_dir());
+    let (count, keys, _) = id_set_and_fanout(&rig.out_dir());
+    assert_eq!(
+        count, 2000,
+        "the clean re-run writes exactly 2000 rows (no dupe/orphan)"
+    );
     assert_eq!(
         keys,
         (1..=2000i64).collect::<BTreeSet<i64>>(),

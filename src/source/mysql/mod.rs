@@ -800,8 +800,16 @@ impl super::Source for MysqlSource {
             .query_scalar("SELECT @@max_execution_time")
             .ok()
             .flatten();
-        let sql_mode = self.query_scalar("SELECT @@sql_mode").ok().flatten();
-        let time_zone = self.query_scalar("SELECT @@time_zone").ok().flatten();
+        // GLOBAL (server truth), not the SESSION value — query_scalar now runs through
+        // MysqlSessionGuard, which pins the session `time_zone`/`sql_mode` (bug #2). A
+        // session read would report the guard's normalized values (+00:00, NO_BACKSLASH_
+        // ESCAPES stripped) and HIDE the exact server settings this forensic snapshot
+        // exists to surface (a tz shift / a backslash-escape data issue).
+        let sql_mode = self.query_scalar("SELECT @@global.sql_mode").ok().flatten();
+        let time_zone = self
+            .query_scalar("SELECT @@global.time_zone")
+            .ok()
+            .flatten();
         let wait_timeout = self.query_scalar("SELECT @@wait_timeout").ok().flatten();
         let max_conns = self.query_scalar("SELECT @@max_connections").ok().flatten();
         Some(

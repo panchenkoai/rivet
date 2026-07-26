@@ -48,6 +48,10 @@ sc_keyset_parallel() {
 verify_state_migrations() {
   local st="${RIVET_TEST_STATE_URL:-}"
   [ -z "$st" ] && { skip "state-migration parity: no Postgres STATE url (set RIVET_TEST_STATE_URL)"; add state migrations parity - SKIP "no state url"; return; }
+  # The url MUST be postgres — the underlying tests self-skip (return) on any other
+  # scheme, which libtest counts as PASSED. Without this, RIVET_TEST_STATE_URL=sqlite://…
+  # would print a green "SQLite == Postgres" having verified NOTHING (a false-pass gate).
+  case "$st" in postgres*|postgresql*) ;; *) skip "state-migration parity: RIVET_TEST_STATE_URL is not a postgres url"; add state migrations parity - SKIP "non-postgres url"; return;; esac
   command -v cargo >/dev/null 2>&1 || { skip "state-migration parity: cargo absent"; add state migrations parity - SKIP "no cargo"; return; }
   # Source Postgres must be reachable (the parity fixtures seed a source table on :5432).
   if ! (exec 3<>/dev/tcp/127.0.0.1/5432) 2>/dev/null; then
