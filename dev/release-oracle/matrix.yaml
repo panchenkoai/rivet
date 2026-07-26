@@ -21,7 +21,9 @@ engines:
     seed: seeds/common/postgres.sql
     versions:
       - { tag: "13", image: "postgres:13", port: 55013 }
+      - { tag: "14", image: "postgres:14", port: 55014 }
       - { tag: "16", image: "postgres:16", port: 55016 }
+      - { tag: "18", image: "postgres:18", port: 55018 }
   mysql:
     # The canonical seed uses a recursive CTE (deterministic fast fill) → MySQL 8.0+
     # ONLY. Pre-8.0 (5.7) would need a non-recursive compat seed; out of matrix.
@@ -46,7 +48,10 @@ engines:
     seed: seeds/mongo_seed.py
     versions:
       - { tag: "4.4", image: "mongo:4.4", port: 55044 }
+      - { tag: "5",   image: "mongo:5",   port: 55005 }
+      - { tag: "6",   image: "mongo:6",   port: 55006 }
       - { tag: "7",   image: "mongo:7",   port: 55007 }
+      - { tag: "8",   image: "mongo:8",   port: 55008 }
 
 # ── Object-store backends (local fakes) ─────────────────────────────────────
 # One CloudDestination impl (src/destination/cloud.rs) serves all three; the gate
