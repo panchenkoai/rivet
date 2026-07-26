@@ -20,7 +20,7 @@ CREATE TABLE keyset_sparse (
 
 INSERT INTO keyset_sparse
 SELECT
-    n * 997                                              AS id,
+    n::bigint * 997                                      AS id,  -- cast: generate_series is int4, n*997 overflows past n≈2.15M
     (n % 1000)::int                                      AS grp,
     ((n % 100000) + (n % 10000) / 10000.0)::decimal(18,4) AS amount,
     n / 7.0                                              AS ratio,

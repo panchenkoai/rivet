@@ -30,7 +30,7 @@ WITH RECURSIVE
   seq10k(a) AS (SELECT 0 UNION ALL SELECT a + 1 FROM seq10k WHERE a < 9999),
   seq1k(b)  AS (SELECT 0 UNION ALL SELECT b + 1 FROM seq1k  WHERE b < 999)
 SELECT
-    10000000000000000000 + CAST(n AS UNSIGNED) * 100000000 AS id,  -- > i64::MAX
+    CAST(10000000000000000000 AS UNSIGNED) + CAST(n AS UNSIGNED) * 100000000 AS id,  -- > i64::MAX; CAST the literal so arithmetic stays integer (a bare 1e19 promotes to slow DECIMAL)
     n % 1000                                        AS grp,
     CAST((n % 100000) + (n % 10000) / 10000.0 AS DECIMAL(18,4)) AS amount,
     n / 7.0                                         AS ratio,
