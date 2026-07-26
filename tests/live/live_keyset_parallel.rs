@@ -879,3 +879,67 @@ fn parallel_keyset_eight_workers_concurrency_postgres() {
     assert!(workers >= 4, "8 workers must fan out widely, got {workers}");
     let _ = c.execute(&format!("DROP TABLE IF EXISTS {table}"), &[]);
 }
+
+/// Resume with a CHANGED parallel N: crash a `parallel: 4` checkpoint run, then resume
+/// with `parallel: 8` (same export, same state db + out dir). The resume must RELOAD the
+/// crashed run's persisted keyset_range rows (the original 4 ranges) rather than re-sample
+/// with the new N, and recover every row. Built without the Rig — two configs sharing one
+/// tempdir (hence one `.rivet_state.db` + out dir) is the only way to vary N across a
+/// crash/resume pair.
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn parallel_keyset_resume_with_changed_worker_count_postgres() {
+    require_alive(LiveService::Postgres);
+    let table = unique_name("pk_resn");
+    let mut c = pg_connect();
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {table};
+         CREATE TABLE {table} (id BIGINT PRIMARY KEY, payload INT NOT NULL);
+         INSERT INTO {table} SELECT g, g FROM generate_series(1, 2000) g;"
+    ))
+    .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("cfg.yaml");
+    let out = dir.path().join("out");
+    let write_cfg = |n: usize| {
+        let lines = [
+            format!("source: {{ type: postgres, url: \"{POSTGRES_URL}\" }}"),
+            "exports:".to_string(),
+            "  - name: pk_resn".to_string(),
+            format!("    table: public.{table}"),
+            "    mode: chunked".to_string(),
+            "    chunk_by_key: id".to_string(),
+            format!("    parallel: {n}"),
+            "    chunk_checkpoint: true".to_string(),
+            "    chunk_size: 200".to_string(),
+            "    format: parquet".to_string(),
+            format!(
+                "    destination: {{ type: local, path: \"{}/\" }}",
+                out.display()
+            ),
+        ];
+        std::fs::write(&cfg, lines.join("\n")).unwrap();
+    };
+    // Run 1: parallel:4, crash after range 1 commits (durable in keyset_range).
+    write_cfg(4);
+    let crash = run_rivet_env(
+        &["run", "-c", cfg.to_str().unwrap()],
+        &[("RIVET_TEST_PANIC_AT", "keyset_parallel_range_committed:1")],
+    );
+    assert!(!crash.status.success(), "the crash run must fail");
+    // Run 2: parallel:8 — resume must reuse the crashed run's 4 persisted ranges.
+    write_cfg(8);
+    let resume = run_rivet_env(&["run", "-c", cfg.to_str().unwrap()], &[]);
+    assert!(
+        resume.status.success(),
+        "resume with a changed parallel N must succeed: {}",
+        String::from_utf8_lossy(&resume.stderr)
+    );
+    let (count, keys, _) = id_set_and_fanout(&out);
+    assert_eq!(
+        count, 2000,
+        "resume with a changed worker count recovers every row"
+    );
+    assert_eq!(keys, (1..=2000i64).collect::<BTreeSet<i64>>());
+    let _ = c.execute(&format!("DROP TABLE IF EXISTS {table}"), &[]);
+}
