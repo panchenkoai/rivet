@@ -22,9 +22,9 @@ const ENGINES: [&str; 4] = ["postgres", "mysql", "mssql", "mongo"];
 
 // Total admitted gaps = scenario `gap` cells + preflight/infra `status: gap` +
 // grid version gaps. Shrink-only: LOWER when a gap is filled; never raise.
-// History: 14 (initial) -> 13 (pooler_safety) -> 12 (state_upgrade).
-// Now: infra gap rows(6) + grid version gaps(3+2+1+0=6) = 12.
-const GAP_RATCHET: usize = 12;
+// History: 14 -> 13 (pooler_safety) -> 12 (state_upgrade) -> 11 (state_concurrency).
+// Now: infra gap rows(5) + grid version gaps(3+2+1+0=6) = 11.
+const GAP_RATCHET: usize = 11;
 
 fn load(path: &str) -> Value {
     let s = fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));

@@ -99,6 +99,62 @@ mod tests {
 
     const P: &str = "gs://b/exports/orders/";
 
+    /// Two independent StateStore connections to ONE shared Postgres state db behave
+    /// like two rivet PROCESSES on a shared-Postgres deployment: a run begun on
+    /// connection A is immediately visible to connection B's has_active_run_on_prefix
+    /// (the gc_orphans concurrency signal — the whole reason PG state exists over the
+    /// per-host SQLite file), and a newer run of the same export SUPERSEDES the older
+    /// one CLOCK-FREE. The gate is otherwise single-process; gc_survival only simulates
+    /// a running manifest. Env-gated on RIVET_TEST_STATE_URL; unique names so the shared
+    /// public schema never collides with a sibling test.
+    #[test]
+    fn pg_shared_state_cross_connection_visibility_and_supersession() {
+        let Ok(url) = std::env::var("RIVET_TEST_STATE_URL") else {
+            return;
+        };
+        if !url.starts_with("postgres") {
+            return;
+        }
+        // Two connections = two processes on the same shared Postgres state.
+        unsafe { std::env::set_var("RIVET_STATE_URL", &url) };
+        let a = StateStore::open(":memory:").expect("conn A");
+        let b = StateStore::open(":memory:").expect("conn B");
+        unsafe { std::env::remove_var("RIVET_STATE_URL") };
+
+        let pid = std::process::id();
+        let exp = format!("conc_test_{pid}");
+        let (r1, r2) = (format!("r1_{pid}"), format!("r2_{pid}"));
+        let pa = format!("gs://b/{exp}/runA/");
+        let pb = format!("gs://b/{exp}/runB/");
+
+        // A begins run1; B — a SEPARATE connection — must SEE it active.
+        a.begin_run(&r1, &exp, &pa, "2026-01-01T00:00:01Z").unwrap();
+        assert!(
+            b.has_active_run_on_prefix(&pa).unwrap(),
+            "conn B must see conn A's active run on the shared Postgres state (multi-process gc signal)"
+        );
+
+        // B begins run2 (newer started_at, same export) → supersedes run1 CLOCK-FREE.
+        b.begin_run(&r2, &exp, &pb, "2026-01-01T00:00:02Z").unwrap();
+        assert!(
+            !a.has_active_run_on_prefix(&pa).unwrap(),
+            "run1 is superseded by the newer run2 (by started_at, no age timer) → its prefix is no longer active"
+        );
+        assert!(
+            a.has_active_run_on_prefix(&pb).unwrap(),
+            "run2 (newest, same export) is the active run"
+        );
+
+        // Finishing run2 clears it — a terminal run is never active.
+        b.finish_run(&r2, "success", "2026-01-01T00:00:03Z")
+            .unwrap();
+        assert!(
+            !a.has_active_run_on_prefix(&pb).unwrap(),
+            "a finished run must not count as active"
+        );
+        a.finish_run(&r1, "success", "2026-01-01T00:00:04Z").ok();
+    }
+
     #[test]
     fn begin_marks_active_then_finish_clears_it() {
         let s = StateStore::open_in_memory().unwrap();

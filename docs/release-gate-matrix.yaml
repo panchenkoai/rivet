@@ -99,8 +99,8 @@ infra:
     note: "pg_upgrade_from_v18_lands_keyset_range_as_bigint_and_keeps_data (src/state/mod.rs) — stages a POPULATED v18 Postgres state db, migrates in place to HEAD, asserts keyset_range is BIGINT + the pre-upgrade cursor survives; run by the state_migrations preflight. RED-proven against the int4 v19."
   - id: state_concurrency
     infra: postgres-state
-    status: gap
-    note: "two live rivet processes racing ONE shared Postgres state db (gc_orphans ledger + run_status supersession — the reason PG state exists); the gate is single-process, gc_survival only SIMULATES a running manifest"
+    status: test
+    note: "pg_shared_state_cross_connection_visibility_and_supersession (src/state/run_status_store.rs) — two StateStore connections = two processes on one shared Postgres state: a run begun on A is active-visible to B (the gc_orphans signal), and a newer run supersedes the older clock-free. Run by the state_migrations preflight; RED-proven against a flipped supersession."
   - id: tls_required
     status: gap
     note: "TLS-required connections + cert validation (the vendored-openssl / tiberius handshake class); the gate runs mssql on accept_invalid_certs"

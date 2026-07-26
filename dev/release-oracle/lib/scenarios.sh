@@ -65,8 +65,9 @@ verify_state_migrations() {
      cargo test --manifest-path "$ROOT/Cargo.toml" --test live_suite -- --ignored --test-threads=1 \
        state_parity_ pg_keyset_range_round_trips_and_commits >"$WORK/state_parity.log" 2>&1 \
      && RIVET_TEST_STATE_URL="$st" \
-        cargo test --manifest-path "$ROOT/Cargo.toml" --lib pg_upgrade_from_v18 >>"$WORK/state_parity.log" 2>&1; then
-    ok "state-migration parity: SQLite == Postgres (fresh + in-place upgrade) on every fixture"
+        cargo test --manifest-path "$ROOT/Cargo.toml" --lib -- \
+          pg_upgrade_from_v18 pg_shared_state_cross_connection >>"$WORK/state_parity.log" 2>&1; then
+    ok "state-migration parity: SQLite == Postgres (fresh + upgrade + shared-state concurrency)"
     add state migrations parity - PASS
   else
     bad "state-migration parity FAILED — a schema drift between MIGRATIONS and PG_MIGRATIONS (see $WORK/state_parity.log)"
