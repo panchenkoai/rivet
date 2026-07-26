@@ -109,6 +109,8 @@ mod live_init;
 mod live_init_extended;
 #[path = "live/live_keyset.rs"]
 mod live_keyset;
+#[path = "live/live_keyset_parallel.rs"]
+mod live_keyset_parallel;
 #[path = "live/live_metrics_persist.rs"]
 mod live_metrics_persist;
 #[path = "live/live_mongo.rs"]
