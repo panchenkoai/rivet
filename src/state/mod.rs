@@ -11,6 +11,7 @@ mod keyset_range;
 mod load_journal_store;
 mod metrics;
 mod progression;
+mod row;
 mod run_aggregate;
 mod run_status_store;
 mod schema;

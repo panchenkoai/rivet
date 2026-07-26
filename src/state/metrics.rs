@@ -273,21 +273,17 @@ impl StateStore {
         let now = chrono::Utc::now().to_rfc3339();
         let sql = "INSERT INTO export_harm (run_id, export_name, metric, delta, recorded_at) \
                    VALUES (?1, ?2, ?3, ?4, ?5)";
-        match &self.conn {
-            StateConn::Sqlite(c) => {
-                for (metric, delta) in deltas {
-                    c.execute(
-                        sql,
-                        rusqlite::params![run_id, export_name, metric, delta, now],
-                    )?;
-                }
-            }
-            StateConn::Postgres(client) => {
-                let mut c = client.borrow_mut();
-                for (metric, delta) in deltas {
-                    c.execute(&pg_sql(sql), &[&run_id, &export_name, metric, delta, &now])?;
-                }
-            }
+        for (metric, delta) in deltas {
+            self.execute(
+                sql,
+                &[
+                    run_id.into(),
+                    export_name.into(),
+                    metric.as_str().into(),
+                    (*delta).into(),
+                    now.as_str().into(),
+                ],
+            )?;
         }
         Ok(())
     }
@@ -337,99 +333,41 @@ impl StateStore {
         export_name: Option<&str>,
         limit: usize,
     ) -> Result<Vec<ExportMetric>> {
-        let cols = "export_name, run_id, run_at, duration_ms, total_rows, peak_rss_mb,
-                    status, error_message, tuning_profile, format, mode,
+        // One projection, written once for both backends (was duplicated per arm).
+        let extract = |r: &dyn super::row::StateRow| ExportMetric {
+            export_name: r.text(0),
+            run_id: r.opt_text(1),
+            run_at: r.text(2),
+            duration_ms: r.i64(3),
+            total_rows: r.i64(4),
+            peak_rss_mb: r.opt_i64(5),
+            status: r.text(6),
+            error_message: r.opt_text(7),
+            tuning_profile: r.opt_text(8),
+            format: r.opt_text(9),
+            mode: r.opt_text(10),
+            files_produced: r.opt_i64(11).unwrap_or(0),
+            bytes_written: r.opt_i64(12).unwrap_or(0),
+            retries: r.opt_i64(13).unwrap_or(0),
+            validated: r.opt_bool(14),
+            schema_changed: r.opt_bool(15),
+        };
+        let cols = "export_name, run_id, run_at, duration_ms, total_rows, peak_rss_mb, \
+                    status, error_message, tuning_profile, format, mode, \
                     files_produced, bytes_written, retries, validated, schema_changed";
-
-        let limit_i64 = limit as i64;
-        match &self.conn {
-            StateConn::Sqlite(c) => {
-                let (sql, params): (&str, Vec<Box<dyn rusqlite::types::ToSql>>) = if let Some(
-                    name,
-                ) = export_name
-                {
-                    (
-                        "SELECT export_name, run_id, run_at, duration_ms, total_rows, peak_rss_mb, \
-                             status, error_message, tuning_profile, format, mode, \
-                             files_produced, bytes_written, retries, validated, schema_changed \
-                             FROM export_metrics WHERE export_name = ?1 ORDER BY id DESC LIMIT ?2",
-                        vec![Box::new(name.to_string()), Box::new(limit_i64)],
-                    )
-                } else {
-                    (
-                        "SELECT export_name, run_id, run_at, duration_ms, total_rows, peak_rss_mb, \
-                             status, error_message, tuning_profile, format, mode, \
-                             files_produced, bytes_written, retries, validated, schema_changed \
-                             FROM export_metrics ORDER BY id DESC LIMIT ?1",
-                        vec![Box::new(limit_i64)],
-                    )
-                };
-                let mut stmt = c.prepare(sql)?;
-                let params_refs: Vec<&dyn rusqlite::types::ToSql> =
-                    params.iter().map(|p| p.as_ref()).collect();
-                let rows = stmt.query_map(params_refs.as_slice(), |row| {
-                    Ok(ExportMetric {
-                        export_name: row.get(0)?,
-                        run_id: row.get(1)?,
-                        run_at: row.get(2)?,
-                        duration_ms: row.get(3)?,
-                        total_rows: row.get(4)?,
-                        peak_rss_mb: row.get(5)?,
-                        status: row.get(6)?,
-                        error_message: row.get(7)?,
-                        tuning_profile: row.get(8)?,
-                        format: row.get(9)?,
-                        mode: row.get(10)?,
-                        files_produced: row.get::<_, Option<i64>>(11)?.unwrap_or(0),
-                        bytes_written: row.get::<_, Option<i64>>(12)?.unwrap_or(0),
-                        retries: row.get::<_, Option<i64>>(13)?.unwrap_or(0),
-                        validated: row.get(14)?,
-                        schema_changed: row.get(15)?,
-                    })
-                })?;
-                rows.collect::<std::result::Result<Vec<_>, _>>()
-                    .map_err(Into::into)
-            }
-            StateConn::Postgres(client) => {
-                // Single borrow for the duration of this call; safe because all Postgres
-                // operations in StateStore are sequential (no re-entrant borrows).
-                let mut c = client.borrow_mut();
-                let rows = if let Some(name) = export_name {
-                    c.query(
-                        &format!("SELECT {} FROM export_metrics WHERE export_name = $1 ORDER BY id DESC LIMIT $2", cols),
-                        &[&name, &limit_i64],
-                    )?
-                } else {
-                    c.query(
-                        &format!(
-                            "SELECT {} FROM export_metrics ORDER BY id DESC LIMIT $1",
-                            cols
-                        ),
-                        &[&limit_i64],
-                    )?
-                };
-                Ok(rows
-                    .iter()
-                    .map(|row| ExportMetric {
-                        export_name: row.get(0),
-                        run_id: row.get(1),
-                        run_at: row.get(2),
-                        duration_ms: row.get(3),
-                        total_rows: row.get(4),
-                        peak_rss_mb: row.get(5),
-                        status: row.get(6),
-                        error_message: row.get(7),
-                        tuning_profile: row.get(8),
-                        format: row.get(9),
-                        mode: row.get(10),
-                        files_produced: row.get::<_, Option<i64>>(11).unwrap_or(0),
-                        bytes_written: row.get::<_, Option<i64>>(12).unwrap_or(0),
-                        retries: row.get::<_, Option<i64>>(13).unwrap_or(0),
-                        validated: row.get(14),
-                        schema_changed: row.get(15),
-                    })
-                    .collect())
-            }
+        match export_name {
+            Some(name) => self.query(
+                &format!(
+                    "SELECT {cols} FROM export_metrics WHERE export_name = ?1 ORDER BY id DESC LIMIT ?2"
+                ),
+                &[name.into(), (limit as i64).into()],
+                extract,
+            ),
+            None => self.query(
+                &format!("SELECT {cols} FROM export_metrics ORDER BY id DESC LIMIT ?1"),
+                &[(limit as i64).into()],
+                extract,
+            ),
         }
     }
 }

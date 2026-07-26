@@ -1,6 +1,6 @@
 use crate::error::Result;
 
-use super::{StateConn, StateStore, pg_sql};
+use super::StateStore;
 
 /// One row from `file_log` (formerly `file_manifest`; renamed in schema v8).
 #[derive(Debug, serde::Serialize)]
@@ -37,114 +37,39 @@ impl StateStore {
         format: &str,
         compression: Option<&str>,
     ) -> Result<()> {
-        let now = chrono::Utc::now().to_rfc3339();
-        let sql = "INSERT INTO file_log (run_id, export_name, file_name, row_count, bytes, format, compression, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)";
-        match &self.conn {
-            StateConn::Sqlite(c) => {
-                c.execute(
-                    sql,
-                    rusqlite::params![
-                        run_id,
-                        export_name,
-                        file_name,
-                        row_count,
-                        bytes,
-                        format,
-                        compression,
-                        now
-                    ],
-                )?;
-            }
-            StateConn::Postgres(client) => {
-                let mut c = client.borrow_mut();
-                c.execute(
-                    &pg_sql(sql),
-                    &[
-                        &run_id,
-                        &export_name,
-                        &file_name,
-                        &row_count,
-                        &bytes,
-                        &format,
-                        &compression,
-                        &now,
-                    ],
-                )?;
-            }
-        }
+        self.execute(
+            "INSERT INTO file_log (run_id, export_name, file_name, row_count, bytes, format, compression, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            &[
+                run_id.into(),
+                export_name.into(),
+                file_name.into(),
+                row_count.into(),
+                bytes.into(),
+                format.into(),
+                compression.into(),
+                chrono::Utc::now().to_rfc3339().into(),
+            ],
+        )?;
         Ok(())
     }
 
     pub fn get_files(&self, export_name: Option<&str>, limit: usize) -> Result<Vec<FileRecord>> {
         let cols =
             "run_id, export_name, file_name, row_count, bytes, format, compression, created_at";
-        let limit_i64 = limit as i64;
-        match &self.conn {
-            StateConn::Sqlite(c) => {
-                let (sql, params): (&str, Vec<Box<dyn rusqlite::types::ToSql>>) = if let Some(
-                    name,
-                ) = export_name
-                {
-                    (
-                        "SELECT run_id, export_name, file_name, row_count, bytes, format, compression, created_at \
-                             FROM file_log WHERE export_name = ?1 ORDER BY id DESC LIMIT ?2",
-                        vec![Box::new(name.to_string()), Box::new(limit_i64)],
-                    )
-                } else {
-                    (
-                        "SELECT run_id, export_name, file_name, row_count, bytes, format, compression, created_at \
-                             FROM file_log ORDER BY id DESC LIMIT ?1",
-                        vec![Box::new(limit_i64)],
-                    )
-                };
-                let mut stmt = c.prepare(sql)?;
-                let params_refs: Vec<&dyn rusqlite::types::ToSql> =
-                    params.iter().map(|p| p.as_ref()).collect();
-                let rows = stmt.query_map(params_refs.as_slice(), |row| {
-                    Ok(FileRecord {
-                        run_id: row.get(0)?,
-                        export_name: row.get(1)?,
-                        file_name: row.get(2)?,
-                        row_count: row.get(3)?,
-                        bytes: row.get(4)?,
-                        format: row.get(5)?,
-                        compression: row.get(6)?,
-                        created_at: row.get(7)?,
-                    })
-                })?;
-                rows.collect::<std::result::Result<Vec<_>, _>>()
-                    .map_err(Into::into)
-            }
-            StateConn::Postgres(client) => {
-                // Single borrow for the duration of this call; safe because all Postgres
-                // operations in StateStore are sequential (no re-entrant borrows).
-                let mut c = client.borrow_mut();
-                let rows = if let Some(name) = export_name {
-                    c.query(
-                        &format!("SELECT {} FROM file_log WHERE export_name = $1 ORDER BY id DESC LIMIT $2", cols),
-                        &[&name, &limit_i64],
-                    )?
-                } else {
-                    c.query(
-                        &format!("SELECT {} FROM file_log ORDER BY id DESC LIMIT $1", cols),
-                        &[&limit_i64],
-                    )?
-                };
-                Ok(rows
-                    .iter()
-                    .map(|row| FileRecord {
-                        run_id: row.get(0),
-                        export_name: row.get(1),
-                        file_name: row.get(2),
-                        row_count: row.get(3),
-                        bytes: row.get(4),
-                        format: row.get(5),
-                        compression: row.get(6),
-                        created_at: row.get(7),
-                    })
-                    .collect())
-            }
+        match export_name {
+            Some(name) => self.query(
+                &format!(
+                    "SELECT {cols} FROM file_log WHERE export_name = ?1 ORDER BY id DESC LIMIT ?2"
+                ),
+                &[name.into(), (limit as i64).into()],
+                file_record,
+            ),
+            None => self.query(
+                &format!("SELECT {cols} FROM file_log ORDER BY id DESC LIMIT ?1"),
+                &[(limit as i64).into()],
+                file_record,
+            ),
         }
     }
 
@@ -157,47 +82,25 @@ impl StateStore {
     pub fn list_files_for_run(&self, run_id: &str) -> Result<Vec<FileRecord>> {
         let cols =
             "run_id, export_name, file_name, row_count, bytes, format, compression, created_at";
-        match &self.conn {
-            StateConn::Sqlite(c) => {
-                let mut stmt = c.prepare(&format!(
-                    "SELECT {cols} FROM file_log WHERE run_id = ?1 ORDER BY id ASC"
-                ))?;
-                let rows = stmt.query_map([run_id], |row| {
-                    Ok(FileRecord {
-                        run_id: row.get(0)?,
-                        export_name: row.get(1)?,
-                        file_name: row.get(2)?,
-                        row_count: row.get(3)?,
-                        bytes: row.get(4)?,
-                        format: row.get(5)?,
-                        compression: row.get(6)?,
-                        created_at: row.get(7)?,
-                    })
-                })?;
-                rows.collect::<std::result::Result<Vec<_>, _>>()
-                    .map_err(Into::into)
-            }
-            StateConn::Postgres(client) => {
-                let mut c = client.borrow_mut();
-                let rows = c.query(
-                    &format!("SELECT {cols} FROM file_log WHERE run_id = $1 ORDER BY id ASC"),
-                    &[&run_id],
-                )?;
-                Ok(rows
-                    .iter()
-                    .map(|row| FileRecord {
-                        run_id: row.get(0),
-                        export_name: row.get(1),
-                        file_name: row.get(2),
-                        row_count: row.get(3),
-                        bytes: row.get(4),
-                        format: row.get(5),
-                        compression: row.get(6),
-                        created_at: row.get(7),
-                    })
-                    .collect())
-            }
-        }
+        self.query(
+            &format!("SELECT {cols} FROM file_log WHERE run_id = ?1 ORDER BY id ASC"),
+            &[run_id.into()],
+            file_record,
+        )
+    }
+}
+
+/// The `FileRecord` projection, written once for both backends.
+fn file_record(r: &dyn super::row::StateRow) -> FileRecord {
+    FileRecord {
+        run_id: r.text(0),
+        export_name: r.text(1),
+        file_name: r.text(2),
+        row_count: r.i64(3),
+        bytes: r.i64(4),
+        format: r.text(5),
+        compression: r.opt_text(6),
+        created_at: r.text(7),
     }
 }
 
