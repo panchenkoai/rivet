@@ -174,6 +174,14 @@ impl Rig {
         super::runner::run_rivet_env(&["run", "--config", cfg.to_str().unwrap()], &[(key, val)])
     }
 
+    /// Run with SEVERAL extra environment variables (e.g. RIVET_STATE_URL to pick the
+    /// Postgres state backend AND RIVET_TEST_PANIC_AT to inject a crash in one run);
+    /// returns the raw output — the caller asserts success or failure.
+    pub fn run_with_envs(&self, envs: &[(&str, &str)]) -> std::process::Output {
+        let cfg = self.config_path();
+        super::runner::run_rivet_env(&["run", "--config", cfg.to_str().unwrap()], envs)
+    }
+
     pub fn checkpoint(&self) -> PathBuf {
         self.ckpt_override
             .clone()

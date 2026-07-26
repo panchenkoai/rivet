@@ -575,6 +575,7 @@ pub(crate) fn synthetic_failed_summary(export_name: &str, err: &anyhow::Error) -
         offending_value: None,
         server_context_json: None,
         key_native_type: None,
+        state_backed: false,
         run_id,
         export_name: export_name.to_string(),
         status: "failed".into(),
@@ -634,6 +635,9 @@ fn finalize_keyset_anchor(
 ) {
     if !failed && matches!(plan.strategy, ExtractionStrategy::Keyset(_)) {
         let _ = state.clear_resume_run_id(export_name);
+        // Parallel keyset persists its per-range recovery rows under the same
+        // anchor; clear them too (a no-op for sequential keyset, which writes none).
+        let _ = state.clear_keyset_ranges(export_name);
     }
 }
 

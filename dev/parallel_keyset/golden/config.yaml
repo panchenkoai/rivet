@@ -1,0 +1,18 @@
+# Reference keyset-parallel config for the sparse GOLDEN. `verify.sh` writes a
+# per-engine copy with the right source.url + table; this documents the shape.
+# The golden holds at parallel=4 + chunk_size=500000 → 20 part files for 10M rows.
+source:
+  type: postgres # postgres | mysql | mssql
+  url: "postgresql://rivet:rivet@127.0.0.1:5432/rivet"
+exports:
+  - name: keyset_sparse_golden
+    table: keyset_sparse # keyset_sparse_unsigned for the MySQL unsigned variant
+    mode: chunked
+    chunk_by_key: id # keyset (seek) pagination on the sparse key
+    parallel: 4 # 4 row-percentile-range workers
+    chunk_size: 500000 # first range 2.5M+1 rows → 6 files, others 5 → 21 total
+    format: parquet
+    compression: zstd
+    destination:
+      type: local
+      path: /tmp/keyset_golden_out/

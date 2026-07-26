@@ -51,6 +51,10 @@ pub(super) fn check_from_type_mappings(
                 "export '{}': could not resolve schema for drift check (skipping): {e:#}",
                 plan.export_name
             );
+            // Mark the facade as HAVING RUN (no drift detectable) so the run-level
+            // bypass guard (check_post_run_invariants) distinguishes "gate ran, could
+            // not resolve" from "gate never called" (schema_changed stays None).
+            summary.schema_changed.get_or_insert(false);
             return Ok(());
         }
     };
@@ -59,6 +63,7 @@ pub(super) fn check_from_type_mappings(
         .filter_map(crate::types::build_arrow_field)
         .collect();
     if fields.is_empty() {
+        summary.schema_changed.get_or_insert(false);
         return Ok(());
     }
     let columns = crate::state::arrow_schema_to_columns(&arrow::datatypes::Schema::new(fields));
@@ -144,7 +149,12 @@ fn check_and_persist(
             }
         }
         Ok(None) => summary.schema_changed = Some(false),
-        Err(e) => log::warn!("schema tracking error: {e:#}"),
+        Err(e) => {
+            log::warn!("schema tracking error: {e:#}");
+            // The gate RAN (tracking just failed) — record that so the run-level
+            // bypass guard doesn't read a tracking error as "gate never called".
+            summary.schema_changed.get_or_insert(false);
+        }
     }
     Ok(())
 }

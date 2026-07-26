@@ -81,9 +81,10 @@ pub(super) fn run_exports_as_child_processes(
 
     // `name_floor` (wave-wide max, from the caller) seeds the card table's name
     // column so it aligns from the first redraw and across batches.
+    let n_cards = exports.len();
     let ui_handle = std::thread::Builder::new()
         .name("rivet-ipc-ui".into())
-        .spawn(move || super::parent_ui::run_ui(rx, name_floor))
+        .spawn(move || super::parent_ui::run_ui(rx, name_floor, n_cards))
         .ok();
 
     const CHILD_STDERR_LINE_CAP: usize = 5_000;

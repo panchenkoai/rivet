@@ -151,17 +151,39 @@ const MIN_MODE_COL: usize = 7;
 ///   that repaints all cards in place every 200 ms, so progress / ETA tick
 ///   forward and finished cards swap their progress bar for a final-metrics
 ///   line without scrolling the screen.
-/// - **Linear (stderr is piped/redirected)**: cursor-up sequences would be
-///   no-ops or, worse, line-wrap around long error messages and corrupt the
-///   anchor — so we instead print each card exactly once when it
-///   transitions to its terminal state.
-pub(crate) fn run_ui(rx: Receiver<UiMessage>, name_floor: usize) {
+/// - **Linear (stderr is piped/redirected, OR the card block is taller than
+///   the terminal viewport)**: cursor-up sequences would be no-ops or, worse,
+///   line-wrap around long error messages and corrupt the anchor — so we
+///   instead print each card exactly once when it transitions to its terminal
+///   state. The viewport check ([`should_render_interactive`]) is what keeps a
+///   many-table `apply` from scrolling stale redraw frames into scrollback.
+pub(crate) fn run_ui(rx: Receiver<UiMessage>, name_floor: usize, n_cards: usize) {
     let width = pick_width();
-    if console::Term::stderr().features().is_attended() {
+    let term = console::Term::stderr();
+    // `Term::size()` returns `(rows, cols)` on a tty, `(0, _)` otherwise.
+    let (rows, _) = term.size();
+    if should_render_interactive(term.features().is_attended(), rows as usize, n_cards) {
         run_ui_interactive(rx, width, name_floor);
     } else {
         run_ui_linear(rx, width, name_floor);
     }
+}
+
+/// Lines the in-place renderer needs BESIDES the one-line-per-card block: the
+/// single trailing newline `commit()` writes to push the block into scrollback.
+const RESERVED_LINES: usize = 1;
+
+/// Decide the render mode. The interactive renderer is only safe when stderr is
+/// a tty AND the whole card block fits the viewport. `redraw()` walks the cursor
+/// UP `n_cards` lines (`\x1b[{n}A`) to repaint in place — each card is exactly
+/// one line (`live_lines`), so the block is `n_cards` rows. If the block is
+/// taller than the terminal the cursor cannot reach the true top: old frames
+/// scroll into scrollback and a capture shows the block DUPLICATED (field-
+/// observed on a ~30-table `apply`). When it can't fit, fall back to the append-
+/// only linear renderer, which is capture-safe by construction. `term_rows == 0`
+/// (size unknown / not a tty) is treated as "doesn't fit" → linear.
+fn should_render_interactive(attended: bool, term_rows: usize, n_cards: usize) -> bool {
+    attended && term_rows > n_cards + RESERVED_LINES
 }
 
 /// In-place card-stack renderer for tty stderr.
@@ -709,6 +731,27 @@ mod tests {
     fn final_line_uses_error_message() {
         let s = render_final_line(0, 0, 0, 0, 0, Some("connection reset"));
         assert_eq!(s, "connection reset");
+    }
+
+    #[test]
+    fn interactive_only_when_the_card_block_fits_the_viewport() {
+        // Fits: tall terminal, few cards → in-place redraw is safe.
+        assert!(should_render_interactive(true, 50, 10));
+        // Field bug: a ~30-table `apply` on a short viewport. The block is
+        // taller than the terminal, so the cursor-up redraw scrolls stale
+        // frames into scrollback and a capture shows the block DUPLICATED —
+        // fall back to the append-only linear renderer. RED against the old
+        // `attended`-only gate (which returned interactive here).
+        assert!(!should_render_interactive(true, 24, 30));
+        // Exact boundary: block (10) + the trailing commit line (1) == rows,
+        // so it does NOT fit (need strictly more rows than the block).
+        assert!(!should_render_interactive(true, 11, 10));
+        // One more row clears it.
+        assert!(should_render_interactive(true, 12, 10));
+        // Never interactive when stderr isn't a tty, whatever the reported size.
+        assert!(!should_render_interactive(false, 100, 1));
+        // `Term::size()` returns 0 rows off a tty → treat as "doesn't fit".
+        assert!(!should_render_interactive(true, 0, 1));
     }
 
     #[test]

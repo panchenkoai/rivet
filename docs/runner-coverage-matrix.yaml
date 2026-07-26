@@ -1,12 +1,29 @@
 # Runner-coverage matrix — every PER-EXPORT feature must be applied on EVERY export
-# runner, not just the single-batch path. rivet has FOUR runners, and three of them
-# (chunked, keyset, mongo_parallel) own their own execution loop that RETURNS BEFORE
-# reaching run_single_export — so any gate/feature wired only into single is silently
-# absent on the headline large-table paths. Round-8 proved this class is real AND
-# recurring: `on_schema_drift: fail` returned exit 0 on keyset + parallel-Mongo
-# because the drift gate lived only in single/chunked (two HIGH-adjacent misses in
-# one round). Building this ledger then surfaced a bigger one — value-checksum Form B
-# is absent on ALL three large-table runners.
+# runner, not just the single-batch path. The columns below collapse to FOUR runner
+# FAMILIES, but the code actually has ~EIGHT distinct commit loops: single;
+# chunked_sequential / chunked_parallel / sequential_checkpoint / parallel_checkpoint;
+# keyset_sequential / keyset_parallel (feat/parallel-keyset); mongo_parallel. Each
+# family here stands for its variants — so a feature marked `test` on `keyset` may be
+# proven only on keyset_SEQUENTIAL while keyset_PARALLEL silently lacks it (iteration 1
+# of parallel-keyset shipped exactly that: the drift gate, wired into keyset_sequential,
+# was absent on keyset_parallel; a human caught it, not this ledger — see below).
+#
+# STRUCTURAL BACKSTOP (feat/parallel-keyset, candidate A): two of the recurring
+# scenarios below — `schema_drift_gate` and value-checksum Form B — are now guarded
+# STRUCTURALLY by `RunSummary::check_post_run_invariants` (a debug/test panic in
+# finalize_manifest), independent of this ledger. Each facade leaves a telltale on the
+# summary when it runs (schema_changed = Some(_); column_checksums populated or
+# ..._incomplete set); any `state_backed` success that committed parts with a telltale
+# ABSENT panics in tests — so a drift/Form-B bypass on ANY batch runner (every variant,
+# including keyset_parallel) fails RED regardless of whether it has a cell here. This
+# ledger stays the map for the OTHER per-runner features (part stamp, cursor range,
+# durability ordering) that have no such telltale; splitting the collapsed families into
+# real per-variant columns is a tracked follow-up.
+#
+# Round-8 proved this class is real AND recurring: `on_schema_drift: fail` returned
+# exit 0 on keyset + parallel-Mongo because the drift gate lived only in single/chunked.
+# Building this ledger then surfaced a bigger one — value-checksum Form B was absent on
+# ALL three large-table runners.
 #
 # Columns are the four RUNNERS. A cell is EXACTLY one of:
 #   test: <fn>  — the feature is applied on this runner AND a test proves it.
@@ -63,7 +80,7 @@ scenarios:
     what: "two runs into ONE destination prefix must not clobber — part filenames carry a run-unique token (millisecond %3f stamp or a random nonce), never a second-granularity stamp that collides."
     single:         { test: roast_rapid_incremental_runs_into_same_prefix_must_not_clobber_prior_parts }
     chunked:        { test: chunk_part_filename_is_collision_proof_for_same_chunk }
-    keyset:         { test: mongo_batch_two_rapid_runs_into_same_prefix_do_not_clobber }
+    keyset:         { test: parallel_keyset_two_full_runs_into_same_prefix_no_clobber_postgres }
     mongo_parallel: { test: mongo_parallel_two_rapid_runs_into_same_prefix_do_not_clobber }
 
   - id: durable_manifest_before_advance

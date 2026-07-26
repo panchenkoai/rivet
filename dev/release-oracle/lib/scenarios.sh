@@ -4,12 +4,137 @@
 # applied) and the DuckDB independent oracle — the same discipline the manual
 # dogfood used, now deterministic and repeatable.
 
+# ── keyset_parallel: the feat/parallel-keyset fan-out, end-to-end per engine ──
+# The sequential keyset path is already exercised by integrity_types/load. This
+# scenario proves the PARALLEL variant on the same 150K users table: (1) the same
+# independent DuckDB loss/dup oracle (no row lost or duped across the N ranges),
+# AND (2) the run actually FANNED OUT — parallel:4 must produce >=2 distinct
+# `_pk_w{ridx}_` worker parts, else it silently degraded to sequential and the
+# headline feature never engaged. Mongo's `parallel:N` is the separate _id-range
+# reader (mongo_parallel), not SQL keyset, so it is NA here.
+sc_keyset_parallel() {
+  local eng=$1 tag=$2 url=$3
+  [ "$eng" = mongo ] && { skip "keyset_parallel[mongo]: separate _id-range path (mongo_parallel), not SQL keyset"; add "$eng" "$tag" keyset_parallel - SKIP "mongo na"; return; }
+  local out="$WORK/kp_${eng}_${tag//./_}"   # own line — bash 3.2 same-line ${eng} gotcha
+  mkdir -p "$out"
+  if ! _export_local "$eng" "$url" users "$out/users" chunked parquet 4; then
+    bad "keyset_parallel[$eng]: export failed"; add "$eng" "$tag" keyset_parallel - FAIL "export"; return
+  fi
+  local fails=""
+  # (1) loss/dup — the SAME independent oracle integrity_types uses.
+  local scnt dcnt
+  scnt="$(_source_count_distinct "$eng" "$url" users id)"
+  dcnt="$(duckdb -noheader -list -c "SELECT count(*)||' '||count(DISTINCT id) FROM read_parquet('$out/users/**/*.parquet')" 2>/dev/null)"
+  [ "$scnt" = "$dcnt" ] || fails+="loss/dup src[$scnt]!=parquet[$dcnt] "
+  # (2) fan-out — >=2 distinct pk_w{ridx} workers (find, not ** — bash 3.2 has no globstar).
+  local workers
+  workers="$(find "$out/users" -name '*.parquet' 2>/dev/null | grep -oE '_pk_w[0-9]+_' | sort -u | wc -l | tr -d ' ')"
+  [ "${workers:-0}" -ge 2 ] || fails+="fan-out workers=${workers:-0} (parallel:4 degraded to sequential) "
+  [ -z "$fails" ] && { ok "keyset_parallel (loss/dup 0, fan-out $workers workers)"; add "$eng" "$tag" keyset_parallel - PASS "$workers workers"; } \
+                  || { bad "keyset_parallel: $fails"; add "$eng" "$tag" keyset_parallel - FAIL "$fails"; }
+}
+
+# ── state-migration parity PREFLIGHT (source-agnostic, runs once) ────────────
+# Bug #1 (int4 keyset_range) proved the state layer has TWO migration arrays
+# (MIGRATIONS/SQLite, PG_MIGRATIONS/Postgres) behind a dialect seam that ASSUMES they
+# are type-compatible — and nothing verified it, so a Postgres-only schema drift was
+# invisible to every SQLite unit test. This preflight INITs (migrates) + RUNs the
+# state-exercising golden fixtures on BOTH backends and compares: the RED-proven
+# tests/live/live_state_backend_parity.rs (+ the keyset_range round-trip), driven
+# through the RELEASE binary so the gate blesses what ships. A schema drift makes the
+# Postgres run abort → the parity assert fails → the release is NOT releasable.
+# Needs a Postgres STATE db (RIVET_TEST_STATE_URL) + the source Postgres on :5432 +
+# cargo; SKIP (never a silent pass) when any is absent.
+verify_state_migrations() {
+  local st="${RIVET_TEST_STATE_URL:-}"
+  [ -z "$st" ] && { skip "state-migration parity: no Postgres STATE url (set RIVET_TEST_STATE_URL)"; add state migrations parity - SKIP "no state url"; return; }
+  # The url MUST be postgres — the underlying tests self-skip (return) on any other
+  # scheme, which libtest counts as PASSED. Without this, RIVET_TEST_STATE_URL=sqlite://…
+  # would print a green "SQLite == Postgres" having verified NOTHING (a false-pass gate).
+  case "$st" in postgres*|postgresql*) ;; *) skip "state-migration parity: RIVET_TEST_STATE_URL is not a postgres url"; add state migrations parity - SKIP "non-postgres url"; return;; esac
+  command -v cargo >/dev/null 2>&1 || { skip "state-migration parity: cargo absent"; add state migrations parity - SKIP "no cargo"; return; }
+  # Source Postgres must be reachable (the parity fixtures seed a source table on :5432).
+  if ! (exec 3<>/dev/tcp/127.0.0.1/5432) 2>/dev/null; then
+    skip "state-migration parity: source Postgres :5432 down"; add state migrations parity - SKIP "no source pg"; return
+  fi
+  exec 3>&- 2>/dev/null || true
+  log "State-migration parity (SQLite vs Postgres state, RED-proven, release binary)"
+  # Drive the parity + round-trip live tests against the RELEASE binary + real PG state.
+  # The test binary itself is debug (fast to build); it only orchestrates — the rivet
+  # process it spawns is the RELEASE binary via RIVET_BIN, so the gate blesses what ships.
+  # Parity fixtures on a FRESH db (live_suite) + the in-place UPGRADE path (a lib test
+  # that stages a populated v18 db and migrates it to HEAD — a migration that works
+  # clean but breaks on populated old data slips past the fresh-db parity otherwise).
+  if RIVET_BIN="$RIVET" RIVET_TEST_STATE_URL="$st" \
+     cargo test --manifest-path "$ROOT/Cargo.toml" --test live_suite -- --ignored --test-threads=1 \
+       state_parity_ pg_keyset_range_round_trips_and_commits >"$WORK/state_parity.log" 2>&1 \
+     && RIVET_TEST_STATE_URL="$st" \
+        cargo test --manifest-path "$ROOT/Cargo.toml" --lib -- \
+          pg_upgrade_from_v18 pg_shared_state_cross_connection >>"$WORK/state_parity.log" 2>&1; then
+    ok "state-migration parity: SQLite == Postgres (fresh + upgrade + shared-state concurrency)"
+    add state migrations parity - PASS
+  else
+    bad "state-migration parity FAILED — a schema drift between MIGRATIONS and PG_MIGRATIONS (see $WORK/state_parity.log)"
+    add state migrations parity - FAIL "$(grep -aiE 'must succeed|cannot convert|FAILED' "$WORK/state_parity.log" | head -1)"
+  fi
+}
+
+# ── coverage-ledger drift-guards PREFLIGHT (offline, runs ONCE) ──────────────
+# "Are all the coverage matrices in the gate?" — YES: this runs every
+# docs/*-matrix.yaml drift-guard (chunking/behaviour/type-fidelity/... via
+# chunking_matrix_guard, plus release_gate_matrix_guard + perf_matrix_guard) so the
+# go/no-go gate itself blocks on a rotted/drifted ledger, not just CI. A drifted
+# matrix means the coverage claims a release rests on are stale -> NOT RELEASABLE.
+# SKIP when cargo is absent.
+verify_coverage_matrices() {
+  command -v cargo >/dev/null 2>&1 || { skip "coverage matrices: cargo absent"; add coverage matrices ledger - SKIP "no cargo"; return; }
+  log "Coverage-ledger drift-guards (all docs/*-matrix.yaml)"
+  if cargo test --manifest-path "$ROOT/Cargo.toml" --test offline_suite matrix_guard >"$WORK/matrices.log" 2>&1; then
+    ok "coverage matrices: all ledgers drift-free"
+    add coverage matrices ledger - PASS
+  else
+    bad "coverage matrices: a ledger drifted (see $WORK/matrices.log)"
+    add coverage matrices ledger - FAIL "$(grep -aiE 'FAILED|panicked|assertion' "$WORK/matrices.log" | head -1)"
+  fi
+}
+
+# ── pooler safety PREFLIGHT (session-pin survival through a transaction pooler) ─
+# Prod often runs behind a transaction-mode pooler that hands a DIFFERENT physical
+# connection per statement — where a session pin (SET LOCAL / time_zone / sql_mode /
+# max_execution_time — the exact leg bug #2 lives on) can leak or vanish. The gate
+# otherwise connects DIRECT to every engine, never through a pooler. This drives the
+# RED-proven tests/live/live_pool_safety.rs through pgbouncer (pool_size=1 transaction
+# mode) + proxysql: the pins reset at COMMIT and the connection is clean after a failed
+# export. Needs the `pool` compose profile (pgbouncer :6432 / proxysql :6033); runs
+# whichever pooler is up, SKIP when neither is.
+verify_pooler_safety() {
+  command -v cargo >/dev/null 2>&1 || { skip "pooler safety: cargo absent"; add pooler safety - - SKIP "no cargo"; return; }
+  local pgb=0 pxy=0 filters=""
+  (exec 3<>/dev/tcp/127.0.0.1/6432) 2>/dev/null && { pgb=1; exec 3>&- 2>/dev/null || true; }
+  (exec 3<>/dev/tcp/127.0.0.1/6033) 2>/dev/null && { pxy=1; exec 3>&- 2>/dev/null || true; }
+  [ $pgb = 1 ] && filters="$filters pg_statement_timeout_not_leaked_after_successful_export pg_connection_usable_and_clean_after_failed_export"
+  [ $pxy = 1 ] && filters="$filters mysql_proxysql_session_vars_clean_after_successful_export mysql_proxysql_session_vars_clean_after_failed_export mysql_proxysql_connection_classified_as_proxysql"
+  if [ -z "$filters" ]; then
+    skip "pooler safety: no pgbouncer :6432 / proxysql :6033 (docker compose --profile pool up -d)"; add pooler safety - - SKIP "no poolers"; return
+  fi
+  log "Pooler safety (session-pin survival + connection hygiene through pgbouncer/proxysql)"
+  # shellcheck disable=SC2086
+  if RIVET_BIN="$RIVET" cargo test --manifest-path "$ROOT/Cargo.toml" --test live_suite -- --ignored --test-threads=1 $filters >"$WORK/pooler.log" 2>&1; then
+    ok "pooler safety: session pins reset + connections clean through the pooler ($([ $pgb = 1 ] && printf pgbouncer) $([ $pxy = 1 ] && printf proxysql))"
+    add pooler safety - - PASS
+  else
+    bad "pooler safety FAILED — a session pin leaked or a connection was left dirty through the pooler (see $WORK/pooler.log)"
+    add pooler safety - - FAIL "$(grep -aiE 'FAILED|leaked|assert' "$WORK/pooler.log" | head -1)"
+  fi
+}
+
 run_scenarios() {
   local eng=$1 tag=$2 url=$3
   sc_verdicts "$eng" "$tag" "$url"
   sc_integrity_types "$eng" "$tag" "$url"
   # blessing the local goldens (verdicts + duckdb-type) — skip the store loads.
   { [ "${BLESS_VERDICTS:-0}" = 1 ] || [ "${BLESS_DUCKDB:-0}" = 1 ]; } && return
+  sc_keyset_parallel "$eng" "$tag" "$url"
   for store in $(cfg stores); do
     sc_load "$eng" "$tag" "$url" "$store"
   done
@@ -212,11 +337,16 @@ _hostport() { docker ps --format '{{.Names}} {{.Ports}}' | grep "rivet-oracle-en
 
 # export one table to a LOCAL dir. mode: chunked|full. fmt: parquet|csv (default parquet).
 _export_local() {
-  local eng=$1 url=$2 tbl=$3 dir=$4 mode=$5 fmt=${6:-parquet}
+  local eng=$1 url=$2 tbl=$3 dir=$4 mode=$5 fmt=${6:-parquet} parallel=${7:-}
   local yaml="$WORK/ex_$$_${tbl//./_}_${fmt}.yaml"   # own line — bash 3.2 same-line ${tbl} gotcha
   rm -rf "$dir"; export ORACLE_URL="$url"
   [ "$eng" = mongo ] && mode=full   # Mongo has no keyset/chunked — full scan only
-  local keyline="    mode: full"; [ "$mode" = chunked ] && keyline=$'    mode: chunked\n    chunk_by_key: id\n    chunk_size: 50000'
+  local keyline="    mode: full"
+  if [ "$mode" = chunked ]; then
+    keyline=$'    mode: chunked\n    chunk_by_key: id\n    chunk_size: 50000'
+    # parallel: N fans keyset into N ROW-percentile ranges (feat/parallel-keyset).
+    [ -n "$parallel" ] && keyline+=$'\n    parallel: '"$parallel"
+  fi
   local tlsblk=""; [ "$eng" = mssql ] && tlsblk=$'\n  tls: {accept_invalid_certs: true}'
   cat > "$yaml" <<YAML
 source:

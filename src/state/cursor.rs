@@ -1,7 +1,7 @@
 use crate::error::Result;
 use crate::types::CursorState;
 
-use super::{StateConn, StateStore, pg_sql};
+use super::StateStore;
 
 /// Incremental cursor store — reads and writes `export_state`.
 ///
@@ -10,47 +10,21 @@ use super::{StateConn, StateStore, pg_sql};
 /// the ordering of cursor updates relative to destination writes.
 impl StateStore {
     pub fn get(&self, export_name: &str) -> Result<CursorState> {
-        match &self.conn {
-            StateConn::Sqlite(c) => {
-                let mut stmt = c.prepare(
-                    "SELECT last_cursor_value, last_run_at FROM export_state WHERE export_name = ?1",
-                )?;
-                let result = stmt.query_row([export_name], |row| {
-                    Ok(CursorState {
-                        export_name: export_name.to_string(),
-                        last_cursor_value: row.get(0)?,
-                        last_run_at: row.get(1)?,
-                    })
-                });
-                match result {
-                    Ok(state) => Ok(state),
-                    Err(rusqlite::Error::QueryReturnedNoRows) => Ok(CursorState {
-                        export_name: export_name.to_string(),
-                        last_cursor_value: None,
-                        last_run_at: None,
-                    }),
-                    Err(e) => Err(e.into()),
-                }
-            }
-            StateConn::Postgres(client) => {
-                let mut c = client.borrow_mut();
-                match c.query_opt(
-                    "SELECT last_cursor_value, last_run_at FROM export_state WHERE export_name = $1",
-                    &[&export_name],
-                )? {
-                    Some(row) => Ok(CursorState {
-                        export_name: export_name.to_string(),
-                        last_cursor_value: row.get(0),
-                        last_run_at: row.get(1),
-                    }),
-                    None => Ok(CursorState {
-                        export_name: export_name.to_string(),
-                        last_cursor_value: None,
-                        last_run_at: None,
-                    }),
-                }
-            }
-        }
+        Ok(self
+            .query_opt(
+                "SELECT last_cursor_value, last_run_at FROM export_state WHERE export_name = ?1",
+                &[export_name.into()],
+                |r| CursorState {
+                    export_name: export_name.to_string(),
+                    last_cursor_value: r.opt_text(0),
+                    last_run_at: r.opt_text(1),
+                },
+            )?
+            .unwrap_or_else(|| CursorState {
+                export_name: export_name.to_string(),
+                last_cursor_value: None,
+                last_run_at: None,
+            }))
     }
 
     pub fn update(&self, export_name: &str, cursor_value: &str) -> Result<()> {
@@ -60,15 +34,7 @@ impl StateStore {
              ON CONFLICT(export_name) DO UPDATE SET
                 last_cursor_value = excluded.last_cursor_value,
                 last_run_at = excluded.last_run_at";
-        match &self.conn {
-            StateConn::Sqlite(c) => {
-                c.execute(sql, rusqlite::params![export_name, cursor_value, now])?;
-            }
-            StateConn::Postgres(client) => {
-                let mut c = client.borrow_mut();
-                c.execute(&pg_sql(sql), &[&export_name, &cursor_value, &now])?;
-            }
-        }
+        self.execute(sql, &[export_name.into(), cursor_value.into(), now.into()])?;
         Ok(())
     }
 
@@ -81,47 +47,24 @@ impl StateStore {
         let sql = "INSERT INTO export_state (export_name, resume_run_id, last_run_at)
              VALUES (?1, ?2, ?3)
              ON CONFLICT(export_name) DO UPDATE SET resume_run_id = excluded.resume_run_id";
-        match &self.conn {
-            StateConn::Sqlite(c) => {
-                c.execute(sql, rusqlite::params![export_name, run_id, now])?;
-            }
-            StateConn::Postgres(client) => {
-                let mut c = client.borrow_mut();
-                c.execute(&pg_sql(sql), &[&export_name, &run_id, &now])?;
-            }
-        }
+        self.execute(sql, &[export_name.into(), run_id.into(), now.into()])?;
         Ok(())
     }
 
     /// The persisted in-progress keyset run_id, or None when no run is in progress.
     pub fn get_resume_run_id(&self, export_name: &str) -> Result<Option<String>> {
         let sql = "SELECT resume_run_id FROM export_state WHERE export_name = ?1";
-        match &self.conn {
-            StateConn::Sqlite(c) => {
-                let mut stmt = c.prepare(sql)?;
-                let mut rows = stmt.query_map([export_name], |r| r.get::<_, Option<String>>(0))?;
-                Ok(rows.next().transpose()?.flatten())
-            }
-            StateConn::Postgres(client) => {
-                let mut c = client.borrow_mut();
-                let rows = c.query(&pg_sql(sql), &[&export_name])?;
-                Ok(rows.first().and_then(|r| r.get::<_, Option<String>>(0)))
-            }
-        }
+        Ok(self
+            .query_opt(sql, &[export_name.into()], |r| r.opt_text(0))?
+            .flatten())
     }
 
     /// Clear the in-progress run_id once a keyset run has finalized its manifest.
     pub fn clear_resume_run_id(&self, export_name: &str) -> Result<()> {
-        let sql = "UPDATE export_state SET resume_run_id = NULL WHERE export_name = ?1";
-        match &self.conn {
-            StateConn::Sqlite(c) => {
-                c.execute(sql, [export_name])?;
-            }
-            StateConn::Postgres(client) => {
-                let mut c = client.borrow_mut();
-                c.execute(&pg_sql(sql), &[&export_name])?;
-            }
-        }
+        self.execute(
+            "UPDATE export_state SET resume_run_id = NULL WHERE export_name = ?1",
+            &[export_name.into()],
+        )?;
         Ok(())
     }
 
@@ -138,16 +81,10 @@ impl StateStore {
     /// Incremental keyset deliberately does NOT clear it — continuing from the
     /// prior high-water mark is the whole point of `keyset_incremental`.
     pub fn clear_cursor_value(&self, export_name: &str) -> Result<()> {
-        let sql = "UPDATE export_state SET last_cursor_value = NULL WHERE export_name = ?1";
-        match &self.conn {
-            StateConn::Sqlite(c) => {
-                c.execute(sql, [export_name])?;
-            }
-            StateConn::Postgres(client) => {
-                let mut c = client.borrow_mut();
-                c.execute(&pg_sql(sql), &[&export_name])?;
-            }
-        }
+        self.execute(
+            "UPDATE export_state SET last_cursor_value = NULL WHERE export_name = ?1",
+            &[export_name.into()],
+        )?;
         Ok(())
     }
 
@@ -158,48 +95,24 @@ impl StateStore {
     /// progression row would make `rivet state progression` report a stale
     /// committed boundary after `state show` is already empty.
     pub fn reset(&self, export_name: &str) -> Result<()> {
-        let sql = "DELETE FROM export_state WHERE export_name = ?1";
-        match &self.conn {
-            StateConn::Sqlite(c) => {
-                c.execute(sql, [export_name])?;
-            }
-            StateConn::Postgres(client) => {
-                let mut c = client.borrow_mut();
-                c.execute(&pg_sql(sql), &[&export_name])?;
-            }
-        }
+        self.execute(
+            "DELETE FROM export_state WHERE export_name = ?1",
+            &[export_name.into()],
+        )?;
         self.delete_progression(export_name)?;
         Ok(())
     }
 
     pub fn list_all(&self) -> Result<Vec<CursorState>> {
-        let sql = "SELECT export_name, last_cursor_value, last_run_at FROM export_state ORDER BY export_name";
-        match &self.conn {
-            StateConn::Sqlite(c) => {
-                let mut stmt = c.prepare(sql)?;
-                let rows = stmt.query_map([], |row| {
-                    Ok(CursorState {
-                        export_name: row.get(0)?,
-                        last_cursor_value: row.get(1)?,
-                        last_run_at: row.get(2)?,
-                    })
-                })?;
-                rows.collect::<std::result::Result<Vec<_>, _>>()
-                    .map_err(Into::into)
-            }
-            StateConn::Postgres(client) => {
-                let mut c = client.borrow_mut();
-                let rows = c.query(sql, &[])?;
-                Ok(rows
-                    .iter()
-                    .map(|row| CursorState {
-                        export_name: row.get(0),
-                        last_cursor_value: row.get(1),
-                        last_run_at: row.get(2),
-                    })
-                    .collect())
-            }
-        }
+        self.query(
+            "SELECT export_name, last_cursor_value, last_run_at FROM export_state ORDER BY export_name",
+            &[],
+            |r| CursorState {
+                export_name: r.text(0),
+                last_cursor_value: r.opt_text(1),
+                last_run_at: r.opt_text(2),
+            },
+        )
     }
 }
 

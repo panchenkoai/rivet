@@ -480,6 +480,369 @@ fn keyset_varchar_pk_roundtrips_full_keyset_across_pages() {
     );
 }
 
+/// PARALLEL keyset (feat/parallel-keyset, iteration 1): `parallel: N` fans N
+/// ROW-percentile-range workers, each keyset-paging a disjoint `(lo, hi]` slice
+/// concurrently. The union of every worker's pages must reproduce the source key
+/// set EXACTLY — parity is STRUCTURAL (the N−1 boundaries partition the key into
+/// half-open intervals whose union is the whole key space), so it holds no matter
+/// how skewed the sample is.
+///
+/// Two assertions, and the FIRST is the self-oracle that makes the second mean
+/// something: a plain SEQUENTIAL keyset run passes the union check too, so the
+/// test would be vacuous without proving parallel actually ran. The `pk_w{id}`
+/// part-name stamp (only the parallel runner emits it) IS that proof — assert it
+/// before the union, so a silent fall-back to sequential fails here, not slips by.
+///
+/// RED proof (run before committing): mutate the boundary in
+/// `build_keyset_query_bounded` from `AND key <= upper` to `AND key < upper` —
+/// each of the N−1 boundary keys then falls in NO worker's half-open range (its
+/// owning worker excludes it as `< hi`, the next excludes it as `> lo`), so the
+/// count drops from 3000 to 2997 and the distinct-set names the 3 dropped keys.
+/// A VARCHAR PK is deliberate: it exercises the string-literal boundary escaping
+/// (`escape_mysql_literal`, quotes) the integer path never hits.
+#[test]
+#[ignore = "live: requires docker compose up -d mysql"]
+fn keyset_parallel_reads_every_row_once_across_workers() {
+    require_alive(LiveService::Mysql);
+
+    const N: usize = 3000;
+    let table = unique_name("keyset_par");
+    let _guard = DropTable(table.clone());
+
+    let mut conn = mysql_connect();
+    conn.query_drop(format!("DROP TABLE IF EXISTS {table}"))
+        .unwrap();
+    conn.query_drop(format!(
+        "CREATE TABLE {table} (uid VARCHAR(40) NOT NULL PRIMARY KEY, payload INT NOT NULL)"
+    ))
+    .unwrap();
+    conn.query_drop("SET SESSION cte_max_recursion_depth = 20000")
+        .unwrap();
+    conn.query_drop(format!(
+        "INSERT INTO {table} (uid, payload) \
+         WITH RECURSIVE seq AS (SELECT 1 n UNION ALL SELECT n+1 FROM seq WHERE n < {N}) \
+         SELECT CONCAT('id-', LPAD(n, 6, '0')), n FROM seq"
+    ))
+    .unwrap();
+
+    // Auto-keyset on the VARCHAR PK + `parallel: 4`. chunk_size 500 → each ~750-row
+    // worker still pages twice, so BOTH the inter-worker boundary and the
+    // intra-worker `WHERE uid > last` boundary are exercised in one run.
+    let export = unique_name("keyset_par_exp");
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let out_dir = tempfile::tempdir().unwrap();
+    let yaml = format!(
+        "source:\n  type: mysql\n  url: \"{MYSQL_URL}\"\nexports:\n  - name: {export}\n    \
+         table: {table}\n    mode: chunked\n    parallel: 4\n    chunk_size: 500\n    \
+         format: parquet\n    compression: zstd\n    destination:\n      type: local\n      path: {out}\n",
+        out = out_dir.path().display(),
+    );
+    let cfg = write_config(&cfg_dir, &yaml);
+    let out = run_rivet_export(&cfg, &export);
+    assert!(
+        out.status.success(),
+        "parallel keyset export must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // (1) SELF-ORACLE: the parallel runner is the only path that stamps `pk_w{id}`
+    // into part names. Assert it ran — else the union check below is satisfied by a
+    // silent sequential fall-back and proves nothing about parallelism.
+    let parts = files_with_extension(out_dir.path(), "parquet");
+    let parallel_parts = parts
+        .iter()
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.contains("_pk_w"))
+        })
+        .count();
+    assert!(
+        parallel_parts >= 2,
+        "expected the parallel runner's `pk_w{{id}}` parts (≥2 workers); got files: {:?}",
+        parts
+            .iter()
+            .filter_map(|p| p.file_name().and_then(|n| n.to_str()))
+            .collect::<Vec<_>>()
+    );
+
+    // (2) STRUCTURAL PARITY: the union of every worker's pages is the whole key set,
+    // no row dropped at a boundary (RED at `< hi`: 2997/3000) or duplicated across
+    // two workers' overlapping ranges (would inflate count past N).
+    let (count, keys) = read_uid_set(out_dir.path());
+    let expected: BTreeSet<String> = (1..=N).map(|n| format!("id-{n:06}")).collect();
+    assert_eq!(
+        count, N,
+        "row count must round-trip exactly across all workers (no boundary drop/dupe)"
+    );
+    assert_eq!(
+        keys, expected,
+        "the union of all parallel workers' keys must equal the source key set"
+    );
+}
+
+/// PARALLEL keyset on a PostgreSQL native `uuid` PK — the canonical
+/// `id UUID PRIMARY KEY` shape. The boundary probe (`query_scalar`) must READ the
+/// uuid to sample percentiles; without the uuid arm (M2) it returns None, the
+/// sampler gets zero boundaries, and `parallel: N` silently COLLAPSES to a single
+/// worker (data complete, but the fan-out absent). Asserts the run fanned out to
+/// ≥2 `pk_w{id}` workers AND round-trips every uuid — RED before the query_scalar
+/// uuid arm (1 worker → 1 part-family).
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn keyset_parallel_pg_uuid_key_fans_out_not_collapses() {
+    require_alive(LiveService::Postgres);
+    const N: usize = 4000;
+    let table = unique_name("pg_par_uuid");
+    struct PgDropTable(String);
+    impl Drop for PgDropTable {
+        fn drop(&mut self) {
+            if let Ok(mut c) = postgres::Client::connect(POSTGRES_URL, postgres::NoTls) {
+                let _ = c.execute(&format!("DROP TABLE IF EXISTS {}", self.0), &[]);
+            }
+        }
+    }
+    let _guard = PgDropTable(table.clone());
+    let mut c = pg_connect();
+    c.batch_execute(&format!(
+        "CREATE TABLE {table} (id UUID PRIMARY KEY, payload INT NOT NULL);
+         INSERT INTO {table} (id, payload)
+         SELECT ('00000000-0000-0000-0000-' || lpad(to_hex(g), 12, '0'))::uuid, g
+         FROM generate_series(1, {N}) g;"
+    ))
+    .unwrap();
+
+    let export = unique_name("pg_par_uuid_exp");
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let out_dir = tempfile::tempdir().unwrap();
+    let yaml = format!(
+        "source: {{type: postgres, url: \"{POSTGRES_URL}\"}}\nexports:\n  - name: {export}\n    \
+         table: public.{table}\n    mode: chunked\n    chunk_by_key: id\n    parallel: 4\n    \
+         chunk_size: 500\n    format: parquet\n    destination: {{type: local, path: {out}}}\n",
+        out = out_dir.path().display(),
+    );
+    let cfg = write_config(&cfg_dir, &yaml);
+    let r = run_rivet_export(&cfg, &export);
+    assert!(
+        r.status.success(),
+        "PG uuid parallel keyset must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+
+    // Fan-out proof: ≥2 distinct pk_w{id} workers (a collapse = only pk_w0).
+    let workers: BTreeSet<String> = files_with_extension(out_dir.path(), "parquet")
+        .iter()
+        .filter_map(|p| p.file_name().and_then(|n| n.to_str()).map(String::from))
+        .filter_map(|n| {
+            n.split("_pk_w")
+                .nth(1)
+                .and_then(|s| s.split('_').next())
+                .map(|w| w.to_string())
+        })
+        .collect();
+    assert!(
+        workers.len() >= 2,
+        "PG uuid parallel keyset must fan out to ≥2 workers, got workers {workers:?} — the \
+         boundary probe collapsed to a single worker (query_scalar uuid arm missing)"
+    );
+
+    // Completeness: every uuid round-trips (PG's first-party parallel completeness
+    // check — the gap the bughunt flagged as absent).
+    let (count, keys) = read_uuid_set_fixed(out_dir.path(), "id");
+    let expected: BTreeSet<String> = (1..=N)
+        .map(|n| format!("00000000-0000-0000-0000-{n:012x}"))
+        .collect();
+    assert_eq!(count, N, "row count must round-trip exactly");
+    assert_eq!(keys, expected, "the uuid set must equal the source");
+}
+
+/// PARALLEL keyset CRASH-RECOVERY (feat/parallel-keyset iteration 2). A parallel
+/// run with `chunk_checkpoint: true` that crashes AFTER one range commits (its
+/// parts durable in file_log, its `keyset_range` row `done=1`) but before finalize
+/// must, on resume, produce a COMPLETE destination manifest: the done range's parts
+/// are REHYDRATED from file_log (not re-read — it is skipped), the crashed ranges
+/// are re-run from their `lo` (their run_id-named partial parts overwritten), and
+/// the union is every row exactly once.
+///
+/// Discriminator = the DESTINATION manifest's `row_count` (not a parquet glob — the
+/// committed parquet survives on disk regardless, so a re-read cannot see an
+/// orphaned-from-the-manifest part). RED against removing the resume rehydrate in
+/// `run_keyset_parallel`: the done range's pre-crash parts are then absent from the
+/// manifest (row_count < N) — the manifest-authoritative loader would silently drop
+/// them. That the mutant goes RED is ALSO the proof the done range was SKIPPED, not
+/// re-read: if it were re-read from source, rehydrate would be immaterial.
+#[test]
+#[ignore = "live: requires docker compose up -d mysql"]
+fn keyset_parallel_crash_resume_writes_a_complete_destination_manifest() {
+    require_alive(LiveService::Mysql);
+    let table = unique_name("keyset_par_crash");
+    let _guard = DropTable(table.clone());
+    let mut conn = mysql_connect();
+    conn.query_drop(format!("DROP TABLE IF EXISTS {table}"))
+        .unwrap();
+    conn.query_drop(format!(
+        "CREATE TABLE {table} (uid VARCHAR(40) NOT NULL PRIMARY KEY, payload INT NOT NULL)"
+    ))
+    .unwrap();
+    conn.query_drop("SET SESSION cte_max_recursion_depth = 20000")
+        .unwrap();
+    conn.query_drop(format!(
+        "INSERT INTO {table} (uid, payload) \
+         WITH RECURSIVE seq AS (SELECT 1 n UNION ALL SELECT n+1 FROM seq WHERE n < 2000) \
+         SELECT CONCAT('id-', LPAD(n, 6, '0')), n FROM seq"
+    ))
+    .unwrap();
+
+    // parallel: 4 + chunk_checkpoint → per-range crash-recovery. Small chunk_size so
+    // each ~500-row range pages several times (a crash mid-range is mid-page-set).
+    let export = unique_name("keyset_par_crash_exp");
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let out_dir = tempfile::tempdir().unwrap();
+    let yaml = format!(
+        "source:\n  type: mysql\n  url: \"{MYSQL_URL}\"\nexports:\n  - name: {export}\n    \
+         table: {table}\n    mode: chunked\n    chunk_by_key: uid\n    parallel: 4\n    \
+         chunk_checkpoint: true\n    chunk_size: 200\n    format: parquet\n    \
+         destination:\n      type: local\n      path: {out}\n",
+        out = out_dir.path().display(),
+    );
+    let cfg = write_config(&cfg_dir, &yaml);
+
+    // Run 1: HARD-EXIT (process dies) right after range 0's atomic checkpoint commit
+    // — range 0 is durably `done`, ranges 1-3 wrote parts to disk but never committed.
+    let crash = std::process::Command::new(RIVET_BIN)
+        .args([
+            "run",
+            "--config",
+            cfg.to_str().unwrap(),
+            "--export",
+            &export,
+        ])
+        .env("RIVET_TEST_PANIC_AT", "keyset_parallel_range_committed:0")
+        .output()
+        .expect("spawn rivet");
+    assert!(
+        !crash.status.success(),
+        "the injected hard-exit must make run 1 fail"
+    );
+
+    // Resume: skips the done range (rehydrates it), re-runs the rest.
+    let resume = run_rivet_export(&cfg, &export);
+    assert!(
+        resume.status.success(),
+        "resume must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&resume.stderr)
+    );
+
+    // MANIFEST-DRIVEN completeness: the destination manifest must declare ALL 2000
+    // rows — the pre-crash done range must be rehydrated, not orphaned.
+    let m: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(out_dir.path().join("manifest.json")).unwrap())
+            .expect("destination manifest.json must exist + parse");
+    assert_eq!(
+        m["row_count"].as_i64(),
+        Some(2000),
+        "destination manifest must declare every row (done range not orphaned); got {}",
+        m["row_count"]
+    );
+
+    // And the physical union is complete with no duplicate keys (the crashed
+    // ranges' partial parts were overwritten by the re-run, not accumulated).
+    let (count, keys) = read_uid_set(out_dir.path());
+    let expected: BTreeSet<String> = (1..=2000).map(|n| format!("id-{n:06}")).collect();
+    assert_eq!(
+        count, 2000,
+        "parquet union must hold every row exactly once"
+    );
+    assert_eq!(
+        keys, expected,
+        "the union must equal the full source key set"
+    );
+}
+
+/// PARALLEL keyset INCREMENTAL (feat/parallel-keyset iteration 3). A parallel run
+/// with `keyset_incremental` seeks past the persisted anchor and ADVANCES it at
+/// success; a CLEAN re-run pulls only keys past the high-water mark, across N
+/// workers (each range floored at the anchor, the last ceiling'd at the source max
+/// pinned at open). Discriminator = the TOTAL row count across all part files (a
+/// set dedups, so the union of keys can't tell a re-read from an incremental
+/// resume): 1000 → 1000 → 1500, never 2000 / 2500 (a full re-read). RED against
+/// the anchor not advancing (planner disabling it, or the runner not updating it):
+/// run 2 would re-read all 1000 → total 2000.
+#[test]
+#[ignore = "live: requires docker compose up -d mysql"]
+fn keyset_parallel_incremental_second_run_captures_only_new_keys() {
+    require_alive(LiveService::Mysql);
+    let table = unique_name("keyset_par_inc");
+    let _guard = DropTable(table.clone());
+    let mut conn = mysql_connect();
+    conn.query_drop(format!("DROP TABLE IF EXISTS {table}"))
+        .unwrap();
+    conn.query_drop(format!(
+        "CREATE TABLE {table} (uid VARCHAR(40) NOT NULL PRIMARY KEY, payload INT NOT NULL)"
+    ))
+    .unwrap();
+    conn.query_drop("SET SESSION cte_max_recursion_depth = 20000")
+        .unwrap();
+    let seed = |conn: &mut mysql::PooledConn, lo: usize, hi: usize| {
+        conn.query_drop(format!(
+            "INSERT INTO {table} (uid, payload) \
+             WITH RECURSIVE seq AS (SELECT {lo} n UNION ALL SELECT n+1 FROM seq WHERE n < {hi}) \
+             SELECT CONCAT('id-', LPAD(n, 6, '0')), n FROM seq"
+        ))
+        .unwrap();
+    };
+    seed(&mut conn, 1, 1000);
+
+    let export = unique_name("keyset_par_inc_exp");
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let out_dir = tempfile::tempdir().unwrap();
+    let yaml = format!(
+        "source:\n  type: mysql\n  url: \"{MYSQL_URL}\"\nexports:\n  - name: {export}\n    \
+         table: {table}\n    mode: chunked\n    chunk_by_key: uid\n    parallel: 4\n    \
+         chunk_checkpoint: true\n    keyset_incremental: true\n    chunk_size: 200\n    \
+         format: parquet\n    destination:\n      type: local\n      path: {out}\n",
+        out = out_dir.path().display(),
+    );
+    let cfg = write_config(&cfg_dir, &yaml);
+    let run = |label: &str| {
+        let out = run_rivet_export(&cfg, &export);
+        assert!(
+            out.status.success(),
+            "{label} failed; stderr:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+
+    // Run 1: all 1000, anchor persisted at the max key (id-001000).
+    run("run 1");
+    let (count1, _) = read_uid_set(out_dir.path());
+    assert_eq!(count1, 1000, "run 1 must export all seeded rows");
+
+    // Run 2 on the UNCHANGED source: anchor floor = id-001000 → ZERO new rows; the
+    // total across files stays 1000 (a re-read would double it to 2000).
+    run("run 2 (unchanged)");
+    let (count2, _) = read_uid_set(out_dir.path());
+    assert_eq!(
+        count2, 1000,
+        "unchanged incremental re-run must add zero rows (got {count2}) — 2000 = a full re-read"
+    );
+
+    // Insert 500 rows with HIGHER keys, resume: only those 500 are read across the
+    // N workers.
+    seed(&mut conn, 1001, 1500);
+    run("run 3 (after insert)");
+    let (count3, keys3) = read_uid_set(out_dir.path());
+    assert_eq!(
+        count3, 1500,
+        "incremental must add ONLY the 500 new keys (got {count3}); 2500 = a full re-read"
+    );
+    let expected: BTreeSet<String> = (1..=1500).map(|n| format!("id-{n:06}")).collect();
+    assert_eq!(
+        keys3, expected,
+        "the union of all runs must equal the full source key set"
+    );
+}
+
 /// Two-run keyset RESUME (`chunk_checkpoint: true` — OPT-4 + Phase 2). Run 1
 /// exports the whole key set and persists the high-water key; an UNCHANGED
 /// re-run exports ZERO new rows; after inserting rows with higher keys, the next

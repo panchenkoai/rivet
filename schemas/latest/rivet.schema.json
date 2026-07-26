@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "Rivet config (rivet-cli 0.22.0)",
+  "title": "Rivet config (rivet-cli 0.23.0)",
   "description": "Top-level Rivet configuration root.\n\nOperators write this struct as YAML (typically `rivet.yaml`).  The\n`JsonSchema` derive is the source of truth for the `schemas/rivet.schema.json`\nartifact and the `rivet schema config` command's output (v0.7.3 P0).",
   "type": "object",
   "properties": {
@@ -593,6 +593,7 @@
           ]
         },
         "parallel": {
+          "description": "Concurrent chunk/page workers (default 1). On a RANGE chunk (`chunk_column`)\nor KEYSET (`chunk_by_key`) export, `parallel: N` fans the table into N\nROW-percentile ranges that seek concurrently over separate connections — the\nhalf-open intervals partition the key, so the union reads every row exactly\nonce (structural parity, all engines). Extraction is I/O-bound, so the win\nplateaus early (~3x at N=4, little beyond). SWEET SPOT: indexed tables up to\n~10M rows at `parallel: 4`. `rivet init` scaffolds a row-scaled value\n(<=500K -> 1, <5M -> 2, >=5M -> 4); a preflight warns past ~5M rows (peak RSS\n~= N x chunk_size). Beyond ~10M the KEYSET boundary sampler (an index OFFSET\nskip) grows costly at setup — prefer a range `chunk_column` there.",
           "type": "integer",
           "format": "uint",
           "minimum": 0,

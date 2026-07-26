@@ -32,10 +32,14 @@ mod examples_parse;
 mod extension_seam;
 #[path = "offline/format_fuzz.rs"]
 mod format_fuzz;
+#[path = "offline/perf_matrix_guard.rs"]
+mod perf_matrix_guard;
 #[path = "offline/planner_fuzz.rs"]
 mod planner_fuzz;
 #[path = "offline/redaction_invariant.rs"]
 mod redaction_invariant;
+#[path = "offline/release_gate_matrix_guard.rs"]
+mod release_gate_matrix_guard;
 #[path = "offline/resource_smoke.rs"]
 mod resource_smoke;
 #[path = "offline/retry_integration.rs"]

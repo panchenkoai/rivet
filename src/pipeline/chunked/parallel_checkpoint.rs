@@ -47,6 +47,9 @@ pub(crate) fn run_chunked_parallel_checkpoint(
     summary: &mut RunSummary,
     chunk_source: ChunkSource,
 ) -> Result<()> {
+    // Subject to the per-runner facade contract (ADR-0018) — dispatched directly
+    // from job.rs (bypassing run_export), so it sets the flag itself.
+    summary.state_backed = true;
     let cp = chunked_plan(plan);
 
     let chunks = if plan.resume {

@@ -10,7 +10,7 @@ use std::collections::HashMap;
 
 use crate::error::Result;
 
-use super::{StateConn, StateStore, pg_sql};
+use super::StateStore;
 
 /// One column whose observed max byte length grew beyond the configured threshold.
 pub struct ShapeWarning {
@@ -24,32 +24,14 @@ pub struct ShapeWarning {
 impl StateStore {
     /// Return the stored per-column max byte lengths for `export_name`.
     pub fn get_shape_stats(&self, export_name: &str) -> Result<HashMap<String, u64>> {
-        let sql = "SELECT column_name, max_byte_len FROM export_shape WHERE export_name = ?1";
-        match &self.conn {
-            StateConn::Sqlite(c) => {
-                let mut stmt = c.prepare(sql)?;
-                let rows = stmt.query_map([export_name], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
-                })?;
-                let mut map = HashMap::new();
-                for r in rows {
-                    let (k, v) = r?;
-                    map.insert(k, v);
-                }
-                Ok(map)
-            }
-            StateConn::Postgres(client) => {
-                let mut c = client.borrow_mut();
-                let rows = c.query(&pg_sql(sql), &[&export_name])?;
-                let mut map = HashMap::new();
-                for row in rows {
-                    let k: String = row.get(0);
-                    let v: i64 = row.get(1);
-                    map.insert(k, v as u64);
-                }
-                Ok(map)
-            }
-        }
+        Ok(self
+            .query(
+                "SELECT column_name, max_byte_len FROM export_shape WHERE export_name = ?1",
+                &[export_name.into()],
+                |r| (r.text(0), r.i64(1) as u64),
+            )?
+            .into_iter()
+            .collect())
     }
 
     /// Upsert per-column max byte lengths, keeping the running maximum.
@@ -60,24 +42,16 @@ impl StateStore {
                  ON CONFLICT(export_name, column_name) DO UPDATE SET
                      max_byte_len = MAX(max_byte_len, excluded.max_byte_len),
                      updated_at   = excluded.updated_at";
-        match &self.conn {
-            StateConn::Sqlite(c) => {
-                for (col, &max_bytes) in stats {
-                    c.execute(
-                        sql,
-                        rusqlite::params![export_name, col, max_bytes as i64, now],
-                    )?;
-                }
-            }
-            StateConn::Postgres(client) => {
-                let mut c = client.borrow_mut();
-                for (col, &max_bytes) in stats {
-                    c.execute(
-                        &pg_sql(sql),
-                        &[&export_name, col, &(max_bytes as i64), &now],
-                    )?;
-                }
-            }
+        for (col, &max_bytes) in stats {
+            self.execute(
+                sql,
+                &[
+                    export_name.into(),
+                    col.as_str().into(),
+                    (max_bytes as i64).into(),
+                    now.as_str().into(),
+                ],
+            )?;
         }
         Ok(())
     }

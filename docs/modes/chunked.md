@@ -24,7 +24,7 @@ Four ways to slice the table. They differ in how chunk boundaries are computed; 
 | **Dense** | `chunk_dense: true` | `ROW_NUMBER() OVER (ORDER BY chunk_column)` instead of range; guarantees equal **row count** per chunk regardless of gaps | Sparse IDs — UUIDs as `BIGINT`, deleted rows, hashed keys | `chunk_by_days` |
 | **Date-native** | `chunk_by_days: 365` | `chunk_column` must be `DATE` / `TIMESTAMP` / `TIMESTAMPTZ`; windows of N days with `>= AND <` (open-end) semantics | Time-series, event logs, historical backfills by period | `chunk_dense` |
 | **Memory-target** (PG only) | `chunk_size_memory_mb: 256` | Auto-computes `chunk_size` from a `pg_class` / `reltuples` row-size estimate; clamped to `[10_000, 5_000_000]` rows. Requires `table:` shortcut | You want to budget by megabytes, not rows; wide tables where row-width is hard to guess | explicit `chunk_size` |
-| **Keyset** (seek) | `chunk_by_key: uid` | Pages with `WHERE key > last ORDER BY key LIMIT chunk_size` on a unique index — **sequential**; each page is one part file | **MySQL** tables with no single-integer PK (UUID / string / composite PK) — the only bounded shape without a server cursor. See [Keyset pagination](#keyset-seek-pagination--the-safe-shape-without-an-integer-pk) below | `chunk_column`, `chunk_dense`, `chunk_by_days`, `chunk_count` |
+| **Keyset** (seek) | `chunk_by_key: uid` | Pages with `WHERE key > last ORDER BY key LIMIT chunk_size` on a unique index — **sequential by default; `parallel: N` fans it into N disjoint key ranges** — each page is one part file | **MySQL** tables with no single-integer PK (UUID / string / composite PK) — the only bounded shape without a server cursor. See [Keyset pagination](#keyset-seek-pagination--the-safe-shape-without-an-integer-pk) below | `chunk_column`, `chunk_dense`, `chunk_by_days`, `chunk_count` |
 
 **Orthogonal options that combine with any strategy:**
 
@@ -326,12 +326,46 @@ whose key already passed is silently never re-read. For a mutable table use
     keyset_incremental: true     # append-only ONLY: clean re-run pulls just new keys
 ```
 
+### Parallel keyset (`parallel: N`)
+
+By default keyset pages sequentially — each page seeks past the previous page's
+last key. Set `parallel: N` and Rivet instead splits the key into **N ROW-based
+percentile ranges** and seeks each range concurrently on its own connection:
+
+```yaml
+    chunk_by_key: event_uuid
+    chunk_size: 1000
+    parallel: 4                  # 4 workers, each seeks a disjoint key range
+```
+
+The ranges are half-open (`[lo, hi)`) and adjacent, so together they partition
+the key — **every row is read exactly once** (structural parity, proven on all
+engines). Each worker still pages by seek within its range, so peak RSS stays
+bounded (`≤ N × chunk_size` rows in flight) and no worker holds a long query.
+Per-range crash-recovery is tracked in the state DB (`chunk_checkpoint`): a run
+that dies resumes only the unfinished ranges.
+
+> **Sweet spot.** Extraction is I/O-bound, so the speedup plateaus early —
+> **~3.1× at `parallel: 4`** on an indexed table, little beyond 4. It is
+> tuned for **indexed tables up to ~10 M rows**. Past that, the range-boundary
+> sampler (an index `OFFSET` skip to find each percentile cut) grows costly at
+> **setup** — for very large tables prefer a range `chunk_column` (integer-PK),
+> which slices `MIN..MAX` arithmetically with no sampling pass.
+>
+> **Canary first.** Parallel keyset is new in 0.23.0. Run it on a canary table
+> and diff row counts against a sequential (`parallel: 1`) pass before rolling
+> it out across a fleet — the sequential path is unchanged and remains the
+> conservative default.
+
+`rivet init` scaffolds a row-scaled `parallel` (≤500 K → 1, <5 M → 2, ≥5 M → 4);
+a preflight warns past ~5 M rows that peak RSS scales with `N`.
+
 **Limitations (current):**
 
-- **Sequential only** — each page depends on the previous page's last key, so
-  keyset does not parallelize (`parallel` is ignored). Range chunking remains the
-  parallel path for integer-PK tables.
 - **Single-column keys only** — composite unique keys are not yet supported.
+- **Decimal / `partition_by` keys are rejected** for parallel keyset (the
+  percentile sampler needs an orderable, evenly-sliceable key) — Rivet fails
+  loudly at plan time rather than emit a skewed split.
 
 ## Troubleshooting
 

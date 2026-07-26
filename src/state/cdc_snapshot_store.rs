@@ -1,6 +1,6 @@
 use crate::error::Result;
 
-use super::{StateConn, StateStore};
+use super::StateStore;
 
 impl StateStore {
     /// Record that `cdc.initial: snapshot`'s backfill for `(export_name,
@@ -17,54 +17,35 @@ impl StateStore {
         run_id: &str,
     ) -> Result<()> {
         let now = chrono::Utc::now().to_rfc3339();
-        match &self.conn {
-            StateConn::Sqlite(c) => {
-                c.execute(
-                    "INSERT OR REPLACE INTO cdc_snapshot
-                       (export_name, table_name, run_id, completed_at)
-                     VALUES (?1, ?2, ?3, ?4)",
-                    rusqlite::params![export_name, table_name, run_id, now],
-                )?;
-            }
-            StateConn::Postgres(client) => {
-                let mut c = client.borrow_mut();
-                c.execute(
-                    "INSERT INTO cdc_snapshot
-                       (export_name, table_name, run_id, completed_at)
-                     VALUES ($1, $2, $3, $4)
-                     ON CONFLICT (export_name, table_name) DO UPDATE SET
-                         run_id       = excluded.run_id,
-                         completed_at = excluded.completed_at",
-                    &[&export_name, &table_name, &run_id, &now],
-                )?;
-            }
-        }
+        // ON CONFLICT DO UPDATE upsert (SQLite ≥ 3.24 + Postgres) — the codebase's
+        // canonical upsert, replacing the old SQLite `INSERT OR REPLACE` arm.
+        self.execute(
+            "INSERT INTO cdc_snapshot (export_name, table_name, run_id, completed_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (export_name, table_name) DO UPDATE SET
+                 run_id       = excluded.run_id,
+                 completed_at = excluded.completed_at",
+            &[
+                export_name.into(),
+                table_name.into(),
+                run_id.into(),
+                now.into(),
+            ],
+        )?;
         Ok(())
     }
 
     /// Whether `(export_name, table_name)`'s initial snapshot has completed per
     /// the state DB — the authoritative, GCS-independent signal.
     pub fn snapshot_done(&self, export_name: &str, table_name: &str) -> Result<bool> {
-        match &self.conn {
-            StateConn::Sqlite(c) => {
-                let n: i64 = c.query_row(
-                    "SELECT COUNT(*) FROM cdc_snapshot
-                     WHERE export_name = ?1 AND table_name = ?2",
-                    rusqlite::params![export_name, table_name],
-                    |r| r.get(0),
-                )?;
-                Ok(n > 0)
-            }
-            StateConn::Postgres(client) => {
-                let mut c = client.borrow_mut();
-                let row = c.query_one(
-                    "SELECT COUNT(*) FROM cdc_snapshot
-                     WHERE export_name = $1 AND table_name = $2",
-                    &[&export_name, &table_name],
-                )?;
-                Ok(row.get::<_, i64>(0) > 0)
-            }
-        }
+        Ok(self
+            .query_opt(
+                "SELECT COUNT(*) FROM cdc_snapshot WHERE export_name = ?1 AND table_name = ?2",
+                &[export_name.into(), table_name.into()],
+                |r| r.i64(0),
+            )?
+            .unwrap_or(0)
+            > 0)
     }
 }
 

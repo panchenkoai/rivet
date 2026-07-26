@@ -124,6 +124,16 @@ pub struct ExportConfig {
     /// column MUST be backed by a usable index (PK or unique); the planner
     /// refuses a non-indexed key rather than emit a full-scan + filesort query.
     pub chunk_by_key: Option<String>,
+    /// Concurrent chunk/page workers (default 1). On a RANGE chunk (`chunk_column`)
+    /// or KEYSET (`chunk_by_key`) export, `parallel: N` fans the table into N
+    /// ROW-percentile ranges that seek concurrently over separate connections — the
+    /// half-open intervals partition the key, so the union reads every row exactly
+    /// once (structural parity, all engines). Extraction is I/O-bound, so the win
+    /// plateaus early (~3x at N=4, little beyond). SWEET SPOT: indexed tables up to
+    /// ~10M rows at `parallel: 4`. `rivet init` scaffolds a row-scaled value
+    /// (<=500K -> 1, <5M -> 2, >=5M -> 4); a preflight warns past ~5M rows (peak RSS
+    /// ~= N x chunk_size). Beyond ~10M the KEYSET boundary sampler (an index OFFSET
+    /// skip) grows costly at setup — prefer a range `chunk_column` there.
     #[serde(default = "default_parallel")]
     pub parallel: usize,
 

@@ -7,9 +7,11 @@ mod checkpoint;
 mod cursor;
 mod file_log;
 mod journal_store;
+mod keyset_range;
 mod load_journal_store;
 mod metrics;
 mod progression;
+mod row;
 mod run_aggregate;
 mod run_status_store;
 mod schema;
@@ -22,6 +24,8 @@ mod shape;
 pub use checkpoint::ChunkTaskInfo;
 #[allow(unused_imports)]
 pub use file_log::FileRecord;
+#[allow(unused_imports)]
+pub use keyset_range::{KeysetRangePart, KeysetRangeRow};
 pub use load_journal_store::LoadRecord;
 #[allow(unused_imports)]
 pub use metrics::ExportMetric;
@@ -353,6 +357,29 @@ const MIGRATIONS: &[(i64, &str)] = &[
          ALTER TABLE export_metrics ADD COLUMN offending_value TEXT;
          ALTER TABLE export_metrics ADD COLUMN server_context_json TEXT;",
     ),
+    // v19: parallel-keyset crash-recovery ranges (feat/parallel-keyset iteration 2).
+    // A parallel keyset run partitions the key into N stable ROW-percentile ranges
+    // sampled at open; recovery is per-range (coarse): a crashed range re-reads from
+    // its `lo`, a `done` range is skipped and rehydrated from file_log. The
+    // boundaries MUST survive the crash (re-sampling a changed table would move them
+    // and leave a gap), so they are persisted here at open, keyed by run_id, and
+    // reloaded on resume — never re-sampled. Each worker flips only its OWN
+    // (export_name, range_index) row `done=1` at completion (disjoint rows → no
+    // cross-worker write contention), in the same transaction that records its parts
+    // to file_log (atomic checkpoint). Cleared post-finalize by `finalize_keyset_anchor`.
+    (
+        19,
+        "CREATE TABLE IF NOT EXISTS keyset_range (
+            export_name TEXT NOT NULL,
+            run_id      TEXT NOT NULL,
+            range_index INTEGER NOT NULL,
+            lo          TEXT,
+            hi          TEXT,
+            done        INTEGER NOT NULL DEFAULT 0,
+            updated_at  TEXT NOT NULL,
+            PRIMARY KEY (export_name, range_index)
+        );",
+    ),
 ];
 
 /// PostgreSQL-compatible DDL.  Column types differ from SQLite (BIGSERIAL,
@@ -636,6 +663,25 @@ const PG_MIGRATIONS: &[(i64, &str)] = &[
          ALTER TABLE export_metrics ADD COLUMN key_descriptor_json TEXT;
          ALTER TABLE export_metrics ADD COLUMN offending_value TEXT;
          ALTER TABLE export_metrics ADD COLUMN server_context_json TEXT;",
+    ),
+    // v19: parallel-keyset crash-recovery ranges (see the SQLite v19 comment).
+    // range_index/done are BIGINT (not the SQLite INTEGER): the state layer binds
+    // them as StateParam::I64 and reads them via StateRow::i64, and rust-postgres
+    // is strictly typed (i64 <-> INT8 only) — an int4 column would reject the bind
+    // (WrongType at persist) and panic on the read (resume). Every other integer
+    // column in PG_MIGRATIONS is BIGINT for exactly this reason.
+    (
+        19,
+        "CREATE TABLE IF NOT EXISTS keyset_range (
+            export_name TEXT NOT NULL,
+            run_id      TEXT NOT NULL,
+            range_index BIGINT NOT NULL,
+            lo          TEXT,
+            hi          TEXT,
+            done        BIGINT NOT NULL DEFAULT 0,
+            updated_at  TEXT NOT NULL,
+            PRIMARY KEY (export_name, range_index)
+        );",
     ),
 ];
 
@@ -1205,6 +1251,90 @@ mod tests {
             )
             .unwrap();
         assert_eq!(cursor, "42", "pre-upgrade data must survive");
+    }
+
+    /// The POSTGRES upgrade path: stage a populated state DB at v18 (before the v19
+    /// keyset_range table), then migrate it in place to HEAD and assert v19 lands
+    /// correctly on the EXISTING db — keyset_range.range_index must be BIGINT (bug #1:
+    /// an int4 there breaks every parallel-keyset run) and the pre-upgrade cursor must
+    /// survive. The state_migrations preflight only ever migrates a FRESH db, so an
+    /// ALTER/CREATE that works clean but breaks on a populated old schema would slip
+    /// through without this. Isolated in its own schema; skips without RIVET_TEST_STATE_URL.
+    #[test]
+    fn pg_upgrade_from_v18_lands_keyset_range_as_bigint_and_keeps_data() {
+        let Ok(url) = std::env::var("RIVET_TEST_STATE_URL") else {
+            return;
+        };
+        if !url.starts_with("postgres") {
+            return;
+        }
+        let mut client = connect_pg(&url).expect("connect pg state");
+        // Isolate: a fresh schema so the staged FIXED-name state tables never collide
+        // with the shared rivet_state db or a concurrent test.
+        client
+            .batch_execute(
+                "DROP SCHEMA IF EXISTS rivet_upgrade_test CASCADE; \
+                 CREATE SCHEMA rivet_upgrade_test; SET search_path TO rivet_upgrade_test;",
+            )
+            .unwrap();
+
+        // Stage at EXACTLY v18 — apply only migrations up to v18, exactly as the rivet
+        // release before keyset_range (v19) wrote a shared-Postgres state db.
+        client
+            .batch_execute(
+                "CREATE TABLE IF NOT EXISTS rivet_schema_version (version BIGINT NOT NULL);",
+            )
+            .unwrap();
+        for &(ver, sql) in PG_MIGRATIONS {
+            if ver <= 18 {
+                client
+                    .batch_execute(&format!(
+                        "BEGIN; {sql} INSERT INTO rivet_schema_version (version) VALUES ({ver}); COMMIT;"
+                    ))
+                    .unwrap();
+            }
+        }
+        // Pre-existing state that MUST survive the in-place upgrade.
+        client
+            .batch_execute(
+                "INSERT INTO export_state (export_name, last_cursor_value, last_run_at) \
+                 VALUES ('orders', '42', '2026-01-01T00:00:00Z')",
+            )
+            .unwrap();
+
+        // Upgrade in place to HEAD (applies v19 keyset_range on the POPULATED db).
+        migrate_pg(&mut client).expect("v18 -> HEAD upgrade must apply cleanly on a populated db");
+
+        // keyset_range.range_index is BIGINT on the upgraded-in-place db (not int4).
+        let dtype: String = client
+            .query_one(
+                "SELECT data_type FROM information_schema.columns \
+                 WHERE table_schema = 'rivet_upgrade_test' AND table_name = 'keyset_range' \
+                   AND column_name = 'range_index'",
+                &[],
+            )
+            .unwrap()
+            .get(0);
+        assert_eq!(
+            dtype, "bigint",
+            "v19 keyset_range.range_index must upgrade to BIGINT, not int4 (bug #1)"
+        );
+        // The v18 data survived the added migration (not dropped/recreated).
+        let cursor: String = client
+            .query_one(
+                "SELECT last_cursor_value FROM export_state WHERE export_name = 'orders'",
+                &[],
+            )
+            .unwrap()
+            .get(0);
+        assert_eq!(
+            cursor, "42",
+            "pre-upgrade cursor must survive the migration"
+        );
+
+        client
+            .batch_execute("DROP SCHEMA IF EXISTS rivet_upgrade_test CASCADE;")
+            .unwrap();
     }
 
     #[test]

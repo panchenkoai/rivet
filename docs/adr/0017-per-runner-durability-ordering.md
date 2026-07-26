@@ -45,9 +45,26 @@ each variant satisfies.
 | `chunked_parallel` | **post-scope drain** | **post-scope drain** | **post-scope drain** |
 | `sequential_checkpoint` | inline, per-chunk | inline, per-chunk | inline, per-chunk |
 | **`parallel_checkpoint`** | **per-chunk in worker (sync)** | **post-scope drain (`state=None`)** | **post-scope drain** |
+| **`keyset_parallel`** | **per-RANGE in worker (sync, txn)** | **post-scope drain (`state=None`)** | **post-scope drain** |
 
-The two odd rows are `chunked_parallel` and `parallel_checkpoint`.
-They are odd for **different** reasons.
+The odd rows are `chunked_parallel`, `parallel_checkpoint`, and
+`keyset_parallel` (feat/parallel-keyset). They are odd for **different**
+reasons.
+
+### `keyset_parallel` — per-RANGE worker-sync file_log (added 2026-07)
+
+The 7th runner. Like `parallel_checkpoint` it writes `file_log` synchronously
+in the worker (so a crash-resume can rehydrate) and drains
+`manifest_parts` + counters + journal post-scope (`record_part(state=None)`).
+It differs on **granularity and atomicity**: the worker-sync write is
+**per-RANGE, not per-chunk** — a range's parts + its `keyset_range.done=1`
+flip go in ONE transaction (`commit_keyset_range_at_ref`), the atomic
+checkpoint boundary (see `dev/parallel_keyset/design_iter2.md`). Because an
+incomplete range writes NO file_log rows, the resume rehydrate pulls only
+`done` ranges with no filtering. This sidesteps ADR-0017's per-chunk
+`StateStore::open` smell — the reconnect amortizes over a whole range, not
+every part — but it is the SAME `*_at_ref` reconnect pattern (see the smell
+section; a shared `with_ref` helper would deepen all four `*_at_ref` sites).
 
 ### `chunked_parallel` — three writes coalesced post-scope
 

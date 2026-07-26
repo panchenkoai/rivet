@@ -176,6 +176,13 @@ pub(crate) fn run_export(
     summary: &mut RunSummary,
     config_path: &str,
 ) -> Result<()> {
+    // Mark this a batch run subject to the per-runner facade contract (ADR-0018):
+    // every runner reachable below MUST apply the schema-drift gate + Form-B harvest.
+    // `check_post_run_invariants` asserts they ran for `state_backed` runs — the
+    // structural half of the runner-bypass guard (this session's parallel-keyset
+    // drift-gate bypass would have tripped it).
+    summary.state_backed = true;
+
     // Keyset (seek) pagination owns its own sequential paging loop (OPT-4).
     if let ExtractionStrategy::Keyset(kp) = &plan.strategy {
         // A MongoDB keyset export with `parallel: N` fans N disjoint `_id`-range

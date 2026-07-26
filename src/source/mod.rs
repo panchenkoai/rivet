@@ -232,6 +232,11 @@ pub struct ExportRequest<'a> {
     /// re-parsing `query`. `None` for a hand-written `query:` / any wrapped or
     /// filtered form. SQL engines ignore it (they run `query`). See ADR-0027.
     pub base_relation: Option<&'a str>,
+    /// INCLUSIVE upper bound on the keyset key for a parallel keyset worker's
+    /// range: the page becomes `WHERE key > cursor AND key <= upper` (OPT
+    /// parallel-keyset). Inlined, so it never consumes the cursor bind slot.
+    /// `None` (the default) = the sequential single-worker page, unbounded above.
+    pub upper_bound: Option<&'a str>,
 }
 
 impl<'a> ExportRequest<'a> {
@@ -256,6 +261,7 @@ impl<'a> ExportRequest<'a> {
             // `query` is the unwrapped base here, so the relation (if this is a
             // `table:` shortcut) is visible directly in it.
             base_relation: crate::sql::strip_select_star_from(query),
+            upper_bound: None,
         }
     }
 
@@ -281,6 +287,7 @@ impl<'a> ExportRequest<'a> {
             page_limit: None,
             // `query` is a table-hiding wrapper; the relation lives in `base`.
             base_relation: crate::sql::strip_select_star_from(base),
+            upper_bound: None,
         }
     }
 
@@ -302,6 +309,14 @@ impl<'a> ExportRequest<'a> {
     /// BY key LIMIT n` page instead of the unbounded query.
     pub fn with_page_limit(mut self, page_limit: usize) -> Self {
         self.page_limit = Some(page_limit);
+        self
+    }
+
+    /// Set the INCLUSIVE upper bound on the keyset key — a parallel keyset
+    /// worker's `(cursor, upper]` range. `None` leaves the page unbounded above
+    /// (the sequential single-worker page).
+    pub fn with_upper_bound(mut self, upper: Option<&'a str>) -> Self {
+        self.upper_bound = upper;
         self
     }
 }

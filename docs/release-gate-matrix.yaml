@@ -1,0 +1,120 @@
+# Release-gate coverage matrix — every gate CHECK × engine × VERSION, plus the
+# backend-INFRASTRUCTURE dimensions the go/no-go gate does (or does not yet) exercise.
+#
+# This is the SINGLE source of truth for what `dev/release-oracle` actually gates, so
+# the gate's coverage is reviewable at a glance and its gaps are counted, not silent.
+# Same cell vocabulary + shrink-only ratchet discipline as the sibling docs/*-matrix.yaml
+# ledgers; drift-guarded against the gate's real config by
+# tests/release_gate_matrix_guard.rs:
+#   - every `grid.<engine>.gated` version must appear in dev/release-oracle/matrix.yaml
+#   - every scenario/preflight function in dev/release-oracle/lib/scenarios.sh must have
+#     a row here (and vice-versa) — a new gate check with no cell fails the guard
+#   - `gap` cells are counted and ratcheted (no NEW gaps; fill one by wiring the check
+#     and flipping gap -> test)
+#
+# Cell vocabulary:
+#   test  — the gate RUNS this check for this engine (across its gridded versions) and it is green.
+#   na    — not applicable to this engine by design (e.g. SQL keyset on Mongo).
+#   gap   — SHOULD be gated, isn't yet (ratcheted; shrink-only).
+
+# ── The engine × VERSION grid the gate brings up (mirrors dev/release-oracle/matrix.yaml) ──
+# `gated`   = versions the gate spins up, seeds, and runs every applicable scenario against.
+# `gaps`    = versions that EXIST (a compose service / a devbox stand / a public image) but
+#             are not yet gated — each is a real coverage hole, ratcheted.
+grid:
+  postgres:
+    gated: [13, 14, 16, 18]          # 14/18 verified green on the devbox against the blessed goldens
+    gaps:  [12, 15, 17]              # 12/15 are compose services; 17 is a public image
+  mysql:
+    gated: ["8.0", "8.4"]
+    gaps:  ["5.7", "mariadb-11"]     # 5.7 = huge install base, needs a CTE-free seed; MariaDB needs a compose service + driver check
+  mssql:
+    gated: ["2022"]
+    gaps:  ["2019"]                  # 2019 ships mssql-tools (not tools18) — needs an sqlcmd-path fallback in bring_up/seed
+  mongo:
+    gated: ["4.4", "5", "6", "7", "8"]   # 5/6/8 added; 4.4 is arm64-flaky on the colima devbox (documented, not a rivet bug)
+    gaps:  []
+
+# ── Per-(engine, version) DATA / BEHAVIOUR scenarios (run once per gridded version) ──
+# Cell is per-ENGINE (uniform across that engine's gridded versions); a version-specific
+# divergence would split into its own note.
+scenarios:
+  - id: verdicts
+    what: "init -> the strategy per table matches the golden (keyset/full/range/name-trap), zero phantom heavy-chunk."
+    postgres: test
+    mysql:    test
+    mssql:    test
+    mongo:    test
+  - id: integrity_types
+    what: "users 150K loss/dup 0 (source count+distinct == DuckDB read) + per-engine DuckDB type/CSV golden (parquet binary path + CSV all-varchar text path)."
+    postgres: test
+    mysql:    test
+    mssql:    test
+    mongo:    { na: "Mongo is a JSON-blob model (full-scan only) — no per-engine type matrix; the loss/dup arm still runs under integrity_types" }
+  - id: keyset_parallel
+    what: "parallel:4 keyset fan-out: loss/dup 0 (DuckDB oracle) AND >=2 distinct pk_w{ridx} workers (no silent degrade to sequential)."
+    postgres: test
+    mysql:    test
+    mssql:    test
+    mongo:    { na: "Mongo parallel:N is the separate _id-range mongo_parallel reader, not SQL keyset" }
+  - id: load
+    what: "manifested parts -> each object store {s3/minio, gcs/fake-gcs, azure/azurite}, independent readback count == summed manifest row_count + id-set round-trips."
+    postgres: test
+    mysql:    test
+    mssql:    test
+    mongo:    test
+  - id: gc_survival
+    what: "concurrent-extract bucket-erasure guard: a Running manifest spares an in-flight part; none deletes the orphan; Success parts always kept."
+    postgres: test
+    mysql:    { na: "store-level property, source-agnostic — one engine's parts exercise it (runs on postgres)" }
+    mssql:    { na: "store-level property (see postgres)" }
+    mongo:    { na: "store-level property (see postgres)" }
+
+# ── Source-agnostic PREFLIGHTS (run ONCE before the engine loop, not per engine/version) ──
+preflights:
+  - id: state_migrations
+    what: "SQLite state == Postgres state on the state-exercising golden fixtures (parallel-checkpoint, incremental, crash-resume) — the migration arrays are type-parity."
+    backends: [sqlite, postgres]
+    status: test        # verify_state_migrations (commit e83656a), RED-proven int4 -> NOT RELEASABLE
+  - id: coverage_matrices
+    what: "every docs/*-matrix.yaml drift-guard runs (chunking/behaviour/type-fidelity/... + release_gate + perf) so a rotted coverage ledger blocks the release, not just CI."
+    status: test        # verify_coverage_matrices
+  - id: pooler_safety
+    what: "session pins (SET LOCAL / time_zone / max_execution_time) reset + connections clean through a transaction-mode pooler (pgbouncer pool_size=1, proxysql)."
+    infra: [pgbouncer, proxysql]
+    status: test        # verify_pooler_safety — drives live_pool_safety.rs through pgbouncer + proxysql
+
+# ── BACKEND-INFRASTRUCTURE dimensions the gate does NOT yet exercise (the audit gaps) ──
+# The gate connects DIRECT to every engine; it never routes through the connection-
+# mediation layer prod runs (poolers/proxies/replicas/degraded networks) even though the
+# compose stack HAS all of it. Each row is a real hole, ratcheted; fill by adding a
+# preflight/scenario and flipping status -> test.
+infra:
+  - id: network_faults
+    infra: toxiproxy
+    status: gap
+    note: "retry/reconnect (retry.rs, classify_pg_sqlstate) under injected latency/drop/reset is untested end-to-end in the gate"
+  - id: state_upgrade
+    status: test
+    note: "pg_upgrade_from_v18_lands_keyset_range_as_bigint_and_keeps_data (src/state/mod.rs) — stages a POPULATED v18 Postgres state db, migrates in place to HEAD, asserts keyset_range is BIGINT + the pre-upgrade cursor survives; run by the state_migrations preflight. RED-proven against the int4 v19."
+  - id: state_concurrency
+    infra: postgres-state
+    status: test
+    note: "pg_shared_state_cross_connection_visibility_and_supersession (src/state/run_status_store.rs) — two StateStore connections = two processes on one shared Postgres state: a run begun on A is active-visible to B (the gc_orphans signal), and a newer run supersedes the older clock-free. Run by the state_migrations preflight; RED-proven against a flipped supersession."
+  - id: tls_required
+    status: gap
+    note: "TLS-required connections + cert validation (the vendored-openssl / tiberius handshake class); the gate runs mssql on accept_invalid_certs"
+  - id: auth
+    infra: mongo-auth
+    status: gap
+    note: "SCRAM / cert auth paths; the gate uses no-auth Mongo and password-only SQL"
+  - id: replica_read
+    infra: [mysql-replica, "pg-cdc-standby"]
+    status: gap
+    note: "reading from a lagging read-replica (read-only errors, staleness); replicas exist in compose, unused by the batch gate"
+  - id: warehouse_load
+    status: partial
+    note: "BigQuery live golden IS gated; Snowflake + ClickHouse are resolver/type-only (no live load-and-readback) — ClickHouse is even a local compose service, cheap to add"
+  - id: scale_memory
+    status: gap
+    note: "the gate is 150K rows; the flat-RSS guarantee (the 454M-row field win) is not asserted, so a memory regression ships green"

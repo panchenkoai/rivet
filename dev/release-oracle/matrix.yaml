@@ -21,7 +21,9 @@ engines:
     seed: seeds/common/postgres.sql
     versions:
       - { tag: "13", image: "postgres:13", port: 55013 }
+      - { tag: "14", image: "postgres:14", port: 55014 }
       - { tag: "16", image: "postgres:16", port: 55016 }
+      - { tag: "18", image: "postgres:18", port: 55018 }
   mysql:
     # The canonical seed uses a recursive CTE (deterministic fast fill) → MySQL 8.0+
     # ONLY. Pre-8.0 (5.7) would need a non-recursive compat seed; out of matrix.
@@ -46,7 +48,10 @@ engines:
     seed: seeds/mongo_seed.py
     versions:
       - { tag: "4.4", image: "mongo:4.4", port: 55044 }
+      - { tag: "5",   image: "mongo:5",   port: 55005 }
+      - { tag: "6",   image: "mongo:6",   port: 55006 }
       - { tag: "7",   image: "mongo:7",   port: 55007 }
+      - { tag: "8",   image: "mongo:8",   port: 55008 }
 
 # ── Object-store backends (local fakes) ─────────────────────────────────────
 # One CloudDestination impl (src/destination/cloud.rs) serves all three; the gate
@@ -55,6 +60,19 @@ stores:
   s3:      { emulator: minio,    endpoint: "http://127.0.0.1:9000",  bucket: rivet-oracle }
   gcs:     { emulator: fake-gcs, endpoint: "http://127.0.0.1:4443",  bucket: rivet-oracle }
   azure:   { emulator: azurite,  endpoint: "http://127.0.0.1:10000/devstoreaccount1", bucket: rivet-oracle }
+
+# ── Preflight (source-agnostic, runs ONCE before the engine loop) ───────────
+# state_migrations: INIT (migrate) + RUN the state-exercising golden fixtures on BOTH
+# state backends (SQLite default + Postgres via RIVET_TEST_STATE_URL) and compare. The
+# state layer has two migration arrays (MIGRATIONS/SQLite, PG_MIGRATIONS/Postgres)
+# behind a dialect seam that ASSUMES type-parity; bug #1 shipped an int4 keyset_range
+# that aborted every Postgres-state run while SQLite passed. This runs the RED-proven
+# tests/live/live_state_backend_parity.rs (parallel-checkpoint, incremental, crash-
+# resume) + the keyset_range round-trip through the RELEASE binary; a schema drift
+# fails it. SKIP when no Postgres STATE url / cargo / source Postgres is present.
+preflight:
+  - id: state_migrations
+    what: "SQLite state == Postgres state on every state-exercising fixture (migrations are type-parity; a keyset_range-style int4/BIGINT drift fails the gate)."
 
 # ── Scenarios (the manual dogfood, codified) ────────────────────────────────
 # Each runs per engine×version. `sql`-only ones skip Mongo where noted.
@@ -67,6 +85,9 @@ scenarios:
     what: "users 150K loss/dup: source count+distinct == DuckDB read of the parts. PLUS a per-engine DuckDB GOLDEN with TWO fidelity arguments per type matrix: <tmt> = PARQUET readback (binary/typed path — decimal precision, uuid, timestamp, enum) and <tmt>__csv = CSV readback read ALL-VARCHAR (the text-writer path parquet never exercises — escape/quote/unicode/null fidelity), both via DuckDB's own reader, never rivet's. Mongo has no type matrix (full-scan only), so it runs the loss/dup arm only."
     applies: [postgres, mysql, mssql, mongo]
 
+  - id: keyset_parallel
+    what: "the feat/parallel-keyset fan-out end-to-end: users 150K exported with mode:chunked + chunk_by_key:id + parallel:4 must (a) lose/dup ZERO rows vs the DuckDB read of the parts (same independent oracle as integrity_types) AND (b) actually FAN OUT — >=2 distinct pk_w{ridx} worker parts, proving parallel:N engaged and did not silently degrade to sequential keyset (which integrity_types/load already exercise)."
+    applies: [postgres, mysql, mssql]   # mongo parallel:N is the separate _id-range reader (mongo_parallel), not SQL keyset
   - id: load
     what: "load the manifested parts into each store {s3/minio, gcs/fake-gcs, azure/azurite} and read them back: warehouse/reread count == summed manifest row_count (the count gate), and the id-set round-trips."
     applies: [postgres, mysql, mssql, mongo]

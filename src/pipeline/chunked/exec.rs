@@ -176,6 +176,10 @@ pub(crate) fn run_chunked_parallel(
     summary: &mut RunSummary,
     chunk_source: super::ChunkSource,
 ) -> Result<()> {
+    // Subject to the per-runner facade contract (ADR-0018) — this runner is
+    // dispatched directly from job.rs, bypassing run_export, so it sets the flag
+    // itself (else check_post_run_invariants is a no-op on the large-table path).
+    summary.state_backed = true;
     let cp = super::chunked_plan(plan);
 
     let chunks = match chunk_source {

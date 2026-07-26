@@ -1,8 +1,6 @@
-use rusqlite::OptionalExtension;
-
 use crate::error::Result;
 
-use super::{StateConn, StateStore};
+use super::StateStore;
 
 /// The `run_status` ledger — a best-effort ADVISORY record of each export run's
 /// lifecycle: written `running` at run START (before any part lands) and
@@ -34,36 +32,23 @@ impl StateStore {
         prefix: &str,
         started_at: &str,
     ) -> Result<()> {
-        match &self.conn {
-            StateConn::Sqlite(c) => {
-                c.execute(
-                    "INSERT INTO run_status
-                       (run_id, export_name, prefix, status, started_at, finished_at)
-                     VALUES (?1, ?2, ?3, 'running', ?4, NULL)
-                     ON CONFLICT(run_id) DO UPDATE SET
-                         export_name = excluded.export_name,
-                         prefix      = excluded.prefix,
-                         status      = 'running',
-                         started_at  = excluded.started_at,
-                         finished_at = NULL",
-                    rusqlite::params![run_id, export_name, prefix, started_at],
-                )?;
-            }
-            StateConn::Postgres(client) => {
-                client.borrow_mut().execute(
-                    "INSERT INTO run_status
-                       (run_id, export_name, prefix, status, started_at, finished_at)
-                     VALUES ($1, $2, $3, 'running', $4, NULL)
-                     ON CONFLICT (run_id) DO UPDATE SET
-                         export_name = excluded.export_name,
-                         prefix      = excluded.prefix,
-                         status      = 'running',
-                         started_at  = excluded.started_at,
-                         finished_at = NULL",
-                    &[&run_id, &export_name, &prefix, &started_at],
-                )?;
-            }
-        }
+        self.execute(
+            "INSERT INTO run_status
+               (run_id, export_name, prefix, status, started_at, finished_at)
+             VALUES (?1, ?2, ?3, 'running', ?4, NULL)
+             ON CONFLICT(run_id) DO UPDATE SET
+                 export_name = excluded.export_name,
+                 prefix      = excluded.prefix,
+                 status      = 'running',
+                 started_at  = excluded.started_at,
+                 finished_at = NULL",
+            &[
+                run_id.into(),
+                export_name.into(),
+                prefix.into(),
+                started_at.into(),
+            ],
+        )?;
         Ok(())
     }
 
@@ -71,20 +56,10 @@ impl StateStore {
     /// `interrupted`) at finalize. A no-op if the row is absent (a run that
     /// never called `begin_run` — e.g. a legacy/in-memory path).
     pub fn finish_run(&self, run_id: &str, status: &str, finished_at: &str) -> Result<()> {
-        match &self.conn {
-            StateConn::Sqlite(c) => {
-                c.execute(
-                    "UPDATE run_status SET status = ?2, finished_at = ?3 WHERE run_id = ?1",
-                    rusqlite::params![run_id, status, finished_at],
-                )?;
-            }
-            StateConn::Postgres(client) => {
-                client.borrow_mut().execute(
-                    "UPDATE run_status SET status = $2, finished_at = $3 WHERE run_id = $1",
-                    &[&run_id, &status, &finished_at],
-                )?;
-            }
-        }
+        self.execute(
+            "UPDATE run_status SET status = ?2, finished_at = ?3 WHERE run_id = ?1",
+            &[run_id.into(), status.into(), finished_at.into()],
+        )?;
         Ok(())
     }
 
@@ -114,19 +89,7 @@ impl StateStore {
                          WHERE r2.export_name = r.export_name
                            AND r2.started_at > r.started_at)
                    LIMIT 1";
-        match &self.conn {
-            StateConn::Sqlite(c) => Ok(c
-                .query_row(sql, rusqlite::params![prefix], |_| Ok(()))
-                .optional()?
-                .is_some()),
-            StateConn::Postgres(client) => {
-                let pg_sql = sql.replace("?1", "$1");
-                Ok(client
-                    .borrow_mut()
-                    .query_opt(&pg_sql, &[&prefix])?
-                    .is_some())
-            }
-        }
+        Ok(self.query_opt(sql, &[prefix.into()], |_| ())?.is_some())
     }
 }
 
@@ -135,6 +98,62 @@ mod tests {
     use super::*;
 
     const P: &str = "gs://b/exports/orders/";
+
+    /// Two independent StateStore connections to ONE shared Postgres state db behave
+    /// like two rivet PROCESSES on a shared-Postgres deployment: a run begun on
+    /// connection A is immediately visible to connection B's has_active_run_on_prefix
+    /// (the gc_orphans concurrency signal — the whole reason PG state exists over the
+    /// per-host SQLite file), and a newer run of the same export SUPERSEDES the older
+    /// one CLOCK-FREE. The gate is otherwise single-process; gc_survival only simulates
+    /// a running manifest. Env-gated on RIVET_TEST_STATE_URL; unique names so the shared
+    /// public schema never collides with a sibling test.
+    #[test]
+    fn pg_shared_state_cross_connection_visibility_and_supersession() {
+        let Ok(url) = std::env::var("RIVET_TEST_STATE_URL") else {
+            return;
+        };
+        if !url.starts_with("postgres") {
+            return;
+        }
+        // Two connections = two processes on the same shared Postgres state.
+        unsafe { std::env::set_var("RIVET_STATE_URL", &url) };
+        let a = StateStore::open(":memory:").expect("conn A");
+        let b = StateStore::open(":memory:").expect("conn B");
+        unsafe { std::env::remove_var("RIVET_STATE_URL") };
+
+        let pid = std::process::id();
+        let exp = format!("conc_test_{pid}");
+        let (r1, r2) = (format!("r1_{pid}"), format!("r2_{pid}"));
+        let pa = format!("gs://b/{exp}/runA/");
+        let pb = format!("gs://b/{exp}/runB/");
+
+        // A begins run1; B — a SEPARATE connection — must SEE it active.
+        a.begin_run(&r1, &exp, &pa, "2026-01-01T00:00:01Z").unwrap();
+        assert!(
+            b.has_active_run_on_prefix(&pa).unwrap(),
+            "conn B must see conn A's active run on the shared Postgres state (multi-process gc signal)"
+        );
+
+        // B begins run2 (newer started_at, same export) → supersedes run1 CLOCK-FREE.
+        b.begin_run(&r2, &exp, &pb, "2026-01-01T00:00:02Z").unwrap();
+        assert!(
+            !a.has_active_run_on_prefix(&pa).unwrap(),
+            "run1 is superseded by the newer run2 (by started_at, no age timer) → its prefix is no longer active"
+        );
+        assert!(
+            a.has_active_run_on_prefix(&pb).unwrap(),
+            "run2 (newest, same export) is the active run"
+        );
+
+        // Finishing run2 clears it — a terminal run is never active.
+        b.finish_run(&r2, "success", "2026-01-01T00:00:03Z")
+            .unwrap();
+        assert!(
+            !a.has_active_run_on_prefix(&pb).unwrap(),
+            "a finished run must not count as active"
+        );
+        a.finish_run(&r1, "success", "2026-01-01T00:00:04Z").ok();
+    }
 
     #[test]
     fn begin_marks_active_then_finish_clears_it() {

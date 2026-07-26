@@ -2,7 +2,7 @@
 
 use chrono::{DateTime, Utc};
 
-use super::{StateConn, StateStore, pg_sql};
+use super::StateStore;
 use crate::error::Result;
 
 /// One export's progression record.
@@ -57,15 +57,10 @@ impl StateStore {
                 last_committed_chunk_index = NULL,
                 last_committed_run_id = excluded.last_committed_run_id,
                 last_committed_at = excluded.last_committed_at";
-        match &self.conn {
-            StateConn::Sqlite(c) => {
-                c.execute(sql, rusqlite::params![export_name, cursor, run_id, now])?;
-            }
-            StateConn::Postgres(client) => {
-                let mut c = client.borrow_mut();
-                c.execute(&pg_sql(sql), &[&export_name, &cursor, &run_id, &now])?;
-            }
-        }
+        self.execute(
+            sql,
+            &[export_name.into(), cursor.into(), run_id.into(), now.into()],
+        )?;
         Ok(())
     }
 
@@ -73,22 +68,10 @@ impl StateStore {
     /// no progression row or its committed boundary is chunked (cursor NULL).
     fn committed_cursor(&self, export_name: &str) -> Result<Option<String>> {
         let sql = "SELECT last_committed_cursor FROM export_progression WHERE export_name = ?1";
-        match &self.conn {
-            StateConn::Sqlite(c) => {
-                match c.query_row(sql, [export_name], |r| r.get::<_, Option<String>>(0)) {
-                    Ok(v) => Ok(v),
-                    Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-                    Err(e) => Err(e.into()),
-                }
-            }
-            StateConn::Postgres(client) => {
-                let mut c = client.borrow_mut();
-                match c.query_opt(&pg_sql(sql), &[&export_name])? {
-                    Some(row) => Ok(row.get::<_, Option<String>>(0)),
-                    None => Ok(None),
-                }
-            }
-        }
+        // query_opt → Option<row>; the row's cursor is itself Option<String> → flatten.
+        Ok(self
+            .query_opt(sql, &[export_name.into()], |r| r.opt_text(0))?
+            .flatten())
     }
 
     /// Record a successful chunked-run commit: the highest completed `chunk_index` for this run.
@@ -110,21 +93,15 @@ impl StateStore {
                 last_committed_chunk_index = excluded.last_committed_chunk_index,
                 last_committed_run_id = excluded.last_committed_run_id,
                 last_committed_at = excluded.last_committed_at";
-        match &self.conn {
-            StateConn::Sqlite(c) => {
-                c.execute(
-                    sql,
-                    rusqlite::params![export_name, highest_chunk_index, run_id, now],
-                )?;
-            }
-            StateConn::Postgres(client) => {
-                let mut c = client.borrow_mut();
-                c.execute(
-                    &pg_sql(sql),
-                    &[&export_name, &highest_chunk_index, &run_id, &now],
-                )?;
-            }
-        }
+        self.execute(
+            sql,
+            &[
+                export_name.into(),
+                highest_chunk_index.into(),
+                run_id.into(),
+                now.into(),
+            ],
+        )?;
         Ok(())
     }
 
@@ -147,21 +124,15 @@ impl StateStore {
                 last_verified_chunk_index = excluded.last_verified_chunk_index,
                 last_verified_run_id = excluded.last_verified_run_id,
                 last_verified_at = excluded.last_verified_at";
-        match &self.conn {
-            StateConn::Sqlite(c) => {
-                c.execute(
-                    sql,
-                    rusqlite::params![export_name, highest_chunk_index, run_id, now],
-                )?;
-            }
-            StateConn::Postgres(client) => {
-                let mut c = client.borrow_mut();
-                c.execute(
-                    &pg_sql(sql),
-                    &[&export_name, &highest_chunk_index, &run_id, &now],
-                )?;
-            }
-        }
+        self.execute(
+            sql,
+            &[
+                export_name.into(),
+                highest_chunk_index.into(),
+                run_id.into(),
+                now.into(),
+            ],
+        )?;
         Ok(())
     }
 
@@ -172,69 +143,29 @@ impl StateStore {
                 last_verified_strategy, last_verified_cursor, last_verified_chunk_index,
                 last_verified_run_id, last_verified_at
              FROM export_progression WHERE export_name = ?1";
-        match &self.conn {
-            StateConn::Sqlite(c) => {
-                let mut stmt = c.prepare(sql)?;
-                let row = stmt.query_row([export_name], |r| {
-                    Ok((
-                        r.get::<_, Option<String>>(0)?,
-                        r.get::<_, Option<String>>(1)?,
-                        r.get::<_, Option<i64>>(2)?,
-                        r.get::<_, Option<String>>(3)?,
-                        r.get::<_, Option<String>>(4)?,
-                        r.get::<_, Option<String>>(5)?,
-                        r.get::<_, Option<String>>(6)?,
-                        r.get::<_, Option<i64>>(7)?,
-                        r.get::<_, Option<String>>(8)?,
-                        r.get::<_, Option<String>>(9)?,
-                    ))
-                });
-                let (c_str, c_cur, c_idx, c_run, c_at, v_str, v_cur, v_idx, v_run, v_at) = match row
-                {
-                    Ok(t) => t,
-                    Err(rusqlite::Error::QueryReturnedNoRows) => {
-                        return Ok(ExportProgression {
-                            export_name: export_name.to_string(),
-                            committed: None,
-                            verified: None,
-                        });
-                    }
-                    Err(e) => return Err(e.into()),
-                };
-                Ok(ExportProgression {
-                    export_name: export_name.to_string(),
-                    committed: boundary_from_row(c_str, c_cur, c_idx, c_run, c_at),
-                    verified: boundary_from_row(v_str, v_cur, v_idx, v_run, v_at),
-                })
-            }
-            StateConn::Postgres(client) => {
-                let mut c = client.borrow_mut();
-                match c.query_opt(&pg_sql(sql), &[&export_name])? {
-                    None => Ok(ExportProgression {
-                        export_name: export_name.to_string(),
-                        committed: None,
-                        verified: None,
-                    }),
-                    Some(row) => {
-                        let c_str: Option<String> = row.get(0);
-                        let c_cur: Option<String> = row.get(1);
-                        let c_idx: Option<i64> = row.get(2);
-                        let c_run: Option<String> = row.get(3);
-                        let c_at: Option<String> = row.get(4);
-                        let v_str: Option<String> = row.get(5);
-                        let v_cur: Option<String> = row.get(6);
-                        let v_idx: Option<i64> = row.get(7);
-                        let v_run: Option<String> = row.get(8);
-                        let v_at: Option<String> = row.get(9);
-                        Ok(ExportProgression {
-                            export_name: export_name.to_string(),
-                            committed: boundary_from_row(c_str, c_cur, c_idx, c_run, c_at),
-                            verified: boundary_from_row(v_str, v_cur, v_idx, v_run, v_at),
-                        })
-                    }
-                }
-            }
-        }
+        Ok(self
+            .query_opt(sql, &[export_name.into()], |r| ExportProgression {
+                export_name: export_name.to_string(),
+                committed: boundary_from_row(
+                    r.opt_text(0),
+                    r.opt_text(1),
+                    r.opt_i64(2),
+                    r.opt_text(3),
+                    r.opt_text(4),
+                ),
+                verified: boundary_from_row(
+                    r.opt_text(5),
+                    r.opt_text(6),
+                    r.opt_i64(7),
+                    r.opt_text(8),
+                    r.opt_text(9),
+                ),
+            })?
+            .unwrap_or_else(|| ExportProgression {
+                export_name: export_name.to_string(),
+                committed: None,
+                verified: None,
+            }))
     }
 
     /// Delete the progression row for an export (committed + verified boundary).
@@ -247,66 +178,38 @@ impl StateStore {
     ///
     /// Returns the number of rows deleted (0 or 1).
     pub fn delete_progression(&self, export_name: &str) -> Result<usize> {
-        let sql = "DELETE FROM export_progression WHERE export_name = ?1";
-        match &self.conn {
-            StateConn::Sqlite(c) => Ok(c.execute(sql, [export_name])?),
-            StateConn::Postgres(client) => {
-                let mut c = client.borrow_mut();
-                Ok(c.execute(&pg_sql(sql), &[&export_name])? as usize)
-            }
-        }
+        self.execute(
+            "DELETE FROM export_progression WHERE export_name = ?1",
+            &[export_name.into()],
+        )
     }
 
     pub fn list_progression(&self) -> Result<Vec<ExportProgression>> {
-        match &self.conn {
-            StateConn::Sqlite(c) => {
-                let mut stmt =
-                    c.prepare("SELECT export_name FROM export_progression ORDER BY export_name")?;
-                let names: Vec<String> = stmt
-                    .query_map([], |r| r.get::<_, String>(0))?
-                    .collect::<std::result::Result<_, _>>()?;
-                drop(stmt);
-                let mut out = Vec::with_capacity(names.len());
-                for n in names {
-                    out.push(self.get_progression(&n)?);
-                }
-                Ok(out)
-            }
-            StateConn::Postgres(client) => {
-                // Single query to avoid nested borrow_mut() calls.
-                let mut c = client.borrow_mut();
-                let rows = c.query(
-                    "SELECT export_name,
-                            last_committed_strategy, last_committed_cursor, last_committed_chunk_index,
-                            last_committed_run_id, last_committed_at,
-                            last_verified_strategy, last_verified_cursor, last_verified_chunk_index,
-                            last_verified_run_id, last_verified_at
-                     FROM export_progression ORDER BY export_name",
-                    &[],
-                )?;
-                Ok(rows
-                    .iter()
-                    .map(|row| {
-                        let export_name: String = row.get(0);
-                        let c_str: Option<String> = row.get(1);
-                        let c_cur: Option<String> = row.get(2);
-                        let c_idx: Option<i64> = row.get(3);
-                        let c_run: Option<String> = row.get(4);
-                        let c_at: Option<String> = row.get(5);
-                        let v_str: Option<String> = row.get(6);
-                        let v_cur: Option<String> = row.get(7);
-                        let v_idx: Option<i64> = row.get(8);
-                        let v_run: Option<String> = row.get(9);
-                        let v_at: Option<String> = row.get(10);
-                        ExportProgression {
-                            export_name,
-                            committed: boundary_from_row(c_str, c_cur, c_idx, c_run, c_at),
-                            verified: boundary_from_row(v_str, v_cur, v_idx, v_run, v_at),
-                        }
-                    })
-                    .collect())
-            }
-        }
+        // One query + one projection for both backends (was a per-name loop on
+        // SQLite and a duplicated 11-column extraction on Postgres).
+        let sql = "SELECT export_name,
+                        last_committed_strategy, last_committed_cursor, last_committed_chunk_index,
+                        last_committed_run_id, last_committed_at,
+                        last_verified_strategy, last_verified_cursor, last_verified_chunk_index,
+                        last_verified_run_id, last_verified_at
+                 FROM export_progression ORDER BY export_name";
+        self.query(sql, &[], |r| ExportProgression {
+            export_name: r.text(0),
+            committed: boundary_from_row(
+                r.opt_text(1),
+                r.opt_text(2),
+                r.opt_i64(3),
+                r.opt_text(4),
+                r.opt_text(5),
+            ),
+            verified: boundary_from_row(
+                r.opt_text(6),
+                r.opt_text(7),
+                r.opt_i64(8),
+                r.opt_text(9),
+                r.opt_text(10),
+            ),
+        })
     }
 }
 

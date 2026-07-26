@@ -44,6 +44,20 @@ scenarios:
     mssql:    { test: keyset_checkpoint_resume_mssql_second_run_captures_only_new_keys }
     mongo:    { test: mongo_batch_resume_reads_only_new_since_last_run }
 
+  - id: keyset_parallel_fanout
+    what: "chunk_by_key + parallel: N → N ROW-percentile-range workers seek concurrently (feat/parallel-keyset — a DISTINCT chunking strategy: nth-row percentile range sampling, sparse-key immune). Union reads every row exactly once AND the run fans to ≥2 workers (no silent collapse to a single serial worker)."
+    postgres: { test: parallel_keyset_parity_postgres }
+    mysql:    { test: parallel_keyset_parity_mysql }
+    mssql:    { test: parallel_keyset_parity_mssql }
+    mongo:    { na: "Mongo `parallel: N` is the SEPARATE `_id`-range reader (mongo_parallel), not SQL keyset fan-out — see the mongo_parallel runner, out of this SQL-keyset scenario" }
+
+  - id: keyset_parallel_incremental
+    what: "chunk_by_key + parallel: N + keyset_incremental: a CLEAN re-run seeks past the persisted anchor + advances it, across N workers (run→unchanged=0→insert→only-new). Discriminator = total row count (1000→1000→1500, never a full re-read)."
+    postgres: { test: parallel_keyset_incremental_postgres }
+    mysql:    { test: parallel_keyset_incremental_mysql }
+    mssql:    { test: parallel_keyset_incremental_mssql }
+    mongo:    { na: "Mongo incremental is the `_id`-range reader's `resume`, not SQL keyset_incremental (covered by the mongo resume scenario above)" }
+
   - id: keyset_init_generates_for_pk
     what: "rivet init on a single-column-PK table scaffolds chunk_by_key (keyset), not range chunk_column"
     postgres: { test: generate_config_chunked_single_pk_uses_keyset }

@@ -63,6 +63,38 @@ pub(crate) fn maybe_panic_at(point: &str) {
     }
 }
 
+/// HARD-EXIT (`std::process::exit`) if the current fault point matches
+/// `"{point}:{index}"`. Unlike `maybe_panic_at*`, this kills the process
+/// IMMEDIATELY rather than unwinding — the only way to simulate a mid-run crash
+/// from a WORKER thread inside `std::thread::scope`, where a panic would instead
+/// be caught and deferred until the scope joins every other worker (by which
+/// point they have all finished, defeating a "some ranges done, some not" crash).
+/// Configure via `RIVET_TEST_PANIC_AT=keyset_parallel_range_committed:0`.
+#[inline]
+pub(crate) fn maybe_exit_at_index(point: &str, index: i64) {
+    if let Some(configured) = configured_point()
+        && *configured == format!("{point}:{index}")
+    {
+        eprintln!("rivet test-hook: injected HARD EXIT at '{point}:{index}' (RIVET_TEST_PANIC_AT)");
+        std::process::exit(70);
+    }
+}
+
+/// Return an `Err` if `RIVET_TEST_ERROR_AT` matches `"{point}:{index}"` — simulates a
+/// per-worker SQL error (connection drop / statement timeout) MID-RANGE, distinct from
+/// the hard-exit crash: the worker RETURNS an error (not process death), the parallel
+/// runner collects it and bails, so NO `_SUCCESS` / manifest is finalized.
+pub(crate) fn maybe_error_at_index(point: &str, index: i64) -> Result<(), String> {
+    if let Ok(p) = std::env::var("RIVET_TEST_ERROR_AT")
+        && p == format!("{point}:{index}")
+    {
+        return Err(format!(
+            "rivet test-hook: injected error at '{point}:{index}' (RIVET_TEST_ERROR_AT)"
+        ));
+    }
+    Ok(())
+}
+
 /// Panic if the current chunk-level fault point matches `"{point}:{chunk_index}"`.
 ///
 /// Configure via `RIVET_TEST_PANIC_AT=after_chunk_complete:0` to crash after
