@@ -25,6 +25,18 @@ pub fn build_plan(
     resume: bool,
     params: Option<&HashMap<String, String>>,
 ) -> Result<ResolvedRunPlan> {
+    // CDC has no batch plan — bail BEFORE resolve_query. A `tables:`-style CDC
+    // export carries no `query`, so resolve_query would fail first and hide this
+    // friendly message behind a confusing "no query" error (bughunt MED: the
+    // dogfood MED-5 message was unreachable for the tables: shape).
+    if export.mode == ExportMode::Cdc {
+        anyhow::bail!(
+            "export '{}': cdc mode has no batch plan — CDC exports stream changes continuously and \
+             are run with `rivet run` (or the `rivet cdc` subcommand), not `rivet plan` / `rivet \
+             apply`. Plan the batch exports separately, or run this one with `rivet run`.",
+            export.name
+        );
+    }
     let base_query = export.resolve_query(config_dir, params)?;
 
     let merged = merge_tuning_config(config.source.tuning.as_ref(), export.tuning.as_ref());
@@ -95,11 +107,8 @@ pub fn build_plan(
                 days_window,
             }
         }
-        ExportMode::Cdc => anyhow::bail!(
-            "export '{}': cdc mode is run by the CDC runner, not batch plan \
-             resolution (internal routing error — dispatch should branch on mode first)",
-            export.name
-        ),
+        // Unreachable: cdc bails at build_plan entry, before resolve_query.
+        ExportMode::Cdc => unreachable!("cdc mode is refused at build_plan entry"),
     };
 
     let (compression, compression_level) = export.effective_compression();
@@ -169,6 +178,19 @@ fn full_strategy(config: &Config, export: &ExportConfig) -> ExtractionStrategy {
             // `parallel: N` fans N `_id`-range workers (Mongo reader only).
             parallel: export.parallel,
         });
+    }
+    // #dogfood LOW: `parallel: N` fans out ONLY the Mongo `_id`-range reader, which
+    // needs `source.mongo.page_size` to page by `_id`. Reaching here on Mongo means
+    // page_size is unset, so a mongo full export stays a single cursor and
+    // `parallel: N` is silently dropped — warn instead of a silent no-op.
+    if config.source.source_type == crate::config::SourceType::Mongo && export.parallel > 1 {
+        log::warn!(
+            "export '{}': parallel: {} has no effect on a Mongo full export without \
+             `source.mongo.page_size` — parallelism fans out the `_id`-range reader, which pages \
+             by `_id`. Set `source.mongo.page_size` to enable it, or remove `parallel`.",
+            export.name,
+            export.parallel
+        );
     }
     ExtractionStrategy::Snapshot
 }
@@ -246,10 +268,30 @@ fn resolve_chunked_strategy(
         .chunk_max_attempts
         .unwrap_or_else(|| tuning.max_retries.saturating_add(1).max(1));
 
-    // Fast path: explicit column AND no memory-budget knob → no DB probe at all.
-    // Preserves the no-network plan-build invariant for users who hand-tune
-    // chunked-mode the old way.
-    if export.chunk_column.is_some() && export.chunk_size_memory_mb.is_none() {
+    // Fast path: explicit column AND no memory-budget knob → no DB probe.
+    // Preserves the no-network plan-build invariant for hand-tuned configs.
+    //
+    // Exception (#103): when the column is integer-`BETWEEN`-sliced (the default
+    // range mode — NOT `chunk_dense`/ROW_NUMBER, NOT `chunk_by_days`/date
+    // half-open, both type-safe) AND a `table:` is present to probe, fall through
+    // to introspection so a NON-integer column is refused rather than silently
+    // dropping every fractional row that falls between two window boundaries.
+    // `query:`-only can't be probed (no relation), so it stays on the fast path
+    // with a loud can't-verify warning.
+    let range_sliced = !export.chunk_dense && export.chunk_by_days.is_none();
+    let can_probe_type = range_sliced && export.table.is_some();
+    if export.chunk_column.is_some() && export.chunk_size_memory_mb.is_none() && !can_probe_type {
+        if range_sliced && export.table.is_none() {
+            log::warn!(
+                "export '{}': chunk_column '{}' is range-sliced by integer BETWEEN, but with \
+                 `query:` (no `table:`) the planner cannot verify it is integer-family — a \
+                 numeric/decimal/float key silently drops rows between windows. Use `table:` (so \
+                 the type is checked), `chunk_by_key:` (keyset — any orderable indexed key), or \
+                 ensure the column is integer.",
+                export.name,
+                export.chunk_column.as_deref().unwrap_or("")
+            );
+        }
         return Ok(ExtractionStrategy::Chunked(ChunkedPlan {
             column: export.chunk_column.clone().unwrap(),
             chunk_size: export.chunk_size,
@@ -293,7 +335,7 @@ fn resolve_chunked_strategy(
             export.name
         )
     })?;
-    let introspection = match config.source.source_type {
+    let introspection_result = match config.source.source_type {
         crate::config::SourceType::Postgres => {
             crate::source::postgres::introspect_pg_table_for_chunking(
                 &url,
@@ -319,14 +361,50 @@ fn resolve_chunked_strategy(
             "chunked mode is not supported for MongoDB — use `mode: full` (the whole \
              collection is read as `_id` + `document` JSON)"
         ),
-    }
-    .map_err(|e| {
-        anyhow::anyhow!(
-            "export '{}': chunked-mode introspection probe failed: {e}. \
-             Set `chunk_column:` (and `chunk_size:`) explicitly or check connectivity.",
-            export.name
-        )
-    })?;
+    };
+    let introspection = match introspection_result {
+        Ok(i) => i,
+        // #103-regression fix: the probe here exists only to TYPE-CHECK an explicit
+        // `chunk_column` (and to size memory / auto-resolve the column). When the
+        // column is explicit and no memory-sizing is requested, a probe FAILURE
+        // (table in a non-default schema so `schema.table::regclass` throws, a
+        // transient blip) must NOT newly break a config that worked before #103
+        // routed it through introspection. Can't-verify → warn loudly and emit the
+        // Chunked plan on the explicit column, exactly like the `query:`-only path.
+        // Genuinely need the probe (auto-resolve column / `chunk_size_memory_mb:` /
+        // `chunk_by_key:` index check) → the error stays fatal.
+        Err(e)
+            if export.chunk_column.is_some()
+                && export.chunk_size_memory_mb.is_none()
+                && export.chunk_by_key.is_none() =>
+        {
+            log::warn!(
+                "export '{}': chunked-mode introspection probe failed ({e}) — cannot verify \
+                 chunk_column '{}' is integer-family. Proceeding on the explicit column; if it is \
+                 numeric/decimal/float, range chunking silently drops rows between integer windows. \
+                 Qualify the table as `schema.table` so the probe can reach it, or use `chunk_by_key:`.",
+                export.name,
+                export.chunk_column.as_deref().unwrap_or("")
+            );
+            return Ok(ExtractionStrategy::Chunked(ChunkedPlan {
+                column: export.chunk_column.clone().unwrap(),
+                chunk_size: export.chunk_size,
+                chunk_count: export.chunk_count,
+                parallel: export.parallel,
+                dense: export.chunk_dense,
+                by_days: export.chunk_by_days,
+                checkpoint: export.chunk_checkpoint,
+                max_attempts,
+            }));
+        }
+        Err(e) => {
+            return Err(anyhow::anyhow!(
+                "export '{}': chunked-mode introspection probe failed: {e}. \
+                 Set `chunk_column:` (and `chunk_size:`) explicitly or check connectivity.",
+                export.name
+            ));
+        }
+    };
 
     chunked_strategy_from_introspection(
         config.source.source_type,
@@ -342,6 +420,36 @@ fn resolve_chunked_strategy(
 /// [`crate::source::TableIntrospection`]. The W5 mutation run found its guards
 /// unguarded offline: the keyset-key refusal `!`, the ADR-0020 MySQL-only
 /// auto-keyset gate, the small-table escape, and the memory->rows arithmetic.
+/// Plan-time WIDTH warning: a fixed `chunk_size` on a wide table (`chunk_size ×
+/// avg_row_bytes` ≥ 512 MB per chunk) risks a statement timeout (MySQL ERROR 3024)
+/// or a memory spike — the field's wide `*_version` tables failed this way. Returns
+/// the actionable warning line, or `None` when it does not apply: a memory budget
+/// is set (already width-aware), no row-width estimate, or the chunk is not heavy.
+/// Pure so the threshold + message are unit-tested without a live DB.
+fn heavy_chunk_warning(
+    name: &str,
+    chunk_size: usize,
+    avg_row_bytes: Option<i64>,
+    memory_mb_set: bool,
+) -> Option<String> {
+    const HEAVY_CHUNK_BYTES: i64 = 512 * 1024 * 1024;
+    if memory_mb_set {
+        return None;
+    }
+    let row_bytes = avg_row_bytes.filter(|b| *b > 0)?;
+    let bytes_per_chunk = (chunk_size as i64).saturating_mul(row_bytes);
+    if bytes_per_chunk < HEAVY_CHUNK_BYTES {
+        return None;
+    }
+    Some(format!(
+        "export '{name}': chunk_size {chunk_size} × ~{row_bytes} B/row ≈ {} MB per chunk on a wide \
+         table — a chunk this large can exceed the statement timeout (e.g. MySQL ERROR 3024) or \
+         spike memory. Prefer `chunk_size_memory_mb:` (width-aware — each chunk stays bounded by \
+         BYTES, not row count), or lower `chunk_size`.",
+        bytes_per_chunk / (1024 * 1024),
+    ))
+}
+
 fn chunked_strategy_from_introspection(
     source_type: crate::config::SourceType,
     export: &ExportConfig,
@@ -380,6 +488,21 @@ fn chunked_strategy_from_introspection(
         export.chunk_size
     };
 
+    // (1b) Width warning: a FIXED `chunk_size` on a WIDE table makes each chunk
+    // read `chunk_size × avg_row_bytes` of data — a heavy chunk that can exceed the
+    // statement timeout (MySQL ERROR 3024 / PG statement_timeout) or spike memory.
+    // The field's wide `*_version` tables failed exactly this way. Emit BEFORE the
+    // run so the operator switches to `chunk_size_memory_mb:` rather than eating a
+    // multi-minute timeout.
+    if let Some(w) = heavy_chunk_warning(
+        &export.name,
+        chunk_size,
+        introspection.avg_row_bytes,
+        export.chunk_size_memory_mb.is_some(),
+    ) {
+        log::warn!("{w}");
+    }
+
     // (2) Small-table escape: a single chunk/page has no benefit and adds
     // plumbing latency. Downgrade to Snapshot (bounded + simplest). Only fires
     // when reltuples is a meaningful positive number — un-analyzed tables
@@ -416,9 +539,12 @@ fn chunked_strategy_from_introspection(
         if !introspection.is_usable_keyset_key(key) {
             anyhow::bail!(
                 "export '{}': chunk_by_key '{}' is not a usable keyset key on {} — it must be a \
-                 single-column, NOT NULL, UNIQUE or PRIMARY key. Without a unique index, \
-                 `ORDER BY {} LIMIT n` would full-scan + filesort the table. Add a unique index \
-                 on it, pick another key, or use `mode: full` to accept one long snapshot query.",
+                 single-column, NOT NULL, UNIQUE or PRIMARY key WHOSE TYPE the keyset cursor can \
+                 read (integer / float / string / timestamp / date / uuid). A `decimal`/`numeric` \
+                 key is excluded: the cursor cannot advance past it (it would fail mid-run after a \
+                 partial write). Without a usable key, `ORDER BY {} LIMIT n` would also full-scan + \
+                 filesort. Add a unique index of a supported type, pick another key, use a range \
+                 `chunk_column:` (integer), or `mode: full`.",
                 export.name,
                 key,
                 tbl,
@@ -454,6 +580,24 @@ fn chunked_strategy_from_introspection(
     // (4) Resolve chunk_column for range chunking, with an auto-keyset fallback
     // on MySQL when there is no single-integer PK but a usable unique key exists.
     let column = if let Some(c) = export.chunk_column.clone() {
+        // #103 (variant 1): an explicit chunk_column that is integer-`BETWEEN`-
+        // sliced must be integer-family, or range chunking silently drops rows
+        // between windows. `chunk_dense` (ROW_NUMBER) and `chunk_by_days` (date
+        // half-open) are type-safe and took the fast path above (never reach here).
+        let range_sliced = !export.chunk_dense && export.chunk_by_days.is_none();
+        if range_sliced && !introspection.is_integer_column(&c) {
+            anyhow::bail!(
+                "export '{}': chunk_column '{}' on {} is not an integer-family column — range \
+                 chunking derives integer min/max boundaries and slices with `BETWEEN`, so a \
+                 numeric/decimal/float/text key silently drops every value between two window \
+                 boundaries. Use `chunk_by_key: {}` (keyset — any orderable indexed key), an \
+                 integer column, `chunk_dense: true`, or `mode: full`.",
+                export.name,
+                c,
+                tbl,
+                c
+            );
+        }
         c
     } else {
         match introspection.single_int_pk.clone() {
@@ -783,6 +927,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cdc_export_plan_gives_a_friendly_message_not_an_internal_invariant() {
+        // #dogfood MED: `rivet plan` on a cdc-mode export leaked "internal routing
+        // error — dispatch should branch on mode first". The bail is now
+        // user-facing (points at `rivet run`), reached before any DB probe.
+        let mut export = minimal_export();
+        export.mode = ExportMode::Cdc;
+        let err = build_plan(
+            &minimal_config(),
+            &export,
+            Path::new("."),
+            false,
+            false,
+            false,
+            None,
+        )
+        .unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("no batch plan") && msg.contains("rivet run"),
+            "must point the user at `rivet run`, got: {msg}"
+        );
+        assert!(
+            !msg.contains("internal routing error"),
+            "must not leak the internal invariant, got: {msg}"
+        );
+    }
+
     // ── auto-resolve chunk_column friendly errors (no DB) ─────────────────
 
     #[test]
@@ -811,13 +983,15 @@ mod tests {
 
     #[test]
     fn chunked_explicit_column_skips_auto_resolve_and_no_db_call() {
-        // Sanity: an explicit chunk_column means we never even try to open a
-        // connection — the resolver short-circuits on the explicit value.
-        // (Otherwise this test would have to hit a real Postgres.)
+        // Sanity: an explicit chunk_column with `query:` (no `table:`) short-
+        // circuits without opening a connection. (#103: `table:` + a range-sliced
+        // column now DOES probe the type, so the no-network fast path is
+        // query-only / dense / by_days from here on.)
         let mut export = minimal_export();
         export.mode = ExportMode::Chunked;
         export.chunk_column = Some("explicit_pk".into());
-        export.table = Some("public.something".into());
+        export.table = None;
+        export.query = Some("SELECT explicit_pk, v FROM something".into());
         let plan = build_plan(
             &minimal_config(),
             &export,
@@ -832,6 +1006,38 @@ mod tests {
             ExtractionStrategy::Chunked(cp) => assert_eq!(cp.column, "explicit_pk"),
             _ => panic!("expected Chunked"),
         }
+    }
+
+    #[test]
+    fn explicit_non_integer_chunk_column_is_refused_not_silently_range_sliced() {
+        // #103 (variant 1): an explicit chunk_column that is range-BETWEEN-sliced
+        // must be integer-family — a numeric/decimal/float key silently drops
+        // rows between integer windows. The planner refuses it and points at
+        // chunk_by_key (keyset works on any orderable indexed key).
+        use crate::config::SourceType;
+        // introspection: `id` is integer-family, `amount` is not.
+        let i = intro(Some("id"), &["id"], 1_000_000, Some(100), &["id"]);
+
+        let mut bad = chunked_export();
+        bad.chunk_column = Some("amount".into());
+        let err =
+            chunked_strategy_from_introspection(SourceType::Postgres, &bad, "public.t", 3, &i)
+                .unwrap_err();
+        assert!(
+            err.to_string().contains("not an integer-family column"),
+            "a non-integer chunk_column must be refused, not silently range-sliced: {err}"
+        );
+
+        // An integer explicit chunk_column resolves to Chunked as before.
+        let mut good = chunked_export();
+        good.chunk_column = Some("id".into());
+        assert!(
+            matches!(
+                chunked_strategy_from_introspection(SourceType::Postgres, &good, "public.t", 3, &i),
+                Ok(ExtractionStrategy::Chunked(_))
+            ),
+            "an integer chunk_column must still resolve"
+        );
     }
 
     #[test]
@@ -966,12 +1172,14 @@ mod tests {
         keyset_keys: &[&str],
         row_estimate: i64,
         avg_row_bytes: Option<i64>,
+        int_columns: &[&str],
     ) -> crate::source::TableIntrospection {
         crate::source::TableIntrospection {
             single_int_pk: single_int_pk.map(str::to_string),
             keyset_keys: keyset_keys.iter().map(|s| s.to_string()).collect(),
             row_estimate,
             avg_row_bytes,
+            int_columns: int_columns.iter().map(|s| s.to_string()).collect(),
         }
     }
 
@@ -991,7 +1199,7 @@ mod tests {
         // Small-table escape: rows <= chunk_size downgrades to Snapshot —
         // INCLUSIVE boundary (row_estimate == chunk_size still snapshots).
         let e = base();
-        let i = intro(Some("id"), &["id"], e.chunk_size as i64, Some(100));
+        let i = intro(Some("id"), &["id"], e.chunk_size as i64, Some(100), &["id"]);
         assert!(matches!(
             resolve(SourceType::Postgres, &e, &i).unwrap(),
             ExtractionStrategy::Snapshot
@@ -1011,7 +1219,7 @@ mod tests {
         // (deleting the `!` accepts a full-scan+filesort key).
         let mut e = base();
         e.chunk_by_key = Some("uid".into());
-        let i = intro(None, &["uid"], 1_000_000, Some(100));
+        let i = intro(None, &["uid"], 1_000_000, Some(100), &[]);
         match resolve(SourceType::Postgres, &e, &i).unwrap() {
             ExtractionStrategy::Keyset(k) => assert_eq!(k.key_column, "uid"),
             other => panic!("usable chunk_by_key must keyset, got {other:?}"),
@@ -1027,12 +1235,12 @@ mod tests {
         // to the defensive 512 B (100 MB / 512 = 204_800), never divide by 0.
         let mut e = base();
         e.chunk_size_memory_mb = Some(100);
-        let i = intro(Some("id"), &["id"], 10_000_000, Some(1024));
+        let i = intro(Some("id"), &["id"], 10_000_000, Some(1024), &["id"]);
         match resolve(SourceType::Postgres, &e, &i).unwrap() {
             ExtractionStrategy::Chunked(p) => assert_eq!(p.chunk_size, 102_400),
             other => panic!("expected chunked, got {other:?}"),
         }
-        let i = intro(Some("id"), &["id"], 10_000_000, Some(0));
+        let i = intro(Some("id"), &["id"], 10_000_000, Some(0), &["id"]);
         match resolve(SourceType::Postgres, &e, &i).unwrap() {
             ExtractionStrategy::Chunked(p) => assert_eq!(p.chunk_size, 204_800),
             other => panic!("expected chunked, got {other:?}"),
@@ -1042,7 +1250,7 @@ mod tests {
         // introspection on Postgres must refuse with the no-safe-shape error —
         // an `==` -> `!=` mutant flips the gate for every engine.
         let e = base();
-        let i = intro(None, &["uuid_col"], 1_000_000, Some(100));
+        let i = intro(None, &["uuid_col"], 1_000_000, Some(100), &[]);
         match resolve(SourceType::Mysql, &e, &i).unwrap() {
             ExtractionStrategy::Keyset(k) => assert_eq!(k.key_column, "uuid_col"),
             other => panic!("mysql auto-keyset expected, got {other:?}"),
@@ -1063,7 +1271,7 @@ mod tests {
         let resolve = |export: &ExportConfig, i: &crate::source::TableIntrospection| {
             chunked_strategy_from_introspection(SourceType::Postgres, export, "public.t", 3, i)
         };
-        let i = intro(Some("id"), &["uid"], 1_000_000, Some(100));
+        let i = intro(Some("id"), &["uid"], 1_000_000, Some(100), &["id"]);
 
         // checkpoint on, incremental unset → crash-recovery only, NOT incremental.
         let mut e = chunked_export();
@@ -1212,6 +1420,58 @@ mod tests {
             }
             _ => panic!("expected Chunked"),
         }
+    }
+
+    #[test]
+    fn heavy_chunk_warning_fires_only_on_a_wide_fixed_size_chunk() {
+        // Narrow table (512 B/row × 100k = ~49 MB/chunk) → no warning.
+        assert!(heavy_chunk_warning("t", 100_000, Some(512), false).is_none());
+        // Wide table (8 KB/row × 100k = ~763 MB/chunk ≥ 512 MB) → warn, actionably.
+        let w = heavy_chunk_warning("t", 100_000, Some(8192), false)
+            .expect("a wide fixed-size chunk must warn");
+        assert!(w.contains("chunk_size_memory_mb"), "must name the fix: {w}");
+        assert!(
+            w.contains("ERROR 3024"),
+            "must name the field failure mode: {w}"
+        );
+        // A memory budget is already width-aware → never warn, even if wide.
+        assert!(heavy_chunk_warning("t", 100_000, Some(8192), true).is_none());
+        // No catalog width estimate → can't judge → no warning.
+        assert!(heavy_chunk_warning("t", 100_000, None, false).is_none());
+        assert!(heavy_chunk_warning("t", 100_000, Some(0), false).is_none());
+        // A large chunk_size makes even a moderate row width heavy.
+        assert!(heavy_chunk_warning("t", 2_000_000, Some(300), false).is_some());
+    }
+
+    #[test]
+    fn full_strategy_mongo_parallel_without_page_size_is_snapshot_and_warns() {
+        // #dogfood: `parallel: N` on a Mongo full export fans out the `_id`-range
+        // reader, which needs `source.mongo.page_size`. WITHOUT it the strategy is
+        // Snapshot (a single cursor) — parallel is a no-op — and rivet WARNS rather
+        // than silently dropping the flag. WITH page_size it engages the Keyset
+        // (`_id`-range parallel) runner instead.
+        let base = "source: { type: mongo, url: \"mongodb://127.0.0.1:27017/db\"MONGO }\n\
+                    exports:\n  - name: m\n    table: coll\n    mode: full\n    parallel: 4\n    \
+                    format: parquet\n    destination: { type: local, path: ./o }\n";
+        let cfg_no_page =
+            crate::config::Config::from_yaml(&base.replace("MONGO", "")).expect("parses");
+        assert!(
+            matches!(
+                full_strategy(&cfg_no_page, &cfg_no_page.exports[0]),
+                ExtractionStrategy::Snapshot
+            ),
+            "mongo full + parallel WITHOUT page_size must be Snapshot (parallel is a no-op)"
+        );
+        let cfg_page =
+            crate::config::Config::from_yaml(&base.replace("MONGO", ", mongo: { page_size: 500 }"))
+                .expect("parses");
+        assert!(
+            matches!(
+                full_strategy(&cfg_page, &cfg_page.exports[0]),
+                ExtractionStrategy::Keyset(_)
+            ),
+            "mongo full + parallel WITH page_size must engage the _id-range Keyset runner"
+        );
     }
 
     #[test]

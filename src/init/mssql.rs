@@ -47,7 +47,7 @@ pub(super) fn connect(url: &str) -> Result<MssqlSource> {
 /// back a single cell.
 pub(super) fn list_tables(conn: &mut MssqlSource, schema: &str) -> Result<Vec<String>> {
     let sql = format!(
-        "SELECT STRING_AGG(TABLE_NAME, CHAR(30)) WITHIN GROUP (ORDER BY TABLE_NAME) \
+        "SELECT STRING_AGG(CONVERT(nvarchar(max), TABLE_NAME), CHAR(30)) WITHIN GROUP (ORDER BY TABLE_NAME) \
          FROM information_schema.TABLES \
          WHERE TABLE_SCHEMA = N'{}' AND TABLE_TYPE IN ('BASE TABLE', 'VIEW')",
         schema.replace('\'', "''"),
@@ -90,7 +90,7 @@ pub(super) fn introspect(conn: &mut MssqlSource, schema: &str, table: &str) -> R
     // precision/scale from `information_schema.COLUMNS`. `ISNULL(...,'')` keeps
     // absent precision/scale as empty fields so the `US` split stays aligned.
     let columns_sql = format!(
-        "SELECT STRING_AGG( \
+        "SELECT STRING_AGG(CONVERT(nvarchar(max), \
              CONCAT( \
                  c.COLUMN_NAME, CHAR(31), \
                  c.DATA_TYPE, CHAR(31), \
@@ -98,7 +98,7 @@ pub(super) fn introspect(conn: &mut MssqlSource, schema: &str, table: &str) -> R
                  c.IS_NULLABLE, CHAR(31), \
                  ISNULL(CONVERT(varchar(12), c.NUMERIC_PRECISION), ''), CHAR(31), \
                  ISNULL(CONVERT(varchar(12), c.NUMERIC_SCALE), '') \
-             ), CHAR(30)) WITHIN GROUP (ORDER BY c.ORDINAL_POSITION) \
+             )), CHAR(30)) WITHIN GROUP (ORDER BY c.ORDINAL_POSITION) \
          FROM information_schema.COLUMNS c \
          LEFT JOIN ( \
              SELECT ku.COLUMN_NAME \
@@ -159,6 +159,32 @@ fn parse_columns_agg(agg: &str) -> Vec<ColumnInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Guard the whole init-introspection SQL against Msg 9829: STRING_AGG caps its
+    /// result at 8000 bytes UNLESS its input is `CONVERT(nvarchar(max), ..)`. A wide
+    /// table (160+ columns) overflows the per-column CONCAT aggregate, so `rivet
+    /// init` FAILED on it — the init-path sibling of the #21 preflight fix in
+    /// source/mssql/mod.rs (which this dogfooding run surfaced was NOT applied here).
+    /// Every STRING_AGG in the PRODUCTION half must wrap its input in
+    /// CONVERT(nvarchar(max)).
+    #[test]
+    fn every_string_agg_uses_nvarchar_max_to_survive_wide_tables() {
+        // Scan only the production half — the test module below mentions
+        // `STRING_AGG(` as a literal in this very check, which must not self-trip.
+        let src = include_str!("mssql.rs");
+        let production = src.split("#[cfg(test)]").next().unwrap();
+        for (i, line) in production.lines().enumerate() {
+            if line.contains("STRING_AGG(") && !line.trim_start().starts_with("//") {
+                assert!(
+                    line.contains("CONVERT(nvarchar(max)"),
+                    "line {}: STRING_AGG without CONVERT(nvarchar(max)) hits Msg 9829 on a wide \
+                     table:\n{}",
+                    i + 1,
+                    line.trim()
+                );
+            }
+        }
+    }
 
     /// Build one `US`-joined column record (mirrors the server-side CONCAT).
     fn rec(fields: &[&str]) -> String {

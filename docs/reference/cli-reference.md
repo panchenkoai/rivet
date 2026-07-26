@@ -170,9 +170,7 @@ The native column schema, target table, partition, and source URIs are all deriv
 ###### **Options:**
 
 * `-c`, `--config <CONFIG>` — Path to YAML config file — extraction PLUS a top-level `load:` block. ONE file drives both the export and the load: the mode (`full`/`incremental`/`cdc`), `pk:`, `cleanup_source:`, `gc_orphans:` and `allow_source_drift:` all live in the config, not on the CLI
-* `--rivet-bin <RIVET_BIN>` — Path to the `rivet` binary used for the type-report subprocess
-
-  Default value: `rivet`
+* `--rivet-bin <RIVET_BIN>` — Path to the `rivet` binary used for the type-report subprocess. Defaults to THIS executable (self), so the load's `rivet check` resolves types with the same version — a `rivet` on `$PATH` may be a different, skewed version. Override only to pin a specific binary
 * `--run-id <RUN_ID>` — Correlation id stamped on every warehouse job/query of this load run (BigQuery `rivet_run` label / Snowflake `QUERY_TAG`), so cost slices per run as well as per table. Defaults to a generated id
 
 
@@ -242,7 +240,7 @@ Show file manifest (files produced by exports)
 
 Clear persisted chunk checkpoint rows (`chunk_run` / `chunk_task`)
 
-**Usage:** `rivet state reset-chunks [OPTIONS] --config <CONFIG>`
+**Usage:** `rivet state reset-chunks --config <CONFIG> <--export <EXPORT>|--stuck-checkpoints>`
 
 ###### **Options:**
 
@@ -322,11 +320,11 @@ Generate a config scaffold from a live database (connect + introspect)
 
 ###### **Options:**
 
-* `--source <SOURCE>` — Database URL (postgresql://, mysql://, or sqlserver://). Visible in shell history / `ps`; prefer `--source-env` or `--source-file` for anything other than local dev
+* `--source <SOURCE>` — Database URL (postgresql://, mysql://, sqlserver://, or mongodb://). Visible in shell history / `ps`; prefer `--source-env` or `--source-file` for anything other than local dev
 * `--source-env <ENV_VAR>` — Name of an environment variable holding the database URL (e.g. DATABASE_URL). The URL never touches the command line
 * `--source-file <PATH>` — Path to a file containing just the database URL (one line). Credentials stay on disk instead of entering the process command line
 * `--table <TABLE>` — Single table, optionally schema-qualified (e.g. public.orders, dbo.orders). Omit to emit all tables/views in a Postgres/SQL Server schema or MySQL database
-* `--schema <SCHEMA>` — PostgreSQL: schema to export (default public). SQL Server: schema (default dbo). MySQL: database name if missing from the URL, or override URL database
+* `--schema <SCHEMA>` — PostgreSQL: schema to export (default public). SQL Server: schema (default dbo). MySQL: database name when the URL omits it (a --schema naming a DIFFERENT database than the URL is refused — put the database in the URL)
 * `--include <GLOB>` — Whole-schema only: keep only tables/views matching this glob (`*`/`?`). Repeatable; a table is kept if it matches any `--include`. No `--include` = keep all
 * `--exclude <GLOB>` — Whole-schema only: drop tables/views matching this glob (`*`/`?`). Repeatable; `--exclude` wins over `--include`
 * `-o`, `--output <OUTPUT>` — Write output to this file instead of stdout

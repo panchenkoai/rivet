@@ -1,0 +1,111 @@
+# CLI export-STRATEGY flag matrix — flag/behaviour × ENGINE, verified on both
+# GOLDEN fixtures (clean, hand-authored shapes) and a distilled GARBAGE profile
+# (the anonymized shape of a real 200+-table field DB: bigint/int/unsigned PKs,
+# dual created_at/updated_at, non-default schemas, sparse spans, wide tables).
+#
+# Two deterministic layers verify these cells — the existing infra, no bespoke
+# harness:
+#   * OFFLINE oracle — src/init/catalog_replay.rs replays `scaffold_strategy`
+#     (init/plan's PURE strategy decision) against src/init/fixtures/
+#     hostile_catalog.json, the distilled GARBAGE profile (schema + stats, ZERO
+#     row data). Engine-agnostic, so the strategy_selection row shares one test.
+#   * LIVE stand — tests/live/chunking_stand.rs seeds a representative SUBSET of
+#     each shape on the docker fixture DB (per-test unique tables, RAII cleanup)
+#     and runs the flag through the real binary. This is where engine-SPECIFIC
+#     behaviour lives (unsigned cursor = MySQL, regclass-throw = PG, STRING_AGG
+#     cap = MSSQL), so those rows are one `test:` engine + `na:` elsewhere.
+#
+# Cell = { test: <fn> } | { na: "<why the shape does not apply to this engine>" }
+#      | { gap: "<why, ratcheted>" }. Same drift-guard as the sibling ledgers
+# (tests/offline/chunking_matrix_guard.rs): every `test:` fn must exist, every
+# scenario covers every engine column, gaps ratcheted (shrink-only).
+#
+# `engines:` is the guard's generic column axis. Mongo pages `_id` and has no
+# SQL range/keyset knob, so the SQL-chunking rows are `na` there.
+
+engines: [postgres, mysql, mssql, mongo]
+
+scenarios:
+  - id: strategy_selection_on_garbage_profile
+    what: "init/plan `mode`/`chunk_by_key`/`cursor_column` scaffold is a PURE function of catalog shape — locked for the whole distilled GARBAGE profile (bigint/int/unsigned PK → keyset(id); PK beats a present timestamp cursor; small keyed table → full below the 100k threshold) by the OFFLINE oracle. Engine-agnostic (the decision does not read the engine), so all columns share the one replay test."
+    postgres: { test: scaffold_strategy_matches_every_distilled_field_shape }
+    mysql:    { test: scaffold_strategy_matches_every_distilled_field_shape }
+    mssql:    { test: scaffold_strategy_matches_every_distilled_field_shape }
+    mongo:    { test: scaffold_strategy_matches_every_distilled_field_shape }
+
+  - id: noninteger_chunk_column_bails
+    what: "GARBAGE + GOLDEN: an explicit `chunk_column` that is NOT integer-family (a text/decimal key — the #103 silent fractional-row-drop shape) must LOUDLY bail, never range-chunk. Tested on every SQL engine's introspection."
+    postgres: { test: stand_non_integer_chunk_column_bail_postgres }
+    mysql:    { test: stand_non_integer_chunk_column_bail_mysql }
+    mssql:    { test: stand_non_integer_chunk_column_bail_mssql }
+    mongo:    { na: "Mongo pages _id; there is no user chunk_column / SQL range slice." }
+
+  - id: sparse_key_warns_or_bails
+    what: "GARBAGE: a chunk_column whose SPAN vastly exceeds its row count (the field profile's gappy ids) explodes range chunking into near-empty windows — the planner must refuse where a scan-free estimate proves it (PG/MSSQL) and warn where it can only suspect it (MySQL)."
+    postgres: { test: stand_sparse_guard_postgres }
+    mysql:    { test: stand_sparse_guard_mysql }
+    mssql:    { test: stand_sparse_guard_mssql }
+    mongo:    { na: "no BETWEEN-over-span shape on the Mongo _id reader." }
+
+  - id: null_keyed_chunk_bails
+    what: "GARBAGE: a chunk_column containing NULLs (a nullable non-PK key in the fleet) would silently drop the NULL rows from every BETWEEN window — the planner must bail. Every SQL engine."
+    postgres: { test: stand_null_keyed_bail_postgres }
+    mysql:    { test: stand_null_keyed_bail_mysql }
+    mssql:    { test: stand_null_keyed_bail_mssql }
+    mongo:    { na: "Mongo _id is non-null by construction; no user chunk key." }
+
+  - id: keyset_unsigned_key_completeness
+    what: "GARBAGE (engine-specific): the field DB CASTs id AS UNSIGNED, so keyset ids run PAST i64::MAX. The high-water cursor extraction (extract_last_cursor_value, #bc512a3) must read the unsigned key or keyset loses/duplicates the tail. Unsigned integers are a MySQL-only type."
+    postgres: { na: "PostgreSQL has no UNSIGNED integer type — bigint is signed." }
+    mysql:    { test: stand_keyset_unsigned_key_completeness_mysql }
+    mssql:    { na: "SQL Server bigint is signed; no UNSIGNED integer type." }
+    mongo:    { na: "Mongo keysets by _id, not a SQL unsigned integer key." }
+
+  - id: nondefault_schema_chunked_degrades
+    what: "GARBAGE (engine-specific): an UNQUALIFIED `table:` in a non-default schema (the field DB's fleet lives in its own schema, reached via search_path) makes the introspection probe — which assumes `public` and casts via a THROWING regclass — fail. The #103 routing then hard-bailed a formerly-working config; the fix degrades a probe FAILURE to the fast-path + a can't-verify warning. The search_path-resolved-unqualified-table shape is PG-specific."
+    postgres: { test: stand_chunked_nondefault_schema_probe_degrades_and_exports_all_postgres }
+    mysql:    { na: "MySQL resolves the database from the URL, not a search_path schema; a --schema naming a different db is refused up front (init guard), not a silent probe throw." }
+    mssql:    { na: "MSSQL introspection targets the dbo schema explicitly; there is no search_path-resolved unqualified-table throw to degrade from." }
+    mongo:    { na: "Mongo has no schema namespace; the database is in the URL." }
+
+  - id: wide_table_introspection
+    what: "GARBAGE (engine-specific): a wide table (the field profile has tables with very many columns) makes the MSSQL introspection STRING_AGG over the column names exceed 8000 bytes and raise Msg 9829 (#21), failing EVERY chunked/keyset plan for that table. The fix CONVERTs to nvarchar(max). STRING_AGG-based introspection is the MSSQL query pattern."
+    postgres: { na: "PG introspection reads pg_attribute rows directly — no STRING_AGG concatenation, no 8000-byte cap." }
+    mysql:    { na: "MySQL introspection reads information_schema.COLUMNS rows directly — no STRING_AGG cap." }
+    mssql:    { test: stand_wide_table_introspection_mssql }
+    mongo:    { na: "Mongo has no column introspection for SQL chunking." }
+
+  - id: chunk_by_days_date_windows
+    what: "GOLDEN: `chunk_by_days` on a DATE column slices half-open date windows (type-safe, no fractional-row-drop) — the alternative rivet steers date-keyed fleet tables toward. Every SQL engine."
+    postgres: { test: stand_chunk_by_days_postgres }
+    mysql:    { test: stand_chunk_by_days_mysql }
+    mssql:    { test: stand_chunk_by_days_mssql }
+    mongo:    { na: "no date-window chunking on the Mongo reader." }
+
+  - id: chunk_count_exact_parts
+    what: "GOLDEN: `chunk_count: N` on a dense clean key emits EXACTLY N part files (the range is divided into N windows). Representative-engine coverage (MySQL + MSSQL); the PG range path shares the same generate_chunks seam, unit-tested in chunked/math.rs."
+    postgres: { na: "PG shares the engine-agnostic generate_chunks seam (chunked/math.rs unit tests); the stand exercises it via chunk_by_days/sparse on PG instead of duplicating chunk_count." }
+    mysql:    { test: stand_chunk_count_mysql }
+    mssql:    { test: stand_chunk_count_mssql }
+    mongo:    { na: "no user chunk_count on the Mongo reader." }
+
+  - id: time_window_bounded_range
+    what: "GOLDEN: `mode: time_window` pulls only a bounded time range (the field tool's time_based tier) — representative-engine coverage (MySQL + MSSQL)."
+    postgres: { na: "time_window resolution is engine-agnostic (plan/contract.rs); the stand covers it on MySQL + MSSQL, and PG time-cursor handling is exercised by the incremental live suite." }
+    mysql:    { test: stand_time_window_mysql }
+    mssql:    { test: stand_time_window_mssql }
+    mongo:    { na: "no SQL time_window on the Mongo reader (it pages _id)." }
+
+  - id: keyset_key_type_extractable
+    what: "GARBAGE (dogfood): `chunk_by_key` must refuse a key type the keyset CURSOR cannot read (`decimal`/`numeric`) at PLAN time — a loud bail naming the type, NOT a partial write then a mid-run 'could not read the key value' failure. The keyset_keys introspection excludes decimal/numeric on every SQL engine so the planner never offers an un-advanceable key."
+    postgres: { test: stand_keyset_decimal_key_bails_postgres }
+    mysql:    { test: stand_keyset_decimal_key_bails_mysql }
+    mssql:    { test: stand_keyset_decimal_key_bails_mssql }
+    mongo:    { na: "Mongo keysets by `_id` (always extractable); no user chunk_by_key type to refuse." }
+
+  - id: mongo_parallel_needs_page_size
+    what: "GARBAGE (dogfood): `parallel: N` on a Mongo `mode: full` export fans out the `_id`-range reader, which requires `source.mongo.page_size`. Without it the export is a single cursor and `parallel: N` is a NO-OP — rivet must WARN, not silently drop it (Mongo-only; the SQL engines fan out via chunk/keyset)."
+    postgres: { na: "SQL parallelism is via chunked/keyset runners, not a Mongo _id-range fan-out." }
+    mysql:    { na: "SQL parallelism is via chunked/keyset runners." }
+    mssql:    { na: "SQL parallelism is via chunked/keyset runners." }
+    mongo:    { test: full_strategy_mongo_parallel_without_page_size_is_snapshot_and_warns }

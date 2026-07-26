@@ -220,29 +220,40 @@ pub fn run_validate_command(
     //
     // Legacy runs (M6) keep exit 0: `passed: false` with no failures
     // means "verifier cannot certify", not "verifier found a problem".
-    let failed_verdicts = all_results
+    // A failing verdict is either VERIFIED-WRONG (a check ran and the data is bad:
+    // missing part, size/checksum/value mismatch, stale _SUCCESS, __pos gap,
+    // self-inconsistent manifest) or purely COULD-NOT-VERIFY (its only failures are
+    // I/O read/list errors against the destination). Only verified-wrong is the
+    // data-integrity stop-the-line class (exit 3); could-not-verify is operational
+    // (exit 1), so a chmod-000 manifest or a transient list blip does not page a
+    // corruption incident (#7 bughunt).
+    let verified_wrong = all_results
         .iter()
-        .filter(|r| verdict_fails_exit(&r.verification))
+        .filter(|r| {
+            verdict_fails_exit(&r.verification) && r.verification.has_verified_wrong_failure()
+        })
         .count();
-    if failed_verdicts > 0 {
-        // A verified-and-wrong verdict (missing part, size mismatch, stale
-        // _SUCCESS, self-inconsistent manifest) is the data-integrity class
-        // (exit 3) — typed so a scheduler stops rather than blindly retries.
-        // `hard_failures` (couldn't open / read the destination) are operational
-        // "could not verify", not "verified wrong", so they fold into the count
-        // but the class is driven by the real verdict failure.
+    let could_not_verify_verdicts = all_results
+        .iter()
+        .filter(|r| {
+            verdict_fails_exit(&r.verification) && !r.verification.has_verified_wrong_failure()
+        })
+        .count();
+    if verified_wrong > 0 {
+        // Typed so a scheduler stops rather than blindly retries. Could-not-verify
+        // verdicts + hard_failures fold into the count (the run did not fully
+        // certify), but the CLASS is driven by the verified-wrong verdict.
         return Err(crate::error::DataIntegrityError::new(format!(
             "rivet validate: {} export(s) failed verification",
-            hard_failures.len() + failed_verdicts
+            hard_failures.len() + verified_wrong + could_not_verify_verdicts
         ))
         .into());
     }
-    if !hard_failures.is_empty() {
-        // Could-not-verify only (no verified-wrong verdict): operational, generic.
-        anyhow::bail!(
-            "rivet validate: {} export(s) failed verification",
-            hard_failures.len()
-        );
+    let could_not_verify = hard_failures.len() + could_not_verify_verdicts;
+    if could_not_verify > 0 {
+        // Could-not-verify only (no verified-wrong verdict): operational, generic
+        // exit 1 — retry, don't stop-the-line.
+        anyhow::bail!("rivet validate: {could_not_verify} export(s) could not be verified");
     }
     Ok(())
 }
@@ -416,14 +427,26 @@ fn verify_one_prefix(
                         pc.first,
                         pc.last
                     ),
+                    // A __pos VIOLATION is verified-wrong (a gap/dup in the change
+                    // stream) — data-integrity (exit 3), same class as a value
+                    // mismatch. Route it into THIS export's verdict, not
+                    // hard_failures (bughunt MED: it was exit 1, inconsistent).
                     Ok(pc) => {
-                        for viol in &pc.violations {
-                            hard_failures
-                                .push(format!("export '{}': cdc __pos: {}", display_name, viol));
+                        if let Some(ev) = all_results.last_mut() {
+                            ev.verification.passed = false;
+                            for viol in &pc.violations {
+                                ev.verification.failures.push(
+                                    crate::pipeline::validate_manifest::Failure::CdcPositionViolation {
+                                        detail: format!("export '{}': {}", display_name, viol),
+                                    },
+                                );
+                            }
                         }
                     }
+                    // A check-RUN failure (couldn't read the parts) is operational
+                    // could-not-verify → hard failure (exit 1), not corruption.
                     Err(e) => hard_failures.push(format!(
-                        "export '{}': cdc __pos check failed: {:#}",
+                        "export '{}': cdc __pos check could not complete: {:#}",
                         display_name, e
                     )),
                 }
@@ -441,13 +464,32 @@ fn verify_one_prefix(
             if target.depth.runs_part_download()
                 && manifest_verified
                 && export.format == crate::config::FormatType::Parquet
-                && let Err(e) =
-                    crate::source::value_checksum::validate_manifest_checksums(&*dest, "")
             {
-                hard_failures.push(format!(
-                    "export '{}': value checksum: {:#}",
-                    display_name, e
-                ));
+                match crate::source::value_checksum::validate_manifest_checksums(&*dest, "") {
+                    // A value-checksum MISMATCH is post-write corruption
+                    // (verified-wrong): fold it into THIS export's verdict so the
+                    // headline reads FAILED and the exit gate classifies it as
+                    // data-integrity (exit 3), not generic (#104). The verdict is
+                    // the just-pushed `all_results` entry (nothing pushes between).
+                    Ok(Some(detail)) => {
+                        if let Some(ev) = all_results.last_mut() {
+                            ev.verification.passed = false;
+                            ev.verification.failures.push(
+                                crate::pipeline::validate_manifest::Failure::ValueChecksumMismatch {
+                                    detail: format!("export '{}': {}", display_name, detail),
+                                },
+                            );
+                        }
+                    }
+                    // An OPERATIONAL failure (could not read the manifest / a part)
+                    // is could-not-verify, NOT corruption — a hard failure (exit 1),
+                    // never mislabelled data-integrity (bughunt MED).
+                    Err(e) => hard_failures.push(format!(
+                        "export '{}': value-checksum re-read could not complete: {:#}",
+                        display_name, e
+                    )),
+                    Ok(None) => {}
+                }
             }
         }
         Err(e) => {
@@ -773,6 +815,45 @@ mod tests {
         assert!(verdict_fails_exit(&v));
     }
 
+    #[test]
+    fn value_checksum_mismatch_flips_verdict_and_fails_exit_gate() {
+        // #104: a `--depth full` value-checksum mismatch is post-write
+        // corruption (verified-wrong). The reclassification folds it into the
+        // verdict — sets passed=false + pushes ValueChecksumMismatch — so the
+        // exit gate fires (DataIntegrity / exit 3) instead of leaving a PASSED
+        // headline + a generic exit 1.
+        let reclassified = ManifestVerification {
+            manifest_found: true,
+            legacy_run: false,
+            passed: false,
+            failures: vec![VFailure::ValueChecksumMismatch {
+                detail: "export 'e': column 'id' checksum differs".into(),
+            }],
+            ..ManifestVerification::legacy()
+        };
+        assert!(
+            verdict_fails_exit(&reclassified),
+            "a value-checksum mismatch must fail the exit gate (exit 3), not pass silently"
+        );
+
+        // The bug this closes: as a `hard_failure` the verdict kept passed=true,
+        // so the gate (correctly, for passed=true) did NOT fire — status PASSED,
+        // exit 1. Proven here so a regression that stops flipping `passed` is caught.
+        let not_reclassified = ManifestVerification {
+            manifest_found: true,
+            legacy_run: false,
+            passed: true,
+            failures: vec![VFailure::ValueChecksumMismatch {
+                detail: "same corruption, left in hard_failures".into(),
+            }],
+            ..ManifestVerification::legacy()
+        };
+        assert!(
+            !verdict_fails_exit(&not_reclassified),
+            "with passed still true the gate wrongly passes — this is exactly bug #104"
+        );
+    }
+
     // ── run_validate_command end-to-end (local destination; the source URL
     //     is never dialed — see tests/validate_historical.rs) ──────────────
 
@@ -868,9 +949,17 @@ mod tests {
             ValidateTarget::default(),
         )
         .expect_err("an unreadable manifest is an explicit failure, not exit 0");
+        // #7 bughunt: an unreadable manifest is COULD-NOT-VERIFY (operational,
+        // exit 1), NOT verified-wrong corruption (exit 3). A scheduler must be
+        // free to retry a permissions/network blip, not stop-the-line.
         assert!(
-            format!("{err:#}").contains("1 export(s) failed verification"),
+            format!("{err:#}").contains("could not be verified"),
             "got: {err:#}"
+        );
+        assert!(
+            err.downcast_ref::<crate::error::DataIntegrityError>()
+                .is_none(),
+            "a read error must not be classed as data-integrity (exit 3): {err:#}"
         );
 
         // The JSON report (written before the bail) still carries the

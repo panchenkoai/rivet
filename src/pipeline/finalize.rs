@@ -478,6 +478,82 @@ fn rerun_warning_message(uri: &str, marker: &str) -> String {
     )
 }
 
+/// Project the `run_status` ledger's `running` row into the bucket as a
+/// schema-less MARKER manifest at run START. Written as the run-unique copy only
+/// (`manifest-<run_id>.json`) — NOT the canonical `manifest.json`, so a prior
+/// run's `_SUCCESS`/canonical pair never desyncs (the `SuccessMarkerStale` trap).
+/// A cross-boundary reader (Airflow, a foreign-host `rivet load`) then sees a
+/// LIVE run on the prefix via `fetch_manifests_keyed` and does NOT GC its
+/// in-flight parts. Cloud-only — a local export has no cross-host reader, and the
+/// state-store ledger already covers the co-located case. Best-effort: a marker
+/// write failure must never fail the run (gc still has the ledger). The terminal
+/// manifest at finalize OVERWRITES this same run-unique file.
+pub(super) fn write_running_manifest(plan: &ResolvedRunPlan, run_id: &str, started_at: &str) {
+    use crate::config::{DestinationType, SourceType};
+    use crate::manifest::{
+        MANIFEST_VERSION, ManifestDestination, ManifestSource, ManifestStatus, RunManifest,
+    };
+    use crate::pipeline::manifest_writer::write_manifest_without_success_marker;
+
+    let kind = match plan.destination.destination_type {
+        DestinationType::Gcs => "gcs",
+        DestinationType::S3 => "s3",
+        DestinationType::Azure => "azure",
+        // No cross-boundary bucket reader for these: the ledger covers the
+        // co-located case, so skip the marker.
+        DestinationType::Local | DestinationType::Stdout => return,
+    };
+    let engine = match plan.source.source_type {
+        SourceType::Postgres => "postgres",
+        SourceType::Mysql => "mysql",
+        SourceType::Mssql => "mssql",
+        SourceType::Mongo => "mongo",
+    };
+    let manifest = RunManifest {
+        manifest_version: MANIFEST_VERSION,
+        run_id: run_id.to_string(),
+        export_name: plan.export_name.clone(),
+        mode: "batch".to_string(),
+        started_at: started_at.to_string(),
+        finished_at: String::new(),
+        status: ManifestStatus::Running,
+        source: ManifestSource {
+            engine: engine.to_string(),
+            schema: None,
+            table: None,
+            extraction: None,
+        },
+        destination: ManifestDestination {
+            kind: kind.to_string(),
+            uri: destination_uri_for_manifest(&plan.destination),
+        },
+        format: String::new(),
+        compression: String::new(),
+        schema_fingerprint: String::new(),
+        row_count: 0,
+        part_count: 0,
+        parts: Vec::new(),
+        column_checksums: None,
+        checksum_key_column: None,
+    };
+    let dest = match crate::destination::create_destination(&plan.destination) {
+        Ok(d) => d,
+        Err(e) => {
+            log::debug!(
+                "export '{}': running-manifest destination unavailable (not fatal): {e:#}",
+                plan.export_name
+            );
+            return;
+        }
+    };
+    if let Err(e) = write_manifest_without_success_marker(&*dest, &manifest) {
+        log::debug!(
+            "export '{}': running-manifest write failed (not fatal; gc uses the ledger): {e:#}",
+            plan.export_name
+        );
+    }
+}
+
 /// Best-effort textual URI for the manifest's `destination.uri` field.
 ///
 /// The manifest is a record of where data was written, so the URI must

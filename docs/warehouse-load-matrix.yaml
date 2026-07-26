@@ -95,9 +95,9 @@ scenarios:
     clickhouse: { test: clickhouse_validates_postgres_type_matrix_parquet }
 
   - id: list_scalar
-    what: "array of a scalar — REPEATED/ARRAY per target, flatten note where autoload nests"
+    what: "array of a scalar — a LOADABLE ARRAY<STRUCT<item T>> DDL per target (BigQuery loads it as REPEATED RECORD{item}), flatten note where the shape nests"
     duckdb:     { test: duckdb_reads_everything_natively }
-    bigquery:   { test: bq_list_is_repeated_native_record_autoload }
+    bigquery:   { test: bq_list_declares_loadable_array_struct_item_ddl }
     snowflake:  { test: snowflake_autoload_degradations_and_native_casts }
     clickhouse: { test: clickhouse_validates_postgres_type_matrix_parquet }
 

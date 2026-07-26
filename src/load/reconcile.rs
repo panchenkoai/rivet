@@ -172,40 +172,117 @@ pub fn select_load_keys(new: &[(String, RunManifest)], all_parquet: &[String]) -
 }
 
 /// Delete every `.parquet` under `gcs_prefix` that no **`Success`** manifest
-/// references — crash leftovers from an interrupted extract (a run killed before
-/// it wrote its manifest leaves orphan parts the load already ignores, but which
-/// accumulate). Keeps every manifest, `_SUCCESS`, and every manifested part
-/// (including a `snapshot/` sub-prefix's, since `keyed` is fetched recursively).
-/// Strictly gentler than `cleanup_source`, which wipes the whole prefix.
+/// references — crash leftovers from an interrupted extract that accumulate.
+/// Keeps every manifest, `_SUCCESS`, and every manifested part (including a
+/// `snapshot/` sub-prefix's, since `keyed` is fetched recursively). Strictly
+/// gentler than `cleanup_source`, which wipes the whole prefix.
 ///
-/// ⚠️ INVARIANT: it cannot distinguish a crash orphan from a *live* extract's
-/// committed-but-not-yet-manifested parts (both are unmanifested `.parquet`), and
-/// there is NO age/lease guard. Only run a load with `gc_orphans` when no extract
-/// is writing the same prefix — the normal pipeline (a load AFTER a completed
-/// extract) satisfies this; a load fired while a `rivet run` streams into the same
-/// prefix would delete its in-flight parts. Returns `(removed_count, removed_bytes)`.
+/// A candidate falls into three classes:
+/// - referenced by a **`Success`** manifest → KEEP (live data).
+/// - referenced by a **`Failed`/`Interrupted`** manifest → DELETE unconditionally.
+///   A run that WROTE a manifest is terminal — no live extract is still streaming
+///   it — so its leftovers are unambiguous crash debris.
+/// - referenced by **NO manifest at all** → AMBIGUOUS: a crash-BEFORE-manifest
+///   orphan (delete) OR a concurrent extract's committed-but-not-yet-manifested
+///   part (must NOT delete). `active` decides — the caller's answer to "is a run
+///   currently WRITING this prefix?", read from the central run-status ledger
+///   (`StateStore::has_active_run_on_prefix`): authoritative and CLOCK-FREE.
+///   `active` → spare every unmanifested part; `!active` → no run is live, so an
+///   unmanifested part is dead crash debris → delete.
+///
+/// The ledger read is the SEAM. A co-located / shared-Postgres load gets a
+/// precise `active`; a stateless or foreign-host load passes `active = true`
+/// (conservative — spare rather than risk a live cross-host extract's parts),
+/// which the bucket-manifest `running`-status projection later refines.
+/// Returns `(removed, bytes)`.
 #[allow(private_interfaces)]
 pub fn gc_orphans(
     store: &GcsStore,
     gcs_prefix: &str,
     keyed: &[(String, RunManifest)],
+    active: bool,
 ) -> Result<(usize, u64)> {
     let (_bucket, base) = crate::load::split_gs_uri(gcs_prefix)?;
-    let keep: std::collections::HashSet<String> = keyed
-        .iter()
-        .filter(|(_, m)| m.status == ManifestStatus::Success)
-        .flat_map(|(key, m)| resolve_parts(key, m))
-        .collect();
+    // Success parts → keep. Failed/Interrupted parts → terminal (their run is
+    // done, so deletable regardless of `active`). A part in NEITHER set has no
+    // manifest at all — the ambiguous case `active` gates.
+    let mut keep: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut terminal: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (key, m) in keyed {
+        match m.status {
+            ManifestStatus::Success => keep.extend(resolve_parts(key, m)),
+            // A `running` manifest is a LIVE run's marker (schema-less, no parts).
+            // Its parts (if any) must NOT be treated as terminal debris — its
+            // activeness is what makes `active` true (see the callsite), which
+            // spares the run's unmanifested in-flight parts below.
+            ManifestStatus::Running => {}
+            ManifestStatus::Failed | ManifestStatus::Interrupted => {
+                terminal.extend(resolve_parts(key, m))
+            }
+        }
+    }
     let mut removed = 0usize;
     let mut removed_bytes = 0u64;
     for key in store.list_files(base)? {
-        if key.ends_with(".parquet") && !keep.contains(&key) {
-            removed_bytes += store.stat_size(&key).unwrap_or(0);
-            store.remove(&key)?;
+        if !key.ends_with(".parquet") || keep.contains(&key) {
+            continue;
+        }
+        // A live run on this prefix + a part with NO manifest → maybe its
+        // in-flight write → spare. A terminal-manifested part is deleted even
+        // while a (different) run is active.
+        if active && !terminal.contains(&key) {
+            log::warn!(
+                "gc_orphans: sparing unmanifested `{key}` — a run is active on this prefix \
+                 (run-status ledger); it is GC'd once no run is active or it gets a manifest"
+            );
+            continue;
+        }
+        removed_bytes += store.stat_size(&key).unwrap_or(0);
+        store.remove(&key)?;
+        removed += 1;
+    }
+    // Second pass: a SUPERSEDED `running` MARKER manifest (its run was overtaken by
+    // a newer run of the same export) is a dead crash marker — never the live
+    // signal — so its lingering `.json` is safe to remove. gc otherwise never
+    // touches it (the parquet pass above only lists `.parquet`), so a hard-crashed
+    // run's marker would accumulate forever. A NON-superseded running manifest is
+    // the ACTIVE signal and MUST survive — deletion here is gated on SUPERSESSION,
+    // never on `active`.
+    for (key, m) in keyed {
+        if m.status == ManifestStatus::Running && is_superseded(m, keyed) {
+            removed_bytes += store.stat_size(key).unwrap_or(0);
+            store.remove(key)?;
             removed += 1;
         }
     }
     Ok((removed, removed_bytes))
+}
+
+/// Is a LIVE run's `running` MARKER manifest present under the prefix — the
+/// bucket-side projection of the run-status ledger, for a cross-boundary load
+/// (Airflow / a foreign-host `rivet load`) that cannot read the extract's state
+/// DB? True iff some `running` manifest is NOT superseded by a NEWER manifest
+/// (any status) of the SAME export — the same clock-free supersession the ledger
+/// uses (a newer `started_at` means the old running run crashed and its successor
+/// already re-ran). `gc_orphans`'s `active` is `ledger_active OR this`, so the two
+/// signals are belt-and-suspenders: the ledger is precise co-located, the marker
+/// covers cross-host.
+pub fn has_active_running_manifest(keyed: &[(String, RunManifest)]) -> bool {
+    keyed
+        .iter()
+        .any(|(_, m)| m.status == ManifestStatus::Running && !is_superseded(m, keyed))
+}
+
+/// A `running` manifest is SUPERSEDED when a NEWER run of the SAME export exists
+/// (a higher `started_at`) — it crashed and its successor already re-ran, so it
+/// no longer protects anything. The ONE clock-free staleness predicate, shared by
+/// [`has_active_running_manifest`] (spare the non-superseded) and `gc_orphans`'s
+/// marker-GC sweep (delete the superseded). The ledger enforces the same rule in
+/// SQL — that copy cannot share this Rust.
+fn is_superseded(m: &RunManifest, keyed: &[(String, RunManifest)]) -> bool {
+    keyed
+        .iter()
+        .any(|(_, o)| o.export_name == m.export_name && o.started_at > m.started_at)
 }
 
 /// Full/chunked loads care only about the LATEST snapshot: from `keyed` (all run
@@ -250,6 +327,14 @@ pub fn select_runs(
     loaded: &std::collections::HashSet<String>,
     mode: crate::load::plan::LoadMode,
 ) -> Vec<(String, RunManifest)> {
+    // A `running` manifest is a LIVE run's in-flight marker — never loadable (no
+    // committed parts). Drop it BEFORE selection so it neither becomes the
+    // "latest" full snapshot nor an incremental delta, either of which would
+    // make `reconcile` refuse the whole load on a non-Success run.
+    let keyed: Vec<(String, RunManifest)> = keyed
+        .into_iter()
+        .filter(|(_, m)| m.status != ManifestStatus::Running)
+        .collect();
     match mode {
         crate::load::plan::LoadMode::Full => latest_full(keyed),
         _ => keyed
@@ -297,7 +382,8 @@ fn is_manifest_key(key: &str) -> bool {
 /// A per-run manifest copy: `manifest-<token>.json` (the sidecar the OSS sink
 /// writes alongside the canonical pointer so cross-run reconcile can sum it).
 fn is_run_unique_manifest(base: &str) -> bool {
-    base.starts_with("manifest-") && base.ends_with(".json")
+    // The sidecar naming scheme lives once, in `manifest.rs` (the writer's home).
+    crate::manifest::is_run_unique_manifest_name(base)
 }
 
 /// Refuse a load whose prefix holds MORE THAN ONE export's manifests. The load
@@ -671,7 +757,8 @@ mod tests {
             ("base/_SUCCESS", b"".to_vec()),           // kept — not a .parquet
         ]);
         let keyed = vec![keyed("base/manifest-r1.json", "r1", "r1-000.parquet")];
-        let (removed, bytes) = gc_orphans(&store, "gs://b/base", &keyed).unwrap();
+        // No run is active on this prefix → the unmanifested part is dead debris.
+        let (removed, bytes) = gc_orphans(&store, "gs://b/base", &keyed, false).unwrap();
         assert_eq!(removed, 1, "only the unmanifested part is removed");
         assert_eq!(bytes, 4, "'junk' is 4 bytes");
         let mut left = store.list_files("base").unwrap();
@@ -691,7 +778,10 @@ mod tests {
     fn gc_orphans_of_an_all_manifested_prefix_removes_nothing() {
         let (store, _g) = fs_store(&[("base/r1-000.parquet", b"a".to_vec())]);
         let keyed = vec![keyed("base/manifest-r1.json", "r1", "r1-000.parquet")];
-        assert_eq!(gc_orphans(&store, "gs://b/base", &keyed).unwrap().0, 0);
+        assert_eq!(
+            gc_orphans(&store, "gs://b/base", &keyed, false).unwrap().0,
+            0
+        );
     }
 
     #[test]
@@ -701,7 +791,7 @@ mod tests {
             ("base/orphan.parquet", b"x".to_vec()),         // top-level orphan
         ]);
         let keyed = vec![keyed("base/snapshot/manifest-s.json", "s", "s-000.parquet")];
-        let (removed, _) = gc_orphans(&store, "gs://b/base", &keyed).unwrap();
+        let (removed, _) = gc_orphans(&store, "gs://b/base", &keyed, false).unwrap();
         assert_eq!(removed, 1, "the top-level orphan goes");
         assert_eq!(
             store.list_files("base/snapshot").unwrap(),
@@ -711,13 +801,141 @@ mod tests {
     }
 
     #[test]
-    fn gc_orphans_does_not_protect_a_failed_runs_parts() {
-        // Only a Success manifest keeps its parts — a Failed/Interrupted run's
-        // files are themselves crash leftovers.
+    fn gc_orphans_deletes_a_terminal_runs_parts_even_while_a_run_is_active() {
+        // A Failed/Interrupted run's parts are terminal crash debris — deleted
+        // regardless of `active`, since no LIVE run is streaming THEM. Passing
+        // active=true proves the `active` gate applies only to UNmanifested parts.
         let (store, _g) = fs_store(&[("base/f-000.parquet", b"x".to_vec())]);
         let mut kv = keyed("base/manifest-f.json", "f", "f-000.parquet");
         kv.1.status = ManifestStatus::Failed;
-        assert_eq!(gc_orphans(&store, "gs://b/base", &[kv]).unwrap().0, 1);
+        assert_eq!(gc_orphans(&store, "gs://b/base", &[kv], true).unwrap().0, 1);
+    }
+
+    #[test]
+    fn gc_orphans_spares_an_unmanifested_part_while_a_run_is_active() {
+        // The concurrent-extract guard. A part with NO manifest, while a run is
+        // ACTIVE on this prefix (the run-status ledger says so), is probably that
+        // run's committed-but-not-yet-manifested write — deleting it would be
+        // silent data loss on the live extract. RED against a mutant that ignores
+        // `active` (deletes every non-Success-manifested `.parquet`).
+        let (store, _g) = fs_store(&[
+            ("base/r1-000.parquet", b"aa".to_vec()),  // manifested (kept)
+            ("base/inflight.parquet", b"x".to_vec()), // unmanifested, a live run's part
+        ]);
+        let keyed = vec![keyed("base/manifest-r1.json", "r1", "r1-000.parquet")];
+        let (removed, _) = gc_orphans(&store, "gs://b/base", &keyed, true).unwrap();
+        assert_eq!(
+            removed, 0,
+            "an unmanifested part is spared while a run is active"
+        );
+        assert!(
+            store
+                .list_files("base")
+                .unwrap()
+                .iter()
+                .any(|k| k.ends_with("inflight.parquet")),
+            "the live run's in-flight part must survive gc_orphans"
+        );
+    }
+
+    #[test]
+    fn gc_orphans_collects_an_unmanifested_part_when_no_run_is_active() {
+        // The other half: with NO run active, an unmanifested part is a dead
+        // crash orphan and IS collected — the gate DEFERS cleanup, never abandons.
+        let (store, _g) = fs_store(&[
+            ("base/r1-000.parquet", b"aa".to_vec()),
+            ("base/dead-orphan.parquet", b"x".to_vec()),
+        ]);
+        let keyed = vec![keyed("base/manifest-r1.json", "r1", "r1-000.parquet")];
+        assert_eq!(
+            gc_orphans(&store, "gs://b/base", &keyed, false).unwrap().0,
+            1,
+            "with no active run, an unmanifested orphan is collected"
+        );
+    }
+
+    /// A `running` MARKER manifest (schema-less, no parts) started at `started_at`.
+    fn running(run: &str, started_at: &str) -> (String, RunManifest) {
+        let mut m = manifest(run, 0, None);
+        m.status = ManifestStatus::Running;
+        m.started_at = started_at.into();
+        m.finished_at = String::new();
+        m.parts.clear();
+        (format!("base/manifest-{run}.json"), m)
+    }
+
+    #[test]
+    fn has_active_running_manifest_true_for_a_lone_running_marker() {
+        assert!(has_active_running_manifest(&[running(
+            "r1",
+            "2026-01-01T00:00:00Z"
+        )]));
+    }
+
+    #[test]
+    fn has_active_running_manifest_false_when_none_is_running() {
+        // A Success manifest is not a live-run marker.
+        assert!(!has_active_running_manifest(&[keyed(
+            "k",
+            "r1",
+            "p.parquet"
+        )]));
+    }
+
+    #[test]
+    fn has_active_running_manifest_false_for_a_superseded_running_marker() {
+        // r1 crashed leaving a `running` marker; r2 (newer started_at, SAME
+        // export) already ran → r1 is stale and must NOT count as active. Same
+        // clock-free supersession the ledger uses.
+        let r1 = running("r1", "2026-01-01T00:00:00Z");
+        let mut r2 = manifest("r2", 10, Some(10)); // Success, same export ("orders")
+        r2.started_at = "2026-01-02T00:00:00Z".into();
+        assert!(!has_active_running_manifest(&[
+            r1,
+            ("base/manifest-r2.json".into(), r2)
+        ]));
+    }
+
+    #[test]
+    fn select_runs_drops_a_running_manifest() {
+        // A `running` (in-flight) manifest must NEVER be selected for load — else
+        // reconcile would refuse the whole load on a non-Success run. Incremental
+        // mode would otherwise include it (not yet loaded).
+        let run_marker = running("r_running", "2026-01-02T00:00:00Z");
+        let ok = keyed("base/manifest-r_ok.json", "r_ok", "r_ok-000.parquet"); // Success
+        let sel = select_runs(
+            vec![run_marker, ok],
+            &std::collections::HashSet::new(),
+            crate::load::plan::LoadMode::Incremental,
+        );
+        assert_eq!(sel.len(), 1, "only the Success run is selected");
+        assert_eq!(sel[0].1.run_id, "r_ok");
+        assert!(sel.iter().all(|(_, m)| m.status != ManifestStatus::Running));
+    }
+
+    #[test]
+    fn gc_orphans_removes_a_superseded_running_marker_but_spares_a_live_one() {
+        // r1 crashed leaving a `running` marker; r2 (newer, same export) is the
+        // live run. The DEAD superseded marker must be GC'd (else it accumulates
+        // forever — gc otherwise only lists `.parquet`); the LIVE one must survive
+        // (it is the active signal). Gated on supersession, so `active=true`.
+        let (store, _g) = fs_store(&[
+            ("base/manifest-r1.json", b"{}".to_vec()), // superseded running marker
+            ("base/manifest-r2.json", b"{}".to_vec()), // live running marker (newest)
+        ]);
+        let r1 = running("r1", "2026-01-01T00:00:01Z");
+        let r2 = running("r2", "2026-01-01T00:00:02Z");
+        let (removed, _) = gc_orphans(&store, "gs://b/base", &[r1, r2], true).unwrap();
+        assert_eq!(removed, 1, "only the superseded running marker is removed");
+        let left = store.list_files("base").unwrap();
+        assert!(
+            !left.iter().any(|k| k.ends_with("manifest-r1.json")),
+            "the superseded (dead) running marker is deleted"
+        );
+        assert!(
+            left.iter().any(|k| k.ends_with("manifest-r2.json")),
+            "the live (non-superseded) running marker survives — it is the active signal"
+        );
     }
 
     fn keyed_at(run: &str, finished_at: &str) -> (String, RunManifest) {
@@ -1047,7 +1265,7 @@ mod tests {
 
         // 4. gc_orphans deletes the orphan over real GCS — a REAL single-object
         // DELETE against the emulator — keeping the manifested part + manifest.
-        let (removed, _bytes) = gc_orphans(&store, &gs, &keyed).unwrap();
+        let (removed, _bytes) = gc_orphans(&store, &gs, &keyed, false).unwrap();
         assert_eq!(
             removed, 1,
             "exactly the orphan parquet is GC'd over real GCS"

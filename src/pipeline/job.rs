@@ -13,6 +13,168 @@ use super::single::{commit_incremental_cursor, run_with_reconnect};
 use super::summary::RunSummary;
 use crate::journal::RunEvent;
 
+/// Classify a raw error message into a STABLE `error_class` so failures group and
+/// trend without `LIKE '%…%'` string-matching (the 0.21.2 field post-mortem grouped
+/// 43 failures into 3 classes by hand). Ordered MOST-SPECIFIC first — the
+/// parallel-checkpoint wrapper embeds the inner `ERROR 3024` text, so it must match
+/// before `statement_timeout`. Returns `None` when nothing matches: an unclassified
+/// error is honest, not force-fit into a bucket.
+pub(crate) fn classify_error_message(msg: &str) -> Option<&'static str> {
+    let m = msg.to_ascii_lowercase();
+    if m.contains("keyset could not read") || m.contains("could not read the key value") {
+        Some("keyset_unreadable_key")
+    } else if m.contains("parallel checkpoint worker") {
+        Some("parallel_checkpoint")
+    } else if m.contains("deadlock") {
+        Some("deadlock")
+    } else if m.contains("lock wait timeout") || m.contains("could not obtain lock") {
+        // A lock-wait embeds "timeout" — match it before statement_timeout.
+        Some("lock_timeout")
+    } else if m.contains("3024")
+        || m.contains("maximum statement execution time")
+        || m.contains("statement timeout")
+    {
+        Some("statement_timeout")
+    } else if m.contains("schema drift")
+        || m.contains("schema changed")
+        || m.contains("on_schema_drift")
+    {
+        Some("schema_drift")
+    } else if m.contains("doesn't exist")
+        || m.contains("does not exist")
+        || m.contains("no such table")
+        || m.contains("invalid object name")
+        || m.contains("unknown table")
+    {
+        Some("relation_not_found")
+    } else if m.contains("permission denied")
+        || m.contains("command denied")
+        || m.contains("privilege")
+        || m.contains("view server state")
+    {
+        Some("privilege")
+    } else if m.contains("access denied")
+        || m.contains("authentication failed")
+        || m.contains("password authentication")
+    {
+        Some("source_auth")
+    } else if m.contains("connection reset")
+        || m.contains("connection refused")
+        || m.contains("connection closed")
+        || m.contains("broken pipe")
+        || m.contains("server has gone away")
+        || m.contains("connection timed out")
+    {
+        Some("connection")
+    } else if m.contains("certificate") || m.contains("tls handshake") || m.contains("ssl error") {
+        Some("tls")
+    } else if m.contains("no space left") || m.contains("disk full") || m.contains("quota exceeded")
+    {
+        Some("disk_full")
+    } else if m.contains("out of memory") || m.contains("cannot allocate memory") {
+        Some("out_of_memory")
+    } else {
+        None
+    }
+}
+
+/// The resolved strategy's `(label, key column)` — the column the run pages by.
+/// `None` for full/snapshot (no key). Shared by `key_descriptor_json` and the open
+/// probe, which resolves the key's native type against this name.
+fn strategy_key_column(plan: &ResolvedRunPlan) -> Option<(&'static str, &str)> {
+    match &plan.strategy {
+        ExtractionStrategy::Keyset(k) => Some(("keyset", &k.key_column)),
+        ExtractionStrategy::Chunked(c) => Some(("chunked", &c.column)),
+        ExtractionStrategy::Incremental(i) => Some(("incremental", &i.primary_column)),
+        _ => None,
+    }
+}
+
+/// A compact JSON descriptor of the resolved strategy's KEY: `{strategy, key}` plus
+/// `db_type` + an `unsigned` flag when the open probe resolved the key's SOURCE
+/// native type (the "was it unsigned" answer inline, which the Arrow repr elides).
+/// `is_primary_key` is implicit for keyset — the planner requires a unique index —
+/// so it is not restated.
+fn key_descriptor_json(plan: &ResolvedRunPlan, key_native_type: Option<&str>) -> Option<String> {
+    let (strategy, key) = strategy_key_column(plan)?;
+    let mut obj = serde_json::json!({ "strategy": strategy, "key": key });
+    if let Some(t) = key_native_type {
+        obj["db_type"] = serde_json::Value::String(t.to_string());
+        if t.to_ascii_lowercase().contains("unsigned") {
+            obj["unsigned"] = serde_json::Value::Bool(true);
+        }
+    }
+    Some(obj.to_string())
+}
+
+/// Capture failure-forensics context at run OPEN, best-effort. `export_schema` is
+/// otherwise SUCCESS-only, so a run that fails before finalize leaves no schema —
+/// the exact case a post-mortem needs (the 0.21.2 field DB had no schema for its 43
+/// failures). From one short-lived open probe this records:
+///  * the source SCHEMA (via `type_mappings`, LIMIT-0 so even a page-0 failure
+///    captures the columns/types) → `store_schema`, keyed by export like the
+///    success path (which OVERWRITES it, so a successful run is unaffected), and
+///  * the source SERVER context (version + limits) → `summary.server_context_json`.
+///
+/// Never fails the run: any probe error is logged at debug and dropped. One extra
+/// lightweight connection per export — cheap relative to the run it forensicates.
+fn capture_open_forensics(plan: &ResolvedRunPlan, state: &StateStore, summary: &mut RunSummary) {
+    let mut src = match crate::source::create_source(&plan.source) {
+        Ok(s) => s,
+        Err(e) => {
+            log::debug!(
+                "open-forensics: source connect failed for '{}': {e}",
+                plan.export_name
+            );
+            return;
+        }
+    };
+    summary.server_context_json = src.server_context();
+    match src.type_mappings(&plan.base_query, &plan.column_overrides) {
+        Ok(mappings) => {
+            // Arrow repr matches the success path's `arrow_schema_to_columns` format
+            // (so a later successful overwrite is consistent), and still names
+            // unsignedness (`UInt64`). Fall back to the source native type only when
+            // Arrow is None (an Unsupported type).
+            let cols: Vec<crate::state::SchemaColumn> = mappings
+                .iter()
+                .map(|m| crate::state::SchemaColumn {
+                    name: m.column_name.clone(),
+                    data_type: m
+                        .arrow_type
+                        .as_ref()
+                        .map(|t| format!("{t:?}"))
+                        .unwrap_or_else(|| m.source_native_type.clone()),
+                })
+                .collect();
+            // Resolve the KEY column's source native type for key_descriptor_json —
+            // it names signedness ("bigint unsigned") that the Arrow repr elides.
+            if let Some((_, key)) = strategy_key_column(plan) {
+                summary.key_native_type = mappings
+                    .iter()
+                    .find(|m| m.column_name == key)
+                    .map(|m| m.source_native_type.clone());
+            }
+            // store_schema_if_absent, NOT store_schema: a stored baseline is the
+            // drift detector's comparison anchor, read by `detect_schema_change`
+            // DURING the export (after this open probe). Overwriting it here would
+            // blind schema-drift detection — a changed column would compare equal to
+            // the just-stored current schema. A first-run failure (no baseline) is
+            // exactly what this forensics exists for and still captures its schema.
+            if let Err(e) = state.store_schema_if_absent(&summary.export_name, &cols) {
+                log::debug!(
+                    "open-forensics: store_schema_if_absent failed for '{}': {e}",
+                    summary.export_name
+                );
+            }
+        }
+        Err(e) => log::debug!(
+            "open-forensics: type_mappings failed for '{}': {e}",
+            plan.export_name
+        ),
+    }
+}
+
 /// Assemble the full `export_metrics` row (v9) from the finished run summary +
 /// plan. One builder so the run and apply paths persist an identical shape
 /// rather than each inlining the metric fields. The richer signals
@@ -65,6 +227,21 @@ fn build_metric_row(
         // is already `mode` = strategy.mode_label.) A sparse-key post-mortem is now
         // one SELECT: mode + chunk_key (+ chunk_task for span/windows).
         chunk_key: plan.strategy.chunk_key().map(str::to_string),
+        // ── v18 failure forensics — write-point map ──
+        // WIRED (data already on the summary/plan at this point):
+        error_class: summary
+            .error_message
+            .as_deref()
+            .and_then(classify_error_message)
+            .map(str::to_string),
+        cursor_min: summary.cursor_low.clone(),
+        cursor_max: summary.cursor_high.clone(),
+        key_descriptor_json: key_descriptor_json(plan, summary.key_native_type.as_deref()),
+        // Producers now wired: offending_value is stamped at the keyset throw
+        // (`pipeline/keyset.rs`); server_context_json is captured at open by
+        // `capture_open_forensics` (source `server_context()`).
+        offending_value: summary.offending_value.clone(),
+        server_context_json: summary.server_context_json.clone(),
     }
 }
 
@@ -176,16 +353,125 @@ fn harm_deltas(before: &[(String, i64)], after: &[(String, i64)]) -> Vec<(String
         .collect()
 }
 
+/// A one-line run-health DIAGNOSIS for the operator's log — the flaky-link /
+/// messy-DB signals a field log must carry so a log the team sends back
+/// self-diagnoses. Returns `Some(line)` only when there is something worth
+/// flagging (a reconnect the run survived, a resume-hit meaning the prior run
+/// crashed, or a source-side tmp-disk spill that `export_harm` records but never
+/// LOGGED before); a clean run returns `None` — its stats already live in the run
+/// card. Emitted at WARN so it is visible at the default log level (INFO is not).
+/// Pure so the wording is unit-tested without a run. PG temp-byte spills are warned
+/// separately (`pg_temp_bytes_delta`), so they are not duplicated here.
+pub(super) fn run_diagnosis(summary: &RunSummary, harm_deltas: &[(String, i64)]) -> Option<String> {
+    let mut flags: Vec<String> = Vec::new();
+    if summary.reconnects > 0 {
+        flags.push(format!(
+            "{} reconnect(s) survived (flaky link)",
+            summary.reconnects
+        ));
+    }
+    if summary.resumed {
+        flags.push("resumed a prior CRASHED run".to_string());
+    }
+    let spills: i64 = harm_deltas
+        .iter()
+        .filter(|(k, _)| k.contains("tmp_disk"))
+        .map(|(_, v)| *v)
+        .sum();
+    if spills >= 100 {
+        flags.push(format!(
+            "{spills} tmp-disk spills — the source spilled to disk; try `mode: chunked`/`chunk_by_key` or a smaller `tuning.batch_size`"
+        ));
+    }
+    if flags.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "export '{}': DIAGNOSIS — {} rows @ {} MB in {} ms [{}] · retries={} · {}",
+        summary.export_name,
+        summary.total_rows,
+        summary.peak_rss_mb,
+        summary.duration_ms,
+        summary.status,
+        summary.retries,
+        flags.join("; "),
+    ))
+}
+
 /// Run `SELECT COUNT(*) FROM ({query})` against the source and compare with exported rows.
 /// Skips reconciliation for incremental exports that used a cursor (moving target).
-fn reconcile_source_count(plan: &ResolvedRunPlan, summary: &mut RunSummary) {
-    if let Some(col) = plan.strategy.cursor_column() {
-        log::info!(
-            "reconcile: skipping for incremental export '{}' (cursor column '{}', count may differ)",
-            plan.export_name,
-            col
+/// Exit gate for `run --reconcile`: a row-count mismatch is a data-integrity
+/// failure (exit 3), mirroring the `rivet reconcile` subcommand
+/// (`enforce_reconcile_exit`) and `--validate`. Returns `Err(DataIntegrityError)`
+/// when a reconcile pass ran and disagreed with the source, so
+/// `rivet run --reconcile && <next>` does not proceed past a mismatch;
+/// a match or a skipped reconcile (`reconciled == None`) returns `Ok`. The
+/// exported data is already durable — only the gate fails.
+/// Fold the run's outcome into the process result: an export/quality failure
+/// wins; otherwise a `run --reconcile` mismatch (`reconcile_gate`) surfaces so
+/// the run exits non-zero (exit 3). Extracted as a pure fn so the WIRING — not
+/// just the gate logic — is unit-tested: without this seam, un-hooking the gate
+/// from `final_result` would silently reopen the "run --reconcile exits 0" bug
+/// (#102) with every existing test still green.
+fn resolve_final_result(
+    failed: bool,
+    run_result: crate::error::Result<()>,
+    reconcile_gate: crate::error::Result<()>,
+) -> crate::error::Result<()> {
+    if failed { run_result } else { reconcile_gate }
+}
+
+fn reconcile_run_gate(
+    summary: &RunSummary,
+    could_not_verify: Option<&str>,
+) -> crate::error::Result<()> {
+    // VERIFIED-WRONG: the count ran and DISAGREED → data-integrity, exit 3.
+    if summary.reconciled == Some(false) {
+        return Err(crate::error::DataIntegrityError::new(format!(
+            "reconcile MISMATCH for '{}': the exported dataset disagrees with the source \
+             count {} — see the reconcile log above",
+            summary.export_name,
+            summary.source_count.unwrap_or(-1),
+        ))
+        .into());
+    }
+    // COULD-NOT-VERIFY: reconcile was requested but could not run (source
+    // unreachable, count NULL / non-integer / query error). The export itself
+    // succeeded and is durable, but the assurance the operator asked for was not
+    // obtained — an OPERATIONAL failure (exit 1, retry), NOT verified-OK (exit 0)
+    // and NOT corruption (exit 3). Diverged from the `reconcile` subcommand before,
+    // which propagated the same connect error (#10 bughunt).
+    if let Some(reason) = could_not_verify {
+        anyhow::bail!(
+            "reconcile could not be verified for '{}': {reason}. The export completed and is \
+             durable; re-run to obtain the reconcile assurance, or drop `--reconcile`.",
+            summary.export_name
         );
-        return;
+    }
+    Ok(())
+}
+
+/// Run the reconcile COUNT(*) and record `source_count` / `reconciled` on the
+/// summary. Returns `Some(reason)` when reconcile COULD NOT run (the source was
+/// unreachable, the count query failed, or its result was NULL / non-integer) —
+/// a COULD-NOT-VERIFY condition the caller turns into an operational exit 1,
+/// distinct from a genuine MISMATCH (`reconciled == Some(false)` → exit 3) and
+/// from a legitimate SUBSET-strategy skip (`None`, exit 0). Before this a
+/// could-not-verify left `reconciled = None`, indistinguishable from the skip, so
+/// `run --reconcile` exited 0 as if verified-OK (#10 bughunt).
+fn reconcile_source_count(plan: &ResolvedRunPlan, summary: &mut RunSummary) -> Option<String> {
+    // Skip the full-source COUNT(*) for any SUBSET/DELTA strategy — its exported
+    // count legitimately differs from the table total, and the #102 exit gate
+    // must not turn that STRUCTURAL mismatch into a false exit-3 (which would
+    // break every healthy scheduled keyset_incremental / time_window / incremental
+    // `run --reconcile`). Previously only the Incremental cursor was skipped. This
+    // is a SKIP, not a could-not-verify — return None (exit 0).
+    if let Some(reason) = plan.strategy.reconcile_subset_skip() {
+        log::info!(
+            "reconcile: skipping full-count for '{}' ({reason})",
+            plan.export_name
+        );
+        return None;
     }
 
     let count_sql = format!(
@@ -201,59 +487,64 @@ fn reconcile_source_count(plan: &ResolvedRunPlan, summary: &mut RunSummary) {
         Ok(s) => s,
         Err(e) => {
             log::warn!("reconcile: could not connect to source: {:#}", e);
-            return;
+            return Some(format!(
+                "could not connect to the source to reconcile: {e:#}"
+            ));
         }
     };
 
     match src.query_scalar(&count_sql) {
         Ok(Some(val)) => {
-            if let Ok(count) = val.parse::<i64>() {
-                summary.source_count = Some(count);
-                // ADR-0012 manifest-aware reconcile: compare source COUNT(*)
-                // against the manifest's *cumulative* row total (sum of
-                // committed parts), not just this run's writes.  In a
-                // resume scenario, `summary.total_rows` reflects only the
-                // chunks that re-ran in this invocation (e.g. 500 for one
-                // chunk), while the on-disk dataset is everything that
-                // ever committed (e.g. 2500 across resume attempts).
-                // Comparing total_rows would falsely report MISMATCH on
-                // every resume.  The manifest_parts accumulator already
-                // holds the cumulative count (Phase C-γ hydration); use
-                // its sum for the comparison.
-                let committed_rows: i64 = summary.manifest_parts.iter().map(|p| p.rows).sum();
-                let exported_total = if committed_rows > 0 {
-                    committed_rows
-                } else {
-                    summary.total_rows
-                };
-                summary.reconciled = Some(exported_total == count);
-                if exported_total != count {
-                    log::warn!(
-                        "reconcile MISMATCH for '{}': committed {} rows, source has {}",
-                        plan.export_name,
-                        exported_total,
-                        count
-                    );
-                } else {
-                    log::info!(
-                        "reconcile MATCH for '{}': {}/{}",
-                        plan.export_name,
-                        exported_total,
-                        count
-                    );
-                }
+            let Ok(count) = val.parse::<i64>() else {
+                // A non-integer COUNT is COULD-NOT-VERIFY (we cannot compare), NOT
+                // a mismatch (#10): operational exit 1, not the exit-3 corruption class.
+                log::warn!("reconcile: could not parse count result '{val}' as integer");
+                return Some(format!("source reconcile count '{val}' is not an integer"));
+            };
+            summary.source_count = Some(count);
+            // ADR-0012 manifest-aware reconcile: compare source COUNT(*)
+            // against the manifest's *cumulative* row total (sum of
+            // committed parts), not just this run's writes.  In a
+            // resume scenario, `summary.total_rows` reflects only the
+            // chunks that re-ran in this invocation (e.g. 500 for one
+            // chunk), while the on-disk dataset is everything that
+            // ever committed (e.g. 2500 across resume attempts).
+            // Comparing total_rows would falsely report MISMATCH on
+            // every resume.  The manifest_parts accumulator already
+            // holds the cumulative count (Phase C-γ hydration); use
+            // its sum for the comparison.
+            let committed_rows: i64 = summary.manifest_parts.iter().map(|p| p.rows).sum();
+            let exported_total = if committed_rows > 0 {
+                committed_rows
             } else {
+                summary.total_rows
+            };
+            summary.reconciled = Some(exported_total == count);
+            if exported_total != count {
                 log::warn!(
-                    "reconcile: could not parse count result '{}' as integer",
-                    val
+                    "reconcile MISMATCH for '{}': committed {} rows, source has {}",
+                    plan.export_name,
+                    exported_total,
+                    count
+                );
+            } else {
+                log::info!(
+                    "reconcile MATCH for '{}': {}/{}",
+                    plan.export_name,
+                    exported_total,
+                    count
                 );
             }
+            // Reconcile RAN — match or mismatch is read off summary.reconciled by
+            // the gate; this is NOT could-not-verify.
+            None
         }
         Ok(None) => {
             log::warn!(
                 "reconcile: COUNT(*) returned NULL for '{}'",
                 plan.export_name
             );
+            Some("source reconcile COUNT(*) returned NULL".to_string())
         }
         Err(e) => {
             log::warn!(
@@ -261,6 +552,7 @@ fn reconcile_source_count(plan: &ResolvedRunPlan, summary: &mut RunSummary) {
                 plan.export_name,
                 e
             );
+            Some(format!("source reconcile count query failed: {e:#}"))
         }
     }
 }
@@ -280,6 +572,9 @@ pub(crate) fn synthetic_failed_summary(export_name: &str, err: &anyhow::Error) -
         cursor_column: None,
         cursor_low: None,
         cursor_high: None,
+        offending_value: None,
+        server_context_json: None,
+        key_native_type: None,
         run_id,
         export_name: export_name.to_string(),
         status: "failed".into(),
@@ -290,6 +585,8 @@ pub(crate) fn synthetic_failed_summary(export_name: &str, err: &anyhow::Error) -
         duration_ms: 0,
         peak_rss_mb: 0,
         retries: 0,
+        reconnects: 0,
+        resumed: false,
         validated: None,
         schema_changed: None,
         quality_passed: None,
@@ -337,6 +634,34 @@ fn finalize_keyset_anchor(
 ) {
     if !failed && matches!(plan.strategy, ExtractionStrategy::Keyset(_)) {
         let _ = state.clear_resume_run_id(export_name);
+    }
+}
+
+/// Mark a run `running` at its START — in the central run-status ledger AND (for
+/// a cloud destination) as a `running` marker manifest projected into the bucket.
+/// The ledger is authoritative for a co-located / shared-Postgres load; the bucket
+/// marker lets a cross-boundary reader (Airflow, a foreign-host `rivet load`) see
+/// the live run too. The `prefix` recorded in the ledger is the run's write URI,
+/// which `gc_orphans` matches at-or-under its load prefix. Best-effort: a miss
+/// only makes gc over-defer cleanup, so it warns rather than failing the export.
+fn ledger_begin_run(state: &StateStore, plan: &ResolvedRunPlan, run_id: &str) {
+    let prefix = super::finalize::destination_uri_for_manifest(&plan.destination);
+    let started_at = chrono::Utc::now().to_rfc3339();
+    if let Err(e) = state.begin_run(run_id, &plan.export_name, &prefix, &started_at) {
+        log::warn!(
+            "export '{}': run-status begin failed (gc may over-defer orphan cleanup): {e:#}",
+            plan.export_name
+        );
+    }
+    super::finalize::write_running_manifest(plan, run_id, &started_at);
+}
+
+/// Transition a run to its terminal status in the run-status ledger at finalize.
+/// Best-effort — mirrors the manifest status written alongside.
+fn ledger_finish_run(state: &StateStore, export_name: &str, run_id: &str, status: &str) {
+    let finished_at = chrono::Utc::now().to_rfc3339();
+    if let Err(e) = state.finish_run(run_id, status, &finished_at) {
+        log::warn!("export '{export_name}': run-status finish failed: {e:#}");
     }
 }
 
@@ -471,6 +796,13 @@ pub(super) fn run_export_job(
     let rss_before = crate::resource::get_rss_mb();
     let rss_sampler = crate::resource::RssPeakSampler::start(rss_before, 100);
     let mut summary = RunSummary::new(&plan);
+    // Record this run `running` BEFORE any part lands — in the ledger + a bucket
+    // marker manifest — the authority `gc_orphans` reads to spare a live extract's
+    // committed-but-not-yet-manifested parts. (finish_run transitions it below.)
+    ledger_begin_run(state, &plan, &summary.run_id);
+    // Failure forensics at open: source schema + server limits, so a run that fails
+    // before finalize still explains itself (export_schema is otherwise success-only).
+    capture_open_forensics(&plan, state, &mut summary);
 
     // PG cursor / sort spill probe — captured around the actual run window.
     // Cluster-level counter, so this is a noisy upper bound on a shared host
@@ -536,11 +868,12 @@ pub(super) fn run_export_job(
 
     // Tier 2: record the per-counter source-harm delta. A failed or absent probe
     // (e.g. missing VIEW SERVER STATE on MSSQL) leaves no rows — never fatal.
+    let mut harm_delta_vec: Vec<(String, i64)> = Vec::new();
     if let Some(before) = &harm_before
         && let Some(after) = harm_snapshot(&plan)
     {
-        let deltas = harm_deltas(before, &after);
-        if let Err(e) = state.record_harm(&summary.run_id, &summary.export_name, &deltas) {
+        harm_delta_vec = harm_deltas(before, &after);
+        if let Err(e) = state.record_harm(&summary.run_id, &summary.export_name, &harm_delta_vec) {
             log::debug!(
                 "export '{}': harm metrics write failed (informational): {:#}",
                 summary.export_name,
@@ -548,7 +881,6 @@ pub(super) fn run_export_job(
             );
         }
     }
-
     let tuning_class = plan.tuning.profile_name().to_string();
     let result = run_chunked_quality_gate(result, &plan, &mut summary);
     let failed = result.is_err();
@@ -566,8 +898,18 @@ pub(super) fn run_export_job(
         }
     }
 
+    // Self-diagnosing run-health line — makes a log the field team sends back
+    // readable at a glance (reconnects survived, a resume-hit, a source spill).
+    // Emitted AFTER the success/failed resolution above so the line reports the
+    // real terminal status, not the transient "running" it was built with (#18
+    // bughunt: it ran before the status was resolved, so it always said running).
+    if let Some(line) = run_diagnosis(&summary, &harm_delta_vec) {
+        log::warn!("{line}");
+    }
+
+    let mut reconcile_gate: crate::error::Result<()> = Ok(());
     if plan.reconcile && !failed {
-        reconcile_source_count(&plan, &mut summary);
+        let could_not_verify = reconcile_source_count(&plan, &mut summary);
         if let (Some(source_count), Some(matched)) = (summary.source_count, summary.reconciled) {
             summary.journal.record(RunEvent::ReconciliationResult {
                 source_count,
@@ -575,6 +917,15 @@ pub(super) fn run_export_job(
                 matched,
             });
         }
+        // The reconcile verdict drives the EXIT CODE (folded into `final_result`):
+        // exit 3 on a mismatch, exit 1 on a could-not-verify. It does NOT flip
+        // `summary.status` to "failed" — that would make `finalize_manifest` write
+        // a Failed manifest with no _SUCCESS, so `rivet load` would REFUSE a
+        // COMPLETE, durable export because a post-hoc COUNT(*) raced a concurrent
+        // write on a live source (#2 bughunt). The export succeeded and stays
+        // loadable; the mismatch surfaces via `summary.reconciled` (report +
+        // metrics + the ReconciliationResult journal event) and the non-zero exit.
+        reconcile_gate = reconcile_run_gate(&summary, could_not_verify.as_deref());
     }
 
     summary.journal.record(RunEvent::RunCompleted {
@@ -592,6 +943,11 @@ pub(super) fn run_export_job(
     }
 
     summary.print();
+    // Transition the run-status ledger to its terminal status — the manifest
+    // written just below is a PROJECTION of this record, so both carry the same
+    // status. A crash before here leaves the row `running`; supersession by a
+    // later run reconciles it (no age timer).
+    ledger_finish_run(state, &plan.export_name, &summary.run_id, &summary.status);
     // Order matters: write the manifest first, then run the manifest-aware
     // `--validate` pass against the destination, then persist the metrics
     // row, then write the run report.  The report sees the verification
@@ -633,7 +989,7 @@ pub(super) fn run_export_job(
     finalize_run_report(config_path, &summary, "export");
     crate::notify::maybe_send(config.notifications.as_ref(), &summary);
 
-    let final_result = if failed { result } else { Ok(()) };
+    let final_result = resolve_final_result(failed, result, reconcile_gate);
     (final_result, summary)
 }
 
@@ -688,6 +1044,12 @@ pub(crate) fn run_export_job_with_chunk_source(
     let rss_sampler = crate::resource::RssPeakSampler::start(rss_before, 100);
     let mut summary = RunSummary::new(plan);
     summary.apply_context = apply_context;
+    ledger_begin_run(state, plan, &summary.run_id);
+    // Runner parity: the apply/chunk-source path is a SEPARATE runner from
+    // run_export_job, so it must re-apply open forensics itself (server_context +
+    // schema-at-open) or an apply-run failure records neither — the runner-bypass
+    // class. See docs/runner-coverage-matrix.yaml.
+    capture_open_forensics(plan, state, &mut summary);
 
     let result = if plan.strategy.requires_parallel_execution() {
         if plan.strategy.is_resumable() {
@@ -724,6 +1086,7 @@ pub(crate) fn run_export_job_with_chunk_source(
     }
 
     summary.print();
+    ledger_finish_run(state, &plan.export_name, &summary.run_id, &summary.status);
     finalize_manifest(plan, state, &summary, "apply");
     // Round-2 audit #12: incremental cursor advance AFTER the manifest is durable
     // (see run_export_job). No-op for the chunked/Precomputed apply path.
@@ -764,6 +1127,129 @@ pub(crate) fn run_export_job_with_chunk_source(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn run_reconcile_gate_fails_on_mismatch_matches_subcommand() {
+        // `run --reconcile` must exit non-zero (data-integrity, exit 3) on a
+        // row-count mismatch — the same gate the `rivet reconcile` subcommand
+        // enforces via `enforce_reconcile_exit`. Before this, the flag path
+        // logged "reconcile MISMATCH" but returned Ok, so
+        // `rivet run --reconcile && <next>` silently proceeded past a data-loss
+        // mismatch (dogfood issue #102).
+        let mut s = RunSummary {
+            export_name: "orders".into(),
+            source_count: Some(1033),
+            reconciled: Some(false),
+            ..Default::default()
+        };
+        let err = reconcile_run_gate(&s, None).unwrap_err();
+        assert!(
+            err.downcast_ref::<crate::error::DataIntegrityError>()
+                .is_some(),
+            "a reconcile mismatch must carry the data-integrity marker"
+        );
+        assert_eq!(
+            crate::error::classify_exit(&err),
+            3,
+            "a reconcile mismatch must classify as exit 3"
+        );
+
+        // A match, and a skipped reconcile (reconciled == None, no could-not-verify
+        // reason), must NOT gate.
+        s.reconciled = Some(true);
+        assert!(reconcile_run_gate(&s, None).is_ok());
+        s.reconciled = None;
+        assert!(reconcile_run_gate(&s, None).is_ok());
+
+        // #10: a COULD-NOT-VERIFY reconcile (reconciled == None BUT a reason is
+        // present) is OPERATIONAL — exit 1, NOT verified-OK (exit 0) and NOT the
+        // data-integrity class (exit 3).
+        let err = reconcile_run_gate(&s, Some("could not connect to the source"))
+            .expect_err("a could-not-verify reconcile must gate non-zero");
+        assert!(
+            err.downcast_ref::<crate::error::DataIntegrityError>()
+                .is_none(),
+            "could-not-verify must NOT be data-integrity (exit 3)"
+        );
+        assert_eq!(
+            crate::error::classify_exit(&err),
+            1,
+            "a could-not-verify reconcile must classify as operational exit 1"
+        );
+        // A genuine MISMATCH wins over a could-not-verify reason (data-integrity).
+        s.reconciled = Some(false);
+        let err = reconcile_run_gate(&s, Some("noise")).unwrap_err();
+        assert_eq!(crate::error::classify_exit(&err), 3);
+    }
+
+    #[test]
+    fn resolve_final_result_surfaces_reconcile_mismatch_when_export_succeeded() {
+        use crate::error::DataIntegrityError;
+        // The WIRING guard for #102: when the export itself succeeded
+        // (failed=false), a reconcile-gate error MUST become the run's result
+        // (exit 3). This is the half the gate-logic test cannot cover — that
+        // `run --reconcile` actually RETURNS the gate rather than Ok. Un-hooking
+        // the fold reopens the bug; this test then goes red.
+        let gate: crate::error::Result<()> = Err(DataIntegrityError::new("mismatch").into());
+        let out = resolve_final_result(false, Ok(()), gate);
+        assert!(
+            out.is_err(),
+            "a reconcile mismatch on a successful export must surface as the run result"
+        );
+        assert_eq!(crate::error::classify_exit(&out.unwrap_err()), 3);
+
+        // An export/quality failure takes precedence over the reconcile gate.
+        let qfail: crate::error::Result<()> = Err(DataIntegrityError::new("quality").into());
+        assert!(resolve_final_result(true, qfail, Ok(())).is_err());
+
+        // Clean run: no export failure, no reconcile mismatch → Ok. (A --validate
+        // verified-wrong verdict is NON-fatal by design — ADR-0001 §I7; a hard gate
+        // is the standalone `rivet validate` command, not `run --validate`.)
+        assert!(resolve_final_result(false, Ok(()), Ok(())).is_ok());
+    }
+
+    #[test]
+    fn run_diagnosis_flags_flaky_link_and_spill_signals_only() {
+        let base = || RunSummary {
+            export_name: "orders".into(),
+            total_rows: 1000,
+            peak_rss_mb: 50,
+            duration_ms: 2000,
+            status: "success".into(),
+            ..Default::default()
+        };
+        // A clean run has nothing to diagnose — its stats are in the run card.
+        assert!(run_diagnosis(&base(), &[]).is_none());
+        // Reconnects survived (the flaky-link signal) → flagged, with the count.
+        let mut s = base();
+        s.reconnects = 2;
+        s.retries = 3;
+        let line = run_diagnosis(&s, &[]).expect("reconnects must diagnose");
+        assert!(line.contains("2 reconnect"), "got: {line}");
+        assert!(line.contains("retries=3"), "got: {line}");
+        // #18 bughunt: the line interpolates the run STATUS — the caller must emit
+        // it AFTER the success/failed resolution so this reads `[success]`, not the
+        // transient `[running]` it was previously built with.
+        assert!(
+            line.contains("[success]"),
+            "status must be the resolved one: {line}"
+        );
+        // A resume-hit means the prior run crashed → flagged.
+        let mut s = base();
+        s.resumed = true;
+        assert!(
+            run_diagnosis(&s, &[])
+                .unwrap()
+                .contains("resumed a prior CRASHED")
+        );
+        // A source tmp-disk spill (recorded in export_harm but never LOGGED before)
+        // → flagged with the escape hatch.
+        let line = run_diagnosis(&base(), &[("Created_tmp_disk_tables".into(), 2782)])
+            .expect("spills must diagnose");
+        assert!(line.contains("2782 tmp-disk spills"), "got: {line}");
+        // A negligible spill is noise, not a diagnosis on its own.
+        assert!(run_diagnosis(&base(), &[("Created_tmp_disk_tables".into(), 5)]).is_none());
+    }
 
     #[test]
     fn synthetic_failed_summary_fields() {
@@ -1062,7 +1548,13 @@ mod tests {
         summary.total_rows = 50_000;
         summary.peak_rss_mb = 142;
         summary.status = "success".into();
-        summary.error_message = Some("boom".into());
+        summary.error_message = Some("export 'x': keyset could not read the 'id' value".into());
+        summary.cursor_low = Some("1".into());
+        summary.cursor_high = Some("18446744073709551615".into()); // u64 past i64::MAX
+        summary.offending_value = Some("9223372036854775800".into()); // last-good before overflow
+        summary.server_context_json =
+            Some(r#"{"engine":"mysql","max_execution_time_ms":"30000"}"#.into());
+        summary.key_native_type = Some("bigint unsigned".into()); // folds into key_descriptor
         summary.format = "parquet".into();
         summary.mode = "chunked".into();
         summary.files_produced = 7;
@@ -1136,6 +1628,12 @@ mod tests {
             rivet_version,
             longest_chunk_ms,
             chunk_key,
+            error_class,
+            cursor_min,
+            cursor_max,
+            key_descriptor_json,
+            offending_value,
+            server_context_json,
         } = build_metric_row(&summary, &plan, "safe");
 
         // ── core (v1) ──
@@ -1145,7 +1643,10 @@ mod tests {
         assert_eq!(total_rows, 50_000);
         assert_eq!(peak_rss_mb, Some(142));
         assert_eq!(status, "success");
-        assert_eq!(error_message.as_deref(), Some("boom"));
+        assert_eq!(
+            error_message.as_deref(),
+            Some("export 'x': keyset could not read the 'id' value")
+        );
         assert_eq!(tuning_profile.as_deref(), Some("safe")); // builder arg
         assert_eq!(format.as_deref(), Some("parquet"));
         assert_eq!(mode.as_deref(), Some("chunked"));
@@ -1176,6 +1677,28 @@ mod tests {
         // ── v12: chunking diagnostics — the chunk key column. The plan is a range
         // Chunked on "id"; the resolved strategy is the `mode` column ("chunked").
         assert_eq!(chunk_key.as_deref(), Some("id"));
+        // ── v18: failure forensics ──
+        assert_eq!(
+            error_class.as_deref(),
+            Some("keyset_unreadable_key"),
+            "error_class is DERIVED from error_message, not hardcoded"
+        );
+        assert_eq!(cursor_min.as_deref(), Some("1"));
+        assert_eq!(cursor_max.as_deref(), Some("18446744073709551615"));
+        let kd = key_descriptor_json.expect("chunked strategy carries a key descriptor");
+        assert!(kd.contains("\"strategy\":\"chunked\""), "{kd}");
+        assert!(kd.contains("\"key\":\"id\""), "{kd}");
+        // enriched from summary.key_native_type — the "was it unsigned" answer inline
+        assert!(kd.contains("\"db_type\":\"bigint unsigned\""), "{kd}");
+        assert!(kd.contains("\"unsigned\":true"), "{kd}");
+        // producers wired: both pass through from the summary
+        assert_eq!(offending_value.as_deref(), Some("9223372036854775800"));
+        assert!(
+            server_context_json
+                .as_deref()
+                .is_some_and(|s| s.contains("max_execution_time_ms")),
+            "server_context flows from the summary: {server_context_json:?}"
+        );
     }
 
     #[test]
@@ -1194,6 +1717,67 @@ mod tests {
         // The non-chunk dimensions are still populated.
         assert_eq!(row.source_type.as_deref(), Some("postgres"));
         assert_eq!(row.destination_type.as_deref(), Some("local"));
+    }
+
+    #[test]
+    fn classify_error_message_maps_the_field_run_failure_classes() {
+        // The exact three classes the 0.21.2 field post-mortem grouped BY HAND.
+        assert_eq!(
+            classify_error_message(
+                "export 'aa_import_advcake': keyset could not read the 'id' value from the last row of page 0"
+            ),
+            Some("keyset_unreadable_key")
+        );
+        assert_eq!(
+            classify_error_message(
+                "MySqlError { ERROR 3024 (HY000): maximum statement execution time exceeded }"
+            ),
+            Some("statement_timeout")
+        );
+        // The parallel-checkpoint wrapper EMBEDS the inner 3024 text — most-specific-
+        // first ordering must bucket it as parallel_checkpoint, NOT statement_timeout.
+        // (RED if the two arms are reordered.)
+        assert_eq!(
+            classify_error_message(
+                "export 'aa_payouts_version': parallel checkpoint worker errors:\nchunk 3: MySqlError { ERROR 3024 (HY000): maximum statement execution time exceeded }"
+            ),
+            Some("parallel_checkpoint"),
+            "the 3024-embedding wrapper must not be mis-bucketed as a bare statement_timeout"
+        );
+        // Extended taxonomy: the field's ERROR 1146 (was None before) + the classes
+        // that group the common infra failures.
+        assert_eq!(
+            classify_error_message(
+                "MySqlError { ERROR 1146 (42S02): Table 'rivet.ext_x' doesn't exist }"
+            ),
+            Some("relation_not_found")
+        );
+        assert_eq!(
+            classify_error_message("Lock wait timeout exceeded; try restarting transaction"),
+            Some("lock_timeout"),
+            "a lock-wait embeds 'timeout' — must not fall through to statement_timeout"
+        );
+        assert_eq!(
+            classify_error_message("Deadlock found when trying to get lock"),
+            Some("deadlock")
+        );
+        assert_eq!(
+            classify_error_message("Connection reset by peer"),
+            Some("connection")
+        );
+        assert_eq!(
+            classify_error_message("SELECT command denied to user 'rivet'@'%' for table 't'"),
+            Some("privilege")
+        );
+        assert_eq!(
+            classify_error_message("No space left on device"),
+            Some("disk_full")
+        );
+        // An unrecognized error stays honest (None), not force-fit into a bucket.
+        assert_eq!(
+            classify_error_message("some entirely novel failure with no known signature"),
+            None
+        );
     }
 
     // ── harm_deltas ─────────────────────────────────────────────────────────

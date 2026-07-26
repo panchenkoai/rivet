@@ -256,8 +256,16 @@ pub(crate) fn check_oversized_chunk(
         let min_i: i64 = cursor_min?.parse().ok()?;
         let max_i: i64 = cursor_max?.parse().ok()?;
         let info = chunk_sparsity_from_counts(rows, min_i, max_i, export.chunk_size);
-        ((info.density * export.chunk_size as f64).round() as i64).max(1)
+        (info.density * export.chunk_size as f64).round() as i64
     };
+    // A single chunk can never scan more rows than the table HOLDS — clamp to
+    // the row estimate. Two ways to exceed it without this: (1) a LOW-cardinality
+    // range key (few distinct values, many rows each) makes `density × chunk_size`
+    // extrapolate the density past the actual key span — e.g. 150K rows over 100
+    // distinct values reports 151M rows/chunk, a 1000× phantom "heavy chunk"; and
+    // (2) a dense/keyset `chunk_size` larger than the whole table. When chunk_size
+    // ≥ span, one chunk IS the table, so `min(…, rows)` is the exact row count.
+    let rows_per_chunk = rows_per_chunk.clamp(1, rows);
 
     let bytes_per_chunk = rows_per_chunk.saturating_mul(bytes_per_row);
     if bytes_per_chunk <= MAX_CHUNK_SCAN_BYTES {
@@ -968,6 +976,41 @@ mod tests {
         assert!(
             w.contains("chunk_size around"),
             "advises a smaller size: {w}"
+        );
+    }
+
+    #[test]
+    fn check_oversized_chunk_low_cardinality_range_key_does_not_phantom_warn() {
+        // A low-cardinality range key: 150K rows over 100 distinct values (span
+        // 0..99), chunk_size 100000 ≥ span → ONE chunk == the whole table (150K
+        // rows × 15 B ≈ 2 MB, well under budget). The bug: `density × chunk_size`
+        // = 150000/99 × 100000 ≈ 151M rows/chunk → ~2167 MB → a phantom "heavy
+        // chunk" warning that told the user to shrink chunk_size 8×. The clamp to
+        // the row estimate kills it. RED before the clamp (warns), green after.
+        let e = cfg("mode: chunked\nchunk_column: amount\nchunk_size: 100000\n");
+        let w = check_oversized_chunk(&e, Some(150_000), Some(15), Some("0"), Some("99"));
+        assert!(
+            w.is_none(),
+            "one chunk holds the whole 150K-row table (~2 MB) — no phantom heavy warning: {w:?}"
+        );
+    }
+
+    #[test]
+    fn check_oversized_chunk_dense_chunk_larger_than_table_does_not_phantom_warn() {
+        // Dense/keyset branch, same class: chunk_size 100000 on a 50K-row table.
+        // A chunk holds only 50K rows (the whole table), 50K × 500 B ≈ 24 MB <
+        // budget. Unclamped `rows_per_chunk = chunk_size = 100000` → 48 MB, still
+        // under here — so push chunk_size past the point the phantom crosses the
+        // budget: 600K chunk_size on a 300K-row table, 300K × 1000 B = 286 MB
+        // (real, over budget IS a legit warn) vs the clamp keeping it honest at
+        // the true row count. Use a case where the phantom warns but the truth
+        // does not: 50K rows × 500 B, chunk_size 700000 → phantom 700K×500=334 MB
+        // warns; clamped 50K×500=24 MB does not.
+        let e = cfg("mode: chunked\nchunk_column: id\nchunk_dense: true\nchunk_size: 700000\n");
+        let w = check_oversized_chunk(&e, Some(50_000), Some(500), None, None);
+        assert!(
+            w.is_none(),
+            "a chunk_size past the row count still scans only the 50K rows present (~24 MB): {w:?}"
         );
     }
 

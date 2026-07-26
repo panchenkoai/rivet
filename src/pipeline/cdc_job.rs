@@ -55,6 +55,18 @@ pub(super) fn run_cdc_export(
         chrono::Utc::now().format("%Y%m%dT%H%M%S%3f")
     );
 
+    // Mark the CDC run `running` in the central ledger so `gc_orphans` never
+    // deletes the live stream's in-flight `__changes` parts. The prefix is the
+    // export's BASE (a multi-table stream writes `<base>/<table>/`); the load
+    // gc's a per-table child, which the ledger's OVERLAP match still sees. A
+    // daemon stream stays `running` for its lifetime (correct — it is live);
+    // `until_current` finishes below. Best-effort.
+    let started_at = chrono::Utc::now().to_rfc3339();
+    let run_prefix = super::finalize::destination_uri_for_manifest(&export.destination);
+    if let Err(e) = state.begin_run(&run_id, &export.name, &run_prefix, &started_at) {
+        log::warn!("cdc: run-status begin failed for '{}': {e:#}", export.name);
+    }
+
     let result = run_cdc_inner(config, export, &run_id);
     let duration_ms = started.elapsed().as_millis() as i64;
 
@@ -89,6 +101,13 @@ pub(super) fn run_cdc_export(
             Some(crate::redact::redact_error(e)),
         ),
     };
+
+    // Transition the ledger to the CDC run's terminal status (mirrors the batch
+    // path). A crash before here leaves the row `running`; the next CDC run
+    // supersedes it. Best-effort.
+    if let Err(e) = state.finish_run(&run_id, &summary.status, &chrono::Utc::now().to_rfc3339()) {
+        log::warn!("cdc: run-status finish failed for '{}': {e:#}", export.name);
+    }
 
     // Record the run in the journal (so `rivet journal` shows a CDC run like a
     // batch one): one FileWritten per committed part, then the RunCompleted outcome.
@@ -177,12 +196,14 @@ pub(super) fn initial_snapshot_pending(
 
     // The pure decision: which tables still need a snapshot, and whether prior
     // evidence forces the fail-loud anchor guard.
-    let ckpt_resume = cdc
-        .checkpoint
-        .as_deref()
-        .map(std::path::Path::new)
-        .and_then(|p| crate::source::cdc::Position::load(p).ok().flatten())
-        .is_some();
+    // A corrupt/truncated checkpoint must FAIL LOUD here (#99), not be swallowed
+    // by `.ok()` into "no checkpoint" — that let PG CDC treat a run as a fresh
+    // first anchor and re-create a dropped slot at 'current', permanently skipping
+    // every change since the loss (the anti-gap guard never fired).
+    let ckpt_resume = match cdc.checkpoint.as_deref().map(std::path::Path::new) {
+        Some(p) => crate::source::cdc::Position::load(p)?.is_some(),
+        None => false,
+    };
     let (pending_idx, resume_expected) = snapshot_plan(&done_flags, ckpt_resume);
 
     // The anchor — one entry point; the engine's AnchorModel decides the

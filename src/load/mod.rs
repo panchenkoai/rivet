@@ -322,17 +322,9 @@ pub fn run_load_cdc(
     expected_delta: Option<u64>,
     cleanup: Option<(&GcsStore, &str)>,
 ) -> Result<CdcLoadReport> {
-    // Round-6: the CDC primary-key columns are interpolated raw into the dedup view's
-    // PARTITION BY — gate them like the column names (source-derived injection surface).
-    for c in pk {
-        if !is_safe_load_ident(c) {
-            bail!(
-                "cannot load `{table}`: CDC primary-key column `{}` is not a plain SQL \
-                 identifier — it is spliced into the dedup view. Rename/alias it.",
-                c.escape_default()
-            );
-        }
-    }
+    // PK-injection gating lives in the SHARED seam `append_and_view` (below), which
+    // covers both the CDC and incremental drivers — no per-driver copy (the old
+    // Round-6 inline gate here was dead once the shared one was hoisted).
     append_and_view(
         loader,
         table,
@@ -610,7 +602,7 @@ mod tests {
             "cleanup_source must REFUSE a bucket-root prefix, not remove_all(\"\")"
         );
         assert!(
-            reconcile::gc_orphans(&store, "gs://bucket/", &[]).is_err(),
+            reconcile::gc_orphans(&store, "gs://bucket/", &[], false).is_err(),
             "gc_orphans must REFUSE a bucket-root prefix, not list+delete the whole bucket"
         );
         // Nothing was deleted — both independent exports survive intact.

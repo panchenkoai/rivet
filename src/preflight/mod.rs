@@ -225,7 +225,7 @@ pub fn check(
     strict: bool,
     json_output: bool,
     target: Option<ExportTarget>,
-) -> Result<()> {
+) -> Result<bool> {
     let config = Config::load_with_params(config_path, params)?;
 
     let exports: Vec<&ExportConfig> = if let Some(name) = export_name {
@@ -440,15 +440,15 @@ pub fn check(
         println!(
             "Verdicts: EFFICIENT > ACCEPTABLE > DEGRADED > UNSAFE — advisory only; the run is never blocked."
         );
-        if clean {
-            // Keep the ladder going to the final rung instead of ending cold.
-            println!(
-                "Looks good. Next: rivet run -c {config_path} --validate   # export, then verify row counts"
-            );
-        }
+        // The "Looks good. Next: …" epilogue is printed by the CALLER
+        // (`dispatch_check`) only after the plan-compatibility gate also passes —
+        // otherwise a config the plan-gate REJECTS printed "Looks good" and then
+        // "Rejected: …" in the same output, a self-contradiction (dogfood MED).
     }
 
-    Ok(())
+    // `clean` = the type check surfaced no fatal mapping. The caller ANDs this
+    // with the plan-compatibility gate before printing the success epilogue.
+    Ok(clean)
 }
 
 /// Emit one export's `--json` line: the type report (`export`/`columns`/

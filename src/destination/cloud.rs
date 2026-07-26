@@ -116,6 +116,20 @@ pub(crate) struct CloudDestination<B: CloudBackend> {
 /// calls this many times before giving up to the chunk worker's outer loop.
 const DEFAULT_MAX_RETRIES: usize = 5;
 
+/// Normalize a destination prefix to the object-store trailing-slash convention.
+/// Every op builds a key as `format!("{}{}", self.prefix, key)`, so a non-empty
+/// prefix WITHOUT a trailing slash jams the part name onto it (`exports/mydata` +
+/// `orders.parquet` -> `exports/mydataorders.parquet`) while `list_prefix` appends
+/// `/` and lists an empty `exports/mydata/` -> a false PART_MISSING on present data
+/// (dogfood). Empty (bucket root) and already-slashed prefixes are unchanged.
+fn normalize_prefix(p: String) -> String {
+    if p.is_empty() || p.ends_with('/') {
+        p
+    } else {
+        format!("{p}/")
+    }
+}
+
 impl<B: CloudBackend> CloudDestination<B> {
     pub fn new(config: &DestinationConfig) -> Result<Self> {
         Self::new_with_retries(config, DEFAULT_MAX_RETRIES)
@@ -164,7 +178,16 @@ impl<B: CloudBackend> CloudDestination<B> {
         );
         let op = blocking::Operator::new(async_op)?;
 
-        let prefix = config.prefix.clone().unwrap_or_default();
+        // Normalize the prefix to a trailing `/` (object-store convention). Every
+        // op builds a key as `format!("{}{}", self.prefix, key)`, so a prefix
+        // WITHOUT a trailing slash JAMS the part name onto it — `write` stores
+        // `exports/mydataorders_….parquet` while `list_prefix` appends `/` and
+        // lists `exports/mydata/` (empty) → a false PART_MISSING on 100%-present,
+        // DuckDB-readable data (dogfood: a natural `prefix: exports/mydata` form
+        // that rivet silently accepted then failed to verify). Adding the slash
+        // here makes write/list/read/head agree; a prefix that already ends in `/`
+        // (or is empty = bucket root) is unchanged, so existing configs are inert.
+        let prefix = normalize_prefix(config.prefix.clone().unwrap_or_default());
 
         Ok(Self {
             _runtime: runtime,
@@ -312,9 +335,23 @@ impl<B: CloudBackend> super::Destination for CloudDestination<B> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AtomicI64, CloudDestination, Ordering, take_from};
+    use super::{AtomicI64, CloudDestination, Ordering, normalize_prefix, take_from};
     use crate::config::{DestinationConfig, DestinationType};
     use crate::destination::gcs::GcsBackend;
+
+    #[test]
+    fn normalize_prefix_appends_a_trailing_slash_only_when_needed() {
+        // dogfood HIGH-adjacent: a no-slash prefix jammed the part name and broke
+        // list (false PART_MISSING). Normalization must add exactly one slash to a
+        // non-empty, non-slashed prefix, and leave the other two forms untouched.
+        assert_eq!(normalize_prefix("exports/mydata".into()), "exports/mydata/");
+        assert_eq!(
+            normalize_prefix("exports/mydata/".into()),
+            "exports/mydata/"
+        );
+        assert_eq!(normalize_prefix(String::new()), ""); // bucket root
+        assert_eq!(normalize_prefix("a".into()), "a/");
+    }
 
     // L20 (cloud-fastfail): the no-retry probe seam must construct. A GCS
     // `allow_anonymous` config builds the OpenDAL operator without touching

@@ -365,6 +365,7 @@ pub(crate) fn introspect_mysql_table_for_chunking(
               AND c.COLUMN_NAME = s.COLUMN_NAME \
          WHERE s.TABLE_SCHEMA = ? AND s.TABLE_NAME = ? AND s.NON_UNIQUE = 0 \
            AND s.SEQ_IN_INDEX = 1 \
+           AND c.DATA_TYPE NOT IN ('decimal', 'numeric') \
            AND NOT EXISTS ( \
              SELECT 1 FROM information_schema.STATISTICS s2 \
              WHERE s2.TABLE_SCHEMA = s.TABLE_SCHEMA AND s2.TABLE_NAME = s.TABLE_NAME \
@@ -385,11 +386,26 @@ pub(crate) fn introspect_mysql_table_for_chunking(
         }
     }
 
+    // Integer-family columns — the safety set for an explicit `chunk_column`
+    // (see TableIntrospection::int_columns). `DATA_TYPE` is unsigned-agnostic
+    // (`int unsigned` still has DATA_TYPE `int`).
+    let int_columns: Vec<String> = conn
+        .exec::<(String,), _, _>(
+            "SELECT COLUMN_NAME FROM information_schema.COLUMNS \
+             WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? \
+               AND DATA_TYPE IN ('tinyint', 'smallint', 'mediumint', 'int', 'bigint')",
+            (&schema, &table),
+        )?
+        .into_iter()
+        .map(|(c,)| c)
+        .collect();
+
     Ok(crate::source::TableIntrospection {
         single_int_pk,
         keyset_keys,
         row_estimate,
         avg_row_bytes,
+        int_columns,
     })
 }
 
@@ -484,6 +500,23 @@ impl Drop for MysqlSessionGuard<'_> {
 /// `sample_pool`: when `tuning.adaptive` is true, a clone of the source pool used
 /// to obtain a second connection for extraction-pressure sampling without interfering
 /// with the streaming result set on `conn`.
+/// Whether a MySQL driver error is the server-side `max_execution_time` /
+/// ER_QUERY_TIMEOUT (3024) statement-duration timeout — so the export path can
+/// re-wrap it as an actionable `StatementDurationTimeout` instead of leaking the
+/// terse driver prose. Matched by code AND message so it survives a MariaDB
+/// spelling (`max_statement_time` / 1969) or a reworded server string.
+fn is_statement_timeout(e: &mysql::Error) -> bool {
+    if let mysql::Error::MySqlError(db) = e
+        && (db.code == 3024 || db.code == 1969)
+    {
+        return true;
+    }
+    let msg = e.to_string();
+    msg.contains("max_execution_time")
+        || msg.contains("max_statement_time")
+        || msg.contains("maximum statement execution time exceeded")
+}
+
 fn mysql_run_export(
     conn: &mut mysql::PooledConn,
     sample_pool: Option<Pool>,
@@ -493,12 +526,24 @@ fn mysql_run_export(
     column_overrides: &ColumnOverrides,
     sink: &mut dyn super::BatchSink,
 ) -> Result<usize> {
+    // Re-wrap a server-side `max_execution_time` timeout (ERROR 3024) as an
+    // actionable StatementDurationTimeout (the classifier downcasts the TYPE →
+    // permanent; the Display carries the fix). The raw driver error is terse and
+    // gave the field's `*_version` timeouts no guidance (#field-3024).
+    let wrap_timeout = |e: mysql::Error| -> anyhow::Error {
+        if tuning.statement_timeout_s > 0 && is_statement_timeout(&e) {
+            super::StatementDurationTimeout::mysql(tuning.statement_timeout_s).into()
+        } else {
+            anyhow::Error::new(e)
+        }
+    };
+
     // SecOps: cursor value is bound via exec_iter rather than string-interpolated.
     // Using exec_iter uniformly (even with empty params) keeps match arms
     // type-compatible — query_iter returns a Text-protocol result, exec_iter Binary.
     let mut result = match cursor_param {
-        Some(val) => conn.exec_iter(sql, (val,))?,
-        None => conn.exec_iter(sql, ())?,
+        Some(val) => conn.exec_iter(sql, (val,)).map_err(&wrap_timeout)?,
+        None => conn.exec_iter(sql, ()).map_err(&wrap_timeout)?,
     };
     let columns = result.columns().as_ref().to_vec();
 
@@ -546,7 +591,9 @@ fn mysql_run_export(
     let max_value_bytes = tuning.max_value_bytes();
 
     for row_result in row_set {
-        let row = row_result?;
+        // The timeout usually fires mid-stream (the query runs while rows are
+        // pulled), so wrap here too, not only at exec_iter above.
+        let row = row_result.map_err(&wrap_timeout)?;
         row_buf.push(row);
 
         if row_buf.len() >= ctl.target() {
@@ -723,6 +770,33 @@ impl super::Source for MysqlSource {
     /// stalling on buffer-pool memory — the MySQL analogue of PG `temp_bytes`.
     fn sample_pressure(&mut self) -> Option<u64> {
         mysql_sample_extraction_pressure(&self.pool)
+    }
+
+    fn server_context(&mut self) -> Option<String> {
+        // Best-effort per var (a proxy or older server may omit one).
+        // `@@max_execution_time` (ms) is the query-level limit that surfaces as
+        // ERROR 3024 — the single field that makes a timeout post-mortem possible.
+        let version = self.query_scalar("SELECT @@version").ok().flatten();
+        let max_exec = self
+            .query_scalar("SELECT @@max_execution_time")
+            .ok()
+            .flatten();
+        let sql_mode = self.query_scalar("SELECT @@sql_mode").ok().flatten();
+        let time_zone = self.query_scalar("SELECT @@time_zone").ok().flatten();
+        let wait_timeout = self.query_scalar("SELECT @@wait_timeout").ok().flatten();
+        let max_conns = self.query_scalar("SELECT @@max_connections").ok().flatten();
+        Some(
+            serde_json::json!({
+                "engine": "mysql",
+                "version": version,
+                "max_execution_time_ms": max_exec,
+                "sql_mode": sql_mode,
+                "time_zone": time_zone,
+                "wait_timeout_s": wait_timeout,
+                "max_connections": max_conns,
+            })
+            .to_string(),
+        )
     }
 }
 

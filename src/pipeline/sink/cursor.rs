@@ -7,8 +7,8 @@
 
 use arrow::array::Array;
 use arrow::array::{
-    Date32Array, FixedSizeBinaryArray, Float64Array, Int16Array, Int32Array, Int64Array,
-    StringArray, TimestampMicrosecondArray, TimestampNanosecondArray,
+    Date32Array, FixedSizeBinaryArray, Float32Array, Float64Array, Int16Array, Int32Array,
+    Int64Array, StringArray, TimestampMicrosecondArray, TimestampNanosecondArray, UInt64Array,
 };
 use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use arrow::record_batch::RecordBatch;
@@ -19,9 +19,11 @@ use arrow::record_batch::RecordBatch;
 /// - the column does not exist in the schema,
 /// - the batch is empty,
 /// - the last value is NULL,
-/// - the column's Arrow type is not one of the supported cursor types
-///   (int16/32/64, float64, utf8, timestamp(µs), date32,
-///   FixedSizeBinary(16) for PG `uuid` per ADR-0014).
+/// - the column's Arrow type is not one of the supported cursor types — the
+///   closed set the drivers actually produce: int16/32/64, uint64 (MySQL
+///   `BIGINT UNSIGNED`; narrower unsigned is widened to a signed arm),
+///   float32/64, utf8, timestamp(µs/ns), date32, FixedSizeBinary(16) for PG
+///   `uuid` per ADR-0014.
 pub(crate) fn extract_last_cursor_value(
     batch: &RecordBatch,
     cursor_column: &str,
@@ -54,6 +56,31 @@ pub(crate) fn extract_last_cursor_value(
             array
                 .as_any()
                 .downcast_ref::<Int64Array>()?
+                .value(last_row)
+                .to_string(),
+        ),
+        // The ONLY unsigned Arrow type the pipeline can produce: MySQL
+        // `BIGINT UNSIGNED` (RivetType::UInt64). Every NARROWER unsigned is widened
+        // to a signed arm before it reaches Arrow (MySQL SHORT unsigned→Int32,
+        // INT24/LONG unsigned→Int64; PG OID→Int64; MSSQL tinyint→Int64), and
+        // RivetType has no UInt8/16/32 variant — so no narrow-unsigned arm is
+        // reachable. Field bug: an unsigned `id` has a sign-agnostic DATA_TYPE, so
+        // it PASSED the integer-family keyset/chunk guard but had no UInt64 arm →
+        // keyset bailed "could not read the 'id' value … unsupported type" on the
+        // first multi-page table (an incremental cursor silently re-read every run).
+        // `.to_string()` on a u64 is the full unsigned decimal, which MySQL's
+        // `WHERE id > '<v>'` compares correctly as unsigned (no i64 truncation).
+        DataType::UInt64 => Some(
+            array
+                .as_any()
+                .downcast_ref::<UInt64Array>()?
+                .value(last_row)
+                .to_string(),
+        ),
+        DataType::Float32 => Some(
+            array
+                .as_any()
+                .downcast_ref::<Float32Array>()?
                 .value(last_row)
                 .to_string(),
         ),
@@ -210,6 +237,26 @@ mod tests {
         assert_eq!(
             extract_last_cursor_value(&batch, "id", &schema),
             Some("3".into())
+        );
+    }
+
+    #[test]
+    fn cursor_unsigned_integers_field_bug() {
+        // FIELD BUG (0.21.2, prod affiliate DB): a MySQL `BIGINT UNSIGNED` id
+        // (Arrow UInt64) had NO cursor-extract arm — keyset bailed "could not read
+        // the 'id' value … unsupported type" on ~40 tables, and an incremental
+        // cursor silently re-read from the last value every run. A value ABOVE
+        // i64::MAX must extract as the full unsigned decimal, never truncate/wrap.
+        let big = u64::MAX - 5; // 18446744073709551610, well past i64::MAX
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::UInt64, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(UInt64Array::from(vec![1, big]))],
+        )
+        .unwrap();
+        assert_eq!(
+            extract_last_cursor_value(&batch, "id", &schema),
+            Some(big.to_string())
         );
     }
 

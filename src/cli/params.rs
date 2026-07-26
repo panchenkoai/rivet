@@ -12,14 +12,24 @@ use crate::error::Result;
 
 /// Collect repeated `--param KEY=VALUE` strings into a map.
 ///
-/// Items without `=` are silently dropped (clap already validates form); the
-/// first `=` wins so values may themselves contain `=` (e.g. SQL fragments).
-/// Duplicate keys follow last-wins ordering, matching shell expectations.
-pub(super) fn parse_params(raw: &[String]) -> HashMap<String, String> {
-    raw.iter()
-        .filter_map(|s| s.split_once('='))
-        .map(|(k, v)| (k.to_string(), v.to_string()))
-        .collect()
+/// The first `=` wins so values may themselves contain `=` (e.g. SQL fragments);
+/// duplicate keys follow last-wins ordering, matching shell expectations. An item
+/// WITHOUT `=` is a loud error — clap validates only that `--param` takes a value,
+/// NOT that it contains `=` (the old code silently dropped `-p foo`, which then
+/// surfaced downstream as a misleading "environment variable foo is not set").
+pub(super) fn parse_params(raw: &[String]) -> Result<HashMap<String, String>> {
+    let mut map = HashMap::with_capacity(raw.len());
+    for s in raw {
+        let (k, v) = s.split_once('=').ok_or_else(|| {
+            anyhow::anyhow!(
+                "invalid --param '{}' — expected KEY=VALUE (the '=' is missing). \
+                 Example: --param table=orders",
+                s
+            )
+        })?;
+        map.insert(k.to_string(), v.to_string());
+    }
+    Ok(map)
 }
 
 /// Resolve the DB URL for `rivet init` from exactly one of `--source`,
@@ -59,21 +69,21 @@ mod tests {
     #[test]
     fn parse_params_basic() {
         let input = vec!["KEY=value".to_string()];
-        let result = parse_params(&input);
+        let result = parse_params(&input).unwrap();
         assert_eq!(result.get("KEY").unwrap(), "value");
     }
 
     #[test]
     fn parse_params_equals_in_value() {
         let input = vec!["FILTER=x=1 AND y=2".to_string()];
-        let result = parse_params(&input);
+        let result = parse_params(&input).unwrap();
         assert_eq!(result.get("FILTER").unwrap(), "x=1 AND y=2");
     }
 
     #[test]
     fn parse_params_multiple() {
         let input = vec!["A=1".to_string(), "B=2".to_string()];
-        let result = parse_params(&input);
+        let result = parse_params(&input).unwrap();
         assert_eq!(result.len(), 2);
         assert_eq!(result.get("A").unwrap(), "1");
         assert_eq!(result.get("B").unwrap(), "2");
@@ -81,28 +91,34 @@ mod tests {
 
     #[test]
     fn parse_params_empty_input() {
-        let result = parse_params(&[]);
+        let result = parse_params(&[]).unwrap();
         assert!(result.is_empty());
     }
 
     #[test]
-    fn parse_params_no_equals_skipped() {
+    fn parse_params_no_equals_is_a_loud_error() {
+        // #dogfood LOW: a malformed `-p foo` (no `=`) used to be SILENTLY dropped
+        // (this test PINNED that), then surfaced downstream as a misleading
+        // "environment variable foo is not set". It is now a clear parse error.
         let input = vec!["NO_EQUALS_HERE".to_string()];
-        let result = parse_params(&input);
-        assert!(result.is_empty());
+        let err = parse_params(&input).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("expected KEY=VALUE"),
+            "malformed --param must name the KEY=VALUE form: {err:#}"
+        );
     }
 
     #[test]
     fn parse_params_empty_value() {
         let input = vec!["KEY=".to_string()];
-        let result = parse_params(&input);
+        let result = parse_params(&input).unwrap();
         assert_eq!(result.get("KEY").unwrap(), "");
     }
 
     #[test]
     fn parse_params_duplicate_last_wins() {
         let input = vec!["K=first".to_string(), "K=second".to_string()];
-        let result = parse_params(&input);
+        let result = parse_params(&input).unwrap();
         assert_eq!(result.get("K").unwrap(), "second");
     }
 

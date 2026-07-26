@@ -1,0 +1,101 @@
+# ── Rivet Release Oracle — the go/no-go gate ────────────────────────────────
+# The automation of the manual dogfood: every ENGINE at every pinned VERSION runs
+# every SCENARIO against the local object-store fakes (MinIO=S3, fake-gcs=GCS,
+# Azurite=Azure), and a final BigQuery stage. Green everywhere ⇒ releasable.
+#
+# This file is the declarative source of truth; `run.sh` executes it. Kept in the
+# same drift-guarded style as docs/*-matrix.yaml (a new scenario/engine/version is
+# a row here, not hidden control flow in the driver).
+#
+# Verdict contract: a cell is PASS only when its check ran AND matched. A skipped
+# cell (service down, cloud creds absent) is reported SKIP — never silently PASS.
+# The gate is RED if any non-skipped cell fails.
+
+# ── Engines × pinned versions ───────────────────────────────────────────────
+# image = the exact tag the gate pins (reproducible on any docker host, not the
+# devbox's ad-hoc stands). port = host port the driver connects on.
+engines:
+  postgres:
+    driver: postgres
+    url: "postgresql://rivet:rivet@127.0.0.1:%PORT%/rivet"
+    seed: seeds/common/postgres.sql
+    versions:
+      - { tag: "13", image: "postgres:13", port: 55013 }
+      - { tag: "16", image: "postgres:16", port: 55016 }
+  mysql:
+    # The canonical seed uses a recursive CTE (deterministic fast fill) → MySQL 8.0+
+    # ONLY. Pre-8.0 (5.7) would need a non-recursive compat seed; out of matrix.
+    driver: mysql
+    url: "mysql://rivet:rivet@127.0.0.1:%PORT%/rivet"
+    seed: seeds/common/mysql.sql
+    versions:
+      - { tag: "8.0", image: "mysql:8.0", port: 55080 }
+      - { tag: "8.4", image: "mysql:8.4", port: 55084 }
+  mssql:
+    # The canonical seed uses GENERATE_SERIES → SQL Server 2022+ ONLY. Pre-2022
+    # (2019) would need a numbers-table compat seed; out of matrix.
+    driver: mssql
+    url: "sqlserver://sa:Rivet_Passw0rd!@127.0.0.1:%PORT%/rivet"
+    tls: accept_invalid_certs
+    seed: seeds/common/mssql.sql
+    versions:
+      - { tag: "2022", image: "mcr.microsoft.com/mssql/server:2022-latest", port: 55022 }
+  mongo:
+    driver: mongo
+    url: "mongodb://127.0.0.1:%PORT%/rivet"
+    seed: seeds/mongo_seed.py
+    versions:
+      - { tag: "4.4", image: "mongo:4.4", port: 55044 }
+      - { tag: "7",   image: "mongo:7",   port: 55007 }
+
+# ── Object-store backends (local fakes) ─────────────────────────────────────
+# One CloudDestination impl (src/destination/cloud.rs) serves all three; the gate
+# proves each wire protocol end-to-end against its emulator.
+stores:
+  s3:      { emulator: minio,    endpoint: "http://127.0.0.1:9000",  bucket: rivet-oracle }
+  gcs:     { emulator: fake-gcs, endpoint: "http://127.0.0.1:4443",  bucket: rivet-oracle }
+  azure:   { emulator: azurite,  endpoint: "http://127.0.0.1:10000/devstoreaccount1", bucket: rivet-oracle }
+
+# ── Scenarios (the manual dogfood, codified) ────────────────────────────────
+# Each runs per engine×version. `sql`-only ones skip Mongo where noted.
+scenarios:
+  - id: verdicts
+    what: "init → the strategy per table matches expectation: clean-PK seeds (users/orders/…) → keyset; orders_sparse → full; garbage decimal_key → full-bail, ref_id_history → chunked (non-unique), heap_no_key/no_pk_no_ts → chunked DEGRADED, unindexed_id → NOT keyset (name-trap), ext_bigint_unsigned_pk (mysql) → keyset; zero phantom heavy-chunk."
+    applies: [postgres, mysql, mssql, mongo]
+
+  - id: integrity_types
+    what: "users 150K loss/dup: source count+distinct == DuckDB read of the parts. PLUS a per-engine DuckDB GOLDEN with TWO fidelity arguments per type matrix: <tmt> = PARQUET readback (binary/typed path — decimal precision, uuid, timestamp, enum) and <tmt>__csv = CSV readback read ALL-VARCHAR (the text-writer path parquet never exercises — escape/quote/unicode/null fidelity), both via DuckDB's own reader, never rivet's. Mongo has no type matrix (full-scan only), so it runs the loss/dup arm only."
+    applies: [postgres, mysql, mssql, mongo]
+
+  - id: load
+    what: "load the manifested parts into each store {s3/minio, gcs/fake-gcs, azure/azurite} and read them back: warehouse/reread count == summed manifest row_count (the count gate), and the id-set round-trips."
+    applies: [postgres, mysql, mssql, mongo]
+
+  - id: gc_survival
+    what: "the concurrent-extract bucket-erasure guard: with a Running manifest present, a load's gc_orphans SPARES an unmanifested in-flight part; with none, it DELETES the true orphan; Success parts always kept. Run once per store."
+    applies: [postgres]   # store-level property; one engine's parts suffice to exercise it
+
+# ── Final stage: real cloud, GOLDEN-checked ─────────────────────────────────
+# Not an emulator — the BigQuery independent oracle. rivet exports the type-matrix
+# tables → loads to BigQuery → reads back with `bq query --format=prettyjson`. The
+# read-back is compared to a CHECKED-IN GOLDEN (golden/bigquery_type_matrix.json):
+# the warehouse-side representation of every type-matrix value after a full
+# rivet→Parquet→BigQuery round-trip. That golden makes the stage DETERMINISTIC —
+# a divergence means either rivet's type export changed or BigQuery changed a type
+# mapping, and the release must not ship until the golden is re-blessed on purpose.
+#
+# Requires ADC + a dataset; SKIP (not fail) when creds are absent — but a release
+# build MUST run it green against the golden. Regenerate the golden intentionally
+# with `run.sh --bless-bigquery-golden` (never silently).
+final:
+  bigquery:
+    project_env: BQ_ORACLE_PROJECT
+    dataset_env: BQ_ORACLE_DATASET
+    # rivet_type_matrix is the FULL canonical per-engine type matrix (ports
+    # tests/type_roundtrip/fixtures/<eng>_schema.sql): every BQ-loadable type incl.
+    # PG arrays (text[]/integer[]) — which `rivet load` now loads as
+    # ARRAY<STRUCT<item T>> (== REPEATED RECORD{item}), matching rivet_type_lab.
+    # bo_pg_matrix_full — after the target.rs::list / from_files fix.
+    tables: [rivet_type_matrix]
+    golden: golden/bigquery_type_matrix.json
+    what: "rivet run → real GCS, rivet load → BigQuery, bq query reads back as JSON and compares EVERY column value to the checked-in golden (decimal precision, TIMESTAMP, BYTES, NUMERIC-widened unsigned, JSON) — deterministic, not a fuzzy count check."

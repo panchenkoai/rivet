@@ -51,6 +51,16 @@ pub(super) fn connect(url: &str) -> Result<mysql::PooledConn> {
     Ok(pool.get_conn()?)
 }
 
+/// Switch the session's default database so the introspection queries (scoped
+/// to `DATABASE()`) read `--schema` instead of the URL's database. A nonexistent
+/// db surfaces MySQL's own "Unknown database" — the loud failure we want, versus
+/// silently ignoring `--schema`. Escapes backticks in the identifier.
+pub(super) fn use_database(conn: &mut mysql::PooledConn, database: &str) -> Result<()> {
+    let escaped = database.replace('`', "``");
+    conn.query_drop(format!("USE `{escaped}`"))?;
+    Ok(())
+}
+
 /// Tables and views in a MySQL database (`information_schema`; `TABLE_SCHEMA` is the database name).
 pub(super) fn list_tables(conn: &mut mysql::PooledConn, database: &str) -> Result<Vec<String>> {
     let rows: Vec<String> = conn.exec(LIST_TABLES_SQL, (database,))?;

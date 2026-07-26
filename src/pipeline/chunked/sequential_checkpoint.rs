@@ -143,6 +143,13 @@ fn run_chunk_with_source_retries(
                 .as_ref()
                 .map(classify_error)
                 .unwrap_or(RetryClass::Permanent);
+            // #4: a retry whose error class needs a fresh connection re-opens the
+            // source below (create_source per attempt) — a real reconnect. Count it
+            // so the flaky-link DIAGNOSIS fires on the chunked runner too, not only
+            // single mode's run_with_reconnect.
+            if class.needs_reconnect() {
+                summary.reconnects = summary.reconnects.saturating_add(1);
+            }
             let backoff = crate::pipeline::retry::retry_backoff_ms(
                 plan.tuning.retry_backoff_ms,
                 attempt,
@@ -234,7 +241,11 @@ pub(crate) fn run_chunked_sequential_checkpoint(
     // ADR-0012 M8: same manifest-aware preamble as the parallel runner —
     // reconcile destination state with chunk_task table before claiming work.
     if plan.resume {
-        let _stats = super::apply_m8_resume_decisions(state, &run_id, plan, summary)?;
+        let stats = super::apply_m8_resume_decisions(state, &run_id, plan, summary)?;
+        // #3: mark the run as a crash-recovery resume when it adopted prior work,
+        // so run_diagnosis emits "resumed a prior CRASHED run" — the field-log
+        // crash signal, previously set only by the keyset runner.
+        summary.resumed = stats.adopted_prior_work();
     }
 
     let total_tasks = state.count_chunk_tasks_total(&run_id).unwrap_or(1);

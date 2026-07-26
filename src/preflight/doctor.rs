@@ -105,6 +105,12 @@ pub fn doctor(config_path: &str, json: bool) -> Result<()> {
     };
 
     let mut all_ok = true;
+    // A transient/connectivity probe failure (connection refused/reset/timeout)
+    // must exit Retryable (2) like `check`/`run`, not Generic (1) — doctor used
+    // to stringify+drop the typed error and re-bail generically, so classify_exit
+    // could no longer see it was transient (dogfood LOW). Carry the original
+    // transient message so the final bail stays classifiable.
+    let mut transient_detail: Option<String> = None;
 
     match check_source_auth(&config) {
         Ok(()) => {
@@ -126,6 +132,11 @@ pub fn doctor(config_path: &str, json: bool) -> Result<()> {
         }
         Err(e) => {
             all_ok = false;
+            if crate::pipeline::retry::classify_error(&e).is_transient() {
+                // Keep the FULL chain (not trim_probe_error) so the transient
+                // keyword survives into the final bail for classify_exit.
+                transient_detail = Some(format!("{e:#}"));
+            }
             let category = categorize_source_error(&e);
             let hint =
                 source_error_hint(category, &e, &config.source.source_type).map(|h| h.to_string());
@@ -205,6 +216,16 @@ pub fn doctor(config_path: &str, json: bool) -> Result<()> {
             }
             Err(e) => {
                 all_ok = false;
+                // #15 bughunt: a TRANSIENT destination failure (S3 timeout, network
+                // blip) must exit Retryable (2), same as a transient SOURCE failure
+                // — the typed signal was set only in the source arm, so a healthy
+                // source + transiently-down destination exited Generic (1). Preserve
+                // the first transient detail (source-first) so classify_exit sees it.
+                if transient_detail.is_none()
+                    && crate::pipeline::retry::classify_error(&e).is_transient()
+                {
+                    transient_detail = Some(format!("{e:#}"));
+                }
                 let category = categorize_dest_error(&e, &expanded_dest);
                 let hint = destination_error_hint(category, &expanded_dest).map(|h| h.to_string());
                 emit_check(
@@ -227,6 +248,17 @@ pub fn doctor(config_path: &str, json: bool) -> Result<()> {
     for c in super::cdc_health::collect(&config) {
         if !c.ok {
             all_ok = false;
+            // #15 bughunt: a transient CDC-health failure should also drive
+            // Retryable (2). These checks arrive pre-stringified, so classify the
+            // detail text (best-effort) rather than a typed error. First transient
+            // signal wins (source/destination arms run before this).
+            if transient_detail.is_none()
+                && let Some(detail) = &c.detail
+                && crate::pipeline::retry::classify_error(&anyhow::anyhow!("{detail}"))
+                    .is_transient()
+            {
+                transient_detail = Some(detail.clone());
+            }
         }
         emit_check(&mut checks, json, c);
     }
@@ -247,7 +279,21 @@ pub fn doctor(config_path: &str, json: bool) -> Result<()> {
     if all_ok {
         Ok(())
     } else {
-        anyhow::bail!("doctor: one or more preflight checks failed (see output above)")
+        Err(doctor_failure_error(transient_detail))
+    }
+}
+
+/// The doctor's terminal error when a check failed. When a probe failed
+/// transiently, the original transient text is PRESERVED so `classify_exit`
+/// (string-based) returns Retryable (2), matching `check`/`run` on the same
+/// connection failure — doctor used to re-bail generically and drop the signal,
+/// exiting Generic (1) (dogfood LOW).
+fn doctor_failure_error(transient_detail: Option<String>) -> anyhow::Error {
+    match transient_detail {
+        Some(detail) => anyhow::anyhow!(
+            "doctor: preflight failed on a transient error (see output above): {detail}"
+        ),
+        None => anyhow::anyhow!("doctor: one or more preflight checks failed (see output above)"),
     }
 }
 
@@ -678,6 +724,26 @@ pub(super) fn destination_error_hint(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn doctor_transient_failure_classifies_as_retryable_exit_2() {
+        // #dogfood LOW: doctor stringified+dropped the typed transient error and
+        // re-bailed generically, so classify_exit could no longer see it was
+        // transient — it exited 1 (Generic) while check/run exited 2 (Retryable)
+        // on the SAME connection failure. Preserving the transient text keeps it
+        // classifiable.
+        let transient = doctor_failure_error(Some("connection refused (os error 61)".to_string()));
+        assert!(
+            crate::pipeline::retry::classify_error(&transient).is_transient(),
+            "a transient probe failure must classify Retryable (exit 2): {transient:#}"
+        );
+        // A non-transient failure stays Generic (exit 1).
+        let generic = doctor_failure_error(None);
+        assert!(
+            !crate::pipeline::retry::classify_error(&generic).is_transient(),
+            "a non-transient failure must stay Generic (exit 1): {generic:#}"
+        );
+    }
 
     // doctor-dedup-path (regression): doctor's destination dedup key must
     // include `path`, so two local destinations with different `path:` values

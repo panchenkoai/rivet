@@ -52,10 +52,24 @@ pub(crate) struct Position(pub(crate) Json);
 impl Position {
     /// Load a persisted checkpoint, or `None` on first run (absent).
     pub(crate) fn load(path: &Path) -> Result<Option<Self>> {
+        use anyhow::Context as _;
         match std::fs::read_to_string(path) {
-            Ok(s) => Ok(Some(Position(serde_json::from_str(&s)?))),
+            Ok(s) => Ok(Some(Position(serde_json::from_str(&s).with_context(
+                || {
+                    format!(
+                        "checkpoint '{}' is corrupt or truncated (not valid JSON) — refusing to \
+                     silently treat it as absent and re-anchor CDC at 'current', which would \
+                     permanently skip every change since the last checkpoint. Restore the file, \
+                     or delete it to accept a new anchor from a fresh snapshot.",
+                        path.display()
+                    )
+                },
+            )?))),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e.into()),
+            Err(e) => {
+                Err(anyhow::Error::new(e)
+                    .context(format!("reading checkpoint '{}'", path.display())))
+            }
         }
     }
 
@@ -220,24 +234,30 @@ pub(crate) fn run(
     max_events: Option<usize>,
 ) -> Result<()> {
     let mut emitted = 0usize;
+    // A cap of 0 means emit nothing — check BEFORE consuming the stream. The
+    // post-emit `emitted >= m` check let exactly one event escape at m=0 (it
+    // printed, incremented to 1, then 1 >= 0 broke), an off-by-one.
+    if max_events == Some(0) {
+        return Ok(());
+    }
     let mut txn_seq = TxnSeq::default();
     while let Some(ev) = stream.next_change() {
         let mut ev = ev?;
         txn_seq.stamp(&mut ev);
-        // Checkpoint at every commit boundary BEFORE the table filter — the
-        // resume position is a stream property; a transaction whose last
-        // event lands on an unlisted table must still advance it (mirrors
-        // the file sink).
-        if ev.committed
-            && let Some(p) = &checkpoint
-        {
-            ev.position.save(p)?;
-        }
-        if !tables.is_empty()
+        let committed = ev.committed;
+        // A commit boundary on an UNLISTED table produces no output line — advance
+        // the checkpoint past it NOW (before the filter `continue`): the resume
+        // position is a stream property, so a transaction whose last event lands on
+        // an unlisted table must still move it (mirrors the file sink). There is no
+        // data to lose here because nothing is emitted.
+        let filtered = !tables.is_empty()
             && !tables
                 .iter()
-                .any(|t| sink::table_matches(t, &ev.schema, &ev.table))
-        {
+                .any(|t| sink::table_matches(t, &ev.schema, &ev.table));
+        if filtered {
+            if committed && let Some(p) = &checkpoint {
+                ev.position.save(p)?;
+            }
             continue;
         }
         // Surface a deferred decode error (e.g. PG unchanged-TOAST with no
@@ -245,8 +265,6 @@ pub(crate) fn run(
         // file sink. Without this the NDJSON path would print the raw
         // `unchanged-toast-datum` sentinel verbatim as the column value (silent
         // corruption). An uncaptured table's poison was already dropped above.
-        // Confirmed captured → surface any deferred decode error before emitting
-        // (an uncaptured table's poison was already dropped by the filter above).
         ev.raise_poison()?;
         let to_json = |img: &Option<Vec<RivetValue>>| {
             img.as_ref()
@@ -263,6 +281,15 @@ pub(crate) fn run(
         });
         println!("{line}");
         emitted += 1;
+        // Checkpoint AFTER emitting the captured event — never before. A crash in
+        // the window between the checkpoint save and the emit would advance the
+        // resume position past a line that was never printed, so the next run reads
+        // strictly after it and SKIPS the transaction tail (#9 bughunt: an
+        // at-least-once break, the save ran before the println). Emit→checkpoint
+        // means a crash there re-emits on resume (a duplicate, never a loss).
+        if committed && let Some(p) = &checkpoint {
+            ev.position.save(p)?;
+        }
         if max_events.is_some_and(|m| emitted >= m) {
             break;
         }
@@ -557,28 +584,46 @@ pub(crate) fn create_change_stream(
 ) -> Result<Box<dyn ChangeStream>> {
     use anyhow::Context;
     let url = cfg.url.as_str();
+    // A host-less URL is a config/parse error, not a per-engine setup problem —
+    // validate BEFORE the engine match so it never gets blanketed by the binlog/
+    // slot/CDC grants hint below (dogfood LOW).
+    crate::source::require_url_has_host(url)?;
     let tls = cfg.tls.as_ref();
     // The engine identity IS the opts variant — no re-resolution from the URL.
     match &cfg.engine {
-        CdcEngineOpts::Mysql { server_id } => Ok(Box::new(
-            crate::source::mysql::cdc::MysqlChangeStream::open_or_resume(
-                url,
-                *server_id,
-                cfg.checkpoint.as_deref(),
-                cfg.drain,
-                tls,
-            )
-            .context(MYSQL_CDC_HINT)?,
-        )),
+        CdcEngineOpts::Mysql { server_id } => {
+            // Validate the checkpoint BEFORE open_or_resume so a corrupt/truncated
+            // checkpoint (or a directory path) surfaces cleanly, not blanketed by
+            // the MYSQL_CDC_HINT binlog-grants message — the same hoist PG/MSSQL
+            // already do below (dogfood MED: MySQL reported a checkpoint-file
+            // error as a permissions/setup problem). open_or_resume re-reads it;
+            // the double read of a tiny file is cheap.
+            if let Some(p) = cfg.checkpoint.as_deref() {
+                Position::load(std::path::Path::new(p))?;
+            }
+            Ok(Box::new(
+                crate::source::mysql::cdc::MysqlChangeStream::open_or_resume(
+                    url,
+                    *server_id,
+                    cfg.checkpoint.as_deref(),
+                    cfg.drain,
+                    tls,
+                )
+                .context(MYSQL_CDC_HINT)?,
+            ))
+        }
         CdcEngineOpts::Postgres { slot } => {
             // A persisted checkpoint proves a prior run happened — if the slot is
             // then MISSING, it was dropped/invalidated and silently recreating it
             // at the current position would skip everything since (a silent gap).
-            let resume_expected = cfg
-                .checkpoint
-                .as_deref()
-                .and_then(|p| Position::load(p).ok().flatten())
-                .is_some();
+            // Propagate a corrupt/truncated checkpoint (#99): `.ok()` swallowed it
+            // into resume_expected=false, so a dropped slot got silently recreated
+            // at 'current' and skipped every change since — the anti-gap guard
+            // (missing slot + resume_expected) never fired.
+            let resume_expected = match cfg.checkpoint.as_deref() {
+                Some(p) => Position::load(p)?.is_some(),
+                None => false,
+            };
             Ok(Box::new(
                 crate::source::postgres::cdc::PgChangeStream::open(
                     url,
@@ -598,16 +643,17 @@ pub(crate) fn create_change_stream(
             // Resume from the checkpoint's LSN if one was persisted (SQL Server has no
             // server-side cursor — the from-LSN is what makes it at-least-once instead
             // of re-reading the whole change table each run).
-            let from_lsn = cfg
-                .checkpoint
-                .as_deref()
-                .and_then(|p| Position::load(p).ok().flatten())
-                .and_then(|pos| {
+            let from_lsn = match cfg.checkpoint.as_deref() {
+                // A corrupt checkpoint must fail loud (#99), not silently drop to
+                // None (a full change-table over-read that re-loads everything).
+                Some(p) => Position::load(p)?.and_then(|pos| {
                     pos.0
                         .get("lsn")
                         .and_then(|v| v.as_str())
                         .map(str::to_string)
-                });
+                }),
+                None => None,
+            };
             Ok(Box::new(
                 crate::source::mssql::cdc::MssqlChangeStream::from_url(
                     url, ci, from_lsn, tls, peek, cfg.drain,
@@ -615,19 +661,29 @@ pub(crate) fn create_change_stream(
                 .context(MSSQL_CDC_HINT)?,
             ))
         }
-        CdcEngineOpts::Mongo { canonical } => Ok(Box::new(
-            // Whole-database change stream; resumes from the persisted token when
-            // one exists. `document` JSON fidelity follows `source.mongo.json`
-            // (canonical vs relaxed), so CDC and batch render it identically.
-            crate::source::mongo::cdc::MongoChangeStream::open(
-                url,
-                tls,
-                cfg.checkpoint.as_deref(),
-                *canonical,
-                cfg.drain,
-            )
-            .context(MONGO_CDC_HINT)?,
-        )),
+        CdcEngineOpts::Mongo { canonical } => {
+            // Validate the checkpoint BEFORE open so a corrupt/truncated one
+            // surfaces cleanly, not blanketed by MONGO_CDC_HINT — the same hoist
+            // MySQL/PG/MSSQL do (bughunt MED: MongoChangeStream::open loaded it
+            // INSIDE the hint wrap). open re-reads it; a tiny double read is cheap.
+            if let Some(p) = cfg.checkpoint.as_deref() {
+                Position::load(std::path::Path::new(p))?;
+            }
+            Ok(Box::new(
+                // Whole-database change stream; resumes from the persisted token
+                // when one exists. `document` JSON fidelity follows
+                // `source.mongo.json` (canonical vs relaxed), so CDC and batch
+                // render it identically.
+                crate::source::mongo::cdc::MongoChangeStream::open(
+                    url,
+                    tls,
+                    cfg.checkpoint.as_deref(),
+                    *canonical,
+                    cfg.drain,
+                )
+                .context(MONGO_CDC_HINT)?,
+            ))
+        }
     }
 }
 
@@ -890,6 +946,64 @@ mod tests {
     /// parent, or every fresh quickstart dies on ENOENT dressed in the
     /// grants hint.
     #[test]
+    fn corrupt_checkpoint_fails_loud_not_silently_absent() {
+        // #99: a corrupt/truncated checkpoint must ERROR, never silently read as
+        // absent — which let PG CDC treat a dropped slot as a fresh first run,
+        // recreate it at 'current', and permanently skip changes. `.ok().flatten()`
+        // at three sites (cdc_job resume_expected, PG + MSSQL create_change_stream)
+        // swallowed it; Position::load now carries a clear corrupt-checkpoint error.
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("ck.json");
+        std::fs::write(&path, b"{not valid json").unwrap();
+        let err = Position::load(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("corrupt or truncated"),
+            "a corrupt checkpoint must fail loud, not read as absent: {err}"
+        );
+
+        // An absent checkpoint stays a clean first run (None).
+        assert!(
+            Position::load(&d.path().join("absent.json"))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn mysql_corrupt_checkpoint_error_is_not_masked_by_the_grants_hint() {
+        // #dogfood MED: MySQL's `Position::load` lived INSIDE open_or_resume,
+        // wrapped by MYSQL_CDC_HINT — so a corrupt/truncated checkpoint was
+        // reported as a binlog permissions/setup problem. The load is now hoisted
+        // ABOVE the wrap (like PG/MSSQL), so the corrupt-checkpoint error surfaces
+        // cleanly and NO network connect is attempted (the `?` returns first —
+        // hence the unreachable port is never dialed). RED against the old code:
+        // without the hoist the error carries the REPLICATION-SLAVE grants hint.
+        let d = tempfile::tempdir().unwrap();
+        let ckpt = d.path().join("ck.json");
+        std::fs::write(&ckpt, b"{not valid json").unwrap();
+        let cfg = CdcConfig {
+            url: "mysql://rivet:rivet@127.0.0.1:1/rivet".into(),
+            checkpoint: Some(ckpt),
+            drain: DrainMode::BoundedAtOpen,
+            tls: None,
+            engine: CdcEngineOpts::Mysql { server_id: 4321 },
+        };
+        let err = match create_change_stream(&cfg, PeekBound::Unbounded) {
+            Ok(_) => panic!("a corrupt checkpoint must error, not open a stream"),
+            Err(e) => e,
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("corrupt or truncated"),
+            "the error must be the clean corrupt-checkpoint message: {msg}"
+        );
+        assert!(
+            !msg.contains("REPLICATION SLAVE") && !msg.contains("binlog_format"),
+            "a checkpoint-file error must NOT carry the binlog-grants hint: {msg}"
+        );
+    }
+
+    #[test]
     fn checkpoint_save_creates_missing_parent_directories() {
         let d = tempfile::tempdir().unwrap();
         let path = d.path().join("cdc").join("nested").join("orders.ckpt");
@@ -1027,5 +1141,24 @@ mod tests {
         let mut s = OneShot(Some(poison_event("audit_log")));
         super::run(&mut s, None, vec!["orders".into()], None)
             .expect("uncaptured poison must not bail the NDJSON run");
+    }
+
+    // A stream that MUST NOT be consumed — `next_change` panics if polled.
+    struct Forbidden;
+    impl super::ChangeStream for Forbidden {
+        fn next_change(&mut self) -> Option<Result<super::ChangeEvent>> {
+            panic!("run must not poll the stream when --max-events 0");
+        }
+    }
+
+    // #dogfood LOW: `--max-events 0` emitted exactly ONE event — the cap was
+    // checked AFTER the emit (`emitted += 1; if emitted >= 0 break`), an
+    // off-by-one. It is now a true no-op: the early return means the stream is
+    // never even polled. RED against the old loop, which would poll (→ panic).
+    #[test]
+    fn max_events_zero_is_a_true_no_op_never_polls_the_stream() {
+        let mut s = Forbidden;
+        super::run(&mut s, None, vec!["orders".into()], Some(0))
+            .expect("--max-events 0 must be a clean no-op");
     }
 }

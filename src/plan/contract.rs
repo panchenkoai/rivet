@@ -195,6 +195,31 @@ impl ExtractionStrategy {
         }
     }
 
+    /// Why `--reconcile` must SKIP the full-source `COUNT(*)` check for this
+    /// strategy, or `None` when the strategy is a complete snapshot the count
+    /// should match. Reconcile means "did the export capture everything the source
+    /// has", which is only meaningful for a full pass (full / chunked / plain
+    /// keyset). Every SUBSET/DELTA strategy — incremental cursor, keyset_incremental
+    /// (append-only, pulls keys past the high-water mark), time_window (a bounded
+    /// window) — legitimately exports fewer rows than the table holds, so the count
+    /// mismatch is STRUCTURAL, not data loss. The exit gate must not fail-loud on
+    /// it (else every healthy scheduled delta `run --reconcile` exits 3 and stops
+    /// the chain).
+    pub fn reconcile_subset_skip(&self) -> Option<&'static str> {
+        match self {
+            ExtractionStrategy::Incremental(_) => {
+                Some("incremental cursor — pulls only rows past the cursor")
+            }
+            ExtractionStrategy::Keyset(kp) if kp.incremental => {
+                Some("keyset_incremental — pulls only keys past the high-water mark")
+            }
+            ExtractionStrategy::TimeWindow { .. } => {
+                Some("time_window — pulls only the bounded window")
+            }
+            _ => None,
+        }
+    }
+
     /// Resolved incremental cursor plan when strategy is incremental.
     pub fn incremental_plan(&self) -> Option<&IncrementalCursorPlan> {
         match self {
@@ -316,6 +341,55 @@ mod tests {
         assert!(s.cursor_column().is_none());
         let q = s.resolve_query("SELECT 1", SourceType::Postgres).unwrap();
         assert_eq!(q, "SELECT 1");
+    }
+
+    #[test]
+    fn reconcile_subset_skip_covers_every_delta_strategy() {
+        // #bughunt HIGH: the #102 reconcile exit gate turned a STRUCTURAL count
+        // mismatch into a false exit-3 for keyset_incremental + time_window (only
+        // the Incremental cursor was skipped). Every subset/delta strategy must
+        // skip the full-source COUNT(*); a full pass must NOT.
+        let keyset = |incremental| {
+            ExtractionStrategy::Keyset(KeysetPlan {
+                key_column: "id".into(),
+                chunk_size: 1000,
+                checkpoint: true,
+                incremental,
+                parallel: 1,
+            })
+        };
+        assert!(
+            keyset(true).reconcile_subset_skip().is_some(),
+            "keyset_incremental pulls only new keys — reconcile must skip"
+        );
+        assert!(
+            keyset(false).reconcile_subset_skip().is_none(),
+            "plain keyset is a FULL pass — reconcile applies"
+        );
+        assert!(
+            ExtractionStrategy::TimeWindow {
+                column: "d".into(),
+                column_type: TimeColumnType::Timestamp,
+                days_window: 7,
+            }
+            .reconcile_subset_skip()
+            .is_some()
+        );
+        assert!(
+            ExtractionStrategy::Incremental(IncrementalCursorPlan {
+                primary_column: "updated_at".into(),
+                fallback_column: None,
+                mode: IncrementalCursorMode::SingleColumn,
+            })
+            .reconcile_subset_skip()
+            .is_some()
+        );
+        assert!(
+            ExtractionStrategy::Snapshot
+                .reconcile_subset_skip()
+                .is_none(),
+            "a full snapshot must be reconciled"
+        );
     }
 
     #[test]

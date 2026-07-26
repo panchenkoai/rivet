@@ -11,6 +11,7 @@ mod load_journal_store;
 mod metrics;
 mod progression;
 mod run_aggregate;
+mod run_status_store;
 mod schema;
 mod shape;
 
@@ -318,6 +319,40 @@ const MIGRATIONS: &[(i64, &str)] = &[
         16,
         "ALTER TABLE export_state ADD COLUMN resume_run_id TEXT;",
     ),
+    // v17: central run-status ledger. The AUTHORITATIVE record of each export
+    // run's lifecycle — `running` at start, terminal at finalize. The bucket
+    // manifest's status is a PROJECTION of this row (written FROM it), so a
+    // cross-boundary reader over the bucket and a rivet process over a shared
+    // state DB agree. gc_orphans reads it to spare a LIVE extract's in-flight
+    // parts (a `running`, non-superseded run on the prefix) rather than guess
+    // from a wall-clock freshness window.
+    (
+        17,
+        "CREATE TABLE IF NOT EXISTS run_status (
+            run_id      TEXT PRIMARY KEY,
+            export_name TEXT NOT NULL,
+            prefix      TEXT NOT NULL,
+            status      TEXT NOT NULL,
+            started_at  TEXT NOT NULL,
+            finished_at TEXT
+         );
+         CREATE INDEX IF NOT EXISTS idx_run_status_prefix ON run_status(prefix);",
+    ),
+    // v18: failure-forensics columns on export_metrics. A `status='failed'` row IS
+    // written on failure (unlike export_schema, which is success-only), so the
+    // fields a post-mortem needs — the error CLASS, the key RANGE it died in, the
+    // key's SHAPE, the OFFENDING value, the source SERVER limits — live HERE, making
+    // one failed row self-sufficient to recreate the failure without the source DB.
+    // Populated in `pipeline::job::build_metric_row` (see the write-point map there).
+    (
+        18,
+        "ALTER TABLE export_metrics ADD COLUMN error_class TEXT;
+         ALTER TABLE export_metrics ADD COLUMN cursor_min TEXT;
+         ALTER TABLE export_metrics ADD COLUMN cursor_max TEXT;
+         ALTER TABLE export_metrics ADD COLUMN key_descriptor_json TEXT;
+         ALTER TABLE export_metrics ADD COLUMN offending_value TEXT;
+         ALTER TABLE export_metrics ADD COLUMN server_context_json TEXT;",
+    ),
 ];
 
 /// PostgreSQL-compatible DDL.  Column types differ from SQLite (BIGSERIAL,
@@ -571,6 +606,36 @@ const PG_MIGRATIONS: &[(i64, &str)] = &[
     (
         16,
         "ALTER TABLE export_state ADD COLUMN resume_run_id TEXT;",
+    ),
+    // v17: central run-status ledger. The AUTHORITATIVE record of each export
+    // run's lifecycle — `running` at start, terminal at finalize. The bucket
+    // manifest's status is a PROJECTION of this row (written FROM it), so a
+    // cross-boundary reader over the bucket and a rivet process over a shared
+    // state DB agree. gc_orphans reads it to spare a LIVE extract's in-flight
+    // parts (a `running`, non-superseded run on the prefix) rather than guess
+    // from a wall-clock freshness window.
+    (
+        17,
+        "CREATE TABLE IF NOT EXISTS run_status (
+            run_id      TEXT PRIMARY KEY,
+            export_name TEXT NOT NULL,
+            prefix      TEXT NOT NULL,
+            status      TEXT NOT NULL,
+            started_at  TEXT NOT NULL,
+            finished_at TEXT
+         );
+         CREATE INDEX IF NOT EXISTS idx_run_status_prefix ON run_status(prefix);",
+    ),
+    // v18: failure-forensics columns (see the SQLite v18 comment). Postgres TEXT
+    // holds the same JSON/scalar payloads.
+    (
+        18,
+        "ALTER TABLE export_metrics ADD COLUMN error_class TEXT;
+         ALTER TABLE export_metrics ADD COLUMN cursor_min TEXT;
+         ALTER TABLE export_metrics ADD COLUMN cursor_max TEXT;
+         ALTER TABLE export_metrics ADD COLUMN key_descriptor_json TEXT;
+         ALTER TABLE export_metrics ADD COLUMN offending_value TEXT;
+         ALTER TABLE export_metrics ADD COLUMN server_context_json TEXT;",
     ),
 ];
 

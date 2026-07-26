@@ -82,6 +82,15 @@ pub struct RunSummary {
     pub duration_ms: i64,
     pub peak_rss_mb: i64,
     pub retries: u32,
+    /// Of `retries`, how many opened a FRESH source connection (a
+    /// reconnect-class error: network reset, "gone away", tunnel drop). The
+    /// field-signal for a flaky link — N reconnects = N blips survived. Distinct
+    /// from a same-connection retry (a lock wait) that `retries` also counts.
+    pub reconnects: u32,
+    /// True when this run picked up a prior CRASHED run instead of starting fresh
+    /// (keyset via the in-progress run_id, chunked via `--resume`). A resume-hit is
+    /// the tell that the previous run died — visible in the run's own log line.
+    pub resumed: bool,
     pub validated: Option<bool>,
     pub schema_changed: Option<bool>,
     pub quality_passed: Option<bool>,
@@ -109,6 +118,19 @@ pub struct RunSummary {
     pub cursor_low: Option<String>,
     pub cursor_high: Option<String>,
     pub error_message: Option<String>,
+    /// v18 failure forensics. `offending_value`: the last key read before an
+    /// unadvanceable keyset row (with `cursor_high` this brackets the value that
+    /// broke advancing — e.g. a u64 above i64::MAX). `server_context_json`: a JSON
+    /// snapshot of the source server's version + limits captured at OPEN (the
+    /// statement-timeout that surfaces as ERROR 3024 is unexplainable without it).
+    /// Both flow onto the failed `export_metrics` row so a post-mortem needs
+    /// neither the source table nor a still-live server.
+    pub offending_value: Option<String>,
+    pub server_context_json: Option<String>,
+    /// The keyset/chunk key's SOURCE native type (`bigint unsigned`, `numeric(11,4)`),
+    /// resolved by the open probe — folded into `key_descriptor_json` so the "was the
+    /// key unsigned" answer travels on the metric row.
+    pub key_native_type: Option<String>,
     /// `profile` from YAML, or `balanced (default)` if omitted.
     pub tuning_profile: String,
     /// Configured `batch_size` from YAML/profile (FETCH cap before `batch_size_memory_mb` override).
@@ -206,10 +228,15 @@ impl RunSummary {
             duration_ms: 0,
             peak_rss_mb: 0,
             retries: 0,
+            reconnects: 0,
+            resumed: false,
             validated: None,
             schema_changed: None,
             quality_passed: None,
             error_message: None,
+            offending_value: None,
+            server_context_json: None,
+            key_native_type: None,
             tuning_profile: plan.tuning_profile_label.clone(),
             batch_size: plan.tuning.batch_size,
             batch_size_memory_mb: plan.tuning.batch_size_memory_mb,
@@ -276,10 +303,15 @@ impl RunSummary {
             duration_ms: 0,
             peak_rss_mb: 0,
             retries: 0,
+            reconnects: 0,
+            resumed: false,
             validated: None,
             schema_changed: None,
             quality_passed: None,
             error_message: None,
+            offending_value: None,
+            server_context_json: None,
+            key_native_type: None,
             tuning_profile: "balanced".into(),
             batch_size: 1000,
             batch_size_memory_mb: None,

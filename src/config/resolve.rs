@@ -41,9 +41,10 @@ pub fn resolve_vars(
             match std::env::var(var_name) {
                 Ok(v) => v,
                 Err(_) => anyhow::bail!(
-                    "environment variable '{}' referenced in config is not set \
-                     (a missing secret silently becomes an empty string — refusing)",
-                    var_name
+                    "'${{{var_name}}}' in the config is unresolved — set it with \
+                     `--param {var_name}=<value>` (`-p`, which wins over the environment) or export \
+                     the environment variable '{var_name}'. (A missing value would silently become \
+                     an empty string, so rivet refuses.)"
                 ),
             }
         };
@@ -148,7 +149,21 @@ pub fn parse_file_size(s: &str) -> crate::error::Result<u64> {
             s
         )
     })?;
-    Ok((value * multiplier as f64) as u64)
+    // Reject anything that lands on 0 bytes: the float→u64 cast saturates zero,
+    // NEGATIVE, NaN, AND sub-byte fractions ("0.5B", "0.0005KB") all to 0 — a
+    // 0-byte rotation threshold that splits a part after every row. The guard
+    // must run on the RESULT (post-multiplier byte count), not the pre-multiplier
+    // float: `0.5 <= 0.0` is false, so a pre-multiplier check let 0.5B through as
+    // 0 bytes (#19 bughunt). Fail loud like a non-numeric value.
+    let bytes = (value * multiplier as f64) as u64;
+    if bytes == 0 {
+        anyhow::bail!(
+            "invalid file size: '{}' — must be at least 1 byte; a zero, negative, or \
+             sub-byte rotation threshold would split the output after every row",
+            s
+        );
+    }
+    Ok(bytes)
 }
 
 #[cfg(test)]
@@ -401,5 +416,39 @@ mod tests {
         assert!(msg.contains("B/KB/MB/GB"), "got: {msg}");
         assert!(msg.contains("fractional"), "got: {msg}");
         assert!(msg.contains("1024"), "got: {msg}");
+    }
+
+    #[test]
+    fn parse_zero_and_negative_rejected_not_coerced_to_zero() {
+        // #dogfood LOW: `0` / `0B` / `-5MB` used to float→u64-saturate to a
+        // 0-byte rotation threshold (a part after every row), silently. They must
+        // fail loud like `banana`/`1PB` do.
+        for bad in ["0", "0B", "0MB", "-5MB", "-1", "-0.5GB"] {
+            let err = parse_file_size(bad).unwrap_err();
+            assert!(
+                err.to_string().contains("at least 1 byte"),
+                "'{bad}' must be rejected as non-positive, got: {err}"
+            );
+        }
+        // A tiny positive value is still accepted (only a <1-byte result is rejected).
+        assert_eq!(parse_file_size("1B").unwrap(), 1);
+    }
+
+    #[test]
+    fn parse_sub_byte_fraction_rejected_not_truncated_to_zero() {
+        // #19 bughunt: the positivity guard ran on the PRE-multiplier float, so a
+        // sub-byte value ("0.5B", "0.0005KB" = 0.512 bytes, bare "0.9") passed the
+        // `<= 0.0` check and then truncated to 0 bytes — the same silent 0-byte
+        // rotation threshold. Must reject: the check now runs on the byte result.
+        for bad in ["0.5B", "0.9", "0.0005KB", "0.4"] {
+            let err = parse_file_size(bad).unwrap_err();
+            assert!(
+                err.to_string().contains("at least 1 byte"),
+                "'{bad}' truncates to 0 bytes and must be rejected, got: {err}"
+            );
+        }
+        // Just-at / just-over one byte still parses.
+        assert_eq!(parse_file_size("1.9B").unwrap(), 1);
+        assert_eq!(parse_file_size("1.5KB").unwrap(), 1536);
     }
 }

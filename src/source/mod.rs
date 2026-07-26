@@ -51,6 +51,23 @@ impl StatementDurationTimeout {
             ),
         }
     }
+
+    /// MySQL server-side `max_execution_time` timeout (ER_QUERY_TIMEOUT / 3024).
+    /// Wraps the driver's terse "maximum statement execution time exceeded" with
+    /// the actionable fix — including the WIDE-table case (a chunk that still
+    /// times out), which the field's `*_version` tables hit and the raw driver
+    /// error gave no guidance for.
+    pub fn mysql(seconds: u64) -> Self {
+        Self {
+            message: format!(
+                "mysql: statement timeout after {seconds}s (max_execution_time from \
+                 tuning.statement_timeout_s) — this query exceeded its time budget (ERROR 3024). \
+                 Split it with `mode: chunked` / `chunk_by_key` so per-chunk queries stay under \
+                 the limit; if a CHUNK still times out on a WIDE table, lower `chunk_size` or use \
+                 `chunk_size_memory_mb:` (width-aware chunking); or raise `tuning.statement_timeout_s`"
+            ),
+        }
+    }
 }
 
 impl std::fmt::Display for StatementDurationTimeout {
@@ -97,11 +114,14 @@ pub(crate) struct TableIntrospection {
     /// the PK type is not an integer family (text, uuid, decimal, …).
     pub single_int_pk: Option<String>,
     /// Single-column, NOT NULL, **unique** index columns usable as a keyset
-    /// (seek) pagination key — PK first (any type), then other UNIQUE indexes
-    /// (OPT-4). Index-backed and unique by construction, so `ORDER BY key
-    /// LIMIT n` is a bounded index range scan (never a filesort) and
-    /// `WHERE key > last` never skips rows with a duplicate key. Empty when the
-    /// table has no such key.
+    /// (seek) pagination key — PK first, then other UNIQUE indexes (OPT-4).
+    /// Index-backed and unique by construction, so `ORDER BY key LIMIT n` is a
+    /// bounded index range scan (never a filesort) and `WHERE key > last` never
+    /// skips a duplicate key. Restricted to types the keyset CURSOR can read
+    /// (`extract_last_cursor_value`: integer / float / string / timestamp / date /
+    /// uuid) — `decimal`/`numeric` keys are EXCLUDED here so the planner refuses
+    /// them up front rather than failing mid-run after a partial write (#dogfood).
+    /// Empty when the table has no such key.
     pub keyset_keys: Vec<String>,
     /// Best-effort row count: PG `reltuples`, MySQL `TABLE_ROWS`. `0` means
     /// the table is empty or stats are unavailable.
@@ -109,6 +129,14 @@ pub(crate) struct TableIntrospection {
     /// Heap-size-per-row in bytes. `None` for empty / unanalysed tables.
     /// Used to convert `chunk_size_memory_mb` into a row count.
     pub avg_row_bytes: Option<i64>,
+    /// Names of the table's integer-family columns (PG `int2`/`int4`/`int8`,
+    /// MySQL `tinyint`…`bigint`, MSSQL `tinyint`/`smallint`/`int`/`bigint`). An
+    /// explicit `chunk_column:` that is range-`BETWEEN`-sliced MUST be one of
+    /// these: chunking derives integer min/max boundaries, so a non-integer key
+    /// (numeric/decimal/real/float/…) silently DROPS every value that falls
+    /// between two integer window boundaries. Empty when the engine does not
+    /// populate it (e.g. Mongo, which does not SQL-range-chunk).
+    pub int_columns: Vec<String>,
 }
 
 impl TableIntrospection {
@@ -122,6 +150,31 @@ impl TableIntrospection {
     /// index-backed). Used to validate an explicit `chunk_by_key`.
     pub fn is_usable_keyset_key(&self, col: &str) -> bool {
         self.keyset_keys.iter().any(|k| k == col)
+    }
+
+    /// Whether `col` is a known integer-family column — the safety precondition
+    /// for range chunking (`chunk_column`), which slices via integer `BETWEEN`
+    /// windows. A non-integer explicit `chunk_column` silently loses fractional
+    /// rows, so the planner refuses it (see `chunked_strategy_from_introspection`).
+    pub fn is_integer_column(&self, col: &str) -> bool {
+        // Case-INSENSITIVE: the config may write `chunk_column: ID` while the
+        // catalog stores `id` (MySQL is case-insensitive for column names; PG
+        // folds unquoted idents to lowercase). A case-sensitive match falsely
+        // refused a valid integer key with a "not an integer-family column" error
+        // (bughunt MED). A guard should not reject on casing.
+        //
+        // ponytail: #8 narrow, documented non-fix. On PostgreSQL a table could in
+        // principle hold BOTH `id` (int) and a quoted `"ID"` (numeric); the config
+        // `chunk_column: ID` would then pass this guard (matching `id`) yet the
+        // export SQL quotes `"ID"` case-sensitively and range-chunks the NUMERIC
+        // one — the #103 loss. A precise guard needs the FULL column list + the
+        // engine's quoting rule, not just the integer names, so it is not fixed
+        // here. It is vanishingly rare (MySQL cannot hold both spellings; PG needs
+        // deliberately quoted mixed-case twins), and WITHOUT the twin a case
+        // mismatch fails loudly at query time ("column ... does not exist"), never
+        // silently. The case-insensitive match's real, common benefit (MySQL)
+        // outweighs guarding this exotic PG shape.
+        self.int_columns.iter().any(|c| c.eq_ignore_ascii_case(col))
     }
 }
 
@@ -282,6 +335,17 @@ pub trait Source: Send {
     fn sample_pressure(&mut self) -> Option<u64> {
         None
     }
+
+    /// A best-effort JSON snapshot of the source SERVER's forensic context —
+    /// version + the limits/session settings that shape failures (the
+    /// statement-timeout that surfaces as `ERROR 3024`, the sql_mode/timezone that
+    /// shape text rendering). Captured ONCE at run open onto the failed
+    /// `export_metrics` row (`server_context_json`), so a post-mortem can explain a
+    /// failure without re-querying a possibly-transient server. `None` when the
+    /// engine can't cheaply gather it; never fails the run.
+    fn server_context(&mut self) -> Option<String> {
+        None
+    }
 }
 
 pub fn create_source(config: &SourceConfig) -> Result<Box<dyn Source>> {
@@ -407,23 +471,26 @@ pub(crate) fn warn_if_tls_disabled(config: &SourceConfig) {
 /// Fails **closed**: any URL we cannot confidently parse a loopback host out of
 /// is treated as non-loopback, so a parse gap can only ever *tighten* the gate
 /// (refuse a connection), never silently allow plaintext to an unverified host.
-pub(crate) fn host_is_loopback(url: &str) -> bool {
-    // Strip the scheme (`postgresql://`, `mysql://`, `sqlserver://`, …).
+/// The `host[:port][,host:port…]` span of a URL — scheme stripped, path/query
+/// dropped, `user[:pass]@` userinfo removed (rsplit the last `@` so an `@` in a
+/// password stays with the userinfo). Empty when the URL carries no authority.
+pub(crate) fn host_port_span(url: &str) -> &str {
     let after_scheme = match url.split_once("://") {
         Some((_, rest)) => rest,
         None => url,
     };
-    // Authority ends at the first `/`, `?` or `#`.
     let authority = after_scheme
         .split(['/', '?', '#'])
         .next()
         .unwrap_or(after_scheme);
-    // Drop `user[:pass]@` — rsplit the last `@` so an `@` inside a password is
-    // tolerated (it belongs to the userinfo, not the host).
-    let host_port = match authority.rsplit_once('@') {
+    match authority.rsplit_once('@') {
         Some((_, hp)) => hp,
         None => authority,
-    };
+    }
+}
+
+pub(crate) fn host_is_loopback(url: &str) -> bool {
+    let host_port = host_port_span(url);
     // A comma seedlist (`host1:p1,host2:p2` — valid for MongoDB AND multi-host
     // PostgreSQL) is loopback ONLY if EVERY host is: reading just the first host
     // let `127.0.0.1:5432,evil.com:5432` dial evil.com in plaintext under the
@@ -453,6 +520,22 @@ fn one_host_is_loopback(host_port: &str) -> bool {
         .is_ok_and(|ip| ip.is_loopback())
 }
 
+/// Refuse a URL that carries no host authority (`mysql://`, `postgres:///db`)
+/// with a clear parse error, BEFORE any engine-specific setup hint can blanket
+/// it (dogfood LOW: `rivet cdc --source mysql://` reported a binlog-grants
+/// problem for a host that doesn't exist). No URL echo — the userinfo may hold
+/// credentials — and no `user:pass@` pattern in the message (the redactor
+/// mangles it).
+pub(crate) fn require_url_has_host(url: &str) -> Result<()> {
+    if host_port_span(url).is_empty() {
+        anyhow::bail!(
+            "source: invalid URL — no host found. Expected a URL of the form \
+             scheme://host:port/database."
+        );
+    }
+    Ok(())
+}
+
 /// Gate plaintext / trust-any-cert connections by host (CWE-319 / CWE-295).
 ///
 /// When no `tls:` block is configured (`tls == None`) **and** the resolved host
@@ -466,6 +549,18 @@ fn one_host_is_loopback(host_port: &str) -> bool {
 /// `tls: { mode: disable }` is `Some(..)`, so it is the operator's opt-in to
 /// remote plaintext and is **not** refused here.
 pub(crate) fn require_tls_or_loopback(url: &str, tls: Option<&TlsConfig>) -> Result<()> {
+    // An explicit `tls: {..}` (including `mode: disable`) is the operator's
+    // opt-in and is never refused here — including for a host-LESS URL, which a
+    // driver resolves as a LOCAL unix socket (`postgres:///db?host=/var/run/
+    // postgresql`). The host-presence check must therefore live INSIDE the
+    // no-tls branch: hoisting it above (da7abbf) rejected a valid socket URL that
+    // worked on main whenever `tls: { mode: disable }` was set (#16 bughunt).
+    if tls.is_none() {
+        // A URL with NO host at all (`mysql://`, `postgres:///db`) is not a
+        // "remote host" — it is malformed. Prescribing a TLS block there sends the
+        // operator chasing a security setting for a host that doesn't exist.
+        require_url_has_host(url)?;
+    }
     if tls.is_none() && !host_is_loopback(url) {
         // The message must name TLS *and* that it is a policy refusal for a
         // remote host. Emit it at `error` level (→ stderr) as well as returning
@@ -488,7 +583,7 @@ pub(crate) fn require_tls_or_loopback(url: &str, tls: Option<&TlsConfig>) -> Res
 
 #[cfg(test)]
 mod tls_gate_tests {
-    use super::{host_is_loopback, require_tls_or_loopback};
+    use super::{host_is_loopback, host_port_span, require_tls_or_loopback};
     use crate::config::{TlsConfig, TlsMode};
 
     #[test]
@@ -568,6 +663,60 @@ mod tls_gate_tests {
         // Enforced TLS to a remote host → allowed (the connect path uses TLS).
         assert!(require_tls_or_loopback(remote, Some(&verify)).is_ok());
     }
+
+    #[test]
+    fn host_port_span_extracts_the_authority() {
+        assert_eq!(host_port_span("mysql://u:p@host:3306/db"), "host:3306");
+        assert_eq!(
+            host_port_span("postgres://127.0.0.1:5432/db"),
+            "127.0.0.1:5432"
+        );
+        // No authority at all.
+        assert_eq!(host_port_span("mysql://"), "");
+        assert_eq!(host_port_span("postgres:///db"), "");
+    }
+
+    #[test]
+    fn hostless_url_is_a_parse_error_not_a_tls_refusal() {
+        // #dogfood LOW: `mysql://` has NO host, yet the gate reported "remote
+        // (non-loopback) host, TLS required" and prescribed a TLS block for a
+        // host that doesn't exist. It must be a clear parse error instead.
+        for u in ["mysql://", "postgres:///db", "sqlserver://"] {
+            let err = require_tls_or_loopback(u, None)
+                .expect_err("a host-less URL must error, not connect");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("no host found"),
+                "host-less URL must be a parse error: {msg}"
+            );
+            assert!(
+                !msg.contains("TLS required"),
+                "host-less URL must NOT prescribe a TLS block: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn hostless_socket_url_with_explicit_tls_disable_is_allowed() {
+        // #16 bughunt: a unix-socket URL has no authority host (the socket path
+        // lives in `?host=`), so the host-presence check rejected it. But an
+        // explicit `tls: { mode: disable }` is the operator's opt-in for a LOCAL
+        // connection — it must connect, as it did on main (where the gate was
+        // skipped whenever tls was Some). The check now lives inside the no-tls
+        // branch, so tls=Some(disable) is never refused.
+        let disable = TlsConfig {
+            mode: TlsMode::Disable,
+            ..Default::default()
+        };
+        for u in [
+            "postgres:///rivet?host=/var/run/postgresql",
+            "mysql://",
+            "postgres:///db",
+        ] {
+            require_tls_or_loopback(u, Some(&disable))
+                .expect("an explicit tls: { mode: disable } must not be refused for a socket URL");
+        }
+    }
 }
 
 /// Batch positional-mapping guard: every engine's batch decoder indexes wire
@@ -616,5 +765,24 @@ mod wire_guard_tests {
         assert!(verify_wire_columns(&["id", "a", "b"], &["id", "b", "a"]).is_err());
         let err = verify_wire_columns(&["id", "a"], &["id"]).unwrap_err();
         assert!(err.to_string().contains("schema changed"));
+    }
+}
+
+#[cfg(test)]
+mod introspection_tests {
+    use super::TableIntrospection;
+
+    #[test]
+    fn is_integer_column_is_case_insensitive() {
+        // #bughunt MED: a case-sensitive match falsely refused `chunk_column: ID`
+        // when the catalog stores `id` — a guard must not reject on casing.
+        let intro = TableIntrospection {
+            int_columns: vec!["id".into(), "user_id".into()],
+            ..Default::default()
+        };
+        assert!(intro.is_integer_column("id"));
+        assert!(intro.is_integer_column("ID"));
+        assert!(intro.is_integer_column("User_Id"));
+        assert!(!intro.is_integer_column("name"));
     }
 }

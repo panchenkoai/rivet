@@ -69,6 +69,25 @@ pub struct MetricRow {
     // is already the `mode` column; whether the key is a PK is a follow-up that
     // needs a run-time probe, so it is not derived-from-strategy here) ──
     pub chunk_key: Option<String>,
+    // ── v18: failure forensics — populated so a `status='failed'` row reconstructs
+    // the failure without the source DB (export_schema is success-only). See
+    // `pipeline::job::build_metric_row` for the per-field write points. ──
+    /// Stable error CLASS (`keyset_unreadable_key` | `statement_timeout` |
+    /// `parallel_checkpoint` | `schema_drift` | …) classified from `error_message`,
+    /// so failures group/trend without `LIKE '%…%'`.
+    pub error_class: Option<String>,
+    /// The key RANGE the run covered/died in (from the summary cursor bounds).
+    pub cursor_min: Option<String>,
+    pub cursor_max: Option<String>,
+    /// The keyset/chunk key's SHAPE as JSON (`{key, db_type, signed, is_primary_key,
+    /// …}`) — the answer to "was the key indexed / unsigned" without the source.
+    pub key_descriptor_json: Option<String>,
+    /// The raw value that could not be read/advanced (e.g. a u64 past i64::MAX) —
+    /// turns "unsupported type" into a concrete number.
+    pub offending_value: Option<String>,
+    /// Source SERVER context as JSON (`{version, max_execution_time, sql_mode,
+    /// time_zone, …}`) — the ERROR 3024 timeout is unexplainable without the limit.
+    pub server_context_json: Option<String>,
 }
 
 /// Metrics store — reads and writes `export_metrics`.
@@ -135,10 +154,12 @@ impl StateStore {
              files_committed, reconciled, source_count, quality_passed, pg_temp_bytes_delta,
              batch_size, batch_size_memory_mb, skip_reason, schema_fingerprint,
              chunk_size, parallel, source_type, destination_type, rivet_version,
-             longest_chunk_ms, chunk_key)
+             longest_chunk_ms, chunk_key,
+             error_class, cursor_min, cursor_max, key_descriptor_json, offending_value,
+             server_context_json)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
              ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31,
-             ?32)";
+             ?32, ?33, ?34, ?35, ?36, ?37, ?38)";
         match &self.conn {
             StateConn::Sqlite(c) => {
                 c.execute(
@@ -175,7 +196,13 @@ impl StateStore {
                         m.destination_type,
                         m.rivet_version,
                         m.longest_chunk_ms,
-                        m.chunk_key
+                        m.chunk_key,
+                        m.error_class,
+                        m.cursor_min,
+                        m.cursor_max,
+                        m.key_descriptor_json,
+                        m.offending_value,
+                        m.server_context_json
                     ],
                 )?;
             }
@@ -216,6 +243,12 @@ impl StateStore {
                         &m.rivet_version,
                         &m.longest_chunk_ms,
                         &m.chunk_key,
+                        &m.error_class,
+                        &m.cursor_min,
+                        &m.cursor_max,
+                        &m.key_descriptor_json,
+                        &m.offending_value,
+                        &m.server_context_json,
                     ],
                 )?;
             }

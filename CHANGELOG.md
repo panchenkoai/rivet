@@ -2,6 +2,69 @@
 
 ## Unreleased
 
+## 0.22.0 — 2026-07-25
+
+### Added
+
+- **Failure-forensics metadata — a failed `export_metrics` row is now
+  self-sufficient.** Every recorded metrics row carries a classified
+  `error_class`, the cursor range it reached (`cursor_min` / `cursor_max`), a
+  `key_descriptor` (which column paged it, and its native type), the
+  `offending_value` when a specific cell failed, and a `server_context`
+  snapshot — captured identically on all four engines (PostgreSQL, MySQL, SQL
+  Server, MongoDB) and on both the `run` and `apply` paths. A post-mortem now
+  reads the cause and the exact resume point from the state DB alone, without
+  re-querying the source. (`export_metrics` schema v18; older rows deserialize
+  with the new fields defaulted.)
+- **`rivet plan` / `check` warn at plan time when a fixed `chunk_size` × row
+  width is a heavy chunk** — before the windows execute, naming the escape
+  (shrink `chunk_size`, or `chunk_size_memory_mb`), so a pathological memory
+  plan is caught up front rather than mid-run.
+- **Canonical self-contained seeds** (`seeds/common/{postgres,mysql,mssql}.sql`,
+  `seeds/mongo_seed.py`) — reproducible per-engine fixtures with a full type
+  matrix, used by the dogfood and the release gate.
+
+### Changed
+
+- **`gc_orphans` is gated on the central run-status ledger, not a wall clock.**
+  A load's orphan cleanup now classifies an unmanifested part by an
+  authoritative run-status signal — a part under an *active* run is spared, a
+  part under a terminal (`Failed`/`Interrupted`) run is collected, `Success`
+  parts are always kept — so a load fired while a `rivet run` streams into the
+  same prefix can no longer delete the extract's in-flight parts. A stale
+  hard-crash `running` row is reconciled by supersession (a newer run of the
+  same export outranks it), never by an age timer.
+
+### Fixed
+
+- **`rivet load` → BigQuery now loads array columns.** A PostgreSQL `text[]` /
+  `integer[]` rendered an invalid `REPEATED <t>` in the standard-SQL
+  `LOAD DATA (schema)` statement, so BigQuery rejected the whole table
+  (`Expected ) or , but got identifier STRING`). Arrays now declare a loadable
+  `ARRAY<STRUCT<item T>>` (matching rivet's Parquet list encoding) with
+  `enable_list_inference`, landing as `REPEATED RECORD{item}` with values
+  intact.
+- **A `DECIMAL` keyset key is refused at plan time**, and a keyset/parallel
+  request on a heterogeneous Mongo `_id` warns instead of silently paging a
+  single BSON type bracket — closing a class of silent partial exports.
+- **Preflight no longer phantom-warns "heavy chunk" on a low-cardinality key.**
+  A per-chunk scan estimate is clamped to the table's own row count, so a dense
+  key (few distinct values, many rows each) no longer extrapolates more rows
+  than the table holds.
+- **MySQL `ERROR 3024` (statement timeout) is wrapped with the actionable
+  fix** instead of surfacing the raw driver error.
+- **`rivet init` fixes:** the SQL Server introspection `STRING_AGG`s are cast to
+  `nvarchar(max)` so a wide table no longer trips `Msg 9829`; the full-mode
+  rationale no longer claims "below 100K" on a table above the threshold.
+
+### Internal
+
+- **Release oracle** (`dev/release-oracle/`, `make release-oracle`) — the manual
+  pre-release dogfood, codified into a deterministic go/no-go gate: every engine
+  × pinned version runs verdicts, integrity + type/CSV fidelity, and load to
+  local S3/GCS/Azure fakes, then a real BigQuery type-matrix round-trip — all
+  compared to checked-in golden JSON fixtures.
+
 ## 0.21.2 — 2026-07-24
 
 ### Added

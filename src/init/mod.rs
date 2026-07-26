@@ -1,5 +1,8 @@
 mod artifact;
 mod candidates;
+/// Offline strategy-decision replay harness — test-only (no runtime caller).
+#[cfg(test)]
+mod catalog_replay;
 mod mongo;
 mod mssql;
 mod mysql;
@@ -13,7 +16,12 @@ pub(crate) use artifact::{
 use crate::error::Result;
 
 /// Column metadata fetched from information_schema.
-#[derive(Debug, Clone)]
+///
+/// `Serialize`/`Deserialize` so a real hostile DB's SCHEMA (types + PK shape, no
+/// row data) can be distilled into a checked-in catalog fixture and replayed
+/// offline against the strategy-decision logic (`catalog_replay`) — the messy DB
+/// becomes a regression oracle with zero customer-data exposure.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ColumnInfo {
     pub name: String,
     pub data_type: String,
@@ -27,7 +35,13 @@ pub(crate) struct ColumnInfo {
 }
 
 /// Table metadata used to generate the config scaffold and discovery artifact.
-#[derive(Debug, Clone)]
+///
+/// This is the ENTIRE input to the strategy decision (init `suggest_mode` +
+/// keyset/chunk resolution) — schema, catalog stats (`row_estimate`,
+/// `total_bytes`), and column shapes. No row data. So a `Vec<TableInfo>`
+/// serialized from a real DB (anonymized) replays every decision the field hit
+/// (see `catalog_replay`).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct TableInfo {
     pub schema: String,
     pub table: String,
@@ -126,10 +140,24 @@ impl TableInfo {
                 fmt_row_estimate(self.row_estimate),
                 self.best_cursor_column().unwrap_or("updated_at"),
             ),
-            "full" => format!(
-                "auto: ~{} rows below 100K chunked threshold",
-                fmt_row_estimate(self.row_estimate),
-            ),
+            "full" => {
+                // full is reached TWO ways: below the 100K threshold, OR above it
+                // with no usable chunk key / cursor column (e.g. a keyless table, or
+                // a Mongo collection whose `_id` isn't surfaced as a chunk key). The
+                // message must say WHICH — claiming "below 100K" on a 150K table is a
+                // false diagnostic that hides the real reason (no key to page by).
+                if self.row_estimate > 100_000 {
+                    format!(
+                        "auto: ~{} rows ≥ 100K but no chunk key or cursor column available — full scan",
+                        fmt_row_estimate(self.row_estimate),
+                    )
+                } else {
+                    format!(
+                        "auto: ~{} rows below 100K chunked threshold",
+                        fmt_row_estimate(self.row_estimate),
+                    )
+                }
+            }
             _ => format!("mode={mode}"),
         }
     }
@@ -383,6 +411,15 @@ pub fn init(
                     "rivet: note: --gcs-bucket / --s3-bucket are ignored for --discover (JSON has no destination)"
                 );
             }
+            if mode_override.is_some() {
+                // The discovery artifact reports the DB's shape + a *suggested*
+                // mode; it has no per-export `mode:` to override. Silently
+                // ignoring --mode made `--discover --mode cdc` byte-identical to
+                // `--discover` with no signal.
+                eprintln!(
+                    "rivet: note: --mode is ignored for --discover (the artifact reports a suggested_mode, not a chosen one); run without --discover to scaffold a YAML with that mode"
+                );
+            }
             (
                 init_discovery_json(source_url, table, schema, filter)?,
                 false,
@@ -392,7 +429,7 @@ pub fn init(
 
     match output {
         Some(path) => {
-            std::fs::write(path, &text)?;
+            write_config_output(path, &text)?;
             let label_written = match format {
                 InitFormat::Yaml => "Config",
                 InitFormat::DiscoveryJson => "Discovery artifact",
@@ -448,6 +485,143 @@ fn next_steps_block(path: &str, provenance: &SourceProvenance) -> String {
     s
 }
 
+/// The "nothing to scaffold" error, filter-aware. When an `--include`/`--exclude`
+/// glob is active, an empty result usually means the globs filtered everything
+/// out (the schema has tables) — blaming `--schema`/privileges then sends the
+/// operator down the wrong path. Point at the filter first.
+fn no_tables_error(filter: &TableFilter) -> anyhow::Error {
+    if !filter.include.is_empty() || !filter.exclude.is_empty() {
+        anyhow::anyhow!(
+            "No tables/views matched the --include/--exclude globs (or the schema is empty). \
+             Check the globs — the same source without filters may discover tables — and also \
+             verify --schema and privileges."
+        )
+    } else {
+        anyhow::anyhow!("No tables or views found (check --schema and privileges)")
+    }
+}
+
+/// Write the scaffold to `-o <path>`, naming the path + cause on failure. The
+/// bare `std::fs::write` error ("No such file or directory (os error 2)") named
+/// neither the path nor the operation (dogfood LOW).
+fn write_config_output(path: &str, text: &str) -> Result<()> {
+    std::fs::write(path, text).map_err(|e| {
+        anyhow::anyhow!(
+            "init: could not write config to '{path}': {e} \
+             (check the parent directory exists and is writable; `-o` takes a file path, not a directory)"
+        )
+    })
+}
+
+/// Resolve the effective schema for a single `--table`, honoring `--schema`.
+/// `--table schema.name` embeds the schema; `--schema` supplies it when the
+/// table is bare. Returns `(Some(schema), name)` when a schema is known, or
+/// `(None, name)` to let the engine default apply (PG `public`, MSSQL `dbo`).
+/// Both an embedded schema AND a differing `--schema` is a conflict — silently
+/// dropping one let a nonexistent schema look valid (the config for `x.users`
+/// and `--schema x --table users` came out identical to no-schema).
+fn resolve_single_table_schema<'a>(
+    table: &'a str,
+    schema_flag: Option<&str>,
+) -> Result<(Option<String>, &'a str)> {
+    let (parsed_schema, name) = yaml_scaffold::parse_table(table);
+    let has_embedded = table.contains('.');
+    match schema_flag.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(s) if has_embedded && s != parsed_schema => anyhow::bail!(
+            "init: --table '{table}' already names schema '{parsed_schema}', but --schema is \
+             '{s}' — remove one so they agree"
+        ),
+        // Bare `--table` + `--schema`: the flag supplies the schema.
+        Some(s) if !has_embedded => Ok((Some(s.to_string()), name)),
+        // Embedded schema (matching or no flag), or no flag at all.
+        _ => Ok((has_embedded.then_some(parsed_schema), name)),
+    }
+}
+
+/// Introspect one `--table` (single-table init), honoring `--schema`. Shared by
+/// the YAML and discovery-JSON paths so the schema wiring can't drift between
+/// them. For MySQL, `--schema` selects the database via `USE`; for PG/MSSQL it
+/// is the introspection schema (defaulting to `public`/`dbo`).
+fn introspect_single_table(
+    source_url: &str,
+    table: &str,
+    schema_flag: Option<&str>,
+) -> Result<TableInfo> {
+    let (eff_schema, table_name) = resolve_single_table_schema(table, schema_flag)?;
+    Ok(match source_type(source_url)? {
+        "postgres" => {
+            let mut client = postgres::connect(source_url)?;
+            postgres::introspect(
+                &mut client,
+                eff_schema.as_deref().unwrap_or("public"),
+                table_name,
+            )?
+        }
+        "mysql" => {
+            let mut conn = mysql::connect(source_url)?;
+            if let Some(db) = eff_schema.as_deref() {
+                // Guard (bughunt HIGH): `--schema` selecting a DIFFERENT database
+                // than the URL would introspect THAT db (via USE), but the
+                // scaffold connects through the URL and emits an UNQUALIFIED
+                // `table:` — so `rivet run` reads the URL's database instead, a
+                // silent wrong-database export (dbA has a `users` too → wrong
+                // data with dbB-derived columns; else run fails right after init
+                // "verified" it). The config can't carry a cross-db table today,
+                // so refuse: the database belongs in the URL.
+                // Only a genuine CROSS-db mismatch is refused: the URL carries a
+                // db AND it differs from --schema. A db-LESS URL (url_db None) is
+                // the documented "database name if missing from the URL" use —
+                // --schema legitimately provides the db there, so it must NOT bail
+                // (#20 bughunt: `None != Some(db)` wrongly refused it).
+                if let Some(url_db) = mysql::resolve_database_for_listing(source_url, None).ok()
+                    && url_db != db
+                {
+                    anyhow::bail!(
+                        "init: --schema '{db}' selects a different MySQL database than the source \
+                         URL ('{url_db}') — the generated config connects via the URL and would \
+                         export the URL's database, not '{db}'. Put the database in the URL instead \
+                         (mysql://…/{db})."
+                    );
+                }
+                mysql::use_database(&mut conn, db)?;
+            }
+            mysql::introspect(&mut conn, table_name)?
+        }
+        "mssql" => {
+            let mut conn = mssql::connect(source_url)?;
+            mssql::introspect(
+                &mut conn,
+                &mssql_table_schema(eff_schema.as_deref().unwrap_or("public")),
+                table_name,
+            )?
+        }
+        "mongo" => {
+            // #12 bughunt: --schema was silently ignored for Mongo (the cross-db
+            // guard the SQL engines got was absent), so an operator scoping to a
+            // schema got the URL's database instead. Mongo has no schema namespace
+            // — refuse rather than mislead; the database lives in the URL.
+            reject_mongo_schema(schema_flag)?;
+            let conn = mongo::connect(source_url)?;
+            mongo::introspect(&conn, table_name)?
+        }
+        _ => unreachable!(),
+    })
+}
+
+/// MongoDB has no schema namespace (collections live directly in a database), so
+/// an explicit `--schema` cannot be honoured — it was silently ignored, exporting
+/// the URL's database instead of what the operator asked for (#12 bughunt). Refuse
+/// it loudly; the database belongs in the connection URL.
+fn reject_mongo_schema(schema_flag: Option<&str>) -> Result<()> {
+    if schema_flag.map(str::trim).is_some_and(|s| !s.is_empty()) {
+        anyhow::bail!(
+            "init: --schema is not supported for MongoDB — a collection has no schema \
+             namespace. Put the database in the connection URL instead (mongodb://…/<db>)."
+        );
+    }
+    Ok(())
+}
+
 fn init_yaml(
     source_url: &str,
     provenance: &SourceProvenance,
@@ -458,26 +632,7 @@ fn init_yaml(
     mode_override: Option<&str>,
 ) -> Result<(String, bool)> {
     if let Some(t) = table {
-        let (sch, table_name) = yaml_scaffold::parse_table(t);
-        let info = match source_type(source_url)? {
-            "postgres" => {
-                let mut client = postgres::connect(source_url)?;
-                postgres::introspect(&mut client, &sch, table_name)?
-            }
-            "mysql" => {
-                let mut conn = mysql::connect(source_url)?;
-                mysql::introspect(&mut conn, table_name)?
-            }
-            "mssql" => {
-                let mut conn = mssql::connect(source_url)?;
-                mssql::introspect(&mut conn, &mssql_table_schema(&sch), table_name)?
-            }
-            "mongo" => {
-                let conn = mongo::connect(source_url)?;
-                mongo::introspect(&conn, table_name)?
-            }
-            _ => unreachable!(),
-        };
+        let info = introspect_single_table(source_url, t, schema)?;
         let hint = yaml_scaffold::table_has_unbounded_decimal_columns(&info);
         let yaml =
             yaml_scaffold::generate_config(&info, source_url, provenance, dest, mode_override)?;
@@ -485,7 +640,7 @@ fn init_yaml(
     }
     let infos = introspect_all(source_url, schema, filter)?;
     if infos.is_empty() {
-        anyhow::bail!("No tables or views found (check --schema and privileges)");
+        return Err(no_tables_error(filter));
     }
     let label = schema_scope_label(source_url, schema, infos.len())?;
     let hint = infos
@@ -509,26 +664,7 @@ fn init_discovery_json(
     filter: &TableFilter,
 ) -> Result<String> {
     let (infos, scope) = if let Some(t) = table {
-        let (sch, table_name) = yaml_scaffold::parse_table(t);
-        let info = match source_type(source_url)? {
-            "postgres" => {
-                let mut client = postgres::connect(source_url)?;
-                postgres::introspect(&mut client, &sch, table_name)?
-            }
-            "mysql" => {
-                let mut conn = mysql::connect(source_url)?;
-                mysql::introspect(&mut conn, table_name)?
-            }
-            "mssql" => {
-                let mut conn = mssql::connect(source_url)?;
-                mssql::introspect(&mut conn, &mssql_table_schema(&sch), table_name)?
-            }
-            "mongo" => {
-                let conn = mongo::connect(source_url)?;
-                mongo::introspect(&conn, table_name)?
-            }
-            _ => unreachable!(),
-        };
+        let info = introspect_single_table(source_url, t, schema)?;
         let scope = match source_type(source_url)? {
             "postgres" => format!("table \"{}\".\"{}\"", info.schema, info.table),
             "mysql" => format!("table `{}`", info.table),
@@ -540,7 +676,7 @@ fn init_discovery_json(
     } else {
         let infos = introspect_all(source_url, schema, filter)?;
         if infos.is_empty() {
-            anyhow::bail!("No tables or views found (check --schema and privileges)");
+            return Err(no_tables_error(filter));
         }
         let label = schema_scope_label(source_url, schema, infos.len())?;
         (infos, label)
@@ -617,6 +753,25 @@ fn introspect_all(
         }
         "mysql" => {
             let db = mysql::resolve_database_for_listing(source_url, schema)?;
+            // Guard (bughunt MED, sibling of the single-table HIGH): whole-schema
+            // MySQL lists tables from `db` (which honors --schema) but introspects
+            // via DATABASE() (the URL's db) — and the generated config connects
+            // through the URL, so a --schema pointing at a DIFFERENT database
+            // lists/describes one db and exports another. Refuse: the database
+            // belongs in the URL, which the config actually uses.
+            // Refuse only a genuine CROSS-db mismatch (URL carries a db AND it
+            // differs). A db-LESS URL + --schema is the documented "database name
+            // if missing from the URL" use and must be allowed (#20 bughunt).
+            if schema.map(str::trim).is_some_and(|s| !s.is_empty())
+                && let Some(url_db) = mysql::resolve_database_for_listing(source_url, None).ok()
+                && url_db != db
+            {
+                anyhow::bail!(
+                    "init: --schema '{db}' selects a different MySQL database than the source URL \
+                     ('{url_db}') — `rivet init`/`run` connect via the URL and would list and export \
+                     the URL's database, not '{db}'. Put the database in the URL instead (mysql://…/{db})."
+                );
+            }
             // One pooled connection for the whole scan — a fresh Pool per
             // table would mean N+1 TCP+auth(+TLS) handshakes on large schemas.
             let mut conn = mysql::connect(source_url)?;
@@ -648,6 +803,7 @@ fn introspect_all(
             Ok(out)
         }
         "mongo" => {
+            reject_mongo_schema(schema)?;
             let conn = mongo::connect(source_url)?;
             let names = retain_filtered(mongo::list_tables(&conn)?, filter);
             let mut out = Vec::with_capacity(names.len());
@@ -776,6 +932,29 @@ mod tests {
             !r.contains("mode: incremental"),
             "no cursor column → no hint: {r}"
         );
+    }
+
+    #[test]
+    fn full_rationale_distinguishes_below_threshold_from_no_key_at_scale() {
+        // Below 100K → the honest "below threshold" message.
+        let small = make_table(500, vec![col("id", "bigint", true)]);
+        assert_eq!(small.suggest_mode(), "full");
+        assert!(
+            small.mode_rationale("full").contains("below 100K"),
+            "small table keeps the below-threshold message"
+        );
+        // ABOVE 100K but NO chunk key and NO cursor (a keyless table, or a Mongo
+        // collection whose _id isn't surfaced as a key) → full, but the message must
+        // NOT claim "below 100K" — the dogfooding bug read "~150K rows below 100K
+        // chunked threshold" on a 150K Mongo collection. It must name the real cause.
+        let big_keyless = make_table(150_000, vec![col("label", "text", false)]);
+        assert_eq!(big_keyless.suggest_mode(), "full");
+        let r = big_keyless.mode_rationale("full");
+        assert!(
+            !r.contains("below 100K"),
+            "150K must not say below 100K: {r}"
+        );
+        assert!(r.contains("no chunk key"), "must name the real reason: {r}");
     }
 
     #[test]
@@ -1273,6 +1452,101 @@ mod tests {
         assert_eq!(mssql_table_schema("public"), "dbo");
         // An explicitly-qualified schema is honoured verbatim.
         assert_eq!(mssql_table_schema("sales"), "sales");
+    }
+
+    #[test]
+    fn reject_mongo_schema_refuses_explicit_schema_but_allows_absent() {
+        // #12 bughunt: --schema was silently ignored for Mongo. It must be refused
+        // (a collection has no schema namespace), while absent/blank is fine.
+        assert!(super::reject_mongo_schema(Some("mydb")).is_err());
+        assert!(super::reject_mongo_schema(Some("  ")).is_ok());
+        assert!(super::reject_mongo_schema(None).is_ok());
+        let err = super::reject_mongo_schema(Some("mydb"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not supported for MongoDB"), "got: {err}");
+    }
+
+    #[test]
+    fn resolve_single_table_schema_honors_schema_flag_and_detects_conflict() {
+        // #dogfood MED: `--schema` was silently dropped when `--table` was given,
+        // so a nonexistent schema looked valid (identical output). Bare table +
+        // --schema now folds the schema in.
+        assert_eq!(
+            resolve_single_table_schema("users", Some("myschema")).unwrap(),
+            (Some("myschema".to_string()), "users")
+        );
+        // No --schema on a bare table → None (engine default applies downstream).
+        assert_eq!(
+            resolve_single_table_schema("users", None).unwrap(),
+            (None, "users")
+        );
+        // Embedded schema wins; a matching --schema is fine.
+        assert_eq!(
+            resolve_single_table_schema("sales.orders", Some("sales")).unwrap(),
+            (Some("sales".to_string()), "orders")
+        );
+        assert_eq!(
+            resolve_single_table_schema("sales.orders", None).unwrap(),
+            (Some("sales".to_string()), "orders")
+        );
+        // Embedded schema AND a DIFFERING --schema is a loud conflict, not a
+        // silent drop.
+        let err = resolve_single_table_schema("sales.orders", Some("other"))
+            .expect_err("conflicting schema must error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("already names schema 'sales'") && msg.contains("--schema is 'other'"),
+            "conflict must name both schemas: {msg}"
+        );
+        // A blank/whitespace --schema is treated as absent, not a conflict.
+        assert_eq!(
+            resolve_single_table_schema("sales.orders", Some("  ")).unwrap(),
+            (Some("sales".to_string()), "orders")
+        );
+    }
+
+    #[test]
+    fn no_tables_error_points_at_the_filter_when_globs_are_active() {
+        // #dogfood LOW: an --include/--exclude that filters everything out used
+        // to emit the schema/privileges message, sending the operator down the
+        // wrong path. With a filter active the error names the globs first.
+        let filtered = no_tables_error(&TableFilter {
+            include: vec!["zzz_nomatch_*".into()],
+            exclude: vec![],
+        });
+        assert!(
+            format!("{filtered}").contains("--include/--exclude"),
+            "filtered-out error must name the globs: {filtered}"
+        );
+        let exclude_all = no_tables_error(&TableFilter {
+            include: vec![],
+            exclude: vec!["*".into()],
+        });
+        assert!(format!("{exclude_all}").contains("--include/--exclude"));
+        // No filter → the original schema/privileges message.
+        let unfiltered = no_tables_error(&TableFilter::default());
+        assert!(
+            format!("{unfiltered}").contains("check --schema and privileges"),
+            "unfiltered error keeps the schema/privileges hint: {unfiltered}"
+        );
+    }
+
+    #[test]
+    fn write_config_output_names_the_path_and_op_on_failure() {
+        // #dogfood LOW: a bad `-o` path emitted a bare "No such file or directory
+        // (os error 2)" naming neither the path nor the failed operation.
+        let err = write_config_output("no_such_dir_xyz/sub/cfg.yaml", "source: {}\n")
+            .expect_err("a missing parent dir must fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("no_such_dir_xyz/sub/cfg.yaml"),
+            "must name the path: {msg}"
+        );
+        assert!(
+            msg.contains("could not write config"),
+            "must name the operation: {msg}"
+        );
     }
 
     #[test]

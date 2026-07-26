@@ -88,9 +88,13 @@ fn parse_file_size_invalid_errors() {
 }
 
 #[test]
-fn parse_file_size_zero() {
-    assert_eq!(parse_file_size("0MB").unwrap(), 0);
-    assert_eq!(parse_file_size("0").unwrap(), 0);
+fn parse_file_size_zero_is_rejected() {
+    // #dogfood LOW: `0` / `0MB` used to parse to a 0-byte rotation threshold
+    // (a part after every row), silently. This test previously PINNED that bug
+    // (asserting `unwrap() == 0`); a zero/negative size is now a loud error.
+    assert!(parse_file_size("0MB").is_err());
+    assert!(parse_file_size("0").is_err());
+    assert!(parse_file_size("-5MB").is_err());
 }
 
 // =============================================================================

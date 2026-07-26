@@ -164,6 +164,9 @@ pub(crate) fn run_keyset(
         None
     };
     let recovering_crash = resume_run_id.is_some();
+    // Surface the recovery in the run's own metrics/log line: a resume-hit is the
+    // tell that the prior run crashed (a flaky-link diagnosis signal).
+    summary.resumed = recovering_crash;
 
     let mut last: Option<String> = if kp.checkpoint && (recovering_crash || kp.incremental) {
         state
@@ -172,6 +175,10 @@ pub(crate) fn run_keyset(
     } else {
         None
     };
+    // Forensics (v18): a resume's lower bound is the checkpoint it continues from
+    // (None on a fresh run — keyset seeks forward from the start). cursor_high (the
+    // max reached) is set at the loop exits below.
+    summary.cursor_low = last.clone();
 
     // Round-5 (keyset checkpoint-resume manifest completeness — the sibling of the
     // chunked fix): a crash mid-keyset leaves pages durably committed (parquet +
@@ -247,6 +254,12 @@ pub(crate) fn run_keyset(
             &base,
         )?
         else {
+            // No further rows (the seek past the last full page came back empty):
+            // the last advanced key is the run's high-water. This is the OTHER exit
+            // from the short-page break below — a table whose size is an exact
+            // multiple of chunk_size leaves via here, so cursor_max must be set on
+            // both paths or an exact-fit keyset records no max.
+            summary.cursor_high = last.clone();
             break;
         };
 
@@ -302,6 +315,12 @@ pub(crate) fn run_keyset(
         // A short page means the index range is exhausted — stop without an
         // extra empty round-trip.
         if page.rows < kp.chunk_size {
+            // Forensics (v18): the final page's max key is the run's true high-water.
+            // Record it BEFORE breaking — the loop stops without advancing `last`, so
+            // a short tail page (e.g. the 3 u64 ids above i64::MAX) is captured yet
+            // would otherwise be invisible in cursor_max. `.or(last)` covers an EMPTY
+            // final page, whose max is the previous full page's key.
+            summary.cursor_high = page.next_cursor.clone().or_else(|| last.clone());
             break;
         }
         // Advance to the page's max key; if it could not be read (NULL or an
@@ -309,14 +328,24 @@ pub(crate) fn run_keyset(
         // re-read the same page forever.
         match page.next_cursor {
             Some(v) => last = Some(v),
-            None => anyhow::bail!(
-                "export '{}': keyset could not read the '{}' value from the last row of page {} \
-                 (NULL or unsupported type) — cannot advance safely. The key must be NOT NULL and \
-                 one of: integer, float, string, timestamp, date, uuid.",
-                plan.export_name,
-                kp.key_column,
-                pages - 1
-            ),
+            None => {
+                // Failure forensics (v18): stamp the LAST key we did read — the
+                // boundary just before the unadvanceable row. With `cursor_high`
+                // (the table's max key) this brackets the value that broke
+                // advancing (e.g. a u64 in the zone above i64::MAX), so a failed
+                // `export_metrics` row explains itself without the source.
+                summary.offending_value = last.clone();
+                summary.cursor_high = last.clone();
+                anyhow::bail!(
+                    "export '{}': keyset could not read the '{}' value from the last row of page {} \
+                     (NULL or unsupported type) — cannot advance safely (last readable key: {}). \
+                     The key must be NOT NULL and one of: integer, float, string, timestamp, date, uuid.",
+                    plan.export_name,
+                    kp.key_column,
+                    pages - 1,
+                    last.as_deref().unwrap_or("<none>"),
+                );
+            }
         }
     }
 

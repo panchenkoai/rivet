@@ -2493,6 +2493,61 @@ fn cdc_resume_from_missing_binlog_fails_loudly_not_silently() {
     );
 }
 
+// #99, MySQL flavour: a corrupt/truncated checkpoint must FAIL the run loudly,
+// never be swallowed (`.ok().flatten()`) into "no checkpoint". On a client-anchor
+// engine that swallow re-anchors at `SHOW MASTER STATUS` (current) and silently
+// skips every change since the last good position. The guard fires at the shared
+// cdc_job resume-plan site (`Position::load`) every engine hits before anchoring.
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
+fn cdc_corrupt_checkpoint_fails_loud_not_silently_absent() {
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("cdc_corrupt_bin");
+    let mut c = conn();
+    c.query_drop(format!("DROP TABLE IF EXISTS {tbl}")).unwrap();
+    c.query_drop(format!("CREATE TABLE {tbl} (id INT PRIMARY KEY, v INT)"))
+        .unwrap();
+    let _guard = Table(tbl.clone());
+
+    // Run 1 pins a valid checkpoint at the open position.
+    let ckpt = d.path().join("cdc.ckpt");
+    let out1 = d.path().join("out1");
+    std::fs::create_dir_all(&out1).unwrap();
+    run_rivet_ok(&cdc_config(&d, &tbl, &ckpt, &out1));
+    assert!(ckpt.exists(), "run 1 pins a checkpoint");
+
+    // The checkpoint is corrupted (a truncated write / disk fault); a change lands
+    // that a silent re-anchor at 'current' would skip.
+    std::fs::write(&ckpt, b"{ not valid json at all").unwrap();
+    c.query_drop(format!("INSERT INTO {tbl} VALUES (1, 100)"))
+        .unwrap();
+
+    // Run 2 must FAIL loudly — never exit 0 having silently re-anchored past id=1.
+    let out2 = d.path().join("out2");
+    std::fs::create_dir_all(&out2).unwrap();
+    let res = std::process::Command::new(RIVET_BIN)
+        .args([
+            "run",
+            "--config",
+            cdc_config(&d, &tbl, &ckpt, &out2).to_str().unwrap(),
+        ])
+        .output()
+        .expect("spawn rivet");
+    assert!(
+        !res.status.success(),
+        "a corrupt checkpoint must fail the run, not silently re-anchor and skip changes"
+    );
+    let stderr = String::from_utf8_lossy(&res.stderr);
+    assert!(
+        stderr.contains("corrupt or truncated"),
+        "the failure must name the corrupt checkpoint, got:\n{stderr}"
+    );
+    assert!(
+        !out2.join("_SUCCESS").exists(),
+        "no _SUCCESS may be written for the failed run"
+    );
+}
+
 // Retention, PostgreSQL flavour (RED for the finding): a prior run's checkpoint
 // exists but the slot is GONE (dropped by an operator / invalidated and removed)
 // — recreating it at the current position would silently skip every change
@@ -2562,6 +2617,86 @@ exports:
     assert!(
         stderr.contains("re-snapshot") || stderr.contains("missing"),
         "the failure must carry the re-snapshot hint, got:\n{stderr}"
+    );
+}
+
+// #99, PostgreSQL flavour — the engine where the bug actually lived. A prior
+// run's checkpoint is corrupt (truncated / not JSON); swallowing it into "no
+// checkpoint" let PG treat the run as a fresh first anchor, recreate a dropped
+// slot at 'current', and permanently skip every change since the loss (the
+// anti-gap guard never fired). The corrupt checkpoint must fail the run loudly.
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical)"]
+fn pg_cdc_corrupt_checkpoint_fails_loud_not_silently_absent() {
+    use postgres::NoTls;
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("rivet_cdc_pgcorrupt");
+    let slot = unique_name("rivet_corrupt_slot");
+    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id INT PRIMARY KEY, v INT)"
+    ))
+    .unwrap();
+    let _tbl = PgTable::adopt(tbl.clone());
+
+    let ckpt = d.path().join("cdc.ckpt");
+    let yaml = |out: &std::path::Path| {
+        format!(
+            r#"source: {{type: postgres, url: "{POSTGRES_CDC_URL}"}}
+exports:
+  - name: {tbl}
+    table: {tbl}
+    mode: cdc
+    format: parquet
+    cdc: {{ slot: {slot}, until_current: true, checkpoint: "{ckpt}" }}
+    destination: {{ type: local, path: "{out}" }}
+"#,
+            ckpt = ckpt.display(),
+            out = out.display(),
+        )
+    };
+
+    // Run 1 (idle) creates the slot — PG anchors server-side, so an idle run
+    // does not yet write the checkpoint FILE (unlike the client-anchor engines).
+    let out1 = d.path().join("out1");
+    std::fs::create_dir_all(&out1).unwrap();
+    run_rivet_ok(&write_config(&d, &yaml(&out1)));
+    let _slot = Slot(slot.clone());
+
+    // Run 2 captures a change and pins a valid checkpoint file.
+    c.execute(&format!("INSERT INTO {tbl} VALUES (1,10)"), &[])
+        .unwrap();
+    let out2 = d.path().join("out2");
+    std::fs::create_dir_all(&out2).unwrap();
+    run_rivet_ok(&write_config(&d, &yaml(&out2)));
+    assert_eq!(manifest_rows(&out2), 1, "run 2 captures the change");
+    assert!(ckpt.exists(), "run 2 pins a checkpoint");
+
+    // The checkpoint is corrupted; a change lands that reading it as absent +
+    // re-anchoring would skip.
+    std::fs::write(&ckpt, b"{ truncated").unwrap();
+    c.execute(&format!("INSERT INTO {tbl} VALUES (2,20)"), &[])
+        .unwrap();
+
+    // Run 3 must FAIL loudly — never read the corrupt checkpoint as absent.
+    let out3 = d.path().join("out3");
+    std::fs::create_dir_all(&out3).unwrap();
+    let res = std::process::Command::new(RIVET_BIN)
+        .args([
+            "run",
+            "--config",
+            write_config(&d, &yaml(&out3)).to_str().unwrap(),
+        ])
+        .output()
+        .expect("spawn rivet");
+    assert!(
+        !res.status.success(),
+        "a corrupt checkpoint must fail the run, not be read as absent and re-anchor"
+    );
+    let stderr = String::from_utf8_lossy(&res.stderr);
+    assert!(
+        stderr.contains("corrupt or truncated"),
+        "the failure must name the corrupt checkpoint, got:\n{stderr}"
     );
 }
 

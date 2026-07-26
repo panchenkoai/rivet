@@ -195,15 +195,22 @@ pub struct RunManifest {
     pub checksum_key_column: Option<String>,
 }
 
-/// Terminal status of the run *as recorded by the writer*.
+/// Status of the run *as recorded by the writer*.
+///
+/// `running` is written at a run's START — a schema-less PROJECTION of the
+/// `run_status` ledger row into the bucket, so a cross-boundary reader (Airflow,
+/// a foreign-host `rivet load`) can see that a run is LIVE on the prefix and not
+/// GC its in-flight parts. It is OVERWRITTEN by the terminal status at finalize.
+/// It carries no parts and MUST NOT be loaded — it is a marker, not a snapshot.
 ///
 /// `success` is only written when M2 (Manifest Before SUCCESS) is satisfied
 /// — i.e. when the writer is about to drop the `_SUCCESS` marker.
 /// `failed` and `interrupted` manifests serve as audit trails and as input
-/// to resume; they do NOT trigger `_SUCCESS`.
+/// to resume; they do NOT trigger `_SUCCESS`. Neither does `running`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ManifestStatus {
+    Running,
     Success,
     Failed,
     Interrupted,

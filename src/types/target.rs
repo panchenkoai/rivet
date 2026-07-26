@@ -444,22 +444,23 @@ mod bigquery {
         let inner_r = native(inner);
         if inner_r.status == TargetStatus::Fail {
             return Resolved::fail(format!(
-                "REPEATED of unsupported element: {}",
+                "ARRAY of unsupported element: {}",
                 inner_r.target_type
             ));
         }
-        // Rivet writes the Parquet list element as `item` (arrow-rs default,
-        // not the spec's `element`), so BigQuery loads arrays as
-        // REPEATED RECORD{item} even with `--parquet_enable_list_inference`
-        // (without the flag they nest one level deeper as RECORD{list:...}).
-        // Verified live: flattening with `UNNEST(col)` + `el.item` recovers a
-        // clean REPEATED scalar.
-        Resolved::diverge(
-            format!("REPEATED {}", inner_r.target_type),
-            format!("REPEATED RECORD{{item {}}}", inner_r.autoload_type),
-            "arrays load as REPEATED RECORD{item}; load the staging table with \
-             --parquet_enable_list_inference, then flatten with UNNEST after load",
-            Some("ARRAY(SELECT el.item FROM UNNEST({col}) AS el)"),
+        // Rivet writes the Parquet list element as `item` (arrow-rs default, not
+        // the spec's `element`), so with `enable_list_inference` BigQuery loads an
+        // array as ARRAY<STRUCT<item T>> (== REPEATED RECORD{item}). Declare THAT
+        // exact shape in the LOAD DATA schema so `rivet load` succeeds: a bare
+        // `REPEATED T` is invalid standard-SQL DDL, and a clean `ARRAY<T>` loads
+        // EMPTY (BigQuery can't map the `item`-named element without the struct).
+        // autoload == target here (BigQuery autodetect produces the same nested
+        // shape), so this is a warn, not a divergence — flatten to a scalar array
+        // after load with `ARRAY(SELECT el.item FROM UNNEST(col) AS el)`.
+        Resolved::warn(
+            format!("ARRAY<STRUCT<item {}>>", inner_r.target_type),
+            "arrays load as ARRAY<STRUCT<item T>> (nested, element named `item`); \
+             flatten to a scalar array with ARRAY(SELECT el.item FROM UNNEST(col) AS el)",
         )
     }
 }
@@ -956,13 +957,22 @@ mod tests {
     }
 
     #[test]
-    fn bq_list_is_repeated_native_record_autoload() {
+    fn bq_list_declares_loadable_array_struct_item_ddl() {
+        // The array target_type MUST be a valid, loadable standard-SQL DDL that
+        // matches rivet's `item`-named Parquet list element. Old code emitted
+        // `REPEATED STRING` — invalid DDL, `rivet load` → BigQuery syntax error
+        // ("Expected ) or , but got identifier STRING"). Guard the exact shape.
         let t = RivetType::List {
             inner: Box::new(RivetType::String),
         };
         let s = bq(&t);
-        assert_eq!(s.target_type, "REPEATED STRING");
-        assert!(s.autoload_type.contains("REPEATED RECORD"));
+        assert_eq!(s.target_type, "ARRAY<STRUCT<item STRING>>");
+        // warn: BigQuery autodetect produces the same nested shape → no divergence.
+        assert_eq!(s.autoload_type, "ARRAY<STRUCT<item STRING>>");
+        assert!(
+            !s.target_type.starts_with("REPEATED "),
+            "must not emit invalid REPEATED DDL"
+        );
         assert_eq!(s.status, TargetStatus::Warn);
     }
 
@@ -1120,15 +1130,10 @@ mod tests {
             unit: super::super::TimeUnit::Microsecond,
             timezone: None,
         };
-        let cases = [
-            RivetType::Json,
-            RivetType::Uuid,
-            RivetType::UInt64,
-            naive,
-            RivetType::List {
-                inner: Box::new(RivetType::String),
-            },
-        ];
+        // NOTE: List is NOT here — arrays load natively as ARRAY<STRUCT<item T>>
+        // (target == autoload, a warn), so they are no longer a divergence. See
+        // `bq_list_declares_loadable_array_struct_item_ddl`.
+        let cases = [RivetType::Json, RivetType::Uuid, RivetType::UInt64, naive];
         for rt in cases {
             let s = bq(&rt);
             assert_ne!(s.autoload_type, s.target_type, "case must diverge: {rt:?}");
@@ -1395,10 +1400,10 @@ mod tests {
         assert!(sql.contains("PARSE_JSON(SAFE_CONVERT_BYTES_TO_STRING(attrs)) AS attrs"));
         assert!(sql.contains("TO_HEX(uid) AS uid"));
         assert!(sql.contains("DATETIME(created_at) AS created_at"));
-        // Arrays flatten via UNNEST (verified live; staging loaded with
-        // --parquet_enable_list_inference).
-        assert!(sql.contains("ARRAY(SELECT el.item FROM UNNEST(tags) AS el) AS tags"));
-        assert!(sql.contains("--parquet_enable_list_inference"));
+        // Arrays load natively as ARRAY<STRUCT<item T>> (== autoload), so they are
+        // NOT recovered — no cast, no flatten (the warn note documents the optional
+        // UNNEST). tags is still projected (see the projection-count test).
+        assert!(!sql.contains("AS tags") && !sql.contains("UNNEST(tags)"));
         // OK columns pass through unchanged.
         assert!(sql.contains("SELECT\n  id"));
         // Reads the autoload staging table, writes the recovered table.
@@ -1443,7 +1448,7 @@ mod tests {
                 RivetType::List {
                     inner: Box::new(RivetType::String),
                 },
-            ), // divergent → cast
+            ), // native ARRAY<STRUCT<item T>> → passthrough (not a divergence)
         ];
         let mappings: Vec<_> = cols
             .iter()
@@ -1475,7 +1480,9 @@ mod tests {
         assert!(body.contains("PARSE_JSON(SAFE_CONVERT_BYTES_TO_STRING(attrs)) AS attrs"));
         assert!(body.contains("TO_HEX(uid) AS uid"));
         assert!(body.contains("DATETIME(created_at) AS created_at"));
-        assert!(body.contains("UNNEST(tags) AS el) AS tags"));
+        // tags (array) loads natively as ARRAY<STRUCT<item T>> → passthrough, not cast
+        // (projected once — asserted by the count/contains checks above).
+        assert!(!body.contains("AS tags") && !body.contains("UNNEST(tags)"));
     }
 
     #[test]

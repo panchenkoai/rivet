@@ -212,6 +212,156 @@ fn seed_nullable_key(eng: Eng, rows: i64) -> (String, StandCleanup) {
     (table, guard)
 }
 
+/// Seed a table whose intended chunk key `k` is a TEXT/VARCHAR column (a
+/// NOT NULL `id` BIGINT PK keeps the table otherwise well-formed). Range
+/// chunking derives integer min/max boundaries and slices with `BETWEEN`, so a
+/// text key would silently drop every value between two window boundaries — the
+/// planner must REFUSE it (#103). Small is fine: the integer-family guard fires
+/// at plan time, before any chunk generation.
+fn seed_text_keyed(eng: Eng, rows: i64) -> (String, StandCleanup) {
+    let table = unique_name("stand_textkey");
+    let guard = StandCleanup(eng, table.clone());
+    match eng {
+        Eng::Pg => {
+            let mut c = pg_connect();
+            c.batch_execute(&format!(
+                "CREATE TABLE {table} (id BIGINT PRIMARY KEY, k VARCHAR(20) NOT NULL);
+                 INSERT INTO {table} (id, k) SELECT g, 'v' || g FROM generate_series(1, {rows}) g;
+                 ANALYZE {table};"
+            ))
+            .unwrap();
+        }
+        Eng::My => {
+            let mut c = mysql_connect();
+            c.query_drop(format!(
+                "CREATE TABLE {table} (id BIGINT PRIMARY KEY, k VARCHAR(20) NOT NULL)"
+            ))
+            .unwrap();
+            c.query_drop(format!(
+                "SET SESSION cte_max_recursion_depth = {}",
+                rows + 10
+            ))
+            .unwrap();
+            c.query_drop(format!(
+                "INSERT INTO {table} (id, k) \
+                 WITH RECURSIVE seq AS (SELECT 1 n UNION ALL SELECT n+1 FROM seq WHERE n < {rows}) \
+                 SELECT n, CONCAT('v', n) FROM seq"
+            ))
+            .unwrap();
+        }
+        Eng::Ms => {
+            mssql_exec(&format!(
+                "CREATE TABLE {table} (id BIGINT PRIMARY KEY, k VARCHAR(20) NOT NULL)"
+            ));
+            mssql_exec(&format!(
+                "INSERT INTO {table} (id, k) \
+                 SELECT value, 'v' + CAST(value AS VARCHAR(20)) \
+                 FROM GENERATE_SERIES(CAST(1 AS BIGINT), CAST({rows} AS BIGINT))"
+            ));
+            mssql_exec(&format!("UPDATE STATISTICS {table}"));
+        }
+    }
+    (table, guard)
+}
+
+/// Seed a table whose sole unique PK is a `DECIMAL(15,0)` — a keyset key the
+/// cursor cannot advance (`extract_last_cursor_value` has no decimal arm). The
+/// planner must refuse `chunk_by_key` on it at plan time, not fail mid-run after a
+/// partial write (#dogfood).
+fn seed_decimal_pk(eng: Eng, rows: i64) -> (String, StandCleanup) {
+    let table = unique_name("stand_deckey");
+    let guard = StandCleanup(eng, table.clone());
+    match eng {
+        Eng::Pg => {
+            let mut c = pg_connect();
+            c.batch_execute(&format!(
+                "CREATE TABLE {table} (dkey DECIMAL(15,0) PRIMARY KEY, v TEXT NOT NULL);
+                 INSERT INTO {table} (dkey, v) SELECT g, 'v'||g FROM generate_series(1, {rows}) g;
+                 ANALYZE {table};"
+            ))
+            .unwrap();
+        }
+        Eng::My => {
+            let mut c = mysql_connect();
+            c.query_drop(format!(
+                "CREATE TABLE {table} (dkey DECIMAL(15,0) PRIMARY KEY, v VARCHAR(20) NOT NULL)"
+            ))
+            .unwrap();
+            c.query_drop(format!(
+                "SET SESSION cte_max_recursion_depth = {}",
+                rows + 10
+            ))
+            .unwrap();
+            c.query_drop(format!(
+                "INSERT INTO {table} (dkey, v) \
+                 WITH RECURSIVE seq AS (SELECT 1 n UNION ALL SELECT n+1 FROM seq WHERE n < {rows}) \
+                 SELECT n, CONCAT('v', n) FROM seq"
+            ))
+            .unwrap();
+        }
+        Eng::Ms => {
+            mssql_exec(&format!(
+                "CREATE TABLE {table} (dkey DECIMAL(15,0) PRIMARY KEY, v VARCHAR(20) NOT NULL)"
+            ));
+            mssql_exec(&format!(
+                "INSERT INTO {table} (dkey, v) SELECT value, CONCAT('v', value) \
+                 FROM GENERATE_SERIES(CAST(1 AS BIGINT), CAST({rows} AS BIGINT))"
+            ));
+            mssql_exec(&format!("UPDATE STATISTICS {table}"));
+        }
+    }
+    (table, guard)
+}
+
+/// #dogfood: `chunk_by_key` on a DECIMAL PK must BAIL at plan time (the cursor
+/// can't read a decimal) — a clean refusal naming the type, NOT a partial write
+/// then a mid-run "could not read the key value" failure.
+fn run_keyset_decimal_key_bails(eng: Eng) {
+    eng.require();
+    let (table, _guard) = seed_decimal_pk(eng, 250);
+    let rig = eng
+        .rig(&table)
+        .mode("chunked")
+        .export_line("chunk_by_key: dkey")
+        .export_line("chunk_size: 100");
+    let out = run_rivet_env(
+        &["run", "--config", rig.config_path().to_str().unwrap()],
+        &[("RUST_LOG", "warn")],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "a DECIMAL keyset key must BAIL, not run; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("not a usable keyset key") && stderr.to_lowercase().contains("decimal"),
+        "the bail must name the TYPE reason (decimal), not just 'unique'; stderr:\n{stderr}"
+    );
+    assert_eq!(
+        count_parquet_rows(&rig.out_dir()),
+        0,
+        "the refusal must be at PLAN time — zero rows written, no partial write"
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn stand_keyset_decimal_key_bails_postgres() {
+    run_keyset_decimal_key_bails(Eng::Pg);
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mysql"]
+fn stand_keyset_decimal_key_bails_mysql() {
+    run_keyset_decimal_key_bails(Eng::My);
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mssql"]
+fn stand_keyset_decimal_key_bails_mssql() {
+    run_keyset_decimal_key_bails(Eng::Ms);
+}
+
 /// Seed a DENSE contiguous integer-PK table (`id` = 1..rows), the well-behaved
 /// shape for range chunking / chunk_count.
 fn seed_dense(eng: Eng, rows: i64) -> (String, StandCleanup) {
@@ -256,6 +406,41 @@ fn seed_dense(eng: Eng, rows: i64) -> (String, StandCleanup) {
             mssql_exec(&format!("UPDATE STATISTICS {table}"));
         }
     }
+    (table, guard)
+}
+
+/// Seed a MySQL table with a `BIGINT UNSIGNED` PK (Arrow UInt64) — the field-bug
+/// shape (0.21.2, prod affiliate DB). `rows` dense low ids PLUS three ids PAST
+/// i64::MAX (up to u64::MAX), so a keyset cursor must page through ALL of them —
+/// advancing across the signed/unsigned boundary — without loss or truncation.
+/// MySQL-only: PostgreSQL has no unsigned integer type, SQL Server has no
+/// unsigned BIGINT. Returns the table + cleanup guard; total rows = `rows + 3`.
+fn seed_mysql_unsigned_key(rows: i64) -> (String, StandCleanup) {
+    let table = unique_name("stand_unsigned");
+    let guard = StandCleanup(Eng::My, table.clone());
+    let mut c = mysql_connect();
+    c.query_drop(format!(
+        "CREATE TABLE {table} (id BIGINT UNSIGNED PRIMARY KEY, payload INT NOT NULL)"
+    ))
+    .unwrap();
+    c.query_drop(format!(
+        "SET SESSION cte_max_recursion_depth = {}",
+        rows + 10
+    ))
+    .unwrap();
+    c.query_drop(format!(
+        "INSERT INTO {table} (id, payload) \
+         WITH RECURSIVE seq AS (SELECT 1 n UNION ALL SELECT n+1 FROM seq WHERE n < {rows}) \
+         SELECT n, n FROM seq"
+    ))
+    .unwrap();
+    // Three ids PAST i64::MAX (9223372036854775807); u64::MAX = 18446744073709551615.
+    // These break any path that reads the key as i64.
+    c.query_drop(format!(
+        "INSERT INTO {table} (id, payload) VALUES \
+         (18446744073709551613, 100), (18446744073709551614, 101), (18446744073709551615, 102)"
+    ))
+    .unwrap();
     (table, guard)
 }
 
@@ -647,6 +832,112 @@ fn stand_null_keyed_bail_mssql() {
     run_null_keyed_bail(Eng::Ms);
 }
 
+/// #103 (variant 1): a non-integer (text/varchar) explicit `chunk_column` under
+/// range chunking must be REFUSED on every SQL engine — range slicing derives
+/// integer min/max and `BETWEEN`, silently dropping values between windows.
+/// `chunk_count` puts the config in `explicit_chunk_shape` so the small-table
+/// escape is bypassed and the integer-family guard is what fires. This proves
+/// each engine's `int_columns` introspection query classifies the real column
+/// correctly (PG `pg_type`, MySQL `DATA_TYPE`, MSSQL `sys.types` STRING_AGG) —
+/// the offline unit test runs on a mock introspection, this on the live catalog.
+fn run_non_integer_chunk_column_bail(eng: Eng) {
+    eng.require();
+    let (table, _guard) = seed_text_keyed(eng, 100);
+    let rig = eng
+        .rig(&table)
+        .mode("chunked")
+        .export_line("chunk_column: k")
+        .export_line("chunk_count: 4");
+    let cfg = rig.config_path();
+    let out = run_rivet_env(
+        &["run", "--config", cfg.to_str().unwrap()],
+        &[("RUST_LOG", "warn")],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "a non-integer chunk_column under range chunking must BAIL; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("not an integer-family column"),
+        "bail must be the #103 integer-family refusal; stderr:\n{stderr}"
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn stand_non_integer_chunk_column_bail_postgres() {
+    run_non_integer_chunk_column_bail(Eng::Pg);
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mysql"]
+fn stand_non_integer_chunk_column_bail_mysql() {
+    run_non_integer_chunk_column_bail(Eng::My);
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mssql"]
+fn stand_non_integer_chunk_column_bail_mssql() {
+    run_non_integer_chunk_column_bail(Eng::Ms);
+}
+
+/// #13 bughunt (a regression THIS branch's #103 fix introduced): an explicit
+/// `chunk_column` on an UNQUALIFIED `table:` that lives in a NON-default schema
+/// (reached via `search_path`) sent the introspection probe — which hard-codes
+/// `public`/`dbo` — into a THROWING `regclass` cast, so the plan HARD-BAILED
+/// ("introspection probe failed … Set `chunk_column:` explicitly", which IS set).
+/// On main this fast-pathed and exported fine. The fix degrades a probe FAILURE to
+/// the fast-path Chunked plan + a loud can't-verify warning, so a formerly-working
+/// config keeps working. Verify: all rows export AND the warn fires.
+///
+/// PG-only: this exact shape (non-default schema + unqualified table + session
+/// search_path) is where the probe's hard-coded-schema assumption bites; the URL
+/// carries the search_path so nothing mutates the shared role.
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn stand_chunked_nondefault_schema_probe_degrades_and_exports_all_postgres() {
+    require_alive(LiveService::Postgres);
+    let schema = unique_name("nd_schema");
+    let mut c = pg_connect();
+    c.batch_execute(&format!(
+        "DROP SCHEMA IF EXISTS {schema} CASCADE; CREATE SCHEMA {schema}; \
+         CREATE TABLE {schema}.t (id BIGINT PRIMARY KEY, v text); \
+         INSERT INTO {schema}.t SELECT g, 'r'||g FROM generate_series(1, 40) g;"
+    ))
+    .unwrap();
+    // Session search_path resolves the UNQUALIFIED `table: t` to {schema}.t, but
+    // the introspection probe hard-codes `public` and throws — the degrade path.
+    let url = format!("{POSTGRES_URL}?options=-c%20search_path%3D{schema},public");
+    let rig = Rig::pg_batch("t") // unqualified — NOT public.t
+        .source_url(&url)
+        .mode("chunked")
+        .export_line("chunk_column: id")
+        .export_line("chunk_size: 10");
+    let cfg = rig.config_path();
+    let out = run_rivet_env(
+        &["run", "--config", cfg.to_str().unwrap()],
+        &[("RUST_LOG", "warn")],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // Clean up the schema before asserting, so a failed assert never leaks it.
+    let _ = c.batch_execute(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE;"));
+    assert!(
+        out.status.success(),
+        "a probe-unreachable table with an explicit chunk_column must DEGRADE, not \
+         hard-bail (#13); stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("introspection probe failed"),
+        "the can't-verify degrade warning must fire; stderr:\n{stderr}"
+    );
+    assert_eq!(
+        count_parquet_rows(&rig.out_dir()),
+        40,
+        "all 40 rows must export via the degrade fast-path"
+    );
+}
+
 #[test]
 #[ignore = "live: requires docker compose up -d mysql"]
 fn stand_chunk_count_mysql() {
@@ -687,6 +978,97 @@ fn stand_keyset_non_usable_bail_postgres() {
 #[ignore = "live: requires docker compose up -d mysql"]
 fn stand_keyset_non_usable_bail_mysql() {
     run_keyset_non_usable_bail(Eng::My);
+}
+
+/// FIELD BUG (0.21.2, prod affiliate DB): keyset over a `BIGINT UNSIGNED` key
+/// bailed "keyset could not read the 'id' value … unsupported type" on the first
+/// MULTI-PAGE table — extract_last_cursor_value (the cursor read-back) had no
+/// UInt arm, so an unsigned id (Arrow UInt64) couldn't advance the cursor. ~37
+/// exports failed. The strategy harness never seeded an unsigned key (every
+/// fixture was signed BIGINT), and the type harness never ran a strategy — the
+/// bug fell in the seam. This closes it end-to-end: a multi-page keyset over an
+/// unsigned key with three ids PAST i64::MAX must export EVERY row (none lost, no
+/// dup, no truncation), where the pre-fix run bailed on page 1. MySQL-only
+/// (unsigned integers don't exist on PG/MSSQL).
+#[test]
+#[ignore = "live: requires docker compose up -d mysql"]
+fn stand_keyset_unsigned_key_completeness_mysql() {
+    require_alive(LiveService::Mysql);
+    let dense = 20i64;
+    let (table, _guard) = seed_mysql_unsigned_key(dense);
+    let expected = (dense + 3) as usize; // dense low ids + 3 past i64::MAX
+    let rig = Rig::mysql_batch(&table)
+        .mode("chunked")
+        .export_line("chunk_by_key: id")
+        .export_line("chunk_size: 5"); // < dense → multi-page → forces the cursor advance
+    let cfg = rig.config_path();
+    let out = run_rivet_env(
+        &["run", "--config", cfg.to_str().unwrap()],
+        &[("RUST_LOG", "warn")],
+    );
+    assert!(
+        out.status.success(),
+        "keyset over a BIGINT UNSIGNED key must succeed (pre-fix it bailed 'could not \
+         read the id value … unsupported type'); stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Completeness: every seeded row present exactly once. A dropped page (the
+    // cursor failing to advance) reads < expected; a re-read page reads > expected.
+    assert_eq!(
+        count_parquet_rows(&rig.out_dir()),
+        expected,
+        "keyset over an unsigned key must export EVERY row, incl. the three ids past i64::MAX"
+    );
+}
+
+/// #21 bughunt (garbage profile — a WIDE table): the MSSQL introspection probes
+/// STRING_AGG the column names, whose result caps at 8000 bytes and raises Msg 9829
+/// once the table is wide enough — so EVERY chunked/keyset plan on that table failed
+/// to build. A 160-int-column table (30-char names) crosses the cap. With the
+/// CONVERT(nvarchar(max), ..) fix the probe returns nvarchar(max) (no cap), so the
+/// plan builds and the export completes. RED against the un-CONVERTed query.
+#[test]
+#[ignore = "live: requires docker compose up -d mssql"]
+fn stand_wide_table_introspection_mssql() {
+    require_alive(LiveService::Mssql);
+    let table = unique_name("stand_wide");
+    let guard = StandCleanup(Eng::Ms, table.clone());
+    // 160 int columns of 30-char names — the STRING_AGG of the names exceeds 8000
+    // bytes, the exact shape that raised Msg 9829 before the CONVERT fix.
+    let cols: Vec<String> = (0..160)
+        .map(|i| format!("col_{i:030} int NOT NULL DEFAULT 0"))
+        .collect();
+    mssql_exec(&format!(
+        "CREATE TABLE {table} (id BIGINT PRIMARY KEY, {})",
+        cols.join(", ")
+    ));
+    mssql_exec(&format!(
+        "INSERT INTO {table} (id) VALUES (1),(2),(3),(4),(5)"
+    ));
+    let rig = Rig::mssql_batch(&format!("dbo.{table}"))
+        .mode("chunked")
+        .export_line("chunk_column: id")
+        .export_line("chunk_size: 2");
+    let out = run_rivet_env(
+        &["run", "--config", rig.config_path().to_str().unwrap()],
+        &[("RUST_LOG", "warn")],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    drop(guard); // drop the table before asserting so a failure never leaks it
+    assert!(
+        out.status.success(),
+        "a 160-column table must not fail the STRING_AGG introspection probe (#21, Msg 9829); \
+         stderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("9829"),
+        "STRING_AGG must not hit the 8000-byte cap: {stderr}"
+    );
+    assert_eq!(
+        count_parquet_rows(&rig.out_dir()),
+        5,
+        "all 5 rows must export once the plan builds"
+    );
 }
 
 #[test]

@@ -577,6 +577,24 @@ mod tests {
             msg.contains("mode: chunked") && msg.contains("statement_timeout_s"),
             "Display must keep the actionable hint: {msg}"
         );
+
+        // #field-3024: the MySQL variant is likewise a PERMANENT typed marker (a
+        // retry just re-times-out), and its Display carries the actionable fix —
+        // including the chunk_size_memory_mb hint for the WIDE `*_version` tables
+        // whose raw driver 3024 gave field operators no guidance.
+        let my: anyhow::Error = StatementDurationTimeout::mysql(300).into();
+        assert_eq!(
+            classify_error(&my),
+            PERMANENT,
+            "the mysql duration-timeout marker must be permanent too"
+        );
+        let mymsg = format!("{}", StatementDurationTimeout::mysql(300));
+        assert!(
+            mymsg.contains("mode: chunked")
+                && mymsg.contains("chunk_size_memory_mb")
+                && mymsg.contains("statement_timeout_s"),
+            "the mysql Display must name the wide-table escape too: {mymsg}"
+        );
     }
 
     /// Belt-and-suspenders: the string fallback still classifies a genuinely

@@ -54,6 +54,18 @@ use serde::Deserialize;
 /// ×2→na) → 0 (chunk_count-Mongo→na).
 const MATRICES: &[(&str, usize)] = &[
     ("docs/chunking-matrix.yaml", 0),
+    // Export-STRATEGY flag × engine, verified on GOLDEN fixtures + a distilled
+    // GARBAGE profile (anonymized shape of a 200+-table field DB). Two layers:
+    // the offline scaffold_strategy oracle (all shapes) + the live chunking_stand
+    // (representative subset). Engine-specific garbage failure modes (unsigned
+    // cursor = MySQL, regclass-throw = PG, STRING_AGG cap = MSSQL) are one test
+    // + justified n/a. 0 gaps — every cell is a test or a justified n/a.
+    ("docs/cli-flag-matrix.yaml", 0),
+    // Destination-backend correctness (local/gcs/s3/azure × scenario): the dogfood
+    // cloud findings (prefix normalization B, --validate-is-advisory A) + the
+    // emulator round-trip + cross-backend parity. 1 gap: no azurite full-round-trip
+    // stand test (the CloudDestination path is shared + proven on S3/GCS).
+    ("docs/destination-matrix.yaml", 1),
     ("docs/behaviour-matrix.yaml", 0),
     ("docs/type-fidelity-matrix.yaml", 0),
     // Cross config × db: 15 honest holes on the non-PG engines (cloud dests, codec
@@ -107,6 +119,12 @@ const MATRICES: &[(&str, usize)] = &[
     // scenario asserts the combo is rejected at CONFIG-LOAD (check == run) AND a
     // legit form is not false-rejected. 0 gaps.
     ("docs/config-validation-matrix.yaml", 0),
+    // CLI-surface — CROSS-COMMAND contracts keyed on the state-inspect COMMAND
+    // (not engine/target). The 0.21.2 dogfood found the "wired into only some
+    // commands" class (typo'd -e accepted silently on files/chunks/progression
+    // while metrics/journal/reset rejected it). Makes each contract × command a
+    // cell so a NEW inspect command that skips it goes red, not silent. 0 gaps.
+    ("docs/cli-surface-matrix.yaml", 0),
     // CSV writer-fidelity — the TEXT-writer class round-7 opened: the CSV writer has
     // its own value rendering AND escaping that Parquet's binary path never exercises,
     // and two silent losses lived there (pre-1970 timestamp → empty cell; un-escaped

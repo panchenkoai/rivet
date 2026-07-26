@@ -16,8 +16,11 @@ use std::process::Command;
 ///
 /// `cleanup_source`/`cluster_by` are target-agnostic; the warehouse and its
 /// connection config live in [`LoadTarget`], keyed on the `target:`
-/// discriminator — so a config that names `snowflake` cannot carry BigQuery
-/// fields (invalid combos fail to deserialize; no runtime `validate()`).
+/// discriminator. NOTE: `#[serde(flatten)]` on `target` DISABLES serde's
+/// `deny_unknown_fields`, so cross-warehouse fields do NOT fail to deserialize —
+/// a `target: snowflake` block silently accepted BigQuery's `project:`/`dataset:`
+/// (dogfood LOW). [`reject_foreign_target_fields`] is the runtime guard that
+/// closes that gap; the "invalid combos fail to deserialize" belief was false.
 #[derive(Debug, Clone, Deserialize)]
 pub struct LoadSection {
     #[serde(flatten)]
@@ -159,6 +162,11 @@ impl LoadMode {
 /// What a rivet config resolves to for a BigQuery load.
 #[derive(Debug, Clone)]
 pub struct LoadPlan {
+    /// The declared export NAME (config `name:`), distinct from the warehouse
+    /// `table` — error messages address the export the operator wrote, not the
+    /// table it resolves to (dogfood LOW: require_pk labelled the table as the
+    /// export).
+    pub export_name: String,
     pub table: String,
     pub partition_by: Option<String>,
     pub specs: Vec<TargetColumnSpec>,
@@ -236,6 +244,97 @@ fn check_load_keys(value: &serde_json::Value, whose: &str) -> Result<()> {
     Ok(())
 }
 
+/// Warehouse fields that belong to exactly ONE target.
+const BIGQUERY_ONLY: &[&str] = &["project", "dataset"];
+const SNOWFLAKE_ONLY: &[&str] = &[
+    "connection",
+    "warehouse",
+    "database",
+    "schema",
+    "storage_integration",
+];
+
+/// Reject fields that belong to a DIFFERENT warehouse than the resolved
+/// `target`. `#[serde(flatten)]` on the target enum can't `deny_unknown_fields`,
+/// so `LOAD_KEYS` (the union of all warehouses' fields) let a `target: snowflake`
+/// block silently carry — and ignore — BigQuery's `project:`/`dataset:` (and
+/// vice versa) (dogfood LOW). Name the offending key and its warehouse.
+fn reject_foreign_target_fields(
+    value: &serde_json::Value,
+    target: &str,
+    whose: &str,
+) -> Result<()> {
+    let (foreign, other) = match target {
+        "bigquery" => (SNOWFLAKE_ONLY, "snowflake"),
+        "snowflake" => (BIGQUERY_ONLY, "bigquery"),
+        _ => return Ok(()),
+    };
+    if let Some(obj) = value.as_object() {
+        for k in obj.keys() {
+            if foreign.contains(&k.as_str()) {
+                bail!(
+                    "the {whose} `load:` block targets `{target}` but carries `{k}`, a `{other}` \
+                     field — remove it (it would be silently ignored, masking a mis-configured load)"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Resolve a load's staging prefix from an export destination.
+///
+/// Expands the same `{date}`/`{export}`/`{table}` placeholders the export wrote
+/// with (`PlaceholderContext::for_today`) so the load lists the ACTUAL prefix
+/// (`exports/orders/`) rather than the literal config token (`exports/{export}/`)
+/// — without this the load found no manifests under the unexpanded path and
+/// reported "up to date" having loaded nothing (#100). `{partition}` is stripped
+/// (its per-partition sub-prefixes live below).
+///
+/// A `{date}` in the load-listed BASE is refused up front: it expands to the
+/// LOAD day, so a nightly export + an after-midnight load list DIFFERENT prefixes
+/// and the load silently reports "up to date" (bughunt HIGH — the same #100
+/// silent-no-load class the expansion above closes for the static tokens, left
+/// open for the day-specific one). `{run_id}` (and any token still unresolved
+/// after expansion) fails loud the same way.
+fn resolve_load_prefix(
+    dest: &crate::config::DestinationConfig,
+    export_name: &str,
+    bucket: &str,
+) -> Result<String> {
+    // Refuse a day-specific `{date}` in the load base BEFORE expansion — once
+    // expanded to the load day, the `contains('{')` guard below can never see it,
+    // so an export written on a different UTC day is silently missed.
+    let raw_prefix = dest.prefix.as_deref().unwrap_or("");
+    let raw_base = raw_prefix.split("{partition}").next().unwrap_or(raw_prefix);
+    if raw_base.contains("{date}") {
+        bail!(
+            "export `{}`: destination.prefix `{}` puts a day-specific `{{date}}` in the load base. \
+             `rivet load` lists the LOAD-day prefix, so an export written on a different day (a \
+             nightly export + an after-midnight load) lands under a different, EMPTY prefix and is \
+             silently reported 'up to date'. Remove `{{date}}` from the load base, or place it \
+             BELOW `{{partition}}` so the load can list a stable prefix.",
+            export_name,
+            raw_base
+        );
+    }
+    let ctx = crate::destination::placeholder::PlaceholderContext::for_today(export_name);
+    let expanded = crate::destination::placeholder::expand_destination(dest.clone(), &ctx);
+    let prefix = expanded.prefix.as_deref().unwrap_or("");
+    let base = prefix.split("{partition}").next().unwrap_or(prefix);
+    if base.contains('{') {
+        bail!(
+            "export `{}`: load prefix `{}` still has an unresolved placeholder after expansion — \
+             `rivet load` cannot reconstruct which run's output to load (a `{{run_id}}` prefix is \
+             run-specific). Drop the run-specific token from `destination.prefix`, or run \
+             `rivet load` from the context that wrote the export.",
+            export_name,
+            base
+        );
+    }
+    Ok(format!("gs://{bucket}/{base}"))
+}
+
 pub fn plan_loads(config_path: &str, rivet_bin: &str) -> Result<Vec<LoadPlan>> {
     let yaml = std::fs::read_to_string(config_path)
         .with_context(|| format!("reading config {config_path}"))?;
@@ -250,8 +349,9 @@ pub fn plan_loads(config_path: &str, rivet_bin: &str) -> Result<Vec<LoadPlan>> {
         "config has no top-level `load:` block — add `load: { target, ... }` to load into a warehouse",
     )?;
     check_load_keys(&load_value, "top-level")?;
-    let load: LoadSection =
-        serde_json::from_value(load_value).context("parsing the top-level `load:` block")?;
+    let load: LoadSection = serde_json::from_value(load_value.clone())
+        .context("parsing the top-level `load:` block")?;
+    reject_foreign_target_fields(&load_value, load.target.name(), "top-level")?;
 
     // Native schema from rivet's own resolver, for the load target — no
     // hand-typing. One JSON document per export, so parse a stream.
@@ -317,9 +417,7 @@ fn build_plans(
                 export.name
             )
         })?;
-        let prefix = dest.prefix.as_deref().unwrap_or("");
-        let base = prefix.split("{partition}").next().unwrap_or(prefix);
-        let gcs_prefix = format!("gs://{bucket}/{base}");
+        let gcs_prefix = resolve_load_prefix(dest, &export.name, bucket)?;
 
         let specs = report
             .columns
@@ -370,6 +468,7 @@ fn build_plans(
             None => load.clone(),
         };
         plans.push(LoadPlan {
+            export_name: export.name.clone(),
             table,
             partition_by: export.partition_by.clone(),
             specs,
@@ -436,6 +535,42 @@ mod tests {
         assert_eq!(LoadMode::Full.ledger_str(), "full");
         assert_eq!(LoadMode::Incremental.ledger_str(), "incremental");
         assert_eq!(LoadMode::Cdc.ledger_str(), "cdc");
+    }
+
+    #[test]
+    fn resolve_load_prefix_expands_deterministic_tokens_and_refuses_run_specific() {
+        use crate::config::{DestinationConfig, DestinationType};
+        let dest = |prefix: &str| DestinationConfig {
+            destination_type: DestinationType::Gcs,
+            bucket: Some("BKT".into()),
+            prefix: Some(prefix.into()),
+            ..Default::default()
+        };
+
+        // {export}/{table} are deterministic → the load must list the ACTUAL
+        // prefix, not the literal token. (#100: the load listed `exports/{export}/`
+        // verbatim, found no manifests, and reported "up to date" — loaded nothing.)
+        assert_eq!(
+            resolve_load_prefix(&dest("exports/{export}/"), "orders", "BKT").unwrap(),
+            "gs://BKT/exports/orders/"
+        );
+        // {partition} is stripped; {table} is an alias for {export}.
+        assert_eq!(
+            resolve_load_prefix(&dest("e/{table}/{partition}/"), "orders", "BKT").unwrap(),
+            "gs://BKT/e/orders/"
+        );
+        // {date} in the load base is DAY-specific → refused (bughunt HIGH: it
+        // expanded to the LOAD day, so a cross-midnight load silently listed an
+        // empty prefix). See resolve_load_prefix_refuses_day_specific_date_in_the_base.
+        assert!(resolve_load_prefix(&dest("d/{date}/{export}/"), "orders", "BKT").is_err());
+
+        // {run_id} is run-specific and unknowable here → refuse LOUD, never a
+        // literal-token listing that silently loads nothing.
+        let err = resolve_load_prefix(&dest("e/{run_id}/"), "orders", "BKT").unwrap_err();
+        assert!(
+            err.to_string().contains("unresolved placeholder"),
+            "a run-specific token must be refused, not silently listed: {err}"
+        );
     }
 
     /// A `ColReport` with an explicit `target_status`.
@@ -713,5 +848,60 @@ load:
         );
         let ok = serde_json::json!({ "pk": ["id"], "cleanup_source": true });
         assert!(serde_json::from_value::<LoadOverride>(ok).is_ok());
+    }
+
+    #[test]
+    fn resolve_load_prefix_refuses_day_specific_date_in_the_base() {
+        // #bughunt HIGH: {date} expands to the LOAD day, so a nightly export + an
+        // after-midnight load list DIFFERENT prefixes → silent "up to date". Refuse
+        // {date} in the load base; a static base (or {date} below {partition}) is ok.
+        let dest = |p: &str| crate::config::DestinationConfig {
+            prefix: Some(p.to_string()),
+            ..Default::default()
+        };
+        let err = resolve_load_prefix(&dest("exports/{date}/{export}/"), "orders", "bkt")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("{date}") && err.contains("load base"),
+            "must refuse a day-specific date base: {err}"
+        );
+        assert!(resolve_load_prefix(&dest("exports/{export}/"), "orders", "bkt").is_ok());
+        // {date} BELOW {partition} is not in the listed base — allowed.
+        assert!(
+            resolve_load_prefix(
+                &dest("exports/{export}/{partition}/{date}/"),
+                "orders",
+                "bkt"
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn cross_warehouse_load_fields_are_rejected() {
+        // #dogfood LOW: `#[serde(flatten)]` on the target enum disables
+        // deny_unknown_fields, so a `target: snowflake` block silently accepted
+        // (and ignored) BigQuery's `project:`/`dataset:`. Now a loud error.
+        let snow_with_bq = serde_json::json!({
+            "target": "snowflake", "connection": "c", "warehouse": "w",
+            "database": "db", "schema": "s", "storage_integration": "si",
+            "project": "STALE", "dataset": "STALE"
+        });
+        let err = reject_foreign_target_fields(&snow_with_bq, "snowflake", "top-level")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("project") && err.contains("bigquery"),
+            "snowflake+project must name the foreign field and warehouse: {err}"
+        );
+        // The reverse: bigquery target carrying a snowflake-only field.
+        let bq_with_snow = serde_json::json!({
+            "target": "bigquery", "project": "p", "dataset": "d", "warehouse": "WH"
+        });
+        assert!(reject_foreign_target_fields(&bq_with_snow, "bigquery", "top-level").is_err());
+        // A clean, target-matching block passes.
+        let clean = serde_json::json!({ "target": "bigquery", "project": "p", "dataset": "d" });
+        assert!(reject_foreign_target_fields(&clean, "bigquery", "top-level").is_ok());
     }
 }

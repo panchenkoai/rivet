@@ -34,6 +34,12 @@ pub(crate) fn run_with_reconnect(
                 .as_ref()
                 .map(classify_error)
                 .unwrap_or(RetryClass::Permanent);
+            // Count reconnect-class retries separately: N reconnects = N flaky-link
+            // blips this run survived (the field-diagnosis signal). A same-conn
+            // retry (a lock wait) advances `retries` but not `reconnects`.
+            if class.needs_reconnect() {
+                summary.reconnects = summary.reconnects.saturating_add(1);
+            }
             let backoff = super::retry::retry_backoff_ms(
                 plan.tuning.retry_backoff_ms,
                 attempt,

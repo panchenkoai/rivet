@@ -132,6 +132,103 @@ fn keyset_export_records_form_b_checksums_and_validate_passes() {
     );
 }
 
+/// v18 failure-forensics on the KEYSET runner: a keyset export must persist the
+/// self-sufficient debug columns on its `export_metrics` row + a schema-at-open
+/// `export_schema` row, so a keyset FAILURE is legible WITHOUT re-querying the
+/// source. Uses 2000 rows / chunk 500 = 4 EXACT pages, so the run exits via the
+/// empty-seek `else break` — the path that recorded `cursor_max = null` before the
+/// fix (RED there). Guards, in one live run, four gaps closed this round:
+/// cursor_max (both loop exits), server_context_json (source limits), the enriched
+/// key_descriptor_json (strategy + key + db_type), and schema-at-open.
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn keyset_export_persists_v18_forensics_columns() {
+    require_alive(LiveService::Postgres);
+    let table = unique_name("keyset_forensics");
+    let mut c = pg_connect();
+    c.batch_execute(&format!(
+        "CREATE TABLE {table} (id BIGINT PRIMARY KEY, v INT NOT NULL);
+         INSERT INTO {table} SELECT g, g FROM generate_series(1, 2000) g;"
+    ))
+    .unwrap();
+    let _guard = PgTable::adopt(table.clone());
+
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let out_dir = tempfile::tempdir().unwrap();
+    let export = unique_name("keyset_forensics_exp");
+    let yaml = format!(
+        "source: {{type: postgres, url: \"{POSTGRES_URL}\"}}\nexports:\n  - name: {export}\n    \
+         table: {table}\n    mode: chunked\n    chunk_by_key: id\n    chunk_size: 500\n    \
+         format: parquet\n    destination: {{type: local, path: {out}}}\n",
+        out = out_dir.path().display(),
+    );
+    let cfg = write_config(&cfg_dir, &yaml);
+    let r = run_rivet_export(&cfg, &export);
+    assert!(
+        r.status.success(),
+        "keyset export must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+
+    let db = cfg.parent().unwrap().join(".rivet_state.db");
+    let conn = rusqlite::Connection::open(&db).expect("open state db");
+    let (cursor_max, server_ctx, key_desc, error_class): (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) = conn
+        .query_row(
+            "SELECT cursor_max, server_context_json, key_descriptor_json, error_class \
+             FROM export_metrics WHERE export_name = ?1 ORDER BY id DESC LIMIT 1",
+            [&export],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .expect("an export_metrics row must exist after the run");
+
+    // cursor_max = the max key reached, captured on the empty-seek `else break`
+    // (2000 / 500 = 4 exact pages). RED (null) before that exit set cursor_high.
+    assert_eq!(
+        cursor_max.as_deref(),
+        Some("2000"),
+        "cursor_max must be the table's max key (via the exact-multiple else-break exit)"
+    );
+    // server_context captured at OPEN — the source limits that explain a timeout.
+    let sc = server_ctx.expect("server_context_json must be captured at open");
+    assert!(
+        sc.contains("postgres") && sc.contains("statement_timeout"),
+        "server_context: {sc}"
+    );
+    // key descriptor: strategy + key + the resolved source native type.
+    let kd = key_desc.expect("key_descriptor_json must be set on keyset");
+    assert!(
+        kd.contains("\"strategy\":\"keyset\"") && kd.contains("\"key\":\"id\""),
+        "kd: {kd}"
+    );
+    assert!(
+        kd.contains("\"db_type\""),
+        "key_descriptor must carry the key's db_type (schema-at-open resolved it): {kd}"
+    );
+    assert!(
+        error_class.is_none(),
+        "a successful run has no error_class: {error_class:?}"
+    );
+
+    // schema-at-open: export_schema carries the columns even though (here) the run
+    // succeeded — the point is the row exists from the OPEN probe, not finalize.
+    let schema_cols: String = conn
+        .query_row(
+            "SELECT columns_json FROM export_schema WHERE export_name = ?1",
+            [&export],
+            |r| r.get(0),
+        )
+        .expect("schema-at-open must record an export_schema row");
+    assert!(
+        schema_cols.contains("\"id\""),
+        "schema-at-open must list the columns: {schema_cols}"
+    );
+}
+
 /// Cross-shape manifest guard on the KEYSET runner: a batch keyset export must
 /// refuse to overwrite a prior CDC manifest at the same prefix (they would
 /// silently destroy each other's audit trail). Every batch runner calls

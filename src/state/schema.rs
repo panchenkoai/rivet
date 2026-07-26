@@ -143,6 +143,26 @@ impl StateStore {
         Ok(())
     }
 
+    /// Store the schema ONLY when no baseline exists yet. Returns `true` if it
+    /// stored (was absent), `false` if an existing baseline was preserved.
+    ///
+    /// The open-time forensics probe uses this: a stored baseline is the drift
+    /// detector's comparison anchor ([`detect_schema_change`] reads it during the
+    /// export, AFTER open), so overwriting it at OPEN would blind drift detection —
+    /// a changed column would compare equal to the just-stored current schema. A
+    /// first-run failure (no baseline) still captures its schema for the post-mortem.
+    pub fn store_schema_if_absent(
+        &self,
+        export_name: &str,
+        columns: &[SchemaColumn],
+    ) -> Result<bool> {
+        if self.get_stored_schema(export_name)?.is_some() {
+            return Ok(false);
+        }
+        self.store_schema(export_name, columns)?;
+        Ok(true)
+    }
+
     /// Detect structural drift versus the stored snapshot.
     ///
     /// On the first run (no stored snapshot) the current schema is stored and
@@ -249,6 +269,49 @@ mod tests {
         s.detect_schema_change("t", &cols).unwrap();
         let change = s.detect_schema_change("t", &cols).unwrap();
         assert!(change.is_none());
+    }
+
+    #[test]
+    fn store_schema_if_absent_preserves_the_drift_baseline() {
+        // Regression (v18 open-forensics, job.rs::capture_open_forensics): the
+        // forensics probe stored the schema at run OPEN, clobbering the previous
+        // run's baseline BEFORE the export's `detect_schema_change` read it — so a
+        // genuinely added/removed column compared equal to itself and
+        // `schema_changed` stayed false (6 live schema-drift tests went RED). The
+        // fix routes the open-time store through `store_schema_if_absent`.
+        // MUTANT: swap `store_schema_if_absent` → `store_schema` (unconditional) and
+        // the final `change.is_some()` goes RED (baseline overwritten with v2).
+        let s = store();
+        let v1 = vec![SchemaColumn {
+            name: "id".into(),
+            data_type: "Int64".into(),
+        }];
+        let v2 = vec![
+            SchemaColumn {
+                name: "id".into(),
+                data_type: "Int64".into(),
+            },
+            SchemaColumn {
+                name: "added".into(),
+                data_type: "Utf8".into(),
+            },
+        ];
+        // Run 1 OPEN: no baseline → stores.
+        assert!(
+            s.store_schema_if_absent("t", &v1).unwrap(),
+            "first open: baseline absent → stored",
+        );
+        // Run 2 OPEN: baseline present → must NOT overwrite (the fix).
+        assert!(
+            !s.store_schema_if_absent("t", &v2).unwrap(),
+            "baseline present → open-forensics must preserve it, not overwrite",
+        );
+        // Run 2 export: drift detection sees v1 (baseline) vs v2 (current) → change.
+        let change = s.detect_schema_change("t", &v2).unwrap();
+        assert!(
+            change.is_some(),
+            "an added column must be detected — a store-at-open must not clobber the baseline",
+        );
     }
 
     #[test]

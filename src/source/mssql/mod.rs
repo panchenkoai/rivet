@@ -782,6 +782,44 @@ impl Source for MssqlSource {
             row.get::<i64, _>(0).map(|v| v.max(0) as u64)
         })
     }
+
+    fn server_context(&mut self) -> Option<String> {
+        // SERVERPROPERTY + @@ globals — cheap, no elevated permission. SQL Server's
+        // query timeout is CLIENT-side (there is no server "ERROR 3024"), so the
+        // load-bearing forensics here are version/edition plus the lock timeout and
+        // connection cap. Best-effort per field.
+        let version = self
+            .query_scalar("SELECT CAST(SERVERPROPERTY('ProductVersion') AS NVARCHAR(128))")
+            .ok()
+            .flatten();
+        let edition = self
+            .query_scalar("SELECT CAST(SERVERPROPERTY('Edition') AS NVARCHAR(128))")
+            .ok()
+            .flatten();
+        let lock_timeout = self
+            .query_scalar("SELECT CAST(@@LOCK_TIMEOUT AS NVARCHAR(32))")
+            .ok()
+            .flatten();
+        let max_conns = self
+            .query_scalar("SELECT CAST(@@MAX_CONNECTIONS AS NVARCHAR(32))")
+            .ok()
+            .flatten();
+        let collation = self
+            .query_scalar("SELECT CAST(SERVERPROPERTY('Collation') AS NVARCHAR(128))")
+            .ok()
+            .flatten();
+        Some(
+            serde_json::json!({
+                "engine": "mssql",
+                "version": version,
+                "edition": edition,
+                "lock_timeout_ms": lock_timeout,
+                "max_connections": max_conns,
+                "collation": collation,
+            })
+            .to_string(),
+        )
+    }
 }
 
 impl MssqlSource {
@@ -1066,15 +1104,17 @@ pub(crate) fn introspect_mssql_table_for_chunking(
     // delimiter because the introspection seam only exposes `query_scalar`; that
     // byte cannot appear in a real identifier, so the split is unambiguous.
     let keyset_sql = format!(
-        "SELECT STRING_AGG(col, CHAR(31)) WITHIN GROUP (ORDER BY is_pk DESC, col) FROM ( \
+        "SELECT STRING_AGG(CONVERT(nvarchar(max), col), CHAR(31)) WITHIN GROUP (ORDER BY is_pk DESC, col) FROM ( \
            SELECT col, MAX(is_pk) AS is_pk FROM ( \
              SELECT MIN(c.name) AS col, MAX(CONVERT(int, i.is_primary_key)) AS is_pk \
              FROM sys.indexes i \
              JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id AND ic.key_ordinal > 0 \
              JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id \
+             JOIN sys.types kt ON kt.user_type_id = c.user_type_id \
              JOIN sys.objects o ON o.object_id = i.object_id \
              JOIN sys.schemas s ON s.schema_id = o.schema_id \
              WHERE i.is_unique = 1 AND c.is_nullable = 0 AND s.name = N'{}' AND o.name = N'{}' \
+               AND kt.name NOT IN ('decimal', 'numeric') \
              GROUP BY i.object_id, i.index_id HAVING COUNT(*) = 1 \
            ) per_index GROUP BY col \
          ) deduped",
@@ -1114,11 +1154,37 @@ pub(crate) fn introspect_mssql_table_for_chunking(
         }
     }
 
+    // Integer-family columns — the safety set for an explicit `chunk_column`.
+    // Same CHAR(31)-delimited STRING_AGG pattern as the keyset probe above.
+    // CONVERT(nvarchar(max), ..) because STRING_AGG over a non-max input caps its
+    // result at 8000 bytes and raises Msg 9829 past it — a wide table (~160 int
+    // columns of 30-char names) then failed EVERY chunked plan (#21 bughunt).
+    let int_sql = format!(
+        "SELECT STRING_AGG(CONVERT(nvarchar(max), c.name), CHAR(31)) FROM sys.columns c \
+         JOIN sys.types t ON t.user_type_id = c.user_type_id \
+         JOIN sys.objects o ON o.object_id = c.object_id \
+         JOIN sys.schemas s ON s.schema_id = o.schema_id \
+         WHERE s.name = N'{}' AND o.name = N'{}' \
+           AND t.name IN ('tinyint', 'smallint', 'int', 'bigint')",
+        schema.replace('\'', "''"),
+        table.replace('\'', "''")
+    );
+    let int_columns: Vec<String> = src
+        .query_scalar(&int_sql)?
+        .map(|s| {
+            s.split('\u{1f}')
+                .filter(|c| !c.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+
     Ok(TableIntrospection {
         single_int_pk,
         keyset_keys,
         row_estimate,
         avg_row_bytes: None,
+        int_columns,
     })
 }
 

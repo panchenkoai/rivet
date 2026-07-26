@@ -222,8 +222,11 @@ pub enum Commands {
         #[arg(short = 'c', long)]
         config: String,
         /// Path to the `rivet` binary used for the type-report subprocess.
-        #[arg(long, default_value = "rivet")]
-        rivet_bin: String,
+        /// Defaults to THIS executable (self), so the load's `rivet check`
+        /// resolves types with the same version — a `rivet` on `$PATH` may be a
+        /// different, skewed version. Override only to pin a specific binary.
+        #[arg(long)]
+        rivet_bin: Option<String>,
         /// Correlation id stamped on every warehouse job/query of this load run
         /// (BigQuery `rivet_run` label / Snowflake `QUERY_TAG`), so cost slices
         /// per run as well as per table. Defaults to a generated id.
@@ -244,7 +247,7 @@ pub enum Commands {
     /// Generate a config scaffold from a live database (connect + introspect)
     #[command(group = clap::ArgGroup::new("source_spec").required(true).multiple(false))]
     Init {
-        /// Database URL (postgresql://, mysql://, or sqlserver://). Visible in shell history / `ps`;
+        /// Database URL (postgresql://, mysql://, sqlserver://, or mongodb://). Visible in shell history / `ps`;
         /// prefer `--source-env` or `--source-file` for anything other than local dev.
         #[arg(long, group = "source_spec")]
         source: Option<String>,
@@ -259,7 +262,7 @@ pub enum Commands {
         /// Single table, optionally schema-qualified (e.g. public.orders, dbo.orders). Omit to emit all tables/views in a Postgres/SQL Server schema or MySQL database.
         #[arg(long)]
         table: Option<String>,
-        /// PostgreSQL: schema to export (default public). SQL Server: schema (default dbo). MySQL: database name if missing from the URL, or override URL database.
+        /// PostgreSQL: schema to export (default public). SQL Server: schema (default dbo). MySQL: database name when the URL omits it (a --schema naming a DIFFERENT database than the URL is refused — put the database in the URL).
         #[arg(long)]
         schema: Option<String>,
         /// Whole-schema only: keep only tables/views matching this glob (`*`/`?`). Repeatable; a table is kept if it matches any `--include`. No `--include` = keep all.
@@ -549,16 +552,18 @@ pub enum StateAction {
         json: bool,
     },
     /// Clear persisted chunk checkpoint rows (`chunk_run` / `chunk_task`).
+    // A required, single-choice ArgGroup renders the usage as
+    // `<--export <EXPORT>|--stuck-checkpoints>` (pick exactly one). The old
+    // paired `conflicts_with` + `required_unless_present` idiom made clap render
+    // BOTH flags as required in the synopsis, then rejected supplying both — a
+    // self-contradictory help line (dogfood LOW). The group keeps the same
+    // runtime contract: neither → MissingRequiredArgument, both → ArgumentConflict.
+    #[command(group = clap::ArgGroup::new("reset_chunks_target").required(true).multiple(false))]
     ResetChunks {
         #[arg(short, long)]
         config: String,
         /// Export whose chunk checkpoints should be cleared (same as `chunk_checkpoint` runs).
-        #[arg(
-            short,
-            long,
-            conflicts_with = "stuck_checkpoints",
-            required_unless_present = "stuck_checkpoints"
-        )]
+        #[arg(short, long, group = "reset_chunks_target")]
         export: Option<String>,
         /// Reset checkpoints for **every export named in this config** that currently has
         /// `chunk_run.status = 'in_progress'` (crash, SIGKILL, stale concurrent worker).
@@ -567,12 +572,7 @@ pub enum StateAction {
         /// database but removed from the YAML are skipped with a printed note.
         ///
         /// Alias `--failed` refers to "checkpoint state stuck", not HTTP-style failures or metric rows.
-        #[arg(
-            long,
-            visible_alias = "failed",
-            conflicts_with = "export",
-            required_unless_present = "export"
-        )]
+        #[arg(long, visible_alias = "failed", group = "reset_chunks_target")]
         stuck_checkpoints: bool,
     },
     /// Show chunk checkpoint status for an export
@@ -656,6 +656,25 @@ mod tests {
         if let Err(kind) = init_parse_kind(extra_args) {
             panic!("{what}: expected clap to accept, got error kind {kind:?}");
         }
+    }
+
+    #[test]
+    fn init_source_help_lists_mongodb() {
+        // #dogfood LOW: `init --help` --source text omitted mongodb:// though init
+        // fully supports it (init routes mongodb to a dedicated path, and the
+        // scheme-validation error itself lists it).
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+        let init = cmd.find_subcommand("init").expect("init subcommand exists");
+        let source = init
+            .get_arguments()
+            .find(|a| a.get_id() == "source")
+            .expect("--source arg exists");
+        let help = source.get_help().map(|h| h.to_string()).unwrap_or_default();
+        assert!(
+            help.contains("mongodb"),
+            "init --source help must list mongodb://, got: {help}"
+        );
     }
 
     fn state_reset_chunks_parse_from(

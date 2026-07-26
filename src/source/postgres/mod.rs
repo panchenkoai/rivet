@@ -365,12 +365,20 @@ pub(crate) fn introspect_pg_table_for_chunking(
     // binds to a real column (not an expression index); `attnotnull` removes
     // NULL-ordering ambiguity. Index-backed + unique ⇒ keyset's `ORDER BY key
     // LIMIT n` is a range scan and `WHERE key > last` never skips dup keys.
+    // The keyset cursor (extract_last_cursor_value) reads only integer / float /
+    // string / timestamp / date / uuid keys — NOT `numeric`/`decimal`. Excluding
+    // it here refuses a DECIMAL keyset key at PLAN time (loud bail) instead of
+    // failing at runtime AFTER a partial write, and stops `rivet check` from
+    // green-lighting it (#dogfood: keyset on a DECIMAL PK check=ACCEPTABLE, run
+    // failed after 100/250 rows "could not read the key value … unsupported type").
     let keyset_rows = client.query(
         "SELECT a.attname::text, i.indisprimary \
          FROM pg_index i \
          JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = i.indkey[0] \
+         JOIN pg_type t ON t.oid = a.atttypid \
          WHERE i.indrelid = (($1::text || '.' || $2::text)::regclass) \
-           AND i.indisunique AND i.indnkeyatts = 1 AND a.attnotnull",
+           AND i.indisunique AND i.indnkeyatts = 1 AND a.attnotnull \
+           AND t.typname <> 'numeric'",
         &[&schema, &table],
     )?;
     let mut keyset_keys: Vec<String> = Vec::new();
@@ -384,11 +392,28 @@ pub(crate) fn introspect_pg_table_for_chunking(
         }
     }
 
+    // Integer-family columns — the safety set for an explicit `chunk_column`
+    // (range chunking slices with integer `BETWEEN`; a non-integer key silently
+    // loses fractional rows). Cheap catalog read on the already-open connection.
+    let int_columns: Vec<String> = client
+        .query(
+            "SELECT a.attname::text FROM pg_attribute a \
+             JOIN pg_type t ON t.oid = a.atttypid \
+             WHERE a.attrelid = (($1::text || '.' || $2::text)::regclass) \
+               AND a.attnum > 0 AND NOT a.attisdropped \
+               AND t.typname IN ('int2', 'int4', 'int8')",
+            &[&schema, &table],
+        )?
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+
     Ok(crate::source::TableIntrospection {
         single_int_pk,
         keyset_keys,
         row_estimate,
         avg_row_bytes,
+        int_columns,
     })
 }
 
@@ -698,6 +723,39 @@ impl super::Source for PostgresSource {
     /// means the source is checkpointing harder under write pressure.
     fn sample_pressure(&mut self) -> Option<u64> {
         pg_sample_checkpoints_req(&mut self.client).map(|v| v.max(0) as u64)
+    }
+
+    fn server_context(&mut self) -> Option<String> {
+        // `current_setting()` returns a text scalar (clean for query_scalar);
+        // `statement_timeout` is the limit behind a cancelled long-running query.
+        let version = self.query_scalar("SELECT version()").ok().flatten();
+        let stmt_timeout = self
+            .query_scalar("SELECT current_setting('statement_timeout')")
+            .ok()
+            .flatten();
+        let idle_timeout = self
+            .query_scalar("SELECT current_setting('idle_in_transaction_session_timeout')")
+            .ok()
+            .flatten();
+        let time_zone = self
+            .query_scalar("SELECT current_setting('TimeZone')")
+            .ok()
+            .flatten();
+        let max_conns = self
+            .query_scalar("SELECT current_setting('max_connections')")
+            .ok()
+            .flatten();
+        Some(
+            serde_json::json!({
+                "engine": "postgres",
+                "version": version,
+                "statement_timeout": stmt_timeout,
+                "idle_in_transaction_session_timeout": idle_timeout,
+                "time_zone": time_zone,
+                "max_connections": max_conns,
+            })
+            .to_string(),
+        )
     }
 }
 

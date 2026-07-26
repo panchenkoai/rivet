@@ -239,6 +239,18 @@ pub enum Failure {
         expected: String,
         actual: String,
     },
+    /// `--depth full` re-read the parts and a per-column VALUE checksum (Form B)
+    /// disagreed with the manifest — post-write corruption an MD5/size check
+    /// cannot see (a flipped bit inside a data page). Verified-wrong, so it fails
+    /// the verdict and classifies as data-integrity (exit 3), not could-not-verify.
+    ValueChecksumMismatch { detail: String },
+    /// `--depth full` re-read a CDC export's parts and the `__pos` continuity
+    /// check found a gap/duplicate in the change positions — the exported change
+    /// stream is incomplete or reordered. Verified-wrong (same class as a value
+    /// mismatch), so it fails the verdict and classifies as data-integrity (exit
+    /// 3), not could-not-verify (bughunt MED: it was folded into hard_failures →
+    /// exit 1, inconsistent with the value-checksum path).
+    CdcPositionViolation { detail: String },
     /// `_SUCCESS` exists but its body is malformed (not `xxh3:<16-hex>` after
     /// trim).  ADR-0012 M2 — orchestrators rely on this format being strict.
     SuccessMarkerMalformed { body_preview: String },
@@ -293,6 +305,23 @@ impl Failure {
         !matches!(self, Failure::UntrackedObject { .. })
     }
 
+    /// Whether this failure is COULD-NOT-VERIFY (an operational I/O error that
+    /// prevented the check) rather than VERIFIED-WRONG (the check ran and found
+    /// the data bad). Could-not-verify is the operational class — exit 1, retry —
+    /// NOT the data-integrity stop-the-line class (exit 3). A read/list error
+    /// against a healthy prefix (a chmod-000 manifest, a transient S3 list blip)
+    /// must not page a corruption incident (#7 bughunt: these fell into the
+    /// verdict and drove exit 3). Fatal-by-omission the other way: a NEW variant
+    /// is verified-wrong (exit 3) unless it is explicitly an I/O could-not-verify.
+    pub fn is_could_not_verify(&self) -> bool {
+        matches!(
+            self,
+            Failure::ManifestReadError { .. }
+                | Failure::SuccessMarkerReadError { .. }
+                | Failure::ListPrefixError { .. }
+        )
+    }
+
     /// Stable `RIVET_VERIFY_*` error code for this failure variant.
     ///
     /// One code per variant, intended for orchestrators / CI to branch on
@@ -306,6 +335,8 @@ impl Failure {
             Failure::PartMissing { .. } => "RIVET_VERIFY_PART_MISSING",
             Failure::PartSizeMismatch { .. } => "RIVET_VERIFY_PART_SIZE_MISMATCH",
             Failure::PartChecksumMismatch { .. } => "RIVET_VERIFY_PART_CHECKSUM_MISMATCH",
+            Failure::ValueChecksumMismatch { .. } => "RIVET_VERIFY_VALUE_CHECKSUM",
+            Failure::CdcPositionViolation { .. } => "RIVET_VERIFY_CDC_POSITION",
             Failure::SuccessMarkerMalformed { .. } => "RIVET_VERIFY_SUCCESS_MALFORMED",
             Failure::SuccessMarkerStale { .. } => "RIVET_VERIFY_SUCCESS_STALE",
             Failure::ManifestSelfInconsistent { .. } => "RIVET_VERIFY_MANIFEST_INCONSISTENT",
@@ -343,6 +374,16 @@ impl std::fmt::Display for Failure {
                 "part {} size mismatch at {}: manifest {}, dest {}",
                 part_id, path, expected, actual
             ),
+            Failure::ValueChecksumMismatch { detail } => {
+                write!(
+                    f,
+                    "value checksum mismatch (post-write corruption): {}",
+                    detail
+                )
+            }
+            Failure::CdcPositionViolation { detail } => {
+                write!(f, "cdc __pos continuity violation: {}", detail)
+            }
             Failure::PartChecksumMismatch {
                 part_id,
                 path,
@@ -484,6 +525,15 @@ impl ManifestVerification {
     /// `!passed`, which can also mean "legacy / not applicable".
     pub fn has_failures(&self) -> bool {
         !self.failures.is_empty()
+    }
+
+    /// Whether any recorded failure is VERIFIED-WRONG (the check ran and the data
+    /// is bad) as opposed to purely COULD-NOT-VERIFY (an I/O read/list error).
+    /// Drives the exit CLASS: a verdict with a verified-wrong failure is
+    /// data-integrity (exit 3); a verdict whose failures are ALL could-not-verify
+    /// is operational (exit 1). See [`Failure::is_could_not_verify`].
+    pub fn has_verified_wrong_failure(&self) -> bool {
+        self.failures.iter().any(|f| !f.is_could_not_verify())
     }
 }
 
@@ -1823,6 +1873,18 @@ mod tests {
                 Failure::ManifestRequiredButAbsent { prefix: "p".into() },
                 "RIVET_VERIFY_MANIFEST_REQUIRED",
             ),
+            (
+                Failure::ValueChecksumMismatch {
+                    detail: "flip".into(),
+                },
+                "RIVET_VERIFY_VALUE_CHECKSUM",
+            ),
+            (
+                Failure::CdcPositionViolation {
+                    detail: "gap".into(),
+                },
+                "RIVET_VERIFY_CDC_POSITION",
+            ),
         ];
         for (failure, code) in cases {
             assert_eq!(&failure.error_code(), code, "code for {failure:?}");
@@ -1831,5 +1893,43 @@ mod tests {
                 "every code shares the RIVET_VERIFY_ prefix"
             );
         }
+    }
+
+    #[test]
+    fn cdc_position_violation_is_verified_wrong_not_could_not_verify() {
+        // #5 / #104 bughunt: a CDC `__pos` continuity violation (a gap/duplicate in
+        // the exported change stream) is VERIFIED-WRONG — data-integrity, exit 3,
+        // the same class as a value-checksum mismatch — NOT a could-not-verify I/O
+        // error (exit 1). This pins the classification so a future edit that made it
+        // operational (folding it back into hard_failures → exit 1, the pre-fix
+        // behaviour) goes RED.
+        let viol = Failure::CdcPositionViolation {
+            detail: "export 'x': pos gap 5 -> 8".into(),
+        };
+        assert!(
+            !viol.is_could_not_verify(),
+            "a __pos violation is verified-wrong, not could-not-verify"
+        );
+        assert!(viol.is_fatal(), "a __pos violation fails the verdict");
+
+        let mut v = ManifestVerification::empty();
+        v.passed = false;
+        v.failures.push(viol);
+        assert!(
+            v.has_verified_wrong_failure(),
+            "a verdict carrying a __pos violation must classify as verified-wrong (exit 3)"
+        );
+
+        // The read-error siblings are the OTHER side of the same axis: could-not-
+        // verify, so a verdict whose ONLY failure is one of them is NOT verified-wrong.
+        let mut op = ManifestVerification::empty();
+        op.passed = false;
+        op.failures.push(Failure::ManifestReadError {
+            detail: "permission denied".into(),
+        });
+        assert!(
+            !op.has_verified_wrong_failure(),
+            "a read error alone is could-not-verify (exit 1), not verified-wrong"
+        );
     }
 }
