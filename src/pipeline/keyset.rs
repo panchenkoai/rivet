@@ -145,6 +145,15 @@ fn percentile_offset(total: i64, i: usize, parts: usize) -> i64 {
     total * i as i64 / parts as i64
 }
 
+/// The run's `cursor_high` (forensics v18): the max key of the HIGHEST-index range that
+/// produced data. Ranges partition the key ascending, so the last POPULATED range holds
+/// the run's top key — walk from the top, skip empty ranges, take the first. Extracted
+/// pure from the post-join merge so this fold is unit-mutation-covered (a dropped
+/// `.rev()` would silently report the LOWEST range's max instead of the highest).
+fn highest_range_max(range_maxes: Vec<Option<String>>) -> Option<String> {
+    range_maxes.into_iter().rev().flatten().next()
+}
+
 /// "The single row at offset `off`" clause (after the `ORDER BY`), per dialect.
 fn nth_row_clause(st: crate::config::SourceType, off: i64) -> String {
     use crate::config::SourceType::*;
@@ -611,13 +620,7 @@ fn run_keyset_parallel(
         manifest_writer::record_run_schema_fingerprint(summary, sc);
     }
     // cursor_high = the highest populated range's max (forensics v18); see range_max.
-    summary.cursor_high = range_max
-        .into_inner()
-        .unwrap()
-        .into_iter()
-        .rev()
-        .flatten()
-        .next();
+    summary.cursor_high = highest_range_max(range_max.into_inner().unwrap());
     summary.cursor_low = None; // a fresh parallel run seeks from the floor of each range
 
     // Record this run's parts through the commit seam (populates
@@ -1030,6 +1033,22 @@ pub(crate) fn run_keyset(
 mod tests {
     use super::*;
     use crate::config::SourceType;
+
+    // ── highest_range_max: cursor_high = the top populated range's max ────────
+    #[test]
+    fn highest_range_max_takes_the_top_populated_range() {
+        let s = |x: &str| Some(x.to_string());
+        // ascending ranges, all populated → the last one's max.
+        assert_eq!(highest_range_max(vec![s("k1"), s("k2"), s("k3")]), s("k3"));
+        // the top range is EMPTY → fall back to the highest populated below it.
+        assert_eq!(highest_range_max(vec![s("k1"), s("k2"), None]), s("k2"));
+        // a GAP: range 1 empty, range 2 populated → range 2 wins, NOT range 0. This is
+        // the case that pins `.rev()` — without it the fold would return "lo".
+        assert_eq!(highest_range_max(vec![s("lo"), None, s("hi")]), s("hi"));
+        // all empty → None.
+        assert_eq!(highest_range_max(vec![None, None]), None);
+        assert_eq!(highest_range_max(vec![]), None);
+    }
 
     // ── percentile_offset: the ROW-percentile boundary arithmetic ────────────
     #[test]
