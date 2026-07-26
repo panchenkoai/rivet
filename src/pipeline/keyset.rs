@@ -160,23 +160,48 @@ fn sample_key_boundaries(
     plan: &ResolvedRunPlan,
     key: &str,
     parts: usize,
+    floor: Option<&str>,
+    ceil: Option<&str>,
 ) -> Result<Vec<String>> {
     let st = plan.source.source_type;
     let base = &plan.base_query;
+    let k = crate::sql::quote_ident(st, key);
+    // Incremental (iteration 3): sample percentiles of only the NEW rows,
+    // `(floor, ceil]`, as inline per-dialect literals (never a bind param).
+    let mut preds: Vec<String> = Vec::new();
+    if let Some(lo) = floor {
+        preds.push(format!(
+            "{k} > {}",
+            crate::source::query::inline_literal(st, lo)
+        ));
+    }
+    if let Some(hi) = ceil {
+        preds.push(format!(
+            "{k} <= {}",
+            crate::source::query::inline_literal(st, hi)
+        ));
+    }
+    let where_clause = if preds.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", preds.join(" AND "))
+    };
     let total: i64 = src
-        .query_scalar(&format!("SELECT COUNT(*) FROM ({base}) AS _rivet_pk_cnt"))?
+        .query_scalar(&format!(
+            "SELECT COUNT(*) FROM ({base}) AS _rivet_pk_cnt {where_clause}"
+        ))?
         .as_deref()
         .and_then(|s| s.trim().parse::<i64>().ok())
         .unwrap_or(0);
     if total <= 1 {
         return Ok(vec![]);
     }
-    let k = crate::sql::quote_ident(st, key);
     let mut bounds: Vec<String> = Vec::with_capacity(parts.saturating_sub(1));
     for i in 1..parts {
         let off = total * i as i64 / parts as i64;
         let nth = nth_row_clause(st, off);
-        let sql = format!("SELECT {k} FROM ({base}) AS _rivet_pk ORDER BY {k} {nth}");
+        let sql =
+            format!("SELECT {k} FROM ({base}) AS _rivet_pk {where_clause} ORDER BY {k} {nth}");
         if let Some(v) = src.query_scalar(&sql)?
             && bounds.last().map(String::as_str) != Some(v.as_str())
         {
@@ -208,16 +233,22 @@ fn sample_parallel_ranges(
     plan: &ResolvedRunPlan,
     key: &str,
     parallel: usize,
+    floor: Option<&str>,
+    ceil: Option<&str>,
 ) -> Result<Vec<(usize, Option<String>, Option<String>, bool)>> {
-    let bounds = sample_key_boundaries(src, plan, key, parallel)?;
+    let bounds = sample_key_boundaries(src, plan, key, parallel, floor, ceil)?;
+    // The first range's floor + the last range's ceiling come from the incremental
+    // bounds (both None for a full pass): the first range seeks past `floor`, the
+    // last stops at `ceil` so a row arriving DURING the run is deferred, not
+    // double-counted (which keeps the anchor advance exact).
     let mut ranges = Vec::with_capacity(bounds.len() + 1);
-    let mut prev: Option<String> = None;
+    let mut prev: Option<String> = floor.map(str::to_string);
     for (i, b) in bounds.iter().enumerate() {
         ranges.push((i, prev.clone(), Some(b.clone()), false));
         prev = Some(b.clone());
     }
     let last = ranges.len();
-    ranges.push((last, prev, None, false));
+    ranges.push((last, prev, ceil.map(str::to_string), false));
     Ok(ranges)
 }
 
@@ -266,6 +297,41 @@ fn run_keyset_parallel(
         None
     };
 
+    // Incremental (iteration 3): a FRESH run seeks past the persisted anchor
+    // (`floor`) up to the source max AT OPEN (`ceil`) — bounding the last range at
+    // `ceil` defers a row arriving mid-run to the next run, so the anchor advance is
+    // exact. A RESUME reloads its ranges (floor/ceil already baked in), so it must
+    // NOT recompute. `key_advances` is numeric-aware so "no new rows" is not a
+    // lexical "1000" < "999" mistake.
+    let incremental = kp.incremental;
+    let (floor, ceil): (Option<String>, Option<String>) = if incremental && resume_run_id.is_none()
+    {
+        let anchor = state
+            .and_then(|s| s.get(&plan.export_name).ok())
+            .and_then(|c| c.last_cursor_value);
+        let key_q = crate::sql::quote_ident(plan.source.source_type, &key);
+        let cur_max = src.query_scalar(&format!(
+            "SELECT MAX({key_q}) FROM ({}) AS _rivet_pk_max",
+            plan.base_query
+        ))?;
+        let advances = match (&anchor, &cur_max) {
+            (_, None) => false,                       // empty source
+            (None, Some(_)) => true,                  // no prior anchor → all rows new
+            (Some(a), Some(c)) => key_advances(a, c), // c strictly past a
+        };
+        if !advances {
+            log::info!(
+                "export '{}': parallel keyset incremental — no new rows past the anchor, nothing to export",
+                plan.export_name
+            );
+            return Ok(());
+        }
+        (anchor, cur_max)
+    } else {
+        (None, None)
+    };
+    let (floor_r, ceil_r) = (floor.as_deref(), ceil.as_deref());
+
     // ranges: (range_index, lo_exclusive, hi_inclusive, already_done)
     let ranges: Vec<(usize, Option<String>, Option<String>, bool)> = match (&resume_run_id, state) {
         (Some(rid), Some(st)) => {
@@ -276,7 +342,7 @@ fn run_keyset_parallel(
                 // Anchor set but no persisted ranges (a crash between set_resume_
                 // run_id and persist_keyset_ranges — nothing committed): re-sample
                 // + persist under this run_id and start over. No skip.
-                let fresh = sample_parallel_ranges(src, plan, &key, parallel)?;
+                let fresh = sample_parallel_ranges(src, plan, &key, parallel, floor_r, ceil_r)?;
                 st.persist_keyset_ranges(&plan.export_name, rid, &lo_hi_pairs(&fresh))?;
                 fresh
             } else {
@@ -290,13 +356,17 @@ fn run_keyset_parallel(
             // THEN set the anchor. If a crash lands before the anchor, the next run
             // sees no resume_run_id and does a fresh full pass (persist replaces the
             // orphaned rows) — safe, never a skip.
-            let fresh = sample_parallel_ranges(src, plan, &key, parallel)?;
+            let fresh = sample_parallel_ranges(src, plan, &key, parallel, floor_r, ceil_r)?;
             st.persist_keyset_ranges(&plan.export_name, &summary.run_id, &lo_hi_pairs(&fresh))?;
             st.set_resume_run_id(&plan.export_name, &summary.run_id)?;
             fresh
         }
-        _ => sample_parallel_ranges(src, plan, &key, parallel)?,
+        _ => sample_parallel_ranges(src, plan, &key, parallel, floor_r, ceil_r)?,
     };
+
+    // The anchor advance for incremental = the last range's ceiling (the source max
+    // pinned at open). None for a full pass (last range's hi is None → no advance).
+    let anchor_ceiling: Option<String> = ranges.last().and_then(|(_, _, hi, _)| hi.clone());
 
     let total_ranges = ranges.len();
     let pending: Vec<(usize, Option<String>, Option<String>)> = ranges
@@ -564,7 +634,38 @@ fn run_keyset_parallel(
             summary,
         )?;
     }
+
+    // Incremental (iteration 3): on CLEAN SUCCESS advance the persisted anchor to
+    // this run's ceiling (the source max pinned at open), so the next run seeks
+    // strictly past it. Also pin the manifest cursor range to the ACCURATE
+    // `[floor, ceil]` — vs `worker_max` which a resume under-reports (done ranges
+    // are skipped, so their max is not re-observed). This is the incremental anchor
+    // that iteration 2's cursor_high caveat deferred.
+    if incremental && let Some(hi) = &anchor_ceiling {
+        summary.cursor_high = Some(hi.clone());
+        summary.cursor_low = floor.clone();
+        if let Some(st) = state {
+            st.update(&plan.export_name, hi)?;
+        }
+    }
     Ok(())
+}
+
+/// True when `candidate` advances strictly past `anchor` under cursor ordering —
+/// numeric-aware (i128 then f64, exact past f64's 2^53 mantissa) with a byte-wise
+/// string fallback for UUIDs / RFC3339 timestamps. Mirrors `progression::
+/// cursor_advances`; used to decide whether an incremental parallel run has any
+/// new rows past the anchor (a lexical compare would misread "1000" < "999").
+fn key_advances(anchor: &str, candidate: &str) -> bool {
+    if let (Ok(a), Ok(b)) = (anchor.parse::<i128>(), candidate.parse::<i128>()) {
+        return b > a;
+    }
+    if let (Ok(a), Ok(b)) = (anchor.parse::<f64>(), candidate.parse::<f64>())
+        && let Some(ord) = b.partial_cmp(&a)
+    {
+        return ord.is_gt();
+    }
+    candidate > anchor
 }
 
 /// The `(lo, hi)` pairs of a sampled range list, for `persist_keyset_ranges`.
@@ -593,12 +694,10 @@ pub(crate) fn run_keyset(
     };
 
     // Parallel keyset (feat/parallel-keyset): N ROW-percentile-range workers seek
-    // concurrently. With `chunk_checkpoint` it does per-range crash-recovery
-    // (iteration 2); without, a fresh full pass (iteration 1). `keyset_incremental`
-    // is not yet parallel-aware — the planner forces `kp.incremental = false` when
-    // parallel > 1, and this `!kp.incremental` gate is the belt-and-suspenders
-    // assertion of that (an incremental parallel config falls through to sequential).
-    if kp.parallel > 1 && !kp.incremental {
+    // concurrently. `chunk_checkpoint` → per-range crash-recovery (iteration 2);
+    // `keyset_incremental` → seek past the persisted anchor + advance it at success
+    // (iteration 3); neither → a fresh full pass (iteration 1).
+    if kp.parallel > 1 {
         return run_keyset_parallel(src, plan, summary, key_plan, kp.parallel, state);
     }
 

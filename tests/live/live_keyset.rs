@@ -684,6 +684,90 @@ fn keyset_parallel_crash_resume_writes_a_complete_destination_manifest() {
     );
 }
 
+/// PARALLEL keyset INCREMENTAL (feat/parallel-keyset iteration 3). A parallel run
+/// with `keyset_incremental` seeks past the persisted anchor and ADVANCES it at
+/// success; a CLEAN re-run pulls only keys past the high-water mark, across N
+/// workers (each range floored at the anchor, the last ceiling'd at the source max
+/// pinned at open). Discriminator = the TOTAL row count across all part files (a
+/// set dedups, so the union of keys can't tell a re-read from an incremental
+/// resume): 1000 → 1000 → 1500, never 2000 / 2500 (a full re-read). RED against
+/// the anchor not advancing (planner disabling it, or the runner not updating it):
+/// run 2 would re-read all 1000 → total 2000.
+#[test]
+#[ignore = "live: requires docker compose up -d mysql"]
+fn keyset_parallel_incremental_second_run_captures_only_new_keys() {
+    require_alive(LiveService::Mysql);
+    let table = unique_name("keyset_par_inc");
+    let _guard = DropTable(table.clone());
+    let mut conn = mysql_connect();
+    conn.query_drop(format!("DROP TABLE IF EXISTS {table}"))
+        .unwrap();
+    conn.query_drop(format!(
+        "CREATE TABLE {table} (uid VARCHAR(40) NOT NULL PRIMARY KEY, payload INT NOT NULL)"
+    ))
+    .unwrap();
+    conn.query_drop("SET SESSION cte_max_recursion_depth = 20000")
+        .unwrap();
+    let seed = |conn: &mut mysql::PooledConn, lo: usize, hi: usize| {
+        conn.query_drop(format!(
+            "INSERT INTO {table} (uid, payload) \
+             WITH RECURSIVE seq AS (SELECT {lo} n UNION ALL SELECT n+1 FROM seq WHERE n < {hi}) \
+             SELECT CONCAT('id-', LPAD(n, 6, '0')), n FROM seq"
+        ))
+        .unwrap();
+    };
+    seed(&mut conn, 1, 1000);
+
+    let export = unique_name("keyset_par_inc_exp");
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let out_dir = tempfile::tempdir().unwrap();
+    let yaml = format!(
+        "source:\n  type: mysql\n  url: \"{MYSQL_URL}\"\nexports:\n  - name: {export}\n    \
+         table: {table}\n    mode: chunked\n    chunk_by_key: uid\n    parallel: 4\n    \
+         chunk_checkpoint: true\n    keyset_incremental: true\n    chunk_size: 200\n    \
+         format: parquet\n    destination:\n      type: local\n      path: {out}\n",
+        out = out_dir.path().display(),
+    );
+    let cfg = write_config(&cfg_dir, &yaml);
+    let run = |label: &str| {
+        let out = run_rivet_export(&cfg, &export);
+        assert!(
+            out.status.success(),
+            "{label} failed; stderr:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+
+    // Run 1: all 1000, anchor persisted at the max key (id-001000).
+    run("run 1");
+    let (count1, _) = read_uid_set(out_dir.path());
+    assert_eq!(count1, 1000, "run 1 must export all seeded rows");
+
+    // Run 2 on the UNCHANGED source: anchor floor = id-001000 → ZERO new rows; the
+    // total across files stays 1000 (a re-read would double it to 2000).
+    run("run 2 (unchanged)");
+    let (count2, _) = read_uid_set(out_dir.path());
+    assert_eq!(
+        count2, 1000,
+        "unchanged incremental re-run must add zero rows (got {count2}) — 2000 = a full re-read"
+    );
+
+    // Insert 500 rows with HIGHER keys, resume: only those 500 are read across the
+    // N workers.
+    seed(&mut conn, 1001, 1500);
+    run("run 3 (after insert)");
+    let (count3, keys3) = read_uid_set(out_dir.path());
+    assert_eq!(
+        count3, 1500,
+        "incremental must add ONLY the 500 new keys (got {count3}); 2500 = a full re-read"
+    );
+    let expected: BTreeSet<String> = (1..=1500).map(|n| format!("id-{n:06}")).collect();
+    assert_eq!(
+        keys3, expected,
+        "the union of all runs must equal the full source key set"
+    );
+}
+
 /// Two-run keyset RESUME (`chunk_checkpoint: true` — OPT-4 + Phase 2). Run 1
 /// exports the whole key set and persists the high-water key; an UNCHANGED
 /// re-run exports ZERO new rows; after inserting rows with higher keys, the next

@@ -260,7 +260,7 @@ pub(crate) fn build_keyset_query_bounded(
 /// In-SQL literal for a key value, per dialect — the injection-safe inline form
 /// (never a bind param). MySQL/PG/MSSQL all implicit-cast a quoted literal to the
 /// key's column type, so a numeric key compares correctly against `'250001'`.
-fn inline_literal(source_type: SourceType, value: &str) -> String {
+pub(crate) fn inline_literal(source_type: SourceType, value: &str) -> String {
     match source_type {
         SourceType::Mysql => escape_mysql_literal(value),
         SourceType::Postgres => escape_pg_literal(value),
