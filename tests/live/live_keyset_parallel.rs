@@ -238,3 +238,128 @@ fn parallel_keyset_crash_recovery_mssql() {
     assert_parallel_crash_recovery(crash_rig(Rig::mssql_batch(&table)), 2000);
     mssql_exec(&format!("DROP TABLE IF EXISTS {table}"));
 }
+
+// ── Incremental-by-key (iteration 3) across every engine ─────────────────────
+
+/// Parallel incremental: a CLEAN re-run pulls only keys past the persisted anchor,
+/// across N workers. Discriminator = the TOTAL row count on disk (a set dedups):
+/// 1000 → 1000 (unchanged) → 1500 (after +500 insert), never a full re-read (2000).
+/// `parallel: 4` + `chunk_checkpoint: true` + `keyset_incremental: true`. The
+/// `seed_more` closure inserts the 500 higher keys between run 2 and run 3.
+fn assert_parallel_incremental(rig: Rig, seed_more: impl FnOnce()) {
+    rig.run_ok();
+    assert_eq!(
+        id_set_and_fanout(&rig.out_dir()).0,
+        1000,
+        "run 1 exports all 1000"
+    );
+    rig.run_ok();
+    assert_eq!(
+        id_set_and_fanout(&rig.out_dir()).0,
+        1000,
+        "unchanged re-run adds zero (a full re-read would double it to 2000)"
+    );
+    seed_more();
+    rig.run_ok();
+    let (count, keys, _) = id_set_and_fanout(&rig.out_dir());
+    assert_eq!(
+        count, 1500,
+        "incremental adds ONLY the 500 new keys (2500 = full re-read)"
+    );
+    assert_eq!(keys, (1..=1500i64).collect::<BTreeSet<i64>>());
+}
+
+fn incremental_rig(rig: Rig) -> Rig {
+    rig.mode("chunked")
+        .export_line("chunk_by_key: id")
+        .export_line("parallel: 4")
+        .export_line("chunk_checkpoint: true")
+        .export_line("keyset_incremental: true")
+        .export_line("chunk_size: 200")
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn parallel_keyset_incremental_postgres() {
+    require_alive(LiveService::Postgres);
+    let table = unique_name("pk_inc_pg");
+    let mut c = pg_connect();
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {table};
+         CREATE TABLE {table} (id BIGINT PRIMARY KEY, payload INT NOT NULL);
+         INSERT INTO {table} SELECT g, g FROM generate_series(1, 1000) g;"
+    ))
+    .unwrap();
+    let t2 = table.clone();
+    assert_parallel_incremental(
+        incremental_rig(Rig::pg_batch(&format!("public.{table}"))),
+        || {
+            let mut c2 = pg_connect();
+            c2.execute(
+                &format!("INSERT INTO {t2} SELECT g, g FROM generate_series(1001, 1500) g"),
+                &[],
+            )
+            .unwrap();
+        },
+    );
+    let _ = c.execute(&format!("DROP TABLE IF EXISTS {table}"), &[]);
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mysql"]
+fn parallel_keyset_incremental_mysql() {
+    require_alive(LiveService::Mysql);
+    use mysql::prelude::Queryable;
+    let table = unique_name("pk_inc_my");
+    let mut c = mysql_connect();
+    c.query_drop(format!("DROP TABLE IF EXISTS {table}"))
+        .unwrap();
+    c.query_drop(format!(
+        "CREATE TABLE {table} (id BIGINT PRIMARY KEY, payload INT NOT NULL)"
+    ))
+    .unwrap();
+    c.query_drop("SET SESSION cte_max_recursion_depth = 20000")
+        .unwrap();
+    c.query_drop(format!(
+        "INSERT INTO {table} (id, payload) \
+         WITH RECURSIVE seq AS (SELECT 1 n UNION ALL SELECT n+1 FROM seq WHERE n < 1000) \
+         SELECT n, n FROM seq"
+    ))
+    .unwrap();
+    let t2 = table.clone();
+    assert_parallel_incremental(incremental_rig(Rig::mysql_batch(&table)), || {
+        let mut c2 = mysql_connect();
+        c2.query_drop("SET SESSION cte_max_recursion_depth = 20000")
+            .unwrap();
+        c2.query_drop(format!(
+            "INSERT INTO {t2} (id, payload) \
+             WITH RECURSIVE seq AS (SELECT 1001 n UNION ALL SELECT n+1 FROM seq WHERE n < 1500) \
+             SELECT n, n FROM seq"
+        ))
+        .unwrap();
+    });
+    let _ = c.query_drop(format!("DROP TABLE IF EXISTS {table}"));
+}
+
+#[test]
+#[ignore = "live: requires docker compose --profile cdc up -d mssql"]
+fn parallel_keyset_incremental_mssql() {
+    require_alive(LiveService::Mssql);
+    let table = unique_name("pk_inc_ms");
+    mssql_exec(&format!("DROP TABLE IF EXISTS {table}"));
+    mssql_exec(&format!(
+        "CREATE TABLE {table} (id BIGINT NOT NULL PRIMARY KEY, payload INT NOT NULL)"
+    ));
+    mssql_exec(&format!(
+        "WITH nums AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM nums WHERE n < 1000) \
+         INSERT INTO {table} (id, payload) SELECT n, n FROM nums OPTION (MAXRECURSION 0)"
+    ));
+    let t2 = table.clone();
+    assert_parallel_incremental(incremental_rig(Rig::mssql_batch(&table)), || {
+        mssql_exec(&format!(
+            "WITH nums AS (SELECT 1001 AS n UNION ALL SELECT n + 1 FROM nums WHERE n < 1500) \
+             INSERT INTO {t2} (id, payload) SELECT n, n FROM nums OPTION (MAXRECURSION 0)"
+        ));
+    });
+    mssql_exec(&format!("DROP TABLE IF EXISTS {table}"));
+}
