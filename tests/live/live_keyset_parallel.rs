@@ -13,6 +13,28 @@ use arrow::array::{Array, Int64Array};
 
 use crate::common::*;
 
+/// Total rows across every parquet part — schema-agnostic (works for any key type:
+/// varchar / decimal / unsigned bigint where the typed `id` reader below can't apply).
+fn count_rows(dir: &std::path::Path) -> usize {
+    read_all_parts(dir).iter().map(|b| b.num_rows()).sum()
+}
+
+/// Distinct `pk_w{range}` workers the parallel runner fanned out to (a collapse to
+/// one worker == a boundary probe that could not read the key).
+fn worker_fanout(dir: &std::path::Path) -> usize {
+    files_with_extension(dir, "parquet")
+        .iter()
+        .filter_map(|p| p.file_name().and_then(|n| n.to_str()).map(String::from))
+        .filter_map(|n| {
+            n.split("_pk_w")
+                .nth(1)
+                .and_then(|s| s.split('_').next())
+                .map(String::from)
+        })
+        .collect::<BTreeSet<String>>()
+        .len()
+}
+
 /// Read the BIGINT `id` column across every parquet part + count the DISTINCT
 /// `pk_w{range}` workers the parallel runner fanned out to. A collapse to one
 /// worker (a boundary probe that could not read the key) shows as workers == 1.
@@ -416,4 +438,248 @@ fn parallel_keyset_incremental_mssql() {
         ));
     });
     mssql_exec(&format!("DROP TABLE IF EXISTS {table}"));
+}
+
+// ── Edge-case scenarios (regression guards for the under-tested surface) ──────
+
+/// `parallel: N` with N GREATER than the row count: the OFFSET percentile sampler
+/// yields fewer distinct boundaries than requested, so the runner must produce fewer,
+/// larger ranges and still export EVERY row exactly once — never crash or drop.
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn parallel_keyset_more_workers_than_rows_postgres() {
+    require_alive(LiveService::Postgres);
+    let table = unique_name("pk_fewrows");
+    let mut c = pg_connect();
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {table};
+         CREATE TABLE {table} (id BIGINT PRIMARY KEY, payload INT NOT NULL);
+         INSERT INTO {table} SELECT g, g FROM generate_series(1, 5) g;"
+    ))
+    .unwrap();
+    let rig = Rig::pg_batch(&format!("public.{table}"))
+        .mode("chunked")
+        .export_line("chunk_by_key: id")
+        .export_line("parallel: 8")
+        .export_line("chunk_size: 2");
+    rig.run_ok();
+    let (count, keys, _) = id_set_and_fanout(&rig.out_dir());
+    assert_eq!(
+        count, 5,
+        "every row exported once even with more workers than rows"
+    );
+    assert_eq!(keys, (1..=5i64).collect::<BTreeSet<i64>>());
+    let _ = c.execute(&format!("DROP TABLE IF EXISTS {table}"), &[]);
+}
+
+/// Parallel keyset on a VARCHAR key: the boundary literals are text, injected + escaped
+/// per dialect. Fan-out must not collapse and every key must round-trip (a text-boundary
+/// mishandling would drop a range).
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn parallel_keyset_varchar_key_postgres() {
+    require_alive(LiveService::Postgres);
+    let table = unique_name("pk_vc");
+    let mut c = pg_connect();
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {table};
+         CREATE TABLE {table} (k VARCHAR(20) PRIMARY KEY, payload INT NOT NULL);
+         INSERT INTO {table} SELECT 'k' || lpad(g::text, 6, '0'), g FROM generate_series(1, 3000) g;"
+    ))
+    .unwrap();
+    let rig = Rig::pg_batch(&format!("public.{table}"))
+        .mode("chunked")
+        .export_line("chunk_by_key: k")
+        .export_line("parallel: 4")
+        .export_line("chunk_size: 500");
+    rig.run_ok();
+    assert_eq!(
+        count_rows(&rig.out_dir()),
+        3000,
+        "varchar-key parallel keyset exports every row"
+    );
+    assert!(
+        worker_fanout(&rig.out_dir()) >= 2,
+        "varchar key must fan out, not collapse"
+    );
+    let _ = c.execute(&format!("DROP TABLE IF EXISTS {table}"), &[]);
+}
+
+/// Parallel keyset on a DECIMAL key must FAIL LOUD at plan time — the keyset cursor
+/// cannot advance past a decimal/numeric, so accepting it would fail MID-RUN after a
+/// partial write (silent data risk). The planner rejects it up front with an actionable
+/// message; this guards that the rejection stays loud + pre-run (never a mid-run crash).
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn parallel_keyset_decimal_key_rejected_loudly_postgres() {
+    require_alive(LiveService::Postgres);
+    let table = unique_name("pk_dec");
+    let mut c = pg_connect();
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {table};
+         CREATE TABLE {table} (dkey DECIMAL(20,0) PRIMARY KEY, payload INT NOT NULL);
+         INSERT INTO {table} SELECT g::decimal, g FROM generate_series(1, 3000) g;"
+    ))
+    .unwrap();
+    let err = Rig::pg_batch(&format!("public.{table}"))
+        .mode("chunked")
+        .export_line("chunk_by_key: dkey")
+        .export_line("parallel: 4")
+        .export_line("chunk_size: 500")
+        .run_expect_fail();
+    assert!(
+        err.contains("not a usable keyset key") && err.to_lowercase().contains("decimal"),
+        "a decimal keyset key must be rejected loudly at plan time, got: {err}"
+    );
+    // Nothing was written — the rejection is pre-run, not a mid-run partial.
+    let _ = c.execute(&format!("DROP TABLE IF EXISTS {table}"), &[]);
+}
+
+/// Parallel keyset on a BIGINT UNSIGNED key ENTIRELY above i64::MAX (the field
+/// unsigned-keyset regime, fast small-N variant of the 10M golden): the boundary
+/// literals + paging cursor must round-trip as u64, or rows past i64::MAX are dropped.
+#[test]
+#[ignore = "live: requires docker compose up -d mysql"]
+fn parallel_keyset_unsigned_above_i64_max_mysql() {
+    require_alive(LiveService::Mysql);
+    use mysql::prelude::Queryable;
+    let table = unique_name("pk_u64");
+    let mut c = mysql_connect();
+    c.query_drop(format!("DROP TABLE IF EXISTS {table}"))
+        .unwrap();
+    c.query_drop(format!(
+        "CREATE TABLE {table} (id BIGINT UNSIGNED PRIMARY KEY, payload INT NOT NULL)"
+    ))
+    .unwrap();
+    // 2000 keys all > i64::MAX (9223372036854775807): id = 10^19 + n*10^6.
+    c.query_drop("SET SESSION cte_max_recursion_depth = 20000")
+        .unwrap();
+    c.query_drop(format!(
+        "INSERT INTO {table} (id, payload) \
+         WITH RECURSIVE seq AS (SELECT 1 n UNION ALL SELECT n+1 FROM seq WHERE n < 2000) \
+         SELECT CAST(10000000000000000000 AS UNSIGNED) + CAST(n AS UNSIGNED) * 1000000, n FROM seq"
+    ))
+    .unwrap();
+    let rig = Rig::mysql_batch(&table)
+        .mode("chunked")
+        .export_line("chunk_by_key: id")
+        .export_line("parallel: 4")
+        .export_line("chunk_size: 400");
+    rig.run_ok();
+    assert_eq!(
+        count_rows(&rig.out_dir()),
+        2000,
+        "every u64 key above i64::MAX exported once (no signed-overflow drop)"
+    );
+    assert!(
+        worker_fanout(&rig.out_dir()) >= 2,
+        "unsigned key must fan out"
+    );
+    let _ = c.query_drop(format!("DROP TABLE IF EXISTS {table}"));
+}
+
+/// Crash after a LATER range commits (range 2 of 4), not just range 0 — resume must
+/// still recover every row. Guards the assumption that recovery works regardless of
+/// WHICH range's commit the crash follows.
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn parallel_keyset_crash_after_later_range_postgres() {
+    require_alive(LiveService::Postgres);
+    let table = unique_name("pk_crash2");
+    let mut c = pg_connect();
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {table};
+         CREATE TABLE {table} (id BIGINT PRIMARY KEY, payload INT NOT NULL);
+         INSERT INTO {table} SELECT g, g FROM generate_series(1, 2000) g;"
+    ))
+    .unwrap();
+    let rig = crash_rig(Rig::pg_batch(&format!("public.{table}")));
+    let crash = rig.run_with_env("RIVET_TEST_PANIC_AT", "keyset_parallel_range_committed:2");
+    assert!(
+        !crash.status.success(),
+        "crash after range 2 must fail run 1"
+    );
+    rig.run_ok();
+    let (count, keys, _) = id_set_and_fanout(&rig.out_dir());
+    assert_eq!(
+        count, 2000,
+        "resume after a later-range crash recovers every row"
+    );
+    assert_eq!(keys, (1..=2000i64).collect::<BTreeSet<i64>>());
+    let _ = c.execute(&format!("DROP TABLE IF EXISTS {table}"), &[]);
+}
+
+/// Bug #2 regression: incremental parallel keyset on a TEXT key CONTAINING backslashes,
+/// under a server whose global sql_mode includes NO_BACKSLASH_ESCAPES. The boundary
+/// sampler (query_scalar) injects the escaped anchor literal; if its connection does not
+/// pin sql_mode like the workers' do, `'p\\...'` mis-parses, a sampled boundary lands
+/// below the true anchor, and a worker range re-reads already-exported rows -> cross-run
+/// DUP. With the sampler pinned (reuse of MysqlSessionGuard), the union is exact.
+/// Sets + restores @@global.sql_mode; the restore runs BEFORE the asserts so a failure
+/// never leaves the server dirty.
+#[test]
+#[ignore = "live: requires docker compose up -d mysql"]
+fn parallel_keyset_incremental_survives_no_backslash_escapes_mysql() {
+    require_alive(LiveService::Mysql);
+    use mysql::prelude::Queryable;
+    let table = unique_name("pk_nbs");
+    let mut c = mysql_connect();
+    let orig: String = c.query_first("SELECT @@global.sql_mode").unwrap().unwrap();
+    // The hostile sql_mode must be the SERVER default so rivet's OWN connections inherit
+    // it — that needs SUPER / SYSTEM_VARIABLES_ADMIN. Skip where the test user lacks it
+    // (the dev stack); this is a real guard on a server the tester controls.
+    if c.query_drop("SET GLOBAL sql_mode = CONCAT(@@global.sql_mode, ',NO_BACKSLASH_ESCAPES')")
+        .is_err()
+    {
+        eprintln!("skip: setting @@global.sql_mode needs SUPER (unavailable for the test user)");
+        return;
+    }
+    c.query_drop(format!("DROP TABLE IF EXISTS {table}"))
+        .unwrap();
+    c.query_drop(format!(
+        "CREATE TABLE {table} (k VARCHAR(40) PRIMARY KEY, payload INT NOT NULL)"
+    ))
+    .unwrap();
+    c.query_drop("SET SESSION cte_max_recursion_depth = 20000")
+        .unwrap();
+    // 1000 text keys each containing a backslash (CHAR(92)): 'p\000001'..'p\001000'.
+    c.query_drop(format!(
+        "INSERT INTO {table} (k, payload) \
+         WITH RECURSIVE seq AS (SELECT 1 n UNION ALL SELECT n+1 FROM seq WHERE n < 1000) \
+         SELECT CONCAT('p', CHAR(92), LPAD(n, 6, '0')), n FROM seq"
+    ))
+    .unwrap();
+
+    let rig = Rig::mysql_batch(&table)
+        .mode("chunked")
+        .export_line("chunk_by_key: k")
+        .export_line("parallel: 4")
+        .export_line("chunk_checkpoint: true")
+        .export_line("keyset_incremental: true")
+        .export_line("chunk_size: 200");
+    rig.run_ok();
+    let r1 = count_rows(&rig.out_dir());
+    // add 500 more keys ABOVE the anchor, then an incremental run past the backslash anchor.
+    c.query_drop(format!(
+        "INSERT INTO {table} (k, payload) \
+         WITH RECURSIVE seq AS (SELECT 1001 n UNION ALL SELECT n+1 FROM seq WHERE n < 1500) \
+         SELECT CONCAT('p', CHAR(92), LPAD(n, 6, '0')), n FROM seq"
+    ))
+    .unwrap();
+    rig.run_ok();
+    let r2 = count_rows(&rig.out_dir());
+
+    // Restore the global sql_mode + drop BEFORE asserting.
+    let _ = c.query_drop(format!(
+        "SET GLOBAL sql_mode = '{}'",
+        orig.replace('\'', "''")
+    ));
+    let _ = c.query_drop(format!("DROP TABLE IF EXISTS {table}"));
+
+    assert_eq!(r1, 1000, "run 1 exports all 1000 backslash-keyed rows");
+    assert_eq!(
+        r2, 1500,
+        "incremental run past a backslash anchor under NO_BACKSLASH_ESCAPES must add EXACTLY \
+         the 500 new keys — not dup (>1500) via a mis-parsed sampler boundary, nor lose (<1500)"
+    );
 }
