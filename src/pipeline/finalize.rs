@@ -97,7 +97,7 @@ pub(super) fn finalize_manifest(
     // from manifest_parts (the bug parallel_checkpoint had before e9b0796).
     // Debug-build only — compiled out in release.
     if cfg!(debug_assertions)
-        && let Err(e) = summary.check_post_run_invariants()
+        && let Err(e) = summary.check_post_run_invariants(plan.resume)
     {
         panic!(
             "summary↔manifest coherence violated at finalize_manifest \

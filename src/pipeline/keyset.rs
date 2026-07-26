@@ -604,15 +604,19 @@ fn run_keyset_parallel(
     summary.cursor_low = None; // a fresh parallel run seeks from the floor of each range
 
     // Record this run's parts through the commit seam (populates
-    // summary.manifest_parts + counters + journal). state=None: the workers ALREADY
-    // wrote file_log atomically with their `done` flip, so a second file_log write
-    // here would duplicate it.
+    // summary.manifest_parts + counters + journal). On a CHECKPOINT run the workers
+    // ALREADY wrote file_log atomically with their `done` flip, so pass None here to
+    // avoid a duplicate write. On a NON-checkpoint run the workers write no file_log
+    // (their commit_keyset_range_at_ref is gated on state_ref = checkpoint-only), so
+    // the merge must write it — matching the sequential keyset path, which records
+    // file_log unconditionally.
+    let file_log_state = if checkpoint { None } else { state };
     let parts = parts_mx.into_inner().unwrap();
     for (idx, rec) in parts.iter().enumerate() {
         super::commit::record_part(
             plan,
             summary,
-            None,
+            file_log_state,
             rec,
             super::commit::PartKind::Page {
                 page_index: idx as i64,

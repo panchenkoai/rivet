@@ -665,15 +665,20 @@ const PG_MIGRATIONS: &[(i64, &str)] = &[
          ALTER TABLE export_metrics ADD COLUMN server_context_json TEXT;",
     ),
     // v19: parallel-keyset crash-recovery ranges (see the SQLite v19 comment).
+    // range_index/done are BIGINT (not the SQLite INTEGER): the state layer binds
+    // them as StateParam::I64 and reads them via StateRow::i64, and rust-postgres
+    // is strictly typed (i64 <-> INT8 only) — an int4 column would reject the bind
+    // (WrongType at persist) and panic on the read (resume). Every other integer
+    // column in PG_MIGRATIONS is BIGINT for exactly this reason.
     (
         19,
         "CREATE TABLE IF NOT EXISTS keyset_range (
             export_name TEXT NOT NULL,
             run_id      TEXT NOT NULL,
-            range_index INTEGER NOT NULL,
+            range_index BIGINT NOT NULL,
             lo          TEXT,
             hi          TEXT,
-            done        INTEGER NOT NULL DEFAULT 0,
+            done        BIGINT NOT NULL DEFAULT 0,
             updated_at  TEXT NOT NULL,
             PRIMARY KEY (export_name, range_index)
         );",

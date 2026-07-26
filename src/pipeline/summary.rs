@@ -741,7 +741,14 @@ impl RunSummary {
     ///
     /// Returns `Ok(())` when the summary satisfies the invariants, else an
     /// `Err(String)` naming which one was violated and by how much.
-    pub fn check_post_run_invariants(&self) -> Result<(), String> {
+    /// `is_resume_run` is the actual `--resume` invocation (plan.resume), NOT the
+    /// `resumed` diagnosis flag (adopted_prior_work). They differ on a checkpoint
+    /// resume that crashed BEFORE its first chunk committed: no prior manifest exists
+    /// so adopted_prior_work() — and thus `resumed` — is false, yet the drift gate was
+    /// still legitimately skipped (plan.resume bypasses prepare_chunk_plan). Keying the
+    /// exemption on the flag as well as `resumed` stops the guard from panicking such a
+    /// legitimate crash-recovery resume in debug/test builds.
+    pub fn check_post_run_invariants(&self, is_resume_run: bool) -> Result<(), String> {
         let parts_bytes: u64 = self.manifest_parts.iter().map(|p| p.size_bytes).sum();
 
         if self.files_committed > self.manifest_parts.len() {
@@ -808,8 +815,11 @@ impl RunSummary {
             // means no runner ever called the gate — EXCEPT on a resume, where the
             // drift gate is legitimately skipped (the baseline was set on the
             // original run; chunked's `--resume` bypasses prepare_chunk_plan, the
-            // only caller of check_from_type_mappings), so `resumed` runs are exempt.
-            if !self.resumed && self.schema_changed.is_none() {
+            // only caller of check_from_type_mappings). Exempt both the adopted-work
+            // diagnosis (`resumed`) AND the raw `--resume` flag (`is_resume_run`) — a
+            // resume that crashed before its first commit adopts nothing yet still
+            // skipped the gate.
+            if !self.resumed && !is_resume_run && self.schema_changed.is_none() {
                 return Err(
                     "state_backed success committed parts but schema_changed is None — \
                      the on_schema_drift gate was never applied (no runner called \
@@ -1527,31 +1537,31 @@ mod tests {
         let mut ok = base();
         ok.schema_changed = Some(false);
         ok.column_checksums.push(ck());
-        assert!(ok.check_post_run_invariants().is_ok());
+        assert!(ok.check_post_run_invariants(false).is_ok());
 
         // Drift gate skipped (schema_changed None) → RED.
         let mut no_drift = base();
         no_drift.column_checksums.push(ck());
-        let e = no_drift.check_post_run_invariants().unwrap_err();
+        let e = no_drift.check_post_run_invariants(false).unwrap_err();
         assert!(e.contains("on_schema_drift gate was never applied"), "{e}");
 
         // Form-B harvest skipped (empty + not incomplete) → RED.
         let mut no_formb = base();
         no_formb.schema_changed = Some(false);
-        let e = no_formb.check_post_run_invariants().unwrap_err();
+        let e = no_formb.check_post_run_invariants(false).unwrap_err();
         assert!(e.contains("Form-B was never harvested"), "{e}");
 
         // A suppressed Form-B (checkpoint resume) is NOT a bypass.
         let mut suppressed = base();
         suppressed.schema_changed = Some(false);
         suppressed.column_checksums_incomplete = true;
-        assert!(suppressed.check_post_run_invariants().is_ok());
+        assert!(suppressed.check_post_run_invariants(false).is_ok());
 
         // NOT state_backed (CDC / a direct-runner unit test) is exempt from the contract.
         let mut cdc = base();
         cdc.state_backed = false;
         assert!(
-            cdc.check_post_run_invariants().is_ok(),
+            cdc.check_post_run_invariants(false).is_ok(),
             "a non-run_export run must not be held to the facade contract"
         );
 
@@ -1561,8 +1571,30 @@ mod tests {
         resumed.column_checksums.push(ck());
         // schema_changed stays None
         assert!(
-            resumed.check_post_run_invariants().is_ok(),
+            resumed.check_post_run_invariants(false).is_ok(),
             "a resume must not trip the drift-gate branch"
+        );
+
+        // A --resume run that crashed BEFORE its first chunk committed adopts no prior
+        // work, so `resumed` (adopted_prior_work) is FALSE — but the drift gate was
+        // still legitimately skipped. Passing is_resume_run=true (plan.resume) must
+        // exempt it; keying only off `resumed` would panic a legitimate crash-recovery
+        // resume in debug/test. RED against `if !self.resumed && schema_changed.is_none()`.
+        let mut resume_flag_no_adopt = base();
+        resume_flag_no_adopt.resumed = false;
+        resume_flag_no_adopt.column_checksums.push(ck());
+        // schema_changed stays None (gate skipped on the --resume path)
+        assert!(
+            resume_flag_no_adopt.check_post_run_invariants(true).is_ok(),
+            "a --resume run that adopted no prior work (crash before first commit) must be exempt"
+        );
+        // ...and the SAME summary with is_resume_run=false (a fresh run) MUST still trip.
+        assert!(
+            resume_flag_no_adopt
+                .check_post_run_invariants(false)
+                .unwrap_err()
+                .contains("on_schema_drift gate was never applied"),
+            "a fresh (non-resume) run with the gate skipped must still be caught"
         );
 
         // A CSV/JSONL export harvests NO Form-B by design — exempt (M4).
@@ -1571,7 +1603,7 @@ mod tests {
         csv.format = "csv".into();
         // column_checksums empty, incomplete false
         assert!(
-            csv.check_post_run_invariants().is_ok(),
+            csv.check_post_run_invariants(false).is_ok(),
             "a non-Parquet export must not trip the Form-B branch"
         );
     }

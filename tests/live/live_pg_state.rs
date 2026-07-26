@@ -45,6 +45,54 @@ fn pg_cursor_round_trip() {
     assert!(empty.last_cursor_value.is_none());
 }
 
+/// Parallel-keyset crash-recovery ranges must round-trip on a Postgres STATE
+/// backend. The `keyset_range` table's range_index/done are bound as StateParam::I64
+/// and read as i64; the v19 PG migration originally declared them int4, so
+/// persist_keyset_ranges errored (WrongType) at OPEN and load/commit panicked on
+/// resume — parallel keyset + chunk_checkpoint was dead-on-arrival on PG state, a gap
+/// the SQLite-only unit tests could never see. This exercises persist → load → commit
+/// against real Postgres: RED on the int4 DDL, green on BIGINT.
+#[test]
+#[ignore]
+fn pg_keyset_range_round_trips_and_commits() {
+    use rivet::state::{KeysetRangePart, StateStore};
+    let Some(s) = pg_store() else { return };
+    let export = "pg_keyset_range_rt";
+    s.clear_keyset_ranges(export).ok();
+
+    let ranges = vec![
+        (None, Some("k0500".to_string())),
+        (Some("k0500".to_string()), None),
+    ];
+    // Binds range_index (i64) into the range_index column — WrongType on int4.
+    s.persist_keyset_ranges(export, "run-1", &ranges).unwrap();
+    // Reads range_index/done (i64) back — panics on int4.
+    let loaded = s.load_keyset_ranges(export, "run-1").unwrap();
+    assert_eq!(loaded.len(), 2);
+    assert!(loaded.iter().all(|r| !r.done), "fresh ranges are not done");
+
+    // Commit range 1 (a worker's atomic done-flip + file_log) over the PG StateRef.
+    StateStore::commit_keyset_range_at_ref(
+        s.state_ref(),
+        "run-1",
+        export,
+        1,
+        &[KeysetRangePart {
+            file_name: "pk_w1_0.parquet".to_string(),
+            rows: 7,
+            bytes: 70,
+        }],
+        "parquet",
+        None,
+    )
+    .unwrap();
+    let after = s.load_keyset_ranges(export, "run-1").unwrap();
+    assert!(!after[0].done, "range 0 untouched");
+    assert!(after[1].done, "range 1 committed → done");
+
+    s.clear_keyset_ranges(export).ok();
+}
+
 #[test]
 #[ignore]
 fn pg_schema_drift_detection() {

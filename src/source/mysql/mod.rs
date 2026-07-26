@@ -729,7 +729,13 @@ impl super::Source for MysqlSource {
 
     fn query_scalar(&mut self, sql: &str) -> Result<Option<String>> {
         let mut conn = self.pool.get_conn()?;
-        let row: Option<mysql::Row> = conn.query_first(sql)?;
+        // Pin the SAME session state the export/worker connections get (sql_mode with
+        // NO_BACKSLASH_ESCAPES stripped + UTC time_zone) via the shared guard.
+        // sample_key_boundaries runs INLINE escaped boundary literals through here; a
+        // sampler whose sql_mode disagrees with the workers' mis-parses a backslash-
+        // bearing key and drifts the percentile split points (the M1 hole this closes).
+        let mut guard = MysqlSessionGuard::apply(&mut conn, None)?;
+        let row: Option<mysql::Row> = guard.conn().query_first(sql)?;
         match row {
             Some(r) => {
                 let val: Option<mysql::Value> = r.get(0);
