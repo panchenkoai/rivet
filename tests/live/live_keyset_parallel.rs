@@ -20,10 +20,12 @@ fn count_rows(dir: &std::path::Path) -> usize {
 }
 
 /// Distinct `pk_w{range}` workers the parallel runner fanned out to (a collapse to
-/// one worker == a boundary probe that could not read the key).
+/// one worker == a boundary probe that could not read the key). Format-agnostic —
+/// the `_pk_w{ridx}_` token is in every part name regardless of parquet/csv.
 fn worker_fanout(dir: &std::path::Path) -> usize {
-    files_with_extension(dir, "parquet")
+    ["parquet", "csv"]
         .iter()
+        .flat_map(|ext| files_with_extension(dir, ext))
         .filter_map(|p| p.file_name().and_then(|n| n.to_str()).map(String::from))
         .filter_map(|n| {
             n.split("_pk_w")
@@ -730,4 +732,150 @@ fn parallel_keyset_works_with_a_select_only_source_user_postgres() {
     let _ = c.batch_execute(&format!(
         "DROP TABLE IF EXISTS {table}; DROP OWNED BY {role}; DROP ROLE IF EXISTS {role};"
     ));
+}
+
+/// Worker mid-range ERROR propagation (the non-crash path): when one worker's source read
+/// errors (connection drop / statement timeout), the run must FAIL CLEANLY — collect the
+/// error, bail, and finalize NOTHING (no _SUCCESS, no manifest), never a partial success.
+/// A clean re-run then recovers every row.
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn parallel_keyset_worker_error_aborts_cleanly_postgres() {
+    require_alive(LiveService::Postgres);
+    let table = unique_name("pk_werr");
+    let mut c = pg_connect();
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {table};
+         CREATE TABLE {table} (id BIGINT PRIMARY KEY, payload INT NOT NULL);
+         INSERT INTO {table} SELECT g, g FROM generate_series(1, 2000) g;"
+    ))
+    .unwrap();
+    let rig = parallel_keyset(Rig::pg_batch(&format!("public.{table}")));
+    // range 2's worker errors mid-range (Err, not a crash).
+    let out = rig.run_with_env("RIVET_TEST_ERROR_AT", "keyset_parallel_worker:2");
+    assert!(
+        !out.status.success(),
+        "a worker mid-range error must FAIL the run"
+    );
+    // No FALSE success: no _SUCCESS marker, and the manifest (written as a FAILED record
+    // so gc_orphans can classify + delete its partial parts) is NOT a Success.
+    assert!(
+        !rig.out_dir().join("_SUCCESS").exists(),
+        "a failed run must not write _SUCCESS"
+    );
+    let mf = rig.out_dir().join("manifest.json");
+    if mf.exists() {
+        let m: serde_json::Value = serde_json::from_slice(&std::fs::read(&mf).unwrap()).unwrap();
+        let status = m["status"].as_str().unwrap_or("").to_lowercase();
+        assert_ne!(
+            status, "success",
+            "a worker-error abort must leave a Failed/Interrupted manifest, not a Success"
+        );
+    }
+    // A clean re-run recovers everything (orphaned partial parts are a subset of the
+    // full clean set, so the DISTINCT key set is exactly 1..=2000).
+    rig.run_ok();
+    let (_, keys, _) = id_set_and_fanout(&rig.out_dir());
+    assert_eq!(
+        keys,
+        (1..=2000i64).collect::<BTreeSet<i64>>(),
+        "a clean re-run after a worker-error abort recovers every key"
+    );
+    let _ = c.execute(&format!("DROP TABLE IF EXISTS {table}"), &[]);
+}
+
+/// CSV row count across every `.csv` part (lines minus the per-file header).
+fn csv_row_count(dir: &std::path::Path) -> usize {
+    files_with_extension(dir, "csv")
+        .iter()
+        .map(|p| {
+            std::fs::read_to_string(p)
+                .map(|s| s.lines().count().saturating_sub(1))
+                .unwrap_or(0)
+        })
+        .sum()
+}
+
+/// Parallel keyset writing CSV (not parquet): the text-writer path must fan out and
+/// export every row (the runner is format-agnostic, but only parquet was exercised).
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn parallel_keyset_csv_format_postgres() {
+    require_alive(LiveService::Postgres);
+    let table = unique_name("pk_csv");
+    let mut c = pg_connect();
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {table};
+         CREATE TABLE {table} (id BIGINT PRIMARY KEY, payload INT NOT NULL);
+         INSERT INTO {table} SELECT g, g FROM generate_series(1, 3000) g;"
+    ))
+    .unwrap();
+    let rig = parallel_keyset(Rig::pg_batch(&format!("public.{table}"))).with_format("csv");
+    rig.run_ok();
+    assert_eq!(
+        csv_row_count(&rig.out_dir()),
+        3000,
+        "parallel keyset CSV exports every row"
+    );
+    assert!(
+        worker_fanout(&rig.out_dir()) >= 2,
+        "CSV parallel keyset must fan out (workers keyed in the part name like parquet)"
+    );
+    let _ = c.execute(&format!("DROP TABLE IF EXISTS {table}"), &[]);
+}
+
+/// partition_by + keyset is REJECTED LOUDLY at plan time: partitioning rewrites the
+/// query into a subquery, which defeats the `table:` index verification keyset needs.
+/// Guards that the incompatibility stays a pre-run error (not a silent wrong-plan).
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn parallel_keyset_partition_by_rejected_loudly_postgres() {
+    require_alive(LiveService::Postgres);
+    let table = unique_name("pk_part");
+    let mut c = pg_connect();
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {table};
+         CREATE TABLE {table} (id BIGINT PRIMARY KEY, grp INT NOT NULL);
+         INSERT INTO {table} SELECT g, g % 4 FROM generate_series(1, 3000) g;"
+    ))
+    .unwrap();
+    let err = parallel_keyset(Rig::pg_batch(&format!("public.{table}")))
+        .export_line("partition_by: grp")
+        .run_expect_fail();
+    assert!(
+        err.contains("partition_by is not compatible with chunk_by_key"),
+        "partition_by + keyset must be rejected loudly at plan time, got: {err}"
+    );
+    let _ = c.execute(&format!("DROP TABLE IF EXISTS {table}"), &[]);
+}
+
+/// Concurrency stress: MORE workers (parallel: 8) + a small chunk_size so each range
+/// pages many times, exercising the shared Mutex/Atomic merge (parts, checksums,
+/// range_max, rows) under heavier contention than the 4-worker parity tests.
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn parallel_keyset_eight_workers_concurrency_postgres() {
+    require_alive(LiveService::Postgres);
+    let table = unique_name("pk_conc");
+    let mut c = pg_connect();
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {table};
+         CREATE TABLE {table} (id BIGINT PRIMARY KEY, payload INT NOT NULL);
+         INSERT INTO {table} SELECT g, g FROM generate_series(1, 8000) g;"
+    ))
+    .unwrap();
+    let rig = Rig::pg_batch(&format!("public.{table}"))
+        .mode("chunked")
+        .export_line("chunk_by_key: id")
+        .export_line("parallel: 8")
+        .export_line("chunk_size: 250");
+    rig.run_ok();
+    let (count, keys, workers) = id_set_and_fanout(&rig.out_dir());
+    assert_eq!(
+        count, 8000,
+        "8-worker keyset merges every row once (no race drop/dupe)"
+    );
+    assert_eq!(keys, (1..=8000i64).collect::<BTreeSet<i64>>());
+    assert!(workers >= 4, "8 workers must fan out widely, got {workers}");
+    let _ = c.execute(&format!("DROP TABLE IF EXISTS {table}"), &[]);
 }

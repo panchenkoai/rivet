@@ -489,6 +489,16 @@ fn run_keyset_parallel(
                     Option<String>,
                 )> = Vec::new();
                 loop {
+                    // Test-only: simulate a per-worker SQL error mid-range (Err path,
+                    // not a crash). The worker records it + returns; the post-join check
+                    // bails, so the run fails cleanly with no _SUCCESS / finalized manifest.
+                    if let Err(e) = crate::test_hook::maybe_error_at_index(
+                        "keyset_parallel_worker",
+                        ridx as i64,
+                    ) {
+                        errs_r.lock().unwrap().push(format!("range {ridx}: {e}"));
+                        return;
+                    }
                     let base = format!(
                         "{}_{}_pk_w{}_{}.{}",
                         plan_r.export_name, tag_r, ridx, pages, ext_r

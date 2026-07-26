@@ -80,6 +80,21 @@ pub(crate) fn maybe_exit_at_index(point: &str, index: i64) {
     }
 }
 
+/// Return an `Err` if `RIVET_TEST_ERROR_AT` matches `"{point}:{index}"` — simulates a
+/// per-worker SQL error (connection drop / statement timeout) MID-RANGE, distinct from
+/// the hard-exit crash: the worker RETURNS an error (not process death), the parallel
+/// runner collects it and bails, so NO `_SUCCESS` / manifest is finalized.
+pub(crate) fn maybe_error_at_index(point: &str, index: i64) -> Result<(), String> {
+    if let Ok(p) = std::env::var("RIVET_TEST_ERROR_AT")
+        && p == format!("{point}:{index}")
+    {
+        return Err(format!(
+            "rivet test-hook: injected error at '{point}:{index}' (RIVET_TEST_ERROR_AT)"
+        ));
+    }
+    Ok(())
+}
+
 /// Panic if the current chunk-level fault point matches `"{point}:{chunk_index}"`.
 ///
 /// Configure via `RIVET_TEST_PANIC_AT=after_chunk_complete:0` to crash after
