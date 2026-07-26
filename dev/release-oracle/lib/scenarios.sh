@@ -4,12 +4,43 @@
 # applied) and the DuckDB independent oracle — the same discipline the manual
 # dogfood used, now deterministic and repeatable.
 
+# ── keyset_parallel: the feat/parallel-keyset fan-out, end-to-end per engine ──
+# The sequential keyset path is already exercised by integrity_types/load. This
+# scenario proves the PARALLEL variant on the same 150K users table: (1) the same
+# independent DuckDB loss/dup oracle (no row lost or duped across the N ranges),
+# AND (2) the run actually FANNED OUT — parallel:4 must produce >=2 distinct
+# `_pk_w{ridx}_` worker parts, else it silently degraded to sequential and the
+# headline feature never engaged. Mongo's `parallel:N` is the separate _id-range
+# reader (mongo_parallel), not SQL keyset, so it is NA here.
+sc_keyset_parallel() {
+  local eng=$1 tag=$2 url=$3
+  [ "$eng" = mongo ] && { skip "keyset_parallel[mongo]: separate _id-range path (mongo_parallel), not SQL keyset"; add "$eng" "$tag" keyset_parallel - SKIP "mongo na"; return; }
+  local out="$WORK/kp_${eng}_${tag//./_}"   # own line — bash 3.2 same-line ${eng} gotcha
+  mkdir -p "$out"
+  if ! _export_local "$eng" "$url" users "$out/users" chunked parquet 4; then
+    bad "keyset_parallel[$eng]: export failed"; add "$eng" "$tag" keyset_parallel - FAIL "export"; return
+  fi
+  local fails=""
+  # (1) loss/dup — the SAME independent oracle integrity_types uses.
+  local scnt dcnt
+  scnt="$(_source_count_distinct "$eng" "$url" users id)"
+  dcnt="$(duckdb -noheader -list -c "SELECT count(*)||' '||count(DISTINCT id) FROM read_parquet('$out/users/**/*.parquet')" 2>/dev/null)"
+  [ "$scnt" = "$dcnt" ] || fails+="loss/dup src[$scnt]!=parquet[$dcnt] "
+  # (2) fan-out — >=2 distinct pk_w{ridx} workers (find, not ** — bash 3.2 has no globstar).
+  local workers
+  workers="$(find "$out/users" -name '*.parquet' 2>/dev/null | grep -oE '_pk_w[0-9]+_' | sort -u | wc -l | tr -d ' ')"
+  [ "${workers:-0}" -ge 2 ] || fails+="fan-out workers=${workers:-0} (parallel:4 degraded to sequential) "
+  [ -z "$fails" ] && { ok "keyset_parallel (loss/dup 0, fan-out $workers workers)"; add "$eng" "$tag" keyset_parallel - PASS "$workers workers"; } \
+                  || { bad "keyset_parallel: $fails"; add "$eng" "$tag" keyset_parallel - FAIL "$fails"; }
+}
+
 run_scenarios() {
   local eng=$1 tag=$2 url=$3
   sc_verdicts "$eng" "$tag" "$url"
   sc_integrity_types "$eng" "$tag" "$url"
   # blessing the local goldens (verdicts + duckdb-type) — skip the store loads.
   { [ "${BLESS_VERDICTS:-0}" = 1 ] || [ "${BLESS_DUCKDB:-0}" = 1 ]; } && return
+  sc_keyset_parallel "$eng" "$tag" "$url"
   for store in $(cfg stores); do
     sc_load "$eng" "$tag" "$url" "$store"
   done
@@ -212,11 +243,16 @@ _hostport() { docker ps --format '{{.Names}} {{.Ports}}' | grep "rivet-oracle-en
 
 # export one table to a LOCAL dir. mode: chunked|full. fmt: parquet|csv (default parquet).
 _export_local() {
-  local eng=$1 url=$2 tbl=$3 dir=$4 mode=$5 fmt=${6:-parquet}
+  local eng=$1 url=$2 tbl=$3 dir=$4 mode=$5 fmt=${6:-parquet} parallel=${7:-}
   local yaml="$WORK/ex_$$_${tbl//./_}_${fmt}.yaml"   # own line — bash 3.2 same-line ${tbl} gotcha
   rm -rf "$dir"; export ORACLE_URL="$url"
   [ "$eng" = mongo ] && mode=full   # Mongo has no keyset/chunked — full scan only
-  local keyline="    mode: full"; [ "$mode" = chunked ] && keyline=$'    mode: chunked\n    chunk_by_key: id\n    chunk_size: 50000'
+  local keyline="    mode: full"
+  if [ "$mode" = chunked ]; then
+    keyline=$'    mode: chunked\n    chunk_by_key: id\n    chunk_size: 50000'
+    # parallel: N fans keyset into N ROW-percentile ranges (feat/parallel-keyset).
+    [ -n "$parallel" ] && keyline+=$'\n    parallel: '"$parallel"
+  fi
   local tlsblk=""; [ "$eng" = mssql ] && tlsblk=$'\n  tls: {accept_invalid_certs: true}'
   cat > "$yaml" <<YAML
 source:
