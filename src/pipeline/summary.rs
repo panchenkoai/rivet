@@ -91,6 +91,15 @@ pub struct RunSummary {
     /// (keyset via the in-progress run_id, chunked via `--resume`). A resume-hit is
     /// the tell that the previous run died — visible in the run's own log line.
     pub resumed: bool,
+    /// True once this run entered `run_export` — the shared batch-runner dispatch
+    /// choke point, which always has a `StateStore`. It marks a run subject to the
+    /// per-runner facade contract (ADR-0018): every batch runner MUST apply the
+    /// schema-drift gate + Form-B harvest. `check_post_run_invariants` asserts those
+    /// facades ran ONLY for such runs, so a CDC run or a direct-`run_single_export`
+    /// unit test (state = None, never through `run_export`) is not held to the
+    /// contract and cannot false-positive. This is the structural half of the
+    /// runner-bypass guard the `runner-coverage-matrix` tracks by hand.
+    pub state_backed: bool,
     pub validated: Option<bool>,
     pub schema_changed: Option<bool>,
     pub quality_passed: Option<bool>,
@@ -230,6 +239,7 @@ impl RunSummary {
             retries: 0,
             reconnects: 0,
             resumed: false,
+            state_backed: false,
             validated: None,
             schema_changed: None,
             quality_passed: None,
@@ -305,6 +315,7 @@ impl RunSummary {
             retries: 0,
             reconnects: 0,
             resumed: false,
+            state_backed: false,
             validated: None,
             schema_changed: None,
             quality_passed: None,
@@ -781,6 +792,40 @@ impl RunSummary {
                  source but no files committed (no output reached the destination)",
                 self.total_rows
             ));
+        }
+        // Runner-bypass guard (structural half of runner-coverage-matrix). A
+        // batch run (`state_backed`, i.e. through `run_export`) that committed
+        // parts MUST have applied the per-runner facades (ADR-0018). Each facade
+        // leaves a telltale on the summary; a runner that owns its loop and forgets
+        // to CALL a facade leaves it absent — the exact bypass class that recurs
+        // (this session's parallel-keyset drift-gate miss; earlier, Form-B on the
+        // large-table runners). Gated on `state_backed` so CDC and direct-runner
+        // unit tests (never through `run_export`) are not held to the contract.
+        if self.state_backed && self.status == "success" && self.files_committed > 0 {
+            // Schema-drift gate: every batch runner calls check_from_sink_schema /
+            // check_from_type_mappings, which ALWAYS leaves schema_changed = Some(_)
+            // when it runs (Some(false) even on a skip/tracking-error). `None` here
+            // means no runner ever called the gate.
+            if self.schema_changed.is_none() {
+                return Err(
+                    "state_backed success committed parts but schema_changed is None — \
+                     the on_schema_drift gate was never applied (no runner called \
+                     check_from_sink_schema / check_from_type_mappings). This is the \
+                     runner-bypass class: a runner owning its loop skipped the facade."
+                        .to_string(),
+                );
+            }
+            // Form-B harvest: harvest_column_checksums either POPULATES
+            // column_checksums or, on a checkpoint-resume that can't recover them,
+            // sets column_checksums_incomplete. Both empty means no runner harvested.
+            if self.column_checksums.is_empty() && !self.column_checksums_incomplete {
+                return Err(
+                    "state_backed success committed parts but column_checksums is empty \
+                     and not flagged incomplete — Form-B was never harvested (no runner \
+                     called harvest_column_checksums). Runner-bypass class."
+                        .to_string(),
+                );
+            }
         }
         Ok(())
     }
@@ -1439,6 +1484,68 @@ mod tests {
         assert!(
             value.contains('⚠') && value.contains("batch_size"),
             "spill over 100 MB carries the tuning hint: {value:?}"
+        );
+    }
+
+    #[test]
+    fn post_run_invariants_flag_a_runner_that_skipped_a_facade() {
+        use crate::manifest::{ColumnChecksum, ManifestPart, PartStatus};
+        // A state_backed success that committed one part — the shape every batch
+        // runner produces. base() applied BOTH facades; each variant drops one.
+        let base = || {
+            let mut s = RunSummary::stub_for_testing("r", "orders");
+            s.status = "success".into();
+            s.state_backed = true;
+            s.files_committed = 1;
+            s.files_produced = 1;
+            s.bytes_written = 10;
+            s.total_rows = 5;
+            s.manifest_parts.push(ManifestPart {
+                part_id: 1,
+                path: "p.parquet".into(),
+                rows: 5,
+                size_bytes: 10,
+                content_fingerprint: String::new(),
+                content_md5: String::new(),
+                status: PartStatus::Committed,
+            });
+            s
+        };
+        let ck = || ColumnChecksum {
+            name: "id".into(),
+            checksum: "1".into(),
+        };
+
+        // Both facades applied → passes.
+        let mut ok = base();
+        ok.schema_changed = Some(false);
+        ok.column_checksums.push(ck());
+        assert!(ok.check_post_run_invariants().is_ok());
+
+        // Drift gate skipped (schema_changed None) → RED.
+        let mut no_drift = base();
+        no_drift.column_checksums.push(ck());
+        let e = no_drift.check_post_run_invariants().unwrap_err();
+        assert!(e.contains("on_schema_drift gate was never applied"), "{e}");
+
+        // Form-B harvest skipped (empty + not incomplete) → RED.
+        let mut no_formb = base();
+        no_formb.schema_changed = Some(false);
+        let e = no_formb.check_post_run_invariants().unwrap_err();
+        assert!(e.contains("Form-B was never harvested"), "{e}");
+
+        // A suppressed Form-B (checkpoint resume) is NOT a bypass.
+        let mut suppressed = base();
+        suppressed.schema_changed = Some(false);
+        suppressed.column_checksums_incomplete = true;
+        assert!(suppressed.check_post_run_invariants().is_ok());
+
+        // NOT state_backed (CDC / a direct-runner unit test) is exempt from the contract.
+        let mut cdc = base();
+        cdc.state_backed = false;
+        assert!(
+            cdc.check_post_run_invariants().is_ok(),
+            "a non-run_export run must not be held to the facade contract"
         );
     }
 

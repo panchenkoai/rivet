@@ -113,6 +113,25 @@ layer (L3) the facade addresses.
 > re-duplicate the detect → policy → store state machine across single
 > mode plus the four chunked Detect arms.
 
+> **Update (2026-07, feat/parallel-keyset):** a 7th runner landed —
+> `keyset_parallel` (N row-percentile-range workers, per-range crash-recovery;
+> see ADR-0017's new row). It re-confirmed the standing gap: the facades make
+> the per-part / cursor / drift logic *live once*, but **calling** them is still
+> per-runner convention, and the completeness ledger
+> (`runner-coverage-matrix.yaml`) models 4 runners for ~8 loops — so a runner
+> that owns its loop can still forget a facade (iteration 1 of this branch
+> shipped `keyset_parallel` without the drift gate; a human caught it, not a
+> guard). The fix extends `check_post_run_invariants` (already the structural
+> guard for the M1 `manifest_parts` gap) to the drift + Form-B facades: each
+> leaves a telltale on `RunSummary` when it runs (`schema_changed = Some(_)`;
+> `column_checksums` populated or `..._incomplete` set), and a `state_backed`
+> success that committed parts with either telltale ABSENT panics in
+> debug/test. This makes "you called the facade" machine-checked for the two
+> write-groups the M1 assert didn't cover — the runner-bypass class becomes
+> RED-by-construction, not a matrix cell a reviewer maintains by hand. It does
+> NOT reopen facade-vs-trait; the facades stay, only their invocation is now
+> verified.
+
 ## Why "builder" instead of one method with `Option` args
 
 Three shapes were considered:

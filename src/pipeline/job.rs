@@ -575,6 +575,7 @@ pub(crate) fn synthetic_failed_summary(export_name: &str, err: &anyhow::Error) -
         offending_value: None,
         server_context_json: None,
         key_native_type: None,
+        state_backed: false,
         run_id,
         export_name: export_name.to_string(),
         status: "failed".into(),
