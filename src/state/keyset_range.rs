@@ -14,7 +14,7 @@
 
 use crate::error::Result;
 
-use super::{StateConn, StateRef, StateStore, open_connection, pg_sql};
+use super::{StateRef, StateStore, open_connection, pg_sql};
 
 /// One persisted range of a parallel keyset run.
 #[derive(Debug, Clone)]
@@ -46,38 +46,24 @@ impl StateStore {
         ranges: &[(Option<String>, Option<String>)],
     ) -> Result<()> {
         let now = chrono::Utc::now().to_rfc3339();
-        match &self.conn {
-            StateConn::Sqlite(c) => {
-                c.execute(
-                    "DELETE FROM keyset_range WHERE export_name = ?1",
-                    [export_name],
-                )?;
-                for (idx, (lo, hi)) in ranges.iter().enumerate() {
-                    c.execute(
-                        "INSERT INTO keyset_range \
-                         (export_name, run_id, range_index, lo, hi, done, updated_at) \
-                         VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)",
-                        rusqlite::params![export_name, run_id, idx as i64, lo, hi, now],
-                    )?;
-                }
-            }
-            StateConn::Postgres(client) => {
-                let mut c = client.borrow_mut();
-                c.execute(
-                    &pg_sql("DELETE FROM keyset_range WHERE export_name = ?1"),
-                    &[&export_name],
-                )?;
-                for (idx, (lo, hi)) in ranges.iter().enumerate() {
-                    c.execute(
-                        &pg_sql(
-                            "INSERT INTO keyset_range \
-                             (export_name, run_id, range_index, lo, hi, done, updated_at) \
-                             VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)",
-                        ),
-                        &[&export_name, &run_id, &(idx as i64), lo, hi, &now],
-                    )?;
-                }
-            }
+        self.execute(
+            "DELETE FROM keyset_range WHERE export_name = ?1",
+            &[export_name.into()],
+        )?;
+        for (idx, (lo, hi)) in ranges.iter().enumerate() {
+            self.execute(
+                "INSERT INTO keyset_range \
+                 (export_name, run_id, range_index, lo, hi, done, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)",
+                &[
+                    export_name.into(),
+                    run_id.into(),
+                    (idx as i64).into(),
+                    lo.clone().into(),
+                    hi.clone().into(),
+                    now.as_str().into(),
+                ],
+            )?;
         }
         Ok(())
     }
@@ -91,55 +77,24 @@ impl StateStore {
     ) -> Result<Vec<KeysetRangeRow>> {
         let sql = "SELECT range_index, lo, hi, done FROM keyset_range \
                    WHERE export_name = ?1 AND run_id = ?2 ORDER BY range_index";
-        match &self.conn {
-            StateConn::Sqlite(c) => {
-                let mut stmt = c.prepare(sql)?;
-                let rows = stmt.query_map(rusqlite::params![export_name, run_id], |r| {
-                    Ok(KeysetRangeRow {
-                        range_index: r.get(0)?,
-                        lo: r.get(1)?,
-                        hi: r.get(2)?,
-                        done: r.get::<_, i64>(3)? != 0,
-                    })
-                })?;
-                rows.collect::<std::result::Result<Vec<_>, _>>()
-                    .map_err(Into::into)
+        self.query(sql, &[export_name.into(), run_id.into()], |r| {
+            KeysetRangeRow {
+                range_index: r.i64(0),
+                lo: r.opt_text(1),
+                hi: r.opt_text(2),
+                done: r.i64(3) != 0,
             }
-            StateConn::Postgres(client) => {
-                let mut c = client.borrow_mut();
-                let rows = c.query(&pg_sql(sql), &[&export_name, &run_id])?;
-                Ok(rows
-                    .iter()
-                    .map(|r| KeysetRangeRow {
-                        range_index: r.get(0),
-                        lo: r.get(1),
-                        hi: r.get(2),
-                        done: r.get::<_, i64>(3) != 0,
-                    })
-                    .collect())
-            }
-        }
+        })
     }
 
     /// Clear an export's persisted ranges. Called post-finalize (via
     /// `finalize_keyset_anchor`) once the complete manifest is written — a no-op
     /// for any export that never ran parallel keyset.
     pub fn clear_keyset_ranges(&self, export_name: &str) -> Result<()> {
-        match &self.conn {
-            StateConn::Sqlite(c) => {
-                c.execute(
-                    "DELETE FROM keyset_range WHERE export_name = ?1",
-                    [export_name],
-                )?;
-            }
-            StateConn::Postgres(client) => {
-                let mut c = client.borrow_mut();
-                c.execute(
-                    &pg_sql("DELETE FROM keyset_range WHERE export_name = ?1"),
-                    &[&export_name],
-                )?;
-            }
-        }
+        self.execute(
+            "DELETE FROM keyset_range WHERE export_name = ?1",
+            &[export_name.into()],
+        )?;
         Ok(())
     }
 

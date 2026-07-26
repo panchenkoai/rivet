@@ -1,6 +1,6 @@
 use crate::error::Result;
 
-use super::{StateConn, StateStore, pg_sql};
+use super::StateStore;
 
 /// One column in a schema snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -89,57 +89,28 @@ impl SchemaChange {
 /// drift (added/removed/retyped columns) by diffing against the stored snapshot.
 impl StateStore {
     pub fn get_stored_schema(&self, export_name: &str) -> Result<Option<Vec<SchemaColumn>>> {
-        match &self.conn {
-            StateConn::Sqlite(c) => {
-                let mut stmt =
-                    c.prepare("SELECT columns_json FROM export_schema WHERE export_name = ?1")?;
-                let result = stmt.query_row([export_name], |row| {
-                    let json_str: String = row.get(0)?;
-                    Ok(json_str)
-                });
-                match result {
-                    Ok(json_str) => {
-                        let cols: Vec<SchemaColumn> = serde_json::from_str(&json_str)?;
-                        Ok(Some(cols))
-                    }
-                    Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-                    Err(e) => Err(e.into()),
-                }
-            }
-            StateConn::Postgres(client) => {
-                let mut c = client.borrow_mut();
-                match c.query_opt(
-                    "SELECT columns_json FROM export_schema WHERE export_name = $1",
-                    &[&export_name],
-                )? {
-                    Some(row) => {
-                        let json_str: String = row.get(0);
-                        let cols: Vec<SchemaColumn> = serde_json::from_str(&json_str)?;
-                        Ok(Some(cols))
-                    }
-                    None => Ok(None),
-                }
-            }
-        }
+        let json = self.query_opt(
+            "SELECT columns_json FROM export_schema WHERE export_name = ?1",
+            &[export_name.into()],
+            |r| r.text(0),
+        )?;
+        Ok(match json {
+            Some(s) => Some(serde_json::from_str(&s)?),
+            None => None,
+        })
     }
 
     pub fn store_schema(&self, export_name: &str, columns: &[SchemaColumn]) -> Result<()> {
         let json = serde_json::to_string(columns)?;
         let now = chrono::Utc::now().to_rfc3339();
-        let sql = "INSERT INTO export_schema (export_name, columns_json, updated_at)
+        self.execute(
+            "INSERT INTO export_schema (export_name, columns_json, updated_at)
              VALUES (?1, ?2, ?3)
              ON CONFLICT(export_name) DO UPDATE SET
                 columns_json = excluded.columns_json,
-                updated_at = excluded.updated_at";
-        match &self.conn {
-            StateConn::Sqlite(c) => {
-                c.execute(sql, rusqlite::params![export_name, json, now])?;
-            }
-            StateConn::Postgres(client) => {
-                let mut c = client.borrow_mut();
-                c.execute(&pg_sql(sql), &[&export_name, &json, &now])?;
-            }
-        }
+                updated_at = excluded.updated_at",
+            &[export_name.into(), json.into(), now.into()],
+        )?;
         Ok(())
     }
 
