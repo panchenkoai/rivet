@@ -56,6 +56,19 @@ stores:
   gcs:     { emulator: fake-gcs, endpoint: "http://127.0.0.1:4443",  bucket: rivet-oracle }
   azure:   { emulator: azurite,  endpoint: "http://127.0.0.1:10000/devstoreaccount1", bucket: rivet-oracle }
 
+# ── Preflight (source-agnostic, runs ONCE before the engine loop) ───────────
+# state_migrations: INIT (migrate) + RUN the state-exercising golden fixtures on BOTH
+# state backends (SQLite default + Postgres via RIVET_TEST_STATE_URL) and compare. The
+# state layer has two migration arrays (MIGRATIONS/SQLite, PG_MIGRATIONS/Postgres)
+# behind a dialect seam that ASSUMES type-parity; bug #1 shipped an int4 keyset_range
+# that aborted every Postgres-state run while SQLite passed. This runs the RED-proven
+# tests/live/live_state_backend_parity.rs (parallel-checkpoint, incremental, crash-
+# resume) + the keyset_range round-trip through the RELEASE binary; a schema drift
+# fails it. SKIP when no Postgres STATE url / cargo / source Postgres is present.
+preflight:
+  - id: state_migrations
+    what: "SQLite state == Postgres state on every state-exercising fixture (migrations are type-parity; a keyset_range-style int4/BIGINT drift fails the gate)."
+
 # ── Scenarios (the manual dogfood, codified) ────────────────────────────────
 # Each runs per engine×version. `sql`-only ones skip Mongo where noted.
 scenarios:

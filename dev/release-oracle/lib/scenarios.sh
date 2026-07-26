@@ -34,6 +34,41 @@ sc_keyset_parallel() {
                   || { bad "keyset_parallel: $fails"; add "$eng" "$tag" keyset_parallel - FAIL "$fails"; }
 }
 
+# ── state-migration parity PREFLIGHT (source-agnostic, runs once) ────────────
+# Bug #1 (int4 keyset_range) proved the state layer has TWO migration arrays
+# (MIGRATIONS/SQLite, PG_MIGRATIONS/Postgres) behind a dialect seam that ASSUMES they
+# are type-compatible — and nothing verified it, so a Postgres-only schema drift was
+# invisible to every SQLite unit test. This preflight INITs (migrates) + RUNs the
+# state-exercising golden fixtures on BOTH backends and compares: the RED-proven
+# tests/live/live_state_backend_parity.rs (+ the keyset_range round-trip), driven
+# through the RELEASE binary so the gate blesses what ships. A schema drift makes the
+# Postgres run abort → the parity assert fails → the release is NOT releasable.
+# Needs a Postgres STATE db (RIVET_TEST_STATE_URL) + the source Postgres on :5432 +
+# cargo; SKIP (never a silent pass) when any is absent.
+verify_state_migrations() {
+  local st="${RIVET_TEST_STATE_URL:-}"
+  [ -z "$st" ] && { skip "state-migration parity: no Postgres STATE url (set RIVET_TEST_STATE_URL)"; add state migrations parity - SKIP "no state url"; return; }
+  command -v cargo >/dev/null 2>&1 || { skip "state-migration parity: cargo absent"; add state migrations parity - SKIP "no cargo"; return; }
+  # Source Postgres must be reachable (the parity fixtures seed a source table on :5432).
+  if ! (exec 3<>/dev/tcp/127.0.0.1/5432) 2>/dev/null; then
+    skip "state-migration parity: source Postgres :5432 down"; add state migrations parity - SKIP "no source pg"; return
+  fi
+  exec 3>&- 2>/dev/null || true
+  log "State-migration parity (SQLite vs Postgres state, RED-proven, release binary)"
+  # Drive the parity + round-trip live tests against the RELEASE binary + real PG state.
+  # The test binary itself is debug (fast to build); it only orchestrates — the rivet
+  # process it spawns is the RELEASE binary via RIVET_BIN, so the gate blesses what ships.
+  if RIVET_BIN="$RIVET" RIVET_TEST_STATE_URL="$st" \
+     cargo test --manifest-path "$ROOT/Cargo.toml" --test live_suite -- --ignored --test-threads=1 \
+       state_parity_ pg_keyset_range_round_trips_and_commits >"$WORK/state_parity.log" 2>&1; then
+    ok "state-migration parity: SQLite == Postgres on every state-exercising fixture"
+    add state migrations parity - PASS
+  else
+    bad "state-migration parity FAILED — a schema drift between MIGRATIONS and PG_MIGRATIONS (see $WORK/state_parity.log)"
+    add state migrations parity - FAIL "$(grep -aiE 'must succeed|cannot convert|FAILED' "$WORK/state_parity.log" | head -1)"
+  fi
+}
+
 run_scenarios() {
   local eng=$1 tag=$2 url=$3
   sc_verdicts "$eng" "$tag" "$url"

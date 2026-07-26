@@ -125,6 +125,11 @@ log "Rivet Release Oracle — $(date -u +%FT%TZ)"
 echo "  rivet: $RIVET ($($RIVET --version 2>/dev/null | head -1))"
 start_stores
 
+# Preflight: the state-DB migrations must be type-parity across SQLite and Postgres
+# (bug #1 shipped an int4 keyset_range that broke every Postgres-state run). Runs once,
+# source-agnostic, before the engine loop; SKIP when no Postgres STATE url is set.
+verify_state_migrations
+
 for eng in $(cfg engines); do
   [ -n "$ENGINES_FILTER" ] && ! grep -qw "$eng" <<<"${ENGINES_FILTER//,/ }" && continue
   while read -r tag image port; do
