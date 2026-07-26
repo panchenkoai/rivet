@@ -71,6 +71,13 @@ scenarios:
     mssql:    { test: mssql_parallel_chunked_crash_after_chunk_complete_resume_finishes_with_no_duplicates }
     mongo:    { na: "no SQL-style chunked path on Mongo" }
 
+  - id: parallel_keyset_crash_recovery
+    what: "crash after ONE range of a parallel KEYSET run commits (per-range atomic checkpoint: file_log + keyset_range done=1) → resume rehydrates the done range + re-runs the rest, destination manifest declares every row (no orphan, no dup). A DISTINCT recovery unit from parallel-chunked (per-RANGE, not per-chunk)."
+    postgres: { test: parallel_keyset_crash_recovery_postgres }
+    mysql:    { test: parallel_keyset_crash_recovery_mysql }
+    mssql:    { test: parallel_keyset_crash_recovery_mssql }
+    mongo:    { na: "Mongo `parallel: N` is the separate `_id`-range reader (mongo_parallel), covered by live_mongo_crash_recovery.rs — not the SQL keyset per-range path" }
+
   # ── run-uniqueness: consecutive runs into the same prefix must not clobber ─
   - id: part_name_no_clobber_batch
     what: "rapid consecutive runs into the same prefix don't clobber — millisecond part stamp (single.rs), proven under sub-second incremental deltas"
