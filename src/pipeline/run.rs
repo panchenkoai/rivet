@@ -311,11 +311,12 @@ pub fn run(
                 e
             ));
         }
+        let n_cards = exports.len();
         let (tx, rx) = std::sync::mpsc::channel::<parent_ui::UiMessage>();
         ipc::install_in_process_tx(tx);
         let ui_thread = std::thread::Builder::new()
             .name("rivet-ui".to_string())
-            .spawn(move || parent_ui::run_ui(rx, name_floor))
+            .spawn(move || parent_ui::run_ui(rx, name_floor, n_cards))
             .ok();
 
         let collected: std::sync::Mutex<Vec<(Result<()>, RunSummary)>> =
@@ -370,11 +371,12 @@ pub fn run(
         // Gating on `is_attended()` left VHS/ttyd on indicatif when the
         // attended bit is unset; `run_ui` already falls back to linear
         // mode for piped stderr.
+        let n_cards = exports.len();
         let (tx, rx) = std::sync::mpsc::channel::<parent_ui::UiMessage>();
         ipc::install_in_process_tx(tx);
         let ui_thread = std::thread::Builder::new()
             .name("rivet-ui".to_string())
-            .spawn(move || parent_ui::run_ui(rx, name_floor))
+            .spawn(move || parent_ui::run_ui(rx, name_floor, n_cards))
             .ok();
 
         for export in &exports {

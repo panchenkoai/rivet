@@ -43,6 +43,17 @@
   (≤500 K → 1, <5 M → 2, ≥5 M → 4); a preflight warns past ~5 M rows that peak
   RSS scales with `N`.
 
+### Fixed
+
+- **The live `run` / `apply` card renderer no longer duplicates the export list
+  when there are more tables than the terminal is tall.** The in-place renderer
+  repaints by walking the cursor up one line per card; once the card block was
+  taller than the viewport the cursor could not reach the true top, so old
+  frames scrolled into scrollback and a capture showed the whole block two or
+  three times (field-observed on a ~30-table `apply`). It now falls back to the
+  append-only linear renderer whenever the block would not fit — capture-safe by
+  construction. No data was ever affected; this was display-only.
+
 ## 0.22.0 — 2026-07-25
 
 ### Added
