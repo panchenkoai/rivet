@@ -129,6 +129,8 @@ start_stores
 # (bug #1 shipped an int4 keyset_range that broke every Postgres-state run). Runs once,
 # source-agnostic, before the engine loop; SKIP when no Postgres STATE url is set.
 verify_state_migrations
+# Coverage-ledger drift-guards: every docs/*-matrix.yaml stays honest, or NOT RELEASABLE.
+verify_coverage_matrices
 
 for eng in $(cfg engines); do
   [ -n "$ENGINES_FILTER" ] && ! grep -qw "$eng" <<<"${ENGINES_FILTER//,/ }" && continue

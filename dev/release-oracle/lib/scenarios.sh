@@ -69,6 +69,25 @@ verify_state_migrations() {
   fi
 }
 
+# ── coverage-ledger drift-guards PREFLIGHT (offline, runs ONCE) ──────────────
+# "Are all the coverage matrices in the gate?" — YES: this runs every
+# docs/*-matrix.yaml drift-guard (chunking/behaviour/type-fidelity/... via
+# chunking_matrix_guard, plus release_gate_matrix_guard + perf_matrix_guard) so the
+# go/no-go gate itself blocks on a rotted/drifted ledger, not just CI. A drifted
+# matrix means the coverage claims a release rests on are stale -> NOT RELEASABLE.
+# SKIP when cargo is absent.
+verify_coverage_matrices() {
+  command -v cargo >/dev/null 2>&1 || { skip "coverage matrices: cargo absent"; add coverage matrices ledger - SKIP "no cargo"; return; }
+  log "Coverage-ledger drift-guards (all docs/*-matrix.yaml)"
+  if cargo test --manifest-path "$ROOT/Cargo.toml" --test offline_suite matrix_guard >"$WORK/matrices.log" 2>&1; then
+    ok "coverage matrices: all ledgers drift-free"
+    add coverage matrices ledger - PASS
+  else
+    bad "coverage matrices: a ledger drifted (see $WORK/matrices.log)"
+    add coverage matrices ledger - FAIL "$(grep -aiE 'FAILED|panicked|assertion' "$WORK/matrices.log" | head -1)"
+  fi
+}
+
 run_scenarios() {
   local eng=$1 tag=$2 url=$3
   sc_verdicts "$eng" "$tag" "$url"
