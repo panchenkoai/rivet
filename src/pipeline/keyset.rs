@@ -138,6 +138,13 @@ pub(crate) fn read_keyset_page_bounded(
     }))
 }
 
+/// The 0-indexed ROW offset of the i-th of `parts` percentile boundaries over `total`
+/// rows (i in 1..parts). Extracted pure so the boundary arithmetic is unit-mutation-
+/// covered — a `*`/`/` slip here silently unbalances the ROW-percentile ranges.
+fn percentile_offset(total: i64, i: usize, parts: usize) -> i64 {
+    total * i as i64 / parts as i64
+}
+
 /// "The single row at offset `off`" clause (after the `ORDER BY`), per dialect.
 fn nth_row_clause(st: crate::config::SourceType, off: i64) -> String {
     use crate::config::SourceType::*;
@@ -198,7 +205,7 @@ fn sample_key_boundaries(
     }
     let mut bounds: Vec<String> = Vec::with_capacity(parts.saturating_sub(1));
     for i in 1..parts {
-        let off = total * i as i64 / parts as i64;
+        let off = percentile_offset(total, i, parts);
         let nth = nth_row_clause(st, off);
         let sql =
             format!("SELECT {k} FROM ({base}) AS _rivet_pk {where_clause} ORDER BY {k} {nth}");
@@ -1007,4 +1014,92 @@ pub(crate) fn run_keyset(
         )?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::SourceType;
+
+    // ── percentile_offset: the ROW-percentile boundary arithmetic ────────────
+    #[test]
+    fn percentile_offset_partitions_evenly() {
+        // 4 workers over 1000 rows → boundaries at 250 / 500 / 750.
+        assert_eq!(percentile_offset(1000, 1, 4), 250);
+        assert_eq!(percentile_offset(1000, 2, 4), 500);
+        assert_eq!(percentile_offset(1000, 3, 4), 750);
+        // A `*`→`/` slip is invisible at i=1 (1000*1/4 == 1000/1/4) but not at i=2,
+        // and `/`→`*`/`%` and `*`→`+` all diverge at i=1 — both cases pinned above.
+        assert_eq!(percentile_offset(999, 1, 3), 333);
+        assert_eq!(percentile_offset(999, 2, 3), 666);
+    }
+
+    // ── nth_row_clause: per-dialect single-row-at-offset clause ───────────────
+    #[test]
+    fn nth_row_clause_is_per_dialect() {
+        assert_eq!(
+            nth_row_clause(SourceType::Postgres, 250),
+            "LIMIT 1 OFFSET 250"
+        );
+        assert_eq!(nth_row_clause(SourceType::Mysql, 250), "LIMIT 1 OFFSET 250");
+        assert_eq!(
+            nth_row_clause(SourceType::Mssql, 250),
+            "OFFSET 250 ROWS FETCH NEXT 1 ROWS ONLY"
+        );
+    }
+
+    // ── sanitize_run_id: filename-safe token for part names ──────────────────
+    #[test]
+    fn sanitize_run_id_keeps_safe_chars_and_replaces_the_rest() {
+        // alnum, '-', '_' survive; everything else becomes '_'.
+        assert_eq!(sanitize_run_id("run-2026_01A9"), "run-2026_01A9");
+        assert_eq!(sanitize_run_id("a/b c:d.e"), "a_b_c_d_e");
+        assert_eq!(sanitize_run_id("../etc"), "___etc");
+        // A `||`→`&&` slip in the keep-predicate would drop alnum too — pinned by the
+        // all-safe case round-tripping unchanged.
+        assert_eq!(sanitize_run_id("ABCabc012"), "ABCabc012");
+    }
+
+    // ── key_advances: numeric-aware strictly-past-anchor compare ─────────────
+    #[test]
+    fn key_advances_is_numeric_not_lexical() {
+        // Numeric: "1000" advances past "999" (a lexical compare would say no).
+        assert!(key_advances("999", "1000"));
+        assert!(!key_advances("1000", "999"));
+        assert!(!key_advances("5", "5")); // equal is NOT an advance (strict >)
+        // Unsigned above i64::MAX still compares as i128.
+        assert!(key_advances("18446744073709551614", "18446744073709551615"));
+        // Float fallback.
+        assert!(key_advances("1.5", "2.0"));
+        assert!(!key_advances("2.0", "1.5"));
+        // String fallback (UUID / RFC3339): byte-wise.
+        assert!(key_advances("2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z"));
+        assert!(!key_advances(
+            "2026-01-02T00:00:00Z",
+            "2026-01-01T00:00:00Z"
+        ));
+    }
+
+    // ── lo_hi_pairs: project (lo, hi) out of a sampled range list ────────────
+    #[test]
+    fn lo_hi_pairs_projects_the_bounds() {
+        let ranges = vec![
+            (0usize, None, Some("k0500".to_string()), false),
+            (
+                1,
+                Some("k0500".to_string()),
+                Some("k1000".to_string()),
+                false,
+            ),
+            (2, Some("k1000".to_string()), None, false),
+        ];
+        assert_eq!(
+            lo_hi_pairs(&ranges),
+            vec![
+                (None, Some("k0500".to_string())),
+                (Some("k0500".to_string()), Some("k1000".to_string())),
+                (Some("k1000".to_string()), None),
+            ]
+        );
+    }
 }
