@@ -683,3 +683,51 @@ fn parallel_keyset_incremental_survives_no_backslash_escapes_mysql() {
          the 500 new keys — not dup (>1500) via a mis-parsed sampler boundary, nor lose (<1500)"
     );
 }
+
+/// Least-privilege: a batch parallel-keyset export must succeed with a source user that
+/// has ONLY SELECT (+ USAGE on the schema) — NEVER SUPER / CREATE / write. rivet's export
+/// does only session-scoped SETs (SET LOCAL / SET SESSION, no privilege) + SELECT, so a
+/// read-only extraction role is all a user must grant. A failure here means the export
+/// reaches for a privilege it should not.
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn parallel_keyset_works_with_a_select_only_source_user_postgres() {
+    require_alive(LiveService::Postgres);
+    let table = unique_name("pk_ro");
+    let role = format!("ro_{}", &table[table.len().saturating_sub(12)..]).replace('-', "_");
+    let mut c = pg_connect();
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {table};
+         CREATE TABLE {table} (id BIGINT PRIMARY KEY, payload INT NOT NULL);
+         INSERT INTO {table} SELECT g, g FROM generate_series(1, 3000) g;"
+    ))
+    .unwrap();
+    // A least-privilege role: LOGIN + USAGE on the schema + SELECT on the table. Nothing
+    // else — the only grants a read-only extractor may assume.
+    c.batch_execute(&format!(
+        "DROP ROLE IF EXISTS {role};
+         CREATE ROLE {role} LOGIN PASSWORD 'ro';
+         GRANT USAGE ON SCHEMA public TO {role};
+         GRANT SELECT ON public.{table} TO {role};"
+    ))
+    .unwrap();
+
+    // Run parallel keyset AS the SELECT-only role.
+    let ro_url = POSTGRES_URL.replacen("rivet:rivet", &format!("{role}:ro"), 1);
+    let rig = parallel_keyset(Rig::pg_batch(&format!("public.{table}")).source_url(&ro_url));
+    rig.run_ok();
+    let (count, keys, workers) = id_set_and_fanout(&rig.out_dir());
+    assert_eq!(
+        count, 3000,
+        "a SELECT-only user must fully export via parallel keyset"
+    );
+    assert_eq!(keys, (1..=3000i64).collect::<BTreeSet<i64>>());
+    assert!(
+        workers >= 2,
+        "fan-out must still happen under a SELECT-only user"
+    );
+
+    let _ = c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {table}; DROP OWNED BY {role}; DROP ROLE IF EXISTS {role};"
+    ));
+}
