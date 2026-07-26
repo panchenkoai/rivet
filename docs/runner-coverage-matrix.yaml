@@ -80,7 +80,7 @@ scenarios:
     what: "two runs into ONE destination prefix must not clobber — part filenames carry a run-unique token (millisecond %3f stamp or a random nonce), never a second-granularity stamp that collides."
     single:         { test: roast_rapid_incremental_runs_into_same_prefix_must_not_clobber_prior_parts }
     chunked:        { test: chunk_part_filename_is_collision_proof_for_same_chunk }
-    keyset:         { test: mongo_batch_two_rapid_runs_into_same_prefix_do_not_clobber }
+    keyset:         { test: parallel_keyset_two_full_runs_into_same_prefix_no_clobber_postgres }
     mongo_parallel: { test: mongo_parallel_two_rapid_runs_into_same_prefix_do_not_clobber }
 
   - id: durable_manifest_before_advance

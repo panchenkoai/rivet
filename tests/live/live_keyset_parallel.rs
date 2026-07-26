@@ -139,6 +139,60 @@ fn parallel_keyset_parity_mssql() {
     mssql_exec(&format!("DROP TABLE IF EXISTS {table}"));
 }
 
+// ── Run-unique part naming: two full runs into ONE prefix must not clobber ───
+
+/// Two consecutive FULL parallel-keyset runs into the SAME destination prefix.
+/// Each run re-exports all `n` rows under a FRESH run_id, so run 2's parts must
+/// sit ALONGSIDE run 1's (the part base is `{export}_{run_tag}_pk_w{ridx}_{page}`,
+/// run_tag = sanitized run_id) — never overwrite them. Re-running without --resume
+/// is a WARN that appends, not a clobber (finalize::rerun_warning_message).
+///
+/// Discriminator = the TOTAL row count across ALL parquet on disk: `2*n` if both
+/// runs' parts survive, `n` if run 2's `pk_w{ridx}_{page}` names collided with
+/// run 1's and idempotent_overwrite silently replaced them. This is the N-worker ×
+/// 2-run collision the runner-coverage matrix warned keyset_PARALLEL could lack —
+/// it goes RED if the run_tag is dropped from the part base.
+fn assert_two_full_runs_no_clobber(rig: Rig, n: usize) {
+    rig.run_ok();
+    assert_eq!(
+        id_set_and_fanout(&rig.out_dir()).0,
+        n,
+        "run 1 writes exactly n rows"
+    );
+    rig.run_ok();
+    let (count, keys, _) = id_set_and_fanout(&rig.out_dir());
+    assert_eq!(
+        count,
+        2 * n,
+        "two full runs into one prefix must ACCUMULATE 2*n parquet rows; \
+         count == n means run 2 clobbered run 1's parts (run_tag not in the part name)"
+    );
+    assert_eq!(
+        keys,
+        (1..=n as i64).collect::<BTreeSet<i64>>(),
+        "the distinct key set is still 1..=n (each id present once per run)"
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn parallel_keyset_two_full_runs_into_same_prefix_no_clobber_postgres() {
+    require_alive(LiveService::Postgres);
+    let table = unique_name("pk_clob_pg");
+    let mut c = pg_connect();
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {table};
+         CREATE TABLE {table} (id BIGINT PRIMARY KEY, payload INT NOT NULL);
+         INSERT INTO {table} SELECT g, g FROM generate_series(1, {N}) g;"
+    ))
+    .unwrap();
+    assert_two_full_runs_no_clobber(
+        parallel_keyset(Rig::pg_batch(&format!("public.{table}"))),
+        N,
+    );
+    let _ = c.execute(&format!("DROP TABLE IF EXISTS {table}"), &[]);
+}
+
 // ── Per-range crash-recovery (iteration 2) across every engine ───────────────
 
 /// Crash after ONE range commits (durable in file_log + keyset_range `done=1`),
