@@ -95,8 +95,8 @@ infra:
     status: gap
     note: "retry/reconnect (retry.rs, classify_pg_sqlstate) under injected latency/drop/reset is untested end-to-end in the gate"
   - id: state_upgrade
-    status: gap
-    note: "migrate a POPULATED old-schema state DB (v1..v18) -> v19; the state_migrations preflight uses a FRESH db, so an ALTER that breaks on existing rows is invisible"
+    status: test
+    note: "pg_upgrade_from_v18_lands_keyset_range_as_bigint_and_keeps_data (src/state/mod.rs) — stages a POPULATED v18 Postgres state db, migrates in place to HEAD, asserts keyset_range is BIGINT + the pre-upgrade cursor survives; run by the state_migrations preflight. RED-proven against the int4 v19."
   - id: state_concurrency
     infra: postgres-state
     status: gap

@@ -58,10 +58,15 @@ verify_state_migrations() {
   # Drive the parity + round-trip live tests against the RELEASE binary + real PG state.
   # The test binary itself is debug (fast to build); it only orchestrates — the rivet
   # process it spawns is the RELEASE binary via RIVET_BIN, so the gate blesses what ships.
+  # Parity fixtures on a FRESH db (live_suite) + the in-place UPGRADE path (a lib test
+  # that stages a populated v18 db and migrates it to HEAD — a migration that works
+  # clean but breaks on populated old data slips past the fresh-db parity otherwise).
   if RIVET_BIN="$RIVET" RIVET_TEST_STATE_URL="$st" \
      cargo test --manifest-path "$ROOT/Cargo.toml" --test live_suite -- --ignored --test-threads=1 \
-       state_parity_ pg_keyset_range_round_trips_and_commits >"$WORK/state_parity.log" 2>&1; then
-    ok "state-migration parity: SQLite == Postgres on every state-exercising fixture"
+       state_parity_ pg_keyset_range_round_trips_and_commits >"$WORK/state_parity.log" 2>&1 \
+     && RIVET_TEST_STATE_URL="$st" \
+        cargo test --manifest-path "$ROOT/Cargo.toml" --lib pg_upgrade_from_v18 >>"$WORK/state_parity.log" 2>&1; then
+    ok "state-migration parity: SQLite == Postgres (fresh + in-place upgrade) on every fixture"
     add state migrations parity - PASS
   else
     bad "state-migration parity FAILED — a schema drift between MIGRATIONS and PG_MIGRATIONS (see $WORK/state_parity.log)"
