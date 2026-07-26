@@ -21,10 +21,13 @@ RIVET_BIN="${RIVET_BIN:-rivet}"
 out="$(mktemp -d)/out"
 cfg="$(mktemp).yaml"
 mkdir -p "$out"
+# SQL Server stands use a self-signed cert — accept it (the URL scheme is sqlserver://).
+tls_block=""
+[ "$engine" = "mssql" ] && tls_block=$'\n  tls:\n    accept_invalid_certs: true'
 cat >"$cfg" <<YAML
 source:
   type: ${engine}
-  url: "${url}"
+  url: "${url}"${tls_block}
 exports:
   - name: keyset_sparse_golden
     table: ${table}
