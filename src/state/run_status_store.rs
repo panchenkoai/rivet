@@ -1,8 +1,6 @@
-use rusqlite::OptionalExtension;
-
 use crate::error::Result;
 
-use super::{StateConn, StateStore};
+use super::StateStore;
 
 /// The `run_status` ledger — a best-effort ADVISORY record of each export run's
 /// lifecycle: written `running` at run START (before any part lands) and
@@ -34,36 +32,23 @@ impl StateStore {
         prefix: &str,
         started_at: &str,
     ) -> Result<()> {
-        match &self.conn {
-            StateConn::Sqlite(c) => {
-                c.execute(
-                    "INSERT INTO run_status
-                       (run_id, export_name, prefix, status, started_at, finished_at)
-                     VALUES (?1, ?2, ?3, 'running', ?4, NULL)
-                     ON CONFLICT(run_id) DO UPDATE SET
-                         export_name = excluded.export_name,
-                         prefix      = excluded.prefix,
-                         status      = 'running',
-                         started_at  = excluded.started_at,
-                         finished_at = NULL",
-                    rusqlite::params![run_id, export_name, prefix, started_at],
-                )?;
-            }
-            StateConn::Postgres(client) => {
-                client.borrow_mut().execute(
-                    "INSERT INTO run_status
-                       (run_id, export_name, prefix, status, started_at, finished_at)
-                     VALUES ($1, $2, $3, 'running', $4, NULL)
-                     ON CONFLICT (run_id) DO UPDATE SET
-                         export_name = excluded.export_name,
-                         prefix      = excluded.prefix,
-                         status      = 'running',
-                         started_at  = excluded.started_at,
-                         finished_at = NULL",
-                    &[&run_id, &export_name, &prefix, &started_at],
-                )?;
-            }
-        }
+        self.execute(
+            "INSERT INTO run_status
+               (run_id, export_name, prefix, status, started_at, finished_at)
+             VALUES (?1, ?2, ?3, 'running', ?4, NULL)
+             ON CONFLICT(run_id) DO UPDATE SET
+                 export_name = excluded.export_name,
+                 prefix      = excluded.prefix,
+                 status      = 'running',
+                 started_at  = excluded.started_at,
+                 finished_at = NULL",
+            &[
+                run_id.into(),
+                export_name.into(),
+                prefix.into(),
+                started_at.into(),
+            ],
+        )?;
         Ok(())
     }
 
@@ -71,20 +56,10 @@ impl StateStore {
     /// `interrupted`) at finalize. A no-op if the row is absent (a run that
     /// never called `begin_run` — e.g. a legacy/in-memory path).
     pub fn finish_run(&self, run_id: &str, status: &str, finished_at: &str) -> Result<()> {
-        match &self.conn {
-            StateConn::Sqlite(c) => {
-                c.execute(
-                    "UPDATE run_status SET status = ?2, finished_at = ?3 WHERE run_id = ?1",
-                    rusqlite::params![run_id, status, finished_at],
-                )?;
-            }
-            StateConn::Postgres(client) => {
-                client.borrow_mut().execute(
-                    "UPDATE run_status SET status = $2, finished_at = $3 WHERE run_id = $1",
-                    &[&run_id, &status, &finished_at],
-                )?;
-            }
-        }
+        self.execute(
+            "UPDATE run_status SET status = ?2, finished_at = ?3 WHERE run_id = ?1",
+            &[run_id.into(), status.into(), finished_at.into()],
+        )?;
         Ok(())
     }
 
@@ -114,19 +89,7 @@ impl StateStore {
                          WHERE r2.export_name = r.export_name
                            AND r2.started_at > r.started_at)
                    LIMIT 1";
-        match &self.conn {
-            StateConn::Sqlite(c) => Ok(c
-                .query_row(sql, rusqlite::params![prefix], |_| Ok(()))
-                .optional()?
-                .is_some()),
-            StateConn::Postgres(client) => {
-                let pg_sql = sql.replace("?1", "$1");
-                Ok(client
-                    .borrow_mut()
-                    .query_opt(&pg_sql, &[&prefix])?
-                    .is_some())
-            }
-        }
+        Ok(self.query_opt(sql, &[prefix.into()], |_| ())?.is_some())
     }
 }
 

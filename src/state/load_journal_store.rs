@@ -126,28 +126,14 @@ impl StateStore {
     /// The extraction run_ids already loaded into `target_table` — the skip set
     /// an incremental load filters its candidate manifests against.
     pub fn loaded_source_run_ids(&self, target_table: &str) -> Result<HashSet<String>> {
-        match &self.conn {
-            StateConn::Sqlite(c) => {
-                let mut stmt = c.prepare(
-                    "SELECT source_run_id FROM loaded_source_run WHERE target_table = ?1",
-                )?;
-                let rows =
-                    stmt.query_map(rusqlite::params![target_table], |r| r.get::<_, String>(0))?;
-                let mut out = HashSet::new();
-                for r in rows {
-                    out.insert(r?);
-                }
-                Ok(out)
-            }
-            StateConn::Postgres(client) => {
-                let mut c = client.borrow_mut();
-                let rows = c.query(
-                    "SELECT source_run_id FROM loaded_source_run WHERE target_table = $1",
-                    &[&target_table],
-                )?;
-                Ok(rows.iter().map(|r| r.get::<_, String>(0)).collect())
-            }
-        }
+        Ok(self
+            .query(
+                "SELECT source_run_id FROM loaded_source_run WHERE target_table = ?1",
+                &[target_table.into()],
+                |r| r.text(0),
+            )?
+            .into_iter()
+            .collect())
     }
 
     /// Recent `load_run` rows, newest first; optionally filtered to one target.
@@ -158,100 +144,31 @@ impl StateStore {
     ) -> Result<Vec<LoadRecord>> {
         const COLS: &str = "load_id, export_name, target_table, warehouse, mode, \
                             source_run_ids, rows_loaded, status, finished_at";
-        // (load_id, export, target, warehouse, mode, run_ids_json, rows, status, finished_at)
-        type Raw = (
-            String,
-            String,
-            String,
-            String,
-            String,
-            String,
-            i64,
-            String,
-            String,
-        );
-        let build = |r: Raw| LoadRecord {
-            load_id: r.0,
-            export_name: r.1,
-            target_table: r.2,
-            warehouse: r.3,
-            mode: r.4,
-            source_run_ids: serde_json::from_str(&r.5).unwrap_or_default(),
-            rows_loaded: r.6,
-            status: r.7,
-            finished_at: r.8,
+        let build = |r: &dyn super::row::StateRow| LoadRecord {
+            load_id: r.text(0),
+            export_name: r.text(1),
+            target_table: r.text(2),
+            warehouse: r.text(3),
+            mode: r.text(4),
+            source_run_ids: serde_json::from_str(&r.text(5)).unwrap_or_default(),
+            rows_loaded: r.i64(6),
+            status: r.text(7),
+            finished_at: r.text(8),
         };
-        match &self.conn {
-            StateConn::Sqlite(c) => {
-                let map = |row: &rusqlite::Row| -> rusqlite::Result<Raw> {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                        row.get(6)?,
-                        row.get(7)?,
-                        row.get(8)?,
-                    ))
-                };
-                let mut out = Vec::new();
-                match target_table {
-                    Some(t) => {
-                        let mut stmt = c.prepare(&format!(
-                            "SELECT {COLS} FROM load_run WHERE target_table = ?1 \
-                             ORDER BY finished_at DESC LIMIT ?2"
-                        ))?;
-                        for r in stmt.query_map(rusqlite::params![t, limit as i64], map)? {
-                            out.push(build(r?));
-                        }
-                    }
-                    None => {
-                        let mut stmt = c.prepare(&format!(
-                            "SELECT {COLS} FROM load_run ORDER BY finished_at DESC LIMIT ?1"
-                        ))?;
-                        for r in stmt.query_map(rusqlite::params![limit as i64], map)? {
-                            out.push(build(r?));
-                        }
-                    }
-                }
-                Ok(out)
-            }
-            StateConn::Postgres(client) => {
-                let mut c = client.borrow_mut();
-                let rows = match target_table {
-                    Some(t) => c.query(
-                        &format!(
-                            "SELECT {COLS} FROM load_run WHERE target_table = $1 \
-                             ORDER BY finished_at DESC LIMIT {limit}"
-                        ),
-                        &[&t],
-                    )?,
-                    None => c.query(
-                        &format!(
-                            "SELECT {COLS} FROM load_run ORDER BY finished_at DESC LIMIT {limit}"
-                        ),
-                        &[],
-                    )?,
-                };
-                Ok(rows
-                    .iter()
-                    .map(|row| {
-                        build((
-                            row.get(0),
-                            row.get(1),
-                            row.get(2),
-                            row.get(3),
-                            row.get(4),
-                            row.get(5),
-                            row.get(6),
-                            row.get(7),
-                            row.get(8),
-                        ))
-                    })
-                    .collect())
-            }
+        match target_table {
+            Some(t) => self.query(
+                &format!(
+                    "SELECT {COLS} FROM load_run WHERE target_table = ?1 \
+                     ORDER BY finished_at DESC LIMIT ?2"
+                ),
+                &[t.into(), (limit as i64).into()],
+                build,
+            ),
+            None => self.query(
+                &format!("SELECT {COLS} FROM load_run ORDER BY finished_at DESC LIMIT ?1"),
+                &[(limit as i64).into()],
+                build,
+            ),
         }
     }
 }
