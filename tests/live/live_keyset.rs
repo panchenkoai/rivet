@@ -581,6 +581,81 @@ fn keyset_parallel_reads_every_row_once_across_workers() {
     );
 }
 
+/// PARALLEL keyset on a PostgreSQL native `uuid` PK — the canonical
+/// `id UUID PRIMARY KEY` shape. The boundary probe (`query_scalar`) must READ the
+/// uuid to sample percentiles; without the uuid arm (M2) it returns None, the
+/// sampler gets zero boundaries, and `parallel: N` silently COLLAPSES to a single
+/// worker (data complete, but the fan-out absent). Asserts the run fanned out to
+/// ≥2 `pk_w{id}` workers AND round-trips every uuid — RED before the query_scalar
+/// uuid arm (1 worker → 1 part-family).
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn keyset_parallel_pg_uuid_key_fans_out_not_collapses() {
+    require_alive(LiveService::Postgres);
+    const N: usize = 4000;
+    let table = unique_name("pg_par_uuid");
+    struct PgDropTable(String);
+    impl Drop for PgDropTable {
+        fn drop(&mut self) {
+            if let Ok(mut c) = postgres::Client::connect(POSTGRES_URL, postgres::NoTls) {
+                let _ = c.execute(&format!("DROP TABLE IF EXISTS {}", self.0), &[]);
+            }
+        }
+    }
+    let _guard = PgDropTable(table.clone());
+    let mut c = pg_connect();
+    c.batch_execute(&format!(
+        "CREATE TABLE {table} (id UUID PRIMARY KEY, payload INT NOT NULL);
+         INSERT INTO {table} (id, payload)
+         SELECT ('00000000-0000-0000-0000-' || lpad(to_hex(g), 12, '0'))::uuid, g
+         FROM generate_series(1, {N}) g;"
+    ))
+    .unwrap();
+
+    let export = unique_name("pg_par_uuid_exp");
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let out_dir = tempfile::tempdir().unwrap();
+    let yaml = format!(
+        "source: {{type: postgres, url: \"{POSTGRES_URL}\"}}\nexports:\n  - name: {export}\n    \
+         table: public.{table}\n    mode: chunked\n    chunk_by_key: id\n    parallel: 4\n    \
+         chunk_size: 500\n    format: parquet\n    destination: {{type: local, path: {out}}}\n",
+        out = out_dir.path().display(),
+    );
+    let cfg = write_config(&cfg_dir, &yaml);
+    let r = run_rivet_export(&cfg, &export);
+    assert!(
+        r.status.success(),
+        "PG uuid parallel keyset must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+
+    // Fan-out proof: ≥2 distinct pk_w{id} workers (a collapse = only pk_w0).
+    let workers: BTreeSet<String> = files_with_extension(out_dir.path(), "parquet")
+        .iter()
+        .filter_map(|p| p.file_name().and_then(|n| n.to_str()).map(String::from))
+        .filter_map(|n| {
+            n.split("_pk_w")
+                .nth(1)
+                .and_then(|s| s.split('_').next())
+                .map(|w| w.to_string())
+        })
+        .collect();
+    assert!(
+        workers.len() >= 2,
+        "PG uuid parallel keyset must fan out to ≥2 workers, got workers {workers:?} — the \
+         boundary probe collapsed to a single worker (query_scalar uuid arm missing)"
+    );
+
+    // Completeness: every uuid round-trips (PG's first-party parallel completeness
+    // check — the gap the bughunt flagged as absent).
+    let (count, keys) = read_uuid_set_fixed(out_dir.path(), "id");
+    let expected: BTreeSet<String> = (1..=N)
+        .map(|n| format!("00000000-0000-0000-0000-{n:012x}"))
+        .collect();
+    assert_eq!(count, N, "row count must round-trip exactly");
+    assert_eq!(keys, expected, "the uuid set must equal the source");
+}
+
 /// PARALLEL keyset CRASH-RECOVERY (feat/parallel-keyset iteration 2). A parallel
 /// run with `chunk_checkpoint: true` that crashes AFTER one range commits (its
 /// parts durable in file_log, its `keyset_range` row `done=1`) but before finalize

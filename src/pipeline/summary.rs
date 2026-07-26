@@ -805,8 +805,11 @@ impl RunSummary {
             // Schema-drift gate: every batch runner calls check_from_sink_schema /
             // check_from_type_mappings, which ALWAYS leaves schema_changed = Some(_)
             // when it runs (Some(false) even on a skip/tracking-error). `None` here
-            // means no runner ever called the gate.
-            if self.schema_changed.is_none() {
+            // means no runner ever called the gate — EXCEPT on a resume, where the
+            // drift gate is legitimately skipped (the baseline was set on the
+            // original run; chunked's `--resume` bypasses prepare_chunk_plan, the
+            // only caller of check_from_type_mappings), so `resumed` runs are exempt.
+            if !self.resumed && self.schema_changed.is_none() {
                 return Err(
                     "state_backed success committed parts but schema_changed is None — \
                      the on_schema_drift gate was never applied (no runner called \
@@ -815,10 +818,14 @@ impl RunSummary {
                         .to_string(),
                 );
             }
-            // Form-B harvest: harvest_column_checksums either POPULATES
-            // column_checksums or, on a checkpoint-resume that can't recover them,
-            // sets column_checksums_incomplete. Both empty means no runner harvested.
-            if self.column_checksums.is_empty() && !self.column_checksums_incomplete {
+            // Form-B harvest — Parquet ONLY: the sink's track_checksum skips
+            // non-Parquet formats by design, so CSV/JSONL legitimately harvest no
+            // checksums (empty, not flagged incomplete). Gate the check on the
+            // Parquet format so a correct CSV/JSONL export is not a false positive.
+            if self.format == "parquet"
+                && self.column_checksums.is_empty()
+                && !self.column_checksums_incomplete
+            {
                 return Err(
                     "state_backed success committed parts but column_checksums is empty \
                      and not flagged incomplete — Form-B was never harvested (no runner \
@@ -1546,6 +1553,26 @@ mod tests {
         assert!(
             cdc.check_post_run_invariants().is_ok(),
             "a non-run_export run must not be held to the facade contract"
+        );
+
+        // A RESUME legitimately skips the drift gate (schema_changed None) — exempt (H2).
+        let mut resumed = base();
+        resumed.resumed = true;
+        resumed.column_checksums.push(ck());
+        // schema_changed stays None
+        assert!(
+            resumed.check_post_run_invariants().is_ok(),
+            "a resume must not trip the drift-gate branch"
+        );
+
+        // A CSV/JSONL export harvests NO Form-B by design — exempt (M4).
+        let mut csv = base();
+        csv.schema_changed = Some(false);
+        csv.format = "csv".into();
+        // column_checksums empty, incomplete false
+        assert!(
+            csv.check_post_run_invariants().is_ok(),
+            "a non-Parquet export must not trip the Form-B branch"
         );
     }
 

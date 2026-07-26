@@ -119,8 +119,11 @@ impl StateStore {
         let file_sql = "INSERT INTO file_log \
              (run_id, export_name, file_name, row_count, bytes, format, compression, created_at) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)";
+        // Scope the `done` flip by run_id (the table's PK is (export_name,
+        // range_index) — run_id is NOT in it), so a run can never flip a row
+        // belonging to ANOTHER run's recovery set left behind by a crash (H1).
         let done_sql = "UPDATE keyset_range SET done = 1, updated_at = ?1 \
-             WHERE export_name = ?2 AND range_index = ?3";
+             WHERE export_name = ?2 AND range_index = ?3 AND run_id = ?4";
         match state_ref {
             StateRef::Sqlite(db_path) => {
                 let mut conn = open_connection(db_path)?;
@@ -140,7 +143,10 @@ impl StateStore {
                         ],
                     )?;
                 }
-                tx.execute(done_sql, rusqlite::params![now, export_name, range_index])?;
+                tx.execute(
+                    done_sql,
+                    rusqlite::params![now, export_name, range_index, run_id],
+                )?;
                 tx.commit()?;
             }
             StateRef::Postgres(url) => {
@@ -161,7 +167,10 @@ impl StateStore {
                         ],
                     )?;
                 }
-                tx.execute(&pg_sql(done_sql), &[&now, &export_name, &range_index])?;
+                tx.execute(
+                    &pg_sql(done_sql),
+                    &[&now, &export_name, &range_index, &run_id],
+                )?;
                 tx.commit()?;
             }
         }

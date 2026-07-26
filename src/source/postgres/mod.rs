@@ -692,6 +692,13 @@ impl super::Source for PostgresSource {
         if let Ok(Some(v)) = row.try_get::<_, Option<chrono::DateTime<chrono::Utc>>>(0) {
             return Ok(Some(v.format("%Y-%m-%d %H:%M:%S").to_string()));
         }
+        // UUID — the canonical PG keyset key (`id UUID PRIMARY KEY`). Without this
+        // arm the String arm rejects the uuid OID → Ok(None), so parallel keyset
+        // samples ZERO boundaries and silently collapses to a single worker (M2).
+        // Rendered canonical (hyphenated), usable as an inline `'…'` literal.
+        if let Ok(Some(v)) = row.try_get::<_, Option<uuid::Uuid>>(0) {
+            return Ok(Some(v.to_string()));
+        }
         if let Ok(Some(v)) = row.try_get::<_, Option<String>>(0) {
             return Ok(Some(v));
         }

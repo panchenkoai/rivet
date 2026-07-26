@@ -467,6 +467,16 @@ impl<'a> MysqlSessionGuard<'a> {
             conn,
             reset_max_exec: false,
         };
+        // Pin sql_mode so NO_BACKSLASH_ESCAPES is OFF: the parallel-keyset inline
+        // boundary literals (escape_mysql_literal) use backslash escaping, which is
+        // ONLY correct when backslash is an escape char. Under a server default of
+        // NO_BACKSLASH_ESCAPES a boundary like 'C:\data' would parse as a DIFFERENT
+        // value than the `?`-bound next-page cursor, silently dropping/dup'ing the
+        // row on that boundary (the encode-leg class CLAUDE.md pins for PG). Removing
+        // just that flag keeps the server's other modes (strictness etc.) intact.
+        guard
+            .conn
+            .query_drop("SET SESSION sql_mode = REPLACE(@@sql_mode, 'NO_BACKSLASH_ESCAPES', '')")?;
         if let Some(ms) = max_exec_ms {
             guard
                 .conn
@@ -485,6 +495,9 @@ impl Drop for MysqlSessionGuard<'_> {
     fn drop(&mut self) {
         // Best-effort; the connection is about to return to the pool either way.
         let _ = self.conn.query_drop("SET time_zone = @@global.time_zone");
+        let _ = self
+            .conn
+            .query_drop("SET SESSION sql_mode = @@global.sql_mode");
         if self.reset_max_exec {
             let _ = self.conn.query_drop("SET SESSION max_execution_time = 0");
         }

@@ -367,6 +367,11 @@ fn run_keyset_parallel(
     // The anchor advance for incremental = the last range's ceiling (the source max
     // pinned at open). None for a full pass (last range's hi is None → no advance).
     let anchor_ceiling: Option<String> = ranges.last().and_then(|(_, _, hi, _)| hi.clone());
+    // The first range's floor = the anchor this run continued PAST. Recovered from
+    // the ranges (not the local `floor`, which is None on a resume — the incremental
+    // bound block is skipped there) so a RESUMED incremental run reports the accurate
+    // manifest cursor range `(floor, ceil]`, not `(None, ceil]` (M6, #72 contract).
+    let anchor_floor: Option<String> = ranges.first().and_then(|(_, lo, _, _)| lo.clone());
 
     let total_ranges = ranges.len();
     let pending: Vec<(usize, Option<String>, Option<String>)> = ranges
@@ -374,6 +379,20 @@ fn run_keyset_parallel(
         .filter(|(_, _, _, done)| !done)
         .map(|(idx, lo, hi, _)| (idx, lo, hi))
         .collect();
+
+    // Fan-out collapse: `parallel: N` was requested but the sampler produced ONE
+    // range — the headline speed-up is silently absent. The usual cause is a key
+    // type the boundary probe cannot render (e.g. a source that returns the key as
+    // an unhandled type from query_scalar). warn, not info, so it is visible.
+    if parallel > 1 && total_ranges == 1 {
+        log::warn!(
+            "export '{}': parallel keyset requested {} workers but sampled 0 boundaries — \
+             running as a SINGLE worker. The key may be a type the boundary probe cannot \
+             read; data is complete but the parallel speed-up is absent.",
+            plan.export_name,
+            parallel
+        );
+    }
 
     log::info!(
         "export '{}': parallel keyset — {} range(s), {} to run{}, page size {}",
@@ -399,7 +418,16 @@ fn run_keyset_parallel(
     // partial parts (idempotent) instead of accumulating duplicates.
     let run_tag = sanitize_run_id(&summary.run_id);
     let run_id = summary.run_id.clone();
-    let state_ref = state.map(|s| s.state_ref().clone());
+    // Workers commit to keyset_range + file_log ONLY on a checkpoint run — a
+    // non-checkpoint run persists no ranges (the `_ =>` sample arm), so letting its
+    // workers run the `done=1` UPDATE would flip a LEFTOVER checkpoint set's rows
+    // under a foreign run_id (H1 silent-loss). Gating state_ref on `checkpoint`
+    // matches the "checkpoint runs only" contract the worker commit documents.
+    let state_ref = if checkpoint {
+        state.map(|s| s.state_ref().clone())
+    } else {
+        None
+    };
     let fmt_label = plan.format.label();
     let cmp_label = plan.compression.label();
 
@@ -643,7 +671,7 @@ fn run_keyset_parallel(
     // that iteration 2's cursor_high caveat deferred.
     if incremental && let Some(hi) = &anchor_ceiling {
         summary.cursor_high = Some(hi.clone());
-        summary.cursor_low = floor.clone();
+        summary.cursor_low = anchor_floor.clone();
         if let Some(st) = state {
             st.update(&plan.export_name, hi)?;
         }
