@@ -46,6 +46,6 @@ FROM (SELECT a * 1000 + b + 1 AS n FROM seq10k CROSS JOIN seq1k) t;
 
 -- Sanity: min_id must exceed i64::MAX (9,223,372,036,854,775,807) — proves the
 -- whole key set is unsigned-territory.
-SELECT COUNT(*) AS rows, MIN(id) AS min_id, MAX(id) AS max_id,
+SELECT COUNT(*) AS row_count, MIN(id) AS min_id, MAX(id) AS max_id,
        MIN(id) > 9223372036854775807 AS all_above_i64_max
 FROM keyset_sparse_unsigned;

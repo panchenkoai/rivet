@@ -40,6 +40,6 @@ SELECT
     CONCAT('note-', n)                             AS note
 FROM (SELECT a * 1000 + b + 1 AS n FROM seq10k CROSS JOIN seq1k) t;
 
-SELECT COUNT(*) AS rows, MIN(id) AS min_id, MAX(id) AS max_id,
+SELECT COUNT(*) AS row_count, MIN(id) AS min_id, MAX(id) AS max_id,
        ROUND((MAX(id) - MIN(id)) / COUNT(*), 1) AS span_per_row
 FROM keyset_sparse;
