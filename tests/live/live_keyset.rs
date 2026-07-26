@@ -480,6 +480,107 @@ fn keyset_varchar_pk_roundtrips_full_keyset_across_pages() {
     );
 }
 
+/// PARALLEL keyset (feat/parallel-keyset, iteration 1): `parallel: N` fans N
+/// ROW-percentile-range workers, each keyset-paging a disjoint `(lo, hi]` slice
+/// concurrently. The union of every worker's pages must reproduce the source key
+/// set EXACTLY — parity is STRUCTURAL (the N−1 boundaries partition the key into
+/// half-open intervals whose union is the whole key space), so it holds no matter
+/// how skewed the sample is.
+///
+/// Two assertions, and the FIRST is the self-oracle that makes the second mean
+/// something: a plain SEQUENTIAL keyset run passes the union check too, so the
+/// test would be vacuous without proving parallel actually ran. The `pk_w{id}`
+/// part-name stamp (only the parallel runner emits it) IS that proof — assert it
+/// before the union, so a silent fall-back to sequential fails here, not slips by.
+///
+/// RED proof (run before committing): mutate the boundary in
+/// `build_keyset_query_bounded` from `AND key <= upper` to `AND key < upper` —
+/// each of the N−1 boundary keys then falls in NO worker's half-open range (its
+/// owning worker excludes it as `< hi`, the next excludes it as `> lo`), so the
+/// count drops from 3000 to 2997 and the distinct-set names the 3 dropped keys.
+/// A VARCHAR PK is deliberate: it exercises the string-literal boundary escaping
+/// (`escape_mysql_literal`, quotes) the integer path never hits.
+#[test]
+#[ignore = "live: requires docker compose up -d mysql"]
+fn keyset_parallel_reads_every_row_once_across_workers() {
+    require_alive(LiveService::Mysql);
+
+    const N: usize = 3000;
+    let table = unique_name("keyset_par");
+    let _guard = DropTable(table.clone());
+
+    let mut conn = mysql_connect();
+    conn.query_drop(format!("DROP TABLE IF EXISTS {table}"))
+        .unwrap();
+    conn.query_drop(format!(
+        "CREATE TABLE {table} (uid VARCHAR(40) NOT NULL PRIMARY KEY, payload INT NOT NULL)"
+    ))
+    .unwrap();
+    conn.query_drop("SET SESSION cte_max_recursion_depth = 20000")
+        .unwrap();
+    conn.query_drop(format!(
+        "INSERT INTO {table} (uid, payload) \
+         WITH RECURSIVE seq AS (SELECT 1 n UNION ALL SELECT n+1 FROM seq WHERE n < {N}) \
+         SELECT CONCAT('id-', LPAD(n, 6, '0')), n FROM seq"
+    ))
+    .unwrap();
+
+    // Auto-keyset on the VARCHAR PK + `parallel: 4`. chunk_size 500 → each ~750-row
+    // worker still pages twice, so BOTH the inter-worker boundary and the
+    // intra-worker `WHERE uid > last` boundary are exercised in one run.
+    let export = unique_name("keyset_par_exp");
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let out_dir = tempfile::tempdir().unwrap();
+    let yaml = format!(
+        "source:\n  type: mysql\n  url: \"{MYSQL_URL}\"\nexports:\n  - name: {export}\n    \
+         table: {table}\n    mode: chunked\n    parallel: 4\n    chunk_size: 500\n    \
+         format: parquet\n    compression: zstd\n    destination:\n      type: local\n      path: {out}\n",
+        out = out_dir.path().display(),
+    );
+    let cfg = write_config(&cfg_dir, &yaml);
+    let out = run_rivet_export(&cfg, &export);
+    assert!(
+        out.status.success(),
+        "parallel keyset export must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // (1) SELF-ORACLE: the parallel runner is the only path that stamps `pk_w{id}`
+    // into part names. Assert it ran — else the union check below is satisfied by a
+    // silent sequential fall-back and proves nothing about parallelism.
+    let parts = files_with_extension(out_dir.path(), "parquet");
+    let parallel_parts = parts
+        .iter()
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.contains("_pk_w"))
+        })
+        .count();
+    assert!(
+        parallel_parts >= 2,
+        "expected the parallel runner's `pk_w{{id}}` parts (≥2 workers); got files: {:?}",
+        parts
+            .iter()
+            .filter_map(|p| p.file_name().and_then(|n| n.to_str()))
+            .collect::<Vec<_>>()
+    );
+
+    // (2) STRUCTURAL PARITY: the union of every worker's pages is the whole key set,
+    // no row dropped at a boundary (RED at `< hi`: 2997/3000) or duplicated across
+    // two workers' overlapping ranges (would inflate count past N).
+    let (count, keys) = read_uid_set(out_dir.path());
+    let expected: BTreeSet<String> = (1..=N).map(|n| format!("id-{n:06}")).collect();
+    assert_eq!(
+        count, N,
+        "row count must round-trip exactly across all workers (no boundary drop/dupe)"
+    );
+    assert_eq!(
+        keys, expected,
+        "the union of all parallel workers' keys must equal the source key set"
+    );
+}
+
 /// Two-run keyset RESUME (`chunk_checkpoint: true` — OPT-4 + Phase 2). Run 1
 /// exports the whole key set and persists the high-water key; an UNCHANGED
 /// re-run exports ZERO new rows; after inserting rows with higher keys, the next

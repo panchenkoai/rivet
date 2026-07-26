@@ -311,6 +311,14 @@ impl<'a> ExportRequest<'a> {
         self.page_limit = Some(page_limit);
         self
     }
+
+    /// Set the INCLUSIVE upper bound on the keyset key — a parallel keyset
+    /// worker's `(cursor, upper]` range. `None` leaves the page unbounded above
+    /// (the sequential single-worker page).
+    pub fn with_upper_bound(mut self, upper: Option<&'a str>) -> Self {
+        self.upper_bound = upper;
+        self
+    }
 }
 
 pub trait Source: Send {

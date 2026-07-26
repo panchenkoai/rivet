@@ -72,6 +72,25 @@ pub(crate) fn read_keyset_page(
     dest: &dyn destination::Destination,
     part_base: &str,
 ) -> Result<Option<KeysetPage>> {
+    read_keyset_page_bounded(
+        src, plan, key_plan, page_size, cursor, None, dest, part_base,
+    )
+}
+
+/// [`read_keyset_page`] with an optional INCLUSIVE upper bound on the key — one
+/// parallel keyset worker's `(cursor, upper]` range (feat/parallel-keyset). The
+/// page becomes `WHERE key > cursor AND key <= upper ORDER BY key LIMIT n`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn read_keyset_page_bounded(
+    src: &mut dyn Source,
+    plan: &ResolvedRunPlan,
+    key_plan: &IncrementalCursorPlan,
+    page_size: usize,
+    cursor: Option<&str>,
+    upper: Option<&str>,
+    dest: &dyn destination::Destination,
+    part_base: &str,
+) -> Result<Option<KeysetPage>> {
     let cursor_state = cursor.map(|v| CursorState {
         export_name: plan.export_name.clone(),
         last_cursor_value: Some(v.to_string()),
@@ -85,6 +104,7 @@ pub(crate) fn read_keyset_page(
         &source::ExportRequest::unwrapped(&plan.base_query, &plan.tuning, &plan.column_overrides)
             .with_incremental(Some(key_plan))
             .with_cursor(cursor_state.as_ref())
+            .with_upper_bound(upper)
             .with_page_limit(page_size),
         &mut sink,
     )?;
@@ -118,6 +138,278 @@ pub(crate) fn read_keyset_page(
     }))
 }
 
+/// "The single row at offset `off`" clause (after the `ORDER BY`), per dialect.
+fn nth_row_clause(st: crate::config::SourceType, off: i64) -> String {
+    use crate::config::SourceType::*;
+    match st {
+        Postgres | Mysql => format!("LIMIT 1 OFFSET {off}"),
+        Mssql => format!("OFFSET {off} ROWS FETCH NEXT 1 ROWS ONLY"),
+        Mongo => unreachable!("parallel keyset sampling is a SQL path; Mongo uses $sample"),
+    }
+}
+
+/// Sample N−1 ROW-percentile boundaries of the keyset key: the key values at row
+/// offsets `total*i/N`. A prototype uses `OFFSET` (an index-only skip, cheap to
+/// ~10M rows; production would SAMPLE beyond that — dev/parallel_keyset/results.md).
+/// Row-count parity is STRUCTURAL: the resulting half-open intervals partition the
+/// key, so the union of ranges reads every row exactly once regardless of the
+/// sample's balance. Fewer boundaries than requested (a repeated value at two
+/// percentiles) just yields fewer, larger ranges — never a gap or an overlap.
+fn sample_key_boundaries(
+    src: &mut dyn Source,
+    plan: &ResolvedRunPlan,
+    key: &str,
+    parts: usize,
+) -> Result<Vec<String>> {
+    let st = plan.source.source_type;
+    let base = &plan.base_query;
+    let total: i64 = src
+        .query_scalar(&format!("SELECT COUNT(*) FROM ({base}) AS _rivet_pk_cnt"))?
+        .as_deref()
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .unwrap_or(0);
+    if total <= 1 {
+        return Ok(vec![]);
+    }
+    let k = crate::sql::quote_ident(st, key);
+    let mut bounds: Vec<String> = Vec::with_capacity(parts.saturating_sub(1));
+    for i in 1..parts {
+        let off = total * i as i64 / parts as i64;
+        let nth = nth_row_clause(st, off);
+        let sql = format!("SELECT {k} FROM ({base}) AS _rivet_pk ORDER BY {k} {nth}");
+        if let Some(v) = src.query_scalar(&sql)?
+            && bounds.last().map(String::as_str) != Some(v.as_str())
+        {
+            bounds.push(v);
+        }
+    }
+    Ok(bounds)
+}
+
+/// Parallel keyset (feat/parallel-keyset, iteration 1 — no crash-recovery).
+///
+/// Samples N−1 row-percentile boundaries, then spawns one worker per disjoint
+/// `(lo, hi]` range in a `std::thread::scope`; each worker owns its source
+/// connection and runs the standard bounded seek loop, writing run-unique parts
+/// to the SHARED destination. Rows / parts / Form-B checksums / the run schema
+/// fingerprint are merged into `summary` after the join, through the same commit
+/// seam the sequential runner uses. Row-count parity is structural (the ranges
+/// partition the key); the live test asserts the union reads every row once.
+fn run_keyset_parallel(
+    src: &mut dyn Source,
+    plan: &ResolvedRunPlan,
+    summary: &mut RunSummary,
+    key_plan: IncrementalCursorPlan,
+    parallel: usize,
+    state: Option<&StateStore>,
+) -> Result<()> {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicI64, Ordering};
+
+    let kp = keyset_plan(plan);
+    let key = kp.key_column.clone();
+    let page_size = kp.chunk_size;
+
+    let bounds = sample_key_boundaries(src, plan, &key, parallel)?;
+    // N boundaries → N+1 half-open ranges (lo_exclusive, hi_inclusive].
+    let mut ranges: Vec<(Option<String>, Option<String>)> = Vec::with_capacity(bounds.len() + 1);
+    let mut prev: Option<String> = None;
+    for b in &bounds {
+        ranges.push((prev.clone(), Some(b.clone())));
+        prev = Some(b.clone());
+    }
+    ranges.push((prev, None));
+    let workers = ranges.len();
+
+    log::info!(
+        "export '{}': parallel keyset — {} workers on '{}', page size {}",
+        plan.export_name,
+        workers,
+        key,
+        page_size
+    );
+
+    let dest = std::sync::Arc::new(destination::create_destination(&plan.destination)?);
+    crate::manifest::guard_manifest_mode(&**dest, "batch")?;
+
+    let ext = format::create_format(plan.format, plan.compression, plan.compression_level, None)
+        .file_extension()
+        .to_string();
+    let stamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f").to_string();
+
+    let rows = AtomicI64::new(0);
+    let parts_mx: Mutex<Vec<super::commit::PartRecord>> = Mutex::new(Vec::new());
+    #[allow(clippy::type_complexity)]
+    let checksums_mx: Mutex<Vec<(std::collections::BTreeMap<String, u64>, Option<String>)>> =
+        Mutex::new(Vec::new());
+    let fingerprint: std::sync::OnceLock<arrow::datatypes::Schema> = std::sync::OnceLock::new();
+    // Per-worker high-water key (indexed by worker id). cursor_high = the highest
+    // NON-EMPTY range's max, since the ranges are ordered ascending (no numeric
+    // comparison needed — the last populated range holds the global max key).
+    let worker_max: Mutex<Vec<Option<String>>> = Mutex::new(vec![None; workers]);
+    let errors: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    std::thread::scope(|scope| {
+        for (wid, (lo, hi)) in ranges.iter().cloned().enumerate() {
+            let dest = std::sync::Arc::clone(&dest);
+            let (plan_r, key_plan_r, ext_r, stamp_r, key_r) =
+                (plan, &key_plan, &ext, &stamp, key.as_str());
+            let (rows_r, parts_r, checks_r, fp_r, wmax_r, errs_r) = (
+                &rows,
+                &parts_mx,
+                &checksums_mx,
+                &fingerprint,
+                &worker_max,
+                &errors,
+            );
+            scope.spawn(move || {
+                let mut wsrc = match source::create_source(&plan_r.source) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        errs_r
+                            .lock()
+                            .unwrap()
+                            .push(format!("worker {wid}: connect: {e:#}"));
+                        return;
+                    }
+                };
+                let mut cursor = lo;
+                let mut pages = 0usize;
+                let mut wmax: Option<String> = None;
+                loop {
+                    let base = format!(
+                        "{}_{}_pk_w{}_{}.{}",
+                        plan_r.export_name, stamp_r, wid, pages, ext_r
+                    );
+                    let page = match read_keyset_page_bounded(
+                        &mut *wsrc,
+                        plan_r,
+                        key_plan_r,
+                        page_size,
+                        cursor.as_deref(),
+                        hi.as_deref(),
+                        &**dest,
+                        &base,
+                    ) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            errs_r
+                                .lock()
+                                .unwrap()
+                                .push(format!("worker {wid}: page {pages}: {e:#}"));
+                            return;
+                        }
+                    };
+                    let Some(page) = page else { break };
+                    rows_r.fetch_add(page.rows as i64, Ordering::Relaxed);
+                    if let Some(sc) = &page.schema {
+                        let _ = fp_r.set(sc.clone());
+                    }
+                    wmax = page.next_cursor.clone().or(wmax);
+                    parts_r.lock().unwrap().extend(page.parts);
+                    checks_r
+                        .lock()
+                        .unwrap()
+                        .push((page.column_checksums, page.checksum_key_column));
+                    if page.rows < page_size {
+                        break;
+                    }
+                    match page.next_cursor {
+                        Some(v) => cursor = Some(v),
+                        None => {
+                            errs_r.lock().unwrap().push(format!(
+                                "worker {wid}: could not advance the '{key_r}' cursor at page {pages} \
+                                 (NULL or unsupported type)"
+                            ));
+                            return;
+                        }
+                    }
+                    pages += 1;
+                }
+                wmax_r.lock().unwrap()[wid] = wmax;
+            });
+        }
+    });
+
+    let errs = errors.into_inner().unwrap();
+    if !errs.is_empty() {
+        anyhow::bail!(
+            "export '{}': parallel keyset failed on {} worker(s): {}",
+            plan.export_name,
+            errs.len(),
+            errs.join("; ")
+        );
+    }
+
+    // Merge into the summary through the shared seams (identical to the sequential
+    // runner's per-page path, folded run-wide).
+    summary.total_rows += rows.into_inner();
+    if plan.validate {
+        summary.validated = Some(true);
+    }
+    if let Some(sc) = fingerprint.get() {
+        manifest_writer::record_run_schema_fingerprint(summary, sc);
+    }
+    // cursor_high = the highest populated range's max (forensics v18).
+    summary.cursor_high = worker_max
+        .into_inner()
+        .unwrap()
+        .into_iter()
+        .rev()
+        .flatten()
+        .next();
+    summary.cursor_low = None; // a fresh parallel run seeks from the floor of each range
+
+    // Record every part through the commit seam (populates summary.manifest_parts +
+    // counters + journal). state=None: iteration 1 has no resume, so no file_log.
+    let parts = parts_mx.into_inner().unwrap();
+    for (idx, rec) in parts.iter().enumerate() {
+        super::commit::record_part(
+            plan,
+            summary,
+            None,
+            rec,
+            super::commit::PartKind::Page {
+                page_index: idx as i64,
+            },
+        );
+    }
+    // Form B: XOR-combine every worker's per-page column checksums run-wide.
+    let mut acc: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    let mut ck_key: Option<String> = None;
+    for (m, k) in checksums_mx.into_inner().unwrap() {
+        super::commit::accumulate_column_checksums(&mut acc, &m);
+        if ck_key.is_none() {
+            ck_key = k;
+        }
+    }
+    super::commit::harvest_column_checksums(summary, acc, ck_key);
+
+    log::info!(
+        "export '{}': parallel keyset complete — {} workers, {} parts, {} rows",
+        plan.export_name,
+        workers,
+        parts.len(),
+        summary.total_rows
+    );
+
+    // on_schema_drift gate — the SAME post-run check the sequential runner applies
+    // (mirror single mode). Without this, `on_schema_drift: fail` would silently
+    // return exit 0 on a drifted schema on the parallel path — the runner-bypass
+    // class. The workers converge on ONE run schema (fingerprint), so the check is
+    // run-wide, not per-worker.
+    if let (Some(sc), Some(st)) = (fingerprint.get(), state) {
+        super::schema_drift::check_from_sink_schema(
+            st,
+            &plan.export_name,
+            sc,
+            plan.schema_drift_policy,
+            summary,
+        )?;
+    }
+    Ok(())
+}
+
 pub(crate) fn run_keyset(
     src: &mut dyn Source,
     plan: &ResolvedRunPlan,
@@ -132,6 +424,14 @@ pub(crate) fn run_keyset(
         fallback_column: None,
         mode: IncrementalCursorMode::SingleColumn,
     };
+
+    // Parallel keyset (feat/parallel-keyset): N ROW-percentile-range workers seek
+    // concurrently. Iteration 1 is lean — no crash-recovery, so the planner turns
+    // checkpoint/incremental OFF when `parallel > 1` (with a warning), and this
+    // gate is the belt-and-suspenders assertion of that.
+    if kp.parallel > 1 && !kp.checkpoint && !kp.incremental {
+        return run_keyset_parallel(src, plan, summary, key_plan, kp.parallel, state);
+    }
 
     log::info!(
         "export '{}': keyset (seek) pagination on '{}', page size {}",

@@ -450,6 +450,38 @@ fn heavy_chunk_warning(
     ))
 }
 
+/// Resolve a keyset plan's `(checkpoint, incremental)` recovery flags.
+///
+/// `chunk_checkpoint` = crash-recovery (a crashed run resumes from its last
+/// committed key; a CLEAN re-run re-reads the whole range, never skipping).
+/// `keyset_incremental` = append-only "continue from key on a clean re-run",
+/// which needs the high-water key persisted — that IS the checkpoint machinery,
+/// so it implies checkpoint (else it is a silent no-op: the cursor is never
+/// stored and every clean re-run re-reads the whole table).
+///
+/// Parallel keyset (iteration 1, `parallel > 1`) has no crash-recovery yet, so
+/// it forces both OFF and WARNS rather than silently honouring a durability flag
+/// the parallel runner cannot keep. A crashed parallel run re-reads from scratch.
+fn keyset_recovery(export: &ExportConfig) -> (bool, bool) {
+    if export.parallel > 1 {
+        if export.chunk_checkpoint || export.keyset_incremental {
+            log::warn!(
+                "export '{}': parallel keyset (parallel={}) has no crash-recovery in this \
+                 release — chunk_checkpoint/keyset_incremental are disabled for this run, so a \
+                 crashed parallel run re-reads from the start. Set `parallel: 1` to keep \
+                 checkpoint/incremental resume.",
+                export.name,
+                export.parallel
+            );
+        }
+        return (false, false);
+    }
+    (
+        export.chunk_checkpoint || export.keyset_incremental,
+        export.keyset_incremental,
+    )
+}
+
 fn chunked_strategy_from_introspection(
     source_type: crate::config::SourceType,
     export: &ExportConfig,
@@ -557,23 +589,18 @@ fn chunked_strategy_from_introspection(
             key,
             chunk_size
         );
+        let (checkpoint, incremental) = keyset_recovery(export);
         return Ok(ExtractionStrategy::Keyset(KeysetPlan {
             key_column: key.to_string(),
             chunk_size,
-            // `chunk_checkpoint: true` = crash-recovery only: a crashed run resumes
-            // from its last committed key (detected via the in-progress run_id),
-            // but a CLEAN re-run re-reads the whole range — it never silently skips
-            // already-exported rows. The append-only "continue from key on a clean
-            // re-run" behaviour is the separate `keyset_incremental` opt-in.
-            // `keyset_incremental` needs the high-water key persisted across runs,
-            // which IS the checkpoint machinery — so it implies checkpoint. Without
-            // this an incremental-only config (no chunk_checkpoint) would be a
-            // silent no-op: the cursor is never stored and every clean re-run
-            // re-reads the whole table.
-            checkpoint: export.chunk_checkpoint || export.keyset_incremental,
-            incremental: export.keyset_incremental,
-            // SQL keyset is sequential; parallel `_id`-range is a Mongo capability.
-            parallel: 1,
+            checkpoint,
+            incremental,
+            // `parallel: N` fans N ROW-percentile-range keyset workers (feat/
+            // parallel-keyset). The runner samples the boundaries at run open and
+            // seeks each disjoint `(lo, hi]` range concurrently; iteration 1 has no
+            // crash-recovery (a crashed parallel run re-reads from scratch), which
+            // is why `keyset_recovery` forces checkpoint/incremental off above.
+            parallel: export.parallel,
         }));
     }
 
@@ -643,17 +670,13 @@ fn chunked_strategy_from_introspection(
                         tbl,
                         key
                     );
+                    let (checkpoint, incremental) = keyset_recovery(export);
                     return Ok(ExtractionStrategy::Keyset(KeysetPlan {
                         key_column: key.to_string(),
                         chunk_size,
-                        // Same split as the explicit `chunk_by_key` path:
-                        // `chunk_checkpoint` = crash-recovery, `keyset_incremental`
-                        // = append-only continue-on-clean-re-run.
-                        // keyset_incremental implies checkpoint (it needs the
-                        // persisted cursor) — else it is a silent no-op.
-                        checkpoint: export.chunk_checkpoint || export.keyset_incremental,
-                        incremental: export.keyset_incremental,
-                        parallel: 1,
+                        checkpoint,
+                        incremental,
+                        parallel: export.parallel,
                     }));
                 }
                 anyhow::bail!(

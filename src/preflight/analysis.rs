@@ -9,6 +9,12 @@ pub(crate) fn derive_strategy(export: &ExportConfig) -> String {
     // must label it keyset — not `chunked(?, …)`, whose `?` is the absent
     // chunk_column that keyset does not use.
     if let Some(key) = export.chunk_by_key.as_deref() {
+        if export.parallel > 1 {
+            return format!(
+                "keyset-parallel({}, size={}, p={})",
+                key, export.chunk_size, export.parallel
+            );
+        }
         return format!("keyset({}, size={})", key, export.chunk_size);
     }
     match export.mode {
@@ -61,6 +67,12 @@ pub(crate) fn diagnose_mode_str(export: &ExportConfig) -> String {
     // key + page size, not `chunked (column: ?, …)` (the `?` = the unused
     // chunk_column). Mirrors the derive_strategy keyset branch above.
     if let Some(key) = export.chunk_by_key.as_deref() {
+        if export.parallel > 1 {
+            return format!(
+                "keyset (key: {}, size: {}, parallel: {})",
+                key, export.chunk_size, export.parallel
+            );
+        }
         return format!("keyset (key: {}, size: {})", key, export.chunk_size);
     }
     match export.mode {
@@ -366,16 +378,23 @@ pub(crate) fn recommend_parallelism(
     row_estimate: Option<i64>,
     uses_index: bool,
 ) -> (u32, &'static str) {
-    // Keyset (seek) pagination is strictly sequential: each page's
-    // `WHERE key > $last` depends on the prior page's max key, so workers cannot
-    // be fanned out (KeysetPlan hard-codes parallel = 1). Recommending parallel
-    // for a chunk_by_key export would be misadvice, so answer before the
-    // mode-based ladder (keyset carries mode: chunked).
+    // Keyset (seek) pagination is sequential WITHIN a range, but `parallel: N`
+    // fans N ROW-percentile ranges, each seeking a disjoint `(lo, hi]` slice
+    // concurrently (feat/parallel-keyset). Keyset is immune to the sparse-key
+    // blow-up that gates range chunking, so parallelism is always safe here —
+    // honour the configured value and, when unset, point at the escape. Answer
+    // before the mode-based ladder (keyset carries mode: chunked).
     if export.chunk_by_key.is_some() {
-        return (
-            1,
-            "keyset pagination is sequential — parallelism does not apply",
-        );
+        return match export.parallel {
+            n if n > 1 => (
+                n as u32,
+                "keyset fans row-percentile-range workers — each seeks a disjoint slice",
+            ),
+            _ => (
+                1,
+                "keyset is sequential by default — set `parallel: N` to fan out N seek workers",
+            ),
+        };
     }
     if export.mode != ExportMode::Chunked {
         return (1, "only chunked mode benefits from parallelism");
@@ -906,16 +925,32 @@ mod tests {
         );
     }
 
-    // ── recommend_parallelism: keyset is sequential ─────────────────────────
+    // ── recommend_parallelism: keyset honours its own parallel, never the ladder ─
     #[test]
-    fn recommend_parallelism_keyset_is_sequential_never_advises_parallel() {
-        // A ~1M-row keyset export: the old code fell through the chunked ladder
-        // and advised parallel: 2 ("no index"), which is doubly wrong — keyset
-        // is index-backed AND sequential (KeysetPlan pins parallel = 1).
+    fn recommend_parallelism_keyset_default_is_sequential_with_the_escape_hint() {
+        // A ~1M-row keyset export with parallel unset: the old code fell through the
+        // chunked ladder and advised parallel: 2 ("no index"), which was wrong —
+        // keyset must answer from its OWN arm, defaulting to 1 but naming the escape.
         let e = cfg("mode: chunked\nchunk_by_key: id\nchunk_size: 250000\n");
         let (level, reason) = recommend_parallelism(&e, Some(1_000_000), true);
-        assert_eq!(level, 1, "keyset must recommend a single worker: {reason}");
-        assert!(reason.contains("sequential"), "got: {reason}");
+        assert_eq!(level, 1, "keyset default must be a single worker: {reason}");
+        assert!(
+            reason.contains("parallel: N"),
+            "must point at the parallel escape: {reason}"
+        );
+    }
+
+    #[test]
+    fn recommend_parallelism_keyset_honours_configured_parallel() {
+        // feat/parallel-keyset: an explicit `parallel: 4` on a keyset export is now
+        // real — the recommendation must echo it, NOT fall to the range ladder.
+        let e = cfg("mode: chunked\nchunk_by_key: id\nchunk_size: 250000\nparallel: 4\n");
+        let (level, reason) = recommend_parallelism(&e, Some(1_000_000), true);
+        assert_eq!(
+            level, 4,
+            "keyset must honour the configured parallel: {reason}"
+        );
+        assert!(reason.contains("row-percentile"), "got: {reason}");
     }
 
     // ── check_oversized_chunk ───────────────────────────────────────────────
