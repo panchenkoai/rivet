@@ -2,6 +2,47 @@
 
 ## Unreleased
 
+## 0.23.0 — 2026-07-26
+
+### Added
+
+- **Parallel keyset (`parallel: N` on `chunk_by_key`).** Keyset (seek) paging
+  no longer runs strictly sequentially: set `parallel: N` and Rivet splits the
+  key into **N ROW-based percentile ranges** and seeks each range concurrently
+  on its own connection. The ranges are half-open and adjacent, so together
+  they partition the key — **every row is read exactly once** (structural
+  parity, verified live on PostgreSQL, MySQL, SQL Server, and MongoDB). Each
+  worker still pages by seek within its range, so peak RSS stays bounded
+  (`≤ N × chunk_size` rows in flight) and no worker holds a long query. This
+  closes the last "no parallel path" gap for tables with no single-integer PK
+  (UUID / string / composite keys). See
+  [docs/modes/chunked.md](docs/modes/chunked.md#parallel-keyset-parallel-n).
+  - **Per-range crash-recovery.** `chunk_checkpoint` records each range's
+    progress in the state DB (`keyset_range`, state schema v19); a run that
+    dies mid-stream resumes only the unfinished ranges on the next run.
+  - **Fail-loud on unsafe keys.** A decimal or `partition_by` keyset key is
+    rejected at plan time (the percentile sampler needs an orderable,
+    evenly-sliceable key) rather than emitting a skewed split.
+  - **Source-safe.** Workers use ordinary read-only `SELECT` over separate
+    connections — no `SUPER`, no server-side state, no source-side effect
+    beyond the reads themselves. Session settings (MySQL `sql_mode`,
+    `time_zone`) are scoped to Rivet's own connections and reset on drop.
+
+  > **Sweet spot & caveats.** Extraction is I/O-bound, so the speedup plateaus
+  > early: **~3.1× at `parallel: 4`** on an indexed table, little beyond 4. It
+  > is tuned for **indexed tables up to ~10 M rows** — past that, the
+  > range-boundary sampler (an index `OFFSET` skip per percentile cut) grows
+  > costly at setup, so prefer a range `chunk_column` (integer-PK) for very
+  > large tables. Parallel keyset is **new**: the sequential path is unchanged
+  > and remains the conservative default, so **canary a table and diff row
+  > counts against a `parallel: 1` pass before a fleet-wide rollout.**
+
+### Changed
+
+- **`rivet init` scaffolds a row-scaled `parallel`** on keyset exports
+  (≤500 K → 1, <5 M → 2, ≥5 M → 4); a preflight warns past ~5 M rows that peak
+  RSS scales with `N`.
+
 ## 0.22.0 — 2026-07-25
 
 ### Added
