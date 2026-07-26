@@ -7,6 +7,7 @@ mod checkpoint;
 mod cursor;
 mod file_log;
 mod journal_store;
+mod keyset_range;
 mod load_journal_store;
 mod metrics;
 mod progression;
@@ -22,6 +23,8 @@ mod shape;
 pub use checkpoint::ChunkTaskInfo;
 #[allow(unused_imports)]
 pub use file_log::FileRecord;
+#[allow(unused_imports)]
+pub use keyset_range::{KeysetRangePart, KeysetRangeRow};
 pub use load_journal_store::LoadRecord;
 #[allow(unused_imports)]
 pub use metrics::ExportMetric;
@@ -353,6 +356,29 @@ const MIGRATIONS: &[(i64, &str)] = &[
          ALTER TABLE export_metrics ADD COLUMN offending_value TEXT;
          ALTER TABLE export_metrics ADD COLUMN server_context_json TEXT;",
     ),
+    // v19: parallel-keyset crash-recovery ranges (feat/parallel-keyset iteration 2).
+    // A parallel keyset run partitions the key into N stable ROW-percentile ranges
+    // sampled at open; recovery is per-range (coarse): a crashed range re-reads from
+    // its `lo`, a `done` range is skipped and rehydrated from file_log. The
+    // boundaries MUST survive the crash (re-sampling a changed table would move them
+    // and leave a gap), so they are persisted here at open, keyed by run_id, and
+    // reloaded on resume — never re-sampled. Each worker flips only its OWN
+    // (export_name, range_index) row `done=1` at completion (disjoint rows → no
+    // cross-worker write contention), in the same transaction that records its parts
+    // to file_log (atomic checkpoint). Cleared post-finalize by `finalize_keyset_anchor`.
+    (
+        19,
+        "CREATE TABLE IF NOT EXISTS keyset_range (
+            export_name TEXT NOT NULL,
+            run_id      TEXT NOT NULL,
+            range_index INTEGER NOT NULL,
+            lo          TEXT,
+            hi          TEXT,
+            done        INTEGER NOT NULL DEFAULT 0,
+            updated_at  TEXT NOT NULL,
+            PRIMARY KEY (export_name, range_index)
+        );",
+    ),
 ];
 
 /// PostgreSQL-compatible DDL.  Column types differ from SQLite (BIGSERIAL,
@@ -636,6 +662,20 @@ const PG_MIGRATIONS: &[(i64, &str)] = &[
          ALTER TABLE export_metrics ADD COLUMN key_descriptor_json TEXT;
          ALTER TABLE export_metrics ADD COLUMN offending_value TEXT;
          ALTER TABLE export_metrics ADD COLUMN server_context_json TEXT;",
+    ),
+    // v19: parallel-keyset crash-recovery ranges (see the SQLite v19 comment).
+    (
+        19,
+        "CREATE TABLE IF NOT EXISTS keyset_range (
+            export_name TEXT NOT NULL,
+            run_id      TEXT NOT NULL,
+            range_index INTEGER NOT NULL,
+            lo          TEXT,
+            hi          TEXT,
+            done        INTEGER NOT NULL DEFAULT 0,
+            updated_at  TEXT NOT NULL,
+            PRIMARY KEY (export_name, range_index)
+        );",
     ),
 ];
 

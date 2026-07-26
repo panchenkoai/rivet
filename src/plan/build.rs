@@ -459,22 +459,24 @@ fn heavy_chunk_warning(
 /// so it implies checkpoint (else it is a silent no-op: the cursor is never
 /// stored and every clean re-run re-reads the whole table).
 ///
-/// Parallel keyset (iteration 1, `parallel > 1`) has no crash-recovery yet, so
-/// it forces both OFF and WARNS rather than silently honouring a durability flag
-/// the parallel runner cannot keep. A crashed parallel run re-reads from scratch.
+/// Parallel keyset (`parallel > 1`) supports crash-recovery since iteration 2, so
+/// it HONOURS `chunk_checkpoint` (a crashed run resumes per-range from the state
+/// DB's persisted boundaries). `keyset_incremental` (append-only continue on a
+/// clean re-run) is NOT yet parallel-aware, so it is disabled with a warning
+/// rather than silently ignored — `parallel: 1` keeps incremental-by-key.
 fn keyset_recovery(export: &ExportConfig) -> (bool, bool) {
     if export.parallel > 1 {
-        if export.chunk_checkpoint || export.keyset_incremental {
+        if export.keyset_incremental {
             log::warn!(
-                "export '{}': parallel keyset (parallel={}) has no crash-recovery in this \
-                 release — chunk_checkpoint/keyset_incremental are disabled for this run, so a \
-                 crashed parallel run re-reads from the start. Set `parallel: 1` to keep \
-                 checkpoint/incremental resume.",
+                "export '{}': keyset_incremental is not supported with parallel keyset \
+                 (parallel={}) yet — it is disabled for this run, so a clean re-run does a full \
+                 parallel pass. Set `parallel: 1` for incremental-by-key. (chunk_checkpoint \
+                 crash-recovery IS supported in parallel.)",
                 export.name,
                 export.parallel
             );
         }
-        return (false, false);
+        return (export.chunk_checkpoint, false);
     }
     (
         export.chunk_checkpoint || export.keyset_incremental,

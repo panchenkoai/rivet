@@ -186,15 +186,57 @@ fn sample_key_boundaries(
     Ok(bounds)
 }
 
-/// Parallel keyset (feat/parallel-keyset, iteration 1 — no crash-recovery).
+/// Sanitize a run_id into a filename-safe token so it can key part names.
+fn sanitize_run_id(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// Sample the N ROW-percentile ranges for a FRESH parallel keyset run:
+/// `(range_index, lo_exclusive, hi_inclusive, done=false)`. The N−1 boundaries
+/// partition the key into half-open intervals whose union is the whole key space.
+#[allow(clippy::type_complexity)]
+fn sample_parallel_ranges(
+    src: &mut dyn Source,
+    plan: &ResolvedRunPlan,
+    key: &str,
+    parallel: usize,
+) -> Result<Vec<(usize, Option<String>, Option<String>, bool)>> {
+    let bounds = sample_key_boundaries(src, plan, key, parallel)?;
+    let mut ranges = Vec::with_capacity(bounds.len() + 1);
+    let mut prev: Option<String> = None;
+    for (i, b) in bounds.iter().enumerate() {
+        ranges.push((i, prev.clone(), Some(b.clone()), false));
+        prev = Some(b.clone());
+    }
+    let last = ranges.len();
+    ranges.push((last, prev, None, false));
+    Ok(ranges)
+}
+
+/// Parallel keyset (feat/parallel-keyset). N ROW-percentile-range workers seek
+/// concurrently in a `std::thread::scope`; each owns its source connection and
+/// runs the standard bounded seek loop, writing run-unique parts to the SHARED
+/// destination. Rows / parts / Form-B checksums / the run schema fingerprint are
+/// merged into `summary` after the join, through the same commit seam the
+/// sequential runner uses. Row-count parity is structural (the ranges partition
+/// the key); the live test asserts the union reads every row once.
 ///
-/// Samples N−1 row-percentile boundaries, then spawns one worker per disjoint
-/// `(lo, hi]` range in a `std::thread::scope`; each worker owns its source
-/// connection and runs the standard bounded seek loop, writing run-unique parts
-/// to the SHARED destination. Rows / parts / Form-B checksums / the run schema
-/// fingerprint are merged into `summary` after the join, through the same commit
-/// seam the sequential runner uses. Row-count parity is structural (the ranges
-/// partition the key); the live test asserts the union reads every row once.
+/// With `chunk_checkpoint` (iteration 2) it does PER-RANGE crash-recovery: the
+/// boundaries are sampled once and PERSISTED (`keyset_range`, keyed by run_id) so
+/// a resume reloads the SAME ranges rather than re-sampling a possibly-changed
+/// table. Each worker, at completion, atomically records its parts to `file_log`
+/// AND flips its range `done=1`. A resume skips `done` ranges (rehydrating their
+/// parts from `file_log`) and re-runs the rest from their `lo` — the run_id-based
+/// part names make the re-run OVERWRITE the crashed range's partial parts rather
+/// than accumulate duplicates. Without `chunk_checkpoint`, a fresh full pass.
 fn run_keyset_parallel(
     src: &mut dyn Source,
     plan: &ResolvedRunPlan,
@@ -209,23 +251,70 @@ fn run_keyset_parallel(
     let kp = keyset_plan(plan);
     let key = kp.key_column.clone();
     let page_size = kp.chunk_size;
+    let checkpoint = kp.checkpoint;
 
-    let bounds = sample_key_boundaries(src, plan, &key, parallel)?;
-    // N boundaries → N+1 half-open ranges (lo_exclusive, hi_inclusive].
-    let mut ranges: Vec<(Option<String>, Option<String>)> = Vec::with_capacity(bounds.len() + 1);
-    let mut prev: Option<String> = None;
-    for b in &bounds {
-        ranges.push((prev.clone(), Some(b.clone())));
-        prev = Some(b.clone());
-    }
-    ranges.push((prev, None));
-    let workers = ranges.len();
+    // Resume detection (checkpoint only): a surviving resume_run_id means a prior
+    // parallel run of this export crashed. Reuse its run_id (so every worker's
+    // file_log lives under ONE run_id, rehydratable) and RELOAD its persisted
+    // ranges — re-sampling a changed table would move the boundaries and leave a
+    // gap. A fresh run samples the ranges, persists them, and sets the anchor.
+    let resume_run_id: Option<String> = if checkpoint {
+        state
+            .and_then(|s| s.get_resume_run_id(&plan.export_name).ok())
+            .flatten()
+    } else {
+        None
+    };
+
+    // ranges: (range_index, lo_exclusive, hi_inclusive, already_done)
+    let ranges: Vec<(usize, Option<String>, Option<String>, bool)> = match (&resume_run_id, state) {
+        (Some(rid), Some(st)) => {
+            summary.run_id = rid.clone();
+            summary.resumed = true;
+            let rows = st.load_keyset_ranges(&plan.export_name, rid)?;
+            if rows.is_empty() {
+                // Anchor set but no persisted ranges (a crash between set_resume_
+                // run_id and persist_keyset_ranges — nothing committed): re-sample
+                // + persist under this run_id and start over. No skip.
+                let fresh = sample_parallel_ranges(src, plan, &key, parallel)?;
+                st.persist_keyset_ranges(&plan.export_name, rid, &lo_hi_pairs(&fresh))?;
+                fresh
+            } else {
+                rows.into_iter()
+                    .map(|r| (r.range_index as usize, r.lo, r.hi, r.done))
+                    .collect()
+            }
+        }
+        (None, Some(st)) if checkpoint => {
+            // Fresh checkpoint run: sample, persist the boundaries (all done=0),
+            // THEN set the anchor. If a crash lands before the anchor, the next run
+            // sees no resume_run_id and does a fresh full pass (persist replaces the
+            // orphaned rows) — safe, never a skip.
+            let fresh = sample_parallel_ranges(src, plan, &key, parallel)?;
+            st.persist_keyset_ranges(&plan.export_name, &summary.run_id, &lo_hi_pairs(&fresh))?;
+            st.set_resume_run_id(&plan.export_name, &summary.run_id)?;
+            fresh
+        }
+        _ => sample_parallel_ranges(src, plan, &key, parallel)?,
+    };
+
+    let total_ranges = ranges.len();
+    let pending: Vec<(usize, Option<String>, Option<String>)> = ranges
+        .into_iter()
+        .filter(|(_, _, _, done)| !done)
+        .map(|(idx, lo, hi, _)| (idx, lo, hi))
+        .collect();
 
     log::info!(
-        "export '{}': parallel keyset — {} workers on '{}', page size {}",
+        "export '{}': parallel keyset — {} range(s), {} to run{}, page size {}",
         plan.export_name,
-        workers,
-        key,
+        total_ranges,
+        pending.len(),
+        if resume_run_id.is_some() {
+            " (resume)"
+        } else {
+            ""
+        },
         page_size
     );
 
@@ -235,7 +324,14 @@ fn run_keyset_parallel(
     let ext = format::create_format(plan.format, plan.compression, plan.compression_level, None)
         .file_extension()
         .to_string();
-    let stamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f").to_string();
+    // Part names key off the run_id, not a wall-clock stamp: unique per fresh run
+    // AND stable across a resume, so a re-run range's parts OVERWRITE its crashed
+    // partial parts (idempotent) instead of accumulating duplicates.
+    let run_tag = sanitize_run_id(&summary.run_id);
+    let run_id = summary.run_id.clone();
+    let state_ref = state.map(|s| s.state_ref().clone());
+    let fmt_label = plan.format.label();
+    let cmp_label = plan.compression.label();
 
     let rows = AtomicI64::new(0);
     let parts_mx: Mutex<Vec<super::commit::PartRecord>> = Mutex::new(Vec::new());
@@ -243,25 +339,28 @@ fn run_keyset_parallel(
     let checksums_mx: Mutex<Vec<(std::collections::BTreeMap<String, u64>, Option<String>)>> =
         Mutex::new(Vec::new());
     let fingerprint: std::sync::OnceLock<arrow::datatypes::Schema> = std::sync::OnceLock::new();
-    // Per-worker high-water key (indexed by worker id). cursor_high = the highest
-    // NON-EMPTY range's max, since the ranges are ordered ascending (no numeric
-    // comparison needed — the last populated range holds the global max key).
-    let worker_max: Mutex<Vec<Option<String>>> = Mutex::new(vec![None; workers]);
+    // Per-range high-water key, indexed by range_index (done ranges stay None —
+    // they are not re-run). cursor_high = the highest populated range's max; on a
+    // RESUME this reflects the RE-RUN ranges only (a range already `done` pre-crash
+    // is skipped), which is acceptable — parallel keyset is a full snapshot, not an
+    // incremental anchor, so its cursor range is descriptive, not a resume floor.
+    let range_max: Mutex<Vec<Option<String>>> = Mutex::new(vec![None; total_ranges]);
     let errors: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
     std::thread::scope(|scope| {
-        for (wid, (lo, hi)) in ranges.iter().cloned().enumerate() {
+        for (ridx, lo, hi) in pending.iter().cloned() {
             let dest = std::sync::Arc::clone(&dest);
-            let (plan_r, key_plan_r, ext_r, stamp_r, key_r) =
-                (plan, &key_plan, &ext, &stamp, key.as_str());
-            let (rows_r, parts_r, checks_r, fp_r, wmax_r, errs_r) = (
+            let (plan_r, key_plan_r, ext_r, tag_r, key_r) =
+                (plan, &key_plan, &ext, run_tag.as_str(), key.as_str());
+            let (rows_r, parts_r, checks_r, fp_r, rmax_r, errs_r) = (
                 &rows,
                 &parts_mx,
                 &checksums_mx,
                 &fingerprint,
-                &worker_max,
+                &range_max,
                 &errors,
             );
+            let (sref_r, rid_r, fmt_r, cmp_r) = (&state_ref, run_id.as_str(), fmt_label, cmp_label);
             scope.spawn(move || {
                 let mut wsrc = match source::create_source(&plan_r.source) {
                     Ok(s) => s,
@@ -269,17 +368,25 @@ fn run_keyset_parallel(
                         errs_r
                             .lock()
                             .unwrap()
-                            .push(format!("worker {wid}: connect: {e:#}"));
+                            .push(format!("range {ridx}: connect: {e:#}"));
                         return;
                     }
                 };
                 let mut cursor = lo;
                 let mut pages = 0usize;
-                let mut wmax: Option<String> = None;
+                let mut rmax: Option<String> = None;
+                // Parts this range committed — recorded to file_log atomically with
+                // its `done` flip at completion (checkpoint only).
+                let mut range_parts: Vec<crate::state::KeysetRangePart> = Vec::new();
+                let mut local_parts: Vec<super::commit::PartRecord> = Vec::new();
+                let mut local_checks: Vec<(
+                    std::collections::BTreeMap<String, u64>,
+                    Option<String>,
+                )> = Vec::new();
                 loop {
                     let base = format!(
                         "{}_{}_pk_w{}_{}.{}",
-                        plan_r.export_name, stamp_r, wid, pages, ext_r
+                        plan_r.export_name, tag_r, ridx, pages, ext_r
                     );
                     let page = match read_keyset_page_bounded(
                         &mut *wsrc,
@@ -296,7 +403,7 @@ fn run_keyset_parallel(
                             errs_r
                                 .lock()
                                 .unwrap()
-                                .push(format!("worker {wid}: page {pages}: {e:#}"));
+                                .push(format!("range {ridx}: page {pages}: {e:#}"));
                             return;
                         }
                     };
@@ -305,28 +412,66 @@ fn run_keyset_parallel(
                     if let Some(sc) = &page.schema {
                         let _ = fp_r.set(sc.clone());
                     }
-                    wmax = page.next_cursor.clone().or(wmax);
-                    parts_r.lock().unwrap().extend(page.parts);
-                    checks_r
-                        .lock()
-                        .unwrap()
-                        .push((page.column_checksums, page.checksum_key_column));
-                    if page.rows < page_size {
-                        break;
+                    rmax = page.next_cursor.clone().or(rmax);
+                    for p in &page.parts {
+                        range_parts.push(crate::state::KeysetRangePart {
+                            file_name: p.file_name.clone(),
+                            rows: p.rows,
+                            bytes: p.bytes as i64,
+                        });
                     }
-                    match page.next_cursor {
-                        Some(v) => cursor = Some(v),
-                        None => {
-                            errs_r.lock().unwrap().push(format!(
-                                "worker {wid}: could not advance the '{key_r}' cursor at page {pages} \
-                                 (NULL or unsupported type)"
-                            ));
-                            return;
+                    local_parts.extend(page.parts);
+                    local_checks.push((page.column_checksums, page.checksum_key_column));
+                    let last_page = page.rows < page_size;
+                    if !last_page {
+                        match page.next_cursor {
+                            Some(v) => cursor = Some(v),
+                            None => {
+                                errs_r.lock().unwrap().push(format!(
+                                    "range {ridx}: could not advance the '{key_r}' cursor at page \
+                                     {pages} (NULL or unsupported type)"
+                                ));
+                                return;
+                            }
                         }
                     }
                     pages += 1;
+                    if last_page {
+                        break;
+                    }
                 }
-                wmax_r.lock().unwrap()[wid] = wmax;
+                // Atomic checkpoint: the range's parts → file_log AND `done=1` in one
+                // transaction (checkpoint runs only). A crash before this leaves the
+                // range `done=0` with no file_log rows — re-read on resume.
+                if let Some(sref) = sref_r
+                    && let Err(e) = crate::state::StateStore::commit_keyset_range_at_ref(
+                        sref,
+                        rid_r,
+                        &plan_r.export_name,
+                        ridx as i64,
+                        &range_parts,
+                        fmt_r,
+                        Some(cmp_r),
+                    )
+                {
+                    errs_r
+                        .lock()
+                        .unwrap()
+                        .push(format!("range {ridx}: checkpoint commit: {e:#}"));
+                    return;
+                }
+                // Crash simulation: this range is now durably `done` in the state DB,
+                // but the run has NOT finalized — a resume must skip it (rehydrate its
+                // parts) and re-run only the ranges that never reached here.
+                crate::test_hook::maybe_exit_at_index(
+                    "keyset_parallel_range_committed",
+                    ridx as i64,
+                );
+                // Publish to the shared merge state ONLY after the checkpoint commits,
+                // so a failed commit does not leave half-merged summary state.
+                rmax_r.lock().unwrap()[ridx] = rmax;
+                parts_r.lock().unwrap().extend(local_parts);
+                checks_r.lock().unwrap().extend(local_checks);
             });
         }
     });
@@ -334,7 +479,7 @@ fn run_keyset_parallel(
     let errs = errors.into_inner().unwrap();
     if !errs.is_empty() {
         anyhow::bail!(
-            "export '{}': parallel keyset failed on {} worker(s): {}",
+            "export '{}': parallel keyset failed on {} range(s): {}",
             plan.export_name,
             errs.len(),
             errs.join("; ")
@@ -350,8 +495,8 @@ fn run_keyset_parallel(
     if let Some(sc) = fingerprint.get() {
         manifest_writer::record_run_schema_fingerprint(summary, sc);
     }
-    // cursor_high = the highest populated range's max (forensics v18).
-    summary.cursor_high = worker_max
+    // cursor_high = the highest populated range's max (forensics v18); see range_max.
+    summary.cursor_high = range_max
         .into_inner()
         .unwrap()
         .into_iter()
@@ -360,8 +505,10 @@ fn run_keyset_parallel(
         .next();
     summary.cursor_low = None; // a fresh parallel run seeks from the floor of each range
 
-    // Record every part through the commit seam (populates summary.manifest_parts +
-    // counters + journal). state=None: iteration 1 has no resume, so no file_log.
+    // Record this run's parts through the commit seam (populates
+    // summary.manifest_parts + counters + journal). state=None: the workers ALREADY
+    // wrote file_log atomically with their `done` flip, so a second file_log write
+    // here would duplicate it.
     let parts = parts_mx.into_inner().unwrap();
     for (idx, rec) in parts.iter().enumerate() {
         super::commit::record_part(
@@ -373,6 +520,16 @@ fn run_keyset_parallel(
                 page_index: idx as i64,
             },
         );
+    }
+    // Resume completeness: reconstruct the parts of the ranges that completed in a
+    // PRIOR (crashed) run — they were not re-run, so they are absent from
+    // `parts_mx`; file_log (under the reused run_id) is their record. rehydrate
+    // dedupes against the parts just recorded, so a fresh run (all ranges re-run
+    // this pass) is a no-op here.
+    if let Some(st) = state
+        && checkpoint
+    {
+        super::chunked::rehydrate_manifest_parts_from_file_log(st, &run_id, summary)?;
     }
     // Form B: XOR-combine every worker's per-page column checksums run-wide.
     let mut acc: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
@@ -386,9 +543,9 @@ fn run_keyset_parallel(
     super::commit::harvest_column_checksums(summary, acc, ck_key);
 
     log::info!(
-        "export '{}': parallel keyset complete — {} workers, {} parts, {} rows",
+        "export '{}': parallel keyset complete — {} range(s), {} parts, {} rows",
         plan.export_name,
-        workers,
+        total_ranges,
         parts.len(),
         summary.total_rows
     );
@@ -410,6 +567,16 @@ fn run_keyset_parallel(
     Ok(())
 }
 
+/// The `(lo, hi)` pairs of a sampled range list, for `persist_keyset_ranges`.
+fn lo_hi_pairs(
+    ranges: &[(usize, Option<String>, Option<String>, bool)],
+) -> Vec<(Option<String>, Option<String>)> {
+    ranges
+        .iter()
+        .map(|(_, lo, hi, _)| (lo.clone(), hi.clone()))
+        .collect()
+}
+
 pub(crate) fn run_keyset(
     src: &mut dyn Source,
     plan: &ResolvedRunPlan,
@@ -426,10 +593,12 @@ pub(crate) fn run_keyset(
     };
 
     // Parallel keyset (feat/parallel-keyset): N ROW-percentile-range workers seek
-    // concurrently. Iteration 1 is lean — no crash-recovery, so the planner turns
-    // checkpoint/incremental OFF when `parallel > 1` (with a warning), and this
-    // gate is the belt-and-suspenders assertion of that.
-    if kp.parallel > 1 && !kp.checkpoint && !kp.incremental {
+    // concurrently. With `chunk_checkpoint` it does per-range crash-recovery
+    // (iteration 2); without, a fresh full pass (iteration 1). `keyset_incremental`
+    // is not yet parallel-aware — the planner forces `kp.incremental = false` when
+    // parallel > 1, and this `!kp.incremental` gate is the belt-and-suspenders
+    // assertion of that (an incremental parallel config falls through to sequential).
+    if kp.parallel > 1 && !kp.incremental {
         return run_keyset_parallel(src, plan, summary, key_plan, kp.parallel, state);
     }
 

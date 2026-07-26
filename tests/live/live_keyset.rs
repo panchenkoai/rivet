@@ -581,6 +581,109 @@ fn keyset_parallel_reads_every_row_once_across_workers() {
     );
 }
 
+/// PARALLEL keyset CRASH-RECOVERY (feat/parallel-keyset iteration 2). A parallel
+/// run with `chunk_checkpoint: true` that crashes AFTER one range commits (its
+/// parts durable in file_log, its `keyset_range` row `done=1`) but before finalize
+/// must, on resume, produce a COMPLETE destination manifest: the done range's parts
+/// are REHYDRATED from file_log (not re-read — it is skipped), the crashed ranges
+/// are re-run from their `lo` (their run_id-named partial parts overwritten), and
+/// the union is every row exactly once.
+///
+/// Discriminator = the DESTINATION manifest's `row_count` (not a parquet glob — the
+/// committed parquet survives on disk regardless, so a re-read cannot see an
+/// orphaned-from-the-manifest part). RED against removing the resume rehydrate in
+/// `run_keyset_parallel`: the done range's pre-crash parts are then absent from the
+/// manifest (row_count < N) — the manifest-authoritative loader would silently drop
+/// them. That the mutant goes RED is ALSO the proof the done range was SKIPPED, not
+/// re-read: if it were re-read from source, rehydrate would be immaterial.
+#[test]
+#[ignore = "live: requires docker compose up -d mysql"]
+fn keyset_parallel_crash_resume_writes_a_complete_destination_manifest() {
+    require_alive(LiveService::Mysql);
+    let table = unique_name("keyset_par_crash");
+    let _guard = DropTable(table.clone());
+    let mut conn = mysql_connect();
+    conn.query_drop(format!("DROP TABLE IF EXISTS {table}"))
+        .unwrap();
+    conn.query_drop(format!(
+        "CREATE TABLE {table} (uid VARCHAR(40) NOT NULL PRIMARY KEY, payload INT NOT NULL)"
+    ))
+    .unwrap();
+    conn.query_drop("SET SESSION cte_max_recursion_depth = 20000")
+        .unwrap();
+    conn.query_drop(format!(
+        "INSERT INTO {table} (uid, payload) \
+         WITH RECURSIVE seq AS (SELECT 1 n UNION ALL SELECT n+1 FROM seq WHERE n < 2000) \
+         SELECT CONCAT('id-', LPAD(n, 6, '0')), n FROM seq"
+    ))
+    .unwrap();
+
+    // parallel: 4 + chunk_checkpoint → per-range crash-recovery. Small chunk_size so
+    // each ~500-row range pages several times (a crash mid-range is mid-page-set).
+    let export = unique_name("keyset_par_crash_exp");
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let out_dir = tempfile::tempdir().unwrap();
+    let yaml = format!(
+        "source:\n  type: mysql\n  url: \"{MYSQL_URL}\"\nexports:\n  - name: {export}\n    \
+         table: {table}\n    mode: chunked\n    chunk_by_key: uid\n    parallel: 4\n    \
+         chunk_checkpoint: true\n    chunk_size: 200\n    format: parquet\n    \
+         destination:\n      type: local\n      path: {out}\n",
+        out = out_dir.path().display(),
+    );
+    let cfg = write_config(&cfg_dir, &yaml);
+
+    // Run 1: HARD-EXIT (process dies) right after range 0's atomic checkpoint commit
+    // — range 0 is durably `done`, ranges 1-3 wrote parts to disk but never committed.
+    let crash = std::process::Command::new(RIVET_BIN)
+        .args([
+            "run",
+            "--config",
+            cfg.to_str().unwrap(),
+            "--export",
+            &export,
+        ])
+        .env("RIVET_TEST_PANIC_AT", "keyset_parallel_range_committed:0")
+        .output()
+        .expect("spawn rivet");
+    assert!(
+        !crash.status.success(),
+        "the injected hard-exit must make run 1 fail"
+    );
+
+    // Resume: skips the done range (rehydrates it), re-runs the rest.
+    let resume = run_rivet_export(&cfg, &export);
+    assert!(
+        resume.status.success(),
+        "resume must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&resume.stderr)
+    );
+
+    // MANIFEST-DRIVEN completeness: the destination manifest must declare ALL 2000
+    // rows — the pre-crash done range must be rehydrated, not orphaned.
+    let m: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(out_dir.path().join("manifest.json")).unwrap())
+            .expect("destination manifest.json must exist + parse");
+    assert_eq!(
+        m["row_count"].as_i64(),
+        Some(2000),
+        "destination manifest must declare every row (done range not orphaned); got {}",
+        m["row_count"]
+    );
+
+    // And the physical union is complete with no duplicate keys (the crashed
+    // ranges' partial parts were overwritten by the re-run, not accumulated).
+    let (count, keys) = read_uid_set(out_dir.path());
+    let expected: BTreeSet<String> = (1..=2000).map(|n| format!("id-{n:06}")).collect();
+    assert_eq!(
+        count, 2000,
+        "parquet union must hold every row exactly once"
+    );
+    assert_eq!(
+        keys, expected,
+        "the union must equal the full source key set"
+    );
+}
+
 /// Two-run keyset RESUME (`chunk_checkpoint: true` — OPT-4 + Phase 2). Run 1
 /// exports the whole key set and persists the high-water key; an UNCHANGED
 /// re-run exports ZERO new rows; after inserting rows with higher keys, the next
