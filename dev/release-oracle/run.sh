@@ -131,6 +131,8 @@ start_stores
 verify_state_migrations
 # Coverage-ledger drift-guards: every docs/*-matrix.yaml stays honest, or NOT RELEASABLE.
 verify_coverage_matrices
+# Session-pin survival + connection hygiene through a transaction-mode pooler.
+verify_pooler_safety
 
 for eng in $(cfg engines); do
   [ -n "$ENGINES_FILTER" ] && ! grep -qw "$eng" <<<"${ENGINES_FILTER//,/ }" && continue

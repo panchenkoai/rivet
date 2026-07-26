@@ -82,7 +82,7 @@ preflights:
   - id: pooler_safety
     what: "session pins (SET LOCAL / time_zone / max_execution_time) reset + connections clean through a transaction-mode pooler (pgbouncer pool_size=1, proxysql)."
     infra: [pgbouncer, proxysql]
-    status: gap         # tests/live/live_pool_safety.rs EXISTS; wire it as verify_pooler_safety (Phase 2)
+    status: test        # verify_pooler_safety — drives live_pool_safety.rs through pgbouncer + proxysql
 
 # ── BACKEND-INFRASTRUCTURE dimensions the gate does NOT yet exercise (the audit gaps) ──
 # The gate connects DIRECT to every engine; it never routes through the connection-
