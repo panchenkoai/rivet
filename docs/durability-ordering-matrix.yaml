@@ -51,6 +51,13 @@ scenarios:
     keyset:      { test: keyset_checkpoint_crash_resume_writes_a_complete_destination_manifest }
     cdc:         { test: cdc_crash_before_manifest_loses_nothing_on_a_manifest_driven_read }
 
+  - id: parallel_keyset_per_range_manifest_complete
+    what: "the PARALLEL keyset per-RANGE checkpoint (commit_keyset_range_at_ref: file_log + keyset_range done=1 in ONE transaction) advances a range's durable position before the terminal manifest; a crash mid-run + resume RECONSTRUCTS the done range's parts into a complete destination manifest. A DISTINCT recovery unit from the sequential per-PAGE cursor above (the keyset cell there = keyset_SEQUENTIAL)."
+    incremental: { na: "parallel-keyset-specific — the incremental strategy has no per-range checkpoint" }
+    chunked:     { na: "parallel-chunked's per-chunk ordering is its own class (resilience-matrix parallel_chunked_crash_recovery)" }
+    keyset:      { test: parallel_keyset_crash_recovery_mysql }
+    cdc:         { na: "CDC has no keyset ranges" }
+
   - id: canonical_success_pair_consistent
     what: "a mid-run/mid-roll manifest write never overwrites the canonical manifest.json while leaving _SUCCESS (which fingerprints it) stale — validate must not flag SuccessMarkerStale on intact data."
     incremental: { na: "the incremental path writes canonical manifest.json + _SUCCESS together exactly once, at finalize_manifest — there is no mid-run canonical write to decouple the pair" }
