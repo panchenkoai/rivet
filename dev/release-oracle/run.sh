@@ -126,6 +126,11 @@ log "Rivet Release Oracle — $(date -u +%FT%TZ)"
 echo "  rivet: $RIVET ($($RIVET --version 2>/dev/null | head -1))"
 start_stores
 
+# Preflight: the release BUILD/PUBLISH path itself (the stricter tooling the tag runs
+# — cargo-chef manifest parse, --locked lock sync, schema regen). MUST run FIRST,
+# before any cargo command below reconciles the working-tree lock out from under the
+# `cargo metadata --locked` stale-lock check.
+verify_release_build_path
 # Preflight: the state-DB migrations must be type-parity across SQLite and Postgres
 # (bug #1 shipped an int4 keyset_range that broke every Postgres-state run). Runs once,
 # source-agnostic, before the engine loop; SKIP when no Postgres STATE url is set.

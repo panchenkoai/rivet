@@ -72,6 +72,9 @@ scenarios:
 
 # ── Source-agnostic PREFLIGHTS (run ONCE before the engine loop, not per engine/version) ──
 preflights:
+  - id: release_build_path
+    what: "the RELEASE build/publish path itself, not `cargo build` (the stricter tooling the TAG runs, which failed AFTER publish for 0.16.0/0.16.1): Cargo.lock in sync (`cargo metadata --locked` — publish + Docker cook are `--locked`), the cargo-manifest strict parse (no multi-line inline tables, the cargo_manifest_chef guard) + JSON-schema regen (schema_drift guard), and `cargo chef prepare` (the Dockerfile's actual planner step, cheap — no compile). Full `docker build` opt-in via RIVET_ORACLE_DOCKER=1. Runs FIRST, before any cargo reconciles the working-tree lock."
+    status: test        # verify_release_build_path (lib/release_path.sh)
   - id: state_migrations
     what: "SQLite state == Postgres state on the state-exercising golden fixtures (parallel-checkpoint, incremental, crash-resume) — the migration arrays are type-parity."
     backends: [sqlite, postgres]

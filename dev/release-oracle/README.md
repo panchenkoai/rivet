@@ -73,6 +73,31 @@ RIVET_CDC_STATE_URL      postgresql://…                          # the state-p
 
 Regenerate the snapshot golden on purpose with `run.sh --bless-cdc`.
 
+## Release build path (pre-tag preflight)
+
+The scenarios above prove **correctness of what ships**; they assume a working binary
+exists. But the release pipeline runs **stricter tooling than `cargo build`**, and the
+gap only surfaces at the **tag — after crates.io, the binaries, and the GitHub release
+have published**, when the failure is no longer re-runnable from the immutable tag.
+`verify_release_build_path` (`lib/release_path.sh`) runs that path **first, pre-tag**:
+
+- **`cargo metadata --locked`** — `Cargo.lock` in sync with `Cargo.toml`. The release
+  publishes with `cargo publish --locked` and the Docker builder cooks + builds
+  `--locked`; a stale committed lock aborts both (**0.16.1**, post-tag). Runs FIRST,
+  before any other cargo command reconciles the lock out from under it.
+- **`cargo_manifest_chef` + `schema_drift`** (offline guards) — no multi-line inline
+  tables in `Cargo.toml` (the spec-strict `cargo-manifest` parser the Docker
+  `cargo chef` step uses rejects them — **0.16.0**, post-tag) and the checked-in JSON
+  schema matches the binary's derived one (a version bump that forgot to regen).
+- **`cargo chef prepare`** — the Dockerfile's actual `planner` step (line 11). It
+  distils the dependency graph with **no compilation**, so it is cheap yet runs the
+  exact cargo-manifest parse the 0.16.0 image failed on — the real command, not a proxy.
+- **`docker build`** — the full release image, opt-in via `RIVET_ORACLE_DOCKER=1`
+  (fat-LTO in-image, minutes); the cheap steps above cover the known classes every run.
+
+RED-proven: a stale `Cargo.lock` reddens the lock check; a multi-line inline table
+reddens **both** the offline guard AND `cargo chef prepare`. SKIP when `cargo` is absent.
+
 ## Final stage — BigQuery golden
 
 The only non-emulator stage, and the load goes through rivet on BOTH legs:

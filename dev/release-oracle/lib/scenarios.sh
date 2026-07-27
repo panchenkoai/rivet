@@ -455,3 +455,9 @@ source "$HERE/lib/bigquery.sh"
 # capture to a store → INDEPENDENT readback + validate + state population + SQLite-
 # vs-Postgres parity + at-least-once crash recovery. Env-driven, SKIP-if-absent.
 source "$HERE/lib/cdc.sh"
+
+# ── Release BUILD/PUBLISH path stage (implemented in lib/release_path.sh) — the
+# release runs stricter tooling than `cargo build` (cargo-chef manifest parse,
+# `publish --locked`, schema regen) that only fails at the TAG, post-publish. Runs
+# the real path pre-tag so the mismatch fails loud and local.
+source "$HERE/lib/release_path.sh"
