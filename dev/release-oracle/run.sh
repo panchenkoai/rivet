@@ -57,6 +57,17 @@ export BLESS_VERDICTS BLESS_DUCKDB BLESS_CDC
 
 [ -x "$RIVET" ] || { echo "rivet binary not found at $RIVET (build --release or set RIVET_BIN)"; exit 2; }
 command -v duckdb >/dev/null || { echo "duckdb not on PATH (needed for the integrity oracle)"; exit 2; }
+# Mongo is the ONLY engine seeded FROM THE HOST (`python3 seeds/mongo_seed.py` → pymongo);
+# pg/mysql/mssql seed INSIDE the container via `docker exec`. So a `python3` that can't import
+# pymongo makes every mongo version emit a cryptic "seed had errors" and the gate read
+# NOT-RELEASABLE — with no hint that the cause is the environment, not rivet. (Real bite: a
+# login shell whose PATH prefers /usr/local/bin/python3 over a pyenv shim that has pymongo.)
+# Fail LOUD here, only when mongo is actually in scope, naming the interpreter.
+if { [ -z "$ENGINES_FILTER" ] || grep -qw mongo <<<"${ENGINES_FILTER//,/ }"; } \
+   && ! python3 -c "import pymongo" >/dev/null 2>&1; then
+  echo "mongo seed needs pymongo but \`$(command -v python3 || echo python3)\` can't import it — \`pip install pymongo\`, or fix PATH (a login shell may shadow a pyenv shim with /usr/local/bin/python3)."
+  exit 2
+fi
 
 # ── local object stores (reuse the repo compose) ──
 AZURITE_CONN="DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://127.0.0.1:10000/devstoreaccount1;"
