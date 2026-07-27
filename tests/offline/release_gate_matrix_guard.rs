@@ -17,7 +17,14 @@ use serde_yaml_ng::Value;
 
 const GATE_MATRIX: &str = "docs/release-gate-matrix.yaml";
 const ORACLE_MATRIX: &str = "dev/release-oracle/matrix.yaml";
-const SCENARIOS_SH: &str = "dev/release-oracle/lib/scenarios.sh";
+// scenarios.sh sources the per-stage libs (bigquery.sh, cdc.sh); a gate CHECK
+// function (`sc_*` / `verify_*`) may live in any of them, so the ledger cross-check
+// scans them all — else a stage moved into its own lib (verify_cdc_e2e → cdc.sh)
+// would silently escape the "every gate function has a ledger row" guard.
+const GATE_SH: [&str; 2] = [
+    "dev/release-oracle/lib/scenarios.sh",
+    "dev/release-oracle/lib/cdc.sh",
+];
 const ENGINES: [&str; 4] = ["postgres", "mysql", "mssql", "mongo"];
 
 // Total admitted gaps = scenario `gap` cells + preflight/infra `status: gap` +
@@ -87,7 +94,11 @@ fn grid_matches_the_oracle_matrix_versions() {
 
 #[test]
 fn every_gate_function_has_a_ledger_row_and_vice_versa() {
-    let sh = fs::read_to_string(SCENARIOS_SH).unwrap();
+    let sh: String = GATE_SH
+        .iter()
+        .map(|p| fs::read_to_string(p).unwrap_or_else(|e| panic!("read {p}: {e}")))
+        .collect::<Vec<_>>()
+        .join("\n");
     // Function DEFINITIONS live at column 0 (`sc_x() {` / `verify_x() {`); calls are indented.
     let mut sc_fns = BTreeSet::new();
     let mut verify_fns = BTreeSet::new();

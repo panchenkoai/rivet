@@ -1,0 +1,9 @@
+{
+  "export_metrics": "populated",
+  "export_schema": "empty",
+  "export_state": "empty",
+  "run_aggregate": "empty",
+  "run_journal": "populated",
+  "run_status": "populated",
+  "run_status_all_success": "yes"
+}

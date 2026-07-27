@@ -449,3 +449,9 @@ sc_gc_survival() {
 
 # ── BigQuery golden stage (implemented in lib/bigquery.sh) ───────────────────
 source "$HERE/lib/bigquery.sh"
+
+# ── CDC end-to-end stage (implemented in lib/cdc.sh) — the change-data-capture
+# surface the batch scenarios never exercise: per engine anchor → typed changes →
+# capture to a store → INDEPENDENT readback + validate + state population + SQLite-
+# vs-Postgres parity + at-least-once crash recovery. Env-driven, SKIP-if-absent.
+source "$HERE/lib/cdc.sh"

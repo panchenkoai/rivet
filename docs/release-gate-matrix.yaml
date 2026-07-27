@@ -83,6 +83,10 @@ preflights:
     what: "session pins (SET LOCAL / time_zone / max_execution_time) reset + connections clean through a transaction-mode pooler (pgbouncer pool_size=1, proxysql)."
     infra: [pgbouncer, proxysql]
     status: test        # verify_pooler_safety — drives live_pool_safety.rs through pgbouncer + proxysql
+  - id: cdc_e2e
+    what: "CDC end-to-end per engine (the change-data-capture surface the batch scenarios never exercise): anchor a typed table → INSERT/UPDATE/DELETE → capture (mode:cdc, until_current) to the object store → INDEPENDENT DuckDB readback == 5 events (never rivet) → rivet validate PASSED → state-DB metabase populated (run_status all-success) → at-least-once CRASH recovery (cdc_after_flush_before_ack holds the anchor; the re-run re-reads id=4). PLUS SQLite-vs-Postgres state PARITY vs golden/cdc_state_snapshot.json (the reference snapshot). Each engine's anchor is its own mechanism (PG slot / MySQL binlog / MSSQL from-LSN / Mongo resume token)."
+    backends: [sqlite, postgres]
+    status: test        # verify_cdc_e2e (lib/cdc.sh) — env-driven RIVET_CDC_<ENGINE>_URL, SKIP-if-absent
 
 # ── BACKEND-INFRASTRUCTURE dimensions the gate does NOT yet exercise (the audit gaps) ──
 # The gate connects DIRECT to every engine; it never routes through the connection-

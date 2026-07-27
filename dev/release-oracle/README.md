@@ -24,6 +24,40 @@ dev/release-oracle/run.sh --bless-bigquery-golden   # re-capture the BQ golden (
 | **load** | `rivet run` extracts to each store {s3/MinIO, gcs/fake-gcs, azure/Azurite}; the readback is **INDEPENDENT** — the store's own client + DuckDB (`httpfs` for MinIO, the fake-gcs JSON API, `az` for Azurite), never rivet's own `--validate` — so a rivet read bug can't rubber-stamp its own write. Row count must equal the source. A run-unique prefix isolates each run (run-unique part names never clobber, so a stable prefix would sum every past run). |
 | **gc_survival** | the concurrent-extract bucket-erasure guard (spare an in-flight part while a run is active, delete a true orphan). Runs in the BigQuery stage (needs a warehouse load target). |
 
+## CDC end-to-end stage (all engines, independent oracle)
+
+The batch scenarios above never exercise **change-data-capture** — the most
+engine-divergent, correctness-critical surface. `verify_cdc_e2e` (`lib/cdc.sh`)
+codifies the manual CDC dogfood as a preflight: for each engine whose
+`RIVET_CDC_<ENGINE>_URL` is set it
+
+1. **anchors** a typed table, applies `INSERT`/`UPDATE`/`DELETE` (3 + 1 + 1 = **5
+   change events**), and **captures** them (`mode: cdc`, `until_current`) to the
+   object store;
+2. reads them back **INDEPENDENTLY** — DuckDB over the store, never rivet — and
+   asserts **5** events, then `rivet validate` re-reads its own parts (`PASSED`);
+3. asserts the **state-DB metabase** is populated (`run_status` all-success);
+4. proves **at-least-once crash recovery**: a `cdc_after_flush_before_ack` panic
+   holds the per-engine anchor (PG slot / MySQL binlog ckpt / MSSQL from-LSN /
+   Mongo resume token), and the re-run **re-reads** the delta (`id=4`), never
+   losing it;
+5. **SQLite-vs-Postgres state PARITY**: a PG CDC run against both state backends
+   must populate the **same** table set, matching `golden/cdc_state_snapshot.json`
+   (the reference snapshot — a release that stops populating `run_status`, or
+   drifts the state schema, fails here).
+
+Env-driven and **SKIP** (never a silent pass) when a URL is absent:
+
+```
+RIVET_CDC_POSTGRES_URL   postgresql://rivet:rivet@host:port/db   # wal_level=logical
+RIVET_CDC_MYSQL_URL      mysql://rivet:rivet@host:port/db        # log_bin, ROW
+RIVET_CDC_MSSQL_URL      sqlserver://rivet:rivet@host:port/db    # CDC enabled + Agent
+RIVET_CDC_MONGO_URL      mongodb://rivet:rivet@host:port/db?authSource=admin&directConnection=true
+RIVET_CDC_STATE_URL      postgresql://…                          # the state-parity leg (else that leg SKIPs)
+```
+
+Regenerate the snapshot golden on purpose with `run.sh --bless-cdc`.
+
 ## Final stage — BigQuery golden
 
 The only non-emulator stage, and the load goes through rivet on BOTH legs:

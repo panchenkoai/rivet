@@ -43,16 +43,17 @@ cleanup() {
 }
 
 # ── options ──
-ENGINES_FILTER=""; NO_CLOUD=0; KEEP=0; BLESS=0; BLESS_VERDICTS=0; BLESS_DUCKDB=0
+ENGINES_FILTER=""; NO_CLOUD=0; KEEP=0; BLESS=0; BLESS_VERDICTS=0; BLESS_DUCKDB=0; BLESS_CDC=0
 while [ $# -gt 0 ]; do case "$1" in
   --engines) ENGINES_FILTER="$2"; shift 2;;
   --no-cloud) NO_CLOUD=1; shift;;
   --keep) KEEP=1; shift;;
   --bless-bigquery-golden) BLESS=1; shift;;
   --bless-local) BLESS_VERDICTS=1; BLESS_DUCKDB=1; NO_CLOUD=1; shift;;   # verdicts + duckdb-type goldens
+  --bless-cdc) BLESS_CDC=1; shift;;                                       # cdc state-snapshot golden
   *) echo "unknown arg: $1"; exit 2;;
 esac; done
-export BLESS_VERDICTS BLESS_DUCKDB
+export BLESS_VERDICTS BLESS_DUCKDB BLESS_CDC
 
 [ -x "$RIVET" ] || { echo "rivet binary not found at $RIVET (build --release or set RIVET_BIN)"; exit 2; }
 command -v duckdb >/dev/null || { echo "duckdb not on PATH (needed for the integrity oracle)"; exit 2; }
@@ -133,6 +134,11 @@ verify_state_migrations
 verify_coverage_matrices
 # Session-pin survival + connection hygiene through a transaction-mode pooler.
 verify_pooler_safety
+# CDC end-to-end (the change-data-capture surface the batch scenarios never touch):
+# per engine anchor → typed changes → capture → store → INDEPENDENT readback +
+# validate + state population + SQLite/Postgres parity + at-least-once crash. Runs
+# from the RIVET_CDC_<ENGINE>_URL env vars; SKIP (never a silent pass) when unset.
+verify_cdc_e2e
 
 for eng in $(cfg engines); do
   [ -n "$ENGINES_FILTER" ] && ! grep -qw "$eng" <<<"${ENGINES_FILTER//,/ }" && continue

@@ -73,6 +73,8 @@ stores:
 preflight:
   - id: state_migrations
     what: "SQLite state == Postgres state on every state-exercising fixture (migrations are type-parity; a keyset_range-style int4/BIGINT drift fails the gate)."
+  - id: cdc_e2e
+    what: "CDC end-to-end per engine (the change-data-capture surface the batch scenarios never exercise). For each engine whose RIVET_CDC_<ENGINE>_URL is set: anchor a typed table → INSERT/UPDATE/DELETE → capture (mode:cdc, until_current) to the object store → INDEPENDENT DuckDB readback == 5 change events (never rivet) → rivet validate PASSED → state-DB metabase populated (run_status all-success) → at-least-once CRASH recovery (a cdc_after_flush_before_ack panic holds the anchor; the re-run re-reads the delta id=4, never loses it). PLUS SQLite-vs-Postgres state PARITY: a PG CDC run against both backends must populate the SAME table set, matching golden/cdc_state_snapshot.json (the эталонный слепок). Each engine's anchor is its own mechanism: PG logical slot (server-side), MySQL binlog checkpoint file, SQL Server from-LSN, Mongo change-stream resume token. SKIP (never a silent pass) when the env URL is absent; the PG state-parity leg additionally needs RIVET_CDC_STATE_URL. lib/cdc.sh; regenerate the snapshot golden with run.sh --bless-cdc."
 
 # ── Scenarios (the manual dogfood, codified) ────────────────────────────────
 # Each runs per engine×version. `sql`-only ones skip Mongo where noted.
