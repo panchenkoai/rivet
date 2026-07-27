@@ -28,6 +28,16 @@
 //! `mode: full` even for a large (150K-doc) collection — it does not auto-scaffold
 //! `page_size` — so Mongo is "always full" at init, its own decision to lock in a
 //! Mongo-specific golden, not here.
+//!
+//! COVERAGE (all auto-scaffold branches, dogfood-cross-checked live on PG / MySQL /
+//! SQL Server): keyset (int / uuid / string / float / timestamp / date PK),
+//! range-chunk (no-PK + composite-PK + decimal-PK-with-int-col; row-scaled
+//! parallel, MySQL-wide → 1), incremental, full. `scaffold_full` models the whole
+//! decision (strategy + chunk_size + parallel + checkpoint), not just the label.
+//! OUT OF SCOPE — `init --mode cdc` is a FORCED mode, not a `suggest_mode` outcome,
+//! so it is not modelled here; it is dogfood-verified separately to scaffold
+//! `mode: cdc` + an engine-specific `cdc:` stream block on all three SQL engines.
+//! `time_window` / `date-chunked` are never auto-selected (no golden needed).
 
 use super::TableInfo;
 
