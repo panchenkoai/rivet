@@ -98,6 +98,32 @@ have published**, when the failure is no longer re-runnable from the immutable t
 RED-proven: a stale `Cargo.lock` reddens the lock check; a multi-line inline table
 reddens **both** the offline guard AND `cargo chef prepare`. SKIP when `cargo` is absent.
 
+## Regression vs the previous release (pre-tag preflight)
+
+The gate compares to checked-in **goldens** and to **itself**, never to the version
+users are actually running. Two regressions ship green through every correctness
+check yet are release-blocking. `verify_release_regression` (`lib/regression.sh`)
+benchmarks against the **DOWNLOADED previous-release binary** (`RIVET_PREV_RELEASE_BIN`
+— a GitHub release asset / brew bottle, the artifact users run, never a rebuilt
+parent) over a seeded 100K keyset+zstd fixture:
+
+- **B-format (cross-version read)** — the previous release WRITES; the current binary
+  must READ its manifest + parts (`rivet validate` PASSED + an independent DuckDB
+  row-count == source). A format bump the new release can't read silently breaks every
+  existing user's data on upgrade — a quiet loss, worse than a crash.
+- **B-perf** — current wall-clock ≤ the previous release's × tolerance
+  (`RIVET_REGRESSION_WALL_TOL`, default 1.5×; RSS reported alongside). A 3× slowdown
+  or an RSS blow-up passes every count/value check.
+
+Each binary runs in its **own env dir** (its own `.rivet_state.db`, which lives next
+to the config): the new binary UPGRADES the state schema (v18→v19), which the old
+binary then cannot open — never share a state dir across versions.
+
+RED-proven: corrupting a part the prev release wrote reddens the format check (cur
+`validate` no longer PASSES); a genuinely slower binary (a debug build, ~1.5×) reddens
+the perf check below its slowdown. SKIP when `RIVET_PREV_RELEASE_BIN` /
+`RIVET_REGRESSION_SOURCE_URL` are absent.
+
 ## Final stage — BigQuery golden
 
 The only non-emulator stage, and the load goes through rivet on BOTH legs:

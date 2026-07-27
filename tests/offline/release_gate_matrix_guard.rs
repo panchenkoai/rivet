@@ -21,10 +21,11 @@ const ORACLE_MATRIX: &str = "dev/release-oracle/matrix.yaml";
 // function (`sc_*` / `verify_*`) may live in any of them, so the ledger cross-check
 // scans them all — else a stage moved into its own lib (verify_cdc_e2e → cdc.sh)
 // would silently escape the "every gate function has a ledger row" guard.
-const GATE_SH: [&str; 3] = [
+const GATE_SH: [&str; 4] = [
     "dev/release-oracle/lib/scenarios.sh",
     "dev/release-oracle/lib/cdc.sh",
     "dev/release-oracle/lib/release_path.sh",
+    "dev/release-oracle/lib/regression.sh",
 ];
 const ENGINES: [&str; 4] = ["postgres", "mysql", "mssql", "mongo"];
 

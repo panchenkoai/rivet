@@ -461,3 +461,9 @@ source "$HERE/lib/cdc.sh"
 # `publish --locked`, schema regen) that only fails at the TAG, post-publish. Runs
 # the real path pre-tag so the mismatch fails loud and local.
 source "$HERE/lib/release_path.sh"
+
+# ── Regression vs the PREVIOUS RELEASE (implemented in lib/regression.sh) — the gate
+# compares to goldens and to itself, never to the version users run. The new release
+# must READ what the previous release WROTE (format-compat) and be no slower / fatter
+# than the DOWNLOADED prev-release binary (perf/RSS). Env-driven, SKIP-if-absent.
+source "$HERE/lib/regression.sh"

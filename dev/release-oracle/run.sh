@@ -144,6 +144,10 @@ verify_pooler_safety
 # validate + state population + SQLite/Postgres parity + at-least-once crash. Runs
 # from the RIVET_CDC_<ENGINE>_URL env vars; SKIP (never a silent pass) when unset.
 verify_cdc_e2e
+# Regression vs the PREVIOUS RELEASE (not a golden, not itself): the new binary reads
+# what the prev release WROTE (format-compat) + is no slower/fatter than the DOWNLOADED
+# prev-release binary. Needs RIVET_PREV_RELEASE_BIN + RIVET_REGRESSION_SOURCE_URL; SKIP.
+verify_release_regression
 
 for eng in $(cfg engines); do
   [ -n "$ENGINES_FILTER" ] && ! grep -qw "$eng" <<<"${ENGINES_FILTER//,/ }" && continue
