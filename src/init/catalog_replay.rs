@@ -40,7 +40,12 @@ use super::TableInfo;
 /// data-free function of the catalog shape.
 pub(crate) fn scaffold_strategy(info: &TableInfo) -> String {
     match info.suggest_mode() {
-        "chunked" => match info.single_pk_column() {
+        // Mirror yaml_scaffold EXACTLY: a KEYSET-usable single PK → keyset;
+        // otherwise range chunk on an integer column. Using `keysettable_pk_column`
+        // (not `single_pk_column`) is load-bearing — a decimal PK is not keysettable,
+        // so a decimal-PK table with an integer column range-chunks the int column
+        // rather than (wrongly) keyseting the decimal.
+        "chunked" => match info.keysettable_pk_column() {
             Some(pk) => format!("keyset({pk})"),
             None => format!("chunked({})", info.best_chunk_column().unwrap_or("id")),
         },

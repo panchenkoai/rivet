@@ -482,5 +482,33 @@
         }
       ]
     }
+  },
+  {
+    "expect": "chunked(seq)",
+    "note": "DECIMAL PK but WITH an integer non-PK column, ~200K rows. init range-chunks the integer column (chunk_column: seq), NEVER keysets the decimal PK (planner refuses a decimal keyset key). Locks that keysettable_pk_column gates the keyset branch \u2014 a decimal PK does not hijack it when a range-chunkable int column exists.",
+    "table": {
+      "schema": "s",
+      "table": "decimal_pk_with_int_col_200k",
+      "row_estimate": 200000,
+      "total_bytes": 40000000,
+      "columns": [
+        {
+          "name": "id",
+          "data_type": "decimal",
+          "is_primary_key": true,
+          "is_nullable": false,
+          "numeric_precision": 20,
+          "numeric_scale": 0
+        },
+        {
+          "name": "seq",
+          "data_type": "int",
+          "is_primary_key": false,
+          "is_nullable": false,
+          "numeric_precision": null,
+          "numeric_scale": null
+        }
+      ]
+    }
   }
 ]
