@@ -1,86 +1,205 @@
 [
   {
     "expect": "keyset(id)",
-    "note": "large int-PK table (~163M rows) → keyset on the indexed PK",
+    "note": "large int-PK table (~163M rows) \u2192 keyset on the indexed PK",
     "table": {
-      "schema": "s", "table": "big_int_pk_163m",
-      "row_estimate": 163000000, "total_bytes": 90000000000,
+      "schema": "s",
+      "table": "big_int_pk_163m",
+      "row_estimate": 163000000,
+      "total_bytes": 90000000000,
       "columns": [
-        {"name":"id","data_type":"bigint","is_primary_key":true,"is_nullable":false,"numeric_precision":null,"numeric_scale":null},
-        {"name":"col_a","data_type":"varchar","is_primary_key":false,"is_nullable":true,"numeric_precision":null,"numeric_scale":null}
+        {
+          "name": "id",
+          "data_type": "bigint",
+          "is_primary_key": true,
+          "is_nullable": false,
+          "numeric_precision": null,
+          "numeric_scale": null
+        },
+        {
+          "name": "col_a",
+          "data_type": "varchar",
+          "is_primary_key": false,
+          "is_nullable": true,
+          "numeric_precision": null,
+          "numeric_scale": null
+        }
       ]
     }
   },
   {
     "expect": "keyset(id)",
-    "note": "huge int-PK table (~318M rows) → keyset stays flat-memory at any size",
+    "note": "huge int-PK table (~318M rows) \u2192 keyset stays flat-memory at any size",
     "table": {
-      "schema": "s", "table": "huge_int_pk_318m",
-      "row_estimate": 318000000, "total_bytes": 200000000000,
+      "schema": "s",
+      "table": "huge_int_pk_318m",
+      "row_estimate": 318000000,
+      "total_bytes": 200000000000,
       "columns": [
-        {"name":"id","data_type":"bigint","is_primary_key":true,"is_nullable":false,"numeric_precision":null,"numeric_scale":null},
-        {"name":"amount","data_type":"decimal","is_primary_key":false,"is_nullable":true,"numeric_precision":11,"numeric_scale":4}
+        {
+          "name": "id",
+          "data_type": "bigint",
+          "is_primary_key": true,
+          "is_nullable": false,
+          "numeric_precision": null,
+          "numeric_scale": null
+        },
+        {
+          "name": "amount",
+          "data_type": "decimal",
+          "is_primary_key": false,
+          "is_nullable": true,
+          "numeric_precision": 11,
+          "numeric_scale": 4
+        }
       ]
     }
   },
   {
     "expect": "chunked(ref_id)",
-    "note": "history/version table with a non-PK integer key (~823M rows) → range chunk on the integer key (no single PK → not keyset)",
+    "note": "history/version table with a non-PK integer key (~823M rows) \u2192 range chunk on the integer key (no single PK \u2192 not keyset)",
     "table": {
-      "schema": "s", "table": "version_ref_id_823m",
-      "row_estimate": 823000000, "total_bytes": 400000000000,
+      "schema": "s",
+      "table": "version_ref_id_823m",
+      "row_estimate": 823000000,
+      "total_bytes": 400000000000,
       "columns": [
-        {"name":"ref_id","data_type":"bigint","is_primary_key":false,"is_nullable":false,"numeric_precision":null,"numeric_scale":null},
-        {"name":"version","data_type":"int","is_primary_key":false,"is_nullable":true,"numeric_precision":null,"numeric_scale":null},
-        {"name":"updated_at","data_type":"timestamp","is_primary_key":false,"is_nullable":true,"numeric_precision":null,"numeric_scale":null}
+        {
+          "name": "ref_id",
+          "data_type": "bigint",
+          "is_primary_key": false,
+          "is_nullable": false,
+          "numeric_precision": null,
+          "numeric_scale": null
+        },
+        {
+          "name": "version",
+          "data_type": "int",
+          "is_primary_key": false,
+          "is_nullable": true,
+          "numeric_precision": null,
+          "numeric_scale": null
+        },
+        {
+          "name": "updated_at",
+          "data_type": "timestamp",
+          "is_primary_key": false,
+          "is_nullable": true,
+          "numeric_precision": null,
+          "numeric_scale": null
+        }
       ]
     }
   },
   {
     "expect": "full",
-    "note": "tiny table (~27 rows) → full is correct, no chunking overhead",
+    "note": "tiny table (~27 rows) \u2192 full is correct, no chunking overhead",
     "table": {
-      "schema": "s", "table": "tiny_27",
-      "row_estimate": 27, "total_bytes": 8192,
+      "schema": "s",
+      "table": "tiny_27",
+      "row_estimate": 27,
+      "total_bytes": 8192,
       "columns": [
-        {"name":"id","data_type":"bigint","is_primary_key":true,"is_nullable":false,"numeric_precision":null,"numeric_scale":null},
-        {"name":"col_a","data_type":"varchar","is_primary_key":false,"is_nullable":true,"numeric_precision":null,"numeric_scale":null}
+        {
+          "name": "id",
+          "data_type": "bigint",
+          "is_primary_key": true,
+          "is_nullable": false,
+          "numeric_precision": null,
+          "numeric_scale": null
+        },
+        {
+          "name": "col_a",
+          "data_type": "varchar",
+          "is_primary_key": false,
+          "is_nullable": true,
+          "numeric_precision": null,
+          "numeric_scale": null
+        }
       ]
     }
   },
   {
     "expect": "full",
-    "note": "small no-PK, no-cursor table (~50K rows) → full (below the 100k threshold anyway)",
+    "note": "small no-PK, no-cursor table (~50K rows) \u2192 full (below the 100k threshold anyway)",
     "table": {
-      "schema": "s", "table": "small_no_key_50k",
-      "row_estimate": 50000, "total_bytes": 3700000,
+      "schema": "s",
+      "table": "small_no_key_50k",
+      "row_estimate": 50000,
+      "total_bytes": 3700000,
       "columns": [
-        {"name":"col_a","data_type":"varchar","is_primary_key":false,"is_nullable":true,"numeric_precision":null,"numeric_scale":null},
-        {"name":"col_b","data_type":"varchar","is_primary_key":false,"is_nullable":true,"numeric_precision":null,"numeric_scale":null}
+        {
+          "name": "col_a",
+          "data_type": "varchar",
+          "is_primary_key": false,
+          "is_nullable": true,
+          "numeric_precision": null,
+          "numeric_scale": null
+        },
+        {
+          "name": "col_b",
+          "data_type": "varchar",
+          "is_primary_key": false,
+          "is_nullable": true,
+          "numeric_precision": null,
+          "numeric_scale": null
+        }
       ]
     }
   },
   {
     "expect": "keyset(id)",
-    "note": "medium int-PK table just over the 100k threshold (~141K rows) → keyset, fast profile",
+    "note": "medium int-PK table just over the 100k threshold (~141K rows) \u2192 keyset, fast profile",
     "table": {
-      "schema": "s", "table": "medium_int_pk_141k",
-      "row_estimate": 141000, "total_bytes": 50000000,
+      "schema": "s",
+      "table": "medium_int_pk_141k",
+      "row_estimate": 141000,
+      "total_bytes": 50000000,
       "columns": [
-        {"name":"id","data_type":"int","is_primary_key":true,"is_nullable":false,"numeric_precision":null,"numeric_scale":null},
-        {"name":"col_a","data_type":"varchar","is_primary_key":false,"is_nullable":true,"numeric_precision":null,"numeric_scale":null}
+        {
+          "name": "id",
+          "data_type": "int",
+          "is_primary_key": true,
+          "is_nullable": false,
+          "numeric_precision": null,
+          "numeric_scale": null
+        },
+        {
+          "name": "col_a",
+          "data_type": "varchar",
+          "is_primary_key": false,
+          "is_nullable": true,
+          "numeric_precision": null,
+          "numeric_scale": null
+        }
       ]
     }
   },
   {
     "expect": "incremental(updated_at)",
-    "note": "large table with NO integer key but a timestamp cursor → incremental (suggest_mode falls through chunked→incremental)",
+    "note": "large table with NO usable single PK (a non-PK uuid column) but a timestamp cursor \u2192 incremental. Kept as the cursor-only path test after init learned to keyset a non-int single-PK: here the uuid is NOT a PK, so keysettable_pk_column is None and the cursor wins.",
     "table": {
-      "schema": "s", "table": "large_cursor_only_2m",
-      "row_estimate": 2000000, "total_bytes": 800000000,
+      "schema": "s",
+      "table": "large_cursor_only_2m",
+      "row_estimate": 2000000,
+      "total_bytes": 800000000,
       "columns": [
-        {"name":"uuid","data_type":"char","is_primary_key":true,"is_nullable":false,"numeric_precision":null,"numeric_scale":null},
-        {"name":"updated_at","data_type":"timestamp","is_primary_key":false,"is_nullable":true,"numeric_precision":null,"numeric_scale":null}
+        {
+          "name": "uuid",
+          "data_type": "char",
+          "is_primary_key": false,
+          "is_nullable": false,
+          "numeric_precision": null,
+          "numeric_scale": null
+        },
+        {
+          "name": "updated_at",
+          "data_type": "timestamp",
+          "is_primary_key": false,
+          "is_nullable": true,
+          "numeric_precision": null,
+          "numeric_scale": null
+        }
       ]
     }
   },
@@ -88,103 +207,279 @@
     "expect": "full",
     "note": "KNOWN GAP: small-by-count (~25K rows) but MB-wide rows (large text columns). Scaffolded full because the 100k threshold is row-count-blind to row WIDTH; a full scan of MB rows times out. It has an integer PK, so it SHOULD keyset(id). Flip to keyset(id) when init weighs total_bytes.",
     "table": {
-      "schema": "s", "table": "wide_short_25k",
-      "row_estimate": 25000, "total_bytes": 21474836480,
+      "schema": "s",
+      "table": "wide_short_25k",
+      "row_estimate": 25000,
+      "total_bytes": 21474836480,
       "columns": [
-        {"name":"id","data_type":"bigint","is_primary_key":true,"is_nullable":false,"numeric_precision":null,"numeric_scale":null},
-        {"name":"wide_text_a","data_type":"longtext","is_primary_key":false,"is_nullable":true,"numeric_precision":null,"numeric_scale":null},
-        {"name":"wide_text_b","data_type":"longtext","is_primary_key":false,"is_nullable":true,"numeric_precision":null,"numeric_scale":null}
-      ]
-    }
-  },
-
-  {
-    "expect": "keyset(id)",
-    "note": "distilled field-fleet profile: a bigint-PK feed table with BOTH created_at + updated_at, ~3M rows / ~1GB, in a non-default schema. The field tool chose a size-tiered timestamp strategy; rivet picks keyset(id) — the single-column PK beats the timestamp cursor, and keyset stays flat-memory regardless of size. Locks 'PK wins over a present cursor'.",
-    "table": {
-      "schema": "ext", "table": "bigint_pk_dual_ts_3m",
-      "row_estimate": 3000000, "total_bytes": 1000000000,
-      "columns": [
-        {"name":"id","data_type":"bigint","is_primary_key":true,"is_nullable":false,"numeric_precision":null,"numeric_scale":null},
-        {"name":"payload","data_type":"varchar","is_primary_key":false,"is_nullable":true,"numeric_precision":null,"numeric_scale":null},
-        {"name":"created_at","data_type":"timestamp","is_primary_key":false,"is_nullable":false,"numeric_precision":null,"numeric_scale":null},
-        {"name":"updated_at","data_type":"timestamp","is_primary_key":false,"is_nullable":true,"numeric_precision":null,"numeric_scale":null}
-      ]
-    }
-  },
-  {
-    "expect": "keyset(id)",
-    "note": "distilled field-fleet profile: the INT-PK minority (a minority of the fleet's tables are int, not bigint), ~500K rows, dual timestamps. Same decision as the bigint majority — keyset(id) on the integer PK. Locks that int and bigint PKs route identically.",
-    "table": {
-      "schema": "ext", "table": "int_pk_dual_ts_500k",
-      "row_estimate": 500000, "total_bytes": 180000000,
-      "columns": [
-        {"name":"id","data_type":"int","is_primary_key":true,"is_nullable":false,"numeric_precision":null,"numeric_scale":null},
-        {"name":"payload","data_type":"varchar","is_primary_key":false,"is_nullable":true,"numeric_precision":null,"numeric_scale":null},
-        {"name":"created_at","data_type":"timestamp","is_primary_key":false,"is_nullable":false,"numeric_precision":null,"numeric_scale":null},
-        {"name":"updated_at","data_type":"timestamp","is_primary_key":false,"is_nullable":true,"numeric_precision":null,"numeric_scale":null}
+        {
+          "name": "id",
+          "data_type": "bigint",
+          "is_primary_key": true,
+          "is_nullable": false,
+          "numeric_precision": null,
+          "numeric_scale": null
+        },
+        {
+          "name": "wide_text_a",
+          "data_type": "longtext",
+          "is_primary_key": false,
+          "is_nullable": true,
+          "numeric_precision": null,
+          "numeric_scale": null
+        },
+        {
+          "name": "wide_text_b",
+          "data_type": "longtext",
+          "is_primary_key": false,
+          "is_nullable": true,
+          "numeric_precision": null,
+          "numeric_scale": null
+        }
       ]
     }
   },
   {
     "expect": "keyset(id)",
-    "note": "distilled field-fleet profile: a very large bigint-PK feed table (~200M rows) whose ids run PAST i64::MAX — the field DB CASTs id AS UNSIGNED (BIGINT UNSIGNED). The STRATEGY is keyset(id) like any bigint PK; the unsigned-cursor RUNTIME hazard (extract_last_cursor_value, fixed in bc512a3) is exercised by the live stand, not this offline oracle.",
+    "note": "distilled field-fleet profile: a bigint-PK feed table with BOTH created_at + updated_at, ~3M rows / ~1GB, in a non-default schema. The field tool chose a size-tiered timestamp strategy; rivet picks keyset(id) \u2014 the single-column PK beats the timestamp cursor, and keyset stays flat-memory regardless of size. Locks 'PK wins over a present cursor'.",
     "table": {
-      "schema": "ext", "table": "bigint_unsigned_pk_200m",
-      "row_estimate": 200000000, "total_bytes": 120000000000,
+      "schema": "ext",
+      "table": "bigint_pk_dual_ts_3m",
+      "row_estimate": 3000000,
+      "total_bytes": 1000000000,
       "columns": [
-        {"name":"id","data_type":"bigint","is_primary_key":true,"is_nullable":false,"numeric_precision":null,"numeric_scale":null},
-        {"name":"payload","data_type":"varchar","is_primary_key":false,"is_nullable":true,"numeric_precision":null,"numeric_scale":null}
+        {
+          "name": "id",
+          "data_type": "bigint",
+          "is_primary_key": true,
+          "is_nullable": false,
+          "numeric_precision": null,
+          "numeric_scale": null
+        },
+        {
+          "name": "payload",
+          "data_type": "varchar",
+          "is_primary_key": false,
+          "is_nullable": true,
+          "numeric_precision": null,
+          "numeric_scale": null
+        },
+        {
+          "name": "created_at",
+          "data_type": "timestamp",
+          "is_primary_key": false,
+          "is_nullable": false,
+          "numeric_precision": null,
+          "numeric_scale": null
+        },
+        {
+          "name": "updated_at",
+          "data_type": "timestamp",
+          "is_primary_key": false,
+          "is_nullable": true,
+          "numeric_precision": null,
+          "numeric_scale": null
+        }
+      ]
+    }
+  },
+  {
+    "expect": "keyset(id)",
+    "note": "distilled field-fleet profile: the INT-PK minority (a minority of the fleet's tables are int, not bigint), ~500K rows, dual timestamps. Same decision as the bigint majority \u2014 keyset(id) on the integer PK. Locks that int and bigint PKs route identically.",
+    "table": {
+      "schema": "ext",
+      "table": "int_pk_dual_ts_500k",
+      "row_estimate": 500000,
+      "total_bytes": 180000000,
+      "columns": [
+        {
+          "name": "id",
+          "data_type": "int",
+          "is_primary_key": true,
+          "is_nullable": false,
+          "numeric_precision": null,
+          "numeric_scale": null
+        },
+        {
+          "name": "payload",
+          "data_type": "varchar",
+          "is_primary_key": false,
+          "is_nullable": true,
+          "numeric_precision": null,
+          "numeric_scale": null
+        },
+        {
+          "name": "created_at",
+          "data_type": "timestamp",
+          "is_primary_key": false,
+          "is_nullable": false,
+          "numeric_precision": null,
+          "numeric_scale": null
+        },
+        {
+          "name": "updated_at",
+          "data_type": "timestamp",
+          "is_primary_key": false,
+          "is_nullable": true,
+          "numeric_precision": null,
+          "numeric_scale": null
+        }
+      ]
+    }
+  },
+  {
+    "expect": "keyset(id)",
+    "note": "distilled field-fleet profile: a very large bigint-PK feed table (~200M rows) whose ids run PAST i64::MAX \u2014 the field DB CASTs id AS UNSIGNED (BIGINT UNSIGNED). The STRATEGY is keyset(id) like any bigint PK; the unsigned-cursor RUNTIME hazard (extract_last_cursor_value, fixed in bc512a3) is exercised by the live stand, not this offline oracle.",
+    "table": {
+      "schema": "ext",
+      "table": "bigint_unsigned_pk_200m",
+      "row_estimate": 200000000,
+      "total_bytes": 120000000000,
+      "columns": [
+        {
+          "name": "id",
+          "data_type": "bigint",
+          "is_primary_key": true,
+          "is_nullable": false,
+          "numeric_precision": null,
+          "numeric_scale": null
+        },
+        {
+          "name": "payload",
+          "data_type": "varchar",
+          "is_primary_key": false,
+          "is_nullable": true,
+          "numeric_precision": null,
+          "numeric_scale": null
+        }
       ]
     }
   },
   {
     "expect": "full",
-    "note": "distilled field-fleet profile: a SMALL keyed feed table (~80K rows, below the 100k chunked threshold) with dual timestamps. Even with a bigint PK it scaffolds full — no chunking overhead under the threshold. Locks 'a PK does not force keyset below the row threshold'.",
+    "note": "distilled field-fleet profile: a SMALL keyed feed table (~80K rows, below the 100k chunked threshold) with dual timestamps. Even with a bigint PK it scaffolds full \u2014 no chunking overhead under the threshold. Locks 'a PK does not force keyset below the row threshold'.",
     "table": {
-      "schema": "ext", "table": "bigint_pk_small_80k",
-      "row_estimate": 80000, "total_bytes": 24000000,
+      "schema": "ext",
+      "table": "bigint_pk_small_80k",
+      "row_estimate": 80000,
+      "total_bytes": 24000000,
       "columns": [
-        {"name":"id","data_type":"bigint","is_primary_key":true,"is_nullable":false,"numeric_precision":null,"numeric_scale":null},
-        {"name":"payload","data_type":"varchar","is_primary_key":false,"is_nullable":true,"numeric_precision":null,"numeric_scale":null},
-        {"name":"created_at","data_type":"timestamp","is_primary_key":false,"is_nullable":false,"numeric_precision":null,"numeric_scale":null},
-        {"name":"updated_at","data_type":"timestamp","is_primary_key":false,"is_nullable":true,"numeric_precision":null,"numeric_scale":null}
+        {
+          "name": "id",
+          "data_type": "bigint",
+          "is_primary_key": true,
+          "is_nullable": false,
+          "numeric_precision": null,
+          "numeric_scale": null
+        },
+        {
+          "name": "payload",
+          "data_type": "varchar",
+          "is_primary_key": false,
+          "is_nullable": true,
+          "numeric_precision": null,
+          "numeric_scale": null
+        },
+        {
+          "name": "created_at",
+          "data_type": "timestamp",
+          "is_primary_key": false,
+          "is_nullable": false,
+          "numeric_precision": null,
+          "numeric_scale": null
+        },
+        {
+          "name": "updated_at",
+          "data_type": "timestamp",
+          "is_primary_key": false,
+          "is_nullable": true,
+          "numeric_precision": null,
+          "numeric_scale": null
+        }
+      ]
+    }
+  },
+  {
+    "expect": "keyset(id)",
+    "note": "NON-INT single-column PK #1 \u2014 UUID PK, ~150K rows. Init now scaffolds keyset(id): a uuid PK is a keyset-usable key, so a large uuid-PK table pages by ROWS (chunk_by_key) instead of an unbounded full scan (durability-safe per ADR-0020's explicit chunk_by_key path). Dogfood-confirmed on PG/MySQL/MSSQL. RED-proves the suggest_mode keysettable-PK fix.",
+    "table": {
+      "schema": "s",
+      "table": "uuid_pk_150k",
+      "row_estimate": 150000,
+      "total_bytes": 30000000,
+      "columns": [
+        {
+          "name": "id",
+          "data_type": "uuid",
+          "is_primary_key": true,
+          "is_nullable": false,
+          "numeric_precision": null,
+          "numeric_scale": null
+        },
+        {
+          "name": "name",
+          "data_type": "text",
+          "is_primary_key": false,
+          "is_nullable": true,
+          "numeric_precision": null,
+          "numeric_scale": null
+        }
+      ]
+    }
+  },
+  {
+    "expect": "keyset(code)",
+    "note": "NON-INT single-column PK #2 \u2014 STRING (varchar) PK, ~150K rows. Init now scaffolds keyset(code): a varchar PK is a keyset-usable key. Same fix as the uuid case.",
+    "table": {
+      "schema": "s",
+      "table": "string_pk_150k",
+      "row_estimate": 150000,
+      "total_bytes": 20000000,
+      "columns": [
+        {
+          "name": "code",
+          "data_type": "varchar",
+          "is_primary_key": true,
+          "is_nullable": false,
+          "numeric_precision": null,
+          "numeric_scale": null
+        },
+        {
+          "name": "name",
+          "data_type": "text",
+          "is_primary_key": false,
+          "is_nullable": true,
+          "numeric_precision": null,
+          "numeric_scale": null
+        }
       ]
     }
   },
   {
     "expect": "full",
-    "note": "NON-INT single-column PK #1 — UUID PK, ~150K rows, no integer column, no cursor. Dogfood-confirmed on PostgreSQL AND MySQL: init scaffolds `full`, NOT keyset — even though the uuid PK IS a usable keyset key. KNOWN GAP: suggest_mode gates 'chunked' on an INTEGER column (best_chunk_column), blind to a single_pk_column of another orderable type. On MySQL (no server cursor) a large uuid-PK full scan is unbounded and should keyset(id); on PostgreSQL full is acceptable (RAM-bounded DECLARE CURSOR, ADR-0020). Flip to keyset(id) when init keysets a non-int single-PK.",
+    "note": "NON-INT single-column PK #3 \u2014 DECIMAL(20,0) PK, ~150K rows. Init correctly scaffolds `full`, NOT keyset: a DECIMAL keyset key is refused at plan time (the keyset cursor excludes decimal/numeric), so init must NOT scaffold chunk_by_key on it (would fail the run). is_keysettable_type excludes decimal, so a decimal PK stays full (or range-chunks an integer column if present). Locks that the keyset fix does NOT over-reach to decimal.",
     "table": {
-      "schema": "s", "table": "uuid_pk_150k",
-      "row_estimate": 150000, "total_bytes": 30000000,
+      "schema": "s",
+      "table": "decimal_pk_150k",
+      "row_estimate": 150000,
+      "total_bytes": 20000000,
       "columns": [
-        {"name":"id","data_type":"uuid","is_primary_key":true,"is_nullable":false,"numeric_precision":null,"numeric_scale":null},
-        {"name":"name","data_type":"text","is_primary_key":false,"is_nullable":true,"numeric_precision":null,"numeric_scale":null}
-      ]
-    }
-  },
-  {
-    "expect": "full",
-    "note": "NON-INT single-column PK #2 — STRING (varchar) PK, ~150K rows, no integer column, no cursor. Dogfood-confirmed on PostgreSQL AND MySQL: init scaffolds `full`. Same KNOWN GAP as the uuid case — a varchar PK is a usable keyset key, but suggest_mode's integer-column gate sends it to full. Flip to keyset(code) when init keysets a non-int single-PK.",
-    "table": {
-      "schema": "s", "table": "string_pk_150k",
-      "row_estimate": 150000, "total_bytes": 20000000,
-      "columns": [
-        {"name":"code","data_type":"varchar","is_primary_key":true,"is_nullable":false,"numeric_precision":null,"numeric_scale":null},
-        {"name":"name","data_type":"text","is_primary_key":false,"is_nullable":true,"numeric_precision":null,"numeric_scale":null}
-      ]
-    }
-  },
-  {
-    "expect": "full",
-    "note": "NON-INT single-column PK #3 — DECIMAL(20,0) PK (integer-valued but a decimal TYPE), ~150K rows. Dogfood-confirmed on PostgreSQL AND MySQL: init scaffolds `full`. Here full is CORRECT, not a gap: a DECIMAL keyset key is refused at plan time (0.22.0 — the percentile sampler needs an evenly-sliceable key), and a decimal is not an integer so it cannot range-chunk either. Full is the only safe strategy; this fixture locks that a decimal-PK does NOT keyset.",
-    "table": {
-      "schema": "s", "table": "decimal_pk_150k",
-      "row_estimate": 150000, "total_bytes": 20000000,
-      "columns": [
-        {"name":"id","data_type":"decimal","is_primary_key":true,"is_nullable":false,"numeric_precision":20,"numeric_scale":0},
-        {"name":"name","data_type":"text","is_primary_key":false,"is_nullable":true,"numeric_precision":null,"numeric_scale":null}
+        {
+          "name": "id",
+          "data_type": "decimal",
+          "is_primary_key": true,
+          "is_nullable": false,
+          "numeric_precision": 20,
+          "numeric_scale": 0
+        },
+        {
+          "name": "name",
+          "data_type": "text",
+          "is_primary_key": false,
+          "is_nullable": true,
+          "numeric_precision": null,
+          "numeric_scale": null
+        }
       ]
     }
   }

@@ -98,10 +98,34 @@ impl TableInfo {
             .map(|c| c.name.as_str())
     }
 
+    /// The single-column PK if it is a KEYSET-usable type (see
+    /// [`is_keysettable_type`]) — an integer / uuid / string / timestamp / date
+    /// PK, but NOT a `decimal`/`numeric` PK (which the planner refuses as a keyset
+    /// key). This is the signal that a large NON-INTEGER-PK table can still keyset
+    /// (`chunk_by_key`) instead of falling to a full scan. `None` for a composite
+    /// PK, no PK, or a decimal-typed PK.
+    pub(crate) fn keysettable_pk_column(&self) -> Option<&str> {
+        let pk = self.single_pk_column()?;
+        let ty = self
+            .columns
+            .iter()
+            .find(|c| c.name == pk)
+            .map(|c| c.data_type.as_str())?;
+        is_keysettable_type(ty).then_some(pk)
+    }
+
     /// Suggest extraction mode based on row count and available columns.
     pub(crate) fn suggest_mode(&self) -> &'static str {
         if self.row_estimate > 100_000 {
-            if self.best_chunk_column().is_some() {
+            // A range-chunkable integer column OR a keyset-usable single PK (uuid /
+            // string / … — any orderable indexed key) both mean "chunked": the
+            // scaffold then routes an integer PK / integer column to range chunking
+            // and a non-integer single PK to keyset (`chunk_by_key`). Before this a
+            // large uuid/string-PK table with no integer column fell to `full` — an
+            // unbounded scan that is not durability-safe on a large table (ADR-0020).
+            // A decimal PK is NOT keysettable (planner refuses it), so it stays
+            // `full` unless it also has an integer column to range-chunk.
+            if self.best_chunk_column().is_some() || self.keysettable_pk_column().is_some() {
                 return "chunked";
             }
             if self.best_cursor_column().is_some() {
@@ -234,6 +258,33 @@ fn is_integer_type(t: &str) -> bool {
 fn is_timestamp_type(t: &str) -> bool {
     let t = t.to_lowercase();
     t.contains("timestamp") || t == "datetime" || t == "date"
+}
+
+/// Whether a column of this type can be a KEYSET (seek) key — i.e. the keyset
+/// cursor can read + compare it (`WHERE key > last ORDER BY key`). MUST mirror the
+/// planner's `keyset_keys` restriction (`source::TableIntrospection`): integer /
+/// float / string / timestamp / date / uuid are readable; `decimal`/`numeric` (and
+/// `money`) are EXCLUDED — the planner refuses a decimal keyset key, so init must
+/// not scaffold `chunk_by_key` on one (it would fail the run). Used to decide
+/// whether a large NON-INTEGER single-PK table can keyset instead of falling to
+/// `full`.
+fn is_keysettable_type(t: &str) -> bool {
+    if is_integer_type(t) || is_timestamp_type(t) {
+        return true;
+    }
+    let t = t.to_lowercase();
+    // uuid, string (char/varchar/text families), and float/real/double — but NOT
+    // decimal/numeric/money (the planner's keyset cursor excludes those).
+    t.contains("uuid")
+        || t.contains("uniqueidentifier")
+        || t.contains("char") // char, varchar, nvarchar, character varying, bpchar
+        || t.contains("text")
+        || t == "float"
+        || t == "real"
+        || t == "double"
+        || t == "double precision"
+        || t == "float4"
+        || t == "float8"
 }
 
 pub(super) fn source_type(source_url: &str) -> Result<&'static str> {
@@ -997,6 +1048,60 @@ mod tests {
     }
 
     #[test]
+    fn init_keysets_a_large_non_int_pk_but_never_a_decimal_pk() {
+        // The fix: a large table with a NON-INTEGER single-column PK of a
+        // keyset-usable type (uuid / string) scaffolds keyset (chunk_by_key), not a
+        // full scan — matching an integer PK. A DECIMAL PK is NOT keysettable (the
+        // planner refuses it), so it stays `full`. Dogfood-confirmed on PG/MySQL/MSSQL.
+        let uuid_pk = make_table(
+            150_000,
+            vec![col("id", "uuid", true), col("n", "int", false)],
+        );
+        assert_eq!(uuid_pk.suggest_mode(), "chunked");
+        assert_eq!(uuid_pk.keysettable_pk_column(), Some("id"));
+
+        let str_pk = make_table(
+            150_000,
+            vec![col("code", "varchar", true), col("n", "int", false)],
+        );
+        assert_eq!(str_pk.suggest_mode(), "chunked");
+        assert_eq!(str_pk.keysettable_pk_column(), Some("code"));
+
+        // Decimal PK: keyset refused at plan time → init must NOT keyset it.
+        let dec_pk = make_table(
+            150_000,
+            vec![
+                ColumnInfo {
+                    name: "id".into(),
+                    data_type: "decimal".into(),
+                    is_primary_key: true,
+                    is_nullable: false,
+                    numeric_precision: Some(20),
+                    numeric_scale: Some(0),
+                },
+                col("name", "text", false),
+            ],
+        );
+        assert_eq!(
+            dec_pk.keysettable_pk_column(),
+            None,
+            "decimal PK not keysettable"
+        );
+        assert_eq!(
+            dec_pk.suggest_mode(),
+            "full",
+            "decimal PK (no int col) stays full"
+        );
+
+        // Below the row threshold, even a keysettable PK stays full (no chunking overhead).
+        let small_uuid = make_table(
+            50_000,
+            vec![col("id", "uuid", true), col("n", "int", false)],
+        );
+        assert_eq!(small_uuid.suggest_mode(), "full");
+    }
+
+    #[test]
     fn generate_config_chunked_single_pk_uses_keyset() {
         // A single-column PK → keyset (`chunk_by_key`), immune to sparse keys —
         // NOT range `chunk_column` (which blows up on a huge/gappy id). Sequential,
@@ -1613,11 +1718,13 @@ mod tests {
 
     #[test]
     fn table_discovery_surfaces_cursor_and_coalesce_hint() {
-        // No integer PK so `suggest_mode` falls back to incremental.
+        // No usable single PK (a non-PK uuid) so `suggest_mode` falls back to
+        // incremental on the timestamp cursor. (A uuid PRIMARY KEY would now keyset
+        // — see `suggest_mode` / `keysettable_pk_column`.)
         let info = make_table(
             300_000,
             vec![
-                col("key", "uuid", true),
+                col("key", "uuid", false),
                 col("created_at", "timestamp", false),
                 ColumnInfo {
                     name: "updated_at".into(),

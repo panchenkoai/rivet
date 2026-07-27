@@ -18,14 +18,16 @@
 //! ENGINE SCOPE — SQL only (PostgreSQL / MySQL / SQL Server). Those three share
 //! ONE `information_schema`-shaped introspection → the same `TableInfo` → the same
 //! engine-agnostic scaffold decision, so a single fixture covers all three
-//! (dogfood-verified live: a uuid / varchar / decimal(p,0) single-PK 150K table
-//! scaffolds `mode: full` identically on PG, MySQL AND SQL Server). MongoDB is a
-//! SEPARATE path (`init::mongo` — no SQL columns / PK; keyset is `source.mongo.
-//! page_size` on `_id`, not `chunk_by_key`), so `TableInfo`/`scaffold_strategy`
-//! does NOT model it and these fixtures do not apply to Mongo. Empirically Mongo
-//! init scaffolds `mode: full` even for a large (150K-doc) collection — it does
-//! not auto-scaffold `page_size` — so Mongo is "always full" at init, but that is
-//! its own decision to lock in a Mongo-specific golden, not here.
+//! (dogfood-verified live on ALL three: a large uuid / varchar single-PK table
+//! scaffolds keyset(`chunk_by_key`) and a decimal(p,0)-PK table scaffolds `full`
+//! IDENTICALLY on PG, MySQL AND SQL Server — end-to-end confirmed: an init-scaffolded
+//! uuid-PK keyset config exported all 120K rows). MongoDB is a SEPARATE path
+//! (`init::mongo` — no SQL columns / PK; keyset is `source.mongo.page_size` on
+//! `_id`, not `chunk_by_key`), so `TableInfo`/`scaffold_strategy` does NOT model it
+//! and these fixtures do not apply to Mongo. Empirically Mongo init scaffolds
+//! `mode: full` even for a large (150K-doc) collection — it does not auto-scaffold
+//! `page_size` — so Mongo is "always full" at init, its own decision to lock in a
+//! Mongo-specific golden, not here.
 
 use super::TableInfo;
 
