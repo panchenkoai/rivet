@@ -151,5 +151,41 @@
         {"name":"updated_at","data_type":"timestamp","is_primary_key":false,"is_nullable":true,"numeric_precision":null,"numeric_scale":null}
       ]
     }
+  },
+  {
+    "expect": "full",
+    "note": "NON-INT single-column PK #1 — UUID PK, ~150K rows, no integer column, no cursor. Dogfood-confirmed on PostgreSQL AND MySQL: init scaffolds `full`, NOT keyset — even though the uuid PK IS a usable keyset key. KNOWN GAP: suggest_mode gates 'chunked' on an INTEGER column (best_chunk_column), blind to a single_pk_column of another orderable type. On MySQL (no server cursor) a large uuid-PK full scan is unbounded and should keyset(id); on PostgreSQL full is acceptable (RAM-bounded DECLARE CURSOR, ADR-0020). Flip to keyset(id) when init keysets a non-int single-PK.",
+    "table": {
+      "schema": "s", "table": "uuid_pk_150k",
+      "row_estimate": 150000, "total_bytes": 30000000,
+      "columns": [
+        {"name":"id","data_type":"uuid","is_primary_key":true,"is_nullable":false,"numeric_precision":null,"numeric_scale":null},
+        {"name":"name","data_type":"text","is_primary_key":false,"is_nullable":true,"numeric_precision":null,"numeric_scale":null}
+      ]
+    }
+  },
+  {
+    "expect": "full",
+    "note": "NON-INT single-column PK #2 — STRING (varchar) PK, ~150K rows, no integer column, no cursor. Dogfood-confirmed on PostgreSQL AND MySQL: init scaffolds `full`. Same KNOWN GAP as the uuid case — a varchar PK is a usable keyset key, but suggest_mode's integer-column gate sends it to full. Flip to keyset(code) when init keysets a non-int single-PK.",
+    "table": {
+      "schema": "s", "table": "string_pk_150k",
+      "row_estimate": 150000, "total_bytes": 20000000,
+      "columns": [
+        {"name":"code","data_type":"varchar","is_primary_key":true,"is_nullable":false,"numeric_precision":null,"numeric_scale":null},
+        {"name":"name","data_type":"text","is_primary_key":false,"is_nullable":true,"numeric_precision":null,"numeric_scale":null}
+      ]
+    }
+  },
+  {
+    "expect": "full",
+    "note": "NON-INT single-column PK #3 — DECIMAL(20,0) PK (integer-valued but a decimal TYPE), ~150K rows. Dogfood-confirmed on PostgreSQL AND MySQL: init scaffolds `full`. Here full is CORRECT, not a gap: a DECIMAL keyset key is refused at plan time (0.22.0 — the percentile sampler needs an evenly-sliceable key), and a decimal is not an integer so it cannot range-chunk either. Full is the only safe strategy; this fixture locks that a decimal-PK does NOT keyset.",
+    "table": {
+      "schema": "s", "table": "decimal_pk_150k",
+      "row_estimate": 150000, "total_bytes": 20000000,
+      "columns": [
+        {"name":"id","data_type":"decimal","is_primary_key":true,"is_nullable":false,"numeric_precision":20,"numeric_scale":0},
+        {"name":"name","data_type":"text","is_primary_key":false,"is_nullable":true,"numeric_precision":null,"numeric_scale":null}
+      ]
+    }
   }
 ]
