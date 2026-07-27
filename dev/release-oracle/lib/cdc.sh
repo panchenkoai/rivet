@@ -184,7 +184,58 @@ verify_cdc_e2e() {
     else bad "cdc[$eng]: $fails"; add "$eng" cdc e2e s3 FAIL "$fails"; fi
   done
   [ "$any" = 0 ] && return
+  _cdc_large_tx_atomic
   _cdc_state_parity
+}
+
+# ── large-transaction atomicity (the committed-boundary invariant) ───────────
+# A source transaction LARGER than `rollover` must roll as ONE unit — the adapter
+# marks ONLY its last event `committed`, so the sink flushes+checkpoints+acks at the
+# true commit boundary, never mid-transaction. A crash mid-flush therefore holds the
+# anchor BEFORE the whole transaction; recovery re-reads it entire, losing no tail.
+# RED-proven against the `committed:true`-on-every-event mutant (which rolls + acks
+# mid-transaction, so a crash advances the anchor past the committed prefix and the
+# tail is skipped on resume). PG only — the slot-anchor engine where the mid-transaction
+# advance is observable (the sink code is shared, so one engine proves the invariant).
+_cdc_large_tx_atomic() {
+  local url="${RIVET_CDC_POSTGRES_URL:-}"
+  [ -z "$url" ] && { skip "cdc large-tx-atomic: no RIVET_CDC_POSTGRES_URL"; add postgres cdc large-tx-atomic - SKIP "no pg cdc url"; return; }
+  export MINIO_ACCESS_KEY=minioadmin MINIO_SECRET_KEY=minioadmin
+  log "CDC large-transaction atomicity (a >rollover transaction survives a mid-flush crash whole)"
+  local work; work="$(mktemp -d)"
+  local slot; slot="orc_ltx_$(basename "$work" | tr 'A-Z.' 'a-z_' | tr -c 'a-z0-9_' '_')"
+  local bkt pfx; bkt="$(cfg store s3 bucket)"; pfx="oracle-cdc-ltx/${WORK##*/}/$(basename "$work")"
+  psql_cdc "$url" <<SQL
+DROP TABLE IF EXISTS orc_ltx;
+SELECT pg_drop_replication_slot('$slot') FROM pg_replication_slots WHERE slot_name='$slot';
+CREATE TABLE orc_ltx (id int PRIMARY KEY);
+ALTER TABLE orc_ltx REPLICA IDENTITY FULL;
+SQL
+  cat > "$work/ltx.yaml" <<YAML
+source: { type: postgres, url: "$url" }
+exports:
+  - name: orc_ltx
+    table: orc_ltx
+    mode: cdc
+    format: parquet
+    cdc: { slot: $slot, until_current: true, rollover: 5 }
+    destination:
+$(_store_dest s3 "$bkt" "$pfx")
+YAML
+  "$RIVET" run -c "$work/ltx.yaml" >/dev/null 2>&1                      # anchor
+  # ONE transaction of 12 rows — larger than rollover 5. Must NOT split.
+  psql_cdc "$url" <<SQL
+BEGIN;
+INSERT INTO orc_ltx SELECT g FROM generate_series(1,12) g;
+COMMIT;
+SQL
+  RIVET_TEST_PANIC_AT=cdc_after_ack "$RIVET" run -c "$work/ltx.yaml" >/dev/null 2>&1   # crash mid-flush
+  "$RIVET" run -c "$work/ltx.yaml" >/dev/null 2>&1                                      # recover
+  local ids cnt; ids="$(_cdc_store_ids s3 "$bkt" "$pfx" id)"
+  cnt="$(printf '%s' "$ids" | tr ',' '\n' | grep -cE '^[0-9]+$')"
+  psql_cdc "$url" -c "SELECT pg_drop_replication_slot('$slot') FROM pg_replication_slots WHERE slot_name='$slot'; DROP TABLE IF EXISTS orc_ltx;" >/dev/null 2>&1
+  if [ "${cnt:-0}" -eq 12 ]; then ok "cdc large-tx-atomic: all 12 rows of the >rollover transaction survived the mid-flush crash"; add postgres cdc large-tx-atomic s3 PASS "12/12"
+  else bad "cdc large-tx-atomic: only $cnt/12 rows survived — the transaction split + lost its tail across the crash"; add postgres cdc large-tx-atomic s3 FAIL "$cnt/12 (ids=$ids)"; fi
 }
 
 # ── SQLite-vs-Postgres state PARITY + reference snapshot (эталонный слепок) ──

@@ -41,10 +41,25 @@ codifies the manual CDC dogfood as a preflight: for each engine whose
    holds the per-engine anchor (PG slot / MySQL binlog ckpt / MSSQL from-LSN /
    Mongo resume token), and the re-run **re-reads** the delta (`id=4`), never
    losing it;
-5. **SQLite-vs-Postgres state PARITY**: a PG CDC run against both state backends
+5. proves **large-transaction atomicity** (the committed-boundary invariant, PG):
+   a single transaction of 12 rows at `rollover: 5` must roll as ONE unit (the
+   adapter marks only its LAST event `committed`), so a `cdc_after_ack` crash
+   holds the anchor BEFORE the whole transaction and recovery re-reads it entire —
+   **all 12 rows survive**;
+6. **SQLite-vs-Postgres state PARITY**: a PG CDC run against both state backends
    must populate the **same** table set, matching `golden/cdc_state_snapshot.json`
    (the reference snapshot — a release that stops populating `run_status`, or
    drifts the state schema, fails here).
+
+**RED-proven, not just green** (mutation-tested against the release binary): a
+data-loss mutant (drop one captured event in the shared sink) makes the INDEPENDENT
+readback go **RED on all four engines** (`4 != 5`) while rivet's own `rows` counter
+AND `rivet validate` stay green — the independent oracle is the load-bearing axis, a
+self-check cannot catch this. A `committed:true`-on-every-event mutant (PG adapter)
+makes the large-transaction leg go **RED** (the tx splits at the shared commit-LSN,
+the mid-flush crash advances the anchor past it, resume skips the tail — **5/12**
+rows survive, 7 lost). Both mutants revert cleanly; the gate is green only on
+correct code.
 
 Env-driven and **SKIP** (never a silent pass) when a URL is absent:
 
