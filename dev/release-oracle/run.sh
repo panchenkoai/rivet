@@ -137,8 +137,8 @@ verify_release_build_path
 verify_state_migrations
 # Coverage-ledger drift-guards: every docs/*-matrix.yaml stays honest, or NOT RELEASABLE.
 verify_coverage_matrices
-# Session-pin survival + connection hygiene through a transaction-mode pooler.
-verify_pooler_safety
+# (pooler safety removed — CI already runs live_pool_safety.rs via `--profile pool`;
+# re-running it here was a dup that reddened on a missing pool backend, not on rivet.)
 # Prod topology: rivet reading from a read-REPLICA, not the master (drives the
 # replica CDC test — mysql-primary :3308 → mysql-replica :3309). SKIP when the
 # `replica` compose profile is down.

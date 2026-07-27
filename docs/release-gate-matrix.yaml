@@ -82,10 +82,12 @@ preflights:
   - id: coverage_matrices
     what: "every docs/*-matrix.yaml drift-guard runs (chunking/behaviour/type-fidelity/... + release_gate + perf) so a rotted coverage ledger blocks the release, not just CI."
     status: test        # verify_coverage_matrices
-  - id: pooler_safety
-    what: "session pins (SET LOCAL / time_zone / max_execution_time) reset + connections clean through a transaction-mode pooler (pgbouncer pool_size=1, proxysql)."
-    infra: [pgbouncer, proxysql]
-    status: test        # verify_pooler_safety — drives live_pool_safety.rs through pgbouncer + proxysql
+  # pooler_safety REMOVED from the gate: it re-ran tests/live/live_pool_safety.rs, which
+  # CI already runs on every push (ci.yml `--profile pool` exists specifically for it).
+  # A CI-owned correctness suite re-run adds no coverage here AND reddened on a missing
+  # pool backend (require_alive(Mysql) panics without compose `mysql` :3306), drowning the
+  # go/no-go signal. Pooler safety is CI-scope, not a gate gap — the gate does the
+  # shipping-artifact + independent-oracle checks CI can't. Not counted as a gap.
   - id: replica_read
     what: "prod topology — rivet reads a read-REPLICA, not the master (the 'we were handed a product, no master access' case). Drives tests/live/live_cdc_replica.rs: the mysql-replica re-logs the primary's replicated changes into its OWN binlog (log_replica_updates) and rivet captures from that. Needs the `replica` compose profile (mysql-primary :3308 → mysql-replica :3309); SKIP when down."
     infra: [mysql-replica]

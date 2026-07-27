@@ -98,35 +98,15 @@ verify_coverage_matrices() {
   fi
 }
 
-# ── pooler safety PREFLIGHT (session-pin survival through a transaction pooler) ─
-# Prod often runs behind a transaction-mode pooler that hands a DIFFERENT physical
-# connection per statement — where a session pin (SET LOCAL / time_zone / sql_mode /
-# max_execution_time — the exact leg bug #2 lives on) can leak or vanish. The gate
-# otherwise connects DIRECT to every engine, never through a pooler. This drives the
-# RED-proven tests/live/live_pool_safety.rs through pgbouncer (pool_size=1 transaction
-# mode) + proxysql: the pins reset at COMMIT and the connection is clean after a failed
-# export. Needs the `pool` compose profile (pgbouncer :6432 / proxysql :6033); runs
-# whichever pooler is up, SKIP when neither is.
-verify_pooler_safety() {
-  command -v cargo >/dev/null 2>&1 || { skip "pooler safety: cargo absent"; add pooler safety - - SKIP "no cargo"; return; }
-  local pgb=0 pxy=0 filters=""
-  (exec 3<>/dev/tcp/127.0.0.1/6432) 2>/dev/null && { pgb=1; exec 3>&- 2>/dev/null || true; }
-  (exec 3<>/dev/tcp/127.0.0.1/6033) 2>/dev/null && { pxy=1; exec 3>&- 2>/dev/null || true; }
-  [ $pgb = 1 ] && filters="$filters pg_statement_timeout_not_leaked_after_successful_export pg_connection_usable_and_clean_after_failed_export"
-  [ $pxy = 1 ] && filters="$filters mysql_proxysql_session_vars_clean_after_successful_export mysql_proxysql_session_vars_clean_after_failed_export mysql_proxysql_connection_classified_as_proxysql"
-  if [ -z "$filters" ]; then
-    skip "pooler safety: no pgbouncer :6432 / proxysql :6033 (docker compose --profile pool up -d)"; add pooler safety - - SKIP "no poolers"; return
-  fi
-  log "Pooler safety (session-pin survival + connection hygiene through pgbouncer/proxysql)"
-  # shellcheck disable=SC2086
-  if RIVET_BIN="$RIVET" cargo test --manifest-path "$ROOT/Cargo.toml" --test live_suite -- --ignored --test-threads=1 $filters >"$WORK/pooler.log" 2>&1; then
-    ok "pooler safety: session pins reset + connections clean through the pooler ($([ $pgb = 1 ] && printf pgbouncer) $([ $pxy = 1 ] && printf proxysql))"
-    add pooler safety - - PASS
-  else
-    bad "pooler safety FAILED — a session pin leaked or a connection was left dirty through the pooler (see $WORK/pooler.log)"
-    add pooler safety - - FAIL "$(grep -aiE 'FAILED|leaked|assert' "$WORK/pooler.log" | head -1)"
-  fi
-}
+# NOTE: pooler safety (session-pin survival through pgbouncer/proxysql) is NOT a gate
+# stage — it is a pure re-run of tests/live/live_pool_safety.rs, which CI ALREADY runs
+# on every push (ci.yml brings up `--profile pool` specifically for it). Re-running a
+# CI-owned correctness suite here adds no coverage AND is a NOISE source: it reddens on
+# a missing pool backend (`require_alive(Mysql)` panics if the compose `mysql` :3306 is
+# down — ci.yml:440 documents exactly this), drowning the real go/no-go signal. The
+# gate's job is the SHIPPING-ARTIFACT checks CI can't do (release build path, regression
+# vs the prev release, flat-RSS at scale) + the independent-oracle scenarios — not a
+# second copy of CI's live suite. Removed for that reason.
 
 # ── replica-read PREFLIGHT (prod topology: reading from a read-replica) ───────
 # Prod often hands you a read REPLICA, not the master ("we have no master access").
