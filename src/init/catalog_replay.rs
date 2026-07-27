@@ -14,6 +14,18 @@
 //! SAME `TableInfo` methods the scaffold uses (`suggest_mode`, `single_pk_column`,
 //! `best_chunk_column`, `best_cursor_column`), so the harness tests the real
 //! decision, never a re-implementation that could agree with a wrong spec.
+//!
+//! ENGINE SCOPE — SQL only (PostgreSQL / MySQL / SQL Server). Those three share
+//! ONE `information_schema`-shaped introspection → the same `TableInfo` → the same
+//! engine-agnostic scaffold decision, so a single fixture covers all three
+//! (dogfood-verified live: a uuid / varchar / decimal(p,0) single-PK 150K table
+//! scaffolds `mode: full` identically on PG, MySQL AND SQL Server). MongoDB is a
+//! SEPARATE path (`init::mongo` — no SQL columns / PK; keyset is `source.mongo.
+//! page_size` on `_id`, not `chunk_by_key`), so `TableInfo`/`scaffold_strategy`
+//! does NOT model it and these fixtures do not apply to Mongo. Empirically Mongo
+//! init scaffolds `mode: full` even for a large (150K-doc) collection — it does
+//! not auto-scaffold `page_size` — so Mongo is "always full" at init, but that is
+//! its own decision to lock in a Mongo-specific golden, not here.
 
 use super::TableInfo;
 
