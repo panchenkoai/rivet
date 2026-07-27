@@ -30,7 +30,7 @@ jobs:
       matrix:
         target: [config_from_yaml, pg_test_decoding, mongo_resume_token]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install nightly + cargo-fuzz
         run: |
           rustup toolchain install nightly --profile minimal
@@ -46,7 +46,7 @@ jobs:
             -rss_limit_mb=4096
       - name: Upload crash reproducer on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fuzz-crash-${{ matrix.target }}
           path: fuzz/artifacts/${{ matrix.target }}/
