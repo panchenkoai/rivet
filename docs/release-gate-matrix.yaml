@@ -94,6 +94,10 @@ preflights:
     what: "regression vs the PREVIOUS RELEASE (not a golden, not the gate itself). B-format: the new binary must READ what the prev release WROTE — prev exports a 100K keyset+zstd fixture, cur `validate` re-reads its manifest+parts (PASSED) + DuckDB row-count == source (a format bump that can't read old artifacts silently breaks every existing user on upgrade). B-perf: cur wall <= the DOWNLOADED prev-release binary's wall × tol (default 1.5×; a 3× slowdown / RSS blow-up ships green through every correctness check), benchmarked against the artifact users actually run, never a rebuilt parent. Env: RIVET_PREV_RELEASE_BIN + RIVET_REGRESSION_SOURCE_URL; SKIP-if-absent."
     backends: [postgres]
     status: test        # verify_release_regression (lib/regression.sh)
+  - id: scale_memory
+    what: "the FLAT-RSS guarantee at scale — rivet's headline value prop (the 454M-row, no-OOM field win vs Airbyte). rivet STREAMS, so peak RSS is O(chunk), not O(rows); the gate's data scenarios are ~150K rows, so a buffering regression that scales RSS with the table ships green through every count check. Runs PER ENGINE over TWO EXISTING tables (no seeding — a small + a large already on the stand, default users vs events) and asserts peak RSS on the LARGE table stays FLAT vs the SMALL: RSS(large) <= RSS(small) × tol (RIVET_SCALE_RSS_TOL, default 3× — generous, the tables differ in row width; streaming keeps the ratio near the width ratio, buffering blows it up by the 10× row-count ratio). Measured for the current binary (assertion) AND the downloaded prev release (comparison). Env per engine: RIVET_SCALE_<ENGINE>_URL + _SMALL + _LARGE; SKIP-if-absent."
+    backends: [postgres, mysql, mssql, mongo]
+    status: test        # verify_scale_memory (lib/regression.sh) — per-engine loop
   - id: cdc_e2e
     what: "CDC end-to-end per engine (the change-data-capture surface the batch scenarios never exercise): anchor a typed table → INSERT/UPDATE/DELETE → capture (mode:cdc, until_current) to the object store → INDEPENDENT DuckDB readback == 5 events (never rivet) → rivet validate PASSED → state-DB metabase populated (run_status all-success) → at-least-once CRASH recovery (cdc_after_flush_before_ack holds the anchor; the re-run re-reads id=4) → large-transaction ATOMICITY (a >rollover 12-row PG tx survives a cdc_after_ack mid-flush crash whole, 12/12 — the committed-boundary invariant). PLUS SQLite-vs-Postgres state PARITY vs golden/cdc_state_snapshot.json (the reference snapshot). Each engine's anchor is its own mechanism (PG slot / MySQL binlog / MSSQL from-LSN / Mongo resume token). RED-proven by mutation vs the release binary: a drop-one-event sink mutant reddens the independent readback on all 4 engines (while rivet validate stays green); a committed:true-every-event PG mutant reddens the large-tx leg."
     backends: [sqlite, postgres]
@@ -130,6 +134,3 @@ infra:
   - id: warehouse_load
     status: partial
     note: "BigQuery live golden IS gated; Snowflake + ClickHouse are resolver/type-only (no live load-and-readback) — ClickHouse is even a local compose service, cheap to add"
-  - id: scale_memory
-    status: gap
-    note: "the gate is 150K rows; the flat-RSS guarantee (the 454M-row field win) is not asserted, so a memory regression ships green"

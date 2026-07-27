@@ -96,3 +96,70 @@ SQL
   if [ -z "$fails" ]; then ok "release regression: cur reads prev's output (format-compat), perf cur ${cw}s <= prev ${pw}s ×${tol}${rssnote}"; add release regression - PASS "wall ${cw}/${pw}s"
   else bad "release regression: $fails"; add release regression - FAIL "$fails"; fi
 }
+
+# ── scale-memory: the FLAT-RSS guarantee at scale (rivet's headline value prop) ──
+# rivet STREAMS — peak RSS is O(chunk), NOT O(rows) (the 454M-row, no-OOM field win
+# vs Airbyte). The gate's data scenarios are ~150K rows, so a regression that
+# reintroduces buffering (RSS scaling with the table) ships GREEN through every
+# count/value check. Runs PER ENGINE, over TWO EXISTING tables (no seeding — a small
+# one + a large one already on the stand, e.g. users vs events): peak RSS on the LARGE
+# table must stay FLAT vs the SMALL one — RSS(large) <= RSS(small) × tol
+# (RIVET_SCALE_RSS_TOL, default 3× — generous, since the two tables differ in row
+# width; streaming keeps the ratio near the width ratio, buffering blows it up by the
+# row-count ratio). Measured for the CURRENT binary (the assertion) AND the DOWNLOADED
+# prev release (comparison). Per engine, set:
+#   RIVET_SCALE_<ENGINE>_URL    the source (a stand with the two tables already seeded)
+#   RIVET_SCALE_<ENGINE>_SMALL  small existing table (default: users)
+#   RIVET_SCALE_<ENGINE>_LARGE  large existing table (default: events)
+# SKIP (never a silent pass) for any engine whose URL is unset.
+verify_scale_memory() {
+  local prev="${RIVET_PREV_RELEASE_BIN:-}" tol="${RIVET_SCALE_RSS_TOL:-3}"
+  local any=0 eng UP uvar url small large work b bin sr lr ratio
+  work="$(mktemp -d)"
+  for eng in postgres mysql mssql mongo; do
+    UP="$(printf '%s' "$eng" | tr a-z A-Z)"
+    uvar="RIVET_SCALE_${UP}_URL"; url="${!uvar:-}"
+    [ -z "$url" ] && { skip "scale[$eng]: no $uvar"; add "$eng" scale memory - SKIP "no url"; continue; }
+    any=1
+    local sv="RIVET_SCALE_${UP}_SMALL" lv="RIVET_SCALE_${UP}_LARGE"
+    small="${!sv:-users}"; large="${!lv:-events}"
+    log "Scale memory [$eng] (FLAT-RSS: existing table '$large' vs '$small' — streaming, not buffering, tol ${tol}×)"
+    local fails="" report=""
+    for b in cur prev; do
+      if [ "$b" = cur ]; then bin="$RIVET"; else { [ -n "$prev" ] && [ -x "$prev" ]; } || continue; bin="$prev"; fi
+      _scale_cfg "$eng" "$url" "$small" "$work/${eng}_${b}_s"
+      _scale_cfg "$eng" "$url" "$large" "$work/${eng}_${b}_l"
+      read -r _ sr < <(_regr_time "$bin" run -c "$work/${eng}_${b}_s/c.yaml"); read -r _ lr < <(_regr_time "$bin" run -c "$work/${eng}_${b}_l/c.yaml")
+      ratio="$(awk -v l="${lr:-0}" -v s="${sr:-0}" 'BEGIN{if(s>0)printf "%.2f",l/s; else printf "NA"}')"
+      report+=" ${b}[$small=$(( ${sr:-0}/1048576 ))MB $large=$(( ${lr:-0}/1048576 ))MB flat×${ratio}]"
+      if [ "$b" = cur ]; then
+        awk -v l="${lr:-0}" -v s="${sr:-0}" -v t="$tol" 'BEGIN{exit !(s>0 && l>0 && l <= s*t)}' \
+          || fails+="rss-NOT-flat(cur $large=$(( ${lr:-0}/1048576 ))MB > $small=$(( ${sr:-0}/1048576 ))MB ×${tol} — buffering, not streaming) "
+      fi
+    done
+    if [ -z "$fails" ]; then ok "scale[$eng]: flat-RSS holds —$report"; add "$eng" scale memory PASS "$report"
+    else bad "scale[$eng]: $fails —$report"; add "$eng" scale memory FAIL "$fails"; fi
+  done
+  [ "$any" = 0 ] && { return; }
+}
+
+# a batch keyset (SQL) / full (Mongo) export config for an EXISTING table → $4/c.yaml,
+# its own state + output in $4 (per-binary isolation across versions).
+_scale_cfg() {  # $1=eng $2=url $3=table $4=envdir
+  local tls="" mode; [ "$1" = mssql ] && tls=$'\n  tls: { accept_invalid_certs: true }'
+  if [ "$1" = mongo ]; then mode="    mode: full"
+  else mode=$'    mode: chunked\n    chunk_by_key: id\n    chunk_size: '"${RIVET_SCALE_CHUNK:-100000}"; fi
+  mkdir -p "$4/out"
+  cat > "$4/c.yaml" <<YAML
+source:
+  type: $1
+  url: "$2"$tls
+exports:
+  - name: $3
+    table: $3
+$mode
+    format: parquet
+    compression: zstd
+    destination: { type: local, path: "$4/out/" }
+YAML
+}

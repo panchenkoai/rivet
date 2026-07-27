@@ -152,6 +152,11 @@ verify_cdc_e2e
 # what the prev release WROTE (format-compat) + is no slower/fatter than the DOWNLOADED
 # prev-release binary. Needs RIVET_PREV_RELEASE_BIN + RIVET_REGRESSION_SOURCE_URL; SKIP.
 verify_release_regression
+# The FLAT-RSS guarantee at scale (rivet's headline value prop, the 454M-row no-OOM
+# win): peak RSS at 5M rows must stay flat vs 500K rows — a buffering regression that
+# scales RSS with the table ships green through every count check otherwise. Needs
+# RIVET_REGRESSION_SOURCE_URL; SKIP.
+verify_scale_memory
 
 for eng in $(cfg engines); do
   [ -n "$ENGINES_FILTER" ] && ! grep -qw "$eng" <<<"${ENGINES_FILTER//,/ }" && continue
