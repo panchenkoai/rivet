@@ -33,8 +33,10 @@ To use a different location, point `--config` at the desired directory.
 
 ## `--resume` for chunked exports
 
-`--resume` is only meaningful for `chunked` mode. It requires an in-progress
-(not yet completed) export in the state file.
+`--resume` is only meaningful for `chunked` mode **with `chunk_checkpoint: true`**
+(not the default — set it so progress is recorded per chunk). It requires an
+in-progress (not yet completed) checkpoint run in the state file. On a
+`full`/`incremental` export `--resume` has no effect and warns.
 
 ### Resume an interrupted export
 

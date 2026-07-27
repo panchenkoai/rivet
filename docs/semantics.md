@@ -104,7 +104,11 @@ The trade-off is **at-least-once at the destination**: a crash between write and
 
 ## Resume semantics
 
-`rivet run --resume` (and the default behaviour for chunked runs with `chunk_checkpoint: true`) consults the state DB to decide what work is outstanding:
+`rivet run --resume` consults the state DB to decide what work is outstanding. A
+**plain** `rivet run` (no `--resume`) never skips completed chunks — it does a
+fresh full pass (and errors if a prior chunk-checkpoint run is still in progress,
+pointing you at `--resume` or `state reset-chunks`). Resume is opt-in via the flag,
+not a default of `chunk_checkpoint: true`:
 
 - **Incremental exports** resume from `export_state.last_cursor_value`.
 - **Chunked exports** consult the `chunk_task` table: tasks in `completed` are skipped; tasks in `pending` or `running` (the latter reset to `pending` on resume) are re-issued; tasks in `failed` are retried while `attempts < max_chunk_attempts`.

@@ -67,9 +67,11 @@ exports:
 | Format  | Default compression | Options |
 |---------|-------------------|---------|
 | Parquet | `zstd` | `zstd`, `snappy`, `gzip`, `lz4`, `none` |
-| CSV     | `zstd` | `zstd`, `gzip`, `none` |
+| CSV     | `none` | `none` only |
 
-CSV with compression produces `.csv.zst` or `.csv.gz`.
+CSV does not support compression — parquet is the compressed format. A
+`compression:` other than `none` on a CSV export is rejected at config
+validation. Compress CSV output downstream (e.g. `gzip`) if you need it.
 
 ## Verify
 

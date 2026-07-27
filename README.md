@@ -180,7 +180,7 @@ Add to your MCP client config:
 
 | What Rivet does | What you bring |
 |-----------------|----------------|
-| Queries PostgreSQL 12–16 and MySQL 5.7 / 8.0 | The database and credentials |
+| Queries PostgreSQL, MySQL, SQL Server, and MongoDB | The database and credentials |
 | Streams rows → Arrow → Parquet or CSV | A destination (local path, S3 bucket, GCS bucket, Azure container) |
 | Retries failed batches with exponential backoff | Orchestration (cron, [Airflow](docs/recipes/airflow/), dbt, etc.) |
 | Validates row counts, null ratios, and uniqueness | Your warehouse or downstream pipeline |
@@ -256,22 +256,26 @@ rivet --version
 
 Download the latest release for your platform from [GitHub Releases](https://github.com/panchenkoai/rivet/releases):
 
+Release assets are versioned (`rivet-<version>-<target>.tar.gz`), so resolve the
+latest version first, then download the tarball for your platform:
+
 ```bash
+# Resolve the latest version tag (e.g. v0.23.0)
+VERSION=$(curl -s https://api.github.com/repos/panchenkoai/rivet/releases/latest | grep -oE '"tag_name": *"[^"]+"' | cut -d'"' -f4)
+BASE="https://github.com/panchenkoai/rivet/releases/download/$VERSION"
+
 # macOS (Apple Silicon)
-curl -L https://github.com/panchenkoai/rivet/releases/latest/download/rivet-aarch64-apple-darwin.tar.gz | tar xz
+curl -L "$BASE/rivet-$VERSION-aarch64-apple-darwin.tar.gz" | tar xz
 sudo mv rivet-*/rivet /usr/local/bin/
 
 # macOS (Intel)
-curl -L https://github.com/panchenkoai/rivet/releases/latest/download/rivet-x86_64-apple-darwin.tar.gz | tar xz
-sudo mv rivet-*/rivet /usr/local/bin/
+curl -L "$BASE/rivet-$VERSION-x86_64-apple-darwin.tar.gz" | tar xz && sudo mv rivet-*/rivet /usr/local/bin/
 
 # Linux (x86_64)
-curl -L https://github.com/panchenkoai/rivet/releases/latest/download/rivet-x86_64-unknown-linux-gnu.tar.gz | tar xz
-sudo mv rivet-*/rivet /usr/local/bin/
+curl -L "$BASE/rivet-$VERSION-x86_64-unknown-linux-gnu.tar.gz" | tar xz && sudo mv rivet-*/rivet /usr/local/bin/
 
 # Linux (arm64)
-curl -L https://github.com/panchenkoai/rivet/releases/latest/download/rivet-aarch64-unknown-linux-gnu.tar.gz | tar xz
-sudo mv rivet-*/rivet /usr/local/bin/
+curl -L "$BASE/rivet-$VERSION-aarch64-unknown-linux-gnu.tar.gz" | tar xz && sudo mv rivet-*/rivet /usr/local/bin/
 ```
 
 > **Windows:** a native binary is not currently published — install from source

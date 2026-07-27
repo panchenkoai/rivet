@@ -214,7 +214,7 @@ Rivet normalises four different source mechanisms behind one `ChangeStream`:
 | engine | mechanism | model |
 | -------- | ----------- | ------- |
 | **MySQL** | binlog (ROW) streamed as a replica | push — the client reads the log directly |
-| **PostgreSQL** | logical replication slot (`test_decoding`) | poll the slot via `pg_logical_slot_get_changes()` |
+| **PostgreSQL** | logical replication slot (`test_decoding`) | poll the slot via `pg_logical_slot_peek_changes()` |
 | **SQL Server** | `cdc.*` change tables the capture Agent extracts | poll the change function by LSN window |
 | **MongoDB** | whole-database change stream (`db.watch()` over the oplog) | tailable stream; the resume token checkpoints the position (JSON-blob image — see [mongodb.md](mongodb.md)) |
 
@@ -277,7 +277,7 @@ Notes:
 ### PostgreSQL — the logical slot
 
 Rivet's PostgreSQL reader consumes a logical slot through the **normal SQL
-connection** (`pg_logical_slot_get_changes()`), not the streaming-replication
+connection** (`pg_logical_slot_peek_changes()`), not the streaming-replication
 protocol. That changes what you must grant:
 
 ```sql

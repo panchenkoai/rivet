@@ -130,11 +130,14 @@ checkpoints from a process that no longer exists.
 rivet state show --config rivet.yaml
 rivet state chunks --config rivet.yaml --export big_table
 
-# Drop only stuck-checkpoint chunk rows (preserves manifest + cursor)
-rivet state reset-chunks --config rivet.yaml --export big_table --stuck-checkpoints
+# Reset the chunk rows for ONE export (preserves manifest + cursor).
+# --export targets a single export by name...
+rivet state reset-chunks --config rivet.yaml --export big_table
 
-# Or: drop only failed-chunk rows
-rivet state reset-chunks --config rivet.yaml --export big_table --failed
+# ...OR --stuck-checkpoints (alias --failed) resets every export in the config
+# whose latest chunk run is stuck in checkpoint state. Pick exactly one target —
+# --export and --stuck-checkpoints are mutually exclusive.
+rivet state reset-chunks --config rivet.yaml --stuck-checkpoints
 
 # Then resume
 rivet run --config rivet.yaml --export big_table --resume
