@@ -86,6 +86,10 @@ preflights:
     what: "session pins (SET LOCAL / time_zone / max_execution_time) reset + connections clean through a transaction-mode pooler (pgbouncer pool_size=1, proxysql)."
     infra: [pgbouncer, proxysql]
     status: test        # verify_pooler_safety — drives live_pool_safety.rs through pgbouncer + proxysql
+  - id: replica_read
+    what: "prod topology — rivet reads a read-REPLICA, not the master (the 'we were handed a product, no master access' case). Drives tests/live/live_cdc_replica.rs: the mysql-replica re-logs the primary's replicated changes into its OWN binlog (log_replica_updates) and rivet captures from that. Needs the `replica` compose profile (mysql-primary :3308 → mysql-replica :3309); SKIP when down."
+    infra: [mysql-replica]
+    status: test        # verify_replica_read — drives cdc_reads_changes_from_a_replica
   - id: release_regression
     what: "regression vs the PREVIOUS RELEASE (not a golden, not the gate itself). B-format: the new binary must READ what the prev release WROTE — prev exports a 100K keyset+zstd fixture, cur `validate` re-reads its manifest+parts (PASSED) + DuckDB row-count == source (a format bump that can't read old artifacts silently breaks every existing user on upgrade). B-perf: cur wall <= the DOWNLOADED prev-release binary's wall × tol (default 1.5×; a 3× slowdown / RSS blow-up ships green through every correctness check), benchmarked against the artifact users actually run, never a rebuilt parent. Env: RIVET_PREV_RELEASE_BIN + RIVET_REGRESSION_SOURCE_URL; SKIP-if-absent."
     backends: [postgres]
@@ -119,10 +123,10 @@ infra:
     infra: mongo-auth
     status: gap
     note: "SCRAM / cert auth paths; the gate uses no-auth Mongo and password-only SQL"
-  - id: replica_read
-    infra: [mysql-replica, "pg-cdc-standby"]
+  - id: cdc_standby
+    infra: ["pg-cdc-standby"]
     status: gap
-    note: "reading from a lagging read-replica (read-only errors, staleness); replicas exist in compose, unused by the batch gate"
+    note: "the mysql read-REPLICA half of this is now the `replica_read` preflight (verify_replica_read, status:test). The residual: bounded CDC on a PostgreSQL STANDBY must fail LOUD (roast_pg_cdc_bounded_on_a_standby_fails_loud EXISTS but the gate does not drive it — needs the `cdc-standby` compose profile up)."
   - id: warehouse_load
     status: partial
     note: "BigQuery live golden IS gated; Snowflake + ClickHouse are resolver/type-only (no live load-and-readback) — ClickHouse is even a local compose service, cheap to add"

@@ -139,6 +139,10 @@ verify_state_migrations
 verify_coverage_matrices
 # Session-pin survival + connection hygiene through a transaction-mode pooler.
 verify_pooler_safety
+# Prod topology: rivet reading from a read-REPLICA, not the master (drives the
+# replica CDC test — mysql-primary :3308 → mysql-replica :3309). SKIP when the
+# `replica` compose profile is down.
+verify_replica_read
 # CDC end-to-end (the change-data-capture surface the batch scenarios never touch):
 # per engine anchor → typed changes → capture → store → INDEPENDENT readback +
 # validate + state population + SQLite/Postgres parity + at-least-once crash. Runs

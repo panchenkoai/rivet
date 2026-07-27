@@ -128,6 +128,29 @@ verify_pooler_safety() {
   fi
 }
 
+# ── replica-read PREFLIGHT (prod topology: reading from a read-replica) ───────
+# Prod often hands you a read REPLICA, not the master ("we have no master access").
+# The gate otherwise reads every engine's primary. This drives the RED-proven
+# tests/live/live_cdc_replica.rs — rivet reads the mysql-replica's OWN re-logged
+# binlog (log_replica_updates) after the primary's changes stream to it, proving the
+# no-master-access topology end-to-end. Needs the `replica` compose profile
+# (mysql-primary :3308 → mysql-replica :3309); runs whichever is up, SKIP when down.
+verify_replica_read() {
+  command -v cargo >/dev/null 2>&1 || { skip "replica read: cargo absent"; add replica read - - SKIP "no cargo"; return; }
+  if ! (exec 3<>/dev/tcp/127.0.0.1/3309) 2>/dev/null; then
+    skip "replica read: no mysql-replica :3309 (docker compose --profile replica up -d mysql-primary mysql-replica)"; add replica read - - SKIP "no replica"; return
+  fi
+  exec 3>&- 2>/dev/null || true
+  log "Replica read (rivet captures a read-replica's re-logged binlog — the no-master-access topology)"
+  if RIVET_BIN="$RIVET" cargo test --manifest-path "$ROOT/Cargo.toml" --test live_suite -- --ignored --test-threads=1 cdc_reads_changes_from_a_replica >"$WORK/replica.log" 2>&1; then
+    ok "replica read: rivet captures changes from the replica's re-logged binlog"
+    add replica read - - PASS
+  else
+    bad "replica read FAILED — rivet could not read from the replica (see $WORK/replica.log)"
+    add replica read - - FAIL "$(grep -aiE 'FAILED|panic|assert|error' "$WORK/replica.log" | head -1)"
+  fi
+}
+
 run_scenarios() {
   local eng=$1 tag=$2 url=$3
   sc_verdicts "$eng" "$tag" "$url"
