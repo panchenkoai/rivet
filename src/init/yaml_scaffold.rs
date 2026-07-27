@@ -466,13 +466,16 @@ fn export_block_lines(
     match mode {
         "chunked" => {
             let chunk_size = info.suggest_chunk_size();
-            if let Some(pk) = info.single_pk_column() {
-                // Single-column PK → keyset (seek) pagination: `WHERE pk > last
-                // ORDER BY pk LIMIT n` pages by ROWS, immune to sparse/huge/gappy
-                // keys — no BETWEEN over the key SPAN, which blows up into
-                // thousands of near-empty windows on a distributed/uuid id. This
-                // is the ADR-0020 explicit `chunk_by_key` path (the planner does
-                // not auto-select it on PG, but honours it when asked).
+            if let Some(pk) = info.keysettable_pk_column() {
+                // Single-column PK of a KEYSET-usable type (integer / uuid / string
+                // / timestamp / date — NOT decimal, which the planner refuses) →
+                // keyset (seek) pagination: `WHERE pk > last ORDER BY pk LIMIT n`
+                // pages by ROWS, immune to sparse/huge/gappy keys — no BETWEEN over
+                // the key SPAN, which blows up into thousands of near-empty windows
+                // on a distributed/uuid id. This is the ADR-0020 explicit
+                // `chunk_by_key` path (the planner does not auto-select it on PG,
+                // but honours it when asked). A decimal PK is not keysettable, so it
+                // falls through to range chunking (on an integer column) or full.
                 lines.push(format!(
                     "    chunk_by_key: {}  # keyset (seek) — pages by ROWS, immune to sparse/huge/gappy keys",
                     yaml_quote_if_needed(pk)
@@ -884,7 +887,11 @@ fn suggest_row_group_mb(info: &TableInfo) -> u64 {
 ///     required — scale workers with the row estimate.
 ///
 /// `avg_row_bytes == None` (unknown size) falls back to the row-count tiers.
-fn suggest_parallel(rows: i64, avg_row_bytes: Option<i64>, source_type: &str) -> ParallelChoice {
+pub(crate) fn suggest_parallel(
+    rows: i64,
+    avg_row_bytes: Option<i64>,
+    source_type: &str,
+) -> ParallelChoice {
     /// At/above this width a row is "wide" for the contention trade-off.
     const WIDE_BYTES: i64 = 1024;
     // The one measured case where parallel is a net loss: wide rows on MySQL,
@@ -918,8 +925,8 @@ fn suggest_parallel(rows: i64, avg_row_bytes: Option<i64>, source_type: &str) ->
 /// The worker count `suggest_parallel` picked, *and why* — so the YAML emitter
 /// can explain a held-at-1 choice without re-deriving the wide-MySQL test the
 /// planner already made (one home for the decision, no duplicated threshold).
-struct ParallelChoice {
-    workers: usize,
+pub(crate) struct ParallelChoice {
+    pub(crate) workers: usize,
     /// Held at 1 because wide MySQL rows make a single scan beat chunked.
     wide_mysql_single: bool,
 }

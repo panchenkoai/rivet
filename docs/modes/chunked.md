@@ -357,8 +357,11 @@ that dies resumes only the unfinished ranges.
 > it out across a fleet — the sequential path is unchanged and remains the
 > conservative default.
 
-`rivet init` scaffolds a row-scaled `parallel` (≤500 K → 1, <5 M → 2, ≥5 M → 4);
-a preflight warns past ~5 M rows that peak RSS scales with `N`.
+`rivet init` scaffolds a row-scaled `parallel` (≤500 K → 1, <5 M → 2, ≥5 M → 4)
+on **range** `chunk_column` tables (no single-column PK). A **keyset**
+(`chunk_by_key`) table is scaffolded **sequential** — add `parallel: N` yourself
+to opt into parallel keyset. A preflight warns past ~5 M rows that peak RSS scales
+with `N`.
 
 **Limitations (current):**
 

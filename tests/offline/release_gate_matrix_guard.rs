@@ -17,14 +17,25 @@ use serde_yaml_ng::Value;
 
 const GATE_MATRIX: &str = "docs/release-gate-matrix.yaml";
 const ORACLE_MATRIX: &str = "dev/release-oracle/matrix.yaml";
-const SCENARIOS_SH: &str = "dev/release-oracle/lib/scenarios.sh";
+// scenarios.sh sources the per-stage libs (bigquery.sh, cdc.sh); a gate CHECK
+// function (`sc_*` / `verify_*`) may live in any of them, so the ledger cross-check
+// scans them all — else a stage moved into its own lib (verify_cdc_e2e → cdc.sh)
+// would silently escape the "every gate function has a ledger row" guard.
+const GATE_SH: [&str; 4] = [
+    "dev/release-oracle/lib/scenarios.sh",
+    "dev/release-oracle/lib/cdc.sh",
+    "dev/release-oracle/lib/release_path.sh",
+    "dev/release-oracle/lib/regression.sh",
+];
 const ENGINES: [&str; 4] = ["postgres", "mysql", "mssql", "mongo"];
 
 // Total admitted gaps = scenario `gap` cells + preflight/infra `status: gap` +
 // grid version gaps. Shrink-only: LOWER when a gap is filled; never raise.
-// History: 14 -> 13 (pooler_safety) -> 12 (state_upgrade) -> 11 (state_concurrency).
-// Now: infra gap rows(5) + grid version gaps(3+2+1+0=6) = 11.
-const GAP_RATCHET: usize = 11;
+// History: 14 -> 13 (pooler_safety) -> 12 (state_upgrade) -> 11 (state_concurrency)
+// -> 10 (scale_memory wired as the verify_scale_memory flat-RSS preflight).
+// Now: infra gap rows(4: network_faults, tls_required, auth, cdc_standby) +
+// grid version gaps(3+2+1+0=6) = 10.
+const GAP_RATCHET: usize = 10;
 
 fn load(path: &str) -> Value {
     let s = fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
@@ -87,7 +98,11 @@ fn grid_matches_the_oracle_matrix_versions() {
 
 #[test]
 fn every_gate_function_has_a_ledger_row_and_vice_versa() {
-    let sh = fs::read_to_string(SCENARIOS_SH).unwrap();
+    let sh: String = GATE_SH
+        .iter()
+        .map(|p| fs::read_to_string(p).unwrap_or_else(|e| panic!("read {p}: {e}")))
+        .collect::<Vec<_>>()
+        .join("\n");
     // Function DEFINITIONS live at column 0 (`sc_x() {` / `verify_x() {`); calls are indented.
     let mut sc_fns = BTreeSet::new();
     let mut verify_fns = BTreeSet::new();

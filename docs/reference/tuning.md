@@ -354,7 +354,10 @@ Add ~50–150 MB overhead for the Tokio runtime, the source connection pool, jem
 | Medium (mixed text, JSON) | ~1 KB | 10 000–25 000 | ~50–250 MB |
 | Wide (TEXT/JSONB payloads ≥ 10 KB avg) | ~10 KB | 500–2 000 | ~50–200 MB |
 
-Use the `safe` profile for wide tables — it caps `batch_size` at 500 automatically.
+Use the `safe` profile for wide tables — it uses a conservative static
+`batch_size` of 2 000 and the tightest throttle. For an explicit memory ceiling
+regardless of profile, set `batch_size_memory_mb` (memory-driven sizing) or a
+smaller `batch_size` directly.
 
 ### How `memory_threshold_mb` works
 

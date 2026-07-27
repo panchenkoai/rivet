@@ -72,6 +72,9 @@ scenarios:
 
 # ── Source-agnostic PREFLIGHTS (run ONCE before the engine loop, not per engine/version) ──
 preflights:
+  - id: release_build_path
+    what: "the RELEASE build/publish path itself, not `cargo build` (the stricter tooling the TAG runs, which failed AFTER publish for 0.16.0/0.16.1): Cargo.lock in sync (`cargo metadata --locked` — publish + Docker cook are `--locked`), the cargo-manifest strict parse (no multi-line inline tables, the cargo_manifest_chef guard) + JSON-schema regen (schema_drift guard), and `cargo chef prepare` (the Dockerfile's actual planner step, cheap — no compile). Full `docker build` opt-in via RIVET_ORACLE_DOCKER=1. Runs FIRST, before any cargo reconciles the working-tree lock."
+    status: test        # verify_release_build_path (lib/release_path.sh)
   - id: state_migrations
     what: "SQLite state == Postgres state on the state-exercising golden fixtures (parallel-checkpoint, incremental, crash-resume) — the migration arrays are type-parity."
     backends: [sqlite, postgres]
@@ -79,10 +82,28 @@ preflights:
   - id: coverage_matrices
     what: "every docs/*-matrix.yaml drift-guard runs (chunking/behaviour/type-fidelity/... + release_gate + perf) so a rotted coverage ledger blocks the release, not just CI."
     status: test        # verify_coverage_matrices
-  - id: pooler_safety
-    what: "session pins (SET LOCAL / time_zone / max_execution_time) reset + connections clean through a transaction-mode pooler (pgbouncer pool_size=1, proxysql)."
-    infra: [pgbouncer, proxysql]
-    status: test        # verify_pooler_safety — drives live_pool_safety.rs through pgbouncer + proxysql
+  # pooler_safety REMOVED from the gate: it re-ran tests/live/live_pool_safety.rs, which
+  # CI already runs on every push (ci.yml `--profile pool` exists specifically for it).
+  # A CI-owned correctness suite re-run adds no coverage here AND reddened on a missing
+  # pool backend (require_alive(Mysql) panics without compose `mysql` :3306), drowning the
+  # go/no-go signal. Pooler safety is CI-scope, not a gate gap — the gate does the
+  # shipping-artifact + independent-oracle checks CI can't. Not counted as a gap.
+  - id: replica_read
+    what: "prod topology — rivet reads a read-REPLICA, not the master (the 'we were handed a product, no master access' case). Drives tests/live/live_cdc_replica.rs: the mysql-replica re-logs the primary's replicated changes into its OWN binlog (log_replica_updates) and rivet captures from that. Needs the `replica` compose profile (mysql-primary :3308 → mysql-replica :3309); SKIP when down."
+    infra: [mysql-replica]
+    status: test        # verify_replica_read — drives cdc_reads_changes_from_a_replica
+  - id: release_regression
+    what: "regression vs the PREVIOUS RELEASE (not a golden, not the gate itself). B-format: the new binary must READ what the prev release WROTE — prev exports a 100K keyset+zstd fixture, cur `validate` re-reads its manifest+parts (PASSED) + DuckDB row-count == source (a format bump that can't read old artifacts silently breaks every existing user on upgrade). B-perf: cur wall <= the DOWNLOADED prev-release binary's wall × tol (default 1.5×; a 3× slowdown / RSS blow-up ships green through every correctness check), benchmarked against the artifact users actually run, never a rebuilt parent. Env: RIVET_PREV_RELEASE_BIN + RIVET_REGRESSION_SOURCE_URL; SKIP-if-absent."
+    backends: [postgres]
+    status: test        # verify_release_regression (lib/regression.sh)
+  - id: scale_memory
+    what: "the FLAT-RSS guarantee at scale — rivet's headline value prop (the 454M-row, no-OOM field win vs Airbyte). rivet STREAMS, so peak RSS is O(chunk), not O(rows); the gate's data scenarios are ~150K rows, so a buffering regression that scales RSS with the table ships green through every count check. Runs PER ENGINE over TWO EXISTING tables (no seeding — a small + a large already on the stand, default users vs events) and asserts peak RSS on the LARGE table stays FLAT vs the SMALL: RSS(large) <= RSS(small) × tol (RIVET_SCALE_RSS_TOL, default 3× — generous, the tables differ in row width; streaming keeps the ratio near the width ratio, buffering blows it up by the 10× row-count ratio). Measured for the current binary (assertion) AND the downloaded prev release (comparison). Env per engine: RIVET_SCALE_<ENGINE>_URL + _SMALL + _LARGE; SKIP-if-absent."
+    backends: [postgres, mysql, mssql, mongo]
+    status: test        # verify_scale_memory (lib/regression.sh) — per-engine loop
+  - id: cdc_e2e
+    what: "CDC end-to-end per engine (the change-data-capture surface the batch scenarios never exercise): anchor a typed table → INSERT/UPDATE/DELETE → capture (mode:cdc, until_current) to the object store → INDEPENDENT DuckDB readback == 5 events (never rivet) → rivet validate PASSED → state-DB metabase populated (run_status all-success) → at-least-once CRASH recovery (cdc_after_flush_before_ack holds the anchor; the re-run re-reads id=4) → large-transaction ATOMICITY (a >rollover 12-row PG tx survives a cdc_after_ack mid-flush crash whole, 12/12 — the committed-boundary invariant). PLUS SQLite-vs-Postgres state PARITY vs golden/cdc_state_snapshot.json (the reference snapshot). Each engine's anchor is its own mechanism (PG slot / MySQL binlog / MSSQL from-LSN / Mongo resume token). RED-proven by mutation vs the release binary: a drop-one-event sink mutant reddens the independent readback on all 4 engines (while rivet validate stays green); a committed:true-every-event PG mutant reddens the large-tx leg."
+    backends: [sqlite, postgres]
+    status: test        # verify_cdc_e2e (lib/cdc.sh) — env-driven RIVET_CDC_<ENGINE>_URL, SKIP-if-absent
 
 # ── BACKEND-INFRASTRUCTURE dimensions the gate does NOT yet exercise (the audit gaps) ──
 # The gate connects DIRECT to every engine; it never routes through the connection-
@@ -108,13 +129,10 @@ infra:
     infra: mongo-auth
     status: gap
     note: "SCRAM / cert auth paths; the gate uses no-auth Mongo and password-only SQL"
-  - id: replica_read
-    infra: [mysql-replica, "pg-cdc-standby"]
+  - id: cdc_standby
+    infra: ["pg-cdc-standby"]
     status: gap
-    note: "reading from a lagging read-replica (read-only errors, staleness); replicas exist in compose, unused by the batch gate"
+    note: "the mysql read-REPLICA half of this is now the `replica_read` preflight (verify_replica_read, status:test). The residual: bounded CDC on a PostgreSQL STANDBY must fail LOUD (roast_pg_cdc_bounded_on_a_standby_fails_loud EXISTS but the gate does not drive it — needs the `cdc-standby` compose profile up)."
   - id: warehouse_load
     status: partial
     note: "BigQuery live golden IS gated; Snowflake + ClickHouse are resolver/type-only (no live load-and-readback) — ClickHouse is even a local compose service, cheap to add"
-  - id: scale_memory
-    status: gap
-    note: "the gate is 150K rows; the flat-RSS guarantee (the 454M-row field win) is not asserted, so a memory regression ships green"

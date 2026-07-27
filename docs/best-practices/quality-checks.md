@@ -12,8 +12,8 @@ data flows through the sink — no separate query is needed.
 |---|---|---|---|
 | Row count minimum | `row_count_min` | Fail | Export fails if fewer rows than threshold |
 | Row count maximum | `row_count_max` | Fail | Export fails if more rows than threshold |
-| Null ratio | `null_ratio_max` | Fail | Export fails if null fraction exceeds threshold per column |
-| Uniqueness | `unique_columns` | Fail | Export fails if duplicate values detected |
+| Null ratio | `null_ratio_max` | Fail | Export fails if null fraction exceeds threshold per column. **Single-runner only** — not enforced on chunked / keyset / parallel-Mongo (each part is independent). |
+| Uniqueness | `unique_columns` | Fail | Export fails if duplicate values detected. **Single-runner only** — not enforced on the multi-part runners; only `row_count` bounds run there. |
 | Uniqueness cap | `unique_max_entries` | Warn | Stops tracking after N distinct values; emits a warning |
 
 ---

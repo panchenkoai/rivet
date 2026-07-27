@@ -43,16 +43,17 @@ cleanup() {
 }
 
 # ── options ──
-ENGINES_FILTER=""; NO_CLOUD=0; KEEP=0; BLESS=0; BLESS_VERDICTS=0; BLESS_DUCKDB=0
+ENGINES_FILTER=""; NO_CLOUD=0; KEEP=0; BLESS=0; BLESS_VERDICTS=0; BLESS_DUCKDB=0; BLESS_CDC=0
 while [ $# -gt 0 ]; do case "$1" in
   --engines) ENGINES_FILTER="$2"; shift 2;;
   --no-cloud) NO_CLOUD=1; shift;;
   --keep) KEEP=1; shift;;
   --bless-bigquery-golden) BLESS=1; shift;;
   --bless-local) BLESS_VERDICTS=1; BLESS_DUCKDB=1; NO_CLOUD=1; shift;;   # verdicts + duckdb-type goldens
+  --bless-cdc) BLESS_CDC=1; shift;;                                       # cdc state-snapshot golden
   *) echo "unknown arg: $1"; exit 2;;
 esac; done
-export BLESS_VERDICTS BLESS_DUCKDB
+export BLESS_VERDICTS BLESS_DUCKDB BLESS_CDC
 
 [ -x "$RIVET" ] || { echo "rivet binary not found at $RIVET (build --release or set RIVET_BIN)"; exit 2; }
 command -v duckdb >/dev/null || { echo "duckdb not on PATH (needed for the integrity oracle)"; exit 2; }
@@ -125,14 +126,37 @@ log "Rivet Release Oracle — $(date -u +%FT%TZ)"
 echo "  rivet: $RIVET ($($RIVET --version 2>/dev/null | head -1))"
 start_stores
 
+# Preflight: the release BUILD/PUBLISH path itself (the stricter tooling the tag runs
+# — cargo-chef manifest parse, --locked lock sync, schema regen). MUST run FIRST,
+# before any cargo command below reconciles the working-tree lock out from under the
+# `cargo metadata --locked` stale-lock check.
+verify_release_build_path
 # Preflight: the state-DB migrations must be type-parity across SQLite and Postgres
 # (bug #1 shipped an int4 keyset_range that broke every Postgres-state run). Runs once,
 # source-agnostic, before the engine loop; SKIP when no Postgres STATE url is set.
 verify_state_migrations
 # Coverage-ledger drift-guards: every docs/*-matrix.yaml stays honest, or NOT RELEASABLE.
 verify_coverage_matrices
-# Session-pin survival + connection hygiene through a transaction-mode pooler.
-verify_pooler_safety
+# (pooler safety removed — CI already runs live_pool_safety.rs via `--profile pool`;
+# re-running it here was a dup that reddened on a missing pool backend, not on rivet.)
+# Prod topology: rivet reading from a read-REPLICA, not the master (drives the
+# replica CDC test — mysql-primary :3308 → mysql-replica :3309). SKIP when the
+# `replica` compose profile is down.
+verify_replica_read
+# CDC end-to-end (the change-data-capture surface the batch scenarios never touch):
+# per engine anchor → typed changes → capture → store → INDEPENDENT readback +
+# validate + state population + SQLite/Postgres parity + at-least-once crash. Runs
+# from the RIVET_CDC_<ENGINE>_URL env vars; SKIP (never a silent pass) when unset.
+verify_cdc_e2e
+# Regression vs the PREVIOUS RELEASE (not a golden, not itself): the new binary reads
+# what the prev release WROTE (format-compat) + is no slower/fatter than the DOWNLOADED
+# prev-release binary. Needs RIVET_PREV_RELEASE_BIN + RIVET_REGRESSION_SOURCE_URL; SKIP.
+verify_release_regression
+# The FLAT-RSS guarantee at scale (rivet's headline value prop, the 454M-row no-OOM
+# win): peak RSS at 5M rows must stay flat vs 500K rows — a buffering regression that
+# scales RSS with the table ships green through every count check otherwise. Needs
+# RIVET_REGRESSION_SOURCE_URL; SKIP.
+verify_scale_memory
 
 for eng in $(cfg engines); do
   [ -n "$ENGINES_FILTER" ] && ! grep -qw "$eng" <<<"${ENGINES_FILTER//,/ }" && continue

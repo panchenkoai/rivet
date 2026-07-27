@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+## 0.23.1 — 2026-07-27
+
+### Fixed
+
+- **`rivet init` scaffolds keyset for a large single non-int PK.** A table with
+  a single non-integer primary key (UUID / string / float / timestamp / date) now
+  scaffolds `mode: chunked` + `chunk_by_key` (keyset seek pagination) instead of
+  falling back to `mode: full` — a durable, resumable, flat-memory config for large
+  tables that previously got a full scan. A `decimal`/`numeric`/`money` PK stays
+  excluded (the planner refuses a decimal keyset key): it scaffolds a range chunk on
+  an integer column if present, else `full`. Aligns init with ADR-0020 (Postgres does
+  not auto-keyset a non-int PK at plan time, but honours the explicit `chunk_by_key`).
+
+### Internal
+
+- **Release-oracle go/no-go gate expanded** (`dev/release-oracle/`, no shipped-binary
+  change): a CDC end-to-end stage (per engine, independent DuckDB oracle, state parity,
+  at-least-once crash + large-transaction atomicity, mutation-proven) and an
+  artifact-level layer CI can't cover — the release build/publish path (the 0.16.0/0.16.1
+  post-tag classes), regression vs the downloaded previous release (format + perf/RSS),
+  read-replica capture, and the flat-RSS-at-scale guarantee per engine. `pooler_safety`
+  dropped from the gate (CI already owns it). Coverage-ledger gap ratchet 11 → 10.
+
 ## 0.23.0 — 2026-07-26
 
 ### Added

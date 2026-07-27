@@ -98,33 +98,36 @@ verify_coverage_matrices() {
   fi
 }
 
-# ── pooler safety PREFLIGHT (session-pin survival through a transaction pooler) ─
-# Prod often runs behind a transaction-mode pooler that hands a DIFFERENT physical
-# connection per statement — where a session pin (SET LOCAL / time_zone / sql_mode /
-# max_execution_time — the exact leg bug #2 lives on) can leak or vanish. The gate
-# otherwise connects DIRECT to every engine, never through a pooler. This drives the
-# RED-proven tests/live/live_pool_safety.rs through pgbouncer (pool_size=1 transaction
-# mode) + proxysql: the pins reset at COMMIT and the connection is clean after a failed
-# export. Needs the `pool` compose profile (pgbouncer :6432 / proxysql :6033); runs
-# whichever pooler is up, SKIP when neither is.
-verify_pooler_safety() {
-  command -v cargo >/dev/null 2>&1 || { skip "pooler safety: cargo absent"; add pooler safety - - SKIP "no cargo"; return; }
-  local pgb=0 pxy=0 filters=""
-  (exec 3<>/dev/tcp/127.0.0.1/6432) 2>/dev/null && { pgb=1; exec 3>&- 2>/dev/null || true; }
-  (exec 3<>/dev/tcp/127.0.0.1/6033) 2>/dev/null && { pxy=1; exec 3>&- 2>/dev/null || true; }
-  [ $pgb = 1 ] && filters="$filters pg_statement_timeout_not_leaked_after_successful_export pg_connection_usable_and_clean_after_failed_export"
-  [ $pxy = 1 ] && filters="$filters mysql_proxysql_session_vars_clean_after_successful_export mysql_proxysql_session_vars_clean_after_failed_export mysql_proxysql_connection_classified_as_proxysql"
-  if [ -z "$filters" ]; then
-    skip "pooler safety: no pgbouncer :6432 / proxysql :6033 (docker compose --profile pool up -d)"; add pooler safety - - SKIP "no poolers"; return
+# NOTE: pooler safety (session-pin survival through pgbouncer/proxysql) is NOT a gate
+# stage — it is a pure re-run of tests/live/live_pool_safety.rs, which CI ALREADY runs
+# on every push (ci.yml brings up `--profile pool` specifically for it). Re-running a
+# CI-owned correctness suite here adds no coverage AND is a NOISE source: it reddens on
+# a missing pool backend (`require_alive(Mysql)` panics if the compose `mysql` :3306 is
+# down — ci.yml:440 documents exactly this), drowning the real go/no-go signal. The
+# gate's job is the SHIPPING-ARTIFACT checks CI can't do (release build path, regression
+# vs the prev release, flat-RSS at scale) + the independent-oracle scenarios — not a
+# second copy of CI's live suite. Removed for that reason.
+
+# ── replica-read PREFLIGHT (prod topology: reading from a read-replica) ───────
+# Prod often hands you a read REPLICA, not the master ("we have no master access").
+# The gate otherwise reads every engine's primary. This drives the RED-proven
+# tests/live/live_cdc_replica.rs — rivet reads the mysql-replica's OWN re-logged
+# binlog (log_replica_updates) after the primary's changes stream to it, proving the
+# no-master-access topology end-to-end. Needs the `replica` compose profile
+# (mysql-primary :3308 → mysql-replica :3309); runs whichever is up, SKIP when down.
+verify_replica_read() {
+  command -v cargo >/dev/null 2>&1 || { skip "replica read: cargo absent"; add replica read - - SKIP "no cargo"; return; }
+  if ! (exec 3<>/dev/tcp/127.0.0.1/3309) 2>/dev/null; then
+    skip "replica read: no mysql-replica :3309 (docker compose --profile replica up -d mysql-primary mysql-replica)"; add replica read - - SKIP "no replica"; return
   fi
-  log "Pooler safety (session-pin survival + connection hygiene through pgbouncer/proxysql)"
-  # shellcheck disable=SC2086
-  if RIVET_BIN="$RIVET" cargo test --manifest-path "$ROOT/Cargo.toml" --test live_suite -- --ignored --test-threads=1 $filters >"$WORK/pooler.log" 2>&1; then
-    ok "pooler safety: session pins reset + connections clean through the pooler ($([ $pgb = 1 ] && printf pgbouncer) $([ $pxy = 1 ] && printf proxysql))"
-    add pooler safety - - PASS
+  exec 3>&- 2>/dev/null || true
+  log "Replica read (rivet captures a read-replica's re-logged binlog — the no-master-access topology)"
+  if RIVET_BIN="$RIVET" cargo test --manifest-path "$ROOT/Cargo.toml" --test live_suite -- --ignored --test-threads=1 cdc_reads_changes_from_a_replica >"$WORK/replica.log" 2>&1; then
+    ok "replica read: rivet captures changes from the replica's re-logged binlog"
+    add replica read - - PASS
   else
-    bad "pooler safety FAILED — a session pin leaked or a connection was left dirty through the pooler (see $WORK/pooler.log)"
-    add pooler safety - - FAIL "$(grep -aiE 'FAILED|leaked|assert' "$WORK/pooler.log" | head -1)"
+    bad "replica read FAILED — rivet could not read from the replica (see $WORK/replica.log)"
+    add replica read - - FAIL "$(grep -aiE 'FAILED|panic|assert|error' "$WORK/replica.log" | head -1)"
   fi
 }
 
@@ -449,3 +452,21 @@ sc_gc_survival() {
 
 # ── BigQuery golden stage (implemented in lib/bigquery.sh) ───────────────────
 source "$HERE/lib/bigquery.sh"
+
+# ── CDC end-to-end stage (implemented in lib/cdc.sh) — the change-data-capture
+# surface the batch scenarios never exercise: per engine anchor → typed changes →
+# capture to a store → INDEPENDENT readback + validate + state population + SQLite-
+# vs-Postgres parity + at-least-once crash recovery. Env-driven, SKIP-if-absent.
+source "$HERE/lib/cdc.sh"
+
+# ── Release BUILD/PUBLISH path stage (implemented in lib/release_path.sh) — the
+# release runs stricter tooling than `cargo build` (cargo-chef manifest parse,
+# `publish --locked`, schema regen) that only fails at the TAG, post-publish. Runs
+# the real path pre-tag so the mismatch fails loud and local.
+source "$HERE/lib/release_path.sh"
+
+# ── Regression vs the PREVIOUS RELEASE (implemented in lib/regression.sh) — the gate
+# compares to goldens and to itself, never to the version users run. The new release
+# must READ what the previous release WROTE (format-compat) and be no slower / fatter
+# than the DOWNLOADED prev-release binary (perf/RSS). Env-driven, SKIP-if-absent.
+source "$HERE/lib/regression.sh"

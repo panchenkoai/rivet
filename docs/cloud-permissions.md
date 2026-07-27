@@ -173,9 +173,12 @@ for:
 ## Verifying the role works
 
 `rivet doctor --config rivet.yaml` performs a probe write under the
-resolved destination prefix (`.rivet_doctor_probe`) and removes it on
-success.  A clean `doctor` run tells you the credential resolves and
-has at least write+delete on the prefix.  It does **not** prove
+resolved destination prefix (`.rivet_doctor_probe`). On cloud backends
+(S3 / GCS / Azure) the probe object is **not** deleted — the destination
+interface is write-only — so a leftover `.rivet_doctor_probe` is expected;
+remove it manually if you want a spotless prefix. A clean `doctor` run tells
+you the credential resolves and has at least write on the prefix.  It does
+**not** prove
 list/head capabilities; the first `rivet run --resume` against an
 existing prefix is what surfaces missing list permissions.
 

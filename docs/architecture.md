@@ -320,7 +320,7 @@ src/
     mapping.rs              TypeMapping struct: source_native_type → RivetType → Arrow DataType + fidelity
     fidelity.rs             TypeFidelity (Lossless / WidenedPrecision / WidenedRange / Lossy / Unsupported)
     policy.rs               TypePolicy (Fail/Warn/Allow per fidelity); PolicyViolation; `--strict` gate
-    target.rs               ExportTarget (BigQuery); TargetCompat (Ok/Warn/Fail); Arrow→BQ type mapping
+    target.rs               ExportTarget (DuckDB / BigQuery / Snowflake / ClickHouse); TargetCompat (Ok/Warn/Fail); per-target type mapping
     decimal.rs              NUMERIC / DECIMAL precision+scale resolution
     override_type.rs        `exports[].columns:` per-column type overrides
     source_column.rs        SourceColumn (driver-neutral column metadata)

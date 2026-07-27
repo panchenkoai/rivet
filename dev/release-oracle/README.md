@@ -24,6 +24,106 @@ dev/release-oracle/run.sh --bless-bigquery-golden   # re-capture the BQ golden (
 | **load** | `rivet run` extracts to each store {s3/MinIO, gcs/fake-gcs, azure/Azurite}; the readback is **INDEPENDENT** — the store's own client + DuckDB (`httpfs` for MinIO, the fake-gcs JSON API, `az` for Azurite), never rivet's own `--validate` — so a rivet read bug can't rubber-stamp its own write. Row count must equal the source. A run-unique prefix isolates each run (run-unique part names never clobber, so a stable prefix would sum every past run). |
 | **gc_survival** | the concurrent-extract bucket-erasure guard (spare an in-flight part while a run is active, delete a true orphan). Runs in the BigQuery stage (needs a warehouse load target). |
 
+## CDC end-to-end stage (all engines, independent oracle)
+
+The batch scenarios above never exercise **change-data-capture** — the most
+engine-divergent, correctness-critical surface. `verify_cdc_e2e` (`lib/cdc.sh`)
+codifies the manual CDC dogfood as a preflight: for each engine whose
+`RIVET_CDC_<ENGINE>_URL` is set it
+
+1. **anchors** a typed table, applies `INSERT`/`UPDATE`/`DELETE` (3 + 1 + 1 = **5
+   change events**), and **captures** them (`mode: cdc`, `until_current`) to the
+   object store;
+2. reads them back **INDEPENDENTLY** — DuckDB over the store, never rivet — and
+   asserts **5** events, then `rivet validate` re-reads its own parts (`PASSED`);
+3. asserts the **state-DB metabase** is populated (`run_status` all-success);
+4. proves **at-least-once crash recovery**: a `cdc_after_flush_before_ack` panic
+   holds the per-engine anchor (PG slot / MySQL binlog ckpt / MSSQL from-LSN /
+   Mongo resume token), and the re-run **re-reads** the delta (`id=4`), never
+   losing it;
+5. proves **large-transaction atomicity** (the committed-boundary invariant, PG):
+   a single transaction of 12 rows at `rollover: 5` must roll as ONE unit (the
+   adapter marks only its LAST event `committed`), so a `cdc_after_ack` crash
+   holds the anchor BEFORE the whole transaction and recovery re-reads it entire —
+   **all 12 rows survive**;
+6. **SQLite-vs-Postgres state PARITY**: a PG CDC run against both state backends
+   must populate the **same** table set, matching `golden/cdc_state_snapshot.json`
+   (the reference snapshot — a release that stops populating `run_status`, or
+   drifts the state schema, fails here).
+
+**RED-proven, not just green** (mutation-tested against the release binary): a
+data-loss mutant (drop one captured event in the shared sink) makes the INDEPENDENT
+readback go **RED on all four engines** (`4 != 5`) while rivet's own `rows` counter
+AND `rivet validate` stay green — the independent oracle is the load-bearing axis, a
+self-check cannot catch this. A `committed:true`-on-every-event mutant (PG adapter)
+makes the large-transaction leg go **RED** (the tx splits at the shared commit-LSN,
+the mid-flush crash advances the anchor past it, resume skips the tail — **5/12**
+rows survive, 7 lost). Both mutants revert cleanly; the gate is green only on
+correct code.
+
+Env-driven and **SKIP** (never a silent pass) when a URL is absent:
+
+```
+RIVET_CDC_POSTGRES_URL   postgresql://rivet:rivet@host:port/db   # wal_level=logical
+RIVET_CDC_MYSQL_URL      mysql://rivet:rivet@host:port/db        # log_bin, ROW
+RIVET_CDC_MSSQL_URL      sqlserver://rivet:rivet@host:port/db    # CDC enabled + Agent
+RIVET_CDC_MONGO_URL      mongodb://rivet:rivet@host:port/db?authSource=admin&directConnection=true
+RIVET_CDC_STATE_URL      postgresql://…                          # the state-parity leg (else that leg SKIPs)
+```
+
+Regenerate the snapshot golden on purpose with `run.sh --bless-cdc`.
+
+## Release build path (pre-tag preflight)
+
+The scenarios above prove **correctness of what ships**; they assume a working binary
+exists. But the release pipeline runs **stricter tooling than `cargo build`**, and the
+gap only surfaces at the **tag — after crates.io, the binaries, and the GitHub release
+have published**, when the failure is no longer re-runnable from the immutable tag.
+`verify_release_build_path` (`lib/release_path.sh`) runs that path **first, pre-tag**:
+
+- **`cargo metadata --locked`** — `Cargo.lock` in sync with `Cargo.toml`. The release
+  publishes with `cargo publish --locked` and the Docker builder cooks + builds
+  `--locked`; a stale committed lock aborts both (**0.16.1**, post-tag). Runs FIRST,
+  before any other cargo command reconciles the lock out from under it.
+- **`cargo_manifest_chef` + `schema_drift`** (offline guards) — no multi-line inline
+  tables in `Cargo.toml` (the spec-strict `cargo-manifest` parser the Docker
+  `cargo chef` step uses rejects them — **0.16.0**, post-tag) and the checked-in JSON
+  schema matches the binary's derived one (a version bump that forgot to regen).
+- **`cargo chef prepare`** — the Dockerfile's actual `planner` step (line 11). It
+  distils the dependency graph with **no compilation**, so it is cheap yet runs the
+  exact cargo-manifest parse the 0.16.0 image failed on — the real command, not a proxy.
+- **`docker build`** — the full release image, opt-in via `RIVET_ORACLE_DOCKER=1`
+  (fat-LTO in-image, minutes); the cheap steps above cover the known classes every run.
+
+RED-proven: a stale `Cargo.lock` reddens the lock check; a multi-line inline table
+reddens **both** the offline guard AND `cargo chef prepare`. SKIP when `cargo` is absent.
+
+## Regression vs the previous release (pre-tag preflight)
+
+The gate compares to checked-in **goldens** and to **itself**, never to the version
+users are actually running. Two regressions ship green through every correctness
+check yet are release-blocking. `verify_release_regression` (`lib/regression.sh`)
+benchmarks against the **DOWNLOADED previous-release binary** (`RIVET_PREV_RELEASE_BIN`
+— a GitHub release asset / brew bottle, the artifact users run, never a rebuilt
+parent) over a seeded 100K keyset+zstd fixture:
+
+- **B-format (cross-version read)** — the previous release WRITES; the current binary
+  must READ its manifest + parts (`rivet validate` PASSED + an independent DuckDB
+  row-count == source). A format bump the new release can't read silently breaks every
+  existing user's data on upgrade — a quiet loss, worse than a crash.
+- **B-perf** — current wall-clock ≤ the previous release's × tolerance
+  (`RIVET_REGRESSION_WALL_TOL`, default 1.5×; RSS reported alongside). A 3× slowdown
+  or an RSS blow-up passes every count/value check.
+
+Each binary runs in its **own env dir** (its own `.rivet_state.db`, which lives next
+to the config): the new binary UPGRADES the state schema (v18→v19), which the old
+binary then cannot open — never share a state dir across versions.
+
+RED-proven: corrupting a part the prev release wrote reddens the format check (cur
+`validate` no longer PASSES); a genuinely slower binary (a debug build, ~1.5×) reddens
+the perf check below its slowdown. SKIP when `RIVET_PREV_RELEASE_BIN` /
+`RIVET_REGRESSION_SOURCE_URL` are absent.
+
 ## Final stage — BigQuery golden
 
 The only non-emulator stage, and the load goes through rivet on BOTH legs:

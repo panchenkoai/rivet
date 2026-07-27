@@ -26,7 +26,7 @@ three artefacts at the resolved prefix on a clean run:
 
 | File | Purpose |
 |---|---|
-| `part-NNNNNN.<fmt>` | Data parts in commit order. `<fmt>` is `parquet` or `csv`. One per chunk for `chunked` exports; one for `full` / `incremental`. |
+| `<export>_<timestamp>[_partN].<fmt>` | Data parts, run-unique (millisecond-stamped, plus `_chunkN` / `_keysetN` on the multi-part runners). `<fmt>` is `parquet` or `csv`. |
 | `manifest.json` | ADR-0012 trust contract: every committed part is listed with `size_bytes` and `content_fingerprint`. Schema fingerprint and run identity travel here. |
 | `_SUCCESS` | Single line `xxh3:<16-hex>` over the exact bytes of `manifest.json`. Presence implies M5 (every listed part exists at recorded size). |
 

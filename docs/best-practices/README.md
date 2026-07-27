@@ -4,10 +4,13 @@ Practical guidance for using Rivet's resource-aware extraction capabilities.
 These guides go beyond the reference documentation to explain *why* settings
 matter and *when* to use them.
 
-The tuning, quality, and compression settings shown here apply to every Rivet
-source (PostgreSQL, MySQL, SQL Server, MongoDB) and every mode (`full`,
-`incremental`, `chunked`, `time_window`, `cdc`) — the quick-start examples below
-use PostgreSQL + `incremental` only for concreteness.
+The tuning and compression settings shown here apply to every Rivet source
+(PostgreSQL, MySQL, SQL Server, MongoDB) and every mode (`full`, `incremental`,
+`chunked`, `time_window`, `cdc`) — the quick-start examples below use PostgreSQL +
+`incremental` only for concreteness. **Quality checks are the exception:** on the
+multi-part runners (`chunked`, keyset, parallel-Mongo) only `row_count` bounds are
+enforced; `null_ratio_max` and `unique_columns` are single-runner only (each part
+processes independently). See [quality-checks.md](quality-checks.md).
 
 | Guide | What it covers |
 |---|---|
