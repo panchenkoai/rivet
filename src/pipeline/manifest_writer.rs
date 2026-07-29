@@ -61,6 +61,9 @@ pub struct ManifestBuilder {
     /// The column the Form B checksum is keyed to (cursor/key column); `None` =
     /// un-keyed. Recorded so `validate` re-keys identically.
     checksum_key_column: Option<String>,
+    /// What this run's `__content_hash` covers. Taken from the plan snapshot so
+    /// the manifest cannot claim a contract the run did not actually apply.
+    content_hash: Option<crate::content_hash::ContentHashContract>,
 }
 
 impl ManifestBuilder {
@@ -109,6 +112,7 @@ impl ManifestBuilder {
             parts: Vec::new(),
             column_checksums: None,
             checksum_key_column: None,
+            content_hash: plan.content_hash.clone(),
         }
     }
 
@@ -206,6 +210,7 @@ impl ManifestBuilder {
             parts: self.parts,
             column_checksums: self.column_checksums,
             checksum_key_column: self.checksum_key_column,
+            content_hash: self.content_hash,
         }
     }
 }
@@ -434,6 +439,7 @@ mod tests {
             resume: false,
             chunk_key: None,
             resumable: false,
+            content_hash: None,
         }
     }
 

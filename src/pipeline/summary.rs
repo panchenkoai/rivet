@@ -40,6 +40,7 @@ fn plan_snapshot_from(plan: &ResolvedRunPlan) -> PlanSnapshot {
         resume: plan.resume,
         chunk_key: plan.strategy.chunk_key().map(|c| c.to_string()),
         resumable: plan.strategy.is_resumable(),
+        content_hash: plan.content_hash.as_ref().map(|c| c.contract()),
     }
 }
 
@@ -216,7 +217,7 @@ impl RunSummary {
             chrono::Utc::now().format("%Y%m%dT%H%M%S%.3f"),
         );
         let mut journal = RunJournal::new(&run_id, &plan.export_name);
-        journal.record(RunEvent::PlanResolved(plan_snapshot_from(plan)));
+        journal.record(RunEvent::PlanResolved(Box::new(plan_snapshot_from(plan))));
 
         ipc::emit_event(&ChildEvent::Started {
             export_name: plan.export_name.clone(),
@@ -410,7 +411,7 @@ impl RunSummary {
     #[doc(hidden)]
     #[allow(dead_code)]
     pub fn with_plan_snapshot(mut self, snap: PlanSnapshot) -> Self {
-        self.journal.record(RunEvent::PlanResolved(snap));
+        self.journal.record(RunEvent::PlanResolved(Box::new(snap)));
         self
     }
 

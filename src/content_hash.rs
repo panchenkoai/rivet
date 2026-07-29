@@ -105,14 +105,51 @@ pub struct ContentHashConfig {
     pub cols: Vec<String>,
 }
 
+/// The identity of the rendering, recorded next to the data.
+///
+/// Any change to the canonical text — the separator, the NULL sentinel, the
+/// timestamp format, the digest, the truncation — produces different values for
+/// the same rows. A consumer that recomputes the hash must be able to tell
+/// "this warehouse column was written by a rendering I know" from "…by one I
+/// do not", and refuse rather than compare different texts. Bump this string
+/// whenever the rendering changes, and never reuse an old one.
+pub const RENDER_ID: &str = "sha256-15hex-pipe-utc-sec-v1";
+
+/// What the warehouse's hash column actually covers, travelling with the data
+/// in the run manifest.
+///
+/// Without it the auditor can only probe that the COLUMN exists, so a hash over
+/// `(id, status)` compared against `--sample-cols status,amount` reads as a
+/// valid hash and silently compares two different texts — a 100% false
+/// divergence on a perfectly synced warehouse, or worse, agreement by accident.
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, PartialEq, Eq)]
+pub struct ContentHashContract {
+    /// The materialized column's name (always [`COL_CONTENT_HASH`] today;
+    /// recorded rather than assumed so a reader never has to guess).
+    pub column: String,
+    /// The covered columns, in hashing order, `pk` first.
+    pub covered: Vec<String>,
+    /// The rendering's identity — see [`RENDER_ID`].
+    pub render: String,
+}
+
 impl ContentHashConfig {
-    /// The column set this hash covers, `pk` first — the exact string an
-    /// auditor compares against its own `--sample-cols`.
+    /// The column set this hash covers, `pk` first — the exact list an auditor
+    /// compares against its own `--sample-cols`.
     pub fn covered(&self) -> Vec<String> {
         let mut v = Vec::with_capacity(self.cols.len() + 1);
         v.push(self.pk.clone());
         v.extend(self.cols.iter().cloned());
         v
+    }
+
+    /// The contract to record in the run manifest.
+    pub fn contract(&self) -> ContentHashContract {
+        ContentHashContract {
+            column: COL_CONTENT_HASH.to_string(),
+            covered: self.covered(),
+            render: RENDER_ID.to_string(),
+        }
     }
 
     /// Config-time validation: everything checkable without a batch.
@@ -730,5 +767,42 @@ mod tests {
     #[test]
     fn covered_puts_pk_first() {
         assert_eq!(cfg("id", &["b", "a"]).covered(), vec!["id", "b", "a"]);
+    }
+
+    /// The contract is what an auditor reads to decide whether the persisted
+    /// hash is comparable to what it is about to compute. It must carry the
+    /// covered set IN HASHING ORDER (order changes every value) and the
+    /// rendering's identity — without the latter, a future change to the text
+    /// format would produce a column that looks valid to an old reader.
+    #[test]
+    fn contract_carries_ordered_coverage_and_a_render_id() {
+        let c = cfg("id", &["status", "updated_at"]).contract();
+        assert_eq!(c.column, COL_CONTENT_HASH);
+        assert_eq!(c.covered, vec!["id", "status", "updated_at"]);
+        assert_eq!(c.render, RENDER_ID);
+        assert_ne!(
+            cfg("id", &["a", "b"]).contract().covered,
+            cfg("id", &["b", "a"]).contract().covered,
+            "column order is part of the contract, so it must survive into it"
+        );
+    }
+
+    /// The render id names the rendering this module implements. If the text
+    /// format changes, this assertion is what forces the id to change with it —
+    /// a stale id on new bytes is the one failure the contract cannot catch.
+    #[test]
+    fn render_id_tracks_the_rendering_it_names() {
+        assert_eq!(RENDER_ID, "sha256-15hex-pipe-utc-sec-v1");
+        assert_eq!(HASH_HEX_CHARS, 15);
+        assert_eq!(FIELD_SEP, '|');
+        assert_eq!(NULL_SENTINEL, "<NULL>");
+        assert_eq!(
+            hash_of("1|x"),
+            Sha256::digest(b"1|x")
+                .iter()
+                .take(8)
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()[..15]
+        );
     }
 }

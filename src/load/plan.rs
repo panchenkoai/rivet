@@ -419,7 +419,7 @@ fn build_plans(
         })?;
         let gcs_prefix = resolve_load_prefix(dest, &export.name, bucket)?;
 
-        let specs = report
+        let mut specs: Vec<TargetColumnSpec> = report
             .columns
             .into_iter()
             .map(|c| TargetColumnSpec {
@@ -435,6 +435,27 @@ fn build_plans(
                 cast_sql: None,
             })
             .collect();
+
+        // `__content_hash` is produced by rivet at EXTRACTION, so it is in every
+        // Parquet part but absent from the column report, which the type
+        // resolver builds from the SOURCE catalog. Without a spec the created
+        // table simply lacks the column and the very first load fails on a
+        // schema mismatch — after the extract has already run.
+        //
+        // The type is resolved through the same per-target resolver every other
+        // text column goes through instead of a hardcoded "STRING", so it cannot
+        // drift from the warehouse's own text type (BigQuery STRING, Snowflake
+        // VARCHAR, ClickHouse String).
+        if export.content_hash.is_some() {
+            let target = crate::types::target::ExportTarget::parse(load.target.name())
+                .with_context(|| format!("unknown load target `{}`", load.target.name()))?;
+            specs.push(target.resolve_column(crate::types::target::TargetInput {
+                column_name: crate::content_hash::COL_CONTENT_HASH,
+                rivet_type: &crate::types::RivetType::String,
+                arrow_type: None,
+                fidelity: crate::types::TypeFidelity::Exact,
+            }));
+        }
 
         // Complete-snapshot modes → overwrite the latest run; delta modes → their
         // own append path. Exhaustive (no `_`) on purpose: a future delta-style
@@ -658,6 +679,54 @@ load:
         assert_eq!(plans[1].table, "alpha_tbl");
         assert_eq!(plans[1].mode, LoadMode::Full);
         assert_eq!(plans[1].gcs_prefix, "gs://b1/exports/alpha/");
+    }
+
+    /// `__content_hash` is written by rivet at extraction, so it never appears
+    /// in the source column report. Without a spec the warehouse table is
+    /// created without the column and the FIRST load fails on a schema mismatch
+    /// — after the extract has already been paid for.
+    #[test]
+    fn build_plans_appends_a_spec_for_the_extraction_hash() {
+        let yaml = |hash_block: &str| {
+            format!(
+                "source:\n  type: postgres\n  url: \"postgresql://localhost/test\"\n\
+                 exports:\n  - name: a\n    table: t\n    mode: full\n    format: parquet\n\
+                 \x20   destination:\n      type: gcs\n      bucket: b\n      prefix: p/\n{hash_block}\
+                 load:\n  target: bigquery\n  project: p\n  dataset: d\n"
+            )
+        };
+        let reports = || {
+            vec![ExportReport {
+                export: "a".into(),
+                columns: vec![col("id", "ok"), col("status", "ok")],
+            }]
+        };
+
+        let without = crate::config::Config::from_yaml(&yaml("")).unwrap();
+        let load: LoadSection = serde_json::from_value(without.load.clone().unwrap()).unwrap();
+        let plans = build_plans(&without, &load, reports()).unwrap();
+        assert_eq!(
+            plans[0]
+                .specs
+                .iter()
+                .map(|s| s.column_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["id", "status"],
+            "no content_hash configured ⇒ no extra column"
+        );
+
+        let with = crate::config::Config::from_yaml(&yaml(
+            "    content_hash:\n      pk: id\n      cols: [status]\n",
+        ))
+        .unwrap();
+        let load: LoadSection = serde_json::from_value(with.load.clone().unwrap()).unwrap();
+        let plans = build_plans(&with, &load, reports()).unwrap();
+        let last = plans[0].specs.last().unwrap();
+        assert_eq!(last.column_name, crate::content_hash::COL_CONTENT_HASH);
+        // Resolved through the per-target resolver, not hardcoded — BigQuery's
+        // text type. A Snowflake target would resolve VARCHAR here.
+        assert_eq!(last.target_type, "STRING");
+        assert_eq!(last.status, TargetStatus::Ok);
     }
 
     #[test]

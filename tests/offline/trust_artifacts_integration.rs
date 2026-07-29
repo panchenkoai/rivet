@@ -107,6 +107,7 @@ fn summary(
             resume: false,
             chunk_key: None,
             resumable: false,
+            content_hash: None,
         })
         .with_manifest_parts(parts);
     s.duration_ms = 100;
@@ -169,6 +170,7 @@ fn build_manifest(run_id: &str, status: ManifestStatus, parts: Vec<ManifestPart>
         parts,
         column_checksums: None,
         checksum_key_column: None,
+        content_hash: None,
     }
 }
 
@@ -795,6 +797,7 @@ fn plan_snap() -> PlanSnapshot {
         resume: false,
         chunk_key: None,
         resumable: false,
+        content_hash: None,
     }
 }
 
@@ -1584,6 +1587,7 @@ fn summary_schema_fingerprint_flows_into_manifest_via_builder() {
             resume: false,
             chunk_key: None,
             resumable: false,
+            content_hash: None,
         },
         &s.run_id,
         chrono::Utc::now(),

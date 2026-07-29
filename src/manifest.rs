@@ -193,6 +193,19 @@ pub struct RunManifest {
     /// un-keyed (a full export with no cursor). See [`ColumnChecksum`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checksum_key_column: Option<String>,
+    /// What this run's `__content_hash` column covers, when `content_hash:` was
+    /// configured — the covered columns in hashing order plus the rendering's
+    /// identity.
+    ///
+    /// The audit's cheap path reads the persisted hash instead of the content
+    /// columns, which is only sound if both sides hash the SAME text. Probing
+    /// that the column exists cannot establish that: a hash over `(id, status)`
+    /// compared against `--sample-cols status,amount` is a valid-looking column
+    /// that silently compares two different texts. The contract travels with the
+    /// data so the auditor can refuse instead of guessing. Optional for
+    /// back-compat; older manifests omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_hash: Option<crate::content_hash::ContentHashContract>,
 }
 
 /// Status of the run *as recorded by the writer*.
@@ -444,6 +457,7 @@ mod tests {
             parts,
             column_checksums: None,
             checksum_key_column: None,
+            content_hash: None,
         }
     }
 

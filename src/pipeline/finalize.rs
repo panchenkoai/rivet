@@ -535,6 +535,7 @@ pub(super) fn write_running_manifest(plan: &ResolvedRunPlan, run_id: &str, start
         parts: Vec::new(),
         column_checksums: None,
         checksum_key_column: None,
+        content_hash: None,
     };
     let dest = match crate::destination::create_destination(&plan.destination) {
         Ok(d) => d,
@@ -688,23 +689,25 @@ mod tests {
         s.cursor_column = Some("updated_at".into());
         s.cursor_low = Some("2026-01-01".into());
         s.cursor_high = Some("2026-02-01".into());
-        s.journal.record(crate::journal::RunEvent::PlanResolved(
-            crate::journal::PlanSnapshot {
-                export_name: plan.export_name.clone(),
-                base_query: plan.base_query.clone(),
-                strategy: "snapshot".into(),
-                format: "parquet".into(),
-                compression: "none".into(),
-                destination_type: "local".into(),
-                tuning_profile: "balanced".into(),
-                batch_size: 1000,
-                validate: false,
-                reconcile: false,
-                resume: false,
-                chunk_key: None,
-                resumable: false,
-            },
-        ));
+        s.journal
+            .record(crate::journal::RunEvent::PlanResolved(Box::new(
+                crate::journal::PlanSnapshot {
+                    export_name: plan.export_name.clone(),
+                    base_query: plan.base_query.clone(),
+                    strategy: "snapshot".into(),
+                    format: "parquet".into(),
+                    compression: "none".into(),
+                    destination_type: "local".into(),
+                    tuning_profile: "balanced".into(),
+                    batch_size: 1000,
+                    validate: false,
+                    reconcile: false,
+                    resume: false,
+                    chunk_key: None,
+                    resumable: false,
+                    content_hash: None,
+                },
+            )));
         s
     }
 

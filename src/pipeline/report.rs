@@ -524,6 +524,7 @@ mod tests {
                 resume: false,
                 chunk_key: None,
                 resumable: false,
+                content_hash: None,
             },
         );
         s.total_rows = 12_345;

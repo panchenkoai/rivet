@@ -717,6 +717,9 @@ fn build_manifest(
             kind: "cdc".to_string(),
             uri: out.dest_uri.clone(),
         },
+        // From the SAME TableOutput the flush hashed with, so the manifest can
+        // never advertise a contract this run did not apply.
+        content_hash: out.content_hash.as_ref().map(|c| c.contract()),
         format: format.label().to_string(),
         compression: "zstd".to_string(),
         schema_fingerprint: String::new(),

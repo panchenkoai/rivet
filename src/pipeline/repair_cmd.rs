@@ -606,6 +606,7 @@ mod tests {
             parts: vec![part(1, 10), part(2, 10)],
             column_checksums: None,
             checksum_key_column: None,
+            content_hash: None,
         };
         let bytes = serde_json::to_vec_pretty(&manifest).unwrap();
         // Both files as a real finalize would leave them; the run-unique copy is
