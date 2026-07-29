@@ -184,3 +184,58 @@ fn golden_timestamp_units_agree() {
         );
     }
 }
+
+/// A DATE renders with a midnight time part, like every engine's zoneless
+/// calendar-day formatter (`to_char(d,'… HH24:MI:SS')`, `CONVERT(…,120)`).
+///
+/// The pre-epoch case is the one that matters. Date32 counts DAYS, and the
+/// natural way to write the widening is a divide — which renders every date as
+/// 1970-01-01: a hash that looks entirely ordinary and disagrees with the
+/// source on every dated row.
+#[test]
+fn golden_dates_render_at_midnight_including_pre_epoch() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("d", DataType::Date32, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(vec![8, 9])),
+            // 19723 = 2024-01-01; -1 = 1969-12-31.
+            Arc::new(Date32Array::from(vec![19_723, -1])),
+        ],
+    )
+    .unwrap();
+    let out = append_content_hash(&batch, &cfg("id", &["d"])).unwrap();
+    assert_eq!(
+        hashes(&out),
+        vec!["291bb751ad05724", "47d634e74ececf1"],
+        "a DATE must carry its calendar day, not collapse to the epoch"
+    );
+}
+
+/// Date64 (milliseconds) must land on the same text as the equivalent Date32 —
+/// the source's date WIDTH is an encoding detail, not content.
+#[test]
+fn golden_date64_agrees_with_date32() {
+    let mk = |field: Field, arr: ArrayRef| {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            field,
+        ]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![8])), arr]).unwrap();
+        hashes(&append_content_hash(&batch, &cfg("id", &["d"])).unwrap())[0].clone()
+    };
+    let d32 = mk(
+        Field::new("d", DataType::Date32, false),
+        Arc::new(Date32Array::from(vec![19_723])),
+    );
+    let d64 = mk(
+        Field::new("d", DataType::Date64, false),
+        Arc::new(Date64Array::from(vec![19_723i64 * 86_400 * 1_000])),
+    );
+    assert_eq!(d32, d64);
+    assert_eq!(d32, "291bb751ad05724");
+}

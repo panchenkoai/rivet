@@ -141,6 +141,14 @@ fn ensure_renderable(name: &str, dt: &DataType) -> Result<()> {
         Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64 => Ok(()),
         Utf8 | LargeUtf8 => Ok(()),
         Timestamp(_, None) => Ok(()),
+        // A DATE earns its place under exactly the rule the catch-all states:
+        // the rendering must be provably session-independent, and it is.
+        // `to_char(d,'YYYY-MM-DD HH24:MI:SS')`, BigQuery's `FORMAT_DATETIME`
+        // over a CAST, and `CONVERT(VARCHAR(19), d, 120)` all render a
+        // zoneless calendar day identically, with a midnight time part. That
+        // is precisely what separates it from the tz-aware timestamp refused
+        // below: there is no session zone for the engines to disagree about.
+        Date32 | Date64 => Ok(()),
         Timestamp(_, Some(_)) => anyhow::bail!(
             "content_hash: column '{name}' is a TZ-AWARE timestamp — its SQL \
              re-rendering is session-zone-dependent, and cross-engine parity \
@@ -149,9 +157,10 @@ fn ensure_renderable(name: &str, dt: &DataType) -> Result<()> {
         ),
         other => anyhow::bail!(
             "content_hash: column '{name}' has type {other} — outside the proven \
-             cross-engine rendering set (int, text, naive timestamp). Decimals/\
-             floats/dates/bytes are refused until their canonical rendering parity \
-             is proven per engine (trailing-zero scale padding differs silently)."
+             cross-engine rendering set (int, text, date, naive timestamp). \
+             Decimals/floats/bytes are refused until their canonical rendering \
+             parity is proven per engine (trailing-zero scale padding differs \
+             silently)."
         ),
     }
 }
@@ -223,6 +232,30 @@ fn render_cell(text: &mut String, name: &str, arr: &ArrayRef, row: usize) -> Res
         DataType::LargeUtf8 => {
             let a = arr.as_any().downcast_ref::<LargeStringArray>().unwrap();
             text.push_str(a.value(row));
+        }
+        // Date32 counts DAYS, Date64 milliseconds — both widened to seconds
+        // here. The direction matters: written as a divide, every DATE renders
+        // as 1970-01-01, which looks like a perfectly ordinary hash and
+        // disagrees with the source on every dated row.
+        DataType::Date32 | DataType::Date64 => {
+            let secs = match arr.data_type() {
+                DataType::Date32 => {
+                    arr.as_any()
+                        .downcast_ref::<Date32Array>()
+                        .unwrap()
+                        .value(row) as i64
+                        * 86_400
+                }
+                _ => arr
+                    .as_any()
+                    .downcast_ref::<Date64Array>()
+                    .unwrap()
+                    .value(row)
+                    .div_euclid(1_000),
+            };
+            let dt = chrono::DateTime::from_timestamp(secs, 0)
+                .ok_or_else(|| anyhow::anyhow!("content_hash: date {secs}s out of chrono range"))?;
+            let _ = write!(text, "{}", dt.format("%Y-%m-%d %H:%M:%S"));
         }
         // One fixed rendering per naive-timestamp unit: the stored wall-clock
         // value truncated to seconds. Tz-aware timestamps are refused by
