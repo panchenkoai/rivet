@@ -275,6 +275,15 @@ impl TargetLoader for BigQueryLoader {
         let create = build_create_changes_sql(&changes_fqtn, &schema, pk);
         self.run_sql(&create, "create", &changes)?;
 
+        // …and, for a log that ALREADY existed, add whatever the declared
+        // schema has and it does not. The CREATE above is a no-op on such a
+        // table, so without this an adopted log — or one that predates a new
+        // meta column — fails the LOAD below on a schema mismatch. ALTER ADD,
+        // never a replace: the table may hold the customer's history.
+        if let Some(alter) = build_alter_add_columns_sql(&changes_fqtn, &full) {
+            self.run_sql(&alter, "alter", &changes)?;
+        }
+
         // Count before / append (free LOAD DATA INTO) / count after — the delta
         // is what THIS load added; the driver gates it against the manifest total.
         let before = self.count_rows(&changes_fqtn, &changes)?;
@@ -312,6 +321,40 @@ fn build_create_changes_sql(fqtn: &str, schema: &str, pk: &[String]) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!("CREATE TABLE IF NOT EXISTS `{fqtn}` (\n{schema}\n)\nCLUSTER BY {cluster_cols};")
+}
+
+/// Bring an EXISTING table's schema up to the declared one by ADDING what is
+/// missing — never by replacing the table.
+///
+/// `CREATE TABLE IF NOT EXISTS` is a no-op on a table that already exists, so a
+/// table rivet did not create — an ADOPTED one (repair-design.md §5e) — keeps
+/// whatever shape its previous owner gave it. The next `LOAD DATA` then declares
+/// columns the table does not have and fails; and a load written to overwrite
+/// instead would impose our schema and destroy the customer's data. Neither is
+/// acceptable on a table we were handed rather than created.
+///
+/// `ADD COLUMN IF NOT EXISTS` is the only verb that is safe here: additive,
+/// idempotent, and metadata-only on BigQuery — no rewrite, no scan, and existing
+/// rows read NULL for the new column, which is exactly the state §5i's per-key
+/// fallback is built to handle.
+///
+/// `None` when there is nothing to add, so the caller skips the round trip
+/// rather than sending a statement with an empty body.
+fn build_alter_add_columns_sql(fqtn: &str, specs: &[TargetColumnSpec]) -> Option<String> {
+    if specs.is_empty() {
+        return None;
+    }
+    let adds = specs
+        .iter()
+        .map(|s| {
+            format!(
+                "ADD COLUMN IF NOT EXISTS `{}` {}",
+                s.column_name, s.target_type
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",\n  ");
+    Some(format!("ALTER TABLE `{fqtn}`\n  {adds};"))
 }
 
 /// Whether `c` is a bare column identifier (so it matches a Hive path key),
@@ -708,6 +751,50 @@ mod tests {
         let stderr = "Waiting on bqjob_x ... (0s) Current status: RUNNING\r\
                       Waiting on bqjob_x ... (0s) Current status: DONE";
         assert!(clean_bq_output(stderr.as_bytes()).is_empty());
+    }
+
+    /// THE adoption-safety test. A table rivet did not create keeps its
+    /// previous owner's shape — `CREATE TABLE IF NOT EXISTS` is a no-op on it —
+    /// so the only way to add a column is ALTER. A replace would impose our
+    /// schema on the customer's history and destroy it.
+    #[test]
+    fn schema_reconciliation_adds_columns_and_never_replaces() {
+        let specs = [
+            spec("id", None, TargetStatus::Ok),
+            spec("_rivet_row_hash", None, TargetStatus::Ok),
+        ];
+        let sql = build_alter_add_columns_sql("p.d.t__changes", &specs).unwrap();
+        assert!(sql.starts_with("ALTER TABLE `p.d.t__changes`"), "{sql}");
+        // IF NOT EXISTS on every column: the statement runs on every load, and
+        // a load must not fail because a column it declares is already there.
+        assert_eq!(sql.matches("ADD COLUMN IF NOT EXISTS").count(), 2, "{sql}");
+        assert!(sql.contains("`_rivet_row_hash` X"), "{sql}");
+        for forbidden in ["REPLACE", "DROP", "CREATE", "TRUNCATE", "OVERWRITE"] {
+            assert!(
+                !sql.contains(forbidden),
+                "reconciliation must be additive only, found {forbidden}: {sql}"
+            );
+        }
+    }
+
+    /// Nothing to add ⇒ no statement, so the loader skips the round trip
+    /// instead of sending `ALTER TABLE t ;`.
+    #[test]
+    fn schema_reconciliation_emits_nothing_for_an_empty_spec_list() {
+        assert!(build_alter_add_columns_sql("p.d.t", &[]).is_none());
+    }
+
+    /// The changelog is only ever CREATEd IF NOT EXISTS and LOADed INTO —
+    /// never OVERWRITE. This pins the pairing: an adopted `__changes` table
+    /// must survive a load with its rows intact.
+    #[test]
+    fn changelog_sql_is_create_if_not_exists_plus_append_only() {
+        let create = build_create_changes_sql("p.d.t__changes", "  `id` INT64", &["id".into()]);
+        assert!(create.starts_with("CREATE TABLE IF NOT EXISTS"), "{create}");
+        let load =
+            build_load_data_sql("p.d.t__changes", false, "  `id` INT64", &None, &[], &uris());
+        assert!(load.starts_with("LOAD DATA INTO"), "{load}");
+        assert!(!load.contains("OVERWRITE"), "{load}");
     }
 
     #[test]
