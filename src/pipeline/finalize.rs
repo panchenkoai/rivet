@@ -176,6 +176,7 @@ pub(super) fn finalize_manifest(
         source_table,
         destination_uri_for_manifest(&plan.destination),
     );
+    builder.set_content_hash(plan.content_hash.clone());
     for part in &summary.manifest_parts {
         builder.record_part(
             part.part_id,
@@ -527,6 +528,7 @@ pub(super) fn write_running_manifest(plan: &ResolvedRunPlan, run_id: &str, start
             kind: kind.to_string(),
             uri: destination_uri_for_manifest(&plan.destination),
         },
+        content_hash: plan.content_hash.clone(),
         format: String::new(),
         compression: String::new(),
         schema_fingerprint: String::new(),
@@ -632,6 +634,7 @@ mod tests {
             max_file_size_bytes: None,
             skip_empty: false,
             meta_columns: Default::default(),
+            content_hash: None,
             destination: cfg_local(Some(&dest.to_string_lossy()), None),
             quality: None,
             tuning: crate::tuning::SourceTuning::from_config(None),

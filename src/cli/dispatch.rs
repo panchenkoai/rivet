@@ -335,6 +335,8 @@ fn dispatch_cdc(a: CdcArgs) -> Result<()> {
         rollover_memory_bytes: None,
         run_id: now.clone(),
         started_at: now,
+        // The ad-hoc CLI has no config surface for content_hash either.
+        content_hash: None,
     })
     .map(|_| ())
 }

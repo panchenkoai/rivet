@@ -390,6 +390,7 @@ fn minimal_sink() -> ExportSink {
         schema: None,
         dest_schema: None,
         meta: crate::config::MetaColumns::default(),
+        content_hash: None,
         enriched_schema: None,
         exported_at_us: 0,
         quality_null_counts: std::collections::HashMap::new(),

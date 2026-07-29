@@ -61,6 +61,9 @@ pub struct ManifestBuilder {
     /// The column the Form B checksum is keyed to (cursor/key column); `None` =
     /// un-keyed. Recorded so `validate` re-keys identically.
     checksum_key_column: Option<String>,
+    /// The `content_hash` contract the parts were hashed under — see
+    /// `RunManifest::content_hash`.
+    content_hash: Option<crate::config::ContentHashConfig>,
 }
 
 impl ManifestBuilder {
@@ -109,6 +112,7 @@ impl ManifestBuilder {
             parts: Vec::new(),
             column_checksums: None,
             checksum_key_column: None,
+            content_hash: None,
         }
     }
 
@@ -175,6 +179,12 @@ impl ManifestBuilder {
         }
     }
 
+    /// Record the `content_hash` contract (`{pk, cols}`, order-significant)
+    /// this run's parts were hashed under.
+    pub fn set_content_hash(&mut self, cfg: Option<crate::config::ContentHashConfig>) {
+        self.content_hash = cfg;
+    }
+
     pub fn finalize(self, status: ManifestStatus) -> RunManifest {
         let row_count: i64 = self
             .parts
@@ -206,6 +216,7 @@ impl ManifestBuilder {
             parts: self.parts,
             column_checksums: self.column_checksums,
             checksum_key_column: self.checksum_key_column,
+            content_hash: self.content_hash,
         }
     }
 }

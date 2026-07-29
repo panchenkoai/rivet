@@ -193,6 +193,15 @@ pub struct RunManifest {
     /// un-keyed (a full export with no cursor). See [`ColumnChecksum`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checksum_key_column: Option<String>,
+    /// The `content_hash` CONTRACT this run's parts were hashed under —
+    /// `{pk, cols}` in declared order. Recorded so a reader (or a
+    /// warehouse↔source auditor) can detect that two runs in one prefix carry
+    /// hashes under DIFFERENT contracts (columns reordered/edited between
+    /// runs): historical rows would then diverge with no other explanation.
+    /// `None` ⇒ the export had no `content_hash` (or the manifest predates
+    /// the field — back-compat, no `MANIFEST_VERSION` bump).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_hash: Option<crate::config::ContentHashConfig>,
 }
 
 /// Status of the run *as recorded by the writer*.
@@ -444,6 +453,7 @@ mod tests {
             parts,
             column_checksums: None,
             checksum_key_column: None,
+            content_hash: None,
         }
     }
 

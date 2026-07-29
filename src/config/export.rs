@@ -218,6 +218,13 @@ pub struct ExportConfig {
     pub verify: VerifyMode,
     #[serde(default)]
     pub meta_columns: MetaColumns,
+    /// Append the extraction-time canonical content hash (`__content_hash`)
+    /// to every part this export writes — see [`ContentHashConfig`]. Unlike
+    /// `meta_columns`, this DOES apply to CDC (both the snapshot leg and
+    /// the change stream): the hash is a data-carrying column the warehouse
+    /// keeps, not run metadata.
+    #[serde(default)]
+    pub content_hash: Option<ContentHashConfig>,
     #[serde(default)]
     pub quality: Option<QualityConfig>,
     /// Rotate to a new part when the current file reaches this size.
@@ -489,6 +496,36 @@ pub struct QualityConfig {
     pub unique_max_entries: Option<usize>,
 }
 
+/// Extraction-time canonical content hash (`__content_hash`): sha256 of
+/// `pk|col|…` in a fixed cross-engine text rendering, first 15 hex chars,
+/// appended as a column on every leg of the export — batch parts, the CDC
+/// snapshot leg AND the CDC change stream (both legs must carry identical
+/// columns; see `synth_snapshot_export`). A warehouse↔source auditor can
+/// then recompute the identical value in SQL and compare content by
+/// reading TWO warehouse columns instead of N.
+///
+/// ```yaml
+/// exports:
+///   - name: cashback_versions
+///     table: cashback_versions
+///     mode: cdc
+///     content_hash: { pk: id, cols: [status, updated_at] }
+/// ```
+///
+/// Column kinds are inferred from the resolved Arrow type; types outside
+/// the proven rendering set (decimal, float, date, bytes, bool) are
+/// refused loudly at run time — see `content_hash.rs`.
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ContentHashConfig {
+    /// The primary-key column anchoring each row's hash (NULL refuses).
+    pub pk: String,
+    /// Content columns, hashed in this declared order. The order is part
+    /// of the contract: the auditor must list the same columns in the
+    /// same order to reproduce the hash.
+    pub cols: Vec<String>,
+}
+
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, Default)]
 #[serde(deny_unknown_fields)]
 pub struct MetaColumns {
@@ -707,6 +744,7 @@ pub(crate) fn sample_export(name: &str) -> ExportConfig {
             ..Default::default()
         },
         meta_columns: MetaColumns::default(),
+        content_hash: None,
         quality: None,
         max_file_size: None,
         chunk_checkpoint: false,

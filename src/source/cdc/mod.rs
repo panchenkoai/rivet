@@ -850,6 +850,8 @@ pub(crate) struct CdcCapture<'a> {
     /// RFC3339 stamps the caller owns (`Utc::now()` is theirs to call).
     pub run_id: String,
     pub started_at: String,
+    /// Extraction-time canonical content hash — see [`sink::SinkConfig::content_hash`].
+    pub content_hash: Option<crate::config::ContentHashConfig>,
 }
 
 /// Open the change stream (with the engine's permission/TLS gate), resolve each
@@ -881,6 +883,29 @@ pub(crate) fn run_capture(cap: CdcCapture<'_>) -> Result<Vec<crate::manifest::Ru
             dest_uri: o.dest_uri,
         });
     }
+    // Validate the content_hash config against every table's RESOLVED schema
+    // BEFORE opening the sink — an idle drain (the "enable during a quiet
+    // period" ops sequence) must fail a typo'd column loudly now, not on the
+    // first future run that happens to see an event.
+    if let Some(ch) = &cap.content_hash {
+        for o in &outputs {
+            let named: Vec<(&str, &arrow::datatypes::DataType)> = o
+                .columns
+                .iter()
+                .map(|m| {
+                    // Mirror `ensure_schema`'s fallback: a type the sink can't
+                    // build exactly becomes a plain Utf8 column.
+                    let dt = match &m.arrow_type {
+                        Some(dt) if value::is_buildable(dt) => dt,
+                        _ => &arrow::datatypes::DataType::Utf8,
+                    };
+                    (m.column_name.as_str(), dt)
+                })
+                .collect();
+            crate::content_hash::validate_named(&named, ch)
+                .map_err(|e| e.context(format!("cdc capture of table '{}'", o.table)))?;
+        }
+    }
     let sink_cfg = sink::SinkConfig {
         outputs,
         engine,
@@ -891,6 +916,7 @@ pub(crate) fn run_capture(cap: CdcCapture<'_>) -> Result<Vec<crate::manifest::Ru
         rollover_memory_bytes: cap.rollover_memory_bytes,
         started_at: cap.started_at,
         run_id: cap.run_id,
+        content_hash: cap.content_hash,
     };
     sink::run_to_files(stream.as_mut(), sink_cfg)
 }

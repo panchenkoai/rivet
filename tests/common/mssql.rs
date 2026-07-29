@@ -152,6 +152,33 @@ pub fn mssql_query_bigints(sql: &str, cols: usize) -> Vec<i64> {
     })
 }
 
+/// `(BIGINT id, VARCHAR value)` rows against `mssql-cdc` (`:1434`) — e.g.
+/// engine-computed expected content hashes keyed by pk.
+pub fn mssql_cdc_query_id_strings(sql: &str) -> std::collections::BTreeMap<i64, String> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("mssql: tokio runtime");
+    rt.block_on(async {
+        let mut client = connect_at(1434).await;
+        let rows = client
+            .simple_query(sql)
+            .await
+            .expect("mssql: query")
+            .into_first_result()
+            .await
+            .expect("mssql: rows");
+        rows.into_iter()
+            .map(|row| {
+                (
+                    row.get::<i64, _>(0).expect("bigint id"),
+                    row.get::<&str, _>(1).expect("string value").to_string(),
+                )
+            })
+            .collect()
+    })
+}
+
 /// Idempotent table drop for RAII cleanup guards (shared `mssql`).
 pub fn mssql_drop_table(name: &str) {
     mssql_exec(&format!(

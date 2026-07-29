@@ -690,6 +690,18 @@
             "row_hash": false
           }
         },
+        "content_hash": {
+          "description": "Append the extraction-time canonical content hash (`__content_hash`)\nto every part this export writes — see [`ContentHashConfig`]. Unlike\n`meta_columns`, this DOES apply to CDC (both the snapshot leg and\nthe change stream): the hash is a data-carrying column the warehouse\nkeeps, not run metadata.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ContentHashConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
         "quality": {
           "anyOf": [
             {
@@ -1117,6 +1129,28 @@
         }
       },
       "additionalProperties": false
+    },
+    "ContentHashConfig": {
+      "description": "Extraction-time canonical content hash (`__content_hash`): sha256 of\n`pk|col|…` in a fixed cross-engine text rendering, first 15 hex chars,\nappended as a column on every leg of the export — batch parts, the CDC\nsnapshot leg AND the CDC change stream (both legs must carry identical\ncolumns; see `synth_snapshot_export`). A warehouse↔source auditor can\nthen recompute the identical value in SQL and compare content by\nreading TWO warehouse columns instead of N.\n\n```yaml\nexports:\n  - name: cashback_versions\n    table: cashback_versions\n    mode: cdc\n    content_hash: { pk: id, cols: [status, updated_at] }\n```\n\nColumn kinds are inferred from the resolved Arrow type; types outside\nthe proven rendering set (decimal, float, date, bytes, bool) are\nrefused loudly at run time — see `content_hash.rs`.",
+      "type": "object",
+      "properties": {
+        "pk": {
+          "description": "The primary-key column anchoring each row's hash (NULL refuses).",
+          "type": "string"
+        },
+        "cols": {
+          "description": "Content columns, hashed in this declared order. The order is part\nof the contract: the auditor must list the same columns in the\nsame order to reproduce the hash.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "pk",
+        "cols"
+      ]
     },
     "QualityConfig": {
       "type": "object",

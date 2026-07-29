@@ -423,6 +423,7 @@ fn run_cdc_inner(
         rollover_memory_bytes: cdc.rollover_memory_mb.map(|mb| mb * 1024 * 1024),
         run_id: run_id.to_string(),
         started_at: now,
+        content_hash: export.content_hash.clone(),
     })
 }
 
@@ -569,6 +570,30 @@ mod tests {
         );
         assert!(!synth.skip_empty, "snapshot must complete even when empty");
         assert_eq!(synth.table.as_deref(), Some("orders"));
+    }
+
+    // `content_hash` is the OPPOSITE of `meta_columns`: it is a data-carrying
+    // column BOTH legs must produce (they append into one `<table>__changes`,
+    // whose column sets must agree) — so the snapshot leg MUST inherit it.
+    // Clearing it like meta_columns would give the snapshot parquet one fewer
+    // column than the CDC parquet and break the shared load.
+    #[test]
+    fn snapshot_leg_inherits_content_hash() {
+        let mut e = crate::config::sample_export("orders");
+        e.content_hash = Some(crate::config::ContentHashConfig {
+            pk: "id".into(),
+            cols: vec!["status".into()],
+        });
+        let dcfg = DestinationConfig {
+            destination_type: DestinationType::Local,
+            path: Some("/tmp/snap".into()),
+            ..Default::default()
+        };
+        let synth = synth_snapshot_export(&e, "orders", &dcfg);
+        assert_eq!(
+            synth.content_hash, e.content_hash,
+            "snapshot leg must carry the same __content_hash config as the stream leg"
+        );
     }
 
     // RED test for the finding: cloud prefixes are LITERAL key prefixes —

@@ -550,6 +550,7 @@ mod tests {
             parts,
             column_checksums: None,
             checksum_key_column: None,
+            content_hash: None,
         }
     }
 
@@ -578,6 +579,7 @@ mod tests {
             max_file_size_bytes: None,
             skip_empty: false,
             meta_columns: Default::default(),
+            content_hash: None,
             destination: DestinationConfig {
                 destination_type: DestinationType::Local,
                 path: Some(dest.to_string_lossy().into_owned()),

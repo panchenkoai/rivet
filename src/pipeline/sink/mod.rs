@@ -55,6 +55,9 @@ pub(crate) struct ExportSink {
     /// detection against the stored snapshot.
     pub(in crate::pipeline) dest_schema: Option<SchemaRef>,
     pub(in crate::pipeline) meta: MetaColumns,
+    /// Extraction-time canonical content hash — appended to every batch
+    /// BEFORE enrichment (it is a data-carrying column, not run metadata).
+    pub(in crate::pipeline) content_hash: Option<crate::config::ContentHashConfig>,
     pub(in crate::pipeline) enriched_schema: Option<SchemaRef>,
     pub(in crate::pipeline) exported_at_us: i64,
     pub(in crate::pipeline) quality_null_counts: std::collections::HashMap<String, usize>,
@@ -143,6 +146,7 @@ impl ExportSink {
             schema: None,
             dest_schema: None,
             meta: plan.meta_columns.clone(),
+            content_hash: plan.content_hash.clone(),
             enriched_schema: None,
             exported_at_us,
             quality_null_counts: std::collections::HashMap::new(),
@@ -503,10 +507,19 @@ impl ExportSink {
         self.track_shape(dest_batch);
         self.track_checksum(dest_batch);
 
-        let output = if let Some(es) = &self.enriched_schema {
+        // Meta enrichment FIRST, hash LAST — `_rivet_row_hash` covers exactly
+        // the data columns it always did (see the on_schema comment). Note
+        // `_rivet_exported_at`/`_rivet_row_hash` sit BEFORE `__content_hash` in
+        // the written schema but the hash only reads its configured columns, so
+        // the meta columns never leak into the canonical text.
+        let enriched = if let Some(es) = &self.enriched_schema {
             enrich::enrich_batch(dest_batch, &self.meta, es, self.exported_at_us)?
         } else {
             dest_batch.clone()
+        };
+        let output = match &self.content_hash {
+            Some(ch) => crate::content_hash::append_content_hash(&enriched, ch)?,
+            None => enriched,
         };
 
         if let Some(w) = self.writer.as_mut() {
@@ -589,7 +602,29 @@ impl BatchSink for ExportSink {
             }
             _ => schema.clone(),
         };
+        // `dest_schema` stays the DATA schema (no `__content_hash`): schema-drift
+        // baselines, quality validation, and checksum coverage all reason about
+        // source-derived columns — and chunked mode derives its drift schema from
+        // source type mappings, so including the synthetic column here would make
+        // single vs chunked disagree about the same export (false drift on every
+        // mode switch). The hash column exists only on the WRITER side below.
+        //
+        // Validate the content_hash config NOW, before any batch — an empty run
+        // must not mask a typo'd column or an unhashable type behind a green
+        // `_SUCCESS` (the config error would otherwise surface only on the first
+        // future non-empty run).
+        if let Some(ch) = &self.content_hash {
+            crate::content_hash::validate_against_schema(&dest_schema, ch)?;
+        }
         let enriched = enrich::enrich_schema(&dest_schema, &self.meta);
+        // Hash LAST, after meta enrichment — `_rivet_row_hash` must keep hashing
+        // exactly the data columns it always did; feeding it a batch that already
+        // contains `__content_hash` would silently change every row-hash across
+        // the config-enable boundary and break warehouse↔warehouse comparability.
+        let writer_schema = match &self.content_hash {
+            Some(_) => crate::content_hash::append_schema(&enriched),
+            None => enriched.clone(),
+        };
         // Compute row group rows from the actual schema now that it's available.
         if let Some(pc) = &self.parquet_config {
             self.parquet_row_group_rows = pc.effective_row_group_rows(&dest_schema);
@@ -632,7 +667,7 @@ impl BatchSink for ExportSink {
         );
         let file = self.tmp.as_file().try_clone()?;
         let buf_writer = BufWriter::new(file);
-        self.writer = Some(fmt.create_writer(&enriched, Box::new(buf_writer))?);
+        self.writer = Some(fmt.create_writer(&writer_schema, Box::new(buf_writer))?);
         // Build quality field index cache from dest_schema (after stripping internal cols).
         if let Some(qc) = &self.quality_columns {
             // Fail loud (#33, CLAUDE.md "never a silent no-op"): a quality rule

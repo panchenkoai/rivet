@@ -67,6 +67,8 @@ mod live_batch_switch_golden;
 mod live_catalog_hints;
 #[path = "live/live_cdc.rs"]
 mod live_cdc;
+#[path = "live/live_cdc_content_hash.rs"]
+mod live_cdc_content_hash;
 #[path = "live/live_cdc_golden.rs"]
 mod live_cdc_golden;
 #[path = "live/live_cdc_mbt.rs"]

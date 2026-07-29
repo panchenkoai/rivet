@@ -419,7 +419,7 @@ fn build_plans(
         })?;
         let gcs_prefix = resolve_load_prefix(dest, &export.name, bucket)?;
 
-        let specs = report
+        let mut specs: Vec<TargetColumnSpec> = report
             .columns
             .into_iter()
             .map(|c| TargetColumnSpec {
@@ -435,6 +435,27 @@ fn build_plans(
                 cast_sql: None,
             })
             .collect();
+        // `rivet check` reports SOURCE columns only — the extraction-time
+        // `__content_hash` column exists in the parts, not in the source
+        // catalog. Without a spec here the warehouse never receives it:
+        // Snowflake's `$1:col` COPY projection silently drops any column not
+        // in specs, and BigQuery's `LOAD DATA` declares an inline schema the
+        // extra parquet field would break. Declaring it also NULL-fills parts
+        // written BEFORE the config was enabled (name-matched load), which is
+        // the intended mixed-prefix behavior.
+        if export.content_hash.is_some() {
+            specs.push(TargetColumnSpec {
+                column_name: crate::content_hash::COL_CONTENT_HASH.to_string(),
+                target_type: match load.target {
+                    LoadTarget::Bigquery { .. } => "STRING".to_string(),
+                    LoadTarget::Snowflake { .. } => "VARCHAR".to_string(),
+                },
+                autoload_type: String::new(),
+                status: TargetStatus::Ok,
+                note: None,
+                cast_sql: None,
+            });
+        }
 
         // Complete-snapshot modes → overwrite the latest run; delta modes → their
         // own append path. Exhaustive (no `_`) on purpose: a future delta-style

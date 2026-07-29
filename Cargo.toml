@@ -139,6 +139,9 @@ reqsign = "0.16"
 # backend opendal already links.
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
+# Extraction-time canonical content hash (`__content_hash`) — must be a hash
+# every SQL engine can recompute (SHA2), unlike xxh3.
+sha2 = "0.10"
 indicatif = "0.18"
 console = "0.16"
 atoi = "3"

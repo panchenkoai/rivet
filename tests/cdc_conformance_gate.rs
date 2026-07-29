@@ -439,6 +439,9 @@ fn every_live_cdc_test_asserts_an_outcome() {
                 || chunk.contains("distinct_int_ids(")
                 || chunk.contains("read_mongo_cdc_changes(") // Mongo blob-CDC oracle
                 || chunk.contains("dir_parquet_distinct_strings(")
+                // Content-hash matrix oracle: reads every part back and maps
+                // (op, id) → __content_hash for engine-SQL parity assertions.
+                || chunk.contains("hashes_by_op_id(")
                 || chunk.contains("read_all(")
                 || chunk.contains("read_all_parts(")
                 // `Rig::run_and_read` runs the capture AND returns every part as

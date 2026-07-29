@@ -536,6 +536,26 @@ impl Config {
                     e.name
                 );
             }
+            if let Some(ch) = &e.content_hash {
+                // One column set per export: a multi-table CDC export shares
+                // one config, but each table has its own columns — a single
+                // `content_hash` list would silently mis-hash (or refuse on)
+                // every other table. Per-table exports only.
+                if e.tables.is_some() {
+                    anyhow::bail!(
+                        "export '{}': content_hash is not supported with `tables:` — the \
+                         hashed column set is per-table; declare one export per table",
+                        e.name
+                    );
+                }
+                if ch.cols.is_empty() {
+                    anyhow::bail!(
+                        "export '{}': content_hash.cols is empty — a pk-only hash attests \
+                         no content; list the content columns to hash",
+                        e.name
+                    );
+                }
+            }
         }
         Ok(())
     }

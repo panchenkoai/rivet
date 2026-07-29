@@ -70,6 +70,11 @@ pub(crate) struct SinkConfig<'a> {
     pub started_at: String,
     /// RFC3339 stamp used as both `finished_at` and the run id seed.
     pub run_id: String,
+    /// Extraction-time canonical content hash (`__content_hash`) — appended
+    /// to every flushed part so the change stream carries the SAME columns
+    /// as the snapshot leg (both load into one `<table>__changes`). Config
+    /// validation restricts it to single-table exports.
+    pub content_hash: Option<crate::config::ContentHashConfig>,
 }
 
 /// When to roll a part: at a transaction boundary, once the buffer reaches the row
@@ -97,6 +102,8 @@ struct TableSink<'a> {
     buf: Vec<ChangeEvent>,
     parts: Vec<PartRecord>,
     seq: usize,
+    /// See [`SinkConfig::content_hash`].
+    content_hash: Option<crate::config::ContentHashConfig>,
     /// Finding #38: per-column value checksums, XOR-accumulated across parts
     /// (the same combining rule `validate_recorded_checksums` applies on
     /// re-read) — recorded into the manifest so `rivet validate` Form B
@@ -121,7 +128,12 @@ impl TableSink<'_> {
         // scales can be refined from the data (SQL Server's metadata-only
         // resolve gives a placeholder scale of 0 — the same gap the batch path
         // fills from rows).
-        let sch = ensure_schema(&mut self.schema, &mut self.out.columns, &self.buf);
+        let sch = ensure_schema(
+            &mut self.schema,
+            &mut self.out.columns,
+            &self.buf,
+            self.content_hash.is_some(),
+        );
         let (part, sums) = flush(
             &self.buf,
             &sch,
@@ -131,6 +143,7 @@ impl TableSink<'_> {
             run_token,
             self.seq,
             self.out.dest,
+            self.content_hash.as_ref(),
         )?;
         for (name, sum) in sums {
             *self.column_sums.entry(name).or_insert(0) ^= sum;
@@ -211,6 +224,7 @@ fn roll_all(
                 run_id,
                 started_at,
                 &s.parts,
+                s.content_hash.as_ref(),
             );
             write_manifest_without_success_marker(s.out.dest, &manifest)?;
         }
@@ -241,6 +255,7 @@ pub(crate) fn run_to_files(
     cfg: SinkConfig<'_>,
 ) -> Result<Vec<RunManifest>> {
     let run_token = run_token(&cfg.run_id);
+    let content_hash = cfg.content_hash.clone();
     let mut sinks: Vec<TableSink<'_>> = cfg
         .outputs
         .into_iter()
@@ -250,6 +265,7 @@ pub(crate) fn run_to_files(
             buf: Vec::new(),
             parts: Vec::new(),
             seq: 0,
+            content_hash: content_hash.clone(),
             column_sums: std::collections::BTreeMap::new(),
         })
         .collect();
@@ -386,6 +402,7 @@ pub(crate) fn run_to_files(
             &cfg.run_id,
             &cfg.started_at,
             &s.parts,
+            s.content_hash.as_ref(),
         );
         // write_manifest leaves the canonical `manifest.json` (latest-run pointer)
         // AND an immutable run-unique copy, so a prefix accumulating several
@@ -402,6 +419,7 @@ fn ensure_schema(
     schema: &mut Option<SchemaRef>,
     columns: &mut [TypeMapping],
     events: &[ChangeEvent],
+    with_content_hash: bool,
 ) -> SchemaRef {
     if schema.is_none() {
         refine_decimal_scales(columns, events);
@@ -424,6 +442,11 @@ fn ensure_schema(
                 _ => Field::new(&m.column_name, DataType::Utf8, m.nullable),
             };
             fields.push(field);
+        }
+        if with_content_hash {
+            // Last, mirroring the batch/snapshot leg — both legs land in the
+            // same `<table>__changes`, so their column sets must agree.
+            fields.push(crate::content_hash::content_hash_field());
         }
         *schema = Some(Arc::new(Schema::new(fields)));
     }
@@ -491,6 +514,7 @@ fn flush(
     run_token: &str,
     seq: usize,
     dest: &dyn Destination,
+    content_hash: Option<&crate::config::ContentHashConfig>,
 ) -> Result<(PartRecord, Vec<(String, u64)>)> {
     let ops: ArrayRef = Arc::new(
         events
@@ -634,6 +658,18 @@ fn flush(
         }
         arrays.push(arr);
     }
+    if let Some(ch) = content_hash {
+        // The typed columns start after the three meta columns
+        // (`__op`/`__pos`/`__seq`). A DELETE's key-only before-image leaves
+        // its content cells NULL — they hash as the sentinel, which is fine:
+        // a delete event's hash never has a source row to compare against.
+        let named: Vec<(&str, &ArrayRef)> = columns
+            .iter()
+            .map(|m| m.column_name.as_str())
+            .zip(arrays.iter().skip(3))
+            .collect();
+        arrays.push(crate::content_hash::hash_array(&named, &ch.pk, &ch.cols)?);
+    }
     let batch = RecordBatch::try_new(schema.clone(), arrays)?;
 
     let tmp = NamedTempFile::new()?;
@@ -654,6 +690,7 @@ fn flush(
 
 /// Assemble one table's `RunManifest` from its committed parts (hand-built — no
 /// plan coupling; `record_part` is the plan-bound path the batch export uses).
+#[allow(clippy::too_many_arguments)]
 fn build_manifest(
     engine: super::CdcEngine,
     column_sums: &std::collections::BTreeMap<String, u64>,
@@ -662,6 +699,7 @@ fn build_manifest(
     run_id: &str,
     started_at: &str,
     parts: &[PartRecord],
+    content_hash: Option<&crate::config::ContentHashConfig>,
 ) -> RunManifest {
     RunManifest {
         manifest_version: MANIFEST_VERSION,
@@ -719,6 +757,7 @@ fn build_manifest(
                 .collect(),
         ),
         checksum_key_column: None,
+        content_hash: content_hash.cloned(),
     }
 }
 
@@ -1224,6 +1263,7 @@ mod tests {
             rollover_memory_bytes: None,
             started_at: "2026-06-23T00:00:00Z".into(),
             run_id: "r".into(),
+            content_hash: None,
         }
     }
 
@@ -1401,6 +1441,7 @@ mod tests {
             rollover_memory_bytes: None,
             started_at: "2026-06-23T00:00:00Z".into(),
             run_id: "r".into(),
+            content_hash: None,
         }
     }
 

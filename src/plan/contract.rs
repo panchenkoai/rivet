@@ -76,6 +76,9 @@ pub struct ResolvedRunPlan {
     pub max_file_size_bytes: Option<u64>,
     pub skip_empty: bool,
     pub meta_columns: MetaColumns,
+    /// Extraction-time canonical content hash (`__content_hash`) — appended
+    /// to every written batch when configured (see `content_hash.rs`).
+    pub content_hash: Option<crate::config::ContentHashConfig>,
     pub destination: DestinationConfig,
     pub quality: Option<QualityConfig>,
     pub tuning: SourceTuning,
