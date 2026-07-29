@@ -835,6 +835,8 @@ pub(crate) struct CaptureOutput<'a> {
     /// `exports[].content_hash` — the drain must emit the SAME hash column the
     /// snapshot leg does, or the warehouse table ends up half-populated.
     pub content_hash: Option<crate::content_hash::ContentHashConfig>,
+    /// `exports[].meta_columns.row_hash` — same requirement, same reason.
+    pub row_hash: crate::config::RowHash,
 }
 
 /// Everything needed to capture a change stream to typed files, assembled once —
@@ -883,6 +885,7 @@ pub(crate) fn run_capture(cap: CdcCapture<'_>) -> Result<Vec<crate::manifest::Ru
             dest: o.dest,
             dest_uri: o.dest_uri,
             content_hash: o.content_hash,
+            row_hash: o.row_hash,
         });
     }
     let sink_cfg = sink::SinkConfig {

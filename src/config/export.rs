@@ -592,15 +592,12 @@ pub struct MetaColumns {
     pub row_hash: RowHash,
 }
 
-impl MetaColumns {
-    /// True iff the operator asked for at least one meta column. The batch
-    /// runners inject these at the shared `ExportSink` seam; the CDC path has
-    /// its OWN sink (`__op`/`__pos`/`__seq` + typed after-image) and does not,
-    /// so a CDC run uses this to warn that the request has no effect.
-    pub fn any_enabled(&self) -> bool {
-        self.exported_at || self.row_hash.enabled()
-    }
-}
+// `any_enabled()` lived here to answer "does the CDC path need to warn that
+// meta columns were dropped". It has no callers since §5h: the two fields no
+// longer share an answer — `exported_at` is still dropped on the CDC leg,
+// `row_hash` is emitted there — so every caller now asks about one of them
+// specifically. Reintroducing a combined predicate would just invite the
+// blanket warning back.
 
 fn default_mode() -> ExportMode {
     ExportMode::Full

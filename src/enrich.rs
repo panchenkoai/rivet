@@ -84,11 +84,7 @@ pub fn enrich_batch(
         // functions independent means neither can quietly drift from the
         // other's idea of coverage.
         let names = row_hash_columns(&batch.schema(), &meta.row_hash)?;
-        let idx: Vec<usize> = names
-            .iter()
-            .map(|n| batch.schema().index_of(n).expect("validated above"))
-            .collect();
-        columns.push(Arc::new(hash_column(batch, n, &idx)));
+        columns.push(row_hash_array(batch, &names)?);
     }
 
     Ok(RecordBatch::try_new(enriched_schema.clone(), columns)?)
@@ -102,26 +98,51 @@ pub fn enrich_batch(
 /// skipped column would produce hashes that agree while attesting content
 /// that was never hashed, which is the quietest way this feature could lie.
 pub fn row_hash_columns(schema: &SchemaRef, spec: &RowHash) -> Result<Vec<String>> {
-    let all = || -> Vec<String> {
-        schema
-            .fields()
-            .iter()
-            .map(|f| f.name().to_string())
-            .collect()
-    };
+    let available: Vec<String> = schema
+        .fields()
+        .iter()
+        .map(|f| f.name().to_string())
+        .collect();
+    row_hash_columns_of(&available, spec)
+}
+
+/// [`row_hash_columns`] over a bare name list — for the CDC seam, where the
+/// DATA columns are known before any Arrow schema exists, and where "all
+/// columns" must mean all *data* columns.
+///
+/// That distinction is the whole reason this overload exists. The CDC sink's
+/// schema also carries `__op`/`__pos`/`__seq`, which the snapshot leg does not
+/// have; folding them in would give the two legs different hashes for the same
+/// row, and they write the same `__changes` log.
+pub fn row_hash_columns_of(available: &[String], spec: &RowHash) -> Result<Vec<String>> {
     let Some(declared) = spec.declared() else {
-        return Ok(all());
+        return Ok(available.to_vec());
     };
     for name in declared {
-        if schema.column_with_name(name).is_none() {
+        if !available.iter().any(|a| a == name) {
             anyhow::bail!(
                 "meta_columns.row_hash names column '{name}', which this export does not \
                  project. Available: {}",
-                all().join(", ")
+                available.join(", ")
             );
         }
     }
     Ok(declared.to_vec())
+}
+
+/// The `_rivet_row_hash` column for a batch, over an already-resolved column
+/// set. Both sinks compute it here so neither can drift from the other's
+/// rendering — the value's only guarantee is that one function produces it.
+pub fn row_hash_array(batch: &RecordBatch, cols: &[String]) -> Result<ArrayRef> {
+    let idx: Vec<usize> = cols
+        .iter()
+        .map(|c| {
+            batch.schema().index_of(c).map_err(|_| {
+                anyhow::anyhow!("row_hash: column '{c}' vanished from the batch schema")
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Arc::new(hash_column(batch, batch.num_rows(), &idx)))
 }
 
 /// Compute deterministic 64-bit hashes over `cols` for all rows in a batch.
@@ -382,6 +403,66 @@ mod tests {
         assert!(err.contains("twice"), "{err}");
         RowHash::Columns(vec!["a".into()]).validate("e").unwrap();
         RowHash::All(true).validate("e").unwrap();
+    }
+
+    /// THE invariant §5h rests on: the CDC drain and the snapshot leg must
+    /// produce the same hash for the same row.
+    ///
+    /// They do not see the same batch. The drain's carries `__op`/`__pos`/
+    /// `__seq` in front of the data; the snapshot's does not. So the hash must
+    /// be computed over the resolved DATA columns and be blind to whatever else
+    /// the batch happens to hold — otherwise every backfilled row and every
+    /// streamed row would disagree in the one log they share, and the column
+    /// would be useless for exactly the comparison it exists to serve.
+    #[test]
+    fn cdc_meta_columns_do_not_enter_the_row_hash() {
+        let data_only = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let snapshot = RecordBatch::try_new(
+            data_only,
+            vec![
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(StringArray::from(vec![Some("alice")])),
+            ],
+        )
+        .unwrap();
+
+        // What the CDC sink builds: meta columns first, then the same data.
+        let with_meta = Arc::new(Schema::new(vec![
+            Field::new("__op", DataType::Utf8, false),
+            Field::new("__pos", DataType::Utf8, false),
+            Field::new("__seq", DataType::Int64, false),
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let drain = RecordBatch::try_new(
+            with_meta,
+            vec![
+                Arc::new(StringArray::from(vec![Some("insert")])),
+                Arc::new(StringArray::from(vec![Some("{\"pos\":7}")])),
+                Arc::new(Int64Array::from(vec![7])),
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(StringArray::from(vec![Some("alice")])),
+            ],
+        )
+        .unwrap();
+
+        let data: Vec<String> = vec!["id".into(), "name".into()];
+        let read = |b: &RecordBatch| {
+            let a = row_hash_array(b, &data).unwrap();
+            a.as_any().downcast_ref::<Int64Array>().unwrap().value(0)
+        };
+        assert_eq!(read(&snapshot), read(&drain));
+
+        // And "all columns" on the CDC leg resolves to the DATA columns, not to
+        // the sink's own — which is what makes the equality above reachable
+        // from a plain `row_hash: true`.
+        assert_eq!(
+            row_hash_columns_of(&data, &RowHash::All(true)).unwrap(),
+            data
+        );
     }
 
     #[test]
