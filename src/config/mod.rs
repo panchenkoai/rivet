@@ -655,21 +655,20 @@ impl Config {
         // than at the first batch.
         export.meta_columns.row_hash.validate(&export.name)?;
 
-        if let Some(ch) = &export.content_hash {
-            ch.validate(&export.name)?;
-            // A hash is `pk|cols` for ONE table's shape. A `tables:` stream
-            // captures several tables through one config, and they do not share
-            // a primary key — applying one spec to all of them would hash the
-            // wrong columns (or fail per table, mid-stream, after the slot is
-            // already open). Refuse at config-load instead.
-            if export.tables.is_some() {
-                anyhow::bail!(
-                    "export '{}': content_hash names one table's pk and columns, so it cannot \
-                     apply to a multi-table `tables:` stream. Give each table its own export \
-                     (with `table:`), or drop content_hash from this one.",
-                    export.name
-                );
-            }
+        // A DECLARED column list describes ONE table's shape. A `tables:`
+        // stream captures several tables through one config and they do not
+        // share a column set, so the list would name columns a sibling table
+        // does not project — failing per table, mid-stream, after the
+        // replication slot is already open. Refuse at config-load instead.
+        // `row_hash: true` is unaffected: "every column" is meaningful for
+        // whatever table the row came from.
+        if export.meta_columns.row_hash.declared().is_some() && export.tables.is_some() {
+            anyhow::bail!(
+                "export '{}': meta_columns.row_hash names one table's columns, so it cannot \
+                 apply to a multi-table `tables:` stream. Give each table its own export \
+                 (with `table:`), or use `row_hash: true` to cover every column of each.",
+                export.name
+            );
         }
 
         // Round-2 audit #15/#16/#6: partition_by has purely-static rules (mode
@@ -1607,10 +1606,11 @@ mod audit_csv_compression {
 }
 
 #[cfg(test)]
-mod content_hash_config {
-    //! `content_hash` names ONE table's pk and columns. The failure mode worth
-    //! guarding is the quiet one: accepting a spec that cannot be honoured and
-    //! discovering it mid-stream, after a replication slot is already open.
+mod row_hash_config {
+    //! A DECLARED `meta_columns.row_hash` names ONE table's columns. The
+    //! failure mode worth guarding is the quiet one: accepting a spec that
+    //! cannot be honoured and discovering it mid-stream, after a replication
+    //! slot is already open.
     use super::*;
 
     fn yaml(export_body: &str) -> String {
@@ -1621,37 +1621,50 @@ mod content_hash_config {
     }
 
     #[test]
-    fn single_table_content_hash_is_accepted() {
+    fn single_table_declared_set_is_accepted() {
         let cfg = Config::from_yaml(&yaml(
-            "    table: orders\n    content_hash:\n      pk: id\n      cols: [status, updated_at]\n",
+            "    table: orders\n    meta_columns:\n      row_hash: [id, status, updated_at]\n",
         ))
-        .expect("a single-table content_hash must parse");
-        let ch = cfg.exports[0].content_hash.as_ref().unwrap();
-        assert_eq!(ch.covered(), vec!["id", "status", "updated_at"]);
+        .expect("a single-table declared row_hash must parse");
+        assert_eq!(
+            cfg.exports[0].meta_columns.row_hash.declared(),
+            Some(["id", "status", "updated_at"].map(String::from).as_slice())
+        );
     }
 
     #[test]
-    fn multi_table_stream_is_refused() {
+    fn multi_table_stream_refuses_a_declared_set() {
         let err = Config::from_yaml(&yaml(
             "    mode: cdc\n    tables: [orders, customers]\n    cdc:\n      checkpoint: /tmp/ck\n\
-             \x20   content_hash:\n      pk: id\n      cols: [status]\n",
+             \x20   meta_columns:\n      row_hash: [id, status]\n",
         ))
         .unwrap_err()
         .to_string();
         assert!(
-            err.contains("multi-table") && err.contains("content_hash"),
+            err.contains("multi-table") && err.contains("row_hash"),
             "a `tables:` stream must be refused at config-load, not mid-stream: {err}"
         );
+    }
+
+    /// …but `true` is not a per-table claim, so it must still be allowed. This
+    /// is the whole reason the guard tests `declared()` rather than `enabled()`.
+    #[test]
+    fn multi_table_stream_still_accepts_row_hash_true() {
+        Config::from_yaml(&yaml(
+            "    mode: cdc\n    tables: [orders, customers]\n    cdc:\n      checkpoint: /tmp/ck\n\
+             \x20   meta_columns:\n      row_hash: true\n",
+        ))
+        .expect("`row_hash: true` covers whatever table the row came from");
     }
 
     #[test]
     fn empty_column_set_is_refused() {
         let err = Config::from_yaml(&yaml(
-            "    table: orders\n    content_hash:\n      pk: id\n      cols: []\n",
+            "    table: orders\n    meta_columns:\n      row_hash: []\n",
         ))
         .unwrap_err()
         .to_string();
-        assert!(err.contains("carries no content"), "{err}");
+        assert!(err.contains("attests nothing"), "{err}");
     }
 }
 

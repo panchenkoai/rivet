@@ -5,40 +5,74 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow::record_batch::RecordBatch;
 
 use crate::config::{MetaColumns, RowHash};
-use crate::content_hash::{self, ContentHashConfig};
 use crate::error::Result;
 
 pub const COL_EXPORTED_AT: &str = "_rivet_exported_at";
 pub const COL_ROW_HASH: &str = "_rivet_row_hash";
 
+/// The identity of the row hash's rendering, recorded next to the data.
+///
+/// Any change to how the canonical bytes are built — the separator, the NULL
+/// marker, Arrow's display formatting, the digest, the truncation to `i64` —
+/// produces different values for the same rows. A reader that recomputes the
+/// hash must be able to tell "this column was written by a rendering I know"
+/// from "…by one I do not", and refuse rather than compare different bytes.
+/// Bump this whenever the rendering changes, and never reuse an old one.
+pub const ROW_HASH_RENDER_ID: &str = "xxh3-128-i64-arrow-display-us-v1";
+
+/// What a run's [`COL_ROW_HASH`] column actually covers, travelling with the
+/// data in the run manifest and the journal.
+///
+/// Without it a reader can only probe that the column EXISTS, and existence
+/// says nothing about coverage: a hash over `(id, status)` compared against a
+/// re-extraction of `(id, status, amount)` is a valid-looking column that
+/// silently attests a different text.
+///
+/// The coverage is recorded as the SPEC, not as a resolved list. `row_hash:
+/// true` means "every column this part projects", and the part's schema is in
+/// the part — resolving it here would duplicate a fact the data already
+/// carries, and would go stale the moment the projection changes.
+#[derive(
+    Debug, serde::Deserialize, serde::Serialize, schemars::JsonSchema, Clone, PartialEq, Eq,
+)]
+pub struct RowHashContract {
+    /// The materialized column's name (always [`COL_ROW_HASH`] today; recorded
+    /// rather than assumed so a reader never has to guess).
+    pub column: String,
+    /// The declared coverage, exactly as configured.
+    pub covered: RowHash,
+    /// The rendering's identity — see [`ROW_HASH_RENDER_ID`].
+    pub render: String,
+}
+
+impl RowHashContract {
+    /// The contract for a run's `meta_columns.row_hash`, or `None` when no hash
+    /// column is written.
+    pub fn of(spec: &RowHash) -> Option<Self> {
+        spec.enabled().then(|| Self {
+            column: COL_ROW_HASH.to_string(),
+            covered: spec.clone(),
+            render: ROW_HASH_RENDER_ID.to_string(),
+        })
+    }
+}
+
 /// Extend an Arrow schema with the columns rivet adds.
 ///
-/// `hash` comes first and the `_rivet_*` meta columns after, because the two
-/// are different kinds of thing: `__content_hash` is part of the warehouse
-/// table's contract (the audit reads it), while the meta columns are optional
-/// provenance. [`enrich_batch`] builds its arrays in this same order — the two
-/// must not be able to disagree, which is why both live here rather than being
-/// appended by each caller.
+/// [`enrich_batch`] builds its arrays in this same order — the two must not be
+/// able to disagree, which is why both live here rather than being appended by
+/// each caller.
 ///
-/// Fallible only because of `hash`: the content hash refuses column types it
-/// cannot render identically in SQL, and that refusal belongs at schema time,
-/// before a single row is read.
-pub fn enrich_schema(
-    schema: &SchemaRef,
-    meta: &MetaColumns,
-    hash: Option<&ContentHashConfig>,
-) -> Result<SchemaRef> {
-    if !meta.exported_at && !meta.row_hash.enabled() && hash.is_none() {
+/// Fallible because `row_hash` may name a column this export does not project;
+/// that refusal belongs at schema time, before a single row is read.
+pub fn enrich_schema(schema: &SchemaRef, meta: &MetaColumns) -> Result<SchemaRef> {
+    if !meta.exported_at && !meta.row_hash.enabled() {
         return Ok(schema.clone());
     }
-    let base = match hash {
-        Some(h) => content_hash::hashed_schema(schema, h)?,
-        None => schema.clone(),
-    };
-    if !meta.exported_at && !meta.row_hash.enabled() {
-        return Ok(base);
-    }
-    let mut fields: Vec<Arc<Field>> = base.fields().iter().cloned().collect();
+    // Resolved for its refusal, not its result: a name outside the projection
+    // must fail the run here rather than on the first batch.
+    row_hash_columns(schema, &meta.row_hash)?;
+    let mut fields: Vec<Arc<Field>> = schema.fields().iter().cloned().collect();
     if meta.exported_at {
         fields.push(Arc::new(Field::new(
             COL_EXPORTED_AT,
@@ -59,18 +93,13 @@ pub fn enrich_batch(
     meta: &MetaColumns,
     enriched_schema: &SchemaRef,
     exported_at_us: i64,
-    hash: Option<&ContentHashConfig>,
 ) -> Result<RecordBatch> {
-    if !meta.exported_at && !meta.row_hash.enabled() && hash.is_none() {
+    if !meta.exported_at && !meta.row_hash.enabled() {
         return Ok(batch.clone());
     }
 
     let n = batch.num_rows();
     let mut columns: Vec<ArrayRef> = batch.columns().to_vec();
-
-    if let Some(h) = hash {
-        columns.push(content_hash::hash_array(batch, h)?);
-    }
 
     if meta.exported_at {
         let ts_array =
@@ -210,88 +239,80 @@ mod tests {
         (schema, batch)
     }
 
-    fn hash_cfg() -> ContentHashConfig {
-        ContentHashConfig {
-            pk: "id".into(),
-            cols: vec!["name".into()],
-        }
-    }
-
-    // `__content_hash` precedes the `_rivet_*` meta columns, and — the part that
-    // actually matters — enrich_schema and enrich_batch agree on that order.
-    // They are separate functions over the same list, so a divergence would show
-    // up as an Arrow "column count/type mismatch" at write time, on a live run.
+    /// `enrich_schema` and `enrich_batch` are separate functions walking the
+    /// same list, so a divergence in order would surface as an Arrow "column
+    /// count/type mismatch" at write time — on a live run. Pin the order here
+    /// instead.
     #[test]
-    fn content_hash_column_precedes_meta_columns() {
+    fn meta_column_order_is_pinned() {
         let (schema, batch) = sample_batch();
         let meta = MetaColumns {
             exported_at: true,
             row_hash: RowHash::All(true),
         };
-        let cfg = hash_cfg();
-        let enriched = enrich_schema(&schema, &meta, Some(&cfg)).unwrap();
+        let enriched = enrich_schema(&schema, &meta).unwrap();
         assert_eq!(
             enriched
                 .fields()
                 .iter()
                 .map(|f| f.name().as_str())
                 .collect::<Vec<_>>(),
-            vec![
-                "id",
-                "name",
-                content_hash::COL_CONTENT_HASH,
-                COL_EXPORTED_AT,
-                COL_ROW_HASH
-            ]
+            vec!["id", "name", COL_EXPORTED_AT, COL_ROW_HASH]
         );
         // try_new is what enforces the agreement — this unwrap IS the assertion.
-        let out = enrich_batch(&batch, &meta, &enriched, 0, Some(&cfg)).unwrap();
-        let hashes = out
-            .column_by_name(content_hash::COL_CONTENT_HASH)
-            .unwrap()
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        assert_eq!(hashes.value(0), content_hash::hash_of("1|alice"));
-        assert_eq!(
-            hashes.value(1),
-            content_hash::hash_of(&format!("2|{}", content_hash::NULL_SENTINEL))
-        );
+        enrich_batch(&batch, &meta, &enriched, 0).unwrap();
     }
 
-    // The hash must be computed over SOURCE columns only. If it were computed
-    // after enrichment, `_rivet_exported_at` would enter the text and the value
-    // would change every run, so no audit could ever match it.
+    /// The hash covers SOURCE columns only. If it were computed after
+    /// enrichment, `_rivet_exported_at` would enter it under `row_hash: true`
+    /// and the value would change every run, so no audit could ever match it —
+    /// and the two legs, which stamp different instants, could never agree.
     #[test]
-    fn content_hash_ignores_the_meta_columns_it_ships_beside() {
-        let (schema, batch) = sample_batch();
-        let cfg = hash_cfg();
-        let bare = MetaColumns {
-            exported_at: false,
-            row_hash: RowHash::All(false),
-        };
-        let with_meta = MetaColumns {
-            exported_at: true,
-            row_hash: RowHash::All(true),
-        };
-        let read = |meta: &MetaColumns| {
-            let sch = enrich_schema(&schema, meta, Some(&cfg)).unwrap();
-            enrich_batch(&batch, meta, &sch, 999, Some(&cfg))
-                .unwrap()
-                .column_by_name(content_hash::COL_CONTENT_HASH)
-                .unwrap()
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap()
-                .value(0)
-                .to_string()
-        };
-        assert_eq!(read(&bare), read(&with_meta));
+    fn the_row_hash_ignores_the_meta_columns_it_ships_beside() {
+        let (_, batch) = sample_batch();
+        let without = row_hashes(
+            &MetaColumns {
+                exported_at: false,
+                row_hash: RowHash::All(true),
+            },
+            &batch,
+        );
+        let with = row_hashes(
+            &MetaColumns {
+                exported_at: true,
+                row_hash: RowHash::All(true),
+            },
+            &batch,
+        );
+        assert_eq!(without, with);
+    }
+
+    /// The contract is what a reader consults to decide whether a persisted
+    /// hash is comparable to what it is about to compute. It records the SPEC:
+    /// `true` means "every column this part projects", and the part carries its
+    /// own schema — resolving it here would duplicate a fact the data already
+    /// holds and go stale when the projection changes.
+    #[test]
+    fn the_contract_records_the_spec_and_a_render_id() {
+        assert_eq!(RowHashContract::of(&RowHash::All(false)), None);
+        let c = RowHashContract::of(&RowHash::All(true)).unwrap();
+        assert_eq!(c.column, COL_ROW_HASH);
+        assert_eq!(c.covered, RowHash::All(true));
+        assert_eq!(c.render, ROW_HASH_RENDER_ID);
+
+        let declared = RowHash::Columns(vec!["status".into(), "amount".into()]);
+        let c = RowHashContract::of(&declared).unwrap();
+        assert_eq!(c.covered, declared);
+        assert_ne!(
+            RowHashContract::of(&RowHash::Columns(vec!["a".into(), "b".into()])),
+            RowHashContract::of(&RowHash::Columns(vec!["b".into(), "a".into()])),
+            "column order changes every hash, so it must survive into the contract"
+        );
     }
 
     fn row_hashes(meta: &MetaColumns, batch: &RecordBatch) -> Vec<i64> {
-        let schema = enrich_schema(&batch.schema(), meta, None).unwrap();
-        let out = enrich_batch(batch, meta, &schema, 0, None).unwrap();
+        let schema = enrich_schema(&batch.schema(), meta).unwrap();
+        let out = enrich_batch(batch, meta, &schema, 0).unwrap();
         let a = out
             .column_by_name(COL_ROW_HASH)
             .unwrap()
@@ -472,9 +493,9 @@ mod tests {
             exported_at: false,
             row_hash: RowHash::All(false),
         };
-        let enriched_schema = enrich_schema(&schema, &meta, None).unwrap();
+        let enriched_schema = enrich_schema(&schema, &meta).unwrap();
         assert_eq!(enriched_schema.fields().len(), 2);
-        let result = enrich_batch(&batch, &meta, &enriched_schema, 0, None).unwrap();
+        let result = enrich_batch(&batch, &meta, &enriched_schema, 0).unwrap();
         assert_eq!(result.num_columns(), 2);
     }
 
@@ -485,12 +506,12 @@ mod tests {
             exported_at: true,
             row_hash: RowHash::All(false),
         };
-        let enriched_schema = enrich_schema(&schema, &meta, None).unwrap();
+        let enriched_schema = enrich_schema(&schema, &meta).unwrap();
         assert_eq!(enriched_schema.fields().len(), 3);
         assert_eq!(enriched_schema.field(2).name(), COL_EXPORTED_AT);
 
         let ts = 1_711_612_800_000_000i64;
-        let result = enrich_batch(&batch, &meta, &enriched_schema, ts, None).unwrap();
+        let result = enrich_batch(&batch, &meta, &enriched_schema, ts).unwrap();
         assert_eq!(result.num_columns(), 3);
         assert_eq!(result.num_rows(), 3);
 
@@ -510,11 +531,11 @@ mod tests {
             exported_at: false,
             row_hash: RowHash::All(true),
         };
-        let enriched_schema = enrich_schema(&schema, &meta, None).unwrap();
+        let enriched_schema = enrich_schema(&schema, &meta).unwrap();
         assert_eq!(enriched_schema.field(2).name(), COL_ROW_HASH);
         assert_eq!(*enriched_schema.field(2).data_type(), DataType::Int64);
 
-        let result = enrich_batch(&batch, &meta, &enriched_schema, 0, None).unwrap();
+        let result = enrich_batch(&batch, &meta, &enriched_schema, 0).unwrap();
         let hash_col = result
             .column(2)
             .as_any()
@@ -533,12 +554,12 @@ mod tests {
             exported_at: true,
             row_hash: RowHash::All(true),
         };
-        let enriched_schema = enrich_schema(&schema, &meta, None).unwrap();
+        let enriched_schema = enrich_schema(&schema, &meta).unwrap();
         assert_eq!(enriched_schema.fields().len(), 4);
         assert_eq!(enriched_schema.field(2).name(), COL_EXPORTED_AT);
         assert_eq!(enriched_schema.field(3).name(), COL_ROW_HASH);
 
-        let result = enrich_batch(&batch, &meta, &enriched_schema, 123456, None).unwrap();
+        let result = enrich_batch(&batch, &meta, &enriched_schema, 123456).unwrap();
         assert_eq!(result.num_columns(), 4);
         assert_eq!(result.num_rows(), 3);
     }
@@ -550,10 +571,10 @@ mod tests {
             exported_at: false,
             row_hash: RowHash::All(true),
         };
-        let enriched_schema = enrich_schema(&schema, &meta, None).unwrap();
+        let enriched_schema = enrich_schema(&schema, &meta).unwrap();
 
-        let r1 = enrich_batch(&batch, &meta, &enriched_schema, 0, None).unwrap();
-        let r2 = enrich_batch(&batch, &meta, &enriched_schema, 0, None).unwrap();
+        let r1 = enrich_batch(&batch, &meta, &enriched_schema, 0).unwrap();
+        let r2 = enrich_batch(&batch, &meta, &enriched_schema, 0).unwrap();
 
         let h1 = r1.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
         let h2 = r2.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
@@ -579,8 +600,8 @@ mod tests {
             exported_at: false,
             row_hash: RowHash::All(true),
         };
-        let enriched_schema = enrich_schema(&schema, &meta, None).unwrap();
-        let result = enrich_batch(&batch, &meta, &enriched_schema, 0, None).unwrap();
+        let enriched_schema = enrich_schema(&schema, &meta).unwrap();
+        let result = enrich_batch(&batch, &meta, &enriched_schema, 0).unwrap();
         let hashes = result
             .column(1)
             .as_any()

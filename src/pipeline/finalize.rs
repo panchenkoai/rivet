@@ -510,6 +510,7 @@ pub(super) fn write_running_manifest(plan: &ResolvedRunPlan, run_id: &str, start
         SourceType::Mongo => "mongo",
     };
     let manifest = RunManifest {
+        row_hash: None,
         manifest_version: MANIFEST_VERSION,
         run_id: run_id.to_string(),
         export_name: plan.export_name.clone(),
@@ -535,7 +536,6 @@ pub(super) fn write_running_manifest(plan: &ResolvedRunPlan, run_id: &str, start
         parts: Vec::new(),
         column_checksums: None,
         checksum_key_column: None,
-        content_hash: None,
     };
     let dest = match crate::destination::create_destination(&plan.destination) {
         Ok(d) => d,
@@ -633,7 +633,6 @@ mod tests {
             max_file_size_bytes: None,
             skip_empty: false,
             meta_columns: Default::default(),
-            content_hash: None,
             destination: cfg_local(Some(&dest.to_string_lossy()), None),
             quality: None,
             tuning: crate::tuning::SourceTuning::from_config(None),
@@ -692,6 +691,7 @@ mod tests {
         s.journal
             .record(crate::journal::RunEvent::PlanResolved(Box::new(
                 crate::journal::PlanSnapshot {
+                    row_hash: None,
                     export_name: plan.export_name.clone(),
                     base_query: plan.base_query.clone(),
                     strategy: "snapshot".into(),
@@ -705,7 +705,6 @@ mod tests {
                     resume: false,
                     chunk_key: None,
                     resumable: false,
-                    content_hash: None,
                 },
             )));
         s

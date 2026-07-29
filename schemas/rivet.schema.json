@@ -690,18 +690,6 @@
             "row_hash": false
           }
         },
-        "content_hash": {
-          "description": "Materialize the canonical per-row content hash (`__content_hash`) at\nextraction — see [`crate::content_hash`] for the rendering contract.\n\nUnlike `meta_columns`, this applies on **every** leg: the batch sink,\nthe CDC drain, and the snapshot leg of a `mode: cdc` export. That is the\npoint of it — the snapshot and the drain write the same warehouse table,\nso a column that only one of them produced would leave half the table\nNULL and make the audit's cheap path unusable.\n\n```yaml\nexports:\n  - name: cashback_versions\n    table: cashback_versions\n    content_hash:\n      pk: id\n      cols: [status, updated_at]\n```",
-          "anyOf": [
-            {
-              "$ref": "#/$defs/ContentHashConfig"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null
-        },
         "quality": {
           "anyOf": [
             {
@@ -1144,28 +1132,6 @@
             "type": "string"
           }
         }
-      ]
-    },
-    "ContentHashConfig": {
-      "description": "Which columns the hash covers.\n\nThis is a **contract**, not a preference: the value only means anything\nnext to the column set that produced it, so the set travels with the data\n(see the run manifest) and an auditor comparing against a different set\nmust fail rather than silently compare different texts.\n\n```yaml\nexports:\n  - name: cashback_versions\n    content_hash:\n      pk: id\n      cols: [status, updated_at]\n```",
-      "type": "object",
-      "properties": {
-        "pk": {
-          "description": "The primary key column. Rendered first and never NULL-coalesced — a\nNULL primary key is refused (see [`append_content_hash`]).",
-          "type": "string"
-        },
-        "cols": {
-          "description": "The content columns, in the order they are hashed. Order is part of\nthe contract: reordering changes every hash.",
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "pk",
-        "cols"
       ]
     },
     "QualityConfig": {

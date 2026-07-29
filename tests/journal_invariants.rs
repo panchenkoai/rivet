@@ -14,6 +14,7 @@ fn make_journal() -> RunJournal {
 
 fn plan_snapshot(name: &str) -> PlanSnapshot {
     PlanSnapshot {
+        row_hash: None,
         export_name: name.to_string(),
         base_query: "SELECT 1".to_string(),
         strategy: "full".to_string(),
@@ -27,7 +28,6 @@ fn plan_snapshot(name: &str) -> PlanSnapshot {
         resume: false,
         chunk_key: None,
         resumable: false,
-        content_hash: None,
     }
 }
 
@@ -91,6 +91,7 @@ fn plan_snapshot_returns_first_plan_resolved() {
 fn plan_snapshot_fields_match_recorded_values() {
     let mut j = make_journal();
     j.record(RunEvent::PlanResolved(Box::new(PlanSnapshot {
+        row_hash: None,
         export_name: "orders".into(),
         base_query: "SELECT * FROM orders".into(),
         strategy: "incremental".into(),
@@ -104,7 +105,6 @@ fn plan_snapshot_fields_match_recorded_values() {
         resume: true,
         chunk_key: None,
         resumable: false,
-        content_hash: None,
     })));
 
     let snap = j.plan_snapshot().unwrap();

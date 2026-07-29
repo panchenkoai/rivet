@@ -261,21 +261,19 @@ fn synth_snapshot_export(
     // for backfill rows, NULL for every CDC-updated row). Clearing here keeps both
     // legs' columns identical; the run-start warn tells the operator the meta
     // columns are dropped for the whole CDC export.
-    // Only `exported_at` is cleared. `row_hash` is INHERITED — see the
-    // paragraph below; the two are opposites for the same reason.
+    // Only `exported_at` is cleared.
     synth.meta_columns.exported_at = false;
-    // content_hash is the EXACT OPPOSITE and is inherited on purpose (it rides
+    // `row_hash` is the EXACT OPPOSITE and is inherited on purpose (it rides
     // along in the clone above — this line is here to say so, because the
-    // obvious next edit is to clear it alongside meta_columns). The same
-    // argument that clears the meta columns *requires* keeping this one: both
-    // legs write the same `__changes` log, so a column only one leg produces
-    // breaks them. meta_columns is producible by the batch leg ALONE, so
-    // inheriting it would desynchronize the two; `__content_hash` is produced by
-    // BOTH (the CDC sink applies the identical Rust render), so inheriting it is
-    // what keeps them synchronized. Dropping it here would leave every
-    // backfilled row NULL and make the audit's cheap path unusable on exactly
-    // the tables it matters most for. `row_hash` is now in the same position.
-    debug_assert_eq!(synth.content_hash, export.content_hash);
+    // obvious next edit is to clear it alongside `exported_at`). The same
+    // argument that clears the stamp *requires* keeping the hash: both legs
+    // write the same `__changes` log, so a column only one leg produces breaks
+    // them. `exported_at` is producible by the batch leg ALONE, so inheriting it
+    // would desynchronize the two; `_rivet_row_hash` is produced by BOTH (the
+    // CDC sink applies the identical Rust render), so inheriting it is what
+    // keeps them synchronized. Dropping it here would leave every backfilled
+    // row NULL and make the audit's cheap path unusable on exactly the tables
+    // it matters most for.
     debug_assert_eq!(synth.meta_columns.row_hash, export.meta_columns.row_hash);
     synth
 }
@@ -392,7 +390,6 @@ fn run_cdc_inner(
                 &all_overrides,
                 t.rsplit('.').next().unwrap_or(t),
             ),
-            content_hash: export.content_hash.clone(),
             row_hash: export.meta_columns.row_hash.clone(),
         })
         .collect();
@@ -609,18 +606,16 @@ mod tests {
 
     // The mirror image of the test above, and the reason the two must be read
     // together: the SAME argument (both legs write one `__changes` log, so their
-    // columns must match) clears meta_columns and REQUIRES keeping content_hash.
-    // The batch leg alone can produce meta_columns, so inheriting them
-    // desynchronizes the legs; BOTH legs produce `__content_hash`, so dropping it
-    // on the snapshot is what would desynchronize them — leaving every backfilled
+    // columns must match) clears `exported_at` and REQUIRES keeping `row_hash`.
+    // The batch leg alone can produce the stamp, so inheriting it desynchronizes
+    // the legs; BOTH legs produce `_rivet_row_hash`, so dropping it on the
+    // snapshot is what would desynchronize them — leaving every backfilled
     // row's hash NULL and the audit's cheap path unusable.
     #[test]
-    fn snapshot_leg_inherits_content_hash() {
+    fn snapshot_leg_inherits_the_row_hash() {
         let mut e = crate::config::sample_export("orders");
-        e.content_hash = Some(crate::content_hash::ContentHashConfig {
-            pk: "id".into(),
-            cols: vec!["status".into(), "updated_at".into()],
-        });
+        e.meta_columns.row_hash =
+            crate::config::RowHash::Columns(vec!["id".into(), "status".into()]);
         e.meta_columns.exported_at = true;
         let dcfg = DestinationConfig {
             destination_type: DestinationType::Local,
@@ -629,12 +624,12 @@ mod tests {
         };
         let synth = synth_snapshot_export(&e, "orders", &dcfg);
         assert_eq!(
-            synth.content_hash, e.content_hash,
+            synth.meta_columns.row_hash, e.meta_columns.row_hash,
             "the snapshot leg must emit the SAME hash column the drain does"
         );
         assert!(
             !synth.meta_columns.exported_at,
-            "clearing the per-run stamp must not take content_hash with it"
+            "clearing the per-run stamp must not take the row hash with it"
         );
     }
 

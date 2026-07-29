@@ -119,6 +119,7 @@ fn journal_plan_snapshot_helper_returns_the_first_plan_resolved_event() {
 
     // Recording a PlanResolved event makes plan_snapshot() return it.
     j.record(RunEvent::PlanResolved(Box::new(PlanSnapshot {
+        row_hash: None,
         export_name: "orders".into(),
         base_query: "SELECT * FROM orders".into(),
         strategy: "snapshot".into(),
@@ -132,7 +133,6 @@ fn journal_plan_snapshot_helper_returns_the_first_plan_resolved_event() {
         resume: false,
         chunk_key: None,
         resumable: false,
-        content_hash: None,
     })));
 
     let snap = j

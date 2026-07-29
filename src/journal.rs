@@ -60,14 +60,14 @@ pub struct PlanSnapshot {
     /// so a pre-existing journal deserializes as `false`.
     #[serde(default)]
     pub resumable: bool,
-    /// The content-hash contract this run wrote, when `content_hash:` was
+    /// The row-hash contract this run wrote, when `meta_columns.row_hash` was
     /// configured. Persisted so a post-mortem from the state DB alone can answer
-    /// "which columns does this table's `__content_hash` actually cover" — the
+    /// "which columns does this table's `_rivet_row_hash` actually cover" — the
     /// question an auditor must settle before trusting the column, and one the
     /// warehouse itself cannot answer: the column's existence says nothing about
     /// its coverage. `#[serde(default)]` so an older journal still deserializes.
     #[serde(default)]
-    pub content_hash: Option<crate::content_hash::ContentHashContract>,
+    pub row_hash: Option<crate::enrich::RowHashContract>,
 }
 
 // ─── Events ──────────────────────────────────────────────────────────────────
@@ -366,6 +366,7 @@ mod tests {
 
     fn snap() -> PlanSnapshot {
         PlanSnapshot {
+            row_hash: None,
             export_name: "orders".into(),
             base_query: "SELECT 1".into(),
             strategy: "snapshot".into(),
@@ -379,7 +380,6 @@ mod tests {
             resume: false,
             chunk_key: None,
             resumable: false,
-            content_hash: None,
         }
     }
 

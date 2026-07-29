@@ -39,13 +39,6 @@ anyhow = "1"
 # download (both already in the tree transitively).
 base64 = "0.22"
 md-5 = "0.11"
-# The content hash (src/content_hash.rs) is SHA-256 because that is the digest
-# every warehouse engine exposes as a built-in — the value must be reproducible
-# by the SOURCE's own SQL, which rules out xxh3 and anything else Rust-only.
-# 0.10 rather than 0.11: opendal / mysql_common / reqsign already pull 0.10, so
-# this adds no new build.
-sha2 = "0.10"
-hex = "0.4"
 # `canonical_extension_types` enables Arrow's canonical extension wrappers
 # (`arrow_schema::extension::{Uuid, Json}`) — see Cargo dep on `parquet`
 # below for the writer-side pairing.

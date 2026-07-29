@@ -20,7 +20,6 @@ pub use arrow;
 
 // Public — accessed by integration tests in tests/*.rs
 pub mod config;
-pub mod content_hash;
 pub mod error;
 pub mod format;
 // Fuzz-only entry points (feature = "fuzzing"); not part of the public API.
@@ -60,7 +59,8 @@ pub mod destination_for_tests {
 // Public since §5h: the auditor recomputes `_rivet_row_hash` over re-extracted
 // sample rows, and it must do so with THIS function. A reimplementation on the
 // consumer side would be a second thing that can drift from the extractor —
-// which is exactly the failure §5h removes.
+// which is exactly the failure §5h removes, and the reason there is only one
+// hash left to recompute.
 pub mod enrich;
 pub(crate) mod notify;
 pub(crate) mod plan;

@@ -436,22 +436,22 @@ fn build_plans(
             })
             .collect();
 
-        // `__content_hash` is produced by rivet at EXTRACTION, so it is in every
-        // Parquet part but absent from the column report, which the type
+        // `_rivet_row_hash` is produced by rivet at EXTRACTION, so it is in
+        // every Parquet part but absent from the column report, which the type
         // resolver builds from the SOURCE catalog. Without a spec the created
         // table simply lacks the column and the very first load fails on a
         // schema mismatch — after the extract has already run.
         //
         // The type is resolved through the same per-target resolver every other
-        // text column goes through instead of a hardcoded "STRING", so it cannot
-        // drift from the warehouse's own text type (BigQuery STRING, Snowflake
-        // VARCHAR, ClickHouse String).
-        if export.content_hash.is_some() {
+        // integer column goes through instead of a hardcoded "INT64", so it
+        // cannot drift from the warehouse's own 64-bit integer type (BigQuery
+        // INT64, Snowflake NUMBER(38,0), ClickHouse Int64).
+        if export.meta_columns.row_hash.enabled() {
             let target = crate::types::target::ExportTarget::parse(load.target.name())
                 .with_context(|| format!("unknown load target `{}`", load.target.name()))?;
             specs.push(target.resolve_column(crate::types::target::TargetInput {
-                column_name: crate::content_hash::COL_CONTENT_HASH,
-                rivet_type: &crate::types::RivetType::String,
+                column_name: crate::enrich::COL_ROW_HASH,
+                rivet_type: &crate::types::RivetType::Int64,
                 arrow_type: None,
                 fidelity: crate::types::TypeFidelity::Exact,
             }));
@@ -681,7 +681,7 @@ load:
         assert_eq!(plans[1].gcs_prefix, "gs://b1/exports/alpha/");
     }
 
-    /// `__content_hash` is written by rivet at extraction, so it never appears
+    /// `_rivet_row_hash` is written by rivet at extraction, so it never appears
     /// in the source column report. Without a spec the warehouse table is
     /// created without the column and the FIRST load fails on a schema mismatch
     /// — after the extract has already been paid for.
@@ -712,20 +712,20 @@ load:
                 .map(|s| s.column_name.as_str())
                 .collect::<Vec<_>>(),
             vec!["id", "status"],
-            "no content_hash configured ⇒ no extra column"
+            "no row_hash configured ⇒ no extra column"
         );
 
         let with = crate::config::Config::from_yaml(&yaml(
-            "    content_hash:\n      pk: id\n      cols: [status]\n",
+            "    meta_columns:\n      row_hash: [id, status]\n",
         ))
         .unwrap();
         let load: LoadSection = serde_json::from_value(with.load.clone().unwrap()).unwrap();
         let plans = build_plans(&with, &load, reports()).unwrap();
         let last = plans[0].specs.last().unwrap();
-        assert_eq!(last.column_name, crate::content_hash::COL_CONTENT_HASH);
+        assert_eq!(last.column_name, crate::enrich::COL_ROW_HASH);
         // Resolved through the per-target resolver, not hardcoded — BigQuery's
-        // text type. A Snowflake target would resolve VARCHAR here.
-        assert_eq!(last.target_type, "STRING");
+        // 64-bit integer. A Snowflake target would resolve NUMBER(38,0) here.
+        assert_eq!(last.target_type, "INT64");
         assert_eq!(last.status, TargetStatus::Ok);
     }
 

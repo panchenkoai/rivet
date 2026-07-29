@@ -40,7 +40,7 @@ fn plan_snapshot_from(plan: &ResolvedRunPlan) -> PlanSnapshot {
         resume: plan.resume,
         chunk_key: plan.strategy.chunk_key().map(|c| c.to_string()),
         resumable: plan.strategy.is_resumable(),
-        content_hash: plan.content_hash.as_ref().map(|c| c.contract()),
+        row_hash: crate::enrich::RowHashContract::of(&plan.meta_columns.row_hash),
     }
 }
 
@@ -1115,7 +1115,6 @@ mod tests {
             max_file_size_bytes: None,
             skip_empty: false,
             meta_columns: MetaColumns::default(),
-            content_hash: None,
             destination: DestinationConfig {
                 destination_type: DestinationType::Local,
                 path: Some("./out".into()),
@@ -1250,7 +1249,6 @@ mod tests {
             max_file_size_bytes: None,
             skip_empty: false,
             meta_columns: MetaColumns::default(),
-            content_hash: None,
             destination: DestinationConfig {
                 destination_type: DestinationType::Local,
                 path: Some("./out".into()),
@@ -1324,7 +1322,6 @@ mod tests {
             max_file_size_bytes: None,
             skip_empty: false,
             meta_columns: MetaColumns::default(),
-            content_hash: None,
             destination: DestinationConfig {
                 destination_type: DestinationType::Local,
                 path: Some("./out".into()),
@@ -1387,6 +1384,31 @@ mod tests {
         let fsnap = full.journal.plan_snapshot().unwrap();
         assert_eq!(fsnap.chunk_key, None);
         assert!(!fsnap.resumable);
+    }
+
+    /// The snapshot is where the row-hash contract enters the trust artifacts:
+    /// the manifest builder copies it verbatim, so the manifest can only ever
+    /// advertise what the RESOLVED PLAN was going to hash. Taking it from
+    /// anywhere else — the raw config, a default — would let the two disagree,
+    /// and a reader has no way to notice.
+    #[test]
+    fn plan_snapshot_records_the_row_hash_contract_the_run_applies() {
+        let mut plan = plan_for("orders");
+        let bare = RunSummary::new(&plan);
+        assert_eq!(
+            bare.journal.plan_snapshot().unwrap().row_hash,
+            None,
+            "no hash column written ⇒ nothing to advertise"
+        );
+
+        plan.meta_columns.row_hash =
+            crate::config::RowHash::Columns(vec!["id".into(), "status".into()]);
+        let hashed = RunSummary::new(&plan);
+        let snap = hashed.journal.plan_snapshot().unwrap();
+        let c = snap.row_hash.clone().expect("a declared set is recorded");
+        assert_eq!(c.column, crate::enrich::COL_ROW_HASH);
+        assert_eq!(c.covered, plan.meta_columns.row_hash);
+        assert_eq!(c.render, crate::enrich::ROW_HASH_RENDER_ID);
     }
 
     #[test]

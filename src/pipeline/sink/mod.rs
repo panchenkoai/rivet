@@ -55,8 +55,6 @@ pub(crate) struct ExportSink {
     /// detection against the stored snapshot.
     pub(in crate::pipeline) dest_schema: Option<SchemaRef>,
     pub(in crate::pipeline) meta: MetaColumns,
-    /// `exports[].content_hash` — the extraction-time `__content_hash` column.
-    pub(in crate::pipeline) content_hash: Option<crate::content_hash::ContentHashConfig>,
     pub(in crate::pipeline) enriched_schema: Option<SchemaRef>,
     pub(in crate::pipeline) exported_at_us: i64,
     pub(in crate::pipeline) quality_null_counts: std::collections::HashMap<String, usize>,
@@ -145,7 +143,6 @@ impl ExportSink {
             schema: None,
             dest_schema: None,
             meta: plan.meta_columns.clone(),
-            content_hash: plan.content_hash.clone(),
             enriched_schema: None,
             exported_at_us,
             quality_null_counts: std::collections::HashMap::new(),
@@ -507,13 +504,7 @@ impl ExportSink {
         self.track_checksum(dest_batch);
 
         let output = if let Some(es) = &self.enriched_schema {
-            enrich::enrich_batch(
-                dest_batch,
-                &self.meta,
-                es,
-                self.exported_at_us,
-                self.content_hash.as_ref(),
-            )?
+            enrich::enrich_batch(dest_batch, &self.meta, es, self.exported_at_us)?
         } else {
             dest_batch.clone()
         };
@@ -598,7 +589,7 @@ impl BatchSink for ExportSink {
             }
             _ => schema.clone(),
         };
-        let enriched = enrich::enrich_schema(&dest_schema, &self.meta, self.content_hash.as_ref())?;
+        let enriched = enrich::enrich_schema(&dest_schema, &self.meta)?;
         // Compute row group rows from the actual schema now that it's available.
         if let Some(pc) = &self.parquet_config {
             self.parquet_row_group_rows = pc.effective_row_group_rows(&dest_schema);

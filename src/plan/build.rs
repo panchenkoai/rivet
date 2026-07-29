@@ -122,7 +122,6 @@ pub fn build_plan(
         max_file_size_bytes: export.max_file_size_bytes(),
         skip_empty: export.skip_empty,
         meta_columns: export.meta_columns.clone(),
-        content_hash: export.content_hash.clone(),
         destination: expand_destination_templates(export.destination.clone(), &export.name),
         quality: export.quality.clone(),
         tuning,

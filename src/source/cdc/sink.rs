@@ -50,14 +50,10 @@ pub(crate) struct TableOutput<'a> {
     pub columns: Vec<TypeMapping>,
     pub dest: &'a dyn Destination,
     pub dest_uri: String,
-    /// Materialize `__content_hash` on the drain, using the same Rust render
-    /// the snapshot leg applies — see [`crate::content_hash`]. Carried per
-    /// TABLE rather than per stream because the spec names one table's pk and
-    /// columns; a multi-table stream is refused at config-load.
-    pub content_hash: Option<crate::content_hash::ContentHashConfig>,
-    /// `_rivet_row_hash` on the drain. The snapshot leg emits it too, over the
-    /// same DATA columns, so the two legs land one shape in the shared
-    /// `__changes` log (repair-design.md §5h).
+    /// `_rivet_row_hash` on the drain, using the same Rust render the snapshot
+    /// leg applies (repair-design.md §5h). Carried per TABLE rather than per
+    /// stream because a DECLARED column set names one table's columns; a
+    /// multi-table stream with one is refused at config-load.
     pub row_hash: crate::config::RowHash,
 }
 
@@ -145,7 +141,6 @@ impl TableSink<'_> {
             run_token,
             self.seq,
             self.out.dest,
-            self.out.content_hash.as_ref(),
             &self.out.row_hash,
         )?;
         for (name, sum) in sums {
@@ -515,7 +510,6 @@ fn flush(
     run_token: &str,
     seq: usize,
     dest: &dyn Destination,
-    content_hash: Option<&crate::content_hash::ContentHashConfig>,
     row_hash: &crate::config::RowHash,
 ) -> Result<(PartRecord, Vec<(String, u64)>)> {
     let ops: ArrayRef = Arc::new(
@@ -671,6 +665,9 @@ fn flush(
     // columns; the resulting hash covers NULL content by that engine's own
     // model, and the audit never reads it, because a tombstoned row is filtered
     // out (`NOT __is_deleted`).
+    //
+    // `col_sums` deliberately excludes the hash: it records SOURCE column
+    // checksums, and the batch leg likewise omits its own added columns.
     let batch = if row_hash.enabled() {
         let data: Vec<String> = columns.iter().map(|m| m.column_name.clone()).collect();
         let covered = crate::enrich::row_hash_columns_of(&data, row_hash)?;
@@ -691,25 +688,6 @@ fn flush(
     } else {
         RecordBatch::try_new(schema.clone(), arrays)?
     };
-
-    // The drain's hash is computed from the image the engine actually sent. For
-    // a DELETE that is the before-image, which some engines populate with only
-    // the key columns — the hash of such a row covers `<NULL>` content by the
-    // engine's own model, and the audit never reads it because a tombstoned row
-    // is filtered out (`NOT __is_deleted`). The per-engine live matrix pins each
-    // engine's delete-image behaviour so this stays a known shape, not a guess.
-    //
-    // `col_sums` deliberately excludes the hash: it records SOURCE column
-    // checksums, and the batch leg likewise omits its own added columns.
-    let (schema, batch) = match content_hash {
-        Some(h) => {
-            let hashed = crate::content_hash::hashed_schema(schema, h)?;
-            let b = crate::content_hash::append_content_hash(&batch, h, &hashed)?;
-            (hashed, b)
-        }
-        None => (schema.clone(), batch),
-    };
-    let schema = &schema;
 
     let tmp = NamedTempFile::new()?;
     let compression = match format {
@@ -768,7 +746,7 @@ fn build_manifest(
         },
         // From the SAME TableOutput the flush hashed with, so the manifest can
         // never advertise a contract this run did not apply.
-        content_hash: out.content_hash.as_ref().map(|c| c.contract()),
+        row_hash: crate::enrich::RowHashContract::of(&out.row_hash),
         format: format.label().to_string(),
         compression: "zstd".to_string(),
         schema_fingerprint: String::new(),
@@ -1293,7 +1271,6 @@ mod tests {
                 columns: cols.to_vec(),
                 dest,
                 dest_uri: String::new(),
-                content_hash: None,
                 row_hash: crate::config::RowHash::All(false),
             }],
             engine: crate::source::cdc::CdcEngine::Mysql,
@@ -1465,7 +1442,6 @@ mod tests {
                     columns: cols.to_vec(),
                     dest: dest_a,
                     dest_uri: "a".into(),
-                    content_hash: None,
                     row_hash: crate::config::RowHash::All(false),
                 },
                 TableOutput {
@@ -1473,7 +1449,6 @@ mod tests {
                     columns: cols.to_vec(),
                     dest: dest_b,
                     dest_uri: "b".into(),
-                    content_hash: None,
                     row_hash: crate::config::RowHash::All(false),
                 },
             ],

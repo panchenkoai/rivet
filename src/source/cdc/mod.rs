@@ -832,10 +832,9 @@ pub(crate) struct CaptureOutput<'a> {
     /// narrowed by `types::overrides_for_table` (bare keys apply everywhere;
     /// `"table.column"` keys target one table and win over bare).
     pub overrides: crate::types::ColumnOverrides,
-    /// `exports[].content_hash` — the drain must emit the SAME hash column the
-    /// snapshot leg does, or the warehouse table ends up half-populated.
-    pub content_hash: Option<crate::content_hash::ContentHashConfig>,
-    /// `exports[].meta_columns.row_hash` — same requirement, same reason.
+    /// `exports[].meta_columns.row_hash` — the drain must emit the SAME hash
+    /// column the snapshot leg does, or the warehouse table ends up
+    /// half-populated.
     pub row_hash: crate::config::RowHash,
 }
 
@@ -884,7 +883,6 @@ pub(crate) fn run_capture(cap: CdcCapture<'_>) -> Result<Vec<crate::manifest::Ru
             columns,
             dest: o.dest,
             dest_uri: o.dest_uri,
-            content_hash: o.content_hash,
             row_hash: o.row_hash,
         });
     }

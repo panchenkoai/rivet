@@ -338,7 +338,6 @@ mod tests {
             max_file_size_bytes: None,
             skip_empty: false,
             meta_columns: MetaColumns::default(),
-            content_hash: None,
             destination: DestinationConfig {
                 destination_type: DestinationType::Local,
                 path: Some("./out".into()),

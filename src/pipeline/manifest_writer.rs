@@ -61,9 +61,9 @@ pub struct ManifestBuilder {
     /// The column the Form B checksum is keyed to (cursor/key column); `None` =
     /// un-keyed. Recorded so `validate` re-keys identically.
     checksum_key_column: Option<String>,
-    /// What this run's `__content_hash` covers. Taken from the plan snapshot so
+    /// What this run's `_rivet_row_hash` covers. Taken from the plan snapshot so
     /// the manifest cannot claim a contract the run did not actually apply.
-    content_hash: Option<crate::content_hash::ContentHashContract>,
+    row_hash: Option<crate::enrich::RowHashContract>,
 }
 
 impl ManifestBuilder {
@@ -112,7 +112,7 @@ impl ManifestBuilder {
             parts: Vec::new(),
             column_checksums: None,
             checksum_key_column: None,
-            content_hash: plan.content_hash.clone(),
+            row_hash: plan.row_hash.clone(),
         }
     }
 
@@ -210,7 +210,7 @@ impl ManifestBuilder {
             parts: self.parts,
             column_checksums: self.column_checksums,
             checksum_key_column: self.checksum_key_column,
-            content_hash: self.content_hash,
+            row_hash: self.row_hash,
         }
     }
 }
@@ -426,6 +426,7 @@ mod tests {
 
     fn plan_snapshot() -> PlanSnapshot {
         PlanSnapshot {
+            row_hash: None,
             export_name: "public.orders".into(),
             base_query: "SELECT * FROM orders".into(),
             strategy: "snapshot".into(),
@@ -439,7 +440,6 @@ mod tests {
             resume: false,
             chunk_key: None,
             resumable: false,
-            content_hash: None,
         }
     }
 

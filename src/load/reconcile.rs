@@ -529,6 +529,7 @@ mod tests {
     /// optionally, a probed `source_row_count`.
     fn manifest(run: &str, rows: i64, source: Option<i64>) -> RunManifest {
         RunManifest {
+            row_hash: None,
             manifest_version: crate::manifest::MANIFEST_VERSION,
             run_id: run.into(),
             export_name: "orders".into(),
@@ -569,7 +570,6 @@ mod tests {
             }],
             column_checksums: None,
             checksum_key_column: None,
-            content_hash: None,
         }
     }
 
