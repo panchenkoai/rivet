@@ -2,6 +2,83 @@
 
 ## Unreleased
 
+## 0.24.0 — 2026-07-29
+
+### Changed — BREAKING
+
+- **`exports[].content_hash` is removed.** A config that still declares it now
+  fails to load (`deny_unknown_fields`). The block existed so the audit's source
+  side could recompute the value IN SQL, which forced SHA-256 (the only digest
+  every warehouse exposes), a 15-hex truncation, one fixed UTC-second timestamp
+  format, and a loud refusal of floats, decimals and booleans — types with no
+  text form five engines agree on.
+
+  That premise is gone: the auditor now re-extracts the sampled rows through the
+  ordinary batch path and re-renders them with the extractor's own function, so
+  agreement is a property of running one piece of code twice rather than of five
+  SQL dialects being kept in step. With no cross-engine treaty to keep, a second
+  hash has no job.
+
+  **Migration:** replace
+
+  ```yaml
+  content_hash:
+    pk: id
+    cols: [status, updated_at]
+  ```
+
+  with
+
+  ```yaml
+  meta_columns:
+    row_hash: [id, status, updated_at]
+  ```
+
+  The column changes name and type — `__content_hash STRING` becomes
+  `_rivet_row_hash INT64` — and the value is NOT comparable across the two. No
+  SQL can convert one to the other: the new value is produced by rivet's
+  extractor, so an existing warehouse column can only be repopulated by
+  re-extraction. Decimal and boolean columns may now be covered; they were
+  refused before because no two engines render them identically, and nothing
+  renders them but rivet now.
+
+  `sha2` and `hex` drop out of the dependency tree. (MD5 stays — that is GCS
+  part-body integrity, unrelated.)
+
+### Added
+
+- **`cdc.initial: adopt`** — create the resume anchor and drain, moving no rows.
+  For a table that is ALREADY in the warehouse, built by something other than
+  rivet: a snapshot would re-move the whole table to learn what it already
+  holds. Distinct from omitting `initial:`, which tails from wherever the stream
+  happens to be with no anchor step — `adopt` runs the same `ensure_anchor` that
+  `snapshot` does, so a later audit can name WHICH source position the existing
+  table was proven against.
+
+- **`meta_columns.row_hash` accepts a column list** (`row_hash: [id, status]`)
+  as well as `true`. A declared set is recorded in the run manifest, so a reader
+  can check what the hash covers instead of inferring it from the query; `true`
+  keeps meaning every projected column. A name outside the projection now fails
+  the run rather than being skipped.
+
+- **`_rivet_row_hash` is emitted on the CDC drain**, over the same data columns
+  the snapshot leg hashes. Both legs write one `__changes` log, so a column only
+  one of them produced would leave half the table NULL.
+
+### Fixed
+
+- **An existing warehouse table's schema is reconciled by `ALTER TABLE … ADD
+  COLUMN IF NOT EXISTS`, never by replacing the table.** `CREATE TABLE IF NOT
+  EXISTS` is a no-op on a table rivet did not create, so its next `LOAD DATA`
+  declared columns the table lacked and failed. Overwriting instead would have
+  imposed rivet's schema on data rivet does not own.
+
+- **The load plan emits a column spec for `_rivet_row_hash`** (resolved as the
+  target's own 64-bit integer type). It is written at extraction, so it is in
+  every Parquet part but absent from the source column report; without a spec the
+  created table lacked it and the first load failed on a schema mismatch, after
+  the extract had already been paid for.
+
 ## 0.23.1 — 2026-07-27
 
 ### Fixed
