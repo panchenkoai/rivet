@@ -14,6 +14,7 @@
 
 // Public — accessed by integration tests in tests/*.rs
 pub mod config;
+pub mod content_hash;
 pub mod error;
 pub mod format;
 // Fuzz-only entry points (feature = "fuzzing"); not part of the public API.
