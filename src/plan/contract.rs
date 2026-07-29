@@ -76,6 +76,8 @@ pub struct ResolvedRunPlan {
     pub max_file_size_bytes: Option<u64>,
     pub skip_empty: bool,
     pub meta_columns: MetaColumns,
+    /// Materialize `__content_hash` at extraction (`exports[].content_hash`).
+    pub content_hash: Option<crate::content_hash::ContentHashConfig>,
     pub destination: DestinationConfig,
     pub quality: Option<QualityConfig>,
     pub tuning: SourceTuning,

@@ -12,6 +12,7 @@ use super::IncrementalCursorMode;
 use super::destination::DestinationConfig;
 use super::format::{CompressionProfile, CompressionType, FormatType, ParquetConfig};
 use super::resolve::{parse_file_size, resolve_vars};
+use crate::content_hash::ContentHashConfig;
 use crate::tuning::TuningConfig;
 
 /// What to do when structural schema drift is detected (column added, removed, or retyped).
@@ -218,6 +219,25 @@ pub struct ExportConfig {
     pub verify: VerifyMode,
     #[serde(default)]
     pub meta_columns: MetaColumns,
+    /// Materialize the canonical per-row content hash (`__content_hash`) at
+    /// extraction — see [`crate::content_hash`] for the rendering contract.
+    ///
+    /// Unlike `meta_columns`, this applies on **every** leg: the batch sink,
+    /// the CDC drain, and the snapshot leg of a `mode: cdc` export. That is the
+    /// point of it — the snapshot and the drain write the same warehouse table,
+    /// so a column that only one of them produced would leave half the table
+    /// NULL and make the audit's cheap path unusable.
+    ///
+    /// ```yaml
+    /// exports:
+    ///   - name: cashback_versions
+    ///     table: cashback_versions
+    ///     content_hash:
+    ///       pk: id
+    ///       cols: [status, updated_at]
+    /// ```
+    #[serde(default)]
+    pub content_hash: Option<ContentHashConfig>,
     #[serde(default)]
     pub quality: Option<QualityConfig>,
     /// Rotate to a new part when the current file reaches this size.
@@ -707,6 +727,7 @@ pub(crate) fn sample_export(name: &str) -> ExportConfig {
             ..Default::default()
         },
         meta_columns: MetaColumns::default(),
+        content_hash: None,
         quality: None,
         max_file_size: None,
         chunk_checkpoint: false,

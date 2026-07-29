@@ -50,6 +50,11 @@ pub(crate) struct TableOutput<'a> {
     pub columns: Vec<TypeMapping>,
     pub dest: &'a dyn Destination,
     pub dest_uri: String,
+    /// Materialize `__content_hash` on the drain, using the same Rust render
+    /// the snapshot leg applies — see [`crate::content_hash`]. Carried per
+    /// TABLE rather than per stream because the spec names one table's pk and
+    /// columns; a multi-table stream is refused at config-load.
+    pub content_hash: Option<crate::content_hash::ContentHashConfig>,
 }
 
 /// Everything the sink needs that isn't the stream itself. `outputs` carries one
@@ -131,6 +136,7 @@ impl TableSink<'_> {
             run_token,
             self.seq,
             self.out.dest,
+            self.out.content_hash.as_ref(),
         )?;
         for (name, sum) in sums {
             *self.column_sums.entry(name).or_insert(0) ^= sum;
@@ -491,6 +497,7 @@ fn flush(
     run_token: &str,
     seq: usize,
     dest: &dyn Destination,
+    content_hash: Option<&crate::content_hash::ContentHashConfig>,
 ) -> Result<(PartRecord, Vec<(String, u64)>)> {
     let ops: ArrayRef = Arc::new(
         events
@@ -635,6 +642,25 @@ fn flush(
         arrays.push(arr);
     }
     let batch = RecordBatch::try_new(schema.clone(), arrays)?;
+
+    // The drain's hash is computed from the image the engine actually sent. For
+    // a DELETE that is the before-image, which some engines populate with only
+    // the key columns — the hash of such a row covers `<NULL>` content by the
+    // engine's own model, and the audit never reads it because a tombstoned row
+    // is filtered out (`NOT __is_deleted`). The per-engine live matrix pins each
+    // engine's delete-image behaviour so this stays a known shape, not a guess.
+    //
+    // `col_sums` deliberately excludes the hash: it records SOURCE column
+    // checksums, and the batch leg likewise omits its own added columns.
+    let (schema, batch) = match content_hash {
+        Some(h) => {
+            let hashed = crate::content_hash::hashed_schema(schema, h)?;
+            let b = crate::content_hash::append_content_hash(&batch, h, &hashed)?;
+            (hashed, b)
+        }
+        None => (schema.clone(), batch),
+    };
+    let schema = &schema;
 
     let tmp = NamedTempFile::new()?;
     let compression = match format {
@@ -1215,6 +1241,7 @@ mod tests {
                 columns: cols.to_vec(),
                 dest,
                 dest_uri: String::new(),
+                content_hash: None,
             }],
             engine: crate::source::cdc::CdcEngine::Mysql,
             format,
@@ -1385,12 +1412,14 @@ mod tests {
                     columns: cols.to_vec(),
                     dest: dest_a,
                     dest_uri: "a".into(),
+                    content_hash: None,
                 },
                 TableOutput {
                     table: "b".into(),
                     columns: cols.to_vec(),
                     dest: dest_b,
                     dest_uri: "b".into(),
+                    content_hash: None,
                 },
             ],
             engine: crate::source::cdc::CdcEngine::Mysql,

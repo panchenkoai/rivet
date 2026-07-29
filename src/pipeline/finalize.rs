@@ -632,6 +632,7 @@ mod tests {
             max_file_size_bytes: None,
             skip_empty: false,
             meta_columns: Default::default(),
+            content_hash: None,
             destination: cfg_local(Some(&dest.to_string_lossy()), None),
             quality: None,
             tuning: crate::tuning::SourceTuning::from_config(None),

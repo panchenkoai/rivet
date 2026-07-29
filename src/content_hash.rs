@@ -279,16 +279,12 @@ impl Role {
     }
 }
 
-/// Append [`COL_CONTENT_HASH`] to a batch.
+/// The [`COL_CONTENT_HASH`] column for a batch, on its own.
 ///
-/// `hashed` must be the schema returned by [`hashed_schema`] for the same
-/// config — passing it in keeps the (validated) schema built once per export
-/// rather than once per batch.
-pub fn append_content_hash(
-    batch: &RecordBatch,
-    cfg: &ContentHashConfig,
-    hashed: &SchemaRef,
-) -> Result<RecordBatch> {
+/// The two sinks assemble their output columns differently — the batch path
+/// appends to an enriched schema, the CDC path builds `__op`/`__pos`/`__seq`
+/// first — so both take the array and place it themselves.
+pub fn hash_array(batch: &RecordBatch, cfg: &ContentHashConfig) -> Result<ArrayRef> {
     let n = batch.num_rows();
     let mut renderers = Vec::with_capacity(cfg.cols.len() + 1);
     renderers.push(Renderer::resolve(batch, &cfg.pk, Role::Pk)?);
@@ -308,9 +304,21 @@ pub fn append_content_hash(
         }
         hashes.push(hash_of(&text));
     }
+    Ok(Arc::new(StringArray::from(hashes)))
+}
 
+/// Append [`COL_CONTENT_HASH`] to a batch.
+///
+/// `hashed` must be the schema returned by [`hashed_schema`] for the same
+/// config — passing it in keeps the (validated) schema built once per export
+/// rather than once per batch.
+pub fn append_content_hash(
+    batch: &RecordBatch,
+    cfg: &ContentHashConfig,
+    hashed: &SchemaRef,
+) -> Result<RecordBatch> {
     let mut columns: Vec<ArrayRef> = batch.columns().to_vec();
-    columns.push(Arc::new(StringArray::from(hashes)));
+    columns.push(hash_array(batch, cfg)?);
     Ok(RecordBatch::try_new(hashed.clone(), columns)?)
 }
 

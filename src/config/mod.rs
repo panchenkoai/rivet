@@ -650,6 +650,23 @@ impl Config {
             }
         }
 
+        if let Some(ch) = &export.content_hash {
+            ch.validate(&export.name)?;
+            // A hash is `pk|cols` for ONE table's shape. A `tables:` stream
+            // captures several tables through one config, and they do not share
+            // a primary key — applying one spec to all of them would hash the
+            // wrong columns (or fail per table, mid-stream, after the slot is
+            // already open). Refuse at config-load instead.
+            if export.tables.is_some() {
+                anyhow::bail!(
+                    "export '{}': content_hash names one table's pk and columns, so it cannot \
+                     apply to a multi-table `tables:` stream. Give each table its own export \
+                     (with `table:`), or drop content_hash from this one.",
+                    export.name
+                );
+            }
+        }
+
         // Round-2 audit #15/#16/#6: partition_by has purely-static rules (mode
         // compatibility, the `{partition}` token, a filename-safe column name) that
         // only lived in the run-time expansion step, so `rivet check` gave a false
@@ -1581,6 +1598,55 @@ mod audit_csv_compression {
                 ct.label()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod content_hash_config {
+    //! `content_hash` names ONE table's pk and columns. The failure mode worth
+    //! guarding is the quiet one: accepting a spec that cannot be honoured and
+    //! discovering it mid-stream, after a replication slot is already open.
+    use super::*;
+
+    fn yaml(export_body: &str) -> String {
+        format!(
+            "source:\n  type: postgres\n  url: \"postgresql://localhost/test\"\n\
+             exports:\n  - name: t\n    format: parquet\n    destination:\n      type: gcs\n      bucket: b\n      prefix: \"t/\"\n{export_body}"
+        )
+    }
+
+    #[test]
+    fn single_table_content_hash_is_accepted() {
+        let cfg = Config::from_yaml(&yaml(
+            "    table: orders\n    content_hash:\n      pk: id\n      cols: [status, updated_at]\n",
+        ))
+        .expect("a single-table content_hash must parse");
+        let ch = cfg.exports[0].content_hash.as_ref().unwrap();
+        assert_eq!(ch.covered(), vec!["id", "status", "updated_at"]);
+    }
+
+    #[test]
+    fn multi_table_stream_is_refused() {
+        let err = Config::from_yaml(&yaml(
+            "    mode: cdc\n    tables: [orders, customers]\n    cdc:\n      checkpoint: /tmp/ck\n\
+             \x20   content_hash:\n      pk: id\n      cols: [status]\n",
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("multi-table") && err.contains("content_hash"),
+            "a `tables:` stream must be refused at config-load, not mid-stream: {err}"
+        );
+    }
+
+    #[test]
+    fn empty_column_set_is_refused() {
+        let err = Config::from_yaml(&yaml(
+            "    table: orders\n    content_hash:\n      pk: id\n      cols: []\n",
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("carries no content"), "{err}");
     }
 }
 

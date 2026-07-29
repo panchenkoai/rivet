@@ -256,6 +256,18 @@ fn synth_snapshot_export(
     // legs' columns identical; the run-start warn tells the operator the meta
     // columns are dropped for the whole CDC export.
     synth.meta_columns = Default::default();
+    // content_hash is the EXACT OPPOSITE and is inherited on purpose (it rides
+    // along in the clone above — this line is here to say so, because the
+    // obvious next edit is to clear it alongside meta_columns). The same
+    // argument that clears the meta columns *requires* keeping this one: both
+    // legs write the same `__changes` log, so a column only one leg produces
+    // breaks them. meta_columns is producible by the batch leg ALONE, so
+    // inheriting it would desynchronize the two; `__content_hash` is produced by
+    // BOTH (the CDC sink applies the identical Rust render), so inheriting it is
+    // what keeps them synchronized. Dropping it here would leave every
+    // backfilled row NULL and make the audit's cheap path unusable on exactly
+    // the tables it matters most for.
+    debug_assert_eq!(synth.content_hash, export.content_hash);
     synth
 }
 
@@ -371,6 +383,7 @@ fn run_cdc_inner(
                 &all_overrides,
                 t.rsplit('.').next().unwrap_or(t),
             ),
+            content_hash: export.content_hash.clone(),
         })
         .collect();
     let now = chrono::Utc::now().to_rfc3339();
@@ -569,6 +582,37 @@ mod tests {
         );
         assert!(!synth.skip_empty, "snapshot must complete even when empty");
         assert_eq!(synth.table.as_deref(), Some("orders"));
+    }
+
+    // The mirror image of the test above, and the reason the two must be read
+    // together: the SAME argument (both legs write one `__changes` log, so their
+    // columns must match) clears meta_columns and REQUIRES keeping content_hash.
+    // The batch leg alone can produce meta_columns, so inheriting them
+    // desynchronizes the legs; BOTH legs produce `__content_hash`, so dropping it
+    // on the snapshot is what would desynchronize them — leaving every backfilled
+    // row's hash NULL and the audit's cheap path unusable.
+    #[test]
+    fn snapshot_leg_inherits_content_hash() {
+        let mut e = crate::config::sample_export("orders");
+        e.content_hash = Some(crate::content_hash::ContentHashConfig {
+            pk: "id".into(),
+            cols: vec!["status".into(), "updated_at".into()],
+        });
+        e.meta_columns.exported_at = true;
+        let dcfg = DestinationConfig {
+            destination_type: DestinationType::Local,
+            path: Some("/tmp/snap".into()),
+            ..Default::default()
+        };
+        let synth = synth_snapshot_export(&e, "orders", &dcfg);
+        assert_eq!(
+            synth.content_hash, e.content_hash,
+            "the snapshot leg must emit the SAME hash column the drain does"
+        );
+        assert!(
+            !synth.meta_columns.any_enabled(),
+            "clearing meta_columns must not take content_hash with it"
+        );
     }
 
     // RED test for the finding: cloud prefixes are LITERAL key prefixes —
