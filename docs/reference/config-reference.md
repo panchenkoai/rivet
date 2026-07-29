@@ -109,7 +109,7 @@ Rendered from the JSON Schema `rivet schema config` emits (schemars ← the Rust
 
 | Field | Type | Required | Description |
 |-------|------|:--------:|-------------|
-| `initial` | `snapshot` |  | First-run behaviour: `snapshot` = anchor → full snapshot → drain (see [`CdcInitialMode`]). Omitted ⇒ capture changes only (the default; the operator owns the initial load). |
+| `initial` | `snapshot` \| `adopt` |  | First-run behaviour: `snapshot` = anchor → full snapshot → drain (see [`CdcInitialMode`]). Omitted ⇒ capture changes only (the default; the operator owns the initial load). |
 | `checkpoint` | `string` |  | Persist/resume the source log position to this file. Omit to tail from the current position without checkpointing. |
 | `until_current` | `boolean` |  | Catch up to the source's current end and exit (a bounded run), instead of streaming indefinitely — ideal for a scheduler. For MySQL this is a non-blocking binlog dump; PostgreSQL / SQL Server already drain-and-exit. **Defaults to `true`** (bounded): the OSS model is scheduler-driven, and omitting this must NOT silently start a never-terminating stream. Set it to `false` to opt into continuous streaming explicitly. |
 | `max_events` | `integer` |  | Stop after N change events (default: until end of stream / interrupted). |

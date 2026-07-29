@@ -636,6 +636,26 @@ pub enum CdcInitialMode {
     /// overlap (dedupe by PK + `__op`), never a gap. The safe switch ordering,
     /// enforced by construction instead of operator discipline.
     Snapshot,
+    /// Anchor only — create the resume anchor and drain, moving NO rows.
+    ///
+    /// For a table that is ALREADY in the warehouse, built by something other
+    /// than rivet (repair-design.md §5e). A snapshot would re-move the whole
+    /// table to learn what it already holds, which is the exact cost this
+    /// exists to avoid; anchoring instead costs nothing and makes everything
+    /// from that instant forward the stream's problem.
+    ///
+    /// This is NOT the same as omitting `initial:`. Omitting it tails from
+    /// wherever the stream happens to be with no anchor step, so on PostgreSQL
+    /// the slot's creation moment is incidental and on MySQL nothing pins the
+    /// binlog position before the first read. `adopt` runs the same
+    /// `ensure_anchor` that `snapshot` does, which is what lets an auditor
+    /// afterwards say WHICH source position the warehouse table was proven
+    /// against.
+    ///
+    /// The anchor must precede any verification of the existing table, or a
+    /// change landing in between is invisible to both — the audit saw the old
+    /// state and the stream started later.
+    Adopt,
 }
 
 /// Per-export CDC settings, required when `mode: cdc`. The output `table`,

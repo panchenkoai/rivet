@@ -909,6 +909,11 @@
           "description": "Anchor-then-snapshot: create the resume anchor (PostgreSQL slot /\nMySQL binlog checkpoint / SQL Server LSN checkpoint) FIRST, then run a\nfull batch snapshot of each table into `<destination>[/<table>]/snapshot/`,\nthen drain CDC. Because the anchor predates the snapshot read, anything\nchanged during the snapshot also appears in the change stream — an\noverlap (dedupe by PK + `__op`), never a gap. The safe switch ordering,\nenforced by construction instead of operator discipline.",
           "type": "string",
           "const": "snapshot"
+        },
+        {
+          "description": "Anchor only — create the resume anchor and drain, moving NO rows.\n\nFor a table that is ALREADY in the warehouse, built by something other\nthan rivet (repair-design.md §5e). A snapshot would re-move the whole\ntable to learn what it already holds, which is the exact cost this\nexists to avoid; anchoring instead costs nothing and makes everything\nfrom that instant forward the stream's problem.\n\nThis is NOT the same as omitting `initial:`. Omitting it tails from\nwherever the stream happens to be with no anchor step, so on PostgreSQL\nthe slot's creation moment is incidental and on MySQL nothing pins the\nbinlog position before the first read. `adopt` runs the same\n`ensure_anchor` that `snapshot` does, which is what lets an auditor\nafterwards say WHICH source position the warehouse table was proven\nagainst.\n\nThe anchor must precede any verification of the existing table, or a\nchange landing in between is invisible to both — the audit saw the old\nstate and the stream started later.",
+          "type": "string",
+          "const": "adopt"
         }
       ]
     },
