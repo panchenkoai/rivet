@@ -509,13 +509,87 @@ pub struct QualityConfig {
     pub unique_max_entries: Option<usize>,
 }
 
+/// What `_rivet_row_hash` covers.
+///
+/// `true` folds every column of the export's result set — the original
+/// behaviour, kept because it is what existing configs say. It is the weaker
+/// form: neither side of a later comparison can state WHICH columns were
+/// hashed, so coverage has to be inferred from the query, and a column whose
+/// value legitimately differs between two systems (a load timestamp, a
+/// surrogate key) cannot be excluded without dropping it from the export.
+///
+/// A declared list fixes both. The covered set is recorded in the run
+/// manifest, so a reader can check coverage instead of assuming it.
+///
+/// ```yaml
+/// meta_columns:
+///   row_hash: [id, status, updated_at]   # or: row_hash: true
+/// ```
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum RowHash {
+    /// `row_hash: true` / `false` — every column, or none.
+    All(bool),
+    /// `row_hash: [a, b]` — exactly these, in this order. Order matters: it is
+    /// the order the canonical text is built in.
+    Columns(Vec<String>),
+}
+
+impl Default for RowHash {
+    fn default() -> Self {
+        RowHash::All(false)
+    }
+}
+
+impl RowHash {
+    /// Whether a hash column is emitted at all.
+    pub fn enabled(&self) -> bool {
+        match self {
+            RowHash::All(b) => *b,
+            // An empty list is a config error, not "off" — `enabled()` says
+            // yes so validation can reject it with a message, rather than
+            // silently producing an export with no hash the operator asked for.
+            RowHash::Columns(_) => true,
+        }
+    }
+
+    /// The declared column list, if the operator gave one.
+    pub fn declared(&self) -> Option<&[String]> {
+        match self {
+            RowHash::Columns(c) => Some(c),
+            RowHash::All(_) => None,
+        }
+    }
+
+    /// Config-time validation — the shape errors that need no schema.
+    pub fn validate(&self, export_name: &str) -> crate::error::Result<()> {
+        let Some(cols) = self.declared() else {
+            return Ok(());
+        };
+        if cols.is_empty() {
+            anyhow::bail!(
+                "export '{export_name}': meta_columns.row_hash is an empty list — that attests \
+                 nothing. Use `row_hash: true` for every column, or name the columns to cover."
+            );
+        }
+        let mut seen = std::collections::HashSet::new();
+        if let Some(dup) = cols.iter().find(|c| !seen.insert(c.as_str())) {
+            anyhow::bail!(
+                "export '{export_name}': meta_columns.row_hash lists '{dup}' twice — the covered \
+                 set must be a set"
+            );
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, Default)]
 #[serde(deny_unknown_fields)]
 pub struct MetaColumns {
     #[serde(default)]
     pub exported_at: bool,
     #[serde(default)]
-    pub row_hash: bool,
+    pub row_hash: RowHash,
 }
 
 impl MetaColumns {
@@ -524,7 +598,7 @@ impl MetaColumns {
     /// its OWN sink (`__op`/`__pos`/`__seq` + typed after-image) and does not,
     /// so a CDC run uses this to warn that the request has no effect.
     pub fn any_enabled(&self) -> bool {
-        self.exported_at || self.row_hash
+        self.exported_at || self.row_hash.enabled()
     }
 }
 

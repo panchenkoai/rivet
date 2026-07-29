@@ -547,7 +547,7 @@ mod tests {
         );
         // row_hash alone also warns.
         e.meta_columns.exported_at = false;
-        e.meta_columns.row_hash = true;
+        e.meta_columns.row_hash = crate::config::RowHash::All(true);
         assert!(
             cdc_ignored_meta_warning(&e).is_some(),
             "row_hash alone must warn too"
@@ -563,7 +563,7 @@ mod tests {
     fn snapshot_leg_does_not_inherit_batch_meta_columns() {
         let mut e = crate::config::sample_export("orders");
         e.meta_columns.exported_at = true;
-        e.meta_columns.row_hash = true;
+        e.meta_columns.row_hash = crate::config::RowHash::All(true);
         let dcfg = DestinationConfig {
             destination_type: DestinationType::Local,
             path: Some("/tmp/snap".into()),

@@ -4,7 +4,7 @@ use arrow::array::{ArrayRef, Int64Array, TimestampMicrosecondArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow::record_batch::RecordBatch;
 
-use crate::config::MetaColumns;
+use crate::config::{MetaColumns, RowHash};
 use crate::content_hash::{self, ContentHashConfig};
 use crate::error::Result;
 
@@ -28,14 +28,14 @@ pub fn enrich_schema(
     meta: &MetaColumns,
     hash: Option<&ContentHashConfig>,
 ) -> Result<SchemaRef> {
-    if !meta.exported_at && !meta.row_hash && hash.is_none() {
+    if !meta.exported_at && !meta.row_hash.enabled() && hash.is_none() {
         return Ok(schema.clone());
     }
     let base = match hash {
         Some(h) => content_hash::hashed_schema(schema, h)?,
         None => schema.clone(),
     };
-    if !meta.exported_at && !meta.row_hash {
+    if !meta.exported_at && !meta.row_hash.enabled() {
         return Ok(base);
     }
     let mut fields: Vec<Arc<Field>> = base.fields().iter().cloned().collect();
@@ -46,7 +46,7 @@ pub fn enrich_schema(
             false,
         )));
     }
-    if meta.row_hash {
+    if meta.row_hash.enabled() {
         fields.push(Arc::new(Field::new(COL_ROW_HASH, DataType::Int64, false)));
     }
     Ok(Arc::new(Schema::new(fields)))
@@ -61,7 +61,7 @@ pub fn enrich_batch(
     exported_at_us: i64,
     hash: Option<&ContentHashConfig>,
 ) -> Result<RecordBatch> {
-    if !meta.exported_at && !meta.row_hash && hash.is_none() {
+    if !meta.exported_at && !meta.row_hash.enabled() && hash.is_none() {
         return Ok(batch.clone());
     }
 
@@ -78,23 +78,68 @@ pub fn enrich_batch(
         columns.push(Arc::new(ts_array));
     }
 
-    if meta.row_hash {
-        columns.push(Arc::new(hash_column(batch, n)));
+    if meta.row_hash.enabled() {
+        // Resolved per batch rather than threaded from `enrich_schema`: the
+        // lookup is one name scan per covered column, and keeping the two
+        // functions independent means neither can quietly drift from the
+        // other's idea of coverage.
+        let names = row_hash_columns(&batch.schema(), &meta.row_hash)?;
+        let idx: Vec<usize> = names
+            .iter()
+            .map(|n| batch.schema().index_of(n).expect("validated above"))
+            .collect();
+        columns.push(Arc::new(hash_column(batch, n, &idx)));
     }
 
     Ok(RecordBatch::try_new(enriched_schema.clone(), columns)?)
 }
 
-/// Compute deterministic 64-bit hashes for all rows in a batch.
-/// Creates one ArrayFormatter per column (avoids per-cell String allocations),
-/// then reuses a single scratch buffer across all rows.
-fn hash_column(batch: &RecordBatch, n: usize) -> Int64Array {
+/// The columns `_rivet_row_hash` covers, resolved against a real schema.
+///
+/// `row_hash: true` resolves to every column in projection order — what the
+/// column has always meant. A declared list resolves to itself, and a name
+/// that is not in the projection FAILS here rather than being skipped: a
+/// skipped column would produce hashes that agree while attesting content
+/// that was never hashed, which is the quietest way this feature could lie.
+pub fn row_hash_columns(schema: &SchemaRef, spec: &RowHash) -> Result<Vec<String>> {
+    let all = || -> Vec<String> {
+        schema
+            .fields()
+            .iter()
+            .map(|f| f.name().to_string())
+            .collect()
+    };
+    let Some(declared) = spec.declared() else {
+        return Ok(all());
+    };
+    for name in declared {
+        if schema.column_with_name(name).is_none() {
+            anyhow::bail!(
+                "meta_columns.row_hash names column '{name}', which this export does not \
+                 project. Available: {}",
+                all().join(", ")
+            );
+        }
+    }
+    Ok(declared.to_vec())
+}
+
+/// Compute deterministic 64-bit hashes over `cols` for all rows in a batch.
+/// Creates one ArrayFormatter per covered column (avoids per-cell String
+/// allocations), then reuses a single scratch buffer across all rows.
+///
+/// The rendering is xxh3 over Arrow's display formatting. That is fine — and
+/// deliberately NOT reproducible in SQL — because the only other place this
+/// value is ever computed is rivet itself, re-reading the sampled rows through
+/// the same path (repair-design.md §5h). Agreement is a property of the code.
+fn hash_column(batch: &RecordBatch, n: usize, cols: &[usize]) -> Int64Array {
     use std::io::Write as IoWrite;
     use xxhash_rust::xxh3::xxh3_128;
 
     let options = arrow::util::display::FormatOptions::default();
-    let formatters: Vec<Option<arrow::util::display::ArrayFormatter>> = (0..batch.num_columns())
-        .map(|i| {
+    let formatters: Vec<Option<arrow::util::display::ArrayFormatter>> = cols
+        .iter()
+        .map(|&i| {
             arrow::util::display::ArrayFormatter::try_new(batch.column(i).as_ref(), &options).ok()
         })
         .collect();
@@ -103,7 +148,7 @@ fn hash_column(batch: &RecordBatch, n: usize) -> Int64Array {
     let mut hashes = Vec::with_capacity(n);
     for row in 0..n {
         buf.clear();
-        for (col_idx, fmt_opt) in formatters.iter().enumerate() {
+        for (&col_idx, fmt_opt) in cols.iter().zip(&formatters) {
             let array = batch.column(col_idx);
             if array.is_null(row) {
                 buf.extend_from_slice(b"\x00");
@@ -160,7 +205,7 @@ mod tests {
         let (schema, batch) = sample_batch();
         let meta = MetaColumns {
             exported_at: true,
-            row_hash: true,
+            row_hash: RowHash::All(true),
         };
         let cfg = hash_cfg();
         let enriched = enrich_schema(&schema, &meta, Some(&cfg)).unwrap();
@@ -202,11 +247,11 @@ mod tests {
         let cfg = hash_cfg();
         let bare = MetaColumns {
             exported_at: false,
-            row_hash: false,
+            row_hash: RowHash::All(false),
         };
         let with_meta = MetaColumns {
             exported_at: true,
-            row_hash: true,
+            row_hash: RowHash::All(true),
         };
         let read = |meta: &MetaColumns| {
             let sch = enrich_schema(&schema, meta, Some(&cfg)).unwrap();
@@ -223,12 +268,128 @@ mod tests {
         assert_eq!(read(&bare), read(&with_meta));
     }
 
+    fn row_hashes(meta: &MetaColumns, batch: &RecordBatch) -> Vec<i64> {
+        let schema = enrich_schema(&batch.schema(), meta, None).unwrap();
+        let out = enrich_batch(batch, meta, &schema, 0, None).unwrap();
+        let a = out
+            .column_by_name(COL_ROW_HASH)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        (0..a.len()).map(|i| a.value(i)).collect()
+    }
+
+    fn meta_rh(spec: RowHash) -> MetaColumns {
+        MetaColumns {
+            exported_at: false,
+            row_hash: spec,
+        }
+    }
+
+    /// `row_hash: true` keeps meaning every column, in projection order —
+    /// existing configs must not silently change what they attest.
+    #[test]
+    fn row_hash_true_still_covers_every_column() {
+        let (schema, batch) = sample_batch();
+        assert_eq!(
+            row_hash_columns(&schema, &RowHash::All(true)).unwrap(),
+            vec!["id", "name"]
+        );
+        assert_eq!(
+            row_hashes(&meta_rh(RowHash::All(true)), &batch),
+            row_hashes(
+                &meta_rh(RowHash::Columns(vec!["id".into(), "name".into()])),
+                &batch
+            ),
+            "naming every column must equal asking for all of them"
+        );
+    }
+
+    /// The point of a declared set: a column outside it does not move the
+    /// hash. This is the behaviour an operator is buying when they exclude a
+    /// load timestamp — and equally the reason the covered set has to be
+    /// recorded rather than inferred.
+    #[test]
+    fn a_declared_set_narrows_what_the_hash_attests() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let mk = |name: &str| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from(vec![1])),
+                    Arc::new(StringArray::from(vec![Some(name)])),
+                ],
+            )
+            .unwrap()
+        };
+        let id_only = meta_rh(RowHash::Columns(vec!["id".into()]));
+        assert_eq!(
+            row_hashes(&id_only, &mk("alice")),
+            row_hashes(&id_only, &mk("bob")),
+            "a column outside the declared set must not move the hash"
+        );
+        let both = meta_rh(RowHash::All(true));
+        assert_ne!(
+            row_hashes(&both, &mk("alice")),
+            row_hashes(&both, &mk("bob")),
+            "...and inside it, it must"
+        );
+    }
+
+    /// Column ORDER is part of what is hashed, so a reorder must change the
+    /// value rather than quietly comparing equal.
+    #[test]
+    fn declared_order_changes_the_hash() {
+        let (_, batch) = sample_batch();
+        assert_ne!(
+            row_hashes(
+                &meta_rh(RowHash::Columns(vec!["id".into(), "name".into()])),
+                &batch
+            ),
+            row_hashes(
+                &meta_rh(RowHash::Columns(vec!["name".into(), "id".into()])),
+                &batch
+            ),
+        );
+    }
+
+    /// A name that is not projected FAILS. Skipping it would produce hashes
+    /// that agree while attesting content that was never hashed.
+    #[test]
+    fn an_unprojected_column_is_refused_with_the_available_list() {
+        let (schema, _) = sample_batch();
+        let err = row_hash_columns(&schema, &RowHash::Columns(vec!["nope".into()]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("nope") && err.contains("id, name"), "{err}");
+    }
+
+    #[test]
+    fn empty_and_duplicate_declared_sets_are_refused() {
+        let err = RowHash::Columns(vec![])
+            .validate("e")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("attests nothing"), "{err}");
+        let err = RowHash::Columns(vec!["a".into(), "a".into()])
+            .validate("e")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("twice"), "{err}");
+        RowHash::Columns(vec!["a".into()]).validate("e").unwrap();
+        RowHash::All(true).validate("e").unwrap();
+    }
+
     #[test]
     fn enrich_disabled_is_noop() {
         let (schema, batch) = sample_batch();
         let meta = MetaColumns {
             exported_at: false,
-            row_hash: false,
+            row_hash: RowHash::All(false),
         };
         let enriched_schema = enrich_schema(&schema, &meta, None).unwrap();
         assert_eq!(enriched_schema.fields().len(), 2);
@@ -241,7 +402,7 @@ mod tests {
         let (schema, batch) = sample_batch();
         let meta = MetaColumns {
             exported_at: true,
-            row_hash: false,
+            row_hash: RowHash::All(false),
         };
         let enriched_schema = enrich_schema(&schema, &meta, None).unwrap();
         assert_eq!(enriched_schema.fields().len(), 3);
@@ -266,7 +427,7 @@ mod tests {
         let (schema, batch) = sample_batch();
         let meta = MetaColumns {
             exported_at: false,
-            row_hash: true,
+            row_hash: RowHash::All(true),
         };
         let enriched_schema = enrich_schema(&schema, &meta, None).unwrap();
         assert_eq!(enriched_schema.field(2).name(), COL_ROW_HASH);
@@ -289,7 +450,7 @@ mod tests {
         let (schema, batch) = sample_batch();
         let meta = MetaColumns {
             exported_at: true,
-            row_hash: true,
+            row_hash: RowHash::All(true),
         };
         let enriched_schema = enrich_schema(&schema, &meta, None).unwrap();
         assert_eq!(enriched_schema.fields().len(), 4);
@@ -306,7 +467,7 @@ mod tests {
         let (schema, batch) = sample_batch();
         let meta = MetaColumns {
             exported_at: false,
-            row_hash: true,
+            row_hash: RowHash::All(true),
         };
         let enriched_schema = enrich_schema(&schema, &meta, None).unwrap();
 
@@ -335,7 +496,7 @@ mod tests {
 
         let meta = MetaColumns {
             exported_at: false,
-            row_hash: true,
+            row_hash: RowHash::All(true),
         };
         let enriched_schema = enrich_schema(&schema, &meta, None).unwrap();
         let result = enrich_batch(&batch, &meta, &enriched_schema, 0, None).unwrap();

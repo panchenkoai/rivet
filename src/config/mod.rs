@@ -650,6 +650,11 @@ impl Config {
             }
         }
 
+        // Shape errors in the declared row-hash set — an empty or duplicated
+        // list — fail at config-load, where `rivet check` reports them, rather
+        // than at the first batch.
+        export.meta_columns.row_hash.validate(&export.name)?;
+
         if let Some(ch) = &export.content_hash {
             ch.validate(&export.name)?;
             // A hash is `pk|cols` for ONE table's shape. A `tables:` stream

@@ -1124,11 +1124,27 @@
           "default": false
         },
         "row_hash": {
-          "type": "boolean",
+          "$ref": "#/$defs/RowHash",
           "default": false
         }
       },
       "additionalProperties": false
+    },
+    "RowHash": {
+      "description": "What `_rivet_row_hash` covers.\n\n`true` folds every column of the export's result set — the original\nbehaviour, kept because it is what existing configs say. It is the weaker\nform: neither side of a later comparison can state WHICH columns were\nhashed, so coverage has to be inferred from the query, and a column whose\nvalue legitimately differs between two systems (a load timestamp, a\nsurrogate key) cannot be excluded without dropping it from the export.\n\nA declared list fixes both. The covered set is recorded in the run\nmanifest, so a reader can check coverage instead of assuming it.\n\n```yaml\nmeta_columns:\n  row_hash: [id, status, updated_at]   # or: row_hash: true\n```",
+      "anyOf": [
+        {
+          "description": "`row_hash: true` / `false` — every column, or none.",
+          "type": "boolean"
+        },
+        {
+          "description": "`row_hash: [a, b]` — exactly these, in this order. Order matters: it is\nthe order the canonical text is built in.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      ]
     },
     "ContentHashConfig": {
       "description": "Which columns the hash covers.\n\nThis is a **contract**, not a preference: the value only means anything\nnext to the column set that produced it, so the set travels with the data\n(see the run manifest) and an auditor comparing against a different set\nmust fail rather than silently compare different texts.\n\n```yaml\nexports:\n  - name: cashback_versions\n    content_hash:\n      pk: id\n      cols: [status, updated_at]\n```",
