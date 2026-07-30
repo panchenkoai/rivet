@@ -756,3 +756,32 @@ mutant that ignores `active` (`gc_orphans_spares_an_unmanifested_part_while_a_ru
 is_active` goes RED) + the defer-not-drop half (`..._collects_an_unmanifested_
 part_when_no_run_is_active`) + the clock-free staleness
 (`a_superseded_running_row_no_longer_counts_as_active`).
+
+## `cargo package` poisons the shared target dir — a build that lies about being fresh
+
+`cargo package` / `cargo publish` copy the crate to `target/package/<name>-<version>/`
+and **build that copy** to verify it. With no `--target-dir` the verify build shares
+the workspace `target/`, so the fingerprints it leaves record the crate's sources as
+`target/package/<name>-<version>/src/**` — a frozen snapshot. Every later `cargo
+build` in the working tree compares those SNAPSHOT mtimes, finds nothing newer,
+prints `Fresh` and **silently produces a binary without your edits**. Cargo names the
+mechanism itself once the snapshot is deleted: `Dirty rivet-cli: the file
+`target/package/rivet-cli-0.24.0/src/types/target.rs` is missing`.
+
+This is worse than a stale build, because every signal you use to check the build is
+also lied to: `cargo build` says Finished, `cargo test` passes, and a deliberate type
+error appended to `src/lib.rs` compiles clean. It cost half a session — an `apply`
+fix verified green by hand kept failing in the matrix, because the matrix staged a
+binary built before the fix while `cargo build` insisted there was nothing to do.
+
+The tell: **the source file is newer than `target/debug/<bin>` and cargo still says
+`Fresh`.** Confirm with `cargo build -v | grep -E "Fresh|Dirty"`; cure with `rm -rf
+target/package` (not a full `cargo clean` — that discards tens of GB of dependency
+build for a fault that lives in one directory).
+
+Process rule: **any command that packages or publishes gets its own `--target-dir`,
+and any hook or script that relies on cargo's answer must drop `target/package`
+BEFORE it asks.** Order matters: a guard placed after the build steps cannot help,
+because those steps are exactly what the staleness corrupts — a check cannot detect
+what it is blind to. Wired as step 0 of `.githooks/pre-commit`, and pinned on the
+release workflow's `cargo publish` so the line stays safe when copied locally.
