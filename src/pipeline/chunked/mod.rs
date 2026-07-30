@@ -85,6 +85,10 @@ pub(crate) fn chunk_part_filename(
 /// to compute boundaries live.  `rivet apply` passes `Precomputed` ranges from
 /// a previously-generated `PlanArtifact`, skipping the detection queries
 /// entirely and replaying the same boundaries that were fixed at plan time.
+// `Clone` so a retrying caller can hand a fresh value to each attempt:
+// `run_with_reconnect` re-enters `run_export` per retry, and the sequential
+// chunked runners take the source BY VALUE.
+#[derive(Clone)]
 pub(crate) enum ChunkSource {
     /// Query the source for min/max and compute boundaries at execution time.
     Detect,

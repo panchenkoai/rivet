@@ -24,6 +24,7 @@ pub(crate) fn run_with_reconnect(
     plan: &ResolvedRunPlan,
     summary: &mut RunSummary,
     config_path: &str,
+    chunk_source: super::chunked::ChunkSource,
 ) -> Result<()> {
     let mut last_err: Option<anyhow::Error> = None;
 
@@ -103,7 +104,14 @@ pub(crate) fn run_with_reconnect(
             }
         };
 
-        match run_export(&mut *src, state, plan, summary, config_path) {
+        match run_export(
+            &mut *src,
+            state,
+            plan,
+            summary,
+            config_path,
+            chunk_source.clone(),
+        ) {
             Ok(()) => return Ok(()),
             Err(e) => match decide_export_retry(
                 attempt,
@@ -175,6 +183,7 @@ pub(crate) fn run_export(
     plan: &ResolvedRunPlan,
     summary: &mut RunSummary,
     config_path: &str,
+    chunk_source: super::chunked::ChunkSource,
 ) -> Result<()> {
     // Mark this a batch run subject to the per-runner facade contract (ADR-0018):
     // every runner reachable below MUST apply the schema-drift gate + Form-B harvest.
@@ -203,16 +212,10 @@ pub(crate) fn run_export(
                 plan,
                 summary,
                 config_path,
-                super::chunked::ChunkSource::Detect,
+                chunk_source,
             );
         } else {
-            return run_chunked_sequential(
-                src,
-                plan,
-                summary,
-                Some(state),
-                super::chunked::ChunkSource::Detect,
-            );
+            return run_chunked_sequential(src, plan, summary, Some(state), chunk_source);
         }
     }
 

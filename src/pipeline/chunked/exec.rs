@@ -640,6 +640,44 @@ mod tests {
         }
     }
 
+    /// `rivet apply` must REPLAY the artifact's chunk boundaries on the
+    /// SEQUENTIAL path, not re-derive them.
+    ///
+    /// `apply_cmd.rs:8-9` states the contract ("Execute using
+    /// `ChunkSource::Precomputed` so chunk boundaries from the artifact are
+    /// replayed without re-running `SELECT min/max` queries"), and the two
+    /// PARALLEL branches honoured it — but `job.rs` handed the sequential branch
+    /// to `run_with_reconnect`, whose signature carried no chunk source, so
+    /// `run_export` hardcoded `ChunkSource::Detect` and a sequential chunked
+    /// apply silently re-detected boundaries from live data.
+    ///
+    /// RED-proof, no mocking framework needed: `EmptySource::query_scalar` is
+    /// `unimplemented!()`, and the Detect path is the only one that calls it for
+    /// min/max. Restore the hardcoded `Detect` in `run_export` and this test
+    /// panics with "not needed in chunked exec tests"; with the source threaded
+    /// through, the precomputed range is used and nothing probes the source.
+    #[test]
+    fn apply_replays_precomputed_chunks_on_the_sequential_path() {
+        let plan = chunked_plan_struct();
+        let mut summary = empty_summary(&plan);
+        let state = crate::state::StateStore::open_in_memory().expect("in-memory state");
+        let mut src = EmptySource;
+
+        crate::pipeline::single::run_export(
+            &mut src,
+            &state,
+            &plan,
+            &mut summary,
+            "",
+            ChunkSource::Precomputed(vec![(1, 100)]),
+        )
+        .expect("precomputed apply must not touch the source for boundaries");
+
+        // EmptySource emits no batches, so the run is empty — the assertion that
+        // matters is that we got here at all (Detect would have panicked).
+        assert_eq!(summary.total_rows, 0);
+    }
+
     fn empty_summary(plan: &ResolvedRunPlan) -> RunSummary {
         let mut s = RunSummary::stub_for_testing("test_run", plan.export_name.clone());
         s.batch_size = 10_000;
