@@ -769,9 +769,19 @@ impl RunSummary {
         let parts_bytes: u64 = self.manifest_parts.iter().map(|p| p.size_bytes).sum();
 
         if self.files_committed > self.manifest_parts.len() {
+            // Subsumes the empty-part-list case: with no parts recorded, ANY
+            // committed file trips this. The dedicated `manifest_parts.is_empty()`
+            // branch that used to sit below was therefore unreachable — it needed
+            // `files_committed > 0` AND `len() == 0`, which this returns on first —
+            // so its message never reached anyone and mutation testing found its
+            // condition unkillable. Its diagnosis is folded in here instead of
+            // deleted, because the ADR reference is the useful half.
             return Err(format!(
                 "summary.files_committed ({}) > manifest_parts.len() ({}) — \
-                 a runner bumped files_committed without commit::record_part",
+                 a runner bumped files_committed without commit::record_part. \
+                 With an EMPTY part list this is also the ADR-0012 M1 gap: the \
+                 cloud manifest would ship with no parts (what parallel_checkpoint \
+                 did before e9b0796)",
                 self.files_committed,
                 self.manifest_parts.len()
             ));
@@ -789,14 +799,6 @@ impl RunSummary {
                 "summary.bytes_written ({}) > sum(manifest_parts.size_bytes) ({}) — \
                  a runner bumped bytes_written without commit::record_part",
                 self.bytes_written, parts_bytes
-            ));
-        }
-        if self.status == "success" && self.files_committed > 0 && self.manifest_parts.is_empty() {
-            return Err(format!(
-                "success run with files_committed={} has empty manifest_parts — \
-                 cloud manifest (ADR-0012 M1) would ship with no part list \
-                 (this is the gap parallel_checkpoint had before commit e9b0796)",
-                self.files_committed
             ));
         }
         // Invariant audit gap #1, weak form: a successful run that produced
@@ -1638,6 +1640,75 @@ mod tests {
             not_applied.check_post_run_invariants(false).is_err(),
             "the precomputed exemption must not weaken the guard for ordinary runs"
         );
+
+        // ── the guard's own BOUNDARIES ────────────────────────────────────────
+        // Every case above varies what the runner DID; none varies the conditions
+        // that decide whether the guard looks at all. Mutation testing found seven
+        // survivors in exactly those conditions (`status == "success"`,
+        // `files_committed > 0`, `total_rows > 0`) — the comparisons could be
+        // inverted or loosened and no test noticed, in the one function whose job
+        // is to notice. These pin each boundary from BOTH sides.
+
+        // `files_committed > 0`: a success that committed NOTHING has no facade
+        // obligation — there is no output to have applied them to. Loosening the
+        // comparison to `>= 0` must not start flagging it.
+        let mut nothing_committed = base();
+        nothing_committed.files_committed = 0;
+        nothing_committed.files_produced = 0;
+        nothing_committed.bytes_written = 0;
+        nothing_committed.total_rows = 0;
+        nothing_committed.manifest_parts.clear();
+        assert!(
+            nothing_committed.check_post_run_invariants(false).is_ok(),
+            "a success that committed no files owes no facades"
+        );
+
+        // …and the same shape WITH rows extracted is the fabrication signature the
+        // second branch exists for: rows read, nothing landed.
+        let mut rows_but_no_files = base();
+        rows_but_no_files.files_committed = 0;
+        rows_but_no_files.files_produced = 0;
+        rows_but_no_files.manifest_parts.clear();
+        rows_but_no_files.bytes_written = 0;
+        rows_but_no_files.total_rows = 5;
+        let e = rows_but_no_files
+            .check_post_run_invariants(false)
+            .unwrap_err();
+        assert!(e.contains("no files committed"), "{e}");
+
+        // `total_rows > 0`: zero rows AND zero files is a legitimate empty run
+        // (a resume with nothing to do), not a fabrication.
+        let mut empty_run = base();
+        empty_run.files_committed = 0;
+        empty_run.files_produced = 0;
+        empty_run.total_rows = 0;
+        empty_run.bytes_written = 0;
+        empty_run.manifest_parts.clear();
+        assert!(
+            empty_run.check_post_run_invariants(false).is_ok(),
+            "an empty run must not read as rows-extracted-but-nothing-landed"
+        );
+
+        // `status == "success"`: a FAILED run is not held to any of it — the
+        // facades may legitimately not have run, which is why it failed.
+        let mut failed = base();
+        failed.status = "failed".into();
+        failed.schema_changed = Some(false);
+        failed.column_checksums.push(ck());
+        assert!(
+            failed.check_post_run_invariants(false).is_ok(),
+            "a failed run must not be graded against the success-only invariants"
+        );
+
+        // Committed files with an EMPTY part list — the ADR-0012 M1 gap. It is
+        // reported by the files_committed-vs-len branch, which subsumes it; a
+        // dedicated branch for it was unreachable and has been removed.
+        let mut no_parts = base();
+        no_parts.schema_changed = Some(false);
+        no_parts.column_checksums.push(ck());
+        no_parts.manifest_parts.clear();
+        let e = no_parts.check_post_run_invariants(false).unwrap_err();
+        assert!(e.contains("ADR-0012 M1"), "{e}");
 
         // A RESUME legitimately skips the drift gate (schema_changed None) — exempt (H2).
         let mut resumed = base();
