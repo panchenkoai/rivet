@@ -4,6 +4,8 @@ source:
   tls: { mode: verify-full }
 exports:
   - name: pa_audit
+    wave: 3
+    parallel_safe: false
     query: "SELECT id, name FROM pa_audit"
     mode: full
     format: parquet

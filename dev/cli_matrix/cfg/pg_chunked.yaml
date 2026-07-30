@@ -4,6 +4,8 @@ source:
 
 exports:
   - name: pa_audit
+    wave: 3
+    parallel_safe: true
     query: "SELECT id, name FROM pa_audit"
     mode: chunked
     chunk_column: id

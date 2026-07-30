@@ -45,7 +45,7 @@ pg_init_unset 1
 pg_journal 0
 pg_journal_last1 0
 pg_journal_missing_run_id 0
-pg_journal_unknown_export 0
+pg_journal_unknown_export 1
 pg_metrics 0
 pg_metrics_export 0
 pg_plan_bad_format 2

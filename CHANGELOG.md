@@ -4,6 +4,20 @@
 
 ### Fixed
 
+- **A plan artifact written by an older rivet stopped being applicable.** The
+  resolved plan gained a required `verify` field on 2026-06-02; three of its
+  siblings in the same struct carry `#[serde(default)]` with comments saying
+  "for old artifacts", and this one did not. Every `plan.json` a user already
+  had on disk failed with `missing field \`verify\``, which is precisely what
+  the frozen v0.7.5 fixture exists to catch — and the fixture's own compat
+  suite could not see it, because (as its module doc explains) it validates the
+  JSON SHAPE of the fixture rather than deserializing it through the current
+  type. So it asserted the fixture against itself and passed for two months.
+  `verify` now defaults to `Size`, the pre-field behaviour. The new guard lives
+  beside the type where it can call the real deserializer:
+  `every_frozen_plan_artifact_still_deserializes` (RED without the default,
+  while the JSON-shape suite stays green on the same mutant).
+
 - **`rivet apply` re-detected chunk boundaries instead of replaying them, on the
   sequential path.** `apply` exists to execute a `PlanArtifact` exactly as
   planned, and its module doc says so: "Execute using `ChunkSource::Precomputed`

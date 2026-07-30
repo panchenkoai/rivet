@@ -1,6 +1,8 @@
 source: { type: mysql, url_env: MY_URL }
 exports:
   - name: pa_audit
+    wave: 2
+    parallel_safe: true
     table: pa_audit
     mode: time_window
     time_column: created_at
