@@ -70,28 +70,28 @@ cargo run --release --bin seed -- --target postgres      # ~500 rows in public.o
 Render all three:
 
 ```bash
-./docs/gifs/render.sh
+python3 -m dev.pytools.render_gifs
 ```
 
 Or just one:
 
 ```bash
-./docs/gifs/render.sh basic
-./docs/gifs/render.sh plan-apply
-./docs/gifs/render.sh reconcile-repair
-./docs/gifs/render.sh init-scaffold
-./docs/gifs/render.sh check-verdict
-./docs/gifs/render.sh inspect
-./docs/gifs/render.sh chunked-progress
-./docs/gifs/render.sh incremental-cursor
-./docs/gifs/render.sh discover-artifact
-./docs/gifs/render.sh plan-campaign     # creates ~35 M rows in rivet_gif.*
-./docs/gifs/render.sh parallel-cards    # 4 chunked exports, parent-side cards UI
-./docs/gifs/render.sh pool-detect       # connect-time pooler/proxy warnings; see below
-./docs/gifs/render.sh doctor-gcs        # real GCS via ADC; see below
+python3 -m dev.pytools.render_gifs basic
+python3 -m dev.pytools.render_gifs plan-apply
+python3 -m dev.pytools.render_gifs reconcile-repair
+python3 -m dev.pytools.render_gifs init-scaffold
+python3 -m dev.pytools.render_gifs check-verdict
+python3 -m dev.pytools.render_gifs inspect
+python3 -m dev.pytools.render_gifs chunked-progress
+python3 -m dev.pytools.render_gifs incremental-cursor
+python3 -m dev.pytools.render_gifs discover-artifact
+python3 -m dev.pytools.render_gifs plan-campaign     # creates ~35 M rows in rivet_gif.*
+python3 -m dev.pytools.render_gifs parallel-cards    # 4 chunked exports, parent-side cards UI
+python3 -m dev.pytools.render_gifs pool-detect       # connect-time pooler/proxy warnings; see below
+python3 -m dev.pytools.render_gifs doctor-gcs        # real GCS via ADC; see below
 ```
 
-The default `render.sh` invocation (no args) renders the eleven "always
+The default invocation (no args) renders the eleven "always
 reproducible" scenarios against Docker Compose (setup per scenario is
 ephemeral — tables live under a dedicated `rivet_gif` schema that is
 dropped on teardown). Two scenarios are opt-in:
@@ -105,7 +105,7 @@ dropped on teardown). Two scenarios are opt-in:
 `plan-campaign` takes ~60 s because it seeds 35 M narrow rows so the
 cost-class classifier triggers `shared_source_heavy_conflict`.
 
-`render.sh` creates an ephemeral `/tmp/rivet-gif-<name>` workdir, seeds any
+The renderer creates an ephemeral `/tmp/rivet-gif-<name>` workdir, seeds any
 fixture the scenario needs (the `reconcile-repair` tape uses a dedicated
 10,000-row `rivet_gif.events` schema that is dropped on exit), invokes
 `vhs`, and moves the rendered `.gif` next to the tape.
@@ -113,7 +113,7 @@ fixture the scenario needs (the `reconcile-repair` tape uses a dedicated
 ## Environment the tapes assume
 
 Each tape inherits `DATABASE_URL`, `RIVET_BIN_DIR`, and `PSQL_BIN` from
-`render.sh`. The first `Hide` block prepends them to `PATH` and sets a
+the renderer. The first `Hide` block prepends them to `PATH` and sets a
 clean `PS1='rivet-demo $ '` prompt, so the rendered terminal is
 deterministic regardless of the user's shell rc.
 
@@ -121,7 +121,7 @@ deterministic regardless of the user's shell rc.
 
 - **Relative `Output` paths only.** VHS rejects absolute paths.
 - **No multi-line `Type` heredocs.** VHS parses every newline as a tape
-  command. Fixture YAMLs are written to the workdir by `render.sh`
+  command. Fixture YAMLs are written to the workdir by the renderer
   *before* `vhs` runs (see `fixture_chunked_setup`).
 - **Theme:** Dracula, 14 pt; 1200 x 720 for `basic` / `plan-apply` and
   1280 x 780 for `reconcile-repair` (wider table output).

@@ -213,6 +213,43 @@ impl TargetLoader for SnowflakeLoader {
         uris: &[String],
         pk: &[String],
     ) -> Result<u64> {
+        let sql = self.build_append_changelog_sql(table, specs, uris, pk)?;
+        let result = self.run_snow(&sql)?;
+        let before = extract_named(&result, "BEFORE_")
+            .context("CDC load ran but the pre-append count (BEFORE_) could not be read")?;
+        let after = extract_named(&result, "AFTER_")
+            .context("CDC load ran but the post-append count (AFTER_) could not be read")?;
+        Ok(after.saturating_sub(before))
+    }
+
+    fn warehouse(&self) -> crate::load::cdc::Warehouse {
+        crate::load::cdc::Warehouse::Snowflake
+    }
+
+    fn create_view(&self, table: &str, view_sql: &str) -> Result<()> {
+        // Fully-qualified DDL; a QUERY_TAG keeps it cost-attributable. CREATE VIEW
+        // is metadata — no warehouse compute needed.
+        let sql = format!(
+            "ALTER SESSION SET QUERY_TAG = '{tag}';\n{view_sql}",
+            tag = self.query_tag(table),
+        );
+        self.run_snow(&sql)?;
+        Ok(())
+    }
+}
+
+impl SnowflakeLoader {
+    /// The append script for one CDC load, separated from its EXECUTION so the
+    /// schema-reconciliation step can be asserted without a Snowflake account.
+    /// The reconciling `ALTER` shipped on BigQuery only, so "the builder exists"
+    /// is not evidence that this adapter calls it — that is what the test pins.
+    fn build_append_changelog_sql(
+        &self,
+        table: &str,
+        specs: &[TargetColumnSpec],
+        uris: &[String],
+        pk: &[String],
+    ) -> Result<String> {
         use crate::load::cdc::Warehouse;
         // Full change-log schema: rivet's `__op`/`__pos`/`__seq` meta columns
         // (not reported by `rivet check`) ahead of the resolved data columns.
@@ -243,6 +280,7 @@ impl TargetLoader for SnowflakeLoader {
              CREATE FILE FORMAT IF NOT EXISTS rivet_pq TYPE=PARQUET BINARY_AS_TEXT=FALSE;\n\
              CREATE OR REPLACE STAGE {stage} URL='{url}' STORAGE_INTEGRATION={si} FILE_FORMAT=rivet_pq;\n\
              CREATE TABLE IF NOT EXISTS {changes_fqtn} (\n{ddl}\n){cluster};\n\
+             {alter}\
              SELECT COUNT(*) AS BEFORE_ FROM {changes_fqtn};\n\
              COPY INTO {changes_fqtn} ({columns})\n\
              \x20 FROM (SELECT {select} FROM @{stage})\n\
@@ -254,35 +292,53 @@ impl TargetLoader for SnowflakeLoader {
             sc = self.schema,
             si = self.storage_integration,
             url = self.gcs_url,
+            alter = build_alter_add_columns_sql(&changes_fqtn, &full),
         );
-
-        let result = self.run_snow(&sql)?;
-        let before = extract_named(&result, "BEFORE_")
-            .context("CDC load ran but the pre-append count (BEFORE_) could not be read")?;
-        let after = extract_named(&result, "AFTER_")
-            .context("CDC load ran but the post-append count (AFTER_) could not be read")?;
-        Ok(after.saturating_sub(before))
-    }
-
-    fn warehouse(&self) -> crate::load::cdc::Warehouse {
-        crate::load::cdc::Warehouse::Snowflake
-    }
-
-    fn create_view(&self, table: &str, view_sql: &str) -> Result<()> {
-        // Fully-qualified DDL; a QUERY_TAG keeps it cost-attributable. CREATE VIEW
-        // is metadata — no warehouse compute needed.
-        let sql = format!(
-            "ALTER SESSION SET QUERY_TAG = '{tag}';\n{view_sql}",
-            tag = self.query_tag(table),
-        );
-        self.run_snow(&sql)?;
-        Ok(())
+        Ok(sql)
     }
 }
 
 /// Whether a column name is one of rivet's CDC meta columns.
 fn is_meta_column(name: &str) -> bool {
     crate::load::cdc::is_meta_column(name)
+}
+
+/// Bring an EXISTING change log's schema up to the declared one by ADDING what
+/// is missing — never by replacing the table, which would impose rivet's schema
+/// on history rivet does not own.
+///
+/// `CREATE TABLE IF NOT EXISTS` is a no-op on a table that already exists, so a
+/// log rivet did not create — one an operator pointed rivet at — keeps whatever shape its previous
+/// owner gave it, and a log that predates a new column keeps the old one. The
+/// `COPY INTO … (<declared columns>)` below then names a column the table lacks
+/// and Snowflake fails the whole load with `invalid identifier` — after the
+/// extract has already been paid for. `_rivet_row_hash` made that concrete: it
+/// is written at extraction and gained a load spec, so every pre-existing log
+/// was suddenly one column short.
+///
+/// `ADD COLUMN IF NOT EXISTS` is the only safe verb: additive, idempotent,
+/// metadata-only, and existing rows read NULL for the new column. Trailing
+/// newline (not `Option`) so the caller interpolates it unconditionally; an
+/// empty spec list yields an empty string rather than a bare `ALTER TABLE t ;`.
+fn build_alter_add_columns_sql(fqtn: &str, specs: &[TargetColumnSpec]) -> String {
+    if specs.is_empty() {
+        return String::new();
+    }
+    let adds = specs
+        .iter()
+        // Bare identifiers, matching `build_schema_ddl` / `build_column_list`:
+        // this loader creates its columns unquoted (Snowflake upper-cases them),
+        // so a quoted `"col"` here would ADD a second, case-sensitive column
+        // instead of matching the one the COPY names.
+        .map(|s| {
+            format!(
+                "ADD COLUMN IF NOT EXISTS {} {}",
+                s.column_name, s.target_type
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",\n  ");
+    format!("ALTER TABLE {fqtn}\n  {adds};\n")
 }
 
 /// A column is loaded through `PARSE_JSON` iff its native type is `VARIANT`
@@ -451,6 +507,75 @@ mod tests {
         assert_eq!(
             SnowflakeLoader::cluster_clause(&["created".to_string(), "customer".to_string()]),
             " CLUSTER BY (created, customer)"
+        );
+    }
+
+    /// An existing change log must be reconciled by ADDING what it lacks, never
+    /// by a replace. `CREATE TABLE IF NOT EXISTS` is a no-op on a table that
+    /// already exists, so without this the `COPY INTO … (<declared columns>)`
+    /// names a column the table does not have and Snowflake fails the load with
+    /// `invalid identifier` — after the extract was already paid for. This is
+    /// the Snowflake twin of bigquery.rs's `build_alter_add_columns_sql`; the
+    /// reconciliation lives in each adapter, so one adapter having it proves
+    /// nothing about the other (it shipped on BigQuery alone).
+    #[test]
+    fn alter_add_columns_reconciles_an_existing_log_and_never_replaces_it() {
+        let specs = vec![
+            spec("__op", "VARCHAR"),
+            spec(crate::enrich::COL_ROW_HASH, "NUMBER(38,0)"),
+        ];
+        let sql = build_alter_add_columns_sql("DB.SC.t__changes", &specs);
+        assert!(
+            sql.starts_with("ALTER TABLE DB.SC.t__changes"),
+            "must ALTER the log in place; got: {sql}"
+        );
+        assert!(
+            sql.contains("ADD COLUMN IF NOT EXISTS __op VARCHAR")
+                && sql.contains("ADD COLUMN IF NOT EXISTS _rivet_row_hash NUMBER(38,0)"),
+            "every declared column is added idempotently; got: {sql}"
+        );
+        assert!(
+            !sql.to_uppercase().contains("REPLACE") && !sql.to_uppercase().contains("DROP"),
+            "reconciliation must never replace or drop — the log holds history \
+             rivet does not own; got: {sql}"
+        );
+        // Bare identifiers: the loader creates its columns unquoted, so a quoted
+        // name would add a SECOND case-sensitive column the COPY never names.
+        assert!(!sql.contains('"'), "identifiers stay bare; got: {sql}");
+        // Empty spec list ⇒ no statement at all, not a bare `ALTER TABLE t ;`.
+        assert_eq!(build_alter_add_columns_sql("DB.SC.t", &[]), "");
+    }
+
+    /// The reconciliation must actually be IN the append script — a correct
+    /// builder that no caller invokes is the bug this release shipped on
+    /// Snowflake. Asserted on the emitted SQL's ORDER: the ALTER has to sit
+    /// after the CREATE (which is the no-op on an existing table) and before
+    /// the COPY that names the columns.
+    #[test]
+    fn the_append_script_alters_between_the_create_and_the_copy() {
+        let specs = vec![spec("id", "NUMBER"), spec("__op", "VARCHAR")];
+        let mut l = SnowflakeLoader::new("c");
+        l.database = "DB".into();
+        l.schema = "SC".into();
+        let sql = l
+            .build_append_changelog_sql(
+                "t",
+                &specs,
+                &["gs://b/p/part-0.parquet".to_string()],
+                &["id".to_string()],
+            )
+            .unwrap();
+        let create = sql
+            .find("CREATE TABLE IF NOT EXISTS")
+            .expect("create present");
+        let alter = sql.find("ALTER TABLE DB.SC.t__changes").expect(
+            "the append script must reconcile an existing log — without this the COPY \
+             names columns the table lacks and the load fails after the extract",
+        );
+        let copy = sql.find("COPY INTO").expect("copy present");
+        assert!(
+            create < alter && alter < copy,
+            "order must be CREATE → ALTER → COPY; got:\n{sql}"
         );
     }
 

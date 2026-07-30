@@ -12,11 +12,11 @@
 # docs/architecture.md § "Connection pooler / proxy detection" for the
 # full signal precedence on both drivers.
 #
-# Fixture: render.sh writes two YAML configs in the workdir and assumes
+# Fixture: the renderer writes two YAML configs in the workdir and assumes
 # the `pool` docker-compose profile is already up
 # (`docker compose --profile pool up -d proxysql`). Skipped from the
-# default render.sh invocation — opt in via:
-#   ./docs/gifs/render.sh pool-detect
+# default renderer invocation — opt in via:
+#   python3 -m dev.pytools.render_gifs pool-detect
 
 Output pool-detect.gif
 

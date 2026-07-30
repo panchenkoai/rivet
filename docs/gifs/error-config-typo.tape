@@ -2,7 +2,7 @@
 # caught at parse time with a "Did you mean" suggestion, naming the line.
 # Attach to docs/getting-started.md § "When something is wrong".
 #
-# Fixture: rivet.yaml is written by render.sh (fixture_error_config_typo_setup).
+# Fixture: rivet.yaml is written by the renderer (fixture_error_config_typo_setup).
 # Parsing fails before any connection, so no live database is needed.
 
 Output error-config-typo.gif

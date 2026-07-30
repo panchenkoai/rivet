@@ -76,6 +76,13 @@ scenarios:
     keyset:         { na: "shared ExportSink seam — runner-agnostic (keyset's ExportRequest::unwrapped carries no meta; the sink injects downstream)" }
     mongo_parallel: { na: "shared ExportSink seam — runner-agnostic (each worker's sink injects)" }
 
+  - id: row_hash_and_its_contract
+    what: "`meta_columns.row_hash` — the `_rivet_row_hash` column AND the `RowHashContract` (covered set + render id) recorded in the run manifest, so a reader can check coverage instead of assuming it. Both halves are `na` by SEAM, and the seams differ: the COLUMN is injected by `ExportSink` (enrich_schema/enrich_batch, like meta_columns); the CONTRACT is derived from the PLAN snapshot (`RunSummary` ← `RowHashContract::of(&plan.meta_columns.row_hash)`), not harvested from the sink — which is what keeps it off the value-checksum `gap` path, where only `single` harvested `sink.column_checksums` into the summary. Recorded here explicitly because 'meta column ⇒ na' is only half the reason: a contract harvested per runner WOULD be a gap, and the next reader needs to see which mechanism it is."
+    single:         { test: plan_snapshot_records_the_row_hash_contract_the_run_applies }
+    chunked:        { na: "shared seams — the column via ExportSink (no runner builds a batch without one), the contract via the plan snapshot the summary is built from; neither is re-applied per runner, so there is no divergence to test" }
+    keyset:         { na: "shared seams — ExportSink for the column, plan snapshot for the contract" }
+    mongo_parallel: { na: "shared seams — each worker's sink injects the column; the contract comes from the same plan snapshot" }
+
   - id: run_unique_part_naming
     what: "two runs into ONE destination prefix must not clobber — part filenames carry a run-unique token (millisecond %3f stamp or a random nonce), never a second-granularity stamp that collides."
     single:         { test: roast_rapid_incremental_runs_into_same_prefix_must_not_clobber_prior_parts }

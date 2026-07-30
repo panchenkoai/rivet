@@ -277,7 +277,7 @@ impl TargetLoader for BigQueryLoader {
 
         // …and, for a log that ALREADY existed, add whatever the declared
         // schema has and it does not. The CREATE above is a no-op on such a
-        // table, so without this an adopted log — or one that predates a new
+        // table, so without this a log rivet did not create — or one that predates a new
         // meta column — fails the LOAD below on a schema mismatch. ALTER ADD,
         // never a replace: the table may hold the customer's history.
         if let Some(alter) = build_alter_add_columns_sql(&changes_fqtn, &full) {
@@ -327,7 +327,7 @@ fn build_create_changes_sql(fqtn: &str, schema: &str, pk: &[String]) -> String {
 /// missing — never by replacing the table.
 ///
 /// `CREATE TABLE IF NOT EXISTS` is a no-op on a table that already exists, so a
-/// table rivet did not create — an ADOPTED one (repair-design.md §5e) — keeps
+/// table rivet did not create — one an operator pointed rivet at — keeps
 /// whatever shape its previous owner gave it. The next `LOAD DATA` then declares
 /// columns the table does not have and fails; and a load written to overwrite
 /// instead would impose our schema and destroy the customer's data. Neither is
@@ -753,7 +753,7 @@ mod tests {
         assert!(clean_bq_output(stderr.as_bytes()).is_empty());
     }
 
-    /// THE adoption-safety test. A table rivet did not create keeps its
+    /// THE foreign-table safety test. A table rivet did not create keeps its
     /// previous owner's shape — `CREATE TABLE IF NOT EXISTS` is a no-op on it —
     /// so the only way to add a column is ALTER. A replace would impose our
     /// schema on the customer's history and destroy it.
@@ -785,7 +785,7 @@ mod tests {
     }
 
     /// The changelog is only ever CREATEd IF NOT EXISTS and LOADed INTO —
-    /// never OVERWRITE. This pins the pairing: an adopted `__changes` table
+    /// never OVERWRITE. This pins the pairing: a pre-existing `__changes` table
     /// must survive a load with its rows intact.
     #[test]
     fn changelog_sql_is_create_if_not_exists_plus_append_only() {

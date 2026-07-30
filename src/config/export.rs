@@ -636,26 +636,11 @@ pub enum CdcInitialMode {
     /// overlap (dedupe by PK + `__op`), never a gap. The safe switch ordering,
     /// enforced by construction instead of operator discipline.
     Snapshot,
-    /// Anchor only — create the resume anchor and drain, moving NO rows.
-    ///
-    /// For a table that is ALREADY in the warehouse, built by something other
-    /// than rivet (repair-design.md §5e). A snapshot would re-move the whole
-    /// table to learn what it already holds, which is the exact cost this
-    /// exists to avoid; anchoring instead costs nothing and makes everything
-    /// from that instant forward the stream's problem.
-    ///
-    /// This is NOT the same as omitting `initial:`. Omitting it tails from
-    /// wherever the stream happens to be with no anchor step, so on PostgreSQL
-    /// the slot's creation moment is incidental and on MySQL nothing pins the
-    /// binlog position before the first read. `adopt` runs the same
-    /// `ensure_anchor` that `snapshot` does, which is what lets an auditor
-    /// afterwards say WHICH source position the warehouse table was proven
-    /// against.
-    ///
-    /// The anchor must precede any verification of the existing table, or a
-    /// change landing in between is invisible to both — the audit saw the old
-    /// state and the stream started later.
-    Adopt,
+    // NOTE: `adopt` (anchor an already-loaded table, move no rows) is NOT an OSS
+    // mode. It belongs to `rivet-pro`, whose audit is what consumes the anchor.
+    // Adding a variant here would put it in the published config schema, the
+    // generated reference and the OSS binary — irreversibly, once the crate is
+    // published. `oss_rejects_the_pro_only_initial_adopt` is the guard.
 }
 
 /// Per-export CDC settings, required when `mode: cdc`. The output `table`,
@@ -664,8 +649,18 @@ pub enum CdcInitialMode {
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Clone)]
 pub struct CdcExportConfig {
     /// First-run behaviour: `snapshot` = anchor → full snapshot → drain (see
-    /// [`CdcInitialMode`]). Omitted ⇒ capture changes only (the default; the
-    /// operator owns the initial load).
+    /// [`CdcInitialMode`]). Omitted ⇒ capture changes only, with no anchor step
+    /// (the default; the operator owns the initial load).
+    ///
+    /// `snapshot` anchors, and on engines with no server-side anchor (MySQL, SQL
+    /// Server) that makes `checkpoint:` mandatory — the checkpoint file IS the
+    /// anchor there.
+    ///
+    /// This doc line is what the generated config reference renders, so every
+    /// accepted value must be explained HERE: the reference lists the variants
+    /// from the enum but describes only this sentence, so an explanation left on
+    /// a variant alone documents a value the reader is told exists and never told
+    /// the meaning of.
     #[serde(default)]
     pub initial: Option<CdcInitialMode>,
     /// Persist/resume the source log position to this file. Omit to tail from the

@@ -1279,17 +1279,23 @@ impl Config {
             }
         }
 
-        // `initial: snapshot` needs a durable anchor BEFORE the snapshot reads.
-        // PostgreSQL pins server-side (the slot); MySQL / SQL Server have no
-        // server-side anchor, so the checkpoint file is mandatory there.
+        // `initial:` needs a durable anchor BEFORE anything reads. PostgreSQL
+        // pins server-side (the slot); MySQL / SQL Server have no server-side
+        // anchor, so the checkpoint file IS the anchor there. Stated against the
+        // MODE rather than only `snapshot` by name, so a future `initial:` mode
+        // inherits the requirement instead of silently deferring the failure to
+        // `ensure_anchor` — which demands a checkpoint on these engines for ANY
+        // mode, i.e. after the run has already started.
         if let Some(cdc) = &export.cdc
-            && cdc.initial == Some(CdcInitialMode::Snapshot)
+            && cdc.initial.is_some()
             && self.source.source_type != SourceType::Postgres
             && cdc.checkpoint.is_none()
         {
             anyhow::bail!(
-                "export '{}': `cdc.initial: snapshot` on {:?} requires `cdc.checkpoint:` — \
-                 the checkpoint file is the anchor that makes snapshot-then-stream gap-free",
+                "export '{}': `cdc.initial:` on {:?} requires `cdc.checkpoint:` — these \
+                 engines have no server-side anchor, so the checkpoint file is the anchor, \
+                 and without it each run re-anchors at the current log position and \
+                 silently skips every change since the last one",
                 export.name,
                 self.source.source_type
             );

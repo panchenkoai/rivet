@@ -122,9 +122,9 @@ Per-backend commit contracts: [ADR-0004](adr/0004-destination-write-contracts.md
 | Engine | Version | PR CI | Manual | Notes |
 |---|---|:---:|:---:|---|
 | PostgreSQL | 16 | ✅ | ✅ | Primary target |
-| PostgreSQL | 12, 13, 14, 15 | — | ✅ | `dev/legacy/run_full_matrix.sh`, opt-in compose profile |
+| PostgreSQL | 12, 13, 14, 15 | — | ✅ | `python3 -m dev.pytools.legacy_stand full-matrix`, opt-in compose profile |
 | MySQL | 8.0 | ✅ | ✅ | Primary target |
-| MySQL | 5.7 | — | ✅ | `dev/legacy/run_full_matrix.sh` — known view-syntax gap in `init.sql`, see [reference/compatibility.md](reference/compatibility.md#mysql-57--window-functions) |
+| MySQL | 5.7 | — | ✅ | `python3 -m dev.pytools.legacy_stand full-matrix` — known view-syntax gap in `init.sql`, see [reference/compatibility.md](reference/compatibility.md#mysql-57--window-functions) |
 | SQL Server | 2022 | ✅ | ✅ | Primary target; `test-type-validators` (type matrix) + `e2e` (live_mssql_* recovery/resume/reconcile) jobs |
 | MongoDB | 7.0 | — | ✅ | Primary target; nightly `mongo-versions` matrix (dispatchable) |
 | MongoDB | 4.4, 5.0, 6.0, 8.0 | — | ✅ | Nightly `mongo-versions` matrix (batch + CDC); CDC capability tiers — 4.4/5.0 current-state, 6.0+ full pre-images |
@@ -137,7 +137,7 @@ Each legacy target runs the full 83-assertion e2e suite when selected. Status ta
 
 Five harnesses that drive the **release binary** against docker fixtures and
 diff captured artifacts against committed baselines. Each one is bound to a
-specific CI tier; the orchestrator at `dev/matrices/run.sh --tier=<tier>`
+specific CI tier; the orchestrator at `python3 -m dev.pytools.matrices --tier=<tier>`
 runs the right set per gate.
 
 | Matrix | Layer | What it pins | Tier | Trigger |

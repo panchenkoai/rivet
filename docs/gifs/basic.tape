@@ -1,5 +1,5 @@
 # Rivet — basic workflow: init -> doctor -> check -> run -> state.
-# Rendered by docs/gifs/render.sh (which sets CWD to /tmp/rivet-gif-basic
+# Rendered by python3 -m dev.pytools.render_gifs (which sets CWD to /tmp/rivet-gif-basic
 # and exports RIVET_BIN_DIR + DATABASE_URL).
 
 Output basic.gif

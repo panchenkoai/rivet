@@ -1101,6 +1101,49 @@ exports:
     assert!(msg.contains("snapshot"), "must name the collision: {msg}");
 }
 
+// On an engine with no server-side anchor the checkpoint file IS the anchor, so
+// `initial:` must require it at CONFIG LOAD. The check is written against the
+// mode's PRESENCE, not against `snapshot` by name, because `ensure_anchor`
+// demands a checkpoint on these engines for any `initial:` mode: a mode the
+// config check named individually would have deferred the failure to mid-run,
+// surfacing as an anchor error rather than the missing setting it is.
+// PostgreSQL is exempt — the slot pins the position server-side.
+#[test]
+fn initial_mode_without_a_server_side_anchor_requires_a_checkpoint() {
+    let yaml = |engine: &str, url: &str, extra: &str| {
+        format!(
+            "source: {{ type: {engine}, url: \"{url}\" }}\n\
+             exports:\n  - name: c\n    table: orders\n    mode: cdc\n    format: parquet\n    \
+             cdc: {{ initial: snapshot{extra} }}\n    \
+             destination: {{ type: local, path: ./out }}\n"
+        )
+    };
+    for (engine, url, sid) in [
+        ("mysql", "mysql://localhost/test", ", server_id: 5001"),
+        ("mssql", "mssql://sa:p@localhost/test", ""),
+    ] {
+        let msg = format!(
+            "{:#}",
+            Config::from_yaml(&yaml(engine, url, sid)).unwrap_err()
+        );
+        assert!(
+            msg.contains("cdc.checkpoint") && msg.contains("cdc.initial"),
+            "{engine} `initial:` without a checkpoint must be refused at config load, \
+             naming the setting that is missing; got: {msg}"
+        );
+        // …and accepted once the anchor is declared.
+        Config::from_yaml(&yaml(
+            engine,
+            url,
+            &format!(", checkpoint: /tmp/a.ckpt{sid}"),
+        ))
+        .unwrap_or_else(|e| panic!("{engine} `initial:` + checkpoint must load: {e:#}"));
+    }
+    // PostgreSQL pins server-side at slot creation — no checkpoint needed.
+    Config::from_yaml(&yaml("postgres", "postgresql://localhost/test", ""))
+        .expect("postgres anchors in the slot, so no checkpoint file is required");
+}
+
 // Negative family #3 (hostile configs), generative flavour: arbitrary
 // bytes/fragments through the whole config parse+validate pipeline must
 // yield Ok or a graceful Err — never a panic. serde almost certainly holds;

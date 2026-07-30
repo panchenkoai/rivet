@@ -1,7 +1,7 @@
 # Rivet — CDC access error: a MySQL user missing the REPLICATION grant gets the
 # exact requirement (and a pointer to the grants doc), not a cryptic driver error.
 #
-# Fixture (render.sh, fixture_error_cdc_access_setup): creates a SELECT-only user
+# Fixture (the renderer, fixture_error_cdc_access_setup): creates a SELECT-only user
 # `rivet_noperm` with no REPLICATION privilege.
 
 Output error-cdc-access.gif

@@ -3,7 +3,7 @@
 # (header + run_id/status/mode + live progress, replaced in-place with final
 # metrics on finish). Batch and CDC of one table, concurrently.
 #
-# Fixture (render.sh, fixture_cdc_parallel_setup): writes parallel.yaml (a
+# Fixture (the renderer, fixture_cdc_parallel_setup): writes parallel.yaml (a
 # mode: full + a mode: cdc export, both on content_items) and seeds the CDC
 # checkpoint + a backlog so the cdc arm drains and exits.
 

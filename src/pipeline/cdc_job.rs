@@ -153,26 +153,20 @@ pub(super) fn run_cdc_export(
 /// drain. Returns the synthesized `mode: full` exports still pending (their
 /// `snapshot/_SUCCESS` marker absent), after ensuring the anchor exists.
 ///
-/// Both `initial:` modes anchor here and they differ only in what follows:
-///
-/// * `snapshot` — anchor, then snapshot every table. Anchor-BEFORE-snapshot is
-///   the whole point: a change landing mid-snapshot is then also in the stream,
-///   an overlap the PK+`__op` dedupe absorbs, never a gap.
-/// * `adopt` — anchor, and return NOTHING to snapshot. The warehouse table is
-///   already there and re-moving it is the cost adoption exists to avoid
-///   (repair-design.md §5e). The anchor still runs, and that is the point: it
-///   is what lets a later audit name the source position the existing table was
-///   proven against.
+/// `snapshot` anchors, then snapshots every table. Anchor-BEFORE-snapshot is the
+/// whole point: a change landing mid-snapshot is then also in the change stream,
+/// an overlap the PK+`__op` dedupe absorbs, never a gap.
 pub(super) fn initial_snapshot_pending(
     config: &Config,
     export: &ExportConfig,
     state: &StateStore,
 ) -> Result<Vec<ExportConfig>> {
-    use crate::config::CdcInitialMode;
     let cdc = export.cdc.clone().unwrap_or_default();
-    let Some(initial) = cdc.initial else {
+    // `snapshot` is the only OSS `initial:` mode; absence means "capture changes
+    // only", which needs no anchor step and no snapshot legs.
+    if cdc.initial.is_none() {
         return Ok(Vec::new());
-    };
+    }
     let url = config.source.resolve_url()?;
     let tls = config.source.tls.as_ref();
 
@@ -230,15 +224,6 @@ pub(super) fn initial_snapshot_pending(
         tls,
         resume_expected,
     )?;
-
-    // Adoption stops here, having paid nothing but the anchor. Deliberately
-    // AFTER `ensure_anchor` and after the resume-evidence scan: an adopted
-    // export must still fail loud on a lost anchor with prior evidence, or a
-    // re-anchor at "current" would silently skip everything since the loss —
-    // the same trap, and adoption has no snapshot to paper over it.
-    if initial == CdcInitialMode::Adopt {
-        return Ok(Vec::new());
-    }
 
     let mut pending = Vec::new();
     for idx in pending_idx {
@@ -622,12 +607,16 @@ mod tests {
         assert_eq!(synth.table.as_deref(), Some("orders"));
     }
 
-    /// `adopt` must parse and must be a DIFFERENT thing from omitting
-    /// `initial:` — the config is where an operator states the intent, and the
-    /// two spellings mean "anchor, move nothing" versus "no anchor step at
-    /// all".
+    /// `adopt` (anchor an already-loaded table, move no rows) is a `rivet-pro`
+    /// mode, so the OSS config must REJECT it rather than quietly accept a value
+    /// this binary cannot honour. 0.24.0 shipped it in the OSS enum, which put it
+    /// in the published JSON schema and the generated reference — irreversible
+    /// once the crate is published, and indistinguishable to a user from a
+    /// supported feature. Omitted `initial:` stays its own third state (capture
+    /// changes only, no anchor step), which is what an OSS operator uses for an
+    /// already-loaded table.
     #[test]
-    fn adopt_is_a_distinct_initial_mode() {
+    fn oss_rejects_the_pro_only_initial_adopt() {
         let parse = |line: &str| {
             crate::config::Config::from_yaml(&format!(
                 "source:\n  type: postgres\n  url: \"postgresql://localhost/t\"\n\
@@ -635,39 +624,28 @@ mod tests {
                  \x20   destination:\n      type: gcs\n      bucket: b\n      prefix: p/\n\
                  \x20   cdc:\n      checkpoint: /tmp/ck\n{line}"
             ))
-            .map(|c| c.exports[0].cdc.clone().unwrap().initial)
         };
-        assert_eq!(
-            parse("      initial: adopt\n").unwrap(),
-            Some(crate::config::CdcInitialMode::Adopt)
+        let err = format!(
+            "{:#}",
+            parse("      initial: adopt\n").expect_err("`adopt` is not an OSS mode")
+        );
+        assert!(
+            err.contains("adopt") || err.contains("initial"),
+            "the refusal must point at the offending value; got: {err}"
         );
         assert_eq!(
-            parse("      initial: snapshot\n").unwrap(),
+            parse("      initial: snapshot\n").unwrap().exports[0]
+                .cdc
+                .clone()
+                .unwrap()
+                .initial,
             Some(crate::config::CdcInitialMode::Snapshot)
         );
-        assert_eq!(parse("").unwrap(), None, "omitted is its own third state");
-    }
-
-    /// Adoption anchors and returns NOTHING to snapshot. Both halves matter:
-    /// no snapshot is the entire economic claim (a 1B-row table is not
-    /// re-moved to learn what the warehouse already holds), and the anchor is
-    /// what lets a later audit name the source position that table was proven
-    /// against.
-    ///
-    /// This test pins the SECOND half only — that adopt yields no pending
-    /// snapshot exports — because `ensure_anchor` needs a live source. The
-    /// anchor call itself sits above the early return, which is the ordering
-    /// the fail-loud guard depends on.
-    #[test]
-    fn adopt_yields_no_snapshot_work() {
-        // Every table un-done and no checkpoint: the shape that WOULD produce a
-        // full pending list under `initial: snapshot`.
-        let (pending, resume_expected) = snapshot_plan(&[false, false], false);
-        assert_eq!(pending, vec![0, 1], "snapshot mode would snapshot both");
-        assert!(!resume_expected);
-        // …and adopt discards exactly that list, after the same anchor step.
-        // (The early return lives in `initial_snapshot_pending`; this asserts
-        // the decision it discards is non-empty, so the return is doing work.)
+        assert_eq!(
+            parse("").unwrap().exports[0].cdc.clone().unwrap().initial,
+            None,
+            "omitted is its own third state — capture changes only, no anchor step"
+        );
     }
 
     // The mirror image of the test above, and the reason the two must be read
