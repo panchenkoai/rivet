@@ -279,13 +279,25 @@ fn plan_and_apply_chunked_export_round_trip_uses_precomputed_ranges() {
 #[test]
 #[ignore = "live: requires docker compose postgres"]
 fn apply_replays_the_artifacts_ranges_and_ignores_rows_added_after_planning() {
+    // Both chunked runners that reach `run_export`. Measured against the released
+    // 0.23.1 binary, BOTH re-detected — plain chunked and chunk_checkpoint alike
+    // produced 6 files / 300 rows where the artifact pinned 3 windows / 150 rows.
+    // (`parallel:` takes a different dispatch tier and already replayed.) One case
+    // would leave the other free to regress alone.
+    for extra in ["", "\n    chunk_checkpoint: true"] {
+        apply_replay_case(extra);
+    }
+}
+
+fn apply_replay_case(extra_mode_lines: &str) {
     require_alive(LiveService::Postgres);
 
     let table = seed_pg_numeric_table(150);
     let out_dir = tempfile::tempdir().unwrap();
     let cfg_dir = tempfile::tempdir().unwrap();
 
-    let mode_block = "mode: chunked\n    chunk_column: id\n    chunk_size: 50".to_string();
+    let mode_block =
+        format!("mode: chunked\n    chunk_column: id\n    chunk_size: 50{extra_mode_lines}");
     let yaml = pg_url_env_config(table.name(), &mode_block, out_dir.path());
     let cfg = write_config(&cfg_dir, &yaml);
     let plan_path = cfg_dir.path().join("plan.json");
