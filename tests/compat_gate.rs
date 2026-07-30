@@ -13,7 +13,11 @@ use rivet::manifest::RunManifest;
 const DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/compat/v0.16");
 
 #[test]
-fn v016_checkpoint_files_parse_for_every_engine() {
+fn v016_checkpoint_files_are_still_valid_json_for_every_engine() {
+    // DOCUMENTS the on-disk shape; it does not verify rivet can still RESUME
+    // from these files — that needs the real loader and lives beside it, in
+    // `src/source/cdc/validate.rs::v016_checkpoint_compat`. Kept because a
+    // fixture that stops being valid JSON is worth catching early and cheaply.
     for (engine, file, key) in [
         ("mysql", "mysql_cdc.ckpt", "file"),
         ("postgres", "pg_cdc.ckpt", "lsn"),
@@ -41,7 +45,10 @@ fn v016_cdc_manifest_deserializes_and_keeps_its_contract_fields() {
 }
 
 #[test]
-fn v016_cdc_parquet_part_reads_with_current_arrow() {
+fn v016_cdc_parquet_part_bytes_still_readable_by_current_arrow() {
+    // Pins the ARROW/PARQUET dependency's ability to read 0.16 bytes — not
+    // rivet's CDC reader, which never runs here. A rivet-side meta-column
+    // change is invisible to this test by construction.
     let f = std::fs::File::open(format!("{DIR}/cdc_part.parquet")).unwrap();
     let r = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(f)
         .unwrap()

@@ -785,3 +785,54 @@ BEFORE it asks.** Order matters: a guard placed after the build steps cannot hel
 because those steps are exactly what the staleness corrupts — a check cannot detect
 what it is blind to. Wired as step 0 of `.githooks/pre-commit`, and pinned on the
 release workflow's `cargo publish` so the line stays safe when copied locally.
+
+## A test compares a golden to rivet's OUTPUT — never a fixture to itself
+
+The oracle must be INDEPENDENT of the code under test. A test that reads a
+checked-in fixture and then asks questions **of that same fixture** — does this
+key exist, does this text contain that substring, does this YAML cell say `test`
+— holds both sides of the comparison. It cannot fail when rivet changes; only
+when someone edits the fixture. It reads like coverage and is none.
+
+The bite: `tests/artifact_legacy_compat.rs` froze plan artifacts from 0.7.5 and
+asserted their JSON contained certain fields, deliberately never deserializing
+them with the current type (its doc explained why — `PlanArtifact` is
+`pub(crate)`). When `verify` was added as a REQUIRED field on 2026-06-02, every
+assertion kept passing while `rivet apply` rejected every `plan.json` users
+already had on disk. Two months, and the fixture that existed to catch exactly
+this was the thing that hid it. The same shape sat in `tests/compat_gate.rs`,
+where v0.16 CDC checkpoints were read with a bare `serde_json::Value` and one key
+per engine was asserted (`pos` never was) — a renamed key leaves it green while a
+user's checkpoint silently re-anchors and skips every change since it was written.
+
+Process rule: **every fixture/golden test must pass the fixture THROUGH rivet's
+own code and compare the result to an expected value produced independently of
+that code** — a hand-written literal, a value derived by a different library, the
+seed the test itself inserted, or a re-read through a different reader. Three
+corollaries, each of which cost something here:
+
+1. **`pub(crate)` is not a reason to test the shape instead.** It is a reason to
+   put the test beside the type. Both fixes this session are inline
+   `#[cfg(test)]` modules next to the code that owns the type
+   (`src/plan/artifact.rs::legacy_wire_compat`,
+   `src/source/cdc/validate.rs::v016_checkpoint_compat`), each calling the real
+   loader. Both go RED on the mutant the integration-level shape check sails
+   through — verified side by side, not argued.
+2. **Derive the enumerated dimension, never type it in.** A gate whose engine /
+   target / variant columns are a hand-written list grades only what its author
+   already knew. `tests/offline/chunking_matrix_guard.rs` parses `SourceType`
+   itself; `tests/cdc_conformance_gate.rs` did not, and its four engine columns
+   were tied to nothing. Be honest about the strength: adding an enum variant
+   does NOT compile silently (every non-exhaustive `match` fails), so the risk is
+   not "it ships unnoticed" — it is that once the compiler's list is finished,
+   nothing asks for the TEST rows. That is the gap the derivation closes.
+3. **A name must not promise what the body cannot check.** `..._guards_...`,
+   `..._must_...`, `no_silent_float_...` on a body that only greps a fixture is
+   how a reviewer's eye is spent. If a test genuinely documents rather than
+   verifies (a migration example, a matrix ledger), name it `..._documents_...`
+   and say so in one line.
+
+Scope honesty: this class is invisible to mutation testing of the PRODUCT, since
+the fixture-only assertion never executes the mutated code. It is found by asking
+of each assertion: *what change in rivet would turn this red?* If the answer is
+"none — only editing the fixture", it is this defect.

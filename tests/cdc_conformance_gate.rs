@@ -473,3 +473,87 @@ fn every_live_cdc_test_asserts_an_outcome() {
         naked.join("\n  ")
     );
 }
+
+// ── the engine set is DERIVED, not typed in ───────────────────────────────────
+// The per-case columns below are a hand-written 4-tuple. That is fine as a shape,
+// but nothing tied it to reality: a fifth CDC engine could ship with ZERO
+// conformance rows and this gate would stay green, because it only ever asked
+// about the four engines its author already knew. The sibling
+// `tests/offline/chunking_matrix_guard.rs` had already solved this — it derives
+// its columns from `SourceType` itself — so the fix is to use the same seam here
+// rather than invent another.
+//
+// Parsed from the source text (not `strum`) so the gate stays dependency-free and
+// so it also fails if the enum is MOVED, which a derive-macro reflection would not
+// notice.
+fn enum_variants(rel: &str, enum_name: &str) -> std::collections::HashSet<String> {
+    let repo_root = || std::path::Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf();
+    let text = std::fs::read_to_string(repo_root().join(rel))
+        .unwrap_or_else(|e| panic!("read {rel}: {e}"));
+    let needle = format!("enum {enum_name} {{");
+    let start = text
+        .find(&needle)
+        .unwrap_or_else(|| panic!("`{needle}` not found in {rel}"));
+    let body = &text[start + needle.len()..];
+    let mut out = std::collections::HashSet::new();
+    let mut depth = 1usize; // already inside the enum's `{`
+    for line in body.lines() {
+        let t = line.trim_start();
+        let at_variant_depth = depth == 1;
+        // Update depth AFTER classifying this line (an opening `{` affects the NEXT
+        // lines, not this variant's own line). Stop at the enum's closing brace.
+        let opens = t.matches('{').count();
+        let closes = t.matches('}').count();
+        if at_variant_depth && !t.is_empty() && !t.starts_with("//") && !t.starts_with('#') {
+            let ident: String = t
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            if ident.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+                out.insert(ident);
+            }
+        }
+        depth = depth + opens - closes.min(depth);
+        if depth == 0 {
+            break; // enum's closing brace
+        }
+    }
+    out
+}
+
+/// [`enum_variants`] lowercased — `SourceType::Postgres` → `"postgres"`,
+/// `ExportTarget::DuckDb` → `"duckdb"`, matching the matrix column labels exactly.
+fn enum_variants_lowercased(rel: &str, enum_name: &str) -> std::collections::HashSet<String> {
+    enum_variants(rel, enum_name)
+        .into_iter()
+        .map(|v| v.to_ascii_lowercase())
+        .collect()
+}
+
+/// A new `SourceType` variant must force a column into this gate.
+///
+/// Without this, adding an engine is silent here: `CASES` keeps its 4-tuples, the
+/// loop below keeps its four `(engine, expect, hay)` entries, every existing row
+/// still matches, and the engine ships with no conformance obligation at all —
+/// the un-enumerated-sibling hole. The assertion is deliberately EQUALITY, not
+/// containment: an engine dropped from the gate is as wrong as one never added.
+#[test]
+fn conformance_columns_cover_every_source_engine() {
+    let declared: std::collections::HashSet<String> = ENGINE_COLUMNS
+        .iter()
+        .map(|e| e.to_ascii_lowercase())
+        .collect();
+    let variants = enum_variants_lowercased("src/config/source.rs", "SourceType");
+    // Parse sanity: a silent parse failure would make this vacuously pass.
+    assert!(
+        variants.len() >= 4 && variants.contains("postgres") && variants.contains("mongo"),
+        "SourceType parse looks wrong ({variants:?}) — the guard would under-require"
+    );
+    assert_eq!(
+        declared, variants,
+        "the CDC conformance gate's engine columns must equal the SourceType variants;          add the engine's column to CASES (and its rows) or remove the stale one"
+    );
+}
+
+/// The engine names this gate grades, in the order the `CASES` tuples use them.
+const ENGINE_COLUMNS: [&str; 4] = ["mysql", "postgres", "mssql", "mongo"];
