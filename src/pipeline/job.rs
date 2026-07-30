@@ -588,6 +588,7 @@ pub(crate) fn synthetic_failed_summary(export_name: &str, err: &anyhow::Error) -
         retries: 0,
         reconnects: 0,
         resumed: false,
+        chunks_precomputed: false,
         validated: None,
         schema_changed: None,
         quality_passed: None,

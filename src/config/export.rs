@@ -637,10 +637,12 @@ pub enum CdcInitialMode {
     /// enforced by construction instead of operator discipline.
     Snapshot,
     // NOTE: `adopt` (anchor an already-loaded table, move no rows) is NOT an OSS
-    // mode. It belongs to `rivet-pro`, whose audit is what consumes the anchor.
-    // Adding a variant here would put it in the published config schema, the
-    // generated reference and the OSS binary — irreversibly, once the crate is
-    // published. `oss_rejects_the_pro_only_initial_adopt` is the guard.
+    // mode — it belongs to the paid tier, whose audit is what consumes the
+    // anchor (the one-way extension seam, ADR-0026; docs may name the crate,
+    // this tree may not). Adding a variant here would put it in the published
+    // config schema, the generated reference and the OSS binary — irreversibly,
+    // once the crate is published. `oss_rejects_the_pro_only_initial_adopt` is
+    // the guard.
 }
 
 /// Per-export CDC settings, required when `mode: cdc`. The output `table`,

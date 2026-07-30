@@ -607,8 +607,9 @@ mod tests {
         assert_eq!(synth.table.as_deref(), Some("orders"));
     }
 
-    /// `adopt` (anchor an already-loaded table, move no rows) is a `rivet-pro`
-    /// mode, so the OSS config must REJECT it rather than quietly accept a value
+    /// `adopt` (anchor an already-loaded table, move no rows) is a paid-tier
+    /// mode (the one-way seam, ADR-0026 — docs may name the crate, this tree may
+    /// not), so the OSS config must REJECT it rather than quietly accept a value
     /// this binary cannot honour. 0.24.0 shipped it in the OSS enum, which put it
     /// in the published JSON schema and the generated reference — irreversible
     /// once the crate is published, and indistinguishable to a user from a

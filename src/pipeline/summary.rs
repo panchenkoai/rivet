@@ -92,6 +92,20 @@ pub struct RunSummary {
     /// (keyset via the in-progress run_id, chunked via `--resume`). A resume-hit is
     /// the tell that the previous run died — visible in the run's own log line.
     pub resumed: bool,
+    /// True when this run's chunk boundaries came from a plan artifact
+    /// (`ChunkSource::Precomputed`), i.e. `rivet apply`, rather than being
+    /// detected against the live source.
+    ///
+    /// It exists for the same reason `resumed` does: the pre-chunk schema-drift
+    /// gate lives inside `prepare_chunk_plan`, which only the `Detect` arm calls
+    /// — deliberately, per that function's contract ("drift was evaluated on the
+    /// original planning run that produced the ranges"). So a precomputed run
+    /// legitimately ends with `schema_changed == None`, which
+    /// `check_post_run_invariants` would otherwise read as a runner that skipped
+    /// its facade. Without this flag the exemption would have to be "any apply",
+    /// which is broader than the truth: an apply whose artifact carries no ranges
+    /// falls back to `Detect` and DOES run the gate.
+    pub chunks_precomputed: bool,
     /// True once this run entered `run_export` — the shared batch-runner dispatch
     /// choke point, which always has a `StateStore`. It marks a run subject to the
     /// per-runner facade contract (ADR-0018): every batch runner MUST apply the
@@ -240,6 +254,7 @@ impl RunSummary {
             retries: 0,
             reconnects: 0,
             resumed: false,
+            chunks_precomputed: false,
             state_backed: false,
             validated: None,
             schema_changed: None,
@@ -316,6 +331,7 @@ impl RunSummary {
             retries: 0,
             reconnects: 0,
             resumed: false,
+            chunks_precomputed: false,
             state_backed: false,
             validated: None,
             schema_changed: None,
@@ -820,7 +836,11 @@ impl RunSummary {
             // diagnosis (`resumed`) AND the raw `--resume` flag (`is_resume_run`) — a
             // resume that crashed before its first commit adopts nothing yet still
             // skipped the gate.
-            if !self.resumed && !is_resume_run && self.schema_changed.is_none() {
+            if !self.resumed
+                && !is_resume_run
+                && !self.chunks_precomputed
+                && self.schema_changed.is_none()
+            {
                 return Err(
                     "state_backed success committed parts but schema_changed is None — \
                      the on_schema_drift gate was never applied (no runner called \
@@ -1589,6 +1609,34 @@ mod tests {
         assert!(
             cdc.check_post_run_invariants(false).is_ok(),
             "a non-run_export run must not be held to the facade contract"
+        );
+
+        // `rivet apply` with PRECOMPUTED chunk boundaries legitimately skips the
+        // drift gate too: the gate lives inside `prepare_chunk_plan`, whose own
+        // contract says a precomputed source never calls it ("drift was evaluated
+        // on the original planning run that produced the ranges"). Without this
+        // exemption the guard reads a correct apply as a runner-bypass — which is
+        // exactly what happened the moment `apply` was fixed to actually replay
+        // its artifact instead of re-detecting: every chunked apply started
+        // aborting at finalize with exit 101.
+        let mut applied = base();
+        applied.chunks_precomputed = true;
+        applied.column_checksums.push(ck());
+        // schema_changed stays None
+        assert!(
+            applied.check_post_run_invariants(false).is_ok(),
+            "an apply replaying precomputed chunks must not trip the drift-gate branch"
+        );
+
+        // …and the exemption is NARROW: it is about the precomputed source, not
+        // about "any apply". A run that did NOT come from an artifact still has to
+        // show the gate ran, or the flag would be a blanket hole in the guard.
+        let mut not_applied = base();
+        not_applied.chunks_precomputed = false;
+        not_applied.column_checksums.push(ck());
+        assert!(
+            not_applied.check_post_run_invariants(false).is_err(),
+            "the precomputed exemption must not weaken the guard for ordinary runs"
         );
 
         // A RESUME legitimately skips the drift gate (schema_changed None) — exempt (H2).

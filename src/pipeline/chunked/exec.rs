@@ -30,7 +30,13 @@ pub(crate) fn run_chunked_sequential(
     let chunks = match chunk_source {
         // Detect: compute ranges + run the pre-chunk drift check once (ADR-0021).
         super::ChunkSource::Detect => super::prepare_chunk_plan(src, plan, state, summary)?,
-        super::ChunkSource::Precomputed(ranges) => ranges,
+        super::ChunkSource::Precomputed(ranges) => {
+            // Records that the drift gate was skipped BY CONTRACT, not by a
+            // runner forgetting its facade — `prepare_chunk_plan` is its only
+            // caller and a precomputed source deliberately does not call it.
+            summary.chunks_precomputed = true;
+            ranges
+        }
     };
 
     let is_date = cp.by_days.is_some();
@@ -186,7 +192,10 @@ pub(crate) fn run_chunked_parallel(
         // Detect: a short-lived connection computes ranges + runs the pre-chunk
         // drift check (ADR-0021), then closes before the workers open theirs.
         super::ChunkSource::Detect => super::prepare_chunk_plan_fresh(plan, state, summary)?,
-        super::ChunkSource::Precomputed(ranges) => ranges,
+        super::ChunkSource::Precomputed(ranges) => {
+            summary.chunks_precomputed = true; // drift gate skipped by contract
+            ranges
+        }
     };
 
     let is_date = cp.by_days.is_some();
