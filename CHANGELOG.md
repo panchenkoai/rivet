@@ -36,11 +36,16 @@
 - **The developer tooling is Python.** The 68 shell scripts under `dev/`,
   `docs/gifs/` and `scripts/` are replaced by `dev/pytools/` and
   `dev/release_oracle/`, driven through `python3 -m dev.pytools.<tool>` /
-  `python3 -m dev.release_oracle`. Three scripts remain because a container image
+  `python3 -m dev.release_oracle`. Three of them remain because a container image
   chooses their interpreter, not rivet: `dev/cdc/primary-hba.sh` (the postgres
-  entrypoint runs only `*.sh` in `docker-entrypoint-initdb.d`) and the two
-  Airflow recipe init assets. CI, the Makefile, the pre-commit hook and the live
+  entrypoint runs only `*.sh` in `docker-entrypoint-initdb.d`, so the extension
+  IS the contract) and the two Airflow recipe init assets, which run in images
+  with no python at all. CI, the Makefile, the pre-commit hook and the live
   source-parity tests call the modules directly.
+
+  (`dev/stand/{up,verify}.sh` also live in the tree, but they were never part of
+  the ported set — the version-matrix stand arrived separately and is committed
+  as its own thing.)
 
   The port was not a transliteration: each module records, at the site, the
   shell defect it removes. Among those that were silently wrong — a `case` with
