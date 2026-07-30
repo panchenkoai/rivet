@@ -51,12 +51,14 @@ into `logs/<scenario>/<probe>/{stdout,stderr,exit_code,cmd}`.
 docker compose up -d postgres mysql
 cargo build --bin rivet --release
 cp target/release/rivet dev/cfg_matrix/rivet
-cd dev/cfg_matrix
-./matrix.sh          # ~30s, 70 × 3 = 210 invocations
-./check_msg.sh       # enforces expected_msg.txt contract
+# from the repo root:
+python3 -m dev.pytools.cfg_matrix run   # ~30s, 70 × 3 = 210 invocations
+python3 -m dev.pytools.matrices check-msg \
+    --contract dev/cfg_matrix/expected_msg.txt \
+    --logs dev/cfg_matrix/logs --layout probe   # enforces the contract
 ```
 
-`gen_fixtures.sh` regenerates the YAMLs from the canonical source —
+`python3 -m dev.pytools.cfg_matrix gen` regenerates the YAMLs from the canonical source —
 re-run it if you add a new axis.
 
 ## Regression contract
@@ -70,9 +72,11 @@ for the same format applied to the CLI surface.
 Adding a new YAML axis:
 
 1. Add a YAML under the right `cfg/<group>/` subdir or extend
-   `gen_fixtures.sh`.
-2. Run `./matrix.sh` to capture behavior.
+   `python3 -m dev.pytools.cfg_matrix gen`.
+2. Run `python3 -m dev.pytools.cfg_matrix run` to capture behavior.
 3. Inspect `logs/<new_id>/` to see what the binary actually does.
 4. Add pinning entries to `expected_msg.txt` for the messages
    that constitute the user-facing contract (errors, hints, key WARNs).
-5. Re-run `./check_msg.sh` to confirm it passes.
+5. Re-run the contract check (`python3 -m dev.pytools.matrices check-msg
+   --contract dev/cfg_matrix/expected_msg.txt --logs dev/cfg_matrix/logs
+   --layout probe`) to confirm it passes.

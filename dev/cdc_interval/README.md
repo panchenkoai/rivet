@@ -39,9 +39,9 @@ pause the loader, drain to current, snapshot the source aggregates, drain again
 ```bash
 docker compose --profile cdc up -d mysql-cdc
 cargo build --release --bin rivet
-RIVET_BIN=target/release/rivet dev/cdc_interval/run.sh          # 10/20/30-min phases
+RIVET_BIN=target/release/rivet python3 -m dev.pytools.cdc_interval run   # 10/20/30-min phases
 # custom schedule (minutes reps, ';'-separated):
-PHASES="10 2;20 2;30 2;60 1;120 1" dev/cdc_interval/run.sh
+PHASES="10 2;20 2;30 2;60 1;120 1" python3 -m dev.pytools.cdc_interval run
 ```
 
 Needs `duckdb` on PATH (destination-side merge oracle). Everything lands under

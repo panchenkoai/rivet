@@ -56,8 +56,8 @@ across PG versions and statistics freshness. Structural plan shape
 docker compose up -d postgres
 cargo build --bin rivet --release
 cp target/release/rivet dev/query_matrix/rivet
-cd dev/query_matrix
-./matrix.sh
+# from the repo root:
+python3 -m dev.pytools.matrix_suites query
 ```
 
 Non-zero exit when at least one EXPLAIN diverged.
@@ -66,7 +66,7 @@ Non-zero exit when at least one EXPLAIN diverged.
 
 When a plan change is intentional:
 
-1. `./matrix.sh` captures the new explain in `logs/<id>/explain`.
+1. `python3 -m dev.pytools.matrix_suites query` captures the new explain in `logs/<id>/explain`.
 2. Inspect `logs/<id>/explain.diff`.
 3. `cp logs/<id>/explain expected/<id>.plan`.
 4. Document in the CHANGELOG of the PR that lands the change.

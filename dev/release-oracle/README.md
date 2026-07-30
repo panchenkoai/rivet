@@ -10,9 +10,9 @@ the local object-store fakes (MinIO=S3, fake-gcs=GCS, Azurite=Azure), then a fin
 
 ```
 make release-oracle                 # full gate (local stage + BigQuery if creds set)
-dev/release-oracle/run.sh --no-cloud        # local stage only
-dev/release-oracle/run.sh --engines postgres,mysql
-dev/release-oracle/run.sh --bless-bigquery-golden   # re-capture the BQ golden (on purpose)
+python3 -m dev.release_oracle --no-cloud        # local stage only
+python3 -m dev.release_oracle --engines postgres,mysql
+python3 -m dev.release_oracle --bless-bigquery-golden   # re-capture the BQ golden (on purpose)
 ```
 
 ## What it checks (per engine × version)
@@ -27,7 +27,7 @@ dev/release-oracle/run.sh --bless-bigquery-golden   # re-capture the BQ golden (
 ## CDC end-to-end stage (all engines, independent oracle)
 
 The batch scenarios above never exercise **change-data-capture** — the most
-engine-divergent, correctness-critical surface. `verify_cdc_e2e` (`lib/cdc.sh`)
+engine-divergent, correctness-critical surface. `verify_cdc_e2e` (`dev/release_oracle/cdc.py`)
 codifies the manual CDC dogfood as a preflight: for each engine whose
 `RIVET_CDC_<ENGINE>_URL` is set it
 
@@ -71,7 +71,7 @@ RIVET_CDC_MONGO_URL      mongodb://rivet:rivet@host:port/db?authSource=admin&dir
 RIVET_CDC_STATE_URL      postgresql://…                          # the state-parity leg (else that leg SKIPs)
 ```
 
-Regenerate the snapshot golden on purpose with `run.sh --bless-cdc`.
+Regenerate the snapshot golden on purpose with `python3 -m dev.release_oracle --bless-cdc`.
 
 ## Release build path (pre-tag preflight)
 
@@ -79,7 +79,7 @@ The scenarios above prove **correctness of what ships**; they assume a working b
 exists. But the release pipeline runs **stricter tooling than `cargo build`**, and the
 gap only surfaces at the **tag — after crates.io, the binaries, and the GitHub release
 have published**, when the failure is no longer re-runnable from the immutable tag.
-`verify_release_build_path` (`lib/release_path.sh`) runs that path **first, pre-tag**:
+`verify_release_build_path` (`dev/release_oracle/release_path.py`) runs that path **first, pre-tag**:
 
 - **`cargo metadata --locked`** — `Cargo.lock` in sync with `Cargo.toml`. The release
   publishes with `cargo publish --locked` and the Docker builder cooks + builds
@@ -102,7 +102,7 @@ reddens **both** the offline guard AND `cargo chef prepare`. SKIP when `cargo` i
 
 The gate compares to checked-in **goldens** and to **itself**, never to the version
 users are actually running. Two regressions ship green through every correctness
-check yet are release-blocking. `verify_release_regression` (`lib/regression.sh`)
+check yet are release-blocking. `verify_release_regression` (`dev/release_oracle/regression.py`)
 benchmarks against the **DOWNLOADED previous-release binary** (`RIVET_PREV_RELEASE_BIN`
 — a GitHub release asset / brew bottle, the artifact users run, never a rebuilt
 parent) over a seeded 100K keyset+zstd fixture:
@@ -149,10 +149,10 @@ green.
 
 ```
 matrix.yaml              # declarative source of truth (engines × versions × scenarios × stores)
-run.sh                   # the driver (orchestration loop); --bless-local re-blesses the local goldens
+python3 -m dev.release_oracle  # the driver (orchestration loop); --bless-local re-blesses the local goldens
 lib/cfg.py               # matrix query interface (dependency-free — no PyYAML)
-lib/scenarios.sh         # the scenario implementations (verdicts / integrity_types / load / gc)
-lib/bigquery.sh          # the BigQuery golden stage (rivet run → GCS, rivet load → BQ, bq query)
+dev/release_oracle/scenarios.py         # the scenario implementations (verdicts / integrity_types / load / gc)
+dev/release_oracle/bigquery.py          # the BigQuery golden stage (rivet run → GCS, rivet load → BQ, bq query)
 lib/parse_verdicts.py    # parse `rivet check` → {table: {strategy, verdict}}
 lib/gcs_pull.py          # independent fake-gcs readback (no gsutil needed)
 lib/normalize_bq.py      # canonicalize a read-back for the golden diff
@@ -162,7 +162,8 @@ golden/bigquery_type_matrix.json   # blessed BQ round-trip of the type-matrix (f
 ```
 
 Re-bless the local goldens (verdicts + DuckDB type/fidelity) on purpose with
-`run.sh --bless-local`; the BQ golden with `run.sh --bless-bigquery-golden`.
+`python3 -m dev.release_oracle --bless-local`; the BQ golden with
+`python3 -m dev.release_oracle --bless-bigquery-golden`.
 
 Requires: docker, the `rivet` release binary, `duckdb`, `python3` (stdlib only),
 and — for the final stage — `bq` + ADC + a real GCS staging bucket

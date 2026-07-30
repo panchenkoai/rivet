@@ -1,0 +1,25 @@
+{
+  "_comment": "Surface digests captured when the GIFs were last rendered. A digest that no longer matches means the recording and the binary have diverged \u2014 re-render that tape, then re-bless it BY NAME (blessing everything would stamp un-rendered GIFs as current).",
+  "surfaces": {
+    "basic": "510e8c21f935e5db",
+    "cdc": "7be7081cb2efd08a",
+    "cdc-parallel": "6f6b93a769370cf2",
+    "check-verdict": "dfd87032b1ee440f",
+    "chunked-progress": "6f6b93a769370cf2",
+    "coalesce-cursor": "88ab50ad25331ead",
+    "discover-artifact": "e73f0083f810eb0f",
+    "doctor-gcs": "578fdbcc06aa2706",
+    "error-cdc-access": "a2d37ca98b0858e2",
+    "error-config-typo": "dfd87032b1ee440f",
+    "error-connection": "f70422846e03251d",
+    "error-missing-table": "dfd87032b1ee440f",
+    "incremental-cursor": "88ab50ad25331ead",
+    "init-scaffold": "e73f0083f810eb0f",
+    "inspect": "69aa68876b22a7ee",
+    "parallel-cards": "6f6b93a769370cf2",
+    "plan-apply": "1fa8032070d82d71",
+    "plan-campaign": "e309cadc58ef9e8c",
+    "pool-detect": "6f6b93a769370cf2",
+    "reconcile-repair": "b6563dcbe76a5326"
+  }
+}

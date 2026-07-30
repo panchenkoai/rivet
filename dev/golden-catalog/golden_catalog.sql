@@ -6,7 +6,7 @@
 -- and the pre-release gate read this instead of hard-coding numbers per test:
 -- a seed's expected outcome lives here, next to what makes it that shape.
 --
---   build:  bash dev/golden-catalog/build.sh   (regenerates golden_catalog.db)
+--   build:  python3 -m dev.pytools.golden_catalog   (regenerates golden_catalog.db)
 --   query:  SELECT * FROM golden_seed WHERE category='garbage' AND engine='postgres';
 --
 -- `category`: 'normal' = a clean golden whose exact counts are pinned; 'garbage'

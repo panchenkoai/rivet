@@ -74,7 +74,7 @@ jobs:
       - name: Reference docs are regenerated from code (clap + schema)
         run: |
           cargo build --bin rivet
-          bash dev/docgen/generate.sh --check
+          python3 -m dev.pytools.docgen --check
 
   boundary:
     name: OSS must not depend on rivet-pro (one-way seam, ADR-0026)
@@ -514,7 +514,7 @@ jobs:
           MINIO_ACCESS_KEY: minioadmin
           MINIO_SECRET_KEY: minioadmin
           RIVET: ./target/debug/rivet
-        run: bash dev/e2e/run_e2e.sh
+        run: python3 -m dev.pytools.e2e
 
       - name: Disk snapshot — post-build
         # Surfaces remaining headroom for the test-profile recompile + per-
@@ -583,18 +583,25 @@ jobs:
       - name: Build rivet (debug)
         # Debug, not --release: the matrices probe CLI / config / path SURFACE
         # behavior, not throughput, so the fat-LTO release build buys nothing.
-        # `stage_rivet.sh` honours $RIVET_BIN, so point it at the debug binary.
+        # The staging step honours $RIVET_BIN, so point it at the debug binary.
         run: cargo build --bin rivet
 
       - name: Create matrix navigation links
         env:
           RIVET_BIN: ${{ github.workspace }}/target/debug/rivet
-        run: bash dev/matrices/setup_links.sh
+        run: python3 -m dev.pytools.matrix_common setup-links
 
       - name: Run PR matrix tier
         env:
           RIVET_BIN: ${{ github.workspace }}/target/debug/rivet
-        run: bash dev/matrices/run.sh --tier=pr --skip-compose | tee dev/matrices/run.log
+        # `shell: bash` + pipefail, because Actions' default is `bash -e` WITHOUT
+        # pipefail: `matrices … | tee run.log` exited with tee's status, so this
+        # gate could not fail no matter what the matrices reported. Inherited from
+        # the bash line this replaced — same shape, same silence.
+        shell: bash
+        run: |
+          set -o pipefail
+          python3 -m dev.pytools.matrices --tier=pr --skip-compose | tee dev/matrices/run.log
 
       - name: Upload artifacts on failure
         if: failure()

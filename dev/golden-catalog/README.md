@@ -40,7 +40,7 @@ for a garbage profile with no pinned count), `guards` (the behaviour/bug it pins
 ## Build
 
 ```bash
-bash dev/golden-catalog/build.sh    # rm + rebuild golden_catalog.db from the .sql
+python3 -m dev.pytools.golden_catalog    # rm + rebuild golden_catalog.db from the .sql
 ```
 
 `golden_catalog.sql` is the diffable source of truth; `golden_catalog.db` is the

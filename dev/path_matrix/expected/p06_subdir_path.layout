@@ -9,5 +9,6 @@ out/p06
 out/p06/nested
 out/p06/nested/run
 out/p06/nested/run/_SUCCESS
+out/p06/nested/run/manifest-pa_audit_<RUNID>.json
 out/p06/nested/run/manifest.json
 out/p06/nested/run/pa_audit_<TS>.parquet

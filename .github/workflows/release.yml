@@ -223,9 +223,8 @@ jobs:
         env:
           RELEASE_TAG: ${{ env.RELEASE_TAG }}
         run: |
-          chmod +x dev/scripts/update_homebrew_formula.sh
           GITHUB_REPOSITORY="${{ github.repository }}" \
-            ./dev/scripts/update_homebrew_formula.sh --tag "${RELEASE_TAG}" --sums-file artifacts/SHA256SUMS.txt
+            python3 -m dev.pytools.homebrew_formula --tag "${RELEASE_TAG}" --sums-file artifacts/SHA256SUMS.txt
 
       - name: Push formula to Homebrew tap
         continue-on-error: true

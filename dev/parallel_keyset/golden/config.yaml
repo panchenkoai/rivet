@@ -1,4 +1,5 @@
-# Reference keyset-parallel config for the sparse GOLDEN. `verify.sh` writes a
+# Reference keyset-parallel config for the sparse GOLDEN.
+# `python3 -m dev.pytools.parallel_keyset verify` writes a
 # per-engine copy with the right source.url + table; this documents the shape.
 # The golden holds at parallel=4 + chunk_size=500000 → 20 part files for 10M rows.
 source:

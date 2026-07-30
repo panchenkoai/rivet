@@ -26,7 +26,7 @@ echo "pre-commit: regenerate code-derived docs (schema + reference)"
 cargo build --quiet --bin rivet
 ./target/debug/rivet schema config > schemas/rivet.schema.json
 cp schemas/rivet.schema.json schemas/latest/rivet.schema.json
-RIVET=./target/debug/rivet bash dev/docgen/generate.sh
+RIVET=./target/debug/rivet python3 -m dev.pytools.docgen
 git add -u schemas docs   # stage the regenerated (tracked) schema + reference docs
 
 # Dependency vulnerability gate — mirrors the CI `audit` job and honors the

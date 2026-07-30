@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Dependency-free query interface over matrix.yaml for run.sh — one source of
+"""Dependency-free query interface over matrix.yaml for `python3 -m dev.release_oracle` — one source of
 truth. Deliberately NO PyYAML: a release gate must run on a bare python3 (broken
 pip / missing yaml must never block it). A tiny line scanner over the KNOWN
 matrix.yaml shape is enough; matrix.yaml stays the human-readable spec.

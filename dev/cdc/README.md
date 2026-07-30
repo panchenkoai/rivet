@@ -8,14 +8,14 @@ whose ports are isolated from the batch stack (5432/3306/1433/27017) so a CDC ru
 never contends with batch/smoke work.
 
 ```sh
-dev/cdc/stand.sh up          # bring the cdc profile up, create the mssql `rivet` DB, verify readiness
-dev/cdc/stand.sh verify      # re-check each engine is CDC-ready
-dev/cdc/stand.sh scenarios   # the live_cdc scenario suite (serial — shared DBs race in parallel)
-dev/cdc/stand.sh perf        # capture-throughput matrix, all 4 engines (dev/cdc/perf.sh)
-dev/cdc/stand.sh soak pg     # steady-state memory + completeness soak (dev/cdc_interval/soak_all.sh)
-dev/cdc/stand.sh standby     # opt-in primary+replica pair; bounded-CDC-on-a-standby fails loud
-dev/cdc/stand.sh all         # up + verify + scenarios + perf
-dev/cdc/stand.sh down        # stop the cdc profile
+python3 -m dev.pytools.cdc_stand up          # bring the cdc profile up, create the mssql `rivet` DB, verify readiness
+python3 -m dev.pytools.cdc_stand verify      # re-check each engine is CDC-ready
+python3 -m dev.pytools.cdc_stand scenarios   # the live_cdc scenario suite (serial — shared DBs race in parallel)
+python3 -m dev.pytools.cdc_stand perf        # capture-throughput matrix, all 4 engines
+python3 -m dev.pytools.cdc_stand soak pg     # steady-state memory + completeness soak (python3 -m dev.pytools.cdc_interval soak-all)
+python3 -m dev.pytools.cdc_stand standby     # opt-in primary+replica pair; bounded-CDC-on-a-standby fails loud
+python3 -m dev.pytools.cdc_stand all         # up + verify + scenarios + perf
+python3 -m dev.pytools.cdc_stand down        # stop the cdc profile
 ```
 
 Prereqs: a release `rivet` for representative perf/soak numbers
@@ -79,7 +79,7 @@ by a disable-bound probe).
   machinery ported to CDC.
 - **Multi-pass crash** is proven on PG only; MySQL/Mongo have single-pass crash
   tests but not the re-drain multi-pass window.
-- **Steady-state on Mongo** — `soak_all.sh mongo` now exists but has had less
+- **Steady-state on Mongo** — `python3 -m dev.pytools.cdc_interval soak-all mongo` now exists but has had less
   mileage than the SQL engines.
 - **Mutation sensitivity** of the CDC integration code is largely invisible to
   `cargo mutants --lib` (it is live-covered) — that layer is closed by the live

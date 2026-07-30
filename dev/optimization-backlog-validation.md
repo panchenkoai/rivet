@@ -116,7 +116,7 @@ OPT-6).
    existing DuckDB/pyarrow helpers (`tests/type_roundtrip/{duckdb,pyarrow}_load.rs`);
    assert value + field-metadata equality. Use proptest shrinking to minimize.
 3. CI tiers: small N on PR, large N nightly (mirror the existing
-   `dev/matrices/run.sh --tier` split).
+   `python3 -m dev.pytools.matrices --tier` split).
 
 **Tests.** The harness *is* the test; any mismatch fails with a minimized fixture
 committed under `tests/type_roundtrip/fixtures/`.

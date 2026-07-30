@@ -43,12 +43,12 @@ Examples:
 - R5: `exit 1, msg contains "fingerprint mismatch"; then reset-chunks + revert YAML, R3 export OK`
 - B1: `check OK, 4 exports, no UNSAFE`
 
-### Repeatable smoke (`dev/scripts/run_uat_smoke.sh`)
+### Repeatable smoke (`python3 -m dev.pytools.dev_scripts uat-smoke`)
 
 From repo root:
 
 ```bash
-bash dev/scripts/run_uat_smoke.sh
+python3 -m dev.pytools.dev_scripts uat-smoke
 ```
 
 Summaries go to `/tmp/rivet_uat_smoke.txt`. **Actual** below matches **`bash dev/scripts/run_uat_smoke.sh`**: **31 PASS, 0 FAIL, 3 SKIP** when Postgres is up and MySQL is absent (B3/C5/C6/G2 skipped). A3/H2/O1 use captured stdout/stderr so pipelines do not false-fail. **P2** part-file count **grows** with repeated split runs (`wc -l` ≥ 2). Re-run after `docker compose up -d` / seed for fuller coverage.
@@ -172,8 +172,8 @@ Summaries go to `/tmp/rivet_uat_smoke.txt`. **Actual** below matches **`bash dev
 
 | ID  | Scenario   | Command / Steps                                                   | Expected          | Actual | Pass |
 | --- | ---------- | ----------------------------------------------------------------- | ----------------- | ------ | ---- |
-| I1  | MinIO / S3 | `docker compose up -d minio` then `dev/cloud/run_s3_export.sh`          | Objects in bucket | not in 2026-03-30 smoke | [ ]  |
-| I2  | fake-gcs   | `docker compose up -d fake-gcs` then `dev/cloud/run_gcs_fake_export.sh` | Upload succeeds   | not run in smoke | [ ]  |
+| I1  | MinIO / S3 | `docker compose up -d minio` then `python3 -m dev.pytools.cloud_exports s3`          | Objects in bucket | not in 2026-03-30 smoke | [ ]  |
+| I2  | fake-gcs   | `docker compose up -d fake-gcs` then `python3 -m dev.pytools.cloud_exports gcs-fake` | Upload succeeds   | not run in smoke | [ ]  |
 | I3  | Real GCS   | `rivet run --config dev/cloud/rivet_gcs_rivet_data_test.yaml`           | Files in bucket   | not run in smoke | [ ]  |
 
 
@@ -214,7 +214,7 @@ exports:
 
 | ID  | Scenario      | Command / Steps                                 | Expected                               | Actual | Pass |
 | --- | ------------- | ----------------------------------------------- | -------------------------------------- | ------ | ---- |
-| K1  | Schema change | Run `dev/scripts/test_schema_evolution.sh` (read first) | Second run logs schema change warnings | not run in smoke | [ ]  |
+| K1  | Schema change | Run `python3 -m dev.pytools.dev_scripts schema-evolution` (read first) | Second run logs schema change warnings | not run in smoke | [ ]  |
 
 
 ---
@@ -292,7 +292,7 @@ docker compose up -d postgres toxiproxy
 sleep 5
 
 # 3. Create proxy endpoints (Postgres on 15432, MySQL on 13306)
-bash dev/scripts/setup_toxiproxy.sh
+python3 -m dev.pytools.dev_scripts setup-toxiproxy
 
 # 4. Make sure the DB is seeded
 cargo run --release --bin seed -- --target pg --users 10000
@@ -315,7 +315,7 @@ Verify the proxy API is up: `curl -s http://localhost:8474/proxies | head` shoul
 | Q8  | Final: confirm clean proxy works           | `rivet run --config dev/fixtures/test_toxiproxy_pg.yaml --validate`                                                                                                                       | `status: success` — proxy is back to normal                                                                                               | not in smoke | [ ]  |
 
 
-> **Shortcut:** run `bash dev/scripts/test_retry_toxiproxy.sh` to execute Q1–Q8 automatically.
+> **Shortcut:** run `python3 -m dev.pytools.dev_scripts retry-toxiproxy` to execute Q1–Q8 automatically.
 >
 > **2026-03-30 smoke:** Q1–Q8 not in `run_uat_smoke.sh`; fill **Actual** after Toxiproxy locally.
 

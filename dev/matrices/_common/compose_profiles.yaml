@@ -1,5 +1,11 @@
 # Docker Compose profiles required by each matrix harness.
 #
+# DESCRIPTIVE, not executable: `dev/pytools/matrices.py` re-encodes the service
+# sets in code and calls each seed function directly, so nothing parses this
+# file. It is the human-readable map of what each matrix needs — keep it in
+# step with `matrices.py` by hand (the `seed:` values name the function the
+# orchestrator calls).
+#
 # Primary services (always-on in CI):
 #   postgres  → rivet-postgres-1 (PG 16)
 #   mysql     → rivet-mysql-1 (8.0)
@@ -10,23 +16,23 @@
 matrices:
   cli:
     services: [postgres, mysql]
-    seed: seed_pa_audit.sh
+    seed: matrix_common.seed_pa_audit()
   cfg:
     services: [postgres, mysql]
     seed: null
   path:
     services: [postgres]
-    seed: seed_pa_audit.sh --engines=postgres
+    seed: matrix_common.seed_pa_audit("postgres")
   query:
     services: [postgres]
-    seed: seed_pa_audit.sh --engines=postgres
+    seed: matrix_common.seed_pa_audit("postgres")
   soak:
     services: [postgres]
-    seed: seed_pa_soak.sh
+    seed: matrix_common.seed_pa_soak()
   cross_version:
     services: [postgres, mysql, postgres-12, postgres-13, postgres-14, postgres-15, mysql-57]
     compose_profile: legacy
-    seed: seed_pa_audit_all.sh
+    seed: matrix_common.seed_pa_audit_all()
 
 tiers:
   pr:

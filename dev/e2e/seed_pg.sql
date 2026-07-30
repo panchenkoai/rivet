@@ -1,5 +1,5 @@
 -- Minimal E2E seed for PostgreSQL.
--- Populates only the tables required by run_e2e.sh (users, orders, events).
+-- Populates only the tables required by dev/pytools/e2e.py (users, orders, events).
 -- All other tables are left empty; `rivet init` only reads metadata, not rows.
 --
 -- Usage:

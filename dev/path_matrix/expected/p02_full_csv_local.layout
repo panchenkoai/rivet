@@ -7,5 +7,6 @@
 out
 out/p02
 out/p02/_SUCCESS
+out/p02/manifest-pa_audit_<RUNID>.json
 out/p02/manifest.json
 out/p02/pa_audit_<TS>.csv

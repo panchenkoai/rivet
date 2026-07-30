@@ -1,7 +1,7 @@
 # CLI behavior matrix — regression guard
 
 Part of the matrix family under [`dev/matrices/`](../matrices/README.md).
-Run the full PR tier with `dev/matrices/run.sh --tier=pr`.
+Run the full PR tier with `python3 -m dev.pytools.matrices --tier=pr`.
 
 Reproduces the 0.7.5 audit: drives the rivet binary through every
 subcommand with realistic flag combinations against PostgreSQL and
@@ -32,11 +32,11 @@ docker fixtures, with the actual flag matrix an operator might use.
 docker compose up -d postgres mysql
 cargo build --bin rivet --release
 cp target/release/rivet dev/cli_matrix/rivet
-cd dev/cli_matrix
-./matrix.sh
+# from the repo root:
+python3 -m dev.pytools.matrix_suites cli
 ```
 
-After ~30s the script prints one line per scenario:
+After ~30s the harness prints one line per scenario:
 
 ```
 pg_apply_drift_force          rc=0   stdout=0    stderr=1022   apply --force drifted (F1)
@@ -62,11 +62,12 @@ Before tagging a release:
 
 Two automated guards complement the manual diff:
 
-- `check_rc.sh` — exit-code contract from `expected_rc.txt`.
-- `check_msg.sh` — substring contract from `expected_msg.txt`.
+- `python3 -m dev.pytools.matrix_suites check-rc` — exit-code contract from `expected_rc.txt`.
+- `python3 -m dev.pytools.matrices check-msg --contract dev/cli_matrix/expected_msg.txt
+  --logs dev/cli_matrix/logs` — substring contract from `expected_msg.txt`.
 
-`check_rc.sh` catches "command stopped failing where it should fail" or
-vice versa. `check_msg.sh` catches the class of regression that rc=0
+`check-rc` catches "command stopped failing where it should fail" or
+vice versa. The `check_msg` contract catches the class of regression that rc=0
 masks: a key WARN silently dropped, a noisy log printed N times, an
 error hint reworded, JSON-errors mode polluted by a stray log line.
 Run both in CI; either failing blocks the release.
@@ -80,7 +81,7 @@ purpose from the log directory listing.
 
 ## Adding scenarios
 
-Edit `matrix.sh` and append a `run` line. The convention:
+Edit `dev/pytools/matrix_suites.py` and append a `run` line. The convention:
 
 ```bash
 run <id> "<one-line description>" -- <command...>

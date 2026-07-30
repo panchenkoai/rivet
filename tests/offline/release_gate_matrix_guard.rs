@@ -3,7 +3,7 @@
 //!
 //! Keeps the ledger honest against the gate's REAL config so it can't rot:
 //!   1. `grid.<engine>.gated` == the versions dev/release-oracle/matrix.yaml brings up.
-//!   2. Every `sc_<id>` / `verify_<id>` in scenarios.sh has a ledger row, and every
+//!   2. Every `sc_<id>` / `verify_<id>` in the gate's modules has a ledger row, and every
 //!      ledger scenario / status:test preflight has its function — a new gate check
 //!      with no cell (or a deleted check with a stale cell) fails here.
 //!   3. Every scenario carries a cell for ALL four engines (column-completeness) and
@@ -17,15 +17,20 @@ use serde_yaml_ng::Value;
 
 const GATE_MATRIX: &str = "docs/release-gate-matrix.yaml";
 const ORACLE_MATRIX: &str = "dev/release-oracle/matrix.yaml";
-// scenarios.sh sources the per-stage libs (bigquery.sh, cdc.sh); a gate CHECK
-// function (`sc_*` / `verify_*`) may live in any of them, so the ledger cross-check
-// scans them all — else a stage moved into its own lib (verify_cdc_e2e → cdc.sh)
-// would silently escape the "every gate function has a ledger row" guard.
-const GATE_SH: [&str; 4] = [
-    "dev/release-oracle/lib/scenarios.sh",
-    "dev/release-oracle/lib/cdc.sh",
-    "dev/release-oracle/lib/release_path.sh",
-    "dev/release-oracle/lib/regression.sh",
+// A gate CHECK function (`sc_*` / `verify_*`) may live in any of the gate's
+// per-stage modules, so the ledger cross-check scans them all — else a stage
+// moved into its own module (verify_cdc_e2e → cdc) would silently escape the
+// "every gate function has a ledger row" guard.
+//
+// These are the PYTHON modules: the gate was ported from `dev/release-oracle/
+// lib/*.sh`, and the function names were preserved one-for-one (verified: the
+// same 12 `sc_*`/`verify_*` names in both), so this guard keeps its meaning
+// while pointing at the implementation that actually runs.
+const GATE_PY: [&str; 4] = [
+    "dev/release_oracle/scenarios.py",
+    "dev/release_oracle/cdc.py",
+    "dev/release_oracle/release_path.py",
+    "dev/release_oracle/regression.py",
 ];
 const ENGINES: [&str; 4] = ["postgres", "mysql", "mssql", "mongo"];
 
@@ -98,21 +103,21 @@ fn grid_matches_the_oracle_matrix_versions() {
 
 #[test]
 fn every_gate_function_has_a_ledger_row_and_vice_versa() {
-    let sh: String = GATE_SH
+    let src: String = GATE_PY
         .iter()
         .map(|p| fs::read_to_string(p).unwrap_or_else(|e| panic!("read {p}: {e}")))
         .collect::<Vec<_>>()
         .join("\n");
-    // Function DEFINITIONS live at column 0 (`sc_x() {` / `verify_x() {`); calls are indented.
+    // Function DEFINITIONS live at column 0 (`def sc_x(` / `def verify_x(`); calls are indented.
     let mut sc_fns = BTreeSet::new();
     let mut verify_fns = BTreeSet::new();
-    for line in sh.lines() {
-        if let Some(rest) = line.strip_prefix("sc_")
-            && rest.contains("()")
+    for line in src.lines() {
+        if let Some(rest) = line.strip_prefix("def sc_")
+            && rest.contains('(')
         {
             sc_fns.insert(rest.split('(').next().unwrap().trim().to_string());
-        } else if let Some(rest) = line.strip_prefix("verify_")
-            && rest.contains("()")
+        } else if let Some(rest) = line.strip_prefix("def verify_")
+            && rest.contains('(')
         {
             verify_fns.insert(rest.split('(').next().unwrap().trim().to_string());
         }
@@ -132,19 +137,19 @@ fn every_gate_function_has_a_ledger_row_and_vice_versa() {
     for f in &sc_fns {
         assert!(
             scenario_ids.contains(f),
-            "scenarios.sh defines sc_{f}() but the gate matrix has no `scenarios` row `{f}`"
+            "the gate defines sc_{f}() but the gate matrix has no `scenarios` row `{f}`"
         );
     }
     for id in &scenario_ids {
         assert!(
             sc_fns.contains(id),
-            "gate matrix scenario `{id}` has no sc_{id}() in scenarios.sh (renamed / deleted?)"
+            "gate matrix scenario `{id}` has no sc_{id}() in the gate modules (renamed / deleted?)"
         );
     }
     for f in &verify_fns {
         assert!(
             preflight_ids.contains(f),
-            "scenarios.sh defines verify_{f}() but the gate matrix has no `preflights` row `{f}`"
+            "the gate defines verify_{f}() but the gate matrix has no `preflights` row `{f}`"
         );
     }
     // A preflight marked status:test MUST have its verify_ function; a `gap` preflight
@@ -154,7 +159,7 @@ fn every_gate_function_has_a_ledger_row_and_vice_versa() {
         if p.get("status").map(scalar).as_deref() == Some("test") {
             assert!(
                 verify_fns.contains(&id),
-                "preflight `{id}` is status:test but scenarios.sh has no verify_{id}()"
+                "preflight `{id}` is status:test but the gate modules have no verify_{id}()"
             );
         }
     }

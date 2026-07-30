@@ -19,7 +19,7 @@
 # query appears in the plan JSON (proves substitution actually happened).
 pg_plan_param_used   stderr - was not referenced
 pg_plan_param_used   stdout + WHERE id <= 20
-# Unused param: warning fires exactly once. We assert presence; check_msg.sh
+# Unused param: warning fires exactly once. We assert presence; the check_msg contract
 # additionally enforces the count for keys flagged with `=N` suffix below.
 pg_plan_param_unused stderr + --param 'unused' was not referenced
 pg_plan_param_unused stderr =1 was not referenced
