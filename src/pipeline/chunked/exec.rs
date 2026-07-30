@@ -682,9 +682,18 @@ mod tests {
         )
         .expect("precomputed apply must not touch the source for boundaries");
 
-        // EmptySource emits no batches, so the run is empty — the assertion that
-        // matters is that we got here at all (Detect would have panicked).
+        // EmptySource emits no batches, so the run is empty — reaching this line at
+        // all is the first assertion (Detect would have panicked on the probe).
         assert_eq!(summary.total_rows, 0);
+
+        // And the runner must RECORD why the drift gate was skipped. Without this
+        // the flag's assignment has no offline coverage: the live replay tests are
+        // `#[ignore]`d, so a mutant that drops it survives every gate that runs on
+        // a PR — and the guard would then read a correct apply as a runner-bypass.
+        assert!(
+            summary.chunks_precomputed,
+            "a precomputed chunk source must be recorded on the summary, or              `check_post_run_invariants` cannot tell a by-contract skip from a bypass"
+        );
     }
 
     fn empty_summary(plan: &ResolvedRunPlan) -> RunSummary {

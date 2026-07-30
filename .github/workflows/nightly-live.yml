@@ -269,7 +269,18 @@ jobs:
     # lib cycle, diffed against the committed baseline. The job is GREEN as
     # long as no NEW missed mutant appears — known misses live in
     # docs/mutants-baseline.txt and only ever shrink (gap-ratchet discipline).
-    timeout-minutes: 180
+    #
+    # 360, raised from 180 because the rotation stopped finishing in three hours.
+    # Note this is the CEILING: GitHub-hosted jobs are hard-capped at 6 h, so
+    # there is no headroom left. When a group outgrows it the fix is to SPLIT the
+    # group (a fourth `case` arm), not to raise this number.
+    #
+    # Why a timeout here is worse than a red mutant: the run below ends in
+    # `|| true` precisely so the baseline diff — not the raw exit code — decides
+    # the verdict. A job killed by this timeout never reaches that step, so it
+    # produces no verdict at all, only a red X that says nothing about mutation
+    # coverage.
+    timeout-minutes: 360
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
