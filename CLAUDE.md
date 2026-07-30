@@ -557,6 +557,33 @@ RED-proven. Three rules fell out, each bitten at least twice:
    collides, the fixture needs ≥2 of the thing — same family as the
    "engineer fixtures past activation thresholds" self-oracle rule.
 
+   Sharpened by the row-hash find (0.24.0 pre-release hunt): **an INJECTIVITY
+   or FRAMING guard needs ≥2 FIELDS, because with one field there is no
+   boundary to forge.** `_rivet_row_hash` concatenated cells with a bare `\x1f`
+   and no length from the day it was born (`9aef5cb`, 2026-03-28), so
+   `("a\x1f","b")` and `("a","\x1fb")` were one hash — and its only guard,
+   `hash_distinguishes_null_from_empty`, shipped in the SAME commit with a
+   ONE-column fixture, which cannot express a field boundary at all. It also
+   picked the easy pair: NULL vs `""` is the distinction rivet's own `is_null`
+   branch already made, not NULL vs a value that RENDERS AS the null marker
+   (a lone `\x00`, which collided). Four months green, reading like an
+   injectivity test while testing half of one. When a test's subject is "can
+   two different inputs produce one output", enumerate the ways a value can
+   imitate a DELIMITER, a LENGTH, or ABSENCE — one field tests none of them.
+
+   The same find's second half is a rule about FEATURES, not fixtures: **a new
+   TYPE must be run through every value-consuming mechanism, not just the
+   read/write path.** Arrays (`RivetType::List`, `c2742ef`, 2026-05-12) landed
+   six weeks after the hash and nobody asked whether the hash could
+   canonicalize one — Arrow's container display joins elements with `", "` and
+   renders a NULL element as the EMPTY string, so `["a, b"]` == `["a","b"]` and
+   `[NULL]` == `[""]` == `[]` in the hash. A container's canonical form must be
+   built from its CHILDREN (element count, then each child framed the same way),
+   never from its rendered text; a lossy rendering cannot be rescued by framing
+   the field around it. When adding a type, grep for every hash/checksum/
+   comparison/fingerprint it can now reach and add a per-type injectivity case
+   to each.
+
 3. **A sleep (or any workaround) in a test that compensates for PRODUCT
    behaviour is a product bug report, not a test fix.** The `sleep(1100ms)`
    authors knew rivet stamped filenames at second granularity — the comment
