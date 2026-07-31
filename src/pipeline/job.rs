@@ -1326,6 +1326,7 @@ mod tests {
 
     fn chunked_plan_with_quality(quality: Option<QualityConfig>) -> ResolvedRunPlan {
         ResolvedRunPlan {
+            export_family: String::new(),
             export_name: "orders".into(),
             base_query: "SELECT id FROM orders".into(),
             strategy: ExtractionStrategy::Chunked(ChunkedPlan {

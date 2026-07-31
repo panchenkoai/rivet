@@ -8,7 +8,10 @@
 
 mod aggregate;
 mod apply_cmd;
+#[cfg(not(test))]
 mod cdc_job;
+#[cfg(test)]
+pub(crate) mod cdc_job;
 pub(crate) mod chunked;
 mod cli;
 pub(crate) mod commit;
@@ -268,6 +271,7 @@ mod tests {
 
     fn minimal_plan() -> ResolvedRunPlan {
         ResolvedRunPlan {
+            export_family: String::new(),
             export_name: "test_export".into(),
             base_query: "SELECT 1".into(),
             strategy: ExtractionStrategy::Snapshot,

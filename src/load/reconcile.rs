@@ -273,6 +273,33 @@ pub fn has_active_running_manifest(keyed: &[(String, RunManifest)]) -> bool {
         .any(|(_, m)| m.status == ManifestStatus::Running && !is_superseded(m, keyed))
 }
 
+/// The family a manifest belongs to, WITH upgrade compatibility.
+///
+/// The RECORDED `export_family` when its writer stamped one; otherwise — a
+/// manifest written before the field existed — the legacy substring fold, EXCEPT
+/// that a legacy manifest joins the recorded family of any manifest sharing its
+/// `export_name`.
+///
+/// That exception is the whole upgrade story. A CDC drain writes `export_name` =
+/// the TABLE, so a pre-upgrade drain folds to "orders" while its post-upgrade
+/// successor records "orders_cdc": grouping without this, a prefix mid-upgrade
+/// reports TWO families and the load refuses rivet's own output — permanently,
+/// for every `name:` ≠ `table:` export, at its first post-upgrade load.
+///
+/// It is precise rather than permissive: the match is on the export NAME the two
+/// manifests literally share, so a legacy manifest of a DIFFERENT export joins
+/// nothing and the guard still refuses. Both directions are pinned by tests.
+fn resolved_family<'a>(m: &'a RunManifest, keyed: &'a [(String, RunManifest)]) -> &'a str {
+    if !m.export_family.is_empty() {
+        return &m.export_family;
+    }
+    keyed
+        .iter()
+        .find(|(_, o)| !o.export_family.is_empty() && o.export_name == m.export_name)
+        .map(|(_, o)| o.export_family.as_str())
+        .unwrap_or_else(|| crate::manifest::snapshot_family(&m.export_name))
+}
+
 /// A `running` manifest is SUPERSEDED when a NEWER run of the SAME export exists
 /// (a higher `started_at`) — it crashed and its successor already re-ran, so it
 /// no longer protects anything. The ONE clock-free staleness predicate, shared by
@@ -286,8 +313,7 @@ fn is_superseded(m: &RunManifest, keyed: &[(String, RunManifest)]) -> bool {
     // stayed "active" forever and gc over-deferred cleanup permanently. Same
     // recorded-identity seam as `ensure_single_export`.
     keyed.iter().any(|(_, o)| {
-        crate::manifest::manifest_family(o) == crate::manifest::manifest_family(m)
-            && o.started_at > m.started_at
+        resolved_family(o, keyed) == resolved_family(m, keyed) && o.started_at > m.started_at
     })
 }
 
@@ -411,13 +437,7 @@ fn is_run_unique_manifest(base: &str) -> bool {
 pub fn ensure_single_export(keyed: &[(String, RunManifest)]) -> Result<()> {
     let mut names: std::collections::BTreeSet<&str> = keyed
         .iter()
-        // The RECORDED family when the writer stamped one; the legacy substring
-        // fold only for pre-field manifests. Recording fixes both failure modes
-        // the guess had: the drain (export_name = the TABLE string) and the
-        // snapshot leg (`{export}__snapshot_{table}`) now carry the same family
-        // even when `name:` differs from `table:`, and a user export literally
-        // named `x__snapshot_y` is no longer mis-folded into family `x`.
-        .map(|(_, m)| crate::manifest::manifest_family(m))
+        .map(|(_, m)| resolved_family(m, keyed))
         .filter(|n| !n.is_empty())
         .collect();
     if names.len() > 1 {
@@ -664,45 +684,104 @@ mod tests {
     }
 
     /// The inverse hole the substring fold had: an export the user literally
-    /// NAMED with the infix. Before the recorded family, `daily__snapshot_v2`
+    /// NAMED with the infix. Before the family was recorded, `daily__snapshot_v2`
     /// folded to `daily` and silently DISARMED the shared-prefix guard — a real
-    /// sibling export could sum into the load and be wiped by cleanup. With the
-    /// family recorded, the name is just a name.
+    /// sibling export could sum into the load and be wiped by cleanup.
+    ///
+    /// This test derives both families from `plan::build`, the code that
+    /// actually decides them, instead of hand-setting `export_family`. The
+    /// earlier version typed the expected value in — and passed against a
+    /// product that still mis-folded, because the batch writer folded the name
+    /// at write time. A fixture that states the answer cannot grade it.
     #[test]
     fn a_user_export_named_like_a_snapshot_leg_no_longer_disarms_the_guard() {
+        // Families as the PRODUCT computes them for two sibling batch exports.
+        let daily = crate::config::sample_export("daily");
+        let mut tricky = crate::config::sample_export("daily__snapshot_v2");
+        tricky.snapshot_parent = None; // a user name, not a synthesized leg
+        // Through the PRODUCT's own resolver — `plan::build` records exactly
+        // this into every manifest. A closure re-implementing the rule here is
+        // what let the previous version of this test survive the fold mutant.
+        assert_eq!(daily.family(), "daily");
+        assert_eq!(
+            tricky.family(),
+            "daily__snapshot_v2",
+            "a user export's name is its own family — folding it merges two exports"
+        );
+
         let keyed = |m: RunManifest| ("gs://b/p/manifest-x.json".to_string(), m);
-        let mut daily = manifest("r1", 10, None);
-        daily.export_name = "daily".into();
-        daily.export_family = "daily".into();
-        let mut tricky = manifest("r2", 10, None);
-        tricky.export_name = "daily__snapshot_v2".into();
-        tricky.export_family = "daily__snapshot_v2".into(); // its OWN family
+        let mut a = manifest("r1", 10, None);
+        a.export_name = daily.name.clone();
+        a.export_family = daily.family();
+        let mut b = manifest("r2", 10, None);
+        b.export_name = tricky.name.clone();
+        b.export_family = tricky.family();
         assert!(
-            ensure_single_export(&[keyed(daily), keyed(tricky)]).is_err(),
+            ensure_single_export(&[keyed(a), keyed(b)]).is_err(),
             "two distinct exports must refuse, even when one's NAME contains the infix"
         );
     }
 
-    /// Supersession must group by FAMILY, not by name. A CDC run\'s `running`
-    /// marker carries the EXPORT name while the drain\'s terminal manifest carries
-    /// the TABLE string, so with `name: orders_cdc` / `table: orders` a name-only
-    /// compare never matches — the crashed marker stays "active" forever and gc
-    /// over-defers cleanup permanently under that prefix.
+    /// The synthesized leg is the ONE case where the infix name does mean a
+    /// family: `cdc_job` sets `snapshot_parent`, so the leg and its drain share
+    /// a family even though their names differ.
     #[test]
-    fn a_crashed_running_marker_is_superseded_by_the_drain_of_the_same_family() {
-        let keyed = |m: RunManifest| ("gs://b/p/manifest-x.json".to_string(), m);
-        let mut marker = manifest("r1", 0, None);
-        marker.export_name = "orders_cdc".into();
-        marker.export_family = "orders_cdc".into();
-        marker.status = ManifestStatus::Running;
-        marker.started_at = "2026-07-31T10:00:00Z".into();
-        let mut drain = manifest("r2", 10, None);
-        drain.export_name = "orders".into(); // the TABLE string, as the sink writes
-        drain.export_family = "orders_cdc".into();
-        drain.started_at = "2026-07-31T10:05:00Z".into();
+    fn the_synthesized_snapshot_leg_takes_its_parents_family() {
+        let export = crate::config::sample_export("orders_cdc");
+        let leg = crate::pipeline::cdc_job::synth_snapshot_export_for_test(&export, "orders");
+        assert_eq!(
+            leg.snapshot_parent.as_deref(),
+            Some("orders_cdc"),
+            "the leg must RECORD its parent, not leave it to be re-derived"
+        );
         assert!(
-            !has_active_running_manifest(&[keyed(marker), keyed(drain)]),
-            "a newer terminal run of the SAME FAMILY must supersede the crashed marker"
+            leg.name.contains(crate::manifest::SNAPSHOT_LEG_INFIX),
+            "sanity: the leg is the infix-named export"
+        );
+    }
+
+    /// UPGRADE COMPAT. `export_family` did not exist before this change, so a
+    /// prefix holds BOTH kinds for as long as the old manifests live: a legacy
+    /// CDC drain manifest carries `export_name` = the TABLE and no family (folds
+    /// to "orders"), while a post-upgrade drain records family = the EXPORT
+    /// ("orders_cdc"). Grouping naively then reports TWO families and the load
+    /// refuses rivet\'s own prefix — a regression the field itself would have
+    /// introduced, hitting every scheduled drain+load cadence with `name:` ≠
+    /// `table:` at its first post-upgrade load.
+    ///
+    /// A legacy manifest joins the family of a recorded manifest that shares its
+    /// `export_name` — precise, not permissive: the legacy drain's name IS the
+    /// recorded drain\'s name.
+    #[test]
+    fn a_legacy_manifest_joins_the_recorded_family_of_the_same_export() {
+        let keyed = |m: RunManifest| ("gs://b/p/manifest-x.json".to_string(), m);
+        let mut legacy = manifest("r1", 10, None);
+        legacy.export_name = "orders".into(); // the TABLE, as the old sink wrote
+        legacy.export_family = String::new(); // pre-upgrade: field absent
+        let mut fresh = manifest("r2", 10, None);
+        fresh.export_name = "orders".into();
+        fresh.export_family = "orders_cdc".into();
+        assert!(
+            ensure_single_export(&[keyed(legacy), keyed(fresh)]).is_ok(),
+            "a pre-upgrade manifest beside its post-upgrade successor is ONE export"
+        );
+    }
+
+    /// The other half: tolerance must not blind the guard. A legacy manifest of a
+    /// genuinely DIFFERENT export shares no name with the recorded one, so it
+    /// stays its own family and the prefix is still refused.
+    #[test]
+    fn a_legacy_manifest_of_another_export_is_still_refused() {
+        let keyed = |m: RunManifest| ("gs://b/p/manifest-x.json".to_string(), m);
+        let mut legacy = manifest("r1", 10, None);
+        legacy.export_name = "customers".into();
+        legacy.export_family = String::new();
+        let mut fresh = manifest("r2", 10, None);
+        fresh.export_name = "orders".into();
+        fresh.export_family = "orders_cdc".into();
+        assert!(
+            ensure_single_export(&[keyed(legacy), keyed(fresh)]).is_err(),
+            "a legacy manifest of a DIFFERENT export must still be refused"
         );
     }
 

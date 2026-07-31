@@ -809,6 +809,7 @@ fn builder_to_writer_roundtrips_through_serde_and_keeps_all_fields() {
 
     let mut b = ManifestBuilder::new(
         &plan_snap(),
+        "orders",
         "orders_20260521T120100",
         chrono::Utc::now(),
         "xxh3:0123456789abcdef".into(),
@@ -861,6 +862,7 @@ fn builder_finalize_failed_status_skips_success_marker_through_full_writer() {
 
     let mut b = ManifestBuilder::new(
         &plan_snap(),
+        "orders",
         "orders_20260521T120200",
         chrono::Utc::now(),
         "xxh3:0123456789abcdef".into(),
@@ -903,6 +905,7 @@ fn builder_finalize_brackets_started_at_before_finished_at() {
     let started = chrono::Utc::now();
     let b = ManifestBuilder::new(
         &plan_snap(),
+        "orders",
         "orders_t",
         started,
         "xxh3:0".into(),
@@ -929,6 +932,7 @@ fn builder_records_parts_in_call_order_preserving_part_id_choice() {
     // fill in their own slot index).  The builder must NOT renumber.
     let mut b = ManifestBuilder::new(
         &plan_snap(),
+        "orders",
         "orders_seq",
         chrono::Utc::now(),
         "xxh3:0".into(),
@@ -1003,6 +1007,7 @@ fn schema_fingerprint_in_manifest_matches_state_helper_output() {
     let dest_proxy = local_dest(dir.path());
     let mut b = ManifestBuilder::new(
         &plan_snap(),
+        "orders",
         "orders_fp_match",
         chrono::Utc::now(),
         fp.clone(),
@@ -1590,6 +1595,7 @@ fn summary_schema_fingerprint_flows_into_manifest_via_builder() {
             chunk_key: None,
             resumable: false,
         },
+        "orders",
         &s.run_id,
         chrono::Utc::now(),
         s.schema_fingerprint.clone().unwrap(),

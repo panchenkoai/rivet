@@ -189,6 +189,11 @@ pub(super) fn finalize_manifest(
 
     let mut builder = ManifestBuilder::new(
         snapshot,
+        &if plan.export_family.is_empty() {
+            plan.export_name.clone()
+        } else {
+            plan.export_family.clone()
+        },
         &summary.run_id,
         started_at,
         schema_fingerprint,
@@ -510,40 +515,13 @@ fn rerun_warning_message(uri: &str, marker: &str) -> String {
 /// write failure must never fail the run (gc still has the ledger). The terminal
 /// manifest at finalize OVERWRITES this same run-unique file.
 pub(super) fn write_running_manifest(plan: &ResolvedRunPlan, run_id: &str, started_at: &str) {
-    write_running_marker(
-        &plan.destination,
-        plan.source.source_type,
-        &plan.export_name,
-        "batch",
-        run_id,
-        started_at,
-    );
-}
-
-/// Plan-free core of [`write_running_manifest`], so the CDC path can drop the
-/// same marker. It could not before: this function demanded a
-/// `ResolvedRunPlan`, which `cdc_job` never constructs — so a CDC run had only
-/// the LOCAL ledger suspender, and a cross-host `gc_orphans` (whose
-/// `StateStore::open` creates a fresh empty DB beside the load config) saw "no
-/// active run" over a live stream's unmanifested parts. Proven live before the
-/// fix: a drain crashed between flush and ack left its part in the bucket with
-/// every manifest still pointing at the PREVIOUS run and no Running marker
-/// anywhere.
-pub(super) fn write_running_marker(
-    destination: &crate::config::DestinationConfig,
-    source_type: crate::config::SourceType,
-    export_name: &str,
-    mode: &str,
-    run_id: &str,
-    started_at: &str,
-) {
     use crate::config::{DestinationType, SourceType};
     use crate::manifest::{
         MANIFEST_VERSION, ManifestDestination, ManifestSource, ManifestStatus, RunManifest,
     };
     use crate::pipeline::manifest_writer::write_manifest_without_success_marker;
 
-    let kind = match destination.destination_type {
+    let kind = match plan.destination.destination_type {
         DestinationType::Gcs => "gcs",
         DestinationType::S3 => "s3",
         DestinationType::Azure => "azure",
@@ -551,7 +529,7 @@ pub(super) fn write_running_marker(
         // co-located case, so skip the marker.
         DestinationType::Local | DestinationType::Stdout => return,
     };
-    let engine = match source_type {
+    let engine = match plan.source.source_type {
         SourceType::Postgres => "postgres",
         SourceType::Mysql => "mysql",
         SourceType::Mssql => "mssql",
@@ -561,14 +539,16 @@ pub(super) fn write_running_marker(
         row_hash: None,
         manifest_version: MANIFEST_VERSION,
         run_id: run_id.to_string(),
-        export_family: crate::manifest::snapshot_family(export_name).to_string(),
-        export_name: export_name.to_string(),
-        // The CALLER's pipeline shape. Hardcoded "batch" here made the CDC
-        // marker bounce off its own prefix: the cross-shape guard (finding #44)
-        // refuses to overwrite a 'cdc' manifest with a 'batch' one — correctly —
-        // and the refusal is a debug-level best-effort miss, so the marker was
-        // silently absent exactly where it was being added.
-        mode: mode.to_string(),
+        // A plan.json sealed before the field existed replays with an empty
+        // family; fall back to the export name, which is what such a run always
+        // recorded.
+        export_family: if plan.export_family.is_empty() {
+            plan.export_name.clone()
+        } else {
+            plan.export_family.clone()
+        },
+        export_name: plan.export_name.clone(),
+        mode: "batch".to_string(),
         started_at: started_at.to_string(),
         finished_at: String::new(),
         status: ManifestStatus::Running,
@@ -580,7 +560,7 @@ pub(super) fn write_running_marker(
         },
         destination: ManifestDestination {
             kind: kind.to_string(),
-            uri: destination_uri_for_manifest(destination),
+            uri: destination_uri_for_manifest(&plan.destination),
         },
         format: String::new(),
         compression: String::new(),
@@ -591,12 +571,12 @@ pub(super) fn write_running_marker(
         column_checksums: None,
         checksum_key_column: None,
     };
-    let dest = match crate::destination::create_destination(destination) {
+    let dest = match crate::destination::create_destination(&plan.destination) {
         Ok(d) => d,
         Err(e) => {
             log::debug!(
                 "export '{}': running-manifest destination unavailable (not fatal): {e:#}",
-                export_name
+                plan.export_name
             );
             return;
         }
@@ -604,7 +584,7 @@ pub(super) fn write_running_marker(
     if let Err(e) = write_manifest_without_success_marker(&*dest, &manifest) {
         log::debug!(
             "export '{}': running-manifest write failed (not fatal; gc uses the ledger): {e:#}",
-            export_name
+            plan.export_name
         );
     }
 }
@@ -678,6 +658,7 @@ mod tests {
     fn fin_plan(dest: &std::path::Path) -> crate::plan::ResolvedRunPlan {
         use crate::config::{SourceConfig, SourceType};
         crate::plan::ResolvedRunPlan {
+            export_family: String::new(),
             export_name: "public.orders".into(),
             base_query: "SELECT 1".into(),
             strategy: crate::plan::ExtractionStrategy::Snapshot,

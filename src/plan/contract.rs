@@ -67,6 +67,19 @@ pub struct KeysetPlan {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResolvedRunPlan {
     pub export_name: String,
+    /// The export FAMILY this run belongs to — the parent export for a CDC
+    /// snapshot leg, the export's own name otherwise. Recorded into the manifest
+    /// so consumers that group by export never re-derive it from the name (see
+    /// `RunManifest::export_family`).
+    ///
+    /// `#[serde(default)]` because this type is SEALED INTO `plan.json`: a
+    /// required field here rejects every artifact a user planned with an older
+    /// rivet at `apply` time. That exact break shipped once (`verify`, added
+    /// required, silently rejecting two months of artifacts) — the frozen-plan
+    /// compat test caught this one before commit. An empty family falls back to
+    /// the export name at the writers, matching a pre-field plan's behaviour.
+    #[serde(default)]
+    pub export_family: String,
     /// Final query string (params substituted, query_file loaded).
     pub base_query: String,
     pub strategy: ExtractionStrategy,

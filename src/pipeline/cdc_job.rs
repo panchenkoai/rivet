@@ -72,19 +72,25 @@ pub(super) fn run_cdc_export(
     if let Err(e) = state.begin_run(&run_id, &export.name, &run_prefix, &started_at) {
         log::warn!("cdc: run-status begin failed for '{}': {e:#}", export.name);
     }
-    // The bucket-side suspender the batch path already has. Without it a
-    // cross-host `gc_orphans` — whose `StateStore::open` creates a FRESH empty
-    // DB beside the load config, so `has_active_run_on_prefix` answers a clean
-    // false — saw a live stream's unmanifested parts as crash debris. The
-    // terminal per-table manifests at clean end overwrite/supersede it.
-    super::finalize::write_running_marker(
-        &export.destination,
-        config.source.source_type,
-        &export.name,
-        "cdc",
-        &run_id,
-        &started_at,
-    );
+    // NO bucket-side running marker here — deliberately, and the gap is REAL:
+    // a cross-host `gc_orphans` (whose `StateStore::open` creates a fresh empty
+    // DB beside the load config) still sees a live stream's unmanifested parts
+    // as crash debris. A marker was written here and REVERTED: the sink names
+    // its per-roll durability manifest with the SAME
+    // `run_unique_manifest_name(run_id)` at the SAME prefix, so the first
+    // commit-boundary roll physically overwrote the marker — the protection
+    // lasted exactly one rollover (proven live: after a `rollover: 1` run the
+    // prefix held only the sink's `success` manifest under the marker's own
+    // name). Multi-table is worse: the marker sits at the base prefix while the
+    // terminal manifests land in per-table sub-prefixes, so it is superseded by
+    // its OWN run and swept, and the sub-prefixes never get a marker at all.
+    //
+    // Closing this needs a marker key the sink cannot collide with, a
+    // supersession rule that exempts a run from retiring its own marker, and a
+    // marker per destination prefix. That is a design change, not a call site —
+    // tracked as an open finding rather than shipped half-working, because a
+    // marker that self-destructs is worse than none: it retires the known issue
+    // while leaving the hole open.
 
     let result = run_cdc_inner(config, export, &run_id);
     let duration_ms = started.elapsed().as_millis() as i64;
@@ -249,12 +255,24 @@ pub(super) fn initial_snapshot_pending(
 /// Synthesize the `mode: full` snapshot export for one CDC table — the batch
 /// leg run BEFORE the CDC drain. Pure (no I/O) so the schema-consistency
 /// invariants below are unit-testable.
+/// Test-only door onto [`synth_snapshot_export`], so the load guard's family
+/// tests can derive the leg's identity from the code that BUILDS it rather than
+/// hand-typing the expected family — the fixture bypass that made the earlier
+/// version of that test green against a product which still mis-folded.
+#[cfg(test)]
+pub(crate) fn synth_snapshot_export_for_test(export: &ExportConfig, table: &str) -> ExportConfig {
+    synth_snapshot_export(export, table, &export.destination)
+}
+
 fn synth_snapshot_export(
     export: &ExportConfig,
     table: &str,
     snap_dcfg: &crate::config::DestinationConfig,
 ) -> ExportConfig {
     let mut synth = export.clone();
+    // The leg's family is the PARENT export, recorded here — the one place that
+    // knows, because it is building the name from it.
+    synth.snapshot_parent = Some(export.name.clone());
     synth.name = format!(
         "{}{}{table}",
         export.name,

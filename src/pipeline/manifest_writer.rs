@@ -47,6 +47,7 @@ use crate::pipeline::summary::RunSummary;
 pub struct ManifestBuilder {
     run_id: String,
     export_name: String,
+    export_family: String,
     started_at: chrono::DateTime<chrono::Utc>,
     source: ManifestSource,
     destination: ManifestDestination,
@@ -77,6 +78,11 @@ impl ManifestBuilder {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         plan: &PlanSnapshot,
+        // The export FAMILY (parent for a synthesized CDC snapshot leg, the
+        // export's own name otherwise) — passed rather than folded from the
+        // name, and rather than widened into `PlanSnapshot`, a persisted
+        // journal wire type.
+        export_family: &str,
         run_id: &str,
         started_at: chrono::DateTime<chrono::Utc>,
         schema_fingerprint: String,
@@ -88,6 +94,7 @@ impl ManifestBuilder {
         Self {
             run_id: run_id.to_string(),
             export_name: plan.export_name.clone(),
+            export_family: export_family.to_string(),
             started_at,
             source: ManifestSource {
                 engine: source_engine.to_string(),
@@ -196,12 +203,12 @@ impl ManifestBuilder {
             manifest_version: crate::manifest::MANIFEST_VERSION,
             mode: "batch".to_string(),
             run_id: self.run_id,
-            // For an ordinary export the fold is identity; for the CDC snapshot
-            // leg the name was JUST synthesized as `{parent}__snapshot_{table}`
-            // by cdc_job, so folding here is authoritative, not a guess — this
-            // is the writer recording its own construction, unlike the readers
-            // that used to re-derive it.
-            export_family: crate::manifest::snapshot_family(&self.export_name).to_string(),
+            // The family the PLAN carries — the parent for a synthesized CDC
+            // snapshot leg, the export's own name otherwise. Folding the name
+            // here instead recorded family `daily` for a user export named
+            // `daily__snapshot_v2`, silently merging it with a real sibling
+            // export `daily` and disarming the shared-prefix guard.
+            export_family: self.export_family,
             export_name: self.export_name,
             started_at: self.started_at.to_rfc3339(),
             finished_at: finished_at.to_rfc3339(),
@@ -464,6 +471,7 @@ mod tests {
     fn builder_starts_empty() {
         let b = ManifestBuilder::new(
             &plan_snapshot(),
+            "e",
             "run_001",
             chrono::Utc::now(),
             "xxh3:0000000000000000".into(),
@@ -483,6 +491,7 @@ mod tests {
     fn builder_aggregates_parts_into_self_consistent_manifest() {
         let mut b = ManifestBuilder::new(
             &plan_snapshot(),
+            "e",
             "run_002",
             chrono::Utc::now(),
             "xxh3:0123456789abcdef".into(),
@@ -519,6 +528,7 @@ mod tests {
     fn builder_records_started_and_finished_in_order() {
         let b = ManifestBuilder::new(
             &plan_snapshot(),
+            "e",
             "run_003",
             chrono::Utc::now(),
             "xxh3:0".into(),
@@ -539,6 +549,7 @@ mod tests {
     fn builder_carries_status_through_finalize() {
         let b = ManifestBuilder::new(
             &plan_snapshot(),
+            "e",
             "run_004",
             chrono::Utc::now(),
             "xxh3:0".into(),
@@ -638,6 +649,7 @@ mod tests {
     fn build_manifest_with_run(status: ManifestStatus, run_id: &str) -> RunManifest {
         let mut b = ManifestBuilder::new(
             &plan_snapshot(),
+            "e",
             run_id,
             chrono::Utc::now(),
             "xxh3:0123456789abcdef".into(),
@@ -676,6 +688,7 @@ mod tests {
         // silently absent from the manifest strips validate of its value leg.
         let mut b = ManifestBuilder::new(
             &plan_snapshot(),
+            "e",
             "run_ck",
             chrono::Utc::now(),
             "xxh3:0".into(),
@@ -709,6 +722,7 @@ mod tests {
         // range breaks the incremental continuity audit trail.
         let mut b = ManifestBuilder::new(
             &plan_snapshot(),
+            "e",
             "run_cr",
             chrono::Utc::now(),
             "xxh3:0".into(),

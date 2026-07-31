@@ -134,6 +134,7 @@ mod tests {
 
     fn minimal_plan(strategy: ExtractionStrategy) -> ResolvedRunPlan {
         ResolvedRunPlan {
+            export_family: String::new(),
             export_name: "test".into(),
             base_query: "SELECT 1".into(),
             strategy,

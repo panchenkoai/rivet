@@ -113,6 +113,7 @@ pub fn build_plan(
 
     let (compression, compression_level) = export.effective_compression();
     Ok(ResolvedRunPlan {
+        export_family: export.family(),
         export_name: export.name.clone(),
         base_query,
         strategy,

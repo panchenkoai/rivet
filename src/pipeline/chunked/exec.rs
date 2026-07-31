@@ -596,6 +596,7 @@ mod tests {
 
     fn chunked_plan_struct() -> ResolvedRunPlan {
         ResolvedRunPlan {
+            export_family: String::new(),
             export_name: "orders".into(),
             base_query: "SELECT id FROM orders".into(),
             strategy: ExtractionStrategy::Chunked(ChunkedPlan {

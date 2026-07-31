@@ -340,6 +340,7 @@ mod tests {
 
     fn make_plan(export_name: &str) -> ResolvedRunPlan {
         ResolvedRunPlan {
+            export_family: String::new(),
             export_name: export_name.into(),
             base_query: "SELECT id FROM orders".into(),
             strategy: ExtractionStrategy::Chunked(ChunkedPlan {

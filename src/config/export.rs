@@ -56,6 +56,23 @@ pub enum SchemaDriftPolicy {
 #[serde(deny_unknown_fields)]
 pub struct ExportConfig {
     pub name: String,
+    /// Set ONLY on the CDC snapshot leg `cdc_job` synthesizes: the parent
+    /// export's name, recorded by the code that builds the leg rather than
+    /// re-derived from the `{parent}__snapshot_{table}` name downstream.
+    ///
+    /// Deriving it was wrong in both directions. Folding the name at the writer
+    /// makes a USER export literally named `daily__snapshot_v2` record family
+    /// `daily` — silently merging it with a real sibling export `daily` under a
+    /// shared prefix, which is exactly the cross-contamination the load guard
+    /// exists to refuse. And a CDC export whose own name contains the infix
+    /// folds at the FIRST one, so its leg and drain land in different families
+    /// and the documented `initial: snapshot` flow self-refuses again.
+    ///
+    /// `skip` (not `skip_serializing_if`): this is an internal synthesis marker,
+    /// never a user-writable key, so it must not appear in the schema or the
+    /// config reference.
+    #[serde(skip)]
+    pub snapshot_parent: Option<String>,
     #[serde(default)]
     pub query: Option<String>,
     pub query_file: Option<String>,
@@ -329,6 +346,20 @@ pub struct ExportConfig {
 }
 
 impl ExportConfig {
+    /// The export FAMILY this export's runs belong to: the RECORDED
+    /// `snapshot_parent` for the CDC snapshot leg `cdc_job` synthesizes, the
+    /// export's own name for everything else.
+    ///
+    /// The single place this is decided. It used to be re-derived at each
+    /// writer by folding the name on `__snapshot_`, which merged a user export
+    /// literally named `daily__snapshot_v2` into family `daily` — silently
+    /// disarming the load's shared-prefix guard against its sibling `daily`.
+    pub fn family(&self) -> String {
+        self.snapshot_parent
+            .clone()
+            .unwrap_or_else(|| self.name.clone())
+    }
+
     /// Resolve the effective `(CompressionType, level)` for this export.
     /// `compression_profile` takes precedence over `compression` + `compression_level`.
     ///
@@ -761,6 +792,7 @@ pub enum PartitionGranularity {
 #[cfg(test)]
 pub(crate) fn sample_export(name: &str) -> ExportConfig {
     ExportConfig {
+        snapshot_parent: None,
         name: name.into(),
         target: None,
         load: None,
