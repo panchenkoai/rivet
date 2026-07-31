@@ -50,6 +50,11 @@ pub(crate) struct TableOutput<'a> {
     pub columns: Vec<TypeMapping>,
     pub dest: &'a dyn Destination,
     pub dest_uri: String,
+    /// `_rivet_row_hash` on the drain, using the same Rust render the snapshot
+    /// leg applies (repair-design.md §5h). Carried per TABLE rather than per
+    /// stream because a DECLARED column set names one table's columns; a
+    /// multi-table stream with one is refused at config-load.
+    pub row_hash: crate::config::RowHash,
 }
 
 /// Everything the sink needs that isn't the stream itself. `outputs` carries one
@@ -121,7 +126,12 @@ impl TableSink<'_> {
         // scales can be refined from the data (SQL Server's metadata-only
         // resolve gives a placeholder scale of 0 — the same gap the batch path
         // fills from rows).
-        let sch = ensure_schema(&mut self.schema, &mut self.out.columns, &self.buf);
+        let sch = ensure_schema(
+            &mut self.schema,
+            &mut self.out.columns,
+            &self.buf,
+            &self.out.row_hash,
+        );
         let (part, sums) = flush(
             &self.buf,
             &sch,
@@ -131,6 +141,7 @@ impl TableSink<'_> {
             run_token,
             self.seq,
             self.out.dest,
+            &self.out.row_hash,
         )?;
         for (name, sum) in sums {
             *self.column_sums.entry(name).or_insert(0) ^= sum;
@@ -402,6 +413,7 @@ fn ensure_schema(
     schema: &mut Option<SchemaRef>,
     columns: &mut [TypeMapping],
     events: &[ChangeEvent],
+    row_hash: &crate::config::RowHash,
 ) -> SchemaRef {
     if schema.is_none() {
         refine_decimal_scales(columns, events);
@@ -424,6 +436,13 @@ fn ensure_schema(
                 _ => Field::new(&m.column_name, DataType::Utf8, m.nullable),
             };
             fields.push(field);
+        }
+        if row_hash.enabled() {
+            fields.push(Field::new(
+                crate::enrich::COL_ROW_HASH,
+                DataType::Int64,
+                false,
+            ));
         }
         *schema = Some(Arc::new(Schema::new(fields)));
     }
@@ -491,6 +510,7 @@ fn flush(
     run_token: &str,
     seq: usize,
     dest: &dyn Destination,
+    row_hash: &crate::config::RowHash,
 ) -> Result<(PartRecord, Vec<(String, u64)>)> {
     let ops: ArrayRef = Arc::new(
         events
@@ -634,7 +654,40 @@ fn flush(
         }
         arrays.push(arr);
     }
-    let batch = RecordBatch::try_new(schema.clone(), arrays)?;
+    // `_rivet_row_hash` covers the DATA columns only — never this sink's own
+    // `__op`/`__pos`/`__seq`, which the snapshot leg does not have. Both legs
+    // write the same `__changes` log, so folding the meta columns in here would
+    // give the two legs different hashes for the same row and make the column
+    // useless for exactly the comparison it exists to serve.
+    //
+    // The image the engine actually sent is what gets hashed. For a DELETE that
+    // is the before-image, which some engines populate with only the key
+    // columns; the resulting hash covers NULL content by that engine's own
+    // model, and the audit never reads it, because a tombstoned row is filtered
+    // out (`NOT __is_deleted`).
+    //
+    // `col_sums` deliberately excludes the hash: it records SOURCE column
+    // checksums, and the batch leg likewise omits its own added columns.
+    let batch = if row_hash.enabled() {
+        let data: Vec<String> = columns.iter().map(|m| m.column_name.clone()).collect();
+        let covered = crate::enrich::row_hash_columns_of(&data, row_hash)?;
+        // The batch is assembled twice: once without the hash so the hash can
+        // be computed from it, once with. The alternative — hashing the raw
+        // arrays — would duplicate the row loop this sink already has.
+        let base = Arc::new(Schema::new(
+            schema
+                .fields()
+                .iter()
+                .take(arrays.len())
+                .cloned()
+                .collect::<Vec<_>>(),
+        ));
+        let bare = RecordBatch::try_new(base, arrays.clone())?;
+        arrays.push(crate::enrich::row_hash_array(&bare, &covered)?);
+        RecordBatch::try_new(schema.clone(), arrays)?
+    } else {
+        RecordBatch::try_new(schema.clone(), arrays)?
+    };
 
     let tmp = NamedTempFile::new()?;
     let compression = match format {
@@ -691,6 +744,9 @@ fn build_manifest(
             kind: "cdc".to_string(),
             uri: out.dest_uri.clone(),
         },
+        // From the SAME TableOutput the flush hashed with, so the manifest can
+        // never advertise a contract this run did not apply.
+        row_hash: crate::enrich::RowHashContract::of(&out.row_hash),
         format: format.label().to_string(),
         compression: "zstd".to_string(),
         schema_fingerprint: String::new(),
@@ -1215,6 +1271,7 @@ mod tests {
                 columns: cols.to_vec(),
                 dest,
                 dest_uri: String::new(),
+                row_hash: crate::config::RowHash::All(false),
             }],
             engine: crate::source::cdc::CdcEngine::Mysql,
             format,
@@ -1385,12 +1442,14 @@ mod tests {
                     columns: cols.to_vec(),
                     dest: dest_a,
                     dest_uri: "a".into(),
+                    row_hash: crate::config::RowHash::All(false),
                 },
                 TableOutput {
                     table: "b".into(),
                     columns: cols.to_vec(),
                     dest: dest_b,
                     dest_uri: "b".into(),
+                    row_hash: crate::config::RowHash::All(false),
                 },
             ],
             engine: crate::source::cdc::CdcEngine::Mysql,

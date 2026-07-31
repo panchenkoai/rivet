@@ -15,7 +15,7 @@ Both tiers run in CI (`.github/workflows/ci.yml`):
 - Offline suite runs in the `test` / `test-invariants` / `test-recovery` / `test-compatibility` jobs on every push and PR.
 - Live suite runs in two dedicated jobs:
   - **`test-type-golden`** — starts only Postgres + MySQL, runs `--test live_type_golden -- --ignored`. Named branch-protection gate for type-contract regressions.
-  - **`e2e`** — full stack (Postgres, MySQL, SQL Server, MinIO, fake-gcs, Azurite, Toxiproxy, plus DuckDB/ClickHouse targets and the `cdc` / `replica` / `pool` compose profiles); seeds databases, builds release binary, runs `dev/e2e/run_e2e.sh`, then runs all remaining `--ignored` tests **except the MongoDB suites** (`live_mongo*` / `live_cdc_mongo`), which run in the dedicated nightly `mongo-versions` matrix (4.4 → 8.0, `nightly-live.yml`).
+  - **`e2e`** — full stack (Postgres, MySQL, SQL Server, MinIO, fake-gcs, Azurite, Toxiproxy, plus DuckDB/ClickHouse targets and the `cdc` / `replica` / `pool` compose profiles); seeds databases, builds release binary, runs `python3 -m dev.pytools.e2e`, then runs all remaining `--ignored` tests **except the MongoDB suites** (`live_mongo*` / `live_cdc_mongo`), which run in the dedicated nightly `mongo-versions` matrix (4.4 → 8.0, `nightly-live.yml`).
 
 ## Offline suite
 
@@ -162,8 +162,8 @@ binary through fixture scenarios and diff stdout/stderr/exit codes, file
 layouts, EXPLAIN plans, and perf thresholds against committed baselines.
 
 ```bash
-bash dev/matrices/setup_links.sh   # one-time
-dev/matrices/run.sh --tier=pr      # cli + cfg + path (PR CI)
+python3 -m dev.pytools.matrix_common setup-links   # one-time
+python3 -m dev.pytools.matrices --tier=pr      # cli + cfg + path (PR CI)
 ```
 
 See [`dev/matrices/README.md`](https://github.com/panchenkoai/rivet/blob/main/dev/matrices/README.md) for the full taxonomy

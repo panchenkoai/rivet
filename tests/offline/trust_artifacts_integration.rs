@@ -94,6 +94,7 @@ fn summary(
 ) -> RunSummary {
     let mut s = RunSummary::stub_for_testing(run_id, export_name)
         .with_plan_snapshot(PlanSnapshot {
+            row_hash: None,
             export_name: export_name.into(),
             base_query: format!("SELECT * FROM {export_name}"),
             strategy: "snapshot".into(),
@@ -144,6 +145,7 @@ fn build_manifest(run_id: &str, status: ManifestStatus, parts: Vec<ManifestPart>
         .filter(|p| p.status == PartStatus::Committed)
         .count() as u32;
     RunManifest {
+        row_hash: None,
         mode: "batch".to_string(),
         manifest_version: MANIFEST_VERSION,
         run_id: run_id.into(),
@@ -782,6 +784,7 @@ fn manifest_constants_match_adr_0012() {
 
 fn plan_snap() -> PlanSnapshot {
     PlanSnapshot {
+        row_hash: None,
         export_name: "public.orders".into(),
         base_query: "SELECT * FROM orders".into(),
         strategy: "snapshot".into(),
@@ -1571,6 +1574,7 @@ fn summary_schema_fingerprint_flows_into_manifest_via_builder() {
     // builder API the way job.rs does and assert the manifest carries it.
     let mut b = ManifestBuilder::new(
         &PlanSnapshot {
+            row_hash: None,
             export_name: s.export_name.clone(),
             base_query: "SELECT * FROM orders".into(),
             strategy: "chunked".into(),

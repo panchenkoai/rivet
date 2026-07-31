@@ -5,7 +5,8 @@
 //! | ID | Scenario | Contract |
 //! |---|---|---|
 //! | PA-L1 | Plan + Apply full-mode round-trip | PA1, PA7 — artifact is comm channel; state writes |
-//! | PA-L2 | Plan + Apply chunked round-trip | PA5 — chunk ranges pre-computed and replayed |
+//! | PA-L2 | Plan + Apply chunked round-trip | PA5 — chunk ranges pre-computed (outcome only) |
+//! | PA-L2b | Apply after the source grew | PA5 — the artifact's ranges are REPLAYED, not re-detected |
 //! | PA-L3 | Plan `--format pretty` prints summary to stdout | PA1 — no file written |
 //! | PA-L4 | Plaintext URL credentials redacted in plan JSON | PA9 |
 //! | PA-L5 | Expired plan (> 24 h) rejected without --force | PA3 |
@@ -247,6 +248,137 @@ fn plan_and_apply_chunked_export_round_trip_uses_precomputed_ranges() {
         dir_parquet_id_set(out_dir.path()),
         (0..150).collect::<std::collections::BTreeSet<i64>>(),
         "chunked round-trip must hold every source id 0..150"
+    );
+}
+
+// ─── PA-L2b: apply REPLAYS the artifact's ranges — it does not re-detect ──────
+
+/// The discriminating half of PA5, which PA-L2 above cannot express.
+///
+/// PA-L2 plans 150 rows at `chunk_size: 50`, applies, and asserts 3 files /
+/// 150 rows / ids 0..150. Every one of those assertions is satisfied *equally*
+/// by replaying the artifact's ranges and by re-detecting them from the live
+/// source: the fixture is unchanged between plan and apply, so `SELECT
+/// min(id), max(id)` reproduces exactly the windows the artifact already holds.
+/// The test is named `..._uses_precomputed_ranges` and its contract table says
+/// "pre-computed and replayed", but it passed for months while `rivet apply`
+/// re-detected on the sequential path — the name described an intention the
+/// code did not have.
+///
+/// To tell the two apart the source must CHANGE between plan and apply, so the
+/// planned windows and the live ones disagree:
+///
+///   plan  → 150 rows (ids 0..149), chunk_size 50 → 3 ranges in the artifact
+///   then  → insert ids 150..299
+///   apply → replay: 3 files, 150 rows (the PLAN's windows)
+///           re-detect: min/max is now 0..299 → 6 windows → 6 files, 300 rows
+///
+/// Ignoring rows added after planning is the POINT of `apply`, not a defect:
+/// the artifact is the unit of execution, which is why staleness is warned at
+/// 1 h and refused at 24 h rather than silently re-planned.
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn apply_replays_the_artifacts_ranges_and_ignores_rows_added_after_planning() {
+    // Both chunked runners that reach `run_export`. Measured against the released
+    // 0.23.1 binary, BOTH re-detected — plain chunked and chunk_checkpoint alike
+    // produced 6 files / 300 rows where the artifact pinned 3 windows / 150 rows.
+    // (`parallel:` takes a different dispatch tier and already replayed.) One case
+    // would leave the other free to regress alone.
+    for extra in ["", "\n    chunk_checkpoint: true"] {
+        apply_replay_case(extra);
+    }
+}
+
+fn apply_replay_case(extra_mode_lines: &str) {
+    require_alive(LiveService::Postgres);
+
+    let table = seed_pg_numeric_table(150);
+    let out_dir = tempfile::tempdir().unwrap();
+    let cfg_dir = tempfile::tempdir().unwrap();
+
+    let mode_block =
+        format!("mode: chunked\n    chunk_column: id\n    chunk_size: 50{extra_mode_lines}");
+    let yaml = pg_url_env_config(table.name(), &mode_block, out_dir.path());
+    let cfg = write_config(&cfg_dir, &yaml);
+    let plan_path = cfg_dir.path().join("plan.json");
+
+    let plan_out = std::process::Command::new(RIVET_BIN)
+        .args([
+            "plan",
+            "--config",
+            cfg.to_str().unwrap(),
+            "--export",
+            table.name(),
+            "--format",
+            "json",
+            "--output",
+            plan_path.to_str().unwrap(),
+        ])
+        .env("DATABASE_URL", POSTGRES_URL)
+        .output()
+        .expect("spawn rivet plan");
+    assert!(
+        plan_out.status.success(),
+        "rivet plan (chunked) must exit 0; stderr:\n{}",
+        String::from_utf8_lossy(&plan_out.stderr)
+    );
+
+    let plan: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&plan_path).expect("read plan.json"))
+            .unwrap();
+    assert_eq!(
+        plan["computed"]["chunk_ranges"]
+            .as_array()
+            .expect("chunk_ranges")
+            .len(),
+        3,
+        "the artifact must carry the 3 windows planned against 150 rows"
+    );
+
+    // The source moves on AFTER the plan was written.
+    {
+        let mut c = pg_connect();
+        let mut sql = format!(
+            "INSERT INTO {} (id, name, amount, created_at) VALUES ",
+            table.name()
+        );
+        for i in 150..300i64 {
+            if i > 150 {
+                sql.push(',');
+            }
+            sql.push_str(&format!("({i}, 'r{i}', {i}.00, now())"));
+        }
+        c.batch_execute(&sql).expect("insert rows after planning");
+    }
+
+    let apply_out = std::process::Command::new(RIVET_BIN)
+        .args(["apply", plan_path.to_str().unwrap()])
+        .env("DATABASE_URL", POSTGRES_URL)
+        .output()
+        .expect("spawn rivet apply");
+    assert!(
+        apply_out.status.success(),
+        "rivet apply (chunked) must exit 0; stderr:\n{}",
+        String::from_utf8_lossy(&apply_out.stderr)
+    );
+
+    let parquet = files_with_extension(out_dir.path(), "parquet");
+    assert_eq!(
+        parquet.len(),
+        3,
+        "apply must execute the artifact's 3 windows, not re-detect 6 from the \
+         grown table; found: {parquet:?}"
+    );
+    assert_eq!(
+        total_parquet_rows(out_dir.path()),
+        150,
+        "apply must move only the rows its plan covered"
+    );
+    assert_eq!(
+        dir_parquet_id_set(out_dir.path()),
+        (0..150).collect::<std::collections::BTreeSet<i64>>(),
+        "the ids must be exactly the planned range — rows added after planning \
+         belong to the next run, not this artifact"
     );
 }
 

@@ -24,17 +24,17 @@ and compare against generous per-scenario thresholds.
 ```bash
 docker compose up -d postgres
 cargo build --bin rivet --release
-bash dev/matrices/setup_links.sh   # if not done yet
-bash dev/soak_matrix/gen_fixtures.sh
-bash dev/matrices/_common/seed_pa_soak.sh
+python3 -m dev.pytools.matrix_common setup-links   # if not done yet
+python3 -m dev.pytools.matrix_suites gen-fixtures soak
+python3 -m dev.pytools.matrix_common seed-pa-soak
 cp target/release/rivet dev/soak_matrix/rivet
-cd dev/soak_matrix && ./matrix.sh
+python3 -m dev.pytools.matrix_suites soak
 ```
 
 Or via the orchestrator:
 
 ```bash
-dev/matrices/run.sh --matrix=soak --build
+python3 -m dev.pytools.matrices --matrix=soak --build
 ```
 
 ## Thresholds
@@ -54,6 +54,6 @@ avoid CI flapping. They catch order-of-magnitude regressions, not micro-tuning.
 
 When a perf change is intentional:
 
-1. Run `./matrix.sh` — NEW scenarios print suggested metrics.
+1. Run `python3 -m dev.pytools.matrix_suites soak` — NEW scenarios print suggested metrics.
 2. Copy `logs/<id>/metrics` values into `expected/<id>.thresholds`.
 3. Document in CHANGELOG.

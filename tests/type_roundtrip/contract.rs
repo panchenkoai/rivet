@@ -152,7 +152,11 @@ fn contract_timestamptz_carries_utc_not_none() {
 }
 
 #[test]
-fn contract_no_silent_float_for_decimal_precision() {
+fn contract_yaml_documents_decimals_as_decimal_not_float() {
+    // Reads the fixture on BOTH sides, so it cannot observe routing. The real
+    // guard against a silent Float64 is `contract_arrow_types_match_documented_shape`
+    // above, which calls `rivet_type_to_arrow`. Verified: 0 of 55 rows are
+    // `tested: planned`, so no decimal escapes that check.
     // Regression guard: money columns must never route through Float64.
     let mut seen = HashMap::new();
     let raw = load_fixture("expected_contracts.yaml");

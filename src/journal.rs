@@ -60,6 +60,14 @@ pub struct PlanSnapshot {
     /// so a pre-existing journal deserializes as `false`.
     #[serde(default)]
     pub resumable: bool,
+    /// The row-hash contract this run wrote, when `meta_columns.row_hash` was
+    /// configured. Persisted so a post-mortem from the state DB alone can answer
+    /// "which columns does this table's `_rivet_row_hash` actually cover" — the
+    /// question an auditor must settle before trusting the column, and one the
+    /// warehouse itself cannot answer: the column's existence says nothing about
+    /// its coverage. `#[serde(default)]` so an older journal still deserializes.
+    #[serde(default)]
+    pub row_hash: Option<crate::enrich::RowHashContract>,
 }
 
 // ─── Events ──────────────────────────────────────────────────────────────────
@@ -76,7 +84,10 @@ pub struct PlanSnapshot {
 pub enum RunEvent {
     // ── Planned ──────────────────────────────────────────────
     /// Emitted once at the start of a run with a snapshot of the resolved plan.
-    PlanResolved(PlanSnapshot),
+    /// Boxed: `PlanSnapshot` is by far the largest variant here (a dozen owned
+    /// Strings and the content-hash contract), and an unboxed one makes every
+    /// `RunEvent` in the journal pay its size.
+    PlanResolved(Box<PlanSnapshot>),
     /// A plan validation diagnostic at `Warning` or `Degraded` level.
     PlanWarning { rule: String, message: String },
 
@@ -201,7 +212,7 @@ impl RunJournal {
     pub fn plan_snapshot(&self) -> Option<&PlanSnapshot> {
         self.entries.iter().find_map(|e| {
             if let RunEvent::PlanResolved(s) = &e.event {
-                Some(s)
+                Some(&**s)
             } else {
                 None
             }
@@ -355,6 +366,7 @@ mod tests {
 
     fn snap() -> PlanSnapshot {
         PlanSnapshot {
+            row_hash: None,
             export_name: "orders".into(),
             base_query: "SELECT 1".into(),
             strategy: "snapshot".into(),
@@ -417,7 +429,7 @@ mod tests {
     #[test]
     fn plan_snapshot_returns_first_resolved() {
         let mut j = journal();
-        j.record(RunEvent::PlanResolved(snap()));
+        j.record(RunEvent::PlanResolved(Box::new(snap())));
         let s = j.plan_snapshot().unwrap();
         assert_eq!(s.export_name, "orders");
         assert_eq!(s.batch_size, 1000);

@@ -1,0 +1,332 @@
+# Version-matrix dev stand — SEPARATE compose project from the repo's
+# canonical docker-compose.yaml (which owns the ports the live-test Rig
+# expects). Run from this directory; the project name is `stand`.
+#
+#   Batch tier (heavy deterministic common seed, identical across engines):
+#     docker compose --profile batch up -d
+#   CDC tier (same engine matrix, light seed, CDC server-side config):
+#     docker compose --profile cdc up -d
+#
+# The tiers are INDEPENDENT — separate containers, ports, volumes.
+# After first boot run ./up.sh (idempotent) — it seeds the MSSQL instances
+# (no initdb hook in that image) and the CDC Mongo replica sets (initdb
+# can't write before the replica set elects a PRIMARY), then cross-checks
+# the common seed with ./verify.sh.
+#
+# Port scheme (memorable: <base><version>):
+#   PostgreSQL   batch 5514 (v14) / 5518 (v18)     cdc 5614 / 5618
+#   MySQL        batch 3557 (5.7) / 3580 (8.0)     cdc 3657 / 3680
+#   SQL Server   batch 1519 (2019)/ 1522 (2022)    cdc 1619 / 1622
+#   MongoDB      batch 27104/27105/27108 (4.4/5/8) cdc 27204/27205/27208
+#
+# Credentials everywhere: rivet/rivet, db `rivet` (MSSQL: sa/Rivet_Passw0rd!).
+# Local object stores (MinIO 9000, fake-gcs 4443, azurite 10000) live in the
+# canonical rivet compose project — not duplicated here.
+
+x-pg-env: &pg-env
+  POSTGRES_USER: rivet
+  POSTGRES_PASSWORD: rivet
+  POSTGRES_DB: rivet
+
+x-mysql-env: &mysql-env
+  MYSQL_ROOT_PASSWORD: rivet
+  MYSQL_USER: rivet
+  MYSQL_PASSWORD: rivet
+  MYSQL_DATABASE: rivet
+
+x-mssql-env: &mssql-env
+  ACCEPT_EULA: "Y"
+  MSSQL_SA_PASSWORD: "Rivet_Passw0rd!"
+  MSSQL_PID: Developer
+
+x-pg-health: &pg-health
+  test: ["CMD-SHELL", "pg_isready -U rivet"]
+  interval: 5s
+  timeout: 3s
+  retries: 30
+
+x-mysql-health: &mysql-health
+  test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-privet"]
+  interval: 5s
+  timeout: 3s
+  retries: 30
+
+# 2022 ships sqlcmd in /opt/mssql-tools18 (needs -C for the self-signed cert);
+# 2019 ships it in /opt/mssql-tools (ODBC 17, no -C). Try both.
+x-mssql-health: &mssql-health
+  test:
+    [
+      "CMD-SHELL",
+      "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P \"$$MSSQL_SA_PASSWORD\" -C -Q 'SELECT 1' || /opt/mssql-tools/bin/sqlcmd -S localhost -U sa -P \"$$MSSQL_SA_PASSWORD\" -Q 'SELECT 1' || exit 1",
+    ]
+  interval: 10s
+  timeout: 5s
+  retries: 30
+
+# Standalone mongod health: plain ping (mongosh on 5+, mongo on 4.4).
+x-mongo-health: &mongo-health
+  test: ["CMD-SHELL", "mongosh --quiet --eval 'db.runCommand({ping:1})' || mongo --quiet --eval 'db.runCommand({ping:1})'"]
+  interval: 5s
+  timeout: 5s
+  retries: 60
+  start_period: 30s
+
+# Replica-set mongod health: idempotently initiate rs0 and report healthy only
+# once THIS node is PRIMARY (else change streams error 13436). Gate on
+# `!rs.status().ok` (4.4's legacy shell RETURNS {ok:0} instead of throwing) and
+# on isMaster().ismaster (hello is 5.0+). Same trick as the canonical compose.
+x-mongo-rs-health: &mongo-rs-health
+  test: ["CMD-SHELL", "mongosh --quiet --eval 'var st; try{st=rs.status()}catch(e){st={ok:0}}; if(!st.ok){try{rs.initiate({_id:\"rs0\",members:[{_id:0,host:\"127.0.0.1:27017\"}]})}catch(e){}}; db.isMaster().ismaster?quit(0):quit(1)' || mongo --quiet --eval 'var st; try{st=rs.status()}catch(e){st={ok:0}}; if(!st.ok){try{rs.initiate({_id:\"rs0\",members:[{_id:0,host:\"127.0.0.1:27017\"}]})}catch(e){}}; db.isMaster().ismaster?quit(0):quit(1)'"]
+  interval: 5s
+  timeout: 5s
+  retries: 60
+  start_period: 10s
+
+services:
+  # ════════════════════════════ BATCH TIER ═══════════════════════════════
+  # Heavy deterministic seed: users 50k / orders 200k / events 500k, the
+  # same rows on every engine (seeds/common/*). Seeds run on FIRST boot of
+  # an empty volume only.
+
+  pg14-batch:
+    image: postgres:14
+    profiles: ["batch"]
+    restart: unless-stopped
+    environment: *pg-env
+    ports: ["5514:5432"]
+    volumes:
+      - pg14_batch_data:/var/lib/postgresql/data
+      - ./seeds/common/postgres.sql:/docker-entrypoint-initdb.d/seed.sql:ro
+    healthcheck: *pg-health
+
+  pg18-batch:
+    image: postgres:18
+    profiles: ["batch"]
+    restart: unless-stopped
+    environment: *pg-env
+    ports: ["5518:5432"]
+    volumes:
+      # 18+ images moved the data volume up a level (PGDATA=/var/lib/postgresql/18/docker)
+      - pg18_batch_data:/var/lib/postgresql
+      - ./seeds/common/postgres.sql:/docker-entrypoint-initdb.d/seed.sql:ro
+    healthcheck: *pg-health
+
+  mysql57-batch:
+    image: mysql:5.7
+    platform: linux/amd64   # no arm64 image; Rosetta
+    profiles: ["batch"]
+    restart: unless-stopped
+    command: ["--default-authentication-plugin=mysql_native_password", "--max-allowed-packet=67108864"]
+    environment: *mysql-env
+    ports: ["3557:3306"]
+    volumes:
+      - mysql57_batch_data:/var/lib/mysql
+      - ./seeds/common/mysql.sql:/docker-entrypoint-initdb.d/seed.sql:ro
+    healthcheck: *mysql-health
+
+  mysql80-batch:
+    image: mysql:8.0
+    profiles: ["batch"]
+    restart: unless-stopped
+    command: ["--default-authentication-plugin=mysql_native_password"]
+    environment: *mysql-env
+    ports: ["3580:3306"]
+    volumes:
+      - mysql80_batch_data:/var/lib/mysql
+      - ./seeds/common/mysql.sql:/docker-entrypoint-initdb.d/seed.sql:ro
+    healthcheck: *mysql-health
+
+  mssql2019-batch:
+    image: mcr.microsoft.com/mssql/server:2019-latest
+    profiles: ["batch"]
+    restart: unless-stopped
+    environment: *mssql-env
+    ports: ["1519:1433"]
+    volumes:
+      - mssql2019_batch_data:/var/opt/mssql
+    healthcheck: *mssql-health
+
+  mssql2022-batch:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    profiles: ["batch"]
+    restart: unless-stopped
+    environment: *mssql-env
+    ports: ["1522:1433"]
+    volumes:
+      - mssql2022_batch_data:/var/opt/mssql
+    healthcheck: *mssql-health
+
+  # Mongo batch: standalone; heavy PERF collections (orders 200k, events
+  # 500k — deliberately similar in shape/volume to the SQL seed, but not
+  # required to match it row-for-row). Seeded by up.sh: seeds/mongo_seed.py →
+  # mongoimport (no initdb hook so the seed pipeline stays python+bash).
+  mongo44-batch:
+    image: mongo:4.4
+    profiles: ["batch"]
+    restart: unless-stopped
+    ports: ["27104:27017"]
+    volumes:
+      - mongo44_batch_data:/data/db
+    healthcheck: *mongo-health
+
+  mongo50-batch:
+    image: mongo:5.0
+    profiles: ["batch"]
+    restart: unless-stopped
+    ports: ["27105:27017"]
+    volumes:
+      - mongo50_batch_data:/data/db
+    healthcheck: *mongo-health
+
+  mongo80-batch:
+    image: mongo:8.0
+    profiles: ["batch"]
+    restart: unless-stopped
+    ports: ["27108:27017"]
+    volumes:
+      - mongo80_batch_data:/data/db
+    healthcheck: *mongo-health
+
+  # ════════════════════════════ CDC TIER ═════════════════════════════════
+  # Same engine matrix, VERY light seed (seeds/cdc/*, 10 rows/table), plus
+  # the server-side CDC prerequisites: logical WAL (PG), row binlog (MySQL),
+  # the Agent (MSSQL), a single-node replica set (Mongo change streams).
+
+  pg14-cdc:
+    image: postgres:14
+    profiles: ["cdc"]
+    restart: unless-stopped
+    command: ["-c", "wal_level=logical", "-c", "max_replication_slots=32"]
+    environment: *pg-env
+    ports: ["5614:5432"]
+    volumes:
+      - pg14_cdc_data:/var/lib/postgresql/data
+      - ./seeds/cdc/postgres.sql:/docker-entrypoint-initdb.d/seed.sql:ro
+    healthcheck: *pg-health
+
+  pg18-cdc:
+    image: postgres:18
+    profiles: ["cdc"]
+    restart: unless-stopped
+    command: ["-c", "wal_level=logical", "-c", "max_replication_slots=32"]
+    environment: *pg-env
+    ports: ["5618:5432"]
+    volumes:
+      # 18+ images moved the data volume up a level (PGDATA=/var/lib/postgresql/18/docker)
+      - pg18_cdc_data:/var/lib/postgresql
+      - ./seeds/cdc/postgres.sql:/docker-entrypoint-initdb.d/seed.sql:ro
+    healthcheck: *pg-health
+
+  mysql57-cdc:
+    image: mysql:5.7
+    platform: linux/amd64
+    profiles: ["cdc"]
+    restart: unless-stopped
+    # 5.7: binlog is OFF by default — enable + ROW format. (No
+    # binlog-row-metadata flag before 8.0.1, so the sink maps positionally.)
+    command:
+      - "--default-authentication-plugin=mysql_native_password"
+      - "--server-id=57"
+      - "--log-bin=binlog"
+      - "--binlog-format=ROW"
+    environment: *mysql-env
+    ports: ["3657:3306"]
+    volumes:
+      - mysql57_cdc_data:/var/lib/mysql
+      - ./seeds/cdc/mysql.sql:/docker-entrypoint-initdb.d/seed.sql:ro
+    healthcheck: *mysql-health
+
+  mysql80-cdc:
+    image: mysql:8.0
+    profiles: ["cdc"]
+    restart: unless-stopped
+    command:
+      - "--default-authentication-plugin=mysql_native_password"
+      - "--server-id=80"
+      - "--log-bin=binlog"
+      - "--binlog-format=ROW"
+      - "--binlog-row-metadata=FULL"
+    environment: *mysql-env
+    ports: ["3680:3306"]
+    volumes:
+      - mysql80_cdc_data:/var/lib/mysql
+      - ./seeds/cdc/mysql.sql:/docker-entrypoint-initdb.d/seed.sql:ro
+    healthcheck: *mysql-health
+
+  mssql2019-cdc:
+    image: mcr.microsoft.com/mssql/server:2019-latest
+    profiles: ["cdc"]
+    restart: unless-stopped
+    environment:
+      <<: *mssql-env
+      MSSQL_AGENT_ENABLED: "true"   # the Agent runs the CDC capture job
+    ports: ["1619:1433"]
+    volumes:
+      - mssql2019_cdc_data:/var/opt/mssql
+    healthcheck: *mssql-health
+
+  mssql2022-cdc:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    profiles: ["cdc"]
+    restart: unless-stopped
+    environment:
+      <<: *mssql-env
+      MSSQL_AGENT_ENABLED: "true"
+    ports: ["1622:1433"]
+    volumes:
+      - mssql2022_cdc_data:/var/opt/mssql
+    healthcheck: *mssql-health
+
+  # Mongo CDC: single-node replica sets (change streams need one). initdb
+  # scripts can't write before the RS elects a PRIMARY, so the light seed is
+  # applied by up.sh AFTER the healthcheck turns green. Clients connect with
+  # ?directConnection=true.
+  mongo44-cdc:
+    image: mongo:4.4
+    profiles: ["cdc"]
+    restart: unless-stopped
+    command: ["--replSet", "rs0", "--bind_ip_all"]
+    ports: ["27204:27017"]
+    volumes:
+      - mongo44_cdc_data:/data/db
+    healthcheck: *mongo-rs-health
+
+  mongo50-cdc:
+    image: mongo:5.0
+    profiles: ["cdc"]
+    restart: unless-stopped
+    command: ["--replSet", "rs0", "--bind_ip_all"]
+    ports: ["27205:27017"]
+    volumes:
+      - mongo50_cdc_data:/data/db
+    healthcheck: *mongo-rs-health
+
+  mongo80-cdc:
+    image: mongo:8.0
+    profiles: ["cdc"]
+    restart: unless-stopped
+    command: ["--replSet", "rs0", "--bind_ip_all"]
+    ports: ["27208:27017"]
+    volumes:
+      - mongo80_cdc_data:/data/db
+    healthcheck: *mongo-rs-health
+
+volumes:
+  pg14_batch_data:
+  pg18_batch_data:
+  mysql57_batch_data:
+  mysql80_batch_data:
+  mssql2019_batch_data:
+  mssql2022_batch_data:
+  mongo44_batch_data:
+  mongo50_batch_data:
+  mongo80_batch_data:
+  pg14_cdc_data:
+  pg18_cdc_data:
+  mysql57_cdc_data:
+  mysql80_cdc_data:
+  mssql2019_cdc_data:
+  mssql2022_cdc_data:
+  mongo44_cdc_data:
+  mongo50_cdc_data:
+  mongo80_cdc_data:

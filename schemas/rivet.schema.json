@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "Rivet config (rivet-cli 0.23.1)",
+  "title": "Rivet config (rivet-cli 0.24.0)",
   "description": "Top-level Rivet configuration root.\n\nOperators write this struct as YAML (typically `rivet.yaml`).  The\n`JsonSchema` derive is the source of truth for the `schemas/rivet.schema.json`\nartifact and the `rivet schema config` command's output (v0.7.3 P0).",
   "type": "object",
   "properties": {
@@ -827,7 +827,7 @@
       "type": "object",
       "properties": {
         "initial": {
-          "description": "First-run behaviour: `snapshot` = anchor → full snapshot → drain (see\n[`CdcInitialMode`]). Omitted ⇒ capture changes only (the default; the\noperator owns the initial load).",
+          "description": "First-run behaviour: `snapshot` = anchor → full snapshot → drain (see\n[`CdcInitialMode`]). Omitted ⇒ capture changes only, with no anchor step\n(the default; the operator owns the initial load).\n\n`snapshot` anchors, and on engines with no server-side anchor (MySQL, SQL\nServer) that makes `checkpoint:` mandatory — the checkpoint file IS the\nanchor there.\n\nThis doc line is what the generated config reference renders, so every\naccepted value must be explained HERE: the reference lists the variants\nfrom the enum but describes only this sentence, so an explanation left on\na variant alone documents a value the reader is told exists and never told\nthe meaning of.",
           "anyOf": [
             {
               "$ref": "#/$defs/CdcInitialMode"
@@ -1112,11 +1112,27 @@
           "default": false
         },
         "row_hash": {
-          "type": "boolean",
+          "$ref": "#/$defs/RowHash",
           "default": false
         }
       },
       "additionalProperties": false
+    },
+    "RowHash": {
+      "description": "What `_rivet_row_hash` covers.\n\n`true` folds every column of the export's result set — the original\nbehaviour, kept because it is what existing configs say. It is the weaker\nform: neither side of a later comparison can state WHICH columns were\nhashed, so coverage has to be inferred from the query, and a column whose\nvalue legitimately differs between two systems (a load timestamp, a\nsurrogate key) cannot be excluded without dropping it from the export.\n\nA declared list fixes both. The covered set is recorded in the run\nmanifest, so a reader can check coverage instead of assuming it.\n\n```yaml\nmeta_columns:\n  row_hash: [id, status, updated_at]   # or: row_hash: true\n```",
+      "anyOf": [
+        {
+          "description": "`row_hash: true` / `false` — every column, or none.",
+          "type": "boolean"
+        },
+        {
+          "description": "`row_hash: [a, b]` — exactly these, in this order. Order matters: it is\nthe order the canonical text is built in.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      ]
     },
     "QualityConfig": {
       "type": "object",

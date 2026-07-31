@@ -7,5 +7,6 @@
 out
 out/p07
 out/p07/_SUCCESS
+out/p07/manifest-pa_audit_<RUNID>.json
 out/p07/manifest.json
 out/p07/pa_audit_<TS>.parquet

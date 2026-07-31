@@ -1,5 +1,5 @@
 # Rivet — plan/apply: sealed execution artifact for CI/CD.
-# Rendered by docs/gifs/render.sh.
+# Rendered by python3 -m dev.pytools.render_gifs.
 
 Output plan-apply.gif
 

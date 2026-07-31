@@ -1,6 +1,8 @@
 source: { type: postgres, url_env: PG_URL }
 exports:
   - name: pa_audit
+    wave: 2
+    parallel_safe: true
     query_file: query_c04.sql
     mode: full
     format: parquet

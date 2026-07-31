@@ -1,7 +1,7 @@
 # Rivet — post-run inspection commands.
 # Attach to docs/getting-started.md § "Inspect & iterate".
 #
-# Fixture: render.sh seeds a chunked export with chunk_checkpoint: true and
+# Fixture: the renderer seeds a chunked export with chunk_checkpoint: true and
 # runs it once against rivet_gif.events so state show / metrics / state files
 # / state progression / journal all have data to display.
 

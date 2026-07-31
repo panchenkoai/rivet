@@ -54,9 +54,9 @@ test-types-snowflake:
 # process skips the RAII Drop guard, so the slow cloud suites can leak
 # `<prefix>_<pid>_<counter>` tables into the shared `rivet` fixture DB). Safe
 # anytime — only touches those fixtures, never the init.sql / seed.rs tables.
-# Best-effort per engine: a down service is skipped. See dev/sweep-test-cruft.sh.
+# Best-effort per engine: a down service is skipped. See dev/pytools/sweep.py.
 sweep-test-db:
-	bash dev/sweep-test-cruft.sh
+	python3 -m dev.pytools.sweep test-cruft
 
 # Full live suite under nextest (per-test isolation), sweeping stale fixtures
 # FIRST so an interrupted prior run never pollutes the shared `rivet` DB.
@@ -124,4 +124,4 @@ seed-garbage-mssql:
 	docker compose exec -T mssql /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 'Rivet_Passw0rd!' -C -d rivet -b -i /dev/stdin < dev/garbage/mssql.sql
 
 release-oracle:  ## Release gate: every engine×version × scenario against local MinIO/fake-gcs/Azurite + a BigQuery golden. Green everywhere ⇒ releasable.
-	dev/release-oracle/run.sh
+	python3 -m dev.release_oracle

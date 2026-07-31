@@ -167,22 +167,33 @@ pub(crate) fn chunk_plan_fingerprint(
     chunk_by_days: Option<u32>,
 ) -> String {
     use xxhash_rust::xxh3::xxh3_64;
-    let mut buf = String::with_capacity(base_query.len() + chunk_column.len() + 32);
-    buf.push_str(base_query);
-    buf.push('\x1f');
-    buf.push_str(chunk_column);
-    buf.push('\x1f');
-    match chunk_by_days {
-        Some(d) => buf.push_str(&format!("date_{}d", d)),
-        None if chunk_dense => buf.push_str("dense_rn"),
-        None if chunk_count.is_some() => buf.push_str(&format!("count_{}", chunk_count.unwrap())),
-        None => {
-            buf.push_str(&chunk_size.to_string());
-            buf.push('\x1f');
-            buf.push_str("range");
-        }
+    // LENGTH-PREFIXED, not `\x1f`-separated. `base_query` is arbitrary operator
+    // SQL and may contain any byte including the separator, so separator-only
+    // framing lets one plan's text imitate another's field boundaries. A
+    // collision is not cosmetic: `ensure_chunk_checkpoint_plan` ADOPTS a prior
+    // run's chunk table when the fingerprints match, so two plans reading
+    // DIFFERENT windows would silently share a checkpoint and export the wrong
+    // rows. (A mismatch is the safe direction — it refuses to resume, loudly —
+    // which is also why re-framing is safe: fingerprints from before this change
+    // no longer match, so an in-flight resume asks for a reset instead of
+    // adopting the wrong plan.)
+    //
+    // `chunk_size` rides inside the range plan's own token because it is
+    // meaningless for the other plan kinds, which derive their windows
+    // differently — see `fingerprint_chunk_count_ignores_chunk_size`.
+    let kind = match chunk_by_days {
+        Some(d) => format!("date_{d}d"),
+        None if chunk_dense => "dense_rn".to_string(),
+        None if chunk_count.is_some() => format!("count_{}", chunk_count.unwrap()),
+        None => format!("range_{chunk_size}"),
+    };
+    let mut buf: Vec<u8> =
+        Vec::with_capacity(base_query.len() + chunk_column.len() + kind.len() + 24);
+    for part in [base_query, chunk_column, kind.as_str()] {
+        buf.extend_from_slice(&(part.len() as u64).to_le_bytes());
+        buf.extend_from_slice(part.as_bytes());
     }
-    format!("{:016x}", xxh3_64(buf.as_bytes()))
+    format!("{:016x}", xxh3_64(&buf))
 }
 
 #[cfg(test)]
@@ -604,6 +615,29 @@ mod tests {
         by_days: Option<u32>,
     ) -> String {
         chunk_plan_fingerprint(query, col, size, count, dense, by_days)
+    }
+
+    /// A plan's TEXT must not be able to imitate another plan's field
+    /// boundaries. `base_query` is arbitrary operator SQL, so it can contain the
+    /// old `\x1f` separator; with separator-only framing the two plans below
+    /// built identical bytes, and a fingerprint match makes
+    /// `ensure_chunk_checkpoint_plan` adopt a chunk table planned for DIFFERENT
+    /// windows. RED against the `\x1f` framing.
+    #[test]
+    fn fingerprint_cannot_be_forged_by_a_query_containing_the_old_separator() {
+        // ("Q\x1fid", "x") vs ("Q", "id\x1fx") — same concatenation, different plans.
+        let a = fp("Q\u{1f}id", "x", 10, None, false, None);
+        let b = fp("Q", "id\u{1f}x", 10, None, false, None);
+        assert_ne!(
+            a, b,
+            "a query carrying the separator must not forge the chunk_column boundary"
+        );
+        // And the boundary POSITION matters even with no separator involved.
+        assert_ne!(
+            fp("ab", "c", 10, None, false, None),
+            fp("a", "bc", 10, None, false, None),
+            "('ab','c') and ('a','bc') are different plans"
+        );
     }
 
     #[test]

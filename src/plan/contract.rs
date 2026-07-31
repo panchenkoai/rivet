@@ -86,6 +86,15 @@ pub struct ResolvedRunPlan {
     /// Integrity depth `--validate` must reach for this export's parts
     /// (`exports[].verify`).  `Content` makes size-only parts a verification
     /// failure.
+    ///
+    /// `#[serde(default)]` for old artifacts, like its siblings above: this
+    /// struct is SERIALIZED into a plan artifact, and `rivet apply` must keep
+    /// accepting one written by an older rivet. Added as a required field, it
+    /// made every pre-existing plan unparseable — `missing field `verify`` —
+    /// which is exactly what the frozen v0.7.5 fixture exists to catch.
+    /// `VerifyMode::Size` is the pre-field behaviour (size-only accepted), so
+    /// defaulting reproduces what those artifacts meant.
+    #[serde(default)]
     pub verify: crate::config::VerifyMode,
     /// Source connection parameters — resolved from config at plan time so pipeline
     /// functions receive the complete execution contract in a single struct.

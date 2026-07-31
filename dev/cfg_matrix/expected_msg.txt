@@ -31,7 +31,11 @@ c10_chunked_with_chunk_count plan/stderr - chunk_column not set
 
 # ── I3: query_file traversal/absolute path rejected at config-load ────────
 # All three probes must catch the bad path; previously only plan did.
-g16_query_file_traversal doctor/stderr + query_file path must not contain '..'
+# doctor prints the finding through its own report (stdout) and leaves a
+# pointer on stderr — `doctor: config check failed (see output above)`.
+# src/preflight/doctor.rs:88 says why: "surface the config error exactly
+# once". check/plan, which have no report, still put it on stderr.
+g16_query_file_traversal doctor/stdout + query_file path must not contain '..'
 g16_query_file_traversal check/stderr  + query_file path must not contain '..'
 g16_query_file_traversal plan/stderr   + query_file path must not contain '..'
 
@@ -39,12 +43,22 @@ g16_query_file_traversal plan/stderr   + query_file path must not contain '..'
 d03_dest_s3 check/stderr + destination preflight failed
 d03_dest_s3 check/stderr + AWS_ACCESS_KEY_ID
 
-# ── Background (pinned from previous PR): warning dedup still holds ──────
-# `cfg_matrix` invokes 3 probes per scenario; warnings still fire once per
-# probe process (Once::call_once is process-scoped). The plan probe for
-# full-mode exports never connects to the source (no introspection needed),
-# so the TLS warning only fires on chunked-mode plans where introspection
-# runs.  We assert against c06_chunked_parquet where the plan probe DOES
-# call create_source.
-c01_full_query_parquet plan/stderr =1 source URL contains plaintext password
-c06_chunked_parquet    plan/stderr =1 TLS is not enforced
+# ── Credential / transport warnings: both were NARROWED on purpose ───────
+# These two lines used to assert the warnings fire here. They no longer do,
+# and in both cases the code is right and the expectation was left behind:
+#
+#   * plaintext password — src/config/source.rs warns only for
+#     `UrlSource::InlineYaml`, i.e. a password committed in the YAML. These
+#     fixtures use `url_env:`, which is the RECOMMENDED form; scolding an
+#     operator who already moved the secret out of the file is a false alarm,
+#     and the code says so at the match arm.
+#   * TLS — src/source/mod.rs::warn_if_tls_disabled exempts loopback hosts,
+#     because on 127.0.0.1 the bytes never leave the box. The matrix connects
+#     to 127.0.0.1. It still fails OPEN: a URL it cannot resolve warns anyway,
+#     so the CWE-319 signal survives for every remote host.
+#
+# Both are asserted here as must-NOT-appear so the narrowing itself is pinned:
+# if either warning starts firing on the recommended form or on loopback, the
+# false alarm comes back and this contract catches it.
+c01_full_query_parquet plan/stderr - source URL contains plaintext password
+c06_chunked_parquet    plan/stderr - TLS is not enforced

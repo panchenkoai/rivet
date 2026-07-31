@@ -30,7 +30,13 @@ pub(crate) fn run_chunked_sequential(
     let chunks = match chunk_source {
         // Detect: compute ranges + run the pre-chunk drift check once (ADR-0021).
         super::ChunkSource::Detect => super::prepare_chunk_plan(src, plan, state, summary)?,
-        super::ChunkSource::Precomputed(ranges) => ranges,
+        super::ChunkSource::Precomputed(ranges) => {
+            // Records that the drift gate was skipped BY CONTRACT, not by a
+            // runner forgetting its facade — `prepare_chunk_plan` is its only
+            // caller and a precomputed source deliberately does not call it.
+            summary.chunks_precomputed = true;
+            ranges
+        }
     };
 
     let is_date = cp.by_days.is_some();
@@ -186,7 +192,10 @@ pub(crate) fn run_chunked_parallel(
         // Detect: a short-lived connection computes ranges + runs the pre-chunk
         // drift check (ADR-0021), then closes before the workers open theirs.
         super::ChunkSource::Detect => super::prepare_chunk_plan_fresh(plan, state, summary)?,
-        super::ChunkSource::Precomputed(ranges) => ranges,
+        super::ChunkSource::Precomputed(ranges) => {
+            summary.chunks_precomputed = true; // drift gate skipped by contract
+            ranges
+        }
     };
 
     let is_date = cp.by_days.is_some();
@@ -638,6 +647,53 @@ mod tests {
             shape_drift_warn_factor: 0.0,
             parquet: None,
         }
+    }
+
+    /// `rivet apply` must REPLAY the artifact's chunk boundaries on the
+    /// SEQUENTIAL path, not re-derive them.
+    ///
+    /// `apply_cmd.rs:8-9` states the contract ("Execute using
+    /// `ChunkSource::Precomputed` so chunk boundaries from the artifact are
+    /// replayed without re-running `SELECT min/max` queries"), and the two
+    /// PARALLEL branches honoured it — but `job.rs` handed the sequential branch
+    /// to `run_with_reconnect`, whose signature carried no chunk source, so
+    /// `run_export` hardcoded `ChunkSource::Detect` and a sequential chunked
+    /// apply silently re-detected boundaries from live data.
+    ///
+    /// RED-proof, no mocking framework needed: `EmptySource::query_scalar` is
+    /// `unimplemented!()`, and the Detect path is the only one that calls it for
+    /// min/max. Restore the hardcoded `Detect` in `run_export` and this test
+    /// panics with "not needed in chunked exec tests"; with the source threaded
+    /// through, the precomputed range is used and nothing probes the source.
+    #[test]
+    fn apply_replays_precomputed_chunks_on_the_sequential_path() {
+        let plan = chunked_plan_struct();
+        let mut summary = empty_summary(&plan);
+        let state = crate::state::StateStore::open_in_memory().expect("in-memory state");
+        let mut src = EmptySource;
+
+        crate::pipeline::single::run_export(
+            &mut src,
+            &state,
+            &plan,
+            &mut summary,
+            "",
+            ChunkSource::Precomputed(vec![(1, 100)]),
+        )
+        .expect("precomputed apply must not touch the source for boundaries");
+
+        // EmptySource emits no batches, so the run is empty — reaching this line at
+        // all is the first assertion (Detect would have panicked on the probe).
+        assert_eq!(summary.total_rows, 0);
+
+        // And the runner must RECORD why the drift gate was skipped. Without this
+        // the flag's assignment has no offline coverage: the live replay tests are
+        // `#[ignore]`d, so a mutant that drops it survives every gate that runs on
+        // a PR — and the guard would then read a correct apply as a runner-bypass.
+        assert!(
+            summary.chunks_precomputed,
+            "a precomputed chunk source must be recorded on the summary, or              `check_post_run_invariants` cannot tell a by-contract skip from a bypass"
+        );
     }
 
     fn empty_summary(plan: &ResolvedRunPlan) -> RunSummary {

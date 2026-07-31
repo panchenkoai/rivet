@@ -14,6 +14,7 @@ fn make_journal() -> RunJournal {
 
 fn plan_snapshot(name: &str) -> PlanSnapshot {
     PlanSnapshot {
+        row_hash: None,
         export_name: name.to_string(),
         base_query: "SELECT 1".to_string(),
         strategy: "full".to_string(),
@@ -75,8 +76,8 @@ fn plan_snapshot_absent_when_no_plan_resolved() {
 #[test]
 fn plan_snapshot_returns_first_plan_resolved() {
     let mut j = make_journal();
-    j.record(RunEvent::PlanResolved(plan_snapshot("export_a")));
-    j.record(RunEvent::PlanResolved(plan_snapshot("export_b")));
+    j.record(RunEvent::PlanResolved(Box::new(plan_snapshot("export_a"))));
+    j.record(RunEvent::PlanResolved(Box::new(plan_snapshot("export_b"))));
 
     let snap = j.plan_snapshot().expect("plan_snapshot must be Some");
     assert_eq!(
@@ -89,7 +90,8 @@ fn plan_snapshot_returns_first_plan_resolved() {
 #[test]
 fn plan_snapshot_fields_match_recorded_values() {
     let mut j = make_journal();
-    j.record(RunEvent::PlanResolved(PlanSnapshot {
+    j.record(RunEvent::PlanResolved(Box::new(PlanSnapshot {
+        row_hash: None,
         export_name: "orders".into(),
         base_query: "SELECT * FROM orders".into(),
         strategy: "incremental".into(),
@@ -103,7 +105,7 @@ fn plan_snapshot_fields_match_recorded_values() {
         resume: true,
         chunk_key: None,
         resumable: false,
-    }));
+    })));
 
     let snap = j.plan_snapshot().unwrap();
     assert_eq!(snap.export_name, "orders");
@@ -445,7 +447,7 @@ fn chunk_events_empty_on_single_path_run() {
 #[test]
 fn entries_preserved_in_insertion_order() {
     let mut j = make_journal();
-    j.record(RunEvent::PlanResolved(plan_snapshot("exp")));
+    j.record(RunEvent::PlanResolved(Box::new(plan_snapshot("exp"))));
     j.record(RunEvent::RetryAttempted {
         attempt: 1,
         reason: "r".into(),

@@ -38,9 +38,11 @@ cfg/<id>.yaml             — one config per scenario
 expected/<id>.layout      — frozen, normalized file listing baseline
 logs/<id>/layout          — actual listing from the last run
 logs/<id>/layout.diff     — empty if PASS, unified diff if FAIL
-normalize.sh              — strips timestamps and run-IDs
-matrix.sh                 — runs every scenario in an isolated workdir
-gen_fixtures.sh           — regenerates the YAMLs idempotently
+
+# the harness, run from the repo root
+python3 -m dev.pytools.matrix_suites path              — runs every scenario in an isolated workdir
+python3 -m dev.pytools.matrix_suites gen-fixtures path — regenerates the YAMLs idempotently
+python3 -m dev.pytools.matrix_common normalize         — strips timestamps and run-IDs
 ```
 
 Each scenario is invoked from its own `logs/<id>/work/` directory (the
@@ -72,8 +74,8 @@ stay scenario-local and don't bleed between runs.
 docker compose up -d postgres
 cargo build --bin rivet --release
 cp target/release/rivet dev/path_matrix/rivet
-cd dev/path_matrix
-./matrix.sh
+# from the repo root:
+python3 -m dev.pytools.matrix_suites path
 ```
 
 Output is one line per scenario:
@@ -87,7 +89,7 @@ Non-zero exit when at least one scenario FAILs.
 
 When a layout change is intentional:
 
-1. Run `./matrix.sh` to capture the new layout in `logs/<id>/layout`.
+1. Run `python3 -m dev.pytools.matrix_suites path` to capture the new layout in `logs/<id>/layout`.
 2. Inspect the diff in `logs/<id>/layout.diff`.
 3. Copy `logs/<id>/layout` over `expected/<id>.layout`.
 4. Document the change in the CHANGELOG entry that lands the PR.

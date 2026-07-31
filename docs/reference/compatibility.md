@@ -128,21 +128,21 @@ Then pick one of:
 
 ```bash
 # Full e2e suite on every version — seeds each DB, then runs
-# dev/e2e/run_e2e.sh against it with URLs retargeted via env.
-bash dev/legacy/run_full_matrix.sh
+# python3 -m dev.pytools.e2e against it with URLs retargeted via env.
+python3 -m dev.pytools.legacy_stand full-matrix
 
 # Just one target
-TARGETS="pg-12"     bash dev/legacy/run_full_matrix.sh
-TARGETS="mysql-57"  bash dev/legacy/run_full_matrix.sh
+TARGETS="pg-12"     python3 -m dev.pytools.legacy_stand full-matrix
+TARGETS="mysql-57"  python3 -m dev.pytools.legacy_stand full-matrix
 
 # Lighter compat smoke (seed + mode sampler + init) — same config, fewer
 # assertions; useful when iterating on compat-sensitive code paths.
-bash dev/legacy/run_legacy.sh
+python3 -m dev.pytools.legacy_stand legacy
 ```
 
 ### How the matrix targets an arbitrary server
 
-`dev/e2e/run_e2e.sh` no longer hardcodes `localhost:5432` / `localhost:3306`.
+`python3 -m dev.pytools.e2e` no longer hardcodes `localhost:5432` / `localhost:3306`.
 It reads `RIVET_PG_URL` and `RIVET_MYSQL_URL` from the environment (falling
 back to the primary ports if unset), and every e2e YAML uses
 `url_env: RIVET_PG_URL` (or `RIVET_MYSQL_URL`). So the same script + configs
@@ -150,11 +150,11 @@ drive any target:
 
 ```bash
 RIVET_PG_URL=postgresql://rivet:rivet@localhost:5412/rivet \
-    bash dev/e2e/run_e2e.sh
+    python3 -m dev.pytools.e2e
 ```
 
-`run_full_matrix.sh` does nothing more exotic than: seed → export those env
-vars → invoke `run_e2e.sh`.
+`python3 -m dev.pytools.legacy_stand full-matrix` does nothing more exotic than:
+seed → export those env vars → invoke `python3 -m dev.pytools.e2e`.
 
 ## Engine-specific notes
 
@@ -231,7 +231,7 @@ every supported PostgreSQL version (12+).
 
 ## What "passes" means per target
 
-Each target in `run_full_matrix.sh` runs 83 assertions against its assigned
+Each target in `dev/pytools/legacy_stand.py` runs 83 assertions against its assigned
 server. Status reported by the suite:
 
 ```
@@ -252,9 +252,9 @@ failed and which specific assertion inside. Per-target logs are written to
 
 - **Adding a new supported version**: add a service to
   `docker-compose.yaml` under the `legacy` profile, add the port mapping to
-  `run_full_matrix.sh`, run the matrix, land the PR with the new version
+  `dev/pytools/legacy_stand.py`, run the matrix, land the PR with the new version
   listed in this page's table.
 - **Dropping a version**: remove the service from the compose file, remove
-  the target from `run_full_matrix.sh`, remove its row from this page,
+  the target from `dev/pytools/legacy_stand.py`, remove its row from this page,
   and note the change in `CHANGELOG.md`. Dropping a version is a minor-version
   bump (no SemVer guarantees apply to unsupported servers).

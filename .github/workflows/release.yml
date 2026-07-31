@@ -59,7 +59,13 @@ jobs:
       - name: cargo publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish --locked
+        # `--target-dir`: publish copies the crate to `target/package/<name>-<ver>/`
+        # and BUILDS that copy to verify it. Sharing the main target dir makes the
+        # verify build write fingerprints that name the SNAPSHOT as the crate's
+        # sources, and every later `cargo build` in that tree then reports `Fresh`
+        # while ignoring real edits. Harmless on a throwaway runner — pinned here so
+        # the line stays safe when someone runs it locally, which is how it bit us.
+        run: cargo publish --locked --target-dir target/publish-verify
 
   build:
     name: Build ${{ matrix.target }}
@@ -223,9 +229,8 @@ jobs:
         env:
           RELEASE_TAG: ${{ env.RELEASE_TAG }}
         run: |
-          chmod +x dev/scripts/update_homebrew_formula.sh
           GITHUB_REPOSITORY="${{ github.repository }}" \
-            ./dev/scripts/update_homebrew_formula.sh --tag "${RELEASE_TAG}" --sums-file artifacts/SHA256SUMS.txt
+            python3 -m dev.pytools.homebrew_formula --tag "${RELEASE_TAG}" --sums-file artifacts/SHA256SUMS.txt
 
       - name: Push formula to Homebrew tap
         continue-on-error: true

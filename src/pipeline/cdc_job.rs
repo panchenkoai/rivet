@@ -26,12 +26,18 @@ use crate::state::StateStore;
 /// Pure so it can be unit-tested without a live stream (mirrors
 /// `detect::sparse_chunk_warning`).
 fn cdc_ignored_meta_warning(export: &ExportConfig) -> Option<String> {
-    export.meta_columns.any_enabled().then(|| {
+    // Narrowed to `exported_at`. `row_hash` USED to be listed here and is not
+    // any more: the CDC sink now emits it over the same data columns the
+    // snapshot leg hashes (§5h), because both legs write one `__changes` log
+    // and a column only one of them produces leaves half the table NULL.
+    // `exported_at` stays ignored — it is a per-RUN stamp, and a changelog row
+    // belongs to the run that captured it, not to the one that backfilled it.
+    export.meta_columns.exported_at.then(|| {
         format!(
-            "export '{}': mode: cdc ignores meta_columns (exported_at / row_hash) — the CDC \
-             output carries its own __op/__pos/__seq columns plus the typed after-image, and \
-             the batch meta columns are NOT added. Remove meta_columns from this export, or use \
-             a batch mode if you need them.",
+            "export '{}': mode: cdc ignores meta_columns.exported_at — the CDC output carries \
+             its own __op/__pos/__seq columns plus the typed after-image, and a per-run export \
+             stamp would differ between the snapshot leg and the drain for the same row. \
+             Remove it from this export, or use a batch mode if you need it.",
             export.name
         )
     })
@@ -143,19 +149,22 @@ pub(super) fn run_cdc_export(
     (result.map(|_| ()), summary)
 }
 
-/// `cdc.initial: snapshot` — the anchor-then-snapshot half, run by the
-/// orchestrator BEFORE the CDC drain. Returns the synthesized `mode: full`
-/// exports still pending (their `snapshot/_SUCCESS` marker absent), after
-/// ensuring the anchor exists. Anchor-BEFORE-snapshot is the whole point: a
-/// change landing mid-snapshot is then also in the stream — an overlap the
-/// PK+`__op` dedupe absorbs, never a gap.
+/// The anchor half of a first CDC run, run by the orchestrator BEFORE the
+/// drain. Returns the synthesized `mode: full` exports still pending (their
+/// `snapshot/_SUCCESS` marker absent), after ensuring the anchor exists.
+///
+/// `snapshot` anchors, then snapshots every table. Anchor-BEFORE-snapshot is the
+/// whole point: a change landing mid-snapshot is then also in the change stream,
+/// an overlap the PK+`__op` dedupe absorbs, never a gap.
 pub(super) fn initial_snapshot_pending(
     config: &Config,
     export: &ExportConfig,
     state: &StateStore,
 ) -> Result<Vec<ExportConfig>> {
     let cdc = export.cdc.clone().unwrap_or_default();
-    if cdc.initial != Some(crate::config::CdcInitialMode::Snapshot) {
+    // `snapshot` is the only OSS `initial:` mode; absence means "capture changes
+    // only", which needs no anchor step and no snapshot legs.
+    if cdc.initial.is_none() {
         return Ok(Vec::new());
     }
     let url = config.source.resolve_url()?;
@@ -255,7 +264,20 @@ fn synth_snapshot_export(
     // for backfill rows, NULL for every CDC-updated row). Clearing here keeps both
     // legs' columns identical; the run-start warn tells the operator the meta
     // columns are dropped for the whole CDC export.
-    synth.meta_columns = Default::default();
+    // Only `exported_at` is cleared.
+    synth.meta_columns.exported_at = false;
+    // `row_hash` is the EXACT OPPOSITE and is inherited on purpose (it rides
+    // along in the clone above — this line is here to say so, because the
+    // obvious next edit is to clear it alongside `exported_at`). The same
+    // argument that clears the stamp *requires* keeping the hash: both legs
+    // write the same `__changes` log, so a column only one leg produces breaks
+    // them. `exported_at` is producible by the batch leg ALONE, so inheriting it
+    // would desynchronize the two; `_rivet_row_hash` is produced by BOTH (the
+    // CDC sink applies the identical Rust render), so inheriting it is what
+    // keeps them synchronized. Dropping it here would leave every backfilled
+    // row NULL and make the audit's cheap path unusable on exactly the tables
+    // it matters most for.
+    debug_assert_eq!(synth.meta_columns.row_hash, export.meta_columns.row_hash);
     synth
 }
 
@@ -371,6 +393,7 @@ fn run_cdc_inner(
                 &all_overrides,
                 t.rsplit('.').next().unwrap_or(t),
             ),
+            row_hash: export.meta_columns.row_hash.clone(),
         })
         .collect();
     let now = chrono::Utc::now().to_rfc3339();
@@ -532,25 +555,34 @@ mod tests {
             msg.contains("__op"),
             "points at the CDC-native columns: {msg}"
         );
-        // row_hash alone also warns.
+        // row_hash alone must NOT warn any more (§5h): the CDC sink emits it.
+        // Warning here would tell the operator their hash was dropped when it
+        // was not — and the whole point of §5h is that both legs carry it.
         e.meta_columns.exported_at = false;
-        e.meta_columns.row_hash = true;
+        e.meta_columns.row_hash = crate::config::RowHash::All(true);
         assert!(
-            cdc_ignored_meta_warning(&e).is_some(),
-            "row_hash alone must warn too"
+            cdc_ignored_meta_warning(&e).is_none(),
+            "row_hash is emitted on the CDC leg now, so claiming it is ignored would be a lie"
         );
     }
 
     // The snapshot (batch) leg and the CDC stream are two legs of ONE dataset the
-    // load view merges by PK. batch-only meta_columns injected on the snapshot
-    // ONLY would diverge the two legs' columns (base table has cols the changelog
-    // lacks) and break the load — the exact mismatch a mixed snapshot+CDC load
-    // hits. The synth snapshot must therefore NOT inherit meta_columns.
+    // load view merges by PK, so their columns must MATCH. That one rule cuts
+    // both ways, and this test pins both halves:
+    //
+    //   exported_at is CLEARED — only the batch leg can produce it, and it is a
+    //   per-run stamp, so inheriting it would give the two legs different
+    //   columns (and the same row a different value depending on which leg
+    //   captured it);
+    //   row_hash is KEPT — since §5h both legs produce it, so dropping it on
+    //   the snapshot is what would diverge them, leaving every backfilled row's
+    //   hash NULL.
     #[test]
-    fn snapshot_leg_does_not_inherit_batch_meta_columns() {
+    fn snapshot_leg_clears_exported_at_but_keeps_the_row_hash() {
         let mut e = crate::config::sample_export("orders");
         e.meta_columns.exported_at = true;
-        e.meta_columns.row_hash = true;
+        e.meta_columns.row_hash =
+            crate::config::RowHash::Columns(vec!["id".into(), "status".into()]);
         let dcfg = DestinationConfig {
             destination_type: DestinationType::Local,
             path: Some("/tmp/snap".into()),
@@ -558,8 +590,12 @@ mod tests {
         };
         let synth = synth_snapshot_export(&e, "orders", &dcfg);
         assert!(
-            !synth.meta_columns.any_enabled(),
-            "the snapshot leg must match the CDC leg's columns — no batch meta_columns"
+            !synth.meta_columns.exported_at,
+            "a per-run stamp must not ride along onto the snapshot leg"
+        );
+        assert_eq!(
+            synth.meta_columns.row_hash, e.meta_columns.row_hash,
+            "both legs write one __changes log, so both must hash the same columns"
         );
         // The other snapshot invariants stay intact.
         assert_eq!(synth.mode, crate::config::ExportMode::Full);
@@ -569,6 +605,77 @@ mod tests {
         );
         assert!(!synth.skip_empty, "snapshot must complete even when empty");
         assert_eq!(synth.table.as_deref(), Some("orders"));
+    }
+
+    /// `adopt` (anchor an already-loaded table, move no rows) is a paid-tier
+    /// mode (the one-way seam, ADR-0026 — docs may name the crate, this tree may
+    /// not), so the OSS config must REJECT it rather than quietly accept a value
+    /// this binary cannot honour. 0.24.0 shipped it in the OSS enum, which put it
+    /// in the published JSON schema and the generated reference — irreversible
+    /// once the crate is published, and indistinguishable to a user from a
+    /// supported feature. Omitted `initial:` stays its own third state (capture
+    /// changes only, no anchor step), which is what an OSS operator uses for an
+    /// already-loaded table.
+    #[test]
+    fn oss_rejects_the_pro_only_initial_adopt() {
+        let parse = |line: &str| {
+            crate::config::Config::from_yaml(&format!(
+                "source:\n  type: postgres\n  url: \"postgresql://localhost/t\"\n\
+                 exports:\n  - name: a\n    table: t\n    mode: cdc\n    format: parquet\n\
+                 \x20   destination:\n      type: gcs\n      bucket: b\n      prefix: p/\n\
+                 \x20   cdc:\n      checkpoint: /tmp/ck\n{line}"
+            ))
+        };
+        let err = format!(
+            "{:#}",
+            parse("      initial: adopt\n").expect_err("`adopt` is not an OSS mode")
+        );
+        assert!(
+            err.contains("adopt") || err.contains("initial"),
+            "the refusal must point at the offending value; got: {err}"
+        );
+        assert_eq!(
+            parse("      initial: snapshot\n").unwrap().exports[0]
+                .cdc
+                .clone()
+                .unwrap()
+                .initial,
+            Some(crate::config::CdcInitialMode::Snapshot)
+        );
+        assert_eq!(
+            parse("").unwrap().exports[0].cdc.clone().unwrap().initial,
+            None,
+            "omitted is its own third state — capture changes only, no anchor step"
+        );
+    }
+
+    // The mirror image of the test above, and the reason the two must be read
+    // together: the SAME argument (both legs write one `__changes` log, so their
+    // columns must match) clears `exported_at` and REQUIRES keeping `row_hash`.
+    // The batch leg alone can produce the stamp, so inheriting it desynchronizes
+    // the legs; BOTH legs produce `_rivet_row_hash`, so dropping it on the
+    // snapshot is what would desynchronize them — leaving every backfilled
+    // row's hash NULL and the audit's cheap path unusable.
+    #[test]
+    fn snapshot_leg_inherits_the_row_hash() {
+        let mut e = crate::config::sample_export("orders");
+        e.meta_columns.row_hash =
+            crate::config::RowHash::Columns(vec!["id".into(), "status".into()]);
+        e.meta_columns.exported_at = true;
+        let dcfg = DestinationConfig {
+            destination_type: DestinationType::Local,
+            path: Some("/tmp/snap".into()),
+            ..Default::default()
+        };
+        let synth = synth_snapshot_export(&e, "orders", &dcfg);
+        assert_eq!(
+            synth.meta_columns.row_hash, e.meta_columns.row_hash,
+            "the snapshot leg must emit the SAME hash column the drain does"
+        );
+        assert!(
+            !synth.meta_columns.exported_at,
+            "clearing the per-run stamp must not take the row hash with it"
+        );
     }
 
     // RED test for the finding: cloud prefixes are LITERAL key prefixes —

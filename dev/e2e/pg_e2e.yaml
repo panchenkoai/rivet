@@ -2,7 +2,7 @@ source:
   type: postgres
   # URL comes from $RIVET_PG_URL so the same suite can be pointed at any server
   # (docker-compose `postgres` on 5432, or `postgres-12/13/14/15` on 5412/…/5415
-  # under the `legacy` profile). `run_e2e.sh` sets a default if unset.
+  # under the `legacy` profile). `python3 -m dev.pytools.e2e` sets a default if unset.
   url_env: RIVET_PG_URL
   tuning:
     profile: fast
@@ -83,7 +83,7 @@ exports:
   # NOTE: `format: csv` + `compression:` is rejected at config-load (the CSV
   # writer has no compression encoder, so the codec would be a silent no-op the
   # manifest then lies about — see src/config/mod.rs::check_csv_compression).
-  # The rejection is asserted as a negative test in run_e2e.sh ("PG csv+gzip
+  # The rejection is asserted as a negative test in dev/pytools/e2e.py ("PG csv+gzip
   # rejected"); it MUST NOT live as an export here, or the whole config fails to
   # parse and every PG operation in the suite dies before touching the database.
   - name: pg_users_zstd

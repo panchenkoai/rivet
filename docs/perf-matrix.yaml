@@ -28,7 +28,7 @@ scenarios:
   # ── Capture throughput ──────────────────────────────────────────────────────
   - id: cdc_capture_throughput
     what: "bulk capture rows/s — one bounded until_current drain over a seeded backlog"
-    harness: "dev/cdc/stand.sh perf"
+    harness: "python3 -m dev.pytools.cdc_stand perf"
     contract: "engine-relative; regression = >2x drop vs baseline at the same rollover"
     postgres: { measured: { rows_per_s: 256000, date: "2026-07-19" } }
     mysql:    { measured: { rows_per_s: 500000, date: "2026-07-19" } }
@@ -38,7 +38,7 @@ scenarios:
   # ── Steady-state memory (the O(rollover) contract) ──────────────────────────
   - id: cdc_interval_soak_rss_flat
     what: "peak drain RSS stays FLAT as the drain INTERVAL grows 12x (10→120 min) — memory is O(rollover), NOT O(per-interval backlog); a regression tracks the interval"
-    harness: "dev/cdc_interval/soak_all.sh <engine>  (PHASES='10 20 30 60 120 240 360 480')"
+    harness: "python3 -m dev.pytools.cdc_interval soak-all <engine>  (PHASES='10 20 30 60 120 240 360 480')"
     contract: "peak RSS at 480 min ≈ peak RSS at 10 min (within noise); every churned row captured"
     note: >
       The harness SELF-ASSERTS this contract each run (RSS-flat across the growing
@@ -46,9 +46,9 @@ scenarios:
       guarded — the per-interval numbers below are just not persisted to a doc (the
       soak.log lives in a run tmpdir). Do NOT re-run to 'fill' this: the harness
       already proves it; harvest a run's soak.log if a captured baseline is wanted.
-    postgres: { measured: { note: "RSS-flat asserted by soak_all.sh pg (10→120 default); numbers unpersisted" } }
-    mysql:    { measured: { note: "RSS-flat asserted by soak_all.sh mysql; numbers unpersisted" } }
-    mssql:    { measured: { note: "RSS-flat asserted by soak_all.sh mssql; numbers unpersisted" } }
+    postgres: { measured: { note: "RSS-flat asserted by python3 -m dev.pytools.cdc_interval soak-all pg (10→120 default); numbers unpersisted" } }
+    mysql:    { measured: { note: "RSS-flat asserted by python3 -m dev.pytools.cdc_interval soak-all mysql; numbers unpersisted" } }
+    mssql:    { measured: { note: "RSS-flat asserted by python3 -m dev.pytools.cdc_interval soak-all mssql; numbers unpersisted" } }
     mongo:    { measured: { peak_rss_mb: 72, note: "22k events, flat RSS across intervals (ad-hoc 2026-07)" } }
 
   # ── Source-side HARM under load ─────────────────────────────────────────────

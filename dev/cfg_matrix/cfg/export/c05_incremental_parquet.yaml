@@ -1,6 +1,8 @@
 source: { type: postgres, url_env: PG_URL }
 exports:
   - name: pa_audit
+    wave: 1
+    parallel_safe: true
     table: pa_audit
     mode: incremental
     cursor_column: id

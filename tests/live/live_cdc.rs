@@ -1730,10 +1730,25 @@ exports:
     // underscore, src/enrich.rs) — a `__rivet` (double) check silently never
     // matched, so this assertion was VACUOUS (green even if the leg leaked them).
     // Caught while RED-proving the sibling cdc→warehouse DuckDB-load test.
+    //
+    // The two meta columns are now ASYMMETRIC, and load parity is exactly why
+    // (§5h / cdc_job.rs::synth_snapshot_export): `exported_at` is a per-run stamp
+    // only the batch leg can produce, so keeping it would make the snapshot
+    // parquet's columns differ from the CDC leg's and break the shared
+    // `__changes` append — it is cleared. `row_hash` is produced by BOTH legs, so
+    // it is INHERITED on purpose; dropping it here is what would break parity,
+    // leaving half the appended table NULL in that column.
     assert!(
-        !snap_cols.iter().any(|c| c.starts_with("_rivet")),
-        "snapshot leg must NOT carry batch meta columns (load parity with the CDC \
-         stream's __changes append); got {snap_cols:?}"
+        !snap_cols.iter().any(|c| c == "_rivet_exported_at"),
+        "snapshot leg must NOT carry `_rivet_exported_at` — only the batch leg can \
+         produce it, so it would break column parity with the CDC leg's __changes \
+         append; got {snap_cols:?}"
+    );
+    assert!(
+        snap_cols.iter().any(|c| c == "_rivet_row_hash"),
+        "snapshot leg MUST carry `_rivet_row_hash` — both legs produce it, and a \
+         column only one leg wrote leaves half the __changes table NULL; got \
+         {snap_cols:?}"
     );
     assert!(
         snap_cols.iter().any(|c| c == "id") && snap_cols.iter().any(|c| c == "v"),
@@ -4131,7 +4146,7 @@ fn roast_pg_cdc_oversized_transaction_bails_loud_not_oom() {
 }
 
 #[test]
-#[ignore = "live: requires the cdc-standby profile — dev/cdc/stand.sh standby (pg-cdc-standby on :5436)"]
+#[ignore = "live: requires the cdc-standby profile — python3 -m dev.pytools.cdc_stand standby (pg-cdc-standby on :5436)"]
 fn roast_pg_cdc_bounded_on_a_standby_fails_loud() {
     // A bounded (until_current) CDC run against a PostgreSQL STANDBY (in recovery)
     // must fail LOUD with an actionable message: pg_current_wal_lsn() is
@@ -4140,7 +4155,7 @@ fn roast_pg_cdc_bounded_on_a_standby_fails_loud() {
     // continuously, or point at the primary) — not a raw "recovery is in
     // progress". Oracle: the run fails, stderr names the standby + the fix.
     //
-    // Opt-in profile: the cdc-standby pair (dev/cdc/stand.sh standby, :5436) is
+    // Opt-in profile: the cdc-standby pair (python3 -m dev.pytools.cdc_stand standby, :5436) is
     // NOT part of the default `cdc` stack, so a plain `--ignored` live run does
     // not provision it. Self-gate: SKIP (loudly) when :5436 is unreachable rather
     // than fail on a Connection-refused that never reaches the recovery check
@@ -4154,7 +4169,7 @@ fn roast_pg_cdc_bounded_on_a_standby_fails_loud() {
     {
         eprintln!(
             "SKIP roast_pg_cdc_bounded_on_a_standby_fails_loud: cdc-standby not up on :5436 \
-             (bring it up with `dev/cdc/stand.sh standby`)"
+             (bring it up with `python3 -m dev.pytools.cdc_stand standby`)"
         );
         return;
     }
@@ -4345,12 +4360,19 @@ exports:
             "__op".to_string(),
             "__pos".to_string(),
             "__seq".to_string(),
+            // Written by BOTH legs since §5h, so it belongs in the union — and it
+            // must be here, not merely tolerated: were only one leg producing it,
+            // `union_by_name` would still succeed and leave that leg's rows NULL,
+            // which is the silent half-empty column the two-leg contract exists to
+            // rule out. `_rivet_exported_at` is deliberately absent (batch-only).
+            "_rivet_row_hash".to_string(),
             "id".to_string(),
             "v".to_string(),
         ],
-        "the unioned __changes must carry EXACTLY the 3 meta columns + the source \
-         data columns; an extra column is a leaked snapshot-leg meta_column (fda1653 \
-         — breaks the warehouse load, silent under count/sum checks)"
+        "the unioned __changes must carry EXACTLY the 3 CDC meta columns + the \
+         both-legs `_rivet_row_hash` + the source data columns; any other column is \
+         a leaked snapshot-leg meta_column (fda1653 — breaks the warehouse load, \
+         silent under count/sum checks)"
     );
 
     // (2) CURRENT-STATE: an INDEPENDENT dedup (latest change per PK wins; the

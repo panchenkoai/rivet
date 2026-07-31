@@ -10,9 +10,11 @@
 out
 out/p04_a
 out/p04_a/_SUCCESS
+out/p04_a/manifest-pa_audit_a_<RUNID>.json
 out/p04_a/manifest.json
 out/p04_a/pa_audit_a_<TS>.parquet
 out/p04_b
 out/p04_b/_SUCCESS
+out/p04_b/manifest-pa_audit_b_<RUNID>.json
 out/p04_b/manifest.json
 out/p04_b/pa_audit_b_<TS>.parquet

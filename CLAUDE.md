@@ -557,6 +557,33 @@ RED-proven. Three rules fell out, each bitten at least twice:
    collides, the fixture needs ≥2 of the thing — same family as the
    "engineer fixtures past activation thresholds" self-oracle rule.
 
+   Sharpened by the row-hash find (0.24.0 pre-release hunt): **an INJECTIVITY
+   or FRAMING guard needs ≥2 FIELDS, because with one field there is no
+   boundary to forge.** `_rivet_row_hash` concatenated cells with a bare `\x1f`
+   and no length from the day it was born (`9aef5cb`, 2026-03-28), so
+   `("a\x1f","b")` and `("a","\x1fb")` were one hash — and its only guard,
+   `hash_distinguishes_null_from_empty`, shipped in the SAME commit with a
+   ONE-column fixture, which cannot express a field boundary at all. It also
+   picked the easy pair: NULL vs `""` is the distinction rivet's own `is_null`
+   branch already made, not NULL vs a value that RENDERS AS the null marker
+   (a lone `\x00`, which collided). Four months green, reading like an
+   injectivity test while testing half of one. When a test's subject is "can
+   two different inputs produce one output", enumerate the ways a value can
+   imitate a DELIMITER, a LENGTH, or ABSENCE — one field tests none of them.
+
+   The same find's second half is a rule about FEATURES, not fixtures: **a new
+   TYPE must be run through every value-consuming mechanism, not just the
+   read/write path.** Arrays (`RivetType::List`, `c2742ef`, 2026-05-12) landed
+   six weeks after the hash and nobody asked whether the hash could
+   canonicalize one — Arrow's container display joins elements with `", "` and
+   renders a NULL element as the EMPTY string, so `["a, b"]` == `["a","b"]` and
+   `[NULL]` == `[""]` == `[]` in the hash. A container's canonical form must be
+   built from its CHILDREN (element count, then each child framed the same way),
+   never from its rendered text; a lossy rendering cannot be rescued by framing
+   the field around it. When adding a type, grep for every hash/checksum/
+   comparison/fingerprint it can now reach and add a per-type injectivity case
+   to each.
+
 3. **A sleep (or any workaround) in a test that compensates for PRODUCT
    behaviour is a product bug report, not a test fix.** The `sleep(1100ms)`
    authors knew rivet stamped filenames at second granularity — the comment
@@ -729,3 +756,83 @@ mutant that ignores `active` (`gc_orphans_spares_an_unmanifested_part_while_a_ru
 is_active` goes RED) + the defer-not-drop half (`..._collects_an_unmanifested_
 part_when_no_run_is_active`) + the clock-free staleness
 (`a_superseded_running_row_no_longer_counts_as_active`).
+
+## `cargo package` poisons the shared target dir — a build that lies about being fresh
+
+`cargo package` / `cargo publish` copy the crate to `target/package/<name>-<version>/`
+and **build that copy** to verify it. With no `--target-dir` the verify build shares
+the workspace `target/`, so the fingerprints it leaves record the crate's sources as
+`target/package/<name>-<version>/src/**` — a frozen snapshot. Every later `cargo
+build` in the working tree compares those SNAPSHOT mtimes, finds nothing newer,
+prints `Fresh` and **silently produces a binary without your edits**. Cargo names the
+mechanism itself once the snapshot is deleted: `Dirty rivet-cli: the file
+`target/package/rivet-cli-0.24.0/src/types/target.rs` is missing`.
+
+This is worse than a stale build, because every signal you use to check the build is
+also lied to: `cargo build` says Finished, `cargo test` passes, and a deliberate type
+error appended to `src/lib.rs` compiles clean. It cost half a session — an `apply`
+fix verified green by hand kept failing in the matrix, because the matrix staged a
+binary built before the fix while `cargo build` insisted there was nothing to do.
+
+The tell: **the source file is newer than `target/debug/<bin>` and cargo still says
+`Fresh`.** Confirm with `cargo build -v | grep -E "Fresh|Dirty"`; cure with `rm -rf
+target/package` (not a full `cargo clean` — that discards tens of GB of dependency
+build for a fault that lives in one directory).
+
+Process rule: **any command that packages or publishes gets its own `--target-dir`,
+and any hook or script that relies on cargo's answer must drop `target/package`
+BEFORE it asks.** Order matters: a guard placed after the build steps cannot help,
+because those steps are exactly what the staleness corrupts — a check cannot detect
+what it is blind to. Wired as step 0 of `.githooks/pre-commit`, and pinned on the
+release workflow's `cargo publish` so the line stays safe when copied locally.
+
+## A test compares a golden to rivet's OUTPUT — never a fixture to itself
+
+The oracle must be INDEPENDENT of the code under test. A test that reads a
+checked-in fixture and then asks questions **of that same fixture** — does this
+key exist, does this text contain that substring, does this YAML cell say `test`
+— holds both sides of the comparison. It cannot fail when rivet changes; only
+when someone edits the fixture. It reads like coverage and is none.
+
+The bite: `tests/artifact_legacy_compat.rs` froze plan artifacts from 0.7.5 and
+asserted their JSON contained certain fields, deliberately never deserializing
+them with the current type (its doc explained why — `PlanArtifact` is
+`pub(crate)`). When `verify` was added as a REQUIRED field on 2026-06-02, every
+assertion kept passing while `rivet apply` rejected every `plan.json` users
+already had on disk. Two months, and the fixture that existed to catch exactly
+this was the thing that hid it. The same shape sat in `tests/compat_gate.rs`,
+where v0.16 CDC checkpoints were read with a bare `serde_json::Value` and one key
+per engine was asserted (`pos` never was) — a renamed key leaves it green while a
+user's checkpoint silently re-anchors and skips every change since it was written.
+
+Process rule: **every fixture/golden test must pass the fixture THROUGH rivet's
+own code and compare the result to an expected value produced independently of
+that code** — a hand-written literal, a value derived by a different library, the
+seed the test itself inserted, or a re-read through a different reader. Three
+corollaries, each of which cost something here:
+
+1. **`pub(crate)` is not a reason to test the shape instead.** It is a reason to
+   put the test beside the type. Both fixes this session are inline
+   `#[cfg(test)]` modules next to the code that owns the type
+   (`src/plan/artifact.rs::legacy_wire_compat`,
+   `src/source/cdc/validate.rs::v016_checkpoint_compat`), each calling the real
+   loader. Both go RED on the mutant the integration-level shape check sails
+   through — verified side by side, not argued.
+2. **Derive the enumerated dimension, never type it in.** A gate whose engine /
+   target / variant columns are a hand-written list grades only what its author
+   already knew. `tests/offline/chunking_matrix_guard.rs` parses `SourceType`
+   itself; `tests/cdc_conformance_gate.rs` did not, and its four engine columns
+   were tied to nothing. Be honest about the strength: adding an enum variant
+   does NOT compile silently (every non-exhaustive `match` fails), so the risk is
+   not "it ships unnoticed" — it is that once the compiler's list is finished,
+   nothing asks for the TEST rows. That is the gap the derivation closes.
+3. **A name must not promise what the body cannot check.** `..._guards_...`,
+   `..._must_...`, `no_silent_float_...` on a body that only greps a fixture is
+   how a reviewer's eye is spent. If a test genuinely documents rather than
+   verifies (a migration example, a matrix ledger), name it `..._documents_...`
+   and say so in one line.
+
+Scope honesty: this class is invisible to mutation testing of the PRODUCT, since
+the fixture-only assertion never executes the mutated code. It is found by asking
+of each assertion: *what change in rivet would turn this red?* If the answer is
+"none — only editing the fixture", it is this defect.

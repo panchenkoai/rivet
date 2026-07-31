@@ -2,6 +2,283 @@
 
 ## Unreleased
 
+### Fixed
+
+- **`_rivet_row_hash` was not injective — different rows could share a hash.**
+  Cells were joined with a bare `0x1f` and no length, and containers were
+  canonicalised from Arrow's *display text*, where elements join with `", "` and a
+  NULL element renders empty. Measured on the released 0.23.1 binary, hashing only
+  the affected column:
+
+  | value | 0.23.1 | now |
+  |---|---:|---:|
+  | `['a, b']` | `3183735681115164839` | `-3174247791433624734` |
+  | `['a','b']` | `3183735681115164839` | `-8270860736070407760` |
+  | `[NULL]` | `2593065788487682130` | `-644691579053858169` |
+  | `['']` | `2593065788487682130` | `8073291495565291491` |
+  | `[]` | `2593065788487682130` | `4938194412766331533` |
+
+  Five distinct values, two hashes. The same shape hits scalars whose text
+  contains `0x1f`: `(a="x\x1f", b="y")` and `(a="x", b="\x1fy")` both hashed
+  `-7288205783345698746`. Cells are length-prefixed now and containers
+  canonicalise from their CHILDREN, never from rendered text.
+
+  **Affects 0.23.x wherever `meta_columns.row_hash` was set** (opt-in, default
+  off). The source columns were exported correctly; what is wrong is the derived
+  column — and specifically the one whose job is to prove two rows differ, so a
+  consumer that dedupes or audits by it treats distinct rows as identical. The
+  values cannot be repaired in place: re-extract the covered rows.
+  `ROW_HASH_RENDER_ID` moves to `xxh3-128-i64-arrow-display-us-v2` so old and new
+  values are labelled and cannot be mistaken for one another — note that EVERY
+  value changes, not only the colliding ones.
+
+- **A declared BigQuery load silently dropped the meta columns.** The load plan
+  gave no spec to either extraction-written column, so neither reached the
+  warehouse — and nothing said so. Measured end to end against a real dataset on
+  0.23.1: the parquet in GCS carried
+  `['id','name','amount','_rivet_exported_at','_rivet_row_hash']`, the BigQuery
+  table ended up with `['id','name','amount']`, and the run reported
+  `columns=3 … integrity ✓ … LOAD OK, rows_loaded: 3`. The integrity check
+  compares ROW counts only, so a missing column cannot fail it. Both columns now
+  get a spec — same fixture, same run: `columns=5`, and the values land
+  (`n=3, hashes=3, stamps=3`).
+
+  **Affects 0.23.x.** Snowflake failed loudly instead — `COPY INTO` named a column
+  the table lacked — so the silent variant is BigQuery-specific.
+
+- **A plan artifact written by an older rivet stopped being applicable.** The
+  resolved plan gained a required `verify` field on 2026-06-02; three of its
+  siblings in the same struct carry `#[serde(default)]` with comments saying
+  "for old artifacts", and this one did not. Every `plan.json` a user already
+  had on disk failed with `missing field \`verify\``, which is precisely what
+  the frozen v0.7.5 fixture exists to catch — and the fixture's own compat
+  suite could not see it, because (as its module doc explains) it validates the
+  JSON SHAPE of the fixture rather than deserializing it through the current
+  type. So it asserted the fixture against itself and passed for two months.
+  `verify` now defaults to `Size`, the pre-field behaviour. The new guard lives
+  beside the type where it can call the real deserializer:
+  `every_frozen_plan_artifact_still_deserializes` (RED without the default,
+  while the JSON-shape suite stays green on the same mutant).
+
+- **`rivet apply` re-detected chunk boundaries instead of replaying them, on the
+  sequential path.** `apply` exists to execute a `PlanArtifact` exactly as
+  planned, and its module doc says so: "Execute using `ChunkSource::Precomputed`
+  so chunk boundaries from the artifact are replayed without re-running `SELECT
+  min/max` queries." Both PARALLEL branches honoured that. The sequential branch
+  went through `run_with_reconnect`, whose signature carried no chunk source, so
+  `run_export` fell back to `ChunkSource::Detect` and derived windows from live
+  data — silently, and differently from the plan whenever the table had changed
+  since planning. The source is now threaded through
+  `run_with_reconnect` → `run_export`; `rivet run` passes `Detect` explicitly at
+  the call site. Regression:
+  `apply_replays_precomputed_chunks_on_the_sequential_path` (RED against the
+  restored fallback: the Detect path probes the source and the test's source
+  double refuses).
+
+  **Affects every release since 0.10.0** — the fallback was there the day
+  plan/apply landed (2026-04-14). Measured on the released 0.23.1 binary rather
+  than read from the code, which turned up one more broken path than the fix was
+  first credited with: against a table grown from 150 to 300 rows between plan and
+  apply, plain chunked AND `chunk_checkpoint: true` both produced 6 files / 300
+  rows where the artifact pinned 3 windows / 150 rows. `parallel:` replayed
+  correctly. `full` and `keyset` artifacts pin no ranges at all, so apply re-reads
+  by construction there, and the incremental cursor-drift guard refuses a stale
+  plan as documented (snapshot 149 vs current 299). Nothing was lost or corrupted
+  — the run covered a different SCOPE than the plan approved.
+
+- **A run-integrity violation produced no signal at all in release builds.**
+  `check_post_run_invariants` asserts that each runner applied its per-runner
+  facades — the `on_schema_drift` gate ran, Form-B column checksums were
+  harvested — by checking the telltales they leave on the summary. It was gated
+  behind `cfg!(debug_assertions)`, and `[profile.release]` sets no
+  debug-assertions, so in the binary users run the check was compiled out
+  entirely: a run that skipped the drift gate and recorded no checksums looked
+  exactly like a clean one. The check now runs in every build; only the reaction
+  differs. Debug/CI still panics, release logs a `warn` naming the run as one
+  whose integrity records are incomplete, and the data (already committed) is
+  left alone.
+
+### Changed
+
+- **The developer tooling is Python.** The 68 shell scripts under `dev/`,
+  `docs/gifs/` and `scripts/` are replaced by `dev/pytools/` and
+  `dev/release_oracle/`, driven through `python3 -m dev.pytools.<tool>` /
+  `python3 -m dev.release_oracle`. Three of them remain because a container image
+  chooses their interpreter, not rivet: `dev/cdc/primary-hba.sh` (the postgres
+  entrypoint runs only `*.sh` in `docker-entrypoint-initdb.d`, so the extension
+  IS the contract) and the two Airflow recipe init assets, which run in images
+  with no python at all. CI, the Makefile, the pre-commit hook and the live
+  source-parity tests call the modules directly.
+
+  (`dev/stand/{up,verify}.sh` also live in the tree, but they were never part of
+  the ported set — the version-matrix stand arrived separately and is committed
+  as its own thing.)
+
+  The port was not a transliteration: each module records, at the site, the
+  shell defect it removes. Among those that were silently wrong — a `case` with
+  no default arm that started nothing and waited for nothing; `exit` inside
+  `$(…)` killing only the subshell; a staging script that printed "Staged …" and
+  exited 0 after a failed `cp` (which is why the caller's status check could
+  never fire); `seed_pa_audit_all.sh` reporting an empty row count as success;
+  and, on macOS bash 3.2, `local x=$1 y="…${x}…"` on one line resolving `${x}`
+  against the ENCLOSING scope, which made the release gate's independent
+  read-back return empty for every CDC engine.
+
+### Added
+
+- **GIF currency is a release gate.** `dev/release_oracle/gifs.py` compares each
+  tape's rivet invocations against the CLI's actual surface — help text and
+  scaffold — through `docs/gifs/surface.lock.json`, so a GIF that documents a
+  flag the binary no longer has fails the gate before the tag rather than after
+  it. Fingerprinting the surface rather than the rendered bytes keeps the check
+  deterministic; re-render with `python3 -m dev.pytools.render_gifs`.
+
+- **`gc_survival` in the release gate.** Three arms per engine: crash debris is
+  collected, a live run's unmanifested parts are spared, and manifested parts are
+  never touched.
+
+### Fixed — tooling
+
+- **The PR matrix gate could not fail.** `python3 -m dev.pytools.matrices
+  --tier=pr … | tee run.log` exited with `tee`'s status, and GitHub Actions runs
+  `run:` under `bash -e` WITHOUT pipefail — so whatever the matrices reported,
+  the step passed. (Inherited shape: the shell line it replaced had the same
+  pipe.) The step now sets `shell: bash` and `set -o pipefail`.
+
+- **The release gate blamed rivet for its own connectivity.** The CDC
+  state-parity cell read the Postgres state backend through the psql of the
+  container resolved from `RIVET_CDC_POSTGRES_URL` — the SOURCE — which only
+  works when the state database happens to live in the source container. Pointed
+  at its own server, every query failed, and a failed query returned `""` → `"0"`
+  → `empty`, indistinguishable from a genuinely empty table. The cell then
+  reported `postgres!=golden`: a state-backend parity divergence, for a reader
+  that could not connect. The container is now resolved from the state URL, and a
+  query failure raises so the caller can SKIP — the rule the SQLite leg of the
+  same function already followed.
+
+- **Layout baselines could not be re-blessed.** `path_matrix` compares a
+  normalised file listing, and the normaliser erased only a second-granularity
+  timestamp. Two intentional product changes had made part names carry more than
+  that — the millisecond field added when sub-second runs into one prefix were
+  found to clobber each other, and the chunk writer's 64-bit collision nonce —
+  both non-deterministic, so a blessed baseline failed on the very next run. The
+  normaliser now erases both (keeping `_chunk<N>`, which is the contract), and
+  the six baselines are re-blessed for the run-unique manifest copy. `matrix_
+  suites` had its own copy of the patterns, which is how the two drifted; it now
+  delegates to the single definition.
+
+
+## 0.24.0 — 2026-07-29
+
+### Changed — BREAKING
+
+- **`exports[].content_hash` is removed.** A config that still declares it now
+  fails to load (`deny_unknown_fields`). The block existed so the audit's source
+  side could recompute the value IN SQL, which forced SHA-256 (the only digest
+  every warehouse exposes), a 15-hex truncation, one fixed UTC-second timestamp
+  format, and a loud refusal of floats, decimals and booleans — types with no
+  text form five engines agree on.
+
+  That premise is gone: the auditor now re-extracts the sampled rows through the
+  ordinary batch path and re-renders them with the extractor's own function, so
+  agreement is a property of running one piece of code twice rather than of five
+  SQL dialects being kept in step. With no cross-engine treaty to keep, a second
+  hash has no job.
+
+  **Migration:** replace
+
+  ```yaml
+  content_hash:
+    pk: id
+    cols: [status, updated_at]
+  ```
+
+  with
+
+  ```yaml
+  meta_columns:
+    row_hash: [id, status, updated_at]
+  ```
+
+  The column changes name and type — `__content_hash STRING` becomes
+  `_rivet_row_hash INT64` — and the value is NOT comparable across the two. No
+  SQL can convert one to the other: the new value is produced by rivet's
+  extractor, so an existing warehouse column can only be repopulated by
+  re-extraction. Decimal and boolean columns may now be covered; they were
+  refused before because no two engines render them identically, and nothing
+  renders them but rivet now.
+
+  `sha2` and `hex` drop out of the dependency tree. (MD5 stays — that is GCS
+  part-body integrity, unrelated.)
+
+### Added
+
+- **`meta_columns.row_hash` accepts a column list** (`row_hash: [id, status]`)
+  as well as `true`. A declared set is recorded in the run manifest, so a reader
+  can check what the hash covers instead of inferring it from the query; `true`
+  keeps meaning every projected column. A name outside the projection now fails
+  the run rather than being skipped.
+
+- **`_rivet_row_hash` is emitted on the CDC drain**, over the same data columns
+  the snapshot leg hashes. Both legs write one `__changes` log, so a column only
+  one of them produced would leave half the table NULL.
+
+### Fixed
+
+- **An existing warehouse table's schema is reconciled by `ALTER TABLE … ADD
+  COLUMN IF NOT EXISTS`, never by replacing the table.** `CREATE TABLE IF NOT
+  EXISTS` is a no-op on a table rivet did not create, so its next `LOAD DATA`
+  declared columns the table lacked and failed. Overwriting instead would have
+  imposed rivet's schema on data rivet does not own.
+
+- **The load plan emits a column spec for every extraction-written meta column**
+  — `_rivet_row_hash` (the target's own 64-bit integer) and `_rivet_exported_at`
+  (its instant type). They are written at extraction, so they are in every
+  Parquet part but absent from the source column report; without a spec the
+  created table lacked the column and the first load failed on a schema
+  mismatch, after the extract had already been paid for.
+
+- **The row hash's canonical bytes are length-prefixed per field, not
+  separator-delimited.** The old framing was not injective, so two DIFFERENT
+  rows could produce one hash: `("a\x1f", "b")` and `("a", "\x1fb")` built the
+  same bytes, and a NULL was indistinguishable from a value rendering as a
+  single `\x00`. Control bytes are legal in every engine's text type, so this
+  was reachable data. `ROW_HASH_RENDER_ID` moves to
+  `xxh3-128-i64-arrow-display-us-v2`; a reader that recomputes the hash refuses
+  a rendering it does not know rather than comparing different bytes.
+
+- **A nested column (`array`/`struct`/`map`) is now REFUSED by `row_hash`
+  instead of hashed ambiguously.** Arrow's rendering of a list is itself lossy —
+  it joins elements with `", "` and renders a NULL element as the empty string,
+  so `["a, b"]` and `["a","b"]` render identically, as do `[NULL]`, `[""]` and
+  `[]`. A PostgreSQL `text[]` reaches that path, so a row whose array changed
+  kept its old hash and change detection skipped it. No framing can fix an
+  ambiguity inside a field's own text; the run now fails naming the column and
+  the escape (`meta_columns.row_hash: [col, ...]`). Hashing nested values
+  structurally is the follow-up.
+
+- **`cdc.initial:` on an engine with no server-side anchor is refused at config
+  load when `cdc.checkpoint:` is missing**, for every mode rather than by naming
+  one. The checkpoint file IS the anchor on MySQL and SQL Server, and
+  `ensure_anchor` requires it for any `initial:` mode — so a mode the config
+  check did not cover only deferred the failure to mid-run, reported as an anchor
+  error instead of the missing setting it is.
+
+- **The chunk-plan fingerprint is length-prefixed rather than `\x1f`-separated.**
+  `base_query` is arbitrary operator SQL and may contain the separator, so one
+  plan's text could imitate another's field boundaries — and a fingerprint match
+  makes a resume ADOPT the prior run's chunk table, reading windows planned for a
+  different query. A mismatch is the safe direction (it refuses to resume), which
+  is also why re-framing is safe: an in-flight resume across this upgrade asks
+  for a chunk reset instead of adopting the wrong plan.
+
+- **An existing Snowflake change log is reconciled by `ALTER TABLE … ADD COLUMN
+  IF NOT EXISTS`**, like BigQuery's. The reconciliation lives in each adapter, so
+  shipping it on BigQuery alone left Snowflake with `CREATE TABLE IF NOT EXISTS`
+  (a no-op on an existing table) followed by a `COPY INTO … (<declared
+  columns>)` naming a column the table lacks — every CDC load onto a
+  pre-existing log failing with `invalid identifier`, after the extract.
+
 ## 0.23.1 — 2026-07-27
 
 ### Fixed

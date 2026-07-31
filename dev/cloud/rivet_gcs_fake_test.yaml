@@ -1,6 +1,6 @@
 # GCS export against local fake-gcs-server (Google Cloud Storage JSON API emulator).
 # Requires: docker compose up -d fake-gcs postgres
-# Run: ./dev/cloud/run_gcs_fake_export.sh
+# Run: python3 -m dev.pytools.cloud_exports gcs-fake
 #
 # allow_anonymous: OpenDAL sends unsigned requests (emulator accepts them).
 # endpoint: base URL only — Rivet/OpenDAL append /storage/v1/... paths.

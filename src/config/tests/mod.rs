@@ -1421,7 +1421,7 @@ exports:
 fn meta_columns_defaults_to_disabled() {
     let cfg = Config::from_yaml(MINIMAL_YAML).unwrap();
     assert!(!cfg.exports[0].meta_columns.exported_at);
-    assert!(!cfg.exports[0].meta_columns.row_hash);
+    assert!(!cfg.exports[0].meta_columns.row_hash.enabled());
 }
 
 #[test]
@@ -1445,7 +1445,7 @@ exports:
     )
     .unwrap();
     assert!(cfg.exports[0].meta_columns.exported_at);
-    assert!(cfg.exports[0].meta_columns.row_hash);
+    assert!(cfg.exports[0].meta_columns.row_hash.enabled());
 }
 
 #[test]
@@ -1490,7 +1490,7 @@ exports:
     )
     .unwrap();
     assert!(!cfg.exports[0].meta_columns.exported_at);
-    assert!(cfg.exports[0].meta_columns.row_hash);
+    assert!(cfg.exports[0].meta_columns.row_hash.enabled());
 }
 
 #[test]

@@ -22,8 +22,8 @@ and compared column-by-column on:
 - **distinct count** — no distinct collapse (catches precision truncation)
 - **sum** (numeric columns) — exact value fidelity, incl. `DECIMAL(38,10)` to the 10th decimal
 
-`source_parity_sweep.sh` covers the **batch** export path; `source_parity_cdc.sh`
-covers the **CDC** path (a separate per-engine value-decode path), deduping the CDC
+`python3 -m dev.pytools.sweep source-parity` covers the **batch** export path;
+`python3 -m dev.pytools.cdc_soak source-parity` covers the **CDC** path (a separate per-engine value-decode path), deduping the CDC
 parquet to current-state (latest change per id by `__pos,__seq`, deletes excluded)
 before comparing.
 
@@ -40,8 +40,8 @@ docker compose exec -T mssql-cdc /opt/mssql-tools18/bin/sqlcmd -S localhost -U s
   -P 'Rivet_Passw0rd!' -C -Q "IF DB_ID('rivet') IS NULL CREATE DATABASE rivet;"
 cargo build --bin rivet
 
-bash dev/sweep/source_parity_sweep.sh   # batch  -> exit 1 on any mismatch
-bash dev/sweep/source_parity_cdc.sh     # cdc    -> exit 1 on any mismatch
+python3 -m dev.pytools.sweep source-parity      # batch  -> exit 1 on any mismatch
+python3 -m dev.pytools.cdc_soak source-parity   # cdc    -> exit 1 on any mismatch
 ```
 
 Override the binary with `RIVET=/path/to/rivet`.

@@ -419,7 +419,7 @@ fn build_plans(
         })?;
         let gcs_prefix = resolve_load_prefix(dest, &export.name, bucket)?;
 
-        let specs = report
+        let mut specs: Vec<TargetColumnSpec> = report
             .columns
             .into_iter()
             .map(|c| TargetColumnSpec {
@@ -435,6 +435,47 @@ fn build_plans(
                 cast_sql: None,
             })
             .collect();
+
+        // The meta columns rivet writes at EXTRACTION are in every Parquet part
+        // but absent from the column report, which the type resolver builds from
+        // the SOURCE catalog. Without a spec the created table simply lacks the
+        // column and the very first load fails on a schema mismatch — after the
+        // extract has already run. So EVERY enabled meta column needs one; they
+        // are resolved together because a spec for one and not the other is the
+        // same bug twice (`_rivet_row_hash` had it fixed while
+        // `_rivet_exported_at`, written by the identical seam, did not).
+        //
+        // Types go through the same per-target resolver every other column does
+        // rather than a hardcoded literal, so they cannot drift from the
+        // warehouse's own types (the hash: BigQuery INT64, Snowflake
+        // NUMBER(38,0), ClickHouse Int64).
+        // Order mirrors `enrich_schema`'s (exported_at, then row_hash) so the spec
+        // list matches the Parquet's column order.
+        let mut meta_specs: Vec<(&str, crate::types::RivetType)> = Vec::new();
+        if export.meta_columns.exported_at {
+            meta_specs.push((
+                crate::enrich::COL_EXPORTED_AT,
+                crate::types::RivetType::Timestamp {
+                    unit: crate::types::TimeUnit::Microsecond,
+                    timezone: Some("UTC".into()),
+                },
+            ));
+        }
+        if export.meta_columns.row_hash.enabled() {
+            meta_specs.push((crate::enrich::COL_ROW_HASH, crate::types::RivetType::Int64));
+        }
+        if !meta_specs.is_empty() {
+            let target = crate::types::target::ExportTarget::parse(load.target.name())
+                .with_context(|| format!("unknown load target `{}`", load.target.name()))?;
+            for (name, rivet_type) in &meta_specs {
+                specs.push(target.resolve_column(crate::types::target::TargetInput {
+                    column_name: name,
+                    rivet_type,
+                    arrow_type: None,
+                    fidelity: crate::types::TypeFidelity::Exact,
+                }));
+            }
+        }
 
         // Complete-snapshot modes → overwrite the latest run; delta modes → their
         // own append path. Exhaustive (no `_`) on purpose: a future delta-style
@@ -658,6 +699,95 @@ load:
         assert_eq!(plans[1].table, "alpha_tbl");
         assert_eq!(plans[1].mode, LoadMode::Full);
         assert_eq!(plans[1].gcs_prefix, "gs://b1/exports/alpha/");
+    }
+
+    /// `_rivet_row_hash` is written by rivet at extraction, so it never appears
+    /// in the source column report. Without a spec the warehouse table is
+    /// created without the column and the FIRST load fails on a schema mismatch
+    /// — after the extract has already been paid for.
+    #[test]
+    fn build_plans_appends_a_spec_for_the_extraction_hash() {
+        let yaml = |hash_block: &str| {
+            format!(
+                "source:\n  type: postgres\n  url: \"postgresql://localhost/test\"\n\
+                 exports:\n  - name: a\n    table: t\n    mode: full\n    format: parquet\n\
+                 \x20   destination:\n      type: gcs\n      bucket: b\n      prefix: p/\n{hash_block}\
+                 load:\n  target: bigquery\n  project: p\n  dataset: d\n"
+            )
+        };
+        let reports = || {
+            vec![ExportReport {
+                export: "a".into(),
+                columns: vec![col("id", "ok"), col("status", "ok")],
+            }]
+        };
+
+        let without = crate::config::Config::from_yaml(&yaml("")).unwrap();
+        let load: LoadSection = serde_json::from_value(without.load.clone().unwrap()).unwrap();
+        let plans = build_plans(&without, &load, reports()).unwrap();
+        assert_eq!(
+            plans[0]
+                .specs
+                .iter()
+                .map(|s| s.column_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["id", "status"],
+            "no row_hash configured ⇒ no extra column"
+        );
+
+        let with = crate::config::Config::from_yaml(&yaml(
+            "    meta_columns:\n      row_hash: [id, status]\n",
+        ))
+        .unwrap();
+        let load: LoadSection = serde_json::from_value(with.load.clone().unwrap()).unwrap();
+        let plans = build_plans(&with, &load, reports()).unwrap();
+        let last = plans[0].specs.last().unwrap();
+        assert_eq!(last.column_name, crate::enrich::COL_ROW_HASH);
+        // Resolved through the per-target resolver, not hardcoded — BigQuery's
+        // 64-bit integer. A Snowflake target would resolve NUMBER(38,0) here.
+        assert_eq!(last.target_type, "INT64");
+        assert_eq!(last.status, TargetStatus::Ok);
+
+        // …and the SIBLING meta column, written by the identical seam, needs a
+        // spec for the identical reason. `_rivet_row_hash` got one and
+        // `_rivet_exported_at` did not, which is the same bug twice: both are
+        // produced at extraction, so neither can ever appear in the SOURCE column
+        // report, and a missing spec fails the first load on a schema mismatch
+        // after the extract was paid for. Asserted as the ORDERED tail so it also
+        // pins the order against `enrich_schema`'s (exported_at, then row_hash) —
+        // a spec list in the other order describes a different Parquet.
+        let both = crate::config::Config::from_yaml(&yaml(
+            "    meta_columns:\n      exported_at: true\n      row_hash: true\n",
+        ))
+        .unwrap();
+        let load: LoadSection = serde_json::from_value(both.load.clone().unwrap()).unwrap();
+        let plans = build_plans(&both, &load, reports()).unwrap();
+        let names: Vec<&str> = plans[0]
+            .specs
+            .iter()
+            .map(|s| s.column_name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "id",
+                "status",
+                crate::enrich::COL_EXPORTED_AT,
+                crate::enrich::COL_ROW_HASH,
+            ],
+            "every extraction-written meta column needs a spec, in enrich_schema's order"
+        );
+        let ts = plans[0].specs.iter().rev().nth(1).unwrap();
+        assert_eq!(
+            ts.column_name,
+            crate::enrich::COL_EXPORTED_AT,
+            "the timestamp spec sits before the hash spec"
+        );
+        assert_eq!(
+            ts.target_type, "TIMESTAMP",
+            "resolved through the per-target resolver, not hardcoded — BigQuery's \
+             instant type for a Timestamp(us, UTC)"
+        );
     }
 
     #[test]

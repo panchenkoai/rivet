@@ -15,7 +15,7 @@ behavior regressions in the binary but cannot catch *version-specific*
 regressions like "the chunked-mode introspection probe broke on PG 12
 when we switched to a `pg_class.relfilenode` query".
 
-`dev/legacy/run_full_matrix.sh` covers cross-version but runs the
+`python3 -m dev.pytools.legacy_stand full-matrix` covers cross-version but runs the
 entire e2e suite per version — minutes of runtime, not CI-friendly as
 a pre-merge gate.
 
@@ -32,16 +32,16 @@ docker compose --profile legacy up -d \
 docker compose up -d postgres mysql
 
 # 2. Seed pa_audit (30 rows) on every version
-./seed_all.sh
+python3 -m dev.pytools.matrix_common seed-pa-audit-all
 
 # 3. Build + copy binary
 cargo build --bin rivet --release
 cp target/release/rivet dev/cross_version_matrix/rivet
 
 # 4. Probe + check agreement
-cd dev/cross_version_matrix
-./matrix.sh
-./check_cross.sh
+# from the repo root:
+python3 -m dev.pytools.cross_version matrix
+python3 -m dev.pytools.cross_version check
 ```
 
 ## Probes
@@ -59,7 +59,7 @@ Per-version invocations (templated YAML in `logs/_template*.yaml`):
 
 ## What the guard asserts
 
-`check_cross.sh` walks `logs/<version>/<probe>/exit_code` and:
+`python3 -m dev.pytools.cross_version check` walks `logs/<version>/<probe>/exit_code` and:
 
 1. For each probe, every PG version that probed must return the SAME rc.
    A divergence (e.g. `pg-12=0, pg-13=1, pg-14-16=0`) is reported with
@@ -85,7 +85,7 @@ is intentional:
   (timestamps, addresses, port numbers differ). For message
   contracts use cli_matrix / cfg_matrix.
 - **smoke only.** Full feature coverage per version stays in
-  `dev/legacy/run_full_matrix.sh`. This matrix exists to catch a
+  `python3 -m dev.pytools.legacy_stand full-matrix`. This matrix exists to catch a
   catastrophic regression early in 20s, not to validate full e2e.
 - **arm64 host caveat.** MySQL 5.7 has no arm64 image — runs under
   emulation on Apple Silicon, which can be slow. If the seed takes

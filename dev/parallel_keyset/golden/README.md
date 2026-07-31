@@ -53,7 +53,7 @@ Server have no unsigned BIGINT, so this variant is MySQL-only.
   on every engine (all columns derived from `n`), types mapped per dialect.
 - `config.yaml` — the rivet keyset-parallel config (`chunk_by_key: id`,
   `parallel: 4`, `chunk_size: 500000`), destination local parquet.
-- `verify.sh` — devbox runner: seed → `rivet run` → assert rows == 10,000,000 AND
+- `python3 -m dev.pytools.parallel_keyset verify` — devbox runner: seed → `rivet run` → assert rows == 10,000,000 AND
   parts == 20 (reads the destination parquet + counts files), per engine.
 
 ## Run on the devbox
@@ -63,8 +63,8 @@ Server have no unsigned BIGINT, so this variant is MySQL-only.
 psql "$PG_URL"     -f fixture_postgres.sql
 mysql  ... < fixture_mysql.sql
 sqlcmd ... -i fixture_mssql.sql
-# then, per engine, point config.yaml at the engine URL and:
-./verify.sh postgres   # → PASS: 10,000,000 rows / 20 files
+# then, per engine, point config.yaml at the engine URL and, from the repo root:
+python3 -m dev.pytools.parallel_keyset verify postgres   # → PASS: 10,000,000 rows / 20 files
 ```
 
 Wire into `dev/release-oracle/matrix.yaml` as a scenario

@@ -588,6 +588,7 @@ pub(crate) fn synthetic_failed_summary(export_name: &str, err: &anyhow::Error) -
         retries: 0,
         reconnects: 0,
         resumed: false,
+        chunks_precomputed: false,
         validated: None,
         schema_changed: None,
         quality_passed: None,
@@ -843,7 +844,13 @@ pub(super) fn run_export_job(
             chunked::run_chunked_parallel(state, &plan, &mut summary, chunked::ChunkSource::Detect)
         }
     } else {
-        run_with_reconnect(state, &plan, &mut summary, config_path)
+        run_with_reconnect(
+            state,
+            &plan,
+            &mut summary,
+            config_path,
+            chunked::ChunkSource::Detect,
+        )
     };
 
     let rss_peak = rss_sampler.stop();
@@ -1063,7 +1070,7 @@ pub(crate) fn run_export_job_with_chunk_source(
             chunked::run_chunked_parallel(state, plan, &mut summary, chunk_source)
         }
     } else {
-        run_with_reconnect(state, plan, &mut summary, "")
+        run_with_reconnect(state, plan, &mut summary, "", chunk_source)
     };
 
     let rss_peak = rss_sampler.stop();

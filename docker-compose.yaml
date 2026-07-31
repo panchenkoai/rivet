@@ -188,7 +188,7 @@ services:
   # that needs a PostgreSQL IN RECOVERY — asserting bounded CDC on a standby fails
   # loud. `trust` auth on the primary is what lets the standby's pg_basebackup
   # connect for replication over the docker network. Brought up by
-  # `dev/cdc/stand.sh standby`.
+  # `python3 -m dev.pytools.cdc_stand standby`.
   pg-cdc-primary:
     image: postgres:${POSTGRES_CDC_TAG:-16}
     profiles: ["cdc-standby"]

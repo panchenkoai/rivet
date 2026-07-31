@@ -93,16 +93,37 @@ pub(super) fn finalize_manifest(
     use crate::manifest::ManifestStatus;
     use crate::pipeline::manifest_writer::{ManifestBuilder, WriteOutcome, write_manifest};
 
-    // CI gate: catch any future runner that drifts summary aggregates away
-    // from manifest_parts (the bug parallel_checkpoint had before e9b0796).
-    // Debug-build only — compiled out in release.
-    if cfg!(debug_assertions)
-        && let Err(e) = summary.check_post_run_invariants(plan.resume)
-    {
-        panic!(
-            "summary↔manifest coherence violated at finalize_manifest \
-             for {} '{}': {}",
-            kind, summary.export_name, e
+    // Catch any future runner that drifts summary aggregates away from
+    // manifest_parts (the bug parallel_checkpoint had before e9b0796), or that
+    // owns its loop and skips a per-runner facade (the runner-bypass class).
+    //
+    // The CHECK now runs in every build; only the REACTION differs. It was
+    // `cfg!(debug_assertions)`-gated, and `[profile.release]` sets no
+    // debug-assertions — so in the binary users actually run it was compiled out
+    // entirely and a violation produced NO signal at all: not a panic, not a log
+    // line. A run that silently skipped the drift gate and harvested no column
+    // checksums looked exactly like a clean one.
+    //
+    // Debug/CI keeps the panic (a test must fail loudly). Release warns and
+    // carries on: the run's data is already committed and aborting here would
+    // destroy nothing but the user's afternoon — but the operator now learns
+    // that this run's integrity records are incomplete, which is the whole point
+    // of the guard.
+    if let Err(e) = summary.check_post_run_invariants(plan.resume) {
+        if cfg!(debug_assertions) {
+            panic!(
+                "summary↔manifest coherence violated at finalize_manifest \
+                 for {} '{}': {}",
+                kind, summary.export_name, e
+            );
+        }
+        log::warn!(
+            "{} '{}': run-integrity invariant violated — {}. The run's data is \
+             committed, but its integrity records are incomplete; treat this \
+             run's manifest as unverified and report it.",
+            kind,
+            summary.export_name,
+            e
         );
     }
 
@@ -510,6 +531,7 @@ pub(super) fn write_running_manifest(plan: &ResolvedRunPlan, run_id: &str, start
         SourceType::Mongo => "mongo",
     };
     let manifest = RunManifest {
+        row_hash: None,
         manifest_version: MANIFEST_VERSION,
         run_id: run_id.to_string(),
         export_name: plan.export_name.clone(),
@@ -687,23 +709,25 @@ mod tests {
         s.cursor_column = Some("updated_at".into());
         s.cursor_low = Some("2026-01-01".into());
         s.cursor_high = Some("2026-02-01".into());
-        s.journal.record(crate::journal::RunEvent::PlanResolved(
-            crate::journal::PlanSnapshot {
-                export_name: plan.export_name.clone(),
-                base_query: plan.base_query.clone(),
-                strategy: "snapshot".into(),
-                format: "parquet".into(),
-                compression: "none".into(),
-                destination_type: "local".into(),
-                tuning_profile: "balanced".into(),
-                batch_size: 1000,
-                validate: false,
-                reconcile: false,
-                resume: false,
-                chunk_key: None,
-                resumable: false,
-            },
-        ));
+        s.journal
+            .record(crate::journal::RunEvent::PlanResolved(Box::new(
+                crate::journal::PlanSnapshot {
+                    row_hash: None,
+                    export_name: plan.export_name.clone(),
+                    base_query: plan.base_query.clone(),
+                    strategy: "snapshot".into(),
+                    format: "parquet".into(),
+                    compression: "none".into(),
+                    destination_type: "local".into(),
+                    tuning_profile: "balanced".into(),
+                    batch_size: 1000,
+                    validate: false,
+                    reconcile: false,
+                    resume: false,
+                    chunk_key: None,
+                    resumable: false,
+                },
+            )));
         s
     }
 

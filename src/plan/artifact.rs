@@ -637,6 +637,53 @@ fn format_rows(n: i64) -> String {
 }
 
 #[cfg(test)]
+mod legacy_wire_compat {
+    //! Every frozen plan artifact must still DESERIALIZE through the current
+    //! `PlanArtifact`.
+    //!
+    //! `tests/artifact_legacy_compat.rs` freezes the same fixtures but checks
+    //! their JSON SHAPE — its own module doc explains why ("`PlanArtifact` is
+    //! `pub(crate)` … we validate the wire format"). That makes it blind to the
+    //! failure it exists to prevent: the fixture is what it asserts against, so
+    //! adding a REQUIRED field to the Rust struct leaves every assertion passing
+    //! while `rivet apply` starts rejecting every plan a user already has on
+    //! disk. That is exactly what happened when `verify` was added on 2026-06-02
+    //! — `missing field `verify`` — and the only thing that caught it was a CLI
+    //! matrix cell nobody had run in months.
+    //!
+    //! This lives beside the type so it can call the real deserializer.
+
+    use super::PlanArtifact;
+
+    #[test]
+    fn every_frozen_plan_artifact_still_deserializes() {
+        for (label, body) in [
+            (
+                "v0_7_5_plan_full",
+                include_str!("../../tests/fixtures/artifacts_legacy/v0_7_5_plan_full.json"),
+            ),
+            (
+                "v0_7_5_plan_incremental",
+                include_str!("../../tests/fixtures/artifacts_legacy/v0_7_5_plan_incremental.json"),
+            ),
+            (
+                "v0_7_5_plan_chunked",
+                include_str!("../../tests/fixtures/artifacts_legacy/v0_7_5_plan_chunked.json"),
+            ),
+        ] {
+            let parsed = PlanArtifact::from_json(body);
+            assert!(
+                parsed.is_ok(),
+                "{label}: a plan artifact written by an older rivet must still parse — \
+                 `rivet apply` reads it straight off a user's disk. A new field on the \
+                 resolved plan needs `#[serde(default)]`, like its siblings. Error: {}",
+                parsed.err().map(|e| e.to_string()).unwrap_or_default()
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{

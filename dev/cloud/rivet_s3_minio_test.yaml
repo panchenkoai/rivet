@@ -1,6 +1,6 @@
 # S3 export to local MinIO (S3-compatible).
 # Requires: docker compose up -d minio postgres
-# Create bucket first: see dev/cloud/run_s3_export.sh or manually via MinIO console at http://localhost:9001
+# Create bucket first: see python3 -m dev.pytools.cloud_exports s3 or manually via MinIO console at http://localhost:9001
 
 source:
   type: postgres

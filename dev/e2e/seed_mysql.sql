@@ -1,5 +1,5 @@
 -- Minimal E2E seed for MySQL 8.0+.
--- Populates only the tables required by run_e2e.sh (users, orders, events).
+-- Populates only the tables required by dev/pytools/e2e.py (users, orders, events).
 -- Uses a recursive CTE numbers table to avoid loops/procedures.
 --
 -- Usage:

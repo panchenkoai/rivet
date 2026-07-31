@@ -129,6 +129,7 @@ mod run_summary_redaction {
     fn make_summary_with_error(msg: String) -> RunSummary {
         let mut s =
             RunSummary::stub_for_testing("r-redact-1", "orders").with_plan_snapshot(PlanSnapshot {
+                row_hash: None,
                 export_name: "orders".into(),
                 base_query: "SELECT 1".into(),
                 strategy: "snapshot".into(),

@@ -328,6 +328,10 @@ fn dispatch_cdc(a: CdcArgs) -> Result<()> {
             dest_uri: dir,
             // The ad-hoc CLI has no `columns:` surface; config-driven runs do.
             overrides: crate::types::ColumnOverrides::new(),
+            // Likewise no `row_hash:` surface — a hash's covered column set is
+            // a contract the warehouse table carries, which needs a config file
+            // to declare.
+            row_hash: crate::config::RowHash::All(false),
         }],
         format: fmt,
         max_events: a.max_events,

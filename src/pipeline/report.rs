@@ -511,6 +511,7 @@ mod tests {
     fn fresh_summary(status: &str, files_committed: usize) -> RunSummary {
         let mut s = RunSummary::stub_for_testing("test_run_001", "orders").with_plan_snapshot(
             PlanSnapshot {
+                row_hash: None,
                 export_name: "orders".into(),
                 base_query: "SELECT * FROM orders".into(),
                 strategy: "snapshot".into(),

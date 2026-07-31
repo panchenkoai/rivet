@@ -33,6 +33,7 @@ use rivet::pipeline::{ValidateOutputFormat, ValidateTarget, run_validate_command
 /// historical-prefix flags affect.
 fn empty_success_manifest(run_id: &str, export_name: &str) -> RunManifest {
     RunManifest {
+        row_hash: None,
         mode: "batch".to_string(),
         manifest_version: MANIFEST_VERSION,
         run_id: run_id.into(),

@@ -40,6 +40,7 @@ fn plan_snapshot_from(plan: &ResolvedRunPlan) -> PlanSnapshot {
         resume: plan.resume,
         chunk_key: plan.strategy.chunk_key().map(|c| c.to_string()),
         resumable: plan.strategy.is_resumable(),
+        row_hash: crate::enrich::RowHashContract::of(&plan.meta_columns.row_hash),
     }
 }
 
@@ -91,6 +92,20 @@ pub struct RunSummary {
     /// (keyset via the in-progress run_id, chunked via `--resume`). A resume-hit is
     /// the tell that the previous run died — visible in the run's own log line.
     pub resumed: bool,
+    /// True when this run's chunk boundaries came from a plan artifact
+    /// (`ChunkSource::Precomputed`), i.e. `rivet apply`, rather than being
+    /// detected against the live source.
+    ///
+    /// It exists for the same reason `resumed` does: the pre-chunk schema-drift
+    /// gate lives inside `prepare_chunk_plan`, which only the `Detect` arm calls
+    /// — deliberately, per that function's contract ("drift was evaluated on the
+    /// original planning run that produced the ranges"). So a precomputed run
+    /// legitimately ends with `schema_changed == None`, which
+    /// `check_post_run_invariants` would otherwise read as a runner that skipped
+    /// its facade. Without this flag the exemption would have to be "any apply",
+    /// which is broader than the truth: an apply whose artifact carries no ranges
+    /// falls back to `Detect` and DOES run the gate.
+    pub chunks_precomputed: bool,
     /// True once this run entered `run_export` — the shared batch-runner dispatch
     /// choke point, which always has a `StateStore`. It marks a run subject to the
     /// per-runner facade contract (ADR-0018): every batch runner MUST apply the
@@ -216,7 +231,7 @@ impl RunSummary {
             chrono::Utc::now().format("%Y%m%dT%H%M%S%.3f"),
         );
         let mut journal = RunJournal::new(&run_id, &plan.export_name);
-        journal.record(RunEvent::PlanResolved(plan_snapshot_from(plan)));
+        journal.record(RunEvent::PlanResolved(Box::new(plan_snapshot_from(plan))));
 
         ipc::emit_event(&ChildEvent::Started {
             export_name: plan.export_name.clone(),
@@ -239,6 +254,7 @@ impl RunSummary {
             retries: 0,
             reconnects: 0,
             resumed: false,
+            chunks_precomputed: false,
             state_backed: false,
             validated: None,
             schema_changed: None,
@@ -315,6 +331,7 @@ impl RunSummary {
             retries: 0,
             reconnects: 0,
             resumed: false,
+            chunks_precomputed: false,
             state_backed: false,
             validated: None,
             schema_changed: None,
@@ -410,7 +427,7 @@ impl RunSummary {
     #[doc(hidden)]
     #[allow(dead_code)]
     pub fn with_plan_snapshot(mut self, snap: PlanSnapshot) -> Self {
-        self.journal.record(RunEvent::PlanResolved(snap));
+        self.journal.record(RunEvent::PlanResolved(Box::new(snap)));
         self
     }
 
@@ -752,9 +769,19 @@ impl RunSummary {
         let parts_bytes: u64 = self.manifest_parts.iter().map(|p| p.size_bytes).sum();
 
         if self.files_committed > self.manifest_parts.len() {
+            // Subsumes the empty-part-list case: with no parts recorded, ANY
+            // committed file trips this. The dedicated `manifest_parts.is_empty()`
+            // branch that used to sit below was therefore unreachable — it needed
+            // `files_committed > 0` AND `len() == 0`, which this returns on first —
+            // so its message never reached anyone and mutation testing found its
+            // condition unkillable. Its diagnosis is folded in here instead of
+            // deleted, because the ADR reference is the useful half.
             return Err(format!(
                 "summary.files_committed ({}) > manifest_parts.len() ({}) — \
-                 a runner bumped files_committed without commit::record_part",
+                 a runner bumped files_committed without commit::record_part. \
+                 With an EMPTY part list this is also the ADR-0012 M1 gap: the \
+                 cloud manifest would ship with no parts (what parallel_checkpoint \
+                 did before e9b0796)",
                 self.files_committed,
                 self.manifest_parts.len()
             ));
@@ -772,14 +799,6 @@ impl RunSummary {
                 "summary.bytes_written ({}) > sum(manifest_parts.size_bytes) ({}) — \
                  a runner bumped bytes_written without commit::record_part",
                 self.bytes_written, parts_bytes
-            ));
-        }
-        if self.status == "success" && self.files_committed > 0 && self.manifest_parts.is_empty() {
-            return Err(format!(
-                "success run with files_committed={} has empty manifest_parts — \
-                 cloud manifest (ADR-0012 M1) would ship with no part list \
-                 (this is the gap parallel_checkpoint had before commit e9b0796)",
-                self.files_committed
             ));
         }
         // Invariant audit gap #1, weak form: a successful run that produced
@@ -819,7 +838,11 @@ impl RunSummary {
             // diagnosis (`resumed`) AND the raw `--resume` flag (`is_resume_run`) — a
             // resume that crashed before its first commit adopts nothing yet still
             // skipped the gate.
-            if !self.resumed && !is_resume_run && self.schema_changed.is_none() {
+            if !self.resumed
+                && !is_resume_run
+                && !self.chunks_precomputed
+                && self.schema_changed.is_none()
+            {
                 return Err(
                     "state_backed success committed parts but schema_changed is None — \
                      the on_schema_drift gate was never applied (no runner called \
@@ -1385,6 +1408,31 @@ mod tests {
         assert!(!fsnap.resumable);
     }
 
+    /// The snapshot is where the row-hash contract enters the trust artifacts:
+    /// the manifest builder copies it verbatim, so the manifest can only ever
+    /// advertise what the RESOLVED PLAN was going to hash. Taking it from
+    /// anywhere else — the raw config, a default — would let the two disagree,
+    /// and a reader has no way to notice.
+    #[test]
+    fn plan_snapshot_records_the_row_hash_contract_the_run_applies() {
+        let mut plan = plan_for("orders");
+        let bare = RunSummary::new(&plan);
+        assert_eq!(
+            bare.journal.plan_snapshot().unwrap().row_hash,
+            None,
+            "no hash column written ⇒ nothing to advertise"
+        );
+
+        plan.meta_columns.row_hash =
+            crate::config::RowHash::Columns(vec!["id".into(), "status".into()]);
+        let hashed = RunSummary::new(&plan);
+        let snap = hashed.journal.plan_snapshot().unwrap();
+        let c = snap.row_hash.clone().expect("a declared set is recorded");
+        assert_eq!(c.column, crate::enrich::COL_ROW_HASH);
+        assert_eq!(c.covered, plan.meta_columns.row_hash);
+        assert_eq!(c.render, crate::enrich::ROW_HASH_RENDER_ID);
+    }
+
     #[test]
     fn plan_snapshot_deserializes_pre_field_journal_as_defaults() {
         // A journal written before chunk_key/resumable existed (real: the state
@@ -1564,6 +1612,103 @@ mod tests {
             cdc.check_post_run_invariants(false).is_ok(),
             "a non-run_export run must not be held to the facade contract"
         );
+
+        // `rivet apply` with PRECOMPUTED chunk boundaries legitimately skips the
+        // drift gate too: the gate lives inside `prepare_chunk_plan`, whose own
+        // contract says a precomputed source never calls it ("drift was evaluated
+        // on the original planning run that produced the ranges"). Without this
+        // exemption the guard reads a correct apply as a runner-bypass — which is
+        // exactly what happened the moment `apply` was fixed to actually replay
+        // its artifact instead of re-detecting: every chunked apply started
+        // aborting at finalize with exit 101.
+        let mut applied = base();
+        applied.chunks_precomputed = true;
+        applied.column_checksums.push(ck());
+        // schema_changed stays None
+        assert!(
+            applied.check_post_run_invariants(false).is_ok(),
+            "an apply replaying precomputed chunks must not trip the drift-gate branch"
+        );
+
+        // …and the exemption is NARROW: it is about the precomputed source, not
+        // about "any apply". A run that did NOT come from an artifact still has to
+        // show the gate ran, or the flag would be a blanket hole in the guard.
+        let mut not_applied = base();
+        not_applied.chunks_precomputed = false;
+        not_applied.column_checksums.push(ck());
+        assert!(
+            not_applied.check_post_run_invariants(false).is_err(),
+            "the precomputed exemption must not weaken the guard for ordinary runs"
+        );
+
+        // ── the guard's own BOUNDARIES ────────────────────────────────────────
+        // Every case above varies what the runner DID; none varies the conditions
+        // that decide whether the guard looks at all. Mutation testing found seven
+        // survivors in exactly those conditions (`status == "success"`,
+        // `files_committed > 0`, `total_rows > 0`) — the comparisons could be
+        // inverted or loosened and no test noticed, in the one function whose job
+        // is to notice. These pin each boundary from BOTH sides.
+
+        // `files_committed > 0`: a success that committed NOTHING has no facade
+        // obligation — there is no output to have applied them to. Loosening the
+        // comparison to `>= 0` must not start flagging it.
+        let mut nothing_committed = base();
+        nothing_committed.files_committed = 0;
+        nothing_committed.files_produced = 0;
+        nothing_committed.bytes_written = 0;
+        nothing_committed.total_rows = 0;
+        nothing_committed.manifest_parts.clear();
+        assert!(
+            nothing_committed.check_post_run_invariants(false).is_ok(),
+            "a success that committed no files owes no facades"
+        );
+
+        // …and the same shape WITH rows extracted is the fabrication signature the
+        // second branch exists for: rows read, nothing landed.
+        let mut rows_but_no_files = base();
+        rows_but_no_files.files_committed = 0;
+        rows_but_no_files.files_produced = 0;
+        rows_but_no_files.manifest_parts.clear();
+        rows_but_no_files.bytes_written = 0;
+        rows_but_no_files.total_rows = 5;
+        let e = rows_but_no_files
+            .check_post_run_invariants(false)
+            .unwrap_err();
+        assert!(e.contains("no files committed"), "{e}");
+
+        // `total_rows > 0`: zero rows AND zero files is a legitimate empty run
+        // (a resume with nothing to do), not a fabrication.
+        let mut empty_run = base();
+        empty_run.files_committed = 0;
+        empty_run.files_produced = 0;
+        empty_run.total_rows = 0;
+        empty_run.bytes_written = 0;
+        empty_run.manifest_parts.clear();
+        assert!(
+            empty_run.check_post_run_invariants(false).is_ok(),
+            "an empty run must not read as rows-extracted-but-nothing-landed"
+        );
+
+        // `status == "success"`: a FAILED run is not held to any of it — the
+        // facades may legitimately not have run, which is why it failed.
+        let mut failed = base();
+        failed.status = "failed".into();
+        failed.schema_changed = Some(false);
+        failed.column_checksums.push(ck());
+        assert!(
+            failed.check_post_run_invariants(false).is_ok(),
+            "a failed run must not be graded against the success-only invariants"
+        );
+
+        // Committed files with an EMPTY part list — the ADR-0012 M1 gap. It is
+        // reported by the files_committed-vs-len branch, which subsumes it; a
+        // dedicated branch for it was unreachable and has been removed.
+        let mut no_parts = base();
+        no_parts.schema_changed = Some(false);
+        no_parts.column_checksums.push(ck());
+        no_parts.manifest_parts.clear();
+        let e = no_parts.check_post_run_invariants(false).unwrap_err();
+        assert!(e.contains("ADR-0012 M1"), "{e}");
 
         // A RESUME legitimately skips the drift gate (schema_changed None) — exempt (H2).
         let mut resumed = base();

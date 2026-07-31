@@ -4,7 +4,7 @@ Branch `feat/parallel-keyset`. Question: can keyset (seek) pagination — today
 **sequential** because each page's `WHERE key > last` depends on the previous
 page's max key — be parallelised **without losing its sparse-key immunity**?
 
-Reproduce: `dev/parallel_keyset/fixture.sh` (1M-row skewed-key MySQL table),
+Reproduce: `python3 -m dev.pytools.parallel_keyset fixture` (1M-row skewed-key MySQL table),
 then `cargo run --release --example parallel_keyset_probe -- <url> big id <N> 10000`.
 
 ## Fixture (the sparse footgun, made concrete)

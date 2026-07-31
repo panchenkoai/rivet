@@ -59,7 +59,10 @@ pub(crate) fn run_chunked_parallel_checkpoint(
             // Detect: a short-lived connection computes ranges + runs the
             // pre-chunk drift check (ADR-0021), then closes before workers spawn.
             ChunkSource::Detect => super::prepare_chunk_plan_fresh(plan, state, summary)?,
-            ChunkSource::Precomputed(ranges) => ranges,
+            ChunkSource::Precomputed(ranges) => {
+                summary.chunks_precomputed = true; // drift gate skipped by contract
+                ranges
+            }
         }
     };
 

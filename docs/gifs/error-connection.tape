@@ -2,7 +2,7 @@
 # port, or tunnel not up) before a single row is read, with a reachability hint.
 # Attach to docs/getting-started.md § "When something is wrong".
 #
-# Fixture: rivet.yaml (url_env: DATABASE_URL) is written by render.sh
+# Fixture: rivet.yaml (url_env: DATABASE_URL) is written by the renderer
 # (fixture_error_connection_setup). This tape overrides DATABASE_URL in the
 # hidden prelude to a closed port so the connect deterministically refuses.
 

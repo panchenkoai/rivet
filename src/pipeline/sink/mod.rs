@@ -589,7 +589,7 @@ impl BatchSink for ExportSink {
             }
             _ => schema.clone(),
         };
-        let enriched = enrich::enrich_schema(&dest_schema, &self.meta);
+        let enriched = enrich::enrich_schema(&dest_schema, &self.meta)?;
         // Compute row group rows from the actual schema now that it's available.
         if let Some(pc) = &self.parquet_config {
             self.parquet_row_group_rows = pc.effective_row_group_rows(&dest_schema);

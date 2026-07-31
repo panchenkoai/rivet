@@ -193,7 +193,7 @@ rivet init --source "$PG_URL" --schema public -o rivet_public.yaml
 rivet init --source "$MY_URL" -o rivet_mysql.yaml
 ```
 
-To refresh many files at once (per-table YAMLs plus combined schema snapshots), run [`dev/scripts/regenerate_docker_init_configs.sh`](https://github.com/panchenkoai/rivet/blob/main/dev/scripts/regenerate_docker_init_configs.sh) from the repo root after the DBs are up (and optionally seeded).
+To refresh many files at once (per-table YAMLs plus combined schema snapshots), run [`python3 -m dev.pytools.dev_scripts regen-docker-configs`](https://github.com/panchenkoai/rivet/blob/main/dev/pytools/dev_scripts.py) from the repo root after the DBs are up (and optionally seeded).
 
 ---
 

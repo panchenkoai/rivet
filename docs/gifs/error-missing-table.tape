@@ -3,7 +3,7 @@
 # so check fails loudly (exit 1) instead of passing through to run time.
 # Attach to docs/getting-started.md § "When something is wrong".
 #
-# Fixture: rivet.yaml is written by render.sh (fixture_error_missing_table_setup);
+# Fixture: rivet.yaml is written by the renderer (fixture_error_missing_table_setup);
 # DATABASE_URL points at the live Postgres so the connect succeeds and only the
 # schema probe fails.
 

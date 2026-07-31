@@ -269,7 +269,18 @@ jobs:
     # lib cycle, diffed against the committed baseline. The job is GREEN as
     # long as no NEW missed mutant appears — known misses live in
     # docs/mutants-baseline.txt and only ever shrink (gap-ratchet discipline).
-    timeout-minutes: 180
+    #
+    # 360, raised from 180 because the rotation stopped finishing in three hours.
+    # Note this is the CEILING: GitHub-hosted jobs are hard-capped at 6 h, so
+    # there is no headroom left. When a group outgrows it the fix is to SPLIT the
+    # group (a fourth `case` arm), not to raise this number.
+    #
+    # Why a timeout here is worse than a red mutant: the run below ends in
+    # `|| true` precisely so the baseline diff — not the raw exit code — decides
+    # the verdict. A job killed by this timeout never reaches that step, so it
+    # produces no verdict at all, only a red X that says nothing about mutation
+    # coverage.
+    timeout-minutes: 360
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -281,7 +292,7 @@ jobs:
         env:
           CARGO_PROFILE_DEV_DEBUG: "0" # mutants never need debuginfo
         run: |
-          case $(( $(date +%j) % 3 )) in
+          case $(( $(date +%j) % 4 )) in
             0)
               echo "group: ledger/pipeline (Tier 0)"
               FILES="-f src/pipeline/manifest_writer.rs -f src/pipeline/manifest_reconcile.rs \
@@ -301,6 +312,23 @@ jobs:
                      -f src/plan/build.rs -f src/format/csv.rs -f src/source/mongo/mod.rs \
                      -f src/source/mssql/mod.rs -f src/source/postgres/mod.rs \
                      -f src/pipeline/apply_cmd.rs"
+              ;;
+            3)
+              # Added because these four were in NO group: the rotation had never
+              # mutated the file that owns `check_post_run_invariants` — the
+              # structural runner-bypass guard — nor the three chunked runners that
+              # must record why they skipped a facade. A one-off run found 7
+              # survivors inside the guard's own conditions, one cluster of them
+              # unkillable because the branch was dead code (removed in the same
+              # commit). A guard nobody mutates is a guard nobody has checked.
+              #
+              # Split into a fourth arm rather than appended to an existing one:
+              # the rotation had already stopped fitting in three hours, and the
+              # job timeout is now at GitHub's six-hour ceiling with no headroom.
+              echo "group: summary/guard + chunked runners (Tier 3)"
+              FILES="-f src/pipeline/summary.rs -f src/pipeline/chunked/exec.rs \
+                     -f src/pipeline/chunked/sequential_checkpoint.rs \
+                     -f src/pipeline/chunked/parallel_checkpoint.rs"
               ;;
           esac
           # `|| true`: known misses are adjudicated by the baseline diff below,
@@ -392,7 +420,7 @@ jobs:
           export PATH="$HOME/.duckdb/cli/latest:$PATH"
           duckdb --version
           cargo build --release
-          scripts/soak_cdc.sh 45 target/release/rivet
+          python3 -m dev.pytools.cdc_soak soak 45 target/release/rivet
       - name: Stop services
         if: always()
         run: docker compose down -v

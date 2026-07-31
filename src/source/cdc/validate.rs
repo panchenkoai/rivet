@@ -36,7 +36,7 @@ impl PositionCheck {
 /// A `__pos` value normalised to a comparable key. Within a run every position is
 /// the same engine's shape, so cross-variant comparison never happens (the derived
 /// `Ord`'s discriminant tie-break is irrelevant).
-#[derive(PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum PosKey {
     /// MySQL binlog `{file, pos}` — zero-padded filename sorts lexically, then pos.
     Binlog(String, u64),
@@ -158,6 +158,71 @@ fn check_order(items: &[(u32, String)]) -> (Option<String>, Option<String>, Vec<
         last = Some(raw.clone());
     }
     (first, last, violations)
+}
+
+#[cfg(test)]
+mod v016_checkpoint_compat {
+    //! A checkpoint written by rivet 0.16 must still LOAD and still yield the
+    //! same resume coordinates.
+    //!
+    //! `tests/compat_gate.rs` freezes the same three files but reads them with a
+    //! bare `serde_json::Value` and asks only "does key X exist" — one key per
+    //! engine, and `pos` is never asserted at all. That cannot fail when rivet
+    //! changes: the fixture is what it inspects. It could not, as written —
+    //! `Position` is `pub(crate)`, so an integration test has no access to the
+    //! real loader. Hence this module, beside the code that owns the type.
+    //!
+    //! The two real consumers are both exercised: `Position::load` (does the
+    //! file still deserialize) and `parse_pos` (are the coordinates still
+    //! extracted, and as the right variant). Rename `file` to `binlog_file`,
+    //! or add a required field to the persisted shape, and this goes red where
+    //! the shape-only check stays green — while a user's 0.16 checkpoint
+    //! silently re-anchors and skips every change since it was written.
+
+    use super::{PosKey, parse_pos};
+    use crate::source::cdc::Position;
+
+    const DIR: &str = "tests/fixtures/compat/v0.16";
+
+    fn load(name: &str) -> Position {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(DIR)
+            .join(name);
+        Position::load(&path)
+            .unwrap_or_else(|e| panic!("{name}: a v0.16 checkpoint must still load: {e:#}"))
+            .unwrap_or_else(|| panic!("{name}: loader reported the fixture as ABSENT"))
+    }
+
+    #[test]
+    fn v016_mysql_checkpoint_still_yields_its_binlog_coordinates() {
+        let p = load("mysql_cdc.ckpt");
+        let raw = serde_json::to_string(&p.0).expect("serialize");
+        assert_eq!(
+            parse_pos(&raw),
+            Some(PosKey::Binlog("binlog.000004".into(), 150_838_422)),
+            "the 0.16 MySQL checkpoint must still resume at the SAME file+pos;              a renamed or newly-required field re-anchors the stream instead"
+        );
+    }
+
+    #[test]
+    fn v016_pg_and_mssql_checkpoints_still_yield_their_lsns() {
+        let pg = load("pg_cdc.ckpt");
+        let raw = serde_json::to_string(&pg.0).expect("serialize");
+        // PG's `0/1A2B3C4D` is parsed into a single u64 (hi<<32 | lo).
+        assert_eq!(
+            parse_pos(&raw),
+            Some(PosKey::PgLsn(0x1A2B_3C4D)),
+            "the 0.16 PostgreSQL checkpoint must still resume at the same LSN"
+        );
+
+        let ms = load("mssql_cdc.ckpt");
+        let raw = serde_json::to_string(&ms.0).expect("serialize");
+        assert_eq!(
+            parse_pos(&raw),
+            Some(PosKey::Lsn("0000003400001A2B0003".into())),
+            "the 0.16 SQL Server checkpoint must still resume at the same LSN"
+        );
+    }
 }
 
 #[cfg(test)]

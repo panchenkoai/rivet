@@ -232,7 +232,10 @@ pub(crate) fn run_chunked_sequential_checkpoint(
         match chunk_source {
             // Detect: compute ranges + run the pre-chunk drift check (ADR-0021).
             ChunkSource::Detect => super::prepare_chunk_plan(src, plan, Some(state), summary)?,
-            ChunkSource::Precomputed(ranges) => ranges,
+            ChunkSource::Precomputed(ranges) => {
+                summary.chunks_precomputed = true; // drift gate skipped by contract
+                ranges
+            }
         }
     };
 

@@ -2,7 +2,7 @@
 # from the MySQL binlog into typed Parquet, then read it back — every change is a
 # typed row (__op + __pos + the columns).
 #
-# Fixture (render.sh, fixture_cdc_setup): seeds a checkpoint at the current binlog
+# Fixture (the renderer, fixture_cdc_setup): seeds a checkpoint at the current binlog
 # position and a small backlog of changes after it, so the run drains a
 # deterministic set and exits.
 
@@ -45,11 +45,16 @@ Type "sed -n '/  - name:/,/server_id/p' cdc.yaml"
 Enter
 Sleep 3s
 
+# No `--until-current`: draining to the log end and exiting is the DEFAULT now,
+# and the flag was removed (`--stream` is the opt-in for continuous streaming).
+# The tape kept passing it long after the CLI stopped accepting it, so this GIF
+# showed a command that errors — caught by the GIF currency gate, which checks
+# every tape's commands against the binary rather than trusting the recording.
 Type "# capture changes since the checkpoint into typed Parquet, then exit"
 Enter
 Sleep 1000ms
 
-Type "rivet cdc --source-env MYSQL_URL --table content_items --checkpoint cdc.ckpt --until-current --output ./cdc-out"
+Type "rivet cdc --source-env MYSQL_URL --table content_items --checkpoint cdc.ckpt --output ./cdc-out"
 Enter
 Sleep 3s
 

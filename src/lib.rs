@@ -12,6 +12,12 @@
 //! **Stable for integration tests**: `config`, `format`, `pipeline`, `resource`, `state`.
 //! All other modules are `pub(crate)` and not reachable from external consumers.
 
+// Re-exported so a downstream crate implementing `source::BatchSink` uses the
+// SAME arrow as this crate. Declaring arrow separately there would compile
+// against a second copy whose types are unrelated — the error is confusing and
+// the version skew is silent until it isn't.
+pub use arrow;
+
 // Public — accessed by integration tests in tests/*.rs
 pub mod config;
 pub mod error;
@@ -50,7 +56,12 @@ pub(crate) mod destination;
 pub mod destination_for_tests {
     pub use crate::destination::{Destination, ObjectMeta, create_destination};
 }
-pub(crate) mod enrich;
+// Public since §5h: the auditor recomputes `_rivet_row_hash` over re-extracted
+// sample rows, and it must do so with THIS function. A reimplementation on the
+// consumer side would be a second thing that can drift from the extractor —
+// which is exactly the failure §5h removes, and the reason there is only one
+// hash left to recompute.
+pub mod enrich;
 pub(crate) mod notify;
 pub(crate) mod plan;
 // Credential redaction invariant (ADR-0014, v0.7.2 P0.3).  `pub` so the

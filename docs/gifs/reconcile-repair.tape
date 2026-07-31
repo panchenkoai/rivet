@@ -2,7 +2,7 @@
 # Requires:
 #   - rivet_gif.events fixture (10,000 rows)
 #   - ./chunked.yaml config in the workdir
-# Both are prepared by docs/gifs/render.sh before vhs is invoked.
+# Both are prepared by python3 -m dev.pytools.render_gifs before vhs is invoked.
 
 Output reconcile-repair.gif
 

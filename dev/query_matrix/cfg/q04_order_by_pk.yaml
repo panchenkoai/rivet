@@ -4,6 +4,8 @@
 source: { type: postgres, url_env: PG_URL }
 exports:
   - name: pa_audit
+    wave: 2
+    parallel_safe: true
     query: "SELECT id, name FROM pa_audit ORDER BY id"
     mode: full
     format: parquet

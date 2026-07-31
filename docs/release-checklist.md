@@ -38,7 +38,7 @@ checklist is what a maintainer fills out **before** pushing the tag.
 - [ ] `cargo test --release -- --ignored` — full live matrix (PG + MySQL,
       MinIO, fake-gcs, Toxiproxy).  Includes the **type golden** parity
       pair on Postgres + MySQL.
-- [ ] Postgres + MySQL `e2e` smoke — `dev/e2e/run_e2e.sh` covers the
+- [ ] Postgres + MySQL `e2e` smoke — `python3 -m dev.pytools.e2e` covers the
       83-assertion end-to-end flow.
 - [ ] Parquet output round-trips through `arrow-rs` reader (covered by
       `live_parquet_roundtrip` + `live_type_golden`).

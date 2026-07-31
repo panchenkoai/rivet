@@ -13,15 +13,15 @@ Layout under `dev/`:
 |-----------|----------|
 | `dev/workbench/` | Compose-oriented rivet configs: PG/MySQL full & structured URLs, incremental (+ coalesce), type matrix, preflight demos, `sparse_chunk_demo.yaml`. |
 | `dev/fixtures/` | Feature-regression YAML (`test_*.yaml`): compression, stdout, params, quality, permissions, toxiproxy, schema evolution, etc. |
-| `dev/cloud/` | S3 / GCS destination samples + `run_*_export.sh` helpers. |
-| `dev/scripts/` | `run_uat_smoke.sh`, `regenerate_docker_init_configs.sh`, `bench.sh`, toxiproxy/schema/permission runners, `update_homebrew_formula.sh`. |
+| `dev/cloud/` | S3 / GCS destination samples; the export helpers are `python3 -m dev.pytools.cloud_exports {s3,gcs,gcs-fake}`. |
+| `dev/pytools/dev_scripts.py` | `python3 -m dev.pytools.dev_scripts` — `uat-smoke`, `regen-docker-configs`, `bench`, `live`, `permissions`, `retry-toxiproxy`, `schema-evolution`, `setup-toxiproxy`; the Homebrew formula updater is `python3 -m dev.pytools.homebrew_formula`. |
 | `dev/e2e/` | CI E2E matrix configs (separate from workbench). |
 | `examples/` | Small copy-paste examples. |
 
 **Regenerated scaffolds** (`rivet init` samples) are not committed. Run:
 
 ```bash
-bash dev/scripts/regenerate_docker_init_configs.sh
+python3 -m dev.pytools.dev_scripts regen-docker-configs
 ```
 
 to populate `dev/init_generated/` locally (directory is gitignored).
