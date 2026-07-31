@@ -871,6 +871,7 @@ mod tests {
             manifest_version: MANIFEST_VERSION,
             run_id: "r-validate-cmd".into(),
             export_name: "orders".into(),
+            export_family: String::new(),
             started_at: "2026-06-09T12:00:00Z".into(),
             finished_at: "2026-06-09T12:01:00Z".into(),
             status: ManifestStatus::Success,
@@ -1088,7 +1089,7 @@ mod tests {
     fn write_multiplex_cfg(dir: &Path, base: &Path) -> std::path::PathBuf {
         let cfg = dir.join("rivet-cdc.yaml");
         let yaml = format!(
-            "source:\n  type: mysql\n  url: mysql://nobody@localhost/nope\nexports:\n  - name: cdc\n    tables: [alpha, beta]\n    mode: cdc\n    format: parquet\n    cdc:\n      server_id: 1\n    destination:\n      type: local\n      path: \"{}\"\n",
+            "source:\n  type: mysql\n  url: mysql://nobody@localhost/nope\nexports:\n  - name: cdc\n    tables: [alpha, beta]\n    mode: cdc\n    format: parquet\n    cdc:\n      server_id: 1\n      checkpoint: /tmp/ck_mx\n    destination:\n      type: local\n      path: \"{}\"\n",
             base.to_string_lossy()
         );
         std::fs::write(&cfg, yaml).unwrap();
