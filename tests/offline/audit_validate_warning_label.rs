@@ -32,6 +32,7 @@ fn one_part_manifest() -> RunManifest {
         manifest_version: MANIFEST_VERSION,
         run_id: "r-l14".into(),
         export_name: "orders".into(),
+        export_family: String::new(),
         started_at: "2026-06-09T12:00:00Z".into(),
         finished_at: "2026-06-09T12:01:00Z".into(),
         status: ManifestStatus::Success,

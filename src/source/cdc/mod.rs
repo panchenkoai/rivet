@@ -845,6 +845,10 @@ pub(crate) struct CaptureOutput<'a> {
 /// `outputs` carries one entry per captured table: several tables ride ONE stream
 /// (one slot / one binlog connection) and one checkpoint.
 pub(crate) struct CdcCapture<'a> {
+    /// `exports[].name` — recorded into each manifest's `export_family` so the
+    /// load's shared-prefix guard groups the drain with its snapshot leg by what
+    /// was WRITTEN, not by re-deriving it from the table string.
+    pub export_name: String,
     pub cdc_cfg: CdcConfig,
     pub outputs: Vec<CaptureOutput<'a>>,
     pub format: crate::config::FormatType,
@@ -887,6 +891,7 @@ pub(crate) fn run_capture(cap: CdcCapture<'_>) -> Result<Vec<crate::manifest::Ru
         });
     }
     let sink_cfg = sink::SinkConfig {
+        export_name: cap.export_name,
         outputs,
         engine,
         format: cap.format,

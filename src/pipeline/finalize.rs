@@ -534,6 +534,7 @@ pub(super) fn write_running_manifest(plan: &ResolvedRunPlan, run_id: &str, start
         row_hash: None,
         manifest_version: MANIFEST_VERSION,
         run_id: run_id.to_string(),
+        export_family: crate::manifest::snapshot_family(&plan.export_name).to_string(),
         export_name: plan.export_name.clone(),
         mode: "batch".to_string(),
         started_at: started_at.to_string(),

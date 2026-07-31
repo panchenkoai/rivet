@@ -405,7 +405,13 @@ fn is_run_unique_manifest(base: &str) -> bool {
 pub fn ensure_single_export(keyed: &[(String, RunManifest)]) -> Result<()> {
     let mut names: std::collections::BTreeSet<&str> = keyed
         .iter()
-        .map(|(_, m)| crate::manifest::snapshot_family(m.export_name.as_str()))
+        // The RECORDED family when the writer stamped one; the legacy substring
+        // fold only for pre-field manifests. Recording fixes both failure modes
+        // the guess had: the drain (export_name = the TABLE string) and the
+        // snapshot leg (`{export}__snapshot_{table}`) now carry the same family
+        // even when `name:` differs from `table:`, and a user export literally
+        // named `x__snapshot_y` is no longer mis-folded into family `x`.
+        .map(|(_, m)| crate::manifest::manifest_family(m))
         .filter(|n| !n.is_empty())
         .collect();
     if names.len() > 1 {
@@ -539,6 +545,7 @@ mod tests {
             manifest_version: crate::manifest::MANIFEST_VERSION,
             run_id: run.into(),
             export_name: "orders".into(),
+            export_family: String::new(),
             mode: "batch".into(),
             started_at: "t".into(),
             finished_at: "t".into(),
@@ -623,6 +630,51 @@ mod tests {
         let mut foreign = manifest("r3", 10, None);
         foreign.export_name = "customers__snapshot_customers".into();
         assert!(ensure_single_export(&[drain, keyed(foreign)]).is_err());
+    }
+
+    /// The documented `initial: snapshot` config — `name: orders_cdc`,
+    /// `table: orders` (docs/reference/cdc.md) — could NOT be loaded even after
+    /// the 0.24.1 family fold: the drain writes `export_name` from the TABLE
+    /// string while the snapshot leg writes `{export.name}__snapshot_{table}`,
+    /// so the substring fold produced families `orders` and `orders_cdc` — two,
+    /// and the guard refused rivet's own output with advice to split a prefix
+    /// rivet shares by design. The RECORDED family closes it: both legs stamp
+    /// the parent export name at write time.
+    #[test]
+    fn recorded_family_reconciles_the_documented_name_ne_table_config() {
+        let keyed = |m: RunManifest| ("gs://b/p/manifest-x.json".to_string(), m);
+        // drain: export_name is the TABLE ("orders"), family records the export.
+        let mut drain = manifest("r1", 10, None);
+        drain.export_name = "orders".into();
+        drain.export_family = "orders_cdc".into();
+        // snapshot leg: synthesized name, same recorded family.
+        let mut snap = manifest("r2", 10, None);
+        snap.export_name = "orders_cdc__snapshot_orders".into();
+        snap.export_family = "orders_cdc".into();
+        assert!(
+            ensure_single_export(&[keyed(drain), keyed(snap)]).is_ok(),
+            "one export whose name differs from its table must reconcile as ONE family"
+        );
+    }
+
+    /// The inverse hole the substring fold had: an export the user literally
+    /// NAMED with the infix. Before the recorded family, `daily__snapshot_v2`
+    /// folded to `daily` and silently DISARMED the shared-prefix guard — a real
+    /// sibling export could sum into the load and be wiped by cleanup. With the
+    /// family recorded, the name is just a name.
+    #[test]
+    fn a_user_export_named_like_a_snapshot_leg_no_longer_disarms_the_guard() {
+        let keyed = |m: RunManifest| ("gs://b/p/manifest-x.json".to_string(), m);
+        let mut daily = manifest("r1", 10, None);
+        daily.export_name = "daily".into();
+        daily.export_family = "daily".into();
+        let mut tricky = manifest("r2", 10, None);
+        tricky.export_name = "daily__snapshot_v2".into();
+        tricky.export_family = "daily__snapshot_v2".into(); // its OWN family
+        assert!(
+            ensure_single_export(&[keyed(daily), keyed(tricky)]).is_err(),
+            "two distinct exports must refuse, even when one's NAME contains the infix"
+        );
     }
 
     #[test]

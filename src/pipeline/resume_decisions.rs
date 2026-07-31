@@ -205,6 +205,7 @@ mod tests {
             manifest_version: MANIFEST_VERSION,
             run_id: "r1".into(),
             export_name: "public.orders".into(),
+            export_family: String::new(),
             started_at: "2026-05-21T12:00:00Z".into(),
             finished_at: "2026-05-21T12:01:00Z".into(),
             status: ManifestStatus::Success,

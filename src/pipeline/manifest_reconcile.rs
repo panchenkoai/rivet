@@ -223,6 +223,7 @@ mod tests {
             manifest_version: MANIFEST_VERSION,
             run_id: "r".into(),
             export_name: "e".into(),
+            export_family: String::new(),
             started_at: "t".into(),
             finished_at: "t".into(),
             status: ManifestStatus::Success,

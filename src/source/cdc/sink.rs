@@ -62,6 +62,12 @@ pub(crate) struct TableOutput<'a> {
 /// binlog connection) and ONE checkpoint, because the resume position is a
 /// property of the stream, not of a table.
 pub(crate) struct SinkConfig<'a> {
+    /// The rivet EXPORT these tables belong to (`exports[].name`). Recorded into
+    /// every manifest's `export_family`, so the load's shared-prefix guard
+    /// compares what the writer knew instead of re-deriving it from the table
+    /// string — which is what made the drain and the snapshot leg read as two
+    /// different exports whenever `name:` differed from `table:`.
+    pub export_name: String,
     pub outputs: Vec<TableOutput<'a>>,
     pub engine: super::CdcEngine,
     pub format: FormatType,
@@ -191,6 +197,7 @@ fn roll_all(
     stream: &mut dyn ChangeStream,
     engine: super::CdcEngine,
     format: FormatType,
+    export_name: &str,
     run_token: &str,
     checkpoint: Option<&Path>,
     last_commit: &Option<Position>,
@@ -218,6 +225,7 @@ fn roll_all(
                 engine,
                 &s.column_sums,
                 &s.out,
+                export_name,
                 format,
                 run_id,
                 started_at,
@@ -332,6 +340,7 @@ pub(crate) fn run_to_files(
                     stream,
                     cfg.engine,
                     cfg.format,
+                    &cfg.export_name,
                     &run_token,
                     checkpoint,
                     &last_commit,
@@ -361,6 +370,7 @@ pub(crate) fn run_to_files(
                 stream,
                 cfg.engine,
                 cfg.format,
+                &cfg.export_name,
                 &run_token,
                 checkpoint,
                 &last_commit,
@@ -393,6 +403,7 @@ pub(crate) fn run_to_files(
             cfg.engine,
             &s.column_sums,
             &s.out,
+            &cfg.export_name,
             cfg.format,
             &cfg.run_id,
             &cfg.started_at,
@@ -707,10 +718,12 @@ fn flush(
 
 /// Assemble one table's `RunManifest` from its committed parts (hand-built — no
 /// plan coupling; `record_part` is the plan-bound path the batch export uses).
+#[allow(clippy::too_many_arguments)] // the export identity joined an existing 7-arg builder
 fn build_manifest(
     engine: super::CdcEngine,
     column_sums: &std::collections::BTreeMap<String, u64>,
     out: &TableOutput<'_>,
+    export_name: &str,
     format: FormatType,
     run_id: &str,
     started_at: &str,
@@ -720,6 +733,11 @@ fn build_manifest(
         manifest_version: MANIFEST_VERSION,
         mode: "cdc".to_string(),
         run_id: run_id.to_string(),
+        // `export_name` stays the TABLE string — established wire format that
+        // multiplexed loads key sub-prefixes on. The FAMILY is the parent
+        // export, recorded so the load guard can group the drain with its
+        // snapshot leg without guessing from either string.
+        export_family: export_name.to_string(),
         export_name: out.table.clone(),
         started_at: started_at.to_string(),
         // A real finish instant (RFC3339) — NOT the run_id. The field is parsed as
@@ -848,6 +866,7 @@ mod tests {
             acked: Vec::new(),
         };
         let cfg = SinkConfig {
+            export_name: "t".into(),
             checkpoint: Some(ckpt.clone()),
             ..cfg(dest.as_ref(), &cols, FormatType::Parquet, 10)
         };
@@ -1119,6 +1138,7 @@ mod tests {
         run_to_files(
             &mut run1,
             SinkConfig {
+                export_name: "t".into(),
                 run_id: "t_cdc_20260702T100000000".into(),
                 ..cfg(dest.as_ref(), &cols, FormatType::Csv, 10)
             },
@@ -1133,6 +1153,7 @@ mod tests {
         run_to_files(
             &mut run2,
             SinkConfig {
+                export_name: "t".into(),
                 run_id: "t_cdc_20260702T100500000".into(),
                 ..cfg(dest.as_ref(), &cols, FormatType::Csv, 10)
             },
@@ -1178,6 +1199,7 @@ mod tests {
         run_to_files(
             &mut run1,
             SinkConfig {
+                export_name: "t".into(),
                 run_id: "t_cdc_20260702T100000000".into(),
                 ..cfg(dest.as_ref(), &cols, FormatType::Csv, 10)
             },
@@ -1191,6 +1213,7 @@ mod tests {
         run_to_files(
             &mut run2,
             SinkConfig {
+                export_name: "t".into(),
                 run_id: "t_cdc_20260702T100500000".into(),
                 ..cfg(dest.as_ref(), &cols, FormatType::Csv, 10)
             },
@@ -1266,6 +1289,7 @@ mod tests {
         rollover: usize,
     ) -> SinkConfig<'a> {
         SinkConfig {
+            export_name: "t".into(),
             outputs: vec![TableOutput {
                 table: "t".into(),
                 columns: cols.to_vec(),
@@ -1436,6 +1460,7 @@ mod tests {
         rollover: usize,
     ) -> SinkConfig<'a> {
         SinkConfig {
+            export_name: "t".into(),
             outputs: vec![
                 TableOutput {
                     table: "a".into(),

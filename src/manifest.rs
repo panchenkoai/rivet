@@ -86,10 +86,25 @@ pub const SNAPSHOT_LEG_INFIX: &str = "__snapshot_";
 /// `{parent}__snapshot_{table}` as `{parent}`, or the pair reads as two
 /// exports and the ordinary `initial: snapshot` → `load` flow refuses itself.
 /// A name with no infix — or a pathological empty parent — returns unchanged.
+/// LEGACY fallback only: manifests written before `export_family` existed carry
+/// nothing but the name, so the substring split is the best available guess for
+/// THEM. New manifests record the family and never take this path — a user
+/// export genuinely named `x__snapshot_y` is no longer mis-folded.
 pub fn snapshot_family(name: &str) -> &str {
     match name.split_once(SNAPSHOT_LEG_INFIX) {
         Some((parent, _)) if !parent.is_empty() => parent,
         _ => name,
+    }
+}
+
+/// The family a manifest belongs to: the recorded field when present, the
+/// legacy substring fold when not. Every consumer that groups manifests by
+/// export goes through here, so the recorded/derived split lives in ONE place.
+pub fn manifest_family(m: &RunManifest) -> &str {
+    if m.export_family.is_empty() {
+        snapshot_family(&m.export_name)
+    } else {
+        &m.export_family
     }
 }
 
@@ -181,6 +196,25 @@ pub struct RunManifest {
     pub manifest_version: u32,
     pub run_id: String,
     pub export_name: String,
+    /// The PARENT export this manifest belongs to — RECORDED, not derived.
+    ///
+    /// Two consumers group manifests by export (the shared-prefix load guard,
+    /// reconcile), and before this field they had to GUESS the family from
+    /// `export_name` via [`snapshot_family`]'s substring split. That guess was
+    /// wrong in both directions at once: the CDC drain writes `export_name`
+    /// from the TABLE string while the snapshot leg writes
+    /// `{export.name}__snapshot_{table}`, so the documented
+    /// `name: orders_cdc` / `table: orders` config produced families
+    /// `orders_cdc` and `orders` — two, and the load refused its own output.
+    /// Meanwhile a user export literally NAMED `daily__snapshot_v2` folded to
+    /// `daily` and silently disarmed the guard.
+    ///
+    /// `#[serde(default)]` (empty) so every pre-existing manifest still parses;
+    /// consumers fall back to the substring heuristic when the field is empty,
+    /// which preserves exactly the old behaviour for old artifacts and nothing
+    /// else.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub export_family: String,
     /// Which pipeline shape wrote this manifest — `batch` or `cdc`. Guards a
     /// prefix against silent cross-shape clobbering (finding #44: a CDC run
     /// overwrote a batch export's manifest at a shared prefix, orphaning its
@@ -457,6 +491,7 @@ mod tests {
             manifest_version: MANIFEST_VERSION,
             run_id: "orders_20260521T120000.000".into(),
             export_name: "public.orders".into(),
+            export_family: String::new(),
             started_at: "2026-05-21T12:00:00Z".into(),
             finished_at: "2026-05-21T12:14:33Z".into(),
             status: ManifestStatus::Success,

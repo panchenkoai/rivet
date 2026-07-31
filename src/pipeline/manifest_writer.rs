@@ -196,6 +196,12 @@ impl ManifestBuilder {
             manifest_version: crate::manifest::MANIFEST_VERSION,
             mode: "batch".to_string(),
             run_id: self.run_id,
+            // For an ordinary export the fold is identity; for the CDC snapshot
+            // leg the name was JUST synthesized as `{parent}__snapshot_{table}`
+            // by cdc_job, so folding here is authoritative, not a guess — this
+            // is the writer recording its own construction, unlike the readers
+            // that used to re-derive it.
+            export_family: crate::manifest::snapshot_family(&self.export_name).to_string(),
             export_name: self.export_name,
             started_at: self.started_at.to_rfc3339(),
             finished_at: finished_at.to_rfc3339(),

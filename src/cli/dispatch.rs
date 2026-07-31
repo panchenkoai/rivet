@@ -321,6 +321,10 @@ fn dispatch_cdc(a: CdcArgs) -> Result<()> {
     // so the sink and the stream share one source of truth for the part size.
     let now = chrono::Utc::now().to_rfc3339();
     crate::source::cdc::run_capture(crate::source::cdc::CdcCapture {
+        // The CLI subcommand has no exports[] block; the table IS the export
+        // identity here, which keeps family == export_name == table — exactly
+        // the shape the load guard folds to one family.
+        export_name: a.table.join("+"),
         cdc_cfg,
         outputs: vec![crate::source::cdc::CaptureOutput {
             table: tbl,

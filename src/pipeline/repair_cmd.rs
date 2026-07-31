@@ -585,6 +585,7 @@ mod tests {
             manifest_version: MANIFEST_VERSION,
             run_id: run_id.into(),
             export_name: "public.orders".into(),
+            export_family: String::new(),
             mode: "chunked".into(),
             started_at: "2026-07-22T12:00:00Z".into(),
             finished_at: "2026-07-22T12:00:10Z".into(),

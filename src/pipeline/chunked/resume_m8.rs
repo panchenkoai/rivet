@@ -530,6 +530,7 @@ mod tests {
             manifest_version: crate::manifest::MANIFEST_VERSION,
             run_id: run_id.into(),
             export_name: "orders".into(),
+            export_family: String::new(),
             started_at: "2026-07-14T00:00:00Z".into(),
             finished_at: "2026-07-14T00:01:00Z".into(),
             status: ManifestStatus::Success,

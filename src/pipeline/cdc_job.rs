@@ -414,6 +414,7 @@ fn run_cdc_inner(
     }
 
     run_capture(CdcCapture {
+        export_name: export.name.clone(),
         cdc_cfg: CdcConfig {
             url,
             checkpoint: cdc.checkpoint.as_ref().map(PathBuf::from),
