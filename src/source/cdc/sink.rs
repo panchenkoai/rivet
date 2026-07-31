@@ -351,7 +351,21 @@ pub(crate) fn run_to_files(
                 total_rows = 0;
                 total_bytes = 0;
             }
-            if cfg.max_events.is_some_and(|m| emitted >= m) {
+            // SOFT cap, judged at the COMMIT BOUNDARY — the same treatment
+            // `should_roll` gives every other budget. Judged per event, the cap
+            // cut a transaction mid-flight: the partial tail flushed as a real
+            // part (violating roll_all's "never split a transaction across
+            // parts") and the end-of-pass roll skipped checkpoint AND ack, so
+            // every later run re-read the same transaction, wrote another
+            // uniquely-named part, and reported success — forever. On PostgreSQL
+            // the slot then pins WAL (`release_empty_frontier` bails once data
+            // was yielded), so the stall grows into a disk-full.
+            //
+            // `committed` here means THIS event ends its transaction, so
+            // stopping now leaves nothing half-captured; the overshoot is
+            // bounded by the transaction the cap landed in, which is exactly
+            // the promise `rollover` already makes.
+            if committed && cfg.max_events.is_some_and(|m| emitted >= m) {
                 hit_max = true;
                 break;
             }
@@ -1306,6 +1320,67 @@ mod tests {
             started_at: "2026-06-23T00:00:00Z".into(),
             run_id: "r".into(),
         }
+    }
+
+    /// `max_events` must be a SOFT cap that lands on a commit boundary — the same
+    /// treatment `should_roll` gives every other budget. The hard break sat inside
+    /// the per-event loop with no boundary condition, so a transaction larger than
+    /// the cap (or one straddling it with no earlier commit in the pass) was cut
+    /// mid-flight: the partial transaction flushed as a real part — violating
+    /// `roll_all`'s own "never split a transaction across parts" doc — and the
+    /// end-of-pass roll skipped checkpoint AND ack (no commit boundary seen), so
+    /// the next run resumed at the same transaction, re-read it, wrote another
+    /// run-uniquely-named part, and reported success. Every cycle. On PostgreSQL
+    /// the self-rescue is disabled too (`release_empty_frontier` bails once data
+    /// was yielded), so the slot pins WAL until the disk fills.
+    ///
+    /// Fixture note: FIVE events, ONE transaction (committed only on the last),
+    /// cap = 3 — past the activation threshold on both counts (a cap the fixture
+    /// never reaches, or a fixture of single-event transactions, cannot express
+    /// the defect: with per-event commits the cap always lands on a boundary).
+    #[test]
+    fn max_events_stops_at_a_commit_boundary_never_inside_a_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = local_dest(&dir);
+        let cols = int_col();
+        let ckpt = dir.path().join("ckpt");
+
+        let mut events: VecDeque<ChangeEvent> = (1..=4)
+            .map(|id| ChangeEvent {
+                committed: false,
+                ..insert(id)
+            })
+            .collect();
+        events.push_back(insert(5)); // the commit boundary
+        let mut stream = FakeStream {
+            events,
+            acked: Vec::new(),
+        };
+
+        let mut c = cfg(dest.as_ref(), &cols, FormatType::Parquet, 100);
+        c.max_events = Some(3);
+        c.checkpoint = Some(ckpt.clone());
+        let manifests = run_to_files(&mut stream, c).expect("run");
+
+        // The whole 5-row transaction is durable — the cap deferred to the
+        // boundary instead of cutting after event 3…
+        let rows: i64 = manifests.iter().map(|m| m.row_count).sum();
+        assert_eq!(
+            rows, 5,
+            "the cap must include the whole transaction, not cut it at 3"
+        );
+        // …and the durable sequence RAN: the boundary was acked and the
+        // checkpoint written, so the next run does NOT re-read this transaction.
+        assert_eq!(
+            stream.acked.len(),
+            1,
+            "the commit boundary must be acked exactly once"
+        );
+        assert!(
+            ckpt.exists(),
+            "the checkpoint must be written — without it every later run re-reads \
+             and re-writes this same transaction forever"
+        );
     }
 
     #[test]

@@ -280,9 +280,15 @@ pub fn has_active_running_manifest(keyed: &[(String, RunManifest)]) -> bool {
 /// marker-GC sweep (delete the superseded). The ledger enforces the same rule in
 /// SQL — that copy cannot share this Rust.
 fn is_superseded(m: &RunManifest, keyed: &[(String, RunManifest)]) -> bool {
-    keyed
-        .iter()
-        .any(|(_, o)| o.export_name == m.export_name && o.started_at > m.started_at)
+    // FAMILY, not name: a CDC run's `running` marker carries the EXPORT name
+    // while the drain's terminal manifest carries the TABLE string, so with
+    // `name:` ≠ `table:` a name-only compare never matched — a crashed marker
+    // stayed "active" forever and gc over-deferred cleanup permanently. Same
+    // recorded-identity seam as `ensure_single_export`.
+    keyed.iter().any(|(_, o)| {
+        crate::manifest::manifest_family(o) == crate::manifest::manifest_family(m)
+            && o.started_at > m.started_at
+    })
 }
 
 /// Full/chunked loads care only about the LATEST snapshot: from `keyed` (all run
@@ -674,6 +680,29 @@ mod tests {
         assert!(
             ensure_single_export(&[keyed(daily), keyed(tricky)]).is_err(),
             "two distinct exports must refuse, even when one's NAME contains the infix"
+        );
+    }
+
+    /// Supersession must group by FAMILY, not by name. A CDC run\'s `running`
+    /// marker carries the EXPORT name while the drain\'s terminal manifest carries
+    /// the TABLE string, so with `name: orders_cdc` / `table: orders` a name-only
+    /// compare never matches — the crashed marker stays "active" forever and gc
+    /// over-defers cleanup permanently under that prefix.
+    #[test]
+    fn a_crashed_running_marker_is_superseded_by_the_drain_of_the_same_family() {
+        let keyed = |m: RunManifest| ("gs://b/p/manifest-x.json".to_string(), m);
+        let mut marker = manifest("r1", 0, None);
+        marker.export_name = "orders_cdc".into();
+        marker.export_family = "orders_cdc".into();
+        marker.status = ManifestStatus::Running;
+        marker.started_at = "2026-07-31T10:00:00Z".into();
+        let mut drain = manifest("r2", 10, None);
+        drain.export_name = "orders".into(); // the TABLE string, as the sink writes
+        drain.export_family = "orders_cdc".into();
+        drain.started_at = "2026-07-31T10:05:00Z".into();
+        assert!(
+            !has_active_running_manifest(&[keyed(marker), keyed(drain)]),
+            "a newer terminal run of the SAME FAMILY must supersede the crashed marker"
         );
     }
 

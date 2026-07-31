@@ -72,6 +72,19 @@ pub(super) fn run_cdc_export(
     if let Err(e) = state.begin_run(&run_id, &export.name, &run_prefix, &started_at) {
         log::warn!("cdc: run-status begin failed for '{}': {e:#}", export.name);
     }
+    // The bucket-side suspender the batch path already has. Without it a
+    // cross-host `gc_orphans` — whose `StateStore::open` creates a FRESH empty
+    // DB beside the load config, so `has_active_run_on_prefix` answers a clean
+    // false — saw a live stream's unmanifested parts as crash debris. The
+    // terminal per-table manifests at clean end overwrite/supersede it.
+    super::finalize::write_running_marker(
+        &export.destination,
+        config.source.source_type,
+        &export.name,
+        "cdc",
+        &run_id,
+        &started_at,
+    );
 
     let result = run_cdc_inner(config, export, &run_id);
     let duration_ms = started.elapsed().as_millis() as i64;
