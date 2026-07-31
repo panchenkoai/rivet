@@ -1,6 +1,71 @@
 # Changelog
 
-## Unreleased
+## 0.24.0 — 2026-07-31
+
+### Changed — BREAKING
+
+- **`exports[].content_hash` is removed.** A config that still declares it now
+  fails to load (`deny_unknown_fields`). The block existed so the audit's source
+  side could recompute the value IN SQL, which forced SHA-256 (the only digest
+  every warehouse exposes), a 15-hex truncation, one fixed UTC-second timestamp
+  format, and a loud refusal of floats, decimals and booleans — types with no
+  text form five engines agree on.
+
+  That premise is gone: the auditor now re-extracts the sampled rows through the
+  ordinary batch path and re-renders them with the extractor's own function, so
+  agreement is a property of running one piece of code twice rather than of five
+  SQL dialects being kept in step. With no cross-engine treaty to keep, a second
+  hash has no job.
+
+  **Migration:** replace
+
+  ```yaml
+  content_hash:
+    pk: id
+    cols: [status, updated_at]
+  ```
+
+  with
+
+  ```yaml
+  meta_columns:
+    row_hash: [id, status, updated_at]
+  ```
+
+  The column changes name and type — `__content_hash STRING` becomes
+  `_rivet_row_hash INT64` — and the value is NOT comparable across the two. No
+  SQL can convert one to the other: the new value is produced by rivet's
+  extractor, so an existing warehouse column can only be repopulated by
+  re-extraction. Decimal and boolean columns may now be covered; they were
+  refused before because no two engines render them identically, and nothing
+  renders them but rivet now.
+
+  `sha2` and `hex` drop out of the dependency tree. (MD5 stays — that is GCS
+  part-body integrity, unrelated.)
+
+### Added
+
+- **GIF currency is a release gate.** `dev/release_oracle/gifs.py` compares each
+  tape's rivet invocations against the CLI's actual surface — help text and
+  scaffold — through `docs/gifs/surface.lock.json`, so a GIF that documents a
+  flag the binary no longer has fails the gate before the tag rather than after
+  it. Fingerprinting the surface rather than the rendered bytes keeps the check
+  deterministic; re-render with `python3 -m dev.pytools.render_gifs`.
+
+- **`gc_survival` in the release gate.** Three arms per engine: crash debris is
+  collected, a live run's unmanifested parts are spared, and manifested parts are
+  never touched.
+
+
+- **`meta_columns.row_hash` accepts a column list** (`row_hash: [id, status]`)
+  as well as `true`. A declared set is recorded in the run manifest, so a reader
+  can check what the hash covers instead of inferring it from the query; `true`
+  keeps meaning every projected column. A name outside the projection now fails
+  the run rather than being skipped.
+
+- **`_rivet_row_hash` is emitted on the CDC drain**, over the same data columns
+  the snapshot leg hashes. Both legs write one `__changes` log, so a column only
+  one of them produced would leave half the table NULL.
 
 ### Fixed
 
@@ -98,132 +163,6 @@
   whose integrity records are incomplete, and the data (already committed) is
   left alone.
 
-### Changed
-
-- **The developer tooling is Python.** The 68 shell scripts under `dev/`,
-  `docs/gifs/` and `scripts/` are replaced by `dev/pytools/` and
-  `dev/release_oracle/`, driven through `python3 -m dev.pytools.<tool>` /
-  `python3 -m dev.release_oracle`. Three of them remain because a container image
-  chooses their interpreter, not rivet: `dev/cdc/primary-hba.sh` (the postgres
-  entrypoint runs only `*.sh` in `docker-entrypoint-initdb.d`, so the extension
-  IS the contract) and the two Airflow recipe init assets, which run in images
-  with no python at all. CI, the Makefile, the pre-commit hook and the live
-  source-parity tests call the modules directly.
-
-  (`dev/stand/{up,verify}.sh` also live in the tree, but they were never part of
-  the ported set — the version-matrix stand arrived separately and is committed
-  as its own thing.)
-
-  The port was not a transliteration: each module records, at the site, the
-  shell defect it removes. Among those that were silently wrong — a `case` with
-  no default arm that started nothing and waited for nothing; `exit` inside
-  `$(…)` killing only the subshell; a staging script that printed "Staged …" and
-  exited 0 after a failed `cp` (which is why the caller's status check could
-  never fire); `seed_pa_audit_all.sh` reporting an empty row count as success;
-  and, on macOS bash 3.2, `local x=$1 y="…${x}…"` on one line resolving `${x}`
-  against the ENCLOSING scope, which made the release gate's independent
-  read-back return empty for every CDC engine.
-
-### Added
-
-- **GIF currency is a release gate.** `dev/release_oracle/gifs.py` compares each
-  tape's rivet invocations against the CLI's actual surface — help text and
-  scaffold — through `docs/gifs/surface.lock.json`, so a GIF that documents a
-  flag the binary no longer has fails the gate before the tag rather than after
-  it. Fingerprinting the surface rather than the rendered bytes keeps the check
-  deterministic; re-render with `python3 -m dev.pytools.render_gifs`.
-
-- **`gc_survival` in the release gate.** Three arms per engine: crash debris is
-  collected, a live run's unmanifested parts are spared, and manifested parts are
-  never touched.
-
-### Fixed — tooling
-
-- **The PR matrix gate could not fail.** `python3 -m dev.pytools.matrices
-  --tier=pr … | tee run.log` exited with `tee`'s status, and GitHub Actions runs
-  `run:` under `bash -e` WITHOUT pipefail — so whatever the matrices reported,
-  the step passed. (Inherited shape: the shell line it replaced had the same
-  pipe.) The step now sets `shell: bash` and `set -o pipefail`.
-
-- **The release gate blamed rivet for its own connectivity.** The CDC
-  state-parity cell read the Postgres state backend through the psql of the
-  container resolved from `RIVET_CDC_POSTGRES_URL` — the SOURCE — which only
-  works when the state database happens to live in the source container. Pointed
-  at its own server, every query failed, and a failed query returned `""` → `"0"`
-  → `empty`, indistinguishable from a genuinely empty table. The cell then
-  reported `postgres!=golden`: a state-backend parity divergence, for a reader
-  that could not connect. The container is now resolved from the state URL, and a
-  query failure raises so the caller can SKIP — the rule the SQLite leg of the
-  same function already followed.
-
-- **Layout baselines could not be re-blessed.** `path_matrix` compares a
-  normalised file listing, and the normaliser erased only a second-granularity
-  timestamp. Two intentional product changes had made part names carry more than
-  that — the millisecond field added when sub-second runs into one prefix were
-  found to clobber each other, and the chunk writer's 64-bit collision nonce —
-  both non-deterministic, so a blessed baseline failed on the very next run. The
-  normaliser now erases both (keeping `_chunk<N>`, which is the contract), and
-  the six baselines are re-blessed for the run-unique manifest copy. `matrix_
-  suites` had its own copy of the patterns, which is how the two drifted; it now
-  delegates to the single definition.
-
-
-## 0.24.0 — 2026-07-29
-
-### Changed — BREAKING
-
-- **`exports[].content_hash` is removed.** A config that still declares it now
-  fails to load (`deny_unknown_fields`). The block existed so the audit's source
-  side could recompute the value IN SQL, which forced SHA-256 (the only digest
-  every warehouse exposes), a 15-hex truncation, one fixed UTC-second timestamp
-  format, and a loud refusal of floats, decimals and booleans — types with no
-  text form five engines agree on.
-
-  That premise is gone: the auditor now re-extracts the sampled rows through the
-  ordinary batch path and re-renders them with the extractor's own function, so
-  agreement is a property of running one piece of code twice rather than of five
-  SQL dialects being kept in step. With no cross-engine treaty to keep, a second
-  hash has no job.
-
-  **Migration:** replace
-
-  ```yaml
-  content_hash:
-    pk: id
-    cols: [status, updated_at]
-  ```
-
-  with
-
-  ```yaml
-  meta_columns:
-    row_hash: [id, status, updated_at]
-  ```
-
-  The column changes name and type — `__content_hash STRING` becomes
-  `_rivet_row_hash INT64` — and the value is NOT comparable across the two. No
-  SQL can convert one to the other: the new value is produced by rivet's
-  extractor, so an existing warehouse column can only be repopulated by
-  re-extraction. Decimal and boolean columns may now be covered; they were
-  refused before because no two engines render them identically, and nothing
-  renders them but rivet now.
-
-  `sha2` and `hex` drop out of the dependency tree. (MD5 stays — that is GCS
-  part-body integrity, unrelated.)
-
-### Added
-
-- **`meta_columns.row_hash` accepts a column list** (`row_hash: [id, status]`)
-  as well as `true`. A declared set is recorded in the run manifest, so a reader
-  can check what the hash covers instead of inferring it from the query; `true`
-  keeps meaning every projected column. A name outside the projection now fails
-  the run rather than being skipped.
-
-- **`_rivet_row_hash` is emitted on the CDC drain**, over the same data columns
-  the snapshot leg hashes. Both legs write one `__changes` log, so a column only
-  one of them produced would leave half the table NULL.
-
-### Fixed
 
 - **An existing warehouse table's schema is reconciled by `ALTER TABLE … ADD
   COLUMN IF NOT EXISTS`, never by replacing the table.** `CREATE TABLE IF NOT
@@ -278,6 +217,62 @@
   (a no-op on an existing table) followed by a `COPY INTO … (<declared
   columns>)` naming a column the table lacks — every CDC load onto a
   pre-existing log failing with `invalid identifier`, after the extract.
+
+### Changed
+
+- **The developer tooling is Python.** The 68 shell scripts under `dev/`,
+  `docs/gifs/` and `scripts/` are replaced by `dev/pytools/` and
+  `dev/release_oracle/`, driven through `python3 -m dev.pytools.<tool>` /
+  `python3 -m dev.release_oracle`. Three of them remain because a container image
+  chooses their interpreter, not rivet: `dev/cdc/primary-hba.sh` (the postgres
+  entrypoint runs only `*.sh` in `docker-entrypoint-initdb.d`, so the extension
+  IS the contract) and the two Airflow recipe init assets, which run in images
+  with no python at all. CI, the Makefile, the pre-commit hook and the live
+  source-parity tests call the modules directly.
+
+  (`dev/stand/{up,verify}.sh` also live in the tree, but they were never part of
+  the ported set — the version-matrix stand arrived separately and is committed
+  as its own thing.)
+
+  The port was not a transliteration: each module records, at the site, the
+  shell defect it removes. Among those that were silently wrong — a `case` with
+  no default arm that started nothing and waited for nothing; `exit` inside
+  `$(…)` killing only the subshell; a staging script that printed "Staged …" and
+  exited 0 after a failed `cp` (which is why the caller's status check could
+  never fire); `seed_pa_audit_all.sh` reporting an empty row count as success;
+  and, on macOS bash 3.2, `local x=$1 y="…${x}…"` on one line resolving `${x}`
+  against the ENCLOSING scope, which made the release gate's independent
+  read-back return empty for every CDC engine.
+
+### Fixed — tooling
+
+- **The PR matrix gate could not fail.** `python3 -m dev.pytools.matrices
+  --tier=pr … | tee run.log` exited with `tee`'s status, and GitHub Actions runs
+  `run:` under `bash -e` WITHOUT pipefail — so whatever the matrices reported,
+  the step passed. (Inherited shape: the shell line it replaced had the same
+  pipe.) The step now sets `shell: bash` and `set -o pipefail`.
+
+- **The release gate blamed rivet for its own connectivity.** The CDC
+  state-parity cell read the Postgres state backend through the psql of the
+  container resolved from `RIVET_CDC_POSTGRES_URL` — the SOURCE — which only
+  works when the state database happens to live in the source container. Pointed
+  at its own server, every query failed, and a failed query returned `""` → `"0"`
+  → `empty`, indistinguishable from a genuinely empty table. The cell then
+  reported `postgres!=golden`: a state-backend parity divergence, for a reader
+  that could not connect. The container is now resolved from the state URL, and a
+  query failure raises so the caller can SKIP — the rule the SQLite leg of the
+  same function already followed.
+
+- **Layout baselines could not be re-blessed.** `path_matrix` compares a
+  normalised file listing, and the normaliser erased only a second-granularity
+  timestamp. Two intentional product changes had made part names carry more than
+  that — the millisecond field added when sub-second runs into one prefix were
+  found to clobber each other, and the chunk writer's 64-bit collision nonce —
+  both non-deterministic, so a blessed baseline failed on the very next run. The
+  normaliser now erases both (keeping `_chunk<N>`, which is the contract), and
+  the six baselines are re-blessed for the run-unique manifest copy. `matrix_
+  suites` had its own copy of the patterns, which is how the two drifted; it now
+  delegates to the single definition.
 
 ## 0.23.1 — 2026-07-27
 
