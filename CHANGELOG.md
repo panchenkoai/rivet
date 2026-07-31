@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.24.1 — 2026-07-31
+
+### Fixed
+
+- **`rivet load` refused its own CDC prefix.** 0.24.0's cross-run manifest
+  summing put the snapshot leg's synthesized export name
+  (`{export}__snapshot_{table}`) in front of the shared-prefix guard for the
+  first time, and the ordinary `initial: snapshot` → drain → `load` flow failed
+  with "the load prefix holds manifests from 2 distinct exports". The guard now
+  compares export **families** — the snapshot leg folds to its parent
+  (`manifest::snapshot_family`); a snapshot leg of a *different* export is
+  still refused. Found live by a downstream re-extraction migration. (#138)
+- **Release oracle: the `cdc[mongo]` cell could never run.** The gate's mongo
+  helper hardcoded in-container credentials the repo compose does not have
+  (`mongo-rs` runs without auth), so every armed run died on "Authentication
+  failed" — invisible while the cell stayed SKIPped. The helper now carries the
+  caller's URL auth/db through and falls back to the legacy `mongo` shell on
+  4.4 images. All four `cdc[*]` cells now run and pass. (#138)
+
 ## 0.24.0 — 2026-07-31
 
 ### Changed — BREAKING
