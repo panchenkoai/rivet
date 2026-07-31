@@ -676,7 +676,12 @@ pub struct CdcExportConfig {
     /// `false` to opt into continuous streaming explicitly.
     #[serde(default = "default_true")]
     pub until_current: bool,
-    /// Stop after N change events (default: until end of stream / interrupted).
+    /// Stop at the first COMMIT BOUNDARY once N change events have been
+    /// captured (default: until end of stream / interrupted). A soft cap, like
+    /// `rollover`: a transaction is never split, so the run may overshoot N by
+    /// the remainder of the transaction the cap landed in — a hard per-event
+    /// stop cut transactions mid-flight and left the stream unable to advance
+    /// past them.
     pub max_events: Option<usize>,
     /// Rows per output part file (default 100000). A part also rolls at a
     /// transaction boundary, so it never splits a transaction. Larger ⇒ fewer,

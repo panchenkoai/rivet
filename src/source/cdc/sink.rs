@@ -321,50 +321,51 @@ pub(crate) fn run_to_files(
                 last_commit = Some(ev.position.clone());
                 unacked_commit = true;
             }
-            let Some(sink) = sinks
+            // Routing is a BLOCK, not a `continue`: the soft cap below must run
+            // for every event, because a commit boundary is a STREAM property
+            // that can land on an UNCAPTURED table (the `commit_boundary_on_an_
+            // uncaptured_table_…` shape). A `continue` here made the cap dead on
+            // exactly those streams — unbounded overshoot. An uncaptured event
+            // simply skips the block, which also drops its deferred poison, as
+            // the `continue` used to.
+            if let Some(sink) = sinks
                 .iter_mut()
                 .find(|s| table_matches(&s.out.table, &ev.schema, &ev.table))
-            else {
-                continue; // not a captured table — its deferred poison never applies
-            };
-            // Confirmed routed to a captured table → surface any deferred decode
-            // error (uncaptured tables' poison was dropped by the `continue`).
-            ev.raise_poison()?;
-            total_bytes += ev.estimated_bytes();
-            sink.buf.push(ev);
-            total_rows += 1;
-            emitted += 1;
-            if policy.should_roll(total_rows, total_bytes, committed) {
-                roll_all(
-                    &mut sinks,
-                    stream,
-                    cfg.engine,
-                    cfg.format,
-                    &cfg.export_name,
-                    &run_token,
-                    checkpoint,
-                    &last_commit,
-                    &mut unacked_commit,
-                    &cfg.run_id,
-                    &cfg.started_at,
-                )?;
-                total_rows = 0;
-                total_bytes = 0;
+            {
+                // Confirmed routed to a captured table → surface any deferred
+                // decode error (uncaptured tables' poison never applies).
+                ev.raise_poison()?;
+                total_bytes += ev.estimated_bytes();
+                sink.buf.push(ev);
+                total_rows += 1;
+                emitted += 1;
+                if policy.should_roll(total_rows, total_bytes, committed) {
+                    roll_all(
+                        &mut sinks,
+                        stream,
+                        cfg.engine,
+                        cfg.format,
+                        &cfg.export_name,
+                        &run_token,
+                        checkpoint,
+                        &last_commit,
+                        &mut unacked_commit,
+                        &cfg.run_id,
+                        &cfg.started_at,
+                    )?;
+                    total_rows = 0;
+                    total_bytes = 0;
+                }
             }
             // SOFT cap, judged at the COMMIT BOUNDARY — the same treatment
             // `should_roll` gives every other budget. Judged per event, the cap
             // cut a transaction mid-flight: the partial tail flushed as a real
-            // part (violating roll_all's "never split a transaction across
-            // parts") and the end-of-pass roll skipped checkpoint AND ack, so
-            // every later run re-read the same transaction, wrote another
-            // uniquely-named part, and reported success — forever. On PostgreSQL
-            // the slot then pins WAL (`release_empty_frontier` bails once data
-            // was yielded), so the stall grows into a disk-full.
-            //
-            // `committed` here means THIS event ends its transaction, so
-            // stopping now leaves nothing half-captured; the overshoot is
-            // bounded by the transaction the cap landed in, which is exactly
-            // the promise `rollover` already makes.
+            // part and the end-of-pass roll skipped checkpoint AND ack, so every
+            // later run re-read the same transaction forever (on PostgreSQL the
+            // slot then pins WAL until the disk fills). It runs AFTER the routed
+            // push — the boundary event itself must be captured before stopping,
+            // or the ack advances past an unwritten row — and OUTSIDE the routed
+            // block, so a boundary on an uncaptured table still honours it.
             if committed && cfg.max_events.is_some_and(|m| emitted >= m) {
                 hit_max = true;
                 break;
@@ -1338,6 +1339,56 @@ mod tests {
     /// cap = 3 — past the activation threshold on both counts (a cap the fixture
     /// never reaches, or a fixture of single-event transactions, cannot express
     /// the defect: with per-event commits the cap always lands on a boundary).
+    /// The hole the first soft-cap placement left: the cap check sat in the
+    /// ROUTED section, but a commit boundary can land on an UNCAPTURED table
+    /// (the exact stream shape `commit_boundary_on_an_uncaptured_table_still_
+    /// advances_the_checkpoint` exists for) — and the routing `continue` skipped
+    /// the check entirely. A stream of transactions committing on uncaptured
+    /// tables then NEVER fires the cap: unbounded overshoot, the opposite
+    /// failure of the hard cut the soft cap replaced. Found by the focused hunt
+    /// over the fix branch, before merge.
+    #[test]
+    fn max_events_fires_at_a_commit_boundary_on_an_uncaptured_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = local_dest(&dir);
+        let cols = int_col();
+        let ckpt = dir.path().join("ckpt");
+
+        // Tx1: three captured uncommitted rows, boundary on an UNCAPTURED table.
+        let mut events: VecDeque<ChangeEvent> = (1..=3)
+            .map(|id| ChangeEvent {
+                committed: false,
+                ..insert(id)
+            })
+            .collect();
+        events.push_back(ChangeEvent {
+            table: "other".into(),
+            ..insert(4)
+        });
+        // Tx2: two more captured rows the cap must NOT reach.
+        events.push_back(ChangeEvent {
+            committed: false,
+            ..insert(5)
+        });
+        events.push_back(insert(6));
+        let mut stream = FakeStream {
+            events,
+            acked: Vec::new(),
+        };
+
+        let mut c = cfg(dest.as_ref(), &cols, FormatType::Parquet, 100);
+        c.max_events = Some(3);
+        c.checkpoint = Some(ckpt);
+        let manifests = run_to_files(&mut stream, c).expect("run");
+
+        let rows: i64 = manifests.iter().map(|m| m.row_count).sum();
+        assert_eq!(
+            rows, 3,
+            "the cap must fire at the uncaptured-table boundary after 3 routed \
+             events — capturing tx2 means the cap is dead on this stream shape"
+        );
+    }
+
     #[test]
     fn max_events_stops_at_a_commit_boundary_never_inside_a_transaction() {
         let dir = tempfile::tempdir().unwrap();

@@ -851,7 +851,7 @@
           "default": true
         },
         "max_events": {
-          "description": "Stop after N change events (default: until end of stream / interrupted).",
+          "description": "Stop at the first COMMIT BOUNDARY once N change events have been\ncaptured (default: until end of stream / interrupted). A soft cap, like\n`rollover`: a transaction is never split, so the run may overshoot N by\nthe remainder of the transaction the cap landed in — a hard per-event\nstop cut transactions mid-flight and left the stream unable to advance\npast them.",
           "type": [
             "integer",
             "null"
