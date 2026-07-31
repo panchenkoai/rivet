@@ -242,7 +242,11 @@ fn synth_snapshot_export(
     snap_dcfg: &crate::config::DestinationConfig,
 ) -> ExportConfig {
     let mut synth = export.clone();
-    synth.name = format!("{}__snapshot_{table}", export.name);
+    synth.name = format!(
+        "{}{}{table}",
+        export.name,
+        crate::manifest::SNAPSHOT_LEG_INFIX
+    );
     synth.mode = crate::config::ExportMode::Full;
     synth.table = Some(table.to_string());
     synth.tables = None;

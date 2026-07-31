@@ -39,6 +39,7 @@ import re
 import sqlite3
 import tempfile
 import time
+import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -189,14 +190,21 @@ def _mongosh(url: str, script: str) -> Proc:
     c = _container_for(url)
     if c is None:
         return _no_container(url)
-    return docker_exec(
-        c,
-        "mongosh",
-        "mongodb://rivet:rivet@127.0.0.1:27017/rivet?authSource=admin",
-        "--quiet",
-        "--eval",
-        script,
-    )
+    # Rebuild the caller's URL for the IN-CONTAINER port, carrying over exactly
+    # the auth and db it declares. The previous hardcoded
+    # `rivet:rivet@…?authSource=admin` could never pass against the repo's own
+    # compose: `mongo-rs` runs WITHOUT auth (see MONGO_RS_URL in
+    # tests/common/env.rs), so every setup died on "Authentication failed" —
+    # invisible for as long as the cell was never armed and always SKIPped.
+    u = urllib.parse.urlsplit(url)
+    auth = f"{u.username}:{u.password}@" if u.username else ""
+    db = (u.path or "").lstrip("/") or "rivet"
+    query = f"?{u.query}" if u.query else ""
+    inner = f"mongodb://{auth}127.0.0.1:27017/{db}{query}"
+    p = docker_exec(c, "mongosh", inner, "--quiet", "--eval", script)
+    if p.returncode in (126, 127):  # image ships only the legacy shell (mongo:4.4)
+        p = docker_exec(c, "mongo", inner, "--quiet", "--eval", script)
+    return p
 
 
 # ── per-engine: create+anchor the typed table / apply changes / crash-delta / clean
