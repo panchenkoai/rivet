@@ -292,7 +292,7 @@ jobs:
         env:
           CARGO_PROFILE_DEV_DEBUG: "0" # mutants never need debuginfo
         run: |
-          case $(( $(date +%j) % 3 )) in
+          case $(( $(date +%j) % 4 )) in
             0)
               echo "group: ledger/pipeline (Tier 0)"
               FILES="-f src/pipeline/manifest_writer.rs -f src/pipeline/manifest_reconcile.rs \
@@ -312,6 +312,23 @@ jobs:
                      -f src/plan/build.rs -f src/format/csv.rs -f src/source/mongo/mod.rs \
                      -f src/source/mssql/mod.rs -f src/source/postgres/mod.rs \
                      -f src/pipeline/apply_cmd.rs"
+              ;;
+            3)
+              # Added because these four were in NO group: the rotation had never
+              # mutated the file that owns `check_post_run_invariants` — the
+              # structural runner-bypass guard — nor the three chunked runners that
+              # must record why they skipped a facade. A one-off run found 7
+              # survivors inside the guard's own conditions, one cluster of them
+              # unkillable because the branch was dead code (removed in the same
+              # commit). A guard nobody mutates is a guard nobody has checked.
+              #
+              # Split into a fourth arm rather than appended to an existing one:
+              # the rotation had already stopped fitting in three hours, and the
+              # job timeout is now at GitHub's six-hour ceiling with no headroom.
+              echo "group: summary/guard + chunked runners (Tier 3)"
+              FILES="-f src/pipeline/summary.rs -f src/pipeline/chunked/exec.rs \
+                     -f src/pipeline/chunked/sequential_checkpoint.rs \
+                     -f src/pipeline/chunked/parallel_checkpoint.rs"
               ;;
           esac
           # `|| true`: known misses are adjudicated by the baseline diff below,

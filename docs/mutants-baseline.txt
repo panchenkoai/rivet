@@ -1539,3 +1539,69 @@ src/types/target.rs:720:27: replace < with <= in clickhouse::native
 src/types/target.rs:77:9: replace ExportTarget::label -> &'static str with ""
 src/types/target.rs:77:9: replace ExportTarget::label -> &'static str with "xyzzy"
 src/types/target.rs:96:70: replace == with != in ExportTarget::resolve_column
+
+# v3 (2026-07-31): + src/pipeline/summary.rs, admitted when the nightly rotation
+# gained a fourth group. This file had been in NO group, so its misses had never
+# been adjudicated — the gap that let 7 survivors sit inside
+# `check_post_run_invariants` itself, one cluster of them unkillable because the
+# branch was dead code. Those 7 are NOT below: they were closed by boundary tests
+# and a branch removal, which is why admitting the rest is honest rather than a
+# way of turning a red job green.
+#
+# ACCEPTED, one verdict for the whole set: every entry is the stderr RENDERING
+# path — `print` -> `render_compact` -> `format_block` -> `*_row` — or a
+# `#[doc(hidden)] #[allow(dead_code)]` builder (`with_status`,
+# `with_files_committed`, `with_manifest_parts`) that production never reaches.
+# The machine-readable artifact does not pass through any of them: `summary.json`
+# is serialized from the struct's fields (`src/pipeline/report.rs:195`), so a
+# mutation here can change a line an operator READS, never a value a consumer
+# PARSES. Same class the header above already accepts (operator-UX output,
+# Display impls); listed rather than excluded in `.cargo/mutants.toml` because
+# these are weakly-tested, not equivalent — assertions on the rendered block
+# would shrink this list, which is the direction it is allowed to move.
+src/pipeline/summary.rs:378:15: replace == with != in RunSummary::with_status
+src/pipeline/summary.rs:378:28: replace || with && in RunSummary::with_status
+src/pipeline/summary.rs:378:33: replace == with != in RunSummary::with_status
+src/pipeline/summary.rs:378:46: replace && with || in RunSummary::with_status
+src/pipeline/summary.rs:395:9: replace RunSummary::with_files_committed -> Self with Default::default()
+src/pipeline/summary.rs:405:9: replace RunSummary::with_manifest_parts -> Self with Default::default()
+src/pipeline/summary.rs:438:9: replace RunSummary::print with ()
+src/pipeline/summary.rs:461:9: replace RunSummary::print_stderr_block with ()
+src/pipeline/summary.rs:510:43: replace > with >= in RunSummary::render_compact
+src/pipeline/summary.rs:568:9: replace RunSummary::status_row -> Row with Default::default()
+src/pipeline/summary.rs:569:34: replace match guard s == "skipped" with false in RunSummary::status_row
+src/pipeline/summary.rs:569:34: replace match guard s == "skipped" with true in RunSummary::status_row
+src/pipeline/summary.rs:569:36: replace == with != in RunSummary::status_row
+src/pipeline/summary.rs:578:9: replace RunSummary::tuning_row -> Row with Default::default()
+src/pipeline/summary.rs:598:32: replace > with < in RunSummary::output_row
+src/pipeline/summary.rs:598:32: replace > with == in RunSummary::output_row
+src/pipeline/summary.rs:598:32: replace > with >= in RunSummary::output_row
+src/pipeline/summary.rs:598:9: replace RunSummary::output_row -> Option<Row> with None
+src/pipeline/summary.rs:598:9: replace RunSummary::output_row -> Option<Row> with Some(Default::default())
+src/pipeline/summary.rs:621:31: replace > with < in RunSummary::bytes_row
+src/pipeline/summary.rs:621:31: replace > with == in RunSummary::bytes_row
+src/pipeline/summary.rs:621:31: replace > with >= in RunSummary::bytes_row
+src/pipeline/summary.rs:621:9: replace RunSummary::bytes_row -> Option<Row> with None
+src/pipeline/summary.rs:621:9: replace RunSummary::bytes_row -> Option<Row> with Some(Default::default())
+src/pipeline/summary.rs:630:29: replace > with < in RunSummary::peak_rss_row
+src/pipeline/summary.rs:630:29: replace > with == in RunSummary::peak_rss_row
+src/pipeline/summary.rs:630:29: replace > with >= in RunSummary::peak_rss_row
+src/pipeline/summary.rs:630:9: replace RunSummary::peak_rss_row -> Option<Row> with None
+src/pipeline/summary.rs:630:9: replace RunSummary::peak_rss_row -> Option<Row> with Some(Default::default())
+src/pipeline/summary.rs:652:29: replace > with >= in RunSummary::pg_temp_spill_row
+src/pipeline/summary.rs:665:24: replace == with != in RunSummary::compression_row
+src/pipeline/summary.rs:665:37: replace && with || in RunSummary::compression_row
+src/pipeline/summary.rs:665:57: replace != with == in RunSummary::compression_row
+src/pipeline/summary.rs:665:9: replace RunSummary::compression_row -> Option<Row> with None
+src/pipeline/summary.rs:665:9: replace RunSummary::compression_row -> Option<Row> with Some(Default::default())
+src/pipeline/summary.rs:674:25: replace > with < in RunSummary::retries_row
+src/pipeline/summary.rs:674:25: replace > with == in RunSummary::retries_row
+src/pipeline/summary.rs:674:25: replace > with >= in RunSummary::retries_row
+src/pipeline/summary.rs:674:9: replace RunSummary::retries_row -> Option<Row> with None
+src/pipeline/summary.rs:674:9: replace RunSummary::retries_row -> Option<Row> with Some(Default::default())
+src/pipeline/summary.rs:722:36: replace > with >= in RunSummary::outcome_rows
+src/pipeline/summary.rs:998:37: replace + with * in format_block
+src/pipeline/summary.rs:998:48: replace + with * in format_block
+src/pipeline/summary.rs:998:48: replace + with - in format_block
+src/pipeline/summary.rs:998:53: replace + with * in format_block
+src/pipeline/summary.rs:998:53: replace + with - in format_block
