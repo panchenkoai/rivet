@@ -396,10 +396,16 @@ fn is_run_unique_manifest(base: &str) -> bool {
 /// wrong data. Legacy manifests with no recorded `export_name` (pre-0.x) are
 /// tolerated — an empty name matches any single named export, so a prefix that
 /// mixes old and new runs of the SAME export still loads.
+///
+/// The CDC `initial: snapshot` leg is NOT a sibling: `cdc_job` synthesizes it
+/// as `{export}__snapshot_{table}` and points it at the SAME prefix by design —
+/// the baseline and the drain are one table's rows, summed and cleaned
+/// together. The guard therefore compares export FAMILIES, folding a
+/// snapshot-leg name to its parent (see [`crate::manifest::snapshot_family`]).
 pub fn ensure_single_export(keyed: &[(String, RunManifest)]) -> Result<()> {
     let mut names: std::collections::BTreeSet<&str> = keyed
         .iter()
-        .map(|(_, m)| m.export_name.as_str())
+        .map(|(_, m)| crate::manifest::snapshot_family(m.export_name.as_str()))
         .filter(|n| !n.is_empty())
         .collect();
     if names.len() > 1 {
@@ -598,6 +604,25 @@ mod tests {
         let mut legacy = manifest("r0", 3, None);
         legacy.export_name = String::new();
         assert!(ensure_single_export(&[orders, keyed(legacy)]).is_ok());
+    }
+
+    /// Regression: the CDC `initial: snapshot` leg shares the drain's prefix BY
+    /// DESIGN (`cdc_job` synthesizes `{export}__snapshot_{table}` pointed at the
+    /// same destination). 0.24.0's cross-run manifest summing put both names in
+    /// front of this guard for the first time and the ordinary snapshot → drain
+    /// → `rivet load` flow refused itself. The pair is ONE export family.
+    #[test]
+    fn ensure_single_export_admits_the_cdc_snapshot_leg_of_the_same_export() {
+        let keyed = |m: RunManifest| ("gs://b/p/manifest-x.json".to_string(), m);
+        let drain = keyed(manifest("r1", 10, None)); // export_name "orders"
+        let mut snap = manifest("r2", 10, None);
+        snap.export_name = "orders__snapshot_orders".into();
+        // Snapshot baseline + drain of the SAME export → one family, loads.
+        assert!(ensure_single_export(&[drain.clone(), keyed(snap)]).is_ok());
+        // A snapshot leg of a DIFFERENT export is still a sibling → refuse.
+        let mut foreign = manifest("r3", 10, None);
+        foreign.export_name = "customers__snapshot_customers".into();
+        assert!(ensure_single_export(&[drain, keyed(foreign)]).is_err());
     }
 
     #[test]

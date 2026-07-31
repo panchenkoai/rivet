@@ -73,6 +73,26 @@ pub fn is_run_unique_manifest_name(name: &str) -> bool {
     name.starts_with("manifest-") && name.ends_with(".json")
 }
 
+/// Infix of the export name `pipeline::cdc_job` synthesizes for the CDC
+/// `initial: snapshot` leg: `{parent}__snapshot_{table}`. The format and
+/// [`snapshot_family`] live together so they cannot drift apart.
+pub const SNAPSHOT_LEG_INFIX: &str = "__snapshot_";
+
+/// Fold a CDC snapshot-leg export name back to its parent export.
+///
+/// The snapshot leg writes its baseline into the SAME destination prefix as
+/// the drain by design — one table, one family. Consumers that group or
+/// compare manifests by export (e.g. the shared-prefix load guard) must treat
+/// `{parent}__snapshot_{table}` as `{parent}`, or the pair reads as two
+/// exports and the ordinary `initial: snapshot` → `load` flow refuses itself.
+/// A name with no infix — or a pathological empty parent — returns unchanged.
+pub fn snapshot_family(name: &str) -> &str {
+    match name.split_once(SNAPSHOT_LEG_INFIX) {
+        Some((parent, _)) if !parent.is_empty() => parent,
+        _ => name,
+    }
+}
+
 /// Writability probe `rivet doctor` drops at the destination prefix.  It is a
 /// Rivet-internal sidecar (like [`MANIFEST_FILENAME`] / [`SUCCESS_FILENAME`]),
 /// so the manifest-aware `--validate` pass must not flag it as an untracked
