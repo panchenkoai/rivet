@@ -4,6 +4,48 @@
 
 ### Fixed
 
+- **`_rivet_row_hash` was not injective — different rows could share a hash.**
+  Cells were joined with a bare `0x1f` and no length, and containers were
+  canonicalised from Arrow's *display text*, where elements join with `", "` and a
+  NULL element renders empty. Measured on the released 0.23.1 binary, hashing only
+  the affected column:
+
+  | value | 0.23.1 | now |
+  |---|---:|---:|
+  | `['a, b']` | `3183735681115164839` | `-3174247791433624734` |
+  | `['a','b']` | `3183735681115164839` | `-8270860736070407760` |
+  | `[NULL]` | `2593065788487682130` | `-644691579053858169` |
+  | `['']` | `2593065788487682130` | `8073291495565291491` |
+  | `[]` | `2593065788487682130` | `4938194412766331533` |
+
+  Five distinct values, two hashes. The same shape hits scalars whose text
+  contains `0x1f`: `(a="x\x1f", b="y")` and `(a="x", b="\x1fy")` both hashed
+  `-7288205783345698746`. Cells are length-prefixed now and containers
+  canonicalise from their CHILDREN, never from rendered text.
+
+  **Affects 0.23.x wherever `meta_columns.row_hash` was set** (opt-in, default
+  off). The source columns were exported correctly; what is wrong is the derived
+  column — and specifically the one whose job is to prove two rows differ, so a
+  consumer that dedupes or audits by it treats distinct rows as identical. The
+  values cannot be repaired in place: re-extract the covered rows.
+  `ROW_HASH_RENDER_ID` moves to `xxh3-128-i64-arrow-display-us-v2` so old and new
+  values are labelled and cannot be mistaken for one another — note that EVERY
+  value changes, not only the colliding ones.
+
+- **A declared BigQuery load silently dropped the meta columns.** The load plan
+  gave no spec to either extraction-written column, so neither reached the
+  warehouse — and nothing said so. Measured end to end against a real dataset on
+  0.23.1: the parquet in GCS carried
+  `['id','name','amount','_rivet_exported_at','_rivet_row_hash']`, the BigQuery
+  table ended up with `['id','name','amount']`, and the run reported
+  `columns=3 … integrity ✓ … LOAD OK, rows_loaded: 3`. The integrity check
+  compares ROW counts only, so a missing column cannot fail it. Both columns now
+  get a spec — same fixture, same run: `columns=5`, and the values land
+  (`n=3, hashes=3, stamps=3`).
+
+  **Affects 0.23.x.** Snowflake failed loudly instead — `COPY INTO` named a column
+  the table lacked — so the silent variant is BigQuery-specific.
+
 - **A plan artifact written by an older rivet stopped being applicable.** The
   resolved plan gained a required `verify` field on 2026-06-02; three of its
   siblings in the same struct carry `#[serde(default)]` with comments saying
@@ -32,6 +74,17 @@
   `apply_replays_precomputed_chunks_on_the_sequential_path` (RED against the
   restored fallback: the Detect path probes the source and the test's source
   double refuses).
+
+  **Affects every release since 0.10.0** — the fallback was there the day
+  plan/apply landed (2026-04-14). Measured on the released 0.23.1 binary rather
+  than read from the code, which turned up one more broken path than the fix was
+  first credited with: against a table grown from 150 to 300 rows between plan and
+  apply, plain chunked AND `chunk_checkpoint: true` both produced 6 files / 300
+  rows where the artifact pinned 3 windows / 150 rows. `parallel:` replayed
+  correctly. `full` and `keyset` artifacts pin no ranges at all, so apply re-reads
+  by construction there, and the incremental cursor-drift guard refuses a stale
+  plan as documented (snapshot 149 vs current 299). Nothing was lost or corrupted
+  — the run covered a different SCOPE than the plan approved.
 
 - **A run-integrity violation produced no signal at all in release builds.**
   `check_post_run_invariants` asserts that each runner applied its per-runner
