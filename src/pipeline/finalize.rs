@@ -518,7 +518,24 @@ fn rerun_warning_message(uri: &str, marker: &str) -> String {
 /// state-store ledger already covers the co-located case. Best-effort: a marker
 /// write failure must never fail the run (gc still has the ledger). The terminal
 /// manifest at finalize OVERWRITES this same run-unique file.
-pub(super) fn write_running_manifest(plan: &ResolvedRunPlan, run_id: &str, started_at: &str) {
+pub(super) fn write_running_manifest(
+    plan: &ResolvedRunPlan,
+    // The export FAMILY, passed by the caller — NOT `plan.export_name`. The two
+    // writers for one run must agree: the terminal manifest records
+    // `export.family()` (job.rs), so a marker recording the NAME diverges for the
+    // one export whose family differs from its name — the CDC snapshot leg,
+    // named `{parent}__snapshot_{table}`. A hard-killed leg then leaves a marker
+    // claiming a family no other manifest carries, `ensure_single_export` bails
+    // ("manifests from 2 distinct exports"), and the marker is un-supersedable,
+    // so the sweep never clears it: the prefix is bricked for loading.
+    //
+    // Recording the WRONG family is strictly worse than recording none — an
+    // empty field falls back to the substring fold, which handles the leg
+    // correctly (`resolved_family`, load/reconcile.rs).
+    export_family: &str,
+    run_id: &str,
+    started_at: &str,
+) {
     use crate::config::{DestinationType, SourceType};
     use crate::manifest::{
         MANIFEST_VERSION, ManifestDestination, ManifestSource, ManifestStatus, RunManifest,
@@ -543,7 +560,7 @@ pub(super) fn write_running_manifest(plan: &ResolvedRunPlan, run_id: &str, start
         row_hash: None,
         manifest_version: MANIFEST_VERSION,
         run_id: run_id.to_string(),
-        export_family: plan.export_name.clone(),
+        export_family: export_family.to_string(),
         export_name: plan.export_name.clone(),
         mode: "batch".to_string(),
         started_at: started_at.to_string(),

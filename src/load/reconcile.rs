@@ -785,6 +785,48 @@ mod tests {
         );
     }
 
+    /// DOCUMENTS the contract a snapshot leg\'s `running` marker must satisfy:
+    /// it carries the leg\'s FAMILY (the parent export), never its decorated
+    /// `{parent}__snapshot_{table}` name. A marker carrying the name would
+    /// belong to a family no other manifest under the prefix shares, so
+    /// `ensure_single_export` refuses the load — and since nothing can supersede
+    /// that marker, the prefix stays bricked until a human deletes the object.
+    /// The family is read back VERBATIM when recorded (`resolved_family`), so
+    /// the substring fold cannot rescue a wrong value: recording the name is
+    /// strictly worse than recording nothing.
+    ///
+    /// SCOPE, stated because a green test here is easy to over-read: this
+    /// exercises the READ side only. It builds the marker by hand and does NOT
+    /// go through `write_running_manifest`, so it stays green against a writer
+    /// that records the wrong family — verified by mutating the writer back and
+    /// watching this pass. The writer is cloud-only (it returns early for a
+    /// local destination, `pipeline/finalize.rs`), so no unit test can observe
+    /// it; the real closure is to route that hand-rolled `RunManifest` literal
+    /// through `ManifestBuilder`, which REQUIRES the family and would make the
+    /// two writers-for-one-run structurally unable to disagree.
+    #[test]
+    fn a_snapshot_legs_running_marker_documents_the_family_contract() {
+        let keyed = |m: RunManifest| ("gs://b/p/manifest-x.json".to_string(), m);
+        let mut drain = manifest("r1", 10, None);
+        drain.export_name = "orders".into();
+        drain.export_family = "sales".into();
+        let mut marker = manifest("r2", 0, None);
+        marker.export_name = "sales__snapshot_orders".into();
+        marker.export_family = "sales".into(); // the family, as the writer records
+        marker.status = ManifestStatus::Running;
+        assert!(
+            ensure_single_export(&[keyed(drain.clone()), keyed(marker.clone())]).is_ok(),
+            "a leg\'s marker belongs to its parent\'s family"
+        );
+        // And the failure this guards: the same marker carrying the NAME.
+        let mut wrong = marker;
+        wrong.export_family = "sales__snapshot_orders".into();
+        assert!(
+            ensure_single_export(&[keyed(drain), keyed(wrong)]).is_err(),
+            "recording the decorated name reads as a second export — the bricked prefix"
+        );
+    }
+
     #[test]
     fn source_rows_is_none_when_no_manifest_probed_the_source() {
         let ms = vec![manifest("r1", 100, None), manifest("r2", 40, None)];

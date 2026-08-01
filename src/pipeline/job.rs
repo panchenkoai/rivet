@@ -649,7 +649,7 @@ fn finalize_keyset_anchor(
 /// the live run too. The `prefix` recorded in the ledger is the run's write URI,
 /// which `gc_orphans` matches at-or-under its load prefix. Best-effort: a miss
 /// only makes gc over-defer cleanup, so it warns rather than failing the export.
-fn ledger_begin_run(state: &StateStore, plan: &ResolvedRunPlan, run_id: &str) {
+fn ledger_begin_run(state: &StateStore, plan: &ResolvedRunPlan, export_family: &str, run_id: &str) {
     let prefix = super::finalize::destination_uri_for_manifest(&plan.destination);
     let started_at = chrono::Utc::now().to_rfc3339();
     if let Err(e) = state.begin_run(run_id, &plan.export_name, &prefix, &started_at) {
@@ -658,7 +658,7 @@ fn ledger_begin_run(state: &StateStore, plan: &ResolvedRunPlan, run_id: &str) {
             plan.export_name
         );
     }
-    super::finalize::write_running_manifest(plan, run_id, &started_at);
+    super::finalize::write_running_manifest(plan, export_family, run_id, &started_at);
 }
 
 /// Transition a run to its terminal status in the run-status ledger at finalize.
@@ -804,7 +804,7 @@ pub(super) fn run_export_job(
     // Record this run `running` BEFORE any part lands — in the ledger + a bucket
     // marker manifest — the authority `gc_orphans` reads to spare a live extract's
     // committed-but-not-yet-manifested parts. (finish_run transitions it below.)
-    ledger_begin_run(state, &plan, &summary.run_id);
+    ledger_begin_run(state, &plan, &export.family(), &summary.run_id);
     // Failure forensics at open: source schema + server limits, so a run that fails
     // before finalize still explains itself (export_schema is otherwise success-only).
     capture_open_forensics(&plan, state, &mut summary);
@@ -1055,7 +1055,7 @@ pub(crate) fn run_export_job_with_chunk_source(
     let rss_sampler = crate::resource::RssPeakSampler::start(rss_before, 100);
     let mut summary = RunSummary::new(plan);
     summary.apply_context = apply_context;
-    ledger_begin_run(state, plan, &summary.run_id);
+    ledger_begin_run(state, plan, &plan.export_name, &summary.run_id);
     // Runner parity: the apply/chunk-source path is a SEPARATE runner from
     // run_export_job, so it must re-apply open forensics itself (server_context +
     // schema-at-open) or an apply-run failure records neither — the runner-bypass
