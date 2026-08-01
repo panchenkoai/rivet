@@ -601,35 +601,32 @@ fn run_keyset_parallel(
     });
 
     let errs = errors.into_inner().unwrap();
-    if !errs.is_empty() {
-        anyhow::bail!(
-            "export '{}': parallel keyset failed on {} range(s): {}",
-            plan.export_name,
-            errs.len(),
-            errs.join("; ")
-        );
-    }
 
-    // Merge into the summary through the shared seams (identical to the sequential
-    // runner's per-page path, folded run-wide).
-    summary.total_rows += rows.into_inner();
-    if plan.validate {
-        summary.validated = Some(true);
-    }
-    if let Some(sc) = fingerprint.get() {
-        manifest_writer::record_run_schema_fingerprint(summary, sc);
-    }
-    // cursor_high = the highest populated range's max (forensics v18); see range_max.
-    summary.cursor_high = highest_range_max(range_max.into_inner().unwrap());
-    summary.cursor_low = None; // a fresh parallel run seeks from the floor of each range
-
-    // Record this run's parts through the commit seam (populates
-    // summary.manifest_parts + counters + journal). On a CHECKPOINT run the workers
-    // ALREADY wrote file_log atomically with their `done` flip, so pass None here to
-    // avoid a duplicate write. On a NON-checkpoint run the workers write no file_log
-    // (their commit_keyset_range_at_ref is gated on state_ref = checkpoint-only), so
-    // the merge must write it — matching the sequential keyset path, which records
-    // file_log unconditionally.
+    // Record what the SUCCESSFUL workers already made durable — BEFORE deciding
+    // whether to bail. `summary.files_committed` is the retry guard's only input
+    // (`decide_export_retry` -> `BailDuplicateGuard`, pipeline/single.rs), and
+    // `record_part` is the sole production site that raises it. Bailing above
+    // this loop left the guard reading ZERO while ranges were already on disk,
+    // so a TRANSIENT worker failure retried the whole export over durable parts.
+    //
+    // Measured before the fix: worker 2 failed transiently, 4 parts were on
+    // disk, rivet retried twice ("retry 1/2", "retry 2/2"). Stable run_id part
+    // names usually make attempt N+1 overwrite attempt N, which is why this hid
+    // since 0.23.0 — but when a range's output SHRINKS between attempts (rows
+    // deleted concurrently, or a part-count drop) the extra part of the earlier
+    // attempt survives as an orphan: a 2000-row fixture with a mid-backoff
+    // DELETE produced 751 rows / 750 distinct — id 501 duplicated, sitting in
+    // both `..._w0_1.parq` (attempt 1, unoverwritten) and `..._w1_0.parq`.
+    //
+    // Recording on the failure path is also the truthful thing: the run
+    // finalizes a Failed manifest, and listing the durable debris is what makes
+    // it discoverable to validate/gc instead of unreferenced.
+    // Records through the commit seam (populates summary.manifest_parts +
+    // counters + journal). On a CHECKPOINT run the workers ALREADY wrote
+    // file_log atomically with their `done` flip, so pass None to avoid a
+    // duplicate write. On a NON-checkpoint run the workers write no file_log
+    // (their commit_keyset_range_at_ref is gated on state_ref = checkpoint-only),
+    // so the merge must write it — matching the sequential keyset path.
     let file_log_state = if checkpoint { None } else { state };
     let parts = parts_mx.into_inner().unwrap();
     for (idx, rec) in parts.iter().enumerate() {
@@ -643,6 +640,29 @@ fn run_keyset_parallel(
             },
         );
     }
+    summary.total_rows += rows.into_inner();
+
+    if !errs.is_empty() {
+        anyhow::bail!(
+            "export '{}': parallel keyset failed on {} range(s): {}",
+            plan.export_name,
+            errs.len(),
+            errs.join("; ")
+        );
+    }
+
+    // Merge into the summary through the shared seams (identical to the sequential
+    // runner's per-page path, folded run-wide).
+    if plan.validate {
+        summary.validated = Some(true);
+    }
+    if let Some(sc) = fingerprint.get() {
+        manifest_writer::record_run_schema_fingerprint(summary, sc);
+    }
+    // cursor_high = the highest populated range's max (forensics v18); see range_max.
+    summary.cursor_high = highest_range_max(range_max.into_inner().unwrap());
+    summary.cursor_low = None; // a fresh parallel run seeks from the floor of each range
+
     // Resume completeness: reconstruct the parts of the ranges that completed in a
     // PRIOR (crashed) run — they were not re-run, so they are absent from
     // `parts_mx`; file_log (under the reused run_id) is their record. rehydrate

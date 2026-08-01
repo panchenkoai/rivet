@@ -209,6 +209,13 @@ impl Rig {
 
     /// Materialized config path — for bespoke invocations (`validate`,
     /// custom envs) the rig doesn't wrap.
+    /// The export name this rig rendered into the config — the key
+    /// `export_metrics` rows are stored under, so a test can read the run's own
+    /// metrics without re-deriving the name it did not choose.
+    pub fn export_name(&self) -> &str {
+        &self.name
+    }
+
     pub fn config_path(&self) -> PathBuf {
         // Materialization point: the ONLY place the rig touches the
         // filesystem (yaml()/render() stay pure — the offline goldens were

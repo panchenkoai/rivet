@@ -734,6 +734,68 @@ fn parallel_keyset_works_with_a_select_only_source_user_postgres() {
     ));
 }
 
+/// THE SEAM the retry guard reads. `decide_export_retry` bails with
+/// `BailDuplicateGuard` only when `summary.files_committed > 0`
+/// (`src/pipeline/single.rs`), and `record_part` is the sole production site
+/// that raises it. Parallel keyset used to `bail!` on a worker error ABOVE that
+/// drain, so the guard read ZERO while ranges were already durable — a TRANSIENT
+/// worker failure then retried the whole export over parts on disk.
+///
+/// Why the existing tests could not see it, which is the point of adding this
+/// one: `decide_export_retry`'s unit matrix feeds `files_committed` as a
+/// parameter (0/2/5) and is correct on every input, while
+/// `parallel_keyset_worker_error_aborts_cleanly_postgres` deliberately DELETES
+/// the orphan parts before its clean re-run (a vacuous-oracle guard its own
+/// comment explains). Neither observes the VALUE one layer hands the other.
+/// This test observes exactly that value, at the boundary.
+///
+/// Measured before the fix: 4 parts on disk, `retry 1/2` and `retry 2/2`, and
+/// with a range whose output SHRANK between attempts (a mid-backoff DELETE) the
+/// earlier attempt's extra part survived unoverwritten — 751 rows / 750
+/// distinct, id 501 duplicated.
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn parallel_keyset_worker_error_still_counts_the_durable_parts_postgres() {
+    require_alive(LiveService::Postgres);
+    let table = unique_name("pk_wcnt");
+    let mut c = pg_connect();
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {table};
+         CREATE TABLE {table} (id BIGINT PRIMARY KEY, payload INT NOT NULL);
+         INSERT INTO {table} SELECT g, g FROM generate_series(1, 2000) g;"
+    ))
+    .unwrap();
+    let rig = parallel_keyset(Rig::pg_batch(&format!("public.{table}")));
+    let out = rig.run_with_env("RIVET_TEST_ERROR_AT", "keyset_parallel_worker:2");
+    assert!(
+        !out.status.success(),
+        "a worker mid-range error must fail the run"
+    );
+
+    // The successful ranges DID write parquet — the premise of the whole test.
+    let on_disk = files_with_extension(&rig.out_dir(), "parquet").len();
+    assert!(
+        on_disk > 0,
+        "fixture is inert: the surviving workers wrote no parts, so there is \
+         nothing for the retry guard to protect"
+    );
+
+    // …and the run must SAY so. This is the assertion that goes RED against the
+    // pre-fix code: files_committed was 0 with parts already on disk.
+    let db = StateDb::next_to_config(&rig.config_path());
+    let run_id = db.latest_run_id(rig.export_name());
+    let m = db.metrics_row(&run_id);
+    assert_eq!(
+        m.files_committed,
+        Some(on_disk as i64),
+        "a failed parallel-keyset run must count the parts it left durable \
+         ({on_disk} on disk) — the retry guard reads this and nothing else"
+    );
+
+    let mut c2 = pg_connect();
+    let _ = c2.batch_execute(&format!("DROP TABLE IF EXISTS {table};"));
+}
+
 /// Worker mid-range ERROR propagation (the non-crash path): when one worker's source read
 /// errors (connection drop / statement timeout), the run must FAIL CLEANLY — collect the
 /// error, bail, and finalize NOTHING (no _SUCCESS, no manifest), never a partial success.
