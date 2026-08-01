@@ -84,6 +84,41 @@ GOLDEN = {
 }
 
 
+# CDC stands — SEPARATE instances carrying the server-side config change capture
+# needs (logical WAL, a REPLICATION grant, the SQL Server Agent), on the shared
+# port + 1. A CDC scenario creates and drops its OWN table here, which does not
+# breach the golden-seed rule: that rule protects the BATCH fixture the oracle
+# reads, while a CDC scenario must GENERATE change events, and a change stream
+# has nothing to read without writes. Writing into the batch stand would be the
+# violation; writing into the stand that exists to be written to is not.
+CDC_STANDS = {
+    "postgres": "postgres://rivet:rivet@127.0.0.1:5434/rivet",
+    "mysql": "mysql://rivet:rivet@127.0.0.1:3307/rivet",
+    "mssql": "sqlserver://sa:Rivet_Passw0rd!@127.0.0.1:1434/rivet",
+    "mongo": "mongodb://127.0.0.1:27017/rivet",
+}
+
+CDC_CONTAINER = {
+    "postgres": "rivet-postgres-cdc-1",
+    "mysql": "rivet-mysql-cdc-1",
+    "mssql": "rivet-mssql-cdc-1",
+}
+
+
+def _cdc_sql(eng: str, sql: str) -> shell.Proc:
+    """Run DDL/DML on the CDC stand through its container client."""
+    c = CDC_CONTAINER[eng]
+    if eng == "postgres":
+        return shell.run(["docker", "exec", c, "psql", "-U", "rivet", "-d", "rivet", "-c", sql], timeout=300)
+    if eng == "mysql":
+        return shell.run(["docker", "exec", c, "mysql", "-urivet", "-privet", "rivet", "-e", sql], timeout=300)
+    return shell.run(
+        ["docker", "exec", c, "/opt/mssql-tools18/bin/sqlcmd", "-S", "localhost",
+         "-U", "sa", "-P", "Rivet_Passw0rd!", "-C", "-d", "rivet", "-Q", sql],
+        timeout=300,
+    )
+
+
 # ── ledger ───────────────────────────────────────────────────────────────────
 @dataclass
 class Scenario:
@@ -304,6 +339,38 @@ _DRIFT_SIGNATURES = (
 )
 
 
+def mssql_capture_ready(tbl: str, want: int = 0, tries: int = 40) -> bool:
+    """Block until SQL Server's capture instance is queryable (and holds `want`
+    rows, when asked).
+
+    Enabling a capture instance does not make it READABLE the same instant: the
+    Agent's capture job must pick it up. A run fired in that window fails with
+    rivet's "CDC must be enabled … with SQL Server Agent running" hint — a
+    truthful message about a state the DRIVER created, which read as a scenario
+    failure. The live CDC tests wait for the same reason.
+    """
+    import time
+
+    for _ in range(tries):
+        # The ANCHOR signal, not merely a readable table: rivet floors a missing
+        # from-LSN at `fn_cdc_get_min_lsn`, and a capture instance created moments
+        # ago returns NULL there until the Agent initialises it. Anchoring in that
+        # window produced "the resume position is older than the change-table
+        # retention" on the drain — a truthful error about a state this driver
+        # created by starting too early.
+        q = _cdc_sql(
+            "mssql",
+            f"SET NOCOUNT ON; SELECT CASE WHEN sys.fn_cdc_get_min_lsn('{tbl}_ci') IS NULL "
+            f"THEN 0 ELSE 1 END, (SELECT COUNT(*) FROM cdc.{tbl}_ci_CT);",
+        )
+        if q.ok:
+            nums = [int(x) for x in re.sub(r"[^0-9]", " ", q.stdout).split() if x.isdigit()]
+            if len(nums) >= 2 and nums[0] == 1 and nums[1] >= want:
+                return True
+        time.sleep(1)
+    return False
+
+
 def looks_like_stand_drift(text: str) -> bool:
     t = text.lower()
     return any(sig in t for sig in _DRIFT_SIGNATURES)
@@ -414,10 +481,87 @@ def execute(sid: str, eng: str, work: Path) -> tuple[str, str]:
         a = _run(cfg, eng)
         b = _run(cfg, eng)
         return ("ok", "") if a.ok and b.ok else ("fail", (a.out + b.out).strip())
-    # Everything else needs source WRITES (CDC) or warehouse credentials (load)
-    # or a crafted prefix (gc) — those arrive with the next slice of the harness.
-    # A named SKIP, never a silent pass: an unimplemented scenario must not read
-    # as a green one.
+    if sid in ("cdc_until_current_twice", "cdc_initial_snapshot"):
+        if eng not in CDC_CONTAINER:
+            return ("skip", f"{eng} CDC scenario driver not wired")
+        if not shell.run(["docker", "inspect", CDC_CONTAINER[eng]], timeout=60).ok:
+            return ("skip", f"{CDC_CONTAINER[eng]} not running (docker compose --profile cdc up -d)")
+        tbl = f"scen_{sid}"[:24]
+        ddl = {
+            "postgres": f"DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl}(id BIGINT PRIMARY KEY, v TEXT);",
+            "mysql": f"DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl}(id BIGINT PRIMARY KEY, v TEXT);",
+            "mssql": f"IF OBJECT_ID('dbo.{tbl}','U') IS NOT NULL DROP TABLE dbo.{tbl}; "
+                     f"CREATE TABLE dbo.{tbl}(id BIGINT PRIMARY KEY, v NVARCHAR(50));",
+        }[eng]
+        if not _cdc_sql(eng, ddl).ok:
+            return ("skip", f"could not create the CDC fixture on {eng}")
+        if eng == "mssql":
+            # SQL Server captures nothing until a capture INSTANCE exists, and the
+            # Agent copies rows asynchronously — the same two steps the live CDC
+            # tests perform. Without them the run reads an empty change table and
+            # the scenario would report a red cell for a missing prerequisite.
+            _cdc_sql(eng, "IF (SELECT is_cdc_enabled FROM sys.databases WHERE name=DB_NAME()) = 0 "
+                          "EXEC sys.sp_cdc_enable_db;")
+            en = _cdc_sql(
+                eng,
+                f"EXEC sys.sp_cdc_enable_table @source_schema=N'dbo', "
+                f"@source_name=N'{tbl}', @role_name=NULL, @capture_instance=N'{tbl}_ci';",
+            )
+            if not en.ok or "cannot" in en.out.lower():
+                return ("skip", "SQL Server Agent/CDC not available on this stand")
+            if not mssql_capture_ready(tbl):
+                return ("skip", "SQL Server capture instance never became readable "
+                                "(Agent not running?) — not a rivet defect")
+        try:
+            initial = "      initial: snapshot\n" if sid == "cdc_initial_snapshot" else ""
+            if sid == "cdc_initial_snapshot":
+                # A snapshot leg needs rows to snapshot; seed BEFORE the first run.
+                _cdc_sql(eng, f"INSERT INTO {tbl} VALUES (1,'a'),(2,'b');")
+            # SQL Server reads a NAMED capture instance — the driver created it,
+            # so the driver names it. Leaving it out makes rivet refuse the run,
+            # which would have read as a scenario failure rather than a config gap.
+            ci = f"      capture_instance: {tbl}_ci\n" if eng == "mssql" else ""
+            cfg = work / "rivet.yaml"
+            cfg.write_text(
+                f"source:\n  type: {eng}\n  url_env: RIVET_SCEN_URL\n"
+                f"exports:\n  - name: {tbl}\n    table: {tbl}\n    mode: cdc\n"
+                f"    format: parquet\n    cdc:\n      checkpoint: {work / 'cdc.ckpt'}\n{ci}{initial}"
+                f"    destination: {{ type: local, path: {work / 'out'} }}\n"
+            )
+            env = {"RIVET_SCEN_URL": CDC_STANDS[eng]}
+            a = shell.run([rivet_bin(), "run", "-c", str(cfg)], env=env, timeout=900)
+            if not a.ok:
+                return ("fail", a.out.strip())
+            _cdc_sql(eng, f"INSERT INTO {tbl} VALUES (10,'x'),(11,'y');")
+            if eng == "mssql":
+                # The Agent copies asynchronously; without this the second cycle
+                # captures zero changes and writes no checkpoint.
+                mssql_capture_ready(tbl, want=1)
+            b = shell.run([rivet_bin(), "run", "-c", str(cfg)], env=env, timeout=900)
+            if not b.ok:
+                return ("fail", b.out.strip())
+            return ("ok", "")
+        finally:
+            if eng == "mssql":
+                # Disable BEFORE dropping: a dropped table can leave its capture
+                # instance behind, and the next run of this harness would then
+                # enable an instance that already exists.
+                _cdc_sql(eng, f"IF EXISTS (SELECT 1 FROM cdc.change_tables "
+                              f"WHERE capture_instance = N'{tbl}_ci') "
+                              f"EXEC sys.sp_cdc_disable_table @source_schema=N'dbo', "
+                              f"@source_name=N'{tbl}', @capture_instance=N'{tbl}_ci';")
+                _cdc_sql(eng, f"IF OBJECT_ID('dbo.{tbl}','U') IS NOT NULL DROP TABLE dbo.{tbl};")
+            else:
+                _cdc_sql(eng, f"DROP TABLE IF EXISTS {tbl};")
+
+    # The load scenarios need a WAREHOUSE. They are implemented against the
+    # config the loader actually reads, and SKIP where no credentials exist —
+    # loudly, so a local run cannot mistake "not attempted" for "passed".
+    if sid.startswith("load_") or sid == "gc_orphans_after_crash":
+        if not os.environ.get("RIVET_SCEN_BQ_PROJECT"):
+            return ("skip", "no warehouse credentials (set RIVET_SCEN_BQ_PROJECT)")
+        return ("skip", "warehouse driver not wired yet")
+
     return ("skip", "scenario driver not implemented yet")
 
 
