@@ -49,6 +49,19 @@ fn chunk_run_id(cfg: &std::path::Path, export: &str) -> Option<String> {
         .ok()
 }
 
+/// Every `run_status` row still marked `running`, newest first — the liveness
+/// signal `gc_orphans` and the load's consumed-set both read.
+fn running_run_status_rows(cfg: &std::path::Path) -> Vec<String> {
+    let db = open_state_db(cfg);
+    let mut st = db
+        .prepare("SELECT run_id FROM run_status WHERE status = 'running' ORDER BY started_at DESC")
+        .expect("run_status must exist");
+    st.query_map([], |r| r.get::<_, String>(0))
+        .expect("query run_status")
+        .filter_map(|r| r.ok())
+        .collect()
+}
+
 fn chunk_task_status(cfg: &std::path::Path, run_id: &str, chunk_index: i64) -> Option<String> {
     open_state_db(cfg)
         .query_row(
@@ -314,6 +327,89 @@ fn chunked_crash_resume_writes_a_complete_destination_manifest() {
 }
 
 // ─── C2: crash after chunk 0 file (before commit) → resume re-runs chunk 0 ───
+
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn chunk_checkpoint_resume_closes_the_ledger_row_it_opened() {
+    // A chunk-checkpoint RESUME adopts the prior run's id: `ledger_begin_run`
+    // opens a `running` row under the FRESH id, then chunked/mod.rs rewrites
+    // `summary.run_id` to the adopted one, and `finish_run` is a bare UPDATE —
+    // so the close matched no row and the fresh id stayed `running` forever.
+    //
+    // Not cosmetic. `has_active_run_on_prefix` keeps answering true, so
+    // `gc_orphans` defers cleanup indefinitely, and since the load now excludes
+    // ACTIVE runs from its consumed set, every later load on that prefix
+    // re-appends instead of recording progress — until some unrelated newer run
+    // of the same export happens to supersede the leak.
+    //
+    // Observes the LEDGER after the resume, not the id-handling logic: the leak
+    // is exactly a value one layer hands another, which a test that supplies its
+    // own ids cannot see.
+    require_alive(LiveService::Postgres);
+    let table = seed_pg_numeric_table(200);
+    let export = unique_name("ckpt_ledger");
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let out = tempfile::tempdir().unwrap();
+    let yaml = Rig::pg_batch(&export)
+        .query(&format!("SELECT id, name FROM {}", table.name()))
+        .mode("chunked")
+        .export_line("chunk_column: id")
+        .export_line("chunk_size: 50")
+        .export_line("chunk_checkpoint: true")
+        .dest_path(out.path().to_path_buf())
+        .yaml();
+    let cfg = write_config(&cfg_dir, &yaml);
+
+    // Crash mid-chunk so the next run RESUMES (and therefore adopts the id).
+    let crash = std::process::Command::new(RIVET_BIN)
+        .args([
+            "run",
+            "--config",
+            cfg.to_str().unwrap(),
+            "--export",
+            &export,
+        ])
+        .env("RIVET_TEST_PANIC_AT", "after_chunk_file:0")
+        .output()
+        .expect("spawn rivet");
+    assert!(!crash.status.success(), "the crash run must exit non-zero");
+    // A hard panic leaves its own row running — that is the crash, not the leak.
+    let after_crash = running_run_status_rows(&cfg);
+
+    // Clean resume: it adopts the prior run_id, so the row opened for THIS run
+    // is the one at risk.
+    let ok = std::process::Command::new(RIVET_BIN)
+        .args([
+            "run",
+            "--config",
+            cfg.to_str().unwrap(),
+            "--export",
+            &export,
+            "--resume",
+        ])
+        .output()
+        .expect("spawn rivet");
+    assert!(
+        ok.status.success(),
+        "the resume run must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&ok.stderr)
+    );
+
+    // A SUCCESSFUL run leaves nothing running — that is the whole contract, and
+    // it is what a row count cannot express: the resume ADOPTS the crashed run's
+    // id, so "one row before, one row after" holds whether the leaked row is the
+    // crashed run (fine, it gets closed) or the fresh one (the leak). Counting
+    // passed against the unfixed product; asserting EMPTY is what bites.
+    let after_resume = running_run_status_rows(&cfg);
+    assert!(
+        after_resume.is_empty(),
+        "a completed resume must leave NO `running` row — the run opened one under \
+         a fresh id, then adopted the prior one, and `finish_run` is a bare UPDATE, \
+         so the row it opened stayed running forever (blocking gc and, since the \
+         load excludes active runs from its consumed set, every later load on this \
+         prefix). before: {after_crash:?}, still running: {after_resume:?}"
+    );
+}
 
 #[test]
 #[ignore = "live: requires docker compose postgres"]

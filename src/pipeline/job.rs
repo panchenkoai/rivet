@@ -805,6 +805,17 @@ pub(super) fn run_export_job(
     // marker manifest — the authority `gc_orphans` reads to spare a live extract's
     // committed-but-not-yet-manifested parts. (finish_run transitions it below.)
     ledger_begin_run(state, &plan, &export.family(), &summary.run_id);
+    // The id the LEDGER row was opened under. A chunk-checkpoint RESUME adopts the
+    // prior run's id (chunked/mod.rs) — `summary.run_id` changes AFTER this point —
+    // and `finish_run` is a bare UPDATE, so closing the run under the adopted id
+    // matched no row and left this one `running` forever.
+    //
+    // That leak is not cosmetic: `has_active_run_on_prefix` keeps answering true,
+    // so `gc_orphans` defers cleanup, and since the load now excludes active runs
+    // from the consumed set (dispatch.rs), every later load on that prefix
+    // re-appends instead of recording progress — until an unrelated newer run of
+    // the same export happens to supersede it.
+    let ledger_run_id = summary.run_id.clone();
     // Failure forensics at open: source schema + server limits, so a run that fails
     // before finalize still explains itself (export_schema is otherwise success-only).
     capture_open_forensics(&plan, state, &mut summary);
@@ -959,6 +970,10 @@ pub(super) fn run_export_job(
     // status. A crash before here leaves the row `running`; supersession by a
     // later run reconciles it (no age timer).
     ledger_finish_run(state, &plan.export_name, &summary.run_id, &summary.status);
+    // Close the row we actually opened when a resume adopted a different id.
+    if ledger_run_id != summary.run_id {
+        ledger_finish_run(state, &plan.export_name, &ledger_run_id, &summary.status);
+    }
     // Order matters: write the manifest first, then run the manifest-aware
     // `--validate` pass against the destination, then persist the metrics
     // row, then write the run report.  The report sees the verification
