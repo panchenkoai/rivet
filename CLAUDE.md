@@ -836,3 +836,62 @@ Scope honesty: this class is invisible to mutation testing of the PRODUCT, since
 the fixture-only assertion never executes the mutated code. It is found by asking
 of each assertion: *what change in rivet would turn this red?* If the answer is
 "none — only editing the fixture", it is this defect.
+
+## A correct test of correct logic on a FABRICATED input proves nothing about the caller
+
+Three distinct defects hide under the phrase "the test is fake", and conflating
+them wastes the fix. Separate them by asking *where the wrong value comes from*:
+
+1. **Fixture against itself** — the test holds both sides of the comparison, so
+   only editing the fixture can turn it red (the class above).
+2. **A test that routes AROUND the defect** — usually honest, and often says so
+   in its own comment. It closes nothing, but it lies to nobody.
+3. **A correct test of correct logic, fed an input the product never produces.**
+   The assertion bites. The logic is right. The defect lives one layer up, in
+   whatever HANDS that logic its input — and nothing in the suite looks there.
+
+The third is the one to learn, because every existing safety net misses it.
+`decide_export_retry` (`src/pipeline/single.rs`) refuses to retry once parts are
+durable, and its unit matrix feeds `files_committed` = 0 / 2 / 5 and checks every
+arm — a genuinely sensitive test. Meanwhile `run_keyset_parallel` bailed on a
+worker error ABOVE its `record_part` drain, so the decider was handed `0` with
+four parquet files already on disk and correctly decided "retry". Both halves
+correct; the seam wrong, since 0.23.0. Measured: a transient worker error left 4
+parts on disk and produced `retry 1/2` then `retry 2/2`; because keyset part
+names key off the stable `run_id`, attempt N+1 normally overwrites attempt N — so
+the damage only surfaces when a range's output SHRINKS between attempts (a
+mid-backoff `DELETE`), where attempt 1's extra part survived unoverwritten: 751
+rows / 750 distinct, one id in two files.
+
+**Mutation testing is structurally blind here.** Mutate inside the decider and
+the matrix goes red; mutate the SUPPLIER of its input and nothing does, because
+no test observes that value. The same blindness applies to any check whose test
+constructs its own subject: a hash test that builds the value it hashes, a guard
+test that builds the manifest it guards, a resolver test that re-implements the
+resolution rule in a closure.
+
+Process rule: **for any value that crosses a layer boundary and decides
+something, one test must observe it AT the boundary, produced by the real
+producer — not supplied by the test.** Concretely: read it back from the
+artifact the product wrote (a metrics row, a manifest, a summary), or call the
+one function that computes it and assert on THAT. Then RED-prove against a
+mutant in the PRODUCER, not in the consumer.
+
+Three misses in a single session say how easy this is to get wrong, twice while
+actively trying not to. A guard test hand-set `export_family` to a value no
+production writer emits (green against the very fold it was written to catch); the
+rewrite replaced the hand-set value with a CLOSURE re-implementing the rule
+(still green against the same mutant); only extracting `ExportConfig::family()`
+and calling it from the test made the mutant bite. A third — the running-marker
+family — could not be closed at all, because its writer is cloud-only and no unit
+test can observe what it records; that test now states in its own doc that it
+pins the READ side only and names the structural fix. **A test you cannot make
+RED should say so where a reader will see it, not pass quietly.**
+
+Template: `parallel_keyset_worker_error_still_counts_the_durable_parts_postgres`
+(`tests/live/live_keyset_parallel.rs`) — it injects the worker error, asserts the
+fixture is not inert (parts really were written), then reads `files_committed`
+from the run's own metrics row. RED against the pre-fix order (`left: Some(0)`,
+`right: Some(4)`) while the pre-existing worker-error test stays GREEN against
+the same mutant. When a new test and an old one disagree about a mutant, the
+disagreement is the finding: the old test's blind spot has a name and a boundary.
