@@ -261,6 +261,41 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --lib -- plan::validate::tests
 
+  release-compat:
+    name: Compatible with the previous release (cli + schema + config)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94"
+      - uses: Swatinem/rust-cache@v2
+      - name: Download the previous release binary (never rebuild the parent)
+        # The DOWNLOADED artifact is what users actually run, and the release
+        # profile is fat-LTO — rebuilding the parent commit costs minutes and
+        # still only approximates it.
+        run: |
+          set -euo pipefail
+          PREV=$(gh release list --limit 20 --json tagName,isPrerelease \
+                   --jq '[.[] | select(.isPrerelease == false) | .tagName][0]')
+          echo "baseline release: $PREV"
+          gh release download "$PREV" \
+            --pattern 'rivet-x86_64-unknown-linux-gnu*' --dir baseline --clobber
+          cd baseline
+          for f in *; do case "$f" in *.tar.gz) tar xzf "$f";; esac; done
+          BIN=$(find . -type f -name rivet | head -1)
+          test -n "$BIN" || { echo "no rivet binary in the release asset"; exit 1; }
+          chmod +x "$BIN"
+          echo "RIVET_BASELINE=$PWD/$BIN" >> "$GITHUB_ENV"
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - name: Build the candidate
+        run: cargo build --bin rivet
+      - name: Compare surfaces and config verdicts
+        # The `artifacts` axis needs a live postgres and runs in the live tier;
+        # these three need nothing and belong on every PR.
+        run: python3 -m dev.pytools.release_compat offline
+
   test-types:
     name: Type mapping contracts (semantic gate)
     runs-on: ubuntu-latest
