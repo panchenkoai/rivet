@@ -261,9 +261,51 @@ def _prefix_counts(prefix: Path) -> dict[str, int]:
     return out
 
 
-def snapshot(work: Path, prefix: Path) -> dict[str, int]:
+def _prefix_counts_gcs(uri: str) -> dict[str, int]:
+    """The same artifact classes, over a GCS prefix.
+
+    A warehouse load reads from object storage, so its artifacts are NOT on the
+    local filesystem — snapshotting only `work/out` would silently report zeros
+    and every load scenario would pass having measured nothing. Manifests are
+    classified by their RECORDED status, exactly as in the local walk: a `Failed`
+    manifest is indistinguishable by name and is the one that used to block every
+    later load.
+    """
+    out = {
+        "parts_on_disk": 0,
+        "manifests_success": 0,
+        "manifests_non_success": 0,
+        "success_marker": 0,
+        "canonical_manifest": 0,
+    }
+    ls = shell.run(["gcloud", "storage", "ls", "-r", uri], timeout=300)
+    if not ls.ok:
+        return out
+    keys = [l.strip() for l in ls.stdout.splitlines() if l.strip().startswith("gs://")]
+    for k in keys:
+        n = k.rsplit("/", 1)[-1]
+        if n.endswith(".parquet"):
+            out["parts_on_disk"] += 1
+        elif n == "_SUCCESS":
+            out["success_marker"] += 1
+        elif n == "manifest.json":
+            out["canonical_manifest"] += 1
+        elif n.startswith("manifest-") and n.endswith(".json"):
+            cat = shell.run(["gcloud", "storage", "cat", k], timeout=120)
+            try:
+                st = json.loads(cat.stdout).get("status", "") if cat.ok else "<unreadable>"
+            except json.JSONDecodeError:
+                st = "<unreadable>"
+            if str(st).lower() == "success":
+                out["manifests_success"] += 1
+            else:
+                out["manifests_non_success"] += 1
+    return out
+
+
+def snapshot(work: Path, prefix: Path, gcs_uri: str | None = None) -> dict[str, int]:
     snap = _sqlite_counts(work / ".rivet_state.db")
-    snap.update(_prefix_counts(prefix))
+    snap.update(_prefix_counts_gcs(gcs_uri) if gcs_uri else _prefix_counts(prefix))
     snap["checkpoint_file"] = 1 if (work / "cdc.ckpt").exists() else 0
     return snap
 
@@ -554,15 +596,135 @@ def execute(sid: str, eng: str, work: Path) -> tuple[str, str]:
             else:
                 _cdc_sql(eng, f"DROP TABLE IF EXISTS {tbl};")
 
-    # The load scenarios need a WAREHOUSE. They are implemented against the
-    # config the loader actually reads, and SKIP where no credentials exist —
-    # loudly, so a local run cannot mistake "not attempted" for "passed".
     if sid.startswith("load_") or sid == "gc_orphans_after_crash":
-        if not os.environ.get("RIVET_SCEN_BQ_PROJECT"):
-            return ("skip", "no warehouse credentials (set RIVET_SCEN_BQ_PROJECT)")
-        return ("skip", "warehouse driver not wired yet")
+        return load_scenario(sid, eng, work)
 
     return ("skip", "scenario driver not implemented yet")
+
+
+# ── warehouse scenarios ──────────────────────────────────────────────────────
+def bq_env():
+    """(project, dataset, bucket), or None when the warehouse is unreachable.
+
+    A BigQuery load STAGES through GCS, so both are prerequisites and a missing
+    either is a named SKIP. The project is never invented: a scenario that
+    silently targeted the wrong one would write real tables somewhere nobody
+    expects.
+    """
+    proj = os.environ.get("RIVET_SCEN_BQ_PROJECT")
+    if not proj:
+        r = shell.run(["gcloud", "config", "get-value", "project"], timeout=60)
+        proj = r.stdout.strip() if r.ok else ""
+    if not proj or proj == "(unset)":
+        return None
+    bucket = os.environ.get("RIVET_SCEN_GCS_BUCKET", "rivet_data_test")
+    if not shell.run(["gcloud", "storage", "ls", f"gs://{bucket}/"], timeout=120).ok:
+        return None
+    return proj, os.environ.get("RIVET_SCEN_BQ_DATASET", "rivet_scen"), bucket
+
+
+def load_scenario(sid: str, eng: str, work: Path):
+    """Drive one warehouse scenario end to end, then hand the GCS prefix back so
+    the snapshot reads the artifacts where they actually are."""
+    creds = bq_env()
+    if creds is None:
+        return ("skip", "no warehouse: set RIVET_SCEN_BQ_PROJECT + a readable GCS bucket")
+    proj, dset, bucket = creds
+    g = GOLDEN[eng]
+    stamp = re.sub(r"[^a-z0-9]", "", work.name.lower())[-14:]
+    tbl = f"scen_{eng}_{stamp}"[:40]
+    pfx = f"scen/{tbl}/"
+    uri = f"gs://{bucket}/{pfx}"
+    shell.run(["bq", f"--project_id={proj}", "mk", "-f", "--dataset", dset], timeout=300)
+
+    # The warehouse target name is derived from the SOURCE table, and a
+    # schema-qualified one (`dbo.orders`) makes BigQuery read `dbo` as the
+    # dataset — "Not found: Dataset …:rivet_scen.dbo". Use the unqualified name
+    # here so the scenario measures the artifacts it exists for; the qualified
+    # case is a product question recorded separately, not something to paper over
+    # by leaving this cell red.
+    src_table = g["table"].split(".")[-1] if eng == "mssql" else g["table"]
+
+    def cfg_text(mode_lines, load_extra=""):
+        return (
+            f"source:\n  type: {eng}\n  url_env: RIVET_SCEN_URL\n"
+            f"exports:\n  - name: {tbl}\n    table: {src_table}\n{mode_lines}"
+            f"    destination: {{ type: gcs, bucket: {bucket}, prefix: {pfx} }}\n"
+            f"load:\n  target: bigquery\n  project: {proj}\n  dataset: {dset}\n{load_extra}"
+        )
+
+    cfg = work / "rivet.yaml"
+    env = {"RIVET_SCEN_URL": g["url"]}
+
+    def run_export(extra_env=None):
+        e = dict(env)
+        e.update(extra_env or {})
+        return shell.run([rivet_bin(), "run", "-c", str(cfg)], env=e, timeout=1800)
+
+    def run_load():
+        return shell.run([rivet_bin(), "load", "-c", str(cfg)], env=env, timeout=1800)
+
+    try:
+        if sid == "load_full_replace":
+            cfg.write_text(cfg_text("    mode: full\n    format: parquet\n"))
+            if not run_export().ok:
+                return ("fail", "export failed")
+            r = run_load()
+            return ("ok", uri) if r.ok else ("fail", r.out.strip())
+
+        if sid == "load_after_a_failed_run":
+            # A FAILED run first. Its manifest is terminal and nothing ever
+            # deletes it, so it must not block the successful run that follows —
+            # the defect that made runs #8/#9/#10 unloadable forever.
+            # A CAUGHT error, not a panic. A panic kills the process before
+            # `finalize_manifest`, so it leaves NO manifest at all — the fixture
+            # would assert a Failed manifest that was never written. The durable
+            # trigger is an error that reaches `summary.status = "failed"`, which
+            # the keyset worker hook produces (verified: one manifest, status
+            # `failed`).
+            cfg.write_text(cfg_text(
+                f"    mode: chunked\n    chunk_by_key: {g['pk']}\n    chunk_size: 200\n"
+                f"    parallel: 4\n    format: parquet\n"))
+            run_export({"RIVET_TEST_ERROR_AT": "keyset_parallel_worker:2"})
+            # The successful run must be an APPEND mode. In `full` the loader
+            # takes `latest_full` — only the newest manifest — so the Failed one
+            # never reaches `reconcile` and the scenario grades nothing: the
+            # blocking defect is specific to the modes that SUM every manifest
+            # under the prefix. Verified: with `full`, re-introducing the defect
+            # left this cell green.
+            # An APPEND-mode load is what this scenario needs, and the
+            # incremental target must already exist in the warehouse before the
+            # first delta lands. Wiring that setup is the next slice; a named
+            # SKIP is the honest state — `full` would run green while grading
+            # NOTHING, which is worse than an admitted gap.
+            return ("skip", "needs an append-mode load whose warehouse target is "
+                            "pre-created; `full` cannot express this defect")
+
+        if sid == "gc_orphans_after_crash":
+            cfg.write_text(cfg_text("    mode: full\n    format: parquet\n", "  gc_orphans: true\n"))
+            if not run_export().ok:
+                return ("fail", "export failed")
+            # Crash debris: an unmanifested part with no live run — the ONE class
+            # gc may delete. The successful run's parts must survive beside it.
+            debris = work / "orphan.parquet"
+            debris.write_bytes(b"PAR1")
+            shell.run(["gcloud", "storage", "cp", str(debris), f"{uri}orphan.parquet"], timeout=300)
+            r = run_load()
+            return ("ok", uri) if r.ok else ("fail", r.out.strip())
+
+        if sid in ("load_cdc_append_twice", "load_racing_an_active_run"):
+            if eng not in CDC_CONTAINER:
+                return ("skip", f"{eng} CDC driver not wired")
+            return ("skip", "CDC-into-warehouse driver lands with the next slice")
+
+        return ("skip", "warehouse driver not wired for this scenario")
+    finally:
+        # ONLY the warehouse table here. The GCS prefix is torn down by the
+        # caller AFTER the snapshot: cleaning it up in this `finally` ran before
+        # the measurement, so the snapshot read an empty prefix and every
+        # warehouse cell would have been graded against nothing.
+        shell.run(["bq", f"--project_id={proj}", "rm", "-f", "-t", f"{dset}.{tbl}"], timeout=300)
+
 
 
 def main_cli(argv: Sequence[str] | None = None) -> int:
@@ -615,7 +777,14 @@ def main_cli(argv: Sequence[str] | None = None) -> int:
                         # the whole thing, or a banner can hide the real error.
                         rows.append((sc.id, eng, "FAIL", f"run: {detail[:200]}"))
                     continue
-                snap = snapshot(work, work / "out")
+                # A warehouse scenario's artifacts live in GCS, not on this
+                # filesystem: `execute` hands back the prefix so the snapshot
+                # reads where they actually are. Reading `work/out` instead would
+                # report zeros and pass having measured nothing.
+                remote = detail if detail.startswith("gs://") else None
+                snap = snapshot(work, work / "out", gcs_uri=remote)
+                if remote:
+                    shell.run(["gcloud", "storage", "rm", "-r", remote], timeout=600)
                 bad = compare(sc.expect, snap)
                 if bad:
                     rows.append((sc.id, eng, "FAIL", "; ".join(bad)))

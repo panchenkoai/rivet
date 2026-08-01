@@ -200,8 +200,8 @@ scenarios:
 
   - id: load_full_replace
     what: "export then load into the warehouse, replace semantics."
-    engines: [postgres]
-    note: "warehouse-bound; runs where credentials exist, SKIP (never a silent pass) otherwise."
+    engines: [postgres, mysql, mssql, mongo]
+    note: "warehouse-bound: BigQuery credentials required, SKIP (never a silent pass) otherwise. Runs on every engine because the artifact the load reads — the manifest — is written by the ENGINE's runner, not by the loader."
     expect:
       run_status_running: []
       load_run_rows: 1
@@ -209,8 +209,8 @@ scenarios:
 
   - id: load_cdc_append_twice
     what: "two CDC load cycles. Each terminal source run is recorded consumed exactly once — the second load must not re-append the first cycle."
-    note: "warehouse-bound: runs where BigQuery/Snowflake credentials exist, SKIP (never a silent pass) otherwise. The source engine is incidental to what is asserted — the skip set is keyed on run ids, not on the engine."
-    engines: [postgres]
+    note: "warehouse-bound. Every CDC-capable SQL engine: the skip set is keyed on run ids, but the MANIFESTS it selects over are written per engine, and a CDC manifest grows under one id — the shape this scenario exists for. Mongo's CDC driver is not wired yet."
+    engines: [postgres, mysql, mssql]
     expect:
       run_status_running: []
       load_run_rows: 2
@@ -218,16 +218,16 @@ scenarios:
 
   - id: load_racing_an_active_run
     what: "a load fired while a source run is still `running` on the prefix. The in-flight run must NOT enter the skip set — its manifest can still grow, and recording it strands every part written afterwards."
-    note: "warehouse-bound, and the assertion is about the LEDGER (an in-flight run must not enter the skip set), which is engine-independent by construction."
-    engines: [postgres]
+    note: "warehouse-bound. The assertion is about the LEDGER (an in-flight run must not enter the skip set), which is engine-independent — but the run that must be in flight is the engine's, so each is driven for real. Mongo pending its CDC driver."
+    engines: [postgres, mysql, mssql]
     expect:
       loaded_source_run_ids: 0
       load_run_rows: 1
 
   - id: load_after_a_failed_run
-    what: "a Failed manifest sits under the prefix beside successful runs. The successful ones must still load — nothing ever deletes a terminal manifest, so a blocking check is a permanent stall."
-    note: "warehouse-bound; the Failed manifest is written by the shared batch finalizer, so the blocking behaviour it guards is engine-independent."
-    engines: [postgres]
+    what: "a Failed manifest sits under the prefix beside successful runs. The successful ones must still load — nothing ever deletes a terminal manifest, so a blocking check is a permanent stall. MUST be driven in an APPEND mode: in `full` the loader takes `latest_full` (the newest manifest only), so the Failed one never reaches `reconcile` and the scenario grades nothing — verified by re-introducing the defect against a `full` fixture and watching the cell stay GREEN."
+    note: "warehouse-bound. The Failed manifest comes from the shared batch finalizer, so the blocking behaviour is engine-independent — but the surrounding successful runs are the engine's, and those are what must still load."
+    engines: [postgres, mysql, mssql, mongo]
     expect:
       manifests_non_success: 1
       load_run_rows: 1
@@ -235,8 +235,8 @@ scenarios:
 
   - id: gc_orphans_after_crash
     what: "gc with a crash orphan and a live run present: the orphan goes, the live run's parts stay."
-    note: "gc classifies parts by MANIFEST status and the run-status ledger, neither of which is engine-specific — the discriminator is the same code for every source. postgres is the reference; widening would re-run one shared decision four times."
-    engines: [postgres]
+    note: "warehouse-bound (gc runs during a load). gc classifies by manifest status and the run-status ledger — shared code — but the debris is the engine's own."
+    engines: [postgres, mysql, mssql, mongo]
     expect:
       run_status_running: []
       manifests_success: ">0"
