@@ -79,6 +79,9 @@ preflights:
     what: "SQLite state == Postgres state on the state-exercising golden fixtures (parallel-checkpoint, incremental, crash-resume) — the migration arrays are type-parity."
     backends: [sqlite, postgres]
     status: test        # verify_state_migrations (commit e83656a), RED-proven int4 -> NOT RELEASABLE
+  - id: inflight_run_stays_loadable
+    what: "a load must NOT record an IN-FLIGHT extraction run as fully consumed. The skip set is keyed on `run_id` alone, but a CDC run's manifest GROWS under one id (the sink rewrites a Success superset at every commit-boundary roll, and list_manifest_keys prefers that copy) — so a load firing mid-cycle recorded the id and every part the run wrote afterwards was skipped FOREVER, while the next load printed `CDC LOAD SKIP: up to date`. Unbounded under `until_current: false`, where the id never rotates. Released since 0.20.0; found 2026-08-01. The fix excludes runs the ledger reports still writing into the prefix (StateStore::active_run_ids_on_prefix); this cell drives that predicate through the RELEASE binary's own schema, both directions — a run wrongly reported active makes every load re-append forever, a run wrongly reported finished restores the silent loss. Deliberately a ledger check, not a timed extract/load race: the race needs sub-second timing against a live stream and a flaky gate is worse than a narrow one; the end-to-end half is the live suite."
+    status: test        # verify_inflight_run_stays_loadable (scenarios.py), RED-proven: dropping the status filter yields {run_done, run_live}
   - id: coverage_matrices
     what: "every docs/*-matrix.yaml drift-guard runs (chunking/behaviour/type-fidelity/... + release_gate + perf) so a rotted coverage ledger blocks the release, not just CI."
     status: test        # verify_coverage_matrices

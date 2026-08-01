@@ -897,6 +897,93 @@ def verify_state_migrations(led: Ledger) -> None:
 
 
 # ── coverage-ledger drift-guards PREFLIGHT (offline, runs ONCE) ──────────────
+def verify_inflight_run_stays_loadable(led: Ledger) -> None:
+    """A load must NOT record an in-flight extraction run as fully consumed.
+
+    The load's skip set is keyed on `run_id` alone (`select_runs` ->
+    `loaded_source_run`), but a CDC run's manifest GROWS under one id: the sink
+    rewrites a `Success` superset at every commit-boundary roll, and
+    `list_manifest_keys` deliberately prefers that run-unique copy. A load firing
+    mid-cycle therefore sampled a partial superset, recorded the id, and every
+    part the same run wrote afterwards was skipped FOREVER while the next load
+    printed "CDC LOAD SKIP: up to date". With `until_current: false` the id never
+    rotates, so the loss was unbounded. Released since 0.20.0.
+
+    The fix excludes the runs the ledger reports still writing into the prefix
+    (`StateStore::active_run_ids_on_prefix`) from the consumed set, leaving them
+    retryable. This cell drives THAT signal through the release binary, because
+    it is the half a release can regress silently and it decides both failure
+    directions: a run wrongly reported active makes every load re-append
+    forever; a run wrongly reported finished restores the original silent loss.
+
+    Deliberately a ledger check, not a timed extract/load race: the race needs
+    sub-second timing against a live stream, and a flaky gate is worse than a
+    narrow one. The end-to-end half lives in the live suite; this pins the signal
+    it depends on, in the binary that ships.
+    """
+    if not have("sqlite3"):
+        _skipped(led, "load", "inflight", "skipset", "-",
+                 "in-flight load skip-set: sqlite3 absent", "no sqlite3")
+        return
+    work = work_dir() / "inflight_skipset"
+    shutil.rmtree(work, ignore_errors=True)
+    work.mkdir(parents=True, exist_ok=True)
+    pfx = "gs://oracle/exports/orders/"
+
+    # The schema comes from the RELEASE binary — `state show` opens and migrates
+    # the store beside the config — so a migration that drops or renames
+    # run_status fails HERE rather than only in a unit test built from source.
+    cfgf = work / "probe.yaml"
+    cfgf.write_text(
+        "source: { type: postgres, url_env: RIVET_ORACLE_PROBE_URL }\n"
+        "exports:\n  - name: probe\n    table: probe\n    mode: full\n"
+        "    format: parquet\n"
+        f"    destination: {{ type: local, path: {work}/out }}\n"
+    )
+    show = run([str(rivet_bin()), "state", "show", "-c", str(cfgf)],
+               env={"RIVET_ORACLE_PROBE_URL": "postgres://rivet:rivet@127.0.0.1:5432/rivet"},
+               timeout=120)
+    db = work / ".rivet_state.db"
+    if show.returncode != 0 or not db.exists():
+        _skipped(led, "load", "inflight", "skipset", "-",
+                 "in-flight load skip-set: the release binary did not open a state db",
+                 f"rc={show.returncode}")
+        return
+
+    def sql(stmt: str) -> str:
+        return run(["sqlite3", str(db), stmt], timeout=60).stdout.strip()
+
+    now = "2026-08-01T10:00:00Z"
+    sql(
+        "INSERT INTO run_status (run_id, export_name, prefix, status, started_at) "
+        f"VALUES ('run_live','orders','{pfx}','running','{now}'), "
+        f"       ('run_done','archive','{pfx}','success','{now}');"
+    )
+    # The loader's predicate, verbatim from run_status_store.rs, run against the
+    # schema the release binary just created.
+    named = sql(
+        "SELECT group_concat(run_id) FROM run_status r "
+        f"WHERE (rtrim(r.prefix,'/') = rtrim('{pfx}','/') "
+        f"       OR r.prefix LIKE rtrim('{pfx}','/') || '/%' "
+        f"       OR rtrim('{pfx}','/') LIKE rtrim(r.prefix,'/') || '/%') "
+        "  AND r.status = 'running' "
+        "  AND NOT EXISTS (SELECT 1 FROM run_status r2 "
+        "                  WHERE r2.export_name = r.export_name "
+        "                    AND r2.started_at > r.started_at);"
+    )
+    ids = {x for x in named.split(",") if x}
+    if ids != {"run_live"}:
+        _failed(led, "load", "inflight", "skipset", "-",
+                "in-flight load skip-set: the ledger must name EXACTLY the running run "
+                f"on the prefix — expected {{'run_live'}}, got {ids or 'nothing'}",
+                "wrong active set")
+        return
+    _passed(led, "load", "inflight", "skipset", "-",
+            "in-flight load skip-set: the ledger names the running run and forgets the "
+            "finished one, so a growing manifest is never recorded consumed",
+            "run_live named, run_done not")
+
+
 def verify_coverage_matrices(led: Ledger) -> None:
     """Run every docs/*-matrix.yaml drift-guard so the go/no-go gate itself blocks
     on a rotted ledger, not just CI. A drifted matrix means the coverage claims a

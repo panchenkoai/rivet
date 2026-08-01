@@ -992,12 +992,52 @@ struct LoadCtx<'a> {
     target_fqtn: &'a str,
     warehouse: &'a str,
     mode: load::plan::LoadMode,
+    /// The source prefix this load consumes — needed to ask the ledger which
+    /// runs are still WRITING into it, so their (still-growing) manifests are
+    /// not recorded as fully consumed.
+    source_prefix: &'a str,
 }
 
 impl LoadCtx<'_> {
     /// Best-effort ledger write — a state-DB failure warns but never fails a load.
     fn record(&self, source_run_ids: &[String], rows_loaded: i64, status: &str) {
         let Some(s) = self.state else { return };
+        // A run still ACTIVE on this prefix can still GROW its manifest: the CDC
+        // sink rewrites a `Success` superset at every commit-boundary roll under
+        // ONE run_id, and `list_manifest_keys` deliberately prefers that
+        // run-unique copy. The skip set is keyed on the run_id ALONE, so
+        // recording an in-flight run as consumed strands every part it writes
+        // afterwards — permanently, and silently: the next load prints
+        // "up to date". With `until_current: false` the id never rotates, so the
+        // loss is unbounded.
+        //
+        // Excluding exactly the active runs leaves them retryable while every
+        // terminal run is still recorded (so a completed run is never
+        // re-loaded). Their parts ARE loaded now — re-appending them next cycle
+        // is at-least-once, which the current-state view absorbs: it keeps
+        // ROW_NUMBER() … = 1 per pk, so a duplicated change row cannot change
+        // what the view reports.
+        //
+        // A stateless or foreign-host load has no ledger to ask (`self.state` is
+        // None above, or the query fails) — see `warn_if_racing_an_active_run`,
+        // which tells that operator to load AFTER the extract instead.
+        let active = s
+            .active_run_ids_on_prefix(self.source_prefix)
+            .unwrap_or_default();
+        let source_run_ids: Vec<String> = source_run_ids
+            .iter()
+            .filter(|id| !active.contains(*id))
+            .cloned()
+            .collect();
+        if !active.is_empty() {
+            eprintln!(
+                "  note: {} source run(s) still writing into {} — loaded now, kept \
+                 retryable so their later parts are not skipped",
+                active.len(),
+                self.source_prefix
+            );
+        }
+        let source_run_ids = &source_run_ids[..];
         let rec = LoadRecord {
             load_id: self.load_id.to_string(),
             export_name: self.export_name.to_string(),
@@ -1053,6 +1093,7 @@ fn execute_load<R>(
         target_fqtn: target_fqtn.as_str(),
         warehouse: job.plan.load.target.name(),
         mode: job.mode,
+        source_prefix: job.plan.gcs_prefix.as_str(),
     };
     let inputs = match prepare_load(
         &store,
@@ -1418,6 +1459,7 @@ mod load_ledger_tests {
 
     fn ctx<'a>(state: &'a StateStore, load_id: &'a str) -> LoadCtx<'a> {
         LoadCtx {
+            source_prefix: "gs://b/p/",
             state: Some(state),
             load_id,
             export_name: "orders",
@@ -1498,6 +1540,7 @@ mod load_ledger_tests {
             target_fqtn: TARGET,
             warehouse: "bigquery",
             mode: load::plan::LoadMode::Full,
+            source_prefix: "gs://b/p/",
         };
         c.record_success(&["r1".into()], 3);
         c.record_skip();

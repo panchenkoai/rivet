@@ -1,5 +1,7 @@
 use crate::error::Result;
 
+use std::collections::HashSet;
+
 use super::StateStore;
 
 /// The `run_status` ledger — a best-effort ADVISORY record of each export run's
@@ -91,11 +93,72 @@ impl StateStore {
                    LIMIT 1";
         Ok(self.query_opt(sql, &[prefix.into()], |_| ())?.is_some())
     }
+
+    /// The run_ids of the runs [`has_active_run_on_prefix`] answers `true` for —
+    /// same predicate, named rather than counted.
+    ///
+    /// The load needs the NAMES because a run still writing into the prefix can
+    /// still GROW its manifest: the CDC sink rewrites a `Success` superset at
+    /// every commit-boundary roll under ONE run_id. Recording such a run as
+    /// consumed strands every part it writes afterwards — silently, forever,
+    /// since the skip set is keyed on the run_id alone. Excluding exactly the
+    /// active runs leaves them retryable while every terminal run is still
+    /// recorded, so a completed run is never re-loaded.
+    pub fn active_run_ids_on_prefix(&self, prefix: &str) -> Result<HashSet<String>> {
+        let sql = "SELECT r.run_id FROM run_status r
+                   WHERE (rtrim(r.prefix, '/') = rtrim(?1, '/')
+                          OR r.prefix LIKE rtrim(?1, '/') || '/%'
+                          OR rtrim(?1, '/') LIKE rtrim(r.prefix, '/') || '/%')
+                     AND r.status = 'running'
+                     AND NOT EXISTS (
+                         SELECT 1 FROM run_status r2
+                         WHERE r2.export_name = r.export_name
+                           AND r2.started_at > r.started_at)";
+        Ok(self
+            .query(sql, &[prefix.into()], |r| r.text(0))?
+            .into_iter()
+            .collect())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The load's skip set is keyed on `run_id` alone, and a CDC run's manifest
+    /// GROWS under one id (the sink rewrites a `Success` superset at every
+    /// commit-boundary roll). So a load that samples an in-flight run must not
+    /// record it consumed — this accessor is what tells it which runs those are.
+    ///
+    /// Pins both halves: an ACTIVE run is named (so it stays retryable), and a
+    /// FINISHED one is not (so a completed run is recorded and never re-loaded).
+    #[test]
+    fn active_run_ids_names_the_in_flight_run_and_forgets_the_finished_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = crate::state::StateStore::open_sqlite(dir.path().join("s.db").to_str().unwrap())
+            .unwrap();
+        let prefix = "gs://b/exports/orders/";
+        st.begin_run("run_a", "orders", prefix, "2026-08-01T10:00:00Z")
+            .unwrap();
+        st.begin_run("run_b", "customers", prefix, "2026-08-01T10:00:01Z")
+            .unwrap();
+        let active = st.active_run_ids_on_prefix(prefix).unwrap();
+        assert!(
+            active.contains("run_a") && active.contains("run_b"),
+            "both in-flight runs must be named; got {active:?}"
+        );
+        st.finish_run("run_a", "success", "2026-08-01T10:05:00Z")
+            .unwrap();
+        let active = st.active_run_ids_on_prefix(prefix).unwrap();
+        assert!(
+            !active.contains("run_a"),
+            "a finished run is no longer active — it must be recordable as consumed"
+        );
+        assert!(
+            active.contains("run_b"),
+            "the still-running sibling stays active"
+        );
+    }
 
     const P: &str = "gs://b/exports/orders/";
 
