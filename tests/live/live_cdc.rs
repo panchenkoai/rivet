@@ -4532,3 +4532,113 @@ fn pg_cdc_typed_values_match_source_via_duckdb_not_batch() {
          got: {res}"
     );
 }
+
+/// The binlog-compression guard, live.
+///
+/// `binlog_transaction_compression` (MySQL 8.0.20+) packs a transaction's
+/// `TableMap`/`Rows`/`Xid` into one `Transaction_payload_event`. This reader
+/// matches those event types individually and ignores everything else, so with
+/// compression ON it captures NOTHING and says nothing — measured on 8.0.46:
+/// anchor, insert two rows, resume ⇒ 0 of 2 events, empty stderr. That is the
+/// worst shape a CDC bug can take, and the operator's own instinct (shrink the
+/// binlog) is what triggers it.
+///
+/// Until the payload is expanded, the run must REFUSE. Flipping a server global
+/// under a shared stand needs a guard that restores it even on panic — the same
+/// discipline as the timezone test above.
+#[test]
+#[ignore = "live: requires the cdc-profile MySQL (:3307)"]
+fn mysql_cdc_refuses_a_compressed_binlog_instead_of_capturing_nothing() {
+    let root_url = MYSQL_CDC_URL.replace("rivet:rivet@", "root:rivet@");
+    let mut admin = match mysql::Conn::new(mysql::Opts::from_url(&root_url).unwrap()) {
+        Ok(c) => c,
+        Err(e) => panic!("cdc-profile MySQL admin connection: {e}"),
+    };
+    // Pre-8.0.20 servers have no such variable — the guard is a no-op there and
+    // so is this test. Skip rather than fail: the engine cannot have the bug.
+    let supported: Option<String> = admin
+        .query_first("SELECT @@global.binlog_transaction_compression")
+        .ok()
+        .flatten();
+    if supported.is_none() {
+        eprintln!("skip: server has no binlog_transaction_compression (pre-8.0.20)");
+        return;
+    }
+
+    struct CompressionGuard(String);
+    impl Drop for CompressionGuard {
+        fn drop(&mut self) {
+            if let Ok(mut c) = mysql::Conn::new(mysql::Opts::from_url(&self.0).unwrap()) {
+                let _ = c.query_drop("SET GLOBAL binlog_transaction_compression = OFF");
+            }
+        }
+    }
+    admin
+        .query_drop("SET GLOBAL binlog_transaction_compression = ON")
+        .expect("set global binlog_transaction_compression");
+    let _restore = CompressionGuard(root_url.clone());
+
+    let tbl = unique_name("cdc_compressed");
+    let mut c = conn();
+    c.query_drop(format!("DROP TABLE IF EXISTS {tbl}")).unwrap();
+    c.query_drop(format!("CREATE TABLE {tbl} (id INT PRIMARY KEY, v INT)"))
+        .unwrap();
+    let _guard = Table(tbl.clone());
+
+    let d = tempfile::tempdir().unwrap();
+    let out = d.path().join("out");
+    let ckpt = d.path().join("cdc.ckpt");
+    std::fs::create_dir_all(&out).unwrap();
+
+    // The refusal must come from the OPEN, before any capture claim — so it
+    // fires on the anchoring run, not only once changes exist.
+    let cfg = cdc_config(&d, &tbl, &ckpt, &out);
+    let out_text = {
+        let o = run_rivet(&["run", "--config", cfg.to_str().unwrap()]);
+        assert!(
+            !o.status.success(),
+            "a compressed binlog must FAIL the run, not capture nothing:\n{}",
+            String::from_utf8_lossy(&o.stdout)
+        );
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&o.stdout),
+            String::from_utf8_lossy(&o.stderr)
+        )
+    };
+    assert!(
+        out_text.contains("binlog_transaction_compression"),
+        "the refusal must name the setting so it is actionable:\n{out_text}"
+    );
+
+    // And with the setting off again the SAME table captures normally —
+    // proving the guard is the only thing that blocked it, not the fixture.
+    // A dir per run, like every other CDC test here: two runs into one prefix
+    // is the clobber scenario, not the capture assertion.
+    drop(_restore);
+    admin
+        .query_drop("SET GLOBAL binlog_transaction_compression = OFF")
+        .unwrap();
+    let out1 = d.path().join("out1");
+    let out2 = d.path().join("out2");
+    std::fs::create_dir_all(&out1).unwrap();
+    std::fs::create_dir_all(&out2).unwrap();
+    run_rivet_ok(&cdc_config(&d, &tbl, &ckpt, &out1)); // anchors
+    // A FRESH connection for the write. `binlog_transaction_compression` is
+    // captured into the SESSION at connect time, so `c` — opened while the
+    // global was ON — still writes compressed transactions no matter what the
+    // global says now. (The first version of this test used `c` here and
+    // captured 0 rows: an accidental second demonstration of the very bug the
+    // guard exists for, and the same session-state trap the timezone test
+    // above documents.)
+    let mut fresh = conn();
+    fresh
+        .query_drop(format!("INSERT INTO {tbl} VALUES (1, 10), (2, 20)"))
+        .unwrap();
+    run_rivet_ok(&cdc_config(&d, &tbl, &ckpt, &out2));
+    assert_eq!(
+        manifest_rows(&out2),
+        2,
+        "with compression off the same table must capture both rows"
+    );
+}
