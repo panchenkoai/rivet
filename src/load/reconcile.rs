@@ -359,13 +359,28 @@ pub fn select_runs(
     loaded: &std::collections::HashSet<String>,
     mode: crate::load::plan::LoadMode,
 ) -> Vec<(String, RunManifest)> {
-    // A `running` manifest is a LIVE run's in-flight marker — never loadable (no
-    // committed parts). Drop it BEFORE selection so it neither becomes the
-    // "latest" full snapshot nor an incremental delta, either of which would
-    // make `reconcile` refuse the whole load on a non-Success run.
+    // Only a `Success` run is loadable, so drop every other status BEFORE
+    // selection. `Running` is a live run's in-flight marker (no committed
+    // parts); `Failed`/`Interrupted` is an ABORTED run whose parts are partial —
+    // its data comes back complete under a NEW run_id when the export is
+    // retried, and `gc_orphans` already classifies those parts as terminal
+    // debris to delete.
+    //
+    // Dropping only `Running` here was a permanent stall: `reconcile` bails on
+    // the first non-Success manifest it is handed, and nothing ever removes a
+    // Failed one (gc deletes `.parquet` and superseded Running markers, never a
+    // terminal manifest; `cleanup_source` runs only after a load that can no
+    // longer succeed). So ONE aborted run — a source drop mid-extract, a query
+    // error, a destination write failure — made every LATER successful run
+    // unloadable forever, with an error telling the operator to reconfigure
+    // prefixes, which is not the cause. Released since 0.20.0.
+    //
+    // Safe by construction for CDC: the drain writes `Success` unconditionally
+    // (source/cdc/sink.rs), so an acked part is never inside a Failed manifest.
+    // `Failed` originates only on the batch path (pipeline/finalize.rs).
     let keyed: Vec<(String, RunManifest)> = keyed
         .into_iter()
-        .filter(|(_, m)| m.status != ManifestStatus::Running)
+        .filter(|(_, m)| m.status == ManifestStatus::Success)
         .collect();
     match mode {
         crate::load::plan::LoadMode::Full => latest_full(keyed),
@@ -824,6 +839,44 @@ mod tests {
         assert!(
             ensure_single_export(&[keyed(drain), keyed(wrong)]).is_err(),
             "recording the decorated name reads as a second export — the bricked prefix"
+        );
+    }
+
+    /// ONE aborted run must not brick the prefix. `reconcile` bails on the first
+    /// non-Success manifest it is handed, and nothing ever deletes a Failed one —
+    /// gc removes `.parquet` and superseded Running markers, never a terminal
+    /// manifest. So before this, run #7 failing made runs #8, #9, #10 unloadable
+    /// FOREVER, with an error blaming a shared prefix instead of naming the
+    /// cause; recovery was a human deleting one object from the bucket.
+    ///
+    /// The Failed run's own parts are deliberately NOT loaded: they are a
+    /// partial export whose data returns complete under a new run_id, and
+    /// `gc_orphans` already classifies them as terminal debris. Safe for CDC by
+    /// construction — the drain writes Success unconditionally, so an acked part
+    /// is never inside a Failed manifest.
+    #[test]
+    fn a_failed_manifest_does_not_block_the_successful_runs() {
+        let keyed = |m: RunManifest| ("gs://b/p/manifest-x.json".to_string(), m);
+        let mut failed = manifest("r7", 5, None);
+        failed.status = ManifestStatus::Failed;
+        let ok8 = manifest("r8", 10, None);
+        let ok9 = manifest("r9", 10, None);
+        let sel = select_runs(
+            vec![keyed(failed), keyed(ok8), keyed(ok9)],
+            &std::collections::HashSet::new(),
+            crate::load::plan::LoadMode::Cdc,
+        );
+        let ids: Vec<&str> = sel.iter().map(|(_, m)| m.run_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["r8", "r9"],
+            "the successful runs must still load; the aborted run is skipped, not fatal"
+        );
+        // …and what survives must pass reconcile, which is where the old bail hit.
+        let manifests: Vec<RunManifest> = sel.into_iter().map(|(_, m)| m).collect();
+        assert!(
+            reconcile(&manifests, false).is_ok(),
+            "reconcile must not see the aborted run at all"
         );
     }
 

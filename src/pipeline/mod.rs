@@ -39,7 +39,7 @@ pub(crate) mod retry;
 // the duplicate is resolved by Rust's namespace rules (modules live in
 // the type namespace, fns in the value namespace) and unambiguous at
 // every call site (`pipeline::run(...)` is the function).
-mod run;
+pub(crate) mod run;
 mod run_store;
 mod schema_drift;
 mod single;

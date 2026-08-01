@@ -805,43 +805,85 @@ fn dispatch_load(args: LoadArgs) -> Result<()> {
     };
     // Route each table by its declared `mode:`; `pk:` and `allow_source_drift:`
     // come from the `load:` block, so the CLI carries no per-mode flags.
+    // Per-table FAULT ISOLATION, mirroring `rivet run` (pipeline/run.rs): collect
+    // failures and keep going, then aggregate. A `?` inside this loop abandoned
+    // every LATER table in the config — silently, since a table that never ran
+    // gets no ledger row either, so `rivet state loads` cannot tell "failed" from
+    // "never attempted". The durable trigger is a per-table PERMANENT error
+    // raised before the run closure (`open_store`, `prepare_load` — which carries
+    // `ensure_single_export` and `reconcile`), so one poisoned prefix starved
+    // every other table, every cycle, indefinitely. The CLI reference already
+    // promised "loads every export into the shared target, one after another".
+    let mut failures: Vec<anyhow::Error> = Vec::new();
     for plan in &plans {
         let load_id = format!("{run_id}:{}", plan.table);
         let drift = plan.load.allow_source_drift;
-        match plan.mode {
-            // CDC: APPEND the change log + rebuild the current-state dedup view.
-            load::plan::LoadMode::Cdc => {
-                let pk = require_pk(plan, "cdc")?;
-                match load_one_cdc(
-                    plan,
-                    &run_id,
-                    engine.expect("engine resolved above for a cdc plan"),
-                    pk,
-                    drift,
-                    state.as_ref(),
-                    &load_id,
-                )? {
-                    Some(report) => println!("CDC LOAD OK [{}]: {report:#?}", plan.table),
-                    None => println!("CDC LOAD SKIP [{}]: up to date", plan.table),
+        let outcome = (|| -> Result<()> {
+            match plan.mode {
+                // CDC: APPEND the change log + rebuild the current-state dedup view.
+                load::plan::LoadMode::Cdc => {
+                    let pk = require_pk(plan, "cdc")?;
+                    match load_one_cdc(
+                        plan,
+                        &run_id,
+                        engine.expect("engine resolved above for a cdc plan"),
+                        pk,
+                        drift,
+                        state.as_ref(),
+                        &load_id,
+                    )? {
+                        Some(report) => println!("CDC LOAD OK [{}]: {report:#?}", plan.table),
+                        None => println!("CDC LOAD SKIP [{}]: up to date", plan.table),
+                    }
                 }
-            }
-            // Incremental: APPEND the delta + a cursor-ordered current-state view.
-            load::plan::LoadMode::Incremental => {
-                let pk = require_pk(plan, "incremental")?;
-                match load_one_incremental(plan, &run_id, pk, drift, state.as_ref(), &load_id)? {
-                    Some(report) => println!("INCREMENTAL LOAD OK [{}]: {report:#?}", plan.table),
-                    None => println!("INCREMENTAL LOAD SKIP [{}]: up to date", plan.table),
+                // Incremental: APPEND the delta + a cursor-ordered current-state view.
+                load::plan::LoadMode::Incremental => {
+                    let pk = require_pk(plan, "incremental")?;
+                    match load_one_incremental(plan, &run_id, pk, drift, state.as_ref(), &load_id)?
+                    {
+                        Some(report) => {
+                            println!("INCREMENTAL LOAD OK [{}]: {report:#?}", plan.table)
+                        }
+                        None => println!("INCREMENTAL LOAD SKIP [{}]: up to date", plan.table),
+                    }
                 }
+                // Full/chunked: ledger-driven latest-run OVERWRITE.
+                _ => match load_one(plan, &run_id, drift, state.as_ref(), &load_id)? {
+                    Some(report) => println!("LOAD OK [{}]: {report:#?}", plan.table),
+                    None => println!("LOAD SKIP [{}]: up to date", plan.table),
+                },
             }
-            // Full/chunked: ledger-driven latest-run OVERWRITE.
-            _ => match load_one(plan, &run_id, drift, state.as_ref(), &load_id)? {
-                Some(report) => println!("LOAD OK [{}]: {report:#?}", plan.table),
-                None => println!("LOAD SKIP [{}]: up to date", plan.table),
-            },
+            Ok(())
+        })();
+        if let Err(e) = outcome {
+            // Name the table on the way out: the aggregate must say WHICH load
+            // failed, or an operator reading a mixed batch cannot act on it.
+            eprintln!("  LOAD FAILED [{}]: {e:#}", plan.table);
+            failures.push(e.context(format!("load '{}'", plan.table)));
+            continue;
         }
         if plan.load.gc_orphans {
             maybe_gc_orphans(plan, state.as_ref());
         }
+    }
+    if !failures.is_empty() {
+        // Same aggregation shape as `rivet run`: carry a representative typed
+        // failure so `classify_exit` still downcasts the marker through anyhow's
+        // context chain, and list the rest as context.
+        let primary_idx = crate::pipeline::run::representative_failure_idx(&failures).unwrap();
+        let primary = failures.remove(primary_idx);
+        if failures.is_empty() {
+            return Err(primary);
+        }
+        let others = failures
+            .iter()
+            .map(|e| format!("{e:#}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(primary.context(format!(
+            "{} load(s) failed; representative error follows (also: {others})",
+            failures.len() + 1
+        )));
     }
     Ok(())
 }
@@ -1528,6 +1570,51 @@ mod load_ledger_tests {
         assert_eq!(loads.len(), 1);
         assert_eq!(loads[0].status, "failed");
         assert_eq!(loads[0].rows_loaded, 0);
+    }
+
+    /// Per-table fault isolation. `rivet load` used `?` inside its per-plan loop,
+    /// so the FIRST table's permanent error abandoned every later table in the
+    /// config — and silently: a table that never ran gets no ledger row, so
+    /// `rivet state loads` cannot tell "failed" from "never attempted". Combined
+    /// with a prefix bricked by an aborted run, that starved every other table,
+    /// every cycle, indefinitely.
+    ///
+    /// Asserts the AGGREGATION contract the loop now shares with `rivet run`:
+    /// several failures collapse to one representative error that still names
+    /// how many failed and lists the others, so the marker survives the
+    /// downcast in `classify_exit` and the operator learns about ALL of them.
+    #[test]
+    fn several_load_failures_aggregate_instead_of_stopping_at_the_first() {
+        let failures: Vec<anyhow::Error> = vec![
+            anyhow::anyhow!("boom alpha").context("load 'alpha'"),
+            anyhow::anyhow!("boom beta").context("load 'beta'"),
+            anyhow::anyhow!("boom gamma").context("load 'gamma'"),
+        ];
+        let mut failures = failures;
+        let idx = crate::pipeline::run::representative_failure_idx(&failures)
+            .expect("a non-empty failure set has a representative");
+        let primary = failures.remove(idx);
+        let others = failures
+            .iter()
+            .map(|e| format!("{e:#}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let aggregated = primary.context(format!(
+            "{} load(s) failed; representative error follows (also: {others})",
+            failures.len() + 1
+        ));
+        let text = format!("{aggregated:#}");
+        assert!(
+            text.contains("3 load(s) failed"),
+            "the aggregate must say how many failed; got: {text}"
+        );
+        for t in ["alpha", "beta", "gamma"] {
+            assert!(
+                text.contains(t),
+                "every failed table must be named — a table missing from the \
+                 aggregate is one an operator never learns about; got: {text}"
+            );
+        }
     }
 
     #[test]
