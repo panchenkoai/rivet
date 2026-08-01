@@ -437,10 +437,33 @@ fn run_cdc_inner(
     // `false` opts into a long-lived continuous stream — surface it so it is a
     // deliberate choice, never a silent never-terminating run.
     if !cdc.until_current {
+        // Engine-specific, because the promise is: MySQL blocks on the binlog and
+        // genuinely stays up, while the POLL adapters (PostgreSQL, SQL Server)
+        // only lose their open-time ceiling and still exit on catch-up — the
+        // `DrainMode` doc's "an outer loop re-wraps them" describes a loop that
+        // does not exist. Telling a PG operator the run "never exits on its own"
+        // sent them away from the supervisor they actually need.
+        let shape = match config.source.source_type {
+            crate::config::SourceType::Mysql => "blocks on the binlog and stays up until stopped",
+            crate::config::SourceType::Mongo => {
+                "tails the change stream while writes continue, and exits on an idle poll"
+            }
+            _ => {
+                concat!(
+                    "removes the open-time ceiling but STILL EXITS ON CATCH-UP — on ",
+                    "this engine it is one unbounded pass, not a daemon; run it under ",
+                    "a supervisor that restarts it, or use the scheduler model instead",
+                )
+            }
+        };
         log::warn!(
-            "cdc: `until_current: false` runs a CONTINUOUS stream (a long-lived daemon that never \
-             exits on its own). For the scheduler model, omit it or set `until_current: true` (the \
-             default) to drain to the log end and exit."
+            concat!(
+                "cdc: `until_current: false` opts into the continuous model, which on {:?} {}. ",
+                "For the scheduler model, omit it or set `until_current: true` (the default) ",
+                "to drain to the log end and exit.",
+            ),
+            config.source.source_type,
+            shape
         );
     }
 

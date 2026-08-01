@@ -627,9 +627,31 @@ fn default_time_column_type() -> TimeColumnType {
 }
 
 /// `until_current` defaults to `true` — the OSS model is the BOUNDED, scheduler-
-/// driven drain ("read to the log end and exit"). Continuous streaming
-/// (`until_current: false`) is an explicit opt-in; making it the default silently
-/// put a hand-written CDC config onto the never-terminating streaming path.
+/// driven drain ("read to the log end and exit"). `until_current: false` is an
+/// explicit opt-in to the continuous model; making it the default would silently
+/// put a hand-written CDC config onto it.
+///
+/// What `false` actually means is ENGINE-SPECIFIC, and the earlier wording
+/// ("the never-terminating streaming path") was only true for one of them:
+///
+/// * **MySQL** — genuinely long-lived: a continuous run omits
+///   `BINLOG_DUMP_NON_BLOCK` (`source/mysql/cdc.rs`), so the dump BLOCKS on the
+///   binlog and the process stays up with an idle source.
+/// * **PostgreSQL / SQL Server** — POLL adapters. `false` removes the open-time
+///   ceiling, nothing more: the run still exits on CATCH-UP, so any moment the
+///   source falls quiet ends it. `DrainMode`'s own doc says these "exit on
+///   catch-up and an outer loop re-wraps them" — that outer loop does not exist
+///   (`run_capture` has exactly two call sites, neither looping), so the run is
+///   one unbounded pass, not a daemon. Measured on the PG CDC stand: exit 0
+///   within seconds, both idle and under a 200-row/0.3 s writer.
+/// * **MongoDB** — a tailable change stream: it keeps returning events under
+///   sustained writes and stops on an empty poll, so it behaves like MySQL while
+///   traffic lasts and like the poll adapters when it stops.
+///
+/// No data is at risk either way — the checkpoint stops at the last committed
+/// position and the next run resumes there (defer-not-drop). The hazard is
+/// operational: on a poll engine, `false` needs a supervisor to re-run it, or the
+/// stream simply stops. If you want a scheduler, use the default.
 fn default_true() -> bool {
     true
 }
