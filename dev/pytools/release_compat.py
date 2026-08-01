@@ -419,26 +419,75 @@ def axis_artifacts(base: str, new: str, allow: dict[str, str]) -> list[str]:
 
 
 # ── driver ───────────────────────────────────────────────────────────────────
-def resolve_baseline(explicit: str | None) -> str:
-    """The DOWNLOADED previous release, never a rebuild of the parent commit.
+def _sha256(path: str) -> str:
+    import hashlib
 
-    Order: `--baseline`, `$RIVET_BASELINE`, then a `rivet` on PATH that is NOT
-    the working-tree build (a Homebrew bottle or a downloaded release asset).
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def resolve_baseline(explicit: str | None, candidate: str) -> str:
+    """The DOWNLOADED previous release, never the working tree's own build.
+
+    Order: `--baseline`, `$RIVET_BASELINE`, then a `rivet` on PATH.
+
+    Every candidate is RESOLVED THROUGH SYMLINKS and then rejected if it points
+    into this repo's `target/`. That check exists because it fired: a dogfood
+    convenience symlink (`~/.local/bin/rivet` -> `<repo>/target/release/rivet`)
+    made `which rivet` resolve to the WORKING TREE's release build. While that
+    build happened to predate the branch the gate looked honest — it even
+    reported the one declared break — and the moment `cargo build --release` ran,
+    the gate silently began comparing the branch against itself and printed
+    "ok — no undeclared incompatibility" having verified nothing.
+
+    A path comparison could not see it: two different paths, one file. So the
+    content is hashed too, and an identical hash is fatal. Neither check is
+    redundant — the symlink check names the CAUSE (so the operator knows to pass
+    `--baseline`), the hash check catches any other way one build reaches two
+    paths (a copy, a hardlink, a stale install).
     """
     for cand in (explicit, os.environ.get("RIVET_BASELINE")):
         if cand:
             if not Path(cand).exists():
                 raise SystemExit(f"baseline binary not found: {cand}")
-            return str(Path(cand).resolve())
+            return _vet_baseline(str(Path(cand).resolve()), candidate)
     found = shutil.which("rivet")
     if not found:
         raise SystemExit(
             "no baseline binary. Pass --baseline <path>, set $RIVET_BASELINE, or "
-            "install the previous release (`brew install rivet`, or download the "
-            "release asset). Do NOT rebuild the parent commit — the release "
-            "profile is fat-LTO and a rebuild only approximates what users run."
+            "download the previous release asset. Do NOT rebuild the parent commit "
+            "— the release profile is fat-LTO and a rebuild only approximates what "
+            "users run."
         )
-    return found
+    return _vet_baseline(str(Path(found).resolve()), candidate)
+
+
+def _vet_baseline(base: str, candidate: str) -> str:
+    """Refuse a baseline that is really the candidate wearing another path."""
+    target_dir = (REPO_ROOT / "target").resolve()
+    if str(Path(base).resolve()).startswith(str(target_dir)):
+        raise SystemExit(
+            f"baseline resolves INTO this repo's build tree:\n"
+            f"    {base}\n"
+            f"That is the working tree's own binary (often via a dogfood symlink "
+            f"such as ~/.local/bin/rivet -> target/release/rivet), so the gate "
+            f"would compare this branch against itself and pass having measured "
+            f"nothing.\n"
+            f"Pass the PREVIOUS RELEASE explicitly: --baseline <path>, or\n"
+            f"    gh release download <prev-tag> --pattern 'rivet-*' --dir /tmp/base"
+        )
+    if Path(base).exists() and Path(candidate).exists() and _sha256(base) == _sha256(candidate):
+        raise SystemExit(
+            f"baseline and candidate are byte-identical ({_sha256(base)[:16]}…):\n"
+            f"    baseline  {base}\n"
+            f"    candidate {candidate}\n"
+            f"One build at two paths measures nothing. Point --baseline at the "
+            f"previous release."
+        )
+    return base
 
 
 def main_cli(argv: Sequence[str] | None = None) -> int:
@@ -455,12 +504,7 @@ def main_cli(argv: Sequence[str] | None = None) -> int:
     new = os.environ.get("RIVET", str(REPO_ROOT / "target" / "debug" / "rivet"))
     if not Path(new).exists():
         raise SystemExit(f"working-tree binary not found: {new} (cargo build --bin rivet)")
-    base = resolve_baseline(baseline)
-    if Path(base).resolve() == Path(new).resolve():
-        raise SystemExit(
-            f"baseline and candidate are the SAME file ({base}) — this gate would "
-            f"compare a binary with itself and pass having measured nothing."
-        )
+    base = resolve_baseline(baseline, new)
     allow = load_allow()
 
     bv = shell.run([base, "--version"], timeout=60).stdout.strip()
