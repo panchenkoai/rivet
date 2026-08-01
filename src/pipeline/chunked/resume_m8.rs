@@ -571,7 +571,6 @@ mod tests {
         use crate::config::{DestinationConfig, DestinationType, SourceConfig, SourceType};
         use crate::tuning::SourceTuning;
         crate::plan::ResolvedRunPlan {
-            export_family: "orders".into(),
             export_name: "orders".into(),
             base_query: "SELECT 1".into(),
             strategy: crate::plan::ExtractionStrategy::Snapshot,

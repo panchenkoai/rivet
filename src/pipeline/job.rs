@@ -968,7 +968,7 @@ pub(super) fn run_export_job(
     // permanently saying validated=pass for a run whose report says it
     // failed.  The notification fires last so it carries the most complete
     // summary.
-    finalize_manifest(&plan, state, &summary, "export");
+    finalize_manifest(&plan, &export.family(), state, &summary, "export");
     // Round-2 audit #12: advance the incremental cursor now that the destination
     // manifest is durable — never before. A failure here is at-least-once safe (the
     // data + manifest are durable; the next run re-exports from the prior cursor),
@@ -1098,7 +1098,11 @@ pub(crate) fn run_export_job_with_chunk_source(
 
     summary.print();
     ledger_finish_run(state, &plan.export_name, &summary.run_id, &summary.status);
-    finalize_manifest(plan, state, &summary, "apply");
+    // Apply replays a SEALED artifact and has no ExportConfig — correctly:
+    // the family is the export's own name here. The one export whose family
+    // differs (the CDC snapshot leg) is synthesized by `cdc_job` at runtime and
+    // never reaches plan/apply, which refuses `mode: cdc` at build_plan entry.
+    finalize_manifest(plan, &plan.export_name, state, &summary, "apply");
     // Round-2 audit #12: incremental cursor advance AFTER the manifest is durable
     // (see run_export_job). No-op for the chunked/Precomputed apply path.
     if let Err(e) = commit_incremental_cursor(state, plan, &summary) {
@@ -1326,7 +1330,6 @@ mod tests {
 
     fn chunked_plan_with_quality(quality: Option<QualityConfig>) -> ResolvedRunPlan {
         ResolvedRunPlan {
-            export_family: String::new(),
             export_name: "orders".into(),
             base_query: "SELECT id FROM orders".into(),
             strategy: ExtractionStrategy::Chunked(ChunkedPlan {

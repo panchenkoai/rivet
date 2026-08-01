@@ -1128,7 +1128,6 @@ mod tests {
         };
         use crate::tuning::SourceTuning;
         let plan = ResolvedRunPlan {
-            export_family: String::new(),
             export_name: "orders".into(),
             base_query: "SELECT 1".into(),
             strategy: ExtractionStrategy::Snapshot,
@@ -1263,7 +1262,6 @@ mod tests {
         };
         use crate::tuning::SourceTuning;
         let plan = ResolvedRunPlan {
-            export_family: String::new(),
             export_name: "events".into(),
             base_query: "SELECT 1".into(),
             strategy: ExtractionStrategy::Snapshot,
@@ -1337,7 +1335,6 @@ mod tests {
         };
         use crate::tuning::SourceTuning;
         ResolvedRunPlan {
-            export_family: String::new(),
             export_name: export_name.into(),
             base_query: "SELECT 1".into(),
             strategy: ExtractionStrategy::Snapshot,

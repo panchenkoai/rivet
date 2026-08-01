@@ -656,7 +656,6 @@ mod tests {
 
     fn minimal_plan() -> ResolvedRunPlan {
         ResolvedRunPlan {
-            export_family: String::new(),
             export_name: "test_export".into(),
             base_query: "SELECT 1".into(),
             strategy: ExtractionStrategy::Snapshot,

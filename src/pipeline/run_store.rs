@@ -163,7 +163,6 @@ mod tests {
 
     fn test_plan(export_name: &str) -> ResolvedRunPlan {
         ResolvedRunPlan {
-            export_family: String::new(),
             export_name: export_name.into(),
             base_query: "SELECT 1".into(),
             strategy: ExtractionStrategy::Snapshot,

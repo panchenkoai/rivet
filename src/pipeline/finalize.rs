@@ -86,6 +86,14 @@ pub(super) fn finalize_run_report(config_path: &str, summary: &RunSummary, kind:
 /// via the local run report.
 pub(super) fn finalize_manifest(
     plan: &ResolvedRunPlan,
+    // The export FAMILY (`ExportConfig::family()`), passed at RUNTIME and
+    // deliberately NOT a field of `ResolvedRunPlan`: that type is sealed into
+    // plan.json and its integrity hash covers the whole serialized struct, so
+    // any field added to it invalidates every plan artifact across a version
+    // boundary — in BOTH directions, with an error that blames the user for
+    // hand-editing. Measured: adding it there broke released-plan → branch-apply
+    // and branch-plan → released-apply alike.
+    export_family: &str,
     state: &StateStore,
     summary: &RunSummary,
     kind: &str,
@@ -189,11 +197,7 @@ pub(super) fn finalize_manifest(
 
     let mut builder = ManifestBuilder::new(
         snapshot,
-        &if plan.export_family.is_empty() {
-            plan.export_name.clone()
-        } else {
-            plan.export_family.clone()
-        },
+        export_family,
         &summary.run_id,
         started_at,
         schema_fingerprint,
@@ -539,14 +543,7 @@ pub(super) fn write_running_manifest(plan: &ResolvedRunPlan, run_id: &str, start
         row_hash: None,
         manifest_version: MANIFEST_VERSION,
         run_id: run_id.to_string(),
-        // A plan.json sealed before the field existed replays with an empty
-        // family; fall back to the export name, which is what such a run always
-        // recorded.
-        export_family: if plan.export_family.is_empty() {
-            plan.export_name.clone()
-        } else {
-            plan.export_family.clone()
-        },
+        export_family: plan.export_name.clone(),
         export_name: plan.export_name.clone(),
         mode: "batch".to_string(),
         started_at: started_at.to_string(),
@@ -658,7 +655,6 @@ mod tests {
     fn fin_plan(dest: &std::path::Path) -> crate::plan::ResolvedRunPlan {
         use crate::config::{SourceConfig, SourceType};
         crate::plan::ResolvedRunPlan {
-            export_family: String::new(),
             export_name: "public.orders".into(),
             base_query: "SELECT 1".into(),
             strategy: crate::plan::ExtractionStrategy::Snapshot,
@@ -756,7 +752,7 @@ mod tests {
         let state = crate::state::StateStore::open_in_memory().unwrap();
         let summary = fin_summary(&plan, "success");
 
-        finalize_manifest(&plan, &state, &summary, "export");
+        finalize_manifest(&plan, "e", &state, &summary, "export");
 
         let m = read_manifest(dir.path());
         assert_eq!(m.status, crate::manifest::ManifestStatus::Success);
@@ -793,7 +789,7 @@ mod tests {
         let state = crate::state::StateStore::open_in_memory().unwrap();
         let summary = fin_summary(&plan, "failed");
 
-        finalize_manifest(&plan, &state, &summary, "export");
+        finalize_manifest(&plan, "e", &state, &summary, "export");
 
         let m = read_manifest(dir.path());
         assert_eq!(m.status, crate::manifest::ManifestStatus::Failed);
@@ -815,7 +811,7 @@ mod tests {
             let mut summary = fin_summary(&plan, "success");
             summary.export_name = name.into();
 
-            finalize_manifest(&plan, &state, &summary, "export");
+            finalize_manifest(&plan, "e", &state, &summary, "export");
 
             let m = read_manifest(dir.path());
             assert_eq!(m.source.schema, None, "export_name {name:?}");
