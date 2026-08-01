@@ -1004,7 +1004,28 @@ fn prepare_load(
     let manifests: Vec<_> = new.iter().map(|(_, m)| m.clone()).collect();
     let integrity = load::reconcile::reconcile(&manifests, allow_source_drift)?;
     let uris = load::reconcile::select_load_uris(store, &plan.gcs_prefix, &new)?;
-    let source_run_ids = new.iter().map(|(_, m)| m.run_id.clone()).collect();
+    let source_run_ids: Vec<String> = new.iter().map(|(_, m)| m.run_id.clone()).collect();
+    if uris.is_empty() {
+        // Unloaded manifests that resolve to NO files: runs that legitimately
+        // produced nothing (a CDC cycle with no changes, the anchor cycle of
+        // `initial: snapshot`). That is "up to date", not an error — the loader
+        // bails deeper down with "no Parquet URIs to append", which surfaced as a
+        // failed load the moment a zero-part manifest stopped dragging the whole
+        // prefix in behind it.
+        //
+        // NOT recorded consumed: the caller's skip path records no run ids, so
+        // an empty cycle is re-evaluated on every later load. Harmless (it
+        // resolves to nothing again and skips again) but it does mean the skip
+        // set omits runs that are, in fact, fully consumed — recording them is
+        // the follow-up.
+        println!(
+            "  {} → {}: {} run(s) produced no files — nothing to load",
+            plan.table,
+            plan.load.target.name(),
+            source_run_ids.len()
+        );
+        return Ok(None);
+    }
     Ok(Some(LoadInputs {
         integrity,
         uris,

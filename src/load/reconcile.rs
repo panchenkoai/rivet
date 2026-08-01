@@ -163,8 +163,18 @@ pub fn select_load_keys(new: &[(String, RunManifest)], all_parquet: &[String]) -
                 resolved_any = true;
             }
         }
-        if !resolved_any {
-            // Can't resolve this run to files — don't risk a partial selection.
+        // A manifest that DECLARES parts but resolves none is genuinely
+        // unresolvable — bail to the full listing rather than risk a partial
+        // selection. A manifest declaring NO parts is a different thing: the run
+        // legitimately produced nothing (a CDC cycle with no changes, the anchor
+        // cycle of `initial: snapshot`), and treating that as unresolvable
+        // dragged EVERY parquet under the prefix into the load while
+        // `expected_delta` still summed the manifests to zero — so the load
+        // appended rows nobody accounted for and rivet's own count gate fired:
+        // "appended 2 rows, expected 0 from the run manifests". Surfaced by the
+        // scenario-artifact matrix on SQL Server, where the async capture Agent
+        // makes an empty first cycle common; the mechanism is engine-independent.
+        if !resolved_any && !m.parts.is_empty() {
             return all_parquet.to_vec();
         }
     }
@@ -877,6 +887,45 @@ mod tests {
         assert!(
             reconcile(&manifests, false).is_ok(),
             "reconcile must not see the aborted run at all"
+        );
+    }
+
+    /// A run that captured NOTHING must not turn the selection into a
+    /// full-prefix load.
+    ///
+    /// `select_load_keys` bails to `all_parquet` when a manifest "can't be
+    /// resolved to files" — a guard against a PARTIAL selection. But a manifest
+    /// with zero parts resolves to nothing for the ordinary reason that the run
+    /// legitimately produced nothing (a CDC cycle with no changes; the anchor
+    /// cycle of `initial: snapshot`), and it then dragged EVERY parquet under the
+    /// prefix into the load while `expected_delta` still summed the manifests to
+    /// 0 — so the load appended rows nobody accounted for and rivet's own count
+    /// gate fired: "appended 2 rows, expected 0 from the run manifests".
+    ///
+    /// Found by the scenario-artifact matrix on SQL Server, where the async
+    /// capture Agent makes an empty first cycle common — but the mechanism is
+    /// engine-independent: any zero-part manifest does it.
+    #[test]
+    fn a_zero_part_manifest_does_not_drag_the_whole_prefix_into_the_load() {
+        // The shared `manifest()` helper always declares ONE part, so it cannot
+        // express this case — an earlier version of this test used it and passed
+        // against the unfixed product, because a declared-but-absent part IS the
+        // unresolvable case the fallback is for. A zero-capture run is different:
+        // it declares nothing.
+        let mut empty = manifest("r_anchor", 0, None);
+        empty.parts = Vec::new();
+        empty.part_count = 0;
+        empty.row_count = 0;
+        let all = vec!["base/a.parquet".to_string(), "base/b.parquet".to_string()];
+        let picked = select_load_keys(
+            &[("gs://b/base/manifest-r_anchor.json".to_string(), empty)],
+            &all,
+        );
+        assert!(
+            picked.is_empty(),
+            "a run with no parts contributes no files; it must not fall back to the \
+             whole prefix (got {picked:?}), or the load appends rows the manifests \
+             never accounted for"
         );
     }
 
