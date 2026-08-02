@@ -592,6 +592,7 @@ mod tests {
     /// optionally, a probed `source_row_count`.
     fn manifest(run: &str, rows: i64, source: Option<i64>) -> RunManifest {
         RunManifest {
+            checksum_render: None,
             row_hash: None,
             manifest_version: crate::manifest::MANIFEST_VERSION,
             run_id: run.into(),

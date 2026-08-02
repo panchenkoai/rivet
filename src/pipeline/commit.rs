@@ -78,11 +78,17 @@ pub(in crate::pipeline) fn accumulate_column_checksums(
     part: &std::collections::BTreeMap<String, u64>,
 ) {
     for (name, sum) in part {
-        *acc.entry(name.clone()).or_insert(0) ^= *sum;
+        // wrapping_add, not XOR: the combiner must be commutative (parts arrive
+        // in no fixed order) WITHOUT being annihilating. Under `^` two parts
+        // whose column checksums coincide — a duplicated part, or two parts of
+        // identical duplicated values — cancelled to zero, and the run published
+        // a checksum that verified anything. Same fold as `value_checksum::Fold::Sum`.
+        let e = acc.entry(name.clone()).or_insert(0);
+        *e = e.wrapping_add(*sum);
     }
 }
 
-/// Record the run-wide XOR-combined checksums + key column into the summary, so
+/// Record the run-wide sum-combined checksums + key column into the summary, so
 /// `finalize_manifest` writes Form B and `rivet validate` can re-verify the
 /// Arrow→Parquet encode / post-write fault Form A cannot see. The single harvest
 /// seam every runner goes through (single mode passes its one sink's map directly;

@@ -1251,8 +1251,10 @@ mod int64_bytes_dispatch_tests {
 // Asserts CORRECT behavior; expected to FAIL until the fix lands.
 #[cfg(test)]
 mod roast_mysql_bit_decode_tests {
+    use super::{
+        MysqlCellSource, TimeUnit, build_array, mysql_native_type_name, mysql_type_to_rivet,
+    };
     use super::{RivetTimeUnit, RivetType};
-    use super::{TimeUnit, build_array, mysql_native_type_name, mysql_type_to_rivet};
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::sync::Arc;
@@ -1726,6 +1728,105 @@ mod roast_mysql_bit_decode_tests {
         assert_eq!(rows.len(), 1, "{label}: one row");
         build_array(dt, 0, &rows, false, "c", None)
             .unwrap_or_else(|e| panic!("{label}: build_array errored: {e}"))
+    }
+
+    /// Every `CellSource` accessor, over the BINARY protocol.
+    ///
+    /// `MysqlCellSource` feeds value-checksum Form A — the number rivet publishes
+    /// to attest that what it read is what it wrote. A wrong accessor does not
+    /// corrupt the data; it corrupts the ATTESTATION, which is worse, because the
+    /// artifact then carries a checksum that agrees with itself. All sixteen
+    /// accessors take `&[mysql::Row]`, so none had a unit test until the binary
+    /// harness existed — 65 standing baseline entries between them.
+    ///
+    /// Expectations are derived from what the quantity MEANS (an unscaled
+    /// integer, days since the epoch, microseconds since it) and written by hand,
+    /// never read back from a run.
+    #[test]
+    fn every_cell_source_accessor_reads_the_binary_value_it_should() {
+        use crate::source::value_checksum::CellSource;
+
+        fn src(cell: (Vec<u8>, Vec<u8>)) -> Vec<mysql::Row> {
+            let (def, bytes) = cell;
+            fetch_binary_rows(vec![def], vec![vec![Some(bytes)]])
+        }
+
+        let r = src(v_int(1));
+        assert_eq!(MysqlCellSource { rows: &r }.num_rows(), 1);
+        assert_eq!(MysqlCellSource { rows: &r }.boolean(0, 0), Some(true));
+        let r = src(v_int(0));
+        assert_eq!(MysqlCellSource { rows: &r }.boolean(0, 0), Some(false));
+
+        let r = src(v_int(-12345));
+        assert_eq!(MysqlCellSource { rows: &r }.int16(0, 0), Some(-12345));
+        let r = src(v_int(-2_000_000_000));
+        assert_eq!(
+            MysqlCellSource { rows: &r }.int32(0, 0),
+            Some(-2_000_000_000)
+        );
+        let r = src(v_int(-9_000_000_000_000_000_000));
+        assert_eq!(
+            MysqlCellSource { rows: &r }.int64(0, 0),
+            Some(-9_000_000_000_000_000_000)
+        );
+        // Only a magnitude past i64::MAX actually yields Value::UInt — see v_uint.
+        let r = src(v_uint(18_000_000_000_000_000_000));
+        assert_eq!(
+            MysqlCellSource { rows: &r }.uint64(0, 0),
+            Some(18_000_000_000_000_000_000)
+        );
+
+        let r = src(v_float(0.5));
+        assert_eq!(MysqlCellSource { rows: &r }.float32(0, 0), Some(0.5));
+        let r = src(v_double(-1.25));
+        assert_eq!(MysqlCellSource { rows: &r }.float64(0, 0), Some(-1.25));
+
+        // decimal keeps the UNSCALED integer: 150.05 at scale 2 is 15005.
+        let r = src(v_bytes(b"150.05"));
+        assert_eq!(
+            MysqlCellSource { rows: &r }.decimal128(0, 0, 2),
+            Some(15005)
+        );
+
+        let r = src(v_bytes(b"h\xc3\xa9llo"));
+        assert_eq!(
+            MysqlCellSource { rows: &r }.utf8(0, 0).as_deref(),
+            // The accessor hands back BYTES, not a validated str — the checksum
+            // folds the exact wire bytes, so an invalid sequence must not be
+            // silently replaced on the way in.
+            Some("h\u{e9}llo".as_bytes())
+        );
+        let r = src(v_blob(&[0xde, 0xad]));
+        assert_eq!(
+            MysqlCellSource { rows: &r }.binary(0, 0).as_deref(),
+            Some(&[0xde, 0xad][..])
+        );
+
+        // 2026-06-23 is 20627 days after 1970-01-01; the same instant at
+        // 10:00:00.123456 is 1_782_208_800_123_456 microseconds after it.
+        let r = src(v_date(2026, 6, 23, 10, 0, 0, 123_456));
+        assert_eq!(MysqlCellSource { rows: &r }.date32(0, 0), Some(20627));
+        assert_eq!(
+            MysqlCellSource { rows: &r }.ts_micros(0, 0),
+            Some(1_782_208_800_123_456)
+        );
+
+        // 13:45:30.123456 is 49_530_123_456 microseconds after midnight. No zero
+        // components: at midnight the multiply, add and divide are indistinguishable.
+        let r = src(v_time(false, 0, 13, 45, 30, 123_456));
+        assert_eq!(
+            MysqlCellSource { rows: &r }.time64_micros(0, 0),
+            Some(49_530_123_456)
+        );
+
+        // A NULL must read as absent through EVERY accessor, not as a zero — a
+        // checksum that folds NULL and 0 to one value attests they are the same.
+        let r = fetch_binary_rows(vec![v_int(0).0], vec![vec![None]]);
+        let s = MysqlCellSource { rows: &r };
+        assert_eq!(s.int64(0, 0), None, "NULL is absent, never 0");
+        assert_eq!(s.boolean(0, 0), None);
+        assert_eq!(s.float64(0, 0), None);
+        assert_eq!(s.utf8(0, 0), None);
     }
 
     /// The FULL `DataType` x `Value` dispatch grid of `build_array`, over the

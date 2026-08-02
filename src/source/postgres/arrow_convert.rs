@@ -597,6 +597,19 @@ impl crate::source::value_checksum::CellSource for PgCellSource<'_> {
     }
 }
 
+/// Microseconds since midnight, truncating sub-microsecond nanos.
+///
+/// Pulled out of the `Time64` arm because it is the only ARITHMETIC in this
+/// mapper, and arithmetic is where an operator swap hides in plain sight: the
+/// `*`, `+` and `/` here carried six standing baseline entries with nothing able
+/// to tell them apart. Identical expression to the MySQL and SQL Server mappers —
+/// the same six mutants survived in all THREE engines, each for the same reason:
+/// no unit test, or a fixture at midnight, where `0 * n`, `0 + n` and `0 / n` are
+/// indistinguishable.
+fn naive_time_to_micros(t: chrono::NaiveTime) -> i64 {
+    t.num_seconds_from_midnight() as i64 * 1_000_000 + t.nanosecond() as i64 / 1_000
+}
+
 fn build_array(
     pg_type: &Type,
     target_type: &DataType,
@@ -698,11 +711,7 @@ fn build_array(
             let mut b = Time64MicrosecondBuilder::with_capacity(rows.len());
             for row in rows {
                 match row.get::<_, Option<chrono::NaiveTime>>(col_idx) {
-                    Some(t) => {
-                        let micros = t.num_seconds_from_midnight() as i64 * 1_000_000
-                            + t.nanosecond() as i64 / 1_000;
-                        b.append_value(micros);
-                    }
+                    Some(t) => b.append_value(naive_time_to_micros(t)),
                     None => b.append_null(),
                 }
             }
@@ -1102,6 +1111,37 @@ mod interval_render_tests {
         // which "P2Y" expresses correctly. (The "T0S" fallback fires only when
         // NOTHING was written, i.e. the string is still bare "P".)
         assert_eq!(pg_interval_to_iso8601(24, 0, 0), "P2Y");
+    }
+}
+
+#[cfg(test)]
+mod time_arithmetic_tests {
+    use super::naive_time_to_micros;
+    use chrono::NaiveTime;
+
+    /// Pins every arithmetic step of the `time` conversion.
+    ///
+    /// Deliberately no zeros. At 00:00:00.000000 the `*`, `+` and `/` in that
+    /// expression all yield 0, so a midnight fixture cannot tell the three
+    /// operators apart — which is exactly why six operator mutants stood in the
+    /// baseline here, and in the MySQL and SQL Server mappers, which carry the
+    /// identical expression. Third engine, same shape, same fix.
+    ///
+    /// The expectations are computed outside this codebase, not read back from a
+    /// run: 01:02:03 is 3723 seconds, and .456789 s is 456_789 microseconds.
+    #[test]
+    fn naive_time_to_micros_pins_every_arithmetic_step() {
+        let t = NaiveTime::from_hms_nano_opt(1, 2, 3, 456_789_000).unwrap();
+        assert_eq!(naive_time_to_micros(t), 3723 * 1_000_000 + 456_789);
+
+        // Sub-microsecond nanos TRUNCATE, they do not round: 999 ns is 0 us.
+        let t = NaiveTime::from_hms_nano_opt(0, 0, 1, 999).unwrap();
+        assert_eq!(naive_time_to_micros(t), 1_000_000);
+
+        // The last representable instant of the day, so a `*`/`+` swap cannot
+        // coincide with the right answer by accident.
+        let t = NaiveTime::from_hms_nano_opt(23, 59, 59, 999_999_000).unwrap();
+        assert_eq!(naive_time_to_micros(t), 86_399 * 1_000_000 + 999_999);
     }
 }
 

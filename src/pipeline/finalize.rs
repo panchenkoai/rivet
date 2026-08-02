@@ -582,6 +582,7 @@ pub(super) fn write_running_manifest(
         row_count: 0,
         part_count: 0,
         parts: Vec::new(),
+        checksum_render: None,
         column_checksums: None,
         checksum_key_column: None,
     };

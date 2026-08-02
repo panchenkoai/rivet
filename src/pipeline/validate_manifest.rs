@@ -882,6 +882,7 @@ mod tests {
             .filter(|p| p.status == PartStatus::Committed)
             .count() as u32;
         RunManifest {
+            checksum_render: None,
             row_hash: None,
             mode: "batch".to_string(),
             manifest_version: MANIFEST_VERSION,

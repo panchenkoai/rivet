@@ -108,9 +108,9 @@ struct TableSink<'a> {
     buf: Vec<ChangeEvent>,
     parts: Vec<PartRecord>,
     seq: usize,
-    /// Finding #38: per-column value checksums, XOR-accumulated across parts
+    /// Finding #38: per-column value checksums, sum-accumulated across parts
     /// (the same combining rule `validate_recorded_checksums` applies on
-    /// re-read) — recorded into the manifest so `rivet validate` Form B
+    /// re-read — see `value_checksum::Fold`) — recorded into the manifest so `rivet validate` Form B
     /// covers CDC prefixes instead of silently skipping the value leg.
     column_sums: std::collections::BTreeMap<String, u64>,
 }
@@ -150,7 +150,12 @@ impl TableSink<'_> {
             &self.out.row_hash,
         )?;
         for (name, sum) in sums {
-            *self.column_sums.entry(name).or_insert(0) ^= sum;
+            // wrapping_add, not XOR — the same fold `Fold::Sum` applies on
+            // re-read. Under `^` two parts whose column checksums coincide
+            // cancelled to zero, so a CDC prefix could publish a checksum that
+            // verified anything.
+            let e = self.column_sums.entry(name).or_insert(0);
+            *e = e.wrapping_add(sum);
         }
         self.parts.push(part);
         self.seq += 1;
@@ -798,6 +803,10 @@ fn build_manifest(
                 status: PartStatus::Committed,
             })
             .collect(),
+        // Stamped because this manifest DOES carry checksums: without the
+        // marker a reader falls back to the v1 (annihilating XOR) fold and
+        // reports every CDC prefix as corrupt.
+        checksum_render: Some(crate::source::value_checksum::CHECKSUM_RENDER_ID.to_string()),
         column_checksums: Some(
             column_sums
                 .iter()

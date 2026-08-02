@@ -451,7 +451,7 @@ pub(crate) fn cells_checksum(dt: &DataType, cells: &[Option<&RivetValue>]) -> u6
         macro_rules! le {
             ($opt:expr) => {
                 if let Some(v) = $opt {
-                    acc ^= xxh3_64(&v.to_le_bytes());
+                    acc = acc.wrapping_add(xxh3_64(&v.to_le_bytes()));
                 }
             };
         }
@@ -464,7 +464,7 @@ pub(crate) fn cells_checksum(dt: &DataType, cells: &[Option<&RivetValue>]) -> u6
                     _ => None,
                 };
                 if let Some(b) = b {
-                    acc ^= xxh3_64(&[b as u8]);
+                    acc = acc.wrapping_add(xxh3_64(&[b as u8]));
                 }
             }
             DataType::Int16 => le!(int_of::<i16>(c)),
@@ -495,20 +495,20 @@ pub(crate) fn cells_checksum(dt: &DataType, cells: &[Option<&RivetValue>]) -> u6
             DataType::Decimal128(_, s) => le!(decimal_to_i128(c, *s)),
             DataType::Decimal256(_, s) => {
                 if let Some(v) = decimal_to_i256(c, *s) {
-                    acc ^= xxh3_64(&v.to_le_bytes());
+                    acc = acc.wrapping_add(xxh3_64(&v.to_le_bytes()));
                 }
             }
-            DataType::Utf8 => acc ^= xxh3_64(render_str(c).as_bytes()),
+            DataType::Utf8 => acc = acc.wrapping_add(xxh3_64(render_str(c).as_bytes())),
             DataType::Binary => {
                 if let V::Bytes(by) = c {
-                    acc ^= xxh3_64(by);
+                    acc = acc.wrapping_add(xxh3_64(by));
                 }
             }
             DataType::FixedSizeBinary(n) => {
                 if let V::Bytes(by) = c
                     && by.len() == *n as usize
                 {
-                    acc ^= xxh3_64(by);
+                    acc = acc.wrapping_add(xxh3_64(by));
                 }
             }
             DataType::List(f) => {
@@ -534,7 +534,7 @@ pub(crate) fn cells_checksum(dt: &DataType, cells: &[Option<&RivetValue>]) -> u6
                             _ => ListElem::Null,
                         })
                         .collect();
-                    acc ^= xxh3_64(&encode_list_cell(&encoded));
+                    acc = acc.wrapping_add(xxh3_64(&encode_list_cell(&encoded)));
                 }
             }
             _ => {}

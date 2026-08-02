@@ -27,6 +27,7 @@ const RIVET_BIN: &str = env!("CARGO_BIN_EXE_rivet");
 /// verdict passes (the surplus is then the only advisory entry).
 fn one_part_manifest() -> RunManifest {
     RunManifest {
+        checksum_render: None,
         row_hash: None,
         mode: "batch".to_string(),
         manifest_version: MANIFEST_VERSION,

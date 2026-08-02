@@ -866,6 +866,7 @@ mod tests {
         let row_count: i64 = parts.iter().map(|p| p.rows).sum();
         let part_count = parts.len() as u32;
         RunManifest {
+            checksum_render: None,
             row_hash: None,
             mode: "batch".to_string(),
             manifest_version: MANIFEST_VERSION,

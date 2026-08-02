@@ -59,6 +59,8 @@ pub struct ManifestBuilder {
     /// [`set_column_checksums`](Self::set_column_checksums) from the sink
     /// accumulator. `None` → omitted from the manifest.
     column_checksums: Option<Vec<ColumnChecksum>>,
+    /// Which fold produced them — see `manifest::RunManifest::checksum_render`.
+    checksum_render: Option<String>,
     /// The column the Form B checksum is keyed to (cursor/key column); `None` =
     /// un-keyed. Recorded so `validate` re-keys identically.
     checksum_key_column: Option<String>,
@@ -92,6 +94,7 @@ impl ManifestBuilder {
         destination_uri: String,
     ) -> Self {
         Self {
+            checksum_render: None,
             run_id: run_id.to_string(),
             export_name: plan.export_name.clone(),
             export_family: export_family.to_string(),
@@ -133,6 +136,10 @@ impl ManifestBuilder {
     ) {
         self.column_checksums = Some(checksums);
         self.checksum_key_column = key_column;
+        // Stamp the fold that produced them. Without this a reader cannot tell
+        // v1's annihilating XOR from v2's sum and would compare incomparable
+        // numbers — reporting either false corruption or none at all.
+        self.checksum_render = Some(crate::source::value_checksum::CHECKSUM_RENDER_ID.to_string());
     }
 
     /// Record a committed part.  Must be called only after `dest.write()`
@@ -200,6 +207,7 @@ impl ManifestBuilder {
             .count() as u32;
         let finished_at = chrono::Utc::now();
         RunManifest {
+            checksum_render: self.checksum_render.clone(),
             manifest_version: crate::manifest::MANIFEST_VERSION,
             mode: "batch".to_string(),
             run_id: self.run_id,

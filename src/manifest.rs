@@ -242,6 +242,18 @@ pub struct RunManifest {
     /// `MANIFEST_VERSION` bump), newer readers tolerate its absence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub column_checksums: Option<Vec<ColumnChecksum>>,
+    /// Which fold produced [`Self::column_checksums`] — see
+    /// `value_checksum::CHECKSUM_RENDER_ID`.
+    ///
+    /// Load-bearing for compatibility, not decoration. v1 combined per-cell
+    /// hashes with XOR, which ANNIHILATES duplicates (`h ^ h == 0`), so a column
+    /// of repeated values checksummed to zero and post-write corruption of it was
+    /// invisible. v2 folds with wrapping addition. The numbers are not
+    /// comparable across the two, so a reader must re-derive with the fold that
+    /// WROTE them: absent marker ⇒ v1, and an old artifact stays verifiable by
+    /// the algorithm that attested it rather than reading as corrupt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checksum_render: Option<String>,
     /// The column the Form B checksum is keyed to (`xxh3(key ‖ value)`, the
     /// export's cursor/key column) so `validate` re-keys identically. `None` ⇒
     /// un-keyed (a full export with no cursor). See [`ColumnChecksum`].
@@ -486,6 +498,7 @@ mod tests {
             .filter(|p| p.status == PartStatus::Committed)
             .count() as u32;
         RunManifest {
+            checksum_render: None,
             row_hash: None,
             mode: "batch".to_string(),
             manifest_version: MANIFEST_VERSION,

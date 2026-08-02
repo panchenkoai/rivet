@@ -525,6 +525,7 @@ mod tests {
         let row_count = parts.iter().map(|p| p.rows).sum();
         let part_count = parts.len() as u32;
         RunManifest {
+            checksum_render: None,
             row_hash: None,
             mode: "batch".to_string(),
             manifest_version: crate::manifest::MANIFEST_VERSION,

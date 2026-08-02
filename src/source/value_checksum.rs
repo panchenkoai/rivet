@@ -200,13 +200,66 @@ fn list_cell_elems(arr: &dyn Array, r: usize) -> Vec<ListElem> {
         .collect()
 }
 
+/// How per-cell hashes are combined into one column checksum.
+///
+/// Both must be COMMUTATIVE: parts arrive from chunked / keyset / parallel
+/// runners in no fixed order, and their per-column checksums are folded together
+/// afterwards. That requirement is real; the question is which commutative
+/// operation, and the first answer was wrong.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Fold {
+    /// `v1`, XOR. Commutative — and ANNIHILATING: `h ^ h == 0`, so any value
+    /// occurring an EVEN number of times contributes nothing. Measured on a real
+    /// export: a column of `["x","x"]` checksums to 0, as does `["y","y"]`, as
+    /// does the EMPTY column — so post-write corruption of a duplicated value is
+    /// invisible, and `rivet validate --depth full` returned PASSED on a part
+    /// whose values DuckDB and rivet's own Arrow reader both showed as changed.
+    /// Kept ONLY to re-verify manifests recorded before v2; never for new runs.
+    Xor,
+    /// `v2`, wrapping addition. Equally commutative and equally order-free, but
+    /// `h + h == 2h`, so duplicates accumulate instead of cancelling and a
+    /// duplicated column no longer collapses to zero. This is the standard
+    /// multiset-hash combiner for exactly this reason.
+    Sum,
+}
+
+/// The rendering identity of a manifest's `column_checksums`.
+///
+/// Recorded per run so a reader can tell "these were folded by an algorithm I
+/// know" from "…by one I do not", and re-verify with the fold that PRODUCED
+/// them rather than comparing incomparable numbers. An older manifest carries no
+/// marker, which is itself the v1 signal — see [`Fold::from_render_id`].
+pub const CHECKSUM_RENDER_ID: &str = "xxh3-64-sum-v2";
+
+impl Fold {
+    /// The fold that produced a manifest's checksums. `None` (no marker) means a
+    /// run written before the id existed, i.e. the XOR fold.
+    pub(crate) fn from_render_id(id: Option<&str>) -> Self {
+        match id {
+            Some(CHECKSUM_RENDER_ID) => Fold::Sum,
+            _ => Fold::Xor,
+        }
+    }
+
+    fn combine(self, acc: u64, h: u64) -> u64 {
+        match self {
+            Fold::Xor => acc ^ h,
+            Fold::Sum => acc.wrapping_add(h),
+        }
+    }
+}
+
 /// The single per-column hasher behind both [`arrow_batch_checksums`] (un-keyed,
 /// `key = None`) and [`arrow_batch_checksums_keyed`] (swap-resistant, `key = Some`).
 /// Each non-null cell hashes `xxh3(key_bytes ‖ value_bytes)` — or just the value
-/// bytes when un-keyed — via [`feed_cell`], XOR-combined (order-independent, so
-/// chunk/parallel order is irrelevant). A [`CheckRule::Skipped`] column
-/// short-circuits to 0 on both paths.
+/// bytes when un-keyed — via [`feed_cell`], then combined by [`Fold`]
+/// (order-independent, so chunk/parallel order is irrelevant). A
+/// [`CheckRule::Skipped`] column short-circuits to 0 on both paths.
 fn column_xxh3(arr: &dyn Array, key: Option<&dyn Array>) -> u64 {
+    column_xxh3_with(arr, key, Fold::Sum)
+}
+
+pub(crate) fn column_xxh3_with(arr: &dyn Array, key: Option<&dyn Array>, fold: Fold) -> u64 {
     if matches!(check_rule(arr.data_type()), CheckRule::Skipped(_)) {
         return 0;
     }
@@ -218,7 +271,7 @@ fn column_xxh3(arr: &dyn Array, key: Option<&dyn Array>) -> u64 {
         match key {
             // Un-keyed: one-shot `xxh3_64` — ~2.5× faster than constructing a
             // streaming `Xxh3` per cell (which inits the full ~576-byte state).
-            None => acc ^= with_cell_bytes(arr, r, xxh3_64),
+            None => acc = fold.combine(acc, with_cell_bytes(arr, r, xxh3_64)),
             // Keyed: stream `key ‖ value` so the swap-resistant hash needs no
             // concat alloc; same hash value as one-shot over the concatenation.
             Some(k) => {
@@ -230,7 +283,7 @@ fn column_xxh3(arr: &dyn Array, key: Option<&dyn Array>) -> u64 {
                         h.digest()
                     })
                 });
-                acc ^= d;
+                acc = fold.combine(acc, d);
             }
         }
     }
@@ -366,7 +419,7 @@ pub fn source_checksums<S: CellSource>(schema: &SchemaRef, src: &S) -> Vec<u64> 
                 macro_rules! le {
                     ($opt:expr) => {
                         if let Some(v) = $opt {
-                            acc ^= xxh3_64(&v.to_le_bytes());
+                            acc = acc.wrapping_add(xxh3_64(&v.to_le_bytes()));
                         }
                     };
                 }
@@ -382,17 +435,17 @@ pub fn source_checksums<S: CellSource>(schema: &SchemaRef, src: &S) -> Vec<u64> 
                     DataType::Timestamp(TimeUnit::Microsecond, _) => le!(src.ts_micros(col, row)),
                     DataType::Boolean => {
                         if let Some(b) = src.boolean(col, row) {
-                            acc ^= xxh3_64(&[b as u8]);
+                            acc = acc.wrapping_add(xxh3_64(&[b as u8]));
                         }
                     }
                     DataType::Utf8 => {
                         if let Some(b) = src.utf8(col, row) {
-                            acc ^= xxh3_64(b.as_ref());
+                            acc = acc.wrapping_add(xxh3_64(b.as_ref()));
                         }
                     }
                     DataType::Binary => {
                         if let Some(b) = src.binary(col, row) {
-                            acc ^= xxh3_64(b.as_ref());
+                            acc = acc.wrapping_add(xxh3_64(b.as_ref()));
                         }
                     }
                     DataType::Time64(TimeUnit::Microsecond) => {
@@ -400,17 +453,17 @@ pub fn source_checksums<S: CellSource>(schema: &SchemaRef, src: &S) -> Vec<u64> 
                     }
                     DataType::FixedSizeBinary(_) => {
                         if let Some(b) = src.fixed_binary(col, row) {
-                            acc ^= xxh3_64(b.as_ref());
+                            acc = acc.wrapping_add(xxh3_64(b.as_ref()));
                         }
                     }
                     DataType::Decimal256(_, scale) => {
                         if let Some(v) = src.decimal256(col, row, *scale) {
-                            acc ^= xxh3_64(&v.to_le_bytes());
+                            acc = acc.wrapping_add(xxh3_64(&v.to_le_bytes()));
                         }
                     }
                     DataType::List(f) => {
                         if let Some(elems) = src.list(col, row, f.data_type()) {
-                            acc ^= xxh3_64(&encode_list_cell(&elems));
+                            acc = acc.wrapping_add(xxh3_64(&encode_list_cell(&elems)));
                         }
                     }
                     _ => {}
@@ -456,6 +509,7 @@ pub fn validate_recorded_checksums(
     recorded: &[crate::manifest::ColumnChecksum],
     part_paths: &[std::path::PathBuf],
     key_col_name: Option<&str>,
+    fold: Fold,
 ) -> Result<Option<String>> {
     use std::collections::BTreeMap;
 
@@ -493,12 +547,24 @@ pub fn validate_recorded_checksums(
                 }
             };
             let key_col = key_col_name.and_then(|n| batch.schema().index_of(n).ok());
-            let sums = match key_col {
-                Some(k) => arrow_batch_checksums_keyed(&batch, k),
-                None => arrow_batch_checksums(&batch),
-            };
+            // Re-derive with the fold that WROTE these numbers, not today's.
+            // EVERY column is keyed when a key exists — including the key column
+            // itself, exactly as `arrow_batch_checksums_keyed` does on the write
+            // side. Excluding it (an exception I invented on the first cut) makes
+            // the key column's re-read disagree with what was recorded, which a
+            // 4-part keyset export reported as post-write corruption.
+            let key_arr = key_col.map(|k| batch.column(k).clone());
+            let sums: Vec<u64> = batch
+                .columns()
+                .iter()
+                .map(|c| column_xxh3_with(c.as_ref(), key_arr.as_deref(), fold))
+                .collect();
             for (i, f) in batch.schema().fields().iter().enumerate() {
-                *actual.entry(f.name().clone()).or_insert(0) ^= sums[i];
+                // Folded by the SAME rule that produced the recorded value —
+                // see `Fold`. Combining batches with a different operation than
+                // the writer used would report every multi-batch part as corrupt.
+                let e = actual.entry(f.name().clone()).or_insert(0);
+                *e = fold.combine(*e, sums[i]);
             }
         }
     }
@@ -578,7 +644,17 @@ pub fn validate_manifest_checksums(
     // Ok(Some) verified-wrong (exit 3), Err operational (exit 1). Everything
     // ABOVE this line (`?` on dest.read / tempfile) is likewise operational, so
     // propagating its result verbatim is correct.
-    validate_recorded_checksums(recorded, &paths, manifest.checksum_key_column.as_deref())
+    // The fold is chosen by what the manifest SAYS produced these numbers. An
+    // older run carries no marker, which is itself the v1 (XOR) signal — so a
+    // pre-v2 artifact stays verifiable with the algorithm that attested it,
+    // instead of every historical manifest reading as corrupt overnight.
+    let fold = Fold::from_render_id(manifest.checksum_render.as_deref());
+    validate_recorded_checksums(
+        recorded,
+        &paths,
+        manifest.checksum_key_column.as_deref(),
+        fold,
+    )
 }
 
 #[cfg(test)]
@@ -805,37 +881,53 @@ mod tests {
     }
 
     #[test]
-    fn column_fold_is_xor_of_per_cell_hashes() {
-        // Kills `^= -> |=` in column_xxh3: an OR fold saturates towards
-        // all-ones after a few rows and then ANY corruption produces the same
-        // "checksum" — false security. Pin the exact XOR fold and its
-        // order-independence.
+    fn column_fold_sums_per_cell_hashes_and_never_cancels() {
+        // v1 pinned an XOR fold here. XOR is commutative — which is the real
+        // requirement, since parts arrive from parallel runners in no order — but
+        // it is also ANNIHILATING: `h ^ h == 0`. A column of duplicated values
+        // therefore checksummed to ZERO whatever the values were, and
+        // `rivet validate --depth full` returned PASSED on a part whose bytes had
+        // been changed under it (measured end-to-end, with DuckDB as the
+        // independent reader). Wrapping addition keeps the commutativity and
+        // drops the annihilation.
         use xxhash_rust::xxh3::xxh3_64;
         let expect = xxh3_64(&10_i64.to_le_bytes())
-            ^ xxh3_64(&20_i64.to_le_bytes())
-            ^ xxh3_64(&30_i64.to_le_bytes());
+            .wrapping_add(xxh3_64(&20_i64.to_le_bytes()))
+            .wrapping_add(xxh3_64(&30_i64.to_le_bytes()));
         let arr = Int64Array::from(vec![10_i64, 20, 30]);
-        assert_eq!(column_xxh3(&arr, None), expect, "fold must be XOR");
+        assert_eq!(column_xxh3(&arr, None), expect, "fold must be wrapping sum");
         let shuffled = Int64Array::from(vec![30_i64, 10, 20]);
         assert_eq!(
             column_xxh3(&shuffled, None),
             expect,
-            "XOR fold is order-independent"
+            "the fold must stay order-independent — parts combine in no fixed order"
         );
-        let or_fold = xxh3_64(&10_i64.to_le_bytes())
-            | xxh3_64(&20_i64.to_le_bytes())
-            | xxh3_64(&30_i64.to_le_bytes());
+
+        // The property the old fold did not have, stated as its own assertion so
+        // a future "simplification" back to XOR cannot pass.
+        let dup = Int64Array::from(vec![7_i64, 7]);
+        let other = Int64Array::from(vec![9_i64, 9]);
+        let empty = Int64Array::from(Vec::<i64>::new());
         assert_ne!(
-            expect, or_fold,
-            "fixture sanity: XOR and OR must differ here"
+            column_xxh3(&dup, None),
+            column_xxh3(&empty, None),
+            "a column of duplicates must not collapse to the empty column's checksum"
+        );
+        assert_ne!(
+            column_xxh3(&dup, None),
+            column_xxh3(&other, None),
+            "two columns of duplicated but DIFFERENT values must not share a checksum \
+             — under XOR both were 0, which is exactly how a corrupted value hid"
         );
     }
 
     #[test]
-    fn validate_folds_multiple_parts_by_xor() {
-        // Kills `^= -> |=` in validate_recorded_checksums' cross-part fold: a
-        // one-part fixture folds once into 0 (`0^s == 0|s`) and cannot see the
-        // operator. Two parts with different rows expose it.
+    fn validate_folds_multiple_parts_by_summing_them() {
+        // Two parts, because a one-part fixture folds once from 0 and cannot see
+        // the operator at all (`0^s == 0+s == 0|s`) — the degenerate-fixture trap.
+        // The recorded value is built the way the WRITER builds it, by summing the
+        // per-part checksums; if validate folded differently the two parts would
+        // read as corrupt.
         let b1 = batch3(2);
         let b2 = batch3(7);
         let dir = tempfile::tempdir().unwrap();
@@ -851,14 +943,15 @@ mod tests {
             .zip(b1.schema().fields())
             .map(|((a, b), f)| crate::manifest::ColumnChecksum {
                 name: f.name().clone(),
-                checksum: (a ^ b).to_string(),
+                checksum: a.wrapping_add(*b).to_string(),
             })
             .collect();
-        let verdict = validate_recorded_checksums(&recorded, &[p1, p2], None)
+        let verdict = validate_recorded_checksums(&recorded, &[p1, p2], None, Fold::Sum)
             .expect("two matching parts must not raise an OPERATIONAL error");
         assert_eq!(
             verdict, None,
-            "two matching parts must validate clean (Ok(None)) — the cross-part fold is XOR"
+            "two matching parts must validate clean (Ok(None)) — the cross-part fold \
+             is the same wrapping sum the writer used"
         );
     }
 
@@ -1322,7 +1415,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("part.parquet");
         write_parquet(&batch, &p);
-        let verdict = validate_recorded_checksums(&recorded_of(&batch), &[p], None)
+        let verdict = validate_recorded_checksums(&recorded_of(&batch), &[p], None, Fold::Sum)
             .expect("matching parts must not raise an operational error");
         assert_eq!(
             verdict, None,
@@ -1341,7 +1434,7 @@ mod tests {
         // A COMPLETED re-read that DISAGREES is verified-wrong: Ok(Some(detail)),
         // NOT an operational Err. (#104 bughunt: the mismatch must reach the caller
         // as the exit-3 corruption channel, distinct from could-not-verify Errs.)
-        let verdict = validate_recorded_checksums(&recorded, &[p], None)
+        let verdict = validate_recorded_checksums(&recorded, &[p], None, Fold::Sum)
             .expect("a corrupted re-read is verified-wrong, not an operational error");
         let detail = verdict.expect("a corrupted re-read must fire a mismatch");
         assert!(
@@ -1361,7 +1454,7 @@ mod tests {
         write_parquet(&batch, &p);
         let mut recorded = recorded_of(&batch);
         recorded[0].checksum = "not-a-u64".into();
-        let res = validate_recorded_checksums(&recorded, &[p], None);
+        let res = validate_recorded_checksums(&recorded, &[p], None, Fold::Sum);
         assert!(
             res.is_err(),
             "a non-u64 recorded hash is operational (Err/exit 1), not a mismatch: {res:?}"
