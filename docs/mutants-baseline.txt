@@ -528,8 +528,6 @@ src/source/mssql/arrow_convert.rs:449:29: replace + with * in build_array
 src/source/mssql/arrow_convert.rs:449:29: replace + with - in build_array
 src/source/mssql/arrow_convert.rs:449:54: replace / with % in build_array
 src/source/mssql/arrow_convert.rs:449:54: replace / with * in build_array
-src/source/mssql/arrow_convert.rs:485:47: replace - with + in rescale_i128
-src/source/mssql/arrow_convert.rs:494:49: replace - with + in rescale_i128
 src/source/mssql/arrow_convert.rs:550:9: replace <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::num_rows -> usize with 0
 src/source/mssql/arrow_convert.rs:550:9: replace <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::num_rows -> usize with 1
 src/source/mssql/arrow_convert.rs:553:9: replace <impl crate::source::value_checksum::CellSource for MssqlCellSource<'_>>::boolean -> Option<bool> with None
@@ -961,25 +959,6 @@ src/source/mysql/arrow_convert.rs:581:5: replace parse_time_str_to_micros -> Opt
 src/source/mysql/arrow_convert.rs:581:5: replace parse_time_str_to_micros -> Option<i64> with Some(-1)
 src/source/mysql/arrow_convert.rs:581:5: replace parse_time_str_to_micros -> Option<i64> with Some(0)
 src/source/mysql/arrow_convert.rs:581:5: replace parse_time_str_to_micros -> Option<i64> with Some(1)
-src/source/mysql/arrow_convert.rs:587:32: replace + with * in parse_time_str_to_micros
-src/source/mysql/arrow_convert.rs:587:32: replace + with - in parse_time_str_to_micros
-src/source/mysql/arrow_convert.rs:590:34: replace - with + in parse_time_str_to_micros
-src/source/mysql/arrow_convert.rs:590:34: replace - with / in parse_time_str_to_micros
-src/source/mysql/arrow_convert.rs:591:27: replace * with + in parse_time_str_to_micros
-src/source/mysql/arrow_convert.rs:591:27: replace * with / in parse_time_str_to_micros
-src/source/mysql/arrow_convert.rs:599:20: replace * with + in parse_time_str_to_micros
-src/source/mysql/arrow_convert.rs:599:20: replace * with / in parse_time_str_to_micros
-src/source/mysql/arrow_convert.rs:599:28: replace + with * in parse_time_str_to_micros
-src/source/mysql/arrow_convert.rs:599:28: replace + with - in parse_time_str_to_micros
-src/source/mysql/arrow_convert.rs:599:32: replace * with + in parse_time_str_to_micros
-src/source/mysql/arrow_convert.rs:599:32: replace * with / in parse_time_str_to_micros
-src/source/mysql/arrow_convert.rs:599:37: replace + with * in parse_time_str_to_micros
-src/source/mysql/arrow_convert.rs:599:37: replace + with - in parse_time_str_to_micros
-src/source/mysql/arrow_convert.rs:599:42: replace * with + in parse_time_str_to_micros
-src/source/mysql/arrow_convert.rs:599:42: replace * with / in parse_time_str_to_micros
-src/source/mysql/arrow_convert.rs:599:54: replace + with * in parse_time_str_to_micros
-src/source/mysql/arrow_convert.rs:599:54: replace + with - in parse_time_str_to_micros
-src/source/mysql/arrow_convert.rs:600:19: delete - in parse_time_str_to_micros
 src/source/mysql/arrow_convert.rs:619:9: delete match arm DataType::Boolean in build_array
 src/source/mysql/arrow_convert.rs:623:21: delete match arm Some(Value::Int(v)) in build_array
 src/source/mysql/arrow_convert.rs:623:62: replace != with == in build_array

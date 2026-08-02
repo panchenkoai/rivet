@@ -1037,6 +1037,47 @@ fn mysql_decimal_to_decimal256(
 }
 
 #[cfg(test)]
+mod time_parse_tests {
+    use super::parse_time_str_to_micros;
+
+    /// `parse_time_str_to_micros` had NO direct test — every arithmetic operator
+    /// in it was reachable only through a full MySQL export, so the mutation
+    /// baseline carried EIGHTEEN uncaught operator mutants for this one
+    /// function. Each value below is chosen so no two operators agree: h=1
+    /// (1*3600 = 3600 vs 1+3600 = 3601), m=2 (2*60 = 120 vs 2+60 = 62), and a
+    /// fraction whose digit count differs from 6 so the `6 - us_digits` exponent
+    /// is observable at all.
+    #[test]
+    fn parse_time_str_to_micros_pins_every_arithmetic_step() {
+        // (1*3600 + 2*60 + 3) * 1e6 + 456789
+        assert_eq!(
+            parse_time_str_to_micros("01:02:03.456789"),
+            Some(3_723_456_789),
+            "hours, minutes, seconds and a full 6-digit fraction"
+        );
+        // A SHORT fraction: 1 digit means scale 10^(6-1), so ".5" is 500_000 µs.
+        // A `+` in that exponent would scale by 10^7 instead.
+        assert_eq!(
+            parse_time_str_to_micros("00:00:01.5"),
+            Some(1_500_000),
+            "a 1-digit fraction scales by 10^(6-1), not 10^(6+1)"
+        );
+        // No fraction: the `us_part` addend is 0, and the rest still holds.
+        assert_eq!(parse_time_str_to_micros("02:00:00"), Some(7_200_000_000));
+        // Negation applies to the WHOLE value, after the sum.
+        assert_eq!(
+            parse_time_str_to_micros("-01:02:03.456789"),
+            Some(-3_723_456_789)
+        );
+        // Over-long fractions truncate at 6 digits, never round or error.
+        assert_eq!(parse_time_str_to_micros("00:00:00.1234567"), Some(123_456));
+        // Malformed input is None — never a panic, never a silent zero.
+        assert_eq!(parse_time_str_to_micros("not a time"), None);
+        assert_eq!(parse_time_str_to_micros("01:02"), None);
+    }
+}
+
+#[cfg(test)]
 mod scale_int_overflow_tests {
     use super::{derive_decimal_ps, narrow, scale_int_to_i128};
 
