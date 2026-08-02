@@ -512,3 +512,43 @@ ANALYZE ext.ref_id_history;
 ANALYZE ext.order_keyed;
 ANALYZE ext.unindexed_id;
 ANALYZE ext.heap_no_key;
+
+-- ── array_matrix — the ARRAY types, which nothing else in this seed carries ──
+--
+-- Added 2026-08-02 after a measurement: stubbing `CellSource::list` to `None`
+-- passed the whole lib cycle AND the whole live suite, including every Form-B
+-- checksum test. The cause was upstream of the tests — this seed declared zero
+-- array columns, so no export ever carried a LIST cell through the value-
+-- checksum path, and an array column contributed NOTHING to the source-side
+-- checksum with nobody to notice.
+--
+-- One element type per column, covering exactly the set `list_elem_covered`
+-- claims to check (bool / i16 / i32 / i64 / f32 / f64 / text), plus the two
+-- shapes that break naive element handling: an empty array (not NULL) and an
+-- array holding NULL elements (inner nullability must survive).
+CREATE TABLE array_matrix (
+    id        BIGSERIAL PRIMARY KEY,
+    bools     BOOLEAN[],
+    i16s      SMALLINT[],
+    i32s      INTEGER[],
+    i64s      BIGINT[],
+    f32s      REAL[],
+    f64s      DOUBLE PRECISION[],
+    texts     TEXT[],
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+INSERT INTO array_matrix (bools, i16s, i32s, i64s, f32s, f64s, texts) VALUES
+    -- ordinary multi-element arrays; distinct values per position so an
+    -- element-order or element-index bug cannot hide behind equal elements
+    ('{true,false,true}', '{1,2,3}', '{10,20,30}', '{100,200,300}',
+     '{1.5,2.5,3.5}', '{1.25,2.25,3.25}', '{"a","bb","ccc"}'),
+    -- inner NULLs: the element accessors must keep them, not collapse to a value
+    ('{true,NULL}', '{1,NULL}', '{10,NULL}', '{100,NULL}',
+     '{1.5,NULL}', '{1.25,NULL}', '{"a",NULL}'),
+    -- EMPTY arrays are not NULL arrays; the canon must tell them apart
+    ('{}', '{}', '{}', '{}', '{}', '{}', '{}'),
+    -- NULL arrays
+    (NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+
+ANALYZE array_matrix;

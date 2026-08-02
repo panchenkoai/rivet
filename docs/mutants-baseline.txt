@@ -15,24 +15,20 @@
 # paths plus accepted cosmetics. NOTE: entries carry file:line, so refactors
 # shift them; the nightly triage re-anchors moved entries instead of treating
 # them as new misses.
-# ── MEASURED CORRECTION (2026-08-02) ────────────────────────────────────────
-# The `CellSource for PgCellSource::list` entries below are NOT live-guarded, and
-# this file used to imply they were. Verified by stubbing the whole function to
-# `None` and running BOTH cycles: `--lib` passes (expected) and so does the live
-# suite — the postgres subset (27 tests) AND every Form-B checksum test
-# (live_keyset, live_cdc_mbt, live_mongo, live_chunked_recovery, 6 tests).
+# ── CLOSED (2026-08-02) ─────────────────────────────────────────────────────
+# The `CellSource for PgCellSource::list` entries are GONE from this file, not
+# accepted: `seeds/common/postgres.sql` now carries `array_matrix` (one column
+# per element type `list_elem_covered` checks, with distinct per-position values,
+# inner NULLs, and an EMPTY array beside a NULL array), and
+# `live_keyset::array_columns_reach_the_value_checksum` exports it.
 #
-# The cause is upstream of the tests: `seeds/common/postgres.sql` declares ZERO
-# array columns, so no live export ever carries a LIST cell through the
-# value-checksum path. With `list` returning None the accumulator is simply not
-# updated (value_checksum.rs: `if let Some(elems) = src.list(..)`), so an array
-# column contributes NOTHING to the source-side checksum and nothing notices.
+# The gap was never in the tests — it was that no array column existed ANYWHERE
+# in the seed, so no export carried a LIST cell through the checksum path.
+# Arrays landed 2026-05-12 and reached neither this mechanism nor the row hash,
+# which is why `_rivet_row_hash` also shipped collapsing `['a, b']` with
+# `['a','b']`. One missing fixture, two blind integrity oracles.
 #
-# This is the "a new TYPE must be run through every value-consuming mechanism"
-# rule biting again: arrays landed 2026-05-12, the checksum path never got a
-# fixture. Closing these needs an array column in the golden seed (a shared
-# fixture, so a deliberate change), not a unit test — `postgres::Row` has no
-# constructor reachable from this crate.
+# RED-proven: stubbing the whole function to `None` fails the new test.
 # ────────────────────────────────────────────────────────────────────────────
 src/destination/cloud.rs:180:9: replace <impl super::Destination for CloudDestination<B>>::write -> Result<super::WriteOutcome> with Ok(Default::default())
 src/destination/cloud.rs:233:9: replace <impl super::Destination for CloudDestination<B>>::list_prefix -> Result<Vec<super::ObjectMeta>> with Ok(vec![])
@@ -1286,15 +1282,6 @@ src/source/postgres/arrow_convert.rs:554:13: delete match arm Ok(Some(PgUuidByte
 src/source/postgres/arrow_convert.rs:559:9: replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::decimal256 -> Option<arrow::datatypes::i256> with None
 src/source/postgres/arrow_convert.rs:559:9: replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::decimal256 -> Option<arrow::datatypes::i256> with Some(Default::default())
 src/source/postgres/arrow_convert.rs:561:13: delete match arm Ok(Some(t)) in <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::decimal256
-src/source/postgres/arrow_convert.rs:571:9: replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::list -> Option<Vec<crate::source::value_checksum::ListElem>> with None
-src/source/postgres/arrow_convert.rs:571:9: replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::list -> Option<Vec<crate::source::value_checksum::ListElem>> with Some(vec![])
-src/source/postgres/arrow_convert.rs:588:13: delete match arm DataType::Boolean in <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::list
-src/source/postgres/arrow_convert.rs:589:13: delete match arm DataType::Int16 in <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::list
-src/source/postgres/arrow_convert.rs:590:13: delete match arm DataType::Int32 in <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::list
-src/source/postgres/arrow_convert.rs:591:13: delete match arm DataType::Int64 in <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::list
-src/source/postgres/arrow_convert.rs:592:13: delete match arm DataType::Float32 in <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::list
-src/source/postgres/arrow_convert.rs:593:13: delete match arm DataType::Float64 in <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::list
-src/source/postgres/arrow_convert.rs:594:13: delete match arm DataType::Utf8 in <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::list
 src/source/postgres/arrow_convert.rs:639:25: replace == with != in build_array
 src/source/postgres/arrow_convert.rs:66:12: replace == with != in <impl PgFromSql<'a> for PgUuidBytes>::accepts
 src/source/postgres/arrow_convert.rs:66:9: replace <impl PgFromSql<'a> for PgUuidBytes>::accepts -> bool with false

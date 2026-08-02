@@ -1853,3 +1853,80 @@ fn read_uuid_set_fixed(dir: &std::path::Path, col: &str) -> (usize, BTreeSet<Str
     }
     (count, keys)
 }
+
+/// ARRAY columns must reach the value checksum — measured gap, not a hypothesis.
+///
+/// Stubbing `CellSource::list` to `None` passed the whole `--lib` cycle AND the
+/// whole live suite, including every existing Form-B test. The cause was
+/// upstream of all of them: `seeds/common/postgres.sql` declared no array column
+/// at all, so no export ever carried a LIST cell through the checksum path, and
+/// such a column contributed NOTHING to the source-side sum with nobody to
+/// notice.
+///
+/// The same missing fixture is why `_rivet_row_hash` shipped collapsing
+/// `['a, b']` with `['a','b']`, and `[NULL]` with `[""]` and `[]` (fixed
+/// 2026-08-01; its injectivity now has unit coverage of its own). Arrays landed
+/// 2026-05-12 and reached neither mechanism — one gap, two blind oracles.
+///
+/// The seed's `array_matrix` carries one column per element type
+/// `list_elem_covered` claims to check, with distinct per-position values so an
+/// ordering or index bug cannot hide behind equal elements, inner NULLs, and an
+/// EMPTY array beside a NULL array.
+#[test]
+#[ignore = "live: requires docker compose up -d postgres with the golden seed"]
+fn array_columns_reach_the_value_checksum() {
+    require_alive(LiveService::Postgres);
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let out_dir = tempfile::tempdir().unwrap();
+    let export = unique_name("array_matrix_exp");
+    let yaml = format!(
+        "source: {{type: postgres, url: \"{POSTGRES_URL}\"}}\nexports:\n  - name: {export}\n    \
+         table: array_matrix\n    mode: full\n    format: parquet\n    \
+         destination: {{type: local, path: {out}}}\n",
+        out = out_dir.path().display(),
+    );
+    let cfg = write_config(&cfg_dir, &yaml);
+    let r = run_rivet_export(&cfg, &export);
+    assert!(
+        r.status.success(),
+        "array_matrix export must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(out_dir.path().join("manifest.json")).expect("manifest.json"),
+    )
+    .expect("parse manifest");
+    let checksums = manifest["column_checksums"]
+        .as_array()
+        .expect("column_checksums must be recorded");
+    let named: Vec<&str> = checksums
+        .iter()
+        .filter_map(|c| c["name"].as_str())
+        .collect();
+    for col in ["bools", "i16s", "i32s", "i64s", "f32s", "f64s", "texts"] {
+        assert!(
+            named.contains(&col),
+            "array column `{col}` must be COVERED by the value checksum — a LIST cell \
+             that contributes nothing is a silently weakened integrity oracle; got {named:?}"
+        );
+    }
+
+    // And the two sides must agree on them: `validate` re-reads the parts and
+    // recomputes side B against the recorded side A.
+    let v = std::process::Command::new(RIVET_BIN)
+        .args([
+            "validate",
+            "--config",
+            cfg.to_str().unwrap(),
+            "--export",
+            &export,
+        ])
+        .output()
+        .expect("spawn rivet validate");
+    assert!(
+        v.status.success(),
+        "validate must re-verify the ARRAY columns' checksums; stderr:\n{}",
+        String::from_utf8_lossy(&v.stderr)
+    );
+}

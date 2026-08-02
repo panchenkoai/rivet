@@ -166,6 +166,10 @@
     }
   },
   "postgres": {
+    "array_matrix": {
+      "strategy": "full",
+      "verdict": "ACCEPTABLE"
+    },
     "bigint_pk_dual_ts": {
       "strategy": "keyset",
       "verdict": "ACCEPTABLE"
