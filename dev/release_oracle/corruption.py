@@ -350,3 +350,117 @@ def verify_cdc_corruption_is_detected(led: Ledger, engine: str, tag: str, url: s
         )
     finally:
         spec.cleanup(cdc_url, work)
+
+
+# ── reconcile × validate: the division of labour, pinned ─────────────────────
+# Measured, because the two commands are easy to mistake for one:
+#
+#   source rows deleted        -> reconcile exit 3 (names the partition + diff)
+#                                 validate  exit 0  (the destination is intact)
+#   destination part deleted   -> reconcile exit 0  ("all partitions match")
+#                                 validate  exit 3
+#
+# reconcile compares the SOURCE against the recorded per-partition counts;
+# validate compares the DESTINATION against the manifest. Neither alone verifies
+# "what I can read equals what the source held" — only the pair does, and nothing
+# makes an operator run both. So this cell asserts the DISJUNCTION: each fault
+# must be caught by at least one command, and it reports which. Framed that way an
+# improvement (reconcile learning to check the destination too) does not redden it,
+# while a regression — a fault neither notices — does.
+
+
+def verify_reconcile_and_validate_cover_both_sides(led: Ledger, engine: str, tag: str, url: str) -> None:
+    if engine != "postgres":
+        _skipped(
+            led, engine, tag, "reconcile_and_validate_cover_both_sides", "-",
+            f"reconcile-coverage: runs on postgres only — the property is command-level, not "
+            f"engine-level, and one engine's chunked export exercises it",
+            "one engine",
+        )
+        return
+
+    work = work_dir() / f"recon_{tag.replace('.', '_')}"
+    out = work / "out"
+    out.mkdir(parents=True, exist_ok=True)
+    table = "public.recon_probe"
+    cfg = work / "recon.yaml"
+    cfg.write_text(
+        f"source:\n  type: postgres\n  url_env: ORACLE_URL\n"
+        f"exports:\n"
+        f"  - name: recon_probe\n"
+        f"    table: {table}\n"
+        f"    mode: chunked\n"
+        f"    chunk_column: id\n"
+        f"    chunk_size: 250\n"
+        f"    chunk_checkpoint: true\n"
+        f"    format: parquet\n"
+        f"    destination: {{ type: local, path: {out} }}\n"
+    )
+    env = {"ORACLE_URL": url}
+
+    def psql(sql: str) -> bool:
+        from .core import run  # local import: only this cell shells to psql
+
+        return run(["psql", url, "-v", "ON_ERROR_STOP=1", "-c", sql], timeout=120).ok
+
+    if not psql(
+        "DROP TABLE IF EXISTS recon_probe; "
+        "CREATE TABLE recon_probe(id INT PRIMARY KEY, v TEXT); "
+        "INSERT INTO recon_probe SELECT g,'v'||g FROM generate_series(1,1000) g;"
+    ):
+        _skipped(led, engine, tag, "reconcile_and_validate_cover_both_sides", "-", "reconcile-coverage: psql absent", "no psql")
+        return
+
+    def rec() -> int:
+        return rivet("reconcile", "-c", str(cfg), "-e", "recon_probe", env=env, timeout=NO_TIMEOUT).returncode
+
+    def val() -> int:
+        return rivet("validate", "-c", str(cfg), "--depth", "full", env=env, timeout=NO_TIMEOUT).returncode
+
+    try:
+        if not rivet("run", "-c", str(cfg), env=env, timeout=NO_TIMEOUT).ok:
+            _failed(led, engine, tag, "reconcile_and_validate_cover_both_sides", "-", "reconcile-coverage: export failed", "export")
+            return
+        # A cell whose checks only ever go red discriminates nothing.
+        if rec() != 0 or val() != 0:
+            _failed(
+                led, engine, tag, "reconcile_and_validate_cover_both_sides", "-",
+                "reconcile-coverage: a CLEAN chunked export must satisfy both commands before "
+                "either negative means anything",
+                "clean red",
+            )
+            return
+
+        # Fault 1 — the SOURCE drifts under a completed export.
+        psql("DELETE FROM recon_probe WHERE id BETWEEN 100 AND 149;")
+        r1, v1 = rec(), val()
+        psql("INSERT INTO recon_probe SELECT g,'v'||g FROM generate_series(100,149) g;")
+
+        # Fault 2 — exported DATA disappears from the destination.
+        parts = sorted(out.rglob("*.parquet"))
+        if not parts:
+            _failed(led, engine, tag, "reconcile_and_validate_cover_both_sides", "-", "reconcile-coverage: no part", "no part")
+            return
+        parts[0].unlink()
+        r2, v2 = rec(), val()
+
+        missed = []
+        if r1 == 0 and v1 == 0:
+            missed.append("source drift went unnoticed by BOTH reconcile and validate")
+        if r2 == 0 and v2 == 0:
+            missed.append("a deleted destination part went unnoticed by BOTH reconcile and validate")
+        if missed:
+            _failed(
+                led, engine, tag, "reconcile_and_validate_cover_both_sides", "-",
+                "reconcile-coverage: " + "; ".join(missed),
+                "uncovered",
+            )
+            return
+        _passed(
+            led, engine, tag, "reconcile_and_validate_cover_both_sides", "-",
+            f"reconcile-coverage: source drift caught by "
+            f"{'reconcile' if r1 else 'validate'} (exit {r1 or v1}); destination loss caught by "
+            f"{'validate' if v2 else 'reconcile'} (exit {v2 or r2}) — both sides covered by the pair",
+        )
+    finally:
+        psql("DROP TABLE IF EXISTS recon_probe;")

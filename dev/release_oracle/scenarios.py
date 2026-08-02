@@ -818,6 +818,8 @@ def run_scenarios(led: Ledger, engine: str, tag: str, url: str) -> None:
     # The CDC sink has its OWN accumulator and manifests — proving the batch leg
     # detects corruption says nothing about this one.
     corruption.verify_cdc_corruption_is_detected(led, engine, tag, url)
+    # reconcile and validate check DIFFERENT sides; the pair is the claim.
+    corruption.verify_reconcile_and_validate_cover_both_sides(led, engine, tag, url)
     for store in cfg("stores").split():
         sc_load(led, engine, tag, url, store)
     if engine == "postgres":
