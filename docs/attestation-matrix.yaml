@@ -133,5 +133,7 @@ claims:
 
   - id: schema_fingerprint
     what: "the run's schema fingerprint, used for drift detection between runs."
-    verified_by: none
-    gap: "the drift gate compares this run's fingerprint to the previous run's — both produced by the same function, so a fingerprint that is blind to a given schema change is blind on both sides and reports `unchanged`. Nothing derives the schema independently (e.g. from the written Parquet's own schema) and compares."
+    verified_by: "gate cell `schema_fingerprint_moves_with_the_schema`: four real DDL changes (add / rename / retype / drop a column) must each move the fingerprint, and a control re-export of an untouched table must leave it put."
+    independence: independent
+    evidence: "the DDL is the other party — the change is applied to the database, not asserted in rivet's terms. RED-proven 2026-08-02 by declaring a rename insensitive: the cell reports the fingerprint moved when it was told to expect otherwise."
+    note: "an exact independent DIGEST is not available and pretending otherwise would be worse than admitting it: the fingerprint hashes `<name>\t<data_type>` where `data_type` is rivet's own rendering of the Arrow type, so a second implementation would reproduce that naming and be a copy rather than a witness. What is checked is the PROPERTY — sensitivity to a real change, and insensitivity to none — which is exactly what drift detection depends on and exactly what a same-function comparison cannot establish."

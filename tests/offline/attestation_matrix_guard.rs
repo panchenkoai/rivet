@@ -24,8 +24,9 @@ const MATRIX: &str = "docs/attestation-matrix.yaml";
 
 /// Claims with `verified_by: none`. LOWER when one gets a verifier; never raise
 /// without saying why in the row itself.
-/// History: 2 -> 1 (`part_rows` gained a footer-vs-manifest check, 2026-08-02).
-const UNVERIFIED_RATCHET: usize = 1;
+/// History: 2 -> 1 (`part_rows`, footer vs manifest) -> 0 (`schema_fingerprint`,
+/// sensitivity to real DDL). At zero, a NEW unverified claim is a deliberate act.
+const UNVERIFIED_RATCHET: usize = 0;
 
 fn claims() -> Vec<Value> {
     let s = fs::read_to_string(MATRIX).unwrap_or_else(|e| panic!("read {MATRIX}: {e}"));
@@ -126,10 +127,14 @@ fn unverified_claims_do_not_grow() {
             )
         })
         .count();
-    assert!(
-        n <= UNVERIFIED_RATCHET,
-        "{n} claims have no verifier, ratchet is {UNVERIFIED_RATCHET}. Publishing a number \
-         nobody checks is a deliberate act: give it a checker and LOWER the ratchet, or raise \
-         it in the same commit that explains why the claim must exist unchecked."
-    );
+    // Expressed as "over the ceiling", not `n <= RATCHET`: at a ratchet of zero
+    // the latter is trivially true for a `usize` and clippy rightly says so — the
+    // guard would have gone quiet at exactly the moment it started mattering.
+    if n > UNVERIFIED_RATCHET {
+        panic!(
+            "{n} claims have no verifier, ratchet is {UNVERIFIED_RATCHET}. Publishing a number \
+             nobody checks is a deliberate act: give it a checker and LOWER the ratchet, or \
+             raise it in the same commit that explains why the claim must exist unchecked."
+        );
+    }
 }

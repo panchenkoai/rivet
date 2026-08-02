@@ -820,6 +820,10 @@ def run_scenarios(led: Ledger, engine: str, tag: str, url: str) -> None:
     corruption.verify_cdc_corruption_is_detected(led, engine, tag, url)
     # reconcile and validate check DIFFERENT sides; the pair is the claim.
     corruption.verify_reconcile_and_validate_cover_both_sides(led, engine, tag, url)
+    # Is the schema fingerprint sensitive to a real schema change at all?
+    from . import schema_drift
+
+    schema_drift.verify_schema_fingerprint_moves_with_the_schema(led, engine, tag, url)
     for store in cfg("stores").split():
         sc_load(led, engine, tag, url, store)
     if engine == "postgres":
