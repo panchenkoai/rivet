@@ -815,6 +815,9 @@ def run_scenarios(led: Ledger, engine: str, tag: str, url: str) -> None:
     rowhash.verify_row_hash(led, engine, tag, url)
     # The NEGATIVE half: does verification fail when the data is wrong?
     corruption.verify_corruption_is_detected(led, engine, tag, url)
+    # The CDC sink has its OWN accumulator and manifests — proving the batch leg
+    # detects corruption says nothing about this one.
+    corruption.verify_cdc_corruption_is_detected(led, engine, tag, url)
     for store in cfg("stores").split():
         sc_load(led, engine, tag, url, store)
     if engine == "postgres":

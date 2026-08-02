@@ -198,3 +198,155 @@ def verify_corruption_is_detected(led: Ledger, engine: str, tag: str, url: str) 
         f"corruption-detected[{engine}]: clean export verifies; a same-length in-place byte flip is "
         f"caught as a value-checksum mismatch on column 'b' (exit {EXIT_DATA_INTEGRITY})",
     )
+
+
+# ── CDC ──────────────────────────────────────────────────────────────────────
+# The CDC sink keeps its OWN per-column accumulator and writes its own manifests,
+# so proving the batch path detects corruption says nothing about this one. The
+# same fold defect lived here (`column_sums` combined with XOR) and the same
+# render marker had to be stamped — it was briefly left `None`, which would have
+# made every CDC prefix read as corrupt.
+#
+# Capture goes to a LOCAL destination rather than the object store the e2e cell
+# uses: the corruption must be a byte flip IN PLACE, and a download / edit /
+# re-upload round trip through a store client rewrites the object.
+
+
+def verify_cdc_corruption_is_detected(led: Ledger, engine: str, tag: str, url: str) -> None:
+    """Positive and negative for a CDC prefix: clean capture verifies, a flipped
+    byte in a captured part does not."""
+    try:
+        from . import cdc as cdc_mod
+    except ImportError:  # pragma: no cover
+        import cdc as cdc_mod  # type: ignore
+
+    spec = cdc_mod._ENGINES.get(engine)
+    uvar = f"RIVET_CDC_{engine.upper()}_URL"
+    cdc_url = os.environ.get(uvar, "")
+    if spec is None or not cdc_url:
+        _skipped(
+            led, engine, tag, "cdc_corruption_is_detected", "-",
+            f"cdc-corruption[{engine}]: no {uvar} (the CDC stand is opt-in, like the e2e cell)",
+            "no url",
+        )
+        return
+
+    work = work_dir() / f"cdccorrupt_{engine}_{tag.replace('.', '_')}"
+    work.mkdir(parents=True, exist_ok=True)
+    cdc_block = spec.setup(cdc_url, work)
+    if cdc_block is None:
+        _failed(led, engine, tag, "cdc_corruption_is_detected", "-", f"cdc-corruption[{engine}]: source setup failed", "setup")
+        return
+
+    out = work / "out"
+    tls = "\n  tls: { accept_invalid_certs: true }" if engine == "mssql" else ""
+    cfg = work / "cdc_local.yaml"
+    cfg.write_text(
+        "source:\n"
+        f"  type: {engine}\n"
+        f'  url: "{cdc_url}"{tls}\n'
+        "exports:\n"
+        "  - name: orc_cdc_probe\n"
+        "    table: orc_cdc_probe\n"
+        "    mode: cdc\n"
+        "    format: parquet\n"
+        f"    {cdc_block}\n"
+        "    destination:\n"
+        f"      type: local\n"
+        f"      path: {out}\n"
+    )
+    try:
+        # anchor, then real changes, then capture them
+        rivet("run", "-c", str(cfg), timeout=NO_TIMEOUT)
+        spec.changes(cdc_url)
+        rivet("run", "-c", str(cfg), timeout=NO_TIMEOUT)
+
+        parts = sorted(out.rglob("*.parquet"))
+        if not parts:
+            _failed(
+                led, engine, tag, "cdc_corruption_is_detected", "-",
+                f"cdc-corruption[{engine}]: the capture wrote no part — nothing to corrupt, so a "
+                f"green here would mean nothing",
+                "no part",
+            )
+            return
+
+        clean = rivet("validate", "-c", str(cfg), "--depth", "full", timeout=NO_TIMEOUT)
+        if not clean.ok:
+            _failed(
+                led, engine, tag, "cdc_corruption_is_detected", "-",
+                f"cdc-corruption[{engine}]: validate FAILED on an untouched CDC prefix — the "
+                f"negative half cannot mean anything until the positive one holds: {clean.out[-200:]}",
+                "clean red",
+            )
+            return
+
+        manifests = sorted(out.rglob("manifest.json"))
+        render = None
+        for m in manifests:
+            try:
+                render = json.loads(m.read_text()).get("checksum_render")
+            except (OSError, json.JSONDecodeError):
+                render = None
+            if render:
+                break
+        if not render:
+            _failed(
+                led, engine, tag, "cdc_corruption_is_detected", "-",
+                f"cdc-corruption[{engine}]: no `checksum_render` in any CDC manifest — a reader "
+                f"falls back to the annihilating v1 fold and the prefix reads as corrupt",
+                "no render id",
+            )
+            return
+
+        target = parts[0]
+        body = bytearray(target.read_bytes())
+        size_before = len(body)
+        # Target a SOURCE column, not a rivet-added one. The value checksum covers
+        # the source's own columns and deliberately omits the CDC meta columns
+        # (`op`, the lsn/position blob), so flipping a byte in `op` changes the
+        # data and is CORRECTLY not reported — the first cut did exactly that and
+        # read as "the CDC leg is not verifying" when the leg was fine. The probe's
+        # `meta` column carries the json `{"k": N}`; its key byte is a source value.
+        anchor = body.find(b'"k"')
+        if anchor < 0:
+            _skipped(
+                led, engine, tag, "cdc_corruption_is_detected", "-",
+                f"cdc-corruption[{engine}]: the captured part carries no recognisable SOURCE value "
+                f"to corrupt (the probe's json shape changed) — flipping a rivet meta column would "
+                f"prove nothing, so SKIP rather than pass",
+                "no source value",
+            )
+            return
+        idx = anchor + 1
+        body[idx] = ord("j")
+        target.write_bytes(bytes(body))
+        if target.stat().st_size != size_before:
+            _failed(led, engine, tag, "cdc_corruption_is_detected", "-",
+                    f"cdc-corruption[{engine}]: the flip changed the file length", "size changed")
+            return
+
+        bad = rivet("validate", "-c", str(cfg), "--depth", "full", timeout=NO_TIMEOUT)
+        text = (bad.out or "") + (getattr(bad, "err", "") or "")
+        if bad.ok:
+            _failed(
+                led, engine, tag, "cdc_corruption_is_detected", "-",
+                f"cdc-corruption[{engine}]: validate PASSED on a CDC part whose bytes were changed "
+                f"in place at offset {idx} — the CDC leg of verification is not verifying",
+                "undetected",
+            )
+            return
+        if "value checksum mismatch" not in text:
+            _failed(
+                led, engine, tag, "cdc_corruption_is_detected", "-",
+                f"cdc-corruption[{engine}]: failed, but not as a value-checksum mismatch: {text[-200:]}",
+                "wrong reason",
+            )
+            return
+        _passed(
+            led, engine, tag, "cdc_corruption_is_detected", "-",
+            f"cdc-corruption[{engine}]: clean capture verifies; a same-length byte flip in a "
+            f"captured part is caught as a value-checksum mismatch",
+        )
+    finally:
+        spec.cleanup(cdc_url, work)
