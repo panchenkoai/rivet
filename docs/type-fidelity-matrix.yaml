@@ -56,6 +56,13 @@ scenarios:
     mssql:    { test: duckdb_validates_mssql_type_matrix_parquet, oracle: independent }
     mongo:    { na: "binary rides the verbatim document blob" }
 
+  - id: type_array
+    what: "ARRAY / LIST — an Arrow List column, element-by-element. This row did not exist until 2026-08-02, which is why arrays reached NEITHER value-integrity mechanism: `_rivet_row_hash` canonicalised containers from Arrow's DISPLAY TEXT (so `['a, b']` == `['a','b']`, and `[NULL]` == `['']` == `[]`) and the value checksum skipped LIST cells entirely — stubbing `CellSource::list` to `None` passed the whole lib cycle AND the whole live suite. One absent row, two blind oracles. PostgreSQL is the ONLY engine that produces an Arrow List, so one `test` cell and three structural `na`s is full coverage here, not a thin row. The covered element types are narrower than the builder suggests: `build_pg_text_array` has arms for JSON/NUMERIC/UUID/INTERVAL arrays, but the pipeline refuses all four upstream (`_numeric` has no mapping; jsonb[] and interval[] fail to decode as a one-dimensional List; uuid[] is refused as 'temporal/uuid/bytea array elements are not yet supported'), leaving bool/i16/i32/i64/f32/f64/text — exactly what the seed's `array_matrix` carries."
+    postgres: { test: array_columns_reach_the_value_checksum, oracle: independent }
+    mysql:    { na: "MySQL has no array type — the closest is JSON, covered by type_json. Nothing here can build an Arrow List." }
+    mssql:    { na: "SQL Server has no array type either; the same JSON note applies." }
+    mongo:    { na: "a Mongo document exports as exactly two columns (`_id` + one extended-JSON blob), so an in-document array never becomes an Arrow List column — the same fixed-shape reason the drift gate is `na` for this engine." }
+
   - id: type_boolean
     what: "boolean — incl NULL; MySQL BIT(1)/TINYINT(1) → Boolean, BIT(8) → Int"
     postgres: { test: duckdb_pg_matrix_per_column_null_profile_matches_source, oracle: independent }
