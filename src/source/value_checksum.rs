@@ -601,6 +601,60 @@ pub fn validate_recorded_checksums(
     Ok(None)
 }
 
+/// What a destination-side re-read found wrong, typed so the caller classifies it
+/// without sniffing the message. Both are verified-wrong (exit 3); they differ in
+/// WHERE the operator should look — the data, or the manifest describing it.
+#[derive(Debug)]
+pub enum ReadbackFault {
+    /// A per-column value digest disagreed: the bytes are not what was written.
+    ValueChecksum(String),
+    /// A part's declared row count disagreed: the bytes may be fine and the
+    /// manifest is wrong.
+    PartRowCount(String),
+}
+
+/// Each part's DECLARED row count against the rows the file actually holds.
+///
+/// `Ok(None)` — every part agrees (or the manifest declares none). `Ok(Some)` —
+/// a genuine disagreement, which is verified-wrong, not an operational failure.
+/// `Err` — the Parquet footer could not be read at all.
+fn part_row_count_mismatch(
+    manifest: &crate::manifest::RunManifest,
+    paths: &[std::path::PathBuf],
+) -> Result<Option<String>> {
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+
+    for (part, path) in manifest.parts.iter().zip(paths) {
+        let file = std::fs::File::open(path)
+            .map_err(|e| anyhow::anyhow!("part row count: open {}: {e}", part.path))?;
+        // Footer only — `num_rows` lives in the file metadata, so this does not
+        // decode a single value.
+        let actual = match SerializedFileReader::new(file) {
+            Ok(r) => r.metadata().file_metadata().num_rows(),
+            // A part that will not open is NOT this check's business. Saying
+            // "declared N rows, holds ?" about an unreadable file tells the
+            // operator nothing they can act on, and classifying it here would
+            // widen what `--depth full` fails on for every run that records no
+            // checksums — which is how this landed on two fixtures whose subject
+            // was surplus labelling and which write a placeholder body. Form B
+            // classifies an undecodable part where checksums exist; this check
+            // stays narrow: a MIS-DECLARED count on a readable part.
+            Err(_) => continue,
+        };
+        let declared = part.rows;
+        if actual != declared {
+            return Ok(Some(format!(
+                "part '{}' declares {declared} rows but holds {actual} — the manifest \
+                 disagrees with the data it describes (every consumer that SUMS these \
+                 numbers, the loader's expected_delta and reconcile's exported side, \
+                 inherits the error)",
+                part.path
+            )));
+        }
+    }
+    Ok(None)
+}
+
 /// Form B at the destination: read the manifest + every part via `dest`,
 /// materialise each part to a temp file (a part may be remote), and verify the
 /// re-read per-column checksums against the manifest's `column_checksums`. A
@@ -617,16 +671,13 @@ pub fn validate_recorded_checksums(
 pub fn validate_manifest_checksums(
     dest: &dyn crate::destination::Destination,
     prefix: &str,
-) -> Result<Option<String>> {
+) -> Result<Option<ReadbackFault>> {
     use std::io::Write;
 
     use crate::manifest::{MANIFEST_FILENAME, RunManifest, join_key};
 
     let manifest_key = join_key(prefix, MANIFEST_FILENAME);
     let manifest: RunManifest = serde_json::from_slice(&dest.read(&manifest_key)?)?;
-    let Some(recorded) = manifest.column_checksums.as_deref() else {
-        return Ok(None);
-    };
 
     // Materialise each part to a temp file so the Parquet reader can seek (the
     // dest may be a cloud backend); keep the temp files alive for the re-read.
@@ -640,6 +691,27 @@ pub fn validate_manifest_checksums(
     }
     let paths: Vec<std::path::PathBuf> = tmps.iter().map(|t| t.path().to_path_buf()).collect();
 
+    // PER-PART ROW COUNTS, before anything about checksums.
+    //
+    // Nothing else compares a part's DECLARED `rows` to the rows the part holds.
+    // `RunManifest::validate_self_consistency` checks the run total against the
+    // SUM of the declared numbers — manifest against manifest — so a writer that
+    // mis-counts one part and compensates in another is self-consistent and
+    // wrong, while the loader's `expected_delta` and reconcile's exported side
+    // both sum exactly those numbers. Read from the Parquet FOOTER, so this costs
+    // a metadata parse, not a decode, on bodies Full depth has already fetched.
+    //
+    // Deliberately ABOVE the `column_checksums` early return: a run that recorded
+    // no checksums (older artifact, non-Parquet leg) still has parts whose counts
+    // can be checked, and the previous shape skipped everything for it.
+    if let Some(detail) = part_row_count_mismatch(&manifest, &paths)? {
+        return Ok(Some(ReadbackFault::PartRowCount(detail)));
+    }
+
+    let Some(recorded) = manifest.column_checksums.as_deref() else {
+        return Ok(None);
+    };
+
     // `validate_recorded_checksums` now classifies for us: Ok(None) clean,
     // Ok(Some) verified-wrong (exit 3), Err operational (exit 1). Everything
     // ABOVE this line (`?` on dest.read / tempfile) is likewise operational, so
@@ -649,12 +721,13 @@ pub fn validate_manifest_checksums(
     // pre-v2 artifact stays verifiable with the algorithm that attested it,
     // instead of every historical manifest reading as corrupt overnight.
     let fold = Fold::from_render_id(manifest.checksum_render.as_deref());
-    validate_recorded_checksums(
+    Ok(validate_recorded_checksums(
         recorded,
         &paths,
         manifest.checksum_key_column.as_deref(),
         fold,
-    )
+    )?
+    .map(ReadbackFault::ValueChecksum))
 }
 
 #[cfg(test)]

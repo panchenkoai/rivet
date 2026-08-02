@@ -77,8 +77,9 @@ claims:
 
   - id: part_rows
     what: "each part's declared row count."
-    verified_by: none
-    gap: "nothing compares a part's declared `rows` to the rows the part actually contains. `validate_self_consistency` checks that the run's `row_count` equals the SUM of the parts' declared rows — manifest against manifest, so a writer that mis-counts one part and compensates in another is self-consistent and wrong. Every downstream consumer (the loader's expected_delta, reconcile's exported side) sums these numbers."
+    verified_by: "`rivet validate --depth full` reads each part's Parquet FOOTER and compares `num_rows` to the manifest's declared `rows`, in the same pass that already fetched the body for Form B — a metadata parse, not a decode."
+    independence: independent
+    evidence: "the PARQUET FILE's own footer is the other party, written by the parquet encoder rather than by rivet's bookkeeping. Reported under its own code `RIVET_VERIFY_PART_ROW_COUNT`, not folded into the value-checksum verdict: the bytes may be perfectly intact and it is the manifest that is wrong, so an operator told `value checksum` would hunt corruption that is not there. Verified 2026-08-02 by skewing one part's declared count and recomputing the run total so the manifest stayed SELF-consistent — the exact shape `validate_self_consistency` cannot see."
 
   - id: run_row_count
     what: "the run's total row count."

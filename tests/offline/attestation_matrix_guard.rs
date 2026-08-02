@@ -24,7 +24,8 @@ const MATRIX: &str = "docs/attestation-matrix.yaml";
 
 /// Claims with `verified_by: none`. LOWER when one gets a verifier; never raise
 /// without saying why in the row itself.
-const UNVERIFIED_RATCHET: usize = 2;
+/// History: 2 -> 1 (`part_rows` gained a footer-vs-manifest check, 2026-08-02).
+const UNVERIFIED_RATCHET: usize = 1;
 
 fn claims() -> Vec<Value> {
     let s = fs::read_to_string(MATRIX).unwrap_or_else(|e| panic!("read {MATRIX}: {e}"));

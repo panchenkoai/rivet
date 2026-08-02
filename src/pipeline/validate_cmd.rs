@@ -471,14 +471,23 @@ fn verify_one_prefix(
                     // headline reads FAILED and the exit gate classifies it as
                     // data-integrity (exit 3), not generic (#104). The verdict is
                     // the just-pushed `all_results` entry (nothing pushes between).
-                    Ok(Some(detail)) => {
+                    // Both are verified-wrong (exit 3) and they differ in WHERE the
+                    // operator should look: the data, or the manifest describing it.
+                    // Telling someone "value checksum" about a mis-declared row count
+                    // sends them hunting corruption in bytes that are fine.
+                    Ok(Some(fault)) => {
+                        use crate::pipeline::validate_manifest::Failure;
+                        use crate::source::value_checksum::ReadbackFault;
                         if let Some(ev) = all_results.last_mut() {
                             ev.verification.passed = false;
-                            ev.verification.failures.push(
-                                crate::pipeline::validate_manifest::Failure::ValueChecksumMismatch {
-                                    detail: format!("export '{}': {}", display_name, detail),
+                            ev.verification.failures.push(match fault {
+                                ReadbackFault::ValueChecksum(d) => Failure::ValueChecksumMismatch {
+                                    detail: format!("export '{}': {}", display_name, d),
                                 },
-                            );
+                                ReadbackFault::PartRowCount(d) => Failure::PartRowCountMismatch {
+                                    detail: format!("export '{}': {}", display_name, d),
+                                },
+                            });
                         }
                     }
                     // An OPERATIONAL failure (could not read the manifest / a part)
