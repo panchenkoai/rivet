@@ -1251,6 +1251,8 @@ mod int64_bytes_dispatch_tests {
 // Asserts CORRECT behavior; expected to FAIL until the fix lands.
 #[cfg(test)]
 mod roast_mysql_bit_decode_tests {
+    use super::{RivetTimeUnit, RivetType};
+    use super::{mysql_native_type_name, mysql_type_to_rivet};
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::sync::Arc;
@@ -1333,22 +1335,39 @@ mod roast_mysql_bit_decode_tests {
     }
 
     /// ColumnDefinition41 for a `BIT(16)` column named `b`.
-    fn bit16_column_definition() -> Vec<u8> {
+    /// One `ColumnDefinition41` packet body, the wire shape the server sends to
+    /// describe a result-set column. Every field the two mapping functions read
+    /// — `character_set`, `column_length`, `column_type`, `flags`, `decimals` —
+    /// is a parameter, so a test can hand the real driver any column MySQL can
+    /// describe without needing a MySQL.
+    fn column_definition(
+        name: &str,
+        character_set: u16,
+        column_length: u32,
+        column_type: u8,
+        flags: u16,
+        decimals: u8,
+    ) -> Vec<u8> {
         let mut p = Vec::new();
         lenc_bytes(&mut p, b"def"); // catalog (fixed value)
         lenc_bytes(&mut p, b""); // schema
         lenc_bytes(&mut p, b"t"); // table
         lenc_bytes(&mut p, b"t"); // org_table
-        lenc_bytes(&mut p, b"b"); // name
-        lenc_bytes(&mut p, b"b"); // org_name
+        lenc_bytes(&mut p, name.as_bytes()); // name
+        lenc_bytes(&mut p, name.as_bytes()); // org_name
         p.push(0x0c); // length of fixed-length fields
-        p.extend_from_slice(&63u16.to_le_bytes()); // character set: binary
-        p.extend_from_slice(&16u32.to_le_bytes()); // column_length: BIT(16)
-        p.push(0x10); // column type: MYSQL_TYPE_BIT
-        p.extend_from_slice(&0x0020u16.to_le_bytes()); // flags: UNSIGNED
-        p.push(0); // decimals
+        p.extend_from_slice(&character_set.to_le_bytes());
+        p.extend_from_slice(&column_length.to_le_bytes());
+        p.push(column_type);
+        p.extend_from_slice(&flags.to_le_bytes());
+        p.push(decimals);
         p.extend_from_slice(&[0, 0]); // filler
         p
+    }
+
+    fn bit16_column_definition() -> Vec<u8> {
+        // charset 63 = binary, BIT(16), MYSQL_TYPE_BIT (0x10), UNSIGNED.
+        column_definition("b", 63, 16, 0x10, 0x0020, 0)
     }
 
     /// Serve exactly one connection: handshake, auth OK, then answer the first
@@ -1376,6 +1395,225 @@ mod roast_mysql_bit_decode_tests {
         // Swallow the COM_QUIT the client sends on drop; errors are fine.
         let mut buf = [0u8; 64];
         let _ = s.read(&mut buf);
+    }
+
+    /// Serve one connection whose single result set has `defs.len()` columns and
+    /// exactly one all-NULL row. The row exists only so the client hands back a
+    /// `mysql::Row` carrying the column metadata — the metadata IS the subject.
+    fn serve_one_metadata_query(listener: TcpListener, defs: Vec<Vec<u8>>) {
+        let (mut s, _) = listener.accept().expect("fake MySQL server: accept");
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        s.set_write_timeout(Some(Duration::from_secs(10))).unwrap();
+
+        write_packet(&mut s, 0, &handshake_greeting());
+        let _handshake_response = read_packet(&mut s);
+        write_packet(&mut s, 2, &[0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00]);
+
+        let _com_query = read_packet(&mut s);
+        let n = u8::try_from(defs.len()).expect("fixture stays under the 251-column lenc boundary");
+        let mut seq = 1u8;
+        write_packet(&mut s, seq, &[n]); // column count
+        for def in &defs {
+            seq += 1;
+            write_packet(&mut s, seq, def);
+        }
+        seq += 1;
+        write_packet(&mut s, seq, &[0xfe, 0x00, 0x00, 0x02, 0x00]); // EOF after metadata
+        seq += 1;
+        write_packet(&mut s, seq, &vec![0xfb; defs.len()]); // one row, every cell NULL
+        seq += 1;
+        write_packet(&mut s, seq, &[0xfe, 0x00, 0x00, 0x02, 0x00]); // EOF after rows
+
+        let mut buf = [0u8; 64];
+        let _ = s.read(&mut buf);
+    }
+
+    /// Drive a set of column definitions through a real `mysql::Conn` and return
+    /// the `(native_type_name, rivet_type)` pair rivet derives for each.
+    fn map_columns(defs: Vec<Vec<u8>>) -> Vec<(String, RivetType)> {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake MySQL server");
+        let port = listener.local_addr().expect("local_addr").port();
+        let server = std::thread::spawn(move || serve_one_metadata_query(listener, defs));
+
+        let opts = OptsBuilder::new()
+            .ip_or_hostname(Some("127.0.0.1"))
+            .tcp_port(port)
+            .user(Some("root"))
+            .pass(Some(""))
+            .prefer_socket(false)
+            .max_allowed_packet(Some(16 * 1024 * 1024))
+            .tcp_connect_timeout(Some(Duration::from_secs(10)))
+            .read_timeout(Some(Duration::from_secs(10)))
+            .write_timeout(Some(Duration::from_secs(10)));
+        let mut conn = Conn::new(opts).expect("connect to fake MySQL server");
+
+        let mapped = {
+            let mut result = conn.query_iter("SELECT * FROM t").expect("COM_QUERY");
+            let row_set = result.iter().expect("one result set");
+            let rows: Vec<mysql::Row> = row_set.map(|r| r.expect("row decodes")).collect();
+            assert_eq!(rows.len(), 1, "fake server sent exactly one row");
+            rows[0]
+                .columns()
+                .iter()
+                .map(|c| (mysql_native_type_name(c), mysql_type_to_rivet(c)))
+                .collect()
+        };
+        drop(conn);
+        server.join().expect("fake MySQL server thread");
+        mapped
+    }
+
+    /// The MySQL wire type map, asserted end-to-end against a REAL driver parse.
+    ///
+    /// Both `mysql_native_type_name` and `mysql_type_to_rivet` read a
+    /// `mysql::Column` — a driver type with no public constructor — so for a long
+    /// time neither had a unit test at all, and the whole map was covered only
+    /// indirectly by live MySQL runs. That left the branch structure unguarded:
+    /// stubbing either function's arms survived the entire offline suite.
+    ///
+    /// The oracle is INDEPENDENT of the code under test on both sides. The input
+    /// is a wire packet built from the MySQL protocol spec (type bytes 0..=19 and
+    /// 245..=254, `UNSIGNED_FLAG`=32, `ENUM_FLAG`=256, `SET_FLAG`=2048, charset
+    /// 63 = binary) and parsed by the driver, not by rivet; the expected side is
+    /// a hand-written literal per row. Nothing here recomputes an expectation
+    /// with the mapping logic it is grading.
+    ///
+    /// Every row is a distinction rivet MAKES — a pair that shares a wire type
+    /// and diverges on one metadata field is the point (signed vs unsigned,
+    /// display width 1 vs not, charset 63 vs not, ENUM_FLAG vs SET_FLAG), because
+    /// a fixture with only one side of each pair cannot see the guard collapse.
+    #[test]
+    fn the_mysql_wire_type_map_is_exhaustive_and_stable() {
+        const UNSIGNED: u16 = 32;
+        const ENUM_F: u16 = 256;
+        const SET_F: u16 = 2048;
+        const BIN: u16 = 63; // charset 63 = binary
+        const UTF8: u16 = 33;
+        let us = RivetTimeUnit::Microsecond;
+
+        // (label, charset, column_length, type byte, flags, decimals, native, rivet)
+        // Hand-aligned on purpose: this is a TABLE, and one row per line is what
+        // makes a missing or duplicated wire type visible at a glance. rustfmt
+        // explodes an 8-tuple into nine lines apiece and the table stops reading
+        // as one.
+        // The wire type is written as the DRIVER'S OWN CONSTANT, never a bare
+        // byte. Two reasons, and the second is load-bearing: `247` tells a reader
+        // nothing, and `the_fixture_exercises_every_wire_type_the_mapper_branches_on`
+        // compares the `MYSQL_TYPE_*` tokens in this table against the ones the two
+        // functions match on. That guard is only possible because the names appear
+        // here literally — a table of bare bytes cannot be checked against the code.
+        use mysql::consts::ColumnType::*;
+        type WireCase = (&'static str, u16, u32, u8, u16, u8, &'static str, RivetType);
+        #[rustfmt::skip]
+        let cases: Vec<WireCase> = vec![
+            // ── integers: the signed/unsigned widening ladder ──
+            ("tiny1",   UTF8, 1,  MYSQL_TYPE_TINY as u8, 0, 0, "tinyint(1)", RivetType::Bool),
+            ("tiny",    UTF8, 4,  MYSQL_TYPE_TINY as u8, 0, 0, "tinyint", RivetType::Int16),
+            // TINYINT UNSIGNED still fits i16 — the name carries the sign, the type need not.
+            ("tinyu",   UTF8, 3,  MYSQL_TYPE_TINY as u8, UNSIGNED, 0, "tinyint unsigned", RivetType::Int16),
+            ("short",   UTF8, 6,  MYSQL_TYPE_SHORT as u8, 0, 0, "smallint", RivetType::Int16),
+            ("shortu",  UTF8, 5,  MYSQL_TYPE_SHORT as u8, UNSIGNED, 0, "smallint unsigned", RivetType::Int32),
+            ("int24",   UTF8, 9,  MYSQL_TYPE_INT24 as u8, 0, 0, "int", RivetType::Int32),
+            ("int24u",  UTF8, 8,  MYSQL_TYPE_INT24 as u8, UNSIGNED, 0, "int unsigned", RivetType::Int64),
+            ("long",    UTF8, 11, MYSQL_TYPE_LONG as u8, 0, 0, "int", RivetType::Int32),
+            ("longu",   UTF8, 10, MYSQL_TYPE_LONG as u8, UNSIGNED, 0, "int unsigned", RivetType::Int64),
+            ("big",     UTF8, 20, MYSQL_TYPE_LONGLONG as u8, 0, 0, "bigint", RivetType::Int64),
+            // BIGINT UNSIGNED is the one integer that does NOT fit a signed Arrow type.
+            ("bigu",    UTF8, 20, MYSQL_TYPE_LONGLONG as u8, UNSIGNED, 0, "bigint unsigned", RivetType::UInt64),
+            ("year",    UTF8, 4,  MYSQL_TYPE_YEAR as u8, 0, 0, "year", RivetType::Int16),
+            // ── floats ──
+            ("f32",     UTF8, 12, MYSQL_TYPE_FLOAT as u8, 0, 31, "float", RivetType::Float32),
+            ("f64",     UTF8, 22, MYSQL_TYPE_DOUBLE as u8, 0, 31, "double", RivetType::Float64),
+            // ── decimal: precision is DERIVED, so vary sign and scale ──
+            // signed, scale>0: length 12 = precision 10 + point + sign
+            ("dec_s",   UTF8, 12, MYSQL_TYPE_NEWDECIMAL as u8, 0, 2, "decimal",
+             RivetType::Decimal { precision: 10, scale: 2 }),
+            // unsigned, scale>0: no sign byte, so the same precision needs one less
+            ("dec_u",   UTF8, 11, MYSQL_TYPE_NEWDECIMAL as u8, UNSIGNED, 2, "decimal",
+             RivetType::Decimal { precision: 10, scale: 2 }),
+            // signed, scale 0: no point byte
+            ("dec_i",   UTF8, 11, MYSQL_TYPE_NEWDECIMAL as u8, 0, 0, "decimal",
+             RivetType::Decimal { precision: 10, scale: 0 }),
+            // the pre-5.0 DECIMAL oid shares NEWDECIMAL's arm — exercised so the
+            // alias cannot fall out of that arm unnoticed (see the guard).
+            ("dec_old", UTF8, 11, MYSQL_TYPE_DECIMAL as u8, 0, 0, "decimal",
+             RivetType::Decimal { precision: 10, scale: 0 }),
+            // ── strings: charset 63 splits text from bytes on the SAME wire type ──
+            ("varchar",   UTF8, 255, MYSQL_TYPE_VAR_STRING as u8, 0, 0, "varchar", RivetType::String),
+            ("varbinary", BIN,  255, MYSQL_TYPE_VAR_STRING as u8, 0, 0, "varbinary", RivetType::Binary),
+            ("char",      UTF8, 10,  MYSQL_TYPE_STRING as u8, 0, 0, "char", RivetType::String),
+            ("binary",    BIN,  10,  MYSQL_TYPE_STRING as u8, 0, 0, "binary", RivetType::Binary),
+            // MYSQL_TYPE_VARCHAR is a THIRD spelling sharing the same arm.
+            ("varchar_oid", UTF8, 255, MYSQL_TYPE_VARCHAR as u8, 0, 0, "varchar", RivetType::String),
+            // ── ENUM/SET ride the string wire types and are told apart by FLAG ──
+            ("enum",    UTF8, 10, MYSQL_TYPE_STRING as u8, ENUM_F, 0, "enum", RivetType::Enum),
+            ("set",     UTF8, 10, MYSQL_TYPE_STRING as u8, SET_F, 0, "set", RivetType::Enum),
+            // …and BOTH functions also carry a belt-and-suspenders arm for the
+            // DEDICATED oids, which some drivers/protocol configurations do
+            // surface. Those arms are a SEPARATE branch from the flag path above:
+            // covering only the common spelling left `delete match arm
+            // MYSQL_TYPE_ENUM` / `…_SET` alive in both functions — the three
+            // survivors of this table's first mutation run, now dead.
+            ("enum_oid", UTF8, 10, MYSQL_TYPE_ENUM as u8, 0, 0, "enum", RivetType::Enum),
+            ("set_oid",  UTF8, 10, MYSQL_TYPE_SET as u8, 0, 0, "set", RivetType::Enum),
+            // ── blobs: same charset-63 split, and FOUR oids share one arm ──
+            ("blob",     BIN,  65535, MYSQL_TYPE_BLOB as u8, 0, 0, "blob", RivetType::Binary),
+            ("textblob", UTF8, 65535, MYSQL_TYPE_BLOB as u8, 0, 0, "blob", RivetType::Text),
+            ("tinyblob", BIN,  255,   MYSQL_TYPE_TINY_BLOB as u8, 0, 0, "blob", RivetType::Binary),
+            ("medblob",  BIN,  16777215, MYSQL_TYPE_MEDIUM_BLOB as u8, 0, 0, "blob", RivetType::Binary),
+            ("longblob", UTF8, 4294967295, MYSQL_TYPE_LONG_BLOB as u8, 0, 0, "blob", RivetType::Text),
+            ("json",     UTF8, 4294967295, MYSQL_TYPE_JSON as u8, 0, 0, "json", RivetType::Json),
+            // ── temporal: DATETIME is naive, TIMESTAMP is UTC — the whole point ──
+            // Each of these has a `*2` (or NEWDATE) alias sharing its arm; both
+            // spellings are exercised so a future split of the arm cannot silently
+            // leave one half untested.
+            ("date",      BIN, 10, MYSQL_TYPE_DATE as u8, 0, 0, "date", RivetType::Date),
+            // MYSQL_TYPE_NEWDATE (0x0e) is deliberately ABSENT and cannot be added:
+            // the driver's `TryFrom<u8> for ColumnType` skips 0x0e entirely (its
+            // list steps 0x0d -> 0x0f), so a column definition carrying it fails
+            // the resultset parse with `Unknown column type 14` before rivet's
+            // mapper is ever called — measured, not assumed. Both mappers keep a
+            // NEWDATE arm; it is unreachable through the client protocol, and the
+            // guard records it as such rather than demanding an impossible row.
+            ("time",      BIN, 10, MYSQL_TYPE_TIME as u8, 0, 0, "time", RivetType::Time { unit: us }),
+            ("time2",     BIN, 10, MYSQL_TYPE_TIME2 as u8, 0, 0, "time", RivetType::Time { unit: us }),
+            ("datetime",  BIN, 19, MYSQL_TYPE_DATETIME as u8, 0, 0, "datetime",
+             RivetType::Timestamp { unit: us, timezone: None }),
+            ("datetime2", BIN, 19, MYSQL_TYPE_DATETIME2 as u8, 0, 0, "datetime",
+             RivetType::Timestamp { unit: us, timezone: None }),
+            ("ts",        BIN, 19, MYSQL_TYPE_TIMESTAMP as u8, 0, 0, "timestamp",
+             RivetType::Timestamp { unit: us, timezone: Some("UTC".into()) }),
+            ("ts2",       BIN, 19, MYSQL_TYPE_TIMESTAMP2 as u8, 0, 0, "timestamp",
+             RivetType::Timestamp { unit: us, timezone: Some("UTC".into()) }),
+            // ── BIT: width 1 is a boolean, wider is an integer that must not truncate ──
+            ("bit1",  BIN, 1,  MYSQL_TYPE_BIT as u8, UNSIGNED, 0, "bit(1)", RivetType::Bool),
+            ("bit16", BIN, 16, MYSQL_TYPE_BIT as u8, UNSIGNED, 0, "bit", RivetType::Int64),
+        ];
+
+        let defs = cases
+            .iter()
+            .map(|(name, cs, len, ty, flags, dec, _, _)| {
+                column_definition(name, *cs, *len, *ty, *flags, *dec)
+            })
+            .collect();
+        let got = map_columns(defs);
+        assert_eq!(got.len(), cases.len(), "one mapping per column definition");
+
+        let mut wrong = Vec::new();
+        for ((label, .., want_name, want_type), (got_name, got_type)) in cases.iter().zip(&got) {
+            if got_name != want_name || got_type != want_type {
+                wrong.push(format!(
+                    "{label}: want ({want_name}, {want_type:?}), got ({got_name}, {got_type:?})"
+                ));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "the MySQL wire type map diverged from its spec. Each line is a column \
+             the driver parsed from a protocol-shaped packet, mapped by rivet, and \
+             compared to a hand-written expectation:\n  {}",
+            wrong.join("\n  ")
+        );
     }
 
     // ROAST-RED mysql-bit-decode: BIT(16) value 0x3132 must decode to 12594,
