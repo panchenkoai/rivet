@@ -70,6 +70,13 @@ fn read_uid_set(dir: &std::path::Path) -> (usize, BTreeSet<String>) {
 #[test]
 #[ignore = "live: requires docker compose postgres"]
 fn keyset_export_records_form_b_checksums_and_validate_passes() {
+    // chunk_size 1000 over 2000 rows, NOT 500: each part must span MORE THAN ONE
+    // read batch (PROBE_BATCH_SIZE = 500). At one batch per part the write-side
+    // fold is applied exactly once from zero, so `0 ^ s` and `0 + s` are equal and
+    // the test cannot tell the two folds apart. Every Form B fixture here used
+    // 500 and all of them stayed green through a fold change that broke the
+    // write/read agreement for every export past 500 rows — measured: 500 rows
+    // exit 0, 501 exit 3.
     require_alive(LiveService::Postgres);
     let table = unique_name("keyset_formb");
     let mut c = pg_connect();
@@ -87,7 +94,7 @@ fn keyset_export_records_form_b_checksums_and_validate_passes() {
     // TEXT key + chunk_by_key → keyset, chunk_size 500 → 4 pages (cross-page XOR).
     let yaml = format!(
         "source: {{type: postgres, url: \"{POSTGRES_URL}\"}}\nexports:\n  - name: {export}\n    \
-         table: {table}\n    mode: chunked\n    chunk_by_key: k\n    chunk_size: 500\n    \
+         table: {table}\n    mode: chunked\n    chunk_by_key: k\n    chunk_size: 1000\n    \
          format: parquet\n    destination: {{type: local, path: {out}}}\n",
         out = out_dir.path().display(),
     );
@@ -158,7 +165,7 @@ fn keyset_export_persists_v18_forensics_columns() {
     let export = unique_name("keyset_forensics_exp");
     let yaml = format!(
         "source: {{type: postgres, url: \"{POSTGRES_URL}\"}}\nexports:\n  - name: {export}\n    \
-         table: {table}\n    mode: chunked\n    chunk_by_key: id\n    chunk_size: 500\n    \
+         table: {table}\n    mode: chunked\n    chunk_by_key: id\n    chunk_size: 1000\n    \
          format: parquet\n    destination: {{type: local, path: {out}}}\n",
         out = out_dir.path().display(),
     );
@@ -302,7 +309,7 @@ fn chunked_export_records_form_b_checksums_and_validate_passes() {
     // Integer chunk_column → range chunking (the chunked runner), chunk_size 500.
     let yaml = format!(
         "source: {{type: postgres, url: \"{POSTGRES_URL}\"}}\nexports:\n  - name: {export}\n    \
-         table: {table}\n    mode: chunked\n    chunk_column: id\n    chunk_size: 500\n    \
+         table: {table}\n    mode: chunked\n    chunk_column: id\n    chunk_size: 1000\n    \
          format: parquet\n    destination: {{type: local, path: {out}}}\n",
         out = out_dir.path().display(),
     );
@@ -368,7 +375,7 @@ fn chunked_checkpoint_export_records_form_b_checksums_and_validate_passes() {
     // chunk_checkpoint: true routes to the CHECKPOINT runner (not exec.rs).
     let yaml = format!(
         "source: {{type: postgres, url: \"{POSTGRES_URL}\"}}\nexports:\n  - name: {export}\n    \
-         table: {table}\n    mode: chunked\n    chunk_column: id\n    chunk_size: 500\n    \
+         table: {table}\n    mode: chunked\n    chunk_column: id\n    chunk_size: 1000\n    \
          chunk_checkpoint: true\n    format: parquet\n    destination: {{type: local, path: {out}}}\n",
         out = out_dir.path().display(),
     );
@@ -446,7 +453,7 @@ fn keyset_varchar_pk_roundtrips_full_keyset_across_pages() {
     let out_dir = tempfile::tempdir().unwrap();
     let yaml = format!(
         "source:\n  type: mysql\n  url: \"{MYSQL_URL}\"\nexports:\n  - name: {export}\n    \
-         table: {table}\n    mode: chunked\n    chunk_size: 500\n    format: parquet\n    \
+         table: {table}\n    mode: chunked\n    chunk_size: 1000\n    format: parquet\n    \
          compression: zstd\n    destination:\n      type: local\n      path: {out}\n",
         out = out_dir.path().display(),
     );
@@ -533,7 +540,7 @@ fn keyset_parallel_reads_every_row_once_across_workers() {
     let out_dir = tempfile::tempdir().unwrap();
     let yaml = format!(
         "source:\n  type: mysql\n  url: \"{MYSQL_URL}\"\nexports:\n  - name: {export}\n    \
-         table: {table}\n    mode: chunked\n    parallel: 4\n    chunk_size: 500\n    \
+         table: {table}\n    mode: chunked\n    parallel: 4\n    chunk_size: 1000\n    \
          format: parquet\n    compression: zstd\n    destination:\n      type: local\n      path: {out}\n",
         out = out_dir.path().display(),
     );
@@ -618,7 +625,7 @@ fn keyset_parallel_pg_uuid_key_fans_out_not_collapses() {
     let yaml = format!(
         "source: {{type: postgres, url: \"{POSTGRES_URL}\"}}\nexports:\n  - name: {export}\n    \
          table: public.{table}\n    mode: chunked\n    chunk_by_key: id\n    parallel: 4\n    \
-         chunk_size: 500\n    format: parquet\n    destination: {{type: local, path: {out}}}\n",
+         chunk_size: 1000\n    format: parquet\n    destination: {{type: local, path: {out}}}\n",
         out = out_dir.path().display(),
     );
     let cfg = write_config(&cfg_dir, &yaml);
@@ -1464,7 +1471,7 @@ fn keyset_mysql_uuid_pk_roundtrips_full_keyset_across_pages() {
     let out_dir = tempfile::tempdir().unwrap();
     let yaml = format!(
         "source:\n  type: mysql\n  url: \"{MYSQL_URL}\"\nexports:\n  - name: {export}\n    \
-         table: {table}\n    mode: chunked\n    chunk_size: 500\n    format: parquet\n    \
+         table: {table}\n    mode: chunked\n    chunk_size: 1000\n    format: parquet\n    \
          compression: zstd\n    destination:\n      type: local\n      path: {out}\n",
         out = out_dir.path().display(),
     );
@@ -1724,7 +1731,7 @@ fn keyset_pg_uuid_pk_via_explicit_chunk_by_key_roundtrips_full_set() {
     // chunk_size 500 → 6 pages, exercising every page boundary.
     let yaml = format!(
         "source:\n  type: postgres\n  url: \"{POSTGRES_URL}\"\nexports:\n  - name: {export}\n    \
-         table: public.{table}\n    mode: chunked\n    chunk_by_key: id\n    chunk_size: 500\n    \
+         table: public.{table}\n    mode: chunked\n    chunk_by_key: id\n    chunk_size: 1000\n    \
          format: parquet\n    compression: zstd\n    destination:\n      type: local\n      path: {out}\n",
         out = out_dir.path().display(),
     );
