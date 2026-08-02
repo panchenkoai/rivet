@@ -15,6 +15,29 @@
 # paths plus accepted cosmetics. NOTE: entries carry file:line, so refactors
 # shift them; the nightly triage re-anchors moved entries instead of treating
 # them as new misses.
+# ── LIVE-GUARDED, MEASURED (2026-08-02) ─────────────────────────────────────
+# The four `cell_to_rivet` temporal arms below stay, and their verdict is now a
+# MEASUREMENT rather than a claim. tiberius decodes temporals through `Row::
+# try_get`, not from `ColumnData`, so these arms need a real `Row` — a type with
+# no public constructor — and the lib cycle cannot reach them at all. Each was
+# deleted in turn and the LIVE suite run:
+#
+#   ColumnData::Date(_)                            -> mssql_cdc_full_type_matrix_matches_batch
+#                                                     RED: "column d: CDC differs from the batch export"
+#   ColumnData::Time(_)                            -> same test, RED on "column t"
+#   DateTime | DateTime2 | SmallDateTime           -> same test, RED on "column dt2"
+#   ColumnData::DateTimeOffset(_)                  -> mssql_cdc_datetimeoffset_value_is_preserved
+#                                                     RED: got "1970-01-01 00:00:00"
+#
+# The oracle is not a self-oracle: the CDC path (`cdc.rs::cell_to_rivet`) is
+# compared against the BATCH path (`mssql::arrow_convert`), two independent
+# decoders, and the matrix fixture carries all three DATETIME spellings as
+# separate columns so a future split of that shared arm cannot leave one
+# untested. The other seventeen entries for this function are GONE, not
+# accepted: the data-only arms and the time arithmetic were split into
+# `cell_from_data` / `naive_time_to_micros` and are now unit-tested (44 mutants,
+# 42 caught, 0 missed, 2 unviable).
+#
 # ── CLOSED (2026-08-02) ─────────────────────────────────────────────────────
 # The `CellSource for PgCellSource::list` entries are GONE from this file, not
 # accepted: `seeds/common/postgres.sql` now carries `array_matrix` (one column
@@ -626,27 +649,10 @@ src/source/mssql/cdc.rs:304:5: replace map_op -> Option<ChangeOp> with None
 src/source/mssql/cdc.rs:305:9: delete match arm 1 in map_op
 src/source/mssql/cdc.rs:306:9: delete match arm 2 in map_op
 src/source/mssql/cdc.rs:307:9: delete match arm 4 in map_op
-src/source/mssql/cdc.rs:318:9: delete match arm ColumnData::Bit(Some(b)) in cell_to_rivet
-src/source/mssql/cdc.rs:319:9: delete match arm ColumnData::U8(Some(v)) in cell_to_rivet
-src/source/mssql/cdc.rs:320:9: delete match arm ColumnData::I16(Some(v)) in cell_to_rivet
-src/source/mssql/cdc.rs:321:9: delete match arm ColumnData::I32(Some(v)) in cell_to_rivet
-src/source/mssql/cdc.rs:322:9: delete match arm ColumnData::I64(Some(v)) in cell_to_rivet
-src/source/mssql/cdc.rs:323:9: delete match arm ColumnData::F32(Some(v)) in cell_to_rivet
-src/source/mssql/cdc.rs:324:9: delete match arm ColumnData::F64(Some(v)) in cell_to_rivet
-src/source/mssql/cdc.rs:325:9: delete match arm ColumnData::String(Some(s)) in cell_to_rivet
-src/source/mssql/cdc.rs:329:9: delete match arm ColumnData::Guid(Some(g)) in cell_to_rivet
-src/source/mssql/cdc.rs:330:9: delete match arm ColumnData::Binary(Some(b)) in cell_to_rivet
-src/source/mssql/cdc.rs:331:9: delete match arm ColumnData::Numeric(Some(n)) in cell_to_rivet
 src/source/mssql/cdc.rs:338:9: delete match arm ColumnData::DateTimeOffset(_) in cell_to_rivet
 src/source/mssql/cdc.rs:343:9: delete match arm ColumnData::DateTime(_) | ColumnData::DateTime2(_) | ColumnData::SmallDateTime(_) in cell_to_rivet
 src/source/mssql/cdc.rs:348:9: delete match arm ColumnData::Date(_) in cell_to_rivet
 src/source/mssql/cdc.rs:354:9: delete match arm ColumnData::Time(_) in cell_to_rivet
-src/source/mssql/cdc.rs:360:62: replace * with + in cell_to_rivet
-src/source/mssql/cdc.rs:360:62: replace * with / in cell_to_rivet
-src/source/mssql/cdc.rs:361:29: replace + with * in cell_to_rivet
-src/source/mssql/cdc.rs:361:29: replace + with - in cell_to_rivet
-src/source/mssql/cdc.rs:361:53: replace / with % in cell_to_rivet
-src/source/mssql/cdc.rs:361:53: replace / with * in cell_to_rivet
 src/source/mssql/cdc.rs:376:21: replace < with <= in numeric_to_decimal_string
 src/source/mssql/cdc.rs:388:5: replace hex -> String with "xyzzy".into()
 src/source/mssql/cdc.rs:388:5: replace hex -> String with String::new()

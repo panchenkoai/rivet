@@ -419,8 +419,17 @@ fn map_op(code: i32) -> Option<ChangeOp> {
 /// tiberius+chrono's structural `try_get` (no manual DateTime2-increment math);
 /// numeric carries its exact unscaled value → decimal text → `Decimal128` at the
 /// sink. Mirrors `mssql::arrow_convert`'s per-`ColumnData` handling.
-fn cell_to_rivet(row: &Row, idx: usize, data: &ColumnData<'_>) -> RivetValue {
-    match data {
+/// The arms that depend ONLY on the cell's own data — no `Row`, no column index.
+///
+/// Split out so they can be tested at all. `cell_to_rivet` takes a `&Row`, a
+/// tiberius type with no public constructor, so for as long as every arm lived
+/// inside it NONE of them had a unit test: deleting any of these eleven arms
+/// survived the whole lib cycle (eleven standing entries in the mutants
+/// baseline). The temporal arms genuinely need the `Row` — tiberius decodes them
+/// through `try_get` rather than from `ColumnData` — so they stay behind, and
+/// `None` here means exactly "not a data-only arm, ask the row".
+fn cell_from_data(data: &ColumnData<'_>) -> Option<RivetValue> {
+    Some(match data {
         ColumnData::Bit(Some(b)) => RivetValue::Bool(*b),
         ColumnData::U8(Some(v)) => RivetValue::Int(*v as i64),
         ColumnData::I16(Some(v)) => RivetValue::Int(*v as i64),
@@ -437,6 +446,24 @@ fn cell_to_rivet(row: &Row, idx: usize, data: &ColumnData<'_>) -> RivetValue {
         ColumnData::Numeric(Some(n)) => {
             RivetValue::Bytes(numeric_to_decimal_string(n.value(), n.scale()).into_bytes())
         }
+        _ => return None,
+    })
+}
+
+/// Microseconds since midnight, truncating sub-microsecond nanos.
+///
+/// Pulled out of the `Time` arm because it is the only ARITHMETIC in this
+/// mapper, and arithmetic is where an operator swap hides: `*`, `+` and `/` here
+/// carried six standing baseline entries with nothing able to tell them apart.
+fn naive_time_to_micros(t: NaiveTime) -> i64 {
+    t.num_seconds_from_midnight() as i64 * 1_000_000 + t.nanosecond() as i64 / 1000
+}
+
+fn cell_to_rivet(row: &Row, idx: usize, data: &ColumnData<'_>) -> RivetValue {
+    if let Some(v) = cell_from_data(data) {
+        return v;
+    }
+    match data {
         // datetimeoffset is tz-aware — `try_get::<NaiveDateTime>` is the *wrong* type
         // and returns None (silent data loss). Read it as FixedOffset and carry its UTC
         // instant; the resolved column is a tz-aware Timestamp, so the sink writes it
@@ -457,17 +484,13 @@ fn cell_to_rivet(row: &Row, idx: usize, data: &ColumnData<'_>) -> RivetValue {
             .flatten()
             .and_then(|d| d.and_hms_opt(0, 0, 0))
             .map_or(RivetValue::Null, RivetValue::DateTime),
-        ColumnData::Time(_) => {
-            row.try_get::<NaiveTime, _>(idx)
-                .ok()
-                .flatten()
-                .map_or(RivetValue::Null, |t| {
-                    RivetValue::TimeMicros(
-                        t.num_seconds_from_midnight() as i64 * 1_000_000
-                            + t.nanosecond() as i64 / 1000,
-                    )
-                })
-        }
+        ColumnData::Time(_) => row
+            .try_get::<NaiveTime, _>(idx)
+            .ok()
+            .flatten()
+            .map_or(RivetValue::Null, |t| {
+                RivetValue::TimeMicros(naive_time_to_micros(t))
+            }),
         // every None (NULL) variant + anything unhandled
         _ => RivetValue::Null,
     }
@@ -557,6 +580,130 @@ fn probe_max_lsn(probe: &crate::source::mssql::MssqlCdcProbe) -> Option<String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every data-only `ColumnData` arm, with an INDEPENDENT expectation.
+    ///
+    /// `cell_to_rivet` takes a `&Row` — no public constructor — so until the
+    /// data-only arms were split into `cell_from_data` not one of them could be
+    /// reached from a unit test, and deleting ANY of the eleven survived the whole
+    /// lib cycle. The expected side here is a hand-written literal, never a value
+    /// recomputed with the mapping logic it grades.
+    ///
+    /// Fixtures are chosen so a wrong arm cannot coincide with a right one: the
+    /// integer widths use DIFFERENT magnitudes (a shared `1` would make U8/I16/
+    /// I32/I64 indistinguishable), and the floats are values whose f32 and f64
+    /// renderings differ.
+    #[test]
+    fn every_data_only_column_data_arm_maps_to_its_documented_value() {
+        use std::borrow::Cow;
+
+        let uuid = tiberius::Uuid::from_bytes([
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+            0x0f, 0x10,
+        ]);
+        let cases: Vec<(&str, ColumnData<'_>, RivetValue)> = vec![
+            (
+                "bit_true",
+                ColumnData::Bit(Some(true)),
+                RivetValue::Bool(true),
+            ),
+            (
+                "bit_false",
+                ColumnData::Bit(Some(false)),
+                RivetValue::Bool(false),
+            ),
+            ("u8", ColumnData::U8(Some(200)), RivetValue::Int(200)),
+            (
+                "i16",
+                ColumnData::I16(Some(-30_000)),
+                RivetValue::Int(-30_000),
+            ),
+            (
+                "i32",
+                ColumnData::I32(Some(2_000_000_000)),
+                RivetValue::Int(2_000_000_000),
+            ),
+            (
+                "i64",
+                ColumnData::I64(Some(9_000_000_000_000_000_000)),
+                RivetValue::Int(9_000_000_000_000_000_000),
+            ),
+            ("f32", ColumnData::F32(Some(0.5)), RivetValue::Float(0.5)),
+            (
+                "f64",
+                ColumnData::F64(Some(-1.25)),
+                RivetValue::Float(-1.25),
+            ),
+            (
+                "string",
+                ColumnData::String(Some(Cow::Borrowed("héllo"))),
+                RivetValue::Bytes("héllo".as_bytes().to_vec()),
+            ),
+            // uniqueidentifier must carry the 16 CANONICAL BYTES, not the 36-char
+            // text — the fixed-size builder nulls anything that is not 16 bytes,
+            // which is the silent-loss shape this repo has already been bitten by.
+            (
+                "guid",
+                ColumnData::Guid(Some(uuid)),
+                RivetValue::Bytes(vec![
+                    0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+                    0x0e, 0x0f, 0x10,
+                ]),
+            ),
+            (
+                "binary",
+                ColumnData::Binary(Some(Cow::Borrowed(&[0xde, 0xad, 0xbe, 0xef]))),
+                RivetValue::Bytes(vec![0xde, 0xad, 0xbe, 0xef]),
+            ),
+            (
+                "numeric",
+                ColumnData::Numeric(Some(tiberius::numeric::Numeric::new_with_scale(15005, 2))),
+                RivetValue::Bytes(b"150.05".to_vec()),
+            ),
+        ];
+
+        let mut wrong = Vec::new();
+        for (label, data, want) in &cases {
+            match cell_from_data(data) {
+                Some(got) if got == *want => {}
+                got => wrong.push(format!("{label}: want {want:?}, got {got:?}")),
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "data-only ColumnData arms diverged from their documented mapping:\n  {}",
+            wrong.join("\n  ")
+        );
+
+        // A NULL of a data-only type, and a temporal type, must both defer to the
+        // row rather than be answered here — otherwise `cell_to_rivet`'s fallback
+        // is unreachable and every temporal value silently becomes NULL.
+        assert_eq!(cell_from_data(&ColumnData::Bit(None)), None, "NULL defers");
+        assert_eq!(
+            cell_from_data(&ColumnData::Date(None)),
+            None,
+            "a temporal arm must NOT be answered from data — it needs the Row"
+        );
+    }
+
+    /// Pins every arithmetic step of the `time` conversion.
+    ///
+    /// Deliberately no zeros: at 00:00:00.000000 the `*`, `+` and `/` in this
+    /// expression all yield 0, so a fixture at midnight cannot tell the three
+    /// operators apart — the same degenerate-fixture trap that hid the MySQL
+    /// Time arm's six operator mutants.
+    #[test]
+    fn naive_time_to_micros_pins_every_arithmetic_step() {
+        // 01:02:03 = 3723 s; .456789 s -> 456_789_000 ns -> 456_789 us
+        let t = NaiveTime::from_hms_nano_opt(1, 2, 3, 456_789_000).unwrap();
+        assert_eq!(naive_time_to_micros(t), 3723 * 1_000_000 + 456_789);
+        // sub-microsecond nanos truncate, they do not round
+        let t = NaiveTime::from_hms_nano_opt(0, 0, 1, 999).unwrap();
+        assert_eq!(naive_time_to_micros(t), 1_000_000);
+        // last representable instant of the day, so a `*`/`+` swap cannot coincide
+        let t = NaiveTime::from_hms_nano_opt(23, 59, 59, 999_999_000).unwrap();
+        assert_eq!(naive_time_to_micros(t), 86_399 * 1_000_000 + 999_999);
+    }
 
     #[test]
     fn numeric_renders_exact_decimal() {
