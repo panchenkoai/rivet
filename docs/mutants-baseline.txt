@@ -1172,25 +1172,6 @@ src/source/postgres/arrow_convert.rs:128:5: replace numeric_raw_to_optional_deci
 src/source/postgres/arrow_convert.rs:128:5: replace numeric_raw_to_optional_decimal_text -> Option<String> with Some("xyzzy".into())
 src/source/postgres/arrow_convert.rs:128:5: replace numeric_raw_to_optional_decimal_text -> Option<String> with Some(String::new())
 src/source/postgres/arrow_convert.rs:130:10: delete ! in numeric_raw_to_optional_decimal_text
-src/source/postgres/arrow_convert.rs:151:9: delete match arm Type::BOOL in pg_type_to_rivet
-src/source/postgres/arrow_convert.rs:152:9: delete match arm Type::INT2 in pg_type_to_rivet
-src/source/postgres/arrow_convert.rs:153:9: delete match arm Type::INT4 in pg_type_to_rivet
-src/source/postgres/arrow_convert.rs:154:9: delete match arm Type::INT8 in pg_type_to_rivet
-src/source/postgres/arrow_convert.rs:157:9: delete match arm Type::OID in pg_type_to_rivet
-src/source/postgres/arrow_convert.rs:158:9: delete match arm Type::FLOAT4 in pg_type_to_rivet
-src/source/postgres/arrow_convert.rs:159:9: delete match arm Type::FLOAT8 in pg_type_to_rivet
-src/source/postgres/arrow_convert.rs:165:9: delete match arm Type::NUMERIC in pg_type_to_rivet
-src/source/postgres/arrow_convert.rs:174:9: delete match arm Type::DATE in pg_type_to_rivet
-src/source/postgres/arrow_convert.rs:175:9: delete match arm Type::TIME in pg_type_to_rivet
-src/source/postgres/arrow_convert.rs:178:9: delete match arm Type::TIMESTAMP in pg_type_to_rivet
-src/source/postgres/arrow_convert.rs:183:9: delete match arm Type::TIMESTAMPTZ in pg_type_to_rivet
-src/source/postgres/arrow_convert.rs:188:9: delete match arm Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME in pg_type_to_rivet
-src/source/postgres/arrow_convert.rs:189:9: delete match arm Type::BYTEA in pg_type_to_rivet
-src/source/postgres/arrow_convert.rs:192:9: delete match arm Type::JSON | Type::JSONB in pg_type_to_rivet
-src/source/postgres/arrow_convert.rs:194:9: delete match arm Type::UUID in pg_type_to_rivet
-src/source/postgres/arrow_convert.rs:197:9: delete match arm Type::INTERVAL in pg_type_to_rivet
-src/source/postgres/arrow_convert.rs:201:13: delete match arm Kind::Enum(_) in pg_type_to_rivet
-src/source/postgres/arrow_convert.rs:203:13: delete match arm Kind::Array(elem_type) in pg_type_to_rivet
 src/source/postgres/arrow_convert.rs:226:25: replace == with != in rivet_type_for_pg_column
 src/source/postgres/arrow_convert.rs:265:21: delete match arm RivetType::Unsupported{reason, ..} in pg_columns_to_schema
 src/source/postgres/arrow_convert.rs:276:8: delete ! in pg_columns_to_schema

@@ -1104,3 +1104,95 @@ mod interval_render_tests {
         assert_eq!(pg_interval_to_iso8601(24, 0, 0), "P2Y");
     }
 }
+
+#[cfg(test)]
+mod type_map_tests {
+    use super::pg_type_to_rivet;
+    use crate::types::{RivetType, TimeUnit as RivetTimeUnit};
+    use postgres::types::Type;
+
+    /// Every arm of `pg_type_to_rivet`, in one table.
+    ///
+    /// The mutation baseline carried NINETEEN "delete match arm" survivors for
+    /// this function: deleting an arm drops that type to the `_` fallback
+    /// (`Unsupported`), which nothing noticed because the mapping was only ever
+    /// exercised end-to-end through a live export. A table test makes each arm
+    /// individually load-bearing — remove one and exactly one row fails, naming
+    /// the type.
+    #[test]
+    fn every_pg_type_maps_to_its_declared_rivet_type() {
+        let cases: &[(Type, RivetType)] = &[
+            (Type::BOOL, RivetType::Bool),
+            (Type::INT2, RivetType::Int16),
+            (Type::INT4, RivetType::Int32),
+            (Type::INT8, RivetType::Int64),
+            // OID is u32; Int64 is the safe widening the arm documents.
+            (Type::OID, RivetType::Int64),
+            (Type::FLOAT4, RivetType::Float32),
+            (Type::FLOAT8, RivetType::Float64),
+            (Type::DATE, RivetType::Date),
+            (
+                Type::TIME,
+                RivetType::Time {
+                    unit: RivetTimeUnit::Microsecond,
+                },
+            ),
+            (Type::TEXT, RivetType::String),
+            (Type::VARCHAR, RivetType::String),
+            (Type::BPCHAR, RivetType::String),
+            (Type::NAME, RivetType::String),
+            (Type::BYTEA, RivetType::Binary),
+            (Type::JSON, RivetType::Json),
+            (Type::JSONB, RivetType::Json),
+            (Type::UUID, RivetType::Uuid),
+            (Type::INTERVAL, RivetType::Interval),
+        ];
+        for (pg, want) in cases {
+            let got = pg_type_to_rivet(pg);
+            assert_eq!(
+                &got, want,
+                "postgres type {pg:?} must map to {want:?}, got {got:?} — a dropped \
+                 arm falls through to Unsupported and silently changes the schema"
+            );
+        }
+    }
+
+    /// The two timestamp arms differ ONLY in the timezone field, which is the
+    /// whole point (roadmap §13: TIMESTAMPTZ carries UTC semantics into Arrow).
+    /// A test that checked only the variant would let the arms be swapped.
+    #[test]
+    fn timestamptz_carries_utc_and_timestamp_does_not() {
+        match pg_type_to_rivet(&Type::TIMESTAMP) {
+            RivetType::Timestamp { timezone, .. } => {
+                assert_eq!(timezone, None, "naive TIMESTAMP must carry NO timezone")
+            }
+            other => panic!("TIMESTAMP mapped to {other:?}"),
+        }
+        match pg_type_to_rivet(&Type::TIMESTAMPTZ) {
+            RivetType::Timestamp { timezone, .. } => assert_eq!(
+                timezone.as_deref(),
+                Some("UTC"),
+                "TIMESTAMPTZ must carry UTC, or the instant loses its meaning downstream"
+            ),
+            other => panic!("TIMESTAMPTZ mapped to {other:?}"),
+        }
+    }
+
+    /// NUMERIC without declared precision is Unsupported ON PURPOSE, and the
+    /// reason must stay actionable: the wire protocol carries no atttypmod, so
+    /// the operator needs to be told the two ways out.
+    #[test]
+    fn bare_numeric_is_unsupported_with_an_actionable_reason() {
+        match pg_type_to_rivet(&Type::NUMERIC) {
+            RivetType::Unsupported { reason, .. } => {
+                for needle in ["override", "decimal("] {
+                    assert!(
+                        reason.contains(needle),
+                        "the NUMERIC reason must mention {needle:?}, got: {reason}"
+                    );
+                }
+            }
+            other => panic!("bare NUMERIC mapped to {other:?} — it has no precision to use"),
+        }
+    }
+}
