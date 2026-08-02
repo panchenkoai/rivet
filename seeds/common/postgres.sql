@@ -517,10 +517,19 @@ ANALYZE ext.heap_no_key;
 --
 -- Added 2026-08-02 after a measurement: stubbing `CellSource::list` to `None`
 -- passed the whole lib cycle AND the whole live suite, including every Form-B
--- checksum test. The cause was upstream of the tests — this seed declared zero
--- array columns, so no export ever carried a LIST cell through the value-
--- checksum path, and an array column contributed NOTHING to the source-side
--- checksum with nobody to notice.
+-- checksum test.
+--
+-- CORRECTED CAUSE (the first version of this comment was wrong): this file DOES
+-- declare array columns — `rivet_type_matrix.tags TEXT[]` and `.nums INTEGER[]`.
+-- The dev stand simply predates them: its `rivet_type_matrix` has 9 columns and
+-- neither array, so no export on that stand ever carried a LIST cell and the
+-- checksum path went unexercised. Stand drift, not a missing declaration.
+--
+-- `array_matrix` is still the right fix, and for a better reason: a fixture that
+-- exists only in a table the local stand may not match is a fixture you cannot
+-- rely on. This one is small, self-contained, and exported by a test that names
+-- the columns it expects, so a drifted stand fails loudly instead of quietly
+-- proving nothing.
 --
 -- One element type per column, covering exactly the set `list_elem_covered`
 -- claims to check (bool / i16 / i32 / i64 / f32 / f64 / text), plus the two
@@ -535,6 +544,14 @@ CREATE TABLE array_matrix (
     f32s      REAL[],
     f64s      DOUBLE PRECISION[],
     texts     TEXT[],
+    -- NO array-of-{json,numeric,uuid,interval} here, and the reason is a
+    -- MEASUREMENT rather than an omission: the pipeline refuses every one of
+    -- them BEFORE `build_pg_text_array` is reached — `_numeric` has "no Rivet
+    -- mapping", jsonb[] and interval[] fail as "could not be decoded as a
+    -- one-dimensional Arrow List", and uuid[] is refused outright
+    -- ("temporal/uuid/bytea array elements are not yet supported"). Putting any
+    -- of them in this shared seed makes `rivet check` fail for every consumer,
+    -- the release oracle included.
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 

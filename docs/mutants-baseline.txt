@@ -22,8 +22,10 @@
 # inner NULLs, and an EMPTY array beside a NULL array), and
 # `live_keyset::array_columns_reach_the_value_checksum` exports it.
 #
-# The gap was never in the tests — it was that no array column existed ANYWHERE
-# in the seed, so no export carried a LIST cell through the checksum path.
+# CORRECTED: the seed FILE does declare arrays (`rivet_type_matrix.tags`,
+# `.nums`), but the dev stand predates them — its copy of that table has 9
+# columns and neither array — so no export on it carried a LIST cell and the
+# checksum path went unexercised. Stand drift, not a missing declaration.
 # Arrays landed 2026-05-12 and reached neither this mechanism nor the row hash,
 # which is why `_rivet_row_hash` also shipped collapsing `['a, b']` with
 # `['a','b']`. One missing fixture, two blind integrity oracles.
