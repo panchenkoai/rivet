@@ -42,6 +42,7 @@ import shutil
 import socket
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from tempfile import mkdtemp
@@ -844,6 +845,19 @@ def verify_state_migrations(led: Ledger) -> None:
             led, "state", "migrations", "parity", "-",
             "state-migration parity: RIVET_TEST_STATE_URL is not a postgres url",
             "non-postgres url",
+        )
+        return
+    # The docstring promises a SKIP when the state db is absent, but a URL string
+    # is not a reachable server: without this probe a stopped stand turns the
+    # documented SKIP into a hard gate FAIL, and "the stand is down" reads as
+    # "the release is broken". Probe what the URL actually points at.
+    _su = urllib.parse.urlsplit(state_url)
+    if not _tcp_open(_su.hostname or "127.0.0.1", _su.port or 5432):
+        _skipped(
+            led, "state", "migrations", "parity", "-",
+            f"state-migration parity: state Postgres {_su.hostname or '127.0.0.1'}:"
+            f"{_su.port or 5432} unreachable (is the dev stand up?)",
+            "state pg down",
         )
         return
     if not have("cargo"):

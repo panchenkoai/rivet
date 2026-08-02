@@ -183,9 +183,25 @@ def bring_up(led: Ledger, engine: str, tag: str, image: str, port: int) -> str |
     # the legacy `mongo` shell — so a mongosh-only probe reports 4.4 as never
     # ready, which (now that the result is honoured) turns a perfectly healthy
     # server into a SKIP. The compose healthcheck makes the same fallback.
+    # The probe must query the TARGET DATABASE, not merely the server.
+    #
+    # `pg_isready` reports whether the server ANSWERS, and a server that answers
+    # `FATAL: database "rivet" does not exist` is answering — so it exits 0 while
+    # the database the seed needs is still being created by the entrypoint. The
+    # two-successes-a-second-apart rule below does not help: both land inside the
+    # same window. Measured on postgres:14 — `pg_isready -U rivet` went true 3
+    # polls before `rivet` was usable, and `pg_isready -U rivet -d rivet` (the
+    # obvious fix, and wrong) still went true 14 polls early. That is what failed
+    # this gate run: `postgres 14 seed FAIL … database "rivet" does not exist`,
+    # a false NOT RELEASABLE with nothing wrong with the product.
+    #
+    # A real `select 1` against `rivet` is true exactly when the seed can connect,
+    # and it subsumes the vanishing-temporary-server case the comment below
+    # describes. Same reasoning for MySQL, whose `mysqladmin ping` answers before
+    # the entrypoint has created `MYSQL_DATABASE`.
     probes: list[list[str]] = {
-        "postgres": [["pg_isready", "-U", "rivet"]],
-        "mysql": [["mysqladmin", "ping", "-urivet", "-privet"]],
+        "postgres": [["psql", "-U", "rivet", "-d", "rivet", "-tAc", "select 1"]],
+        "mysql": [["mysql", "-urivet", "-privet", "rivet", "-e", "select 1"]],
         "mssql": [["/opt/mssql-tools18/bin/sqlcmd", "-S", "localhost", "-U", "sa",
                    "-P", "Rivet_Passw0rd!", "-C", "-Q", "SELECT 1"]],
         "mongo": [["mongosh", "--quiet", "--eval", "db.runCommand({ping:1})"],
@@ -284,10 +300,16 @@ def engine_loop(led: Ledger, ns: argparse.Namespace) -> None:
             # failure is retried: a fresh container under load can drop the seed
             # connection mid-stream, and crying wolf on that is worse than a retry.
             err = ""
-            for _ in range(3):
+            for attempt in range(3):
                 err = seed_engine(engine, tag, url)
                 if not err:
                     break
+                # Back off between attempts. Without this the three retries fire
+                # back-to-back and all land inside the SAME startup window, so a
+                # race the retry exists to absorb is retried three times in the
+                # few hundred ms during which it cannot possibly succeed — which
+                # is how a transient became a FAIL.
+                time.sleep(2.0 * (attempt + 1))
             if err:
                 led.failed(engine, tag, "seed", "-", f"{engine}:{tag} seed had errors", err)
                 continue

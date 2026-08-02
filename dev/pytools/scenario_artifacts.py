@@ -975,6 +975,32 @@ def main_cli(argv: Sequence[str] | None = None) -> int:
         del args[i:i + 2]
     only = args[0] if args and not args[0].startswith("-") else None
 
+    # This harness measures PER-RUN meta-DB artifacts, and it reads them out of
+    # the SQLite state file inside each scenario's own work dir — which is what
+    # makes an assertion like "run_status_running == 0" exact: nothing else has
+    # ever written to that file.
+    #
+    # `shell.run` merges `os.environ` into every child, so a `RIVET_STATE_URL`
+    # exported for the dev stand would silently redirect every scenario's state
+    # into the SHARED Postgres backend. The state file would then never be
+    # created, `_sqlite_counts` would return its all-zero default, and all NINE
+    # meta-DB classes would report zero — passing every `[]`/`0` expectation in
+    # the ledger having measured NOTHING. Exactly the failure the GCS branch
+    # below already guards against, one backend over.
+    #
+    # Scoping the counts to a shared backend instead is not available here: rows
+    # persist across gate runs, and neither `export_name` nor the destination
+    # prefix is unique per scenario across repeated runs. So the harness PINS its
+    # own backend rather than half-measuring a shared one. Postgres-vs-SQLite
+    # equivalence is the release oracle's job — its `state` / `migrations` /
+    # `parity` scenario runs the RED-proven parity fixtures on both backends.
+    if os.environ.pop("RIVET_STATE_URL", None) is not None:
+        print(
+            "note: RIVET_STATE_URL ignored — the scenario harness pins the "
+            "per-scenario SQLite state file so its meta-DB counts stay exact. "
+            "Postgres-state parity is covered by `make release-oracle`."
+        )
+
     declared, _classes, scenarios = parse_matrix(MATRIX.read_text())
     if not Path(rivet_bin()).exists():
         raise SystemExit(f"binary not found: {rivet_bin()} (cargo build --bin rivet)")
@@ -1021,6 +1047,19 @@ def main_cli(argv: Sequence[str] | None = None) -> int:
                 # reads where they actually are. Reading `work/out` instead would
                 # report zeros and pass having measured nothing.
                 remote = detail if detail.startswith("gs://") else None
+                # A missing state file and a genuinely empty one are the same
+                # all-zero dict, and nine of the fifteen classes are meta-DB —
+                # so "absent" must be a FAIL, never a quiet pass. `main_cli`
+                # pins the backend to keep this from happening; this is the
+                # assertion that would catch it if some other path redirected
+                # state anyway.
+                if not (work / ".rivet_state.db").exists():
+                    rows.append((
+                        sc.id, eng, "FAIL",
+                        "no state DB in the work dir — the nine meta-DB classes "
+                        "would have measured nothing (state backend redirected?)",
+                    ))
+                    continue
                 snap = snapshot(work, work / "out", gcs_uri=remote)
                 if remote:
                     shell.run(["gcloud", "storage", "rm", "-r", remote], timeout=600)
