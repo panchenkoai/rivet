@@ -32,6 +32,8 @@ mod examples_parse;
 mod extension_seam;
 #[path = "offline/format_fuzz.rs"]
 mod format_fuzz;
+#[path = "offline/mssql_column_data_fixture_guard.rs"]
+mod mssql_column_data_fixture_guard;
 #[path = "offline/mysql_wire_type_fixture_guard.rs"]
 mod mysql_wire_type_fixture_guard;
 #[path = "offline/perf_matrix_guard.rs"]
