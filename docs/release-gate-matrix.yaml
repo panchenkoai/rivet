@@ -85,6 +85,12 @@ preflights:
   - id: coverage_matrices
     what: "every docs/*-matrix.yaml drift-guard runs (chunking/behaviour/type-fidelity/... + release_gate + perf) so a rotted coverage ledger blocks the release, not just CI."
     status: test        # verify_coverage_matrices
+  - id: gif_currency
+    what: "the instructional GIFs still show commands this binary accepts. They are binary assets, so no test reads them and no diff flags them — a GIF demonstrating a rejected flag is documentation that lies, and re-rendering does not fix it (the tape has to change). Ran in the gate since it was written; had NO ledger row until 2026-08-02, when the guard stopped reading a hand-typed module list and started deriving it."
+    status: test        # verify_gif_currency (dev/release_oracle/gifs.py)
+  - id: row_hash
+    what: "`_rivet_row_hash` recomputed by something that is NOT rivet. The in-tree auditor recomputes with rivet's own `enrich` function — `src/lib.rs` says so deliberately, to avoid a second implementation drifting from the extractor — which is sound for detecting changed DATA and structurally blind to a defect in the SPEC, because both sides share it. Render id v1 shipped non-injective in two independent ways and lived four months. So this cell holds the other side: DuckDB re-reads the exported parquet, a Python implementation rebuilds the canonical image from the spec (presence tag, u32 length, rendered bytes) and hashes it with `xxhash`, and the two are compared. TWO checks, neither implying the other: DIGEST PARITY (catches a drift in rendering or framing) and INJECTIVITY (two rows differing only in where a field boundary falls must hash differently). The probe is exported TWICE because injectivity needs the primary key OUT of the coverage — measured: under v1's rendering the same probe scores 4/4 distinct with the key covered and 3/4 without it, so `row_hash: true` alone would pass against a length-less join. RED-proven on postgres against a v1-shape mutant: both checks fire, the second naming the colliding row pair. SKIPs loudly without the `xxhash` package rather than comparing rivet against itself."
+    status: test        # verify_row_hash (dev/release_oracle/rowhash.py)
   # pooler_safety REMOVED from the gate: it re-ran tests/live/live_pool_safety.rs, which
   # CI already runs on every push (ci.yml `--profile pool` exists specifically for it).
   # A CI-owned correctness suite re-run adds no coverage here AND reddened on a missing

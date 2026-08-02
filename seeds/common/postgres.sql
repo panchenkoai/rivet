@@ -569,3 +569,37 @@ INSERT INTO array_matrix (bools, i16s, i32s, i64s, f32s, f64s, texts) VALUES
     (NULL, NULL, NULL, NULL, NULL, NULL, NULL);
 
 ANALYZE array_matrix;
+
+-- ── row_hash injectivity probe ───────────────────────────────────────────────
+-- The canonical image `_rivet_row_hash` builds must be INJECTIVE: two different
+-- rows must never produce one hash. Render id v1 was not, in a way no ordinary
+-- fixture can show — fields were joined by a bare \x1f with no length, so a value
+-- carrying that byte could forge a field boundary. Rows 1 and 2 below are exactly
+-- that pair: ('a'||US, 'b') and ('a', US||'b') build the SAME bytes when the join
+-- has no lengths, and different bytes when it has them.
+--
+-- Rows 3 and 4 are the second half: absence versus a PRESENT value of length
+-- zero. Under v1 both were a bare marker; they must stay distinct.
+--
+-- The probe only bites when the hash covers these columns and NOT the primary
+-- key — with a unique column in the coverage no two rows can ever collide, so
+-- `row_hash: true` over this table would pass whatever the framing does. The gate
+-- exports it twice for that reason: once with `true` (digest parity against an
+-- independent implementation) and once with `row_hash: [a, b]` (injectivity).
+--
+-- chr(0) is deliberately absent: PostgreSQL rejects it in text ("null character
+-- not permitted"), so the NULL-vs-lone-\x00 forgery is unreachable here and
+-- claiming to cover it would be a lie.
+CREATE TABLE row_hash_probe (
+    id INT PRIMARY KEY,
+    a  TEXT,
+    b  TEXT
+);
+
+INSERT INTO row_hash_probe (id, a, b) VALUES
+    (1, 'a' || chr(31), 'b'),
+    (2, 'a',            chr(31) || 'b'),
+    (3, NULL,           'x'),
+    (4, '',             'x');
+
+ANALYZE row_hash_probe;

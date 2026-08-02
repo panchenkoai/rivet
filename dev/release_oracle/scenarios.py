@@ -808,6 +808,11 @@ def run_scenarios(led: Ledger, engine: str, tag: str, url: str) -> None:
     if _bless("BLESS_VERDICTS") or _bless("BLESS_DUCKDB"):
         return
     sc_keyset_parallel(led, engine, tag, url)
+    # The one integrity column a reader is asked to trust, checked by something
+    # that is not rivet — see rowhash.py for why the in-tree auditor cannot.
+    from . import rowhash
+
+    rowhash.verify_row_hash(led, engine, tag, url)
     for store in cfg("stores").split():
         sc_load(led, engine, tag, url, store)
     if engine == "postgres":
