@@ -70,6 +70,10 @@
       "strategy": "full",
       "verdict": "ACCEPTABLE"
     },
+    "row_hash_probe": {
+      "strategy": "full",
+      "verdict": "ACCEPTABLE"
+    },
     "sparse_key": {
       "strategy": "keyset",
       "verdict": "ACCEPTABLE"
@@ -160,6 +164,10 @@
       "strategy": "full",
       "verdict": "ACCEPTABLE"
     },
+    "row_hash_probe": {
+      "strategy": "full",
+      "verdict": "ACCEPTABLE"
+    },
     "users": {
       "strategy": "keyset",
       "verdict": "ACCEPTABLE"
@@ -227,6 +235,10 @@
       "verdict": "ACCEPTABLE"
     },
     "rivet_type_matrix": {
+      "strategy": "full",
+      "verdict": "ACCEPTABLE"
+    },
+    "row_hash_probe": {
       "strategy": "full",
       "verdict": "ACCEPTABLE"
     },
