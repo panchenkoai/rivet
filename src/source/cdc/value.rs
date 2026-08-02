@@ -1380,6 +1380,35 @@ mod tests {
         );
     }
 
+    /// The `Value::Time` arm's arithmetic, which nothing exercised: the Date arm
+    /// had a test, the Time arm had none, and the mutation baseline carried
+    /// SEVENTEEN operator survivors for this one conversion.
+    ///
+    /// Every component is non-zero and distinct so no two operators agree:
+    /// days=2 (2*86400 = 172800 vs 2+86400 = 86402), h=3 (3*3600 = 10800 vs
+    /// 3+3600 = 3603), mi=4 (4*60 = 240 vs 4+60 = 64). A fixture with zeros —
+    /// the obvious "a time value" — makes `*`, `+` and `/` indistinguishable and
+    /// is exactly why these survived.
+    #[test]
+    fn mysql_time_arm_pins_every_arithmetic_step() {
+        // (2*86400 + 3*3600 + 4*60 + 5) * 1e6 + 678901
+        let v = RivetValue::from_mysql(&mysql::Value::Time(false, 2, 3, 4, 5, 678_901));
+        assert_eq!(
+            v,
+            RivetValue::TimeMicros(183_845_678_901),
+            "days, hours, minutes, seconds and microseconds must each carry their \
+             own weight"
+        );
+        // The sign applies to the WHOLE value, after the sum — not to a part.
+        let neg = RivetValue::from_mysql(&mysql::Value::Time(true, 2, 3, 4, 5, 678_901));
+        assert_eq!(neg, RivetValue::TimeMicros(-183_845_678_901));
+        // A pure-microsecond value: the `+ us` addend must survive on its own.
+        assert_eq!(
+            RivetValue::from_mysql(&mysql::Value::Time(false, 0, 0, 0, 0, 1)),
+            RivetValue::TimeMicros(1)
+        );
+    }
+
     #[test]
     fn temporal_is_structural_not_string() {
         let v = RivetValue::from_mysql(&mysql::Value::Date(2026, 6, 23, 11, 58, 1, 500_000));

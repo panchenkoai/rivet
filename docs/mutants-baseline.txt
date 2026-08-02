@@ -408,25 +408,8 @@ src/source/cdc/value.rs:653:33: replace match guard f.is_finite() with true in d
 src/source/cdc/value.rs:667:9: delete match arm RivetValue::UInt(u) in decimal_to_i128
 src/source/cdc/value.rs:671:33: replace match guard f.is_finite() with false in decimal_to_i128
 src/source/cdc/value.rs:671:33: replace match guard f.is_finite() with true in decimal_to_i128
-src/source/cdc/value.rs:73:36: replace * with + in RivetValue::from_mysql
-src/source/cdc/value.rs:73:36: replace * with / in RivetValue::from_mysql
-src/source/cdc/value.rs:73:45: replace + with * in RivetValue::from_mysql
-src/source/cdc/value.rs:73:45: replace + with - in RivetValue::from_mysql
-src/source/cdc/value.rs:73:57: replace * with + in RivetValue::from_mysql
-src/source/cdc/value.rs:73:57: replace * with / in RivetValue::from_mysql
-src/source/cdc/value.rs:73:65: replace + with * in RivetValue::from_mysql
-src/source/cdc/value.rs:73:65: replace + with - in RivetValue::from_mysql
-src/source/cdc/value.rs:73:78: replace * with + in RivetValue::from_mysql
-src/source/cdc/value.rs:73:78: replace * with / in RivetValue::from_mysql
-src/source/cdc/value.rs:73:83: replace + with * in RivetValue::from_mysql
-src/source/cdc/value.rs:73:83: replace + with - in RivetValue::from_mysql
-src/source/cdc/value.rs:74:25: replace * with + in RivetValue::from_mysql
-src/source/cdc/value.rs:74:25: replace * with / in RivetValue::from_mysql
-src/source/cdc/value.rs:75:25: replace + with * in RivetValue::from_mysql
-src/source/cdc/value.rs:75:25: replace + with - in RivetValue::from_mysql
 src/source/cdc/value.rs:767:40: replace + with * in parse_enum_labels
 src/source/cdc/value.rs:767:59: replace + with * in parse_enum_labels
-src/source/cdc/value.rs:76:50: delete - in RivetValue::from_mysql
 src/source/cdc/value.rs:814:62: replace != with == in MysqlCellFix::apply
 src/source/cdc/value.rs:815:63: replace != with == in MysqlCellFix::apply
 src/source/cdc/value.rs:816:53: replace match guard b.len() <= 8 with true in MysqlCellFix::apply
