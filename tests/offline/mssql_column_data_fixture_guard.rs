@@ -6,8 +6,9 @@
 //! fixture feeds each one, or that the variant is declared ROW_BOUND with the
 //! live test that covers it instead.
 //!
-//! Why the declaration matters here more than it did for MySQL. Four temporal
-//! variants cannot be unit-tested at all: tiberius decodes `date`, `time`,
+//! Why the declaration matters here more than it did for MySQL. Six temporal
+//! variants — four arms, since DateTime, DateTime2 and SmallDateTime share one —
+//! cannot be unit-tested at all: tiberius decodes `date`, `time`,
 //! `datetime*` and `datetimeoffset` through `Row::try_get`, not from the
 //! `ColumnData` the mapper is handed, and `Row` has no public constructor. They
 //! are covered by the live MSSQL CDC suite — a claim that is worth only what it

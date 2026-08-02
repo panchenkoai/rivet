@@ -94,7 +94,7 @@ def _bring_up(led: Ledger, engine: str, tag: str, image: str, port: int) -> str 
     stage's container after whichever engine the main loop had visited last.
     """
     name = engine_container(engine, tag)
-    docker("rm", "-f", name)
+    docker("rm", "-fv", name)
 
     args: list[str] = ["run", "-d", "--name", name]
     if engine == "postgres":
@@ -347,7 +347,7 @@ def run_bigquery_golden(
             led.skipped("bigquery", engine, "golden", "-",
                         f"BigQuery[{engine}]: seed errors", "seed")
             if not keep:
-                docker("rm", "-f", engine_container(engine, _TAG))
+                docker("rm", "-fv", engine_container(engine, _TAG))
             continue
 
         tlsblk = "\n  tls: {accept_invalid_certs: true}" if engine == "mssql" else ""
@@ -405,7 +405,7 @@ def run_bigquery_golden(
         run(["gcloud", "storage", "rm", "-r", f"gs://{bucket}/{pfx}"])
         run(["bq", f"--project_id={proj}", "rm", "-f", "-t", f"{dset}.{exp}"])
         if not keep:
-            docker("rm", "-f", engine_container(engine, _TAG))
+            docker("rm", "-fv", engine_container(engine, _TAG))
         if not got:
             # Either the run/load leg already recorded its FAIL, or the read-back
             # itself produced nothing. KNOWN GAP, carried over from the bash: the

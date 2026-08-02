@@ -157,7 +157,15 @@ def bring_up(led: Ledger, engine: str, tag: str, image: str, port: int) -> str |
     named the BigQuery stage's container after whichever engine the main loop had
     visited last."""
     name = engine_container(engine, tag)
-    docker("rm", "-f", name)
+    # `-v`, not a bare `-f`. Every engine image here declares a VOLUME for its
+    # data directory, and `docker run` with no `-v` of our own answers that by
+    # creating an ANONYMOUS volume. `docker rm -f` deletes the container and
+    # ORPHANS that volume — so each gate run leaked one per engine×version
+    # (~15), invisibly, because nothing ever lists them. Measured on this
+    # machine before the fix: 814 anonymous volumes holding 370 GB, against 30
+    # named ones, on a disk at 89%. The engines are seeded from scratch every
+    # run, so there is nothing in them worth keeping past teardown.
+    docker("rm", "-fv", name)
 
     args: list[str] = ["run", "-d", "--name", name]
     if engine == "postgres":
@@ -316,7 +324,7 @@ def engine_loop(led: Ledger, ns: argparse.Namespace) -> None:
             led.ok("seeded")
             scenarios.run_scenarios(led, engine, tag, url)
             if not ns.keep:
-                docker("rm", "-f", engine_container(engine, tag))
+                docker("rm", "-fv", engine_container(engine, tag))
 
 
 def main(argv: list[str] | None = None) -> int:
