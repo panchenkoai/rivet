@@ -87,6 +87,8 @@ artifact_classes:
     what: "load_run audit rows, one per load attempt per table."
   - id: loaded_source_run_ids
     what: "the load skip set. An IN-FLIGHT source run must NOT appear (its manifest can still grow); a terminal one must."
+  - id: committed_matches_parts
+    what: "1 iff the meta-DB's `files_committed` EQUALS the parquet parts actually under the prefix — the two sides reconciled against each other, not each against its own `>0`. Only meaningful for a single-run scenario: on a repeated run the parts accumulate while `files_committed` is the newest run's, so the scenarios that mean it ask for it by name."
   - id: parts_on_disk
     what: "*.parquet under the destination prefix."
   - id: manifests_success
@@ -109,6 +111,7 @@ scenarios:
       run_status_terminal: 1
       export_metrics_rows: 1
       parts_on_disk: ">0"
+committed_matches_parts: 1
       manifests_success: 1
       manifests_non_success: []
       success_marker: 1
@@ -121,6 +124,7 @@ scenarios:
     expect:
       run_status_running: []
       parts_on_disk: ">0"
+committed_matches_parts: 1
       manifests_success: 1
       manifests_non_success: []
       chunk_run_rows: 0
@@ -155,6 +159,7 @@ scenarios:
     expect:
       run_status_running: []
       parts_on_disk: ">0"
+committed_matches_parts: 1
       files_committed: ">0"
       manifests_success: 1
       success_marker: 1

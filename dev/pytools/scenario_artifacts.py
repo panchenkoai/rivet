@@ -315,6 +315,20 @@ def snapshot(work: Path, prefix: Path, gcs_uri: str | None = None) -> dict[str, 
     snap = _sqlite_counts(work / ".rivet_state.db")
     snap.update(_prefix_counts_gcs(gcs_uri) if gcs_uri else _prefix_counts(prefix))
     snap["checkpoint_file"] = 1 if (work / "cdc.ckpt").exists() else 0
+
+    # The TWO SIDES, reconciled against each other rather than each against its
+    # own expectation. `files_committed` is what the run RECORDED in the meta-DB;
+    # `parts_on_disk` is what the destination actually HOLDS. Every scenario so
+    # far graded them separately — and only ever as `">0"` — so a run that
+    # recorded eight parts while five existed satisfied both cells.
+    #
+    # Declared per scenario, never universal: on a multi-run scenario the parts
+    # ACCUMULATE while `files_committed` is the newest run's alone, so equality is
+    # false there by construction. A scenario that means "one run, and its own
+    # count must match what it left" asks for it explicitly.
+    snap["committed_matches_parts"] = int(
+        snap.get("files_committed", 0) == snap.get("parts_on_disk", 0)
+    )
     return snap
 
 
