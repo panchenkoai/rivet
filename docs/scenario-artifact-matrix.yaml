@@ -244,8 +244,16 @@ scenarios:
     note: "warehouse-bound. The Failed manifest comes from the shared batch finalizer, so the blocking behaviour is engine-independent — but the surrounding successful runs are the engine's, and those are what must still load."
     engines: [postgres, mysql, mssql, mongo]
     expect:
-      manifests_non_success: 1
-      load_run_rows: 1
+      # TWO aborted manifests, because the scenario runs the aborted export
+      # twice: once to poison the prefix and once more after the target exists.
+      # What matters is that they survive (nothing deletes a terminal manifest)
+      # and do not block — not their count.
+      manifests_non_success: ">0"
+      # TWO loads: one seeds the append target (the same mode throughout — `full`
+      # would materialise the name as a TABLE where the append modes need a
+      # VIEW), one lands the delta AFTER the prefix was poisoned. The second is
+      # the assertion: it must succeed.
+      load_run_rows: 2
       loaded_source_run_ids: ">0"
 
   - id: gc_orphans_after_crash

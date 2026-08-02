@@ -70,8 +70,16 @@ GOLDEN = {
         "cursor": "updated_at",
     },
     "mssql": {
+        # `users`, not `orders`. Both are in the golden seed, but `dbo.orders` is
+        # ALSO declared by dev/mssql/init.sql with a different shape (id/name/
+        # amount, the decimal-precision fixture `audit_init_deferred` asserts on),
+        # and the Makefile documents that seeding one overwrites the other. A
+        # harness that reads a contested table reports "stand does not match the
+        # golden seed" whenever the other fixture is in place — which is exactly
+        # what happened. `users` is uncontested and carries the PK + cursor this
+        # matrix needs.
         "url": "sqlserver://sa:Rivet_Passw0rd!@127.0.0.1:1433/rivet",
-        "table": "dbo.orders",
+        "table": "dbo.users",
         "pk": "id",
         "cursor": "updated_at",
     },
@@ -379,6 +387,37 @@ _DRIFT_SIGNATURES = (
     "no such column",
     "invalid object name",
 )
+
+
+def _cdc_flood_cmd(eng: str, tbl: str) -> list[str]:
+    """A continuous in-DATABASE insert loop, as an argv for `shell.popen`.
+
+    In-database on purpose: a host-side `docker exec` per row tops out around
+    3 rows/second, which a poll adapter catches up with between inserts — the run
+    then exits and there is nothing to race. A server-side loop keeps the log
+    genuinely ahead of the reader.
+    """
+    c = CDC_CONTAINER[eng]
+    if eng == "postgres":
+        sql = (f"DO $$ BEGIN FOR i IN 1..100000 LOOP "
+               f"INSERT INTO {tbl} VALUES (1000+i, 'flood'); "
+               f"COMMIT; END LOOP; END $$;")
+        return ["docker", "exec", c, "psql", "-U", "rivet", "-d", "rivet", "-c", sql]
+    if eng == "mysql":
+        # Piped through a SHELL, not passed as argv. Two earlier attempts failed
+        # silently and both looked like "the daemon would not stay up": a stored
+        # procedure (mysql -e cannot change DELIMITER, so BEGIN…END is a syntax
+        # error) and 5000 statements in one -e (185 KB of argv — "argument list
+        # too long", rc 255, zero rows inserted). Generating the statements
+        # inside the container avoids both limits.
+        gen = (f"i=1000; while [ $i -lt 106000 ]; do "
+               f"echo \"INSERT INTO {tbl} VALUES ($i,'flood');\"; i=$((i+1)); done "
+               f"| mysql -urivet -privet rivet")
+        return ["docker", "exec", c, "sh", "-c", gen]
+    sql = (f"DECLARE @i INT = 0; WHILE @i < 100000 BEGIN "
+           f"INSERT INTO dbo.{tbl} VALUES (1000+@i,'flood'); SET @i = @i + 1; END")
+    return ["docker", "exec", c, "/opt/mssql-tools18/bin/sqlcmd", "-S", "localhost",
+            "-U", "sa", "-P", "Rivet_Passw0rd!", "-C", "-d", "rivet", "-Q", sql]
 
 
 def mssql_capture_ready(tbl: str, want: int = 0, tries: int = 40) -> bool:
@@ -692,13 +731,40 @@ def load_scenario(sid: str, eng: str, work: Path):
             # blocking defect is specific to the modes that SUM every manifest
             # under the prefix. Verified: with `full`, re-introducing the defect
             # left this cell green.
-            # An APPEND-mode load is what this scenario needs, and the
-            # incremental target must already exist in the warehouse before the
-            # first delta lands. Wiring that setup is the next slice; a named
-            # SKIP is the honest state — `full` would run green while grading
-            # NOTHING, which is worse than an admitted gap.
-            return ("skip", "needs an append-mode load whose warehouse target is "
-                            "pre-created; `full` cannot express this defect")
+            # Seed the append target with an INCREMENTAL cycle, not a full one:
+            # `full` materialises `<table>` as a TABLE while the append modes want
+            # that same name to be the current-state VIEW over `<table>__changes`,
+            # and BigQuery refuses ("is not allowed for this operation because it
+            # is currently a TABLE"). Same mode throughout is the only coherent
+            # setup.
+            inc = (
+                f"    mode: incremental\n    cursor_column: {g['cursor']}\n"
+                f"    format: parquet\n"
+            )
+            cfg.write_text(cfg_text(inc, "  pk: [id]\n"))
+            if g["cursor"] is None:
+                # Mongo has no cursor-column incremental mode, so there is no
+                # append target to seed and no delta to land. Its equivalent is
+                # the change stream, which this stand cannot run (standalone
+                # mongod, no replica set).
+                return ("skip", "no incremental mode on this engine — its append "
+                                "path is CDC, which needs a replica set")
+            if not run_export().ok or not run_load().ok:
+                return ("fail", "could not pre-create the append target")
+            # Now the aborted run: a CAUGHT error (a panic dies before
+            # `finalize_manifest` and leaves no manifest at all).
+            cfg.write_text(cfg_text(
+                f"    mode: chunked\n    chunk_by_key: {g['pk']}\n    chunk_size: 200\n"
+                f"    parallel: 4\n    format: parquet\n"))
+            run_export({"RIVET_TEST_ERROR_AT": "keyset_parallel_worker:2"})
+            # …and the delta. APPEND mode on purpose: in `full` the loader takes
+            # `latest_full` — the newest manifest only — so the Failed one never
+            # reaches `reconcile` and the scenario would grade nothing.
+            cfg.write_text(cfg_text(inc, "  pk: [id]\n"))
+            if not run_export().ok:
+                return ("fail", "the delta export failed")
+            r = run_load()
+            return ("ok", uri) if r.ok else ("fail", r.out.strip())
 
         if sid == "gc_orphans_after_crash":
             cfg.write_text(cfg_text("    mode: full\n    format: parquet\n", "  gc_orphans: true\n"))
@@ -737,7 +803,16 @@ def load_scenario(sid: str, eng: str, work: Path):
                     if not mssql_capture_ready(tbl_src):
                         return ("skip", "SQL Server capture instance never became readable")
                 ci = f"      capture_instance: {tbl_src}_ci\n" if eng == "mssql" else ""
-                daemon = "      until_current: false\n" if sid == "load_racing_an_active_run" else ""
+                # A small rollover for the race: parts roll at `rollover` rows
+                # (default 100_000) or at run end, so a daemon under a 5k-row
+                # flood published NOTHING for the whole wait window and the
+                # scenario skipped for want of a part rather than for want of a
+                # race.
+                daemon = (
+                    "      until_current: false\n      rollover: 50\n"
+                    if sid == "load_racing_an_active_run"
+                    else ""
+                )
                 cfg.write_text(
                     f"source:\n  type: {eng}\n  url_env: RIVET_SCEN_URL\n"
                     f"exports:\n  - name: {tbl_src}\n    table: {tbl_src}\n    mode: cdc\n"
@@ -797,23 +872,71 @@ def load_scenario(sid: str, eng: str, work: Path):
                 _cdc_sql(eng, f"INSERT INTO {tbl_src} VALUES (1,'a'),(2,'b');")
                 if eng == "mssql":
                     mssql_capture_ready(tbl_src, want=1)
-                # NOT DRIVEN — and the reason is a finding, not a gap in this
-                # harness. Holding a run in flight needs a writer that keeps
-                # streaming, and `until_current: false` is documented as "the
-                # never-terminating streaming path" (config/export.rs) — but it
-                # TERMINATES: measured on the PostgreSQL CDC stand, a daemon run
-                # exits 0 within seconds both with an idle source AND under a
-                # sustained 200-row writer (`timeout 15` never fired). With the
-                # run already `success` when the load arrives, there is no race
-                # to observe, and the cell would grade nothing.
-                #
-                # Left as a named SKIP rather than a green cell: this scenario
-                # guards the defect fixed in 06ed78f (an in-flight run recorded
-                # as consumed strands every part it writes afterwards), which is
-                # exactly the kind of coverage that must not be faked.
-                return ("skip", "cannot hold a run in flight: `until_current: false` "
-                                "exits within seconds despite documenting continuous "
-                                "streaming — recorded as an open finding")
+                # A daemon EXITS on catch-up (that is the documented poll-adapter
+                # behaviour, see config/export.rs). Holding one in flight therefore
+                # needs writes it cannot catch up WITH: an in-database loop, not a
+                # docker-exec per row. The first attempt inserted every 300 ms from
+                # the host and the run had already finished `success` when the load
+                # arrived — the race never happened and the cell graded nothing.
+                writer = shell.popen(_cdc_flood_cmd(eng, tbl_src))
+                proc = shell.popen([rivet_bin(), "run", "-c", str(cfg)], env=cdc_env)
+                try:
+                    # Wait until the daemon has published a part AND the ledger
+                    # still shows it running — both, because either alone can lie:
+                    # a part with a finished run is the race we missed before.
+                    import time
+
+                    def ledger_running() -> bool:
+                        # The signal the LOAD reads. A live PID is not it:
+                        # `finish_run` commits before the process exits, so mssql
+                        # slipped through that window and the run was recorded
+                        # consumed while the harness still believed it was racing.
+                        db = work / ".rivet_state.db"
+                        if not db.exists():
+                            return False
+                        con = sqlite3.connect(str(db))
+                        try:
+                            r = con.execute(
+                                "SELECT COUNT(*) FROM run_status WHERE status='running'"
+                            ).fetchone()
+                            return bool(r and r[0])
+                        except sqlite3.Error:
+                            return False
+                        finally:
+                            con.close()
+
+                    raced = False
+                    for _ in range(60):
+                        ls = shell.run(["gcloud", "storage", "ls", "-r", uri], timeout=120)
+                        has_part = ls.ok and any(
+                            l.strip().endswith(".parquet") for l in ls.stdout.splitlines()
+                        )
+                        if has_part and ledger_running():
+                            raced = True
+                            break
+                        time.sleep(1)
+                    if not raced:
+                        # SQL Server specifically: its Continuous mode is
+                        # "chase-the-head" and still exits on catch-up, while the
+                        # capture Agent copies asynchronously — the reader
+                        # outruns the writer no matter how hard the source is
+                        # flooded, so the run reaches `success` before a load can
+                        # race it. Structural, not a fixture problem. Named so it
+                        # cannot be mistaken for coverage.
+                        return ("skip", "engine cannot hold a run in flight: the poll "
+                                        "reader catches up faster than the capture Agent "
+                                        "copies, so the run ends before a load can race it")
+                    lr = shell.run([rivet_bin(), "load", "-c", str(cfg)], env=cdc_env, timeout=1800)
+                    if not lr.ok:
+                        return ("fail", lr.out.strip())
+                    return ("ok", uri)
+                finally:
+                    for pr in (proc, writer):
+                        pr.terminate()
+                        try:
+                            pr.wait(timeout=30)
+                        except Exception:
+                            pr.kill()
             finally:
                 if eng == "mssql":
                     _cdc_sql(eng, f"IF EXISTS (SELECT 1 FROM cdc.change_tables "
@@ -826,11 +949,20 @@ def load_scenario(sid: str, eng: str, work: Path):
 
         return ("skip", "warehouse driver not wired for this scenario")
     finally:
-        # ONLY the warehouse table here. The GCS prefix is torn down by the
+        # ONLY the warehouse tables here. The GCS prefix is torn down by the
         # caller AFTER the snapshot: cleaning it up in this `finally` ran before
         # the measurement, so the snapshot read an empty prefix and every
         # warehouse cell would have been graded against nothing.
-        shell.run(["bq", f"--project_id={proj}", "rm", "-f", "-t", f"{dset}.{tbl}"], timeout=300)
+        #
+        # TWO names, because the loader derives the target from the SOURCE table
+        # (`orders`, `users`), not from the export name — so every engine and
+        # every scenario lands in the SAME warehouse table and inherits the
+        # previous one's schema and rows. Dropping only the unique name left that
+        # collision in place and the second scenario failed on state it did not
+        # create.
+        src_leaf = src_table.split(".")[-1]
+        for t in {tbl, src_leaf, f"{src_leaf}__changes"}:
+            shell.run(["bq", f"--project_id={proj}", "rm", "-f", "-t", f"{dset}.{t}"], timeout=300)
 
 
 
