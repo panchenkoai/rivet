@@ -15,6 +15,25 @@
 # paths plus accepted cosmetics. NOTE: entries carry file:line, so refactors
 # shift them; the nightly triage re-anchors moved entries instead of treating
 # them as new misses.
+# ── MEASURED CORRECTION (2026-08-02) ────────────────────────────────────────
+# The `CellSource for PgCellSource::list` entries below are NOT live-guarded, and
+# this file used to imply they were. Verified by stubbing the whole function to
+# `None` and running BOTH cycles: `--lib` passes (expected) and so does the live
+# suite — the postgres subset (27 tests) AND every Form-B checksum test
+# (live_keyset, live_cdc_mbt, live_mongo, live_chunked_recovery, 6 tests).
+#
+# The cause is upstream of the tests: `seeds/common/postgres.sql` declares ZERO
+# array columns, so no live export ever carries a LIST cell through the
+# value-checksum path. With `list` returning None the accumulator is simply not
+# updated (value_checksum.rs: `if let Some(elems) = src.list(..)`), so an array
+# column contributes NOTHING to the source-side checksum and nothing notices.
+#
+# This is the "a new TYPE must be run through every value-consuming mechanism"
+# rule biting again: arrays landed 2026-05-12, the checksum path never got a
+# fixture. Closing these needs an array column in the golden seed (a shared
+# fixture, so a deliberate change), not a unit test — `postgres::Row` has no
+# constructor reachable from this crate.
+# ────────────────────────────────────────────────────────────────────────────
 src/destination/cloud.rs:180:9: replace <impl super::Destination for CloudDestination<B>>::write -> Result<super::WriteOutcome> with Ok(Default::default())
 src/destination/cloud.rs:233:9: replace <impl super::Destination for CloudDestination<B>>::list_prefix -> Result<Vec<super::ObjectMeta>> with Ok(vec![])
 src/destination/cloud.rs:237:41: replace || with && in <impl super::Destination for CloudDestination<B>>::list_prefix
