@@ -12,6 +12,8 @@
 //! one test takes its siblings down with it. That isolation was free in the old one-binary-per-file
 //! layout; consolidation made it conditional on the runner. See `.config/nextest.toml`.
 
+#[path = "offline/attestation_matrix_guard.rs"]
+mod attestation_matrix_guard;
 #[path = "offline/audit_validate_warning_label.rs"]
 mod audit_validate_warning_label;
 #[path = "offline/cargo_manifest_chef.rs"]

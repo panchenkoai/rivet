@@ -1256,6 +1256,17 @@ mod roast_mysql_bit_decode_tests {
     };
     use super::{RivetTimeUnit, RivetType};
     use std::io::{Read, Write};
+
+    /// How long any socket in the fake harness waits.
+    ///
+    /// Deliberately SHORT. Under `cargo mutants` a mutation can break the fake
+    /// server's own protocol, and every fetch then sat on a 10-second read
+    /// timeout — with dozens of fetches per test that exceeded the mutant budget
+    /// and 43 of 278 mutants TIMED OUT, which is neither caught nor missed but
+    /// UNMEASURED. Everything here talks to localhost against an in-process
+    /// server, so a second is already generous; a longer wait only buys a slower
+    /// way to learn the same failure.
+    const FAKE_IO_TIMEOUT: Duration = Duration::from_secs(1);
     use std::net::{TcpListener, TcpStream};
     use std::sync::Arc;
     use std::time::Duration;
@@ -1376,8 +1387,8 @@ mod roast_mysql_bit_decode_tests {
     /// COM_QUERY with one BIT(16) row whose raw wire bytes are [0x31, 0x32].
     fn serve_one_bit16_query(listener: TcpListener) {
         let (mut s, _) = listener.accept().expect("fake MySQL server: accept");
-        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-        s.set_write_timeout(Some(Duration::from_secs(10))).unwrap();
+        s.set_read_timeout(Some(FAKE_IO_TIMEOUT)).unwrap();
+        s.set_write_timeout(Some(FAKE_IO_TIMEOUT)).unwrap();
 
         // ── connection phase (seq 0..=2) ──
         write_packet(&mut s, 0, &handshake_greeting());
@@ -1404,8 +1415,8 @@ mod roast_mysql_bit_decode_tests {
     /// `mysql::Row` carrying the column metadata — the metadata IS the subject.
     fn serve_one_metadata_query(listener: TcpListener, defs: Vec<Vec<u8>>) {
         let (mut s, _) = listener.accept().expect("fake MySQL server: accept");
-        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-        s.set_write_timeout(Some(Duration::from_secs(10))).unwrap();
+        s.set_read_timeout(Some(FAKE_IO_TIMEOUT)).unwrap();
+        s.set_write_timeout(Some(FAKE_IO_TIMEOUT)).unwrap();
 
         write_packet(&mut s, 0, &handshake_greeting());
         let _handshake_response = read_packet(&mut s);
@@ -1473,8 +1484,8 @@ mod roast_mysql_bit_decode_tests {
         rows: Vec<Vec<Option<Vec<u8>>>>,
     ) {
         let (mut s, _) = listener.accept().expect("fake MySQL server: accept");
-        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-        s.set_write_timeout(Some(Duration::from_secs(10))).unwrap();
+        s.set_read_timeout(Some(FAKE_IO_TIMEOUT)).unwrap();
+        s.set_write_timeout(Some(FAKE_IO_TIMEOUT)).unwrap();
 
         write_packet(&mut s, 0, &handshake_greeting());
         let _handshake_response = read_packet(&mut s);
@@ -1550,9 +1561,9 @@ mod roast_mysql_bit_decode_tests {
             .pass(Some(""))
             .prefer_socket(false)
             .max_allowed_packet(Some(16 * 1024 * 1024))
-            .tcp_connect_timeout(Some(Duration::from_secs(10)))
-            .read_timeout(Some(Duration::from_secs(10)))
-            .write_timeout(Some(Duration::from_secs(10)));
+            .tcp_connect_timeout(Some(FAKE_IO_TIMEOUT))
+            .read_timeout(Some(FAKE_IO_TIMEOUT))
+            .write_timeout(Some(FAKE_IO_TIMEOUT));
         let mut conn = Conn::new(opts).expect("connect to fake MySQL server");
         let rows: Vec<mysql::Row> = conn
             .exec("SELECT * FROM t", ())
@@ -1576,9 +1587,9 @@ mod roast_mysql_bit_decode_tests {
             .pass(Some(""))
             .prefer_socket(false)
             .max_allowed_packet(Some(16 * 1024 * 1024))
-            .tcp_connect_timeout(Some(Duration::from_secs(10)))
-            .read_timeout(Some(Duration::from_secs(10)))
-            .write_timeout(Some(Duration::from_secs(10)));
+            .tcp_connect_timeout(Some(FAKE_IO_TIMEOUT))
+            .read_timeout(Some(FAKE_IO_TIMEOUT))
+            .write_timeout(Some(FAKE_IO_TIMEOUT));
         let mut conn = Conn::new(opts).expect("connect to fake MySQL server");
 
         let mapped = {
@@ -1722,7 +1733,37 @@ mod roast_mysql_bit_decode_tests {
         )
     }
 
-    fn one_array(cell: (Vec<u8>, Vec<u8>), dt: &DataType, label: &str) -> Arc<dyn Array> {
+    /// Build every case's array from ONE fetch.
+    ///
+    /// A server per case is correct and unusable: at ~35 cases that is 35 TCP
+    /// listeners and 35 threads for one test, which under `cargo mutants` timed
+    /// out 43 of 278 mutants — and a timeout is neither caught nor missed, it is
+    /// UNMEASURED. Every case becomes a COLUMN of one resultset instead, so the
+    /// whole grid costs one connection.
+    /// A column definition paired with the binary bytes of one cell.
+    type Cell = (Vec<u8>, Vec<u8>);
+
+    fn arrays_for(cases: &[(&'static str, Cell, DataType, &'static str)]) -> Vec<Arc<dyn Array>> {
+        let defs: Vec<Vec<u8>> = cases.iter().map(|(_, (d, _), _, _)| d.clone()).collect();
+        let row: Vec<Option<Vec<u8>>> = cases
+            .iter()
+            .map(|(_, (_, b), _, _)| Some(b.clone()))
+            .collect();
+        let rows = fetch_binary_rows(defs, vec![row]);
+        assert_eq!(rows.len(), 1, "one row");
+        cases
+            .iter()
+            .enumerate()
+            .map(|(i, (label, _, dt, _))| {
+                build_array(dt, i, &rows, false, "c", None)
+                    .unwrap_or_else(|e| panic!("{label}: build_array errored: {e}"))
+            })
+            .collect()
+    }
+
+    /// One fetch for a single case — kept for the assertions that need a lone
+    /// column (the temporal grid grades raw primitives one type at a time).
+    fn one_array(cell: Cell, dt: &DataType, label: &str) -> Arc<dyn Array> {
         let (def, bytes) = cell;
         let rows = fetch_binary_rows(vec![def], vec![vec![Some(bytes)]]);
         assert_eq!(rows.len(), 1, "{label}: one row");
@@ -1746,87 +1787,75 @@ mod roast_mysql_bit_decode_tests {
     fn every_cell_source_accessor_reads_the_binary_value_it_should() {
         use crate::source::value_checksum::CellSource;
 
-        fn src(cell: (Vec<u8>, Vec<u8>)) -> Vec<mysql::Row> {
-            let (def, bytes) = cell;
-            fetch_binary_rows(vec![def], vec![vec![Some(bytes)]])
-        }
+        // ONE resultset, ONE connection, one fake server — for the whole grid.
+        //
+        // The first version fetched per assertion, which is 13 TCP servers and 13
+        // threads for one test. Correct, and unusable under `cargo mutants`: 43 of
+        // 278 mutants TIMED OUT, and a timeout is neither caught nor missed, it is
+        // UNMEASURED — 15% of the result silently absent. A checksum grid that
+        // cannot be graded is not much better than no grid.
+        //
+        // Row 0 carries a value in every column; row 1 is all NULL, so absence is
+        // tested through the same fetch instead of another server.
+        let cases: Vec<(&str, Cell)> = vec![
+            ("bool_true", v_int(1)),
+            ("bool_false", v_int(0)),
+            ("i16", v_int(-12345)),
+            ("i32", v_int(-2_000_000_000)),
+            ("i64", v_int(-9_000_000_000_000_000_000)),
+            ("u64", v_uint(18_000_000_000_000_000_000)),
+            ("f32", v_float(0.5)),
+            ("f64", v_double(-1.25)),
+            ("dec", v_bytes(b"150.05")),
+            ("utf8", v_bytes("h\u{e9}llo".as_bytes())),
+            ("bin", v_blob(&[0xde, 0xad])),
+            ("date_ts", v_date(2026, 6, 23, 10, 0, 0, 123_456)),
+            ("time", v_time(false, 0, 13, 45, 30, 123_456)),
+        ];
+        let col = |name: &str| cases.iter().position(|(n, _)| *n == name).expect("column");
+        let defs: Vec<Vec<u8>> = cases.iter().map(|(_, (d, _))| d.clone()).collect();
+        let row0: Vec<Option<Vec<u8>>> = cases.iter().map(|(_, (_, b))| Some(b.clone())).collect();
+        let row1: Vec<Option<Vec<u8>>> = cases.iter().map(|_| None).collect();
+        let rows = fetch_binary_rows(defs, vec![row0, row1]);
+        let s = MysqlCellSource { rows: &rows };
 
-        let r = src(v_int(1));
-        assert_eq!(MysqlCellSource { rows: &r }.num_rows(), 1);
-        assert_eq!(MysqlCellSource { rows: &r }.boolean(0, 0), Some(true));
-        let r = src(v_int(0));
-        assert_eq!(MysqlCellSource { rows: &r }.boolean(0, 0), Some(false));
-
-        let r = src(v_int(-12345));
-        assert_eq!(MysqlCellSource { rows: &r }.int16(0, 0), Some(-12345));
-        let r = src(v_int(-2_000_000_000));
-        assert_eq!(
-            MysqlCellSource { rows: &r }.int32(0, 0),
-            Some(-2_000_000_000)
-        );
-        let r = src(v_int(-9_000_000_000_000_000_000));
-        assert_eq!(
-            MysqlCellSource { rows: &r }.int64(0, 0),
-            Some(-9_000_000_000_000_000_000)
-        );
+        assert_eq!(s.num_rows(), 2);
+        assert_eq!(s.boolean(col("bool_true"), 0), Some(true));
+        assert_eq!(s.boolean(col("bool_false"), 0), Some(false));
+        assert_eq!(s.int16(col("i16"), 0), Some(-12345));
+        assert_eq!(s.int32(col("i32"), 0), Some(-2_000_000_000));
+        assert_eq!(s.int64(col("i64"), 0), Some(-9_000_000_000_000_000_000));
         // Only a magnitude past i64::MAX actually yields Value::UInt — see v_uint.
-        let r = src(v_uint(18_000_000_000_000_000_000));
-        assert_eq!(
-            MysqlCellSource { rows: &r }.uint64(0, 0),
-            Some(18_000_000_000_000_000_000)
-        );
-
-        let r = src(v_float(0.5));
-        assert_eq!(MysqlCellSource { rows: &r }.float32(0, 0), Some(0.5));
-        let r = src(v_double(-1.25));
-        assert_eq!(MysqlCellSource { rows: &r }.float64(0, 0), Some(-1.25));
-
+        assert_eq!(s.uint64(col("u64"), 0), Some(18_000_000_000_000_000_000));
+        assert_eq!(s.float32(col("f32"), 0), Some(0.5));
+        assert_eq!(s.float64(col("f64"), 0), Some(-1.25));
         // decimal keeps the UNSCALED integer: 150.05 at scale 2 is 15005.
-        let r = src(v_bytes(b"150.05"));
+        assert_eq!(s.decimal128(col("dec"), 0, 2), Some(15005));
         assert_eq!(
-            MysqlCellSource { rows: &r }.decimal128(0, 0, 2),
-            Some(15005)
-        );
-
-        let r = src(v_bytes(b"h\xc3\xa9llo"));
-        assert_eq!(
-            MysqlCellSource { rows: &r }.utf8(0, 0).as_deref(),
+            s.utf8(col("utf8"), 0).as_deref(),
             // The accessor hands back BYTES, not a validated str — the checksum
             // folds the exact wire bytes, so an invalid sequence must not be
             // silently replaced on the way in.
             Some("h\u{e9}llo".as_bytes())
         );
-        let r = src(v_blob(&[0xde, 0xad]));
-        assert_eq!(
-            MysqlCellSource { rows: &r }.binary(0, 0).as_deref(),
-            Some(&[0xde, 0xad][..])
-        );
-
+        assert_eq!(s.binary(col("bin"), 0).as_deref(), Some(&[0xde, 0xad][..]));
         // 2026-06-23 is 20627 days after 1970-01-01; the same instant at
         // 10:00:00.123456 is 1_782_208_800_123_456 microseconds after it.
-        let r = src(v_date(2026, 6, 23, 10, 0, 0, 123_456));
-        assert_eq!(MysqlCellSource { rows: &r }.date32(0, 0), Some(20627));
-        assert_eq!(
-            MysqlCellSource { rows: &r }.ts_micros(0, 0),
-            Some(1_782_208_800_123_456)
-        );
-
+        assert_eq!(s.date32(col("date_ts"), 0), Some(20627));
+        assert_eq!(s.ts_micros(col("date_ts"), 0), Some(1_782_208_800_123_456));
         // 13:45:30.123456 is 49_530_123_456 microseconds after midnight. No zero
         // components: at midnight the multiply, add and divide are indistinguishable.
-        let r = src(v_time(false, 0, 13, 45, 30, 123_456));
-        assert_eq!(
-            MysqlCellSource { rows: &r }.time64_micros(0, 0),
-            Some(49_530_123_456)
-        );
+        assert_eq!(s.time64_micros(col("time"), 0), Some(49_530_123_456));
 
-        // A NULL must read as absent through EVERY accessor, not as a zero — a
-        // checksum that folds NULL and 0 to one value attests they are the same.
-        let r = fetch_binary_rows(vec![v_int(0).0], vec![vec![None]]);
-        let s = MysqlCellSource { rows: &r };
-        assert_eq!(s.int64(0, 0), None, "NULL is absent, never 0");
-        assert_eq!(s.boolean(0, 0), None);
-        assert_eq!(s.float64(0, 0), None);
-        assert_eq!(s.utf8(0, 0), None);
+        // Row 1 is all NULL. Absence must read as absent through EVERY accessor,
+        // never as a zero — a checksum that folds NULL and 0 to one value attests
+        // they are the same.
+        assert_eq!(s.int64(col("i64"), 1), None, "NULL is absent, never 0");
+        assert_eq!(s.boolean(col("bool_true"), 1), None);
+        assert_eq!(s.float64(col("f64"), 1), None);
+        assert_eq!(s.utf8(col("utf8"), 1), None);
+        assert_eq!(s.date32(col("date_ts"), 1), None);
+        assert_eq!(s.time64_micros(col("time"), 1), None);
     }
 
     /// The FULL `DataType` x `Value` dispatch grid of `build_array`, over the
@@ -1855,7 +1884,7 @@ mod roast_mysql_bit_decode_tests {
 
         let ts = DataType::Timestamp(TimeUnit::Microsecond, None);
         /// (label, the (column-definition, binary-cell) pair, target type, expected render)
-        type GridCase = (&'static str, (Vec<u8>, Vec<u8>), DataType, &'static str);
+        type GridCase = (&'static str, Cell, DataType, &'static str);
         let cases: Vec<GridCase> = vec![
             // Boolean: any non-zero is true, and the Bytes path reads BIT bytes
             // big-endian (b"1" is 0x31 = 49, not the digit one).
@@ -1980,11 +2009,11 @@ mod roast_mysql_bit_decode_tests {
             ),
         ];
 
+        let arrays = arrays_for(&cases);
         let mut wrong = Vec::new();
-        for (label, cell, dt, want) in cases {
-            let arr = one_array(cell, &dt, label);
+        for ((label, _, _, want), arr) in cases.iter().zip(&arrays) {
             let got = array_value_to_string(arr.as_ref(), 0).expect("renderable");
-            if got != want {
+            if got != *want {
                 wrong.push(format!("{label}: want {want:?}, got {got:?}"));
             }
         }
@@ -2275,9 +2304,9 @@ mod roast_mysql_bit_decode_tests {
             .pass(Some(""))
             .prefer_socket(false)
             .max_allowed_packet(Some(16 * 1024 * 1024))
-            .tcp_connect_timeout(Some(Duration::from_secs(10)))
-            .read_timeout(Some(Duration::from_secs(10)))
-            .write_timeout(Some(Duration::from_secs(10)));
+            .tcp_connect_timeout(Some(FAKE_IO_TIMEOUT))
+            .read_timeout(Some(FAKE_IO_TIMEOUT))
+            .write_timeout(Some(FAKE_IO_TIMEOUT));
         let mut conn = Conn::new(opts).expect("connect to fake MySQL server");
 
         let rows: Vec<mysql::Row> = {
