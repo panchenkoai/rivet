@@ -1198,13 +1198,6 @@ src/source/postgres/arrow_convert.rs:304:22: replace != with == in <impl postgre
 src/source/postgres/arrow_convert.rs:317:13: replace == with != in <impl postgres_types::FromSql<'a> for PgInterval>::accepts
 src/source/postgres/arrow_convert.rs:317:9: replace <impl postgres_types::FromSql<'a> for PgInterval>::accepts -> bool with false
 src/source/postgres/arrow_convert.rs:317:9: replace <impl postgres_types::FromSql<'a> for PgInterval>::accepts -> bool with true
-src/source/postgres/arrow_convert.rs:343:32: replace < with <= in pg_interval_to_iso8601
-src/source/postgres/arrow_convert.rs:343:32: replace < with == in pg_interval_to_iso8601
-src/source/postgres/arrow_convert.rs:361:23: replace != with == in pg_interval_to_iso8601
-src/source/postgres/arrow_convert.rs:361:28: replace || with && in pg_interval_to_iso8601
-src/source/postgres/arrow_convert.rs:361:34: replace == with != in pg_interval_to_iso8601
-src/source/postgres/arrow_convert.rs:361:39: replace && with || in pg_interval_to_iso8601
-src/source/postgres/arrow_convert.rs:361:45: replace == with != in pg_interval_to_iso8601
 src/source/postgres/arrow_convert.rs:383:9: replace <impl postgres_types::FromSql<'a> for AnyAsString>::accepts -> bool with false
 src/source/postgres/arrow_convert.rs:410:28: replace != with == in rows_to_record_batch_typed
 src/source/postgres/arrow_convert.rs:447:9: replace <impl crate::source::value_checksum::CellSource for PgCellSource<'_>>::num_rows -> usize with 0

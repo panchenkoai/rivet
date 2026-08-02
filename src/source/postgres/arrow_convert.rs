@@ -1057,3 +1057,50 @@ fn pg_numeric_to_decimal256(
         b.finish().with_precision_and_scale(precision, scale)?,
     ))
 }
+
+#[cfg(test)]
+mod interval_render_tests {
+    use super::pg_interval_to_iso8601;
+
+    /// `pg_interval_to_iso8601` is a pure renderer with seven arithmetic steps
+    /// and, until now, no direct test — it was reachable only through a live
+    /// PostgreSQL export, which is why the mutation baseline carried seven
+    /// operator survivors for it (and why this 1000-line file had no test module
+    /// at all).
+    ///
+    /// Every component is chosen so no two operators agree: months=25 makes
+    /// `months / 12` (2) differ from `months * 12` (300) and `months % 12` (1)
+    /// differ from every other combination, and the microsecond value decomposes
+    /// into four DISTINCT non-zero fields (1h 2m 3s 456789µs) so each successive
+    /// `/` and `%` is observable on its own. The obvious fixture — a whole
+    /// number of hours — collapses three of them to zero.
+    #[test]
+    fn interval_render_pins_every_arithmetic_step() {
+        // 25 months = 2Y1M; 5 days; 3_723_456_789 µs = 1H 2M 3.456789S
+        assert_eq!(
+            pg_interval_to_iso8601(25, 5, 3_723_456_789),
+            "P2Y1M5DT1H2M3.456789S"
+        );
+        // The sign rides on each time component, and the magnitudes are
+        // unchanged — `unsigned_abs` before the division, not after.
+        assert_eq!(
+            pg_interval_to_iso8601(25, 5, -3_723_456_789),
+            "P2Y1M5DT-1H-2M-3.456789S"
+        );
+        // A sub-second-only interval: seconds is 0 but the fraction must still
+        // print, so the `us != 0` arm cannot be folded into the `sec != 0` one.
+        assert_eq!(pg_interval_to_iso8601(0, 0, 456_789), "PT0.456789S");
+        // Whole seconds with no fraction take the other arm.
+        assert_eq!(pg_interval_to_iso8601(0, 0, 3_000_000), "PT3S");
+        // Exactly one hour: minutes and seconds are zero, and the trailing "0S"
+        // is suppressed because h is non-zero.
+        assert_eq!(pg_interval_to_iso8601(0, 0, 3_600_000_000), "PT1H");
+        // Nothing at all still renders a valid ISO-8601 duration.
+        assert_eq!(pg_interval_to_iso8601(0, 0, 0), "PT0S");
+        // Months that are a whole number of years drop the month field — and
+        // with no time component at all the `T` section is omitted entirely,
+        // which "P2Y" expresses correctly. (The "T0S" fallback fires only when
+        // NOTHING was written, i.e. the string is still bare "P".)
+        assert_eq!(pg_interval_to_iso8601(24, 0, 0), "P2Y");
+    }
+}
