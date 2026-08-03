@@ -145,6 +145,31 @@ pub(crate) fn rehydrate_manifest_parts_from_file_log(
     // (silent loss / blocked load) and left size_bytes=0 (a lying PartSizeMismatch
     // in `rivet validate`) — both closed by using file_log (round-5).
     let files = state.list_files_for_run(run_id)?;
+
+    // Only the parts of COMPLETED chunks, which is what the caller's comment has
+    // always said this reconstructs — the implementation had lost the qualifier.
+    //
+    // A chunk-checkpoint resume ADOPTS the crashed run's id, so
+    // `list_files_for_run` returns that attempt's parts too. A chunk interrupted
+    // mid-flight has already written and LOGGED its part, but its task is not
+    // `completed`, so the resume re-runs it and writes a new part under a new
+    // nonce. Taking every logged file therefore rehydrated the abandoned one
+    // alongside the replacement, and deduping by PATH could not see it: different
+    // names, same rows. Measured on a 4000-row table — crash at chunk 0, then
+    // `--resume`, and the manifest declared 5 parts / 5000 rows with `validate`
+    // returning 0, because it is perfectly self-consistent with the files it
+    // lists. Every consumer that SUMS manifests inherits the duplicate.
+    //
+    // Filtering by the chunk's task status keeps rotation siblings (they belong to
+    // a completed chunk) and drops only the superseded attempt. A file with no
+    // chunk token is not a chunked part at all and is left alone.
+    let completed: std::collections::BTreeSet<String> = state
+        .list_chunk_tasks_for_run(run_id)?
+        .into_iter()
+        .filter(|t| t.status == "completed")
+        .map(|t| t.chunk_index.to_string())
+        .collect();
+
     let mut next_id = summary
         .manifest_parts
         .iter()
@@ -157,6 +182,11 @@ pub(crate) fn rehydrate_manifest_parts_from_file_log(
     for f in files {
         // Don't duplicate a part a fresh record_part already added this run.
         if summary.manifest_parts.iter().any(|p| p.path == f.file_name) {
+            continue;
+        }
+        // …nor resurrect the part of a chunk that is NOT completed: it is the
+        // abandoned attempt of a chunk this resume is about to re-run.
+        if super::chunk_index_of(&f.file_name).is_some_and(|c| !completed.contains(c)) {
             continue;
         }
         next_id += 1;
@@ -627,6 +657,15 @@ mod tests {
         let state =
             crate::state::StateStore::open_at_path(&state_dir.path().join("state.db")).unwrap();
         let run_id = "r_rot";
+        // The chunk's TASK, as a real checkpoint run always has one — the fixture
+        // omitted it, which made this test silently exercise a state no run can be
+        // in. Rehydration now asks whether the chunk COMPLETED (an interrupted
+        // chunk's part is the superseded attempt, not committed data), so without
+        // the task there is nothing to ask.
+        state.insert_chunk_tasks(run_id, &[(1, 100)]).unwrap();
+        state
+            .complete_chunk_task(run_id, 0, 50, Some("orders_chunk0_p0.parquet"))
+            .unwrap();
         // Two rotation siblings of ONE chunk, as record_part logs them per-part.
         state
             .record_file(
@@ -770,6 +809,69 @@ mod tests {
             summary.total_rows, parts_rows,
             "resume must accumulate onto the rehydrated base — total_rows must equal \
              sum(manifest_parts.rows), never under-report only this invocation's rows"
+        );
+    }
+
+    #[test]
+    fn rehydration_skips_the_part_of_a_chunk_that_did_not_complete() {
+        // The duplicate this filter exists for. A chunk-checkpoint resume ADOPTS the
+        // crashed run's id, so `list_files_for_run` returns the abandoned attempt's
+        // part too — under a DIFFERENT name, because the re-run picks a new nonce, so
+        // deduping by path cannot see it. Measured before the fix on a 4000-row table:
+        // crash at chunk 0, `--resume`, and the manifest declared 5 parts / 5000 rows
+        // while `validate` returned 0, being perfectly self-consistent with the files
+        // it listed. Every consumer that SUMS manifests inherited the duplicate.
+        let state_dir = tempfile::tempdir().unwrap();
+        let state =
+            crate::state::StateStore::open_at_path(&state_dir.path().join("state.db")).unwrap();
+        let run_id = "r_partial";
+        state
+            .insert_chunk_tasks(run_id, &[(1, 100), (101, 200)])
+            .unwrap();
+        // Chunk 0 completed; chunk 1 was interrupted mid-write and stays claimed.
+        state
+            .complete_chunk_task(run_id, 0, 50, Some("orders_chunk0_a.parquet"))
+            .unwrap();
+        state
+            .record_file(
+                run_id,
+                "orders",
+                "orders_chunk0_a.parquet",
+                50,
+                4096,
+                "parquet",
+                None,
+            )
+            .unwrap();
+        // …and its part IS on record, which is exactly the trap: written, logged,
+        // and about to be replaced.
+        state
+            .record_file(
+                run_id,
+                "orders",
+                "orders_chunk1_abandoned.parquet",
+                50,
+                4096,
+                "parquet",
+                None,
+            )
+            .unwrap();
+
+        let mut summary =
+            crate::pipeline::summary::RunSummary::stub_for_testing(run_id, String::from("orders"));
+        let n = rehydrate_manifest_parts_from_file_log(&state, run_id, &mut summary).unwrap();
+
+        assert_eq!(n, 1, "only the COMPLETED chunk's part may be reconstructed");
+        let paths: Vec<&str> = summary
+            .manifest_parts
+            .iter()
+            .map(|p| p.path.as_str())
+            .collect();
+        assert_eq!(paths, vec!["orders_chunk0_a.parquet"]);
+        assert!(
+            !paths.iter().any(|p| p.contains("abandoned")),
+            "the interrupted chunk's part must not be declared — the resume rewrites \
+             that chunk, and declaring both duplicates its rows in the manifest"
         );
     }
 

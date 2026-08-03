@@ -77,6 +77,20 @@ pub(crate) fn chunk_part_filename(
     )
 }
 
+/// The chunk index encoded in a part produced by [`chunk_part_filename`].
+///
+/// Lives BESIDE the formatter on purpose: the two are one contract, and a reader
+/// that parses what a distant writer formats is how a name silently stops meaning
+/// what it used to. Returns `None` for anything not shaped like a chunk part
+/// (a single-mode part, a CDC part, an operator's stray file), so a caller can
+/// treat "not a chunk part" as its own case rather than guessing.
+pub(crate) fn chunk_index_of(file_name: &str) -> Option<&str> {
+    let rest = file_name.split("_chunk").nth(1)?;
+    let end = rest.find('_')?;
+    let idx = &rest[..end];
+    (!idx.is_empty() && idx.bytes().all(|b| b.is_ascii_digit())).then_some(idx)
+}
+
 // ─── Chunk source selection ───────────────────────────────────────────────────
 
 /// Determines how chunk ranges are obtained at execution time.
