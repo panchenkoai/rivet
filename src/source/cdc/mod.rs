@@ -508,13 +508,23 @@ impl CdcEngine {
         url: &str,
         tls: Option<&TlsConfig>,
         tables: &[String],
+        opts: &CdcEngineOpts,
     ) -> RowImage {
         match self {
             Self::Mysql => crate::source::mysql::cdc::MysqlChangeStream::row_image(url, tls),
             Self::Postgres => {
                 crate::source::postgres::cdc::PgChangeStream::row_image(url, tls, tables)
             }
-            Self::Mssql => crate::source::mssql::cdc::row_image(url, tls, tables),
+            Self::Mssql => {
+                // The gate must grade the instance the poll will READ; anything
+                // else either sums across instances (masking a partial one) or
+                // matches a same-named table in another schema.
+                let ci = match opts {
+                    CdcEngineOpts::Mssql { capture_instance } => capture_instance.as_deref(),
+                    _ => None,
+                };
+                crate::source::mssql::cdc::row_image(url, tls, tables, ci)
+            }
             // The reader requests `FullDocumentType::UpdateLookup`, so the
             // post-image is the whole document whatever the server is set to.
             Self::Mongo => RowImage::Whole,
@@ -706,9 +716,25 @@ pub(crate) fn create_change_stream(
                 }),
                 None => None,
             };
+            // Was that position an ANCHOR or a resume? Only an anchor may be
+            // floored up to the instance's start; a resume position below the
+            // change table's min LSN is retention loss and must THROW. Absent on
+            // a legacy checkpoint ⇒ treated as a resume, the loud direction.
+            let from_is_pin = match cfg.checkpoint.as_deref() {
+                Some(p) => Position::load(p)?
+                    .and_then(|pos| pos.0.get("pinned").and_then(|v| v.as_bool()))
+                    .unwrap_or(false),
+                None => false,
+            };
             Ok(Box::new(
                 crate::source::mssql::cdc::MssqlChangeStream::from_url(
-                    url, ci, from_lsn, tls, peek, cfg.drain,
+                    url,
+                    ci,
+                    from_lsn,
+                    from_is_pin,
+                    tls,
+                    peek,
+                    cfg.drain,
                 )
                 .context(MSSQL_CDC_HINT)?,
             ))
@@ -941,7 +967,7 @@ pub(crate) fn run_capture(cap: CdcCapture<'_>) -> Result<Vec<crate::manifest::Ru
     // rather than inside each stream's `open`: scoped to what is actually being
     // captured, the answer is one line an operator can act on instead of a census
     // of the database (a first cut counted every table and said "704").
-    match engine.row_image(&url, tls.as_ref(), &cap_tables) {
+    match engine.row_image(&url, tls.as_ref(), &cap_tables, &cap.cdc_cfg.engine) {
         RowImage::Whole => {}
         RowImage::KeyOnlyDeletes { why } => log::warn!(
             "{} cdc: {why}. Counts still reconcile, but a per-row hash over deletes will differ \

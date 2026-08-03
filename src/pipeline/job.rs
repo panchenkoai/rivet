@@ -639,6 +639,28 @@ pub(crate) fn synthetic_failed_summary(export_name: &str, err: &anyhow::Error) -
 /// regression. A shared seam makes the wiring structural, not a per-wrapper
 /// checklist. No-op for a non-keyset strategy, and for a FAILED run (the anchor
 /// must survive a failure so the next run rehydrates rather than orphans).
+/// Did this run end in a state where its keyset resume anchor must be KEPT?
+///
+/// The anchor (`resume_run_id` + the per-range recovery rows) is what lets the
+/// next run adopt pages this one already made durable. Clearing it on a run that
+/// did not actually complete strands them: the parts are on the prefix, and the
+/// only mechanism that would pick them up is gone.
+///
+/// `failed` alone is not that question. It is `result.is_err()`, computed before
+/// the manifest is written — so a run whose PARTS landed but whose MANIFEST did
+/// not has `failed == false` while being, by then, a failed run: the status is
+/// corrected to "failed", the cursor is held back, and the process exits
+/// non-zero. Clearing the anchor there discarded the resume path for pages that
+/// no manifest names, which is the strand-the-durable-rows shape this repo has
+/// already paid for once.
+///
+/// Deliberately NOT folded into `failed` itself: `resolve_final_result` returns
+/// `run_result` when `failed`, so widening that variable would make a
+/// manifest-gap run exit 0 with an Ok result. Two questions, two names.
+pub(super) fn keyset_anchor_survives(failed: bool, manifest_gap: &Option<String>) -> bool {
+    failed || manifest_gap.is_some()
+}
+
 fn finalize_keyset_anchor(
     state: &StateStore,
     plan: &ResolvedRunPlan,
@@ -1040,7 +1062,12 @@ pub(super) fn run_export_job(
     // later run isn't treated as a resume of this finished one. Clearing AFTER the
     // manifest write is the same ordering as the cursor advance: a crash before here
     // leaves resume_run_id set, so the next run rehydrates rather than orphans.
-    finalize_keyset_anchor(state, &plan, &summary.export_name, failed);
+    finalize_keyset_anchor(
+        state,
+        &plan,
+        &summary.export_name,
+        keyset_anchor_survives(failed, &manifest_gap),
+    );
     if plan.validate {
         finalize_validate_manifest(&plan, &mut summary, "export");
     }
@@ -1191,7 +1218,12 @@ pub(crate) fn run_export_job_with_chunk_source(
     // here; a wrapper that skips it strands resume_run_id forever, so the next apply
     // is misread as a resume, reuses the frozen run_id, and the run-unique manifest
     // sidecar collides across runs (round-3 wrapper-bypass regression).
-    finalize_keyset_anchor(state, plan, &summary.export_name, failed);
+    finalize_keyset_anchor(
+        state,
+        plan,
+        &summary.export_name,
+        keyset_anchor_survives(failed, &manifest_gap),
+    );
     if plan.validate {
         finalize_validate_manifest(plan, &mut summary, "apply");
     }
@@ -1214,6 +1246,40 @@ pub(crate) fn run_export_job_with_chunk_source(
 
 #[cfg(test)]
 mod tests {
+
+    /// The keyset resume anchor must outlive a run that did not finish — and
+    /// "did not finish" includes a run whose PARTS landed but whose MANIFEST did
+    /// not, which `failed` (computed from `result.is_err()` before the manifest
+    /// is written) reports as a success.
+    ///
+    /// Clearing the anchor there wipes `resume_run_id` and the per-range recovery
+    /// rows, so the next run cannot adopt pages already on the prefix that no
+    /// manifest names — they are unreachable from both ends. Found by an
+    /// adversarial pass over this branch; the manifest-gap handling that made the
+    /// status "failed" did not widen the flag this decision reads.
+    #[test]
+    fn a_run_whose_manifest_did_not_land_keeps_its_keyset_resume_anchor() {
+        let gap = Some("the manifest write FAILED".to_string());
+
+        assert!(
+            keyset_anchor_survives(false, &gap),
+            "parts are durable and nothing names them — the anchor is the only way back to them"
+        );
+        assert!(
+            keyset_anchor_survives(true, &None),
+            "an export failure keeps its anchor, as it always did"
+        );
+        assert!(
+            keyset_anchor_survives(true, &gap),
+            "both at once is still a run that did not finish"
+        );
+        assert!(
+            !keyset_anchor_survives(false, &None),
+            "a genuinely complete run MUST clear it, or the next run is misread as a resume of \
+             this finished one and reuses its frozen run_id"
+        );
+    }
+
     use super::*;
 
     #[test]

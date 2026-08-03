@@ -1374,3 +1374,89 @@ fn mssql_cdc_typed_values_match_source_via_duckdb_not_batch() {
          batch): bigint, decimal 12345.6789, text, date, binary (hex), MONEY 123.4567; got: {res}"
     );
 }
+
+/// A PARTIAL capture instance must be refused even when a sibling instance of the
+/// same table is complete.
+///
+/// SQL Server allows two capture instances per source table, and the documented
+/// schema-change workflow is exactly that: create a second, cut over, drop the
+/// old. `row_image` joined `cdc.captured_columns` on the CHANGE table but grouped
+/// by the SOURCE table, so the two instances' captured columns were SUMMED
+/// against a denominator counted once — 2 of 3 plus 3 of 3 reads as 5 of 3, the
+/// `got < all` test goes false, and the gate returns `Whole`. Pointing rivet at
+/// the partial instance then writes NULL for the omitted column in every event,
+/// with `status: success`: precisely the harm the gate exists to refuse.
+///
+/// Invisible with one instance, which is what every other test and every manual
+/// check uses — the mechanism only misbehaves at N=2.
+#[test]
+#[ignore = "live: requires docker compose mssql with SQL Server Agent + CDC"]
+fn mssql_a_partial_capture_instance_is_refused_even_beside_a_complete_sibling() {
+    let _serial = CDC_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let d = tempfile::tempdir().unwrap();
+    let table = unique_name("rivet_cdc_twoci");
+    let ci_full = format!("{table}_full");
+    let ci_part = format!("{table}_part");
+    mssql_cdc_drop_table(&format!("dbo.{table}"));
+    mssql_cdc_exec(&format!(
+        "CREATE TABLE dbo.{table}(id INT PRIMARY KEY, keep INT, dropped INT)"
+    ));
+
+    // Instance ONE captures every column; instance TWO omits `dropped`.
+    enable_cdc(&table, &ci_full);
+    mssql_cdc_exec(&format!(
+        "EXEC sys.sp_cdc_enable_table @source_schema=N'dbo', @source_name=N'{table}', \
+         @role_name=NULL, @capture_instance=N'{ci_part}', \
+         @captured_column_list=N'id,keep';"
+    ));
+    let _g1 = MssqlCdcTable {
+        table: table.clone(),
+        ci: ci_full.clone(),
+    };
+    let _g2 = MssqlCdcTable {
+        table: table.clone(),
+        ci: ci_part.clone(),
+    };
+
+    // The fixture must actually be the shape under test: two instances, and the
+    // one rivet is pointed at must really be short.
+    let n_ci = mssql_cdc_query_i64(&format!(
+        "SELECT COUNT(*) FROM cdc.change_tables ct JOIN sys.tables t \
+         ON t.object_id = ct.source_object_id WHERE t.name = '{table}'"
+    ));
+    assert_eq!(
+        n_ci, 2,
+        "fixture is inert — the two-instance case is the whole point"
+    );
+    let n_part = mssql_cdc_query_i64(&format!(
+        "SELECT COUNT(*) FROM cdc.captured_columns cc JOIN cdc.change_tables ct \
+         ON ct.object_id = cc.object_id WHERE ct.capture_instance = '{ci_part}'"
+    ));
+    assert_eq!(
+        n_part, 2,
+        "the partial instance must capture 2 of the table's 3 columns"
+    );
+
+    mssql_cdc_exec(&format!(
+        "INSERT INTO dbo.{table} VALUES (1,10,100),(2,20,200)"
+    ));
+    wait_for_capture(&ci_part, 2);
+
+    let ckpt = d.path().join("cdc.ckpt");
+    let out = d.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let cfg = mssql_cdc_config(&d, &table, &ci_part, &ckpt, &out);
+    let res = run_rivet(&["run", "--config", cfg.to_str().unwrap()]);
+    let stderr = String::from_utf8_lossy(&res.stderr).into_owned();
+
+    assert!(
+        !res.status.success(),
+        "capturing through an instance that omits a column must be REFUSED, not reported \
+         successful with that column NULL in every event; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("2 of 3 columns"),
+        "the refusal must name the instance's REAL arity (2 of 3), not the sum across \
+         instances; stderr:\n{stderr}"
+    );
+}
