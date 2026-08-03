@@ -858,6 +858,10 @@ pub(crate) struct CdcCapture<'a> {
     /// RFC3339 stamps the caller owns (`Utc::now()` is theirs to call).
     pub run_id: String,
     pub started_at: String,
+    /// The central ledger. A `mode: cdc` run passes its store so every part is
+    /// recorded in the DATABASE as it becomes durable; the `rivet cdc` CLI has
+    /// no state store and passes `None`.
+    pub state: Option<&'a crate::state::StateStore>,
 }
 
 /// Open the change stream (with the engine's permission/TLS gate), resolve each
@@ -901,6 +905,7 @@ pub(crate) fn run_capture(cap: CdcCapture<'_>) -> Result<Vec<crate::manifest::Ru
         rollover_memory_bytes: cap.rollover_memory_bytes,
         started_at: cap.started_at,
         run_id: cap.run_id,
+        state: cap.state,
     };
     sink::run_to_files(stream.as_mut(), sink_cfg)
 }

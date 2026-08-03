@@ -92,7 +92,7 @@ pub(super) fn run_cdc_export(
     // marker that self-destructs is worse than none: it retires the known issue
     // while leaving the hole open.
 
-    let result = run_cdc_inner(config, export, &run_id);
+    let result = run_cdc_inner(config, export, &run_id, state);
     let duration_ms = started.elapsed().as_millis() as i64;
 
     let mut summary = match &result {
@@ -379,6 +379,7 @@ fn run_cdc_inner(
     config: &Config,
     export: &ExportConfig,
     run_id: &str,
+    state: &StateStore,
 ) -> Result<Vec<crate::manifest::RunManifest>> {
     let url = config.source.resolve_url()?;
     let cdc = export.cdc.clone().unwrap_or_default();
@@ -505,6 +506,7 @@ fn run_cdc_inner(
         rollover_memory_bytes: cdc.rollover_memory_mb.map(|mb| mb * 1024 * 1024),
         run_id: run_id.to_string(),
         started_at: now,
+        state: Some(state),
     })
 }
 

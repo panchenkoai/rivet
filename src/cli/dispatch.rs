@@ -343,6 +343,11 @@ fn dispatch_cdc(a: CdcArgs) -> Result<()> {
         rollover_memory_bytes: None,
         run_id: now.clone(),
         started_at: now,
+        // The ad-hoc `rivet cdc` subcommand runs without a config, and so
+        // without a state store to record into. A `mode: cdc` export — the
+        // supported path, and the one the sweep and the load read — passes its
+        // store, so every part reaches the database as it becomes durable.
+        state: None,
     })
     .map(|_| ())
 }

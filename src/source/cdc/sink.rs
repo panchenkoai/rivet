@@ -81,6 +81,10 @@ pub(crate) struct SinkConfig<'a> {
     pub started_at: String,
     /// RFC3339 stamp used as both `finished_at` and the run id seed.
     pub run_id: String,
+    /// The central ledger, so every part reaches the DATABASE as it becomes
+    /// durable — not just the manifest beside it. `None` only where there is no
+    /// state store to write to (the unit sinks, which have no database).
+    pub state: Option<&'a crate::state::StateStore>,
 }
 
 /// When to roll a part: at a transaction boundary, once the buffer reaches the row
@@ -124,6 +128,7 @@ impl TableSink<'_> {
         engine: super::CdcEngine,
         format: FormatType,
         run_token: &str,
+        ledger: Option<(&crate::state::StateStore, &str, &str)>,
     ) -> Result<()> {
         if self.buf.is_empty() {
             return Ok(());
@@ -156,6 +161,38 @@ impl TableSink<'_> {
             // verified anything.
             let e = self.column_sums.entry(name).or_insert(0);
             *e = e.wrapping_add(sum);
+        }
+        // The part is durable at the destination NOW — so the ledger learns
+        // about it NOW, at the same seam the batch path uses (`commit.rs`
+        // `record_file`), and strictly BEFORE the checkpoint/ack that
+        // `roll_all` performs next.
+        //
+        // Without this the state DB was not a record of a CDC run at all: it
+        // got `begin_run` at the start and one aggregate `export_metrics` row at
+        // finalize, and NOTHING per part — so a run that died mid-stream left
+        // durable, manifest-covered rows the database had never heard of. The
+        // manifest was finer-grained AND earlier than the ledger, which inverts
+        // the intended relationship: the database is the record, the manifest is
+        // its projection at the destination.
+        //
+        // Non-fatal, matching ADR-0001 I7: the file is already durable, so a
+        // ledger write failure is logged, never a reason to fail a run whose
+        // data is safe.
+        if let Some((state, export_name, run_id)) = ledger
+            && let Err(e) = state.record_file(
+                run_id,
+                export_name,
+                &part.file_name,
+                part.rows,
+                part.bytes as i64,
+                format.label(),
+                Some(part_compression(format).label()),
+            )
+        {
+            log::warn!(
+                "cdc: file_log write failed for '{}' (the part IS durable): {e:#}",
+                part.file_name
+            );
         }
         self.parts.push(part);
         self.seq += 1;
@@ -209,9 +246,15 @@ fn roll_all(
     unacked_commit: &mut bool,
     run_id: &str,
     started_at: &str,
+    state: Option<&crate::state::StateStore>,
 ) -> Result<()> {
     for s in sinks.iter_mut() {
-        s.flush_buffered(engine, format, run_token)?;
+        s.flush_buffered(
+            engine,
+            format,
+            run_token,
+            state.map(|st| (st, export_name, run_id)),
+        )?;
     }
     // Fault point: the parts are durable but the checkpoint/ack have NOT run. A
     // crash here must re-read on resume (at-least-once) — never lose the change.
@@ -357,6 +400,7 @@ pub(crate) fn run_to_files(
                         &mut unacked_commit,
                         &cfg.run_id,
                         &cfg.started_at,
+                        cfg.state,
                     )?;
                     total_rows = 0;
                     total_bytes = 0;
@@ -397,6 +441,7 @@ pub(crate) fn run_to_files(
                 &mut unacked_commit,
                 &cfg.run_id,
                 &cfg.started_at,
+                cfg.state,
             )?;
             total_rows = 0;
             total_bytes = 0;
@@ -721,11 +766,7 @@ fn flush(
     };
 
     let tmp = NamedTempFile::new()?;
-    let compression = match format {
-        FormatType::Csv => CompressionType::None,
-        FormatType::Parquet => CompressionType::Zstd,
-    };
-    let fmt = crate::format::create_format(format, compression, None, None);
+    let fmt = crate::format::create_format(format, part_compression(format), None, None);
     let writer: Box<dyn std::io::Write + Send> = Box::new(tmp.reopen()?);
     let mut w = fmt.create_writer(schema, writer)?;
     w.write_batch(&batch)?;
@@ -734,6 +775,22 @@ fn flush(
     let file_name = format!("cdc-{run_token}-{seq:06}.{}", format.label());
     let part = write_part_file(dest, tmp.path(), events.len() as i64, file_name)?;
     Ok((part, col_sums))
+}
+
+/// How a CDC part is compressed, per format — the ONE place that decides.
+///
+/// It was two places: the writer picked `None` for CSV and `Zstd` for Parquet,
+/// and `build_manifest`, sixty lines below, wrote the literal `"zstd"` for both.
+/// So a `format: csv` CDC export shipped plain-text parts under a manifest
+/// advertising zstd. Nothing in the pipeline reads the field back, which is why
+/// it survived — but the manifest is the contract a cross-boundary consumer
+/// decodes by, and a batch CSV export records the truth (`plan.compression
+/// .label()`), so the two legs described the same artifact differently.
+pub(crate) fn part_compression(format: FormatType) -> CompressionType {
+    match format {
+        FormatType::Csv => CompressionType::None,
+        FormatType::Parquet => CompressionType::Zstd,
+    }
 }
 
 /// Assemble one table's `RunManifest` from its committed parts (hand-built — no
@@ -786,7 +843,7 @@ fn build_manifest(
         // never advertise a contract this run did not apply.
         row_hash: crate::enrich::RowHashContract::of(&out.row_hash),
         format: format.label().to_string(),
-        compression: "zstd".to_string(),
+        compression: part_compression(format).label().to_string(),
         schema_fingerprint: String::new(),
         row_count: parts.iter().map(|p| p.rows).sum(),
         part_count: parts.len() as u32,
@@ -1148,6 +1205,143 @@ mod tests {
     // name (`cdc-000000`) silently overwrites the prior run's part AFTER the
     // source has already been acked past those changes: unrecoverable loss
     // (not in the slot, not in the destination).
+    /// Every durable CDC part reaches the DATABASE, not only the manifest.
+    ///
+    /// The database is meant to be the record of what a run produced and the
+    /// manifest its projection at the destination. For CDC it was the other way
+    /// round: `cdc_job` wrote `begin_run` at the start and one aggregate
+    /// `export_metrics` row at finalize, and the sink — which knows about parts —
+    /// never touched the state store at all. So the manifest was both FINER
+    /// (per part) and EARLIER (written before each ack, deliberately, so a crash
+    /// keeps the data visible) than the ledger, and a run that died mid-stream
+    /// left durable rows the database had never heard of. The batch path has
+    /// recorded each part through `commit.rs::record_file` all along; this is
+    /// the same seam on the CDC side.
+    ///
+    /// The oracle is the LEDGER, read back after a real `run_to_files` — the
+    /// value observed at the boundary, produced by the real writer, not a count
+    /// the test hands itself. `rollover: 2` over five changes so there is more
+    /// than one part: with a single part any per-part loop and any
+    /// write-once-at-the-end both look identical.
+    #[test]
+    fn every_durable_cdc_part_is_recorded_in_the_state_db_not_just_the_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = local_dest(&dir);
+        let cols = int_col();
+        let state = crate::state::StateStore::open_in_memory().expect("in-memory state");
+        let mut stream = FakeStream {
+            events: VecDeque::from(vec![insert(1), insert(2), insert(3), insert(4), insert(5)]),
+            acked: Vec::new(),
+        };
+        let manifest = run_to_files(
+            &mut stream,
+            SinkConfig {
+                state: Some(&state),
+                ..cfg(dest.as_ref(), &cols, FormatType::Parquet, 2)
+            },
+        )
+        .unwrap();
+
+        let logged = state.list_files_for_run("r").expect("read file_log");
+        let parts = &manifest[0].parts;
+        assert!(
+            parts.len() > 1,
+            "fixture must produce SEVERAL parts, or a per-part ledger write and a single \
+             write-at-the-end are indistinguishable; got {}",
+            parts.len()
+        );
+        assert_eq!(
+            logged.len(),
+            parts.len(),
+            "the manifest lists {} part(s) and the ledger recorded {} — every part the run made \
+             durable must be IN THE DATABASE, or a crashed run leaves rows nothing in the state \
+             store knows about",
+            parts.len(),
+            logged.len()
+        );
+        for p in parts {
+            let row = logged
+                .iter()
+                .find(|r| r.file_name == p.path)
+                .unwrap_or_else(|| {
+                    panic!("part '{}' is in the manifest but not in file_log", p.path)
+                });
+            assert_eq!(
+                row.row_count, p.rows,
+                "ledger and manifest disagree about how many rows '{}' holds",
+                p.path
+            );
+            assert_eq!(row.export_name, "t", "the ledger row must name the export");
+        }
+    }
+
+    /// The manifest must describe the compression the part actually has.
+    ///
+    /// The writer picked `None` for CSV and `Zstd` for Parquet; `build_manifest`
+    /// wrote the literal `"zstd"` for both. So a `format: csv` CDC export shipped
+    /// PLAIN-TEXT parts under a manifest advertising zstd — a cross-boundary
+    /// consumer that decodes by the field gets a zstd error on a readable file,
+    /// and the batch leg, which records `plan.compression.label()`, describes the
+    /// same artifact differently.
+    ///
+    /// The oracle is the FILE, not the other branch of the same match: the
+    /// assertion reads the bytes the run actually wrote and requires the manifest
+    /// to agree with them. Comparing the manifest to `part_compression` would
+    /// share the producer's opinion and pass on any consistent lie. Both formats
+    /// run, because with one the match arm is unobservable — the literal `"zstd"`
+    /// was RIGHT for parquet, which is exactly how it stayed for months.
+    #[test]
+    fn a_cdc_manifest_declares_the_compression_the_part_actually_has() {
+        for (format, ext) in [(FormatType::Csv, "csv"), (FormatType::Parquet, "parquet")] {
+            let dir = tempfile::tempdir().unwrap();
+            let dest = local_dest(&dir);
+            let cols = int_col();
+            let mut stream = FakeStream {
+                events: VecDeque::from(vec![insert(1), insert(2)]),
+                acked: Vec::new(),
+            };
+            let manifest =
+                run_to_files(&mut stream, cfg(dest.as_ref(), &cols, format, 10)).unwrap();
+            let declared = &manifest[0].compression;
+
+            let part = std::fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .find(|p| p.extension().is_some_and(|e| e == ext))
+                .unwrap_or_else(|| panic!("{format:?}: no .{ext} part was written"));
+            let bytes = std::fs::read(&part).unwrap();
+
+            // What the bytes say they are, decided WITHOUT asking rivet: a zstd
+            // frame opens with the magic 28 B5 2F FD; a plain CSV opens with its
+            // header text; a Parquet file opens with "PAR1" and carries its codec
+            // inside, which `compression:` is describing.
+            let zstd_framed = bytes.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]);
+            match format {
+                FormatType::Csv => {
+                    assert!(
+                        !zstd_framed && bytes.starts_with(b"__op"),
+                        "the CSV part is plain text, so the manifest cannot say it is compressed"
+                    );
+                    assert_eq!(
+                        declared, "none",
+                        "the CSV part on disk is uncompressed plain text and the manifest \
+                         declares `{declared}` — the sidecar is describing a different file \
+                         than the one beside it"
+                    );
+                }
+                FormatType::Parquet => {
+                    assert!(bytes.starts_with(b"PAR1"), "not a parquet file");
+                    assert_eq!(
+                        declared, "zstd",
+                        "parquet parts are written with the zstd codec and the manifest must \
+                         still say so — a fix for the CSV arm that flips this one has moved \
+                         the defect rather than removed it"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn roast_second_run_into_same_prefix_must_not_clobber_prior_parts() {
         let dir = tempfile::tempdir().unwrap();
@@ -1329,6 +1523,8 @@ mod tests {
             rollover_memory_bytes: None,
             started_at: "2026-06-23T00:00:00Z".into(),
             run_id: "r".into(),
+            // The unit sinks write to a tempdir with no database behind them.
+            state: None,
         }
     }
 
@@ -1620,6 +1816,8 @@ mod tests {
             rollover_memory_bytes: None,
             started_at: "2026-06-23T00:00:00Z".into(),
             run_id: "r".into(),
+            // The unit sinks write to a tempdir with no database behind them.
+            state: None,
         }
     }
 
