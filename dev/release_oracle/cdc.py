@@ -492,13 +492,66 @@ def _cdc_write_cfg(eng: str, url: str, work: Path, store: str, cdc_block: str) -
     return _Capture(yaml, bkt, pfx)
 
 
-def _state_populated(sdb: Path) -> bool:
+def _runs_seen(export: str = "orc_cdc_probe") -> frozenset[str] | None:
+    """Run ids already recorded for `export` on the Postgres store, or `None` when
+    the run is going to SQLite (fresh per engine, nothing to subtract)."""
+    url = os.environ.get("RIVET_STATE_URL", "").strip()
+    if not url:
+        return None
+    c = container_for_port(port_of(url) or 5432)
+    if c is None:
+        return frozenset()
+    return frozenset(
+        ln.strip()
+        for ln in docker_exec(
+            c, "psql", "-U", "rivet", "-d", "rivet_state", "-tAc",
+            f"SELECT run_id FROM run_status WHERE export_name = '{export}'",
+        ).stdout.splitlines()
+        if ln.strip()
+    )
+
+
+def _state_populated(
+    sdb: Path, export: str = "orc_cdc_probe", before: frozenset[str] | None = None
+) -> bool:
     """Did the run populate the state metabase — every recorded run a success?
 
-    Reads the SQLite file through the stdlib (read-only URI), so a diagnostic can
-    neither create nor migrate the db it is inspecting, and a host without the
-    `sqlite3` CLI no longer reports a populated state as `state-not-populated`.
+    READS THE BACKEND THE RUN ACTUALLY USED. It used to read a SQLite file at a
+    fixed path unconditionally, so the moment the gate was pointed at Postgres
+    (`--state-url`) every engine reported `state-not-populated`: the file it
+    looked for had never been created, because the run had written to Postgres.
+    Four red cells, none of them about rivet. A diagnostic that assumes the
+    environment it was written in grades that environment, not the product.
+
+    On Postgres the store is SHARED and PERMANENT, so the export name is not
+    enough scope: `orc_cdc_probe` is a constant, and every past invocation's
+    CRASH leg left a `running` row under it (54 success, 8 running when this was
+    first measured). The check must see only THIS invocation's runs.
+
+    The scope is the RUN ID SET taken before the run, not a timestamp. A
+    timestamp looked simpler and was wrong twice over: `now()` renders
+    `2026-08-03 13:45` with a space while `started_at` is RFC3339 with a `T`, and
+    a space sorts BELOW `T`, so the window came out wider than everything instead
+    of narrower. Isolation from the KEY, never from a clock — the same rule the
+    sweeps paid for.
+
+    On SQLite the work dir is fresh per engine, so no scope is needed.
     """
+    url = os.environ.get("RIVET_STATE_URL", "").strip()
+    if url:
+        c = container_for_port(port_of(url) or 5432)
+        if c is None:
+            return False
+        rows = [
+            ln.split("|", 1)
+            for ln in docker_exec(
+                c, "psql", "-U", "rivet", "-d", "rivet_state", "-tAc",
+                f"SELECT run_id||'|'||status FROM run_status WHERE export_name = '{export}'",
+            ).stdout.splitlines()
+            if "|" in ln
+        ]
+        mine = [st for rid, st in rows if before is None or rid not in before]
+        return bool(mine) and all(st == "success" for st in mine)
     # Goes through the same opener, so a WAL-mode db right after a run is READ
     # rather than mistaken for an empty one. An unreadable db returns False here
     # (the caller's `state-not-populated` wording covers it), but the read itself
@@ -546,11 +599,12 @@ def verify_cdc_e2e(led: Ledger) -> None:
         # 1. clean capture: anchor (A) → changes → capture (B)
         rivet("run", "-c", str(cap.yaml))
         spec.changes(url)
+        before = _runs_seen()  # the key set this cell will subtract, see _state_populated
         rivet("run", "-c", str(cap.yaml))
         n = _store_readback("s3", cap.bucket, cap.prefix, work)  # INDEPENDENT (DuckDB)
         vout = rivet("validate", "-c", str(cap.yaml)).out
         vp = "passed" in vout.lower()
-        spop = _state_populated(work / ".rivet_state.db")
+        spop = _state_populated(work / ".rivet_state.db", before=before)
 
         # 2. crash-recovery: an extra row (id=4) + crash at cdc_after_flush_before_ack →
         #    anchor held → recovery re-reads it (at-least-once, no loss).
