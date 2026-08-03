@@ -108,13 +108,15 @@ impl PgChangeStream {
     ///
     /// Best-effort: a catalog permission error must not fail a capture that is
     /// otherwise fine.
-    pub(crate) fn warn_partial_delete_image(
+    pub(crate) fn row_image(
         conn_str: &str,
         tls: Option<&TlsConfig>,
         tables: &[String],
-    ) {
+    ) -> crate::source::cdc::RowImage {
+        use crate::source::cdc::RowImage;
+
         if tables.is_empty() {
-            return;
+            return RowImage::Whole;
         }
         let Ok(mut client) = (match tls {
             Some(cfg) if cfg.mode.is_enforced() => crate::source::tls::build_native_tls(cfg)
@@ -124,34 +126,34 @@ impl PgChangeStream {
                 }),
             _ => Client::connect(conn_str, NoTls).map_err(Into::into),
         }) else {
-            return;
+            return RowImage::Whole;
         };
-        // The config may name a table bare or schema-qualified; match on the bare
-        // name, which is what `relname` holds.
+        // The config may name a table bare or schema-qualified; `relname` is bare.
         let bare: Vec<String> = tables
             .iter()
             .map(|t| t.rsplit('.').next().unwrap_or(t).to_string())
             .collect();
         let Ok(rows) = client.query(
             "SELECT c.relname::text FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
-         WHERE c.relkind = 'r' AND c.relreplident <> 'f' AND c.relname = ANY($1)",
+             WHERE c.relkind = 'r' AND c.relreplident <> 'f' AND c.relname = ANY($1)",
             &[&bare],
         ) else {
-            return;
+            return RowImage::Whole;
         };
         if rows.is_empty() {
-            return;
+            return RowImage::Whole;
         }
         let named: Vec<String> = rows.iter().map(|r| r.get::<_, String>(0)).collect();
-        log::warn!(
-            "pg cdc: {} of the captured table(s) ({}) have REPLICA IDENTITY other than FULL. A \
-         DELETE from them carries ONLY the primary key — every other column is NULL — while \
-         INSERT and UPDATE keep their full new-row image. Counts still reconcile, but a per-row \
-         hash over deletes will differ from the same table's batch export. \
-         `ALTER TABLE <t> REPLICA IDENTITY FULL` if the before-image matters.",
-            named.len(),
-            named.join(", ")
-        );
+        RowImage::KeyOnlyDeletes {
+            why: format!(
+                "{} of the captured table(s) ({}) have REPLICA IDENTITY other than FULL, so a \
+                 DELETE carries ONLY the primary key while INSERT and UPDATE keep their whole \
+                 new-row image. `ALTER TABLE <t> REPLICA IDENTITY FULL` if the before-image \
+                 matters",
+                named.len(),
+                named.join(", ")
+            ),
+        }
     }
 
     pub(crate) fn open(

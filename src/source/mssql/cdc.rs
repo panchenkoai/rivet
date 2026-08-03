@@ -36,6 +36,77 @@ use crate::source::cdc::value::RivetValue;
 use crate::source::cdc::{ChangeEvent, ChangeOp, ChangeStream, DrainMode, Position};
 use crate::source::require_tls_or_loopback;
 
+/// Does the capture instance carry every column of its source table?
+///
+/// `sp_cdc_enable_table @captured_column_list` lets an operator capture a SUBSET,
+/// and rivet had NO check for it — `grep -c captured_column_list src/` returned 0
+/// while MySQL was being taught to refuse a partial binlog image and PostgreSQL to
+/// warn about key-only deletes. SQL Server was the one engine where a partial
+/// image is CONFIGURABLE and unchecked.
+///
+/// `cdc.captured_columns` is the catalog answer, joined to `sys.columns` for what
+/// the table actually has. Catalogs, not names.
+///
+/// Best-effort: a reader without rights on the `cdc` schema answers `Whole` rather
+/// than blocking a capture that is otherwise fine.
+pub(crate) fn row_image(
+    url: &str,
+    tls: Option<&TlsConfig>,
+    tables: &[String],
+) -> crate::source::cdc::RowImage {
+    use crate::source::cdc::RowImage;
+
+    if tables.is_empty() {
+        return RowImage::Whole;
+    }
+    let Ok(mut src) = crate::source::mssql::MssqlSource::connect_with_tls(url, tls) else {
+        return RowImage::Whole;
+    };
+    let bare: Vec<String> = tables
+        .iter()
+        .map(|t| t.rsplit('.').next().unwrap_or(t).to_string())
+        .collect();
+    let list = bare
+        .iter()
+        .map(|t| format!("'{}'", t.replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT t.name + ':' + CAST(COUNT(cc.column_name) AS varchar(12)) + '/' + \
+                CAST((SELECT COUNT(*) FROM sys.columns sc WHERE sc.object_id = t.object_id) \
+                     AS varchar(12)) \
+         FROM cdc.change_tables ct \
+         JOIN sys.tables t ON t.object_id = ct.source_object_id \
+         JOIN cdc.captured_columns cc ON cc.object_id = ct.object_id \
+         WHERE t.name IN ({list}) \
+         GROUP BY t.name, t.object_id"
+    );
+    let Ok(rows) = src.query_single_column(&sql) else {
+        return RowImage::Whole;
+    };
+    let short: Vec<String> = rows
+        .iter()
+        .filter_map(|r| {
+            let (name, counts) = r.split_once(':')?;
+            let (got, all) = counts.split_once('/')?;
+            (got.trim().parse::<i64>().ok()? < all.trim().parse::<i64>().ok()?)
+                .then(|| format!("{name} ({got} of {all} columns)"))
+        })
+        .collect();
+    if short.is_empty() {
+        return RowImage::Whole;
+    }
+    RowImage::Partial {
+        why: format!(
+            "the capture instance(s) for {} were enabled with a PARTIAL @captured_column_list, so \
+             every change event is missing the columns that were left out — the rows would be \
+             recorded as NULL rather than as absent. Re-enable the table with the full column \
+             list (omit @captured_column_list) and re-run",
+            short.join(", ")
+        ),
+    }
+}
+
 /// Build one poll's T-SQL. `bound` pins `@max` to the open-time ceiling
 /// (`0x{hex}`, a bounded `until_current` run) instead of re-reading
 /// `sys.fn_cdc_get_max_lsn()` per poll (the daemon's chase-the-head mode) — the

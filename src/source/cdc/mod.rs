@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value as Json;
 
+use crate::config::TlsConfig;
 use crate::error::Result;
 use value::RivetValue;
 
@@ -468,7 +469,58 @@ pub(crate) enum CdcEngine {
     Mongo,
 }
 
+/// What image of a row this source can actually supply per change event.
+///
+/// rivet's change stream is a WHOLE-ROW image per event, and whether the source
+/// can produce one is a SERVER setting, not a rivet setting. Each engine has its
+/// own knob, so the question was being asked in two different layers with a third
+/// engine not asked at all:
+///
+///   mysql    `binlog_row_image`         inside the stream's `open`
+///   postgres `REPLICA IDENTITY`         a layer up, in `run_capture`
+///   mongo    —                          whole by construction (UpdateLookup)
+///   mssql    `@captured_column_list`    nowhere
+///
+/// One enum makes the answers comparable and moves the POLICY — refuse, warn, or
+/// proceed — out of each engine's prose into one place. A new engine then cannot
+/// forget: the method is a hole the compiler makes it fill.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RowImage {
+    /// Every column, on every event. Nothing to say.
+    Whole,
+    /// Inserts and updates carry the whole new row; DELETE carries only the key.
+    /// Not corruption — a delete's job is to name the key that is gone — but it
+    /// moves any per-row hash computed over deletes, so it is worth one line.
+    KeyOnlyDeletes { why: String },
+    /// The event cannot represent the row. Capturing would record events that are
+    /// wrong rather than merely thin, so this is refused.
+    Partial { why: String },
+}
+
 impl CdcEngine {
+    /// Ask the source what it can supply for the tables about to be captured.
+    ///
+    /// Best-effort by construction: a catalog the reader cannot query answers
+    /// `Whole`. Refusing on a permission error would lock out sources that are
+    /// fine, and this check exists to catch a CONFIGURATION, not to police access.
+    pub(crate) fn row_image(
+        &self,
+        url: &str,
+        tls: Option<&TlsConfig>,
+        tables: &[String],
+    ) -> RowImage {
+        match self {
+            Self::Mysql => crate::source::mysql::cdc::MysqlChangeStream::row_image(url, tls),
+            Self::Postgres => {
+                crate::source::postgres::cdc::PgChangeStream::row_image(url, tls, tables)
+            }
+            Self::Mssql => crate::source::mssql::cdc::row_image(url, tls, tables),
+            // The reader requests `FullDocumentType::UpdateLookup`, so the
+            // post-image is the whole document whatever the server is set to.
+            Self::Mongo => RowImage::Whole,
+        }
+    }
+
     pub(crate) fn from_url(url: &str) -> Result<Self> {
         if url.starts_with("mysql://") {
             Ok(Self::Mysql)
@@ -884,16 +936,23 @@ pub(crate) fn run_capture(cap: CdcCapture<'_>) -> Result<Vec<crate::manifest::Ru
     // ONE resolver session serves every table (was: 2 fresh connections per
     // table per run — the multi-table per-cycle cost the roast flagged).
     crate::test_hook::maybe_panic_at("cdc_before_resolve");
-    // The captured tables are known HERE and nowhere earlier, which is why the
-    // replica-identity notice lives at this seam rather than in the stream's
-    // `open`: scoped to what is actually being captured, it is one line an
-    // operator can act on instead of a census of the database.
-    if matches!(engine, CdcEngine::Postgres) {
-        crate::source::postgres::cdc::PgChangeStream::warn_partial_delete_image(
-            &url,
-            tls.as_ref(),
-            &cap_tables,
-        );
+    // ONE place decides what each verdict MEANS. The captured tables are known
+    // here and nowhere earlier, which is why the question is asked at this seam
+    // rather than inside each stream's `open`: scoped to what is actually being
+    // captured, the answer is one line an operator can act on instead of a census
+    // of the database (a first cut counted every table and said "704").
+    match engine.row_image(&url, tls.as_ref(), &cap_tables) {
+        RowImage::Whole => {}
+        RowImage::KeyOnlyDeletes { why } => log::warn!(
+            "{} cdc: {why}. Counts still reconcile, but a per-row hash over deletes will differ \
+             from the same table's batch export.",
+            engine.label()
+        ),
+        RowImage::Partial { why } => anyhow::bail!(
+            "{} cdc: {why}. Capturing under this setting would report success over events that \
+             cannot represent the row.",
+            engine.label()
+        ),
     }
     let mut resolver = CdcSchemaResolver::connect(&url, tls.as_ref())?;
     for o in cap.outputs {

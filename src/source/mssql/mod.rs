@@ -153,6 +153,22 @@ pub(crate) fn parse_mssql_url(url: &str) -> Result<MssqlUrl> {
 }
 
 impl MssqlSource {
+    /// Every row of a ONE-COLUMN query, as text. The multi-row sibling of
+    /// [`query_scalar`], for catalog probes that answer per table.
+    pub(crate) fn query_single_column(&mut self, sql: &str) -> Result<Vec<String>> {
+        let Self { rt, client, .. } = self;
+        rt.block_on(async {
+            let rows = client
+                .query(sql, &[])
+                .await
+                .map_err(|e| anyhow::anyhow!("mssql: catalog query failed: {e}"))?
+                .into_first_result()
+                .await
+                .map_err(|e| anyhow::anyhow!("mssql: reading catalog rows failed: {e}"))?;
+            Ok(rows.iter().filter_map(scalar_to_string).collect())
+        })
+    }
+
     /// Connect to SQL Server, honouring the shared `TlsConfig`. `url` is the
     /// resolved `sqlserver://user:pass@host:port/db` form. A successful return
     /// has completed a TLS login handshake and a `SELECT 1` round-trip.
