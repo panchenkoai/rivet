@@ -792,6 +792,85 @@ def apply_axes(cdc_block: str, case: Case, work: Path) -> str:
     return "cdc: { " + ", ".join(keys) + case.cdc_extra + " }"
 
 
+def prepare_source(engine: str, url: str, table: str) -> None:
+    """Retire the previous case's capture instance BEFORE its table is dropped.
+
+    The shared setup does `DROP TABLE` first and only then looks for a capture
+    instance to disable — by which point the join through `sys.tables` finds
+    nothing, so the orphaned instance is left to SQL Server's asynchronous
+    cleanup. That cleanup deletes the change functions BY NAME, and the next case
+    has already created a fresh instance under the same name, so it deletes the
+    NEW one's functions. Reading then dies with `Invalid object name
+    'cdc.fn_cdc_get_all_changes_dbo_orc_cdc_probe'`, which the sweep reports as
+    "the manifests list no part at all" — indistinguishable from rivet losing the
+    changes, and it took a whole engine's re-run to tell apart.
+
+    Disabling while the table still exists makes the removal synchronous, so the
+    name is free before the next `sp_cdc_enable_table` claims it.
+    """
+    if engine != "mssql":
+        return
+    from release_oracle import cdc as gate_cdc
+
+    gate_cdc._sqlcmd(
+        url,
+        sql=(
+            f"IF EXISTS (SELECT 1 FROM cdc.change_tables ct JOIN sys.tables t "
+            f"ON ct.source_object_id=t.object_id WHERE t.name='{table}')\n"
+            f"  EXEC sys.sp_cdc_disable_table @source_schema='dbo', @source_name='{table}',"
+            f" @capture_instance='all';\n"
+        ),
+    )
+    # Disabling only helps while the table still EXISTS — once the previous case
+    # dropped it the instance is orphaned, the join above finds nothing, and the
+    # asynchronous cleanup is still pending. Checking that the new instance exists
+    # is then not enough either: the pending cleanup fires AFTER the check and
+    # deletes the new functions by name (`rollover_1` died exactly there, one case
+    # after the readiness check went in). So the pre-condition is that the NAME IS
+    # FREE — wait for the old function to be gone before anyone creates a new one.
+    for _ in range(15):
+        p = gate_cdc._sqlcmd(
+            url,
+            q=(
+                f"SET NOCOUNT ON; SELECT CASE WHEN OBJECT_ID("
+                f"'cdc.fn_cdc_get_all_changes_dbo_{table}') IS NULL THEN 1 ELSE 0 END"
+            ),
+        )
+        if "1" in (p.stdout or ""):
+            return
+        time.sleep(2.0)
+
+
+def capture_ready(engine: str, url: str, table: str) -> bool:
+    """Is the capture instance's change FUNCTION actually there to be read?
+
+    `sp_cdc_enable_table` returning success is not the same as the object being
+    present and staying present — see `prepare_source` for how it can vanish. The
+    sweep checks the thing rivet will actually call, not the DDL's exit status.
+    """
+    if engine != "mssql":
+        return True
+    from release_oracle import cdc as gate_cdc
+
+    # BOTH objects, because both have gone missing at read time in different runs:
+    # the change function (the async cleanup deleting the new instance's functions
+    # by name) and the SOURCE TABLE itself. Checking one and assuming the other is
+    # how the same race came back wearing a different error message.
+    for _ in range(15):
+        p = gate_cdc._sqlcmd(
+            url,
+            q=(
+                f"SET NOCOUNT ON; SELECT CASE WHEN OBJECT_ID("
+                f"'cdc.fn_cdc_get_all_changes_dbo_{table}') IS NOT NULL "
+                f"AND OBJECT_ID('dbo.{table}') IS NOT NULL THEN 1 ELSE 0 END"
+            ),
+        )
+        if "1" in (p.stdout or ""):
+            return True
+        time.sleep(2.0)
+    return False
+
+
 def settle(engine: str, url: str, table: str, want: int) -> bool:
     """Wait until the SOURCE itself can see the changes.
 
@@ -863,16 +942,20 @@ def measure(engine: str, case: Case, work_root: Path) -> Result:
     # sweeps: it succeeds. Bounded, so a genuinely broken source still surfaces.
     cdc_block = None
     for attempt in range(4):
+        prepare_source(engine, url, "orc_cdc_probe")
         cdc_block = spec.setup(url, work)
-        if cdc_block is not None:
+        if cdc_block is not None and capture_ready(engine, url, "orc_cdc_probe"):
             break
+        cdc_block = None
         time.sleep(2.0 * (attempt + 1))
     if cdc_block is None:
         r.skipped = "source setup failed after 4 attempts"
         return r
-    if case.multi and not _second_table_ddl(engine, url):
-        r.skipped = "could not create the second table"
-        return r
+    if case.multi:
+        prepare_source(engine, url, SECOND_TABLE)
+        if not _second_table_ddl(engine, url) or not capture_ready(engine, url, SECOND_TABLE):
+            r.skipped = "could not create the second table"
+            return r
     cdc_block = apply_axes(cdc_block, case, work)
 
     cfg = work / "cdc.yaml"
@@ -1205,7 +1288,15 @@ def acquire_lock() -> Path | None:
     A lock file with the pid, not a process scan: the scan has to guess at command
     lines, and this has to be right.
     """
-    lock = Path(os.environ.get("RIVET_CDC_SWEEP_LOCK", "/tmp/.rivet_cdc_sweep.lock"))
+    # Keyed on the ENGINE, not global. Two sweeps collide because they share the
+    # probe TABLES, and tables live on a server — postgres and mysql sweeps have
+    # nothing to take from each other. A global lock would also make the one
+    # scenario worth testing impossible to run: every engine, batch and CDC, all
+    # writing to ONE state backend at the same time.
+    engine = os.environ.get("RIVET_CDC_SWEEP_ENGINE") or "all"
+    lock = Path(
+        os.environ.get("RIVET_CDC_SWEEP_LOCK", f"/tmp/.rivet_cdc_sweep.{engine}.lock")
+    )
     if lock.exists():
         try:
             pid = int(lock.read_text().strip())

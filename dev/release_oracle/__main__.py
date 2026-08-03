@@ -44,7 +44,7 @@ import time
 from pathlib import Path
 
 from .core import Ledger, Status, engine_container, docker, have, remove_engine_containers, rivet, rivet_bin, run, HERE, ROOT
-from . import bigquery, cdc, gifs, regression, release_path, scenarios
+from . import bigquery, cdc, concurrency, gifs, regression, release_path, scenarios
 
 
 def matrix_cfg(*args: str) -> str:
@@ -145,6 +145,21 @@ def preflight(led: Ledger, *, bless_gifs: bool = False) -> None:
     cdc.verify_cdc_e2e(led)
     regression.verify_release_regression(led)
     regression.verify_scale_memory(led)
+    # Several writers into ONE prefix and ONE state backend. Placed in the
+    # source-agnostic preflight because the property is the WRITERS' — a shared
+    # deployment's exports do not take turns — not any engine's; one source
+    # exercises it. Local first, then the same race over a flat object-store
+    # namespace, where there is no rename to fall back on.
+    concurrency.verify_concurrent_writers_share_a_prefix(
+        led,
+        state_url=os.environ.get("RIVET_CDC_STATE_URL") or os.environ.get("RIVET_CONC_STATE_URL"),
+        state_container=os.environ.get("RIVET_SWEEP_STATE_CONTAINER", "rivet-postgres-state-1"),
+        src_container=os.environ.get("RIVET_CONC_SRC_CONTAINER", "rivet-postgres-1"),
+        src_url=os.environ.get(
+            "RIVET_CONC_SRC_URL", "postgresql://rivet:rivet@localhost:5432/rivet"
+        ),
+        bucket=os.environ.get("BQ_ORACLE_BUCKET") or "rivet_data_test",
+    )
 
 
 def bring_up(led: Ledger, engine: str, tag: str, image: str, port: int) -> str | None:
