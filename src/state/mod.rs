@@ -29,7 +29,7 @@ pub use keyset_range::{KeysetRangePart, KeysetRangeRow};
 pub use load_journal_store::LoadRecord;
 #[allow(unused_imports)]
 pub use metrics::ExportMetric;
-pub use metrics::MetricRow;
+pub use metrics::{MetricRow, RunProgress};
 #[allow(unused_imports)]
 pub use progression::{Boundary, ExportProgression};
 #[allow(unused_imports)]

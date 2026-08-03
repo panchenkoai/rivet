@@ -94,6 +94,18 @@ pub struct MetricRow {
 ///
 /// Invariant I4 (Metric After Verdict) governs when `record_metric` is called:
 /// only after the terminal run outcome is determined.
+/// What a run has made durable so far — the payload of an in-flight
+/// [`StateStore::record_metric_progress`].
+///
+/// A struct rather than three positional `i64`s: `(rows, files, bytes)` at a call
+/// site is three numbers of the same type in an order nothing checks.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RunProgress {
+    pub total_rows: i64,
+    pub files: i64,
+    pub bytes: i64,
+}
+
 impl StateStore {
     /// Back-compat shim: the original 15-field metric. Fills the v9 columns with
     /// defaults (NULL) and delegates to [`record_metric_full`]. The production
@@ -142,10 +154,115 @@ impl StateStore {
         })
     }
 
+    /// The `running` aggregate for a run in flight — written at the same durable
+    /// seam as the parts, so the ledger describes a run WHILE it happens.
+    ///
+    /// `export_metrics` used to appear only at finalize, which meant a run that
+    /// died mid-stream had its parts in `file_log` (once the CDC sink started
+    /// recording them) and no aggregate anywhere: the database knew the files
+    /// existed and could not say what run they amounted to. This closes that —
+    /// the row exists from the first durable roll and carries the totals so far.
+    ///
+    /// ONE row per run, always: this UPDATEs the run's `running` row and inserts
+    /// only when there is none, and [`record_metric_full`] clears it before
+    /// writing the terminal row. Anything that sums `total_rows` across runs
+    /// would otherwise double-count a run for every roll it survived — a far
+    /// worse failure than the gap being closed.
+    /// Drop a run's in-flight `running` aggregate. Only ever called by
+    /// [`record_metric_full`], immediately before the terminal row replaces it.
+    fn clear_running_metric(&self, run_id: &str) -> Result<()> {
+        let sql = "DELETE FROM export_metrics WHERE run_id = ?1 AND status = 'running'";
+        match &self.conn {
+            StateConn::Sqlite(c) => {
+                c.execute(sql, rusqlite::params![run_id])?;
+            }
+            StateConn::Postgres(client) => {
+                client.borrow_mut().execute(&pg_sql(sql), &[&run_id])?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn record_metric_progress(
+        &self,
+        export_name: &str,
+        run_id: &str,
+        mode: &str,
+        format: &str,
+        p: RunProgress,
+    ) -> Result<()> {
+        let RunProgress {
+            total_rows,
+            files,
+            bytes,
+        } = p;
+        let now = chrono::Utc::now().to_rfc3339();
+        let upd = "UPDATE export_metrics SET total_rows = ?1, files_produced = ?2, \
+                   files_committed = ?3, bytes_written = ?4, run_at = ?5 \
+                   WHERE run_id = ?6 AND status = 'running'";
+        let ins = "INSERT INTO export_metrics (export_name, run_id, run_at, duration_ms, \
+                   total_rows, status, mode, format, files_produced, files_committed, \
+                   bytes_written, retries) \
+                   VALUES (?1, ?2, ?3, 0, ?4, 'running', ?5, ?6, ?7, ?8, ?9, 0)";
+        match &self.conn {
+            StateConn::Sqlite(c) => {
+                let n = c.execute(
+                    upd,
+                    rusqlite::params![total_rows, files, files, bytes, now, run_id],
+                )?;
+                if n == 0 {
+                    c.execute(
+                        ins,
+                        rusqlite::params![
+                            export_name,
+                            run_id,
+                            now,
+                            total_rows,
+                            mode,
+                            format,
+                            files,
+                            files,
+                            bytes
+                        ],
+                    )?;
+                }
+            }
+            StateConn::Postgres(client) => {
+                let mut c = client.borrow_mut();
+                let n = c.execute(
+                    &pg_sql(upd),
+                    &[&total_rows, &files, &files, &bytes, &now, &run_id],
+                )?;
+                if n == 0 {
+                    c.execute(
+                        &pg_sql(ins),
+                        &[
+                            &export_name,
+                            &run_id,
+                            &now,
+                            &total_rows,
+                            &mode,
+                            &format,
+                            &files,
+                            &files,
+                            &bytes,
+                        ],
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Insert one fully-populated `export_metrics` row (all v1 + v9 columns).
     /// The production run/apply path builds the complete [`MetricRow`]; the
     /// 15-field [`record_metric`] shim covers callers with only the core signals.
+    ///
+    /// Clears this run's in-flight `running` row first, so a run leaves exactly
+    /// ONE row at rest — see [`record_metric_progress`] for why that matters more
+    /// than keeping the progress history.
     pub fn record_metric_full(&self, m: &MetricRow) -> Result<()> {
+        self.clear_running_metric(&m.run_id)?;
         let now = chrono::Utc::now().to_rfc3339();
         let sql = "INSERT INTO export_metrics (
              export_name, run_id, run_at, duration_ms, total_rows, peak_rss_mb,

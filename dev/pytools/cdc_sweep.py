@@ -597,13 +597,25 @@ def oracle_metadb(
     problems: list[str] = []
     notes: list[str] = []
     rows = {}
+    dupes = []
     for line in psql_state(
-        f"SELECT run_id||'|'||total_rows||'|'||coalesce(files_committed,-1) "
+        f"SELECT run_id||'|'||total_rows||'|'||coalesce(files_committed,-1)||'|'||status "
         f"FROM export_metrics WHERE {owned_by(export)}"
     ).splitlines():
         f = line.split("|")
-        if len(f) == 3 and f[0] in new_runs:
-            rows[f[0]] = (as_int(f[1]), as_int(f[2]))
+        if len(f) == 4 and f[0] in new_runs:
+            if f[0] in rows:
+                dupes.append(f[0])
+            rows[f[0]] = (as_int(f[1]), as_int(f[2]), f[3])
+    if dupes:
+        # The aggregate is now written per ROLL, in flight — so the row that
+        # matters is the one there is exactly ONE of. A second row per run makes
+        # every sum over `export_metrics` count that run twice, which is worse
+        # than the in-flight gap the per-roll write closes.
+        problems.append(
+            f"run(s) {sorted(set(dupes))} have MORE THAN ONE export_metrics row — the in-flight "
+            f"aggregate must be updated and then replaced by the terminal row, never appended to"
+        )
 
     # `tables:` puts several manifests under ONE run id — the ledger records the
     # run, not the table, so the comparison is against the run's TOTAL.
@@ -621,26 +633,18 @@ def oracle_metadb(
     for run_id, (m_rows, m_parts) in sorted(per_run.items()):
         rec = rows.get(run_id)
         if rec is None:
-            if run_id in crashed:
-                # BY DESIGN, and worth stating rather than tolerating silently:
-                # `roll_all` writes a Success run-unique manifest BEFORE the ack,
-                # so a crash past that point leaves durable, manifest-covered rows
-                # — while the metrics row, written at finalize, never happens. The
-                # ledger therefore UNDER-COUNTS a crashed run by exactly the rows
-                # it made durable. Anything reconciling from the state DB alone
-                # would miss them; the manifest copies are the authority.
-                notes.append(
-                    f"the crashed run left {m_rows} durable manifest-covered row(s) that the "
-                    f"meta-DB has no metrics row for — the manifest is written before the ack, "
-                    f"the metrics row at finalize"
-                )
-                continue
+            # No excuse for a crashed run any more. The aggregate is written at
+            # the same durable seam as the parts, so a run that made rows durable
+            # has a row saying so whether or not it lived to finalize. This USED
+            # to be a documented under-count — the manifest was written before the
+            # ack and the metrics row only at finalize, so anything reconciling
+            # from the state DB alone missed exactly the crashed run's rows.
             problems.append(
                 f"{run_id}: the run wrote a manifest but the meta-DB has no metrics row for it — "
                 f"the artifact and the ledger disagree about whether this run happened"
             )
             continue
-        meta_rows, files_committed = rec
+        meta_rows, files_committed, status = rec
         if meta_rows != m_rows:
             problems.append(
                 f"{run_id}: meta-DB total_rows={meta_rows}, its own manifest(s) say {m_rows}"
@@ -649,6 +653,25 @@ def oracle_metadb(
             problems.append(
                 f"{run_id}: meta-DB files_committed={files_committed}, the manifest(s) list "
                 f"{m_parts} parts"
+            )
+        # A run that never reached finalize must READ as unfinished. `running` is
+        # what makes the row honest — and it is what supersession later resolves,
+        # so a crashed run silently labelled `success` would be indistinguishable
+        # from a clean one in every downstream report.
+        if run_id in crashed and status != "running":
+            problems.append(
+                f"{run_id}: the run crashed but its metrics row says `{status}` — an aggregate "
+                f"written in flight must stay `running` until a terminal write replaces it"
+            )
+        elif run_id not in crashed and status == "running":
+            problems.append(
+                f"{run_id}: the run finished but its metrics row is still `running` — the "
+                f"terminal write did not replace the in-flight aggregate"
+            )
+        if status == "running":
+            notes.append(
+                f"the crashed run's {m_rows} durable row(s) ARE in the ledger, as a `running` "
+                f"aggregate — the seam that records the parts records the run"
             )
         total += meta_rows or 0
     return problems, notes, total

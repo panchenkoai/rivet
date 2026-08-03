@@ -194,6 +194,17 @@ shape_axes:
       is the one case where the manifest cannot be the oracle. RED against the
       pre-fix binary (2 unrecorded files on a crash case), green after.
 
+  - id: ledger_records_the_run_in_flight
+    coverage: swept
+    case: every crash case
+    detail: >-
+      A run that made rows durable has an `export_metrics` row saying so, whether
+      or not it lived to finalize — written at the same roll seam as the parts,
+      `running` until a terminal write replaces it. And EXACTLY one row per run:
+      an aggregate appended per roll would make every sum over `export_metrics`
+      count a five-roll run five times, which is worse than the gap it closes.
+      Both halves RED-proven (3 rows vs 1; 2 rows vs 1).
+
   - id: run_status_lifecycle
     coverage: swept
     case: every case
@@ -236,15 +247,20 @@ gap_ratchet: 2
 # ── properties the sweep pins that are not axes ──────────────────────────────
 # Design decisions the sweep would otherwise silently tolerate a change to.
 properties:
-  - id: crashed_run_ledger_gap
+  - id: the_database_is_the_record
     statement: >-
-      A crashed CDC run leaves durable, manifest-covered rows that the meta-DB
-      has NO metrics row for. `roll_all` writes a run-unique Success manifest
-      before each ack precisely so the data stays visible; the metrics row is
-      written at finalize, which the crash never reaches.
+      Everything a CDC run makes durable is in the DATABASE at the moment it
+      becomes durable: the part in `file_log`, the run's aggregate in
+      `export_metrics` as a `running` row. The manifest at the destination is a
+      PROJECTION of that record, not the record itself.
     consequence: >-
-      Anything reconciling a CDC prefix from the state DB alone UNDER-COUNTS by
-      exactly the crashed run's rows. The manifest copies are the authority. The
-      sweep asserts this shape explicitly rather than tolerating a missing row,
-      so a change that starts recording the crashed run — or stops writing the
-      early manifest — shows up as a disagreement.
+      This was inverted until 2026-08-03. `cdc_job` wrote `begin_run` and one
+      aggregate at finalize; the sink — the only thing that knows about parts —
+      never touched the state store, while writing a run-unique Success manifest
+      before EVERY ack so a crash kept the data visible. The manifest was both
+      finer-grained and earlier than the ledger, so a run that died mid-stream
+      left durable rows the database had never heard of and anything reconciling
+      from the state DB alone under-counted by exactly those rows. Now the sweep
+      checks the direction that matters: from every file ON DISK to the ledger
+      that must account for it — the check a crash's orphan is the whole point
+      of, since that file is in no manifest at all.

@@ -256,6 +256,39 @@ fn roll_all(
             state.map(|st| (st, export_name, run_id)),
         )?;
     }
+    // The run's AGGREGATE, at the same durable seam as the parts themselves.
+    //
+    // `export_metrics` used to be written once, at finalize — so a run that died
+    // mid-stream left its parts in `file_log` (recorded just above) and no
+    // aggregate at all: the database held the files and could not say what run
+    // they added up to. One `running` row per run, updated each roll, replaced by
+    // the terminal row at finalize.
+    //
+    // Across ALL tables, because the row describes the RUN: a `tables:` stream is
+    // one run writing several prefixes, exactly as `files_committed` and
+    // `total_rows` already mean at finalize.
+    if let Some(st) = state {
+        let rows: i64 = sinks.iter().flat_map(|s| &s.parts).map(|p| p.rows).sum();
+        let files = sinks.iter().map(|s| s.parts.len()).sum::<usize>() as i64;
+        let bytes: i64 = sinks
+            .iter()
+            .flat_map(|s| &s.parts)
+            .map(|p| p.bytes as i64)
+            .sum();
+        if let Err(e) = st.record_metric_progress(
+            export_name,
+            run_id,
+            "cdc",
+            format.label(),
+            crate::state::RunProgress {
+                total_rows: rows,
+                files,
+                bytes,
+            },
+        ) {
+            log::warn!("cdc: in-flight metrics write failed for '{export_name}': {e:#}");
+        }
+    }
     // Fault point: the parts are durable but the checkpoint/ack have NOT run. A
     // crash here must re-read on resume (at-least-once) — never lose the change.
     crate::test_hook::maybe_panic_at("cdc_after_flush_before_ack");
@@ -1273,6 +1306,91 @@ mod tests {
             );
             assert_eq!(row.export_name, "t", "the ledger row must name the export");
         }
+    }
+
+    /// A run in flight has an aggregate in the DATABASE, and a finished run has
+    /// exactly ONE.
+    ///
+    /// Two halves, and the second is the dangerous one. Writing progress is easy;
+    /// writing it as a NEW row each roll would leave a five-roll run as five
+    /// `export_metrics` rows, and every consumer that sums `total_rows` across
+    /// runs would report five times the data — a far worse defect than the gap it
+    /// closes. So the progress row is keyed on the run and the terminal write
+    /// clears it.
+    ///
+    /// The oracle is the ledger itself, read back around a real `run_to_files`:
+    /// during the run the row must exist and carry the totals so far; after the
+    /// terminal write there must be exactly one row and it must not say
+    /// `running`. `rollover: 2` over five changes so several rolls happen — with
+    /// one roll a per-roll upsert and a single write are indistinguishable, and
+    /// the duplicate-row failure cannot appear at all.
+    #[test]
+    fn a_cdc_run_has_exactly_one_metrics_row_and_it_exists_before_the_run_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = local_dest(&dir);
+        let cols = int_col();
+        let state = crate::state::StateStore::open_in_memory().expect("in-memory state");
+        let mut stream = FakeStream {
+            events: VecDeque::from(vec![insert(1), insert(2), insert(3), insert(4), insert(5)]),
+            acked: Vec::new(),
+        };
+        let manifest = run_to_files(
+            &mut stream,
+            SinkConfig {
+                state: Some(&state),
+                ..cfg(dest.as_ref(), &cols, FormatType::Parquet, 2)
+            },
+        )
+        .unwrap();
+        assert!(
+            manifest[0].parts.len() > 1,
+            "fixture must roll more than once, or neither half of this test can fail"
+        );
+
+        // The sink never reaches finalize (that is `cdc_job`'s job), so what the
+        // ledger holds here is precisely the in-flight row the old code never
+        // wrote at all.
+        let rows = state
+            .get_metrics(Some("t"), 100)
+            .expect("read export_metrics");
+        assert_eq!(
+            rows.len(),
+            1,
+            "a run must leave ONE aggregate row, not one per roll — {} rows would make every \
+             sum over export_metrics count this run {} times",
+            rows.len(),
+            rows.len()
+        );
+        assert_eq!(
+            rows[0].status, "running",
+            "an unfinished run reads as running"
+        );
+        assert_eq!(
+            rows[0].total_rows, 5,
+            "the in-flight aggregate must carry the rows made durable so far"
+        );
+
+        // The terminal write replaces it rather than adding to it.
+        state
+            .record_metric_full(&crate::state::MetricRow {
+                export_name: "t".into(),
+                run_id: "r".into(),
+                total_rows: 5,
+                status: "success".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let after = state
+            .get_metrics(Some("t"), 100)
+            .expect("read export_metrics");
+        assert_eq!(
+            after.len(),
+            1,
+            "the terminal row must REPLACE the in-flight one; {} rows means a finished run is \
+             double-counted forever",
+            after.len()
+        );
+        assert_eq!(after[0].status, "success");
     }
 
     /// The manifest must describe the compression the part actually has.
