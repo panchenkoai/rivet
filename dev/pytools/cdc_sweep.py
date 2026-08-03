@@ -1191,7 +1191,50 @@ def selftest(out: Path) -> list[str]:
     return failures
 
 
+def acquire_lock() -> Path | None:
+    """Refuse to run while another sweep is in flight.
+
+    Every case creates and drops the SAME probe tables on the SAME engines, so
+    two sweeps do not merely interleave — each one's cleanup deletes the fixture
+    the other is mid-way through using. The symptom is `relation
+    "orc_cdc_probe" does not exist` surfacing as "the manifests list no part at
+    all" scattered across engines and cases, which reads exactly like a product
+    defect and is not one. It cost a full re-run to notice that the previous
+    invocation had never exited.
+
+    A lock file with the pid, not a process scan: the scan has to guess at command
+    lines, and this has to be right.
+    """
+    lock = Path(os.environ.get("RIVET_CDC_SWEEP_LOCK", "/tmp/.rivet_cdc_sweep.lock"))
+    if lock.exists():
+        try:
+            pid = int(lock.read_text().strip())
+            os.kill(pid, 0)  # signal 0 only tests for existence
+        except (ValueError, OSError):
+            lock.unlink(missing_ok=True)  # stale: the owner is gone
+        else:
+            print(
+                f"another cdc sweep is already running (pid {pid}, lock {lock}).\n"
+                f"  Two sweeps share the probe tables, so each one's cleanup destroys the "
+                f"other's fixtures — the result would be a page of phantom 'no parts' failures.\n"
+                f"  Wait for it, or remove the lock if you are certain it is stale."
+            )
+            return None
+    lock.write_text(str(os.getpid()))
+    return lock
+
+
 def main() -> int:
+    lock = acquire_lock()
+    if lock is None:
+        return 2
+    try:
+        return _main()
+    finally:
+        lock.unlink(missing_ok=True)
+
+
+def _main() -> int:
     only_engine = os.environ.get("RIVET_CDC_SWEEP_ENGINE")
     only_case = os.environ.get("RIVET_CDC_SWEEP_CASE")
     if not Path(RIVET).exists():

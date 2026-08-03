@@ -55,21 +55,21 @@ def psql_state(sql: str) -> str:
 
 
 def wipe_state() -> str:
-    """Truncate every table in the Postgres state DB, and delete every SQLite one.
+    """A genuinely empty state backend: drop the schema, delete every SQLite file.
 
-    TRUNCATE rather than DROP DATABASE: the schema and its migration version stay
-    exactly as a real deployment's, so this measures an EMPTY database and not a
-    differently-shaped one. Dropping and recreating would also re-run migrations,
-    which is a different thing to test and would hide a defect that only appears
-    on an already-migrated schema.
+    DROP SCHEMA, not TRUNCATE. The first cut truncated every table in
+    `pg_tables` — which includes `rivet_schema_version`, the migration
+    bookkeeping. rivet then opened a database whose tables all existed and whose
+    version said zero, re-ran the migrations, and died on `migration v8 failed`.
+    Every run of phase A failed for that reason and the phase reported "13 OK / 84
+    cases" as though the PRODUCT were broken.
+
+    Dropping the schema is also the more honest "clean": it is what a new
+    deployment looks like, and rivet migrates from scratch on first open — which
+    this then exercises for free. The lesson is the general one: wiping DATA must
+    not wipe the bookkeeping that says what shape the data is in.
     """
-    tables = [
-        t for t in psql_state(
-            "SELECT tablename FROM pg_tables WHERE schemaname='public'"
-        ).splitlines() if t.strip()
-    ]
-    if tables:
-        psql_state("TRUNCATE " + ", ".join(f'"{t}"' for t in tables) + " RESTART IDENTITY CASCADE")
+    psql_state("DROP SCHEMA public CASCADE; CREATE SCHEMA public; GRANT ALL ON SCHEMA public TO rivet;")
     killed = []
     for base in (ROOT, Path("/tmp")):
         for p in base.rglob(".rivet_state.db*"):
@@ -78,9 +78,11 @@ def wipe_state() -> str:
                 killed.append(str(p))
             except OSError:
                 pass
-    left = psql_state("SELECT count(*) FROM export_metrics") or "?"
-    return f"{len(tables)} state table(s) truncated (export_metrics now {left}), " \
-           f"{len(killed)} sqlite state file(s) removed"
+    left = psql_state("SELECT count(*) FROM pg_tables WHERE schemaname='public'") or "?"
+    return (
+        f"schema dropped and recreated ({left} table(s) left — rivet migrates on first open), "
+        f"{len(killed)} sqlite state file(s) removed"
+    )
 
 
 def parse(out: str) -> dict[tuple[str, str], str]:
@@ -115,17 +117,32 @@ def parse(out: str) -> dict[tuple[str, str], str]:
     return seen
 
 
+def _keep(label: str, out: str, err: str) -> None:
+    """Every sub-sweep's full output on disk, always.
+
+    Phase A once reported "13 OK / 84 cases" with no way to see WHY, because this
+    printed nothing unless the exit code was unexpected — and a sweep that finds
+    disagreements exits 1, the code it treated as normal. A driver that discards
+    the evidence for the failures it exists to find is worse than no driver: it
+    turns a diagnosable problem into a number.
+    """
+    p = Path(f"/tmp/iso_{label}.log")
+    p.write_text(out + ("\n--- stderr ---\n" + err if err else ""))
+    print(f"    full output: {p}")
+
+
 def run_cdc(token: str, work: str) -> dict[tuple[str, str], str]:
     p = sh(
         [sys.executable, "-u", str(CDC_SWEEP)],
         env={"RIVET_CDC_SWEEP_TOKEN": token, "RIVET_CDC_SWEEP_WORK": work},
     )
-    print(p.stdout[-400:] if p.returncode not in (0, 1) else "", end="")
+    _keep(f"cdc_{token}", p.stdout, p.stderr)
     return parse(p.stdout)
 
 
 def run_batch(work: str) -> dict[tuple[str, str], str]:
     p = sh([sys.executable, "-u", str(BATCH_SWEEP)], env={"RIVET_SWEEP_WORK": work})
+    _keep(f"batch_{Path(work).name}", p.stdout, p.stderr)
     # The batch sweep prints one column fewer (no engine), so give every row the
     # engine it actually uses rather than letting the parser invent one.
     out = {}
@@ -153,7 +170,22 @@ def main() -> int:
     a_cdc = run_cdc("cleanA", f"{work}/a_cdc")
     a_batch = run_batch(f"{work}/a_batch")
     a = {**a_cdc, **a_batch}
-    print(f"  {sum(1 for v in a.values() if v == 'OK')} OK / {len(a)} cases on a clean database")
+    ok_a = sum(1 for v in a.values() if v == "OK")
+    print(f"  {ok_a} OK / {len(a)} cases on a clean database")
+    # The baseline must be green before the comparison means anything — the same
+    # discipline the corruption cell applies to its clean half. Phases B and C ask
+    # "did history change this?", and against a baseline that was already broken
+    # the answer is noise. It has happened once: a wipe that took the migration
+    # bookkeeping with it left every phase-A run failing, and the driver went
+    # right on to compare two sets of failures.
+    if len(a) and ok_a < len(a) * 0.8:
+        print(
+            f"\n  ABORTING: only {ok_a} of {len(a)} cases pass on a CLEAN database. Phases B and C "
+            f"compare against this baseline, so they would be comparing noise. Read the full "
+            f"output above — the environment or the product is broken before isolation is even "
+            f"in question."
+        )
+        return 2
 
     print("\n=== phase B: PREFILLED state, DIFFERENT export names ===")
     print(f"  export_metrics now holds {psql_state('SELECT count(*) FROM export_metrics')} row(s)")
