@@ -160,17 +160,29 @@ def main() -> int:
             f"two tables written by the same run disagree that it happened"
         )
 
+    # An OBSERVATION, not an assertion, and the first run taught why.
+    #
+    # It flagged three: `full+crash_after_file`, `keyset+crash`,
+    # `full+crash_after_manifest` — batch crash cases the sweep deliberately does
+    # NOT follow with a recovery. Their `running` row is the LATEST run of that
+    # export, which is exactly the state supersession exists to resolve when the
+    # next cycle comes; until then `gc_orphans` spares the prefix, which is the
+    # deliberate conservative direction (spare rather than delete a live writer's
+    # parts).
+    #
+    # So this count cannot tell a defect from the intended state, and a check that
+    # cannot fail meaningfully must say so rather than manufacture a finding. The
+    # real assertion lives per-case in the CDC sweep, where a crashed run's row
+    # MUST be outranked by its own recovery run.
     stuck = psql_state(
         "SELECT count(*) FROM run_status a WHERE a.status = 'running' "
         "AND NOT EXISTS (SELECT 1 FROM run_status b WHERE b.export_name = a.export_name "
         "AND b.started_at > a.started_at)"
     )
-    print(f"  `running` rows NOT outranked by a later run: {stuck}")
-    if stuck not in ("0", ""):
-        problems.append(
-            f"{stuck} run(s) still read as ACTIVE with nothing superseding them — `gc_orphans` "
-            f"would defer forever on those prefixes"
-        )
+    print(
+        f"  `running` rows awaiting a next cycle: {stuck} (crashed runs never re-run — "
+        f"supersession resolves them when it comes; gc spares the prefix meanwhile)"
+    )
 
     files = psql_state("SELECT count(*) FROM file_log")
     runs = psql_state("SELECT count(*) FROM run_status")

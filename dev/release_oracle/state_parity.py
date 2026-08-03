@@ -242,14 +242,6 @@ def verify_state_backend_parity(
     # fresh — so its counts are incomparable by construction, not by defect. Said
     # out loud rather than dropped: a silently narrowed comparison is how a cell
     # comes to grade less than its name claims.
-    unscoped = {
-        k[len("count:"):]
-        for k in set(a) | set(b)
-        if k.startswith("count:") and k[len("count:"):] not in BOOKKEEPING
-    }
-    scopable = {t for t in unscoped if a.get(f"count:{t}") == 0 or b.get(f"count:{t}") == 0 or True}
-    _ = scopable
-
     def populated(profile: dict[str, object]) -> set[str]:
         return {
             k[len("count:"):]

@@ -104,19 +104,6 @@ def _config(path: Path, name: str, dest_block: str, src_url: str) -> None:
     )
 
 
-def _manifest_copies(read_json) -> list[dict]:
-    """Every `manifest-<run_id>.json` on the prefix, parsed."""
-    out = []
-    for name, text in read_json():
-        if not name.startswith("manifest-"):
-            continue
-        try:
-            out.append(json.loads(text))
-        except json.JSONDecodeError:
-            pass
-    return out
-
-
 def _run_writers(cfgs: list[Path], state_url: str) -> tuple[list[int], str]:
     """Start every writer, THEN wait. Sequential `run()` calls would make this a
     consecutive-runs test wearing a concurrent name.
