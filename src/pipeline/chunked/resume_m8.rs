@@ -234,8 +234,6 @@ pub(crate) fn apply_m8_resume_decisions(
     plan: &ResolvedRunPlan,
     summary: &mut RunSummary,
 ) -> Result<M8Stats> {
-    use crate::destination::WriteCommitProtocol;
-
     // ── 1. Open destination + early-exit on streaming ──────────────────
     let dest = match crate::destination::create_destination(&plan.destination) {
         Ok(d) => d,
@@ -249,7 +247,7 @@ pub(crate) fn apply_m8_resume_decisions(
             return Ok(M8Stats::default());
         }
     };
-    if dest.capabilities().commit_protocol == WriteCommitProtocol::Streaming {
+    if !dest.capabilities().commit_protocol.leaves_objects_at_rest() {
         log::debug!(
             "M8 resume preamble: streaming destination for export '{}'; skipped",
             plan.export_name

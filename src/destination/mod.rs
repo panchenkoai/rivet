@@ -37,6 +37,28 @@ pub enum WriteCommitProtocol {
     Streaming,
 }
 
+impl WriteCommitProtocol {
+    /// Does this destination leave NAMED OBJECTS behind that a later process can
+    /// list, stat, or overwrite?
+    ///
+    /// Seven places in the pipeline asked this question — the rerun guard, the
+    /// manifest writer, the running marker, manifest-aware `--validate`, the M8
+    /// resume scan, `rivet validate` — each by re-comparing against `Streaming`,
+    /// each independently mutable, and none of them tested. That is the shape
+    /// this repo already knows: a rule every site must re-apply drifts one site
+    /// at a time. It lives here so there is ONE answer, and the match is
+    /// exhaustive so a new protocol has to decide rather than inherit.
+    ///
+    /// `false` means "there is nothing at rest to look at": stdout has no prefix
+    /// to collide on, no manifest to read back, no prior run to warn about.
+    pub fn leaves_objects_at_rest(self) -> bool {
+        match self {
+            Self::Atomic | Self::FinalizeOnClose => true,
+            Self::Streaming => false,
+        }
+    }
+}
+
 /// Operational guarantees provided by a destination backend.
 ///
 /// Returned by `Destination::capabilities()`.  Inspected at runtime in the execution
@@ -268,6 +290,61 @@ pub fn create_destination_for_probe(config: &DestinationConfig) -> Result<Box<dy
 
 #[cfg(test)]
 mod tests {
+
+    /// One answer for "is there anything at rest here", asserted against the
+    /// protocol every REAL destination reports — not against the enum in the
+    /// abstract, because the thing that would break is a destination whose
+    /// protocol stops matching what the pipeline assumes about it.
+    ///
+    /// Seven call sites depend on this; before it existed each compared against
+    /// `Streaming` itself and every one of those comparisons survived the suite.
+    #[test]
+    fn only_a_streaming_destination_leaves_nothing_at_rest() {
+        use super::WriteCommitProtocol as P;
+
+        assert!(
+            P::Atomic.leaves_objects_at_rest(),
+            "a local file is at rest"
+        );
+        assert!(
+            P::FinalizeOnClose.leaves_objects_at_rest(),
+            "a cloud object is at rest once the handle closes — the prefix can be listed"
+        );
+        assert!(
+            !P::Streaming.leaves_objects_at_rest(),
+            "stdout has no prefix to collide on, no manifest to read back, no prior run to warn \
+             about — every guard that probes a destination must skip it"
+        );
+
+        // The real destinations, so the enum arms above are not graded in the
+        // abstract: a destination whose protocol changed would break the seven
+        // call sites while the arms above stayed green.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let of = |t: crate::config::DestinationType, path: Option<String>| {
+            let cfg = crate::config::DestinationConfig {
+                destination_type: t,
+                path,
+                ..Default::default()
+            };
+            super::create_destination(&cfg)
+                .expect("destination builds")
+                .capabilities()
+                .commit_protocol
+        };
+        assert!(
+            of(
+                crate::config::DestinationType::Local,
+                Some(tmp.path().to_string_lossy().into_owned())
+            )
+            .leaves_objects_at_rest(),
+            "the local destination is the one every rerun/manifest guard actually protects"
+        );
+        assert!(
+            !of(crate::config::DestinationType::Stdout, None).leaves_objects_at_rest(),
+            "stdout is the one they must all skip"
+        );
+    }
+
     use super::*;
     use std::path::Path;
 

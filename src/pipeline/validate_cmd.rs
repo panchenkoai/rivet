@@ -361,7 +361,7 @@ fn verify_one_prefix(
         }
     };
     // Streaming destinations have no prefix to verify — note and skip.
-    if dest.capabilities().commit_protocol == crate::destination::WriteCommitProtocol::Streaming {
+    if !dest.capabilities().commit_protocol.leaves_objects_at_rest() {
         log::info!(
             "export '{}': streaming destination, skipping (nothing to verify)",
             display_name

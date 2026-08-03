@@ -24,7 +24,7 @@
 use std::io::Read;
 use std::path::Path;
 
-use crate::destination::{Destination, WriteCommitProtocol};
+use crate::destination::Destination;
 use crate::error::Result;
 use crate::journal::PlanSnapshot;
 use crate::manifest::{
@@ -392,7 +392,7 @@ fn write_manifest_inner(
     emit_success_marker: bool,
     write_canonical: bool,
 ) -> Result<WriteOutcome> {
-    if dest.capabilities().commit_protocol == WriteCommitProtocol::Streaming {
+    if !dest.capabilities().commit_protocol.leaves_objects_at_rest() {
         log::info!(
             "destination is streaming; manifest.json / _SUCCESS not written (ADR-0012 §Artifacts)"
         );

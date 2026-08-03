@@ -41,6 +41,18 @@
 engines: [single, chunked, keyset, mongo_parallel]
 
 scenarios:
+  - id: failed_chunk_fails_the_run
+    what: "a chunk/worker that FAILS (not crashes) must fail the run rather than ship a short export. Measured 2026-08-03: disabling the sequential guard (`pending > 0`) left 14 live tests green while a run shipped 100 of 150 rows as SUCCESS; disabling BOTH parallel-checkpoint guards left 56 green. Every prior test injected a PANIC, and a panic never reaches a guard that only runs once the loop finishes — hence the RIVET_TEST_ERROR_AT=chunk_export:N hook these tests added."
+    single:         { na: "no chunk loop to continue past — a failed single export IS the run's failure (run_single_export returns Err); the retry side is decide_export_retry's own matrix" }
+    # BOTH checkpoint runners are proven; the cell names the sequential one and
+    # `a_failed_chunk_must_fail_the_parallel_run_not_ship_a_short_export` covers
+    # the parallel twin. The parallel case goes RED only with BOTH its guards
+    # disabled — the worker-error bail and the completion count are redundant
+    # there, and the test says so in its own body rather than claiming two proofs.
+    chunked:        { test: a_failed_chunk_must_fail_the_run_not_ship_a_short_export }
+    keyset:         { test: parallel_keyset_worker_error_still_counts_the_durable_parts_postgres }
+    mongo_parallel: { na: "the drain does `let out = res?` — the FIRST worker error propagates immediately, so there is no keep-going path and therefore no end-of-run guard that can silently fail to fire. The residual risk is the opposite one (a later worker's parts unrecorded because the bail preceded their drain), which is the durable-part-count scenario, not this one" }
+
   - id: schema_drift_gate
     what: "on_schema_drift enforcement — a drifted schema under `fail` aborts (exit 4). Each runner bypasses run_single_export, so each must re-apply the gate (check_from_sink_schema / check_from_type_mappings). Round-8: keyset + mongo_parallel had SILENTLY dropped it (exit 0 on drift)."
     single:         { test: schema_drift_removed_column_is_detected }

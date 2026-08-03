@@ -1172,3 +1172,155 @@ fn chunked_sequential_checkpoint_validate_records_validated_metric() {
         "sequential checkpoint + --validate must record validated=true in export_metrics"
     );
 }
+
+/// A chunk that FAILS (not crashes) must fail the run — never a success whose
+/// output is quietly short.
+///
+/// The checkpoint runner marks a failed chunk `failed` and keeps going, so the
+/// only thing standing between a partial export and a green `_SUCCESS` is the
+/// end-of-loop guard that counts chunk tasks which never completed. Disabling
+/// that guard (`pending > 0` → `pending < 0`) left the ENTIRE live suite green —
+/// 9 chunked-recovery, 1 crash-soak and 4 chaos tests all passed while a run
+/// missing a whole chunk reported success. Every existing test injects a PANIC,
+/// and a panic never reaches the guard: the guard only runs when the loop
+/// finishes, which a crashed process never does.
+///
+/// So this injects an ERROR instead (`RIVET_TEST_ERROR_AT=chunk_export:1`): the
+/// chunk returns, the loop completes, and the guard is the only thing that can
+/// notice. The oracle is the exported ROW COUNT as well as the exit code —
+/// exiting non-zero for some other reason would satisfy a status-only assertion
+/// without the guard existing at all.
+#[test]
+#[ignore = "live: postgres"]
+fn a_failed_chunk_must_fail_the_run_not_ship_a_short_export() {
+    require_alive(LiveService::Postgres);
+
+    let table = seed_pg_numeric_table(150);
+    let export = unique_name("chunk_fail_guard");
+    let out = tempfile::tempdir().unwrap();
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let yaml = Rig::pg_batch(&export)
+        .query(&format!(
+            r#"SELECT id, name FROM {table_name}"#,
+            table_name = table.name()
+        ))
+        .mode("chunked")
+        .export_line("chunk_column: id")
+        .export_line("chunk_size: 50")
+        .export_line("chunk_checkpoint: true")
+        .dest_path(out.path().to_path_buf())
+        .yaml();
+    let cfg = write_config(&cfg_dir, &yaml);
+
+    let run = std::process::Command::new(RIVET_BIN)
+        .args([
+            "run",
+            "--config",
+            cfg.to_str().unwrap(),
+            "--export",
+            &export,
+        ])
+        .env("RIVET_TEST_ERROR_AT", "chunk_export:1")
+        .output()
+        .expect("spawn rivet");
+    let stderr = String::from_utf8_lossy(&run.stderr).into_owned();
+
+    // The fixture must not be inert: the OTHER chunks have to have run, or the
+    // run failed for an unrelated reason and proves nothing about the guard.
+    let rows = total_parquet_rows(out.path());
+    assert!(
+        rows > 0 && rows < 150,
+        "fixture is inert — expected a PARTIAL export (some chunks written, one failed), \
+         got {rows} of 150 rows; stderr:\n{stderr}"
+    );
+
+    assert!(
+        !run.status.success(),
+        "a run that exported {rows} of 150 rows reported SUCCESS — the chunk-completion guard \
+         is the only thing that notices a failed chunk, and it did not; stderr:\n{stderr}"
+    );
+    assert!(
+        !out.path().join("_SUCCESS").exists(),
+        "a short export must not leave a _SUCCESS marker for a downstream loader to trust"
+    );
+}
+
+/// The PARALLEL checkpoint runner's half of the same contract — and it needed
+/// its own test for the reason this repo keeps re-learning: a guard wired into
+/// one runner says nothing about the others.
+///
+/// Here TWO guards stand between a partial export and a green `_SUCCESS`: the
+/// collected worker errors, and the chunk-completion count behind it. Disabling
+/// BOTH left 56 live tests green — chunked-recovery, chunked-dense, cli-flags and
+/// crash-soak — while a run missing a whole chunk reported success.
+///
+/// So this injects an ERROR instead (`RIVET_TEST_ERROR_AT=chunk_export:1`): the
+/// chunk returns, the loop completes, and the guard is the only thing that can
+/// notice. The oracle is the exported ROW COUNT as well as the exit code —
+/// exiting non-zero for some other reason would satisfy a status-only assertion
+/// without the guard existing at all.
+#[test]
+#[ignore = "live: postgres"]
+fn a_failed_chunk_must_fail_the_parallel_run_not_ship_a_short_export() {
+    require_alive(LiveService::Postgres);
+
+    let table = seed_pg_numeric_table(150);
+    let export = unique_name("chunk_fail_guard_par");
+    let out = tempfile::tempdir().unwrap();
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let yaml = Rig::pg_batch(&export)
+        .query(&format!(
+            r#"SELECT id, name FROM {table_name}"#,
+            table_name = table.name()
+        ))
+        .mode("chunked")
+        .export_line("chunk_column: id")
+        .export_line("chunk_size: 50")
+        .export_line("chunk_checkpoint: true")
+        .export_line("parallel: 4")
+        .dest_path(out.path().to_path_buf())
+        .yaml();
+    let cfg = write_config(&cfg_dir, &yaml);
+
+    let run = std::process::Command::new(RIVET_BIN)
+        .args([
+            "run",
+            "--config",
+            cfg.to_str().unwrap(),
+            "--export",
+            &export,
+        ])
+        .env("RIVET_TEST_ERROR_AT", "chunk_export:1")
+        .output()
+        .expect("spawn rivet");
+    let stderr = String::from_utf8_lossy(&run.stderr).into_owned();
+
+    // Raw parquet on disk is NOT the oracle here, and measuring it was the first
+    // draft's mistake: a worker retries its chunk internally, and each attempt
+    // writes a distinct part before the injected error discards its record — so
+    // the prefix legitimately holds MORE rows than the table (measured: 303 files
+    // for 299 recorded). Those are unmanifested parts of a FAILED run, which is
+    // exactly what `gc_orphans` is for, not a loss. The ledger is what a
+    // downstream reader would trust, so the ledger is what this asserts.
+    let committed = {
+        let db = StateDb::next_to_config(&cfg);
+        let run_id = db.latest_run_id(&export);
+        db.metrics_row(&run_id).files_committed.unwrap_or(0)
+    };
+    assert!(
+        committed > 0,
+        "fixture is inert — no chunk completed, so the run failed for an unrelated reason and \
+         proves nothing about the guard; stderr:\n{stderr}"
+    );
+
+    assert!(
+        !run.status.success(),
+        "a run that recorded only {committed} chunk part(s) of a 3-chunk export reported \
+         SUCCESS — the worker-error and chunk-completion guards are the only things that \
+         notice a failed chunk, and neither did; stderr:\n{stderr}"
+    );
+    assert!(
+        !out.path().join("_SUCCESS").exists(),
+        "a short export must not leave a _SUCCESS marker for a downstream loader to trust"
+    );
+}

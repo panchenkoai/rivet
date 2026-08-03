@@ -282,3 +282,103 @@ exports:
         String::from_utf8_lossy(&apply_out.stderr)
     );
 }
+
+// ─── the apply wrapper must obey the manifest gap too ────────────────────────
+
+/// `rivet apply` reaches the SAME single-export runner `rivet run` does, so it
+/// sets `cursor_high` and can advance the incremental cursor. The guard that
+/// refuses to advance it when the manifest did not land was bound only in
+/// `run_export_job` — the apply wrapper discarded `finalize_manifest`'s verdict,
+/// reported success, and moved the cursor past a window no manifest names. The
+/// next run then starts after data nothing describes: a silent skip.
+///
+/// The failure is injected without touching the product: `manifest.json` is
+/// pre-created as a DIRECTORY, so the manifest write fails while every parquet
+/// part still lands — exactly the shape the guard exists for (parts durable, the
+/// thing that names them absent).
+///
+/// The oracle is the PERSISTED CURSOR, not rivet's exit code or summary: those
+/// describe the run that just ended, while the cursor decides where the next one
+/// starts, which is where the loss would actually happen.
+#[test]
+#[ignore = "live: postgres"]
+fn apply_must_not_advance_the_cursor_when_the_manifest_did_not_land() {
+    require_alive(LiveService::Postgres);
+
+    let out_dir = tempfile::tempdir().unwrap();
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let export = unique_name("orders_incr");
+    let yaml = format!(
+        r#"
+source:
+  type: postgres
+  url_env: DATABASE_URL
+
+exports:
+  - name: {export}
+    query: "SELECT id, updated_at FROM orders"
+    mode: incremental
+    cursor_column: updated_at
+    format: parquet
+    destination:
+      type: local
+      path: {out}
+"#,
+        out = out_dir.path().display()
+    );
+    let cfg = write_config(&cfg_dir, &yaml);
+    let plan_path = cfg_dir.path().join("plan.json");
+
+    let plan_out = std::process::Command::new(RIVET_BIN)
+        .args([
+            "plan",
+            "--config",
+            cfg.to_str().unwrap(),
+            "--export",
+            &export,
+            "--format",
+            "json",
+            "--output",
+            plan_path.to_str().unwrap(),
+        ])
+        .env("DATABASE_URL", POSTGRES_URL)
+        .output()
+        .expect("spawn rivet plan");
+    assert!(
+        plan_out.status.success(),
+        "rivet plan must exit 0; stderr:\n{}",
+        String::from_utf8_lossy(&plan_out.stderr)
+    );
+
+    // Block the manifest write: a directory cannot be replaced by a file rename.
+    std::fs::create_dir_all(out_dir.path().join("manifest.json")).expect("block manifest.json");
+
+    let apply_out = std::process::Command::new(RIVET_BIN)
+        .args(["apply", plan_path.to_str().unwrap()])
+        .env("DATABASE_URL", POSTGRES_URL)
+        .output()
+        .expect("spawn rivet apply");
+    let stderr = String::from_utf8_lossy(&apply_out.stderr).into_owned();
+
+    // The fixture must not be inert: if no part landed, the run failed for an
+    // unrelated reason and the cursor assertion below would pass vacuously.
+    let parts = files_with_extension(out_dir.path(), "parquet");
+    assert!(
+        !parts.is_empty(),
+        "fixture is inert — no parquet part was written, so nothing was at risk; stderr:\n{stderr}"
+    );
+
+    let cursor = StateDb::next_to_config(&cfg).cursor_value(&export);
+    assert_eq!(
+        cursor,
+        None,
+        "the cursor advanced to {cursor:?} even though the manifest never landed — the next run \
+         starts past {} durable part(s) nothing describes; stderr:\n{stderr}",
+        parts.len()
+    );
+
+    assert!(
+        !apply_out.status.success(),
+        "a run whose manifest did not land must not report success; stderr:\n{stderr}"
+    );
+}

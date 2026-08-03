@@ -81,12 +81,12 @@ pub(crate) fn run_with_reconnect(
                 // before the same error. Fail fast with a doctor pointer on the
                 // first attempt. (Connection RESET / EOF / cold-start "starting
                 // up" can recover, so those still flow into the retry below.)
-                if attempt == 0 && is_port_closed(&e) {
+                if should_fail_fast_on_connect(attempt, &e) {
                     return Err(e.context(format!(
                         "cannot reach the source — run `rivet doctor -c {config_path}` to diagnose (is the host/port right and the server up?)"
                     )));
                 }
-                if attempt < plan.tuning.max_retries && classify_error(&e).is_transient() {
+                if super::retry::should_retry(attempt, plan.tuning.max_retries, &e) {
                     log::warn!(
                         "export '{}': connection failed, will retry: {}",
                         plan.export_name,
@@ -148,6 +148,22 @@ enum ExportRetry {
     /// Caller must propagate the *original* error (either permanent, or we have
     /// exhausted the retry budget).
     BailOriginal,
+}
+
+/// Should a CONNECT failure end the run immediately, before any backoff?
+///
+/// Only on the very first attempt, and only for an endpoint that will never come
+/// up on its own (nothing listening, unroutable host, DNS). Everything else —
+/// including a connection RESET or EOF mid-handshake, which does recover — flows
+/// into the retry below.
+///
+/// `attempt == 0` is load-bearing in BOTH directions, which is why it is here
+/// rather than inline: relaxing it makes a dead endpoint bail on a later attempt
+/// (pointless — the backoff was already paid), and `&&`→`||` makes EVERY
+/// first-attempt connect error fatal, so a transient blip that would have
+/// recovered on retry kills the run instead.
+fn should_fail_fast_on_connect(attempt: u32, e: &anyhow::Error) -> bool {
+    attempt == 0 && is_port_closed(e)
 }
 
 fn decide_export_retry(
@@ -823,6 +839,28 @@ mod tests {
     fn permanent_err() -> anyhow::Error {
         // String form matches the auth branch in classify_error.
         anyhow::anyhow!("permission denied for table users")
+    }
+
+    /// The CONNECT decisions, which `is_port_closed`'s own test does not reach:
+    /// it grades the classifier, not what the loop does with it. Ten mutants
+    /// survived on these two lines — every comparison and both `&&`s — because
+    /// nothing observed the composed answer.
+    #[test]
+    fn a_dead_endpoint_bails_on_the_first_attempt_and_a_blip_still_retries() {
+        let dead = anyhow::anyhow!("connection refused");
+
+        assert!(
+            should_fail_fast_on_connect(0, &dead),
+            "nothing is listening — the ~14s of escalating backoff buys the same error"
+        );
+        assert!(
+            !should_fail_fast_on_connect(0, &transient_err()),
+            "a RESET mid-handshake recovers; failing fast on it turns a blip into a failed run"
+        );
+        assert!(
+            !should_fail_fast_on_connect(1, &dead),
+            "past the first attempt the backoff is already spent — the fast path is pointless"
+        );
     }
 
     #[test]

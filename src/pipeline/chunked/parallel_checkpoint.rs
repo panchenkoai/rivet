@@ -267,9 +267,7 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                             let mut thread_src = match source::create_source(&plan_w.source) {
                                 Ok(s) => s,
                                 Err(e) => {
-                                    if attempt < plan_w.tuning.max_retries
-                                        && classify_error(&e).is_transient()
-                                    {
+                                    if crate::pipeline::retry::should_retry(attempt, plan_w.tuning.max_retries, &e) {
                                         last_err = Some(e);
                                         continue;
                                     }
@@ -349,9 +347,7 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                             match export_attempt {
                                 Ok(v) => return Ok(v),
                                 Err(e) => {
-                                    if attempt < plan_w.tuning.max_retries
-                                        && classify_error(&e).is_transient()
-                                    {
+                                    if crate::pipeline::retry::should_retry(attempt, plan_w.tuning.max_retries, &e) {
                                         last_err = Some(e);
                                         continue;
                                     }
@@ -363,6 +359,18 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                             .unwrap_or_else(|| anyhow::anyhow!("chunk failed after retries")))
                     })();
 
+                    // Test-only, mirroring the sequential runner: make ONE chunk
+                    // fail without killing the process, so the worker-error and
+                    // chunk-completion guards below can be exercised. A panic hook
+                    // cannot reach them — they only run once the workers join,
+                    // which a crashed process never does.
+                    let result = match crate::test_hook::maybe_error_at_index(
+                        "chunk_export",
+                        chunk_index,
+                    ) {
+                        Err(msg) => Err(anyhow::anyhow!(msg)),
+                        Ok(()) => result,
+                    };
                     match result {
                         Ok((rows, parts, chunk_checksums, chunk_key)) => {
                             agg_rows.fetch_add(rows as i64, Ordering::Relaxed);

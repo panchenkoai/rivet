@@ -1156,10 +1156,27 @@ pub(crate) fn run_export_job_with_chunk_source(
     // the family is the export's own name here. The one export whose family
     // differs (the CDC snapshot leg) is synthesized by `cdc_job` at runtime and
     // never reaches plan/apply, which refuses `mode: cdc` at build_plan entry.
-    finalize_manifest(plan, &plan.export_name, state, &summary, "apply");
+    // The manifest gap is handled EXACTLY as `run_export_job` handles it, and the
+    // duplication is the point: this wrapper reaches `run_with_reconnect` for a
+    // plain incremental plan, so it sets `cursor_high` and can advance the cursor
+    // just like the run path. Binding the verdict only there left `rivet apply`
+    // reporting success, advancing the cursor past a window no manifest names, and
+    // skipping it on the next run — the same defect, undone one runner over.
+    let manifest_gap = finalize_manifest(plan, &plan.export_name, state, &summary, "apply");
+    if let Some(why) = &manifest_gap {
+        summary.status = "failed".into();
+        summary.error_message = Some(why.clone());
+        ledger_finish_run(state, &plan.export_name, &summary.run_id, &summary.status);
+    }
     // Round-2 audit #12: incremental cursor advance AFTER the manifest is durable
-    // (see run_export_job). No-op for the chunked/Precomputed apply path.
-    if let Err(e) = commit_incremental_cursor(state, plan, &summary) {
+    // (see run_export_job) — and never when it did not land.
+    if manifest_gap.is_some() {
+        log::error!(
+            "apply '{}': incremental cursor NOT advanced — the manifest did not land, so the \
+             next run must re-export this window rather than skip past it",
+            summary.export_name,
+        );
+    } else if let Err(e) = commit_incremental_cursor(state, plan, &summary) {
         log::error!(
             "apply '{}': cursor advance failed AFTER the manifest was written — the next run \
              re-exports from the prior cursor (at-least-once, no loss): {:#}",
@@ -1190,7 +1207,9 @@ pub(crate) fn run_export_job_with_chunk_source(
     }
     finalize_run_report(config_path, &summary, "apply");
 
-    if failed { result } else { Ok(()) }
+    // Same fold as the run path: an export failure wins, otherwise an unwritten
+    // manifest fails the run. `apply` has no reconcile flag, so that leg is `Ok`.
+    resolve_final_result(failed, result, Ok(()), manifest_gap)
 }
 
 #[cfg(test)]

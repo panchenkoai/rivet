@@ -593,12 +593,56 @@ RED-proven. Three rules fell out, each bitten at least twice:
    When a test needs artificial separation (time, ordering, uniqueness) that
    the product claims to provide, stop and check the product first.
 
+Scope honesty, first and most expensive: **`cargo mutants -- --lib` on a
+live-only path reports 100% survival and means NOTHING.** Both chunk-checkpoint
+runners measured 84 of 84 MISSED — not 84 gaps, but proof that no unit test
+executes those files at all, since they need a real source and destination. The
+same scoping inflates every `src/pipeline/` survivor count. Read a survivor as
+"no UNIT test", then decide whether the honest oracle is a unit test or a live
+one, and PROVE which by mutating and running the live suite: `total_rows += `
+→ `*=` (single) looked like a glaring hole and four live tests caught it;
+`apply_m8_resume_decisions` stubbed to `Ok(Default::default())` — named in this
+file as a lib-suite survivor — is caught by three. What the live suite did NOT
+catch was worth the search: see the failed-chunk guard below.
+
 Scope honesty: mutation testing measures assertion SENSITIVITY on code that
 exists. It cannot see a missing behaviour (the manifest-clobber fix itself was
 invisible to it — an independent-oracle harness caught that), nor a test and
 code that agree on a wrong spec. Layers: matrices (coverage exists) → mutants
 (assertions bite) → live suites (integration) → independent-oracle harness
 (absent behaviour). One layer's green is not another layer's proof.
+
+## A guard that only runs at the END of a loop is invisible to every PANIC test
+
+A fault hook that kills the process cannot reach code that runs after the loop
+finishes — a crashed run never gets there. So a guard placed at the end of a
+runner ("not every claimed chunk completed", "no worker reported an error") is
+untestable by the entire existing crash-injection vocabulary, and looks covered
+because the crash tests around it are green.
+
+Measured 2026-08-03: disabling the sequential chunk-checkpoint guard
+(`pending > 0` → `pending < 0`) left 14 live tests green — 9 chunked-recovery,
+1 crash-soak, 4 chaos — while the run shipped **100 of 150 rows with status
+`success`**. Disabling BOTH parallel-checkpoint guards (the worker-error bail
+and the completion count) left 56 green. Every one of those tests injects
+`RIVET_TEST_PANIC_AT`; none of them can reach the guard.
+
+The fixture the class needs is an error that RETURNS, not one that kills:
+`maybe_error_at_index` existed for exactly this but was wired only into keyset,
+so the chunked runners got the hook (`RIVET_TEST_ERROR_AT=chunk_export:N`) as
+part of the fix. Process rule: **for any check that runs after a loop/join,
+there must be a test whose failure is RETURNED rather than crashed** — and the
+oracle is the LEDGER, not parquet on disk. The first draft of the parallel test
+counted files and read "300 of 150 rows": a worker retries its chunk internally
+and each attempt writes a part before the error discards its record (measured:
+303 files for 299 recorded). Those are unmanifested parts of a FAILED run — the
+`gc_orphans` case, not a loss. Raw artifacts under a failed prefix are not
+evidence about what the run delivered.
+
+Corollary on redundant guards: the parallel test goes RED only when BOTH guards
+are off. Say that in the test body rather than presenting it as two proofs —
+the same load-bearing / belt-and-suspenders distinction the `until_current`
+rule already insists on.
 
 ## A per-export feature must be wired into EVERY runner — the runner-bypass class
 

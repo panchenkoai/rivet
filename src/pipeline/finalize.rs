@@ -35,6 +35,22 @@ use super::summary::RunSummary;
 /// Failures to write are non-fatal: the run keeps its existing exit code,
 /// the reason is logged, and the resume hint is still shown so the operator
 /// can recover even if disk-full prevents the report itself from landing.
+/// Does this run have something to resume?
+///
+/// A FAILED run that already committed parts: the data is on the prefix, so the
+/// next step is `--resume` and not a fresh run. On a success there is nothing to
+/// resume, and on a failure that committed nothing a resume would find nothing.
+///
+/// Extracted because it could not be tested where it was. Four mutations of the
+/// condition survived the suite — flipping `==` to `!=`, `>` to `<`/`==`/`>=` —
+/// so the advisory could have stopped firing, or started firing on every
+/// successful run, and nothing would have gone red. It matters more since a
+/// manifest that fails to land now FAILS the run with its parts durable: that is
+/// exactly the state this line addresses.
+pub(super) fn should_offer_resume(summary: &RunSummary) -> bool {
+    summary.status == "failed" && summary.files_committed > 0
+}
+
 pub(super) fn finalize_run_report(config_path: &str, summary: &RunSummary, kind: &str) {
     use std::io::Write;
 
@@ -67,7 +83,7 @@ pub(super) fn finalize_run_report(config_path: &str, summary: &RunSummary, kind:
     if written && !crate::pipeline::multi_export_mode() {
         let _ = writeln!(h, "report:    {}", dir.join("summary.md").display());
     }
-    if summary.status == "failed" && summary.files_committed > 0 {
+    if should_offer_resume(summary) {
         let _ = writeln!(
             h,
             "resume:    rivet run --config {} --resume",
@@ -298,12 +314,35 @@ pub(super) fn finalize_manifest(
 /// Streaming destinations (stdout) have no prefix to verify; skipped silently
 /// since `finalize_manifest` has already logged its own "skipped streaming"
 /// note for that case.
+/// Does the manifest-aware pass overturn a per-file "validated" verdict?
+///
+/// Three conditions, and each one is load-bearing:
+///
+///   * `!passed` — only a FATAL verdict downgrades. An advisory failure (an
+///     untracked surplus part) is not a reason to fail a run.
+///   * `manifest_found` — a legacy run (M6) has no manifest to judge by, so it
+///     keeps the row-count verdict it earned rather than being failed for the
+///     absence of a file its version never wrote.
+///   * `current == Some(true)` — there is nothing to downgrade from otherwise,
+///     and overwriting `None` would claim a verdict that was never reached.
+///
+/// Extracted because it could not be tested in place. Three mutations survived
+/// the suite — `&&`→`||` twice and `delete !` — each of which makes the downgrade
+/// stop happening or start happening to runs that earned their pass. The failure
+/// is quiet and durable: `rivet metrics` would say `validated=pass` for a run
+/// whose own report says the manifest pass failed.
+pub(super) fn should_downgrade_validated(
+    v: &crate::pipeline::validate_manifest::ManifestVerification,
+    current: Option<bool>,
+) -> bool {
+    !v.passed && v.manifest_found && current == Some(true)
+}
+
 pub(super) fn finalize_validate_manifest(
     plan: &ResolvedRunPlan,
     summary: &mut RunSummary,
     kind: &str,
 ) {
-    use crate::destination::WriteCommitProtocol;
     use crate::pipeline::validate_manifest::{ValidateDepth, verify_at_destination};
 
     let dest = match crate::destination::create_destination(&plan.destination) {
@@ -318,7 +357,7 @@ pub(super) fn finalize_validate_manifest(
             return;
         }
     };
-    if dest.capabilities().commit_protocol == WriteCommitProtocol::Streaming {
+    if !dest.capabilities().commit_protocol.leaves_objects_at_rest() {
         log::debug!(
             "{} '{}': streaming destination — skipping manifest-aware --validate",
             kind,
@@ -339,7 +378,7 @@ pub(super) fn finalize_validate_manifest(
             // the manifest-aware verdict.  Downgrade on a *fatal* verdict
             // (`!passed`) — advisory failures (untracked surplus) don't fail
             // the run; legacy runs (M6) keep their row-count verdict.
-            if !v.passed && v.manifest_found && summary.validated == Some(true) {
+            if should_downgrade_validated(&v, summary.validated) {
                 summary.validated = Some(false);
             }
             log::info!(
@@ -385,11 +424,10 @@ pub(super) fn finalize_validate_manifest(
 /// we're about to write to) bubble up as `Err` so the operator sees the
 /// real problem before the run starts spending source query time.
 pub(super) fn check_success_gate_for_resume(plan: &ResolvedRunPlan) -> Result<()> {
-    use crate::destination::WriteCommitProtocol;
     use crate::manifest::SUCCESS_FILENAME;
 
     let dest = crate::destination::create_destination(&plan.destination)?;
-    if dest.capabilities().commit_protocol == WriteCommitProtocol::Streaming {
+    if !dest.capabilities().commit_protocol.leaves_objects_at_rest() {
         log::debug!(
             "resume: streaming destination for export '{}' has no prefix; gate skipped",
             plan.export_name
@@ -430,8 +468,24 @@ pub(super) fn check_success_gate_for_resume(plan: &ResolvedRunPlan) -> Result<()
 /// safety hint emitted *before* extraction, not a correctness gate, so a
 /// transient stat failure must never block an otherwise-valid run (the resume
 /// gate, which *does* gate, surfaces such errors instead).
+/// Can this destination even HAVE a prior run's output sitting under the prefix?
+///
+/// Only a destination that commits named objects can — a `Streaming` one (stdout)
+/// has no prefix to collide on, so probing it is meaningless. Everything else
+/// (`Atomic` local, `FinalizeOnClose` cloud) is exactly where a second export
+/// writing under one prefix silently overwrites the first, which is the whole
+/// reason the warning exists.
+///
+/// Extracted because the comparison was untestable in place and `==`→`!=`
+/// survived the suite. That mutation inverts the guard: every real destination
+/// returns early — the rerun warning goes SILENT on local and cloud both — while
+/// stdout gets probed instead. Nothing fails, nothing is logged, and the operator
+/// who pointed two exports at one prefix is told nothing.
+pub(super) fn prefix_guard_applies(commit: crate::destination::WriteCommitProtocol) -> bool {
+    commit.leaves_objects_at_rest()
+}
+
 pub(super) fn warn_if_prefix_has_completed_run(plan: &ResolvedRunPlan) {
-    use crate::destination::WriteCommitProtocol;
     use crate::manifest::{MANIFEST_FILENAME, SUCCESS_FILENAME};
 
     let dest = match crate::destination::create_destination(&plan.destination) {
@@ -445,7 +499,7 @@ pub(super) fn warn_if_prefix_has_completed_run(plan: &ResolvedRunPlan) {
             return;
         }
     };
-    if dest.capabilities().commit_protocol == WriteCommitProtocol::Streaming {
+    if !prefix_guard_applies(dest.capabilities().commit_protocol) {
         return;
     }
 
@@ -494,12 +548,11 @@ pub(super) fn warn_if_prefix_has_completed_run(plan: &ResolvedRunPlan) {
 /// same probe as [`warn_if_prefix_has_completed_run`]; a streaming destination
 /// (stdout) or a probe error counts as "not complete" (re-run it).
 pub(crate) fn destination_has_success(dest: &crate::config::DestinationConfig) -> bool {
-    use crate::destination::WriteCommitProtocol;
     use crate::manifest::SUCCESS_FILENAME;
     let Ok(d) = crate::destination::create_destination(dest) else {
         return false;
     };
-    if d.capabilities().commit_protocol == WriteCommitProtocol::Streaming {
+    if !d.capabilities().commit_protocol.leaves_objects_at_rest() {
         return false;
     }
     matches!(d.head(SUCCESS_FILENAME), Ok(Some(_)))
@@ -667,6 +720,130 @@ pub(crate) fn destination_uri_for_manifest(cfg: &DestinationConfig) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// The rerun guard must apply to every destination that can actually hold a
+    /// previous run's parts — and the protocols come from the REAL destinations,
+    /// not a hand-built capability struct, because the bug this guards is a
+    /// mismatch between the guard and what `create_destination` really reports.
+    ///
+    /// RED against `==`→`!=` on the guard's comparison, which silences the
+    /// overwrite warning on local AND cloud at once while probing stdout instead.
+    #[test]
+    fn the_rerun_guard_applies_to_every_destination_that_can_hold_a_prior_run() {
+        use crate::config::{DestinationConfig, DestinationType};
+
+        let protocol_of = |t: DestinationType, path: Option<String>| {
+            let cfg = DestinationConfig {
+                destination_type: t,
+                path,
+                ..Default::default()
+            };
+            crate::destination::create_destination(&cfg)
+                .expect("destination builds")
+                .capabilities()
+                .commit_protocol
+        };
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let local = protocol_of(
+            DestinationType::Local,
+            Some(tmp.path().to_string_lossy().into_owned()),
+        );
+        assert!(
+            prefix_guard_applies(local),
+            "a local prefix is precisely where a second export overwrites the first"
+        );
+
+        let stdout = protocol_of(DestinationType::Stdout, None);
+        assert!(
+            !prefix_guard_applies(stdout),
+            "stdout has no prefix to collide on — probing it would stat nothing"
+        );
+
+        assert_ne!(
+            local, stdout,
+            "if both destinations reported one protocol the assertions above would be vacuous"
+        );
+    }
+
+    /// The manifest pass overturns a per-file pass ONLY when all three
+    /// conditions hold — and each row below kills a mutant that survived.
+    ///
+    /// The quiet failure this guards: without the downgrade, `rivet metrics`
+    /// records `validated=pass` for a run whose own report says the manifest
+    /// pass failed, and it stays that way. `&&`→`||` and `delete !` each break
+    /// it in a different direction, so a single happy-path assertion would let
+    /// two of the three through.
+    #[test]
+    fn the_manifest_pass_downgrades_only_a_fatal_verdict_on_a_run_that_had_passed() {
+        use crate::pipeline::validate_manifest::ManifestVerification;
+        let v = |passed: bool, manifest_found: bool| ManifestVerification {
+            passed,
+            manifest_found,
+            legacy_run: !manifest_found,
+            parts_verified: 0,
+            parts_md5_verified: 0,
+            parts_failed: 0,
+            success_marker_consistent: true,
+            manifest_self_consistent: true,
+            failures: Vec::new(),
+            depth_level: "full".into(),
+        };
+
+        assert!(
+            should_downgrade_validated(&v(false, true), Some(true)),
+            "a FATAL manifest verdict on a run that passed its file check is the whole point"
+        );
+        assert!(
+            !should_downgrade_validated(&v(true, true), Some(true)),
+            "a passing manifest pass must not fail a run — `delete !` makes it do exactly that"
+        );
+        assert!(
+            !should_downgrade_validated(&v(false, false), Some(true)),
+            "a LEGACY run has no manifest to be judged by and keeps the verdict it earned"
+        );
+        assert!(
+            !should_downgrade_validated(&v(false, true), None),
+            "there is nothing to downgrade from — writing Some(false) would claim a verdict \
+             the run never reached"
+        );
+        assert!(
+            !should_downgrade_validated(&v(false, true), Some(false)),
+            "already failed; the downgrade is not a second opinion"
+        );
+    }
+
+    /// The resume advisory fires exactly when there is something to resume.
+    ///
+    /// RED-proven against the four mutants that survived the suite on its
+    /// condition: `==`→`!=` (silent on failures, loud on successes), `>`→`<` /
+    /// `==` / `>=` (silent with parts, loud with none). Each row below kills at
+    /// least one of them, which is why the table has all four corners rather
+    /// than the one case a reader would think to write.
+    #[test]
+    fn the_resume_hint_fires_only_when_a_failed_run_left_durable_parts() {
+        let case = |status: &str, files: usize| {
+            let s = crate::pipeline::summary::RunSummary {
+                status: status.into(),
+                files_committed: files,
+                ..Default::default()
+            };
+            should_offer_resume(&s)
+        };
+        assert!(
+            case("failed", 3),
+            "a failed run WITH committed parts is the one case worth a resume line — the data \
+             is on the prefix and a fresh run would not pick it up"
+        );
+        assert!(
+            !case("failed", 0),
+            "a failure that committed nothing has nothing to resume; the line would send the \
+             operator after data that is not there"
+        );
+        assert!(!case("success", 3), "a successful run is not resumed");
+        assert!(!case("success", 0), "nor an empty successful one");
+    }
+
     use super::*;
     use crate::config::DestinationType;
 
