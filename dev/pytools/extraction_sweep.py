@@ -160,11 +160,16 @@ CASES: list[Case] = [
         crash="after_file_write",
         notes="crash after the part is written, before the manifest",
     ),
+    # `before_commit_rename` is deliberately NOT here: it is a BLOCK hook
+    # (`maybe_block_at`), not a panic point, so `RIVET_TEST_PANIC_AT` never fires
+    # it and the case ran to a clean success while calling itself a crash test —
+    # a fixture that tests nothing and reports green. The harness now asserts the
+    # crash actually happened, which is what surfaced it.
     Case(
-        "full+crash_before_rename",
+        "full+crash_after_manifest",
         "    mode: full\n",
-        crash="before_commit_rename",
-        notes="crash before the atomic commit",
+        crash="after_manifest_update",
+        notes="crash after the manifest is written",
     ),
 ]
 
@@ -192,6 +197,20 @@ def measure(case: Case, work: Path) -> Result:
     out.mkdir(parents=True, exist_ok=True)
     cfg = write_cfg(work, case.name, case.export_block, out)
     env = {"RIVET_STATE_URL": STATE_URL}
+
+    # Every run_id this export already has. A shared Postgres backend KEEPS every
+    # run ever made, so counting `running` rows by export name alone sums this
+    # sweep's own history — it reported a leak growing 1 -> 2 -> 3 across three
+    # sweep executions when a single crash leaves exactly one row, correctly, as
+    # the marker that stops gc from collecting a possibly-live run. Isolation on a
+    # shared store has to come from the KEY, not from the table being empty.
+    before_runs = {
+        rid
+        for rid in psql_state(
+            f"SELECT run_id FROM run_status WHERE export_name='{case.name}'"
+        ).splitlines()
+        if rid.strip()
+    }
 
     if case.crash:
         sh([RIVET, "run", "-c", str(cfg)], env={**env, "RIVET_TEST_PANIC_AT": case.crash})
@@ -240,11 +259,14 @@ def measure(case: Case, work: Path) -> Result:
     r.file_log_rows = as_int(
         psql_state(f"SELECT count(*) FROM file_log WHERE export_name='{case.name}'")
     )
-    r.running_left = as_int(
-        psql_state(
-            f"SELECT count(*) FROM run_status WHERE export_name='{case.name}' AND status='running'"
-        )
-    )
+    now_running = {
+        rid
+        for rid in psql_state(
+            f"SELECT run_id FROM run_status WHERE export_name='{case.name}' AND status='running'"
+        ).splitlines()
+        if rid.strip()
+    }
+    r.running_left = len(now_running - before_runs)
     r.validate_exit = sh([RIVET, "validate", "-c", str(cfg), "--depth", "full"], env=env).returncode
 
     crashed_no_resume = bool(case.crash) and not case.resume
@@ -271,8 +293,20 @@ def measure(case: Case, work: Path) -> Result:
             )
         if r.validate_exit not in (0, None):
             r.disagreements.append(f"validate exit {r.validate_exit} on data that reconciles")
-    if r.running_left:
-        r.disagreements.append(f"{r.running_left} run_status row(s) left `running`")
+    # A crash with no resume SHOULD leave one: it marks a run that may still be
+    # live, so `gc_orphans` defers rather than deleting an in-flight run's parts,
+    # and a later run of the same export supersedes it by `started_at` (verified —
+    # never an age timer). Only an UNEXPLAINED one is a disagreement.
+    expected_running = 1 if (case.crash and not case.resume) else 0
+    if r.running_left != expected_running:
+        r.disagreements.append(
+            f"{r.running_left} run_status row(s) left `running`, expected {expected_running}"
+            + (
+                " — the injected crash never fired, so this case proves nothing"
+                if case.crash and r.running_left == 0
+                else ""
+            )
+        )
     return r
 
 
