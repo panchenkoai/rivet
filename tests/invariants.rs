@@ -3,7 +3,7 @@
 //! Each test below encodes one invariant from docs/adr/0001-state-update-invariants.md.
 //! The invariant ID (I1–I7) is noted in each test name.
 
-use rivet::state::StateStore;
+use rivet::state::{FilePart, StateStore};
 
 /// File-backed store for tests that use `claim_next_chunk_task`.
 /// `claim_next_chunk_task` opens a *new* connection to the DB path;
@@ -300,15 +300,15 @@ fn i2_manifest_absent_before_record_file_is_called() {
     );
 
     state
-        .record_file(
-            "run-x",
-            "exp",
-            "exp_20240601.parquet",
-            100,
-            4096,
-            "parquet",
-            Some("zstd"),
-        )
+        .record_file(FilePart {
+            run_id: "run-x",
+            export_name: "exp",
+            file_name: "exp_20240601.parquet",
+            rows: 100,
+            bytes: 4096,
+            format: "parquet",
+            compression: Some("zstd"),
+        })
         .unwrap();
 
     let files = state.get_files(Some("exp"), 10).unwrap();
@@ -323,26 +323,26 @@ fn i2_distinct_files_produce_distinct_manifest_entries() {
     let state = StateStore::open_in_memory().unwrap();
 
     state
-        .record_file(
-            "run-y",
-            "exp",
-            "exp_part0.parquet",
-            50,
-            2048,
-            "parquet",
-            None,
-        )
+        .record_file(FilePart {
+            run_id: "run-y",
+            export_name: "exp",
+            file_name: "exp_part0.parquet",
+            rows: 50,
+            bytes: 2048,
+            format: "parquet",
+            compression: None,
+        })
         .unwrap();
     state
-        .record_file(
-            "run-y",
-            "exp",
-            "exp_part1.parquet",
-            50,
-            2048,
-            "parquet",
-            None,
-        )
+        .record_file(FilePart {
+            run_id: "run-y",
+            export_name: "exp",
+            file_name: "exp_part1.parquet",
+            rows: 50,
+            bytes: 2048,
+            format: "parquet",
+            compression: None,
+        })
         .unwrap();
 
     let files = state.get_files(Some("exp"), 10).unwrap();
@@ -374,29 +374,29 @@ fn i7_prior_manifest_entries_survive_subsequent_record_file_calls() {
 
     // First write — committed successfully.
     state
-        .record_file(
-            "run-z",
-            "exp",
-            "exp_20240601.parquet",
-            100,
-            4096,
-            "parquet",
-            None,
-        )
+        .record_file(FilePart {
+            run_id: "run-z",
+            export_name: "exp",
+            file_name: "exp_20240601.parquet",
+            rows: 100,
+            bytes: 4096,
+            format: "parquet",
+            compression: None,
+        })
         .unwrap();
 
     // Simulate the pipeline's `let _ = st.record_file(...)` pattern: discard the
     // result unconditionally.  Whether this call succeeds or fails, the prior
     // committed entry must remain intact.
-    let _ = state.record_file(
-        "run-z",
-        "exp",
-        "exp_20240602.parquet",
-        200,
-        8192,
-        "parquet",
-        None,
-    );
+    let _ = state.record_file(FilePart {
+        run_id: "run-z",
+        export_name: "exp",
+        file_name: "exp_20240602.parquet",
+        rows: 200,
+        bytes: 8192,
+        format: "parquet",
+        compression: None,
+    });
 
     // The first manifest entry must still be present — SQLite row-level durability
     // ensures each committed INSERT survives independent of any later call outcome.

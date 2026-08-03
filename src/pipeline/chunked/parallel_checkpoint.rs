@@ -140,6 +140,7 @@ pub(crate) fn run_chunked_parallel_checkpoint(
     let config_path_owned = config_path.to_string();
     let fmt_label = plan.format.label();
     let comp_label = plan.compression.label();
+    let mode_label = plan.strategy.mode_label();
 
     let shared_destination =
         std::sync::Arc::new(destination::create_destination(&plan.destination)?);
@@ -173,6 +174,7 @@ pub(crate) fn run_chunked_parallel_checkpoint(
             let config_path_w = config_path_owned.clone();
             let fmt_label_w = fmt_label;
             let comp_label_w = comp_label;
+            let mode_label_w = mode_label;
             let pb_w = pb_cp_handle.clone();
             let streamed_rows = std::sync::Arc::clone(&streamed_rows);
 
@@ -379,14 +381,17 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                                 match StateStore::open(&config_path_w) {
                                     Ok(store) => {
                                         for rec in &parts {
-                                            if let Err(e) = store.record_file(
-                                                run_id_arc.as_str(),
-                                                &plan_w.export_name,
-                                                &rec.file_name,
-                                                rec.rows,
-                                                rec.bytes as i64,
-                                                fmt_label_w,
-                                                Some(comp_label_w),
+                                            if let Err(e) = store.record_durable_part(
+                                                crate::state::DurablePart {
+                                                    run_id: run_id_arc.as_str(),
+                                                    export_name: &plan_w.export_name,
+                                                    file_name: &rec.file_name,
+                                                    rows: rec.rows,
+                                                    bytes: rec.bytes as i64,
+                                                    format: fmt_label_w,
+                                                    compression: Some(comp_label_w),
+                                                    mode: mode_label_w,
+                                                },
                                             ) {
                                                 log::warn!(
                                                     "export '{}': file_log write failed for parallel checkpoint chunk '{}' (file was produced): {:#}",

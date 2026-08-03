@@ -31,7 +31,7 @@
 //! `StateStore` methods but with concurrent workers; its recovery behaviour under
 //! mid-run process failure is not yet covered by automated tests.
 
-use rivet::state::StateStore;
+use rivet::state::{FilePart, StateStore};
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -47,15 +47,15 @@ fn file_store() -> (StateStore, tempfile::NamedTempFile) {
 /// Shorthand: record a parquet file entry in the manifest.
 fn record_file(state: &StateStore, run_id: &str, export: &str, file: &str, rows: i64) {
     state
-        .record_file(
+        .record_file(FilePart {
             run_id,
-            export,
-            file,
+            export_name: export,
+            file_name: file,
             rows,
-            rows * 100,
-            "parquet",
-            Some("zstd"),
-        )
+            bytes: rows * 100,
+            format: "parquet",
+            compression: Some("zstd"),
+        })
         .unwrap();
 }
 

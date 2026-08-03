@@ -540,6 +540,8 @@ fn quarantine_move(
 
 #[cfg(test)]
 mod tests {
+    use crate::state::FilePart;
+
     use super::*;
     use crate::state::ChunkTaskInfo;
 
@@ -668,26 +670,26 @@ mod tests {
             .unwrap();
         // Two rotation siblings of ONE chunk, as record_part logs them per-part.
         state
-            .record_file(
+            .record_file(FilePart {
                 run_id,
-                "orders",
-                "orders_chunk0_p0.parquet",
-                30,
-                4096,
-                "parquet",
-                None,
-            )
+                export_name: "orders",
+                file_name: "orders_chunk0_p0.parquet",
+                rows: 30,
+                bytes: 4096,
+                format: "parquet",
+                compression: None,
+            })
             .unwrap();
         state
-            .record_file(
+            .record_file(FilePart {
                 run_id,
-                "orders",
-                "orders_chunk0_p1.parquet",
-                20,
-                2048,
-                "parquet",
-                None,
-            )
+                export_name: "orders",
+                file_name: "orders_chunk0_p1.parquet",
+                rows: 20,
+                bytes: 2048,
+                format: "parquet",
+                compression: None,
+            })
             .unwrap();
         let mut summary =
             crate::pipeline::summary::RunSummary::stub_for_testing(run_id, String::from("orders"));
@@ -752,26 +754,26 @@ mod tests {
         let run_id = "r_par_resume";
         // Two pre-crash parts (50 rows) durably committed to file_log, no manifest.
         state
-            .record_file(
+            .record_file(FilePart {
                 run_id,
-                "orders",
-                "orders_chunk0.parquet",
-                30,
-                4096,
-                "parquet",
-                None,
-            )
+                export_name: "orders",
+                file_name: "orders_chunk0.parquet",
+                rows: 30,
+                bytes: 4096,
+                format: "parquet",
+                compression: None,
+            })
             .unwrap();
         state
-            .record_file(
+            .record_file(FilePart {
                 run_id,
-                "orders",
-                "orders_chunk1.parquet",
-                20,
-                2048,
-                "parquet",
-                None,
-            )
+                export_name: "orders",
+                file_name: "orders_chunk1.parquet",
+                rows: 20,
+                bytes: 2048,
+                format: "parquet",
+                compression: None,
+            })
             .unwrap();
         let mut summary =
             crate::pipeline::summary::RunSummary::stub_for_testing(run_id, String::from("orders"));
@@ -833,28 +835,28 @@ mod tests {
             .complete_chunk_task(run_id, 0, 50, Some("orders_chunk0_a.parquet"))
             .unwrap();
         state
-            .record_file(
+            .record_file(FilePart {
                 run_id,
-                "orders",
-                "orders_chunk0_a.parquet",
-                50,
-                4096,
-                "parquet",
-                None,
-            )
+                export_name: "orders",
+                file_name: "orders_chunk0_a.parquet",
+                rows: 50,
+                bytes: 4096,
+                format: "parquet",
+                compression: None,
+            })
             .unwrap();
         // …and its part IS on record, which is exactly the trap: written, logged,
         // and about to be replaced.
         state
-            .record_file(
+            .record_file(FilePart {
                 run_id,
-                "orders",
-                "orders_chunk1_abandoned.parquet",
-                50,
-                4096,
-                "parquet",
-                None,
-            )
+                export_name: "orders",
+                file_name: "orders_chunk1_abandoned.parquet",
+                rows: 50,
+                bytes: 4096,
+                format: "parquet",
+                compression: None,
+            })
             .unwrap();
 
         let mut summary =
@@ -1089,26 +1091,26 @@ mod tests {
         // file_log records BOTH committed parts — including part-x, which the
         // stale manifest omits (the crash-before-finalize case).
         state
-            .record_file(
+            .record_file(FilePart {
                 run_id,
-                "orders",
-                "part-a.parquet",
-                10,
-                5,
-                "parquet",
-                Some("zstd"),
-            )
+                export_name: "orders",
+                file_name: "part-a.parquet",
+                rows: 10,
+                bytes: 5,
+                format: "parquet",
+                compression: Some("zstd"),
+            })
             .unwrap();
         state
-            .record_file(
+            .record_file(FilePart {
                 run_id,
-                "orders",
-                "part-x.parquet",
-                10,
-                7,
-                "parquet",
-                Some("zstd"),
-            )
+                export_name: "orders",
+                file_name: "part-x.parquet",
+                rows: 10,
+                bytes: 7,
+                format: "parquet",
+                compression: Some("zstd"),
+            })
             .unwrap();
 
         let plan = m8_plan(dir.path());

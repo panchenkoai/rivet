@@ -326,15 +326,16 @@ pub(crate) fn record_part(
     // ADR-0001 I7: file-log (manifest) write failure is non-fatal — the file is
     // already durable at the destination; log and continue.
     if let Some(st) = state
-        && let Err(e) = st.record_file(
-            &summary.run_id,
-            &plan.export_name,
-            &part.file_name,
-            part.rows,
-            part.bytes as i64,
-            plan.format.label(),
-            Some(plan.compression.label()),
-        )
+        && let Err(e) = st.record_durable_part(crate::state::DurablePart {
+            run_id: &summary.run_id,
+            export_name: &plan.export_name,
+            file_name: &part.file_name,
+            rows: part.rows,
+            bytes: part.bytes as i64,
+            format: plan.format.label(),
+            compression: Some(plan.compression.label()),
+            mode: plan.strategy.mode_label(),
+        })
     {
         log::warn!(
             "export '{}': file_log write failed for '{}' (file was produced): {:#}",

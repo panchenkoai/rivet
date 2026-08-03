@@ -23,13 +23,13 @@ mod shape;
 #[allow(unused_imports)]
 pub use checkpoint::ChunkTaskInfo;
 #[allow(unused_imports)]
-pub use file_log::FileRecord;
+pub use file_log::{DurablePart, FilePart, FileRecord};
 #[allow(unused_imports)]
 pub use keyset_range::{KeysetRangePart, KeysetRangeRow};
 pub use load_journal_store::LoadRecord;
 #[allow(unused_imports)]
 pub use metrics::ExportMetric;
-pub use metrics::{MetricRow, RunProgress};
+pub use metrics::MetricRow;
 #[allow(unused_imports)]
 pub use progression::{Boundary, ExportProgression};
 #[allow(unused_imports)]

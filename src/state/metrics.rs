@@ -94,18 +94,6 @@ pub struct MetricRow {
 ///
 /// Invariant I4 (Metric After Verdict) governs when `record_metric` is called:
 /// only after the terminal run outcome is determined.
-/// What a run has made durable so far — the payload of an in-flight
-/// [`StateStore::record_metric_progress`].
-///
-/// A struct rather than three positional `i64`s: `(rows, files, bytes)` at a call
-/// site is three numbers of the same type in an order nothing checks.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct RunProgress {
-    pub total_rows: i64,
-    pub files: i64,
-    pub bytes: i64,
-}
-
 impl StateStore {
     /// Back-compat shim: the original 15-field metric. Fills the v9 columns with
     /// defaults (NULL) and delegates to [`record_metric_full`]. The production
@@ -154,20 +142,6 @@ impl StateStore {
         })
     }
 
-    /// The `running` aggregate for a run in flight — written at the same durable
-    /// seam as the parts, so the ledger describes a run WHILE it happens.
-    ///
-    /// `export_metrics` used to appear only at finalize, which meant a run that
-    /// died mid-stream had its parts in `file_log` (once the CDC sink started
-    /// recording them) and no aggregate anywhere: the database knew the files
-    /// existed and could not say what run they amounted to. This closes that —
-    /// the row exists from the first durable roll and carries the totals so far.
-    ///
-    /// ONE row per run, always: this UPDATEs the run's `running` row and inserts
-    /// only when there is none, and [`record_metric_full`] clears it before
-    /// writing the terminal row. Anything that sums `total_rows` across runs
-    /// would otherwise double-count a run for every roll it survived — a far
-    /// worse failure than the gap being closed.
     /// Drop a run's in-flight `running` aggregate. Only ever called by
     /// [`record_metric_full`], immediately before the terminal row replaces it.
     fn clear_running_metric(&self, run_id: &str) -> Result<()> {
@@ -183,71 +157,53 @@ impl StateStore {
         Ok(())
     }
 
-    pub fn record_metric_progress(
+    /// Refresh the run's in-flight aggregate FROM `file_log`.
+    ///
+    /// A projection, not a second opinion: the totals are summed from the parts
+    /// this run has actually recorded, so the aggregate cannot drift from them and
+    /// no caller has to accumulate anything. Called by
+    /// [`StateStore::record_durable_part`], which is the only place that should.
+    ///
+    /// ONE row per run, always. `export_metrics` used to appear only at finalize,
+    /// so a run that died mid-stream had parts and no aggregate. Writing a NEW row
+    /// per part instead would be worse than the gap: a five-part run would be five
+    /// rows and every sum over the table would count it five times. Hence UPDATE
+    /// the run's `running` row, INSERT only when there is none, and let
+    /// [`record_metric_full`] clear it when the terminal row lands.
+    pub(super) fn project_running_aggregate(
         &self,
-        export_name: &str,
         run_id: &str,
+        export_name: &str,
         mode: &str,
         format: &str,
-        p: RunProgress,
     ) -> Result<()> {
-        let RunProgress {
-            total_rows,
-            files,
-            bytes,
-        } = p;
         let now = chrono::Utc::now().to_rfc3339();
-        let upd = "UPDATE export_metrics SET total_rows = ?1, files_produced = ?2, \
-                   files_committed = ?3, bytes_written = ?4, run_at = ?5 \
-                   WHERE run_id = ?6 AND status = 'running'";
+        let upd = "UPDATE export_metrics SET \
+                   total_rows = (SELECT coalesce(sum(row_count),0) FROM file_log WHERE run_id = ?1), \
+                   files_produced = (SELECT count(*) FROM file_log WHERE run_id = ?1), \
+                   files_committed = (SELECT count(*) FROM file_log WHERE run_id = ?1), \
+                   bytes_written = (SELECT coalesce(sum(bytes),0) FROM file_log WHERE run_id = ?1), \
+                   run_at = ?2 \
+                   WHERE run_id = ?1 AND status = 'running'";
         let ins = "INSERT INTO export_metrics (export_name, run_id, run_at, duration_ms, \
                    total_rows, status, mode, format, files_produced, files_committed, \
                    bytes_written, retries) \
-                   VALUES (?1, ?2, ?3, 0, ?4, 'running', ?5, ?6, ?7, ?8, ?9, 0)";
+                   SELECT ?1, ?2, ?3, 0, coalesce(sum(row_count),0), 'running', ?4, ?5, \
+                          count(*), count(*), coalesce(sum(bytes),0), 0 \
+                   FROM file_log WHERE run_id = ?2";
         match &self.conn {
             StateConn::Sqlite(c) => {
-                let n = c.execute(
-                    upd,
-                    rusqlite::params![total_rows, files, files, bytes, now, run_id],
-                )?;
-                if n == 0 {
+                if c.execute(upd, rusqlite::params![run_id, now])? == 0 {
                     c.execute(
                         ins,
-                        rusqlite::params![
-                            export_name,
-                            run_id,
-                            now,
-                            total_rows,
-                            mode,
-                            format,
-                            files,
-                            files,
-                            bytes
-                        ],
+                        rusqlite::params![export_name, run_id, now, mode, format],
                     )?;
                 }
             }
             StateConn::Postgres(client) => {
                 let mut c = client.borrow_mut();
-                let n = c.execute(
-                    &pg_sql(upd),
-                    &[&total_rows, &files, &files, &bytes, &now, &run_id],
-                )?;
-                if n == 0 {
-                    c.execute(
-                        &pg_sql(ins),
-                        &[
-                            &export_name,
-                            &run_id,
-                            &now,
-                            &total_rows,
-                            &mode,
-                            &format,
-                            &files,
-                            &files,
-                            &bytes,
-                        ],
-                    )?;
+                if c.execute(&pg_sql(upd), &[&run_id, &now])? == 0 {
+                    c.execute(&pg_sql(ins), &[&export_name, &run_id, &now, &mode, &format])?;
                 }
             }
         }

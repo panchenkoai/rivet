@@ -179,18 +179,19 @@ impl TableSink<'_> {
         // ledger write failure is logged, never a reason to fail a run whose
         // data is safe.
         if let Some((state, export_name, run_id)) = ledger
-            && let Err(e) = state.record_file(
+            && let Err(e) = state.record_durable_part(crate::state::DurablePart {
                 run_id,
                 export_name,
-                &part.file_name,
-                part.rows,
-                part.bytes as i64,
-                format.label(),
-                Some(part_compression(format).label()),
-            )
+                file_name: &part.file_name,
+                rows: part.rows,
+                bytes: part.bytes as i64,
+                format: format.label(),
+                compression: Some(part_compression(format).label()),
+                mode: "cdc",
+            })
         {
             log::warn!(
-                "cdc: file_log write failed for '{}' (the part IS durable): {e:#}",
+                "cdc: ledger write failed for '{}' (the part IS durable): {e:#}",
                 part.file_name
             );
         }
@@ -255,39 +256,6 @@ fn roll_all(
             run_token,
             state.map(|st| (st, export_name, run_id)),
         )?;
-    }
-    // The run's AGGREGATE, at the same durable seam as the parts themselves.
-    //
-    // `export_metrics` used to be written once, at finalize — so a run that died
-    // mid-stream left its parts in `file_log` (recorded just above) and no
-    // aggregate at all: the database held the files and could not say what run
-    // they added up to. One `running` row per run, updated each roll, replaced by
-    // the terminal row at finalize.
-    //
-    // Across ALL tables, because the row describes the RUN: a `tables:` stream is
-    // one run writing several prefixes, exactly as `files_committed` and
-    // `total_rows` already mean at finalize.
-    if let Some(st) = state {
-        let rows: i64 = sinks.iter().flat_map(|s| &s.parts).map(|p| p.rows).sum();
-        let files = sinks.iter().map(|s| s.parts.len()).sum::<usize>() as i64;
-        let bytes: i64 = sinks
-            .iter()
-            .flat_map(|s| &s.parts)
-            .map(|p| p.bytes as i64)
-            .sum();
-        if let Err(e) = st.record_metric_progress(
-            export_name,
-            run_id,
-            "cdc",
-            format.label(),
-            crate::state::RunProgress {
-                total_rows: rows,
-                files,
-                bytes,
-            },
-        ) {
-            log::warn!("cdc: in-flight metrics write failed for '{export_name}': {e:#}");
-        }
     }
     // Fault point: the parts are durable but the checkpoint/ack have NOT run. A
     // crash here must re-read on resume (at-least-once) — never lose the change.

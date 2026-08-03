@@ -25,18 +25,108 @@ pub struct FileRecord {
 /// Invariant I2 (Write Before Log) governs when `record_file` is called:
 /// only after a destination write succeeds.  Failed writes produce no log entry.
 /// Invariant I7 (File-Log Failure Is Non-Fatal) means callers use `let _ = record_file(...)`.
+/// The seven facts about a part that `record_file` stores. Named, because seven
+/// positional arguments — three of them same-typed strings in a row — say nothing
+/// at the call site about which string is the export and which is the file.
+pub struct FilePart<'a> {
+    pub run_id: &'a str,
+    pub export_name: &'a str,
+    pub file_name: &'a str,
+    pub rows: i64,
+    pub bytes: i64,
+    pub format: &'a str,
+    pub compression: Option<&'a str>,
+}
+
+/// One part of one run, as it lands. A named value rather than eight
+/// positional arguments — three of them same-typed strings in an order nothing
+/// checks, which is exactly the mix-up a parameter object exists to prevent.
+pub struct DurablePart<'a> {
+    pub run_id: &'a str,
+    pub export_name: &'a str,
+    pub file_name: &'a str,
+    pub rows: i64,
+    pub bytes: i64,
+    pub format: &'a str,
+    pub compression: Option<&'a str>,
+    /// The extraction strategy that produced it (`full`, `chunked`, `cdc`, …) —
+    /// recorded on the run's aggregate, which may not exist yet when the first
+    /// part lands.
+    pub mode: &'a str,
+}
+
 impl StateStore {
-    #[allow(clippy::too_many_arguments)]
-    pub fn record_file(
-        &self,
-        run_id: &str,
-        export_name: &str,
-        file_name: &str,
-        row_count: i64,
-        bytes: i64,
-        format: &str,
-        compression: Option<&str>,
-    ) -> Result<()> {
+    /// ONE part became durable: record the part AND the run's aggregate.
+    ///
+    /// "A part just landed" is a single moment in the domain, and the code said it
+    /// in three production places — `commit.rs`, `parallel_checkpoint.rs`, the CDC
+    /// sink — of which exactly ONE also wrote the run's in-flight aggregate. So a
+    /// crashed CDC run left both records and a crashed BATCH run left half: its
+    /// parts in `file_log` and nothing saying what run they amounted to. Nothing
+    /// in the types said the two travel together, so the pairing arrived one call
+    /// site at a time and stopped at the first.
+    ///
+    /// The aggregate is DERIVED from `file_log` rather than passed in. That is the
+    /// point of the seam: two numbers computed by two writers can disagree, a
+    /// projection cannot. No caller accumulates totals, no caller can forget to,
+    /// and a re-recorded part corrects the aggregate instead of double-counting
+    /// it.
+    ///
+    /// Non-fatal by ADR-0001 I7 — the file is already durable at the destination,
+    /// so a ledger failure is worth logging and never worth failing a run whose
+    /// data is safe. Returns the error for the caller to log with its own words.
+    pub fn record_durable_part(&self, p: DurablePart<'_>) -> Result<()> {
+        let DurablePart {
+            run_id,
+            export_name,
+            file_name,
+            rows,
+            bytes,
+            format,
+            compression,
+            mode,
+        } = p;
+        // A part is identified by its NAME within its run. Recording it twice is the
+        // same fact stated twice, not two parts — and `file_log` has no uniqueness
+        // to say so, so a retried attempt that rewrites the same file name would
+        // add a second row and inflate every total derived from it. The projection
+        // made that visible the first time it was asserted: three parts summing 42
+        // became 52 after one re-record. Delete-then-insert keeps the table a SET
+        // of parts, which is what "the parts this run produced" means.
+        self.forget_part(run_id, file_name)?;
+        self.record_file(FilePart {
+            run_id,
+            export_name,
+            file_name,
+            rows,
+            bytes,
+            format,
+            compression,
+        })?;
+        self.project_running_aggregate(run_id, export_name, mode, format)
+    }
+
+    /// Drop any prior row for this run's part, so re-recording replaces rather
+    /// than accumulates. Scoped to (run_id, file_name): another run's part with
+    /// the same name is a different part.
+    fn forget_part(&self, run_id: &str, file_name: &str) -> Result<()> {
+        self.execute(
+            "DELETE FROM file_log WHERE run_id = ?1 AND file_name = ?2",
+            &[run_id.into(), file_name.into()],
+        )?;
+        Ok(())
+    }
+
+    pub fn record_file(&self, p: FilePart<'_>) -> Result<()> {
+        let FilePart {
+            run_id,
+            export_name,
+            file_name,
+            rows: row_count,
+            bytes,
+            format,
+            compression,
+        } = p;
         self.execute(
             "INSERT INTO file_log (run_id, export_name, file_name, row_count, bytes, format, compression, created_at) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -106,6 +196,70 @@ fn file_record(r: &dyn super::row::StateRow) -> FileRecord {
 
 #[cfg(test)]
 mod tests {
+
+    /// Recording a durable part writes BOTH records, and the aggregate is a
+    /// PROJECTION of the parts rather than a second opinion.
+    ///
+    /// The pairing used to live in the callers: three production sites wrote the
+    /// part and exactly ONE also wrote the aggregate, so a crashed batch run left
+    /// its parts in `file_log` with nothing saying what run they amounted to.
+    /// Deriving the totals from `file_log` is what makes the two unable to
+    /// disagree — no caller accumulates, so no caller can forget.
+    ///
+    /// THREE parts, not one: with a single part every arithmetic is the identity
+    /// and a sum that ignored its input would still look right.
+    #[test]
+    fn recording_a_durable_part_projects_the_run_aggregate_from_the_parts() {
+        let s = StateStore::open_in_memory().expect("in-memory state");
+        for (i, rows) in [(0, 10i64), (1, 25), (2, 7)] {
+            s.record_durable_part(DurablePart {
+                run_id: "r1",
+                export_name: "orders",
+                file_name: &format!("orders_{i}.parquet"),
+                rows,
+                bytes: 100 * (i + 1) as i64,
+                format: "parquet",
+                compression: Some("zstd"),
+                mode: "chunked",
+            })
+            .expect("record");
+        }
+
+        let rows = s.get_metrics(Some("orders"), 10).expect("metrics");
+        assert_eq!(
+            rows.len(),
+            1,
+            "ONE aggregate per run — a row per part would make every sum over \
+             export_metrics count this run three times"
+        );
+        assert_eq!(rows[0].status, "running", "the run has not finished");
+        assert_eq!(
+            rows[0].total_rows, 42,
+            "the aggregate must equal the SUM of the parts (10+25+7), because it is \
+             computed from them"
+        );
+        assert_eq!(s.list_files_for_run("r1").expect("files").len(), 3);
+
+        // The projection corrects itself: re-recording a part must not double it.
+        s.record_durable_part(DurablePart {
+            run_id: "r1",
+            export_name: "orders",
+            file_name: "orders_0.parquet",
+            rows: 10,
+            bytes: 100,
+            format: "parquet",
+            compression: Some("zstd"),
+            mode: "chunked",
+        })
+        .expect("re-record");
+        let again = s.get_metrics(Some("orders"), 10).expect("metrics");
+        assert_eq!(
+            again[0].total_rows, 42,
+            "a re-recorded part must not inflate the aggregate — that is the difference \
+             between a projection and an accumulator"
+        );
+    }
+
     use super::*;
 
     fn store() -> StateStore {
@@ -115,35 +269,35 @@ mod tests {
     #[test]
     fn record_and_query_files() {
         let s = store();
-        s.record_file(
-            "run_001",
-            "orders",
-            "orders_20260329.parquet",
-            50000,
-            4096,
-            "parquet",
-            Some("zstd"),
-        )
+        s.record_file(FilePart {
+            run_id: "run_001",
+            export_name: "orders",
+            file_name: "orders_20260329.parquet",
+            rows: 50000,
+            bytes: 4096,
+            format: "parquet",
+            compression: Some("zstd"),
+        })
         .unwrap();
-        s.record_file(
-            "run_001",
-            "orders",
-            "orders_20260329_chunk1.parquet",
-            25000,
-            2048,
-            "parquet",
-            Some("zstd"),
-        )
+        s.record_file(FilePart {
+            run_id: "run_001",
+            export_name: "orders",
+            file_name: "orders_20260329_chunk1.parquet",
+            rows: 25000,
+            bytes: 2048,
+            format: "parquet",
+            compression: Some("zstd"),
+        })
         .unwrap();
-        s.record_file(
-            "run_002",
-            "users",
-            "users_20260329.csv",
-            1000,
-            500,
-            "csv",
-            None,
-        )
+        s.record_file(FilePart {
+            run_id: "run_002",
+            export_name: "users",
+            file_name: "users_20260329.csv",
+            rows: 1000,
+            bytes: 500,
+            format: "csv",
+            compression: None,
+        })
         .unwrap();
 
         let files = s.get_files(Some("orders"), 10).unwrap();
@@ -159,15 +313,15 @@ mod tests {
     fn files_limit_works() {
         let s = store();
         for i in 0..10 {
-            s.record_file(
-                &format!("r{}", i),
-                "t",
-                &format!("f{}.parquet", i),
-                i,
-                i * 100,
-                "parquet",
-                None,
-            )
+            s.record_file(FilePart {
+                run_id: &format!("r{}", i),
+                export_name: "t",
+                file_name: &format!("f{}.parquet", i),
+                rows: i,
+                bytes: i * 100,
+                format: "parquet",
+                compression: None,
+            })
             .unwrap();
         }
         let files = s.get_files(Some("t"), 3).unwrap();

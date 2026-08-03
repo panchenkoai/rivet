@@ -730,6 +730,8 @@ pub fn show_journal(
 
 #[cfg(test)]
 mod tests {
+    use crate::state::FilePart;
+
     use super::*;
     use crate::journal::{RunEvent, RunJournal};
 
@@ -1011,15 +1013,15 @@ exports:
         let (dir, config_path) = setup_dir();
         let state = open_state(&dir);
         state
-            .record_file(
-                "r1",
-                "orders",
-                "orders_001.parquet",
-                50_000,
-                4096,
-                "parquet",
-                Some("zstd"),
-            )
+            .record_file(FilePart {
+                run_id: "r1",
+                export_name: "orders",
+                file_name: "orders_001.parquet",
+                rows: 50_000,
+                bytes: 4096,
+                format: "parquet",
+                compression: Some("zstd"),
+            })
             .unwrap();
         drop(state);
         assert!(show_files(&config_path, Some("orders"), 10, false).is_ok());
@@ -1164,7 +1166,15 @@ exports:
         state.update("beta_foreign", "2025-01-02").unwrap(); // another config, same DB
         let f = |run: &str, export: &str, name: &str| {
             state
-                .record_file(run, export, name, 10, 100, "parquet", None)
+                .record_file(FilePart {
+                    run_id: run,
+                    export_name: export,
+                    file_name: name,
+                    rows: 10,
+                    bytes: 100,
+                    format: "parquet",
+                    compression: None,
+                })
                 .unwrap();
         };
         f("r1", "orders", "o.parquet");
