@@ -44,7 +44,7 @@ import time
 from pathlib import Path
 
 from .core import Ledger, Status, engine_container, docker, have, remove_engine_containers, rivet, rivet_bin, run, HERE, ROOT
-from . import bigquery, cdc, concurrency, gifs, regression, release_path, scenarios
+from . import bigquery, cdc, concurrency, gifs, regression, release_path, scenarios, state_parity
 
 
 def matrix_cfg(*args: str) -> str:
@@ -118,6 +118,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--engines", default="", help="comma-separated subset, e.g. postgres,mysql")
     ap.add_argument("--no-cloud", action="store_true", help="local stage only (skip BigQuery)")
     ap.add_argument("--keep", action="store_true", help="leave engine containers up (debug)")
+    ap.add_argument("--no-clean", action="store_true",
+                    help="skip the clean rebuild (iteration only — a release must be gated on a "
+                         "tree built from nothing)")
+    ap.add_argument("--state-url", default="",
+                    help="state backend for EVERY cell (default: SQLite beside each config). "
+                         "A gate pass grades ONE backend; run it twice to grade both.")
     ap.add_argument("--bless-bigquery-golden", action="store_true")
     ap.add_argument("--bless-local", action="store_true", help="re-capture verdict + duckdb-type goldens (implies --no-cloud)")
     ap.add_argument("--bless-cdc", action="store_true", help="re-capture the cdc state-snapshot golden")
@@ -127,6 +133,47 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if ns.bless_local:
         ns.no_cloud = True
     return ns
+
+
+def clean_tree_and_build(led: Ledger) -> bool:
+    """Step ZERO: gate a binary built from nothing.
+
+    A release must be graded on a tree with no history in it. `cargo package`
+    alone can make every later build LIE about being fresh — it copies the crate
+    to `target/package/<name>-<version>/` and builds THAT, leaving fingerprints
+    that record the sources at frozen paths, so the next `cargo build` compares
+    against a snapshot, finds nothing newer, prints `Fresh`, and produces a binary
+    without your edits. Every signal you would use to check it is lied to too:
+    `cargo test` passes, a deliberate type error compiles clean. Stale artifacts
+    from an interrupted run are the same class with a smaller blast radius.
+
+    So the gate starts by deleting the target directory and its own scratch, then
+    builds `--release` itself. It costs one full compile; it buys the guarantee
+    that the binary every cell below exercises is the code in the tree.
+    """
+    led.phase("Clean tree — the gate builds the binary it grades")
+    for stale in ("/tmp/rivet_conc", "/tmp/rivet_iso", "/tmp/rivet_sweep", "/tmp/rivet_cdc_sweep"):
+        shutil.rmtree(stale, ignore_errors=True)
+    for lock in Path("/tmp").glob(".rivet_cdc_sweep*.lock"):
+        lock.unlink(missing_ok=True)
+    if not run(["cargo", "clean"], cwd=ROOT, timeout=600).ok:
+        led.failed("-", "-", "clean_tree", "-",
+                   "clean tree: `cargo clean` failed — the gate cannot vouch for the binary it "
+                   "is about to grade")
+        return False
+    build = run(["cargo", "build", "--release"], cwd=ROOT, timeout=3600)
+    if not build.ok or not rivet_bin().is_file():
+        led.failed(
+            "-", "-", "clean_tree", "-",
+            f"clean tree: the release build FAILED on a clean tree — nothing below can mean "
+            f"anything: {(build.err or build.out)[-300:]}",
+        )
+        return False
+    led.passed(
+        "-", "-", "clean_tree", "-",
+        f"clean tree: target/ removed and the release binary rebuilt from nothing ({rivet_bin()})",
+    )
+    return True
 
 
 def preflight(led: Ledger, *, bless_gifs: bool = False) -> None:
@@ -150,6 +197,20 @@ def preflight(led: Ledger, *, bless_gifs: bool = False) -> None:
     # deployment's exports do not take turns — not any engine's; one source
     # exercises it. Local first, then the same race over a flat object-store
     # namespace, where there is no rename to fall back on.
+    # The two state backends are separate implementations of one contract, with
+    # hand-written SQL on both sides. `golden/cdc_state_snapshot.json` checks that
+    # each POPULATES the expected tables; this checks that they AGREE about the
+    # same run — the gap that let shape tracking be absent on Postgres entirely
+    # while every run reported success.
+    state_parity.verify_state_backend_parity(
+        led,
+        state_url=os.environ.get("RIVET_CDC_STATE_URL") or os.environ.get("RIVET_CONC_STATE_URL"),
+        state_container=os.environ.get("RIVET_SWEEP_STATE_CONTAINER", "rivet-postgres-state-1"),
+        src_container=os.environ.get("RIVET_CONC_SRC_CONTAINER", "rivet-postgres-1"),
+        src_url=os.environ.get(
+            "RIVET_CONC_SRC_URL", "postgresql://rivet:rivet@localhost:5432/rivet"
+        ),
+    )
     concurrency.verify_concurrent_writers_share_a_prefix(
         led,
         state_url=os.environ.get("RIVET_CDC_STATE_URL") or os.environ.get("RIVET_CONC_STATE_URL"),
@@ -377,6 +438,26 @@ def main(argv: list[str] | None = None) -> int:
         version = rivet("--version").stdout.splitlines()
         print(f"  rivet: {rivet_bin()} ({version[0] if version else 'unknown'})")
 
+        # WHICH STATE BACKEND IS BEING GRADED, said out loud.
+        #
+        # `run()` merges os.environ into every cell's env, so one variable decides
+        # the backend for the WHOLE gate — and until it was printed, nothing in a
+        # green report told you which one. That matters: a SQLite pass does not
+        # cover Postgres, and the two have diverged before (shape tracking never
+        # worked on Postgres at all). Grading both is two passes, deliberately,
+        # rather than a subset of cells quietly touching the other backend.
+        state_url = ns.state_url or os.environ.get("RIVET_GATE_STATE_URL", "")
+        if state_url:
+            os.environ["RIVET_STATE_URL"] = state_url
+            backend = f"POSTGRES ({state_url.split('@')[-1]})"
+        else:
+            os.environ.pop("RIVET_STATE_URL", None)
+            backend = "SQLITE (a .rivet_state.db beside each config — the default)"
+        print(f"  state backend under test: {backend}")
+        print("  a pass grades ONE backend; --state-url runs the same cells against the other")
+
+        if not ns.no_clean and not clean_tree_and_build(led):
+            return 1
         start_stores(led)
         preflight(led, bless_gifs=ns.bless_gifs)
         engine_loop(led, ns)
