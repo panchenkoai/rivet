@@ -91,6 +91,14 @@ _STATE_TABLES = (
     "run_aggregate",
     "export_state",
     "export_schema",
+    # `file_log` — one row per durable part, written by the CDC sink as each part
+    # lands. Added when the sink started recording them (2026-08-03): before that
+    # a CDC run wrote `begin_run` and one aggregate at finalize and nothing per
+    # part, so the manifest at the destination was both finer-grained and earlier
+    # than the database. This snapshot calls itself the canonical set of state
+    # tables a CDC run populates, so a table the run now populates and the golden
+    # does not name is the ledger being wrong about itself.
+    "file_log",
 )
 
 

@@ -33,10 +33,10 @@ import shutil
 from pathlib import Path
 
 try:
-    from .core import Ledger, have, rivet
+    from .core import Ledger, have, rivet, run
     from .scenarios import NO_TIMEOUT, _failed, _passed, _skipped, work_dir
 except ImportError:  # pragma: no cover - depends on how the driver is invoked
-    from core import Ledger, have, rivet  # type: ignore
+    from core import Ledger, have, rivet, run  # type: ignore
     from scenarios import NO_TIMEOUT, _failed, _passed, _skipped, work_dir  # type: ignore
 
 __all__ = ["verify_corruption_is_detected"]
@@ -212,6 +212,28 @@ def verify_corruption_is_detected(led: Ledger, engine: str, tag: str, url: str) 
 # re-upload round trip through a store client rewrites the object.
 
 
+def _read_values(part: Path) -> str | None:
+    """Everything a reader returns from this part, as one comparable blob.
+
+    DuckDB, not rivet: the question is whether a byte flip is visible to ANY
+    reader, and asking rivet would make the check depend on the code it grades.
+    `None` when the file cannot be read at all — which is itself a corruption, but
+    a different one than "the value changed", and the caller wants the second.
+    """
+    if not have("duckdb"):
+        return None
+    p = run(
+        [
+            "duckdb",
+            "-noheader",
+            "-list",
+            "-c",
+            f"SELECT * FROM read_parquet('{part}') ORDER BY ALL",
+        ]
+    )
+    return p.stdout if p.ok else None
+
+
 def verify_cdc_corruption_is_detected(led: Ledger, engine: str, tag: str, url: str) -> None:
     """Positive and negative for a CDC prefix: clean capture verifies, a flipped
     byte in a captured part does not."""
@@ -300,27 +322,66 @@ def verify_cdc_corruption_is_detected(led: Ledger, engine: str, tag: str, url: s
             return
 
         target = parts[0]
-        body = bytearray(target.read_bytes())
-        size_before = len(body)
+        original = target.read_bytes()
+        size_before = len(original)
         # Target a SOURCE column, not a rivet-added one. The value checksum covers
         # the source's own columns and deliberately omits the CDC meta columns
         # (`op`, the lsn/position blob), so flipping a byte in `op` changes the
         # data and is CORRECTLY not reported — the first cut did exactly that and
         # read as "the CDC leg is not verifying" when the leg was fine. The probe's
         # `meta` column carries the json `{"k": N}`; its key byte is a source value.
-        anchor = body.find(b'"k"')
-        if anchor < 0:
+        #
+        # BUT a literal is not necessarily a VALUE. A parquet file carries the
+        # column's min/max STATISTICS in its footer, uncompressed, so `"k"` occurs
+        # there too — and on Mongo, whose `document` column compresses well enough
+        # that the data page holds no literal at all, the first occurrence IS the
+        # footer. Flipping it changes no value any reader returns, `validate`
+        # correctly passes, and the cell reported the product as broken. So each
+        # candidate is flipped and the part is RE-READ: only a flip DuckDB can see
+        # is a corruption worth asking `validate` about. A mutation that changes
+        # nothing proves nothing.
+        before = _read_values(target)
+        idx = None
+        anchor = -1
+        while True:
+            anchor = original.find(b'"k"', anchor + 1)
+            if anchor < 0:
+                break
+            body = bytearray(original)
+            body[anchor + 1] = ord("j")
+            target.write_bytes(bytes(body))
+            after = _read_values(target)
+            if after is not None and before is not None and after != before:
+                idx = anchor + 1
+                break
+
+        # SECOND TIER, when no literal is corruptible. On Mongo every `"k"` in the
+        # part is footer statistics — the `document` column compresses, so its data
+        # page holds no literal at all — and stopping at a SKIP would leave the one
+        # engine whose CDC shape differs most as the one engine nothing grades.
+        # A flip inside a COMPRESSED data page makes the part unreadable, which is
+        # a different corruption than a changed value but the same question: with
+        # the data on disk wrong, does rivet say so? Reported as the shape it
+        # actually proved, never as the value-checksum leg.
+        unreadable = False
+        if idx is None:
+            for probe in range(64, min(len(original), 1024), 16):
+                body = bytearray(original)
+                body[probe] ^= 0xFF
+                target.write_bytes(bytes(body))
+                if _read_values(target) is None:
+                    idx, unreadable = probe, True
+                    break
+        if idx is None:
+            target.write_bytes(original)
             _skipped(
                 led, engine, tag, "cdc_corruption_is_detected", "-",
-                f"cdc-corruption[{engine}]: the captured part carries no recognisable SOURCE value "
-                f"to corrupt (the probe's json shape changed) — flipping a rivet meta column would "
-                f"prove nothing, so SKIP rather than pass",
-                "no source value",
+                f"cdc-corruption[{engine}]: no same-length flip of this part was observable to a "
+                f"reader at all — neither a changed value nor an unreadable file. A mutation that "
+                f"changes nothing cannot grade `validate`, so SKIP rather than pass",
+                "no observable flip",
             )
             return
-        idx = anchor + 1
-        body[idx] = ord("j")
-        target.write_bytes(bytes(body))
         if target.stat().st_size != size_before:
             _failed(led, engine, tag, "cdc_corruption_is_detected", "-",
                     f"cdc-corruption[{engine}]: the flip changed the file length", "size changed")
@@ -334,6 +395,30 @@ def verify_cdc_corruption_is_detected(led: Ledger, engine: str, tag: str, url: s
                 f"cdc-corruption[{engine}]: validate PASSED on a CDC part whose bytes were changed "
                 f"in place at offset {idx} — the CDC leg of verification is not verifying",
                 "undetected",
+            )
+            return
+        if unreadable:
+            # The second tier proved the unreadable-part leg, not the value
+            # checksum — say which, so the row cannot be read as coverage it does
+            # not have. rivet must still report data-integrity, not an
+            # operational error: an operator triaging exit 1 goes looking for a
+            # broken credential.
+            if bad.returncode != EXIT_DATA_INTEGRITY:
+                _failed(
+                    led, engine, tag, "cdc_corruption_is_detected", "-",
+                    f"cdc-corruption[{engine}]: an unreadable CDC part failed with exit "
+                    f"{bad.returncode}, not {EXIT_DATA_INTEGRITY} — corrupt data must classify as "
+                    f"verified-WRONG, never as could-not-verify: {text[-160:]}",
+                    "wrong exit",
+                )
+                return
+            _passed(
+                led, engine, tag, "cdc_corruption_is_detected", "-",
+                f"cdc-corruption[{engine}]: clean capture verifies; a same-length flip at offset "
+                f"{idx} makes the part unreadable and validate reports data-integrity (exit "
+                f"{bad.returncode}). NOTE: this engine's part holds no corruptible literal — every "
+                f"`\"k\"` is footer statistics — so this grades the unreadable-part leg, NOT the "
+                f"value checksum",
             )
             return
         if "value checksum mismatch" not in text:
