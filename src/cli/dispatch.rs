@@ -969,6 +969,10 @@ struct LoadInputs {
     integrity: load::reconcile::LoadIntegrity,
     uris: Vec<String>,
     source_run_ids: Vec<String>,
+    /// `engine:schema.table` of the manifests this load consumes — recorded so a
+    /// LATER load of the same warehouse table from a DIFFERENT database can be
+    /// refused instead of silently replacing these rows.
+    source_ident: String,
 }
 
 /// Reconcile the manifests under a load's prefix into its [`LoadInputs`],
@@ -996,6 +1000,35 @@ fn prepare_load(
     // disambiguate). Covers Full (wrong-export snapshot pick), incremental, and
     // CDC in one place, before any irreversible step.
     load::reconcile::ensure_single_export(&keyed)?;
+    // THE WAREHOUSE TABLE BELONGS TO ONE SOURCE.
+    //
+    // `ensure_single_export` above refuses two sources sharing a PREFIX. Two
+    // configs with SEPARATE prefixes pointed at one `dataset.table` get past it
+    // and the second load simply replaces the first's rows — both reporting
+    // success, because nothing recorded where the existing rows came from. The
+    // ledger now does, so the mismatch is answerable.
+    //
+    // Refuse rather than warn: by the time a load runs, the alternative is
+    // deleting someone else's data. Rows written before the ledger carried the
+    // identity read as unknown and never block — an upgrade must not start
+    // refusing loads that were fine yesterday.
+    if let Some(s) = state
+        && let Some((_, m)) = keyed.first()
+    {
+        let mine = load::reconcile::manifest_source_ident(m);
+        if !mine.is_empty()
+            && let Ok(prior) = s.loaded_source_idents(target_fqtn)
+            && let Some(other) = prior.iter().find(|p| **p != mine)
+        {
+            anyhow::bail!(
+                "target table `{target_fqtn}` was last loaded from `{other}` and this load \
+                 carries `{mine}` — loading would REPLACE the other source's rows, and both \
+                 commands would report success. Name a different `dataset:`/table for this \
+                 source, or load them into one table deliberately by giving them one export \
+                 name and one prefix."
+            );
+        }
+    }
     // The ledger's already-loaded run_ids — empty when stateless (no state DB),
     // so `select_runs` degrades safely rather than dropping the mode selection.
     let loaded = match state {
@@ -1031,10 +1064,17 @@ fn prepare_load(
         );
         return Ok(None);
     }
+    // The manifests agree on their source — `ensure_single_export` refused the
+    // prefix otherwise — so the first one speaks for all of them.
+    let source_ident = new
+        .first()
+        .map(|(_, m)| load::reconcile::manifest_source_ident(m))
+        .unwrap_or_default();
     Ok(Some(LoadInputs {
         integrity,
         uris,
         source_run_ids,
+        source_ident,
     }))
 }
 
@@ -1064,6 +1104,9 @@ struct LoadCtx<'a> {
     /// runs are still WRITING into it, so their (still-growing) manifests are
     /// not recorded as fully consumed.
     source_prefix: &'a str,
+    /// Set once the manifests are known (after `prepare_load`), so the ledger row
+    /// records WHERE the rows came from and not merely that they arrived.
+    source_ident: String,
 }
 
 impl LoadCtx<'_> {
@@ -1107,6 +1150,7 @@ impl LoadCtx<'_> {
         }
         let source_run_ids = &source_run_ids[..];
         let rec = LoadRecord {
+            source_ident: self.source_ident.clone(),
             load_id: self.load_id.to_string(),
             export_name: self.export_name.to_string(),
             target_table: self.target_fqtn.to_string(),
@@ -1154,7 +1198,7 @@ fn execute_load<R>(
     let store = load::open_store(&job.plan.destination)?;
     let loader = load::build_loader(job.plan, job.run_id);
     let target_fqtn = loader.fqtn(&job.plan.table);
-    let ctx = LoadCtx {
+    let mut ctx = LoadCtx {
         state: job.state,
         load_id: job.load_id,
         export_name: job.plan.table.as_str(),
@@ -1162,6 +1206,7 @@ fn execute_load<R>(
         warehouse: job.plan.load.target.name(),
         mode: job.mode,
         source_prefix: job.plan.gcs_prefix.as_str(),
+        source_ident: String::new(),
     };
     let inputs = match prepare_load(
         &store,
@@ -1170,7 +1215,10 @@ fn execute_load<R>(
         &target_fqtn,
         job.allow_source_drift,
     )? {
-        Some(i) => i,
+        Some(i) => {
+            ctx.source_ident = i.source_ident.clone();
+            i
+        }
         None => {
             let label = if job.mode == load::plan::LoadMode::Cdc {
                 "cdc load"
@@ -1527,6 +1575,7 @@ mod load_ledger_tests {
 
     fn ctx<'a>(state: &'a StateStore, load_id: &'a str) -> LoadCtx<'a> {
         LoadCtx {
+            source_ident: String::new(),
             source_prefix: "gs://b/p/",
             state: Some(state),
             load_id,
@@ -1647,6 +1696,7 @@ mod load_ledger_tests {
     fn record_is_a_noop_without_a_state_store() {
         // Stateless load (state=None): recording must not panic and writes nothing.
         let c = LoadCtx {
+            source_ident: String::new(),
             state: None,
             load_id: "L1",
             export_name: "orders",

@@ -380,6 +380,22 @@ const MIGRATIONS: &[(i64, &str)] = &[
             PRIMARY KEY (export_name, range_index)
         );",
     ),
+    // v20: WHICH SOURCE a target table was last loaded from.
+    //
+    // The ledger keyed loads on (target_table, source_run_id) and recorded
+    // nothing about WHERE the rows came from, so two configs pointed at one
+    // `dataset.table` from different databases were indistinguishable — the
+    // second load replaced the first's rows and both reported success. The
+    // prefix-level guard (`ensure_single_source`) catches them when they SHARE a
+    // bucket prefix; separate prefixes into one warehouse table needed this.
+    //
+    // Nullable and additive: rows written before this column exists read NULL,
+    // and the guard treats NULL as "unknown, do not block" — an upgrade must not
+    // start refusing loads that were fine yesterday.
+    (
+        20,
+        "ALTER TABLE loaded_source_run ADD COLUMN source_ident TEXT;",
+    ),
 ];
 
 /// PostgreSQL-compatible DDL.  Column types differ from SQLite (BIGSERIAL,
@@ -682,6 +698,22 @@ const PG_MIGRATIONS: &[(i64, &str)] = &[
             updated_at  TEXT NOT NULL,
             PRIMARY KEY (export_name, range_index)
         );",
+    ),
+    // v20: WHICH SOURCE a target table was last loaded from.
+    //
+    // The ledger keyed loads on (target_table, source_run_id) and recorded
+    // nothing about WHERE the rows came from, so two configs pointed at one
+    // `dataset.table` from different databases were indistinguishable — the
+    // second load replaced the first's rows and both reported success. The
+    // prefix-level guard (`ensure_single_source`) catches them when they SHARE a
+    // bucket prefix; separate prefixes into one warehouse table needed this.
+    //
+    // Nullable and additive: rows written before this column exists read NULL,
+    // and the guard treats NULL as "unknown, do not block" — an upgrade must not
+    // start refusing loads that were fine yesterday.
+    (
+        20,
+        "ALTER TABLE loaded_source_run ADD COLUMN IF NOT EXISTS source_ident TEXT;",
     ),
 ];
 

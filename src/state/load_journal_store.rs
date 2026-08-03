@@ -21,6 +21,10 @@ pub struct LoadRecord {
     pub rows_loaded: i64,
     pub status: String,
     pub finished_at: String,
+    /// WHICH SOURCE these rows came from (`engine:schema.table`), so a later load
+    /// of the same target from a DIFFERENT database is refusable. Empty when the
+    /// manifests did not say — treated as unknown, never as a mismatch.
+    pub source_ident: String,
 }
 
 impl StateStore {
@@ -108,12 +112,19 @@ impl StateStore {
                     for rid in &rec.source_run_ids {
                         tx.execute(
                             "INSERT INTO loaded_source_run
-                               (target_table, source_run_id, load_id, loaded_at)
-                             VALUES ($1, $2, $3, $4)
+                               (target_table, source_run_id, load_id, loaded_at, source_ident)
+                             VALUES ($1, $2, $3, $4, $5)
                              ON CONFLICT (target_table, source_run_id) DO UPDATE SET
-                                 load_id   = excluded.load_id,
-                                 loaded_at = excluded.loaded_at",
-                            &[&rec.target_table, rid, &rec.load_id, &rec.finished_at],
+                                 load_id      = excluded.load_id,
+                                 loaded_at    = excluded.loaded_at,
+                                 source_ident = excluded.source_ident",
+                            &[
+                                &rec.target_table,
+                                rid,
+                                &rec.load_id,
+                                &rec.finished_at,
+                                &rec.source_ident,
+                            ],
                         )?;
                     }
                 }
@@ -125,6 +136,21 @@ impl StateStore {
 
     /// The extraction run_ids already loaded into `target_table` — the skip set
     /// an incremental load filters its candidate manifests against.
+    /// The DISTINCT non-empty source identities a target table has been loaded
+    /// from. More than one means two different databases wrote the same
+    /// warehouse table — the second silently replaced the first.
+    pub fn loaded_source_idents(&self, target_table: &str) -> Result<Vec<String>> {
+        let mut out = self.query(
+            "SELECT DISTINCT source_ident FROM loaded_source_run \
+             WHERE target_table = ?1 AND source_ident IS NOT NULL AND source_ident <> ''",
+            &[target_table.into()],
+            |r| r.text(0),
+        )?;
+        out.sort();
+        out.dedup();
+        Ok(out)
+    }
+
     pub fn loaded_source_run_ids(&self, target_table: &str) -> Result<HashSet<String>> {
         Ok(self
             .query(
@@ -145,6 +171,9 @@ impl StateStore {
         const COLS: &str = "load_id, export_name, target_table, warehouse, mode, \
                             source_run_ids, rows_loaded, status, finished_at";
         let build = |r: &dyn super::row::StateRow| LoadRecord {
+            // Reading back a historical row: the identity is not part of the
+            // load_run projection, and no caller of this reader needs it.
+            source_ident: String::new(),
             load_id: r.text(0),
             export_name: r.text(1),
             target_table: r.text(2),
@@ -179,6 +208,7 @@ mod tests {
 
     fn rec(load_id: &str, target: &str, runs: &[&str], rows: i64, status: &str) -> LoadRecord {
         LoadRecord {
+            source_ident: String::new(),
             load_id: load_id.into(),
             export_name: "customers".into(),
             target_table: target.into(),

@@ -500,20 +500,26 @@ pub fn ensure_single_export(keyed: &[(String, RunManifest)]) -> Result<()> {
 /// A single source is the norm and stays silent. Two are refused, because the
 /// alternatives both lose: loading one of them silently drops the other, and
 /// loading their union would double-count the ordinary case of repeated runs.
+/// `engine:schema.table` for one manifest — the identity two loads of one
+/// warehouse table must agree on. Shared with the ledger so the guard and the
+/// record cannot drift apart on what "the same source" means.
+pub fn manifest_source_ident(m: &RunManifest) -> String {
+    match (&m.source.schema, &m.source.table) {
+        (Some(s), Some(t)) => format!("{}:{s}.{t}", m.source.engine),
+        (None, Some(t)) => format!("{}:{t}", m.source.engine),
+        _ => m.source.engine.clone(),
+    }
+}
+
 fn ensure_single_source(keyed: &[(String, RunManifest)]) -> Result<()> {
     // The ENGINE alone is already an identity — a batch manifest records
     // `table: null` (the export's table lives in the plan, not here), so a
     // filter that required a table dropped both sides and the guard stayed
     // silent on the very case it was written for. Only a manifest with no engine
     // at all has nothing to compare.
-    let ident = |m: &RunManifest| match (&m.source.schema, &m.source.table) {
-        (Some(s), Some(t)) => format!("{}:{s}.{t}", m.source.engine),
-        (None, Some(t)) => format!("{}:{t}", m.source.engine),
-        _ => m.source.engine.clone(),
-    };
     let sources: std::collections::BTreeSet<String> = keyed
         .iter()
-        .map(|(_, m)| ident(m))
+        .map(|(_, m)| manifest_source_ident(m))
         .filter(|s| !s.is_empty())
         .collect();
     if sources.len() > 1 {

@@ -159,6 +159,35 @@ impl LoadMode {
     }
 }
 
+/// The warehouse table name for a source table, with the schema qualifier folded
+/// into it rather than left as a dot.
+///
+/// The loaders build a fully-qualified name as `{project}.{dataset}.{table}`, so
+/// a schema-qualified source table produced FOUR segments and the warehouse read
+/// the extra one as part of the dataset:
+///
+///     table: public.orders  ->  rivet-data-tool.rivet_e2e.public.orders
+///     Not found: Dataset rivet-data-tool:rivet_e2e.public
+///
+/// A hard failure with a message that blames a dataset the operator never named.
+///
+/// Folded to `public_orders`, not truncated to `orders`: two schemas that both
+/// have `orders` are a normal arrangement, and collapsing them onto one warehouse
+/// table would turn a loud failure into a silent overwrite — the trade this
+/// codebase keeps refusing to make. Bare names are untouched, so nothing that
+/// works today changes.
+fn warehouse_table_name(table: &str, export_name: &str) -> String {
+    if !table.contains('.') {
+        return table.to_string();
+    }
+    let folded = table.replace('.', "_");
+    log::info!(
+        "export '{export_name}': source table `{table}` is schema-qualified; the warehouse table \
+         is `{folded}` (a dot would be read as part of the dataset name)"
+    );
+    folded
+}
+
 /// What a rivet config resolves to for a BigQuery load.
 #[derive(Debug, Clone)]
 pub struct LoadPlan {
@@ -408,7 +437,10 @@ fn build_plans(
                     report.export
                 )
             })?;
-        let table = export.table.clone().unwrap_or_else(|| export.name.clone());
+        let table = warehouse_table_name(
+            &export.table.clone().unwrap_or_else(|| export.name.clone()),
+            &export.name,
+        );
 
         let dest = &export.destination;
         let bucket = dest.bucket.as_deref().with_context(|| {
@@ -566,6 +598,34 @@ pub fn source_engine(config_path: &str) -> Result<crate::load::cdc::SourceEngine
 
 #[cfg(test)]
 mod tests {
+
+    /// A schema-qualified source table must not leak its dot into the warehouse
+    /// address, and two schemas that share a table name must stay apart.
+    ///
+    /// The loaders build `{project}.{dataset}.{table}`, so `public.orders` made
+    /// four segments and BigQuery read the extra one as part of the dataset:
+    /// `Not found: Dataset rivet-data-tool:rivet_e2e.public` — a hard failure
+    /// naming a dataset the operator never wrote.
+    ///
+    /// The second assertion is the one that matters more: folding to `orders`
+    /// would have fixed the error and collapsed two schemas onto one warehouse
+    /// table, trading a loud failure for a silent overwrite.
+    #[test]
+    fn a_schema_qualified_table_folds_instead_of_splitting_the_dataset() {
+        assert_eq!(warehouse_table_name("public.orders", "e"), "public_orders");
+        assert_ne!(
+            warehouse_table_name("public.orders", "e"),
+            warehouse_table_name("archive.orders", "e"),
+            "two schemas with the same table name must stay DISTINCT in the warehouse — \
+             collapsing them is a silent overwrite wearing a bugfix"
+        );
+        assert_eq!(
+            warehouse_table_name("orders", "e"),
+            "orders",
+            "a bare name is untouched: nothing that works today may change"
+        );
+    }
+
     use super::*;
 
     #[test]
