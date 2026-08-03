@@ -417,8 +417,19 @@ fn resolve_final_result(
     failed: bool,
     run_result: crate::error::Result<()>,
     reconcile_gate: crate::error::Result<()>,
+    manifest_gap: Option<String>,
 ) -> crate::error::Result<()> {
-    if failed { run_result } else { reconcile_gate }
+    if failed {
+        return run_result;
+    }
+    // The manifest gap outranks the reconcile verdict. Reconcile answers "is the
+    // data right?"; this answers "is the data REACHABLE?" — and an unreachable
+    // prefix makes the first question moot. Ordered before so the exit code names
+    // the condition an operator must act on first.
+    if let Some(why) = manifest_gap {
+        return Err(anyhow::anyhow!(why));
+    }
+    reconcile_gate
 }
 
 fn reconcile_run_gate(
@@ -983,12 +994,40 @@ pub(super) fn run_export_job(
     // permanently saying validated=pass for a run whose report says it
     // failed.  The notification fires last so it carries the most complete
     // summary.
-    finalize_manifest(&plan, &export.family(), state, &summary, "export");
+    // A run whose manifest never landed is NOT a success, whatever its rows say.
+    // The parts are durable and the counts are right — and no manifest names them,
+    // so the loader will not read them. Reporting success there is a claim the
+    // artifacts do not support.
+    //
+    // The status has already been printed and the ledger row already closed by
+    // this point, so both are corrected: the metrics row is written below and
+    // picks up the new status, and the ledger row is re-closed. The manifest
+    // itself cannot be re-written to say `failed` — failing to write it is the
+    // problem.
+    let manifest_gap = finalize_manifest(&plan, &export.family(), state, &summary, "export");
+    if let Some(why) = &manifest_gap {
+        summary.status = "failed".into();
+        summary.error_message = Some(why.clone());
+        ledger_finish_run(state, &plan.export_name, &summary.run_id, &summary.status);
+        if ledger_run_id != summary.run_id {
+            ledger_finish_run(state, &plan.export_name, &ledger_run_id, &summary.status);
+        }
+    }
     // Round-2 audit #12: advance the incremental cursor now that the destination
     // manifest is durable — never before. A failure here is at-least-once safe (the
     // data + manifest are durable; the next run re-exports from the prior cursor),
     // so log loudly rather than fail a run whose write cycle already succeeded.
-    if let Err(e) = commit_incremental_cursor(state, &plan, &summary) {
+    //
+    // "now that the manifest is durable" was a PREMISE, not a check: the cursor
+    // advanced even when the manifest write had just failed, so the next run
+    // started past data nothing described. Guarded now.
+    if manifest_gap.is_some() {
+        log::error!(
+            "export '{}': incremental cursor NOT advanced — the manifest did not land, so the \
+             next run must re-export this window rather than skip past it",
+            summary.export_name,
+        );
+    } else if let Err(e) = commit_incremental_cursor(state, &plan, &summary) {
         log::error!(
             "export '{}': cursor advance failed AFTER the manifest was written — the next run \
              re-exports from the prior cursor (at-least-once, no loss): {:#}",
@@ -1015,7 +1054,7 @@ pub(super) fn run_export_job(
     finalize_run_report(config_path, &summary, "export");
     crate::notify::maybe_send(config.notifications.as_ref(), &summary);
 
-    let final_result = resolve_final_result(failed, result, reconcile_gate);
+    let final_result = resolve_final_result(failed, result, reconcile_gate, manifest_gap);
     (final_result, summary)
 }
 
@@ -1221,7 +1260,7 @@ mod tests {
         // `run --reconcile` actually RETURNS the gate rather than Ok. Un-hooking
         // the fold reopens the bug; this test then goes red.
         let gate: crate::error::Result<()> = Err(DataIntegrityError::new("mismatch").into());
-        let out = resolve_final_result(false, Ok(()), gate);
+        let out = resolve_final_result(false, Ok(()), gate, None);
         assert!(
             out.is_err(),
             "a reconcile mismatch on a successful export must surface as the run result"
@@ -1230,12 +1269,21 @@ mod tests {
 
         // An export/quality failure takes precedence over the reconcile gate.
         let qfail: crate::error::Result<()> = Err(DataIntegrityError::new("quality").into());
-        assert!(resolve_final_result(true, qfail, Ok(())).is_err());
+        assert!(resolve_final_result(true, qfail, Ok(()), None).is_err());
 
         // Clean run: no export failure, no reconcile mismatch → Ok. (A --validate
         // verified-wrong verdict is NON-fatal by design — ADR-0001 §I7; a hard gate
         // is the standalone `rivet validate` command, not `run --validate`.)
-        assert!(resolve_final_result(false, Ok(()), Ok(())).is_ok());
+        assert!(resolve_final_result(false, Ok(()), Ok(()), None).is_ok());
+        // A run whose manifest never landed is not a success, even with the
+        // export and the reconcile both green: the parts are durable and no
+        // manifest names them, so the loader cannot reach them.
+        let gap = resolve_final_result(false, Ok(()), Ok(()), Some("no manifest".into()));
+        assert!(
+            gap.is_err(),
+            "an unwritten manifest must fail the run — reporting success there is a claim the \
+             artifacts do not support"
+        );
     }
 
     #[test]

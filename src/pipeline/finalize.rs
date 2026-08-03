@@ -81,9 +81,19 @@ pub(super) fn finalize_run_report(config_path: &str, summary: &RunSummary, kind:
 /// write it (plus `_SUCCESS` for clean runs) to the destination.
 ///
 /// ADR-0012 M1 / M2 / M7: parts are already committed, manifest is written
-/// next, then `_SUCCESS` only when status == Success.  Failures are
-/// non-fatal — the run keeps its exit code and operators can investigate
-/// via the local run report.
+/// next, then `_SUCCESS` only when status == Success.
+///
+/// Returns the reason the prefix did NOT become consumable, or `None` when it
+/// did. This used to be logged at `warn` and dropped, so a run whose manifest
+/// never landed printed `status: success`, `rows: 4,000`, `files: 4` — with its
+/// parts on the prefix and no manifest naming them. A manifest-authoritative
+/// `rivet load` does not load those rows, so "success" was a claim the artifacts
+/// did not support. Worse, the caller advanced the incremental cursor
+/// immediately after, on the stated premise that the manifest was durable: the
+/// next run then started PAST data no manifest described.
+///
+/// The parts are still durable, which is exactly why this must be loud. Nothing
+/// about the failure is visible in the data; it is visible only here.
 pub(super) fn finalize_manifest(
     plan: &ResolvedRunPlan,
     // The export FAMILY (`ExportConfig::family()`), passed at RUNTIME and
@@ -97,7 +107,7 @@ pub(super) fn finalize_manifest(
     state: &StateStore,
     summary: &RunSummary,
     kind: &str,
-) {
+) -> Option<String> {
     use crate::manifest::ManifestStatus;
     use crate::pipeline::manifest_writer::{ManifestBuilder, WriteOutcome, write_manifest};
 
@@ -140,12 +150,15 @@ pub(super) fn finalize_manifest(
         None => {
             // Synthetic-failure summaries never recorded a PlanResolved event.
             // There is no committed work to manifest; just log and return.
+            // A synthetic-failure summary never recorded a PlanResolved event:
+            // there is no committed work to describe, so an absent manifest is
+            // not a gap. `None`, not an error.
             log::debug!(
                 "{} '{}': no plan snapshot, manifest skipped",
                 kind,
                 summary.export_name
             );
-            return;
+            return None;
         }
     };
 
@@ -236,13 +249,9 @@ pub(super) fn finalize_manifest(
     let dest = match crate::destination::create_destination(&plan.destination) {
         Ok(d) => d,
         Err(e) => {
-            log::warn!(
-                "{} '{}': could not create destination for manifest write (not fatal): {:#}",
-                kind,
-                summary.export_name,
-                e
-            );
-            return;
+            let why = format!("could not create the destination for the manifest write: {e:#}");
+            log::error!("{} '{}': {}", kind, summary.export_name, why);
+            return Some(why);
         }
     };
 
@@ -256,21 +265,26 @@ pub(super) fn finalize_manifest(
                 manifest.row_count,
                 if success_marker { " + _SUCCESS" } else { "" },
             );
+            None
         }
+        // A streaming destination (stdout) has no prefix to describe, so there is
+        // no manifest to miss — the only legitimately absent one.
         Ok(WriteOutcome::SkippedStreaming) => {
             log::info!(
                 "{} '{}': manifest skipped (streaming destination)",
                 kind,
                 summary.export_name,
             );
+            None
         }
         Err(e) => {
-            log::warn!(
-                "{} '{}': manifest write failed (not fatal): {:#}",
-                kind,
-                summary.export_name,
-                e
+            let why = format!(
+                "the manifest write FAILED, so the prefix has {} durable part(s) that no manifest \
+                 names — a manifest-authoritative `rivet load` will not read them: {e:#}",
+                manifest.part_count
             );
+            log::error!("{} '{}': {}", kind, summary.export_name, why);
+            Some(why)
         }
     }
 }
