@@ -477,6 +477,58 @@ pub fn ensure_single_export(keyed: &[(String, RunManifest)]) -> Result<()> {
             listed.join(", ")
         );
     }
+    ensure_single_source(keyed)
+}
+
+/// One family is not one EXPORT when two different databases are called the same
+/// thing.
+///
+/// The family is the export NAME, so two configs that both call their export
+/// `orders` — because both databases have an `orders` table — are one family to
+/// every check above. Measured end to end: two sources wrote 600 rows into one
+/// GCS prefix under one name, and `rivet load` driven by the POSTGRES config put
+/// the MYSQL rows in the warehouse (`n=300, lo=10001`), reported `integrity ✓`,
+/// and exited 0. The postgres rows reached the warehouse from neither command.
+/// The second load then replaced the first's table with the same 300. Half the
+/// data absent, both commands green.
+///
+/// The manifest has always recorded WHICH SOURCE it came from, so the identity
+/// this guard needs is already on disk — including in artifacts written before
+/// this check existed, which is why the source is read rather than folded into
+/// `export_family` (that would only protect prefixes written after the change).
+///
+/// A single source is the norm and stays silent. Two are refused, because the
+/// alternatives both lose: loading one of them silently drops the other, and
+/// loading their union would double-count the ordinary case of repeated runs.
+fn ensure_single_source(keyed: &[(String, RunManifest)]) -> Result<()> {
+    // The ENGINE alone is already an identity — a batch manifest records
+    // `table: null` (the export's table lives in the plan, not here), so a
+    // filter that required a table dropped both sides and the guard stayed
+    // silent on the very case it was written for. Only a manifest with no engine
+    // at all has nothing to compare.
+    let ident = |m: &RunManifest| match (&m.source.schema, &m.source.table) {
+        (Some(s), Some(t)) => format!("{}:{s}.{t}", m.source.engine),
+        (None, Some(t)) => format!("{}:{t}", m.source.engine),
+        _ => m.source.engine.clone(),
+    };
+    let sources: std::collections::BTreeSet<String> = keyed
+        .iter()
+        .map(|(_, m)| ident(m))
+        .filter(|s| !s.is_empty())
+        .collect();
+    if sources.len() > 1 {
+        let listed: Vec<&str> = sources.iter().map(String::as_str).collect();
+        bail!(
+            "the load prefix holds manifests from {} DIFFERENT SOURCES ({}) under one export \
+             name. The warehouse table is named from the source table, so loading this prefix \
+             puts one source's rows in the table and leaves the other's unloaded — and a second \
+             load REPLACES the first. Both commands report success while half the data never \
+             arrives. Give each source its own destination prefix and its own export name, or \
+             load them into separate target tables.",
+            listed.len(),
+            listed.join(", ")
+        );
+    }
     Ok(())
 }
 
@@ -663,6 +715,54 @@ mod tests {
         let mut legacy = manifest("r0", 3, None);
         legacy.export_name = String::new();
         assert!(ensure_single_export(&[orders, keyed(legacy)]).is_ok());
+    }
+
+    /// Two DIFFERENT databases, ONE export name, one prefix — refuse.
+    ///
+    /// The family is the export name, so this arrangement is invisible to every
+    /// other check: an operator with two databases that both have `orders`, two
+    /// configs that both call the export `orders`, and one bucket prefix. What
+    /// actually happened, measured end to end before this guard: 600 rows on the
+    /// prefix, `rivet load` driven by the POSTGRES config loaded the MYSQL rows
+    /// (`n=300, lo=10001`), said `integrity ✓`, exited 0 — and the second load
+    /// replaced that table with the same 300. Half the data in the warehouse
+    /// from neither command, both green.
+    ///
+    /// The fixture varies ONLY the source. Same family, same name, same shape —
+    /// otherwise the older family guard would catch it and this one would never
+    /// be reached, which is the shape of a test that grades a check it does not
+    /// exercise.
+    #[test]
+    fn ensure_single_export_refuses_two_different_sources_under_one_name() {
+        let keyed = |m: RunManifest| ("gs://b/p/manifest-x.json".to_string(), m);
+        let mut pg = manifest("r1", 300, None);
+        pg.source.engine = "postgres".into();
+        pg.source.table = Some("orders".into());
+        let mut my = manifest("r2", 300, None);
+        my.source.engine = "mysql".into();
+        my.source.table = Some("orders".into());
+        assert_eq!(
+            pg.export_name, my.export_name,
+            "the fixture must share the name"
+        );
+
+        let err = ensure_single_export(&[keyed(pg.clone()), keyed(my.clone())])
+            .expect_err("two sources under one name must be refused, not silently half-loaded");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("DIFFERENT SOURCES") && msg.contains("postgres") && msg.contains("mysql"),
+            "the refusal must NAME both sources — an operator cannot act on `something is \
+             ambiguous`: {msg}"
+        );
+
+        // The ordinary case stays silent: many runs of ONE export from ONE source.
+        let mut again = manifest("r3", 300, None);
+        again.source.engine = "postgres".into();
+        again.source.table = Some("orders".into());
+        assert!(
+            ensure_single_export(&[keyed(pg), keyed(again)]).is_ok(),
+            "repeated runs of one export must not be refused — that is the normal load"
+        );
     }
 
     /// Regression: the CDC `initial: snapshot` leg shares the drain's prefix BY
