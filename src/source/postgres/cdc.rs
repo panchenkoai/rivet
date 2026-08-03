@@ -83,6 +83,77 @@ impl PgChangeStream {
     ///
     /// A [`DrainMode::BoundedAtOpen`] run snapshots `pg_current_wal_lsn()` once
     /// and stops at the first commit past it — see [`Self::bound`].
+    /// Say so when a DELETE from a CAPTURED table will carry only its key.
+    ///
+    /// `REPLICA IDENTITY` decides what PostgreSQL puts in the OLD tuple. At `FULL` a
+    /// delete carries every column; at `DEFAULT` — what a table has unless someone
+    /// changed it — it carries the primary key and nothing else. Measured on a real
+    /// server at DEFAULT:
+    ///
+    ///     insert | 1 | 10.5000 | alpha
+    ///     update | 1 | 99.9000 | alpha        <- the AFTER image is complete
+    ///     delete | 2 |         |              <- key only
+    ///
+    /// Not corruption and not a reason to refuse: a delete event's job is to say
+    /// which key is gone, and `test_decoding` still renders the whole NEW tuple, so
+    /// inserts and updates are unaffected. But it is invisible, every test stand sets
+    /// FULL so nothing here ever shows it, and it moves any per-row hash computed
+    /// over deletes — a CDC prefix and a batch export of the same table then disagree
+    /// for a reason nothing in the output explains.
+    ///
+    /// SCOPED TO THE CAPTURED TABLES. A first cut counted every table in the database
+    /// and said "704 table(s)" — true, useless, and the exact shape of a diagnostic
+    /// an operator learns to scroll past. A warning about tables nobody is capturing
+    /// is noise competing with the one that matters.
+    ///
+    /// Best-effort: a catalog permission error must not fail a capture that is
+    /// otherwise fine.
+    pub(crate) fn warn_partial_delete_image(
+        conn_str: &str,
+        tls: Option<&TlsConfig>,
+        tables: &[String],
+    ) {
+        if tables.is_empty() {
+            return;
+        }
+        let Ok(mut client) = (match tls {
+            Some(cfg) if cfg.mode.is_enforced() => crate::source::tls::build_native_tls(cfg)
+                .and_then(|c| {
+                    Client::connect(conn_str, postgres_native_tls::MakeTlsConnector::new(c))
+                        .map_err(Into::into)
+                }),
+            _ => Client::connect(conn_str, NoTls).map_err(Into::into),
+        }) else {
+            return;
+        };
+        // The config may name a table bare or schema-qualified; match on the bare
+        // name, which is what `relname` holds.
+        let bare: Vec<String> = tables
+            .iter()
+            .map(|t| t.rsplit('.').next().unwrap_or(t).to_string())
+            .collect();
+        let Ok(rows) = client.query(
+            "SELECT c.relname::text FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE c.relkind = 'r' AND c.relreplident <> 'f' AND c.relname = ANY($1)",
+            &[&bare],
+        ) else {
+            return;
+        };
+        if rows.is_empty() {
+            return;
+        }
+        let named: Vec<String> = rows.iter().map(|r| r.get::<_, String>(0)).collect();
+        log::warn!(
+            "pg cdc: {} of the captured table(s) ({}) have REPLICA IDENTITY other than FULL. A \
+         DELETE from them carries ONLY the primary key — every other column is NULL — while \
+         INSERT and UPDATE keep their full new-row image. Counts still reconcile, but a per-row \
+         hash over deletes will differ from the same table's batch export. \
+         `ALTER TABLE <t> REPLICA IDENTITY FULL` if the before-image matters.",
+            named.len(),
+            named.join(", ")
+        );
+    }
+
     pub(crate) fn open(
         conn_str: &str,
         slot: &str,

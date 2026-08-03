@@ -879,10 +879,22 @@ pub(crate) fn run_capture(cap: CdcCapture<'_>) -> Result<Vec<crate::manifest::Ru
     // Fault point: stream (and any server-side anchor) opened, nothing read.
     crate::test_hook::maybe_panic_at("cdc_after_open");
     let engine = CdcEngine::from_url(&url)?;
+    let cap_tables: Vec<String> = cap.outputs.iter().map(|o| o.table.clone()).collect();
     let mut outputs = Vec::with_capacity(cap.outputs.len());
     // ONE resolver session serves every table (was: 2 fresh connections per
     // table per run — the multi-table per-cycle cost the roast flagged).
     crate::test_hook::maybe_panic_at("cdc_before_resolve");
+    // The captured tables are known HERE and nowhere earlier, which is why the
+    // replica-identity notice lives at this seam rather than in the stream's
+    // `open`: scoped to what is actually being captured, it is one line an
+    // operator can act on instead of a census of the database.
+    if matches!(engine, CdcEngine::Postgres) {
+        crate::source::postgres::cdc::PgChangeStream::warn_partial_delete_image(
+            &url,
+            tls.as_ref(),
+            &cap_tables,
+        );
+    }
     let mut resolver = CdcSchemaResolver::connect(&url, tls.as_ref())?;
     for o in cap.outputs {
         let columns = resolver.resolve(&o.table, &o.overrides)?;
