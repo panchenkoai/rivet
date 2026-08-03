@@ -69,7 +69,16 @@ class Engine:
 ENGINES = [
     Engine("postgres", "rivet-postgres-1", "postgresql://rivet:rivet@localhost:5432/rivet", 1),
     Engine("mysql", "rivet-mysql-1", "mysql://rivet:rivet@localhost:3306/rivet", 10_001),
-    Engine("mssql", "rivet-mssql-1", "sqlserver://rivet:rivet@localhost:1433/rivet", 20_001),
+    # `sa`, not `rivet`: the BATCH stand's SQL Server has no `rivet` login (the
+    # CDC stand does), and the seed failed with `Login failed for user 'rivet'` —
+    # which the driver reported as "mssql FAILED", indistinguishable from an
+    # engine problem. One engine short of the scenario it claims to run.
+    Engine(
+        "mssql",
+        "rivet-mssql-1",
+        "sqlserver://sa:Rivet_Passw0rd!@localhost:1433/rivet",
+        20_001,
+    ),
     Engine("mongo", "rivet-mongo-1", "mongodb://localhost:27017/rivet", 30_001),
 ]
 
@@ -111,24 +120,35 @@ def seed(e: Engine) -> bool:
         ], timeout=300).returncode == 0
     if e.name == "mysql":
         rows = ",".join(f"({i},'mysql')" for i in range(lo, hi + 1))
-        return sh([
-            "docker", "exec", "-i", e.container, "mysql", "-urivet", "-privet", "rivet",
-        ], timeout=300) and subprocess.run(
+        # One call, with input. An earlier edit left a first `docker exec -i mysql`
+        # with NO stdin in front of this — it simply waited for input until the
+        # timeout, and the seed died 300 seconds later blaming MySQL.
+        return subprocess.run(
             ["docker", "exec", "-i", e.container, "mysql", "-urivet", "-privet", "rivet"],
             input=f"DROP TABLE IF EXISTS {TABLE}; CREATE TABLE {TABLE}(id INT PRIMARY KEY, src TEXT); "
                   f"INSERT INTO {TABLE} VALUES {rows};",
             capture_output=True, text=True, timeout=300,
         ).returncode == 0
     if e.name == "mssql":
-        rows = ",".join(f"({i},'mssql')" for i in range(lo, hi + 1))
-        return subprocess.run(
+        # Generated server-side, not as one giant literal. The first cut inlined
+        # 500 tuples into a single INSERT and sqlcmd rejected the statement; the
+        # sweep then reported "mssql FAILED" as though the engine were at fault,
+        # and three of the four writers below never ran.
+        stmt = (
+            f"IF OBJECT_ID('dbo.{TABLE}') IS NOT NULL DROP TABLE dbo.{TABLE};\n"
+            f"CREATE TABLE dbo.{TABLE}(id INT PRIMARY KEY, src NVARCHAR(20));\n"
+            f"WITH n AS (SELECT TOP ({PER_ENGINE}) ROW_NUMBER() OVER (ORDER BY (SELECT 1)) - 1 AS k "
+            f"FROM sys.all_objects a CROSS JOIN sys.all_objects b) "
+            f"INSERT INTO dbo.{TABLE} SELECT {lo} + k, 'mssql' FROM n;\n"
+        )
+        r = subprocess.run(
             ["docker", "exec", "-i", e.container, "/opt/mssql-tools18/bin/sqlcmd",
-             "-S", "localhost", "-U", "rivet", "-P", "rivet", "-C", "-d", "rivet", "-b"],
-            input=f"IF OBJECT_ID('dbo.{TABLE}') IS NOT NULL DROP TABLE dbo.{TABLE};\n"
-                  f"CREATE TABLE dbo.{TABLE}(id INT PRIMARY KEY, src NVARCHAR(20));\n"
-                  f"INSERT INTO dbo.{TABLE} VALUES {rows};\n",
-            capture_output=True, text=True, timeout=600,
-        ).returncode == 0
+             "-S", "localhost", "-U", "sa", "-P", "Rivet_Passw0rd!", "-C", "-d", "rivet", "-b"],
+            input=stmt, capture_output=True, text=True, timeout=600,
+        )
+        if r.returncode != 0:
+            print(f"    mssql seed said: {(r.stdout + r.stderr).strip().splitlines()[-1:]}")
+        return r.returncode == 0
     if e.name == "mongo":
         docs = ",".join(f"{{_id:{i},src:'mongo'}}" for i in range(lo, hi + 1))
         return subprocess.run(
@@ -177,12 +197,10 @@ def launch(cfgs: list[Path], env: dict) -> tuple[list[int], str]:
     return exits, " | ".join(chatter[:3])
 
 
-def check_union(out: Outcome, read_sql: str, engines: list[Engine]) -> None:
+def check_union(out: Outcome, ids: list[int], engines: list[Engine]) -> None:
     """Per-id, not per-count: loss, duplication and overwrite look identical in a
     total and completely different here."""
     expected = {i for e in engines for i in range(e.base, e.base + PER_ENGINE)}
-    got = duckdb(f"SELECT id FROM ({read_sql})")
-    ids = [int(x) for x in got.splitlines() if x.strip().isdigit()]
     seen = set(ids)
     missing = expected - seen
     if missing:
@@ -253,8 +271,21 @@ def local_leg(work: Path, backend: str, state_env: dict) -> Outcome:
             f"{len(ENGINES) * PER_ENGINE}"
         )
     if files:
-        lst = ",".join(f"'{f}'" for f in files)
-        check_union(out, f"SELECT id FROM read_parquet([{lst}])", ENGINES)
+        # PER ENGINE, because the shapes differ: a Mongo export carries `_id` and a
+        # verbatim `document`, the SQL engines carry `id`. One query over the union
+        # made DuckDB error, the read returned nothing, and every id read as
+        # MISSING — the sweep reported 1500 rows lost when all 1500 were on disk.
+        ids: list[int] = []
+        for e in ENGINES:
+            mine = [f for f in files if f"{TABLE}_{e.name}" in f.name]
+            if not mine:
+                out.problems.append(f"{e.name}: no part on the shared prefix")
+                continue
+            lst = ",".join(f"'{f}'" for f in mine)
+            col = "_id" if e.name == "mongo" else "id"
+            raw = duckdb(f'SELECT "{col}" FROM read_parquet([{lst}])')
+            ids += [int(x) for x in raw.splitlines() if x.strip().lstrip("-").isdigit()]
+        check_union(out, ids, ENGINES)
     else:
         out.problems.append("no parquet on the shared prefix at all")
     if backend == "postgres":
