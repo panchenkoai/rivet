@@ -760,9 +760,16 @@ def _cdc_state_parity(led: Ledger) -> None:
         # written and blamed the missing snapshot on the state backend.
         led.skipped("postgres", "cdc", "state-parity", "-", "cdc state-parity: source setup failed", "setup")
         return
-    rivet("run", "-c", str(cap1.yaml))
+    # The SQLite half must actually USE SQLite. This leg exists to compare the two
+    # backends, so it cannot inherit whichever one the gate is pointed at: with
+    # `--state-url` in force the run wrote to Postgres, no `.rivet_state.db` was
+    # ever created, and the comparison SKIPped itself with "state db unreadable"
+    # — the parity check quietly absent in exactly the configuration that makes
+    # parity worth checking. An empty `RIVET_STATE_URL` pins it.
+    sqlite_only = {"RIVET_STATE_URL": ""}
+    rivet("run", "-c", str(cap1.yaml), env=sqlite_only)
     _cdc_postgres_changes(url)
-    rivet("run", "-c", str(cap1.yaml))
+    rivet("run", "-c", str(cap1.yaml), env=sqlite_only)
     try:
         snap_sqlite = _cdc_state_snapshot_sqlite(w1 / ".rivet_state.db")
     except (sqlite3.Error, OSError) as e:
