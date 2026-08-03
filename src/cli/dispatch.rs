@@ -1015,7 +1015,7 @@ fn prepare_load(
     if let Some(s) = state
         && let Some((_, m)) = keyed.first()
     {
-        let mine = load::reconcile::manifest_source_ident(m);
+        let mine = crate::manifest::identity_source(m);
         if !mine.is_empty()
             && let Ok(prior) = s.loaded_source_idents(target_fqtn)
             && let Some(other) = prior.iter().find(|p| **p != mine)
@@ -1068,7 +1068,7 @@ fn prepare_load(
     // prefix otherwise — so the first one speaks for all of them.
     let source_ident = new
         .first()
-        .map(|(_, m)| load::reconcile::manifest_source_ident(m))
+        .map(|(_, m)| crate::manifest::identity_source(m))
         .unwrap_or_default();
     Ok(Some(LoadInputs {
         integrity,

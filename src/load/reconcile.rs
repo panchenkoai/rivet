@@ -283,33 +283,6 @@ pub fn has_active_running_manifest(keyed: &[(String, RunManifest)]) -> bool {
         .any(|(_, m)| m.status == ManifestStatus::Running && !is_superseded(m, keyed))
 }
 
-/// The family a manifest belongs to, WITH upgrade compatibility.
-///
-/// The RECORDED `export_family` when its writer stamped one; otherwise — a
-/// manifest written before the field existed — the legacy substring fold, EXCEPT
-/// that a legacy manifest joins the recorded family of any manifest sharing its
-/// `export_name`.
-///
-/// That exception is the whole upgrade story. A CDC drain writes `export_name` =
-/// the TABLE, so a pre-upgrade drain folds to "orders" while its post-upgrade
-/// successor records "orders_cdc": grouping without this, a prefix mid-upgrade
-/// reports TWO families and the load refuses rivet's own output — permanently,
-/// for every `name:` ≠ `table:` export, at its first post-upgrade load.
-///
-/// It is precise rather than permissive: the match is on the export NAME the two
-/// manifests literally share, so a legacy manifest of a DIFFERENT export joins
-/// nothing and the guard still refuses. Both directions are pinned by tests.
-fn resolved_family<'a>(m: &'a RunManifest, keyed: &'a [(String, RunManifest)]) -> &'a str {
-    if !m.export_family.is_empty() {
-        return &m.export_family;
-    }
-    keyed
-        .iter()
-        .find(|(_, o)| !o.export_family.is_empty() && o.export_name == m.export_name)
-        .map(|(_, o)| o.export_family.as_str())
-        .unwrap_or_else(|| crate::manifest::snapshot_family(&m.export_name))
-}
-
 /// A `running` manifest is SUPERSEDED when a NEWER run of the SAME export exists
 /// (a higher `started_at`) — it crashed and its successor already re-ran, so it
 /// no longer protects anything. The ONE clock-free staleness predicate, shared by
@@ -323,7 +296,8 @@ fn is_superseded(m: &RunManifest, keyed: &[(String, RunManifest)]) -> bool {
     // stayed "active" forever and gc over-deferred cleanup permanently. Same
     // recorded-identity seam as `ensure_single_export`.
     keyed.iter().any(|(_, o)| {
-        resolved_family(o, keyed) == resolved_family(m, keyed) && o.started_at > m.started_at
+        crate::manifest::identity_family(o, keyed) == crate::manifest::identity_family(m, keyed)
+            && o.started_at > m.started_at
     })
 }
 
@@ -462,7 +436,7 @@ fn is_run_unique_manifest(base: &str) -> bool {
 pub fn ensure_single_export(keyed: &[(String, RunManifest)]) -> Result<()> {
     let mut names: std::collections::BTreeSet<&str> = keyed
         .iter()
-        .map(|(_, m)| resolved_family(m, keyed))
+        .map(|(_, m)| crate::manifest::identity_family(m, keyed))
         .filter(|n| !n.is_empty())
         .collect();
     if names.len() > 1 {
@@ -500,17 +474,6 @@ pub fn ensure_single_export(keyed: &[(String, RunManifest)]) -> Result<()> {
 /// A single source is the norm and stays silent. Two are refused, because the
 /// alternatives both lose: loading one of them silently drops the other, and
 /// loading their union would double-count the ordinary case of repeated runs.
-/// `engine:schema.table` for one manifest — the identity two loads of one
-/// warehouse table must agree on. Shared with the ledger so the guard and the
-/// record cannot drift apart on what "the same source" means.
-pub fn manifest_source_ident(m: &RunManifest) -> String {
-    match (&m.source.schema, &m.source.table) {
-        (Some(s), Some(t)) => format!("{}:{s}.{t}", m.source.engine),
-        (None, Some(t)) => format!("{}:{t}", m.source.engine),
-        _ => m.source.engine.clone(),
-    }
-}
-
 fn ensure_single_source(keyed: &[(String, RunManifest)]) -> Result<()> {
     // The ENGINE alone is already an identity — a batch manifest records
     // `table: null` (the export's table lives in the plan, not here), so a
@@ -519,7 +482,7 @@ fn ensure_single_source(keyed: &[(String, RunManifest)]) -> Result<()> {
     // at all has nothing to compare.
     let sources: std::collections::BTreeSet<String> = keyed
         .iter()
-        .map(|(_, m)| manifest_source_ident(m))
+        .map(|(_, m)| crate::manifest::identity_source(m))
         .filter(|s| !s.is_empty())
         .collect();
     if sources.len() > 1 {
