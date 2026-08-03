@@ -796,6 +796,30 @@ fn get_current_version(conn: &Connection) -> i64 {
 }
 
 fn migrate(conn: &Connection) -> Result<()> {
+    // ONE writer migrates at a time. `BEGIN IMMEDIATE` takes the database's write
+    // lock before anything is read, so the version this process sees cannot be
+    // stale by the time it acts on it; the others block on `busy_timeout` and
+    // find the work already done.
+    //
+    // Without it, several rivet processes starting together against an EMPTY
+    // state db each read version 0 and each apply the whole ladder. Measured on
+    // four concurrent exports, five rounds out of five had failures:
+    // `migration v8 failed: no such table: file_manifest` (one process renamed it
+    // while another was still looking for the old name), `already another table
+    // or index with this name: file_log`, `duplicate column name:
+    // files_committed`. That is the first day of a shared deployment — provision
+    // the backend, start the exports — and most of them died on startup.
+    //
+    // The guard is advisory-by-transaction rather than a lock table: an aborted
+    // process releases it by dying, so a crashed migrator cannot wedge the next
+    // one.
+    let _ = conn.execute_batch("BEGIN IMMEDIATE;");
+    let out = migrate_locked(conn);
+    let _ = conn.execute_batch(if out.is_ok() { "COMMIT;" } else { "ROLLBACK;" });
+    out
+}
+
+fn migrate_locked(conn: &Connection) -> Result<()> {
     ensure_schema_version_table(conn);
 
     let current = get_current_version(conn);
@@ -828,8 +852,13 @@ fn migrate(conn: &Connection) -> Result<()> {
     for &(ver, sql) in MIGRATIONS {
         if ver > current {
             log::debug!("state: applying migration v{}", ver);
+            // No inner BEGIN/COMMIT: `migrate` already holds the write
+            // transaction, and SQLite does not nest. The atomicity the inner
+            // pair provided is now the outer one's, which is strictly stronger —
+            // a failure rolls back the whole ladder rather than leaving the db
+            // at a half-applied version.
             let atomic_sql = format!(
-                "BEGIN;\n{}\nINSERT INTO schema_version (version) VALUES ({});\nCOMMIT;",
+                "{}\nINSERT INTO schema_version (version) VALUES ({});",
                 sql, ver
             );
             conn.execute_batch(&atomic_sql)
@@ -856,7 +885,32 @@ fn migrate(conn: &Connection) -> Result<()> {
 
 // ─── PostgreSQL migration ─────────────────────────────────────────────────────
 
+/// The advisory-lock key for state migrations. An arbitrary constant, chosen
+/// once: any two rivet processes must agree, and nothing else uses the space.
+const PG_MIGRATION_LOCK: i64 = 0x7269_7665_745f_6d69_u64 as i64; // "rivet_mi"
+
 fn migrate_pg(client: &mut postgres::Client) -> Result<()> {
+    // ONE writer migrates at a time, across PROCESSES and HOSTS. A session
+    // advisory lock is the right instrument: it is held for the connection, so a
+    // process that dies mid-migration releases it, and it needs no table of its
+    // own (which would itself have to be created race-free).
+    //
+    // `CREATE TABLE IF NOT EXISTS` is NOT race-free in PostgreSQL — concurrent
+    // creators collide in the catalog — and even past it each migration ran in
+    // its own transaction with no coordination, so two clients both read version
+    // N and both applied N+1. Measured on four concurrent exports against an
+    // EMPTY schema: THREE of the four died with `state(pg): create version table:
+    // db error`, at the very first statement. One survived. That is the first day
+    // of a shared deployment.
+    client
+        .batch_execute(&format!("SELECT pg_advisory_lock({PG_MIGRATION_LOCK});"))
+        .map_err(|e| anyhow::anyhow!("state(pg): take migration lock: {:#}", e))?;
+    let out = migrate_pg_locked(client);
+    let _ = client.batch_execute(&format!("SELECT pg_advisory_unlock({PG_MIGRATION_LOCK});"));
+    out
+}
+
+fn migrate_pg_locked(client: &mut postgres::Client) -> Result<()> {
     client
         .batch_execute("CREATE TABLE IF NOT EXISTS rivet_schema_version (version BIGINT NOT NULL);")
         .map_err(|e| anyhow::anyhow!("state(pg): create version table: {:#}", e))?;
