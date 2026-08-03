@@ -41,6 +41,31 @@ use crate::source::require_tls_or_loopback;
 /// `sys.fn_cdc_get_max_lsn()` per poll (the daemon's chase-the-head mode) — the
 /// termination contract of [`MssqlChangeStream::bound`], pure so the bounded
 /// shape is asserted without a server.
+///
+/// TWO WAYS a resume position can sit below `fn_cdc_get_min_lsn`, and only one is
+/// data loss. `cdc.change_tables.start_lsn` is where the capture instance BEGAN
+/// and never moves; `fn_cdc_get_min_lsn` is the current low watermark, which the
+/// cleanup job raises. So:
+///
+///   * `@from < @start` — the position PREDATES the instance. There is no history
+///     before its creation to have lost, so floor to `@min` and over-read, which
+///     is SQL Server's anchor model to begin with.
+///   * `@start <= @from < @min` — the position was inside the instance's lifetime
+///     and the cleanup job removed it. That IS loss, and the THROW is right.
+///
+/// Without the first case the anchor wedged a brand-new export permanently, and
+/// the diagnosis it printed was wrong in a way that cost the operator real work.
+/// `pin_checkpoint_at_max_lsn` anchors at the DATABASE-wide
+/// `sys.fn_cdc_get_max_lsn()`, and a capture instance enabled moments earlier has
+/// not published its own `min_lsn` yet (it reads NULL) — the capture job then
+/// publishes a `start_lsn` ABOVE that database watermark. Measured on a real
+/// server: anchor pinned at `0x…5A78001A` while `min_lsn` was NULL, and twelve
+/// seconds later the instance reported `0x…61600037`. Every subsequent poll threw
+/// "the cleanup job removed it — re-snapshot the table", when nothing had been
+/// removed and re-snapshotting could not help: `ensure_anchor` returns early on a
+/// present checkpoint ("anchored already — never move it"), so the export stayed
+/// wedged until someone deleted the file by hand. The ops sequence that hits it is
+/// the ordinary one — enable CDC on the table, start rivet.
 fn fill_sql(ci: &str, from_expr: &str, batch: i64, bound: Option<&str>) -> String {
     let max_expr = match bound {
         Some(hex) => format!("0x{hex}"),
@@ -50,6 +75,9 @@ fn fill_sql(ci: &str, from_expr: &str, batch: i64, bound: Option<&str>) -> Strin
         "DECLARE @from binary(10) = {from_expr}; \
          DECLARE @min binary(10) = sys.fn_cdc_get_min_lsn('{ci}'); \
          DECLARE @max binary(10) = {max_expr}; \
+         DECLARE @start binary(10) = (SELECT start_lsn FROM cdc.change_tables \
+             WHERE capture_instance = '{ci}'); \
+         IF @from IS NOT NULL AND @start IS NOT NULL AND @from < @start SET @from = @min; \
          IF @from IS NOT NULL AND @min IS NOT NULL AND @from < @min \
             THROW 51000, 'rivet cdc: the resume position is older than the SQL Server \
 CDC change-table retention (the cleanup job removed it). Resuming would silently skip changes \
@@ -741,6 +769,44 @@ mod tests {
         assert!(
             daemon.contains("DECLARE @max binary(10) = sys.fn_cdc_get_max_lsn();"),
             "daemon poll keeps chasing the head: {daemon}"
+        );
+    }
+
+    /// A resume position that PREDATES the capture instance is floored, not
+    /// refused — and the refusal survives for the case that is real loss.
+    ///
+    /// This is a shape assertion on generated SQL, which is a weak instrument, so
+    /// it asserts the two things the server's behaviour actually turns on and
+    /// says what it cannot see. The ORDER matters: the floor must be applied
+    /// before the guard reads `@from`, or the guard throws on a position the next
+    /// statement was about to make valid. And the floor must key off
+    /// `cdc.change_tables.start_lsn` — the instance's creation LSN, which never
+    /// moves — because `fn_cdc_get_min_lsn` is exactly the moving value that
+    /// cannot tell the two cases apart.
+    ///
+    /// What it cannot check is that a real SQL Server agrees. That is the
+    /// `mssql/initial_snapshot` case of `dev/pytools/cdc_sweep.py`, which
+    /// reproduces the wedge end to end: it fails before this change and passes
+    /// after.
+    #[test]
+    fn a_resume_position_predating_the_capture_instance_is_floored_not_refused() {
+        let sql = fill_sql("dbo_orders", "sys.fn_cdc_increment_lsn(0xabcd)", 500, None);
+        let floor = sql
+            .find("SET @from = @min")
+            .expect("a position below the instance's start_lsn must be floored, not thrown on");
+        let guard = sql
+            .find("THROW 51000")
+            .expect("the retention guard must survive — cleanup eating a position IS loss");
+        assert!(
+            floor < guard,
+            "the floor must be applied BEFORE the guard reads @from, or the guard refuses a \
+             position the very next statement would have made valid:\n{sql}"
+        );
+        assert!(
+            sql.contains("start_lsn FROM cdc.change_tables"),
+            "the floor must key off the instance's CREATION lsn from the catalog — \
+             fn_cdc_get_min_lsn moves with cleanup and so cannot tell `predates the instance` \
+             from `cleanup removed it`:\n{sql}"
         );
     }
 
