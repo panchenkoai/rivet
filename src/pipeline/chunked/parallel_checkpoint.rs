@@ -137,7 +137,6 @@ pub(crate) fn run_chunked_parallel_checkpoint(
     // per chunk against the same on-disk SQLite (the connection is not Sync).
     // The post-scope drain uses the main-thread `state` reference + state=None
     // to commit::record_part so file_log is not double-written.
-    let config_path_owned = config_path.to_string();
     let fmt_label = plan.format.label();
     let comp_label = plan.compression.label();
     let mode_label = plan.strategy.mode_label();
@@ -171,7 +170,6 @@ pub(crate) fn run_chunked_parallel_checkpoint(
             let shared_fingerprint = &shared_fingerprint;
             let plan_w = plan_for_workers.clone();
             let cp_w = cp_for_workers.clone();
-            let config_path_w = config_path_owned.clone();
             let fmt_label_w = fmt_label;
             let comp_label_w = comp_label;
             let mode_label_w = mode_label;
@@ -394,7 +392,20 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                             let fname_for_state: Option<String> = if parts.is_empty() {
                                 None
                             } else {
-                                match StateStore::open(&config_path_w) {
+                                // Reopen from the REF, not from `config_path`.
+                                // `rivet apply` dispatches this runner with an
+                                // empty config_path (job.rs — it is a
+                                // display-only hint there), and
+                                // `StateStore::open("")` resolves to
+                                // `./.rivet_state.db` in the process CWD. Every
+                                // durable-part row and the running aggregate
+                                // landed in a stray database while the real
+                                // state DB got none — invisible on a clean run,
+                                // and on recovery the resume found the chunks
+                                // `completed` with no file_log to rehydrate, so
+                                // it declared a manifest with zero parts over
+                                // parquet that was already on the destination.
+                                match StateStore::open_at_ref(&state_ref) {
                                     Ok(store) => {
                                         for rec in &parts {
                                             if let Err(e) = store.record_durable_part(

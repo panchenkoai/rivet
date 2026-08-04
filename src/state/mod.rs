@@ -1164,7 +1164,55 @@ impl StateStore {
         Self::open_sqlite(config_path)
     }
 
+    /// Reopen the store a [`StateRef`] points at.
+    ///
+    /// The reconnection seam for parallel chunk workers, which cannot share one
+    /// `StateStore` across threads. It exists because the alternative — handing a
+    /// worker the CONFIG PATH and re-deriving the location — silently writes to
+    /// the wrong database whenever that string is not a real config path: `rivet
+    /// apply` dispatches its chunk-checkpoint runner with `""`, and
+    /// `Path::new("").parent()` is `None`, so the fallback lands on
+    /// `./.rivet_state.db` in the process CWD. A `StateRef` carries the resolved
+    /// location, so there is nothing left to re-derive.
+    pub fn open_at_ref(state_ref: &StateRef) -> Result<Self> {
+        match state_ref {
+            StateRef::Sqlite(db_path) => {
+                let conn = open_connection(db_path)?;
+                migrate(&conn)?;
+                Ok(Self {
+                    conn: StateConn::Sqlite(conn),
+                    state_ref: StateRef::Sqlite(db_path.clone()),
+                })
+            }
+            StateRef::Postgres(url) => Self::open_postgres(url),
+        }
+    }
+
     fn open_sqlite(config_path: &str) -> Result<Self> {
+        // An EMPTY path is never a location — it is a caller that had nothing to
+        // give and passed a placeholder. `Path::new("").parent()` is `None`, so
+        // the fallback below would silently resolve it to `./.rivet_state.db` in
+        // whatever the process CWD happens to be, CREATE that database, migrate
+        // it, and return a perfectly usable store pointed at the wrong file.
+        //
+        // That is not hypothetical: `rivet apply` dispatches its chunk-checkpoint
+        // runner with `""` (a display-only hint there), and the worker used it to
+        // reopen the ledger. Every durable-part row landed in a stray database
+        // while the real state DB got none — invisible on a clean run, and on
+        // recovery the resume found the chunks `completed` with no file_log to
+        // rehydrate, so it declared a manifest with zero parts over parquet
+        // already on the destination. Reopening from a `StateRef`
+        // ([`StateStore::open_at_ref`]) is the fix for that caller; refusing the
+        // empty path is the fix for the CLASS, so the next one fails loudly at
+        // the open instead of quietly at recovery.
+        if config_path.is_empty() {
+            anyhow::bail!(
+                "state: refusing to open a state database from an EMPTY path — \
+                 it would resolve to './{STATE_DB_NAME}' in the current working \
+                 directory rather than beside the config. Pass the config path, \
+                 or reopen from a StateRef with StateStore::open_at_ref()."
+            );
+        }
         let config_dir = std::path::Path::new(config_path)
             .parent()
             .unwrap_or(std::path::Path::new("."));
@@ -1235,6 +1283,60 @@ impl StateStore {
 }
 
 // ─── Migration tests ──────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod empty_state_path_guard {
+    use super::*;
+
+    /// An empty config path must FAIL the open, not resolve to the CWD.
+    ///
+    /// `Path::new("").parent()` is `None`, so the fallback in `open_sqlite`
+    /// resolved it to `./.rivet_state.db` — creating, migrating and returning a
+    /// usable store pointed at the process working directory. `rivet apply`
+    /// dispatches its chunk-checkpoint runner with exactly that placeholder, and
+    /// the worker reopened the ledger from it: every durable-part row landed in a
+    /// stray database while the real state DB got none. Nothing failed, because
+    /// nothing looked — the clean-run manifest is built from the in-memory
+    /// summary. It surfaced only on RECOVERY, where the resume found the chunks
+    /// `completed` with no file_log to rehydrate and declared a manifest with
+    /// zero parts over parquet that was already durable.
+    ///
+    /// The sibling half of the fix is `open_at_ref`, so a worker never re-derives
+    /// a location from a string at all.
+    #[test]
+    fn an_empty_config_path_is_refused_rather_than_resolved_to_the_cwd() {
+        let msg = match StateStore::open("") {
+            Ok(_) => panic!(
+                "an empty path must not open a store — it silently becomes \
+                 ./.rivet_state.db in the process CWD"
+            ),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            msg.contains("EMPTY path"),
+            "the error must name the cause, not just fail: {msg}"
+        );
+        assert!(
+            msg.contains("open_at_ref"),
+            "…and name the seam that replaces it, since every caller that hits \
+             this is a worker that already holds a StateRef: {msg}"
+        );
+    }
+
+    /// A REAL path with no parent component still works — the guard is about
+    /// emptiness, not about parentlessness, and `:memory:` / a bare filename are
+    /// legitimate callers that must keep opening.
+    #[test]
+    fn a_bare_filename_still_opens_beside_itself() {
+        let d = tempfile::tempdir().unwrap();
+        let cfg = d.path().join("rivet.yaml");
+        std::fs::write(&cfg, "exports: []").unwrap();
+        assert!(
+            StateStore::open(cfg.to_str().unwrap()).is_ok(),
+            "a real config path must still open"
+        );
+    }
+}
 
 #[cfg(test)]
 mod tests {
