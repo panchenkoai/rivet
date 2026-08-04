@@ -104,6 +104,19 @@ pub(crate) fn chunk_index_of(file_name: &str) -> Option<&str> {
     // completed-chunk set that keyset never populates: durable pages silently
     // missing from the manifest a resumed run declares.
     let stem = file_name.rsplit_once('.').map_or(file_name, |(s, _)| s);
+    // Strip the ROTATION suffix first. `part_indexed_name` appends `_p{n}` AFTER
+    // the nonce whenever a chunk rotates past `max_file_size`, so the last field
+    // of a rotated part is `p0`, not the 16-hex nonce. Requiring the nonce last
+    // made every rotated part unclassified — and the caller
+    // (`resume_m8::rehydrate_manifest_parts_from_file_log`) treats "not a chunk
+    // part" as KEEP, so an interrupted chunk's abandoned siblings were resurrected
+    // into the manifest a resumed run declares, beside the replacements. The
+    // same normalization `attempt_key` performs, applied before the shape check
+    // rather than after it.
+    let stem = match stem.rsplit_once("_p") {
+        Some((h, n)) if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => h,
+        _ => stem,
+    };
     let (head, nonce) = stem.rsplit_once('_')?;
     if nonce.len() != 16 || !nonce.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
@@ -376,6 +389,21 @@ mod tests {
         // A plain name still works — the fix must not lose the ordinary case.
         let plain = chunk_part_filename("orders", 12, "parquet");
         assert_eq!(chunk_index_of(&plain), Some("12"), "{plain}");
+
+        // A ROTATED part — the shape `part_indexed_name` produces when a chunk
+        // exceeds `max_file_size`. Its last field is `p0`, not the nonce, and an
+        // earlier version of this parser therefore returned None for every one of
+        // them. The caller treats "not a chunk part" as KEEP, so an interrupted
+        // chunk's abandoned siblings were resurrected into a resumed run's
+        // manifest. Built through BOTH real writers, never typed by hand.
+        for i in 0..2 {
+            let rotated = crate::pipeline::commit::part_indexed_name(&name, i, 2);
+            assert_eq!(
+                chunk_index_of(&rotated),
+                Some("7"),
+                "a rotation sibling is still a part of chunk 7: {rotated}"
+            );
+        }
 
         // A keyset part carries no chunk token and must stay unclassified, even
         // when the export name contains one: classifying it makes the rehydration

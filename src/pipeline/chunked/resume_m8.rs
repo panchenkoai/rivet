@@ -871,6 +871,86 @@ mod tests {
     ///
     /// At one resume the abandoned part's chunk is simply not completed, so the
     /// index filter is enough — which is why every existing test passed.
+    /// An INTERRUPTED chunk whose parts ROTATED must contribute nothing — the
+    /// case where "keep" and "drop" actually differ.
+    ///
+    /// `part_indexed_name` appends `_p{n}` AFTER the nonce, so a rotated part's
+    /// last field is `p0`. A parser that required the nonce last returned None
+    /// for every one of them, and this filter treats "not a chunk part" as KEEP:
+    /// the abandoned siblings of a chunk the resume is about to RE-RUN were
+    /// declared in the manifest beside their replacements. Duplicate rows, in a
+    /// manifest self-consistent with the files it lists, so `validate` returns 0.
+    ///
+    /// The chunk must be INTERRUPTED. Rotating a COMPLETED chunk cannot go RED,
+    /// because keeping its siblings is the right answer under both the broken and
+    /// the fixed parser — which is why the existing rotation test passed either
+    /// way. Names come from both real writers, never typed by hand.
+    #[test]
+    fn an_interrupted_chunks_rotated_parts_are_not_declared_by_the_resume() {
+        let state_dir = tempfile::tempdir().unwrap();
+        let state =
+            crate::state::StateStore::open_at_path(&state_dir.path().join("state.db")).unwrap();
+        let run_id = "r_rot";
+        state
+            .insert_chunk_tasks(run_id, &[(1, 100), (101, 200)])
+            .unwrap();
+
+        // Chunk 0 completed, rotated into two siblings. Chunk 1 was interrupted
+        // mid-write, also rotated — its task stays pending.
+        let done_base = super::super::chunk_part_filename("orders", 0, "parquet");
+        let lost_base = super::super::chunk_part_filename("orders", 1, "parquet");
+        let done: Vec<String> = (0..2)
+            .map(|i| crate::pipeline::commit::part_indexed_name(&done_base, i, 2))
+            .collect();
+        let lost: Vec<String> = (0..2)
+            .map(|i| crate::pipeline::commit::part_indexed_name(&lost_base, i, 2))
+            .collect();
+        assert!(
+            done[0].ends_with("_p0.parquet") && lost[1].ends_with("_p1.parquet"),
+            "fixture is inert — these must really be ROTATED names: {done:?} {lost:?}"
+        );
+        for f in done.iter().chain(lost.iter()) {
+            state
+                .record_file(FilePart {
+                    run_id,
+                    export_name: "orders",
+                    file_name: f,
+                    rows: 50,
+                    bytes: 4096,
+                    format: "parquet",
+                    compression: None,
+                })
+                .unwrap();
+        }
+        state
+            .complete_chunk_task(run_id, 0, 100, Some(&done[0]))
+            .unwrap();
+
+        let mut summary =
+            crate::pipeline::summary::RunSummary::stub_for_testing(run_id, String::from("orders"));
+        let n = rehydrate_manifest_parts_from_file_log(&state, run_id, &mut summary).unwrap();
+
+        let mut paths: Vec<&str> = summary
+            .manifest_parts
+            .iter()
+            .map(|p| p.path.as_str())
+            .collect();
+        paths.sort_unstable();
+        let mut want: Vec<&str> = done.iter().map(String::as_str).collect();
+        want.sort_unstable();
+        assert_eq!(
+            paths, want,
+            "only the COMPLETED chunk's rotation siblings may be declared; the interrupted \
+             chunk's are about to be re-written and would be counted twice"
+        );
+        assert_eq!(n, 2);
+        assert_eq!(
+            summary.total_rows, 100,
+            "declaring the abandoned siblings doubles the run's rows in a manifest that still \
+             validates, because it is self-consistent with the files it lists"
+        );
+    }
+
     #[test]
     fn a_chunk_re_run_after_a_crash_contributes_one_part_not_its_abandoned_attempt() {
         let state_dir = tempfile::tempdir().unwrap();
