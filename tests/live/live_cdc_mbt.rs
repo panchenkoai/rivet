@@ -502,10 +502,7 @@ exports:
     );
     let cfg = write_config(&d, &yaml);
 
-    let doc = std::process::Command::new(RIVET_BIN)
-        .args(["doctor", "--config", cfg.to_str().unwrap(), "--json"])
-        .output()
-        .unwrap();
+    let doc = run_rivet(&["doctor", "--config", cfg.to_str().unwrap(), "--json"]);
     let j: serde_json::Value = serde_json::from_slice(&doc.stdout).expect("doctor --json parses");
     let checks = j["checks"].as_array().expect("checks array");
     // The sensor contract: SOME cdc check must be non-ok and name the binlog
@@ -528,10 +525,7 @@ exports:
     // And the healthy baseline: with a fresh checkpoint doctor is green again
     // (the sensor has no stuck-at-fail failure mode).
     std::fs::remove_file(&ckpt).unwrap();
-    let doc = std::process::Command::new(RIVET_BIN)
-        .args(["doctor", "--config", cfg.to_str().unwrap(), "--json"])
-        .output()
-        .unwrap();
+    let doc = run_rivet(&["doctor", "--config", cfg.to_str().unwrap(), "--json"]);
     let j: serde_json::Value = serde_json::from_slice(&doc.stdout).expect("doctor --json parses");
     assert_eq!(j["all_ok"], true, "healthy state must read green: {j}");
 }
@@ -659,10 +653,7 @@ fn ddl_cfg(tbl: &str) -> Rig {
 }
 
 fn run_ok(cfg: &std::path::Path) {
-    let st = std::process::Command::new(RIVET_BIN)
-        .args(["run", "--config", cfg.to_str().unwrap()])
-        .status()
-        .unwrap();
+    let st = run_rivet(&["run", "--config", cfg.to_str().unwrap()]).status;
     assert!(st.success());
 }
 
@@ -701,10 +692,7 @@ fn cdc_manifest_records_form_b_checksums_and_validate_verifies_them() {
     );
 
     // Clean validate passes…
-    let ok = std::process::Command::new(RIVET_BIN)
-        .args(["validate", "--config", rig.config_path().to_str().unwrap()])
-        .output()
-        .unwrap();
+    let ok = rig.cli(&["validate"]);
     assert!(
         ok.status.success(),
         "clean validate must pass:\n{}",
@@ -719,10 +707,7 @@ fn cdc_manifest_records_form_b_checksums_and_validate_verifies_them() {
         }
     }
     std::fs::write(&manifest_path, serde_json::to_string_pretty(&m2).unwrap()).unwrap();
-    let bad = std::process::Command::new(RIVET_BIN)
-        .args(["validate", "--config", rig.config_path().to_str().unwrap()])
-        .output()
-        .unwrap();
+    let bad = rig.cli(&["validate"]);
     assert!(
         !bad.status.success(),
         "a checksum mismatch must fail validate"
@@ -791,10 +776,7 @@ exports:
     );
     let cfg = write_config(&d, &yaml);
     let run = || {
-        let st = std::process::Command::new(RIVET_BIN)
-            .args(["run", "--config", cfg.to_str().unwrap()])
-            .status()
-            .unwrap();
+        let st = run_rivet(&["run", "--config", cfg.to_str().unwrap()]).status;
         assert!(st.success());
     };
     run(); // anchor → per-table snapshots on GCS → drain(0)
@@ -875,10 +857,7 @@ fn cdc_corrupt_checkpoint_fails_loudly_never_reanchors() {
         ("empty", ""),
     ] {
         std::fs::write(&ckpt, body).unwrap();
-        let res = std::process::Command::new(RIVET_BIN)
-            .args(["run", "--config", rig.config_path().to_str().unwrap()])
-            .output()
-            .unwrap();
+        let res = rig.cli(&["run"]);
         assert!(
             !res.status.success(),
             "{name}: a corrupt checkpoint must fail the run loudly, never \
@@ -1012,10 +991,7 @@ exports:
     c.query_drop(format!("INSERT INTO {tbl} VALUES (1, 10)"))
         .unwrap();
 
-    let res = std::process::Command::new(RIVET_BIN)
-        .args(["run", "--config", cfg.to_str().unwrap()])
-        .output()
-        .unwrap();
+    let res = run_rivet(&["run", "--config", cfg.to_str().unwrap()]);
     assert!(
         !res.status.success(),
         "revoked grants must fail the run loudly"
@@ -1115,10 +1091,7 @@ exports:
             .unwrap();
     }
 
-    let res = std::process::Command::new(RIVET_BIN)
-        .args(["run", "--config", mk_cfg(&out_tiny).to_str().unwrap()])
-        .output()
-        .unwrap();
+    let res = run_rivet(&["run", "--config", mk_cfg(&out_tiny).to_str().unwrap()]);
     assert!(!res.status.success(), "ENOSPC must fail the run loudly");
     let err = String::from_utf8_lossy(&res.stderr);
     assert!(
@@ -1427,21 +1400,9 @@ fn cdc_scaffold_gets_its_own_prefix_and_cross_shape_overwrite_is_refused() {
 
     // Layer 1: the scaffolds separate prefixes out of the box.
     let d = tempfile::tempdir().unwrap();
-    let out = std::process::Command::new(RIVET_BIN)
-        .args([
-            "init",
-            "--source-env",
-            "RIVET_SHAPE_URL",
-            "--table",
-            &scn.table,
-            "--mode",
-            "cdc",
-            "-o",
-            d.path().join("cdc.yaml").to_str().unwrap(),
-        ])
-        .env("RIVET_SHAPE_URL", MYSQL_CDC_URL)
-        .output()
-        .unwrap();
+    let out = // `init` GENERATES a config, so there is no rig to run it against —
+        // the canonical helper, not a hand-rolled Command.
+        run_rivet_env(&["init", "--source-env", "RIVET_SHAPE_URL", "--table", &scn.table, "--mode", "cdc", "-o", d.path().join("cdc.yaml").to_str().unwrap(),], &[("RIVET_SHAPE_URL", MYSQL_CDC_URL)]);
     assert!(out.status.success());
     let yaml = std::fs::read_to_string(d.path().join("cdc.yaml")).unwrap();
     assert!(
