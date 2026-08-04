@@ -72,6 +72,25 @@ pub(crate) struct PgChangeStream {
     frontier_text: Option<String>,
 }
 
+/// The run-start warning emitted when a logical replication slot has to be
+/// CREATED — i.e. capture starts at the current WAL position and nothing written
+/// before now is reachable.
+///
+/// `warn`, never `info`: the default log level hides `info`, so an info-level
+/// "this may have skipped your data" is functionally silent — the same rule the
+/// sparse-chunk diagnostic was fixed under. Pure and unit-tested because the
+/// branch that emits it needs a live PostgreSQL, so the message itself is the
+/// only part an offline test can hold.
+pub(crate) fn slot_created_warning(slot: &str) -> String {
+    format!(
+        "pg cdc: creating replication slot '{slot}' — capture starts at the CURRENT WAL \
+         position, so changes written before now are NOT captured. On a first run this is \
+         expected. If this slot existed before, it was dropped or invalidated and the changes \
+         since then are unrecoverable: re-snapshot (mode: full) before trusting this stream. \
+         Set `cdc.checkpoint:` to turn this case into a hard error instead of a warning."
+    )
+}
+
 impl PgChangeStream {
     /// Connect and ensure a `test_decoding` logical slot named `slot` exists
     /// (idempotent — reuses an existing slot, which is how a real run resumes).
@@ -216,6 +235,19 @@ impl PgChangeStream {
                      checkpoint (delete the checkpoint file to accept a new slot)."
                 );
             }
+            // Creating the slot anchors capture at the CURRENT WAL position:
+            // everything already written is unreachable from here. That is correct
+            // and expected on a first run — and indistinguishable, from inside this
+            // process, from a slot an admin or a failover dropped out from under a
+            // running deployment.
+            //
+            // The hard bail above only fires when a checkpoint FILE proves a prior
+            // run, and `cdc.checkpoint` is optional on PostgreSQL precisely because
+            // the slot itself is the server-side anchor. So the configuration most
+            // reliant on the slot is the one with no evidence that it ever existed,
+            // and the silent branch was the one it took. Loud beats silent: rivet
+            // cannot know which case this is, but the operator can.
+            log::warn!("{}", slot_created_warning(slot));
             client.execute(
                 "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
                 &[&slot],
@@ -1606,6 +1638,41 @@ mod tests {
             ops,
             vec![ChangeOp::Insert, ChangeOp::Update, ChangeOp::Delete],
             "logical slot must decode INSERT, UPDATE, DELETE in commit order"
+        );
+    }
+}
+
+#[cfg(test)]
+mod slot_creation_warning_tests {
+    use super::slot_created_warning;
+
+    /// A created slot means capture starts at the CURRENT WAL position, so
+    /// anything written earlier is unreachable. On a first run that is correct;
+    /// on a slot an admin or a failover dropped it is silent data loss, and from
+    /// inside the process the two are indistinguishable.
+    ///
+    /// The hard bail in `open` only fires when a checkpoint FILE proves a prior
+    /// run — and `cdc.checkpoint` is optional on PostgreSQL exactly because the
+    /// slot is the server-side anchor. So the config most dependent on the slot
+    /// had no guard at all and took the silent branch.
+    ///
+    /// This pins the message because the branch that emits it needs a live
+    /// server. It asserts the three things an operator acts on, not the prose.
+    #[test]
+    fn the_created_slot_warning_names_the_loss_and_the_remedy() {
+        let w = slot_created_warning("rivet_orders");
+        assert!(w.contains("rivet_orders"), "must name the slot: {w}");
+        assert!(
+            w.contains("NOT captured"),
+            "must say what was skipped, in words a scanning operator catches: {w}"
+        );
+        assert!(
+            w.contains("mode: full"),
+            "must name the recovery — re-snapshot — not just the symptom: {w}"
+        );
+        assert!(
+            w.contains("cdc.checkpoint"),
+            "must name the setting that upgrades this to a hard error: {w}"
         );
     }
 }
