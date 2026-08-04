@@ -171,6 +171,35 @@ pub(crate) fn render_type(arrow_type: Option<&DataType>) -> DataType {
     }
 }
 
+/// Canonical bytes for a `FixedSizeBinary(n)` cell, or `None` when the value
+/// genuinely cannot fill the width.
+///
+/// A width-`n` value passes through. At `n == 16` a value that is NOT 16 bytes
+/// gets the batch reader's second chance: the canonical 36-char text form is
+/// parsed to its 16 raw bytes (`src/source/mysql/arrow_convert.rs` does exactly
+/// this). Without it, the only route to UUID semantics on MySQL — the documented
+/// `columns: { uid: uuid }` override — nulled 100% of a `CHAR(36)`/`VARCHAR(36)`
+/// column on CDC while the batch export of the same table was correct, because
+/// the binlog delivers the cell as the 36-byte text.
+///
+/// Both the builder and `cells_checksum` MUST go through here. They previously
+/// shared the bare `len() == n` test, which is why the two-ended value check was
+/// blind to the loss: side A skipped the 36-byte cell (contributing 0) and side B
+/// hashed a null (also 0), so the folds agreed and the mismatch bail never fired.
+/// Fixing one side alone would invert that into a false failure on correct data.
+fn fixed_binary_bytes(by: &[u8], n: usize) -> Option<Vec<u8>> {
+    if by.len() == n {
+        return Some(by.to_vec());
+    }
+    if n == 16
+        && let Ok(s) = std::str::from_utf8(by)
+        && let Ok(u) = uuid::Uuid::parse_str(s.trim())
+    {
+        return Some(u.as_bytes().to_vec());
+    }
+    None
+}
+
 /// Build one Arrow column from typed cells (one per row; `None` ⇒ null). `dt` is
 /// the [`render_type`] — i.e. exactly the array type the schema field declares.
 pub(crate) fn build_column(dt: &DataType, cells: &[Option<&RivetValue>]) -> Result<ArrayRef> {
@@ -389,12 +418,15 @@ pub(crate) fn build_column(dt: &DataType, cells: &[Option<&RivetValue>]) -> Resu
             let mut b = FixedSizeBinaryBuilder::with_capacity(cells.len(), *n);
             for c in cells {
                 match c {
-                    // Only a value of exactly the declared width is valid (e.g. a
-                    // 16-byte UUID); anything else degrades to null rather than
-                    // failing the whole batch.
-                    Some(V::Bytes(by)) if by.len() == *n as usize => {
-                        b.append_value(by).map_err(|e| anyhow::anyhow!(e))?
-                    }
+                    // Width-`n` bytes, or (at n=16) the canonical 36-char text
+                    // UUID the MySQL binlog delivers for a CHAR/VARCHAR(36)
+                    // column under a `uuid` override — see `fixed_binary_bytes`.
+                    // Anything genuinely unfillable still degrades to null rather
+                    // than failing the whole batch.
+                    Some(V::Bytes(by)) => match fixed_binary_bytes(by, *n as usize) {
+                        Some(bytes) => b.append_value(&bytes).map_err(|e| anyhow::anyhow!(e))?,
+                        None => b.append_null(),
+                    },
                     _ => b.append_null(),
                 }
             }
@@ -505,10 +537,12 @@ pub(crate) fn cells_checksum(dt: &DataType, cells: &[Option<&RivetValue>]) -> u6
                 }
             }
             DataType::FixedSizeBinary(n) => {
+                // Same canonicalisation the builder applies, or the two sides
+                // disagree on exactly the cells the builder now recovers.
                 if let V::Bytes(by) = c
-                    && by.len() == *n as usize
+                    && let Some(bytes) = fixed_binary_bytes(by, *n as usize)
                 {
-                    acc = acc.wrapping_add(xxh3_64(by));
+                    acc = acc.wrapping_add(xxh3_64(&bytes));
                 }
             }
             DataType::List(f) => {
@@ -1234,6 +1268,78 @@ mod tests {
                 "fold ≠ built array for {dt:?}"
             );
         }
+    }
+
+    /// A `uuid` override on a MySQL `CHAR(36)`/`VARCHAR(36)` column resolves to
+    /// `FixedSizeBinary(16)`, but the binlog delivers the cell as the 36-BYTE
+    /// canonical text. The arm used to accept only exactly-16-byte values, so
+    /// 100% of the column became NULL on CDC while the batch export of the same
+    /// table was correct (batch has always parsed the text form).
+    ///
+    /// Two assertions, and the second is the one with teeth. Agreement alone is
+    /// worthless here: before the fix the two folds ALSO agreed — side A skipped
+    /// the 36-byte cell and side B hashed a null, both contributing 0 — which is
+    /// exactly why the sink's two-ended value check could not see the loss. So
+    /// the test first pins the recovered VALUE against a hard-coded expected byte
+    /// array (an oracle independent of this module), then pins that the folds
+    /// still agree, which is what would break if only one side were taught.
+    #[test]
+    fn a_text_uuid_survives_cdc_under_a_fixed_size_binary_override() {
+        use crate::source::value_checksum::array_checksum;
+        use RivetValue as V;
+        use arrow::array::{Array, FixedSizeBinaryArray};
+
+        let dt = DataType::FixedSizeBinary(16);
+        // Canonical text, as MySQL stores it in CHAR(36) and ships it on the wire.
+        let text = V::Bytes(b"550e8400-e29b-41d4-a716-446655440000".to_vec());
+        // Independently derived: the RFC-4122 hex of that string, by hand.
+        let expected: [u8; 16] = [
+            0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44,
+            0x00, 0x00,
+        ];
+        // A value already in 16-byte form must keep passing through untouched.
+        let raw = V::Bytes(expected.to_vec());
+        let cells = [Some(&text), Some(&raw), None];
+        let refs: Vec<Option<&RivetValue>> = cells.to_vec();
+
+        let arr = build_column(&dt, &refs).unwrap();
+        let fsb = arr
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .expect("FixedSizeBinary(16) array");
+
+        assert!(
+            !fsb.is_null(0),
+            "the 36-char text form must decode, not degrade to null — this is the \
+             whole defect: every row of the column became NULL while counts passed"
+        );
+        assert_eq!(
+            fsb.value(0),
+            expected,
+            "text form must decode to its raw bytes"
+        );
+        assert_eq!(fsb.value(1), expected, "raw 16-byte form must pass through");
+        assert!(fsb.is_null(2), "a missing cell stays null");
+
+        assert_eq!(
+            cells_checksum(&dt, &refs),
+            array_checksum(arr.as_ref()),
+            "both ends must canonicalise identically — teaching only the builder \
+             turns a CORRECT export into a checksum-mismatch failure at sink.rs"
+        );
+    }
+
+    /// A value that is neither the declared width nor a parseable UUID still
+    /// degrades to null rather than failing the batch — the lenient half of the
+    /// contract is deliberate and must survive the fix above.
+    #[test]
+    fn a_fixed_size_binary_cell_that_is_neither_width_nor_uuid_stays_null() {
+        use RivetValue as V;
+        let dt = DataType::FixedSizeBinary(16);
+        let junk = V::Bytes(b"not-a-uuid".to_vec());
+        let refs: Vec<Option<&RivetValue>> = vec![Some(&junk)];
+        let arr = build_column(&dt, &refs).unwrap();
+        assert_eq!(arr.null_count(), 1, "unparseable stays null, no panic");
     }
 
     // Sensitivity: a corrupted cell must MOVE the fold, so the sink's compare
