@@ -180,8 +180,16 @@ fn mysql_export_recovers_after_mid_stream_proxy_disable_then_enable_with_retries
         "mysql export must recover after transient proxy outage; stderr:\n{}",
         String::from_utf8_lossy(&out_run.stderr),
     );
+    // File COUNT was the only assertion here, so rows lost at the reconnect
+    // boundary passed unnoticed. MySQL parity means parity of the row set, not of
+    // the file count.
     let files = files_with_extension(out.path(), "parquet");
-    assert_eq!(files.len(), 1);
+    assert_eq!(files.len(), 1, "one part expected; got {files:?}");
+    assert_eq!(
+        total_parquet_rows(out.path()),
+        50,
+        "a retry across a mid-stream connection death must deliver EVERY row"
+    );
 }
 
 #[test]

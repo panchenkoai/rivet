@@ -192,9 +192,18 @@ fn export_recovers_after_mid_stream_proxy_disable_then_enable_with_retries() {
         "export must recover after transient proxy outage; stderr:\n{}",
         String::from_utf8_lossy(&out_run.stderr),
     );
-    // Row-count sanity: a single file was produced and contains 50 rows.
+    // The comment here used to promise "a single file was produced and contains
+    // 50 rows" while asserting only the FILE COUNT — so an in-place retry that
+    // dropped rows at the reconnect boundary, which is precisely the hazard this
+    // test exists for, passed as long as one file appeared. Assert the rows.
     let files = files_with_extension(out.path(), "parquet");
-    assert_eq!(files.len(), 1);
+    assert_eq!(files.len(), 1, "one part expected; got {files:?}");
+    assert_eq!(
+        total_parquet_rows(out.path()),
+        50,
+        "a retry across a mid-stream connection death must deliver EVERY row — \
+         a short export with one file on disk is the silent failure this guards"
+    );
 }
 
 // ─── Task 4.1: retry counter & classification at runtime ───────────────────
