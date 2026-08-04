@@ -195,6 +195,19 @@ impl Rig {
         self
     }
 
+    /// Name the EXPORT independently of the table it reads.
+    ///
+    /// `Rig::<engine>_batch(t)` names the export after the table, which is right
+    /// for the common case and wrong whenever a test needs a unique export name
+    /// for isolation while reading a fixed table — `live_keyset.rs` does this in
+    /// 23 places, driving runs with `--export <unique>` against `table: <fixed>`.
+    /// Without this the config declares one name and the CLI asks for another,
+    /// which fails at RUN time, not compile time.
+    pub fn export_named(mut self, name: &str) -> Self {
+        self.name = name.to_string();
+        self
+    }
+
     /// Declare the source URL through an ENV VAR (`url_env:`) instead of inline.
     ///
     /// Load-bearing for plan/apply round-trips, not a style choice: an inline URL
