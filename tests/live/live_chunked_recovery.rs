@@ -244,43 +244,23 @@ fn chunked_crash_resume_writes_a_complete_destination_manifest() {
     let table = seed_pg_numeric_table(150);
     let export = unique_name("c1_manifest_complete");
     let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = Rig::pg_batch(&export)
+    let rig = Rig::pg_batch(&export)
         .query(&format!("SELECT id, name FROM {}", table.name()))
         .mode("chunked")
         .export_line("chunk_column: id")
         .export_line("chunk_size: 50")
         .export_line("chunk_checkpoint: true")
-        .dest_path(out.path().to_path_buf())
-        .yaml();
-    let cfg = write_config(&cfg_dir, &yaml);
+        .dest_path(out.path().to_path_buf());
 
     // Crash after chunk 0 commits (before any destination manifest is written).
-    let crash = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            &export,
-        ])
-        .env("RIVET_TEST_PANIC_AT", "after_chunk_complete:0")
-        .output()
-        .expect("spawn rivet");
+    let crash = rig.run_args_env(
+        &["--export", &export],
+        &[("RIVET_TEST_PANIC_AT", "after_chunk_complete:0")],
+    );
     assert!(!crash.status.success(), "crash run must exit non-zero");
 
     // Resume completes.
-    let resume = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            &export,
-            "--resume",
-        ])
-        .output()
-        .expect("spawn rivet resume");
+    let resume = rig.run_args(&["--export", &export, "--resume"]);
     assert!(
         resume.status.success(),
         "--resume must succeed; stderr:\n{}",
@@ -334,47 +314,28 @@ fn chunk_checkpoint_resume_closes_the_ledger_row_it_opened() {
     require_alive(LiveService::Postgres);
     let table = seed_pg_numeric_table(200);
     let export = unique_name("ckpt_ledger");
-    let cfg_dir = tempfile::tempdir().unwrap();
     let out = tempfile::tempdir().unwrap();
-    let yaml = Rig::pg_batch(&export)
+    let rig = Rig::pg_batch(&export)
         .query(&format!("SELECT id, name FROM {}", table.name()))
         .mode("chunked")
         .export_line("chunk_column: id")
         .export_line("chunk_size: 50")
         .export_line("chunk_checkpoint: true")
-        .dest_path(out.path().to_path_buf())
-        .yaml();
-    let cfg = write_config(&cfg_dir, &yaml);
+        .dest_path(out.path().to_path_buf());
+    let cfg = rig.config_path();
 
     // Crash mid-chunk so the next run RESUMES (and therefore adopts the id).
-    let crash = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            &export,
-        ])
-        .env("RIVET_TEST_PANIC_AT", "after_chunk_file:0")
-        .output()
-        .expect("spawn rivet");
+    let crash = rig.run_args_env(
+        &["--export", &export],
+        &[("RIVET_TEST_PANIC_AT", "after_chunk_file:0")],
+    );
     assert!(!crash.status.success(), "the crash run must exit non-zero");
     // A hard panic leaves its own row running — that is the crash, not the leak.
     let after_crash = running_run_status_rows(&cfg);
 
     // Clean resume: it adopts the prior run_id, so the row opened for THIS run
     // is the one at risk.
-    let ok = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            &export,
-            "--resume",
-        ])
-        .output()
-        .expect("spawn rivet");
+    let ok = rig.run_args(&["--export", &export, "--resume"]);
     assert!(
         ok.status.success(),
         "the resume run must succeed; stderr:\n{}",
@@ -413,8 +374,7 @@ fn chunked_crash_after_chunk_file_before_commit_resume_reruns_chunk_atleastonce(
     let table = seed_pg_numeric_table(150);
     let export = unique_name("c2_crash_file");
     let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = Rig::pg_batch(&export)
+    let rig = Rig::pg_batch(&export)
         .query(&format!(
             r#"SELECT id, name FROM {table_name}"#,
             table_name = table.name()
@@ -423,22 +383,14 @@ fn chunked_crash_after_chunk_file_before_commit_resume_reruns_chunk_atleastonce(
         .export_line("chunk_column: id")
         .export_line("chunk_size: 50")
         .export_line("chunk_checkpoint: true")
-        .dest_path(out.path().to_path_buf())
-        .yaml();
-    let cfg = write_config(&cfg_dir, &yaml);
+        .dest_path(out.path().to_path_buf());
+    let cfg = rig.config_path();
 
     // ── Crash run ────────────────────────────────────────────────────────────
-    let crash = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            &export,
-        ])
-        .env("RIVET_TEST_PANIC_AT", "after_chunk_file:0")
-        .output()
-        .expect("spawn rivet");
+    let crash = rig.run_args_env(
+        &["--export", &export],
+        &[("RIVET_TEST_PANIC_AT", "after_chunk_file:0")],
+    );
     assert!(
         !crash.status.success(),
         "crash run must exit non-zero; stderr:\n{}",
@@ -465,17 +417,7 @@ fn chunked_crash_after_chunk_file_before_commit_resume_reruns_chunk_atleastonce(
     // mask exactly that regression (matrix audit: sleep-masked class).
 
     // ── Resume run ────────────────────────────────────────────────────────────
-    let resume = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            &export,
-            "--resume",
-        ])
-        .output()
-        .expect("spawn rivet resume");
+    let resume = rig.run_args(&["--export", &export, "--resume"]);
     assert!(
         resume.status.success(),
         "--resume must succeed; stderr:\n{}",
@@ -587,8 +529,7 @@ fn parallel_chunked_crash_after_chunk_complete_resume_finishes_with_no_duplicate
     let table = seed_pg_numeric_table(ROW_COUNT);
     let export = unique_name("c3_parallel_crash_complete");
     let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = Rig::pg_batch(&export)
+    let rig = Rig::pg_batch(&export)
         .query(&format!(
             r#"SELECT id, name FROM {table_name}"#,
             table_name = table.name()
@@ -598,22 +539,14 @@ fn parallel_chunked_crash_after_chunk_complete_resume_finishes_with_no_duplicate
         .export_line(&format!(r#"chunk_size: {CHUNK_SIZE}"#))
         .export_line("chunk_checkpoint: true")
         .export_line("parallel: 4")
-        .dest_path(out.path().to_path_buf())
-        .yaml();
-    let cfg = write_config(&cfg_dir, &yaml);
+        .dest_path(out.path().to_path_buf());
+    let cfg = rig.config_path();
 
     // ── Crash run ────────────────────────────────────────────────────────────
-    let crash = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            &export,
-        ])
-        .env("RIVET_TEST_PANIC_AT", "after_chunk_complete:0")
-        .output()
-        .expect("spawn rivet");
+    let crash = rig.run_args_env(
+        &["--export", &export],
+        &[("RIVET_TEST_PANIC_AT", "after_chunk_complete:0")],
+    );
     assert!(
         !crash.status.success(),
         "crash run must exit non-zero (worker panic propagated through scope); stderr:\n{}",
@@ -644,17 +577,7 @@ fn parallel_chunked_crash_after_chunk_complete_resume_finishes_with_no_duplicate
     // mask exactly that regression (matrix audit: sleep-masked class).
 
     // ── Resume run ────────────────────────────────────────────────────────────
-    let resume = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            &export,
-            "--resume",
-        ])
-        .output()
-        .expect("spawn rivet resume");
+    let resume = rig.run_args(&["--export", &export, "--resume"]);
     assert!(
         resume.status.success(),
         "--resume must succeed; stderr:\n{}",
@@ -721,46 +644,27 @@ fn parallel_chunked_resume_reports_cumulative_total_rows_not_just_this_run() {
     let table = seed_pg_numeric_table(ROW_COUNT);
     let export = unique_name("f9_parallel_total_rows");
     let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = Rig::pg_batch(&export)
+    let rig = Rig::pg_batch(&export)
         .query(&format!("SELECT id, name FROM {}", table.name()))
         .mode("chunked")
         .export_line("chunk_column: id")
         .export_line(&format!("chunk_size: {CHUNK_SIZE}"))
         .export_line("chunk_checkpoint: true")
         .export_line("parallel: 4")
-        .dest_path(out.path().to_path_buf())
-        .yaml();
-    let cfg = write_config(&cfg_dir, &yaml);
+        .dest_path(out.path().to_path_buf());
+    let cfg = rig.config_path();
 
-    let crash = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            &export,
-        ])
-        .env("RIVET_TEST_PANIC_AT", "after_chunk_complete:0")
-        .output()
-        .expect("spawn rivet");
+    let crash = rig.run_args_env(
+        &["--export", &export],
+        &[("RIVET_TEST_PANIC_AT", "after_chunk_complete:0")],
+    );
     assert!(
         !crash.status.success(),
         "crash run must exit non-zero; stderr:\n{}",
         String::from_utf8_lossy(&crash.stderr)
     );
 
-    let resume = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            &export,
-            "--resume",
-        ])
-        .output()
-        .expect("spawn rivet resume");
+    let resume = rig.run_args(&["--export", &export, "--resume"]);
     assert!(
         resume.status.success(),
         "--resume must succeed; stderr:\n{}",
@@ -817,6 +721,8 @@ fn chunked_checkpoint_resume_suppresses_form_b_so_validate_does_not_false_fail()
                           out: &std::path::Path,
                           cfg_dir: &tempfile::TempDir,
                           parallel: u32| {
+        // Caller-owned dir: a Rig owns its tempdir, so returning rig.config_path()
+        // from this closure would drop the rig and delete the config. Keep yaml().
         let yaml = Rig::pg_batch(export)
             .query(&format!("SELECT id, name FROM {table_name}"))
             .mode("chunked")
@@ -829,16 +735,16 @@ fn chunked_checkpoint_resume_suppresses_form_b_so_validate_does_not_false_fail()
         write_config(cfg_dir, &yaml)
     };
     let validate = |cfg: &std::path::Path, export: &str| {
-        std::process::Command::new(RIVET_BIN)
-            .args([
+        run_rivet_env(
+            &[
                 "validate",
                 "--config",
                 cfg.to_str().unwrap(),
                 "--export",
                 export,
-            ])
-            .output()
-            .expect("spawn rivet validate")
+            ],
+            &[],
+        )
     };
 
     // ── Baseline: a CLEAN parallel-checkpoint run RECORDS Form B, and validate
@@ -854,16 +760,16 @@ fn chunked_checkpoint_resume_suppresses_form_b_so_validate_does_not_false_fail()
         &base_cfg_dir,
         4,
     );
-    let base_run = std::process::Command::new(RIVET_BIN)
-        .args([
+    let base_run = run_rivet_env(
+        &[
             "run",
             "--config",
             base_cfg.to_str().unwrap(),
             "--export",
             &base_export,
-        ])
-        .output()
-        .expect("spawn rivet");
+        ],
+        &[],
+    );
     assert!(
         base_run.status.success(),
         "baseline run must succeed; stderr:\n{}",
@@ -892,33 +798,32 @@ fn chunked_checkpoint_resume_suppresses_form_b_so_validate_does_not_false_fail()
         &res_cfg_dir,
         1,
     );
-    let crash = std::process::Command::new(RIVET_BIN)
-        .args([
+    let crash = run_rivet_env(
+        &[
             "run",
             "--config",
             res_cfg.to_str().unwrap(),
             "--export",
             &res_export,
-        ])
-        .env("RIVET_TEST_PANIC_AT", "after_chunk_complete:0")
-        .output()
-        .expect("spawn rivet");
+        ],
+        &[("RIVET_TEST_PANIC_AT", "after_chunk_complete:0")],
+    );
     assert!(
         !crash.status.success(),
         "crash run must exit non-zero; stderr:\n{}",
         String::from_utf8_lossy(&crash.stderr)
     );
-    let resume = std::process::Command::new(RIVET_BIN)
-        .args([
+    let resume = run_rivet_env(
+        &[
             "run",
             "--config",
             res_cfg.to_str().unwrap(),
             "--export",
             &res_export,
             "--resume",
-        ])
-        .output()
-        .expect("spawn rivet resume");
+        ],
+        &[],
+    );
     assert!(
         resume.status.success(),
         "--resume must succeed; stderr:\n{}",
@@ -973,8 +878,7 @@ fn parallel_chunked_crash_after_chunk_file_stuck_running_resume_reruns_chunk() {
     let table = seed_pg_numeric_table(ROW_COUNT);
     let export = unique_name("c4_parallel_stuck_running");
     let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = Rig::pg_batch(&export)
+    let rig = Rig::pg_batch(&export)
         .query(&format!(
             r#"SELECT id, name FROM {table_name}"#,
             table_name = table.name()
@@ -984,22 +888,14 @@ fn parallel_chunked_crash_after_chunk_file_stuck_running_resume_reruns_chunk() {
         .export_line(&format!(r#"chunk_size: {CHUNK_SIZE}"#))
         .export_line("chunk_checkpoint: true")
         .export_line("parallel: 1")
-        .dest_path(out.path().to_path_buf())
-        .yaml();
-    let cfg = write_config(&cfg_dir, &yaml);
+        .dest_path(out.path().to_path_buf());
+    let cfg = rig.config_path();
 
     // ── Crash run ────────────────────────────────────────────────────────────
-    let crash = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            &export,
-        ])
-        .env("RIVET_TEST_PANIC_AT", "after_chunk_file:0")
-        .output()
-        .expect("spawn rivet");
+    let crash = rig.run_args_env(
+        &["--export", &export],
+        &[("RIVET_TEST_PANIC_AT", "after_chunk_file:0")],
+    );
     assert!(
         !crash.status.success(),
         "crash run must exit non-zero; stderr:\n{}",
@@ -1028,20 +924,11 @@ fn parallel_chunked_crash_after_chunk_file_stuck_running_resume_reruns_chunk() {
     // Rewrite the config to use parallel: 2 on resume; this proves that
     // reset_stale_running_chunk_tasks works regardless of whether the resume
     // worker count matches the crash worker count.
-    let yaml_resume = yaml.replace("parallel: 1", "parallel: 2");
+    // yaml() borrows, so the variant config comes from the rig itself.
+    let yaml_resume = rig.yaml().replace("parallel: 1", "parallel: 2");
     std::fs::write(&cfg, yaml_resume).expect("rewrite config for resume");
 
-    let resume = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            &export,
-            "--resume",
-        ])
-        .output()
-        .expect("spawn rivet resume");
+    let resume = rig.run_args(&["--export", &export, "--resume"]);
     assert!(
         resume.status.success(),
         "--resume must succeed; stderr:\n{}",
@@ -1121,8 +1008,7 @@ fn chunked_sequential_checkpoint_validate_records_validated_metric() {
     let table = seed_pg_numeric_table(150);
     let export = unique_name("c5_seq_validated");
     let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = Rig::pg_batch(&export)
+    let rig = Rig::pg_batch(&export)
         .query(&format!(
             r#"SELECT id, name FROM {table_name}"#,
             table_name = table.name()
@@ -1131,21 +1017,10 @@ fn chunked_sequential_checkpoint_validate_records_validated_metric() {
         .export_line("chunk_column: id")
         .export_line("chunk_size: 50")
         .export_line("chunk_checkpoint: true")
-        .dest_path(out.path().to_path_buf())
-        .yaml();
-    let cfg = write_config(&cfg_dir, &yaml);
+        .dest_path(out.path().to_path_buf());
+    let cfg = rig.config_path();
 
-    let run = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            &export,
-            "--validate",
-        ])
-        .output()
-        .expect("spawn rivet");
+    let run = rig.run_args(&["--export", &export, "--validate"]);
     assert!(
         run.status.success(),
         "clean validated run must succeed; stderr:\n{}",
@@ -1184,8 +1059,7 @@ fn a_failed_chunk_must_fail_the_run_not_ship_a_short_export() {
     let table = seed_pg_numeric_table(150);
     let export = unique_name("chunk_fail_guard");
     let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = Rig::pg_batch(&export)
+    let rig = Rig::pg_batch(&export)
         .query(&format!(
             r#"SELECT id, name FROM {table_name}"#,
             table_name = table.name()
@@ -1194,21 +1068,12 @@ fn a_failed_chunk_must_fail_the_run_not_ship_a_short_export() {
         .export_line("chunk_column: id")
         .export_line("chunk_size: 50")
         .export_line("chunk_checkpoint: true")
-        .dest_path(out.path().to_path_buf())
-        .yaml();
-    let cfg = write_config(&cfg_dir, &yaml);
+        .dest_path(out.path().to_path_buf());
 
-    let run = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            &export,
-        ])
-        .env("RIVET_TEST_ERROR_AT", "chunk_export:1")
-        .output()
-        .expect("spawn rivet");
+    let run = rig.run_args_env(
+        &["--export", &export],
+        &[("RIVET_TEST_ERROR_AT", "chunk_export:1")],
+    );
     let stderr = String::from_utf8_lossy(&run.stderr).into_owned();
 
     // The fixture must not be inert: the OTHER chunks have to have run, or the
@@ -1253,8 +1118,7 @@ fn a_failed_chunk_must_fail_the_parallel_run_not_ship_a_short_export() {
     let table = seed_pg_numeric_table(150);
     let export = unique_name("chunk_fail_guard_par");
     let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = Rig::pg_batch(&export)
+    let rig = Rig::pg_batch(&export)
         .query(&format!(
             r#"SELECT id, name FROM {table_name}"#,
             table_name = table.name()
@@ -1264,21 +1128,13 @@ fn a_failed_chunk_must_fail_the_parallel_run_not_ship_a_short_export() {
         .export_line("chunk_size: 50")
         .export_line("chunk_checkpoint: true")
         .export_line("parallel: 4")
-        .dest_path(out.path().to_path_buf())
-        .yaml();
-    let cfg = write_config(&cfg_dir, &yaml);
+        .dest_path(out.path().to_path_buf());
+    let cfg = rig.config_path();
 
-    let run = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            &export,
-        ])
-        .env("RIVET_TEST_ERROR_AT", "chunk_export:1")
-        .output()
-        .expect("spawn rivet");
+    let run = rig.run_args_env(
+        &["--export", &export],
+        &[("RIVET_TEST_ERROR_AT", "chunk_export:1")],
+    );
     let stderr = String::from_utf8_lossy(&run.stderr).into_owned();
 
     // Raw parquet on disk is NOT the oracle here, and measuring it was the first
