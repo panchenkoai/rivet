@@ -176,13 +176,50 @@ pub fn duckdb_parquet_distinct(container_dir: &str, column: &str) -> i64 {
 /// loss. Reporting both at once names which one happened instead of leaving the
 /// reader to guess from a single number.
 pub fn duckdb_assert_complete(container_dir: &str, column: &str, expected: i64, what: &str) {
+    duckdb_assert_rows_and_distinct(container_dir, column, expected, expected, what);
+}
+
+/// The general primitive: exact row count AND exact distinct count.
+///
+/// The named claims above are the two common cases; a test whose expectation is
+/// neither — two full snapshots into one prefix, say, where 200 rows over 100
+/// distinct keys is CORRECT — states both numbers here rather than bending one of
+/// the named helpers into a shape it does not mean.
+pub fn duckdb_assert_rows_and_distinct(
+    container_dir: &str,
+    column: &str,
+    rows: i64,
+    distinct: i64,
+    what: &str,
+) {
+    let got_rows = duckdb_parquet_rows(container_dir);
+    let got_distinct = duckdb_parquet_distinct(container_dir, column);
+    assert_eq!(
+        (got_rows, got_distinct),
+        (rows, distinct),
+        "{what}: expected {rows} rows over {distinct} distinct `{column}`, DuckDB \
+         read {got_rows} rows / {got_distinct} distinct"
+    );
+}
+
+/// The AT-LEAST-ONCE shape: every key present, duplicates permitted.
+///
+/// Distinct must equal `expected` exactly (a missing key is loss) while the total
+/// may exceed it (a crash-orphaned page re-exported on recovery is correct
+/// behaviour, not a defect). Deliberately NOT [`duckdb_assert_complete`], which
+/// demands total == distinct and would fail a legitimate recovery — the two
+/// claims are different and collapsing them would make one of them a lie.
+pub fn duckdb_assert_at_least_once(container_dir: &str, column: &str, expected: i64, what: &str) {
     let total = duckdb_parquet_rows(container_dir);
     let distinct = duckdb_parquet_distinct(container_dir, column);
     assert_eq!(
-        (total, distinct),
-        (expected, expected),
-        "{what}: expected {expected} rows all distinct on `{column}`, DuckDB read \
-         {total} rows / {distinct} distinct — fewer rows is loss, fewer distinct \
-         is duplication"
+        distinct, expected,
+        "{what}: every `{column}` must survive — DuckDB read {distinct} distinct of \
+         {expected} expected ({total} rows total). A missing key is loss."
+    );
+    assert!(
+        total >= expected,
+        "{what}: {total} rows for {expected} distinct `{column}` — fewer rows than \
+         keys is impossible unless the read itself is wrong"
     );
 }
