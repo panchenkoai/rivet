@@ -203,13 +203,34 @@ pub(crate) fn row_image(
 /// on a resume. What legacy checkpoints without the field should default to is a
 /// real decision with a cost either way (a false alarm that wedges an export, or
 /// a silent skip), which is why this is documented rather than guessed.
-fn fill_sql(
-    ci: &str,
-    from_expr: &str,
+/// What one poll needs to know. A parameter object rather than five positional
+/// arguments, because four of them are `&str`/`Option`/`bool` in a row and the
+/// call site said nothing: `fill_sql(ci, expr, 500, None, false)` gives a reader
+/// no way to see that the last value decides whether a purged resume position is
+/// refused or silently skipped.
+struct Poll<'a> {
+    /// The capture instance whose change function is read.
+    ci: &'a str,
+    /// SQL expression yielding `@from` — the position to read AFTER.
+    from_expr: &'a str,
+    /// Row cap for one batch (`TOP (n)`).
     batch: i64,
-    bound: Option<&str>,
+    /// `Some(hex)` pins `@max` at the open-time LSN (a bounded drain); `None`
+    /// re-reads `fn_cdc_get_max_lsn()` every poll (the daemon).
+    bound: Option<&'a str>,
+    /// True when `from_expr` came from a PIN rather than a flush. Only a pin may
+    /// be floored up to the instance's start.
     from_is_pin: bool,
-) -> String {
+}
+
+fn fill_sql(p: Poll<'_>) -> String {
+    let Poll {
+        ci,
+        from_expr,
+        batch,
+        bound,
+        from_is_pin,
+    } = p;
     let max_expr = match bound {
         Some(hex) => format!("0x{hex}"),
         None => "sys.fn_cdc_get_max_lsn()".to_string(),
@@ -252,6 +273,20 @@ CDC change-table retention (the cleanup job removed it). Resuming would silently
 }
 
 /// Connection parameters for a SQL Server CDC poll stream.
+/// Where a poll resumes from, and WHAT that position is.
+///
+/// One named value rather than two positional arguments, because the pair is a
+/// `String` and a `bool` whose meaning is invisible at the call site — and the
+/// bool decides whether a position the cleanup job purged past is REFUSED or
+/// silently skipped.
+pub(crate) struct Resume {
+    /// Hex LSN to read after, or `None` for "from the change table's min".
+    pub from_lsn: Option<String>,
+    /// True when that LSN is an ANCHOR (nothing was captured from it) rather
+    /// than a flushed resume position.
+    pub from_is_pin: bool,
+}
+
 pub(crate) struct MssqlCdcConfig {
     pub host: String,
     pub port: u16,
@@ -418,8 +453,7 @@ impl MssqlChangeStream {
     pub(crate) fn from_url(
         url: &str,
         capture_instance: &str,
-        from_lsn: Option<String>,
-        from_is_pin: bool,
+        resume: Resume,
         tls: Option<&TlsConfig>,
         peek: crate::source::cdc::PeekBound,
         mode: DrainMode,
@@ -436,8 +470,8 @@ impl MssqlChangeStream {
                 user: p.user,
                 password: p.password,
                 capture_instance: capture_instance.to_string(),
-                from_lsn,
-                from_is_pin,
+                from_lsn: resume.from_lsn,
+                from_is_pin: resume.from_is_pin,
             },
             tls,
             peek,
@@ -466,13 +500,13 @@ impl MssqlChangeStream {
             Some(hex) => format!("sys.fn_cdc_increment_lsn(0x{hex})"),
             None => format!("sys.fn_cdc_get_min_lsn('{ci}')"),
         };
-        let sql = fill_sql(
-            &ci,
-            &from_expr,
-            self.batch_limit,
-            self.bound.as_deref(),
-            self.from_is_pin,
-        );
+        let sql = fill_sql(Poll {
+            ci: &ci,
+            from_expr: &from_expr,
+            batch: self.batch_limit,
+            bound: self.bound.as_deref(),
+            from_is_pin: self.from_is_pin,
+        });
         // The most common SQL Server gotcha — "Invalid object name
         // cdc.fn_cdc_get_all_changes_…" — surfaces here, at the first poll, not at
         // connect. Append the setup hint so the missing CDC enable is obvious.
@@ -932,13 +966,13 @@ mod tests {
     // the daemon poll must keep doing exactly that.
     #[test]
     fn fill_sql_bounded_pins_max_and_daemon_chases_it() {
-        let bounded = fill_sql(
-            "dbo_orders",
-            "sys.fn_cdc_get_min_lsn('dbo_orders')",
-            500,
-            Some("0000002f000004d80005"),
-            false,
-        );
+        let bounded = fill_sql(Poll {
+            ci: "dbo_orders",
+            from_expr: "sys.fn_cdc_get_min_lsn('dbo_orders')",
+            batch: 500,
+            bound: Some("0000002f000004d80005"),
+            from_is_pin: false,
+        });
         assert!(
             bounded.contains("DECLARE @max binary(10) = 0x0000002f000004d80005;"),
             "bounded poll must pin @max to the open-time LSN: {bounded}"
@@ -951,13 +985,13 @@ mod tests {
         assert!(bounded.contains("sys.fn_cdc_get_min_lsn('dbo_orders')"));
         assert!(bounded.contains("TOP (500)"));
 
-        let daemon = fill_sql(
-            "dbo_orders",
-            "sys.fn_cdc_increment_lsn(0xabcd)",
-            500,
-            None,
-            false,
-        );
+        let daemon = fill_sql(Poll {
+            ci: "dbo_orders",
+            from_expr: "sys.fn_cdc_increment_lsn(0xabcd)",
+            batch: 500,
+            bound: None,
+            from_is_pin: false,
+        });
         assert!(
             daemon.contains("DECLARE @max binary(10) = sys.fn_cdc_get_max_lsn();"),
             "daemon poll keeps chasing the head: {daemon}"
@@ -992,7 +1026,13 @@ mod tests {
     /// skipping them silently is the harm).
     #[test]
     fn only_a_pinned_anchor_is_floored_a_resume_position_must_reach_the_retention_guard() {
-        let pinned = fill_sql("dbo_orders", "0xabcd", 500, None, true);
+        let pinned = fill_sql(Poll {
+            ci: "dbo_orders",
+            from_expr: "0xabcd",
+            batch: 500,
+            bound: None,
+            from_is_pin: true,
+        });
         assert!(
             pinned.contains("SET @from = @min"),
             "an anchor below a newer instance must be floored, not thrown on — throwing wedges \
@@ -1008,13 +1048,13 @@ mod tests {
              position the next statement was about to make valid"
         );
 
-        let resumed = fill_sql(
-            "dbo_orders",
-            "sys.fn_cdc_increment_lsn(0xabcd)",
-            500,
-            None,
-            false,
-        );
+        let resumed = fill_sql(Poll {
+            ci: "dbo_orders",
+            from_expr: "sys.fn_cdc_increment_lsn(0xabcd)",
+            batch: 500,
+            bound: None,
+            from_is_pin: false,
+        });
         assert!(
             !resumed.contains("SET @from = @min"),
             "a RESUME position must reach the retention guard — flooring it silently skips every \

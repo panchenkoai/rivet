@@ -267,7 +267,11 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                             let mut thread_src = match source::create_source(&plan_w.source) {
                                 Ok(s) => s,
                                 Err(e) => {
-                                    if crate::pipeline::retry::should_retry(attempt, plan_w.tuning.max_retries, &e) {
+                                    if crate::pipeline::retry::should_retry(crate::pipeline::retry::Attempt {
+                                        attempt,
+                                        max_retries: plan_w.tuning.max_retries,
+                                        error: &e,
+                                    }) {
                                         last_err = Some(e);
                                         continue;
                                     }
@@ -347,7 +351,11 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                             match export_attempt {
                                 Ok(v) => return Ok(v),
                                 Err(e) => {
-                                    if crate::pipeline::retry::should_retry(attempt, plan_w.tuning.max_retries, &e) {
+                                    if crate::pipeline::retry::should_retry(crate::pipeline::retry::Attempt {
+                                        attempt,
+                                        max_retries: plan_w.tuning.max_retries,
+                                        error: &e,
+                                    }) {
                                         last_err = Some(e);
                                         continue;
                                     }

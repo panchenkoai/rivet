@@ -730,8 +730,10 @@ pub(crate) fn create_change_stream(
                 crate::source::mssql::cdc::MssqlChangeStream::from_url(
                     url,
                     ci,
-                    from_lsn,
-                    from_is_pin,
+                    crate::source::mssql::cdc::Resume {
+                        from_lsn,
+                        from_is_pin,
+                    },
                     tls,
                     peek,
                     cfg.drain,

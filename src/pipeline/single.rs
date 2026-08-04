@@ -86,7 +86,11 @@ pub(crate) fn run_with_reconnect(
                         "cannot reach the source — run `rivet doctor -c {config_path}` to diagnose (is the host/port right and the server up?)"
                     )));
                 }
-                if super::retry::should_retry(attempt, plan.tuning.max_retries, &e) {
+                if super::retry::should_retry(super::retry::Attempt {
+                    attempt,
+                    max_retries: plan.tuning.max_retries,
+                    error: &e,
+                }) {
                     log::warn!(
                         "export '{}': connection failed, will retry: {}",
                         plan.export_name,

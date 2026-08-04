@@ -178,11 +178,21 @@ impl TableSink<'_> {
         // Non-fatal, matching ADR-0001 I7: the file is already durable, so a
         // ledger write failure is logged, never a reason to fail a run whose
         // data is safe.
+        // The ledger key is (run_id, file_name), and the part name carries only
+        // this sink's OWN sequence — `cdc-<run_token>-000000` — so in a
+        // multi-table CDC export every table's first part has the SAME name.
+        // The files do not collide (each table writes under its own sub-prefix,
+        // `cdc_job::dest_for_table`), but the ledger rows did: `record_durable_part`
+        // deletes-then-inserts on that key, so each roll erased the sibling
+        // table's row and the projected aggregate under-reported both parts and
+        // rows. Qualify the LEDGER name with the table — the same distinction the
+        // destination already makes — rather than renaming the object on disk.
+        let ledger_name = ledger_part_name(&self.out.table, &part.file_name);
         if let Some((state, export_name, run_id)) = ledger
             && let Err(e) = state.record_durable_part(crate::state::DurablePart {
                 run_id,
                 export_name,
-                file_name: &part.file_name,
+                file_name: &ledger_name,
                 rows: part.rows,
                 bytes: part.bytes as i64,
                 format: format.label(),
@@ -778,6 +788,22 @@ fn flush(
     Ok((part, col_sums))
 }
 
+/// The name a CDC part is recorded under in `file_log`.
+///
+/// The ledger key is `(run_id, file_name)` and a part's own name carries only its
+/// sink's sequence — `cdc-<run_token>-000000` — so in a MULTI-TABLE cdc export
+/// every table's first part is called the same thing. The objects do not collide
+/// (each table writes under its own sub-prefix, `cdc_job::dest_for_table`), but
+/// the ledger rows did: `record_durable_part` deletes-then-inserts on that key,
+/// so each roll erased the sibling table's row and the projected aggregate
+/// under-reported both parts and rows.
+///
+/// One function so the sink and its test agree by CONSTRUCTION rather than by two
+/// copies of a format string.
+pub(crate) fn ledger_part_name(table: &str, file_name: &str) -> String {
+    format!("{table}/{file_name}")
+}
+
 /// How a CDC part is compressed, per format — the ONE place that decides.
 ///
 /// It was two places: the writer picked `None` for CSV and `Zstd` for Parquet,
@@ -1224,6 +1250,88 @@ mod tests {
     /// the test hands itself. `rollover: 2` over five changes so there is more
     /// than one part: with a single part any per-part loop and any
     /// write-once-at-the-end both look identical.
+    /// TWO tables in one CDC export: every table's parts must survive in the
+    /// ledger, not just the last one to flush.
+    ///
+    /// The part name carries only its own sink's sequence, so table `a` and table
+    /// `b` both produce `cdc-<run_token>-000000`. The objects are fine — each
+    /// table writes under its own sub-prefix — but `file_log` is keyed
+    /// `(run_id, file_name)` and `record_durable_part` deletes-then-inserts on
+    /// that key, so each roll erased the sibling's row. The projected run
+    /// aggregate then under-reported both parts and rows, and no single-table
+    /// test could see it: at N=1 there is no sibling to erase.
+    #[test]
+    fn two_tables_in_one_cdc_export_do_not_erase_each_others_ledger_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest_a = local_dest(&dir);
+        let dir_b = tempfile::tempdir().unwrap();
+        let dest_b = local_dest(&dir_b);
+        let cols = int_col();
+        let state = crate::state::StateStore::open_in_memory().expect("in-memory state");
+
+        let ev = |table: &str, id: i64| {
+            let mut e = insert(id);
+            e.table = table.into();
+            e
+        };
+        let mut stream = FakeStream {
+            events: VecDeque::from(vec![ev("a", 1), ev("b", 2), ev("a", 3), ev("b", 4)]),
+            acked: Vec::new(),
+        };
+
+        let base = cfg(dest_a.as_ref(), &cols, FormatType::Parquet, 1);
+        let manifests = run_to_files(
+            &mut stream,
+            SinkConfig {
+                state: Some(&state),
+                outputs: vec![
+                    TableOutput {
+                        table: "a".into(),
+                        columns: cols.clone(),
+                        dest: dest_a.as_ref(),
+                        dest_uri: String::new(),
+                        row_hash: crate::config::RowHash::All(false),
+                    },
+                    TableOutput {
+                        table: "b".into(),
+                        columns: cols.clone(),
+                        dest: dest_b.as_ref(),
+                        dest_uri: String::new(),
+                        row_hash: crate::config::RowHash::All(false),
+                    },
+                ],
+                ..base
+            },
+        )
+        .unwrap();
+
+        let manifest_parts: usize = manifests.iter().map(|m| m.parts.len()).sum();
+        assert!(
+            manifests.len() == 2 && manifest_parts >= 2,
+            "fixture is inert — both tables must have produced parts, or there is no sibling \
+             row to erase; got {} manifest(s), {manifest_parts} part(s)",
+            manifests.len()
+        );
+
+        let logged = state.list_files_for_run("r").expect("read file_log");
+        assert_eq!(
+            logged.len(),
+            manifest_parts,
+            "the two manifests list {manifest_parts} part(s) between them and the ledger kept \
+             {} — a table's parts were erased by its sibling's, so every sum over file_log \
+             under-reports the run",
+            logged.len()
+        );
+        for table in ["a", "b"] {
+            assert!(
+                logged
+                    .iter()
+                    .any(|r| r.file_name.starts_with(&format!("{table}/"))),
+                "table '{table}' has no row in the ledger at all"
+            );
+        }
+    }
+
     #[test]
     fn every_durable_cdc_part_is_recorded_in_the_state_db_not_just_the_manifest() {
         let dir = tempfile::tempdir().unwrap();
@@ -1263,7 +1371,7 @@ mod tests {
         for p in parts {
             let row = logged
                 .iter()
-                .find(|r| r.file_name == p.path)
+                .find(|r| r.file_name == ledger_part_name("t", &p.path))
                 .unwrap_or_else(|| {
                     panic!("part '{}' is in the manifest but not in file_log", p.path)
                 });

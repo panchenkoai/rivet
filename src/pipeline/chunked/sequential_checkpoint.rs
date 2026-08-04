@@ -169,7 +169,11 @@ fn run_chunk_with_source_retries(
         let mut src = match source::create_source(&plan.source) {
             Ok(s) => s,
             Err(e) => {
-                if super::super::retry::should_retry(attempt, plan.tuning.max_retries, &e) {
+                if super::super::retry::should_retry(super::super::retry::Attempt {
+                    attempt,
+                    max_retries: plan.tuning.max_retries,
+                    error: &e,
+                }) {
                     last_err = Some(e);
                     continue;
                 }
@@ -195,7 +199,11 @@ fn run_chunk_with_source_retries(
         ) {
             Ok(v) => return Ok(v),
             Err(e) => {
-                if super::super::retry::should_retry(attempt, plan.tuning.max_retries, &e) {
+                if super::super::retry::should_retry(super::super::retry::Attempt {
+                    attempt,
+                    max_retries: plan.tuning.max_retries,
+                    error: &e,
+                }) {
                     last_err = Some(e);
                     continue;
                 }

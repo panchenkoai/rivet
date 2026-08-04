@@ -871,26 +871,42 @@ fn dispatch_load(args: LoadArgs) -> Result<()> {
             maybe_gc_orphans(plan, state.as_ref());
         }
     }
-    if !failures.is_empty() {
-        // Same aggregation shape as `rivet run`: carry a representative typed
-        // failure so `classify_exit` still downcasts the marker through anyhow's
-        // context chain, and list the rest as context.
-        let primary_idx = crate::pipeline::run::representative_failure_idx(&failures).unwrap();
-        let primary = failures.remove(primary_idx);
-        if failures.is_empty() {
-            return Err(primary);
-        }
-        let others = failures
-            .iter()
-            .map(|e| format!("{e:#}"))
-            .collect::<Vec<_>>()
-            .join("; ");
-        return Err(primary.context(format!(
-            "{} load(s) failed; representative error follows (also: {others})",
-            failures.len() + 1
-        )));
+    match aggregate_load_failures(failures) {
+        Some(e) => Err(e),
+        None => Ok(()),
     }
-    Ok(())
+}
+
+/// Fold every per-plan failure into ONE error, or `None` when nothing failed.
+///
+/// Extracted so a test can call the REAL producer instead of re-typing the fold
+/// into its own body. The test that guarded this used to build three errors,
+/// re-implement `remove(idx)` + the `others` join + this exact format string, and
+/// assert on the string IT had produced — so putting `?` back on the first
+/// failure (the fault-isolation regression it was written to catch) left it
+/// green. It held both sides of the comparison.
+///
+/// Same aggregation shape as `rivet run`: carry a representative TYPED failure so
+/// `classify_exit` still downcasts the marker through anyhow's context chain, and
+/// list the rest as context.
+pub(crate) fn aggregate_load_failures(mut failures: Vec<anyhow::Error>) -> Option<anyhow::Error> {
+    if failures.is_empty() {
+        return None;
+    }
+    let primary_idx = crate::pipeline::run::representative_failure_idx(&failures)?;
+    let primary = failures.remove(primary_idx);
+    if failures.is_empty() {
+        return Some(primary);
+    }
+    let others = failures
+        .iter()
+        .map(|e| format!("{e:#}"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    Some(primary.context(format!(
+        "{} load(s) failed; representative error follows (also: {others})",
+        failures.len() + 1
+    )))
 }
 
 /// The dedup view's primary key for an append mode (`cdc` / `incremental`), read
@@ -1660,25 +1676,22 @@ mod load_ledger_tests {
     /// downcast in `classify_exit` and the operator learns about ALL of them.
     #[test]
     fn several_load_failures_aggregate_instead_of_stopping_at_the_first() {
+        // The oracle is the PRODUCT's fold, not a copy of it. The previous
+        // version called `representative_failure_idx` and then re-typed
+        // `remove(idx)`, the `others` join and the format string into its own
+        // body — so it asserted on a value the TEST had produced, and putting `?`
+        // back on the first failure (the regression it exists to catch) left it
+        // green. Every expectation below is a hand-written literal or a property
+        // of the INPUT, never a re-derivation of the code under test.
         let failures: Vec<anyhow::Error> = vec![
             anyhow::anyhow!("boom alpha").context("load 'alpha'"),
             anyhow::anyhow!("boom beta").context("load 'beta'"),
             anyhow::anyhow!("boom gamma").context("load 'gamma'"),
         ];
-        let mut failures = failures;
-        let idx = crate::pipeline::run::representative_failure_idx(&failures)
-            .expect("a non-empty failure set has a representative");
-        let primary = failures.remove(idx);
-        let others = failures
-            .iter()
-            .map(|e| format!("{e:#}"))
-            .collect::<Vec<_>>()
-            .join("; ");
-        let aggregated = primary.context(format!(
-            "{} load(s) failed; representative error follows (also: {others})",
-            failures.len() + 1
-        ));
-        let text = format!("{aggregated:#}");
+        let text = format!(
+            "{:#}",
+            aggregate_load_failures(failures).expect("three failures must aggregate to an error")
+        );
         assert!(
             text.contains("3 load(s) failed"),
             "the aggregate must say how many failed; got: {text}"
@@ -1686,10 +1699,28 @@ mod load_ledger_tests {
         for t in ["alpha", "beta", "gamma"] {
             assert!(
                 text.contains(t),
-                "every failed table must be named — a table missing from the \
-                 aggregate is one an operator never learns about; got: {text}"
+                "every failed table must be named — a table missing from the aggregate is one \
+                 an operator never learns about; got: {text}"
             );
         }
+
+        // One failure is NOT dressed up as an aggregate: no count, no "also".
+        let one = format!(
+            "{:#}",
+            aggregate_load_failures(vec![anyhow::anyhow!("boom solo").context("load 'solo'")])
+                .expect("one failure is still an error")
+        );
+        assert!(one.contains("solo"), "got: {one}");
+        assert!(
+            !one.contains("load(s) failed"),
+            "a single failure must surface as itself, not as a 1-of-1 aggregate; got: {one}"
+        );
+
+        // And nothing failed is not an error at all.
+        assert!(
+            aggregate_load_failures(Vec::new()).is_none(),
+            "an empty failure set must not manufacture an error"
+        );
     }
 
     #[test]

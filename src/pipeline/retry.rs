@@ -108,8 +108,20 @@ pub fn retry_backoff_ms(base_ms: u64, attempt: u32, extra_ms: u64) -> u64 {
 /// `&&`, not `||`: a permanent failure (auth, TLS) would otherwise be retried
 /// into the same wall while the operator waits out the full backoff for an
 /// answer the first attempt already had.
-pub fn should_retry(attempt: u32, max_retries: u32, e: &anyhow::Error) -> bool {
-    attempt < max_retries && classify_error(e).is_transient()
+pub struct Attempt<'a> {
+    /// Zero-based index of the attempt that just failed.
+    pub attempt: u32,
+    /// Budget from the tuning profile.
+    pub max_retries: u32,
+    /// The failure being judged.
+    pub error: &'a anyhow::Error,
+}
+
+pub fn should_retry(a: Attempt<'_>) -> bool {
+    // Named rather than three positional arguments: `attempt` and `max_retries`
+    // are both `u32`, so a swapped call site compiles, runs, and silently changes
+    // the budget — the kind of edit no test distinguishes from the correct one.
+    a.attempt < a.max_retries && classify_error(a.error).is_transient()
 }
 
 pub fn classify_error(err: &anyhow::Error) -> RetryClass {
@@ -429,21 +441,37 @@ mod tests {
     #[test]
     fn a_connect_retry_needs_both_budget_and_a_recoverable_error() {
         assert!(
-            should_retry(0, 3, &transient_err()),
+            should_retry(Attempt {
+                attempt: 0,
+                max_retries: 3,
+                error: &transient_err()
+            }),
             "budget left and a recoverable error is the whole retry case"
         );
         assert!(
-            !should_retry(3, 3, &transient_err()),
+            !should_retry(Attempt {
+                attempt: 3,
+                max_retries: 3,
+                error: &transient_err()
+            }),
             "attempt is zero-based, so attempt == max_retries is the LAST permitted attempt — \
              retrying from it runs max_retries + 1 times"
         );
         assert!(
-            !should_retry(2, 3, &permanent_err()),
+            !should_retry(Attempt {
+                attempt: 2,
+                max_retries: 3,
+                error: &permanent_err()
+            }),
             "an auth failure is retried into the same wall; the operator waits out the full \
              backoff for an answer the first attempt already had"
         );
         assert!(
-            !should_retry(0, 0, &transient_err()),
+            !should_retry(Attempt {
+                attempt: 0,
+                max_retries: 0,
+                error: &transient_err()
+            }),
             "max_retries: 0 means exactly one attempt, recoverable or not"
         );
     }

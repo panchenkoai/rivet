@@ -657,8 +657,16 @@ pub(crate) fn synthetic_failed_summary(export_name: &str, err: &anyhow::Error) -
 /// Deliberately NOT folded into `failed` itself: `resolve_final_result` returns
 /// `run_result` when `failed`, so widening that variable would make a
 /// manifest-gap run exit 0 with an Ok result. Two questions, two names.
-pub(super) fn keyset_anchor_survives(failed: bool, manifest_gap: &Option<String>) -> bool {
-    failed || manifest_gap.is_some()
+pub(super) struct RunOutcome<'a> {
+    /// `result.is_err()` — the export/quality verdict, computed BEFORE the
+    /// manifest is written.
+    pub failed: bool,
+    /// `Some(why)` when `finalize_manifest` could not write the manifest.
+    pub manifest_gap: &'a Option<String>,
+}
+
+pub(super) fn keyset_anchor_survives(o: RunOutcome<'_>) -> bool {
+    o.failed || o.manifest_gap.is_some()
 }
 
 fn finalize_keyset_anchor(
@@ -1066,7 +1074,10 @@ pub(super) fn run_export_job(
         state,
         &plan,
         &summary.export_name,
-        keyset_anchor_survives(failed, &manifest_gap),
+        keyset_anchor_survives(RunOutcome {
+            failed,
+            manifest_gap: &manifest_gap,
+        }),
     );
     if plan.validate {
         finalize_validate_manifest(&plan, &mut summary, "export");
@@ -1222,7 +1233,10 @@ pub(crate) fn run_export_job_with_chunk_source(
         state,
         plan,
         &summary.export_name,
-        keyset_anchor_survives(failed, &manifest_gap),
+        keyset_anchor_survives(RunOutcome {
+            failed,
+            manifest_gap: &manifest_gap,
+        }),
     );
     if plan.validate {
         finalize_validate_manifest(plan, &mut summary, "apply");
@@ -1262,19 +1276,31 @@ mod tests {
         let gap = Some("the manifest write FAILED".to_string());
 
         assert!(
-            keyset_anchor_survives(false, &gap),
+            keyset_anchor_survives(RunOutcome {
+                failed: false,
+                manifest_gap: &gap
+            }),
             "parts are durable and nothing names them — the anchor is the only way back to them"
         );
         assert!(
-            keyset_anchor_survives(true, &None),
+            keyset_anchor_survives(RunOutcome {
+                failed: true,
+                manifest_gap: &None
+            }),
             "an export failure keeps its anchor, as it always did"
         );
         assert!(
-            keyset_anchor_survives(true, &gap),
+            keyset_anchor_survives(RunOutcome {
+                failed: true,
+                manifest_gap: &gap
+            }),
             "both at once is still a run that did not finish"
         );
         assert!(
-            !keyset_anchor_survives(false, &None),
+            !keyset_anchor_survives(RunOutcome {
+                failed: false,
+                manifest_gap: &None
+            }),
             "a genuinely complete run MUST clear it, or the next run is misread as a resume of \
              this finished one and reuses its frozen run_id"
         );
