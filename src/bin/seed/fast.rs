@@ -225,9 +225,9 @@ SELECT
     'User ' || i,
     'user' || i || '@example.com',
     18 + (i % 48),
-    round((random() * 200000)::numeric, 2),
-    (random() > 0.1),
-    CASE WHEN random() > 0.3 THEN 'seed bio ' || i ELSE NULL END,
+    round(((i % 200000) + 0.99)::numeric, 2),
+    (i % 10 <> 0),
+    CASE WHEN i % 3 <> 0 THEN 'seed bio ' || i ELSE NULL END,
     timestamp '2023-01-01' + ((i % 730) * interval '1 hour'),
     timestamp '2023-01-01' + ((i % 910) * interval '1 hour')
 FROM generate_series(1, {users}) AS i
@@ -285,9 +285,9 @@ INSERT INTO page_views (
 )
 SELECT
     lpad(to_hex(i), 32, '0'),
-    CASE WHEN random() > 0.3 THEN 1 + (i % {users}) ELSE NULL END,
+    CASE WHEN i % 3 = 0 THEN NULL ELSE 1 + (i % {users}) END,
     '/page/' || (i % 26),
-    CASE WHEN random() > 0.4 THEN 'https://google.com' ELSE NULL END,
+    CASE WHEN i % 4 = 0 THEN 'https://google.com' ELSE NULL END,
     'Mozilla/5.0 seed',
     '192.168.' || (i % 255)::text || '.' || ((i * 3) % 254 + 1)::text,
     (ARRAY['US','GB','DE','FR','CA'])[(i % 5) + 1],
@@ -385,9 +385,9 @@ SELECT
     CONCAT('User ', i + {offset}),
     CONCAT('user', i + {offset}, '@example.com'),
     18 + ((i + {offset}) % 48),
-    ROUND(RAND(i + {offset}) * 200000, 2),
+    ROUND(((i + {offset}) % 200000) + 0.99, 2),
     ((i + {offset}) % 10 <> 0),
-    IF((i + {offset}) % 3 = 0, CONCAT('seed bio ', i + {offset}), NULL),
+    IF((i + {offset}) % 3 <> 0, CONCAT('seed bio ', i + {offset}), NULL),
     DATE_SUB('2023-01-01', INTERVAL -((i + {offset}) % 730) HOUR),
     DATE_SUB('2023-01-01', INTERVAL -((i + {offset}) % 910) HOUR)
 FROM n
@@ -460,7 +460,7 @@ WITH RECURSIVE n(i) AS (
 )
 SELECT
     LPAD(HEX(i + {offset}), 32, '0'),
-    IF((i + {offset}) % 3 = 0, 1 + ((i + {offset}) % {users}), NULL),
+    IF((i + {offset}) % 3 = 0, NULL, 1 + ((i + {offset}) % {users})),
     CONCAT('/page/', (i + {offset}) MOD 26),
     IF((i + {offset}) % 4 = 0, 'https://google.com', NULL),
     'Mozilla/5.0 seed',

@@ -87,13 +87,24 @@ SEED_ARGS ?= --users 1000 --orders-per-user 5 --events-per-user 5 --page-views 5
 # command therefore yields byte-identical fixtures on PostgreSQL, MySQL and SQL
 # Server, which is what makes a cross-engine comparison meaningful.
 #
-# Scoped to the default on purpose: this said "no RNG anywhere in
-# `src/bin/seed/`", which is false — `copy_pg.rs` and `insert.rs` call
-# `rand::rng()` (the entropy-seeded thread-local) in ten places, so
-# `--profile realistic` / `--profile insert` produce fixtures that differ
-# between engines AND between runs. Determinism is a property of the profile,
-# not of the tool, and a cross-engine comparison run under the wrong profile
-# compares noise.
+# The claim is now TRUE and measured; it was not before, in two layers. The
+# comment said "no RNG anywhere in `src/bin/seed/`" — false, `copy_pg.rs` and
+# `insert.rs` call `rand::rng()` in ten places (those are the `realistic` /
+# `insert` profiles, which remain non-deterministic BY DESIGN and must never be
+# used for a cross-engine comparison). Correcting only that would still have
+# left the sentence wrong, because `fast.rs` called SQL-side `random()` five
+# times: postgres drew `balance` / `is_active` / `bio` and two page_views
+# columns at random, so the DEFAULT profile was not reproducible even run to
+# run. Worse, the two engines that WERE deterministic disagreed: MySQL wrote
+# `bio` when `i %% 3 = 0` and SQL Server when `i %% 3 <> 0` — inverted, and the
+# same inversion on `page_views.user_id`.
+#
+# All five sites now use SQL Server's index-derived formulas, which had no
+# randomness to begin with. Verified engine-neutrally: exporting `users` from
+# each engine and hashing the parquet through DuckDB yields one digest,
+# 4b7ee9027565608f23ca39aae2d10f23, on all three. A hash computed with each
+# engine's OWN string concatenation does NOT agree — that is type rendering,
+# not data, and it is why the check has to go through a neutral reader.
 #
 # NOT the default: 1M content_items is ~17x the standard 60k (~1 min), and the
 # everyday `make seed-db` should stay fast. Run this before the release matrix.
