@@ -24,6 +24,29 @@ places**:
 
 Neither is visible to a per-stage test: each stage does its own job correctly.
 
+WHAT THIS IS NOT, because an earlier version of this docstring over-claimed and
+a reviewer caught it. `docs/scenario-artifact-matrix.yaml` (driver
+`dev/pytools/scenario_artifacts.py`) already covers the ARTIFACT half, on all
+engines, against the canonical golden seed, across fourteen lifecycle scenarios
+— and it snapshots MORE than this module looks at (`chunk_run`, `chunk_task`,
+`load_run`, `loaded_source_run`). If the question is "what did this scenario
+leave behind", that ledger is the answer and this one is not.
+
+Three things it genuinely does not do, each verified rather than assumed:
+
+  no independent oracle   `grep duckdb` over its driver returns nothing. It
+                          compares rivet's records to declared expectations and
+                          rivet's files to rivet's manifest — both sides are
+                          rivet's. No foreign decoder reads the parquet.
+  no command chain        it drives `check` as a probe and `load`; nothing runs
+                          init → doctor → plan → apply in sequence.
+  no date window          `chunk_by_days` appears in neither the matrix nor the
+                          driver.
+
+Those three are this module's contribution, plus the BigQuery cycle. The
+artifact snapshot here is deliberately thinner than that ledger's and must not
+be read as a replacement for it.
+
 WHAT THIS ASSERTS, per engine × state backend × destination:
 
   init      the config file EXISTS and parses as YAML with an `exports:` list.
@@ -60,6 +83,11 @@ from .core import Ledger, container_for_port, docker_exec, have, port_of, run, r
 from . import scenarios
 
 BUCKET = "rivet-blessed"
+
+# The dev stand, by engine. `_matrix_cfg("url", engine)` owns the TEMPLATE; the
+# ports here are the stand's, so the same walk runs against a local stand and
+# against the gate's own containers without two copies of the URL grammar.
+STAND_PORT = {"postgres": 5432, "mysql": 3306, "mssql": 1433, "mongo": 27017}
 
 # The GOLDEN batches — what `make seed` / `make seed-release` writes, identical
 # on every engine by construction, so a row count is an absolute expectation
@@ -150,6 +178,14 @@ def _source_rows(engine: str, url: str, table: str) -> int:
     elif engine == "mysql":
         out = docker_exec(c, "mysql", "-urivet", "-privet", "rivet", "-N",
                           "-e", f"SELECT count(*) FROM {table}").stdout.strip()
+    elif engine == "mssql":
+        out = docker_exec(c, "/opt/mssql-tools18/bin/sqlcmd", "-C", "-S", "localhost",
+                          "-U", "sa", "-P", "Rivet_Passw0rd!", "-d", "rivet",
+                          "-h-1", "-W", "-Q",
+                          f"SET NOCOUNT ON; SELECT count(*) FROM {table}").stdout.strip()
+    elif engine == "mongo":
+        out = docker_exec(c, "mongosh", "--quiet", "rivet", "--eval",
+                          f"print(db.{table}.countDocuments({{}}))").stdout.strip()
     else:
         return -1
     head = out.splitlines()[0].strip() if out else ""
@@ -162,6 +198,22 @@ def _manifest_of(prefix: Path) -> dict | None:
         return None
     try:
         return json.loads(m.read_text())
+    except json.JSONDecodeError:
+        return None
+
+
+def _cloud_manifest(bucket: str, prefix: str) -> dict | None:
+    """Pull `manifest.json` out of the object store, so the cloud oracle can
+    compare the SAME three parties the local one does.
+
+    Without this the cloud cell compared source vs DuckDB — two parties — and
+    the file count was unchecked. A manifest is exactly the artifact a
+    cross-boundary reader (`rivet load`, a warehouse job) trusts, so leaving it
+    unread meant the leg most like production was the least verified."""
+    url = f"http://127.0.0.1:4443/storage/v1/b/{bucket}/o/{prefix.strip('/')}%2Fmanifest.json?alt=media"
+    out = run(["curl", "-sf", url]).stdout
+    try:
+        return json.loads(out) if out.strip() else None
     except json.JSONDecodeError:
         return None
 
@@ -425,9 +477,11 @@ def sc_blessed_path(
         if store == "local":
             duck_rows, duck_files = _parquet_rows_and_files(dest_dir)
         else:
-            got = scenarios.store_readback(store, BUCKET, f"blessed/{engine}/{tag}/{table}/{scenario}", work)
+            pfx = f"blessed/{engine}/{tag}/{table}/{scenario}"
+            got = scenarios.store_readback(store, BUCKET, pfx, work)
             duck_rows = int(got.splitlines()[0]) if got.strip().isdigit() else -1
-            duck_files = -1  # readback is row-count only for cloud stores
+            duck_files = -1  # the readback helper reports rows only
+            man = _cloud_manifest(BUCKET, pfx) or man
         man_rows = int(man.get("row_count", -1)) if man else -1
         man_files = int(man.get("part_count", -1)) if man else -1
 
@@ -457,6 +511,81 @@ def sc_blessed_path(
     # chain that answers only one of them is not a verified chain.
     r = rivet("run", "-c", str(cfg), "--reconcile", env=env, timeout=scenarios.NO_TIMEOUT)
     _stage(led, engine, tag, store, "reconcile", r.ok, f"exit={r.returncode}", scenario)
+
+
+def sc_bq_cycle(led: Ledger, engine: str, tag: str, url: str, table: str) -> None:
+    """The full cloud cycle: export to REAL GCS -> rivet load -> verify -> clean.
+
+    This is the leg the other stores stand in for. fake-gcs proves the protocol;
+    it does not prove that a warehouse can READ what rivet wrote — schema types,
+    logical annotations, compression and file layout all have to survive a
+    reader that shares no code with rivet at all.
+
+    BigQuery is the independent oracle here, and a strong one: the row count
+    comes from `bq query`, decoded by Google's parquet reader. When it agrees
+    with the source, the artifact has been read end to end by something that
+    has never seen rivet's writer.
+
+    CLEANUP IS PART OF THE CYCLE, not politeness. A left-behind table makes the
+    NEXT run's count a union of two loads, and a gate that quietly accumulates
+    state stops measuring the run in front of it — the same reason the prefix is
+    cleared before the export rather than after.
+    """
+    proj = os.environ.get("BQ_ORACLE_PROJECT") or run(
+        ["gcloud", "config", "get-value", "project"]).stdout.strip()
+    dset = os.environ.get("BQ_ORACLE_DATASET", "rivet_blessed")
+    bucket = os.environ.get("BQ_ORACLE_BUCKET", "rivet_data_test")
+    if not have("bq") or not proj:
+        led.skipped(engine, tag, "blessed:bq", "bigquery",
+                    f"{engine} {tag} · bigquery — no bq CLI or project", "no creds")
+        return
+
+    work = scenarios.work_dir() / f"bq_{engine}_{tag}_{table}"
+    work.mkdir(parents=True, exist_ok=True)
+    pfx = f"blessed/{engine}/{tag}/{table}"
+    # `rivet load` derives the warehouse table from the `table:` field, NOT from
+    # the export name — so this must be the source table's name or the verify
+    # queries a table that was never created. It read `-1` (absent) while the
+    # load had in fact landed 1000 rows correctly.
+    tbl = table.split(".")[-1]
+    cfg = work / "rivet.yaml"
+    tls = "\n  tls: {accept_invalid_certs: true}" if engine == "mssql" else ""
+    cfg.write_text(
+        f"source:\n  type: {engine}\n  url_env: ORACLE_URL{tls}\n"
+        f"exports:\n  - name: {tbl}\n    table: {table}\n"
+        f"    mode: full\n    format: parquet\n"
+        f"    destination: {{type: gcs, bucket: {bucket}, prefix: {pfx}/}}\n"
+        f"load:\n  target: bigquery\n  project: {proj}\n  dataset: {dset}\n"
+    )
+    env = {"ORACLE_URL": url}
+
+    run(["bq", "--project_id", proj, "mk", "-f", "--dataset", f"{proj}:{dset}"])
+    run(["gcloud", "storage", "rm", "-r", f"gs://{bucket}/{pfx}"])
+
+    rp = rivet("run", "-c", str(cfg), env=env, timeout=scenarios.NO_TIMEOUT)
+    if not _stage(led, engine, tag, "gcs-real", "bq-export", rp.ok, f"exit={rp.returncode} {rp.stderr[-160:]}"):
+        return
+    lp = rivet("load", "-c", str(cfg), env=env, timeout=scenarios.NO_TIMEOUT)
+    if not _stage(led, engine, tag, "bigquery", "bq-load", lp.ok, f"exit={lp.returncode} {lp.stderr[-160:]}"):
+        return
+
+    q = run(["bq", "--project_id", proj, "--format", "csv", "query", "--nouse_legacy_sql",
+             f"SELECT count(*) FROM `{proj}.{dset}.{tbl}`"]).stdout.strip().splitlines()
+    got = int(q[-1]) if q and q[-1].strip().isdigit() else -1
+    want = _source_rows(engine, url, table)
+    _stage(led, engine, tag, "bigquery", "bq-verify", got >= 0 and got == want,
+           f"source={want} bigquery={got}")
+
+    # Clean both ends. Reported, because a cleanup that silently fails leaves
+    # the next run measuring a union.
+    run(["bq", "--project_id", proj, "rm", "-f", "-t", f"{proj}:{dset}.{tbl}"])
+    d2 = run(["gcloud", "storage", "rm", "-r", f"gs://{bucket}/{pfx}"])
+    # `bq rm -f` exits 0 whether it deleted a table or found none, so its exit
+    # status cannot answer "is it gone" — this cell reported a clean cleanup
+    # while dropping a table that never existed. Ask afterwards instead.
+    still = run(["bq", "--project_id", proj, "show", "-t", f"{proj}:{dset}.{tbl}"])
+    _stage(led, engine, tag, "bigquery", "bq-cleanup", not still.ok and d2.ok,
+           f"table absent after drop={not still.ok}, prefix removed={d2.ok}")
 
 
 def verify_blessed_path(
@@ -496,6 +625,11 @@ def verify_blessed_path(
             engine, tag, "blessed:backend", "postgres",
             f"{engine} {tag} · postgres state backend — no --state-url given",
         )
+    # The warehouse cycle runs on ONE table per engine, deliberately: it costs a
+    # real GCS round-trip and a BigQuery job, and what it proves — that a
+    # foreign reader can decode what rivet wrote — does not multiply with the
+    # row count. The strategy axis is where breadth belongs.
+    sc_bq_cycle(led, engine, tag, url, tables[0])
     if scenarios.store_up("gcs"):
         for t in tables:
             for name, sc in SCENARIOS.items():
