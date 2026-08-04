@@ -170,6 +170,26 @@ impl Rig {
         self
     }
 
+    /// Run `rivet run --config <rig cfg>` plus `extra` args, with `envs` set.
+    ///
+    /// The affordance the crash-recovery files were bypassing the rig for: they
+    /// built their YAML through `Rig` and then dropped to a raw
+    /// `Command::new(RIVET_BIN)` because the rig could express an env var OR a
+    /// config, never extra ARGS (`--export`, `--resume`) alongside a fault
+    /// injection. That one gap accounted for most of the hand-rolled invocations
+    /// in `live_chunked_recovery.rs` and its siblings.
+    pub fn run_args_env(&self, extra: &[&str], envs: &[(&str, &str)]) -> std::process::Output {
+        let cfg = self.config_path();
+        let mut args: Vec<&str> = vec!["run", "--config", cfg.to_str().unwrap()];
+        args.extend_from_slice(extra);
+        super::runner::run_rivet_env(&args, envs)
+    }
+
+    /// `run_args_env` with no env — a plain run with extra flags.
+    pub fn run_args(&self, extra: &[&str]) -> std::process::Output {
+        self.run_args_env(extra, &[])
+    }
+
     /// Run with an extra environment variable (fault injection); returns the
     /// raw output — the caller asserts success or failure.
     pub fn run_with_env(&self, key: &str, val: &str) -> std::process::Output {

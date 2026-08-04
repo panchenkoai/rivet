@@ -160,12 +160,11 @@ fn chunked_crash_after_first_chunk_complete_resume_finishes_export() {
     // advances to chunk 1.  On resume, chunk 0 must NOT re-run; total row count
     // must equal the seeded count with no duplicates.
     require_alive(LiveService::Postgres);
+    require_alive(LiveService::DuckDb);
 
     let table = seed_pg_numeric_table(150);
     let export = unique_name("c1_crash_complete");
-    let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = Rig::pg_batch(&export)
+    let rig = Rig::pg_batch(&export)
         .query(&format!(
             r#"SELECT id, name FROM {table_name}"#,
             table_name = table.name()
@@ -174,22 +173,14 @@ fn chunked_crash_after_first_chunk_complete_resume_finishes_export() {
         .export_line("chunk_column: id")
         .export_line("chunk_size: 50")
         .export_line("chunk_checkpoint: true")
-        .dest_path(out.path().to_path_buf())
-        .yaml();
-    let cfg = write_config(&cfg_dir, &yaml);
+        .duckdb_oracle();
+    let cfg = rig.config_path();
 
     // ── Crash run ────────────────────────────────────────────────────────────
-    let crash = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            &export,
-        ])
-        .env("RIVET_TEST_PANIC_AT", "after_chunk_complete:0")
-        .output()
-        .expect("spawn rivet");
+    let crash = rig.run_args_env(
+        &["--export", &export],
+        &[("RIVET_TEST_PANIC_AT", "after_chunk_complete:0")],
+    );
     assert!(
         !crash.status.success(),
         "crash run must exit non-zero; stderr:\n{}",
@@ -210,24 +201,14 @@ fn chunked_crash_after_first_chunk_complete_resume_finishes_export() {
     );
 
     // ── Resume run ────────────────────────────────────────────────────────────
-    let resume = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            &export,
-            "--resume",
-        ])
-        .output()
-        .expect("spawn rivet resume");
+    let resume = rig.run_args(&["--export", &export, "--resume"]);
     assert!(
         resume.status.success(),
         "--resume must succeed; stderr:\n{}",
         String::from_utf8_lossy(&resume.stderr)
     );
 
-    // ── Final state: chunk_run completed, 3 manifest entries, 150 total rows ─
+    // ── Final state ──────────────────────────────────────────────────────────
     assert_eq!(
         chunk_run_status(&cfg, &export).as_deref(),
         Some("completed"),
@@ -238,10 +219,15 @@ fn chunked_crash_after_first_chunk_complete_resume_finishes_export() {
         3,
         "3 chunks × 1 run each = 3 manifest entries; chunk 0 must not be re-run"
     );
-    assert_eq!(
-        manifest_total_rows(&cfg, &export),
+    // The DESTINATION is the oracle for rows. `manifest_total_rows` reads rivet's
+    // own ledger, so a run that miscounts agrees with itself; and a re-read
+    // through the parquet crate rivet writes with shares its codec. DuckDB shares
+    // neither. Distinct rides along because "no duplicates" is half the claim
+    // this test's own comment makes.
+    rig.assert_complete(
+        "id",
         150,
-        "total manifest rows must equal seeded row count (no duplicates)"
+        "chunked crash+resume must deliver every seeded row exactly once",
     );
 }
 
