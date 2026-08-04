@@ -24,10 +24,28 @@ pub struct Rig {
     cdc_lines: Vec<String>,
     extra_lines: Vec<String>,
     dest_override: Option<PathBuf>,
+    /// Additional exports rendered after the primary one. See [`Rig::also_export`].
+    extra_exports: Vec<SecondaryExport>,
     /// Container-visible twin of `dest_override`, set by [`Rig::duckdb_oracle`].
     oracle_container_dir: Option<String>,
     ckpt_override: Option<PathBuf>,
     dir: tempfile::TempDir,
+}
+
+/// A non-primary export in a multi-export config, with its OWN destination.
+///
+/// The three affordances below exist because `live_cli_flags.rs` could not use
+/// the rig AT ALL, and the reasons were structural rather than neglect: five of
+/// its nineteen configs declare TWO exports (this), its tests drive `check` /
+/// `validate` / `doctor` rather than `run` ([`Rig::cli`]), and its signal tests
+/// need a LIVE child process to kill ([`Rig::spawn_args_env`]). A seam that
+/// cannot express a third of a file is why that file grew its own harness.
+#[derive(Clone)]
+struct SecondaryExport {
+    name: String,
+    query: String,
+    mode: String,
+    lines: Vec<String>,
 }
 
 impl Rig {
@@ -44,6 +62,7 @@ impl Rig {
             cdc_lines: Vec::new(),
             extra_lines: Vec::new(),
             dest_override: None,
+            extra_exports: Vec::new(),
             oracle_container_dir: None,
             ckpt_override: None,
             dir: tempfile::tempdir().expect("rig tempdir"),
@@ -170,6 +189,75 @@ impl Rig {
         self
     }
 
+    /// Declare a SECOND (third, …) export in the same config, with its own
+    /// destination directory — reachable via [`Rig::out_dir_for`].
+    ///
+    /// Multi-export configs are how `--export` selection, per-export failure
+    /// isolation and wave ordering get tested; a single-export rig cannot state
+    /// those cases at all.
+    pub fn also_export(mut self, name: &str, query: &str) -> Self {
+        self.extra_exports.push(SecondaryExport {
+            name: name.to_string(),
+            query: query.to_string(),
+            mode: "full".to_string(),
+            lines: Vec::new(),
+        });
+        self
+    }
+
+    /// Extra export-level lines for the most recently added [`Rig::also_export`].
+    pub fn also_export_line(mut self, line: &str) -> Self {
+        self.extra_exports
+            .last_mut()
+            .expect("also_export_line needs a preceding also_export")
+            .lines
+            .push(line.to_string());
+        self
+    }
+
+    /// Destination directory of a named export — the primary or any secondary.
+    pub fn out_dir_for(&self, name: &str) -> PathBuf {
+        if name == self.name {
+            return self.out_dir();
+        }
+        self.dir.path().join(format!("out_{name}"))
+    }
+
+    /// Run an ARBITRARY subcommand against this rig's config: `rivet <args…>
+    /// --config <cfg>`.
+    ///
+    /// `run_args`/`run_args_env` hard-code the `run` subcommand, so a test for
+    /// `check`, `validate`, `doctor` or `init` had no way through the rig and
+    /// dropped to a raw `Command`. The config flag is appended, which clap
+    /// accepts in any position.
+    pub fn cli(&self, args: &[&str]) -> std::process::Output {
+        let cfg = self.config_path();
+        let mut all: Vec<&str> = args.to_vec();
+        all.push("--config");
+        all.push(cfg.to_str().unwrap());
+        super::runner::run_rivet_env(&all, &[])
+    }
+
+    /// Spawn `rivet run` and hand back the LIVE child, output discarded.
+    ///
+    /// For tests that must act on a running process — signal it, inspect its
+    /// children, watch the staged `.tmp` appear — rather than wait for an exit
+    /// status. `run_args_env` blocks until completion and so cannot express them.
+    /// The caller owns the `Child` and must reap it.
+    pub fn spawn_args_env(&self, extra: &[&str], envs: &[(&str, &str)]) -> std::process::Child {
+        let cfg = self.config_path();
+        let mut cmd = std::process::Command::new(super::runner::RIVET_BIN);
+        cmd.args(["run", "--config", cfg.to_str().unwrap()]);
+        cmd.args(extra);
+        for (k, v) in envs {
+            cmd.env(k, v);
+        }
+        cmd.stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn rivet")
+    }
+
     /// Run `rivet run --config <rig cfg>` plus `extra` args, with `envs` set.
     ///
     /// The affordance the crash-recovery files were bypassing the rig for: they
@@ -244,6 +332,9 @@ impl Rig {
         // filesystem (yaml()/render() stay pure — the offline goldens were
         // mkdir-ing /tmp/o as a side effect of rendering a string).
         std::fs::create_dir_all(self.out_dir()).unwrap();
+        for e in &self.extra_exports {
+            std::fs::create_dir_all(self.out_dir_for(&e.name)).unwrap();
+        }
         let cfg = self.dir.path().join("rig.yaml");
         std::fs::write(&cfg, self.render()).unwrap();
         cfg
@@ -294,8 +385,27 @@ impl Rig {
             .trim_end()
             .to_string()
         };
+        // Secondary exports (see `Rig::also_export`) each get their OWN
+        // destination, which is what the multi-export configs under test
+        // actually declare — per-export failure isolation is only observable
+        // when the outputs are separable.
+        let secondaries: String = self
+            .extra_exports
+            .iter()
+            .map(|e| {
+                let lines: String = e.lines.iter().map(|l| format!("    {l}\n")).collect();
+                format!(
+                    "  - name: {n}\n    query: \"{q}\"\n    mode: {m}\n    format: {f}\n{lines}    destination: {{ type: local, path: \"{o}\" }}\n",
+                    n = e.name,
+                    q = e.query,
+                    m = e.mode,
+                    f = self.format,
+                    o = self.out_dir_for(&e.name).display(),
+                )
+            })
+            .collect();
         let yaml = format!(
-            "{source}\nexports:\n  - name: {name}\n    {tables}\n    mode: {mode}\n    format: {fmt}\n{cdc}{extra}    destination: {{ type: local, path: \"{out}\" }}\n",
+            "{source}\nexports:\n  - name: {name}\n    {tables}\n    mode: {mode}\n    format: {fmt}\n{cdc}{extra}    destination: {{ type: local, path: \"{out}\" }}\n{secondaries}",
             name = self.name,
             tables = tables,
             mode = self.mode,
@@ -599,6 +709,51 @@ impl CdcScenario {
 #[cfg(test)]
 mod rig_render_goldens {
     use super::*;
+
+    /// A second export renders as its own block with its OWN destination.
+    ///
+    /// Pins the affordance that `live_cli_flags.rs` needed and the rig did not
+    /// have: five of its nineteen configs declare two exports, so a third of
+    /// that file could not go through the seam at all and grew a hand-rolled
+    /// template instead.
+    ///
+    /// The destinations must DIFFER, which is the load-bearing half — per-export
+    /// failure isolation and `--export` selection are only observable when the
+    /// outputs are separable. The paths themselves live under the rig's tempdir
+    /// and so are not pinned; that they are distinct is.
+    #[test]
+    fn a_second_export_renders_its_own_block_and_its_own_destination() {
+        let rig = Rig::pg_batch("primary")
+            .also_export("secondary", "SELECT id FROM other")
+            .also_export_line("chunk_size: 10");
+        let yaml = rig.yaml();
+
+        assert_eq!(
+            yaml.matches("- name:").count(),
+            2,
+            "both exports must render:\n{yaml}"
+        );
+        assert!(
+            yaml.contains("- name: secondary"),
+            "the secondary export is missing:\n{yaml}"
+        );
+        assert!(
+            yaml.contains(r#"query: "SELECT id FROM other""#),
+            "the secondary keeps its own query:\n{yaml}"
+        );
+        assert!(
+            yaml.contains("    chunk_size: 10\n"),
+            "also_export_line attaches to the secondary:\n{yaml}"
+        );
+        assert_ne!(
+            rig.out_dir_for("primary"),
+            rig.out_dir_for("secondary"),
+            "each export needs a separable destination, or per-export failure \
+             isolation cannot be observed"
+        );
+        let dests: Vec<&str> = yaml.matches("path: ").collect();
+        assert_eq!(dests.len(), 2, "one destination per export:\n{yaml}");
+    }
 
     /// The full constructor surface, pinned as rendered YAML — the rig's own
     /// contract test. Any drift in the render is a diff HERE first, offline,
