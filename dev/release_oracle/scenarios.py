@@ -973,11 +973,22 @@ def verify_inflight_run_stays_loadable(led: Ledger) -> None:
     show = run([str(rivet_bin()), "state", "show", "-c", str(cfgf)],
                env={"RIVET_ORACLE_PROBE_URL": "postgres://rivet:rivet@127.0.0.1:5432/rivet"},
                timeout=120)
+    # This cell inspects the state through `sqlite3` on the file beside the
+    # config, so it grades the SQLITE backend only. On a `--state-url` pass the
+    # state lives in PostgreSQL and no such file exists — a legitimate skip, but
+    # it used to be reported as `rc=0`, which names the one thing that was fine.
+    # A skip reason that does not say why is how a backend silently loses a cell.
     db = work / ".rivet_state.db"
-    if show.returncode != 0 or not db.exists():
+    if show.returncode != 0:
         _skipped(led, "load", "inflight", "skipset", "-",
-                 "in-flight load skip-set: the release binary did not open a state db",
-                 f"rc={show.returncode}")
+                 f"in-flight load skip-set: `rivet state show` failed (rc={show.returncode})",
+                 "state show failed")
+        return
+    if not db.exists():
+        _skipped(led, "load", "inflight", "skipset", "-",
+                 "in-flight load skip-set: this cell reads the SQLite state file directly, and "
+                 "this pass stores state in PostgreSQL — graded on the SQLite pass",
+                 "sqlite-only cell")
         return
 
     def sql(stmt: str) -> str:
