@@ -81,19 +81,32 @@ SEED_ARGS ?= --users 1000 --orders-per-user 5 --events-per-user 5 --page-views 5
 # which is exactly the noise a go/no-go check must not produce.
 #
 # Fixed in the SEED rather than in the test, because the seed is the canonical
-# generator for every engine and is deterministic by construction: every row
-# comes from a SQL series (`generate_series` / a chunked range), with no RNG
-# anywhere in `src/bin/seed/`. The same command therefore yields byte-identical
-# fixtures on PostgreSQL, MySQL and SQL Server, which is what makes a
-# cross-engine comparison meaningful in the first place.
+# generator and the DEFAULT profile is deterministic by construction: `fast`
+# generates every row SQL-side from a series (`generate_series` / a chunked
+# range), and `fast.rs` + `mssql.rs` contain ZERO `rand::rng()` calls. The same
+# command therefore yields byte-identical fixtures on PostgreSQL, MySQL and SQL
+# Server, which is what makes a cross-engine comparison meaningful.
+#
+# Scoped to the default on purpose: this said "no RNG anywhere in
+# `src/bin/seed/`", which is false — `copy_pg.rs` and `insert.rs` call
+# `rand::rng()` (the entropy-seeded thread-local) in ten places, so
+# `--profile realistic` / `--profile insert` produce fixtures that differ
+# between engines AND between runs. Determinism is a property of the profile,
+# not of the tool, and a cross-engine comparison run under the wrong profile
+# compares noise.
 #
 # NOT the default: 1M content_items is ~17x the standard 60k (~1 min), and the
 # everyday `make seed-db` should stay fast. Run this before the release matrix.
 RELEASE_SEED_ARGS ?= --users 1000 --orders-per-user 5 --events-per-user 5 --page-views 5000 --content-items 1000000
 
+# `--target all` covers postgres + mysql + sqlserver in ONE invocation. It used
+# to be two calls naming postgres and mysql, which silently left SQL Server on
+# whatever an earlier run had put there — and a stand where the engines hold
+# DIFFERENT row counts makes every cross-engine comparison meaningless, which is
+# the one thing this fixture exists to enable. Measured 2026-08-04, before the
+# fix: postgres 1000/5000/1000521, mysql 1000/5000/1000000, mssql 150000/500/150000.
 seed-release: seed-build
-	RIVET_SEED_I_KNOW=1 target/debug/seed --target postgres $(RELEASE_SEED_ARGS)
-	RIVET_SEED_I_KNOW=1 target/debug/seed --target mysql $(RELEASE_SEED_ARGS)
+	RIVET_SEED_I_KNOW=1 target/debug/seed --target all $(RELEASE_SEED_ARGS)
 
 seed-build:
 	cargo build --bin seed --features dev-seed
