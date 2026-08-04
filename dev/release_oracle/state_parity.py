@@ -39,9 +39,11 @@ import sqlite3
 from pathlib import Path
 
 try:
+    from . import state_parity_duckdb
     from .core import Ledger, rivet, run
     from .scenarios import NO_TIMEOUT, _failed, _passed, _skipped, work_dir
 except ImportError:  # pragma: no cover - depends on how the driver is invoked
+    import state_parity_duckdb  # type: ignore
     from core import Ledger, rivet, run  # type: ignore
     from scenarios import NO_TIMEOUT, _failed, _passed, _skipped, work_dir  # type: ignore
 
@@ -67,9 +69,17 @@ BOOKKEEPING = {"schema_version", "rivet_schema_version"}
 #: export, and the Postgres store is SHARED with the rest of the gate while the
 #: SQLite one is fresh — so comparing their raw counts compares "everything this
 #: gate ever did" against "this run", which is a harness artefact and not a
-#: finding. Their PARITY is still worth having; it needs a scoped query per
-#: table, which is a follow-up rather than a silent omission.
-UNSCOPED = {"chunk_run", "chunk_task", "keyset_range", "loaded_source_run", "load_run"}
+#: finding.
+#:
+#: CORRECTED 2026-08-04: this listed five tables and the stated reason was false
+#: for three of them. `chunk_run`, `keyset_range` and `load_run` DO carry
+#: `export_name` (checked against the live schema, not the comment), so they
+#: were scopable all along and this exclusion silently dropped three comparable
+#: tables from the parity claim. Found by the independent DuckDB cell, which
+#: filters on the actual column and consequently compares twelve tables where
+#: this one compared six. An exclusion is only as good as its reason, and this
+#: reason had gone stale without anything asking.
+UNSCOPED = {"chunk_task", "loaded_source_run"}
 
 
 def _psql(container: str, sql: str) -> str:
@@ -277,6 +287,25 @@ def verify_state_backend_parity(
         if key in a and key in b and a[key] != b[key]:
             problems.append(f"{key}: SQLite {a[key]} vs Postgres {b[key]}")
 
+    # An EMPTY comparison is not agreement. Both profiles empty — a run that
+    # recorded nothing on either backend, or two unreadable stores — makes
+    # `only_sq`/`only_pg` empty, the count loop iterate over nothing and the
+    # work-key loop find nothing, so `problems` stays empty and this cell used
+    # to report a clean parity over two blanks. The guard is on `pop_a` because
+    # the SQLite side is FRESH per run and scoped: if it did not populate the
+    # tables a batch export populates, the fixture is inert and no comparison
+    # happened.
+    if len(pop_a) < 3:
+        _failed(
+            led, "-", "-", "state_backend_parity", "-",
+            f"state-parity: the SQLite side populated only {sorted(pop_a)} — below the "
+            f"three tables a batch export writes (export_metrics, file_log, run_status). "
+            f"Two empty profiles match perfectly and prove nothing, so this is a failure, "
+            f"not agreement",
+            "nothing to compare",
+        )
+        return
+
     if problems:
         _failed(
             led, "-", "-", "state_backend_parity", "-",
@@ -284,6 +313,18 @@ def verify_state_backend_parity(
             "backends disagree",
         )
         return
+    # The SAME run, compared a SECOND time by a reader that shares nothing with
+    # either client above. Everything to this point was read by `sqlite3` on one
+    # side and `psql` on the other, so a surviving difference could be data OR
+    # rendering — and today's seed work proved that is not academic: a digest
+    # built with each engine's own concatenation disagreed across three engines
+    # whose data was byte-identical.
+    state_parity_duckdb.verify_state_parity_independent(
+        led, sqlite_db=db, pg_url=state_url, export=export,
+        # Each backend ran into its OWN directory; alias both so a destination
+        # column compares what rivet RECORDED, not where this cell put it.
+        path_aliases=(str(work / "sqlite"), str(work / "pg")),
+    )
     _passed(
         led, "-", "-", "state_backend_parity", "-",
         f"state-parity: one export recorded into BOTH backends agrees on the populated table set "
