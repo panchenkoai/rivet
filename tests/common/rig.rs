@@ -24,6 +24,8 @@ pub struct Rig {
     cdc_lines: Vec<String>,
     extra_lines: Vec<String>,
     dest_override: Option<PathBuf>,
+    /// Container-visible twin of `dest_override`, set by [`Rig::duckdb_oracle`].
+    oracle_container_dir: Option<String>,
     ckpt_override: Option<PathBuf>,
     dir: tempfile::TempDir,
 }
@@ -42,6 +44,7 @@ impl Rig {
             cdc_lines: Vec::new(),
             extra_lines: Vec::new(),
             dest_override: None,
+            oracle_container_dir: None,
             ckpt_override: None,
             dir: tempfile::tempdir().expect("rig tempdir"),
         }
@@ -316,6 +319,50 @@ impl Rig {
     pub fn run(&self) -> std::process::Output {
         let cfg = self.config_path();
         super::runner::run_rivet(&["run", "--config", cfg.to_str().unwrap()])
+    }
+
+    /// Put the destination under the shared bind mount so the DuckDB validator
+    /// container can read it, enabling [`Rig::assert_complete`].
+    ///
+    /// Needed because the rig's own tempdir is invisible inside the container.
+    /// Call it at construction; a test that does not need an independent decoder
+    /// should not pay the container round-trip.
+    pub fn duckdb_oracle(mut self) -> Self {
+        // The label MUST be unique per rig, not per table. Deriving it from
+        // `self.name` collided immediately: five Mongo tests all export a
+        // collection called `bench`, so they shared one directory, ran in
+        // parallel, and read each other's parquet — DuckDB reported 19000 rows /
+        // 14000 distinct where each expected 5000. `live_shared_workdir` also
+        // CLEARS the directory it hands back, so they were deleting each other's
+        // output as well. Loud, but only because the oracle is strict.
+        let (host, container) =
+            super::env::live_shared_workdir(&super::unique_name(&format!("rig_{}", self.name)));
+        self.dest_override = Some(host);
+        self.oracle_container_dir = Some(container);
+        self
+    }
+
+    /// Assert the destination holds exactly `expected` rows, all distinct on
+    /// `column` — read by DuckDB, which does NOT share rivet's parquet codec.
+    ///
+    /// `read_all_parts` / `total_parquet_rows` decode with the same crate rivet
+    /// encodes with, so a fault in that shared path cancels out and the claim
+    /// passes over corrupt output. This is the reader that does not.
+    ///
+    /// Requires [`Rig::duckdb_oracle`] at construction.
+    pub fn assert_complete(&self, column: &str, expected: i64, what: &str) {
+        let dir = self
+            .oracle_container_dir
+            .as_deref()
+            .expect("assert_complete needs Rig::duckdb_oracle() at construction");
+        super::duckdb::duckdb_assert_complete(dir, column, expected, what);
+    }
+
+    /// The container-visible destination path, for a bespoke DuckDB query.
+    pub fn oracle_dir(&self) -> &str {
+        self.oracle_container_dir
+            .as_deref()
+            .expect("oracle_dir needs Rig::duckdb_oracle() at construction")
     }
 
     /// Run and read every parquet part back — the canonical
