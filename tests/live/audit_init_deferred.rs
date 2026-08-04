@@ -53,12 +53,22 @@ fn init_mssql_single_table_emits_valid_config_that_passes_check() {
         export_count, 1,
         "single-table init must emit exactly 1 export; got {export_count}:\n{yaml}"
     );
-    // The `amount DECIMAL(12,2)` column (see dev/mssql/init.sql `dbo.orders`)
-    // must ride through with its declared precision/scale (catalog hint), so no
-    // unbounded-decimal REVIEW marker.
+    // A DECIMAL column must ride through with its declared precision/scale
+    // (catalog hint), so no unbounded-decimal REVIEW marker.
+    //
+    // Asserted against `price DECIMAL(10,2)` from the CANONICAL seed
+    // (`src/bin/seed/mssql.rs`), not `amount DECIMAL(12,2)` from
+    // `dev/mssql/init.sql`. Both used to create `dbo.orders`, with incompatible
+    // schemas and the seed doing a DROP+CREATE, so whichever ran last won — and
+    // this assertion was green only because nobody ran `seed --target mssql`.
+    // Nobody did, because `seed-release` named postgres and mysql and silently
+    // skipped SQL Server; fixing that coverage gap on 2026-08-04 is what
+    // surfaced the collision. `orders` now belongs to the seed alone (the
+    // init-time probe was renamed `dbo.planning_probe`), so this test depends
+    // on the fixture that every engine shares.
     assert!(
-        yaml.contains("amount: decimal(12,2)"),
-        "DECIMAL(12,2) must scaffold with its catalog precision/scale; got:\n{yaml}"
+        yaml.contains("price: decimal(10,2)"),
+        "DECIMAL(10,2) must scaffold with its catalog precision/scale; got:\n{yaml}"
     );
 
     // ── swap url_env → literal url so `rivet check` can connect ─────────────
