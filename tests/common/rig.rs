@@ -19,11 +19,14 @@ pub struct Rig {
     tables: Vec<String>,
     query: Option<String>,
     source_lines: Vec<String>,
-    mode: &'static str,
+    mode: String,
     format: &'static str,
     cdc_lines: Vec<String>,
     extra_lines: Vec<String>,
     dest_override: Option<PathBuf>,
+    /// When set, the source declares `url_env: <name>` INSTEAD of an inline
+    /// `url:`. See [`Rig::source_url_env`].
+    url_env: Option<String>,
     /// Additional exports rendered after the primary one. See [`Rig::also_export`].
     extra_exports: Vec<SecondaryExport>,
     /// Container-visible twin of `dest_override`, set by [`Rig::duckdb_oracle`].
@@ -57,11 +60,12 @@ impl Rig {
             tables: vec![table.to_string()],
             query: None,
             source_lines: Vec::new(),
-            mode: "full",
+            mode: "full".to_string(),
             format: "parquet",
             cdc_lines: Vec::new(),
             extra_lines: Vec::new(),
             dest_override: None,
+            url_env: None,
             extra_exports: Vec::new(),
             oracle_container_dir: None,
             ckpt_override: None,
@@ -71,7 +75,7 @@ impl Rig {
 
     pub fn mysql_cdc(table: &str) -> Self {
         let mut r = Self::new("mysql", super::env::MYSQL_CDC_URL, table);
-        r.mode = "cdc";
+        r.mode = "cdc".to_string();
         r.cdc_lines.push("until_current: true".into());
         r.cdc_lines.push("__CKPT__".into()); // resolved at render time
         r.cdc_lines
@@ -81,7 +85,7 @@ impl Rig {
 
     pub fn mssql_cdc(table: &str, capture_instance: &str) -> Self {
         let mut r = Self::new("mssql", super::env::MSSQL_CDC_URL, table);
-        r.mode = "cdc";
+        r.mode = "cdc".to_string();
         r.cdc_lines
             .push(format!("capture_instance: {capture_instance}"));
         r.cdc_lines.push("__CKPT__".into()); // resolved at render time
@@ -90,7 +94,7 @@ impl Rig {
 
     pub fn pg_cdc(table: &str, slot: &str) -> Self {
         let mut r = Self::new("postgres", super::env::POSTGRES_CDC_URL, table);
-        r.mode = "cdc";
+        r.mode = "cdc".to_string();
         r.cdc_lines.push("until_current: true".into());
         r.cdc_lines.push(format!("slot: {slot}"));
         r
@@ -126,7 +130,7 @@ impl Rig {
     /// `.source_url(&MongoTest::url(PORT, &db))`.
     pub fn mongo_cdc(table: &str) -> Self {
         let mut r = Self::new("mongo", super::env::MONGO_RS_URL, table);
-        r.mode = "cdc";
+        r.mode = "cdc".to_string();
         r.cdc_lines.push("until_current: true".into());
         r.cdc_lines.push("__CKPT__".into()); // resolved at render time
         r
@@ -134,8 +138,10 @@ impl Rig {
 
     /// Export mode (`full` / `incremental` / `chunked`); CDC constructors
     /// set `cdc`.
-    pub fn mode(mut self, mode: &'static str) -> Self {
-        self.mode = mode;
+    /// `String`, not `&'static str`: a mode derived at runtime is a real need —
+    /// `live_plan_apply.rs` builds one from a mode BLOCK shared across its tests.
+    pub fn mode(mut self, mode: &str) -> Self {
+        self.mode = mode.to_string();
         self
     }
 
@@ -189,6 +195,17 @@ impl Rig {
         self
     }
 
+    /// Declare the source URL through an ENV VAR (`url_env:`) instead of inline.
+    ///
+    /// Load-bearing for plan/apply round-trips, not a style choice: an inline URL
+    /// carries credentials, which are REDACTED into the plan artifact, so `rivet
+    /// apply` then cannot reconnect. Every plan/apply test therefore needs this
+    /// shape, which is why `live_plan_apply.rs` had its own config builder.
+    pub fn source_url_env(mut self, var: &str) -> Self {
+        self.url_env = Some(var.to_string());
+        self
+    }
+
     /// Declare a SECOND (third, …) export in the same config, with its own
     /// destination directory — reachable via [`Rig::out_dir_for`].
     ///
@@ -226,16 +243,26 @@ impl Rig {
     /// Run an ARBITRARY subcommand against this rig's config: `rivet <args…>
     /// --config <cfg>`.
     ///
+    /// NOT for `apply`, which takes a PLAN PATH rather than `--config` — use
+    /// `run_rivet_env` directly there. This method appends the config flag, so it
+    /// fits the subcommands that read one: `plan`, `check`, `validate`, `doctor`.
+    ///
     /// `run_args`/`run_args_env` hard-code the `run` subcommand, so a test for
     /// `check`, `validate`, `doctor` or `init` had no way through the rig and
     /// dropped to a raw `Command`. The config flag is appended, which clap
     /// accepts in any position.
     pub fn cli(&self, args: &[&str]) -> std::process::Output {
+        self.cli_env(args, &[])
+    }
+
+    /// [`Rig::cli`] with environment variables — needed wherever the config
+    /// declares `url_env:`, since the process must be able to resolve it.
+    pub fn cli_env(&self, args: &[&str], envs: &[(&str, &str)]) -> std::process::Output {
         let cfg = self.config_path();
         let mut all: Vec<&str> = args.to_vec();
         all.push("--config");
         all.push(cfg.to_str().unwrap());
-        super::runner::run_rivet_env(&all, &[])
+        super::runner::run_rivet_env(&all, envs)
     }
 
     /// Spawn `rivet run` and hand back the LIVE child, output discarded.
@@ -368,20 +395,29 @@ impl Rig {
             .map(|l| format!("    {l}\n"))
             .collect();
         let source = if self.source_lines.is_empty() {
-            format!(
-                "source: {{ type: {}, url: \"{}\" }}",
-                self.source_type, self.source_url
-            )
+            match &self.url_env {
+                Some(v) => format!("source: {{ type: {}, url_env: {v} }}", self.source_type),
+                None => format!(
+                    "source: {{ type: {}, url: \"{}\" }}",
+                    self.source_type, self.source_url
+                ),
+            }
         } else {
             let extra: String = self
                 .source_lines
                 .iter()
                 .map(|l| format!("  {l}\n"))
                 .collect();
-            format!(
-                "source:\n  type: {}\n  url: \"{}\"\n{extra}",
-                self.source_type, self.source_url
-            )
+            match &self.url_env {
+                Some(v) => format!(
+                    "source:\n  type: {}\n  url_env: {v}\n{extra}",
+                    self.source_type
+                ),
+                None => format!(
+                    "source:\n  type: {}\n  url: \"{}\"\n{extra}",
+                    self.source_type, self.source_url
+                ),
+            }
             .trim_end()
             .to_string()
         };
@@ -709,6 +745,48 @@ impl CdcScenario {
 #[cfg(test)]
 mod rig_render_goldens {
     use super::*;
+
+    /// `url_env:` replaces the inline `url:` in both source-render shapes.
+    ///
+    /// Pins the affordance `live_plan_apply.rs` needed. Not cosmetic: an inline
+    /// URL carries credentials, which are redacted into the plan artifact, so a
+    /// subsequent `rivet apply` cannot reconnect. Every plan/apply test uses this
+    /// shape — which is why that file had its own config builder rather than a
+    /// stray preference for one.
+    #[test]
+    fn source_url_env_replaces_the_inline_url_in_both_render_shapes() {
+        // Inline shape (postgres: no extra source lines).
+        let flat = Rig::pg_batch("t")
+            .source_url_env("DATABASE_URL")
+            .dest_path("/tmp/o".into())
+            .yaml();
+        assert!(
+            flat.contains("source: { type: postgres, url_env: DATABASE_URL }"),
+            "inline source must carry url_env:\n{flat}"
+        );
+        assert!(
+            !flat.contains("url: \""),
+            "…and must NOT also emit an inline url, or the credential is back:\n{flat}"
+        );
+
+        // Multi-line shape (mssql: carries tls lines).
+        let nested = Rig::mssql_batch("t")
+            .source_url_env("MSSQL_URL")
+            .dest_path("/tmp/o".into())
+            .yaml();
+        assert!(
+            nested.contains("url_env: MSSQL_URL"),
+            "multi-line source must carry url_env:\n{nested}"
+        );
+        assert!(
+            !nested.contains("url: \""),
+            "…and must not keep the inline url beside it:\n{nested}"
+        );
+        assert!(
+            nested.contains("accept_invalid_certs: true"),
+            "the engine's own source lines must survive:\n{nested}"
+        );
+    }
 
     /// A second export renders as its own block with its OWN destination.
     ///
