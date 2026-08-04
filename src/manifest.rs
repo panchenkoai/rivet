@@ -809,6 +809,18 @@ fn default_manifest_mode() -> String {
 /// replaces its own manifest by design; CDC extends its own). A missing or
 /// unreadable manifest is not this guard's business — corruption surfaces in
 /// `rivet validate`, and first runs must not require a read round-trip.
+/// The `schema_fingerprint` a manifest carries when NO schema evidence was
+/// available for the run — a last-resort signal to the reader, deliberately
+/// distinct from any real xxh3 digest.
+///
+/// One constant because it has TWO producers (`commit::record_part`'s checksum
+/// fallback, `finalize_manifest`'s last resort) and a CONSUMER
+/// (`resume_m8`, which refuses to hydrate it as if it were evidence). All three
+/// held their own copy of the literal, so drifting any one of them would have
+/// made the consumer treat "evidence unavailable" AS evidence, silently, on
+/// every resume.
+pub const SCHEMA_FINGERPRINT_UNAVAILABLE: &str = "xxh3:0000000000000000";
+
 pub fn guard_manifest_mode(
     dest: &dyn crate::destination::Destination,
     new_mode: &str,

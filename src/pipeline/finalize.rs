@@ -199,7 +199,7 @@ pub(super) fn finalize_manifest(
                 .flatten()
                 .map(|cols| crate::state::schema_fingerprint(&cols))
         })
-        .unwrap_or_else(|| "xxh3:0000000000000000".to_string());
+        .unwrap_or_else(|| crate::manifest::SCHEMA_FINGERPRINT_UNAVAILABLE.to_string());
 
     let source_engine = match plan.source.source_type {
         crate::config::SourceType::Postgres => "postgres",

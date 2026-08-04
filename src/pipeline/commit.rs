@@ -182,7 +182,10 @@ pub(crate) fn write_part_file(
     let (fingerprint, md5) =
         manifest_writer::compute_part_checksums(tmp_path).unwrap_or_else(|e| {
             log::warn!("part checksums failed for '{file_name}' (not fatal): {e:#}");
-            ("xxh3:0000000000000000".to_string(), String::new())
+            (
+                crate::manifest::SCHEMA_FINGERPRINT_UNAVAILABLE.to_string(),
+                String::new(),
+            )
         });
     // Fail-fast transit check (ADR-0001 I1): when the store reported its own
     // checksum, it computed it from the bytes it received — a mismatch with our

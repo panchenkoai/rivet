@@ -1626,25 +1626,34 @@ fn summary_schema_fingerprint_flows_into_manifest_via_builder() {
     assert_ne!(parsed.schema_fingerprint, "xxh3:0000000000000000");
 }
 
+/// The "schema evidence unavailable" sentinel must keep its exact shape, because
+/// consumers OUTSIDE rivet detect the condition by that literal string.
+///
+/// This used to declare its own copy of the literal and then assert things about
+/// that copy — so it held both sides of the comparison and only editing the test
+/// could turn it red. It now reads the production constant, so changing the
+/// sentinel in `src/manifest.rs` fails here.
+///
+/// The bigger half of the fix is not a test at all. The literal had THREE
+/// independent production copies: two producers (`commit::record_part`'s
+/// checksum fallback, `finalize_manifest`'s last resort) and one CONSUMER
+/// (`resume_m8`, which refuses to hydrate the placeholder as if it were real
+/// evidence). Drifting any one of them would have made a resumed run treat
+/// "evidence unavailable" AS evidence, silently. They now share one constant, so
+/// that agreement is structural and needs no test to hold it.
 #[test]
-fn missing_summary_fingerprint_lands_as_placeholder_not_panic() {
-    // Resume-from-state scenarios may reconstruct a `RunSummary` that never
-    // saw a live schema.  finalize_manifest's contract is then: try state
-    // lookup, finally use the placeholder.  This test just pins the sentinel
-    // shape (16-hex zeros) so consumers can detect "schema evidence missing"
-    // explicitly instead of reading garbage.
-    let placeholder = "xxh3:0000000000000000";
-    assert!(placeholder.starts_with("xxh3:"));
-    assert_eq!(placeholder.len(), "xxh3:".len() + 16);
-    assert_eq!(
-        placeholder
-            .strip_prefix("xxh3:")
-            .unwrap()
-            .chars()
-            .filter(|c| *c == '0')
-            .count(),
-        16,
-        "placeholder is 16 zeros — distinct from any plausible real fingerprint"
+fn the_unavailable_fingerprint_sentinel_keeps_its_detectable_shape() {
+    let s = rivet::manifest::SCHEMA_FINGERPRINT_UNAVAILABLE;
+    assert!(
+        s.starts_with("xxh3:"),
+        "external readers match on the algorithm prefix: {s}"
+    );
+    let digest = s.strip_prefix("xxh3:").expect("prefix checked above");
+    assert_eq!(digest.len(), 16, "an xxh3 digest is 16 hex chars: {s}");
+    assert!(
+        digest.chars().all(|c| c == '0'),
+        "all-zero is what makes it distinguishable from a real digest — any \
+         other value is indistinguishable from evidence: {s}"
     );
 }
 

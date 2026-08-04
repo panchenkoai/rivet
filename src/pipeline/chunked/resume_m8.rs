@@ -421,7 +421,7 @@ pub(crate) fn apply_m8_resume_decisions(
     // already produced.  Since this resume reuses the same run_id we just
     // verified, the prior fingerprint is the authoritative one.
     if summary.schema_fingerprint.is_none()
-        && manifest.schema_fingerprint != "xxh3:0000000000000000"
+        && manifest.schema_fingerprint != crate::manifest::SCHEMA_FINGERPRINT_UNAVAILABLE
     {
         summary.schema_fingerprint = Some(manifest.schema_fingerprint.clone());
     }
