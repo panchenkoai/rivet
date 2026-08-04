@@ -39,6 +39,12 @@ grid:
 # Cell is per-ENGINE (uniform across that engine's gridded versions); a version-specific
 # divergence would split into its own note.
 scenarios:
+  - id: blessed_path
+    what: "the full chain in ONE traversal: init -> doctor -> check -> plan -> apply -> validate, one cell per stage, asserting every artifact (config, plan.json, parquet, manifest.json, _SUCCESS, export_metrics/file_log/run_status) with DuckDB as the independent oracle for rows and file count. Per-stage coverage existed everywhere; no test drove three of the five subcommands in one body, and both defects found 2026-08-04 (apply's empty config path, CDC's unexpanded {date}) lived in that handoff gap."
+    postgres: test
+    mysql:    test
+    mssql:    test
+    mongo:    test
   - id: verdicts
     what: "init -> the strategy per table matches the golden (keyset/full/range/name-trap), zero phantom heavy-chunk."
     postgres: test
