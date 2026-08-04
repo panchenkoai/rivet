@@ -523,10 +523,30 @@ pub(crate) fn apply_m8_resume_decisions(
         quarantine_move(&*dest, key, run_id, &plan.export_name, &mut stats);
     }
 
+    // The manifest-EXISTS path needs the same reconstruction as the no-manifest
+    // one above, and used to be the only caller that skipped it.
+    //
+    // A chunk-checkpoint resume ADOPTS the crashed run's id, so `file_log`
+    // accumulates every attempt's parts. When attempt 1 wrote `manifest.json` and
+    // attempt 2 crashed AFTER committing more chunks, the manifest this preamble
+    // hydrates from is attempt 1's — stale — and attempt 2's durable parts appear
+    // nowhere in `summary.manifest_parts`. Finalize then writes a manifest that
+    // omits them: the rows are on the destination but invisible to every
+    // manifest-authoritative reader, which is the same silent loss the round-4 fix
+    // closed for the no-manifest case.
+    //
+    // The quarantine loop just above already consults `file_log` to avoid MOVING
+    // those parts — it knew they were durable and still left them undeclared.
+    //
+    // Safe to call unconditionally: the rehydrator skips any path already present
+    // in `summary.manifest_parts`, so parts hydrated from the manifest are not
+    // duplicated, and it admits only the SURVIVING attempt of each completed chunk.
+    let rehydrated = rehydrate_manifest_parts_from_file_log(state, run_id, summary)?;
+
     log::info!(
         "M8 resume preamble: export '{}' run_id '{}' — {} skipped, {} reset for rewrite, \
          {} reset for quarantine, {} quarantined ({} move failure(s)), {} orphan part(s), \
-         {} untracked surplus object(s)",
+         {} untracked surplus object(s), {} part(s) rehydrated from file_log",
         plan.export_name,
         run_id,
         stats.skipped,
@@ -536,6 +556,7 @@ pub(crate) fn apply_m8_resume_decisions(
         stats.quarantine_move_failures,
         stats.orphan_parts,
         untracked_surplus,
+        rehydrated,
     );
 
     Ok(stats)
@@ -1266,6 +1287,89 @@ mod tests {
     // manifest was classified untracked surplus and quarantine-MOVED — dropping
     // the exact rows finalize rehydrates from file_log (silent loss). The guard
     // must skip any untracked object file_log records for the run.
+    /// A STALE destination manifest must not hide a later attempt's durable parts.
+    ///
+    /// A chunk-checkpoint resume ADOPTS the crashed run's id, so `file_log`
+    /// accumulates every attempt. Attempt 1 finalizes a manifest listing chunk 0;
+    /// attempt 2 completes chunk 1, commits its part, and crashes before
+    /// re-finalizing. The preamble hydrated `summary.manifest_parts` from attempt
+    /// 1's manifest and rehydrated from `file_log` ONLY on the no-manifest branch,
+    /// so chunk 1's part was never declared — on the destination, invisible to
+    /// every manifest-authoritative reader. The same silent loss round-4 closed for
+    /// the no-manifest case, left open for the case a manifest exists.
+    ///
+    /// The sibling test above proves the quarantine loop already CONSULTS file_log
+    /// for these parts (it declines to move them). Knowing they are durable and
+    /// still not declaring them is the whole defect, which is why not-quarantined
+    /// is not a sufficient assertion.
+    ///
+    /// Part names come from the real writer, never typed by hand.
+    #[test]
+    fn a_stale_manifest_must_not_hide_a_later_attempts_committed_part() {
+        let run_id = "m8stale";
+        let dir = tempfile::tempdir().unwrap();
+
+        let p0 = super::super::chunk_part_filename("orders", 0, "parquet");
+        let p1 = super::super::chunk_part_filename("orders", 1, "parquet");
+        std::fs::write(dir.path().join(&p0), b"AAAAA").unwrap();
+        std::fs::write(dir.path().join(&p1), b"BBBBBBB").unwrap();
+
+        // Attempt 1's manifest — it knows about chunk 0 only.
+        let mut parts = vec![m8_part(&p0, 10, 5)];
+        parts[0].part_id = 1;
+        std::fs::write(
+            dir.path().join(MANIFEST_FILENAME),
+            serde_json::to_vec_pretty(&m8_manifest(run_id, parts)).unwrap(),
+        )
+        .unwrap();
+
+        let state_dir = tempfile::tempdir().unwrap();
+        let state =
+            crate::state::StateStore::open_at_path(&state_dir.path().join("state.db")).unwrap();
+        state
+            .insert_chunk_tasks(run_id, &[(0, 10), (11, 20)])
+            .unwrap();
+        for (idx, name) in [(0i64, &p0), (1, &p1)] {
+            state.claim_next_chunk_task(run_id).unwrap();
+            state
+                .complete_chunk_task(run_id, idx, 10, Some(name.as_str()))
+                .unwrap();
+            state
+                .record_file(FilePart {
+                    run_id,
+                    export_name: "orders",
+                    file_name: name.as_str(),
+                    rows: 10,
+                    bytes: if idx == 0 { 5 } else { 7 },
+                    format: "parquet",
+                    compression: Some("zstd"),
+                })
+                .unwrap();
+        }
+
+        let plan = m8_plan(dir.path());
+        let mut summary =
+            crate::pipeline::summary::RunSummary::stub_for_testing(run_id, String::from("orders"));
+        apply_m8_resume_decisions(&state, run_id, &plan, &mut summary).unwrap();
+
+        let declared: Vec<&str> = summary
+            .manifest_parts
+            .iter()
+            .map(|p| p.path.as_str())
+            .collect();
+        assert!(
+            declared.contains(&p1.as_str()),
+            "chunk 1 completed and its part is durable per file_log, but the stale \
+             manifest omits it — finalize would ship a manifest without it, so the rows \
+             exist on the destination and no manifest reader can see them. declared: {declared:?}"
+        );
+        assert_eq!(
+            declared.iter().filter(|d| **d == p1.as_str()).count(),
+            1,
+            "and exactly once — rehydrating must not double-declare: {declared:?}"
+        );
+    }
+
     #[test]
     fn m8_does_not_quarantine_a_part_recorded_in_the_state_file_log() {
         let run_id = "m8run";
