@@ -223,6 +223,25 @@ struct Poll<'a> {
     from_is_pin: bool,
 }
 
+/// Move the read cursor to `to` — which CONSUMES the pin.
+///
+/// A pin is a guess written by `ensure_anchor` before anything was read, and
+/// `fill_sql` may floor it to the capture instance's start: nothing was captured,
+/// so nothing can be lost. Once a poll has consumed real changes, `from_lsn` is a
+/// position we REACHED, and flooring that is precisely the silent skip the
+/// retention THROW exists to prevent.
+///
+/// The flag used to be set once in the constructor and never cleared, so from the
+/// SECOND poll onward a mid-run retention purge was floored instead of thrown.
+/// Note the shape of that bug: `fill_sql` was correct on every input it was given
+/// — its own unit test feeds `from_is_pin` by hand and passes either way. The
+/// defect lived in the SUPPLIER. Hence this is a function both production and the
+/// test call, rather than an assignment only a live SQL Server could reach.
+fn advance_cursor(from_lsn: &mut Option<String>, from_is_pin: &mut bool, to: String) {
+    *from_lsn = Some(to);
+    *from_is_pin = false;
+}
+
 fn fill_sql(p: Poll<'_>) -> String {
     let Poll {
         ci,
@@ -619,8 +638,9 @@ impl MssqlChangeStream {
         }
         match max_lsn {
             // Advance the internal cursor to @to; the next poll reads past it.
-            Some(l) => self.from_lsn = Some(l),
-            // No rows ⇒ the window is drained up to the current max LSN.
+            Some(l) => advance_cursor(&mut self.from_lsn, &mut self.from_is_pin, l),
+            // No rows ⇒ the window is drained up to the current max LSN. The
+            // position did not move, so a pin is still a pin.
             None => self.exhausted = true,
         }
         Ok(())
@@ -998,6 +1018,47 @@ mod tests {
         );
     }
 
+    /// The floor is only ever right for an UNCONSUMED pin, and `fill_sql` cannot
+    /// tell — it believes whatever `from_is_pin` it is handed. This pins the
+    /// supplier: the first advance must consume the pin, so poll 2 reaches the
+    /// retention THROW instead of being floored past a purged span.
+    ///
+    /// Deliberately NOT a `fill_sql` test. That function's own matrix hand-sets
+    /// `from_is_pin` and is correct on both values — it stayed green for the whole
+    /// life of the bug, because the wrong value came from the layer above it.
+    #[test]
+    fn the_first_advance_consumes_the_pin_so_a_purge_is_thrown_not_floored() {
+        let mut lsn = None;
+        let mut is_pin = true;
+
+        advance_cursor(&mut lsn, &mut is_pin, "0000abcd".to_string());
+        assert_eq!(lsn.as_deref(), Some("0000abcd"), "cursor must move");
+        assert!(
+            !is_pin,
+            "consuming real changes turns the anchor into a REACHED position — \
+             leaving it pinned makes fill_sql floor a mid-run retention purge, \
+             which is the silent skip the THROW exists to prevent"
+        );
+
+        // And the floor really does disappear from the SQL the next poll builds —
+        // the observable the stream hands downstream.
+        let after = fill_sql(Poll {
+            ci: "dbo_orders",
+            from_expr: "sys.fn_cdc_increment_lsn(0x0000abcd)",
+            batch: 500,
+            bound: None,
+            from_is_pin: is_pin,
+        });
+        assert!(
+            !after.contains("SET @from = @min"),
+            "a position we reached must not be floored: {after}"
+        );
+        assert!(
+            after.contains("THROW 51000"),
+            "…it must reach the retention guard instead: {after}"
+        );
+    }
+
     /// A resume position that PREDATES the capture instance is floored, not
     /// refused — and the refusal survives for the case that is real loss.
     ///
@@ -1005,6 +1066,10 @@ mod tests {
     ///
     /// A shape assertion on generated SQL is a weak instrument, so this asserts
     /// only what the server's behaviour turns on, and says what it cannot see.
+    /// In particular it hand-sets `from_is_pin` and so cannot see whether the
+    /// STREAM still deserves that flag — the gap
+    /// `the_first_advance_consumes_the_pin_so_a_purge_is_thrown_not_floored`
+    /// exists to close.
     ///
     /// The distinction is not cosmetic. `@from < @min` has two causes that no
     /// LSN comparison can separate, because the cleanup job ADVANCES
