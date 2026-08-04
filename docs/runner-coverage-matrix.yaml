@@ -20,6 +20,32 @@
 # durability ordering) that have no such telltale; splitting the collapsed families into
 # real per-variant columns is a tracked follow-up.
 #
+# PER-VARIANT VERIFICATION PASS, 2026-08-04. The follow-up above was DISCHARGED as an
+# audit rather than as new columns: all EIGHT commit loops were read individually
+# against all thirteen scenarios below (single; chunked_{sequential,parallel};
+# {sequential,parallel}_checkpoint; keyset_{sequential,parallel}; mongo_parallel), and
+# every claimed absence was then handed to an independent agent instructed to REFUTE it.
+# Result: no collapsed family was hiding a divergence — zero new gaps. The columns stayed
+# at four because 96 cells of prose would restate one fact (the families agree today)
+# while adding a second ledger to keep in sync; the pass is recorded here instead.
+#
+# Three findings that are worth keeping, none of them a gap:
+#   * shape_drift_warn reads `absent` on six variants if you ask "is it applied", and
+#     `na` if you ask "should it be" — the `na` cells below are the honest answer, but
+#     note the distinction is DESIGN, not structure. It is the one row where a future
+#     reader could mistake the two.
+#   * durable_manifest_before_advance on keyset_parallel LOOKS absent at
+#     keyset.rs:716-722 (st.update before the manifest) and is not: the anchor+ranges
+#     persist first (keyset.rs:375-377), resume ignores the cursor (keyset.rs:323), and
+#     job.rs:1091-1099 keeps the anchor across a manifest gap. Cost one refutation pass
+#     to establish; recorded so it does not cost another.
+#   * files_committed_on_abort on mongo_parallel is genuinely not applied — the drain
+#     bails at `let out = res?` (mongo_parallel.rs:106) ABOVE the record_part calls
+#     (:121-131). Harm is bounded to the worker-0 case (a later worker's failure leaves
+#     files_committed > 0, so decide_export_retry bails correctly) and to ORPHANS rather
+#     than duplicates, because the stamp is re-minted per invocation (:64). That is the
+#     defect the `na` cell below already names as tracked-separately, now measured.
+#
 # Round-8 proved this class is real AND recurring: `on_schema_drift: fail` returned
 # exit 0 on keyset + parallel-Mongo because the drift gate lived only in single/chunked.
 # Building this ledger then surfaced a bigger one — value-checksum Form B was absent on
