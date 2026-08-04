@@ -112,6 +112,58 @@ fn mongo_parallel_export_records_form_b_checksum() {
     );
 }
 
+/// `files_committed` is `decide_export_retry`'s ONLY input, and `commit::record_part`
+/// is the sole production site that raises it. `run_mongo_parallel` used to drain
+/// with `let out = res?` ABOVE its `record_part` calls, so ONE worker's failure
+/// abandoned both its own durable pages and every LATER worker's — the guard read
+/// ZERO while parquet sat on the destination, and a transient failure retried the
+/// whole export over live data.
+///
+/// The Mongo twin of `parallel_keyset_worker_error_still_counts_the_durable_parts_postgres`.
+/// It needs an error that RETURNS, not a panic: a crashed run never reaches the
+/// drain at all, so the entire `RIVET_TEST_PANIC_AT` vocabulary is structurally
+/// blind to this — hence `RIVET_TEST_ERROR_AT=mongo_parallel_worker:0`.
+///
+/// Worker 0 is the injection point on purpose. It fails before writing anything,
+/// so its own contribution is zero and the assertion turns purely on whether
+/// workers 1..3 — which DID write — are counted. Pre-fix that was 0 of them.
+///
+/// The oracle is the LEDGER, not the files: raw parquet under a failed prefix is
+/// `gc_orphans` debris, not evidence about what the run reported.
+#[test]
+#[ignore = "live: requires docker compose up -d mongo"]
+fn mongo_parallel_worker_error_still_counts_the_durable_parts() {
+    require_alive(LiveService::Mongo);
+    let db = unique_name("mwcnt");
+    MongoTest::connect(PORT, &db).seed_int_id("bench", 4000);
+    let rig = batch(&db, "bench")
+        .mongo("page_size: 500")
+        .export_line("parallel: 4");
+    let out = rig.run_with_env("RIVET_TEST_ERROR_AT", "mongo_parallel_worker:0");
+    assert!(
+        !out.status.success(),
+        "a worker mid-range error must fail the run"
+    );
+
+    // The surviving workers DID write parquet — the premise of the whole test.
+    let on_disk = files_with_extension(&rig.out_dir(), "parquet").len();
+    assert!(
+        on_disk > 0,
+        "fixture is inert: the surviving workers wrote no parts, so there is \
+         nothing for the retry guard to protect"
+    );
+
+    // …and the run must SAY so. This is the assertion that goes RED pre-fix.
+    let sdb = StateDb::next_to_config(&rig.config_path());
+    let run_id = sdb.latest_run_id(rig.export_name());
+    assert_eq!(
+        sdb.metrics_row(&run_id).files_committed,
+        Some(on_disk as i64),
+        "a failed parallel-Mongo run must count the parts it left durable \
+         ({on_disk} on disk) — the retry guard reads this and nothing else"
+    );
+}
+
 /// Cross-shape manifest guard on the MONGO-PARALLEL runner: a batch parallel
 /// export must refuse to overwrite a prior CDC manifest at the same prefix.
 /// Proves the mongo_parallel column of the runner-coverage matrix — the last
