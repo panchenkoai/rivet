@@ -44,17 +44,16 @@ fn run_rivet_crash(
     export_name: &str,
     crash_at: &str,
 ) -> std::process::Output {
-    let out = std::process::Command::new(RIVET_BIN)
-        .args([
+    let out = run_rivet_env(
+        &[
             "run",
             "--config",
             cfg_path.to_str().unwrap(),
             "--export",
             export_name,
-        ])
-        .env("RIVET_TEST_PANIC_AT", crash_at)
-        .output()
-        .expect("spawn rivet");
+        ],
+        &[("RIVET_TEST_PANIC_AT", crash_at)],
+    );
     assert!(
         !out.status.success(),
         "run with RIVET_TEST_PANIC_AT='{crash_at}' must exit non-zero; stderr:\n{}",
@@ -161,16 +160,13 @@ fn crash_after_source_read_leaves_state_completely_clean() {
     // the panic unwinds — either way, the resume logic does not depend on it.
 
     // Recovery: re-run without the crash.  Full row count must surface.
-    let rec = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            &export,
-        ])
-        .output()
-        .expect("spawn rivet");
+    let rec = run_rivet(&[
+        "run",
+        "--config",
+        cfg.to_str().unwrap(),
+        "--export",
+        &export,
+    ]);
     assert!(rec.status.success(), "recovery run must succeed");
     assert_eq!(
         files_with_extension(out.path(), "parquet").len(),
@@ -211,16 +207,13 @@ fn crash_after_file_write_leaves_file_but_no_manifest_or_cursor() {
     // No sleep: parts and run_ids are millisecond-stamped (`%3f`), so
     // back-to-back sub-second runs must not collide — sleeping here would
     // mask exactly that regression (matrix audit: sleep-masked class).
-    let rec = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            &export,
-        ])
-        .output()
-        .expect("spawn rivet");
+    let rec = run_rivet(&[
+        "run",
+        "--config",
+        cfg.to_str().unwrap(),
+        "--export",
+        &export,
+    ]);
     assert!(rec.status.success());
 
     // Post-recovery: manifest has one entry for the recovery run, cursor is
@@ -281,16 +274,13 @@ fn crash_after_manifest_update_leaves_file_and_manifest_but_no_cursor() {
     // No sleep: parts and run_ids are millisecond-stamped (`%3f`), so
     // back-to-back sub-second runs must not collide — sleeping here would
     // mask exactly that regression (matrix audit: sleep-masked class).
-    let rec = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            &export,
-        ])
-        .output()
-        .expect("spawn rivet");
+    let rec = run_rivet(&[
+        "run",
+        "--config",
+        cfg.to_str().unwrap(),
+        "--export",
+        &export,
+    ]);
     assert!(rec.status.success());
     assert_eq!(manifest_count(&cfg, &export), 2);
     assert!(cursor_value(&cfg, &export).is_some());
@@ -340,16 +330,13 @@ fn crash_after_cursor_commit_is_recoverable_with_full_state() {
     // No sleep: parts and run_ids are millisecond-stamped (`%3f`), so
     // back-to-back sub-second runs must not collide — sleeping here would
     // mask exactly that regression (matrix audit: sleep-masked class).
-    let rec = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            &export,
-        ])
-        .output()
-        .expect("spawn rivet");
+    let rec = run_rivet(&[
+        "run",
+        "--config",
+        cfg.to_str().unwrap(),
+        "--export",
+        &export,
+    ]);
     assert!(rec.status.success());
 
     assert_eq!(
@@ -397,16 +384,13 @@ fn crash_after_cursor_commit_is_recoverable_via_a_manifest_driven_read() {
              SELECT g, now() + (interval '1 hour') * g FROM generate_series(7, 9) g;"
         ))
         .unwrap();
-    let rec = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            &export,
-        ])
-        .output()
-        .expect("spawn rivet");
+    let rec = run_rivet(&[
+        "run",
+        "--config",
+        cfg.to_str().unwrap(),
+        "--export",
+        &export,
+    ]);
     assert!(
         rec.status.success(),
         "recovery run must succeed: {}",
@@ -512,16 +496,15 @@ fn parallel_processes_recovers_from_child_crash_at_each_boundary() {
 
         // Crash the child mid-write-cycle through the subprocess engine — the env
         // is inherited by the spawned child, which runs the in-process write path.
-        let crashed = std::process::Command::new(RIVET_BIN)
-            .args([
+        let crashed = run_rivet_env(
+            &[
                 "run",
                 "--config",
                 cfg.to_str().unwrap(),
                 "--parallel-export-processes",
-            ])
-            .env("RIVET_TEST_PANIC_AT", crash_at)
-            .output()
-            .expect("spawn rivet --parallel-export-processes");
+            ],
+            &[("RIVET_TEST_PANIC_AT", crash_at)],
+        );
         assert!(
             !crashed.status.success(),
             "{crash_at}: the parent must report the child crash (non-zero); stderr:\n{}",
@@ -529,15 +512,12 @@ fn parallel_processes_recovers_from_child_crash_at_each_boundary() {
         );
 
         // Recover via a clean subprocess rerun.
-        let rec = std::process::Command::new(RIVET_BIN)
-            .args([
-                "run",
-                "--config",
-                cfg.to_str().unwrap(),
-                "--parallel-export-processes",
-            ])
-            .output()
-            .expect("spawn rivet recovery");
+        let rec = run_rivet(&[
+            "run",
+            "--config",
+            cfg.to_str().unwrap(),
+            "--parallel-export-processes",
+        ]);
         assert!(
             rec.status.success(),
             "{crash_at}: subprocess rerun must recover; stderr:\n{}",

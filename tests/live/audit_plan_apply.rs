@@ -17,7 +17,7 @@
 //!
 //! Harness mirrors `tests/live_plan_apply.rs` exactly: `mod common; use
 //! common::*;`, `#[ignore = "live: postgres"]`, drive the real binary via
-//! `std::process::Command::new(RIVET_BIN)`, assert on exit code + output files.
+//! `run_rivet` / `run_rivet_env`, assert on exit code + output files.
 
 use crate::common::*;
 
@@ -150,8 +150,8 @@ exports:
     let plan_path = plan_dir.path().join("plan.json");
 
     // No --export flag → plan iterates ALL exports in the config.
-    let plan_out = std::process::Command::new(RIVET_BIN)
-        .args([
+    let plan_out = run_rivet_env(
+        &[
             "plan",
             "--config",
             cfg.to_str().unwrap(),
@@ -159,10 +159,9 @@ exports:
             "json",
             "--output",
             plan_path.to_str().unwrap(),
-        ])
-        .env("DATABASE_URL", POSTGRES_URL)
-        .output()
-        .expect("spawn rivet plan");
+        ],
+        &[("DATABASE_URL", POSTGRES_URL)],
+    );
 
     assert!(
         plan_out.status.success(),
@@ -219,8 +218,8 @@ exports:
     let cfg = write_config(&cfg_dir, &yaml);
     let plan_path = cfg_dir.path().join("plan.json");
 
-    let plan_out = std::process::Command::new(RIVET_BIN)
-        .args([
+    let plan_out = run_rivet_env(
+        &[
             "plan",
             "--config",
             cfg.to_str().unwrap(),
@@ -230,10 +229,9 @@ exports:
             "json",
             "--output",
             plan_path.to_str().unwrap(),
-        ])
-        .env("DATABASE_URL", POSTGRES_URL)
-        .output()
-        .expect("spawn rivet plan");
+        ],
+        &[("DATABASE_URL", POSTGRES_URL)],
+    );
     assert!(
         plan_out.status.success(),
         "rivet plan must exit 0; stderr:\n{}",
@@ -257,11 +255,10 @@ exports:
     let tampered_path = cfg_dir.path().join("tampered_plan.json");
     std::fs::write(&tampered_path, &tampered).expect("write tampered plan");
 
-    let apply_out = std::process::Command::new(RIVET_BIN)
-        .args(["apply", tampered_path.to_str().unwrap()])
-        .env("DATABASE_URL", POSTGRES_URL)
-        .output()
-        .expect("spawn rivet apply");
+    let apply_out = run_rivet_env(
+        &["apply", tampered_path.to_str().unwrap()],
+        &[("DATABASE_URL", POSTGRES_URL)],
+    );
 
     // If apply DID run (exit 0), surface which table it exported so the failure
     // message names the wrong value: a users export under the orders name is
@@ -329,8 +326,8 @@ exports:
     let cfg = write_config(&cfg_dir, &yaml);
     let plan_path = cfg_dir.path().join("plan.json");
 
-    let plan_out = std::process::Command::new(RIVET_BIN)
-        .args([
+    let plan_out = run_rivet_env(
+        &[
             "plan",
             "--config",
             cfg.to_str().unwrap(),
@@ -340,10 +337,9 @@ exports:
             "json",
             "--output",
             plan_path.to_str().unwrap(),
-        ])
-        .env("DATABASE_URL", POSTGRES_URL)
-        .output()
-        .expect("spawn rivet plan");
+        ],
+        &[("DATABASE_URL", POSTGRES_URL)],
+    );
     assert!(
         plan_out.status.success(),
         "rivet plan must exit 0; stderr:\n{}",
@@ -353,11 +349,10 @@ exports:
     // Block the manifest write: a directory cannot be replaced by a file rename.
     std::fs::create_dir_all(out_dir.path().join("manifest.json")).expect("block manifest.json");
 
-    let apply_out = std::process::Command::new(RIVET_BIN)
-        .args(["apply", plan_path.to_str().unwrap()])
-        .env("DATABASE_URL", POSTGRES_URL)
-        .output()
-        .expect("spawn rivet apply");
+    let apply_out = run_rivet_env(
+        &["apply", plan_path.to_str().unwrap()],
+        &[("DATABASE_URL", POSTGRES_URL)],
+    );
     let stderr = String::from_utf8_lossy(&apply_out.stderr).into_owned();
 
     // The fixture must not be inert: if no part landed, the run failed for an

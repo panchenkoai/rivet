@@ -268,17 +268,16 @@ exports:
 
     // Crash mid-run, after chunk 1's file is written but before it commits →
     // chunk 1 re-runs on resume (at-least-once duplicate part).
-    let crash = std::process::Command::new(RIVET_BIN)
-        .args([
+    let crash = run_rivet_env(
+        &[
             "run",
             "--config",
             cfg.to_str().unwrap(),
             "--export",
             &export,
-        ])
-        .env("RIVET_TEST_PANIC_AT", "after_chunk_file:1")
-        .output()
-        .expect("spawn rivet");
+        ],
+        &[("RIVET_TEST_PANIC_AT", "after_chunk_file:1")],
+    );
     assert!(
         !crash.status.success(),
         "crash run must exit non-zero; stderr:\n{}",
@@ -286,17 +285,14 @@ exports:
     );
     std::thread::sleep(std::time::Duration::from_millis(1100));
 
-    let resume = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            &export,
-            "--resume",
-        ])
-        .output()
-        .expect("spawn rivet resume");
+    let resume = run_rivet(&[
+        "run",
+        "--config",
+        cfg.to_str().unwrap(),
+        "--export",
+        &export,
+        "--resume",
+    ]);
     assert!(
         resume.status.success(),
         "--resume must succeed; stderr:\n{}",
@@ -421,11 +417,17 @@ exports:
         );
         let cfg = write_config(&cfg_dir, &yaml);
 
-        let crash = std::process::Command::new(RIVET_BIN)
-            .args(["run", "--config", cfg.to_str().unwrap(), "--export", &export])
-            .env("RIVET_TEST_PANIC_AT", format!("after_chunk_file:{crash_at}"))
-            .output()
-            .expect("spawn rivet");
+        let panic_at = format!("after_chunk_file:{crash_at}");
+        let crash = run_rivet_env(
+            &[
+                "run",
+                "--config",
+                cfg.to_str().unwrap(),
+                "--export",
+                &export,
+            ],
+            &[("RIVET_TEST_PANIC_AT", panic_at.as_str())],
+        );
         prop_assert!(
             !crash.status.success(),
             "rows={} chunk={} crash_at={}: the injected crash must fail the run",
@@ -433,10 +435,7 @@ exports:
         );
         std::thread::sleep(std::time::Duration::from_millis(1100));
 
-        let resume = std::process::Command::new(RIVET_BIN)
-            .args(["run", "--config", cfg.to_str().unwrap(), "--export", &export, "--resume"])
-            .output()
-            .expect("spawn rivet resume");
+        let resume = run_rivet(&["run", "--config", cfg.to_str().unwrap(), "--export", &export, "--resume"]);
         prop_assert!(
             resume.status.success(),
             "rows={} chunk={} crash_at={}: resume failed:\n{}",
@@ -550,10 +549,7 @@ exports:
         ok = ok_out.display(),
     );
     let cfg = write_config(&cfg_dir, &yaml);
-    let run = std::process::Command::new(RIVET_BIN)
-        .args(["run", "--config", cfg.to_str().unwrap()])
-        .output()
-        .expect("spawn rivet");
+    let run = run_rivet(&["run", "--config", cfg.to_str().unwrap()]);
 
     // The run reports overall failure (bad_exp failed)…
     assert!(
