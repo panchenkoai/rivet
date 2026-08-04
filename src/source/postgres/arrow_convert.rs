@@ -35,7 +35,9 @@ use postgres::Row;
 use postgres::types::{FromSql as PgFromSql, Kind, Type};
 
 use crate::error::Result;
-use crate::source::pg_numeric_wire::{PgNumericWire, numeric_wire_normalized_plain};
+use crate::source::pg_numeric_wire::{
+    PgNumericWire, numeric_wire_normalized_plain, numeric_wire_special_text,
+};
 use crate::types::{
     ColumnOverrides, RivetType, SourceColumn, TimeUnit as RivetTimeUnit, TypeMapping,
     build_arrow_field,
@@ -125,10 +127,18 @@ fn pg_numeric_optional_utf8_string(row: &Row, col_idx: usize) -> Result<Option<S
 }
 
 fn numeric_raw_to_optional_decimal_text(raw: &[u8]) -> Option<String> {
-    numeric_wire_normalized_plain(raw).or_else(|| {
-        let text = simdutf8::basic::from_utf8(raw).ok()?.trim();
-        (!text.is_empty()).then(|| text.to_owned())
-    })
+    numeric_wire_normalized_plain(raw)
+        // NaN / ±Infinity have no decimal literal, so `normalized_plain` returns
+        // None for them — but this is the STRING path, and text holds them
+        // losslessly. Without this the `or_else` below ran `from_utf8` over the
+        // BINARY wire header, failed, and emitted NULL: a silent degrade on the
+        // one path that could have carried the value intact, while the Decimal
+        // path (correctly) errors loudly on the same input.
+        .or_else(|| numeric_wire_special_text(raw).map(str::to_owned))
+        .or_else(|| {
+            let text = simdutf8::basic::from_utf8(raw).ok()?.trim();
+            (!text.is_empty()).then(|| text.to_owned())
+        })
 }
 
 // ─── Type mapping ────────────────────────────────────────────────────────────
@@ -1234,5 +1244,76 @@ mod type_map_tests {
             }
             other => panic!("bare NUMERIC mapped to {other:?} — it has no precision to use"),
         }
+    }
+}
+
+#[cfg(test)]
+mod numeric_string_path_tests {
+    use super::numeric_raw_to_optional_decimal_text;
+
+    /// PostgreSQL `numeric` binary header, built from the wire spec by hand —
+    /// NOT through rivet's own encoder, so the fixture is an independent oracle.
+    /// Layout: ndigits(u16), weight(i16), sign(u16), dscale(u16), then digits.
+    fn wire(sign: u16) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(&0u16.to_be_bytes()); // ndigits
+        v.extend_from_slice(&0i16.to_be_bytes()); // weight
+        v.extend_from_slice(&sign.to_be_bytes());
+        v.extend_from_slice(&0u16.to_be_bytes()); // dscale
+        v
+    }
+
+    /// A `columns: { c: string }` override on a PG `numeric` must carry the three
+    /// non-finite values as text, not degrade them to NULL.
+    ///
+    /// They have no decimal literal, so the shared wire decoder returns None for
+    /// them — correct for the Decimal path, which turns that into a loud error
+    /// ("unsupported NaN/infinity payload"). The STRING path inherited the same
+    /// None and fell through to a `from_utf8` over the BINARY header, which fails,
+    /// yielding a null indistinguishable from a real one. Text loses nothing here,
+    /// so nulling was the one avoidable outcome — and the asymmetry meant the same
+    /// column exported loudly-wrong under one config and silently-empty under
+    /// another.
+    ///
+    /// Expected strings are PostgreSQL's own spellings, hard-coded rather than
+    /// derived from anything under test.
+    #[test]
+    fn a_string_override_carries_nan_and_infinity_instead_of_nulling_them() {
+        for (sign, expected) in [
+            (0xC000u16, "NaN"),
+            (0xD000, "Infinity"),
+            (0xF000, "-Infinity"),
+        ] {
+            assert_eq!(
+                numeric_raw_to_optional_decimal_text(&wire(sign)).as_deref(),
+                Some(expected),
+                "sign field {sign:#06x} must render as {expected}, not degrade to NULL — \
+                 a string column holds it losslessly"
+            );
+        }
+    }
+
+    /// The finite path is untouched, and a genuinely undecodable payload still
+    /// yields None rather than a bogus string.
+    #[test]
+    fn finite_values_are_unaffected_and_garbage_still_yields_none() {
+        // ndigits=1, weight=0, sign=positive, dscale=0, digit=1 -> "1"
+        let mut finite = Vec::new();
+        finite.extend_from_slice(&1u16.to_be_bytes());
+        finite.extend_from_slice(&0i16.to_be_bytes());
+        finite.extend_from_slice(&0u16.to_be_bytes());
+        finite.extend_from_slice(&0u16.to_be_bytes());
+        finite.extend_from_slice(&1u16.to_be_bytes());
+        assert_eq!(
+            numeric_raw_to_optional_decimal_text(&finite).as_deref(),
+            Some("1"),
+            "finite decoding must not regress"
+        );
+
+        assert_eq!(
+            numeric_raw_to_optional_decimal_text(&[]).as_deref(),
+            None,
+            "an empty payload has no text form"
+        );
     }
 }
