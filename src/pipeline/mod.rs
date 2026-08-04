@@ -272,6 +272,7 @@ mod tests {
     fn minimal_plan() -> ResolvedRunPlan {
         ResolvedRunPlan {
             export_name: "test_export".into(),
+            source_table: None,
             base_query: "SELECT 1".into(),
             strategy: ExtractionStrategy::Snapshot,
             format: FormatType::Parquet,

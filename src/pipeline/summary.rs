@@ -1129,6 +1129,7 @@ mod tests {
         use crate::tuning::SourceTuning;
         let plan = ResolvedRunPlan {
             export_name: "orders".into(),
+            source_table: None,
             base_query: "SELECT 1".into(),
             strategy: ExtractionStrategy::Snapshot,
             format: FormatType::Parquet,
@@ -1263,6 +1264,7 @@ mod tests {
         use crate::tuning::SourceTuning;
         let plan = ResolvedRunPlan {
             export_name: "events".into(),
+            source_table: None,
             base_query: "SELECT 1".into(),
             strategy: ExtractionStrategy::Snapshot,
             format: FormatType::Parquet,
@@ -1336,6 +1338,7 @@ mod tests {
         use crate::tuning::SourceTuning;
         ResolvedRunPlan {
             export_name: export_name.into(),
+            source_table: None,
             base_query: "SELECT 1".into(),
             strategy: ExtractionStrategy::Snapshot,
             format: FormatType::Parquet,

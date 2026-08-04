@@ -704,6 +704,31 @@ fn ledger_begin_run(state: &StateStore, plan: &ResolvedRunPlan, export_family: &
 
 /// Transition a run to its terminal status in the run-status ledger at finalize.
 /// Best-effort — mirrors the manifest status written alongside.
+/// Close the run-status row(s) this run owns — BOTH of them when a resume
+/// adopted a different id than the one the ledger was opened under.
+///
+/// A chunk-checkpoint resume replaces `summary.run_id` with the crashed run's id
+/// (`chunked::ensure_chunk_checkpoint_plan`), so the row opened at the start is
+/// no longer named by the summary. Closing only the summary's id leaves the
+/// opening row `running` forever, and `has_active_run_on_prefix` then reports a
+/// live writer on that prefix for good — `gc_orphans` defers cleanup
+/// indefinitely, with no later run to supersede it.
+///
+/// One function because the two job wrappers had drifted: `run_export_job`
+/// closed both, `run_export_job_with_chunk_source` — which dispatches to the very
+/// checkpoint runners that DO the adopting — closed one.
+fn ledger_finish_owned_runs(
+    state: &StateStore,
+    export_name: &str,
+    opened_as: &str,
+    summary: &RunSummary,
+) {
+    ledger_finish_run(state, export_name, &summary.run_id, &summary.status);
+    if opened_as != summary.run_id {
+        ledger_finish_run(state, export_name, opened_as, &summary.status);
+    }
+}
+
 fn ledger_finish_run(state: &StateStore, export_name: &str, run_id: &str, status: &str) {
     let finished_at = chrono::Utc::now().to_rfc3339();
     if let Err(e) = state.finish_run(run_id, status, &finished_at) {
@@ -1010,11 +1035,7 @@ pub(super) fn run_export_job(
     // written just below is a PROJECTION of this record, so both carry the same
     // status. A crash before here leaves the row `running`; supersession by a
     // later run reconciles it (no age timer).
-    ledger_finish_run(state, &plan.export_name, &summary.run_id, &summary.status);
-    // Close the row we actually opened when a resume adopted a different id.
-    if ledger_run_id != summary.run_id {
-        ledger_finish_run(state, &plan.export_name, &ledger_run_id, &summary.status);
-    }
+    ledger_finish_owned_runs(state, &plan.export_name, &ledger_run_id, &summary);
     // Order matters: write the manifest first, then run the manifest-aware
     // `--validate` pass against the destination, then persist the metrics
     // row, then write the run report.  The report sees the verification
@@ -1038,10 +1059,7 @@ pub(super) fn run_export_job(
     if let Some(why) = &manifest_gap {
         summary.status = "failed".into();
         summary.error_message = Some(why.clone());
-        ledger_finish_run(state, &plan.export_name, &summary.run_id, &summary.status);
-        if ledger_run_id != summary.run_id {
-            ledger_finish_run(state, &plan.export_name, &ledger_run_id, &summary.status);
-        }
+        ledger_finish_owned_runs(state, &plan.export_name, &ledger_run_id, &summary);
     }
     // Round-2 audit #12: advance the incremental cursor now that the destination
     // manifest is durable — never before. A failure here is at-least-once safe (the
@@ -1148,6 +1166,11 @@ pub(crate) fn run_export_job_with_chunk_source(
     let mut summary = RunSummary::new(plan);
     summary.apply_context = apply_context;
     ledger_begin_run(state, plan, &plan.export_name, &summary.run_id);
+    // The id the ledger row was opened under. A chunk-checkpoint resume — which
+    // THIS wrapper dispatches to — replaces `summary.run_id` with the crashed
+    // run's, so the opening row must be closed by name or it stays `running`
+    // forever.
+    let ledger_run_id = summary.run_id.clone();
     // Runner parity: the apply/chunk-source path is a SEPARATE runner from
     // run_export_job, so it must re-apply open forensics itself (server_context +
     // schema-at-open) or an apply-run failure records neither — the runner-bypass
@@ -1189,7 +1212,7 @@ pub(crate) fn run_export_job_with_chunk_source(
     }
 
     summary.print();
-    ledger_finish_run(state, &plan.export_name, &summary.run_id, &summary.status);
+    ledger_finish_owned_runs(state, &plan.export_name, &ledger_run_id, &summary);
     // Apply replays a SEALED artifact and has no ExportConfig — correctly:
     // the family is the export's own name here. The one export whose family
     // differs (the CDC snapshot leg) is synthesized by `cdc_job` at runtime and
@@ -1204,7 +1227,7 @@ pub(crate) fn run_export_job_with_chunk_source(
     if let Some(why) = &manifest_gap {
         summary.status = "failed".into();
         summary.error_message = Some(why.clone());
-        ledger_finish_run(state, &plan.export_name, &summary.run_id, &summary.status);
+        ledger_finish_owned_runs(state, &plan.export_name, &ledger_run_id, &summary);
     }
     // Round-2 audit #12: incremental cursor advance AFTER the manifest is durable
     // (see run_export_job) — and never when it did not land.
@@ -1260,6 +1283,56 @@ pub(crate) fn run_export_job_with_chunk_source(
 
 #[cfg(test)]
 mod tests {
+
+    /// A resume that ADOPTS a prior run's id must still close the row the ledger
+    /// was opened under — both wrappers, through one seam.
+    ///
+    /// The row is opened with the new run's id; a chunk-checkpoint resume then
+    /// replaces `summary.run_id` with the crashed run's. Closing only the
+    /// summary's id leaves the opening row `running` with nothing to supersede
+    /// it, and `has_active_run_on_prefix` reports a live writer on that prefix
+    /// forever — so `gc_orphans` defers cleanup indefinitely.
+    ///
+    /// Asserted on the STATE the run leaves behind, read back from the store,
+    /// rather than on a count of calls.
+    #[test]
+    fn an_adopted_run_id_does_not_strand_the_row_the_ledger_opened() {
+        let state = crate::state::StateStore::open_in_memory().expect("in-memory state");
+        let export = "orders";
+        let opened_as = "run_new";
+        let adopted = "run_crashed";
+
+        // Both rows exist and are `running`: the crashed one from its own earlier
+        // run, the new one from this run's start. Two rows is the whole point —
+        // with one there is nothing to strand.
+        let prefix = "file:///out";
+        for rid in [adopted, opened_as] {
+            state
+                .begin_run(rid, export, prefix, "2026-01-01T00:00:00Z")
+                .expect("open a run-status row");
+        }
+        assert_eq!(
+            state.active_run_ids_on_prefix(prefix).unwrap().len(),
+            2,
+            "fixture is inert — two open rows are the whole point"
+        );
+
+        let summary = crate::pipeline::summary::RunSummary {
+            run_id: adopted.into(),
+            export_name: export.into(),
+            status: "success".into(),
+            ..Default::default()
+        };
+        ledger_finish_owned_runs(&state, export, opened_as, &summary);
+
+        let still_active = state.active_run_ids_on_prefix(prefix).unwrap();
+        assert!(
+            still_active.is_empty(),
+            "these run(s) are still marked active after the run ended: {still_active:?} — a \
+             permanently running row makes gc_orphans defer this prefix forever, with no later \
+             run to supersede it"
+        );
+    }
 
     /// The keyset resume anchor must outlive a run that did not finish — and
     /// "did not finish" includes a run whose PARTS landed but whose MANIFEST did
@@ -1505,6 +1578,7 @@ mod tests {
     fn chunked_plan_with_quality(quality: Option<QualityConfig>) -> ResolvedRunPlan {
         ResolvedRunPlan {
             export_name: "orders".into(),
+            source_table: None,
             base_query: "SELECT id FROM orders".into(),
             strategy: ExtractionStrategy::Chunked(ChunkedPlan {
                 column: "id".into(),

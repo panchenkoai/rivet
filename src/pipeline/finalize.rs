@@ -208,13 +208,34 @@ pub(super) fn finalize_manifest(
         crate::config::SourceType::Mongo => "mongo",
     };
 
-    // `export_name` is often `schema.table`; split for the manifest fields
-    // without fabricating values for free-form queries.
-    let (source_schema, source_table) = match summary.export_name.split_once('.') {
-        Some((s, t)) if !s.is_empty() && !t.is_empty() => {
-            (Some(s.to_string()), Some(t.to_string()))
-        }
-        _ => (None, None),
+    // The DECLARED table first — a name is a label, the config is the catalog.
+    //
+    // Deriving this by splitting `export_name` on '.' made the two legs of one
+    // `initial: snapshot` CDC export disagree about their own identity: the drain
+    // records the capture output's table, while the snapshot leg's synthesized
+    // name (`orders__snapshot_orders`) has no dot, so it recorded nothing.
+    // Measured on a real run into one prefix — drain
+    // `{engine: postgres, table: "idsrc_orders"}`, leg
+    // `{engine: postgres, table: null}` — which `identity_source` reads as
+    // `postgres:idsrc_orders` and `postgres`, two sources under one export name,
+    // and `ensure_single_source` refuses the flow the docs describe.
+    //
+    // The name split stays as the FALLBACK: an export declared with `query:`
+    // has no `table:`, and a `schema.table` export name is still the only place
+    // its schema appears.
+    let (source_schema, source_table) = match plan.source_table.as_deref() {
+        Some(t) => match t.split_once('.') {
+            Some((s, tbl)) if !s.is_empty() && !tbl.is_empty() => {
+                (Some(s.to_string()), Some(tbl.to_string()))
+            }
+            _ => (None, Some(t.to_string())),
+        },
+        None => match summary.export_name.split_once('.') {
+            Some((s, t)) if !s.is_empty() && !t.is_empty() => {
+                (Some(s.to_string()), Some(t.to_string()))
+            }
+            _ => (None, None),
+        },
     };
 
     let started_at = summary
@@ -865,6 +886,7 @@ mod tests {
         use crate::config::{SourceConfig, SourceType};
         crate::plan::ResolvedRunPlan {
             export_name: "public.orders".into(),
+            source_table: None,
             base_query: "SELECT 1".into(),
             strategy: crate::plan::ExtractionStrategy::Snapshot,
             format: crate::config::FormatType::Parquet,

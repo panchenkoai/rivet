@@ -603,6 +603,7 @@ mod tests {
         use crate::tuning::SourceTuning;
         crate::plan::ResolvedRunPlan {
             export_name: "orders".into(),
+            source_table: None,
             base_query: "SELECT 1".into(),
             strategy: crate::plan::ExtractionStrategy::Snapshot,
             format: crate::config::FormatType::Parquet,
@@ -825,18 +826,25 @@ mod tests {
         let state =
             crate::state::StateStore::open_at_path(&state_dir.path().join("state.db")).unwrap();
         let run_id = "r_partial";
+        // Names from the REAL formatter. Hand-typed stand-ins like
+        // `orders_chunk0_a.parquet` are not what the writer emits (no nonce), so
+        // the reader that classifies them was being graded on an input the
+        // product never produces — and stayed green when the classification
+        // itself was wrong.
+        let done_part = super::super::chunk_part_filename("orders", 0, "parquet");
+        let abandoned_part = super::super::chunk_part_filename("orders", 1, "parquet");
         state
             .insert_chunk_tasks(run_id, &[(1, 100), (101, 200)])
             .unwrap();
         // Chunk 0 completed; chunk 1 was interrupted mid-write and stays claimed.
         state
-            .complete_chunk_task(run_id, 0, 50, Some("orders_chunk0_a.parquet"))
+            .complete_chunk_task(run_id, 0, 50, Some(&done_part))
             .unwrap();
         state
             .record_file(FilePart {
                 run_id,
                 export_name: "orders",
-                file_name: "orders_chunk0_a.parquet",
+                file_name: &done_part,
                 rows: 50,
                 bytes: 4096,
                 format: "parquet",
@@ -849,7 +857,7 @@ mod tests {
             .record_file(FilePart {
                 run_id,
                 export_name: "orders",
-                file_name: "orders_chunk1_abandoned.parquet",
+                file_name: &abandoned_part,
                 rows: 50,
                 bytes: 4096,
                 format: "parquet",
@@ -867,7 +875,7 @@ mod tests {
             .iter()
             .map(|p| p.path.as_str())
             .collect();
-        assert_eq!(paths, vec!["orders_chunk0_a.parquet"]);
+        assert_eq!(paths, vec![done_part.as_str()]);
         assert!(
             !paths.iter().any(|p| p.contains("abandoned")),
             "the interrupted chunk's part must not be declared — the resume rewrites \

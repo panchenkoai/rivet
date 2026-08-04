@@ -4532,3 +4532,87 @@ fn pg_cdc_typed_values_match_source_via_duckdb_not_batch() {
          got: {res}"
     );
 }
+
+// The two legs of ONE `initial: snapshot` export must claim ONE source identity.
+//
+// `identity_source` is what `ensure_single_source` compares when a load reads a
+// prefix, and the two legs derived it differently: the CDC drain records the
+// capture output's table, while the snapshot leg is a batch run whose manifest
+// source used to be split off the EXPORT NAME — and the leg's synthesized name
+// (`orders__snapshot_orders`) has no dot, so it recorded `table: null`. Measured
+// on a real run into one prefix before the fix: drain
+// `{engine: postgres, table: "idsrc_orders"}` and leg `{engine: postgres,
+// table: null}`, which read as `postgres:idsrc_orders` and `postgres` — two
+// sources under one export name, so `rivet load` refuses the flow the docs
+// describe.
+//
+// A name is a label; the config is the catalog. The manifest's source table now
+// comes from the export's declared `table:`, carried on the plan.
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
+fn both_legs_of_an_initial_snapshot_export_claim_one_source_identity() {
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("cdc_ident");
+    let mut c = conn();
+    c.query_drop(format!("DROP TABLE IF EXISTS {tbl}")).unwrap();
+    c.query_drop(format!("CREATE TABLE {tbl} (id INT PRIMARY KEY, v INT)"))
+        .unwrap();
+    let _guard = Table(tbl.clone());
+    c.query_drop(format!("INSERT INTO {tbl} VALUES (1,10),(2,20)"))
+        .unwrap();
+
+    let out = d.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let ckpt = d.path().join("cdc.ckpt");
+    let cfg_text = format!(
+        r#"
+source: {{ type: mysql, url_env: MYSQL_CDC_URL }}
+exports:
+  - name: {tbl}
+    table: {tbl}
+    mode: cdc
+    cdc: {{ initial: snapshot, checkpoint: "{ckpt}", until_current: true, server_id: {sid} }}
+    format: parquet
+    destination: {{ type: local, path: "{out}" }}
+"#,
+        ckpt = ckpt.display(),
+        out = out.display(),
+        sid = server_id_for(&tbl),
+    );
+    let cfg = write_config(&d, &cfg_text);
+    run_rivet_ok(&cfg);
+
+    // Read what each leg actually WROTE, and compare with the product's own
+    // identity rule rather than a copy of it.
+    let source_of = |p: &std::path::Path| -> (String, Option<String>) {
+        let body =
+            std::fs::read_to_string(p).unwrap_or_else(|e| panic!("read {}: {e}", p.display()));
+        let m: serde_json::Value = serde_json::from_str(&body).unwrap();
+        (
+            m["source"]["engine"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            m["source"]["table"].as_str().map(str::to_string),
+        )
+    };
+    let drain = source_of(&out.join("manifest.json"));
+    let leg = source_of(&out.join("snapshot").join("manifest.json"));
+
+    // Not inert: both legs must have written a manifest with an engine at all.
+    assert!(
+        !drain.0.is_empty() && !leg.0.is_empty(),
+        "fixture is inert — one leg wrote no manifest: drain={drain:?} leg={leg:?}"
+    );
+    assert_eq!(
+        drain, leg,
+        "the two legs of ONE export disagree about their source: a load over this prefix sees \
+         two identities and refuses to load either"
+    );
+    assert_eq!(
+        leg.1.as_deref(),
+        Some(tbl.as_str()),
+        "the snapshot leg must record the DECLARED table, not whatever its synthesized export \
+         name happens to parse to"
+    );
+}

@@ -67,6 +67,19 @@ pub struct KeysetPlan {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResolvedRunPlan {
     pub export_name: String,
+    /// The export's declared source table (`table:`), carried VERBATIM.
+    ///
+    /// The manifest's source identity is built from this. It used to be derived
+    /// by splitting the EXPORT NAME on '.', which is a label, not the catalog —
+    /// so the two legs of one `initial: snapshot` CDC export disagreed about who
+    /// they were: the drain recorded `table: "orders"` (from the capture output)
+    /// while the snapshot leg, whose synthesized name is `orders__snapshot_orders`
+    /// and contains no dot, recorded `table: null`. `identity_source` then read
+    /// `postgres:orders` and `postgres` — two sources under one prefix — and
+    /// `ensure_single_source` refused the documented flow.
+    ///
+    /// `None` for a free-form `query:` export, which genuinely has no one table.
+    pub source_table: Option<String>,
     /// Final query string (params substituted, query_file loaded).
     pub base_query: String,
     pub strategy: ExtractionStrategy,
