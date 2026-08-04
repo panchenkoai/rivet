@@ -56,10 +56,19 @@ import shutil
 import sqlite3
 from pathlib import Path
 
-from .core import Ledger, have, run, rivet
+from .core import Ledger, container_for_port, docker_exec, have, port_of, run, rivet
 from . import scenarios
 
 BUCKET = "rivet-blessed"
+
+# The GOLDEN batches — what `make seed` / `make seed-release` writes, identical
+# on every engine by construction, so a row count is an absolute expectation
+# rather than whatever the stand happens to hold. Three shapes on purpose: a
+# small dimension, a fact table with a foreign key, and the wide million-row
+# table the release seed exists for. A chain proven on 1000 rows has not met a
+# rollover, a part boundary, or a multi-file manifest — and the file-count half
+# of the oracle is vacuous until the export produces more than one part.
+GOLDEN_TABLES = ("users", "orders", "content_items")
 
 
 def _duckdb_ok() -> bool:
@@ -89,6 +98,31 @@ def _parquet_rows_and_files(path: Path) -> tuple[int, int]:
         return (int(parts[0]), int(parts[1]))
     except (ValueError, IndexError):
         return (-1, -1)
+
+
+def _source_rows(engine: str, url: str, table: str) -> int:
+    """Row count from the source engine's OWN client, resolved by the URL's port.
+
+    `scenarios._source_count_distinct` finds the gate's own `rivet-oracle-eng-*`
+    containers by name; pointed at a dev stand it returns "" and the oracle then
+    SKIPs — correct, but it never compares. `container_for_port` resolves
+    whichever container actually serves the URL under test, so the same walk
+    works on the gate's containers and on a local stand. -1 means unresolvable,
+    which the caller turns into a SKIP, never into agreement."""
+    port = port_of(url)
+    c = container_for_port(port) if port else None
+    if not c:
+        return -1
+    if engine == "postgres":
+        out = docker_exec(c, "psql", "-U", "rivet", "-d", "rivet", "-tA",
+                          "-c", f"SELECT count(*) FROM {table}").stdout.strip()
+    elif engine == "mysql":
+        out = docker_exec(c, "mysql", "-urivet", "-privet", "rivet", "-N",
+                          "-e", f"SELECT count(*) FROM {table}").stdout.strip()
+    else:
+        return -1
+    head = out.splitlines()[0].strip() if out else ""
+    return int(head) if head.isdigit() else -1
 
 
 def _manifest_of(prefix: Path) -> dict | None:
@@ -181,7 +215,7 @@ def sc_blessed_path(
     The two are the same contract with hand-written SQL on each side, so the
     chain is walked on both rather than assumed transferable.
     """
-    work = scenarios.work_dir() / f"blessed_{engine}_{tag}_{store}_{'pg' if state_url else 'sq'}"
+    work = scenarios.work_dir() / f"blessed_{engine}_{tag}_{table.replace('.','_')}_{store}_{'pg' if state_url else 'sq'}"
     shutil.rmtree(work, ignore_errors=True)
     work.mkdir(parents=True, exist_ok=True)
     dest_dir = work / "out"
@@ -214,12 +248,17 @@ def sc_blessed_path(
     if store == "local":
         dest_block = f"    destination: {{type: local, path: {dest_dir}/}}"
     else:
-        raw = scenarios.store_dest(store, BUCKET, f"blessed/{engine}/{tag}")
+        raw = scenarios.store_dest(store, BUCKET, f"blessed/{engine}/{tag}/{table}")
         if not raw:
             led.skipped(engine, tag, "blessed:init", store, f"{store} — no destination block")
             _downstream_unreached(led, engine, tag, store, "init")
             return
-        dest_block = raw
+        # `store_dest` returns the CONTENT under `destination:`, already
+        # indented — the key itself is the caller's to write. Omitting it made
+        # init's own config unparseable, which doctor caught immediately and
+        # correctly; the chain surfaced it as a doctor FAIL, which is the
+        # handoff working exactly as intended.
+        dest_block = "    destination:\n" + raw.rstrip("\n")
     tls = "\n  tls: {accept_invalid_certs: true}" if engine == "mssql" else ""
     cfg.write_text(
         f"source:\n"
@@ -283,19 +322,40 @@ def sc_blessed_path(
         # Cloud: presence is asserted through the readback below, since a
         # bucket listing is not a local path. Counting objects with `mc ls`
         # was the documented false-green — file PRESENCE is not row content.
+        # KNOWN WEAKER THAN LOCAL, stated rather than hidden. The manifest is
+        # not pulled out of the bucket, so the cloud oracle below compares TWO
+        # parties (source vs DuckDB) where local compares three, and the file
+        # count is not checked at all (`-1` in the cell). Closing it means
+        # pulling manifest.json through the store's own API — the readback
+        # helper only fetches parquet today. A cell that reads PASS must not
+        # imply the local cell's strength.
         parts, man, ok = [], None, True
-        detail = "cloud prefix — asserted via readback"
+        detail = "cloud prefix — rows via readback; manifest+file-count NOT compared (weaker than local)"
     if not _stage(led, engine, tag, store, "artifacts", ok, detail):
         _downstream_unreached(led, engine, tag, store, "artifacts")
         return
 
     # ── state DB ──────────────────────────────────────────────────────────────
     if state_url:
-        counts, where = {}, "postgres"
-        got = scenarios._duckdb_list("SELECT 1")  # presence probe only
-        # Postgres-side counts are compared by state_parity, which owns that
-        # comparison; here the question is only whether apply RECORDED the run.
-        ok, detail = True, "postgres backend — recording asserted by state_parity"
+        # Query the Postgres state DB for THIS run. Deferring to state_parity was
+        # a PASS that asserted nothing — the vacuous-cell shape this module is
+        # written against, and I wrote one. The backend is a separate SQL
+        # implementation of the same contract; "the other pass covers it" is the
+        # assumption, not the evidence.
+        port = port_of(state_url)
+        c = container_for_port(port) if port else None
+        if not c:
+            ok, detail = False, f"state backend container not resolvable from {state_url}"
+        else:
+            db = state_url.rsplit("/", 1)[-1]
+            got = {}
+            for t in ("export_metrics", "file_log", "run_status"):
+                out = docker_exec(c, "psql", "-U", "rivet", "-d", db, "-tA",
+                                  "-c", f"SELECT count(*) FROM {t}").stdout.strip()
+                got[t] = int(out) if out.isdigit() else -1
+            missing = [t for t, n in got.items() if n < 1]
+            ok = not missing
+            detail = f"{db}@{c}: " + ", ".join(f"{t}={n}" for t, n in got.items())
     else:
         db = cfg.parent / ".rivet_state.db"
         counts = _state_counts(db)
@@ -316,26 +376,21 @@ def sc_blessed_path(
     if not _duckdb_ok():
         led.skipped(engine, tag, "blessed:oracle", store, f"{engine} {tag} {store} · oracle — no duckdb")
     else:
-        src_rows = scenarios._source_count_distinct(engine, url, table, "id")
+        want = _source_rows(engine, url, table)
         if store == "local":
             duck_rows, duck_files = _parquet_rows_and_files(dest_dir)
         else:
-            got = scenarios.store_readback(store, BUCKET, f"blessed/{engine}/{tag}", work)
+            got = scenarios.store_readback(store, BUCKET, f"blessed/{engine}/{tag}/{table}", work)
             duck_rows = int(got.splitlines()[0]) if got.strip().isdigit() else -1
             duck_files = -1  # readback is row-count only for cloud stores
         man_rows = int(man.get("row_count", -1)) if man else -1
         man_files = int(man.get("part_count", -1)) if man else -1
 
-        try:
-            want = int(str(src_rows).strip().splitlines()[0])
-        except (ValueError, IndexError):
-            want = -1
-
         if want < 0 or duck_rows < 0:
             led.skipped(
                 engine, tag, "blessed:oracle", store,
                 f"{engine} {tag} {store} · oracle — unreadable "
-                f"(source={src_rows!r} duckdb={duck_rows})",
+                f"(source={want} duckdb={duck_rows})",
             )
         else:
             agree = duck_rows == want and (man_rows < 0 or man_rows == want)
@@ -356,7 +411,7 @@ def verify_blessed_path(
     engine: str,
     tag: str,
     url: str,
-    table: str,
+    table: str = "",
     state_url: str = "",
 ) -> None:
     """The matrix for one engine × version: {local, gcs} × {sqlite, postgres}.
@@ -369,15 +424,18 @@ def verify_blessed_path(
     module exists for.
     """
     led.phase(f"blessed path · {engine} {tag}")
-    sc_blessed_path(led, engine, tag, url, table, store="local")
+    for t in (table,) if table else GOLDEN_TABLES:
+        sc_blessed_path(led, engine, tag, url, t, store="local")
     if state_url:
-        sc_blessed_path(led, engine, tag, url, table, store="local", state_url=state_url)
+        for t in (table,) if table else GOLDEN_TABLES:
+            sc_blessed_path(led, engine, tag, url, t, store="local", state_url=state_url)
     else:
         led.skipped(
             engine, tag, "blessed:backend", "postgres",
             f"{engine} {tag} · postgres state backend — no --state-url given",
         )
     if scenarios.store_up("gcs"):
-        sc_blessed_path(led, engine, tag, url, table, store="gcs")
+        for t in (table,) if table else GOLDEN_TABLES:
+            sc_blessed_path(led, engine, tag, url, t, store="gcs")
     else:
         led.skipped(engine, tag, "blessed:store", "gcs", f"{engine} {tag} · gcs — store not up")
