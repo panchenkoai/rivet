@@ -349,7 +349,11 @@ fn dispatch_cdc(a: CdcArgs) -> Result<()> {
         // store, so every part reaches the database as it becomes durable.
         state: None,
     })
-    .map(|_| ())
+    // `.1` is the outcome; `.0` is what the drain made durable. The ad-hoc
+    // subcommand has no state store and no summary to attribute parts to, so
+    // there is nothing here to record them into — unlike `mode: cdc`, where
+    // discarding them was the defect this tuple exists to fix.
+    .1
 }
 
 #[allow(clippy::too_many_arguments)]

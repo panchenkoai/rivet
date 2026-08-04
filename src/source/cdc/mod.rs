@@ -947,18 +947,28 @@ pub(crate) struct CdcCapture<'a> {
 /// Open the change stream (with the engine's permission/TLS gate), resolve each
 /// table's typed schema, and drive the commit-seam file sink — the single place
 /// the typed CDC capture is assembled. Returns one `RunManifest` per output, in
-/// `outputs` order.
-pub(crate) fn run_capture(cap: CdcCapture<'_>) -> Result<Vec<crate::manifest::RunManifest>> {
+/// `outputs` order — PAIRED with the outcome, so a run that failed after
+/// committing parts still hands the caller what it made durable. Returning a
+/// bare `Result` discarded exactly that, and the caller recorded zeros.
+pub(crate) fn run_capture(cap: CdcCapture<'_>) -> (Vec<crate::manifest::RunManifest>, Result<()>) {
     let url = cap.cdc_cfg.url.clone();
     let tls = cap.cdc_cfg.tls.clone();
     let checkpoint = cap.cdc_cfg.checkpoint.clone();
     // Derive the peek bound from the ONE rollover the sink also uses — so the
     // PG peek is always ≥ the part rollover (never starves). The single source
     // of truth for both is `cap.rollover`.
-    let mut stream = create_change_stream(&cap.cdc_cfg, PeekBound::Sized(cap.rollover))?;
+    // Setup failures happen BEFORE anything is durable, so an empty manifest
+    // list is the truth here — unlike the drain, where it was a lie.
+    let mut stream = match create_change_stream(&cap.cdc_cfg, PeekBound::Sized(cap.rollover)) {
+        Ok(s) => s,
+        Err(e) => return (Vec::new(), Err(e)),
+    };
     // Fault point: stream (and any server-side anchor) opened, nothing read.
     crate::test_hook::maybe_panic_at("cdc_after_open");
-    let engine = CdcEngine::from_url(&url)?;
+    let engine = match CdcEngine::from_url(&url) {
+        Ok(e) => e,
+        Err(e) => return (Vec::new(), Err(e)),
+    };
     let cap_tables: Vec<String> = cap.outputs.iter().map(|o| o.table.clone()).collect();
     let mut outputs = Vec::with_capacity(cap.outputs.len());
     // ONE resolver session serves every table (was: 2 fresh connections per
@@ -976,15 +986,26 @@ pub(crate) fn run_capture(cap: CdcCapture<'_>) -> Result<Vec<crate::manifest::Ru
              from the same table's batch export.",
             engine.label()
         ),
-        RowImage::Partial { why } => anyhow::bail!(
-            "{} cdc: {why}. Capturing under this setting would report success over events that \
-             cannot represent the row.",
-            engine.label()
-        ),
+        RowImage::Partial { why } => {
+            return (
+                Vec::new(),
+                Err(anyhow::anyhow!(
+                    "{} cdc: {why}. Capturing under this setting would report success over \
+                     events that cannot represent the row.",
+                    engine.label()
+                )),
+            );
+        }
     }
-    let mut resolver = CdcSchemaResolver::connect(&url, tls.as_ref())?;
+    let mut resolver = match CdcSchemaResolver::connect(&url, tls.as_ref()) {
+        Ok(r) => r,
+        Err(e) => return (Vec::new(), Err(e)),
+    };
     for o in cap.outputs {
-        let columns = resolver.resolve(&o.table, &o.overrides)?;
+        let columns = match resolver.resolve(&o.table, &o.overrides) {
+            Ok(c) => c,
+            Err(e) => return (Vec::new(), Err(e)),
+        };
         outputs.push(sink::TableOutput {
             table: o.table,
             columns,
