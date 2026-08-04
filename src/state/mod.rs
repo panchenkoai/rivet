@@ -740,6 +740,21 @@ const PG_MIGRATIONS: &[(i64, &str)] = &[
         20,
         "ALTER TABLE loaded_source_run ADD COLUMN IF NOT EXISTS source_ident TEXT;",
     ),
+    // v21: ONE in-flight aggregate row per run — see the SQLite ladder for why.
+    //
+    // PostgreSQL needs `ctid` rather than `id NOT IN (SELECT max(id) …)`: the
+    // column exists on both, but keeping the ladders as close as the dialects
+    // allow matters less than the DELETE being correct here. Partial unique
+    // indexes work the same on both.
+    (
+        21,
+        "DELETE FROM export_metrics a
+             WHERE a.status = 'running'
+               AND a.id < (SELECT max(b.id) FROM export_metrics b
+                            WHERE b.run_id = a.run_id AND b.status = 'running');
+         CREATE UNIQUE INDEX IF NOT EXISTS export_metrics_one_running_per_run
+             ON export_metrics(run_id) WHERE status = 'running';",
+    ),
 ];
 
 // ─── SQL helpers ──────────────────────────────────────────────────────────────
@@ -1223,6 +1238,40 @@ impl StateStore {
 
 #[cfg(test)]
 mod tests {
+
+    /// The two ladders must define the SAME versions.
+    ///
+    /// A migration added to one and not the other is not a slow divergence — it
+    /// breaks the missing backend on the next start, because `migrate` compares
+    /// the reached version against `SCHEMA_VERSION`, which is the LAST entry of
+    /// the SQLite ladder for both. Measured 2026-08-04: v21 went into
+    /// `MIGRATIONS` alone, and every Postgres-backed run died with
+    /// `state(pg): migration incomplete — expected schema v21 but reached v20` —
+    /// the release gate's state-parity, concurrent-writers and cdc-parity cells
+    /// all failed on that one omission, twenty minutes into a run.
+    ///
+    /// The SQL differs per dialect and always will; the VERSION SET must not.
+    #[test]
+    fn both_migration_ladders_define_the_same_versions() {
+        let sqlite: Vec<i64> = MIGRATIONS.iter().map(|(v, _)| *v).collect();
+        let pg: Vec<i64> = PG_MIGRATIONS.iter().map(|(v, _)| *v).collect();
+        assert_eq!(
+            sqlite, pg,
+            "the SQLite and PostgreSQL migration ladders disagree; the backend missing a \
+             version refuses to start, because SCHEMA_VERSION is the last SQLite entry for both"
+        );
+        assert_eq!(
+            SCHEMA_VERSION,
+            *sqlite.last().expect("the ladder is not empty"),
+            "SCHEMA_VERSION must be the ladder's last version"
+        );
+        // Ascending and unique, or `migrate` can skip or re-apply one.
+        assert!(
+            sqlite.windows(2).all(|w| w[0] < w[1]),
+            "migration versions must be strictly ascending: {sqlite:?}"
+        );
+    }
+
     use super::*;
 
     #[test]
