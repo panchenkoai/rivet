@@ -133,6 +133,22 @@ impl M8Stats {
 /// parts are DECLARED + size-verified (an empty md5 degrades validate to a size-only
 /// check) though not content-re-verified — strictly better than a silent orphan.
 /// Returns the number of parts reconstructed.
+/// The part name with any rotation suffix removed — the identity of ONE attempt
+/// at one chunk.
+///
+/// `chunk_part_filename` ends every part with `_chunk{idx}_{nonce}`, and
+/// `part_indexed_name` appends `_p{n}` to each sibling when a chunk rotates past
+/// `max_file_size`. So siblings of one attempt share everything up to `_p{n}`,
+/// while a different attempt at the same chunk carries a different nonce. That
+/// is the discriminator an index-only filter lacks.
+fn attempt_key(file_name: &str) -> &str {
+    let stem = file_name.rsplit_once('.').map_or(file_name, |(s, _)| s);
+    match stem.rsplit_once("_p") {
+        Some((head, n)) if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => head,
+        _ => stem,
+    }
+}
+
 pub(crate) fn rehydrate_manifest_parts_from_file_log(
     state: &StateStore,
     run_id: &str,
@@ -163,11 +179,32 @@ pub(crate) fn rehydrate_manifest_parts_from_file_log(
     // Filtering by the chunk's task status keeps rotation siblings (they belong to
     // a completed chunk) and drops only the superseded attempt. A file with no
     // chunk token is not a chunked part at all and is left alone.
-    let completed: std::collections::BTreeSet<String> = state
+    // Keyed by chunk index, the value is the ATTEMPT that survived — identified
+    // by the file name `chunk_task` recorded when the chunk completed.
+    //
+    // Filtering on the index ALONE is not enough once a run has been resumed
+    // twice, because a chunk-checkpoint resume ADOPTS the crashed run's id and
+    // `file_log` therefore accumulates every attempt's parts under one run_id,
+    // pruned by nothing. Attempt 1 crashes mid-chunk-1 (part written and logged,
+    // task still pending); attempt 2 re-runs chunk 1, writes a new part and marks
+    // the chunk completed; attempt 2 then crashes elsewhere. On attempt 3 chunk 1
+    // IS completed, so an index-only filter admits BOTH the abandoned part and
+    // its replacement — the same rows twice, in a manifest that is perfectly
+    // self-consistent with the files it lists, so `validate` returns 0 and every
+    // consumer that sums manifests inherits the duplicate.
+    //
+    // Rotation siblings of the surviving attempt must still be kept: they share
+    // its base (nonce included) and differ only by the `_p{n}` suffix
+    // `part_indexed_name` appends, which `attempt_key` strips.
+    let surviving: std::collections::BTreeMap<String, String> = state
         .list_chunk_tasks_for_run(run_id)?
         .into_iter()
         .filter(|t| t.status == "completed")
-        .map(|t| t.chunk_index.to_string())
+        .filter_map(|t| {
+            t.file_name
+                .as_deref()
+                .map(|f| (t.chunk_index.to_string(), attempt_key(f).to_string()))
+        })
         .collect();
 
     let mut next_id = summary
@@ -186,8 +223,14 @@ pub(crate) fn rehydrate_manifest_parts_from_file_log(
         }
         // …nor resurrect the part of a chunk that is NOT completed: it is the
         // abandoned attempt of a chunk this resume is about to re-run.
-        if super::chunk_index_of(&f.file_name).is_some_and(|c| !completed.contains(c)) {
-            continue;
+        // …nor resurrect a part that does not belong to the attempt that
+        // COMPLETED its chunk: it is either an interrupted chunk's abandoned
+        // write, or an earlier attempt superseded by the one that finished.
+        if let Some(idx) = super::chunk_index_of(&f.file_name) {
+            match surviving.get(idx) {
+                Some(key) if attempt_key(&f.file_name) == *key => {}
+                _ => continue,
+            }
         }
         next_id += 1;
         summary.manifest_parts.push(crate::manifest::ManifestPart {
@@ -810,6 +853,81 @@ mod tests {
             summary.total_rows, parts_rows,
             "resume must accumulate onto the rehydrated base — total_rows must equal \
              sum(manifest_parts.rows), never under-report only this invocation's rows"
+        );
+    }
+
+    /// A chunk re-run after a crash must contribute ONE part, not its abandoned
+    /// attempt as well — which only shows up on the SECOND resume.
+    ///
+    /// A chunk-checkpoint resume adopts the crashed run's id, so `file_log`
+    /// accumulates every attempt's parts under one run_id and nothing prunes it.
+    /// Attempt 1 crashes mid-chunk-1: the part is written and logged, the task
+    /// stays pending. Attempt 2 re-runs chunk 1, writes a replacement and marks
+    /// the chunk completed — then crashes elsewhere. On attempt 3 chunk 1 IS
+    /// completed, so a filter keyed on the chunk INDEX admits both parts: the
+    /// same rows twice, in a manifest perfectly self-consistent with the files it
+    /// lists, so `validate` returns 0 and every consumer that sums manifests
+    /// inherits the duplicate.
+    ///
+    /// At one resume the abandoned part's chunk is simply not completed, so the
+    /// index filter is enough — which is why every existing test passed.
+    #[test]
+    fn a_chunk_re_run_after_a_crash_contributes_one_part_not_its_abandoned_attempt() {
+        let state_dir = tempfile::tempdir().unwrap();
+        let state =
+            crate::state::StateStore::open_at_path(&state_dir.path().join("state.db")).unwrap();
+        let run_id = "r_twice";
+        state.insert_chunk_tasks(run_id, &[(1, 100)]).unwrap();
+
+        // Attempt 1's part for chunk 0: written, logged, then abandoned.
+        let abandoned = super::super::chunk_part_filename("orders", 0, "parquet");
+        // Attempt 2's replacement, which is the one that completed the chunk.
+        let survivor = super::super::chunk_part_filename("orders", 0, "parquet");
+        assert_ne!(
+            abandoned, survivor,
+            "fixture is inert — two attempts must produce DIFFERENT names, which is what the \
+             nonce is for"
+        );
+        for f in [&abandoned, &survivor] {
+            state
+                .record_file(FilePart {
+                    run_id,
+                    export_name: "orders",
+                    file_name: f,
+                    rows: 50,
+                    bytes: 4096,
+                    format: "parquet",
+                    compression: None,
+                })
+                .unwrap();
+        }
+        state
+            .complete_chunk_task(run_id, 0, 50, Some(&survivor))
+            .unwrap();
+
+        let mut summary =
+            crate::pipeline::summary::RunSummary::stub_for_testing(run_id, String::from("orders"));
+        let n = rehydrate_manifest_parts_from_file_log(&state, run_id, &mut summary).unwrap();
+
+        assert_eq!(
+            n, 1,
+            "chunk 0 completed ONCE and contributes ONE part; its abandoned attempt is not a \
+             second part of the same chunk"
+        );
+        let paths: Vec<&str> = summary
+            .manifest_parts
+            .iter()
+            .map(|p| p.path.as_str())
+            .collect();
+        assert_eq!(
+            paths,
+            vec![survivor.as_str()],
+            "the part kept must be the one `chunk_task` recorded as completing the chunk"
+        );
+        assert_eq!(
+            summary.total_rows, 50,
+            "counting both attempts doubles the chunk's rows in a manifest that still \
+             validates, because it is self-consistent with the files it lists"
         );
     }
 

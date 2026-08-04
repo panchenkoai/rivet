@@ -338,7 +338,18 @@ pub(super) fn collect_child_entries(
         let mut entry: Option<RunAggregateEntry> = None;
         match state.get_metrics(Some(&export.name), 1) {
             Ok(rows) => {
+                // A `running` row is an IN-FLIGHT marker, not an outcome. Since
+                // this branch began projecting a run's aggregate as each part
+                // lands, a hard-crashed child (OOM-kill, panic — there is no
+                // catch_unwind) leaves exactly such a row: partial `total_rows`,
+                // status `running`, timestamped by its last durable part. Taking
+                // it as the child's result reported those partial rows as the
+                // export's outcome AND discarded the real cause, which the parent
+                // holds in `child_failures` and which only the fallback below
+                // surfaces. Before the projection existed a crashed child left no
+                // row at all and fell through correctly.
                 if let Some(m) = rows.into_iter().next()
+                    && m.status != "running"
                     && let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(&m.run_at)
                     && parsed.with_timezone(&Utc) >= started_at
                 {
@@ -388,6 +399,84 @@ pub(super) fn collect_child_entries(
 
 #[cfg(test)]
 mod tests {
+
+    /// A child that CRASHED must be reported as failed with its own cause — not
+    /// as its half-finished in-flight aggregate.
+    ///
+    /// Since a run's aggregate is projected as each part lands, a hard-killed
+    /// child leaves a `running` row carrying whatever it had committed. Reading
+    /// the latest row without checking that it is TERMINAL turned that into the
+    /// export's reported outcome: partial rows presented as the result, and the
+    /// real failure — which the parent holds and only the fallback surfaces —
+    /// thrown away.
+    #[test]
+    fn a_crashed_childs_in_flight_row_is_not_mistaken_for_its_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::state::StateStore::open_at_path(&dir.path().join("state.db")).unwrap();
+
+        // Exactly what a killed child leaves behind: parts on record, so the
+        // projection wrote a `running` aggregate with PARTIAL rows.
+        for i in 0..3 {
+            state
+                .record_file(crate::state::FilePart {
+                    run_id: "r_crashed",
+                    export_name: "orders",
+                    file_name: &format!("part{i}.parquet"),
+                    rows: 100,
+                    bytes: 1000,
+                    format: "parquet",
+                    compression: None,
+                })
+                .unwrap();
+        }
+        state
+            .record_durable_part(crate::state::DurablePart {
+                run_id: "r_crashed",
+                export_name: "orders",
+                file_name: "part0.parquet",
+                rows: 100,
+                bytes: 1000,
+                format: "parquet",
+                compression: None,
+                mode: "chunked",
+            })
+            .unwrap();
+
+        // Not inert: the row really is there, really is `running`, and really
+        // carries rows — otherwise there is nothing to mistake for an outcome.
+        let latest = state.get_metrics(Some("orders"), 1).unwrap();
+        assert_eq!(latest.len(), 1, "the projection must have written a row");
+        assert_eq!(latest[0].status, "running");
+        assert!(latest[0].total_rows > 0, "partial rows are the trap");
+
+        let export: crate::config::ExportConfig = serde_yaml_ng::from_str(
+            "name: orders\nquery: \"SELECT 1\"\nformat: parquet\ndestination:\n  type: local\n  path: /tmp\n",
+        )
+        .expect("parse test ExportConfig");
+        let mut failures = std::collections::HashMap::new();
+        failures.insert("orders".to_string(), "child killed by signal 9".to_string());
+        let entries = collect_child_entries(
+            &state,
+            &[&export],
+            chrono::Utc::now() - chrono::Duration::hours(1),
+            &failures,
+        );
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].status, "failed",
+            "a child that never finished must not be reported by its in-flight row"
+        );
+        assert_eq!(
+            entries[0].rows, 0,
+            "the rows it had written when it died are not the rows it delivered"
+        );
+        assert_eq!(
+            entries[0].error_message.as_deref(),
+            Some("child killed by signal 9"),
+            "the parent's own cause must survive — it is the only place it exists"
+        );
+    }
     use super::*;
     use chrono::Duration;
 

@@ -396,6 +396,31 @@ const MIGRATIONS: &[(i64, &str)] = &[
         20,
         "ALTER TABLE loaded_source_run ADD COLUMN source_ident TEXT;",
     ),
+    // v21: ONE in-flight aggregate row per run, enforced by the database.
+    //
+    // `project_running_aggregate` was UPDATE-else-INSERT, which is not atomic:
+    // the parallel chunk-checkpoint runner gives every worker thread its own
+    // connection, so two finishing their first chunk together both saw the UPDATE
+    // affect zero rows and both INSERTed. The run then had two `running`
+    // aggregates — in the table this branch made the record of a run — and the
+    // whole point of projecting instead of appending is that a run has exactly
+    // one.
+    //
+    // The DELETE first: an existing database may already hold duplicates from
+    // that race, and the index cannot be created over them. It keeps the highest
+    // `id` per run (the most recently written projection) and drops the rest;
+    // both are projections of the same `file_log` rows, so no information is lost.
+    //
+    // PARTIAL on `status = 'running'`: terminal rows are written by
+    // `record_metric_full` and a run legitimately has one per attempt.
+    (
+        21,
+        "DELETE FROM export_metrics WHERE status = 'running' AND id NOT IN (
+             SELECT max(id) FROM export_metrics WHERE status = 'running' GROUP BY run_id
+         );
+         CREATE UNIQUE INDEX IF NOT EXISTS export_metrics_one_running_per_run
+             ON export_metrics(run_id) WHERE status = 'running';",
+    ),
 ];
 
 /// PostgreSQL-compatible DDL.  Column types differ from SQLite (BIGSERIAL,
@@ -845,7 +870,21 @@ fn migrate(conn: &Connection) -> Result<()> {
     // The guard is advisory-by-transaction rather than a lock table: an aborted
     // process releases it by dying, so a crashed migrator cannot wedge the next
     // one.
-    let _ = conn.execute_batch("BEGIN IMMEDIATE;");
+    // Discarding this result would defeat the whole guard: `BEGIN IMMEDIATE`
+    // returns SQLITE_BUSY when the write lock is not obtained within
+    // `busy_timeout`, and continuing anyway runs the ladder unprotected —
+    // exactly the concurrent-migration case above. It does not corrupt silently
+    // (the unprotected ladder hits the errors quoted above and they propagate),
+    // but the operator is then handed "no such table: file_manifest" instead of
+    // the truth, which names neither the cause nor the remedy.
+    conn.execute_batch("BEGIN IMMEDIATE;").map_err(|e| {
+        anyhow::anyhow!(
+            "state: could not acquire the migration lock within the busy timeout ({e}). \
+             Another rivet process is migrating this state database; wait for it to finish \
+             and retry. Running the migration ladder without the lock is what produces \
+             'no such table' / 'duplicate column' failures on a shared backend."
+        )
+    })?;
     let out = migrate_locked(conn);
     let _ = conn.execute_batch(if out.is_ok() { "COMMIT;" } else { "ROLLBACK;" });
     out

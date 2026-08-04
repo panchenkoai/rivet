@@ -1148,9 +1148,24 @@ impl LoadCtx<'_> {
         // A stateless or foreign-host load has no ledger to ask (`self.state` is
         // None above, or the query fails) — see `warn_if_racing_an_active_run`,
         // which tells that operator to load AFTER the extract instead.
-        let active = s
-            .active_run_ids_on_prefix(self.source_prefix)
-            .unwrap_or_default();
+        // A query failure must fail SAFE, and "safe" here is the opposite of the
+        // default: an empty set excludes nothing, so every in-flight run gets
+        // recorded as consumed and every part it writes afterwards is skipped
+        // forever — the harm the comment above describes. Treating the answer as
+        // "assume they are all active" records none of them, and the next cycle
+        // re-evaluates: at-least-once, which the current-state view absorbs.
+        let active = match s.active_run_ids_on_prefix(self.source_prefix) {
+            Ok(a) => a,
+            Err(e) => {
+                log::warn!(
+                    "load: cannot tell which runs are still writing into {} ({e:#}) — not \
+                     recording any run as consumed this cycle, so nothing they write later is \
+                     stranded. The next load re-evaluates them.",
+                    self.source_prefix
+                );
+                source_run_ids.iter().cloned().collect()
+            }
+        };
         let source_run_ids: Vec<String> = source_run_ids
             .iter()
             .filter(|id| !active.contains(*id))
