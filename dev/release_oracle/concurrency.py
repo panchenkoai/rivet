@@ -71,10 +71,20 @@ def _rivet_bin() -> Path:
     )
 
 
-def _psql_state(container: str, sql: str) -> str:
-    return run(
+def _psql_state(container: str, sql: str) -> str | None:
+    """The scalar, or None when the QUERY DID NOT RUN.
+
+    This returned `.stdout.strip()` and threw the exit status away, so a wrong
+    container name, a stopped state DB or a SQL error all produced `""` — and
+    every caller compared against `"0"`-or-empty, making an unreachable meta-DB
+    score exactly like a clean one. That is not hypothetical: pointing the gate
+    at the wrong Postgres is a one-flag mistake, and it was made in this repo.
+    `None` forces the caller to say "could not verify", which is a different
+    verdict from "verified clean"."""
+    p = run(
         ["docker", "exec", container, "psql", "-U", "rivet", "-d", "rivet_state", "-tAc", sql]
-    ).stdout.strip()
+    )
+    return p.stdout.strip() if p.ok else None
 
 
 def _seed(src_container: str) -> bool:
@@ -190,7 +200,16 @@ def _judge(
         f"SELECT count(*) FROM (SELECT run_id FROM export_metrics WHERE export_name LIKE "
         f"'{export_prefix}%' AND run_id IS NOT NULL GROUP BY run_id HAVING count(*) > 1) d",
     )
-    if dupes not in ("0", ""):
+    # `None` means the query DID NOT RUN. It is called out separately from a
+    # non-zero count because the two are different verdicts and only one of them
+    # is about rivet: an unreachable meta-DB says nothing about duplicate rows,
+    # and must never be reported as having found none.
+    if dupes is None:
+        problems.append(
+            "the duplicate-export_metrics check DID NOT RUN — the state DB was "
+            "unreadable, which is not the same as clean"
+        )
+    elif dupes != "0":
         problems.append(
             f"{dupes} run(s) left MORE THAN ONE export_metrics row — under concurrency an "
             f"UPDATE-or-INSERT becomes two INSERTs, and every sum then double-counts"
@@ -201,7 +220,11 @@ def _judge(
         f"AND a.status='running' AND NOT EXISTS (SELECT 1 FROM run_status b "
         f"WHERE b.export_name=a.export_name AND b.started_at > a.started_at)",
     )
-    if stuck not in ("0", ""):
+    if stuck is None:
+        problems.append(
+            "the stuck-active check DID NOT RUN — the state DB was unreadable"
+        )
+    elif stuck != "0":
         problems.append(
             f"{stuck} run(s) still read as ACTIVE with nothing superseding them — gc_orphans "
             f"would defer on that prefix forever"
@@ -211,7 +234,11 @@ def _judge(
         f"SELECT coalesce(sum(total_rows),0) FROM export_metrics WHERE export_name LIKE "
         f"'{export_prefix}%' AND status='success'",
     )
-    if meta_rows not in ("", str(claimed_rows)):
+    if meta_rows is None:
+        problems.append(
+            "the meta-row/manifest agreement check DID NOT RUN — the state DB was unreadable"
+        )
+    elif meta_rows != str(claimed_rows):
         problems.append(
             f"the state DB records {meta_rows} rows for these runs, the manifests claim "
             f"{claimed_rows}"
@@ -324,13 +351,32 @@ def verify_concurrent_writers_share_a_prefix(
             copies.append(json.loads(text))
         except json.JSONDecodeError:
             pass
+    # Count the rows BEFORE the prefix is deleted. This passed `rows_read=None`
+    # on the strength of a comment saying they were "counted by the loader
+    # below" — there is no loader below; the function ends on the next line,
+    # deleting the evidence. So the GCS leg rendered a verdict with the
+    # row-count arm of `_judge` switched off (it is guarded by
+    # `rows_read is not None`), and nothing in the report said so.
+    #
+    # httpfs cannot read `gs://` here, which is what the old comment was
+    # reaching for — but pulling the parts down and reading them with DuckDB is
+    # the same independent decode, plus a copy step.
+    dl = work / f"dl_gcs_{stamp}"
+    dl.mkdir(parents=True, exist_ok=True)
+    pulled = run(["gsutil", "-m", "cp", "-r", f"gs://{bucket}/{pfx}/*", str(dl)], timeout=900)
+    rows_read = _duckdb_count(f"{dl}/**/*.parquet") if pulled.ok else None
+    if rows_read is None:
+        _skipped(led, "-", "-", "concurrent_writers_share_a_prefix", "gcs-rows",
+                 "concurrent-writers[gcs]: row count NOT verified — "
+                 + ("duckdb absent or unreadable" if pulled.ok else "gsutil cp failed"),
+                 "no row oracle")
     _judge(
         led, "gcs",
         exits=exits,
         chatter=chatter,
         files=files,
         copies=copies,
-        rows_read=None,  # counted by the loader below, not by httpfs
+        rows_read=rows_read,
         state_container=state_container,
         export_prefix=f"conc_{stamp}_g",
     )
