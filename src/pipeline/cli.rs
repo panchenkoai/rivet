@@ -149,11 +149,7 @@ pub fn show_state(config_path: &str, json: bool) -> Result<()> {
                  • rivet state files  — every produced file with row count + size"
             );
         } else {
-            println!(
-                "No exports have been run yet.\n  \
-                 Run `rivet run --config {}` first, then try `rivet state show` again.",
-                config_path
-            );
+            println!("{}", never_run_hint(config_path));
         }
         return Ok(());
     }
@@ -290,22 +286,18 @@ pub fn show_files(
         }
         return Ok(());
     }
-    // run_ids are `{export}_{%Y%m%dT%H%M%S%3f}` (timestamp alone is 18 chars),
-    // so a column narrower than the longest export name + 19 wraps and breaks
-    // alignment. 40 fits the common case; longer names overflow gracefully.
-    println!(
-        "{:<40} {:<40} {:>8} {:>10} CREATED",
-        "RUN ID", "FILE", "ROWS", "BYTES"
-    );
+    println!("{}", files_header());
     println!("{}", "-".repeat(115));
     for f in &files {
         println!(
-            "{:<40} {:<40} {:>8} {:>10} {}",
-            f.run_id,
-            f.file_name,
-            f.row_count,
-            format_bytes(f.bytes as u64),
-            f.created_at,
+            "{}",
+            files_row(
+                &f.run_id,
+                &f.file_name,
+                f.row_count,
+                &format_bytes(f.bytes as u64),
+                &f.created_at,
+            )
         );
     }
     Ok(())
@@ -728,6 +720,56 @@ pub fn show_journal(
     Ok(())
 }
 
+/// The hint printed when the state DB has no runs yet.
+///
+/// Extracted so its guard can assert on the STRING PRODUCTION EMITS. The guard
+/// used to build its own copy with `format!` and assert on that, so it could not
+/// fail if this text regressed — which is exactly how it once came to name the
+/// bare subcommand group `rivet state` (which errors without a leaf) instead of
+/// the runnable `rivet state show`.
+pub(crate) fn never_run_hint(config_path: &str) -> String {
+    format!(
+        "No exports have been run yet.\n  \
+         Run `rivet run --config {config_path}` first, then try `rivet state show` again."
+    )
+}
+
+/// Column width for RUN ID and FILE in `rivet state files`.
+///
+/// run_ids are `{export}_{%Y%m%dT%H%M%S%3f}` (the timestamp alone is 18 chars),
+/// so a column narrower than the longest export name + 19 overflows and pushes
+/// every later column out of line with the header.
+const FILES_COL_W: usize = 40;
+
+pub(crate) fn files_header() -> String {
+    format!(
+        "{:<w$} {:<w$} {:>8} {:>10} CREATED",
+        "RUN ID",
+        "FILE",
+        "ROWS",
+        "BYTES",
+        w = FILES_COL_W
+    )
+}
+
+pub(crate) fn files_row(
+    run_id: &str,
+    file_name: &str,
+    rows: i64,
+    bytes: &str,
+    created_at: &str,
+) -> String {
+    format!(
+        "{:<w$} {:<w$} {:>8} {:>10} {}",
+        run_id,
+        file_name,
+        rows,
+        bytes,
+        created_at,
+        w = FILES_COL_W
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use crate::state::FilePart;
@@ -860,14 +902,14 @@ exports:
         let run_id = "transactions_historyy_20250115T143022999"; // 40 chars
         assert_eq!(run_id.len(), 40, "fixture must be a realistic 40-char id");
 
-        let header = format!(
-            "{:<40} {:<40} {:>8} {:>10} CREATED",
-            "RUN ID", "FILE", "ROWS", "BYTES"
-        );
-        let row = format!(
-            "{:<40} {:<40} {:>8} {:>10} {}",
-            run_id, "orders_001.parquet", 50_000, "4.0KB", "2025-01-15",
-        );
+        // Both strings come from the PRODUCTION formatters. They used to be
+        // rebuilt here with a local `format!` carrying its own `{:<40}`, so the
+        // test compared two copies of its own literal: narrowing the real column
+        // left it green. Now shrinking FILES_COL_W below 40 overflows the run_id
+        // in the row while the header pads "RUN ID" to the narrower width, and the
+        // two offsets diverge.
+        let header = files_header();
+        let row = files_row(run_id, "orders_001.parquet", 50_000, "4.0KB", "2025-01-15");
 
         // The FILE column header and the row's file value must start at the
         // same byte offset — the alignment invariant a too-narrow column breaks.
@@ -892,11 +934,16 @@ exports:
     // never-run branch builds.
     #[test]
     fn show_state_never_run_hint_points_at_state_show() {
+        // The hint comes from PRODUCTION. It used to be rebuilt here with a local
+        // `format!`, so the assertions interrogated the test's own copy and could
+        // not fail if the real text regressed — which is how it once came to name
+        // the bare group `rivet state` (which errors without a leaf) in the first
+        // place.
         let config_path = "rivet.yaml";
-        let hint = format!(
-            "No exports have been run yet.\n  \
-             Run `rivet run --config {}` first, then try `rivet state show` again.",
-            config_path
+        let hint = never_run_hint(config_path);
+        assert!(
+            hint.contains(config_path),
+            "the hint must name the operator's actual config: {hint}"
         );
         assert!(
             hint.contains("try `rivet state show` again"),

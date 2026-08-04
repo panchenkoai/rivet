@@ -409,18 +409,41 @@ mod tests {
         );
     }
 
+    /// The not-retry-safe WARN must not fire for a LOCAL destination — and the
+    /// mechanism is not a demotion inside `log_capabilities`, which has no
+    /// per-kind branch at all. It is that `LocalDestination` genuinely reports
+    /// `retry_safe: true`, because temp-then-rename leaves nothing at the final
+    /// key on failure. That claim is the thing worth pinning.
+    ///
+    /// The previous test called `log_capabilities` with a HAND-BUILT
+    /// `streaming_unsafe()` stub and asserted NOTHING — no `should_panic`, no log
+    /// capture. It proved the function does not panic, while its name promised a
+    /// demotion that does not exist. Flipping `local.rs`'s `retry_safe` to false
+    /// left it green, and every local run would then nag about partial artifacts
+    /// that temp-then-rename makes impossible.
     #[test]
-    fn log_capabilities_local_unsafe_demoted_to_debug() {
-        // Local destination is formally not retry-safe but idempotent
-        // overwrite makes the partial-file window benign; WARN must be
-        // demoted to DEBUG so it stops nagging dev/test workflows. No
-        // panic + no observable WARN in the default log level.
-        log_capabilities(
-            "orders",
-            &streaming_unsafe(),
-            crate::config::DestinationType::Local,
-            3,
+    fn a_local_destination_is_retry_safe_so_the_partial_artifact_warning_cannot_fire() {
+        let cfg = crate::config::DestinationConfig {
+            destination_type: crate::config::DestinationType::Local,
+            path: Some("/tmp/rivet-caps-probe".to_string()),
+            ..Default::default()
+        };
+        let local = local::LocalDestination::new(&cfg).expect("local destination");
+        let caps = local.capabilities();
+
+        assert!(
+            caps.retry_safe,
+            "temp-then-rename leaves nothing at the final key on failure, so a local \
+             destination IS retry-safe — reporting otherwise makes log_capabilities \
+             warn about partial artifacts on every ordinary local run"
         );
+        assert!(
+            !caps.partial_write_risk,
+            "…and for the same reason there is no partial-write window"
+        );
+        // The warn branch is `!retry_safe && max_retries > 0`, so the assertion
+        // above IS the condition that keeps it silent — restating it as
+        // `!(!retry_safe && 3 > 0)` would add a line and no coverage.
     }
 
     #[test]
