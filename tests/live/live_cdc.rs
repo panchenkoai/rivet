@@ -31,17 +31,24 @@ fn write_checkpoint(c: &mut mysql::PooledConn, path: &std::path::Path) {
     std::fs::write(path, format!(r#"{{"file":"{file}","pos":{pos}}}"#)).unwrap();
 }
 
+/// The CDC rig for this file — ONE builder behind both accessors below.
+fn cdc_rig(tbl: &str, ckpt: &std::path::Path, out: &std::path::Path) -> Rig {
+    Rig::mysql_cdc(tbl)
+        .checkpoint_path(ckpt.to_path_buf())
+        .dest_path(out.to_path_buf())
+}
+
+/// Config PATH in a CALLER-owned dir. Kept because ~46 sites here only need a
+/// path (and the state DB beside it); a `Rig` owns its own tempdir, so handing
+/// back `rig.config_path()` from a helper would drop the rig and delete the file.
+/// Tests that need `run_args_env` (fault injection) take [`cdc_rig`] instead.
 fn cdc_config(
     d: &tempfile::TempDir,
     tbl: &str,
     ckpt: &std::path::Path,
     out: &std::path::Path,
 ) -> std::path::PathBuf {
-    let yaml = Rig::mysql_cdc(tbl)
-        .checkpoint_path(ckpt.to_path_buf())
-        .dest_path(out.to_path_buf())
-        .yaml();
-    write_config(d, &yaml)
+    write_config(d, &cdc_rig(tbl, ckpt, out).yaml())
 }
 
 /// Template-equivalence golden: the rig must render EXACTLY the config the
@@ -445,15 +452,10 @@ fn cdc_crash_after_flush_before_ack_re_reads_on_resume() {
     // Run 1 crashes right after the part is flushed, before the checkpoint+ack.
     let crash_out = d.path().join("crash");
     std::fs::create_dir_all(&crash_out).unwrap();
-    let crashed = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cdc_config(&d, &tbl, &ckpt, &crash_out).to_str().unwrap(),
-        ])
-        .env("RIVET_TEST_PANIC_AT", "cdc_after_flush_before_ack")
-        .output()
-        .expect("spawn rivet");
+    let crashed = cdc_rig(&tbl, &ckpt, &crash_out).run_args_env(
+        &[],
+        &[("RIVET_TEST_PANIC_AT", "cdc_after_flush_before_ack")],
+    );
     assert!(
         !crashed.status.success(),
         "the injected crash must fail run 1"
@@ -1381,14 +1383,14 @@ exports:
         &[],
     )
     .unwrap();
-    let out = std::process::Command::new(RIVET_BIN)
-        .args([
+    let out = run_rivet_env(
+        &[
             "run",
             "--config",
             pg_cdc_config(&d, &tbl, &slot, &cdc_out).to_str().unwrap(),
-        ])
-        .output()
-        .expect("spawn rivet");
+        ],
+        &[],
+    );
     assert!(
         !out.status.success(),
         "CDC must fail loudly on NaN::numeric, like batch — not NULL it silently"
@@ -1821,10 +1823,7 @@ exports:
 
     // Run 2 MUST fail loudly — silently recreating the slot at the current
     // position would skip row 2 forever while reporting success.
-    let res = std::process::Command::new(RIVET_BIN)
-        .args(["run", "--config", cfg.to_str().unwrap()])
-        .output()
-        .expect("spawn rivet");
+    let res = run_rivet_env(&["run", "--config", cfg.to_str().unwrap()], &[]);
     assert!(
         !res.status.success(),
         "a vanished slot with a completed snapshot behind it must FAIL, not silently re-anchor"
@@ -2494,10 +2493,7 @@ fn cdc_resume_from_missing_binlog_fails_loudly_not_silently() {
     let out_dir = d.path().join("out");
     std::fs::create_dir_all(&out_dir).unwrap();
     let cfg = cdc_config(&d, &tbl, &ckpt, &out_dir);
-    let out = std::process::Command::new(RIVET_BIN)
-        .args(["run", "--config", cfg.to_str().unwrap()])
-        .output()
-        .expect("spawn rivet");
+    let out = run_rivet_env(&["run", "--config", cfg.to_str().unwrap()], &[]);
     assert!(
         !out.status.success(),
         "resuming from a purged/missing binlog must FAIL, not silently re-anchor"
@@ -2540,14 +2536,14 @@ fn cdc_corrupt_checkpoint_fails_loud_not_silently_absent() {
     // Run 2 must FAIL loudly — never exit 0 having silently re-anchored past id=1.
     let out2 = d.path().join("out2");
     std::fs::create_dir_all(&out2).unwrap();
-    let res = std::process::Command::new(RIVET_BIN)
-        .args([
+    let res = run_rivet_env(
+        &[
             "run",
             "--config",
             cdc_config(&d, &tbl, &ckpt, &out2).to_str().unwrap(),
-        ])
-        .output()
-        .expect("spawn rivet");
+        ],
+        &[],
+    );
     assert!(
         !res.status.success(),
         "a corrupt checkpoint must fail the run, not silently re-anchor and skip changes"
@@ -2620,10 +2616,7 @@ exports:
     let out3 = d.path().join("out3");
     std::fs::create_dir_all(&out3).unwrap();
     let cfg3 = write_config(&d, &yaml(&out3));
-    let out = std::process::Command::new(RIVET_BIN)
-        .args(["run", "--config", cfg3.to_str().unwrap()])
-        .output()
-        .expect("spawn rivet");
+    let out = run_rivet_env(&["run", "--config", cfg3.to_str().unwrap()], &[]);
     assert!(
         !out.status.success(),
         "a vanished slot with an existing checkpoint must fail the run, not silently re-create"
@@ -2696,14 +2689,11 @@ exports:
     // Run 3 must FAIL loudly — never read the corrupt checkpoint as absent.
     let out3 = d.path().join("out3");
     std::fs::create_dir_all(&out3).unwrap();
-    let res = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            write_config(&d, &yaml(&out3)).to_str().unwrap(),
-        ])
-        .output()
-        .expect("spawn rivet");
+    let res = run_rivet(&[
+        "run",
+        "--config",
+        write_config(&d, &yaml(&out3)).to_str().unwrap(),
+    ]);
     assert!(
         !res.status.success(),
         "a corrupt checkpoint must fail the run, not be read as absent and re-anchor"
@@ -2744,10 +2734,7 @@ fn doctor_reports_cdc_slot_health_and_flags_foreign_inactive_slots() {
     let out_dir = d.path().join("out");
     std::fs::create_dir_all(&out_dir).unwrap();
     let cfg = pg_cdc_config(&d, &tbl, &own_slot, &out_dir);
-    let out = std::process::Command::new(RIVET_BIN)
-        .args(["doctor", "--config", cfg.to_str().unwrap(), "--json"])
-        .output()
-        .expect("spawn rivet doctor");
+    let out = run_rivet(&["doctor", "--config", cfg.to_str().unwrap(), "--json"]);
     let report: serde_json::Value =
         serde_json::from_slice(&out.stdout).expect("doctor --json output");
     let checks = report["checks"].as_array().expect("checks array");
@@ -2857,15 +2844,14 @@ fn pg_cdc_crash_after_flush_before_ack_does_not_advance_the_slot() {
     // Run 1 crashes after the part is flushed, before the slot advances.
     let crash_out = d.path().join("crash");
     std::fs::create_dir_all(&crash_out).unwrap();
-    let crashed = std::process::Command::new(RIVET_BIN)
-        .args([
+    let crashed = run_rivet_env(
+        &[
             "run",
             "--config",
             pg_cdc_config(&d, &tbl, &slot, &crash_out).to_str().unwrap(),
-        ])
-        .env("RIVET_TEST_PANIC_AT", "cdc_after_flush_before_ack")
-        .output()
-        .expect("spawn rivet");
+        ],
+        &[("RIVET_TEST_PANIC_AT", "cdc_after_flush_before_ack")],
+    );
     assert!(
         !crashed.status.success(),
         "the injected crash must fail run 1"
@@ -2938,11 +2924,7 @@ fn roast_pg_cdc_crash_in_a_re_drain_pass_stays_at_least_once() {
         .cdc("rollover: 5")
         .dest_path(out.clone());
     // Run 1 crashes right after the FIRST ack (the pass-1 uncaptured-span ack).
-    let crashed = std::process::Command::new(RIVET_BIN)
-        .args(["run", "--config", rig.config_path().to_str().unwrap()])
-        .env("RIVET_TEST_PANIC_AT", "cdc_after_ack")
-        .output()
-        .expect("spawn rivet");
+    let crashed = rig.run_args_env(&[], &[("RIVET_TEST_PANIC_AT", "cdc_after_ack")]);
     assert!(
         !crashed.status.success(),
         "the injected crash must fail run 1"
@@ -3012,11 +2994,7 @@ fn roast_pg_cdc_large_transaction_is_atomic_across_a_mid_flush_crash() {
         .cdc("rollover: 5")
         .dest_path(out.clone());
     // Run 1 crashes right after the FIRST ack.
-    let crashed = std::process::Command::new(RIVET_BIN)
-        .args(["run", "--config", rig.config_path().to_str().unwrap()])
-        .env("RIVET_TEST_PANIC_AT", "cdc_after_ack")
-        .output()
-        .expect("spawn rivet");
+    let crashed = rig.run_args_env(&[], &[("RIVET_TEST_PANIC_AT", "cdc_after_ack")]);
     assert!(
         !crashed.status.success(),
         "the injected crash must fail run 1"
@@ -3077,11 +3055,7 @@ fn roast_mysql_cdc_large_transaction_is_atomic_across_a_mid_flush_crash() {
         .unwrap();
 
     // Run 1 crashes right after the FIRST ack.
-    let crashed = std::process::Command::new(RIVET_BIN)
-        .args(["run", "--config", rig.config_path().to_str().unwrap()])
-        .env("RIVET_TEST_PANIC_AT", "cdc_after_ack")
-        .output()
-        .expect("spawn rivet");
+    let crashed = rig.run_args_env(&[], &[("RIVET_TEST_PANIC_AT", "cdc_after_ack")]);
     assert!(
         !crashed.status.success(),
         "the injected crash must fail run 1"
