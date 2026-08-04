@@ -61,6 +61,31 @@ pub(super) fn run_cdc_export(
         chrono::Utc::now().format("%Y%m%dT%H%M%S%3f")
     );
 
+    // Resolve `{date}`/`{export}`/… ONCE, here, before anything reads a prefix.
+    //
+    // The batch path gets this for free and that is exactly why the gap was
+    // invisible: every batch runner writes to `plan.destination`, and
+    // `plan::build` expands the templates while building it
+    // (`expand_destination_templates`). CDC returns from `job.rs` BEFORE
+    // `build_plan` ever runs, so it had no plan and no expansion — the drain
+    // called `create_destination` on the RAW config and created a directory
+    // named, literally, `{date}`. Meanwhile `rivet validate` resolves the same
+    // template to today's date (`validate_cmd.rs`, whose comment asserts this
+    // is "the same shape `rivet run` resolves at write time" — true for batch,
+    // false here) and reported an empty destination over a stream that had
+    // captured everything correctly.
+    //
+    // `for_today` is deliberately the SAME constructor the reader uses. The
+    // load-bearing property is not which date lands in the path — it is that
+    // the writer and the reader compute it the same way.
+    let expanded_export = {
+        let ctx = crate::destination::placeholder::PlaceholderContext::for_today(&export.name);
+        let mut e = export.clone();
+        e.destination = crate::destination::placeholder::expand_destination(e.destination, &ctx);
+        e
+    };
+    let export = &expanded_export;
+
     // Mark the CDC run `running` in the central ledger so `gc_orphans` never
     // deletes the live stream's in-flight `__changes` parts. The prefix is the
     // export's BASE (a multi-table stream writes `<base>/<table>/`); the load

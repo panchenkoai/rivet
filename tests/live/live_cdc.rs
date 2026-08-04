@@ -4603,3 +4603,84 @@ exports:
          name happens to parse to"
     );
 }
+
+// A CDC destination carrying a `{date}` template must be resolved at WRITE time
+// the same way `rivet validate` resolves it at READ time.
+//
+// The batch path never had this bug and that is precisely why it hid: every
+// batch runner writes to `plan.destination`, which `plan::build` expands while
+// building the plan. `job.rs` returns into `cdc_job::run_cdc_export` BEFORE
+// `build_plan`, so CDC had no plan and no expansion — `create_destination` got
+// the RAW config and made a directory named, literally, `{date}`, while
+// validate/load resolved the template to today's date and reported an empty
+// destination over a perfectly captured stream.
+//
+// The assertion is deliberately two-sided. "Rows landed somewhere" is not the
+// property (they always did); the property is that they landed where the reader
+// looks AND that the literal-template directory does not exist. A one-sided
+// check passes against the bug — the pre-fix run also produces readable parquet,
+// just at an address nothing else in rivet ever visits.
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical)"]
+fn roast_pg_cdc_destination_placeholders_resolve_like_the_batch_path() {
+    use postgres::NoTls;
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("cdc_placeholder");
+    let slot = unique_name("rivet_placeholder_slot");
+    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {tbl}; \
+         CREATE TABLE {tbl} (id INT PRIMARY KEY, v TEXT);"
+    ))
+    .unwrap();
+    c.execute(
+        "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+        &[&slot],
+    )
+    .unwrap();
+    c.batch_execute(&format!(
+        "INSERT INTO {tbl} (id, v) VALUES (1, 'a'), (2, 'b'), (3, 'c');"
+    ))
+    .unwrap();
+
+    let base = d.path().join("out");
+    std::fs::create_dir_all(&base).unwrap();
+    // The config carries the TEMPLATE, exactly as an operator would write it.
+    Rig::pg_cdc(&tbl, &slot)
+        .dest_path(base.join("{date}"))
+        .run_ok();
+
+    let literal = base.join("{date}");
+    let resolved = base.join(chrono::Utc::now().format("%Y-%m-%d").to_string());
+
+    // The oracle is WHERE THE PARQUET IS, never whether a directory exists: the
+    // rig itself `create_dir_all`s the configured destination before launching
+    // (`rig.rs`), so the literal `{date}` directory is present either way and an
+    // existence check would grade the harness instead of the product. This cost
+    // one RED run to learn — the first draft asserted `!literal.exists()` and
+    // failed against the FIXED binary.
+    let parquet_in = |p: &std::path::Path| -> usize {
+        std::fs::read_dir(p)
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .filter(|e| e.path().extension().is_some_and(|x| x == "parquet"))
+                    .count()
+            })
+            .unwrap_or(0)
+    };
+    let at_resolved = parquet_in(&resolved);
+    assert!(
+        at_resolved > 0,
+        "no parquet at the RESOLVED prefix the reader computes ({}) — the \
+         template reached `create_destination` unexpanded, so validate, load and \
+         gc all look somewhere the drain never wrote",
+        resolved.display()
+    );
+    assert_eq!(
+        parquet_in(&literal),
+        0,
+        "parquet landed under the LITERAL `{{date}}` directory ({}) — the write \
+         address and the read address disagree",
+        literal.display()
+    );
+}
