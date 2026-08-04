@@ -4554,7 +4554,20 @@ exports:
         sid = server_id_for(&tbl),
     );
     let cfg = write_config(&d, &cfg_text);
-    run_rivet_ok(&cfg);
+    // The config resolves its source through `url_env:` ON PURPOSE — this test is
+    // about SOURCE IDENTITY, and the env form is the one a deployment uses when a
+    // plaintext URL would be redacted out of the artifact. But nothing ever SET
+    // the variable, so every run of this test died at config load with "env var
+    // 'MYSQL_CDC_URL' is not set" before reaching a single assertion. Pass it.
+    let out_run = run_rivet_env(
+        &["run", "--config", cfg.to_str().unwrap()],
+        &[("MYSQL_CDC_URL", MYSQL_CDC_URL)],
+    );
+    assert!(
+        out_run.status.success(),
+        "the snapshot+cdc run must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&out_run.stderr)
+    );
 
     // Read what each leg actually WROTE, and compare with the product's own
     // identity rule rather than a copy of it.

@@ -73,6 +73,28 @@ test-live: sweep-test-db
 # the 1M-row `max_pressure` test stays manual (override SEED_ARGS to change).
 SEED_ARGS ?= --users 1000 --orders-per-user 5 --events-per-user 5 --page-views 5000 --content-items 60000
 
+# ── Release-size fixture ────────────────────────────────────────────────────
+# The PRE-RELEASE size. `live_content_load::pg_full_content_export_max_pressure`
+# asserts `content_items >= 1_000_000` and FAILS — it does not skip — below that,
+# so `cargo test --release -- --ignored` (release-checklist §2) cannot pass on a
+# standard-seeded stand. That is a gate that reports red for a fixture reason,
+# which is exactly the noise a go/no-go check must not produce.
+#
+# Fixed in the SEED rather than in the test, because the seed is the canonical
+# generator for every engine and is deterministic by construction: every row
+# comes from a SQL series (`generate_series` / a chunked range), with no RNG
+# anywhere in `src/bin/seed/`. The same command therefore yields byte-identical
+# fixtures on PostgreSQL, MySQL and SQL Server, which is what makes a
+# cross-engine comparison meaningful in the first place.
+#
+# NOT the default: 1M content_items is ~17x the standard 60k (~1 min), and the
+# everyday `make seed-db` should stay fast. Run this before the release matrix.
+RELEASE_SEED_ARGS ?= --users 1000 --orders-per-user 5 --events-per-user 5 --page-views 5000 --content-items 1000000
+
+seed-release: seed-build
+	RIVET_SEED_I_KNOW=1 target/debug/seed --target postgres $(RELEASE_SEED_ARGS)
+	RIVET_SEED_I_KNOW=1 target/debug/seed --target mysql $(RELEASE_SEED_ARGS)
+
 seed-build:
 	cargo build --bin seed --features dev-seed
 

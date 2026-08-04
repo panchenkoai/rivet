@@ -35,6 +35,11 @@ checklist is what a maintainer fills out **before** pushing the tag.
 ## 2. Local extraction
 
 - [ ] `cargo test --release` — full offline suite (~1300 tests).
+- [ ] `make seed-release` — the 1M-row `content_items` fixture the pressure test
+      needs. The everyday `make seed-db` seeds 60k, and
+      `live_content_load::pg_full_content_export_max_pressure` FAILS (it does not
+      skip) below 1M, so the live matrix below cannot go green without this.
+      Same canonical seed, deterministic across engines — only the size differs.
 - [ ] `cargo test --release -- --ignored` — full live matrix (PG + MySQL,
       MinIO, fake-gcs, Toxiproxy).  Includes the **type golden** parity
       pair on Postgres + MySQL.
