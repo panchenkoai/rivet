@@ -265,3 +265,23 @@ pub fn duckdb_distinct_set(
         })
         .unwrap_or_default()
 }
+
+/// [`duckdb_distinct_set`] for an INTEGER key column.
+///
+/// The stringified form is the right default (a Mongo `_id` may be an ObjectId or
+/// a string), but a SQL test comparing against `(0..10).collect()` wants the
+/// numbers — converting at every call site would put a parse in the assertion,
+/// which is where a silent `unwrap_or(0)` would hide a real decode failure.
+pub fn duckdb_distinct_i64_set(
+    container_dir: &str,
+    column: &str,
+) -> std::collections::BTreeSet<i64> {
+    duckdb_distinct_set(container_dir, column)
+        .into_iter()
+        .map(|v| {
+            v.parse().unwrap_or_else(|e| {
+                panic!("`{column}` is not an integer in the destination: {v:?} ({e})")
+            })
+        })
+        .collect()
+}
