@@ -39,6 +39,12 @@ grid:
 # Cell is per-ENGINE (uniform across that engine's gridded versions); a version-specific
 # divergence would split into its own note.
 scenarios:
+  - id: bq_cycle
+    what: "the full warehouse cycle on real infrastructure: export to a real GCS bucket -> rivet load -> row count verified by `bq query` (Google's parquet reader, which shares no code with rivet's writer) -> table dropped and prefix removed, with the drop VERIFIED by asking afterwards (bq rm -f exits 0 whether it deleted a table or found none, so its exit status cannot answer 'is it gone' — that cell reported a clean cleanup while dropping a table that never existed)."
+    postgres: test
+    mysql:    test
+    mssql:    test
+    mongo:    test
   - id: blessed_path
     what: "COMPLEMENTS docs/scenario-artifact-matrix.yaml, which owns the artifact/meta-DB half more deeply (14 lifecycle scenarios, all engines, canonical seed, chunk_run/chunk_task/load_run snapshots). What is added here and provably absent there: an INDEPENDENT oracle (that driver has zero duckdb calls — it compares rivet's records to rivet's files), the COMMAND CHAIN in one traversal: init -> doctor -> check -> plan -> apply -> validate, one cell per stage, asserting every artifact (config, plan.json, parquet, manifest.json, _SUCCESS, export_metrics/file_log/run_status) with DuckDB as the independent oracle for rows and file count. Per-stage coverage existed everywhere; no test drove three of the five subcommands in one body, and both defects found 2026-08-04 (apply's empty config path, CDC's unexpanded {date}) lived in that handoff gap."
     postgres: test
