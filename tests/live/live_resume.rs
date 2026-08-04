@@ -528,7 +528,7 @@ fn full_mode_resume_flag_is_rejected() {
     // exports, the flag must produce a diagnostic rather than silently ignoring it.
     require_alive(LiveService::Postgres);
     let table = seed_pg_numeric_table(10);
-    let export_name = unique_name("qa12_full_resume");
+    let export_name = unique_name("qa12_full_norsm");
     let out = tempfile::tempdir().unwrap();
     let yaml = Rig::pg_batch(&export_name)
         .query(&format!(
@@ -552,9 +552,22 @@ fn full_mode_resume_flag_is_rejected() {
     // silently succeed as if resume had an effect.  The export itself may succeed
     // (the warning does not block execution), but the operator must be informed.
     let stderr = String::from_utf8_lossy(&result.stderr);
+    // Assert the RULE the validator emits, not a substring the fixture supplies
+    // for free. The old condition was
+    //   stderr.contains("resume") || contains("checkpoint") || contains("warn")
+    // and the export name itself contained "resume" — so it passed on the
+    // fixture's own name, with `--resume` on the command line as a second free
+    // hit. Deleting check_resume_without_checkpoint from src/plan/validate.rs
+    // left all three engines green.
     assert!(
-        stderr.contains("resume") || stderr.contains("checkpoint") || stderr.contains("warn"),
-        "--resume on full-mode export must produce a diagnostic; stderr:\n{stderr}"
+        stderr.contains("resume-no-checkpoint"),
+        "--resume on a full-mode export must emit the resume-no-checkpoint rule, \
+         not merely mention the word; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("has no effect unless"),
+        "…and it must say the flag does NOTHING, which is the actionable half; \
+         stderr:\n{stderr}"
     );
 }
 

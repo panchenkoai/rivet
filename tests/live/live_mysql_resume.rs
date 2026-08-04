@@ -348,7 +348,7 @@ fn mysql_chunked_resume_with_completed_run_gives_actionable_message() {
 fn mysql_full_mode_resume_flag_is_rejected() {
     require_alive(LiveService::Mysql);
     let table = seed_mysql_numeric_table(10);
-    let export_name = unique_name("qa12my_full_resume");
+    let export_name = unique_name("qa12my_full_norsm");
     let out = tempfile::tempdir().unwrap();
     let yaml = Rig::mysql_batch(&export_name)
         .query(&format!(
@@ -371,8 +371,21 @@ fn mysql_full_mode_resume_flag_is_rejected() {
     // Plan validator emits a Warning for resume-no-checkpoint; the export
     // itself may succeed but the operator must be informed.
     let stderr = String::from_utf8_lossy(&result.stderr);
+    // Assert the RULE the validator emits, not a substring the fixture supplies
+    // for free. The old condition was
+    //   stderr.contains("resume") || contains("checkpoint") || contains("warn")
+    // and the export name itself contained "resume" — so it passed on the
+    // fixture's own name, with `--resume` on the command line as a second free
+    // hit. Deleting check_resume_without_checkpoint from src/plan/validate.rs
+    // left all three engines green.
     assert!(
-        stderr.contains("resume") || stderr.contains("checkpoint") || stderr.contains("warn"),
-        "--resume on full-mode export must produce a diagnostic; stderr:\n{stderr}"
+        stderr.contains("resume-no-checkpoint"),
+        "--resume on a full-mode export must emit the resume-no-checkpoint rule, \
+         not merely mention the word; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("has no effect unless"),
+        "…and it must say the flag does NOTHING, which is the actionable half; \
+         stderr:\n{stderr}"
     );
 }
