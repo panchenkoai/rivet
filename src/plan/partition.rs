@@ -62,6 +62,21 @@ pub(crate) fn generate_ranges(
 /// coerce them against a `DATE` / `TIMESTAMP` / `TIMESTAMPTZ` column. For a
 /// timestamptz column the literal is interpreted at the session time zone —
 /// callers that need a fixed zone must pin it (`SET time_zone='+00:00'`).
+///
+/// SQL Server is the exception and gets `YYYYMMDD`. Against a `datetime` /
+/// `smalldatetime` column T-SQL parses the SEPARATED form per the session's
+/// `DATEFORMAT` (which follows the login's `LANGUAGE`), so on any server whose
+/// default is not `us_english` — British English, German, most European
+/// installs — `'2024-03-05'` is read as 5 March or rejected outright, and every
+/// partition window silently covers the wrong range. The unseparated form is
+/// defined as ISO and is immune to `DATEFORMAT` and `LANGUAGE` in all of them.
+///
+/// Deliberately fixed HERE rather than by pinning `SET DATEFORMAT ymd` on the
+/// connection, the way the PostgreSQL and MySQL readers pin their session
+/// (`postgres/mod.rs`, `mysql/mod.rs`). A literal that cannot be misread needs no
+/// session to be correct, so it also survives a pooled or user-supplied
+/// connection rivet does not own. Pinning the session is still worth doing as
+/// defence in depth for any OTHER literal.
 pub(crate) fn build_range_query(
     base_query: &str,
     col: &str,
@@ -69,12 +84,22 @@ pub(crate) fn build_range_query(
     source_type: SourceType,
 ) -> String {
     let q = crate::sql::quote_ident(source_type, col);
+    let fmt = date_literal_format(source_type);
     format!(
         "SELECT * FROM ({base}) AS _rivet_part WHERE {q} >= '{lo}' AND {q} < '{hi}'",
         base = base_query,
-        lo = range.lo.format("%Y-%m-%d"),
-        hi = range.hi.format("%Y-%m-%d"),
+        lo = range.lo.format(fmt),
+        hi = range.hi.format(fmt),
     )
+}
+
+/// The date-literal spelling that this engine parses unambiguously regardless of
+/// session `DATEFORMAT` / `LANGUAGE` settings. See [`build_range_query`].
+pub(crate) fn date_literal_format(source_type: SourceType) -> &'static str {
+    match source_type {
+        SourceType::Mssql => "%Y%m%d",
+        _ => "%Y-%m-%d",
+    }
 }
 
 /// Wrap `base_query` for the NULL bucket — rows whose partition column is NULL,
@@ -328,5 +353,64 @@ mod tests {
             build_null_count_query("SELECT * FROM events", "created_at", SourceType::Postgres)
                 .contains("WHERE \"created_at\" IS NULL")
         );
+    }
+}
+
+#[cfg(test)]
+mod date_literal_dialect_tests {
+    use super::{PartitionRange, build_range_query, date_literal_format};
+    use crate::config::SourceType;
+    use chrono::NaiveDate;
+
+    fn day(s: &str) -> NaiveDate {
+        NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap()
+    }
+
+    /// SQL Server must receive the UNSEPARATED date literal.
+    ///
+    /// Against a `datetime` / `smalldatetime` column T-SQL parses `'2024-03-05'`
+    /// according to the session `DATEFORMAT`, which follows the login's
+    /// `LANGUAGE`. On a British-English or German server — the default on a large
+    /// share of real installs — that is 5 March, or a hard parse failure. Either
+    /// way every partition window silently covers a different range than the plan
+    /// says, and no count or checksum can notice: each window is internally
+    /// consistent.
+    ///
+    /// `'20240305'` is defined as ISO in every language, so it needs no session
+    /// to be right. Expected strings are literal, not derived from the formatter.
+    #[test]
+    fn sql_server_gets_an_unseparated_date_literal_the_others_keep_iso() {
+        let range = PartitionRange {
+            lo: day("2024-03-05"),
+            hi: day("2024-04-01"),
+            label_value: "2024-03".to_string(),
+        };
+
+        let mssql = build_range_query("SELECT * FROM t", "created_at", &range, SourceType::Mssql);
+        assert!(
+            mssql.contains("'20240305'") && mssql.contains("'20240401'"),
+            "SQL Server bounds must be DATEFORMAT-immune: {mssql}"
+        );
+        assert!(
+            !mssql.contains("'2024-03-05'"),
+            "the separated form is exactly what a non-us_english server misreads: {mssql}"
+        );
+
+        for engine in [SourceType::Postgres, SourceType::Mysql] {
+            let q = build_range_query("SELECT * FROM t", "created_at", &range, engine);
+            assert!(
+                q.contains("'2024-03-05'") && q.contains("'2024-04-01'"),
+                "{engine:?} parses ISO-with-dashes unambiguously and must keep it: {q}"
+            );
+        }
+    }
+
+    /// The helper the date-CHUNK emitter shares — `pipeline::chunked::math` builds
+    /// its own WHERE bounds and had the identical defect at three more sites.
+    #[test]
+    fn the_dialect_helper_is_engine_specific() {
+        assert_eq!(date_literal_format(SourceType::Mssql), "%Y%m%d");
+        assert_eq!(date_literal_format(SourceType::Postgres), "%Y-%m-%d");
+        assert_eq!(date_literal_format(SourceType::Mysql), "%Y-%m-%d");
     }
 }
