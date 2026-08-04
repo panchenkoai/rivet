@@ -24,13 +24,16 @@ const PORT: u16 = 27018; // mongo-rs
 
 /// A `mode: cdc` Rig (until_current + checkpoint) over `table` in a fresh db.
 fn cdc(db: &str, table: &str) -> Rig {
-    Rig::mongo_cdc(table).source_url(&MongoTest::url(PORT, db))
+    Rig::mongo_cdc(table)
+        .source_url(&MongoTest::url(PORT, db))
+        .duckdb_oracle()
 }
 
 #[test]
 #[ignore = "live: requires docker compose up -d mongo-rs"]
 fn mongo_cdc_capture_resume_and_until_current_drain() {
     require_alive(LiveService::MongoRs);
+    require_alive(LiveService::DuckDb);
     let db = unique_name("cdc_cap");
     let m = MongoTest::connect(PORT, &db);
     m.drop_collection("t");
@@ -51,7 +54,7 @@ fn mongo_cdc_capture_resume_and_until_current_drain() {
 
     // until_current must DRAIN the whole backlog and exit (the 4.4 race guard).
     rig.run_ok();
-    let ids = dir_parquet_distinct_strings(&rig.out_dir(), "_id");
+    let ids = duckdb_distinct_set(rig.oracle_dir(), "_id");
     assert!(
         ["1", "2", "3"].iter().all(|i| ids.contains(*i)),
         "until_current dropped part of the backlog: got {ids:?}"
@@ -62,7 +65,7 @@ fn mongo_cdc_capture_resume_and_until_current_drain() {
     let rig2 = cdc(&db, "t").checkpoint_path(rig.checkpoint());
     rig2.run_ok();
     assert_eq!(
-        total_parquet_rows(&rig2.out_dir()),
+        duckdb_parquet_rows(rig2.oracle_dir()),
         0,
         "resume must capture only new changes"
     );
@@ -72,6 +75,7 @@ fn mongo_cdc_capture_resume_and_until_current_drain() {
 #[ignore = "live: requires docker compose up -d mongo-rs"]
 fn mongo_cdc_crash_after_flush_before_ack_re_reads_on_resume() {
     require_alive(LiveService::MongoRs);
+    require_alive(LiveService::DuckDb);
     let db = unique_name("cdc_crash");
     let m = MongoTest::connect(PORT, &db);
     m.drop_collection("t");
@@ -94,12 +98,12 @@ fn mongo_cdc_crash_after_flush_before_ack_re_reads_on_resume() {
     // superset of the 5 source changes — no silent loss, at-least-once the only
     // allowed surplus.
     rig.run_ok();
-    let ids = dir_parquet_distinct_strings(&rig.out_dir(), "_id");
+    let ids = duckdb_distinct_set(rig.oracle_dir(), "_id");
     for i in 1..=5 {
         assert!(ids.contains(&i.to_string()), "id {i} lost across the crash");
     }
     assert!(
-        total_parquet_rows(&rig.out_dir()) >= 5,
+        duckdb_parquet_rows(rig.oracle_dir()) >= 5,
         "crash + resume must be at-least-once (superset), not lose rows"
     );
 }
@@ -108,6 +112,7 @@ fn mongo_cdc_crash_after_flush_before_ack_re_reads_on_resume() {
 #[ignore = "live: requires docker compose up -d mongo-rs"]
 fn mongo_cdc_soak_dedup_matches_source_current_state() {
     require_alive(LiveService::MongoRs);
+    require_alive(LiveService::DuckDb);
     let db = unique_name("cdc_soak");
     let m = MongoTest::connect(PORT, &db);
     m.drop_collection("s");
@@ -146,6 +151,7 @@ fn mongo_cdc_soak_dedup_matches_source_current_state() {
 #[ignore = "live: requires docker compose up -d mongo-rs"]
 fn mongo_cdc_idle_first_run_then_change_is_captured() {
     require_alive(LiveService::MongoRs);
+    require_alive(LiveService::DuckDb);
     let db = unique_name("cdc_idle");
     let m = MongoTest::connect(PORT, &db);
     m.drop_collection("t");
@@ -164,7 +170,7 @@ fn mongo_cdc_idle_first_run_then_change_is_captured() {
     m.upsert_set("t", 42, "v", "after_quiet_enable");
     rig.run_ok();
     assert!(
-        dir_parquet_distinct_strings(&rig.out_dir(), "_id").contains("42"),
+        duckdb_distinct_set(rig.oracle_dir(), "_id").contains("42"),
         "the change made during a quiet first run must be captured on resume"
     );
 }
@@ -173,6 +179,7 @@ fn mongo_cdc_idle_first_run_then_change_is_captured() {
 #[ignore = "live: requires docker compose up -d mongo-rs"]
 fn mongo_cdc_update_and_delete_carry_document() {
     require_alive(LiveService::MongoRs);
+    require_alive(LiveService::DuckDb);
     let db = unique_name("cdc_ud");
     let m = MongoTest::connect(PORT, &db);
     m.drop_collection("t");
@@ -212,6 +219,7 @@ fn mongo_cdc_update_and_delete_carry_document() {
 #[ignore = "live: requires docker compose up -d mongo-rs"]
 fn mongo_cdc_initial_snapshot_covers_preexisting_rows() {
     require_alive(LiveService::MongoRs);
+    require_alive(LiveService::DuckDb);
     let db = unique_name("cdc_snap");
     let m = MongoTest::connect(PORT, &db);
     // Pre-existing rows the stream alone would NOT see (they predate the anchor);
@@ -258,6 +266,7 @@ fn walkdir_parquet_ids(root: &std::path::Path, marker: &str) -> std::collections
 #[ignore = "live: requires docker compose up -d mongo-rs"]
 fn mongo_cdc_mixed_transaction_ending_on_uncaptured_table() {
     require_alive(LiveService::MongoRs);
+    require_alive(LiveService::DuckDb);
     let db = unique_name("cdc_mix");
     let m = MongoTest::connect(PORT, &db);
     m.drop_collection("orders");
@@ -273,7 +282,7 @@ fn mongo_cdc_mixed_transaction_ending_on_uncaptured_table() {
     m.txn_two_collections("orders", 1, "audit", 99);
 
     rig.run_ok();
-    let ids = dir_parquet_distinct_strings(&rig.out_dir(), "_id");
+    let ids = duckdb_distinct_set(rig.oracle_dir(), "_id");
     assert!(
         ids.contains("1"),
         "the captured-collection change must appear"
@@ -291,6 +300,7 @@ fn roast_corrupt_checkpoint_fails_loudly_not_silent_reanchor() {
     // treated as "no checkpoint" → re-anchor at now → silent gap. It must fail
     // loudly instead (bug-hunt find).
     require_alive(LiveService::MongoRs);
+    require_alive(LiveService::DuckDb);
     let db = unique_name("cdc_corrupt");
     let m = MongoTest::connect(PORT, &db);
     m.drop_collection("t");
@@ -315,6 +325,7 @@ fn roast_pos_column_leads_with_data_for_downstream_sort() {
     // keystring, whereas a `rt`-first `__pos` sorts by the full token (whose hex
     // is not length-stable) and mis-orders the dedup (bug-hunt find).
     require_alive(LiveService::MongoRs);
+    require_alive(LiveService::DuckDb);
     let db = unique_name("cdc_posdata");
     let m = MongoTest::connect(PORT, &db);
     m.drop_collection("t");
@@ -346,6 +357,7 @@ fn roast_until_current_terminates_under_sustained_writes_and_keeps_backlog() {
     // (bug-hunt H) — and (2) still capture the pre-open backlog (a naive bound
     // dropped it). Assert both.
     require_alive(LiveService::MongoRs);
+    require_alive(LiveService::DuckDb);
     let db = unique_name("cdc_hbound");
     let m = MongoTest::connect(PORT, &db);
     m.drop_collection("t");
@@ -381,7 +393,7 @@ fn roast_until_current_terminates_under_sustained_writes_and_keeps_backlog() {
     );
     // The whole pre-open backlog (0..29) must be present — termination must NOT
     // come from dropping the backlog.
-    let ids = dir_parquet_distinct_strings(&rig.out_dir(), "_id");
+    let ids = duckdb_distinct_set(rig.oracle_dir(), "_id");
     for i in 0..30 {
         assert!(
             ids.contains(&i.to_string()),
@@ -419,6 +431,7 @@ fn roast_mongo_cdc_until_current_open_bound_two_runs_lose_nothing() {
     //    it guards a future refactor away from per-event tokens. Oracle: the
     //    source collection, never rivet's own counters.
     require_alive(LiveService::MongoRs);
+    require_alive(LiveService::DuckDb);
     let db = unique_name("cdc_mongoob");
     let m = MongoTest::connect(PORT, &db);
     m.drop_collection("t");
@@ -464,7 +477,7 @@ fn roast_mongo_cdc_until_current_open_bound_two_runs_lose_nothing() {
         "run 2 (no writers) must drain the deferred tail and exit"
     );
 
-    let got = dir_parquet_distinct_strings(&rig.out_dir(), "_id");
+    let got = duckdb_distinct_set(rig.oracle_dir(), "_id");
     let want: std::collections::BTreeSet<String> = m
         .current_state_i64("t", "v")
         .into_keys()
@@ -485,6 +498,7 @@ fn roast_uncaptured_collection_drop_does_not_wedge_capture() {
     // collection failed the whole run — and every resume re-hit it: a wedge
     // (bug-hunt G). DDL is now skipped; the captured collection keeps flowing.
     require_alive(LiveService::MongoRs);
+    require_alive(LiveService::DuckDb);
     let db = unique_name("cdc_ddl");
     let m = MongoTest::connect(PORT, &db);
     m.drop_collection("orders");
@@ -501,7 +515,7 @@ fn roast_uncaptured_collection_drop_does_not_wedge_capture() {
 
     // Must NOT bail on the drop — both orders changes captured.
     rig.run_ok();
-    let ids = dir_parquet_distinct_strings(&rig.out_dir(), "_id");
+    let ids = duckdb_distinct_set(rig.oracle_dir(), "_id");
     assert!(
         ids.contains("1") && ids.contains("2"),
         "captured collection must keep flowing across an uncaptured drop, got: {ids:?}"
@@ -517,6 +531,7 @@ fn roast_checkpoint_advances_on_uncaptured_only_traffic() {
     // uncaptured backlog until the oplog rolled past it (bug-hunt K). The final
     // roll now fires on an unacked commit even with empty buffers.
     require_alive(LiveService::MongoRs);
+    require_alive(LiveService::DuckDb);
     let db = unique_name("cdc_kstall");
     let m = MongoTest::connect(PORT, &db);
     m.drop_collection("orders");
@@ -556,6 +571,7 @@ fn roast_checkpoint_advances_on_uncaptured_only_traffic() {
 #[ignore = "live: requires docker compose up -d mongo-rs"]
 fn mongo_cdc_change_stream_renders_tricky_bson_verbatim_like_batch() {
     require_alive(LiveService::MongoRs);
+    require_alive(LiveService::DuckDb);
     use mongodb::bson::{Bson, doc};
     let db = unique_name("cdc_types");
     let m = MongoTest::connect(PORT, &db);

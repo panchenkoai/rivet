@@ -145,14 +145,36 @@ fn python_repr(s: &str) -> String {
 ///
 /// `container_dir` is the second element of [`duckdb_shared_workdir`].
 pub fn duckdb_parquet_rows(container_dir: &str) -> i64 {
-    let v = duckdb_run_sql_json(&format!(
-        "SELECT count(*) AS n FROM read_parquet('{container_dir}/**/*.parquet')"
-    ));
-    v["rows"][0][0]
-        .as_str()
-        .unwrap_or("0")
-        .parse()
-        .unwrap_or_else(|e| panic!("duckdb row count not an integer: {e}; raw {v}"))
+    duckdb_scalar_or_empty(container_dir, "count(*)", "*").unwrap_or(0)
+}
+
+/// One aggregate over every parquet under `container_dir`, or `None` when the
+/// directory holds NO parquet at all.
+///
+/// An empty destination is a legitimate expected value — "resume must capture
+/// only new changes" asserts exactly zero — but `read_parquet` on a glob that
+/// matches nothing is an ERROR, so the first version of these helpers panicked
+/// on the one answer some tests are looking for. The emptiness is resolved in
+/// python, where the exception is catchable, rather than by asking the caller to
+/// know in advance whether any file exists.
+fn duckdb_scalar_or_empty(container_dir: &str, agg: &str, col: &str) -> Option<i64> {
+    let py = format!(
+        r#"
+import duckdb, json, sys, glob
+files = glob.glob({dir_repr} + "/**/*.parquet", recursive=True)
+if not files:
+    sys.stdout.write("null")
+else:
+    con = duckdb.connect()
+    v = con.execute("SELECT {agg} FROM read_parquet('" + {dir_repr} + "/**/*.parquet')").fetchone()[0]
+    sys.stdout.write(json.dumps(int(v)))
+"#,
+        dir_repr = python_repr(container_dir),
+        agg = agg.replace("{col}", col),
+    );
+    let out = duckdb_run_python(&py);
+    serde_json::from_str::<Option<i64>>(out.trim())
+        .unwrap_or_else(|e| panic!("duckdb scalar not an int/null: {e}; raw {out}"))
 }
 
 /// Distinct values of `column` across every `.parquet` under `container_dir`.
@@ -160,14 +182,7 @@ pub fn duckdb_parquet_rows(container_dir: &str) -> i64 {
 /// The count that separates "no rows lost" from "no rows lost AND none
 /// duplicated" — a retry or a resume can satisfy the first and break the second.
 pub fn duckdb_parquet_distinct(container_dir: &str, column: &str) -> i64 {
-    let v = duckdb_run_sql_json(&format!(
-        "SELECT count(DISTINCT {column}) AS n FROM read_parquet('{container_dir}/**/*.parquet')"
-    ));
-    v["rows"][0][0]
-        .as_str()
-        .unwrap_or("0")
-        .parse()
-        .unwrap_or_else(|e| panic!("duckdb distinct count not an integer: {e}; raw {v}"))
+    duckdb_scalar_or_empty(container_dir, &format!("count(DISTINCT {column})"), column).unwrap_or(0)
 }
 
 /// Assert total and distinct in one call — the shape a completeness claim needs.
@@ -222,4 +237,31 @@ pub fn duckdb_assert_at_least_once(container_dir: &str, column: &str, expected: 
         "{what}: {total} rows for {expected} distinct `{column}` — fewer rows than \
          keys is impossible unless the read itself is wrong"
     );
+}
+
+/// Distinct values of `column` as a SET, read by DuckDB.
+///
+/// The counting helpers above answer "how many"; a set answers "which", which is
+/// what a CDC test needs — membership of a specific `_id`, or the exact symmetric
+/// difference against the source. Values come back stringified (the same
+/// convention as [`duckdb_run_sql_json`]), so an integer `_id` reads as "42".
+pub fn duckdb_distinct_set(
+    container_dir: &str,
+    column: &str,
+) -> std::collections::BTreeSet<String> {
+    if duckdb_scalar_or_empty(container_dir, "count(*)", "*").is_none() {
+        return std::collections::BTreeSet::new(); // no parquet at all
+    }
+    let v = duckdb_run_sql_json(&format!(
+        "SELECT DISTINCT CAST({column} AS VARCHAR) AS v \
+         FROM read_parquet('{container_dir}/**/*.parquet') WHERE {column} IS NOT NULL"
+    ));
+    v["rows"]
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|r| r[0].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
 }
