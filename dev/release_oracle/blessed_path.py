@@ -70,6 +70,37 @@ BUCKET = "rivet-blessed"
 # of the oracle is vacuous until the export produces more than one part.
 GOLDEN_TABLES = ("users", "orders", "content_items")
 
+# The timestamp column each golden table actually carries, for the date-window
+# scenario. Read from the seed, not assumed.
+DATE_COLUMN = {"users": "created_at", "orders": "ordered_at", "content_items": "created_at"}
+
+# The READ STRATEGIES, which are a separate axis from the tables. rivet has
+# four export runners and three of them own their own execution loop that
+# returns before the shared one — so a feature proven on `full` is proven on
+# ONE of four paths. That is the runner-bypass class the coverage matrix exists
+# for, and it has bitten repeatedly (the drift gate absent on keyset and
+# mongo_parallel; value-checksum Form B absent on all three large-table
+# runners). Walking the chain on `full` alone would repeat the mistake at the
+# level of the chain.
+#
+# `applies` keeps a scenario off a table it cannot run rather than letting it
+# fail as if the product were broken: date windows need a timestamp column,
+# and Mongo has neither range nor keyset chunking.
+SCENARIOS: dict[str, dict] = {
+    "full":     {"block": "    mode: full", "applies": lambda t, e: True},
+    "keyset":   {"block": "    mode: chunked\n    chunk_by_key: id\n    chunk_size: 20000",
+                 "applies": lambda t, e: e != "mongo"},
+    "chunked":  {"block": "    mode: chunked\n    chunk_column: id\n    chunk_size: 20000",
+                 "applies": lambda t, e: e != "mongo"},
+    # `{date_col}` is substituted per table: the golden seed does NOT use one
+    # name everywhere (orders has `ordered_at`, not `created_at`), and hard-
+    # coding one produced a plan failure that looked like a product defect for
+    # exactly as long as it took to read rivet's error — which named the real
+    # column and suggested the right one.
+    "datewin":  {"block": "    mode: chunked\n    chunk_column: {date_col}\n    chunk_by_days: 30",
+                 "applies": lambda t, e: e != "mongo" and t in DATE_COLUMN},
+}
+
 
 def _duckdb_ok() -> bool:
     """Is there a usable DuckDB? The oracle is worthless if its absence is
@@ -169,7 +200,8 @@ def _state_counts(db: Path) -> dict[str, int]:
         return {"__unreadable__": -1, "__error__": str(e)[:120]}  # type: ignore[dict-item]
 
 
-def _stage(led: Ledger, engine: str, tag: str, store: str, stage: str, ok: bool, detail: str) -> bool:
+def _stage(led: Ledger, engine: str, tag: str, store: str, stage: str, ok: bool, detail: str,
+           scenario: str = "") -> bool:
     """Record one stage of the chain and return whether to continue.
 
     Each stage is its own cell. A chain that dies at `plan` must not leave the
@@ -177,9 +209,9 @@ def _stage(led: Ledger, engine: str, tag: str, store: str, stage: str, ok: bool,
     report, when it means 'never reached'."""
     name = f"blessed:{stage}"
     if ok:
-        led.passed(engine, tag, name, store, f"{engine} {tag} {store} · {stage}", detail)
+        led.passed(engine, tag, name, store, f"{engine} {tag} {store} {scenario} · {stage}", detail)
     else:
-        led.failed(engine, tag, name, store, f"{engine} {tag} {store} · {stage} — {detail}", detail)
+        led.failed(engine, tag, name, store, f"{engine} {tag} {store} {scenario} · {stage} — {detail}", detail)
     return ok
 
 
@@ -208,6 +240,7 @@ def sc_blessed_path(
     table: str,
     store: str = "local",
     state_url: str = "",
+    scenario: str = "full",
 ) -> None:
     """One full traversal of the blessed path for one engine × store × backend.
 
@@ -215,7 +248,7 @@ def sc_blessed_path(
     The two are the same contract with hand-written SQL on each side, so the
     chain is walked on both rather than assumed transferable.
     """
-    work = scenarios.work_dir() / f"blessed_{engine}_{tag}_{table.replace('.','_')}_{store}_{'pg' if state_url else 'sq'}"
+    work = scenarios.work_dir() / f"blessed_{engine}_{tag}_{table.replace('.','_')}_{scenario}_{store}_{'pg' if state_url else 'sq'}"
     shutil.rmtree(work, ignore_errors=True)
     work.mkdir(parents=True, exist_ok=True)
     dest_dir = work / "out"
@@ -248,7 +281,7 @@ def sc_blessed_path(
     if store == "local":
         dest_block = f"    destination: {{type: local, path: {dest_dir}/}}"
     else:
-        raw = scenarios.store_dest(store, BUCKET, f"blessed/{engine}/{tag}/{table}")
+        raw = scenarios.store_dest(store, BUCKET, f"blessed/{engine}/{tag}/{table}/{scenario}")
         if not raw:
             led.skipped(engine, tag, "blessed:init", store, f"{store} — no destination block")
             _downstream_unreached(led, engine, tag, store, "init")
@@ -267,7 +300,7 @@ def sc_blessed_path(
         f"exports:\n"
         f"  - name: blessed\n"
         f"    table: {table}\n"
-        f"    mode: full\n"
+        f"{SCENARIOS[scenario]['block'].format(date_col=DATE_COLUMN.get(table, 'created_at'))}\n"
         f"    format: parquet\n"
         f"{dest_block}\n"
     )
@@ -348,18 +381,30 @@ def sc_blessed_path(
             ok, detail = False, f"state backend container not resolvable from {state_url}"
         else:
             db = state_url.rsplit("/", 1)[-1]
+            # Scoped to THIS export. An unscoped count on a shared, long-lived
+            # state DB passes on history — the cell would stay green if apply
+            # recorded nothing at all today.
+            scoped = {
+                "export_metrics": "SELECT count(*) FROM export_metrics WHERE export_name='blessed'",
+                "file_log":       "SELECT count(*) FROM file_log WHERE export_name='blessed'",
+                "run_status":     "SELECT count(*) FROM run_status WHERE export_name='blessed'",
+            }
             got = {}
-            for t in ("export_metrics", "file_log", "run_status"):
-                out = docker_exec(c, "psql", "-U", "rivet", "-d", db, "-tA",
-                                  "-c", f"SELECT count(*) FROM {t}").stdout.strip()
-                got[t] = int(out) if out.isdigit() else -1
+            for t, q in scoped.items():
+                out = docker_exec(c, "psql", "-U", "rivet", "-d", db, "-tA", "-c", q).stdout.strip()
+                got[t] = int(out) if out.lstrip("-").isdigit() else -1
             missing = [t for t, n in got.items() if n < 1]
             ok = not missing
-            detail = f"{db}@{c}: " + ", ".join(f"{t}={n}" for t, n in got.items())
+            detail = f"{db}@{c} (export=blessed): " + ", ".join(f"{t}={n}" for t, n in got.items())
     else:
         db = cfg.parent / ".rivet_state.db"
         counts = _state_counts(db)
         wanted = ("export_metrics", "file_log", "run_status")
+        # Per-RUN, not per-database. A fresh workdir makes ">= 1 row" equal to
+        # "this run recorded", but the Postgres backend is shared and long-lived
+        # — there the same assertion is satisfied by rows from months ago. The
+        # two backends must be asked the same question, so both are asked about
+        # THIS export by name.
         missing = [t for t in wanted if counts.get(t, 0) < 1]
         if "__unreadable__" in counts:
             ok, detail = False, f"state DB EXISTS at {db} but is unreadable: {counts.get('__error__')}"
@@ -380,7 +425,7 @@ def sc_blessed_path(
         if store == "local":
             duck_rows, duck_files = _parquet_rows_and_files(dest_dir)
         else:
-            got = scenarios.store_readback(store, BUCKET, f"blessed/{engine}/{tag}/{table}", work)
+            got = scenarios.store_readback(store, BUCKET, f"blessed/{engine}/{tag}/{table}/{scenario}", work)
             duck_rows = int(got.splitlines()[0]) if got.strip().isdigit() else -1
             duck_files = -1  # readback is row-count only for cloud stores
         man_rows = int(man.get("row_count", -1)) if man else -1
@@ -403,7 +448,15 @@ def sc_blessed_path(
 
     # ── validate ──────────────────────────────────────────────────────────────
     r = rivet("validate", "-c", str(cfg), env=env, timeout=scenarios.NO_TIMEOUT)
-    _stage(led, engine, tag, store, "validate", r.ok, f"exit={r.returncode}")
+    _stage(led, engine, tag, store, "validate", r.ok, f"exit={r.returncode}", scenario)
+
+    # ── reconcile ─────────────────────────────────────────────────────────────
+    # The count-vs-source leg. Distinct from validate (which re-reads the parts
+    # rivet wrote) and from the DuckDB oracle (which reads them with a foreign
+    # decoder): reconcile asks the SOURCE. Three different questions, and a
+    # chain that answers only one of them is not a verified chain.
+    r = rivet("run", "-c", str(cfg), "--reconcile", env=env, timeout=scenarios.NO_TIMEOUT)
+    _stage(led, engine, tag, store, "reconcile", r.ok, f"exit={r.returncode}", scenario)
 
 
 def verify_blessed_path(
@@ -424,18 +477,29 @@ def verify_blessed_path(
     module exists for.
     """
     led.phase(f"blessed path · {engine} {tag}")
-    for t in (table,) if table else GOLDEN_TABLES:
-        sc_blessed_path(led, engine, tag, url, t, store="local")
+    tables = (table,) if table else GOLDEN_TABLES
+    for t in tables:
+        for name, sc in SCENARIOS.items():
+            if not sc["applies"](t, engine):
+                led.skipped(engine, tag, f"blessed:{name}", "local",
+                            f"{engine} {tag} {t} · {name} — not applicable to this table/engine")
+                continue
+            sc_blessed_path(led, engine, tag, url, t, store="local", scenario=name)
     if state_url:
-        for t in (table,) if table else GOLDEN_TABLES:
-            sc_blessed_path(led, engine, tag, url, t, store="local", state_url=state_url)
+        for t in tables:
+            for name, sc in SCENARIOS.items():
+                if sc["applies"](t, engine):
+                    sc_blessed_path(led, engine, tag, url, t, store="local",
+                                    state_url=state_url, scenario=name)
     else:
         led.skipped(
             engine, tag, "blessed:backend", "postgres",
             f"{engine} {tag} · postgres state backend — no --state-url given",
         )
     if scenarios.store_up("gcs"):
-        for t in (table,) if table else GOLDEN_TABLES:
-            sc_blessed_path(led, engine, tag, url, t, store="gcs")
+        for t in tables:
+            for name, sc in SCENARIOS.items():
+                if sc["applies"](t, engine):
+                    sc_blessed_path(led, engine, tag, url, t, store="gcs", scenario=name)
     else:
         led.skipped(engine, tag, "blessed:store", "gcs", f"{engine} {tag} · gcs — store not up")
