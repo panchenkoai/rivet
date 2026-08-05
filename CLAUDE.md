@@ -939,3 +939,52 @@ from the run's own metrics row. RED against the pre-fix order (`left: Some(0)`,
 `right: Some(4)`) while the pre-existing worker-error test stays GREEN against
 the same mutant. When a new test and an old one disagree about a mutant, the
 disagreement is the finding: the old test's blind spot has a name and a boundary.
+
+## A coverage ledger must grade the CALL SITE, not the definition
+
+A matrix row saying `test` means "the gate runs this". The guard that protects
+it asked a weaker question — does every `def verify_*` have a ROW — and the gap
+between the two was live: `blessed_path.verify_blessed_path` was registered
+`test` for all four engines and had **no caller anywhere in the tree**. Dead
+code behind four green cells, and every signal a reader has (the matrix, the
+definition, the guard, the docstring) agreed it was covered. Nothing in the
+suite asks "is this reachable from an entry point".
+
+Process rule: **a drift guard over a coverage ledger must assert the check is
+INVOKED, not merely defined** — an occurrence of `name(` that is not the `def`,
+in any module the runner can reach. `every_gate_function_has_a_call_site`
+(`tests/offline/release_gate_matrix_guard.rs`), RED-proven by deleting one call.
+The same shape applies to any registry-of-checks: a lint rule list, a scenario
+table, a hook map. Registration is a claim about behaviour; only the call site
+is evidence.
+
+Two siblings from the same build, both recurrences of rules already in this file:
+
+1. **An unscoped count is satisfied by history.** Three separate assertions in
+   ONE module counted `WHERE export_name='flow'` (37 rows on a cell that wrote
+   one) and `SELECT count(*) FROM load_run` (the same 21 in all twelve load
+   cells). Scope by whatever key the table actually has — a watermark on
+   `max(id)` where there is no `run_id` (clock-free; comparing the host's clock
+   to the database's is two clocks), the run ids from `.rivet/runs/*/summary.json`
+   (which rivet writes beside the CONFIG whatever the destination is, so it has
+   no local-vs-cloud asymmetry the way the destination manifest does), a PREFIX
+   match on `load_id` (the stored id is `<--run-id>:<export>` — one load over N
+   exports records N rows). A count twelve cells agree on is measuring none of
+   them.
+
+2. **One oracle across backends, or two that disagree about the bug.** The local
+   readback was fixed to count only manifest-DECLARED parts (a crash leaves
+   orphans no manifest names); the cloud readback kept counting everything under
+   the prefix, so every resume cell on s3/gcs read 2000 rows from a 1000-row
+   table. The fix is not to patch the second one — it is to PULL the cloud prefix
+   whole and run the identical local oracle over it. A store-specific "what was
+   delivered" is a second definition, and it drifts on the first fix.
+
+And a fixture rule the same run paid for: **`DROP TABLE` before a CDC disable
+orphans the change table**, so a guard joining `cdc.change_tables` to
+`sys.tables` stops seeing it, the disable is skipped, and the next
+`sp_cdc_enable_table` fails with 22926 "capture instance already exists". It
+alternates pass/fail and reads as a race; it is order-dependent state the guard
+went blind to. Disable first, guard on `capture_instance` (which survives the
+drop), and wait on `fn_cdc_get_min_lsn` rather than the enable call's exit code —
+rivet's preflight reads that function, so "enabled" is not "ready".
