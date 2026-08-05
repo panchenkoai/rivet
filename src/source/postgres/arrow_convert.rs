@@ -35,7 +35,9 @@ use postgres::Row;
 use postgres::types::{FromSql as PgFromSql, Kind, Type};
 
 use crate::error::Result;
-use crate::source::pg_numeric_wire::{PgNumericWire, numeric_wire_normalized_plain};
+use crate::source::pg_numeric_wire::{
+    PgNumericWire, numeric_wire_normalized_plain, numeric_wire_special_text,
+};
 use crate::types::{
     ColumnOverrides, RivetType, SourceColumn, TimeUnit as RivetTimeUnit, TypeMapping,
     build_arrow_field,
@@ -125,10 +127,18 @@ fn pg_numeric_optional_utf8_string(row: &Row, col_idx: usize) -> Result<Option<S
 }
 
 fn numeric_raw_to_optional_decimal_text(raw: &[u8]) -> Option<String> {
-    numeric_wire_normalized_plain(raw).or_else(|| {
-        let text = simdutf8::basic::from_utf8(raw).ok()?.trim();
-        (!text.is_empty()).then(|| text.to_owned())
-    })
+    numeric_wire_normalized_plain(raw)
+        // NaN / ±Infinity have no decimal literal, so `normalized_plain` returns
+        // None for them — but this is the STRING path, and text holds them
+        // losslessly. Without this the `or_else` below ran `from_utf8` over the
+        // BINARY wire header, failed, and emitted NULL: a silent degrade on the
+        // one path that could have carried the value intact, while the Decimal
+        // path (correctly) errors loudly on the same input.
+        .or_else(|| numeric_wire_special_text(raw).map(str::to_owned))
+        .or_else(|| {
+            let text = simdutf8::basic::from_utf8(raw).ok()?.trim();
+            (!text.is_empty()).then(|| text.to_owned())
+        })
 }
 
 // ─── Type mapping ────────────────────────────────────────────────────────────
@@ -597,6 +607,19 @@ impl crate::source::value_checksum::CellSource for PgCellSource<'_> {
     }
 }
 
+/// Microseconds since midnight, truncating sub-microsecond nanos.
+///
+/// Pulled out of the `Time64` arm because it is the only ARITHMETIC in this
+/// mapper, and arithmetic is where an operator swap hides in plain sight: the
+/// `*`, `+` and `/` here carried six standing baseline entries with nothing able
+/// to tell them apart. Identical expression to the MySQL and SQL Server mappers —
+/// the same six mutants survived in all THREE engines, each for the same reason:
+/// no unit test, or a fixture at midnight, where `0 * n`, `0 + n` and `0 / n` are
+/// indistinguishable.
+fn naive_time_to_micros(t: chrono::NaiveTime) -> i64 {
+    t.num_seconds_from_midnight() as i64 * 1_000_000 + t.nanosecond() as i64 / 1_000
+}
+
 fn build_array(
     pg_type: &Type,
     target_type: &DataType,
@@ -698,11 +721,7 @@ fn build_array(
             let mut b = Time64MicrosecondBuilder::with_capacity(rows.len());
             for row in rows {
                 match row.get::<_, Option<chrono::NaiveTime>>(col_idx) {
-                    Some(t) => {
-                        let micros = t.num_seconds_from_midnight() as i64 * 1_000_000
-                            + t.nanosecond() as i64 / 1_000;
-                        b.append_value(micros);
-                    }
+                    Some(t) => b.append_value(naive_time_to_micros(t)),
                     None => b.append_null(),
                 }
             }
@@ -1056,4 +1075,245 @@ fn pg_numeric_to_decimal256(
     Ok(Arc::new(
         b.finish().with_precision_and_scale(precision, scale)?,
     ))
+}
+
+#[cfg(test)]
+mod interval_render_tests {
+    use super::pg_interval_to_iso8601;
+
+    /// `pg_interval_to_iso8601` is a pure renderer with seven arithmetic steps
+    /// and, until now, no direct test — it was reachable only through a live
+    /// PostgreSQL export, which is why the mutation baseline carried seven
+    /// operator survivors for it (and why this 1000-line file had no test module
+    /// at all).
+    ///
+    /// Every component is chosen so no two operators agree: months=25 makes
+    /// `months / 12` (2) differ from `months * 12` (300) and `months % 12` (1)
+    /// differ from every other combination, and the microsecond value decomposes
+    /// into four DISTINCT non-zero fields (1h 2m 3s 456789µs) so each successive
+    /// `/` and `%` is observable on its own. The obvious fixture — a whole
+    /// number of hours — collapses three of them to zero.
+    #[test]
+    fn interval_render_pins_every_arithmetic_step() {
+        // 25 months = 2Y1M; 5 days; 3_723_456_789 µs = 1H 2M 3.456789S
+        assert_eq!(
+            pg_interval_to_iso8601(25, 5, 3_723_456_789),
+            "P2Y1M5DT1H2M3.456789S"
+        );
+        // The sign rides on each time component, and the magnitudes are
+        // unchanged — `unsigned_abs` before the division, not after.
+        assert_eq!(
+            pg_interval_to_iso8601(25, 5, -3_723_456_789),
+            "P2Y1M5DT-1H-2M-3.456789S"
+        );
+        // A sub-second-only interval: seconds is 0 but the fraction must still
+        // print, so the `us != 0` arm cannot be folded into the `sec != 0` one.
+        assert_eq!(pg_interval_to_iso8601(0, 0, 456_789), "PT0.456789S");
+        // Whole seconds with no fraction take the other arm.
+        assert_eq!(pg_interval_to_iso8601(0, 0, 3_000_000), "PT3S");
+        // Exactly one hour: minutes and seconds are zero, and the trailing "0S"
+        // is suppressed because h is non-zero.
+        assert_eq!(pg_interval_to_iso8601(0, 0, 3_600_000_000), "PT1H");
+        // Nothing at all still renders a valid ISO-8601 duration.
+        assert_eq!(pg_interval_to_iso8601(0, 0, 0), "PT0S");
+        // Months that are a whole number of years drop the month field — and
+        // with no time component at all the `T` section is omitted entirely,
+        // which "P2Y" expresses correctly. (The "T0S" fallback fires only when
+        // NOTHING was written, i.e. the string is still bare "P".)
+        assert_eq!(pg_interval_to_iso8601(24, 0, 0), "P2Y");
+    }
+}
+
+#[cfg(test)]
+mod time_arithmetic_tests {
+    use super::naive_time_to_micros;
+    use chrono::NaiveTime;
+
+    /// Pins every arithmetic step of the `time` conversion.
+    ///
+    /// Deliberately no zeros. At 00:00:00.000000 the `*`, `+` and `/` in that
+    /// expression all yield 0, so a midnight fixture cannot tell the three
+    /// operators apart — which is exactly why six operator mutants stood in the
+    /// baseline here, and in the MySQL and SQL Server mappers, which carry the
+    /// identical expression. Third engine, same shape, same fix.
+    ///
+    /// The expectations are computed outside this codebase, not read back from a
+    /// run: 01:02:03 is 3723 seconds, and .456789 s is 456_789 microseconds.
+    #[test]
+    fn naive_time_to_micros_pins_every_arithmetic_step() {
+        let t = NaiveTime::from_hms_nano_opt(1, 2, 3, 456_789_000).unwrap();
+        assert_eq!(naive_time_to_micros(t), 3723 * 1_000_000 + 456_789);
+
+        // Sub-microsecond nanos TRUNCATE, they do not round: 999 ns is 0 us.
+        let t = NaiveTime::from_hms_nano_opt(0, 0, 1, 999).unwrap();
+        assert_eq!(naive_time_to_micros(t), 1_000_000);
+
+        // The last representable instant of the day, so a `*`/`+` swap cannot
+        // coincide with the right answer by accident.
+        let t = NaiveTime::from_hms_nano_opt(23, 59, 59, 999_999_000).unwrap();
+        assert_eq!(naive_time_to_micros(t), 86_399 * 1_000_000 + 999_999);
+    }
+}
+
+#[cfg(test)]
+mod type_map_tests {
+    use super::pg_type_to_rivet;
+    use crate::types::{RivetType, TimeUnit as RivetTimeUnit};
+    use postgres::types::Type;
+
+    /// Every arm of `pg_type_to_rivet`, in one table.
+    ///
+    /// The mutation baseline carried NINETEEN "delete match arm" survivors for
+    /// this function: deleting an arm drops that type to the `_` fallback
+    /// (`Unsupported`), which nothing noticed because the mapping was only ever
+    /// exercised end-to-end through a live export. A table test makes each arm
+    /// individually load-bearing — remove one and exactly one row fails, naming
+    /// the type.
+    #[test]
+    fn every_pg_type_maps_to_its_declared_rivet_type() {
+        let cases: &[(Type, RivetType)] = &[
+            (Type::BOOL, RivetType::Bool),
+            (Type::INT2, RivetType::Int16),
+            (Type::INT4, RivetType::Int32),
+            (Type::INT8, RivetType::Int64),
+            // OID is u32; Int64 is the safe widening the arm documents.
+            (Type::OID, RivetType::Int64),
+            (Type::FLOAT4, RivetType::Float32),
+            (Type::FLOAT8, RivetType::Float64),
+            (Type::DATE, RivetType::Date),
+            (
+                Type::TIME,
+                RivetType::Time {
+                    unit: RivetTimeUnit::Microsecond,
+                },
+            ),
+            (Type::TEXT, RivetType::String),
+            (Type::VARCHAR, RivetType::String),
+            (Type::BPCHAR, RivetType::String),
+            (Type::NAME, RivetType::String),
+            (Type::BYTEA, RivetType::Binary),
+            (Type::JSON, RivetType::Json),
+            (Type::JSONB, RivetType::Json),
+            (Type::UUID, RivetType::Uuid),
+            (Type::INTERVAL, RivetType::Interval),
+        ];
+        for (pg, want) in cases {
+            let got = pg_type_to_rivet(pg);
+            assert_eq!(
+                &got, want,
+                "postgres type {pg:?} must map to {want:?}, got {got:?} — a dropped \
+                 arm falls through to Unsupported and silently changes the schema"
+            );
+        }
+    }
+
+    /// The two timestamp arms differ ONLY in the timezone field, which is the
+    /// whole point (roadmap §13: TIMESTAMPTZ carries UTC semantics into Arrow).
+    /// A test that checked only the variant would let the arms be swapped.
+    #[test]
+    fn timestamptz_carries_utc_and_timestamp_does_not() {
+        match pg_type_to_rivet(&Type::TIMESTAMP) {
+            RivetType::Timestamp { timezone, .. } => {
+                assert_eq!(timezone, None, "naive TIMESTAMP must carry NO timezone")
+            }
+            other => panic!("TIMESTAMP mapped to {other:?}"),
+        }
+        match pg_type_to_rivet(&Type::TIMESTAMPTZ) {
+            RivetType::Timestamp { timezone, .. } => assert_eq!(
+                timezone.as_deref(),
+                Some("UTC"),
+                "TIMESTAMPTZ must carry UTC, or the instant loses its meaning downstream"
+            ),
+            other => panic!("TIMESTAMPTZ mapped to {other:?}"),
+        }
+    }
+
+    /// NUMERIC without declared precision is Unsupported ON PURPOSE, and the
+    /// reason must stay actionable: the wire protocol carries no atttypmod, so
+    /// the operator needs to be told the two ways out.
+    #[test]
+    fn bare_numeric_is_unsupported_with_an_actionable_reason() {
+        match pg_type_to_rivet(&Type::NUMERIC) {
+            RivetType::Unsupported { reason, .. } => {
+                for needle in ["override", "decimal("] {
+                    assert!(
+                        reason.contains(needle),
+                        "the NUMERIC reason must mention {needle:?}, got: {reason}"
+                    );
+                }
+            }
+            other => panic!("bare NUMERIC mapped to {other:?} — it has no precision to use"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod numeric_string_path_tests {
+    use super::numeric_raw_to_optional_decimal_text;
+
+    /// PostgreSQL `numeric` binary header, built from the wire spec by hand —
+    /// NOT through rivet's own encoder, so the fixture is an independent oracle.
+    /// Layout: ndigits(u16), weight(i16), sign(u16), dscale(u16), then digits.
+    fn wire(sign: u16) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(&0u16.to_be_bytes()); // ndigits
+        v.extend_from_slice(&0i16.to_be_bytes()); // weight
+        v.extend_from_slice(&sign.to_be_bytes());
+        v.extend_from_slice(&0u16.to_be_bytes()); // dscale
+        v
+    }
+
+    /// A `columns: { c: string }` override on a PG `numeric` must carry the three
+    /// non-finite values as text, not degrade them to NULL.
+    ///
+    /// They have no decimal literal, so the shared wire decoder returns None for
+    /// them — correct for the Decimal path, which turns that into a loud error
+    /// ("unsupported NaN/infinity payload"). The STRING path inherited the same
+    /// None and fell through to a `from_utf8` over the BINARY header, which fails,
+    /// yielding a null indistinguishable from a real one. Text loses nothing here,
+    /// so nulling was the one avoidable outcome — and the asymmetry meant the same
+    /// column exported loudly-wrong under one config and silently-empty under
+    /// another.
+    ///
+    /// Expected strings are PostgreSQL's own spellings, hard-coded rather than
+    /// derived from anything under test.
+    #[test]
+    fn a_string_override_carries_nan_and_infinity_instead_of_nulling_them() {
+        for (sign, expected) in [
+            (0xC000u16, "NaN"),
+            (0xD000, "Infinity"),
+            (0xF000, "-Infinity"),
+        ] {
+            assert_eq!(
+                numeric_raw_to_optional_decimal_text(&wire(sign)).as_deref(),
+                Some(expected),
+                "sign field {sign:#06x} must render as {expected}, not degrade to NULL — \
+                 a string column holds it losslessly"
+            );
+        }
+    }
+
+    /// The finite path is untouched, and a genuinely undecodable payload still
+    /// yields None rather than a bogus string.
+    #[test]
+    fn finite_values_are_unaffected_and_garbage_still_yields_none() {
+        // ndigits=1, weight=0, sign=positive, dscale=0, digit=1 -> "1"
+        let mut finite = Vec::new();
+        finite.extend_from_slice(&1u16.to_be_bytes());
+        finite.extend_from_slice(&0i16.to_be_bytes());
+        finite.extend_from_slice(&0u16.to_be_bytes());
+        finite.extend_from_slice(&0u16.to_be_bytes());
+        finite.extend_from_slice(&1u16.to_be_bytes());
+        assert_eq!(
+            numeric_raw_to_optional_decimal_text(&finite).as_deref(),
+            Some("1"),
+            "finite decoding must not regress"
+        );
+
+        assert_eq!(
+            numeric_raw_to_optional_decimal_text(&[]).as_deref(),
+            None,
+            "an empty payload has no text form"
+        );
+    }
 }

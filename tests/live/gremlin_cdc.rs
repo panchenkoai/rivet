@@ -34,20 +34,14 @@ fn conn() -> mysql::PooledConn {
 /// CDC config against an arbitrary source URL (direct or through toxiproxy),
 /// with a small rollover so a big backlog produces many parts (a mid-drain
 /// fault then lands between parts, not before the first one).
-fn cdc_cfg(
-    d: &tempfile::TempDir,
-    url: &str,
-    tbl: &str,
-    ckpt: &std::path::Path,
-    out: &std::path::Path,
-) -> std::path::PathBuf {
-    let yaml = Rig::mysql_cdc(tbl)
+fn cdc_rig(url: &str, tbl: &str, ckpt: &std::path::Path, out: &std::path::Path) -> Rig {
+    // Returns the RIG, not a config path: these tests need `run_args` and
+    // `spawn_args_env` on it, and a bare path cannot give them either.
+    Rig::mysql_cdc(tbl)
         .source_url(url)
         .cdc("rollover: 200")
         .checkpoint_path(ckpt.to_path_buf())
         .dest_path(out.to_path_buf())
-        .yaml();
-    write_config(d, &yaml)
 }
 
 /// Distinct `id`s across every parquet part under `out` — the gap detector.
@@ -115,23 +109,15 @@ fn gremlin_cdc_sigkill_mid_drain_recovers_without_gap() {
     let out = d.path().join("out");
     let ckpt = d.path().join("cdc.ckpt");
     std::fs::create_dir_all(&out).unwrap();
-    let cfg = cdc_cfg(&d, MYSQL_CDC_URL, &tbl, &ckpt, &out);
+    let rig = cdc_rig(MYSQL_CDC_URL, &tbl, &ckpt, &out);
 
     // Pin, then a 5k-row backlog (25 parts at rollover: 200).
-    let st = std::process::Command::new(RIVET_BIN)
-        .args(["run", "--config", cfg.to_str().unwrap()])
-        .status()
-        .unwrap();
+    let st = rig.run_args(&[]).status;
     assert!(st.success());
     seed_backlog(&mut c, &tbl, 5_000);
 
     // Start the drain; SIGKILL as soon as the first part exists.
-    let mut child = std::process::Command::new(RIVET_BIN)
-        .args(["run", "--config", cfg.to_str().unwrap()])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .unwrap();
+    let mut child = rig.spawn_args_env(&[], &[]);
     let mut killed_mid_drain = false;
     for _ in 0..600 {
         let parts = std::fs::read_dir(&out)
@@ -160,10 +146,7 @@ fn gremlin_cdc_sigkill_mid_drain_recovers_without_gap() {
 
     // Recovery run(s): drain whatever the killed run left behind.
     for _ in 0..3 {
-        let st = std::process::Command::new(RIVET_BIN)
-            .args(["run", "--config", cfg.to_str().unwrap()])
-            .status()
-            .unwrap();
+        let st = rig.run_args(&[]).status;
         assert!(st.success(), "recovery run must succeed");
         if distinct_ids(&out).len() >= 5_000 {
             break;
@@ -201,22 +184,16 @@ fn gremlin_cdc_binlog_cut_mid_drain_fails_loud_then_recovers() {
     let out = d.path().join("out");
     let ckpt = d.path().join("cdc.ckpt");
     std::fs::create_dir_all(&out).unwrap();
-    let cfg = cdc_cfg(&d, proxied, &tbl, &ckpt, &out);
+    let rig = cdc_rig(proxied, &tbl, &ckpt, &out);
 
     // Pin through the healthy proxy, then seed ~1.2 MB of binlog.
-    let st = std::process::Command::new(RIVET_BIN)
-        .args(["run", "--config", cfg.to_str().unwrap()])
-        .status()
-        .unwrap();
+    let st = rig.run_args(&[]).status;
     assert!(st.success(), "pin run through the healthy proxy");
     seed_backlog(&mut c, &tbl, 5_000);
 
     // Cut the stream after 256 KB — mid-drain, deterministically.
     toxi_add_limit_data("mysql_cdc_gremlin", 256 * 1024, "downstream");
-    let out_cut = std::process::Command::new(RIVET_BIN)
-        .args(["run", "--config", cfg.to_str().unwrap()])
-        .output()
-        .unwrap();
+    let out_cut = rig.run_args(&[]);
     assert!(
         !out_cut.status.success(),
         "a cut mid-drain must fail the run loudly, not succeed partially:\n{}",
@@ -226,10 +203,7 @@ fn gremlin_cdc_binlog_cut_mid_drain_fails_loud_then_recovers() {
     // Heal and retry until the union is complete.
     toxi_reset_toxics("mysql_cdc_gremlin");
     for _ in 0..5 {
-        let st = std::process::Command::new(RIVET_BIN)
-            .args(["run", "--config", cfg.to_str().unwrap()])
-            .status()
-            .unwrap();
+        let st = rig.run_args(&[]).status;
         assert!(st.success(), "post-heal run must succeed");
         if distinct_ids(&out).len() >= 5_000 {
             break;
@@ -262,13 +236,10 @@ fn gremlin_cdc_checkpoint_write_failure_is_loud_and_lossless() {
     let ckpt = ro_dir.join("cdc.ckpt");
     let out = d.path().join("out");
     std::fs::create_dir_all(&out).unwrap();
-    let cfg = cdc_cfg(&d, MYSQL_CDC_URL, &tbl, &ckpt, &out);
+    let rig = cdc_rig(MYSQL_CDC_URL, &tbl, &ckpt, &out);
 
     // Pin normally (writable), THEN make the checkpoint dir read-only.
-    let st = std::process::Command::new(RIVET_BIN)
-        .args(["run", "--config", cfg.to_str().unwrap()])
-        .status()
-        .unwrap();
+    let st = rig.run_args(&[]).status;
     assert!(st.success());
     c.query_drop(format!("INSERT INTO {tbl} VALUES (1, 'x'), (2, 'y')"))
         .unwrap();
@@ -277,10 +248,7 @@ fn gremlin_cdc_checkpoint_write_failure_is_loud_and_lossless() {
     perms.set_mode(0o555);
     std::fs::set_permissions(&ro_dir, perms.clone()).unwrap();
 
-    let res = std::process::Command::new(RIVET_BIN)
-        .args(["run", "--config", cfg.to_str().unwrap()])
-        .output()
-        .unwrap();
+    let res = rig.run_args(&[]);
     // Restore writability FIRST so the guard cleanup and the retry work even
     // if the asserts below fail.
     perms.set_mode(0o755);
@@ -294,11 +262,8 @@ fn gremlin_cdc_checkpoint_write_failure_is_loud_and_lossless() {
     // The ack never ran, so the retry must re-deliver both rows.
     let out2 = d.path().join("out2");
     std::fs::create_dir_all(&out2).unwrap();
-    let cfg2 = cdc_cfg(&d, MYSQL_CDC_URL, &tbl, &ckpt, &out2);
-    let st = std::process::Command::new(RIVET_BIN)
-        .args(["run", "--config", cfg2.to_str().unwrap()])
-        .status()
-        .unwrap();
+    let rig2 = cdc_rig(MYSQL_CDC_URL, &tbl, &ckpt, &out2);
+    let st = rig2.run_args(&[]).status;
     assert!(st.success());
     let ids: std::collections::HashSet<i64> = distinct_ids(&out)
         .union(&distinct_ids(&out2))
@@ -359,6 +324,10 @@ exports:
     // Pin through the healthy proxy, seed, then cut uploads after 128 KB.
     let proxied = "http://127.0.0.1:14443";
     let cfg = cfg_for(&d, proxied);
+    // Hand-rolled config on purpose: this test writes to GCS through a proxied
+    // endpoint, and the rig renders only `type: local` destinations. Adding
+    // cloud destinations to the seam for one test would be speculative; the gap
+    // is named here so the next reader knows it is a limit, not an oversight.
     let st = std::process::Command::new(RIVET_BIN)
         .args(["run", "--config", cfg.to_str().unwrap()])
         .status()

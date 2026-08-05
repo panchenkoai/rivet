@@ -56,6 +56,23 @@ pub enum SchemaDriftPolicy {
 #[serde(deny_unknown_fields)]
 pub struct ExportConfig {
     pub name: String,
+    /// Set ONLY on the CDC snapshot leg `cdc_job` synthesizes: the parent
+    /// export's name, recorded by the code that builds the leg rather than
+    /// re-derived from the `{parent}__snapshot_{table}` name downstream.
+    ///
+    /// Deriving it was wrong in both directions. Folding the name at the writer
+    /// makes a USER export literally named `daily__snapshot_v2` record family
+    /// `daily` — silently merging it with a real sibling export `daily` under a
+    /// shared prefix, which is exactly the cross-contamination the load guard
+    /// exists to refuse. And a CDC export whose own name contains the infix
+    /// folds at the FIRST one, so its leg and drain land in different families
+    /// and the documented `initial: snapshot` flow self-refuses again.
+    ///
+    /// `skip` (not `skip_serializing_if`): this is an internal synthesis marker,
+    /// never a user-writable key, so it must not appear in the schema or the
+    /// config reference.
+    #[serde(skip)]
+    pub snapshot_parent: Option<String>,
     #[serde(default)]
     pub query: Option<String>,
     pub query_file: Option<String>,
@@ -329,6 +346,20 @@ pub struct ExportConfig {
 }
 
 impl ExportConfig {
+    /// The export FAMILY this export's runs belong to: the RECORDED
+    /// `snapshot_parent` for the CDC snapshot leg `cdc_job` synthesizes, the
+    /// export's own name for everything else.
+    ///
+    /// The single place this is decided. It used to be re-derived at each
+    /// writer by folding the name on `__snapshot_`, which merged a user export
+    /// literally named `daily__snapshot_v2` into family `daily` — silently
+    /// disarming the load's shared-prefix guard against its sibling `daily`.
+    pub fn family(&self) -> String {
+        self.snapshot_parent
+            .clone()
+            .unwrap_or_else(|| self.name.clone())
+    }
+
     /// Resolve the effective `(CompressionType, level)` for this export.
     /// `compression_profile` takes precedence over `compression` + `compression_level`.
     ///
@@ -596,9 +627,31 @@ fn default_time_column_type() -> TimeColumnType {
 }
 
 /// `until_current` defaults to `true` — the OSS model is the BOUNDED, scheduler-
-/// driven drain ("read to the log end and exit"). Continuous streaming
-/// (`until_current: false`) is an explicit opt-in; making it the default silently
-/// put a hand-written CDC config onto the never-terminating streaming path.
+/// driven drain ("read to the log end and exit"). `until_current: false` is an
+/// explicit opt-in to the continuous model; making it the default would silently
+/// put a hand-written CDC config onto it.
+///
+/// What `false` actually means is ENGINE-SPECIFIC, and the earlier wording
+/// ("the never-terminating streaming path") was only true for one of them:
+///
+/// * **MySQL** — genuinely long-lived: a continuous run omits
+///   `BINLOG_DUMP_NON_BLOCK` (`source/mysql/cdc.rs`), so the dump BLOCKS on the
+///   binlog and the process stays up with an idle source.
+/// * **PostgreSQL / SQL Server** — POLL adapters. `false` removes the open-time
+///   ceiling, nothing more: the run still exits on CATCH-UP, so any moment the
+///   source falls quiet ends it. `DrainMode`'s own doc says these "exit on
+///   catch-up and an outer loop re-wraps them" — that outer loop does not exist
+///   (`run_capture` has exactly two call sites, neither looping), so the run is
+///   one unbounded pass, not a daemon. Measured on the PG CDC stand: exit 0
+///   within seconds, both idle and under a 200-row/0.3 s writer.
+/// * **MongoDB** — a tailable change stream: it keeps returning events under
+///   sustained writes and stops on an empty poll, so it behaves like MySQL while
+///   traffic lasts and like the poll adapters when it stops.
+///
+/// No data is at risk either way — the checkpoint stops at the last committed
+/// position and the next run resumes there (defer-not-drop). The hazard is
+/// operational: on a poll engine, `false` needs a supervisor to re-run it, or the
+/// stream simply stops. If you want a scheduler, use the default.
 fn default_true() -> bool {
     true
 }
@@ -676,7 +729,12 @@ pub struct CdcExportConfig {
     /// `false` to opt into continuous streaming explicitly.
     #[serde(default = "default_true")]
     pub until_current: bool,
-    /// Stop after N change events (default: until end of stream / interrupted).
+    /// Stop at the first COMMIT BOUNDARY once N change events have been
+    /// captured (default: until end of stream / interrupted). A soft cap, like
+    /// `rollover`: a transaction is never split, so the run may overshoot N by
+    /// the remainder of the transaction the cap landed in — a hard per-event
+    /// stop cut transactions mid-flight and left the stream unable to advance
+    /// past them.
     pub max_events: Option<usize>,
     /// Rows per output part file (default 100000). A part also rolls at a
     /// transaction boundary, so it never splits a transaction. Larger ⇒ fewer,
@@ -756,6 +814,7 @@ pub enum PartitionGranularity {
 #[cfg(test)]
 pub(crate) fn sample_export(name: &str) -> ExportConfig {
     ExportConfig {
+        snapshot_parent: None,
         name: name.into(),
         target: None,
         load: None,

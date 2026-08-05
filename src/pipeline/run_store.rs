@@ -164,6 +164,7 @@ mod tests {
     fn test_plan(export_name: &str) -> ResolvedRunPlan {
         ResolvedRunPlan {
             export_name: export_name.into(),
+            source_table: None,
             base_query: "SELECT 1".into(),
             strategy: ExtractionStrategy::Snapshot,
             format: FormatType::Parquet,

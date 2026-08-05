@@ -361,7 +361,7 @@ fn verify_one_prefix(
         }
     };
     // Streaming destinations have no prefix to verify — note and skip.
-    if dest.capabilities().commit_protocol == crate::destination::WriteCommitProtocol::Streaming {
+    if !dest.capabilities().commit_protocol.leaves_objects_at_rest() {
         log::info!(
             "export '{}': streaming destination, skipping (nothing to verify)",
             display_name
@@ -471,14 +471,23 @@ fn verify_one_prefix(
                     // headline reads FAILED and the exit gate classifies it as
                     // data-integrity (exit 3), not generic (#104). The verdict is
                     // the just-pushed `all_results` entry (nothing pushes between).
-                    Ok(Some(detail)) => {
+                    // Both are verified-wrong (exit 3) and they differ in WHERE the
+                    // operator should look: the data, or the manifest describing it.
+                    // Telling someone "value checksum" about a mis-declared row count
+                    // sends them hunting corruption in bytes that are fine.
+                    Ok(Some(fault)) => {
+                        use crate::pipeline::validate_manifest::Failure;
+                        use crate::source::value_checksum::ReadbackFault;
                         if let Some(ev) = all_results.last_mut() {
                             ev.verification.passed = false;
-                            ev.verification.failures.push(
-                                crate::pipeline::validate_manifest::Failure::ValueChecksumMismatch {
-                                    detail: format!("export '{}': {}", display_name, detail),
+                            ev.verification.failures.push(match fault {
+                                ReadbackFault::ValueChecksum(d) => Failure::ValueChecksumMismatch {
+                                    detail: format!("export '{}': {}", display_name, d),
                                 },
-                            );
+                                ReadbackFault::PartRowCount(d) => Failure::PartRowCountMismatch {
+                                    detail: format!("export '{}': {}", display_name, d),
+                                },
+                            });
                         }
                     }
                     // An OPERATIONAL failure (could not read the manifest / a part)
@@ -866,11 +875,13 @@ mod tests {
         let row_count: i64 = parts.iter().map(|p| p.rows).sum();
         let part_count = parts.len() as u32;
         RunManifest {
+            checksum_render: None,
             row_hash: None,
             mode: "batch".to_string(),
             manifest_version: MANIFEST_VERSION,
             run_id: "r-validate-cmd".into(),
             export_name: "orders".into(),
+            export_family: String::new(),
             started_at: "2026-06-09T12:00:00Z".into(),
             finished_at: "2026-06-09T12:01:00Z".into(),
             status: ManifestStatus::Success,
@@ -1088,7 +1099,7 @@ mod tests {
     fn write_multiplex_cfg(dir: &Path, base: &Path) -> std::path::PathBuf {
         let cfg = dir.join("rivet-cdc.yaml");
         let yaml = format!(
-            "source:\n  type: mysql\n  url: mysql://nobody@localhost/nope\nexports:\n  - name: cdc\n    tables: [alpha, beta]\n    mode: cdc\n    format: parquet\n    cdc:\n      server_id: 1\n    destination:\n      type: local\n      path: \"{}\"\n",
+            "source:\n  type: mysql\n  url: mysql://nobody@localhost/nope\nexports:\n  - name: cdc\n    tables: [alpha, beta]\n    mode: cdc\n    format: parquet\n    cdc:\n      server_id: 1\n      checkpoint: /tmp/ck_mx\n    destination:\n      type: local\n      path: \"{}\"\n",
             base.to_string_lossy()
         );
         std::fs::write(&cfg, yaml).unwrap();

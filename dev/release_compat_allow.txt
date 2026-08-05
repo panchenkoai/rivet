@@ -1,0 +1,25 @@
+# Declared incompatibilities — changes users FEEL across an upgrade, signed off.
+#
+# `python3 -m dev.pytools.release_compat` compares the working-tree binary
+# against the previous release across four axes (cli, schema, config,
+# artifacts). Any divergence fails the gate unless it is declared here.
+#
+# Format:  <axis>:<key>  # why this break is worth it
+#
+#   cli:<subcommand>          a removed subcommand
+#   cli:<subcommand>:--flag   a removed or retyped flag
+#   schema:<key.path>         a removed or retyped config key
+#   config:<case>             a corpus config that changes accept/reject verdict
+#   artifacts:<exchange>      a cross-version artifact exchange that breaks
+#
+# ADDING a flag or config key is additive and never needs a line here — it
+# cannot break a config that already works. Only removals, retypes and verdict
+# changes do.
+#
+# The reason is mandatory: the gate refuses an entry without one. A silenced
+# break with no rationale is indistinguishable from a regression someone muted
+# to get a build green.
+#
+# Every line is a promise to write a CHANGELOG entry under "Changed — BREAKING".
+
+config:cdc-nockpt/mysql  # 0.24.2: MySQL `mode: cdc` now requires `cdc.checkpoint:`. The binlog has no server-side anchor, so without it EVERY run re-anchors at the current position — measured on a live stand: two runs with three changes between them captured ZERO events, both exiting 0. The config was accepted and silently lost data; rejecting it loudly is the fix. `rivet doctor` already printed this exact diagnosis. Mongo has carried the same rule since 0.18.0.

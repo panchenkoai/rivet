@@ -512,3 +512,94 @@ ANALYZE ext.ref_id_history;
 ANALYZE ext.order_keyed;
 ANALYZE ext.unindexed_id;
 ANALYZE ext.heap_no_key;
+
+-- ── array_matrix — the ARRAY types, which nothing else in this seed carries ──
+--
+-- Added 2026-08-02 after a measurement: stubbing `CellSource::list` to `None`
+-- passed the whole lib cycle AND the whole live suite, including every Form-B
+-- checksum test.
+--
+-- CORRECTED CAUSE (the first version of this comment was wrong): this file DOES
+-- declare array columns — `rivet_type_matrix.tags TEXT[]` and `.nums INTEGER[]`.
+-- The dev stand simply predates them: its `rivet_type_matrix` has 9 columns and
+-- neither array, so no export on that stand ever carried a LIST cell and the
+-- checksum path went unexercised. Stand drift, not a missing declaration.
+--
+-- `array_matrix` is still the right fix, and for a better reason: a fixture that
+-- exists only in a table the local stand may not match is a fixture you cannot
+-- rely on. This one is small, self-contained, and exported by a test that names
+-- the columns it expects, so a drifted stand fails loudly instead of quietly
+-- proving nothing.
+--
+-- One element type per column, covering exactly the set `list_elem_covered`
+-- claims to check (bool / i16 / i32 / i64 / f32 / f64 / text), plus the two
+-- shapes that break naive element handling: an empty array (not NULL) and an
+-- array holding NULL elements (inner nullability must survive).
+CREATE TABLE array_matrix (
+    id        BIGSERIAL PRIMARY KEY,
+    bools     BOOLEAN[],
+    i16s      SMALLINT[],
+    i32s      INTEGER[],
+    i64s      BIGINT[],
+    f32s      REAL[],
+    f64s      DOUBLE PRECISION[],
+    texts     TEXT[],
+    -- NO array-of-{json,numeric,uuid,interval} here, and the reason is a
+    -- MEASUREMENT rather than an omission: the pipeline refuses every one of
+    -- them BEFORE `build_pg_text_array` is reached — `_numeric` has "no Rivet
+    -- mapping", jsonb[] and interval[] fail as "could not be decoded as a
+    -- one-dimensional Arrow List", and uuid[] is refused outright
+    -- ("temporal/uuid/bytea array elements are not yet supported"). Putting any
+    -- of them in this shared seed makes `rivet check` fail for every consumer,
+    -- the release oracle included.
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+INSERT INTO array_matrix (bools, i16s, i32s, i64s, f32s, f64s, texts) VALUES
+    -- ordinary multi-element arrays; distinct values per position so an
+    -- element-order or element-index bug cannot hide behind equal elements
+    ('{true,false,true}', '{1,2,3}', '{10,20,30}', '{100,200,300}',
+     '{1.5,2.5,3.5}', '{1.25,2.25,3.25}', '{"a","bb","ccc"}'),
+    -- inner NULLs: the element accessors must keep them, not collapse to a value
+    ('{true,NULL}', '{1,NULL}', '{10,NULL}', '{100,NULL}',
+     '{1.5,NULL}', '{1.25,NULL}', '{"a",NULL}'),
+    -- EMPTY arrays are not NULL arrays; the canon must tell them apart
+    ('{}', '{}', '{}', '{}', '{}', '{}', '{}'),
+    -- NULL arrays
+    (NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+
+ANALYZE array_matrix;
+
+-- ── row_hash injectivity probe ───────────────────────────────────────────────
+-- The canonical image `_rivet_row_hash` builds must be INJECTIVE: two different
+-- rows must never produce one hash. Render id v1 was not, in a way no ordinary
+-- fixture can show — fields were joined by a bare \x1f with no length, so a value
+-- carrying that byte could forge a field boundary. Rows 1 and 2 below are exactly
+-- that pair: ('a'||US, 'b') and ('a', US||'b') build the SAME bytes when the join
+-- has no lengths, and different bytes when it has them.
+--
+-- Rows 3 and 4 are the second half: absence versus a PRESENT value of length
+-- zero. Under v1 both were a bare marker; they must stay distinct.
+--
+-- The probe only bites when the hash covers these columns and NOT the primary
+-- key — with a unique column in the coverage no two rows can ever collide, so
+-- `row_hash: true` over this table would pass whatever the framing does. The gate
+-- exports it twice for that reason: once with `true` (digest parity against an
+-- independent implementation) and once with `row_hash: [a, b]` (injectivity).
+--
+-- chr(0) is deliberately absent: PostgreSQL rejects it in text ("null character
+-- not permitted"), so the NULL-vs-lone-\x00 forgery is unreachable here and
+-- claiming to cover it would be a lie.
+CREATE TABLE row_hash_probe (
+    id INT PRIMARY KEY,
+    a  TEXT,
+    b  TEXT
+);
+
+INSERT INTO row_hash_probe (id, a, b) VALUES
+    (1, 'a' || chr(31), 'b'),
+    (2, 'a',            chr(31) || 'b'),
+    (3, NULL,           'x'),
+    (4, '',             'x');
+
+ANALYZE row_hash_probe;

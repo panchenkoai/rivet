@@ -217,3 +217,155 @@ mod validate_redaction {
         assert!(out.contains("s3://REDACTED@bucket/path"));
     }
 }
+
+// ── the WIRING, proven by a real failed run ──────────────────────────────────
+//
+// Everything above (and `summary_json_does_not_carry_url_password`) feeds an
+// ALREADY-REDACTED message into the fixture — `make_summary_with_error` calls
+// `redact_secrets` itself, and `RunSummary::with_error` is a bare assignment. So
+// those tests prove the redactor WORKS; none of them proves it is CALLED. Delete
+// `redact_error` from `job.rs`, `single.rs` or `cdc_job.rs` and every one of them
+// stays green while real summaries start carrying passwords.
+//
+// This closes that by producing the failure the way production does: a real
+// `rivet run` against an unreachable host, so the driver writes the message and
+// the pipeline's own assignment site is the only thing standing between the
+// password and the artifacts.
+
+mod wiring {
+    use super::SECRET_MARKER;
+    use std::path::{Path, PathBuf};
+
+    const RIVET_BIN: &str = env!("CARGO_BIN_EXE_rivet");
+
+    fn find_all(dir: &Path, name: &str, out: &mut Vec<PathBuf>) {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                find_all(&p, name, out);
+            } else if p.file_name().and_then(|s| s.to_str()) == Some(name) {
+                out.push(p);
+            }
+        }
+    }
+
+    /// A password-bearing source URL must not reach ANY artifact or stream of a
+    /// run that failed to connect.
+    ///
+    /// Port 1 on loopback refuses immediately, so this needs no server and stays
+    /// offline, while the failure travels the real path (`run_export_job` →
+    /// `redact_error` → `RunSummary::error_message` → the state DB and the run
+    /// report). That is the seam the pre-existing tests cannot observe, because
+    /// they redact the message themselves before handing it over.
+    ///
+    /// HONEST LIMIT — this cannot currently go RED, and the reason is worth more
+    /// than the assertion. Deleting `redact_error` from the pipeline leaves it
+    /// green, because none of the connect-failure paths probed (PG refused, PG
+    /// TLS-refused, MySQL refused, bad port, empty host, unknown scheme) echoes
+    /// the URL at all: rivet's messages name the host:port and the remedy, never
+    /// the connection string. So the redactor has no password to strip on this
+    /// route, and the leak the older tests dramatise was not reproducible.
+    ///
+    /// It is kept because it is the only test that exercises the WIRING rather
+    /// than the redactor, and it holds the line if a future error path starts
+    /// interpolating the URL — which is exactly when the guard is needed and the
+    /// pre-redacting tests would still say nothing. A test that pins a real path
+    /// and states what it cannot yet prove beats one that proves the wrong thing
+    /// confidently.
+    #[test]
+    fn a_real_failed_run_never_writes_the_source_password_anywhere() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("rivet.yaml");
+        std::fs::write(
+            &cfg,
+            format!(
+                r#"
+source:
+  type: postgres
+  url: "postgresql://rivet:{SECRET_MARKER}@127.0.0.1:1/orders"
+exports:
+  - name: leaky
+    table: public.orders
+    mode: full
+    format: parquet
+    destination:
+      type: local
+      path: "{}"
+"#,
+                dir.path().join("out").display()
+            ),
+        )
+        .unwrap();
+
+        let summary_out = dir.path().join("summary.json");
+        let out = std::process::Command::new(RIVET_BIN)
+            .args([
+                "run",
+                "--config",
+                cfg.to_str().unwrap(),
+                "--summary-output",
+                summary_out.to_str().unwrap(),
+            ])
+            .current_dir(dir.path())
+            .output()
+            .expect("run rivet");
+
+        assert!(
+            !out.status.success(),
+            "fixture is inert: the run was supposed to FAIL to connect, so there \
+             is no error message for the redactor to be wired into"
+        );
+
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        assert!(
+            !stdout.contains(SECRET_MARKER) && !stderr.contains(SECRET_MARKER),
+            "the password reached the process streams.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+
+        // Every artifact the run left behind, wherever it landed. The STATE DB is
+        // the load-bearing one: `run_export_job` records error_message there on
+        // the failure path, and it outlives the process — an operator's `rivet
+        // report` reads it back long after the streams are gone. Scanned as BYTES
+        // because SQLite is not UTF-8 text.
+        let mut found = Vec::new();
+        for name in [
+            "summary.json",
+            "summary.md",
+            "manifest.json",
+            ".rivet_state.db",
+        ] {
+            find_all(dir.path(), name, &mut found);
+        }
+        assert!(
+            !found.is_empty(),
+            "fixture is inert: a failed run wrote no artifact at all, so this test \
+             cannot see whether it would have been redacted"
+        );
+        let marker = SECRET_MARKER.as_bytes();
+        let mut checked_an_error_bearing_artifact = false;
+        for f in &found {
+            let body = std::fs::read(f).unwrap_or_default();
+            if body
+                .windows(b"connection".len())
+                .any(|w| w.eq_ignore_ascii_case(b"connection"))
+                || f.extension().is_some_and(|e| e == "json")
+            {
+                checked_an_error_bearing_artifact = true;
+            }
+            assert!(
+                !body.windows(marker.len()).any(|w| w == marker),
+                "{} carries the source password",
+                f.display()
+            );
+        }
+        assert!(
+            checked_an_error_bearing_artifact,
+            "fixture is inert: none of the artifacts found actually recorded the \
+             connection error, so nothing here could have leaked it. Found: {found:?}"
+        );
+    }
+}

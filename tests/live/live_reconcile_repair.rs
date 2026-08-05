@@ -19,60 +19,27 @@ use crate::common::*;
 
 /// Seed a 100-row table, write a chunked config with checkpoint, run the
 /// export, then return the config path (and the table RAII guard).
-fn seed_and_run_chunked(
-    row_count: i64,
-    chunk_size: u32,
-) -> (
-    PgTable,
-    tempfile::TempDir,
-    tempfile::TempDir,
-    std::path::PathBuf,
-) {
+fn seed_and_run_chunked(row_count: i64, chunk_size: u32) -> (PgTable, Rig) {
     let table = seed_pg_numeric_table(row_count);
-    let out_dir = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
+    // The rig owns its config and destination dirs, so the two TempDirs this
+    // helper used to return purely to keep them alive are gone with the tuple.
+    let rig = Rig::pg_batch(table.name())
+        .query(&format!("SELECT id, name FROM {}", table.name()))
+        .mode("chunked")
+        .export_line("chunk_column: id")
+        // A brace inside an export line is INTERPOLATION in the old format! —
+        // emitting it as a plain literal would make the YAML invalid, which is
+        // how the MySQL chunked migration broke two tests silently.
+        .export_line(&format!("chunk_size: {chunk_size}"))
+        .export_line("chunk_checkpoint: true");
 
-    let yaml = format!(
-        r#"
-source:
-  type: postgres
-  url: "{POSTGRES_URL}"
-
-exports:
-  - name: {name}
-    query: "SELECT id, name FROM {name}"
-    mode: chunked
-    chunk_column: id
-    chunk_size: {chunk_size}
-    chunk_checkpoint: true
-    format: parquet
-    destination:
-      type: local
-      path: {out}
-"#,
-        name = table.name(),
-        out = out_dir.path().display()
-    );
-
-    let cfg = write_config(&cfg_dir, &yaml);
-
-    let run_out = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            table.name(),
-        ])
-        .output()
-        .expect("spawn rivet run (setup)");
+    let run_out = rig.run_args(&["--export", table.name()]);
     assert!(
         run_out.status.success(),
         "setup export must succeed; stderr:\n{}",
         String::from_utf8_lossy(&run_out.stderr)
     );
-
-    (table, out_dir, cfg_dir, cfg)
+    (table, rig)
 }
 
 // ─── RR1: reconcile pretty — all partitions match ─────────────────────────────
@@ -82,18 +49,9 @@ exports:
 fn reconcile_all_match_exits_zero_with_pretty_output() {
     require_alive(LiveService::Postgres);
 
-    let (table, out, _cfg_dir, cfg) = seed_and_run_chunked(100, 50);
+    let (table, rig) = seed_and_run_chunked(100, 50);
 
-    let result = std::process::Command::new(RIVET_BIN)
-        .args([
-            "reconcile",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            table.name(),
-        ])
-        .output()
-        .expect("spawn rivet reconcile");
+    let result = rig.cli(&["reconcile", "--export", table.name()]);
 
     assert!(
         result.status.success(),
@@ -115,7 +73,7 @@ fn reconcile_all_match_exits_zero_with_pretty_output() {
     // chain. Re-read the destination parquet and count physically (matrix
     // audit: self-oracle class) — the verdict and the physical rows must agree.
     assert_eq!(
-        total_parquet_rows(out.path()),
+        total_parquet_rows(&rig.out_dir()),
         100,
         "destination parquet must physically hold every source row, independent of the reconcile verdict"
     );
@@ -128,20 +86,9 @@ fn reconcile_all_match_exits_zero_with_pretty_output() {
 fn reconcile_format_json_emits_valid_json_report() {
     require_alive(LiveService::Postgres);
 
-    let (table, _out, _cfg_dir, cfg) = seed_and_run_chunked(100, 50);
+    let (table, rig) = seed_and_run_chunked(100, 50);
 
-    let result = std::process::Command::new(RIVET_BIN)
-        .args([
-            "reconcile",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            table.name(),
-            "--format",
-            "json",
-        ])
-        .output()
-        .expect("spawn rivet reconcile --format json");
+    let result = rig.cli(&["reconcile", "--export", table.name(), "--format", "json"]);
 
     assert!(
         result.status.success(),
@@ -186,23 +133,19 @@ fn reconcile_format_json_emits_valid_json_report() {
 fn reconcile_format_json_output_flag_writes_report_to_file() {
     require_alive(LiveService::Postgres);
 
-    let (table, _out, cfg_dir, cfg) = seed_and_run_chunked(100, 50);
-    let report_path = cfg_dir.path().join("reconcile_report.json");
+    let (table, rig) = seed_and_run_chunked(100, 50);
+    let report_dir = tempfile::tempdir().unwrap();
+    let report_path = report_dir.path().join("reconcile_report.json");
 
-    let result = std::process::Command::new(RIVET_BIN)
-        .args([
-            "reconcile",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            table.name(),
-            "--format",
-            "json",
-            "--output",
-            report_path.to_str().unwrap(),
-        ])
-        .output()
-        .expect("spawn rivet reconcile --format json --output");
+    let result = rig.cli(&[
+        "reconcile",
+        "--export",
+        table.name(),
+        "--format",
+        "json",
+        "--output",
+        report_path.to_str().unwrap(),
+    ]);
 
     assert!(
         result.status.success(),
@@ -230,24 +173,20 @@ fn reconcile_format_json_output_flag_writes_report_to_file() {
 fn repair_report_flag_uses_precomputed_reconcile_json() {
     require_alive(LiveService::Postgres);
 
-    let (table, _out, cfg_dir, cfg) = seed_and_run_chunked(100, 50);
-    let reconcile_path = cfg_dir.path().join("reconcile.json");
+    let (table, rig) = seed_and_run_chunked(100, 50);
+    let report_dir = tempfile::tempdir().unwrap();
+    let reconcile_path = report_dir.path().join("reconcile.json");
 
     // Step 1: generate reconcile report.
-    let rec_out = std::process::Command::new(RIVET_BIN)
-        .args([
-            "reconcile",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            table.name(),
-            "--format",
-            "json",
-            "--output",
-            reconcile_path.to_str().unwrap(),
-        ])
-        .output()
-        .expect("spawn rivet reconcile --format json --output");
+    let rec_out = rig.cli(&[
+        "reconcile",
+        "--export",
+        table.name(),
+        "--format",
+        "json",
+        "--output",
+        reconcile_path.to_str().unwrap(),
+    ]);
 
     assert!(
         rec_out.status.success(),
@@ -260,18 +199,13 @@ fn repair_report_flag_uses_precomputed_reconcile_json() {
     );
 
     // Step 2: repair dry-run using the precomputed reconcile JSON.
-    let repair_out = std::process::Command::new(RIVET_BIN)
-        .args([
-            "repair",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            table.name(),
-            "--report",
-            reconcile_path.to_str().unwrap(),
-        ])
-        .output()
-        .expect("spawn rivet repair --report");
+    let repair_out = rig.cli(&[
+        "repair",
+        "--export",
+        table.name(),
+        "--report",
+        reconcile_path.to_str().unwrap(),
+    ]);
 
     assert!(
         repair_out.status.success(),
@@ -294,18 +228,9 @@ fn repair_report_flag_uses_precomputed_reconcile_json() {
 fn repair_dryrun_exits_zero_when_nothing_to_repair() {
     require_alive(LiveService::Postgres);
 
-    let (table, _out, _cfg_dir, cfg) = seed_and_run_chunked(100, 50);
+    let (table, rig) = seed_and_run_chunked(100, 50);
 
-    let result = std::process::Command::new(RIVET_BIN)
-        .args([
-            "repair",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            table.name(),
-        ])
-        .output()
-        .expect("spawn rivet repair (dry-run)");
+    let result = rig.cli(&["repair", "--export", table.name()]);
 
     assert!(
         result.status.success(),
@@ -328,19 +253,9 @@ fn repair_dryrun_exits_zero_when_nothing_to_repair() {
 fn repair_execute_flag_exits_zero_when_nothing_to_repair() {
     require_alive(LiveService::Postgres);
 
-    let (table, _out, _cfg_dir, cfg) = seed_and_run_chunked(100, 50);
+    let (table, rig) = seed_and_run_chunked(100, 50);
 
-    let result = std::process::Command::new(RIVET_BIN)
-        .args([
-            "repair",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            table.name(),
-            "--execute",
-        ])
-        .output()
-        .expect("spawn rivet repair --execute");
+    let result = rig.cli(&["repair", "--export", table.name(), "--execute"]);
 
     assert!(
         result.status.success(),
@@ -356,20 +271,9 @@ fn repair_execute_flag_exits_zero_when_nothing_to_repair() {
 fn repair_format_json_emits_valid_json_plan() {
     require_alive(LiveService::Postgres);
 
-    let (table, _out, _cfg_dir, cfg) = seed_and_run_chunked(100, 50);
+    let (table, rig) = seed_and_run_chunked(100, 50);
 
-    let result = std::process::Command::new(RIVET_BIN)
-        .args([
-            "repair",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            table.name(),
-            "--format",
-            "json",
-        ])
-        .output()
-        .expect("spawn rivet repair --format json");
+    let result = rig.cli(&["repair", "--export", table.name(), "--format", "json"]);
 
     assert!(
         result.status.success(),
@@ -395,23 +299,14 @@ fn repair_format_json_emits_valid_json_plan() {
 #[ignore = "live: requires docker compose up -d postgres"]
 fn reconcile_exits_nonzero_on_mismatch() {
     require_alive(LiveService::Postgres);
-    let (table, _out, _cfg_dir, cfg) = seed_and_run_chunked(100, 50);
+    let (table, rig) = seed_and_run_chunked(100, 50);
 
     // Drift the source under chunk 0 [1..50]: delete 20 rows → source 30 vs exported 50.
     let mut c = pg_connect();
     c.batch_execute(&format!("DELETE FROM {} WHERE id <= 20", table.name()))
         .expect("drift source");
 
-    let out = std::process::Command::new(RIVET_BIN)
-        .args([
-            "reconcile",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            table.name(),
-        ])
-        .output()
-        .expect("spawn rivet reconcile");
+    let out = rig.cli(&["reconcile", "--export", table.name()]);
 
     assert!(
         !out.status.success(),
@@ -435,7 +330,7 @@ fn reconcile_exits_nonzero_on_mismatch() {
 #[ignore = "live: requires docker compose up -d postgres"]
 fn repair_execute_reexports_mismatch_and_preserves_original_file() {
     require_alive(LiveService::Postgres);
-    let (table, out_dir, _cfg_dir, cfg) = seed_and_run_chunked(100, 50);
+    let (table, rig) = seed_and_run_chunked(100, 50);
 
     let chunk0 = |dir: &std::path::Path| -> Vec<std::path::PathBuf> {
         files_with_extension(dir, "parquet")
@@ -448,7 +343,7 @@ fn repair_execute_reexports_mismatch_and_preserves_original_file() {
             .collect()
     };
 
-    let before = chunk0(out_dir.path());
+    let before = chunk0(&rig.out_dir());
     assert_eq!(before.len(), 1, "exactly one chunk0 file after export");
     let original = before[0].clone();
     let original_size = std::fs::metadata(&original).unwrap().len();
@@ -458,17 +353,7 @@ fn repair_execute_reexports_mismatch_and_preserves_original_file() {
     c.batch_execute(&format!("DELETE FROM {} WHERE id <= 20", table.name()))
         .expect("drift source");
 
-    let out = std::process::Command::new(RIVET_BIN)
-        .args([
-            "repair",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            table.name(),
-            "--execute",
-        ])
-        .output()
-        .expect("spawn rivet repair --execute");
+    let out = rig.cli(&["repair", "--export", table.name(), "--execute"]);
     assert!(
         out.status.success(),
         "repair --execute must succeed; stderr:\n{}",
@@ -487,7 +372,7 @@ fn repair_execute_reexports_mismatch_and_preserves_original_file() {
     );
     // The re-export landed as a distinct new file alongside it.
     assert_eq!(
-        chunk0(out_dir.path()).len(),
+        chunk0(&rig.out_dir()).len(),
         2,
         "repair must add a new chunk0 file alongside the original (collision-proof naming)"
     );

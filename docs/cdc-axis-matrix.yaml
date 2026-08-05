@@ -1,0 +1,266 @@
+# The CDC surface, axis by axis, and what actually exercises each one.
+#
+# WHY THIS FILE EXISTS. "We swept every CDC axis" is true on the day it is said
+# and quietly false a release later, because the axes are not a list anybody
+# maintains — they are the fields of `CdcExportConfig`, the `cdc_*` crash hooks,
+# and the per-engine capability splits. Each of those grows by ordinary work: a
+# new knob, a new fault point. Nothing about adding one asks whether the sweep
+# covers it, so coverage decays silently while the claim stays in a commit
+# message.
+#
+# `tests/offline/cdc_axis_matrix_guard.rs` DERIVES both enumerations from the
+# product — the struct fields out of src/config/export.rs, the hooks out of the
+# `maybe_panic_at("cdc_…")` call sites — and fails when one has no row here. So a
+# new CDC knob cannot land without a sentence saying how it is swept, or an
+# explicit `na:` saying why it needs no sweeping.
+#
+# VOCABULARY, and it is load-bearing:
+#   swept  a live case in dev/pytools/cdc_sweep.py drives this axis on real
+#          engines and judges it with the three oracles.
+#   test   an offline/live test in the Rust suite covers it; no sweep case needed.
+#   na     structurally inapplicable, with the reason. Never a shrug.
+#   gap    known uncovered. Allowed, but it is counted and ratcheted.
+#
+# The oracles a `swept` row is judged by, all three independent of rivet's own
+# verdict on itself:
+#   artifacts  the manifests' per-part arithmetic, with `content_md5` recomputed
+#              by hashlib, `size_bytes` by stat(), `rows` by the parquet footer
+#   meta-db    the Postgres state backend, joined to the manifest copies BY RUN ID
+#   duckdb     an independent count + op-profile over exactly the parts the
+#              manifests list
+
+harness: dev/pytools/cdc_sweep.py
+state_backend: postgres
+engines: [postgres, mysql, mssql, mongo]
+
+# ── the config surface: every field of CdcExportConfig ────────────────────────
+config_fields:
+  - id: initial
+    coverage: swept
+    case: initial_snapshot
+    detail: >-
+      Rows seeded BEFORE the anchor, so the snapshot leg has something no change
+      stream could ever produce; the leg's own manifest must carry them. The
+      third value, `adopt`, is Pro-only and the OSS binary must REJECT it.
+    also: oss_rejects_the_pro_only_initial_adopt
+
+  - id: checkpoint
+    coverage: swept
+    case: checkpoint_present, checkpoint_absent
+    detail: >-
+      Both directions on every engine, because the engines do not agree on what
+      the file is FOR: PostgreSQL pins WAL server-side at slot creation and the
+      file is optional, MySQL and Mongo have no server-side anchor at all so the
+      file IS the anchor, SQL Server floors at fn_cdc_get_min_lsn. The absent
+      case therefore asserts completeness only on the server-side-anchored
+      engines and RECORDS what the others did — asserting one anchor model on
+      all four is how a harness comes to grade the wrong engine's behaviour.
+
+  - id: until_current
+    coverage: swept
+    case: bounded, continuous
+    detail: >-
+      `true` is the default and every other case rides on it. `false` is the
+      daemon — no open-time bound, so `max_events` is its only stop condition,
+      with a 120s wall clock as a NET: a stream that does not terminate is
+      reported as a failure to stop, never absorbed as a slow run.
+
+  - id: max_events
+    coverage: swept
+    case: max_events_2, continuous
+    detail: >-
+      A soft cap: it stops at the first COMMIT boundary past N, so the run may
+      overshoot by the rest of that transaction. What the case actually pins is
+      DEFER-NOT-DROP — a follow-up bounded run must pick up the remainder, and
+      the union across both runs must hold every change.
+
+  - id: rollover
+    coverage: swept
+    case: rollover_1
+    detail: One part per change, so the per-part manifest arithmetic has more than one part to be wrong about.
+
+  - id: rollover_memory_mb
+    coverage: swept
+    case: rollover_memory_mb
+    detail: The byte-capped sibling. Swept for the same arithmetic, not for the byte threshold itself.
+
+  - id: server_id
+    coverage: swept
+    case: every mysql case
+    detail: Carried by the MySQL engine block; a wrong or colliding replica id fails the connection outright, so every green MySQL row exercises it.
+
+  - id: slot
+    coverage: swept
+    case: every postgres case
+    detail: >-
+      Every case names its own slot, derived from the run-unique work dir. That
+      is also what makes the PostgreSQL cases independent of each other — a
+      shared slot would carry one case's un-acked WAL into the next.
+
+  - id: capture_instance
+    coverage: swept
+    case: every mssql case
+    detail: >-
+      Named explicitly rather than inferred. The inference it replaces is the one
+      that split the capture-instance NAME on `_` and routed 100% of six tables'
+      events into the void; the catalog is the truth, the name is a label.
+
+# ── the fault points: every `cdc_*` crash hook in the product ─────────────────
+crash_hooks:
+  - id: cdc_after_open
+    coverage: swept
+    case: crash_after_open
+    detail: Died holding the stream, before reading anything — the recovery must carry the whole change set.
+  - id: cdc_before_resolve
+    coverage: swept
+    case: crash_before_resolve
+    detail: Died before resolving the resume position.
+  - id: cdc_after_flush_before_ack
+    coverage: swept
+    case: crash_flush_before_ack
+    detail: >-
+      The classic at-least-once point: parts durable, source not acked. The
+      recovery re-reads, so the union holds duplicates — permitted — and no loss.
+  - id: cdc_after_checkpoint_before_ack
+    coverage: swept
+    case: crash_checkpoint_before_ack
+    detail: Checkpoint advanced, ack not sent.
+  - id: cdc_after_ack
+    coverage: swept
+    case: crash_after_ack
+    detail: >-
+      Fully durable and acked. What this case pins is the property below
+      (`crashed_run_ledger_gap`): the parts are manifest-covered and the ledger
+      has no row for them.
+  - id: cdc_before_manifest
+    coverage: swept
+    case: crash_before_manifest
+    detail: >-
+      Parts written, terminal manifest not. Recoverable WITHOUT re-capturing,
+      because roll_all already wrote a run-unique Success manifest before each
+      ack; only `_SUCCESS` is missing.
+
+# ── shape axes that are not a single config field ────────────────────────────
+shape_axes:
+  - id: tables
+    coverage: swept
+    case: multi_table
+    detail: >-
+      Several tables through ONE stream, each routed to its own prefix with its
+      own manifest — under ONE run id, which is why every artifact-to-ledger
+      comparison here groups by run id and sums. SQL Server is documented
+      unsupported (capture instances are per-table) and skips; Mongo is
+      undocumented, so the case MEASURES it and reports rather than asserting.
+
+  - id: format
+    coverage: swept
+    case: format_csv
+    detail: >-
+      The text writer, whose failure mode (silent value loss, escape corruption)
+      parquet's binary path cannot exercise. The parquet-footer oracle does not
+      apply to CSV; the digest and size oracles still do.
+
+  - id: resume
+    coverage: swept
+    case: bounded_twice, checkpoint_present
+    detail: A second drain over an unchanged source must add nothing — the shape that catches a reader re-reading its whole retained window every poll.
+
+  - id: manifest_copies
+    coverage: swept
+    case: every case
+    detail: >-
+      Completeness is judged on the UNION of `manifest-<run_id>.json`, never on
+      the parquet on disk. A consumer that sums manifests (the Pro loader's
+      reconcile) sees exactly that set; the canonical `manifest.json` is
+      last-writer-wins and shows only the final run.
+
+  - id: orphan_parts
+    coverage: swept
+    case: every case
+    detail: >-
+      Data files no manifest lists. Required to be ZERO without a crash — a part
+      outside every manifest is invisible to a manifest-authoritative consumer.
+
+  - id: ledger_covers_every_durable_file
+    coverage: swept
+    case: every case
+    detail: >-
+      Checked from the FILES ON DISK toward the database, not the other way: every
+      data file must have a `file_log` row. The direction is the point — the
+      database is the record and the manifest is its projection at the
+      destination, so a file only the destination knows about inverts the
+      relationship. Strictly stronger than comparing the ledger to the manifests,
+      because a crash's orphan is precisely the file no manifest mentions, which
+      is the one case where the manifest cannot be the oracle. RED against the
+      pre-fix binary (2 unrecorded files on a crash case), green after.
+
+  - id: ledger_records_the_run_in_flight
+    coverage: swept
+    case: every crash case
+    detail: >-
+      A run that made rows durable has an `export_metrics` row saying so, whether
+      or not it lived to finalize — written at the same roll seam as the parts,
+      `running` until a terminal write replaces it. And EXACTLY one row per run:
+      an aggregate appended per roll would make every sum over `export_metrics`
+      count a five-roll run five times, which is worse than the gap it closes.
+      Both halves RED-proven (3 rows vs 1; 2 rows vs 1).
+
+  - id: run_status_lifecycle
+    coverage: swept
+    case: every case
+    detail: >-
+      Scoped to the invocation's own run ids. A crashed CDC run KEEPS its
+      `running` row after a successful recovery — unlike a batch `--resume`,
+      which adopts the crashed id, CDC recovery is a fresh run — and is resolved
+      by SUPERSESSION, which the sweep asserts rather than assuming a timer.
+
+  - id: schema_fingerprint
+    coverage: gap
+    detail: >-
+      A CDC manifest records `schema_fingerprint: ""`. Batch exports get a real
+      fingerprint and the release gate proves it moves with actual DDL
+      (dev/release_oracle/schema_drift.py); the CDC leg records nothing, so drift
+      detection has nothing to compare on a CDC prefix. Not swept because there
+      is no behaviour to sweep — the field is empty by construction. Recorded
+      here so it stays a known gap instead of an assumed capability.
+
+  - id: cloud_destination
+    coverage: test
+    detail: >-
+      The sweep writes to local paths. The object-store leg (MinIO/S3, its own
+      commit seam) is the release gate's `cdc.py`, which reads back through the
+      store's own protocol. Duplicating it here would test DuckDB's httpfs.
+
+  - id: continuous_daemon_lifetime
+    coverage: gap
+    detail: >-
+      `until_current: false` is swept only in its bounded-by-max_events form. A
+      genuinely long-lived daemon — signal handling, checkpoint cadence under
+      sustained writes, memory over hours — is `dev/pytools/cdc_soak.py`'s
+      subject, not a sweep case. Named as a gap because "the continuous axis is
+      swept" would otherwise imply more than a capped run proves.
+
+# Rows with `coverage: gap`. LOWER when one gets covered; raising it is a
+# deliberate act that belongs in the same commit as the reason.
+gap_ratchet: 2
+
+# ── properties the sweep pins that are not axes ──────────────────────────────
+# Design decisions the sweep would otherwise silently tolerate a change to.
+properties:
+  - id: the_database_is_the_record
+    statement: >-
+      Everything a CDC run makes durable is in the DATABASE at the moment it
+      becomes durable: the part in `file_log`, the run's aggregate in
+      `export_metrics` as a `running` row. The manifest at the destination is a
+      PROJECTION of that record, not the record itself.
+    consequence: >-
+      This was inverted until 2026-08-03. `cdc_job` wrote `begin_run` and one
+      aggregate at finalize; the sink — the only thing that knows about parts —
+      never touched the state store, while writing a run-unique Success manifest
+      before EVERY ack so a crash kept the data visible. The manifest was both
+      finer-grained and earlier than the ledger, so a run that died mid-stream
+      left durable rows the database had never heard of and anything reconciling
+      from the state DB alone under-counted by exactly those rows. Now the sweep
+      checks the direction that matters: from every file ON DISK to the ledger
+      that must account for it — the check a crash's orphan is the whole point
+      of, since that file is in no manifest at all.

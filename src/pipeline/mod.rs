@@ -8,7 +8,10 @@
 
 mod aggregate;
 mod apply_cmd;
+#[cfg(not(test))]
 mod cdc_job;
+#[cfg(test)]
+pub(crate) mod cdc_job;
 pub(crate) mod chunked;
 mod cli;
 pub(crate) mod commit;
@@ -36,7 +39,7 @@ pub(crate) mod retry;
 // the duplicate is resolved by Rust's namespace rules (modules live in
 // the type namespace, fns in the value namespace) and unambiguous at
 // every call site (`pipeline::run(...)` is the function).
-mod run;
+pub(crate) mod run;
 mod run_store;
 mod schema_drift;
 mod single;
@@ -269,6 +272,7 @@ mod tests {
     fn minimal_plan() -> ResolvedRunPlan {
         ResolvedRunPlan {
             export_name: "test_export".into(),
+            source_table: None,
             base_query: "SELECT 1".into(),
             strategy: ExtractionStrategy::Snapshot,
             format: FormatType::Parquet,

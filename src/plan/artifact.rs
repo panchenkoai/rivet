@@ -696,6 +696,7 @@ mod tests {
     fn minimal_plan() -> ResolvedRunPlan {
         ResolvedRunPlan {
             export_name: "orders".into(),
+            source_table: None,
             base_query: "SELECT * FROM orders".into(),
             strategy: ExtractionStrategy::Snapshot,
             format: FormatType::Parquet,

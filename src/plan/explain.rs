@@ -27,6 +27,18 @@ use crate::tuning::memory::{DEFAULT_MEM_BUDGET_MB, estimate_peak_rss_mb};
 /// Reads only from the preflight [`ExportDiagnostic`] and the [`ExportConfig`]
 /// (both lib-accessible) and the shared [`crate::tuning::memory`] model, so it
 /// compiles in the library and never fabricates a number it does not have.
+/// The BASE token of a diagnostic `mode` string. `diagnose_mode_str` decorates
+/// every non-`full` mode — `"chunked (column: id, size: 1000000)"`,
+/// `"keyset (key: k, size: n)"`, `"incremental (cursor: c)"` — while the
+/// matches in this file compared the exact bare token, so no arm ever fired on
+/// a real diagnostic: every chunked/keyset/incremental export read the `_`
+/// fallback's narrative, including "resumable: no" on a checkpointed chunked
+/// plan. Match on the first word instead of trusting two files to agree on a
+/// format nobody pinned.
+fn mode_token(mode: &str) -> &str {
+    mode.split([' ', '(']).next().unwrap_or(mode)
+}
+
 pub fn explain_strategy(diag: &ExportDiagnostic, export: &ExportConfig) -> String {
     let mut sentences: Vec<String> = Vec::new();
 
@@ -44,7 +56,7 @@ pub fn explain_strategy(diag: &ExportDiagnostic, export: &ExportConfig) -> Strin
 /// threshold and the presence (or absence) of an indexed chunk/cursor column.
 fn explain_mode(diag: &ExportDiagnostic, export: &ExportConfig) -> String {
     let rows = fmt_rows(diag.row_estimate);
-    match diag.mode.as_str() {
+    match mode_token(&diag.mode) {
         "chunked" => {
             let col = export
                 .chunk_column
@@ -107,7 +119,7 @@ fn explain_mode(diag: &ExportDiagnostic, export: &ExportConfig) -> String {
 /// Why this chunk_size / file geometry — only meaningful for chunked exports;
 /// relates the row estimate to the chunk size and the resulting part count.
 fn explain_geometry(diag: &ExportDiagnostic, export: &ExportConfig) -> Option<String> {
-    if diag.mode != "chunked" {
+    if mode_token(&diag.mode) != "chunked" {
         return None;
     }
 
@@ -171,7 +183,7 @@ fn explain_parallelism(diag: &ExportDiagnostic, export: &ExportConfig) -> String
 
 /// Risk profile — resumability and the memory bound.
 fn explain_risk(diag: &ExportDiagnostic, export: &ExportConfig) -> String {
-    let resumable = match diag.mode.as_str() {
+    let resumable = match mode_token(&diag.mode) {
         // Incremental resumes by its stored watermark every run.
         "incremental" => "resumable: yes — re-runs continue from the stored watermark".to_string(),
         // Chunked resumes only when the checkpoint is on. Without it a failed run
@@ -203,7 +215,7 @@ fn explain_risk(diag: &ExportDiagnostic, export: &ExportConfig) -> String {
 /// Worker count that will actually run: the configured `parallel` for chunked
 /// exports (the only mode that spawns a worker pool), 1 for everything else.
 fn parallel_workers(diag: &ExportDiagnostic, export: &ExportConfig) -> usize {
-    if diag.mode == "chunked" {
+    if mode_token(&diag.mode) == "chunked" {
         export.parallel.max(1)
     } else {
         1
@@ -237,6 +249,52 @@ mod tests {
 
     fn base_export(name: &str) -> ExportConfig {
         crate::config::sample_export(name)
+    }
+
+    /// The producer/consumer contract this file silently broke: `diagnose_mode_str`
+    /// returns DECORATED strings — `"chunked (column: id, size: 1000000)"` — while
+    /// every match in this file compared the exact bare token, so no arm ever
+    /// fired on a real diagnostic: a chunked export read the `_` fallback's
+    /// narrative ("resumable: no"), including on a checkpointed plan. Bare only
+    /// for `full`, which is why the mismatch survived: the only mode anyone eyed
+    /// in tests was the one that happened to compare equal.
+    ///
+    /// The test therefore goes through the REAL producer rather than hand-typing
+    /// the mode string — hand-typing is exactly how the bug stayed invisible.
+    #[test]
+    fn explain_understands_what_diagnose_mode_str_actually_produces() {
+        let mut export = base_export("t");
+        export.mode = crate::config::ExportMode::Chunked;
+        export.chunk_column = Some("id".into());
+
+        let mut diag = base_diag("placeholder");
+        diag.mode = crate::preflight::diagnose_mode_str(&export);
+        assert!(
+            diag.mode.starts_with("chunked"),
+            "producer sanity: got {:?}",
+            diag.mode
+        );
+
+        // The chunked narrative names the chunk column; the `_` fallback cannot.
+        let mode_text = explain_mode(&diag, &export);
+        assert!(
+            mode_text.contains("chunk column"),
+            "a chunked diagnostic must take the chunked arm, got: {mode_text}"
+        );
+        // The risk line must give chunked's resumability, not the fallback's
+        // "resumable: no".
+        let risk = explain_risk(&diag, &export);
+        assert!(
+            risk.contains("per-chunk"),
+            "a chunked plan's risk line must describe per-chunk resume, got: {risk}"
+        );
+        // And the worker count must honour `parallel` for chunked.
+        export.parallel = 4;
+        assert_eq!(
+            parallel_workers(&diag, &export),
+            4,
+            "a chunked diagnostic must report the configured worker pool"
+        );
     }
 
     fn base_diag(mode: &str) -> ExportDiagnostic {

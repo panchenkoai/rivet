@@ -120,3 +120,168 @@ fn python_repr(s: &str) -> String {
         .collect();
     format!("'{escaped}'")
 }
+
+// ── row/value oracles ────────────────────────────────────────────────────────
+//
+// Why these exist, and what they are NOT for.
+//
+// `common::parquet::{parquet_rows, total_parquet_rows}` decode with the SAME
+// `parquet` crate rivet ENCODES with. That is independent of rivet's COUNTERS —
+// which was the point when they were written — but not of rivet's CODEC: a fault
+// in the shared encode/decode path cancels out and the assertion still passes.
+// For a completeness or value claim, DuckDB is the reader that does not share
+// that failure mode.
+//
+// Deliberately NOT extended to file COUNTS or file HASHES. Counting entries is
+// `std::fs::read_dir` and hashing bytes is a digest over the file — neither goes
+// through rivet's codec, so routing them through DuckDB would buy nothing and
+// cost a container round-trip. Independence is only worth paying for where a
+// DECODER sits between the bytes and the claim.
+//
+// The files must live under the shared bind mount, so the test's output dir has
+// to come from `duckdb_shared_workdir` rather than a bare `tempfile::tempdir()`.
+
+/// Total rows across every `.parquet` under `container_dir`, read by DuckDB.
+///
+/// `container_dir` is the second element of [`duckdb_shared_workdir`].
+pub fn duckdb_parquet_rows(container_dir: &str) -> i64 {
+    duckdb_scalar_or_empty(container_dir, "count(*)", "*").unwrap_or(0)
+}
+
+/// One aggregate over every parquet under `container_dir`, or `None` when the
+/// directory holds NO parquet at all.
+///
+/// An empty destination is a legitimate expected value — "resume must capture
+/// only new changes" asserts exactly zero — but `read_parquet` on a glob that
+/// matches nothing is an ERROR, so the first version of these helpers panicked
+/// on the one answer some tests are looking for. The emptiness is resolved in
+/// python, where the exception is catchable, rather than by asking the caller to
+/// know in advance whether any file exists.
+fn duckdb_scalar_or_empty(container_dir: &str, agg: &str, col: &str) -> Option<i64> {
+    let py = format!(
+        r#"
+import duckdb, json, sys, glob
+files = glob.glob({dir_repr} + "/**/*.parquet", recursive=True)
+if not files:
+    sys.stdout.write("null")
+else:
+    con = duckdb.connect()
+    v = con.execute("SELECT {agg} FROM read_parquet('" + {dir_repr} + "/**/*.parquet')").fetchone()[0]
+    sys.stdout.write(json.dumps(int(v)))
+"#,
+        dir_repr = python_repr(container_dir),
+        agg = agg.replace("{col}", col),
+    );
+    let out = duckdb_run_python(&py);
+    serde_json::from_str::<Option<i64>>(out.trim())
+        .unwrap_or_else(|e| panic!("duckdb scalar not an int/null: {e}; raw {out}"))
+}
+
+/// Distinct values of `column` across every `.parquet` under `container_dir`.
+///
+/// The count that separates "no rows lost" from "no rows lost AND none
+/// duplicated" — a retry or a resume can satisfy the first and break the second.
+pub fn duckdb_parquet_distinct(container_dir: &str, column: &str) -> i64 {
+    duckdb_scalar_or_empty(container_dir, &format!("count(DISTINCT {column})"), column).unwrap_or(0)
+}
+
+/// Assert total and distinct in one call — the shape a completeness claim needs.
+///
+/// Equal totals with a lower distinct count is duplication; a lower total is
+/// loss. Reporting both at once names which one happened instead of leaving the
+/// reader to guess from a single number.
+pub fn duckdb_assert_complete(container_dir: &str, column: &str, expected: i64, what: &str) {
+    duckdb_assert_rows_and_distinct(container_dir, column, expected, expected, what);
+}
+
+/// The general primitive: exact row count AND exact distinct count.
+///
+/// The named claims above are the two common cases; a test whose expectation is
+/// neither — two full snapshots into one prefix, say, where 200 rows over 100
+/// distinct keys is CORRECT — states both numbers here rather than bending one of
+/// the named helpers into a shape it does not mean.
+pub fn duckdb_assert_rows_and_distinct(
+    container_dir: &str,
+    column: &str,
+    rows: i64,
+    distinct: i64,
+    what: &str,
+) {
+    let got_rows = duckdb_parquet_rows(container_dir);
+    let got_distinct = duckdb_parquet_distinct(container_dir, column);
+    assert_eq!(
+        (got_rows, got_distinct),
+        (rows, distinct),
+        "{what}: expected {rows} rows over {distinct} distinct `{column}`, DuckDB \
+         read {got_rows} rows / {got_distinct} distinct"
+    );
+}
+
+/// The AT-LEAST-ONCE shape: every key present, duplicates permitted.
+///
+/// Distinct must equal `expected` exactly (a missing key is loss) while the total
+/// may exceed it (a crash-orphaned page re-exported on recovery is correct
+/// behaviour, not a defect). Deliberately NOT [`duckdb_assert_complete`], which
+/// demands total == distinct and would fail a legitimate recovery — the two
+/// claims are different and collapsing them would make one of them a lie.
+pub fn duckdb_assert_at_least_once(container_dir: &str, column: &str, expected: i64, what: &str) {
+    let total = duckdb_parquet_rows(container_dir);
+    let distinct = duckdb_parquet_distinct(container_dir, column);
+    assert_eq!(
+        distinct, expected,
+        "{what}: every `{column}` must survive — DuckDB read {distinct} distinct of \
+         {expected} expected ({total} rows total). A missing key is loss."
+    );
+    assert!(
+        total >= expected,
+        "{what}: {total} rows for {expected} distinct `{column}` — fewer rows than \
+         keys is impossible unless the read itself is wrong"
+    );
+}
+
+/// Distinct values of `column` as a SET, read by DuckDB.
+///
+/// The counting helpers above answer "how many"; a set answers "which", which is
+/// what a CDC test needs — membership of a specific `_id`, or the exact symmetric
+/// difference against the source. Values come back stringified (the same
+/// convention as [`duckdb_run_sql_json`]), so an integer `_id` reads as "42".
+pub fn duckdb_distinct_set(
+    container_dir: &str,
+    column: &str,
+) -> std::collections::BTreeSet<String> {
+    if duckdb_scalar_or_empty(container_dir, "count(*)", "*").is_none() {
+        return std::collections::BTreeSet::new(); // no parquet at all
+    }
+    let v = duckdb_run_sql_json(&format!(
+        "SELECT DISTINCT CAST({column} AS VARCHAR) AS v \
+         FROM read_parquet('{container_dir}/**/*.parquet') WHERE {column} IS NOT NULL"
+    ));
+    v["rows"]
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|r| r[0].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// [`duckdb_distinct_set`] for an INTEGER key column.
+///
+/// The stringified form is the right default (a Mongo `_id` may be an ObjectId or
+/// a string), but a SQL test comparing against `(0..10).collect()` wants the
+/// numbers — converting at every call site would put a parse in the assertion,
+/// which is where a silent `unwrap_or(0)` would hide a real decode failure.
+pub fn duckdb_distinct_i64_set(
+    container_dir: &str,
+    column: &str,
+) -> std::collections::BTreeSet<i64> {
+    duckdb_distinct_set(container_dir, column)
+        .into_iter()
+        .map(|v| {
+            v.parse().unwrap_or_else(|e| {
+                panic!("`{column}` is not an integer in the destination: {v:?} ({e})")
+            })
+        })
+        .collect()
+}

@@ -31,17 +31,24 @@ fn write_checkpoint(c: &mut mysql::PooledConn, path: &std::path::Path) {
     std::fs::write(path, format!(r#"{{"file":"{file}","pos":{pos}}}"#)).unwrap();
 }
 
+/// The CDC rig for this file — ONE builder behind both accessors below.
+fn cdc_rig(tbl: &str, ckpt: &std::path::Path, out: &std::path::Path) -> Rig {
+    Rig::mysql_cdc(tbl)
+        .checkpoint_path(ckpt.to_path_buf())
+        .dest_path(out.to_path_buf())
+}
+
+/// Config PATH in a CALLER-owned dir. Kept because ~46 sites here only need a
+/// path (and the state DB beside it); a `Rig` owns its own tempdir, so handing
+/// back `rig.config_path()` from a helper would drop the rig and delete the file.
+/// Tests that need `run_args_env` (fault injection) take [`cdc_rig`] instead.
 fn cdc_config(
     d: &tempfile::TempDir,
     tbl: &str,
     ckpt: &std::path::Path,
     out: &std::path::Path,
 ) -> std::path::PathBuf {
-    let yaml = Rig::mysql_cdc(tbl)
-        .checkpoint_path(ckpt.to_path_buf())
-        .dest_path(out.to_path_buf())
-        .yaml();
-    write_config(d, &yaml)
+    write_config(d, &cdc_rig(tbl, ckpt, out).yaml())
 }
 
 /// Template-equivalence golden: the rig must render EXACTLY the config the
@@ -445,15 +452,10 @@ fn cdc_crash_after_flush_before_ack_re_reads_on_resume() {
     // Run 1 crashes right after the part is flushed, before the checkpoint+ack.
     let crash_out = d.path().join("crash");
     std::fs::create_dir_all(&crash_out).unwrap();
-    let crashed = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cdc_config(&d, &tbl, &ckpt, &crash_out).to_str().unwrap(),
-        ])
-        .env("RIVET_TEST_PANIC_AT", "cdc_after_flush_before_ack")
-        .output()
-        .expect("spawn rivet");
+    let crashed = cdc_rig(&tbl, &ckpt, &crash_out).run_args_env(
+        &[],
+        &[("RIVET_TEST_PANIC_AT", "cdc_after_flush_before_ack")],
+    );
     assert!(
         !crashed.status.success(),
         "the injected crash must fail run 1"
@@ -1381,14 +1383,14 @@ exports:
         &[],
     )
     .unwrap();
-    let out = std::process::Command::new(RIVET_BIN)
-        .args([
+    let out = run_rivet_env(
+        &[
             "run",
             "--config",
             pg_cdc_config(&d, &tbl, &slot, &cdc_out).to_str().unwrap(),
-        ])
-        .output()
-        .expect("spawn rivet");
+        ],
+        &[],
+    );
     assert!(
         !out.status.success(),
         "CDC must fail loudly on NaN::numeric, like batch — not NULL it silently"
@@ -1821,10 +1823,7 @@ exports:
 
     // Run 2 MUST fail loudly — silently recreating the slot at the current
     // position would skip row 2 forever while reporting success.
-    let res = std::process::Command::new(RIVET_BIN)
-        .args(["run", "--config", cfg.to_str().unwrap()])
-        .output()
-        .expect("spawn rivet");
+    let res = run_rivet_env(&["run", "--config", cfg.to_str().unwrap()], &[]);
     assert!(
         !res.status.success(),
         "a vanished slot with a completed snapshot behind it must FAIL, not silently re-anchor"
@@ -2494,10 +2493,7 @@ fn cdc_resume_from_missing_binlog_fails_loudly_not_silently() {
     let out_dir = d.path().join("out");
     std::fs::create_dir_all(&out_dir).unwrap();
     let cfg = cdc_config(&d, &tbl, &ckpt, &out_dir);
-    let out = std::process::Command::new(RIVET_BIN)
-        .args(["run", "--config", cfg.to_str().unwrap()])
-        .output()
-        .expect("spawn rivet");
+    let out = run_rivet_env(&["run", "--config", cfg.to_str().unwrap()], &[]);
     assert!(
         !out.status.success(),
         "resuming from a purged/missing binlog must FAIL, not silently re-anchor"
@@ -2540,14 +2536,14 @@ fn cdc_corrupt_checkpoint_fails_loud_not_silently_absent() {
     // Run 2 must FAIL loudly — never exit 0 having silently re-anchored past id=1.
     let out2 = d.path().join("out2");
     std::fs::create_dir_all(&out2).unwrap();
-    let res = std::process::Command::new(RIVET_BIN)
-        .args([
+    let res = run_rivet_env(
+        &[
             "run",
             "--config",
             cdc_config(&d, &tbl, &ckpt, &out2).to_str().unwrap(),
-        ])
-        .output()
-        .expect("spawn rivet");
+        ],
+        &[],
+    );
     assert!(
         !res.status.success(),
         "a corrupt checkpoint must fail the run, not silently re-anchor and skip changes"
@@ -2620,10 +2616,7 @@ exports:
     let out3 = d.path().join("out3");
     std::fs::create_dir_all(&out3).unwrap();
     let cfg3 = write_config(&d, &yaml(&out3));
-    let out = std::process::Command::new(RIVET_BIN)
-        .args(["run", "--config", cfg3.to_str().unwrap()])
-        .output()
-        .expect("spawn rivet");
+    let out = run_rivet_env(&["run", "--config", cfg3.to_str().unwrap()], &[]);
     assert!(
         !out.status.success(),
         "a vanished slot with an existing checkpoint must fail the run, not silently re-create"
@@ -2696,14 +2689,11 @@ exports:
     // Run 3 must FAIL loudly — never read the corrupt checkpoint as absent.
     let out3 = d.path().join("out3");
     std::fs::create_dir_all(&out3).unwrap();
-    let res = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            write_config(&d, &yaml(&out3)).to_str().unwrap(),
-        ])
-        .output()
-        .expect("spawn rivet");
+    let res = run_rivet(&[
+        "run",
+        "--config",
+        write_config(&d, &yaml(&out3)).to_str().unwrap(),
+    ]);
     assert!(
         !res.status.success(),
         "a corrupt checkpoint must fail the run, not be read as absent and re-anchor"
@@ -2744,10 +2734,7 @@ fn doctor_reports_cdc_slot_health_and_flags_foreign_inactive_slots() {
     let out_dir = d.path().join("out");
     std::fs::create_dir_all(&out_dir).unwrap();
     let cfg = pg_cdc_config(&d, &tbl, &own_slot, &out_dir);
-    let out = std::process::Command::new(RIVET_BIN)
-        .args(["doctor", "--config", cfg.to_str().unwrap(), "--json"])
-        .output()
-        .expect("spawn rivet doctor");
+    let out = run_rivet(&["doctor", "--config", cfg.to_str().unwrap(), "--json"]);
     let report: serde_json::Value =
         serde_json::from_slice(&out.stdout).expect("doctor --json output");
     let checks = report["checks"].as_array().expect("checks array");
@@ -2857,15 +2844,14 @@ fn pg_cdc_crash_after_flush_before_ack_does_not_advance_the_slot() {
     // Run 1 crashes after the part is flushed, before the slot advances.
     let crash_out = d.path().join("crash");
     std::fs::create_dir_all(&crash_out).unwrap();
-    let crashed = std::process::Command::new(RIVET_BIN)
-        .args([
+    let crashed = run_rivet_env(
+        &[
             "run",
             "--config",
             pg_cdc_config(&d, &tbl, &slot, &crash_out).to_str().unwrap(),
-        ])
-        .env("RIVET_TEST_PANIC_AT", "cdc_after_flush_before_ack")
-        .output()
-        .expect("spawn rivet");
+        ],
+        &[("RIVET_TEST_PANIC_AT", "cdc_after_flush_before_ack")],
+    );
     assert!(
         !crashed.status.success(),
         "the injected crash must fail run 1"
@@ -2938,11 +2924,7 @@ fn roast_pg_cdc_crash_in_a_re_drain_pass_stays_at_least_once() {
         .cdc("rollover: 5")
         .dest_path(out.clone());
     // Run 1 crashes right after the FIRST ack (the pass-1 uncaptured-span ack).
-    let crashed = std::process::Command::new(RIVET_BIN)
-        .args(["run", "--config", rig.config_path().to_str().unwrap()])
-        .env("RIVET_TEST_PANIC_AT", "cdc_after_ack")
-        .output()
-        .expect("spawn rivet");
+    let crashed = rig.run_args_env(&[], &[("RIVET_TEST_PANIC_AT", "cdc_after_ack")]);
     assert!(
         !crashed.status.success(),
         "the injected crash must fail run 1"
@@ -3012,11 +2994,7 @@ fn roast_pg_cdc_large_transaction_is_atomic_across_a_mid_flush_crash() {
         .cdc("rollover: 5")
         .dest_path(out.clone());
     // Run 1 crashes right after the FIRST ack.
-    let crashed = std::process::Command::new(RIVET_BIN)
-        .args(["run", "--config", rig.config_path().to_str().unwrap()])
-        .env("RIVET_TEST_PANIC_AT", "cdc_after_ack")
-        .output()
-        .expect("spawn rivet");
+    let crashed = rig.run_args_env(&[], &[("RIVET_TEST_PANIC_AT", "cdc_after_ack")]);
     assert!(
         !crashed.status.success(),
         "the injected crash must fail run 1"
@@ -3077,11 +3055,7 @@ fn roast_mysql_cdc_large_transaction_is_atomic_across_a_mid_flush_crash() {
         .unwrap();
 
     // Run 1 crashes right after the FIRST ack.
-    let crashed = std::process::Command::new(RIVET_BIN)
-        .args(["run", "--config", rig.config_path().to_str().unwrap()])
-        .env("RIVET_TEST_PANIC_AT", "cdc_after_ack")
-        .output()
-        .expect("spawn rivet");
+    let crashed = rig.run_args_env(&[], &[("RIVET_TEST_PANIC_AT", "cdc_after_ack")]);
     assert!(
         !crashed.status.success(),
         "the injected crash must fail run 1"
@@ -4532,6 +4506,185 @@ fn pg_cdc_typed_values_match_source_via_duckdb_not_batch() {
          got: {res}"
     );
 }
+
+// The two legs of ONE `initial: snapshot` export must claim ONE source identity.
+//
+// `identity_source` is what `ensure_single_source` compares when a load reads a
+// prefix, and the two legs derived it differently: the CDC drain records the
+// capture output's table, while the snapshot leg is a batch run whose manifest
+// source used to be split off the EXPORT NAME — and the leg's synthesized name
+// (`orders__snapshot_orders`) has no dot, so it recorded `table: null`. Measured
+// on a real run into one prefix before the fix: drain
+// `{engine: postgres, table: "idsrc_orders"}` and leg `{engine: postgres,
+// table: null}`, which read as `postgres:idsrc_orders` and `postgres` — two
+// sources under one export name, so `rivet load` refuses the flow the docs
+// describe.
+//
+// A name is a label; the config is the catalog. The manifest's source table now
+// comes from the export's declared `table:`, carried on the plan.
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
+fn both_legs_of_an_initial_snapshot_export_claim_one_source_identity() {
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("cdc_ident");
+    let mut c = conn();
+    c.query_drop(format!("DROP TABLE IF EXISTS {tbl}")).unwrap();
+    c.query_drop(format!("CREATE TABLE {tbl} (id INT PRIMARY KEY, v INT)"))
+        .unwrap();
+    let _guard = Table(tbl.clone());
+    c.query_drop(format!("INSERT INTO {tbl} VALUES (1,10),(2,20)"))
+        .unwrap();
+
+    let out = d.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let ckpt = d.path().join("cdc.ckpt");
+    let cfg_text = format!(
+        r#"
+source: {{ type: mysql, url_env: MYSQL_CDC_URL }}
+exports:
+  - name: {tbl}
+    table: {tbl}
+    mode: cdc
+    cdc: {{ initial: snapshot, checkpoint: "{ckpt}", until_current: true, server_id: {sid} }}
+    format: parquet
+    destination: {{ type: local, path: "{out}" }}
+"#,
+        ckpt = ckpt.display(),
+        out = out.display(),
+        sid = server_id_for(&tbl),
+    );
+    let cfg = write_config(&d, &cfg_text);
+    // The config resolves its source through `url_env:` ON PURPOSE — this test is
+    // about SOURCE IDENTITY, and the env form is the one a deployment uses when a
+    // plaintext URL would be redacted out of the artifact. But nothing ever SET
+    // the variable, so every run of this test died at config load with "env var
+    // 'MYSQL_CDC_URL' is not set" before reaching a single assertion. Pass it.
+    let out_run = run_rivet_env(
+        &["run", "--config", cfg.to_str().unwrap()],
+        &[("MYSQL_CDC_URL", MYSQL_CDC_URL)],
+    );
+    assert!(
+        out_run.status.success(),
+        "the snapshot+cdc run must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&out_run.stderr)
+    );
+
+    // Read what each leg actually WROTE, and compare with the product's own
+    // identity rule rather than a copy of it.
+    let source_of = |p: &std::path::Path| -> (String, Option<String>) {
+        let body =
+            std::fs::read_to_string(p).unwrap_or_else(|e| panic!("read {}: {e}", p.display()));
+        let m: serde_json::Value = serde_json::from_str(&body).unwrap();
+        (
+            m["source"]["engine"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            m["source"]["table"].as_str().map(str::to_string),
+        )
+    };
+    let drain = source_of(&out.join("manifest.json"));
+    let leg = source_of(&out.join("snapshot").join("manifest.json"));
+
+    // Not inert: both legs must have written a manifest with an engine at all.
+    assert!(
+        !drain.0.is_empty() && !leg.0.is_empty(),
+        "fixture is inert — one leg wrote no manifest: drain={drain:?} leg={leg:?}"
+    );
+    assert_eq!(
+        drain, leg,
+        "the two legs of ONE export disagree about their source: a load over this prefix sees \
+         two identities and refuses to load either"
+    );
+    assert_eq!(
+        leg.1.as_deref(),
+        Some(tbl.as_str()),
+        "the snapshot leg must record the DECLARED table, not whatever its synthesized export \
+         name happens to parse to"
+    );
+}
+
+// A CDC destination carrying a `{date}` template must be resolved at WRITE time
+// the same way `rivet validate` resolves it at READ time.
+//
+// The batch path never had this bug and that is precisely why it hid: every
+// batch runner writes to `plan.destination`, which `plan::build` expands while
+// building the plan. `job.rs` returns into `cdc_job::run_cdc_export` BEFORE
+// `build_plan`, so CDC had no plan and no expansion — `create_destination` got
+// the RAW config and made a directory named, literally, `{date}`, while
+// validate/load resolved the template to today's date and reported an empty
+// destination over a perfectly captured stream.
+//
+// The assertion is deliberately two-sided. "Rows landed somewhere" is not the
+// property (they always did); the property is that they landed where the reader
+// looks AND that the literal-template directory does not exist. A one-sided
+// check passes against the bug — the pre-fix run also produces readable parquet,
+// just at an address nothing else in rivet ever visits.
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical)"]
+fn roast_pg_cdc_destination_placeholders_resolve_like_the_batch_path() {
+    use postgres::NoTls;
+    let d = tempfile::tempdir().unwrap();
+    let tbl = unique_name("cdc_placeholder");
+    let slot = unique_name("rivet_placeholder_slot");
+    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {tbl}; \
+         CREATE TABLE {tbl} (id INT PRIMARY KEY, v TEXT);"
+    ))
+    .unwrap();
+    c.execute(
+        "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+        &[&slot],
+    )
+    .unwrap();
+    c.batch_execute(&format!(
+        "INSERT INTO {tbl} (id, v) VALUES (1, 'a'), (2, 'b'), (3, 'c');"
+    ))
+    .unwrap();
+
+    let base = d.path().join("out");
+    std::fs::create_dir_all(&base).unwrap();
+    // The config carries the TEMPLATE, exactly as an operator would write it.
+    Rig::pg_cdc(&tbl, &slot)
+        .dest_path(base.join("{date}"))
+        .run_ok();
+
+    let literal = base.join("{date}");
+    let resolved = base.join(chrono::Utc::now().format("%Y-%m-%d").to_string());
+
+    // The oracle is WHERE THE PARQUET IS, never whether a directory exists: the
+    // rig itself `create_dir_all`s the configured destination before launching
+    // (`rig.rs`), so the literal `{date}` directory is present either way and an
+    // existence check would grade the harness instead of the product. This cost
+    // one RED run to learn — the first draft asserted `!literal.exists()` and
+    // failed against the FIXED binary.
+    let parquet_in = |p: &std::path::Path| -> usize {
+        std::fs::read_dir(p)
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .filter(|e| e.path().extension().is_some_and(|x| x == "parquet"))
+                    .count()
+            })
+            .unwrap_or(0)
+    };
+    let at_resolved = parquet_in(&resolved);
+    assert!(
+        at_resolved > 0,
+        "no parquet at the RESOLVED prefix the reader computes ({}) — the \
+         template reached `create_destination` unexpanded, so validate, load and \
+         gc all look somewhere the drain never wrote",
+        resolved.display()
+    );
+    assert_eq!(
+        parquet_in(&literal),
+        0,
+        "parquet landed under the LITERAL `{{date}}` directory ({}) — the write \
+         address and the read address disagree",
+        literal.display()
+    );
+}
+
 
 /// The binlog-compression guard, live.
 ///

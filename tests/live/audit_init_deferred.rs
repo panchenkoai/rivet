@@ -21,31 +21,64 @@ fn init_mssql_single_table_emits_valid_config_that_passes_check() {
 
     let cfg_dir = tempfile::tempdir().unwrap();
 
-    // ── init --table dbo.orders ────────────────────────────────────────────
+    // FIXTURE precondition, and the table is DELIBERATELY the one that a plain
+    // `docker compose up -d mssql` provisions.
+    //
+    // This test used to scaffold `dbo.orders`, which `dev/mssql/init.sql` and
+    // the canonical Rust seed BOTH created with incompatible schemas — the seed
+    // DROP+CREATEs, so whichever ran last won (fixed 2026-08-05 by renaming the
+    // init-time probe to `dbo.planning_probe` and leaving `orders` to the seed).
+    //
+    // The first attempt at that fix pointed this test at the SEED's `orders`
+    // instead, and that was an over-correction: it made a test that had always
+    // worked on a bare compose-up require a separate manual seeding step, and
+    // the very next clean checkout hit the precondition. What this test actually
+    // needs is ANY table with a DECIMAL column — not the cross-engine fixture —
+    // so it uses the probe the documented setup already creates.
+    let probe_present = mssql_query_i64(
+        "SELECT count(*) FROM sys.columns \
+         WHERE object_id = OBJECT_ID('dbo.planning_probe') AND name = 'amount'",
+    );
+    assert_eq!(
+        probe_present, 1,
+        "`dbo.planning_probe` is absent — a STAND problem, not a rivet one. It comes from \
+         dev/mssql/init.sql, which docker runs only on a FRESH data directory, so an \
+         existing stand does not get it by pulling. Apply it to a running one with:\n  \
+         docker exec -i rivet-mssql-1 /opt/mssql-tools18/bin/sqlcmd -C -S localhost \
+         -U sa -P 'Rivet_Passw0rd!' -d rivet -i /dev/stdin < dev/mssql/init.sql"
+    );
+
+    // ── init --table dbo.planning_probe ────────────────────────────────────
     let out = std::process::Command::new(RIVET_BIN)
-        .args(["init", "--source", MSSQL_URL, "--table", "dbo.orders"])
+        .args([
+            "init",
+            "--source",
+            MSSQL_URL,
+            "--table",
+            "dbo.planning_probe",
+        ])
         .output()
         .expect("spawn rivet init (mssql)");
 
     assert!(
         out.status.success(),
-        "rivet init --table dbo.orders must exit 0; stderr:\n{}",
+        "rivet init --table dbo.planning_probe must exit 0; stderr:\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
 
     let yaml = String::from_utf8_lossy(&out.stdout);
-    // SQL Server scaffold: `type: mssql`, schema-qualified `FROM dbo.orders`.
+    // SQL Server scaffold: `type: mssql`, schema-qualified `FROM dbo.planning_probe`.
     assert!(
         yaml.contains("type: mssql"),
         "emitted YAML must declare `type: mssql`; got:\n{yaml}"
     );
     assert!(
-        yaml.contains("  - name: orders"),
-        "dbo.orders must own a dedicated export block; got:\n{yaml}"
+        yaml.contains("  - name: planning_probe"),
+        "dbo.planning_probe must own a dedicated export block; got:\n{yaml}"
     );
     assert!(
-        yaml.contains("dbo.orders"),
-        "emitted YAML must reference the schema-qualified `dbo.orders`; got:\n{yaml}"
+        yaml.contains("dbo.planning_probe"),
+        "emitted YAML must reference the schema-qualified `dbo.planning_probe`; got:\n{yaml}"
     );
     // Exactly one export (single-table init).
     let export_count = yaml.matches("  - name:").count();
@@ -53,7 +86,7 @@ fn init_mssql_single_table_emits_valid_config_that_passes_check() {
         export_count, 1,
         "single-table init must emit exactly 1 export; got {export_count}:\n{yaml}"
     );
-    // The `amount DECIMAL(12,2)` column (see dev/mssql/init.sql `dbo.orders`)
+    // The `amount DECIMAL(12,2)` column (dev/mssql/init.sql, `dbo.planning_probe`)
     // must ride through with its declared precision/scale (catalog hint), so no
     // unbounded-decimal REVIEW marker.
     assert!(

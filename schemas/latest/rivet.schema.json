@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "Rivet config (rivet-cli 0.24.1)",
+  "title": "Rivet config (rivet-cli 0.24.2)",
   "description": "Top-level Rivet configuration root.\n\nOperators write this struct as YAML (typically `rivet.yaml`).  The\n`JsonSchema` derive is the source of truth for the `schemas/rivet.schema.json`\nartifact and the `rivet schema config` command's output (v0.7.3 P0).",
   "type": "object",
   "properties": {
@@ -851,7 +851,7 @@
           "default": true
         },
         "max_events": {
-          "description": "Stop after N change events (default: until end of stream / interrupted).",
+          "description": "Stop at the first COMMIT BOUNDARY once N change events have been\ncaptured (default: until end of stream / interrupted). A soft cap, like\n`rollover`: a transaction is never split, so the run may overshoot N by\nthe remainder of the transaction the cap landed in — a hard per-event\nstop cut transactions mid-flight and left the stream unable to advance\npast them.",
           "type": [
             "integer",
             "null"

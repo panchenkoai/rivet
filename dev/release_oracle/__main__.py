@@ -44,7 +44,7 @@ import time
 from pathlib import Path
 
 from .core import Ledger, Status, engine_container, docker, have, remove_engine_containers, rivet, rivet_bin, run, HERE, ROOT
-from . import bigquery, cdc, gifs, regression, release_path, scenarios
+from . import bigquery, cdc, concurrency, gifs, regression, release_path, scenarios, state_parity
 
 
 def matrix_cfg(*args: str) -> str:
@@ -118,6 +118,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--engines", default="", help="comma-separated subset, e.g. postgres,mysql")
     ap.add_argument("--no-cloud", action="store_true", help="local stage only (skip BigQuery)")
     ap.add_argument("--keep", action="store_true", help="leave engine containers up (debug)")
+    ap.add_argument("--no-clean", action="store_true",
+                    help="skip the clean rebuild (iteration only — a release must be gated on a "
+                         "tree built from nothing)")
+    ap.add_argument("--state-url", default="",
+                    help="state backend for EVERY cell (default: SQLite beside each config). "
+                         "A gate pass grades ONE backend; run it twice to grade both.")
     ap.add_argument("--bless-bigquery-golden", action="store_true")
     ap.add_argument("--bless-local", action="store_true", help="re-capture verdict + duckdb-type goldens (implies --no-cloud)")
     ap.add_argument("--bless-cdc", action="store_true", help="re-capture the cdc state-snapshot golden")
@@ -129,10 +135,52 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return ns
 
 
+def clean_tree_and_build(led: Ledger) -> bool:
+    """Step ZERO: gate a binary built from nothing.
+
+    A release must be graded on a tree with no history in it. `cargo package`
+    alone can make every later build LIE about being fresh — it copies the crate
+    to `target/package/<name>-<version>/` and builds THAT, leaving fingerprints
+    that record the sources at frozen paths, so the next `cargo build` compares
+    against a snapshot, finds nothing newer, prints `Fresh`, and produces a binary
+    without your edits. Every signal you would use to check it is lied to too:
+    `cargo test` passes, a deliberate type error compiles clean. Stale artifacts
+    from an interrupted run are the same class with a smaller blast radius.
+
+    So the gate starts by deleting the target directory and its own scratch, then
+    builds `--release` itself. It costs one full compile; it buys the guarantee
+    that the binary every cell below exercises is the code in the tree.
+    """
+    led.phase("Clean tree — the gate builds the binary it grades")
+    for stale in ("/tmp/rivet_conc", "/tmp/rivet_iso", "/tmp/rivet_sweep", "/tmp/rivet_cdc_sweep"):
+        shutil.rmtree(stale, ignore_errors=True)
+    for lock in Path("/tmp").glob(".rivet_cdc_sweep*.lock"):
+        lock.unlink(missing_ok=True)
+    if not run(["cargo", "clean"], cwd=ROOT, timeout=600).ok:
+        led.failed("-", "-", "clean_tree", "-",
+                   "clean tree: `cargo clean` failed — the gate cannot vouch for the binary it "
+                   "is about to grade")
+        return False
+    build = run(["cargo", "build", "--release"], cwd=ROOT, timeout=3600)
+    if not build.ok or not rivet_bin().is_file():
+        led.failed(
+            "-", "-", "clean_tree", "-",
+            f"clean tree: the release build FAILED on a clean tree — nothing below can mean "
+            f"anything: {(build.err or build.out)[-300:]}",
+        )
+        return False
+    led.passed(
+        "-", "-", "clean_tree", "-",
+        f"clean tree: target/ removed and the release binary rebuilt from nothing ({rivet_bin()})",
+    )
+    return True
+
+
 def preflight(led: Ledger, *, bless_gifs: bool = False) -> None:
     """Everything that is source-agnostic, in the order the comments above give."""
     release_path.verify_release_build_path(led)
     scenarios.verify_state_migrations(led)
+    scenarios.verify_inflight_run_stays_loadable(led)
     scenarios.verify_coverage_matrices(led)
     # The instructional GIFs are documentation that can go stale silently — they
     # are binary assets, so no test reads them and no diff flags them. Placed
@@ -144,6 +192,35 @@ def preflight(led: Ledger, *, bless_gifs: bool = False) -> None:
     cdc.verify_cdc_e2e(led)
     regression.verify_release_regression(led)
     regression.verify_scale_memory(led)
+    # Several writers into ONE prefix and ONE state backend. Placed in the
+    # source-agnostic preflight because the property is the WRITERS' — a shared
+    # deployment's exports do not take turns — not any engine's; one source
+    # exercises it. Local first, then the same race over a flat object-store
+    # namespace, where there is no rename to fall back on.
+    # The two state backends are separate implementations of one contract, with
+    # hand-written SQL on both sides. `golden/cdc_state_snapshot.json` checks that
+    # each POPULATES the expected tables; this checks that they AGREE about the
+    # same run — the gap that let shape tracking be absent on Postgres entirely
+    # while every run reported success.
+    state_parity.verify_state_backend_parity(
+        led,
+        state_url=os.environ.get("RIVET_CDC_STATE_URL") or os.environ.get("RIVET_CONC_STATE_URL"),
+        state_container=os.environ.get("RIVET_SWEEP_STATE_CONTAINER", "rivet-postgres-state-1"),
+        src_container=os.environ.get("RIVET_CONC_SRC_CONTAINER", "rivet-postgres-1"),
+        src_url=os.environ.get(
+            "RIVET_CONC_SRC_URL", "postgresql://rivet:rivet@localhost:5432/rivet"
+        ),
+    )
+    concurrency.verify_concurrent_writers_share_a_prefix(
+        led,
+        state_url=os.environ.get("RIVET_CDC_STATE_URL") or os.environ.get("RIVET_CONC_STATE_URL"),
+        state_container=os.environ.get("RIVET_SWEEP_STATE_CONTAINER", "rivet-postgres-state-1"),
+        src_container=os.environ.get("RIVET_CONC_SRC_CONTAINER", "rivet-postgres-1"),
+        src_url=os.environ.get(
+            "RIVET_CONC_SRC_URL", "postgresql://rivet:rivet@localhost:5432/rivet"
+        ),
+        bucket=os.environ.get("BQ_ORACLE_BUCKET") or "rivet_data_test",
+    )
 
 
 def bring_up(led: Ledger, engine: str, tag: str, image: str, port: int) -> str | None:
@@ -156,7 +233,15 @@ def bring_up(led: Ledger, engine: str, tag: str, image: str, port: int) -> str |
     named the BigQuery stage's container after whichever engine the main loop had
     visited last."""
     name = engine_container(engine, tag)
-    docker("rm", "-f", name)
+    # `-v`, not a bare `-f`. Every engine image here declares a VOLUME for its
+    # data directory, and `docker run` with no `-v` of our own answers that by
+    # creating an ANONYMOUS volume. `docker rm -f` deletes the container and
+    # ORPHANS that volume — so each gate run leaked one per engine×version
+    # (~15), invisibly, because nothing ever lists them. Measured on this
+    # machine before the fix: 814 anonymous volumes holding 370 GB, against 30
+    # named ones, on a disk at 89%. The engines are seeded from scratch every
+    # run, so there is nothing in them worth keeping past teardown.
+    docker("rm", "-fv", name)
 
     args: list[str] = ["run", "-d", "--name", name]
     if engine == "postgres":
@@ -182,9 +267,25 @@ def bring_up(led: Ledger, engine: str, tag: str, image: str, port: int) -> str |
     # the legacy `mongo` shell — so a mongosh-only probe reports 4.4 as never
     # ready, which (now that the result is honoured) turns a perfectly healthy
     # server into a SKIP. The compose healthcheck makes the same fallback.
+    # The probe must query the TARGET DATABASE, not merely the server.
+    #
+    # `pg_isready` reports whether the server ANSWERS, and a server that answers
+    # `FATAL: database "rivet" does not exist` is answering — so it exits 0 while
+    # the database the seed needs is still being created by the entrypoint. The
+    # two-successes-a-second-apart rule below does not help: both land inside the
+    # same window. Measured on postgres:14 — `pg_isready -U rivet` went true 3
+    # polls before `rivet` was usable, and `pg_isready -U rivet -d rivet` (the
+    # obvious fix, and wrong) still went true 14 polls early. That is what failed
+    # this gate run: `postgres 14 seed FAIL … database "rivet" does not exist`,
+    # a false NOT RELEASABLE with nothing wrong with the product.
+    #
+    # A real `select 1` against `rivet` is true exactly when the seed can connect,
+    # and it subsumes the vanishing-temporary-server case the comment below
+    # describes. Same reasoning for MySQL, whose `mysqladmin ping` answers before
+    # the entrypoint has created `MYSQL_DATABASE`.
     probes: list[list[str]] = {
-        "postgres": [["pg_isready", "-U", "rivet"]],
-        "mysql": [["mysqladmin", "ping", "-urivet", "-privet"]],
+        "postgres": [["psql", "-U", "rivet", "-d", "rivet", "-tAc", "select 1"]],
+        "mysql": [["mysql", "-urivet", "-privet", "rivet", "-e", "select 1"]],
         "mssql": [["/opt/mssql-tools18/bin/sqlcmd", "-S", "localhost", "-U", "sa",
                    "-P", "Rivet_Passw0rd!", "-C", "-Q", "SELECT 1"]],
         "mongo": [["mongosh", "--quiet", "--eval", "db.runCommand({ping:1})"],
@@ -283,17 +384,23 @@ def engine_loop(led: Ledger, ns: argparse.Namespace) -> None:
             # failure is retried: a fresh container under load can drop the seed
             # connection mid-stream, and crying wolf on that is worse than a retry.
             err = ""
-            for _ in range(3):
+            for attempt in range(3):
                 err = seed_engine(engine, tag, url)
                 if not err:
                     break
+                # Back off between attempts. Without this the three retries fire
+                # back-to-back and all land inside the SAME startup window, so a
+                # race the retry exists to absorb is retried three times in the
+                # few hundred ms during which it cannot possibly succeed — which
+                # is how a transient became a FAIL.
+                time.sleep(2.0 * (attempt + 1))
             if err:
                 led.failed(engine, tag, "seed", "-", f"{engine}:{tag} seed had errors", err)
                 continue
             led.ok("seeded")
             scenarios.run_scenarios(led, engine, tag, url)
             if not ns.keep:
-                docker("rm", "-f", engine_container(engine, tag))
+                docker("rm", "-fv", engine_container(engine, tag))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -331,6 +438,26 @@ def main(argv: list[str] | None = None) -> int:
         version = rivet("--version").stdout.splitlines()
         print(f"  rivet: {rivet_bin()} ({version[0] if version else 'unknown'})")
 
+        # WHICH STATE BACKEND IS BEING GRADED, said out loud.
+        #
+        # `run()` merges os.environ into every cell's env, so one variable decides
+        # the backend for the WHOLE gate — and until it was printed, nothing in a
+        # green report told you which one. That matters: a SQLite pass does not
+        # cover Postgres, and the two have diverged before (shape tracking never
+        # worked on Postgres at all). Grading both is two passes, deliberately,
+        # rather than a subset of cells quietly touching the other backend.
+        state_url = ns.state_url or os.environ.get("RIVET_GATE_STATE_URL", "")
+        if state_url:
+            os.environ["RIVET_STATE_URL"] = state_url
+            backend = f"POSTGRES ({state_url.split('@')[-1]})"
+        else:
+            os.environ.pop("RIVET_STATE_URL", None)
+            backend = "SQLITE (a .rivet_state.db beside each config — the default)"
+        print(f"  state backend under test: {backend}")
+        print("  a pass grades ONE backend; --state-url runs the same cells against the other")
+
+        if not ns.no_clean and not clean_tree_and_build(led):
+            return 1
         start_stores(led)
         preflight(led, bless_gifs=ns.bless_gifs)
         engine_loop(led, ns)

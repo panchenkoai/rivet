@@ -88,6 +88,11 @@ pub(crate) fn build_chunk_query_sql(
     source_type: crate::config::SourceType,
 ) -> String {
     let quoted_col = crate::sql::quote_ident(source_type, order_column);
+    // SQL Server parses a SEPARATED date literal per the session DATEFORMAT, so a
+    // non-us_english server reads every window bound wrong (or rejects it). The
+    // unseparated form is ISO in every language. Same reason as
+    // `plan::partition::build_range_query`, which owns the helper.
+    let date_fmt = crate::plan::partition::date_literal_format(source_type);
 
     if chunk_dense {
         return format!(
@@ -122,8 +127,8 @@ pub(crate) fn build_chunk_query_sql(
                 "SELECT * FROM {table} WHERE {col} >= '{s}' AND {col} < '{e}'",
                 table = table_ident,
                 col = quoted_col,
-                s = start_date.format("%Y-%m-%d"),
-                e = end_date.format("%Y-%m-%d"),
+                s = start_date.format(date_fmt),
+                e = end_date.format(date_fmt),
             );
         }
         return format!(
@@ -144,8 +149,8 @@ pub(crate) fn build_chunk_query_sql(
             "SELECT * FROM ({base}) AS _rivet WHERE {col} >= '{start}' AND {col} < '{end}'",
             base = base_query,
             col = quoted_col,
-            start = start_date.format("%Y-%m-%d"),
-            end = end_date.format("%Y-%m-%d"),
+            start = start_date.format(date_fmt),
+            end = end_date.format(date_fmt),
         );
     }
 

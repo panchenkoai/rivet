@@ -70,6 +70,10 @@
       "strategy": "full",
       "verdict": "ACCEPTABLE"
     },
+    "row_hash_probe": {
+      "strategy": "full",
+      "verdict": "ACCEPTABLE"
+    },
     "sparse_key": {
       "strategy": "keyset",
       "verdict": "ACCEPTABLE"
@@ -160,12 +164,20 @@
       "strategy": "full",
       "verdict": "ACCEPTABLE"
     },
+    "row_hash_probe": {
+      "strategy": "full",
+      "verdict": "ACCEPTABLE"
+    },
     "users": {
       "strategy": "keyset",
       "verdict": "ACCEPTABLE"
     }
   },
   "postgres": {
+    "array_matrix": {
+      "strategy": "full",
+      "verdict": "ACCEPTABLE"
+    },
     "bigint_pk_dual_ts": {
       "strategy": "keyset",
       "verdict": "ACCEPTABLE"
@@ -223,6 +235,10 @@
       "verdict": "ACCEPTABLE"
     },
     "rivet_type_matrix": {
+      "strategy": "full",
+      "verdict": "ACCEPTABLE"
+    },
+    "row_hash_probe": {
       "strategy": "full",
       "verdict": "ACCEPTABLE"
     },

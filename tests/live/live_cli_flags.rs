@@ -570,49 +570,16 @@ fn run_parallel_exports_flag_runs_both_exports() {
 
     let t1 = seed_pg_numeric_table(10);
     let t2 = seed_pg_numeric_table(10);
-    let out1 = tempfile::tempdir().unwrap();
-    let out2 = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
 
-    let yaml = format!(
-        r#"
-source:
-  type: postgres
-  url: "{POSTGRES_URL}"
+    // A two-export config through the rig — the shape that used to force a
+    // hand-rolled template, because the rig could only ever declare one export.
+    let rig = Rig::pg_batch(t1.name())
+        .query(&format!("SELECT id, name FROM {}", t1.name()))
+        .also_export(t2.name(), &format!("SELECT id, name FROM {}", t2.name()));
 
-exports:
-  - name: {n1}
-    query: "SELECT id, name FROM {n1}"
-    mode: full
-    format: parquet
-    destination:
-      type: local
-      path: {o1}
-  - name: {n2}
-    query: "SELECT id, name FROM {n2}"
-    mode: full
-    format: parquet
-    destination:
-      type: local
-      path: {o2}
-"#,
-        n1 = t1.name(),
-        o1 = out1.path().display(),
-        n2 = t2.name(),
-        o2 = out2.path().display()
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
-
-    let result = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--parallel-exports",
-            "--json",
-        ])
-        .output()
-        .expect("spawn rivet run --parallel-exports");
+    // `cli` drives an arbitrary flag set against the rig's config; the previous
+    // raw Command existed only because `run_args` hard-codes bare `run`.
+    let result = rig.cli(&["run", "--parallel-exports", "--json"]);
 
     assert!(
         result.status.success(),
@@ -632,14 +599,15 @@ exports:
         2,
         "both exports must succeed"
     );
-    // Back the success-count with independent destination reads of both outputs.
+    // Back the success-count with independent destination reads of BOTH outputs —
+    // separable destinations are the point of `also_export`.
     assert_eq!(
-        total_parquet_rows(out1.path()),
+        total_parquet_rows(&rig.out_dir_for(t1.name())),
         10,
         "export 1 destination must hold 10 rows"
     );
     assert_eq!(
-        total_parquet_rows(out2.path()),
+        total_parquet_rows(&rig.out_dir_for(t2.name())),
         10,
         "export 2 destination must hold 10 rows"
     );

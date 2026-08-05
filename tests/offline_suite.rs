@@ -12,10 +12,14 @@
 //! one test takes its siblings down with it. That isolation was free in the old one-binary-per-file
 //! layout; consolidation made it conditional on the runner. See `.config/nextest.toml`.
 
+#[path = "offline/attestation_matrix_guard.rs"]
+mod attestation_matrix_guard;
 #[path = "offline/audit_validate_warning_label.rs"]
 mod audit_validate_warning_label;
 #[path = "offline/cargo_manifest_chef.rs"]
 mod cargo_manifest_chef;
+#[path = "offline/cdc_axis_matrix_guard.rs"]
+mod cdc_axis_matrix_guard;
 #[path = "offline/chunking_matrix_guard.rs"]
 mod chunking_matrix_guard;
 #[path = "offline/cli_contract.rs"]
@@ -32,6 +36,10 @@ mod examples_parse;
 mod extension_seam;
 #[path = "offline/format_fuzz.rs"]
 mod format_fuzz;
+#[path = "offline/mssql_column_data_fixture_guard.rs"]
+mod mssql_column_data_fixture_guard;
+#[path = "offline/mysql_wire_type_fixture_guard.rs"]
+mod mysql_wire_type_fixture_guard;
 #[path = "offline/perf_matrix_guard.rs"]
 mod perf_matrix_guard;
 #[path = "offline/planner_fuzz.rs"]
@@ -46,6 +54,8 @@ mod resource_smoke;
 mod retry_integration;
 #[path = "offline/run_summary_contract.rs"]
 mod run_summary_contract;
+#[path = "offline/scenario_artifact_matrix_guard.rs"]
+mod scenario_artifact_matrix_guard;
 #[path = "offline/schema_drift.rs"]
 mod schema_drift;
 #[path = "offline/schema_evolution.rs"]

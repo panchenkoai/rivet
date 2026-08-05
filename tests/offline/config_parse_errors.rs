@@ -248,6 +248,68 @@ exports:
 }
 
 #[test]
+fn roast_mysql_cdc_requires_checkpoint() {
+    // Same anchor model as mongo, same total loss, and it was left out when the
+    // mongo rule was added. The binlog has no server-side resume anchor: without
+    // `cdc.checkpoint:` each run reads the CURRENT coordinates and the ceiling
+    // moments later, so the covered window is milliseconds wide and everything
+    // committed since the previous cycle sits below it, unread, forever.
+    //
+    // Nothing downstream catches it. The `cdc.initial.is_some()` rule does not
+    // apply (no `initial:` here), and the run-time backstop `ensure_anchor` — which
+    // does demand a checkpoint for Mysql|Mssql|Mongo — is unreachable, because its
+    // only production caller sits inside `initial_snapshot_pending`, which returns
+    // early when `cdc.initial` is absent. Measured before the fix: two runs with
+    // three changes between them captured ZERO events, both exiting 0, while
+    // `rivet doctor` on the same config printed the exact diagnosis nobody sees
+    // because `run` does not invoke it.
+    //
+    // SQL Server is deliberately NOT in this rule: a missing from-LSN floors at
+    // the change table's min-LSN, which over-reads rather than skips.
+    let yaml = r#"
+source:
+  type: mysql
+  url: "mysql://u:p@localhost:3306/db"
+exports:
+  - name: t
+    table: t
+    mode: cdc
+    format: parquet
+    cdc: { until_current: true }
+    destination: { type: local, path: "/tmp/x" }
+"#;
+    let err = parse_err(yaml);
+    assert!(
+        err.contains("checkpoint"),
+        "the error must require cdc.checkpoint; got: {err}"
+    );
+}
+
+#[test]
+fn mssql_cdc_without_a_checkpoint_stays_allowed() {
+    // The counterpart to the rule above, so it cannot quietly widen: SQL Server
+    // floors a missing from-LSN at `fn_cdc_get_min_lsn`, so the failure mode is a
+    // re-read, never a skip. If someone adds Mssql to the match, this goes red and
+    // asks them to justify it.
+    let yaml = r#"
+source:
+  type: mssql
+  url: "sqlserver://u:p@localhost:1433/db"
+exports:
+  - name: t
+    table: t
+    mode: cdc
+    format: parquet
+    cdc: { until_current: true }
+    destination: { type: local, path: "/tmp/x" }
+"#;
+    assert!(
+        rivet::config::Config::from_yaml(yaml).is_ok(),
+        "SQL Server over-reads without a checkpoint; it must not inherit the rule"
+    );
+}
+
+#[test]
 fn roast_mongo_cdc_rejects_dotted_collection_name() {
     // A dotted collection name does not route through the change-stream capture —
     // its events are silently dropped (0-row success forever). Refuse at load

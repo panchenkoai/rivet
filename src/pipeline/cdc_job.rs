@@ -61,6 +61,31 @@ pub(super) fn run_cdc_export(
         chrono::Utc::now().format("%Y%m%dT%H%M%S%3f")
     );
 
+    // Resolve `{date}`/`{export}`/… ONCE, here, before anything reads a prefix.
+    //
+    // The batch path gets this for free and that is exactly why the gap was
+    // invisible: every batch runner writes to `plan.destination`, and
+    // `plan::build` expands the templates while building it
+    // (`expand_destination_templates`). CDC returns from `job.rs` BEFORE
+    // `build_plan` ever runs, so it had no plan and no expansion — the drain
+    // called `create_destination` on the RAW config and created a directory
+    // named, literally, `{date}`. Meanwhile `rivet validate` resolves the same
+    // template to today's date (`validate_cmd.rs`, whose comment asserts this
+    // is "the same shape `rivet run` resolves at write time" — true for batch,
+    // false here) and reported an empty destination over a stream that had
+    // captured everything correctly.
+    //
+    // `for_today` is deliberately the SAME constructor the reader uses. The
+    // load-bearing property is not which date lands in the path — it is that
+    // the writer and the reader compute it the same way.
+    let expanded_export = {
+        let ctx = crate::destination::placeholder::PlaceholderContext::for_today(&export.name);
+        let mut e = export.clone();
+        e.destination = crate::destination::placeholder::expand_destination(e.destination, &ctx);
+        e
+    };
+    let export = &expanded_export;
+
     // Mark the CDC run `running` in the central ledger so `gc_orphans` never
     // deletes the live stream's in-flight `__changes` parts. The prefix is the
     // export's BASE (a multi-table stream writes `<base>/<table>/`); the load
@@ -72,41 +97,57 @@ pub(super) fn run_cdc_export(
     if let Err(e) = state.begin_run(&run_id, &export.name, &run_prefix, &started_at) {
         log::warn!("cdc: run-status begin failed for '{}': {e:#}", export.name);
     }
+    // NO bucket-side running marker here — deliberately, and the gap is REAL:
+    // a cross-host `gc_orphans` (whose `StateStore::open` creates a fresh empty
+    // DB beside the load config) still sees a live stream's unmanifested parts
+    // as crash debris. A marker was written here and REVERTED: the sink names
+    // its per-roll durability manifest with the SAME
+    // `run_unique_manifest_name(run_id)` at the SAME prefix, so the first
+    // commit-boundary roll physically overwrote the marker — the protection
+    // lasted exactly one rollover (proven live: after a `rollover: 1` run the
+    // prefix held only the sink's `success` manifest under the marker's own
+    // name). Multi-table is worse: the marker sits at the base prefix while the
+    // terminal manifests land in per-table sub-prefixes, so it is superseded by
+    // its OWN run and swept, and the sub-prefixes never get a marker at all.
+    //
+    // Closing this needs a marker key the sink cannot collide with, a
+    // supersession rule that exempts a run from retiring its own marker, and a
+    // marker per destination prefix. That is a design change, not a call site —
+    // tracked as an open finding rather than shipped half-working, because a
+    // marker that self-destructs is worse than none: it retires the known issue
+    // while leaving the hole open.
 
-    let result = run_cdc_inner(config, export, &run_id);
+    let result = run_cdc_inner(config, export, &run_id, state);
     let duration_ms = started.elapsed().as_millis() as i64;
 
-    let mut summary = match &result {
-        // One manifest per captured table (a multi-table `tables:` stream
-        // produces several); the export-level summary carries the totals.
-        Ok(manifests) => {
-            let bytes: u64 = manifests
-                .iter()
-                .flat_map(|m| &m.parts)
-                .map(|p| p.size_bytes)
-                .sum();
-            cdc_summary(
-                &run_id,
-                export,
-                "success",
-                manifests.iter().map(|m| m.row_count).sum(),
-                manifests.iter().map(|m| m.part_count as usize).sum(),
-                bytes,
-                duration_ms,
-                None,
-            )
-        }
-        Err(e) => cdc_summary(
-            &run_id,
-            export,
-            "failed",
-            0,
-            0,
-            0,
-            duration_ms,
-            Some(crate::redact::redact_error(e)),
-        ),
-    };
+    // The manifests describe what was made DURABLE; `outcome` says whether the
+    // run finished. They are independent, and the totals come from the
+    // manifests on BOTH paths.
+    //
+    // This used to hard-code 0 / 0 / 0 on the error path. The CDC drain rolls
+    // (flush → per-roll manifest → checkpoint → ack) many times per run, so a
+    // run that captured and ACKED N rows and then failed reported "failed,
+    // 0 rows, 0 files" while the object store held the parts and the source was
+    // advanced past them. Nothing was lost — but an operator reading that
+    // concludes nothing was captured, and re-runs expecting to recapture
+    // changes the log no longer has. Any tool summing metric rows under-counted
+    // by the same amount.
+    let (manifests, outcome) = result;
+    let bytes: u64 = manifests
+        .iter()
+        .flat_map(|m| &m.parts)
+        .map(|p| p.size_bytes)
+        .sum();
+    let mut summary = cdc_summary(
+        &run_id,
+        export,
+        if outcome.is_ok() { "success" } else { "failed" },
+        manifests.iter().map(|m| m.row_count).sum(),
+        manifests.iter().map(|m| m.part_count as usize).sum(),
+        bytes,
+        duration_ms,
+        outcome.as_ref().err().map(crate::redact::redact_error),
+    );
 
     // Transition the ledger to the CDC run's terminal status (mirrors the batch
     // path). A crash before here leaves the row `running`; the next CDC run
@@ -117,17 +158,19 @@ pub(super) fn run_cdc_export(
 
     // Record the run in the journal (so `rivet journal` shows a CDC run like a
     // batch one): one FileWritten per committed part, then the RunCompleted outcome.
-    if let Ok(manifests) = &result {
-        for (i, part) in manifests.iter().flat_map(|m| &m.parts).enumerate() {
-            summary
-                .journal
-                .record(crate::journal::RunEvent::FileWritten {
-                    file_name: part.path.clone(),
-                    rows: part.rows,
-                    bytes: part.size_bytes,
-                    part_index: i,
-                });
-        }
+    // Unconditionally: a part that is durable happened, whatever the run's
+    // verdict. Gating this on `Ok` left a failed run with no FileWritten events
+    // at all, so `rivet journal` showed nothing to recover from — the record of
+    // the debris is exactly what makes it discoverable.
+    for (i, part) in manifests.iter().flat_map(|m| &m.parts).enumerate() {
+        summary
+            .journal
+            .record(crate::journal::RunEvent::FileWritten {
+                file_name: part.path.clone(),
+                rows: part.rows,
+                bytes: part.size_bytes,
+                part_index: i,
+            });
     }
     summary
         .journal
@@ -146,7 +189,7 @@ pub(super) fn run_cdc_export(
 
     record_metric(state, config, export, &summary);
     finalize_run_report(config_path, &summary, "cdc");
-    (result.map(|_| ()), summary)
+    (outcome, summary)
 }
 
 /// The anchor half of a first CDC run, run by the orchestrator BEFORE the
@@ -236,12 +279,24 @@ pub(super) fn initial_snapshot_pending(
 /// Synthesize the `mode: full` snapshot export for one CDC table — the batch
 /// leg run BEFORE the CDC drain. Pure (no I/O) so the schema-consistency
 /// invariants below are unit-testable.
+/// Test-only door onto [`synth_snapshot_export`], so the load guard's family
+/// tests can derive the leg's identity from the code that BUILDS it rather than
+/// hand-typing the expected family — the fixture bypass that made the earlier
+/// version of that test green against a product which still mis-folded.
+#[cfg(test)]
+pub(crate) fn synth_snapshot_export_for_test(export: &ExportConfig, table: &str) -> ExportConfig {
+    synth_snapshot_export(export, table, &export.destination)
+}
+
 fn synth_snapshot_export(
     export: &ExportConfig,
     table: &str,
     snap_dcfg: &crate::config::DestinationConfig,
 ) -> ExportConfig {
     let mut synth = export.clone();
+    // The leg's family is the PARENT export, recorded here — the one place that
+    // knows, because it is building the name from it.
+    synth.snapshot_parent = Some(export.name.clone());
     synth.name = format!(
         "{}{}{table}",
         export.name,
@@ -344,12 +399,18 @@ pub(crate) fn dest_for_table(
 /// [`crate::source::cdc::run_capture`] (the same assembler the `rivet cdc` CLI
 /// uses). Returns the manifests (one per captured table) so the caller records
 /// the metric + journal.
+/// Returns what the drain made DURABLE paired with its outcome — never one
+/// without the other. See `sink::run_to_files`.
 fn run_cdc_inner(
     config: &Config,
     export: &ExportConfig,
     run_id: &str,
-) -> Result<Vec<crate::manifest::RunManifest>> {
-    let url = config.source.resolve_url()?;
+    state: &StateStore,
+) -> (Vec<crate::manifest::RunManifest>, Result<()>) {
+    let url = match config.source.resolve_url() {
+        Ok(u) => u,
+        Err(e) => return (Vec::new(), Err(e)),
+    };
     let cdc = export.cdc.clone().unwrap_or_default();
     // `tables:` (multi-table, one stream) or the single `table:` — validation
     // guarantees exactly one of them is set.
@@ -357,7 +418,13 @@ fn run_cdc_inner(
         (Some(ts), _) => (ts.clone(), true),
         (None, Some(t)) => (vec![t.clone()], false),
         (None, None) => {
-            anyhow::bail!("export '{}': cdc mode requires `table:`", export.name)
+            return (
+                Vec::new(),
+                Err(anyhow::anyhow!(
+                    "export '{}': cdc mode requires `table:`",
+                    export.name
+                )),
+            );
         }
     };
     // Per-table destinations must outlive the borrowed CaptureOutputs.
@@ -369,11 +436,16 @@ fn run_cdc_inner(
         } else {
             export.destination.clone()
         };
-        let dest = crate::destination::create_destination(&dcfg)?;
+        let dest = match crate::destination::create_destination(&dcfg) {
+            Ok(d) => d,
+            Err(e) => return (Vec::new(), Err(e)),
+        };
         // Finding #44, early check: refuse BEFORE the first part lands if the
         // prefix belongs to the other pipeline shape (config error, fail the
         // run cleanly — the write-seam guard stays as the backstop).
-        crate::manifest::guard_manifest_mode(dest.as_ref(), "cdc")?;
+        if let Err(e) = crate::manifest::guard_manifest_mode(dest.as_ref(), "cdc") {
+            return (Vec::new(), Err(e));
+        }
         let uri = dcfg
             .path
             .clone()
@@ -386,7 +458,10 @@ fn run_cdc_inner(
     // over bare — so one table's override can never bleed into a same-named
     // column elsewhere.
     let all_overrides =
-        crate::plan::build::parse_column_overrides_pub(&export.columns, &export.name)?;
+        match crate::plan::build::parse_column_overrides_pub(&export.columns, &export.name) {
+            Ok(v) => v,
+            Err(e) => return (Vec::new(), Err(e)),
+        };
     let outputs = wired
         .iter()
         .map(|(t, d, u)| crate::source::cdc::CaptureOutput {
@@ -406,14 +481,38 @@ fn run_cdc_inner(
     // `false` opts into a long-lived continuous stream — surface it so it is a
     // deliberate choice, never a silent never-terminating run.
     if !cdc.until_current {
+        // Engine-specific, because the promise is: MySQL blocks on the binlog and
+        // genuinely stays up, while the POLL adapters (PostgreSQL, SQL Server)
+        // only lose their open-time ceiling and still exit on catch-up — the
+        // `DrainMode` doc's "an outer loop re-wraps them" describes a loop that
+        // does not exist. Telling a PG operator the run "never exits on its own"
+        // sent them away from the supervisor they actually need.
+        let shape = match config.source.source_type {
+            crate::config::SourceType::Mysql => "blocks on the binlog and stays up until stopped",
+            crate::config::SourceType::Mongo => {
+                "tails the change stream while writes continue, and exits on an idle poll"
+            }
+            _ => {
+                concat!(
+                    "removes the open-time ceiling but STILL EXITS ON CATCH-UP — on ",
+                    "this engine it is one unbounded pass, not a daemon; run it under ",
+                    "a supervisor that restarts it, or use the scheduler model instead",
+                )
+            }
+        };
         log::warn!(
-            "cdc: `until_current: false` runs a CONTINUOUS stream (a long-lived daemon that never \
-             exits on its own). For the scheduler model, omit it or set `until_current: true` (the \
-             default) to drain to the log end and exit."
+            concat!(
+                "cdc: `until_current: false` opts into the continuous model, which on {:?} {}. ",
+                "For the scheduler model, omit it or set `until_current: true` (the default) ",
+                "to drain to the log end and exit.",
+            ),
+            config.source.source_type,
+            shape
         );
     }
 
     run_capture(CdcCapture {
+        export_name: export.name.clone(),
         cdc_cfg: CdcConfig {
             url,
             checkpoint: cdc.checkpoint.as_ref().map(PathBuf::from),
@@ -450,6 +549,7 @@ fn run_cdc_inner(
         rollover_memory_bytes: cdc.rollover_memory_mb.map(|mb| mb * 1024 * 1024),
         run_id: run_id.to_string(),
         started_at: now,
+        state: Some(state),
     })
 }
 

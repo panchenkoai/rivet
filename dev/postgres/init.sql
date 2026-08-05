@@ -184,3 +184,54 @@ INSERT INTO rivet_type_matrix_full VALUES
   (1, TRUE,  32767,       2147483647,  3.14::real, '2024-03-15', '14:30:00.123456',  INTERVAL '1 year 2 months 3 days', 'active',   ARRAY['alpha','beta'], ARRAY[1,2,3]),
   (2, FALSE, -32768,     -2147483648, -1.5::real,  '1970-01-01', '00:00:00',         INTERVAL '-1 year',                'inactive', ARRAY['gamma'],        ARRAY[42]),
   (3, NULL,  NULL,        0,           0.0::real,  '2000-02-29', '23:59:59.999999',  INTERVAL '0',                      NULL,       ARRAY[]::text[],       NULL);
+
+
+-- ── array_matrix — copied from seeds/common/postgres.sql ────────────────────
+--
+-- `array_columns_reach_the_value_checksum` declares it needs "docker compose up
+-- -d postgres with the golden seed". That precondition was UNREACHABLE by the
+-- documented command: the root compose mounts THIS file, not
+-- `seeds/common/postgres.sql`, and this file had no array column. The test
+-- passed only on stands where somebody had applied the golden SQL by hand.
+--
+-- The whole golden file cannot be applied here — it DROPs and CREATEs `users`,
+-- `orders` and `content_items`, which the canonical Rust seed owns, and would
+-- wipe the 1M-row release fixture. Only the array fixture is copied: static,
+-- 8 rows, no other owner.
+--
+-- Init scripts run ONLY on an empty data directory, so an EXISTING stand does
+-- not get this by pulling. Apply to a running one with:
+--   docker exec -i rivet-postgres-1 psql -U rivet -d rivet < dev/postgres/init.sql
+DROP TABLE IF EXISTS array_matrix;
+CREATE TABLE array_matrix (
+    id        BIGSERIAL PRIMARY KEY,
+    bools     BOOLEAN[],
+    i16s      SMALLINT[],
+    i32s      INTEGER[],
+    i64s      BIGINT[],
+    f32s      REAL[],
+    f64s      DOUBLE PRECISION[],
+    texts     TEXT[],
+    -- NO array-of-{json,numeric,uuid,interval} here, and the reason is a
+    -- MEASUREMENT rather than an omission: the pipeline refuses every one of
+    -- them BEFORE `build_pg_text_array` is reached — `_numeric` has "no Rivet
+    -- mapping", jsonb[] and interval[] fail as "could not be decoded as a
+    -- one-dimensional Arrow List", and uuid[] is refused outright
+    -- ("temporal/uuid/bytea array elements are not yet supported"). Putting any
+    -- of them in this shared seed makes `rivet check` fail for every consumer,
+    -- the release oracle included.
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+INSERT INTO array_matrix (bools, i16s, i32s, i64s, f32s, f64s, texts) VALUES
+    -- ordinary multi-element arrays; distinct values per position so an
+    -- element-order or element-index bug cannot hide behind equal elements
+    ('{true,false,true}', '{1,2,3}', '{10,20,30}', '{100,200,300}',
+     '{1.5,2.5,3.5}', '{1.25,2.25,3.25}', '{"a","bb","ccc"}'),
+    -- inner NULLs: the element accessors must keep them, not collapse to a value
+    ('{true,NULL}', '{1,NULL}', '{10,NULL}', '{100,NULL}',
+     '{1.5,NULL}', '{1.25,NULL}', '{"a",NULL}'),
+    -- EMPTY arrays are not NULL arrays; the canon must tell them apart
+    ('{}', '{}', '{}', '{}', '{}', '{}', '{}'),
+    -- NULL arrays
+    (NULL, NULL, NULL, NULL, NULL, NULL, NULL);

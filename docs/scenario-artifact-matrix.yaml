@@ -1,0 +1,270 @@
+# Scenario × artifact matrix — what rivet LEAVES BEHIND after each lifecycle event.
+#
+# The other ledgers answer different questions. `runner-coverage-matrix` asks
+# whether a FEATURE reached every runner. `release-gate-matrix` lists the gate's
+# cells. The release oracle proves DATA ARRIVES, on 12 engine-versions, verified
+# by a third-party client. None of them asks:
+#
+#     after this scenario, what is on disk and in the meta-DB — and is it right?
+#
+# That is where four defects found on 2026-08-01 lived, every one of them
+# invisible to a data-arrival check because the DATA was fine:
+#
+#   * a resumed run left its `run_status` row `running` FOREVER (the ledger was
+#     opened under a fresh id, then the run adopted the prior one, and
+#     `finish_run` is a bare UPDATE). gc deferred cleanup indefinitely and the
+#     load stopped recording progress on that prefix;
+#   * one `Failed` manifest under a prefix made every LATER successful run
+#     unloadable, permanently, because nothing ever deletes a terminal manifest;
+#   * a load that raced an in-flight CDC run recorded the whole run consumed, so
+#     every part that run wrote afterwards was skipped forever;
+#   * a parallel-keyset abort left durable parts uncounted, so the retry guard
+#     read zero and retried over them.
+#
+# Each is an ARTIFACT invariant: a row that must not survive, a file that must
+# not block, a counter that must match what is on disk. This ledger states them
+# per scenario so they are a standing obligation rather than a test someone
+# remembered to write.
+#
+# ── How a scenario is verified ───────────────────────────────────────────────
+#
+# `dev/pytools/scenario_artifacts.py` runs each scenario against the CANONICAL
+# GOLDEN SEED (`seeds/common/<engine>.sql` — the same fixture the release oracle
+# uses, so a scenario cannot drift onto hand-made data the way an ad-hoc test
+# does), then snapshots EVERY artifact class and compares it to the `expect`
+# block below.
+#
+# Snapshot covers, after every scenario, without exception:
+#
+#   meta-DB     run_status, export_metrics, chunk_run, chunk_task, file_log,
+#               load_run, loaded_source_run
+#   prefix      *.parquet, manifest-<run_id>.json (by status), manifest.json,
+#               _SUCCESS
+#   sidecar     checkpoint files
+#
+# Snapshotting EVERYTHING is the point: a scenario that asserts only the artifact
+# class it was written about is how three of the four defects above stayed
+# invisible while their own subsystem's tests passed.
+#
+# ── Cell grammar ─────────────────────────────────────────────────────────────
+#
+# Each scenario carries an `expect` mapping. A key is an artifact query; a value
+# is the expected result. Supported values:
+#
+#   <int>           exact count
+#   ">0" / ">=N"    a bound, for counts that legitimately vary with timing
+#   []              MUST BE EMPTY — the strongest and most-used assertion here,
+#                   because the defects above are all "something survived that
+#                   should not have"
+#
+# `engines` names the engines a scenario runs on. Full coverage is the goal; a
+# scenario restricted to fewer engines states WHY on the row, and the guard
+# (`scenario_artifact_matrix_guard`) refuses a silent omission.
+
+version: 1
+
+engines: [postgres, mysql, mssql, mongo]
+
+# Artifact classes every snapshot collects. The guard asserts each scenario's
+# `expect` keys resolve to one of these, so a typo cannot silently assert
+# nothing — the failure mode this whole ledger exists to prevent.
+artifact_classes:
+  - id: run_status_running
+    what: "run_status rows still marked `running`. A COMPLETED run must leave none — a survivor makes `has_active_run_on_prefix` answer true forever, which defers gc and (since the load excludes active runs from its consumed set) stops the load recording progress on that prefix."
+  - id: run_status_terminal
+    what: "run_status rows in a terminal status (success/failed/interrupted)."
+  - id: export_metrics_rows
+    what: "export_metrics rows — one per run attempt, carrying files_committed, the retry guard's only input."
+  - id: files_committed
+    what: "the newest export_metrics row's files_committed. Must equal the parts actually on disk, INCLUDING after an abort: the duplicate guard reads this and nothing else."
+  - id: chunk_run_rows
+    what: "chunk_run rows (chunk-checkpoint plans)."
+  - id: chunk_task_running
+    what: "chunk_task rows stuck `running` — a crash leaves these; a resume must reset them."
+  - id: file_log_rows
+    what: "file_log rows — the per-part journal a resume rehydrates from."
+  - id: load_run_rows
+    what: "load_run audit rows, one per load attempt per table."
+  - id: loaded_source_run_ids
+    what: "the load skip set. An IN-FLIGHT source run must NOT appear (its manifest can still grow); a terminal one must."
+  - id: committed_matches_parts
+    what: "1 iff the meta-DB's `files_committed` EQUALS the parquet parts actually under the prefix — the two sides reconciled against each other, not each against its own `>0`. Only meaningful for a single-run scenario: on a repeated run the parts accumulate while `files_committed` is the newest run's, so the scenarios that mean it ask for it by name."
+  - id: parts_on_disk
+    what: "*.parquet under the destination prefix."
+  - id: manifests_success
+    what: "manifest-<run_id>.json with status success."
+  - id: manifests_non_success
+    what: "manifest-<run_id>.json with any other status. These are never deleted by gc, so a scenario that leaves one must say so — one such file used to make every later run unloadable."
+  - id: success_marker
+    what: "_SUCCESS at the prefix (1 or 0)."
+  - id: canonical_manifest
+    what: "manifest.json — the last-writer-wins pointer."
+  - id: checkpoint_file
+    what: "the CDC checkpoint sidecar (1 or 0)."
+
+scenarios:
+  - id: clean_full
+    what: "a plain `mode: full` export against the golden seed, no checkpoint, no load."
+    engines: [postgres, mysql, mssql, mongo]
+    expect:
+      run_status_running: []
+      run_status_terminal: 1
+      export_metrics_rows: 1
+      parts_on_disk: ">0"
+committed_matches_parts: 1
+      manifests_success: 1
+      manifests_non_success: []
+      success_marker: 1
+      canonical_manifest: 1
+
+  - id: clean_chunked
+    what: "range-chunked export over the seed's integer PK, no checkpoint."
+    engines: [postgres, mysql, mssql]
+    note: "mongo has no range-chunked runner — it uses mongo_parallel; covered by clean_mongo_parallel."
+    expect:
+      run_status_running: []
+      parts_on_disk: ">0"
+committed_matches_parts: 1
+      manifests_success: 1
+      manifests_non_success: []
+      chunk_run_rows: 0
+      success_marker: 1
+
+  - id: clean_chunked_checkpoint
+    what: "chunk-checkpoint export, clean. The checkpoint plan is recorded and every task completes."
+    note: "chunk_checkpoint is a SQL-runner feature: mongo exports through mongo_parallel, which has no chunk_run/chunk_task plan to record."
+    engines: [postgres, mysql, mssql]
+    expect:
+      run_status_running: []
+      chunk_run_rows: 1
+      chunk_task_running: []
+      file_log_rows: ">0"
+      manifests_success: 1
+      success_marker: 1
+
+  - id: crash_then_resume
+    what: "crash mid-chunk (`RIVET_TEST_PANIC_AT=after_chunk_file:0`), then `run --resume`. THE scenario that caught the ledger leak: the resume opens a row under a fresh id, adopts the prior one, and must close BOTH."
+    engines: [postgres, mysql]
+    note: "mssql/mongo crash-resume live tests exist separately; wiring them here is tracked — the guard counts this row as engine-incomplete rather than letting the omission pass silently."
+    expect:
+      run_status_running: []
+      chunk_task_running: []
+      manifests_success: 1
+      success_marker: 1
+
+  - id: keyset_parallel_clean
+    what: "parallel keyset over the seed's unique key."
+    note: "keyset needs a unique ORDERABLE indexed key the planner can verify; mssql's seed table has no such key wired here yet (tracked), and mongo uses its own _id paginator with a separate heterogeneous-key guard."
+    engines: [postgres, mysql]
+    expect:
+      run_status_running: []
+      parts_on_disk: ">0"
+committed_matches_parts: 1
+      files_committed: ">0"
+      manifests_success: 1
+      success_marker: 1
+
+  - id: keyset_parallel_worker_error
+    what: "one worker errors (`RIVET_TEST_ERROR_AT=keyset_parallel_worker:2`). The successful ranges' parts are durable and MUST be counted — the retry guard reads files_committed and nothing else."
+    note: "the fault hook `keyset_parallel_worker` is engine-agnostic, but the assertion is about files_committed on ONE runner; postgres is the reference. Widening is tracked — the defect it guards was found on the shared runner, not a per-engine path."
+    engines: [postgres]
+    expect:
+      run_status_running: []
+      parts_on_disk: ">0"
+      files_committed: ">0"
+      manifests_success: 0
+      success_marker: 0
+
+  - id: incremental_twice
+    what: "two incremental runs over a cursor column, the second after new rows."
+    note: "mongo has no cursor-column incremental mode — its equivalent is the CDC change stream, covered by cdc_until_current_twice."
+    engines: [postgres, mysql, mssql]
+    expect:
+      run_status_running: []
+      export_metrics_rows: 2
+      manifests_success: 2
+      manifests_non_success: []
+
+  - id: cdc_until_current_twice
+    what: "two bounded CDC cycles into one prefix. Both runs' parts must survive — the sink names parts run-uniquely so cycle 2 cannot clobber cycle 1."
+    engines: [postgres, mysql, mssql, mongo]
+    expect:
+      run_status_running: []
+      checkpoint_file: 1
+      manifests_success: ">=2"
+      manifests_non_success: []
+
+  - id: cdc_initial_snapshot
+    what: "`initial: snapshot` — the synthesized leg plus the drain, sharing a prefix by design. The leg's family must be its PARENT export, or the load refuses rivet's own output."
+    note: "mongo's `initial: snapshot` leg exists but seeds through a different path (collection copy, no SQL leg); wiring it here is tracked."
+    engines: [postgres, mysql, mssql]
+    expect:
+      run_status_running: []
+      checkpoint_file: 1
+      manifests_success: ">=2"
+
+  - id: load_full_replace
+    what: "export then load into the warehouse, replace semantics."
+    engines: [postgres, mysql, mssql, mongo]
+    note: "warehouse-bound: BigQuery credentials required, SKIP (never a silent pass) otherwise. Runs on every engine because the artifact the load reads — the manifest — is written by the ENGINE's runner, not by the loader."
+    expect:
+      run_status_running: []
+      load_run_rows: 1
+      loaded_source_run_ids: 1
+
+  - id: load_cdc_append_twice
+    what: "two CDC load cycles. Each terminal source run is recorded consumed exactly once — the second load must not re-append the first cycle."
+    note: "warehouse-bound. Every CDC-capable SQL engine: the skip set is keyed on run ids, but the MANIFESTS it selects over are written per engine, and a CDC manifest grows under one id — the shape this scenario exists for. Mongo's CDC driver is not wired yet."
+    engines: [postgres, mysql, mssql]
+    expect:
+      run_status_running: []
+      load_run_rows: 2
+      # At least the two data-bearing cycles, and every run recorded AT MOST
+      # once — the property this scenario guards (the table's primary key makes
+      # double-recording impossible, so a bound cannot hide a duplicate).
+      #
+      # Why a bound and not an exact 3: the cycle opens with an ANCHOR run,
+      # because no engine sees rows written before its first checkpointed open
+      # (MySQL has no server-side anchor at all). Whether that anchor run YIELDS
+      # anything is engine-specific — PostgreSQL and MySQL capture into it, SQL
+      # Server's asynchronous Agent typically has not copied yet — and a run that
+      # produced no files is skipped as "nothing to load" without being recorded
+      # consumed. So 3 on PG/MySQL, 2 on SQL Server, both correct.
+      #
+      # Follow-up, deliberately not done under time pressure: recording an
+      # empty run as consumed would make this exact again AND stop the empty
+      # cycle being re-selected on every later load.
+      loaded_source_run_ids: ">=2"
+
+  - id: load_racing_an_active_run
+    what: "a load fired while a source run is still `running` on the prefix. The in-flight run must NOT enter the skip set — its manifest can still grow, and recording it strands every part written afterwards."
+    note: "warehouse-bound. The assertion is about the LEDGER (an in-flight run must not enter the skip set), which is engine-independent — but the run that must be in flight is the engine's, so each is driven for real. Mongo pending its CDC driver."
+    engines: [postgres, mysql, mssql]
+    expect:
+      loaded_source_run_ids: 0
+      load_run_rows: 1
+
+  - id: load_after_a_failed_run
+    what: "a Failed manifest sits under the prefix beside successful runs. The successful ones must still load — nothing ever deletes a terminal manifest, so a blocking check is a permanent stall. MUST be driven in an APPEND mode: in `full` the loader takes `latest_full` (the newest manifest only), so the Failed one never reaches `reconcile` and the scenario grades nothing — verified by re-introducing the defect against a `full` fixture and watching the cell stay GREEN."
+    note: "warehouse-bound. The Failed manifest comes from the shared batch finalizer, so the blocking behaviour is engine-independent — but the surrounding successful runs are the engine's, and those are what must still load."
+    engines: [postgres, mysql, mssql, mongo]
+    expect:
+      # TWO aborted manifests, because the scenario runs the aborted export
+      # twice: once to poison the prefix and once more after the target exists.
+      # What matters is that they survive (nothing deletes a terminal manifest)
+      # and do not block — not their count.
+      manifests_non_success: ">0"
+      # TWO loads: one seeds the append target (the same mode throughout — `full`
+      # would materialise the name as a TABLE where the append modes need a
+      # VIEW), one lands the delta AFTER the prefix was poisoned. The second is
+      # the assertion: it must succeed.
+      load_run_rows: 2
+      loaded_source_run_ids: ">0"
+
+  - id: gc_orphans_after_crash
+    what: "gc with a crash orphan and a live run present: the orphan goes, the live run's parts stay."
+    note: "warehouse-bound (gc runs during a load). gc classifies by manifest status and the run-status ledger — shared code — but the debris is the engine's own."
+    engines: [postgres, mysql, mssql, mongo]
+    expect:
+      run_status_running: []
+      manifests_success: ">0"

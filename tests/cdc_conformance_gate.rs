@@ -425,6 +425,9 @@ fn every_live_cdc_test_asserts_an_outcome() {
                 // `rivet validate` re-reads the destination (parts + manifest +
                 // checksums) — an independent read-back, not the capture's exit.
                 || chunk.contains("args([\"validate\"")
+                // …and the same command driven through the rig, which supplies
+                // the config flag itself.
+                || chunk.contains("cli(&[\"validate\"")
                 // External-warehouse oracles (the strongest read-back in the
                 // suite): the CDC parquet is loaded and queried by another engine.
                 || chunk.contains("duckdb_run_sql_json(")
@@ -439,6 +442,19 @@ fn every_live_cdc_test_asserts_an_outcome() {
                 || chunk.contains("distinct_int_ids(")
                 || chunk.contains("read_mongo_cdc_changes(") // Mongo blob-CDC oracle
                 || chunk.contains("dir_parquet_distinct_strings(")
+                // DuckDB read-backs. The strongest oracle in the suite for a
+                // COMPLETENESS claim: DuckDB does not share the parquet crate
+                // rivet ENCODES with, so a fault in that shared encode/decode
+                // path cannot cancel out the way it can for a re-read through
+                // rivet's own reader. Registered here rather than routed around
+                // the gate, per the rule these markers exist to enforce.
+                || chunk.contains("duckdb_distinct_set(")
+                || chunk.contains("duckdb_distinct_i64_set(")
+                || chunk.contains("duckdb_assert_complete(")
+                || chunk.contains("duckdb_assert_at_least_once(")
+                || chunk.contains("duckdb_assert_rows_and_distinct(")
+                // `Rig::assert_complete` is the same oracle behind a method.
+                || chunk.contains("assert_complete(")
                 || chunk.contains("read_all(")
                 || chunk.contains("read_all_parts(")
                 // `Rig::run_and_read` runs the capture AND returns every part as

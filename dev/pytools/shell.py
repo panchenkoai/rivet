@@ -263,6 +263,30 @@ def rm_rf(path: Path) -> None:
         path.unlink(missing_ok=True)
 
 
+def popen(
+    argv: Sequence[str],
+    *,
+    env: dict[str, str] | None = None,
+    cwd: Path | str | None = None,
+) -> subprocess.Popen:
+    """Start a process and hand it back RUNNING — for the cases that need a
+    live peer rather than a result: a daemon export a load must race, a stream
+    that has to still be writing while something else reads.
+
+    `run` cannot express that: it waits. The caller owns termination, so every
+    use belongs in a `try/finally`.
+    """
+    full_env = {**os.environ, **(env or {})}
+    return subprocess.Popen(
+        [str(a) for a in argv],
+        env=full_env,
+        cwd=str(cwd) if cwd else None,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+
+
 # ── entry point ────────────────────────────────────────────────────────────────
 def main(fn: Callable[[], int | None]) -> None:
     """Run `fn` as a script body: `Fail` becomes a message + exit code, Ctrl-C

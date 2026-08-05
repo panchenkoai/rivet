@@ -78,6 +78,60 @@ pub fn is_run_unique_manifest_name(name: &str) -> bool {
 /// [`snapshot_family`] live together so they cannot drift apart.
 pub const SNAPSHOT_LEG_INFIX: &str = "__snapshot_";
 
+// ── artifact identity ────────────────────────────────────────────────────────
+//
+// WHAT MAKES TWO MANIFESTS "THE SAME". Six guards across the codebase ask a
+// version of that question at different moments — `guard_manifest_mode` at write
+// time, `ensure_single_export` and `ensure_single_source` at load time,
+// `reject_duplicate_target_tables` at plan time, the ledger's source check before
+// a warehouse write, `warn_if_prefix_has_completed_run` at finalize. They fire at
+// genuinely different points, so merging them would move complexity rather than
+// concentrate it.
+//
+// What they should NOT each define for themselves is the answer to "same". These
+// two functions are that definition, in one place, next to the type that carries
+// it. Adding a dimension is then one edit rather than a hunt through five files —
+// which is how `manifest_source_ident` came to exist at all: the prefix guard and
+// the ledger had begun to drift on what "the same source" meant.
+
+/// The family a manifest belongs to, WITH upgrade compatibility.
+///
+/// The RECORDED `export_family` when its writer stamped one; otherwise — a
+/// manifest written before the field existed — the legacy substring fold, EXCEPT
+/// that a legacy manifest joins the recorded family of any manifest sharing its
+/// `export_name`.
+///
+/// That exception is the whole upgrade story. A CDC drain writes `export_name` =
+/// the TABLE, so a pre-upgrade drain folds to "orders" while its post-upgrade
+/// successor records "orders_cdc": grouping without this, a prefix mid-upgrade
+/// reports TWO families and the load refuses rivet's own output — permanently,
+/// for every `name:` ≠ `table:` export, at its first post-upgrade load.
+///
+/// It is precise rather than permissive: the match is on the export NAME the two
+/// manifests literally share, so a legacy manifest of a DIFFERENT export joins
+/// nothing and the guard still refuses. Both directions are pinned by tests.
+pub fn identity_family<'a>(m: &'a RunManifest, keyed: &'a [(String, RunManifest)]) -> &'a str {
+    if !m.export_family.is_empty() {
+        return &m.export_family;
+    }
+    keyed
+        .iter()
+        .find(|(_, o)| !o.export_family.is_empty() && o.export_name == m.export_name)
+        .map(|(_, o)| o.export_family.as_str())
+        .unwrap_or_else(|| crate::manifest::snapshot_family(&m.export_name))
+}
+
+/// `engine:schema.table` for one manifest — the identity two loads of one
+/// warehouse table must agree on. Shared with the ledger so the guard and the
+/// record cannot drift apart on what "the same source" means.
+pub fn identity_source(m: &RunManifest) -> String {
+    match (&m.source.schema, &m.source.table) {
+        (Some(s), Some(t)) => format!("{}:{s}.{t}", m.source.engine),
+        (None, Some(t)) => format!("{}:{t}", m.source.engine),
+        _ => m.source.engine.clone(),
+    }
+}
+
 /// Fold a CDC snapshot-leg export name back to its parent export.
 ///
 /// The snapshot leg writes its baseline into the SAME destination prefix as
@@ -86,10 +140,25 @@ pub const SNAPSHOT_LEG_INFIX: &str = "__snapshot_";
 /// `{parent}__snapshot_{table}` as `{parent}`, or the pair reads as two
 /// exports and the ordinary `initial: snapshot` → `load` flow refuses itself.
 /// A name with no infix — or a pathological empty parent — returns unchanged.
+/// LEGACY fallback only: manifests written before `export_family` existed carry
+/// nothing but the name, so the substring split is the best available guess for
+/// THEM. New manifests record the family and never take this path — a user
+/// export genuinely named `x__snapshot_y` is no longer mis-folded.
 pub fn snapshot_family(name: &str) -> &str {
     match name.split_once(SNAPSHOT_LEG_INFIX) {
         Some((parent, _)) if !parent.is_empty() => parent,
         _ => name,
+    }
+}
+
+/// The family a manifest belongs to: the recorded field when present, the
+/// legacy substring fold when not. Every consumer that groups manifests by
+/// export goes through here, so the recorded/derived split lives in ONE place.
+pub fn manifest_family(m: &RunManifest) -> &str {
+    if m.export_family.is_empty() {
+        snapshot_family(&m.export_name)
+    } else {
+        &m.export_family
     }
 }
 
@@ -181,6 +250,25 @@ pub struct RunManifest {
     pub manifest_version: u32,
     pub run_id: String,
     pub export_name: String,
+    /// The PARENT export this manifest belongs to — RECORDED, not derived.
+    ///
+    /// Two consumers group manifests by export (the shared-prefix load guard,
+    /// reconcile), and before this field they had to GUESS the family from
+    /// `export_name` via [`snapshot_family`]'s substring split. That guess was
+    /// wrong in both directions at once: the CDC drain writes `export_name`
+    /// from the TABLE string while the snapshot leg writes
+    /// `{export.name}__snapshot_{table}`, so the documented
+    /// `name: orders_cdc` / `table: orders` config produced families
+    /// `orders_cdc` and `orders` — two, and the load refused its own output.
+    /// Meanwhile a user export literally NAMED `daily__snapshot_v2` folded to
+    /// `daily` and silently disarmed the guard.
+    ///
+    /// `#[serde(default)]` (empty) so every pre-existing manifest still parses;
+    /// consumers fall back to the substring heuristic when the field is empty,
+    /// which preserves exactly the old behaviour for old artifacts and nothing
+    /// else.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub export_family: String,
     /// Which pipeline shape wrote this manifest — `batch` or `cdc`. Guards a
     /// prefix against silent cross-shape clobbering (finding #44: a CDC run
     /// overwrote a batch export's manifest at a shared prefix, orphaning its
@@ -208,6 +296,18 @@ pub struct RunManifest {
     /// `MANIFEST_VERSION` bump), newer readers tolerate its absence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub column_checksums: Option<Vec<ColumnChecksum>>,
+    /// Which fold produced [`Self::column_checksums`] — see
+    /// `value_checksum::CHECKSUM_RENDER_ID`.
+    ///
+    /// Load-bearing for compatibility, not decoration. v1 combined per-cell
+    /// hashes with XOR, which ANNIHILATES duplicates (`h ^ h == 0`), so a column
+    /// of repeated values checksummed to zero and post-write corruption of it was
+    /// invisible. v2 folds with wrapping addition. The numbers are not
+    /// comparable across the two, so a reader must re-derive with the fold that
+    /// WROTE them: absent marker ⇒ v1, and an old artifact stays verifiable by
+    /// the algorithm that attested it rather than reading as corrupt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checksum_render: Option<String>,
     /// The column the Form B checksum is keyed to (`xxh3(key ‖ value)`, the
     /// export's cursor/key column) so `validate` re-keys identically. `None` ⇒
     /// un-keyed (a full export with no cursor). See [`ColumnChecksum`].
@@ -452,11 +552,13 @@ mod tests {
             .filter(|p| p.status == PartStatus::Committed)
             .count() as u32;
         RunManifest {
+            checksum_render: None,
             row_hash: None,
             mode: "batch".to_string(),
             manifest_version: MANIFEST_VERSION,
             run_id: "orders_20260521T120000.000".into(),
             export_name: "public.orders".into(),
+            export_family: String::new(),
             started_at: "2026-05-21T12:00:00Z".into(),
             finished_at: "2026-05-21T12:14:33Z".into(),
             status: ManifestStatus::Success,
@@ -707,6 +809,18 @@ fn default_manifest_mode() -> String {
 /// replaces its own manifest by design; CDC extends its own). A missing or
 /// unreadable manifest is not this guard's business — corruption surfaces in
 /// `rivet validate`, and first runs must not require a read round-trip.
+/// The `schema_fingerprint` a manifest carries when NO schema evidence was
+/// available for the run — a last-resort signal to the reader, deliberately
+/// distinct from any real xxh3 digest.
+///
+/// One constant because it has TWO producers (`commit::record_part`'s checksum
+/// fallback, `finalize_manifest`'s last resort) and a CONSUMER
+/// (`resume_m8`, which refuses to hydrate it as if it were evidence). All three
+/// held their own copy of the literal, so drifting any one of them would have
+/// made the consumer treat "evidence unavailable" AS evidence, silently, on
+/// every resume.
+pub const SCHEMA_FINGERPRINT_UNAVAILABLE: &str = "xxh3:0000000000000000";
+
 pub fn guard_manifest_mode(
     dest: &dyn crate::destination::Destination,
     new_mode: &str,

@@ -71,7 +71,7 @@ pub(crate) fn run_mongo_parallel(
 
     // Fan out: each worker reads its disjoint slice, writes its parts, returns
     // (rows, PartRecords). Errors surface per worker and fail the whole run.
-    let results: Vec<Result<WorkerOutput>> = std::thread::scope(|s| {
+    let results: Vec<(WorkerOutput, Result<()>)> = std::thread::scope(|s| {
         let handles: Vec<_> = ranges
             .iter()
             .enumerate()
@@ -87,8 +87,21 @@ pub(crate) fn run_mongo_parallel(
         handles
             .into_iter()
             .map(|h| {
-                h.join()
-                    .unwrap_or_else(|_| Err(anyhow::anyhow!("mongo parallel worker panicked")))
+                h.join().unwrap_or_else(|_| {
+                    // A panicked worker hands back nothing: its stack is gone, so
+                    // any part it wrote is genuinely unknown here (the orphan-GC
+                    // case, not a countable part).
+                    (
+                        WorkerOutput {
+                            rows: 0,
+                            parts: Vec::new(),
+                            schema: None,
+                            column_checksums: std::collections::BTreeMap::new(),
+                            checksum_key_column: None,
+                        },
+                        Err(anyhow::anyhow!("mongo parallel worker panicked")),
+                    )
+                })
             })
             .collect()
     });
@@ -102,8 +115,18 @@ pub(crate) fn run_mongo_parallel(
     let mut checksums_acc: std::collections::BTreeMap<String, u64> =
         std::collections::BTreeMap::new();
     let mut checksum_key_column: Option<String> = None;
-    for (w, res) in results.into_iter().enumerate() {
-        let out = res?;
+    // Errors are COLLECTED, not propagated mid-drain. `let out = res?` used to sit
+    // here, above the record_part calls below — so a worker failure abandoned both
+    // its OWN durable pages and every later worker's, and handed
+    // `decide_export_retry` a files_committed of ZERO while parquet sat on the
+    // destination. Recording first is also the truthful thing: the run finalizes a
+    // Failed manifest, and listing the debris is what makes it discoverable to
+    // validate/gc instead of unreferenced.
+    let mut errs: Vec<String> = Vec::new();
+    for (w, (out, res)) in results.into_iter().enumerate() {
+        if let Err(e) = res {
+            errs.push(format!("worker {w}: {e}"));
+        }
         summary.total_rows += out.rows;
         if let Some(sc) = &out.schema {
             super::manifest_writer::record_run_schema_fingerprint(summary, sc);
@@ -131,6 +154,16 @@ pub(crate) fn run_mongo_parallel(
         }
     }
     super::commit::harvest_column_checksums(summary, checksums_acc, checksum_key_column);
+
+    // Only now — every durable part is recorded and the counters are truthful.
+    if !errs.is_empty() {
+        anyhow::bail!(
+            "export '{}': parallel mongo failed on {} range(s): {}",
+            plan.export_name,
+            errs.len(),
+            errs.join("; ")
+        );
+    }
 
     log::info!(
         "export '{}': parallel complete — {} range(s), {} rows",
@@ -164,6 +197,17 @@ struct WorkerOutput {
     checksum_key_column: Option<String>,
 }
 
+/// Runs one `_id` range and ALWAYS hands back what it made durable, even when it
+/// fails part-way.
+///
+/// The pages this worker already wrote are on the destination the moment
+/// `read_keyset_page` returns them; an error on a LATER page does not un-write
+/// them. Returning a bare `Result<WorkerOutput>` dropped that record on the floor
+/// — `summary.files_committed` is `decide_export_retry`'s only input, so a
+/// transient failure reported ZERO durable parts and the whole export retried
+/// over live data. Same defect the parallel-keyset runner was fixed for
+/// (`keyset.rs`, "Record what the SUCCESSFUL workers already made durable —
+/// BEFORE deciding whether to bail"); this is the Mongo twin of that shape.
 #[allow(clippy::too_many_arguments)]
 fn range_worker(
     url: &str,
@@ -174,7 +218,30 @@ fn range_worker(
     worker: usize,
     lo: mongodb::bson::Bson,
     hi: mongodb::bson::Bson,
-) -> Result<WorkerOutput> {
+) -> (WorkerOutput, Result<()>) {
+    let mut out = WorkerOutput {
+        rows: 0,
+        parts: Vec::new(),
+        schema: None,
+        column_checksums: std::collections::BTreeMap::new(),
+        checksum_key_column: None,
+    };
+    let res = range_worker_pages(url, plan, key_plan, kp, stamp, worker, lo, hi, &mut out);
+    (out, res)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn range_worker_pages(
+    url: &str,
+    plan: &ResolvedRunPlan,
+    key_plan: &IncrementalCursorPlan,
+    kp: &KeysetPlan,
+    stamp: &str,
+    worker: usize,
+    lo: mongodb::bson::Bson,
+    hi: mongodb::bson::Bson,
+    out: &mut WorkerOutput,
+) -> Result<()> {
     let mut src = MongoSource::connect(url, plan.source.tls.as_ref(), plan.source.mongo.as_ref())?
         .with_id_range(lo, hi);
     let dest = destination::create_destination(&plan.destination)?;
@@ -183,17 +250,19 @@ fn range_worker(
         .file_extension()
         .to_string();
 
-    let mut out = WorkerOutput {
-        rows: 0,
-        parts: Vec::new(),
-        schema: None,
-        column_checksums: std::collections::BTreeMap::new(),
-        checksum_key_column: None,
-    };
     let mut last: Option<String> = None;
     let mut page = 0usize;
 
     loop {
+        // Test-only: a per-worker error mid-range (Err path, not a crash). A crash
+        // cannot reach the drain at all, so it is blind to whether the drain
+        // records durable parts before bailing — the same reason the chunked
+        // runners needed RIVET_TEST_ERROR_AT rather than RIVET_TEST_PANIC_AT.
+        if let Err(e) =
+            crate::test_hook::maybe_error_at_index("mongo_parallel_worker", worker as i64)
+        {
+            anyhow::bail!("range {worker}: {e}");
+        }
         // run-unique (stamp) + worker-unique (w{worker}) + page-unique.
         let base = format!(
             "{}_{}_w{}_keyset{}.{}",
@@ -244,5 +313,5 @@ fn range_worker(
             ),
         }
     }
-    Ok(out)
+    Ok(())
 }

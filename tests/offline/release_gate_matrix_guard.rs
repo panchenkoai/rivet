@@ -12,6 +12,7 @@
 
 use std::collections::BTreeSet;
 use std::fs;
+use std::path::PathBuf;
 
 use serde_yaml_ng::Value;
 
@@ -23,15 +24,33 @@ const ORACLE_MATRIX: &str = "dev/release-oracle/matrix.yaml";
 // "every gate function has a ledger row" guard.
 //
 // These are the PYTHON modules: the gate was ported from `dev/release-oracle/
-// lib/*.sh`, and the function names were preserved one-for-one (verified: the
-// same 12 `sc_*`/`verify_*` names in both), so this guard keeps its meaning
-// while pointing at the implementation that actually runs.
-const GATE_PY: [&str; 4] = [
-    "dev/release_oracle/scenarios.py",
-    "dev/release_oracle/cdc.py",
-    "dev/release_oracle/release_path.py",
-    "dev/release_oracle/regression.py",
-];
+// lib/*.sh`, and the function names were preserved one-for-one, so this guard
+// keeps its meaning while pointing at the implementation that actually runs.
+//
+// DERIVED from the directory, not typed in — and the comment above is exactly
+// why. It already warned that "a stage moved into its own module would silently
+// escape", and then a hand-written four-file list did precisely that: by the time
+// this was noticed, `gifs.verify_gif_currency`, `bigquery.verify_gc_survival` and
+// `rowhash.verify_row_hash` were all running in the gate while invisible to the
+// guard meant to enumerate it. A list an author must remember to extend grades
+// only the modules its author already knew about.
+fn gate_py() -> Vec<PathBuf> {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("dev/release_oracle");
+    let mut out: Vec<PathBuf> = fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "py"))
+        .filter(|p| p.file_name().is_some_and(|n| n != "__init__.py"))
+        .collect();
+    out.sort();
+    assert!(
+        out.len() >= 4,
+        "dev/release_oracle holds {} python modules — the gate cannot have shrunk that \
+         far; this guard is reading the wrong directory",
+        out.len()
+    );
+    out
+}
 const ENGINES: [&str; 4] = ["postgres", "mysql", "mssql", "mongo"];
 
 // Total admitted gaps = scenario `gap` cells + preflight/infra `status: gap` +
@@ -103,9 +122,9 @@ fn grid_matches_the_oracle_matrix_versions() {
 
 #[test]
 fn every_gate_function_has_a_ledger_row_and_vice_versa() {
-    let src: String = GATE_PY
+    let src: String = gate_py()
         .iter()
-        .map(|p| fs::read_to_string(p).unwrap_or_else(|e| panic!("read {p}: {e}")))
+        .map(|p| fs::read_to_string(p).unwrap_or_else(|e| panic!("read {}: {e}", p.display())))
         .collect::<Vec<_>>()
         .join("\n");
     // Function DEFINITIONS live at column 0 (`def sc_x(` / `def verify_x(`); calls are indented.
@@ -146,10 +165,15 @@ fn every_gate_function_has_a_ledger_row_and_vice_versa() {
             "gate matrix scenario `{id}` has no sc_{id}() in the gate modules (renamed / deleted?)"
         );
     }
+    // A `verify_X` is satisfied by a row under EITHER heading. The same check can
+    // exist twice — `gc_survival` runs as a local scenario (`sc_gc_survival`) and
+    // again in the BigQuery stage (`verify_gc_survival`) — and which heading its
+    // ledger row sits under is a fact about the stage, not about the name.
     for f in &verify_fns {
         assert!(
-            preflight_ids.contains(f),
-            "the gate defines verify_{f}() but the gate matrix has no `preflights` row `{f}`"
+            preflight_ids.contains(f) || scenario_ids.contains(f),
+            "the gate defines verify_{f}() but the gate matrix has no `preflights` \
+             or `scenarios` row `{f}`"
         );
     }
     // A preflight marked status:test MUST have its verify_ function; a `gap` preflight

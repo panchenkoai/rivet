@@ -380,11 +380,20 @@ impl ExportSink {
             Some(k) => arrow_batch_checksums_keyed(batch, k),
             None => arrow_batch_checksums(batch),
         };
+        // wrapping_add, matching `value_checksum::Fold::Sum` — the fold every
+        // other site uses. This one was MISSED when the fold changed, and the
+        // consequence was invisible below 500 rows: with a single batch per part
+        // `0 ^ s == 0 + s`, so the write and read sides agreed exactly as long as
+        // no part spanned more than one read batch (PROBE_BATCH_SIZE = 500). Past
+        // that the recorded checksum diverged from the re-read and `validate
+        // --depth full` reported post-write corruption on healthy data — measured
+        // at the boundary: 500 rows exit 0, 501 rows exit 3.
         for (i, field) in batch.schema().fields().iter().enumerate() {
-            *self
+            let e = self
                 .column_checksums
                 .entry(field.name().clone())
-                .or_insert(0) ^= sums[i];
+                .or_insert(0);
+            *e = e.wrapping_add(sums[i]);
         }
     }
 

@@ -21,24 +21,17 @@ use crate::common::*;
 /// Build a YAML config that uses `url_env: DATABASE_URL` (safe for plan/apply
 /// round-trips — plaintext URL credentials would be redacted in the artifact
 /// and cause apply to fail to reconnect).
-fn pg_url_env_config(table: &str, mode_block: &str, out_dir: &std::path::Path) -> String {
-    format!(
-        r#"
-source:
-  type: postgres
-  url_env: DATABASE_URL
-
-exports:
-  - name: {table}
-    query: "SELECT id, name FROM {table}"
-    {mode_block}
-    format: parquet
-    destination:
-      type: local
-      path: {out}
-"#,
-        out = out_dir.display()
-    )
+fn pg_url_env_rig(table: &str, mode_block: &str) -> Rig {
+    let mut r = Rig::pg_batch(table)
+        .query(&format!("SELECT id, name FROM {table}"))
+        .source_url_env("DATABASE_URL");
+    for line in mode_block.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        r = match line.strip_prefix("mode:") {
+            Some(m) => r.mode(m.trim()),
+            None => r.export_line(line),
+        };
+    }
+    r
 }
 
 /// Patch `created_at` in a plan JSON to a fixed old timestamp (2020-01-01T00:00:00Z),
@@ -68,29 +61,24 @@ fn plan_and_apply_full_export_round_trip() {
     require_alive(LiveService::Postgres);
 
     let table = seed_pg_numeric_table(30);
-    let out_dir = tempfile::tempdir().unwrap();
     let cfg_dir = tempfile::tempdir().unwrap();
 
-    let yaml = pg_url_env_config(table.name(), "mode: full", out_dir.path());
-    let cfg = write_config(&cfg_dir, &yaml);
+    let rig = pg_url_env_rig(table.name(), "mode: full");
     let plan_path = cfg_dir.path().join("plan.json");
 
     // ── rivet plan ────────────────────────────────────────────────────────────
-    let plan_out = std::process::Command::new(RIVET_BIN)
-        .args([
+    let plan_out = rig.cli_env(
+        &[
             "plan",
-            "--config",
-            cfg.to_str().unwrap(),
             "--export",
             table.name(),
             "--format",
             "json",
             "--output",
             plan_path.to_str().unwrap(),
-        ])
-        .env("DATABASE_URL", POSTGRES_URL)
-        .output()
-        .expect("spawn rivet plan");
+        ],
+        &[("DATABASE_URL", POSTGRES_URL)],
+    );
 
     assert!(
         plan_out.status.success(),
@@ -125,11 +113,10 @@ fn plan_and_apply_full_export_round_trip() {
     );
 
     // ── rivet apply ───────────────────────────────────────────────────────────
-    let apply_out = std::process::Command::new(RIVET_BIN)
-        .args(["apply", plan_path.to_str().unwrap()])
-        .env("DATABASE_URL", POSTGRES_URL)
-        .output()
-        .expect("spawn rivet apply");
+    let apply_out = run_rivet_env(
+        &["apply", plan_path.to_str().unwrap()],
+        &[("DATABASE_URL", POSTGRES_URL)],
+    );
 
     assert!(
         apply_out.status.success(),
@@ -139,15 +126,15 @@ fn plan_and_apply_full_export_round_trip() {
     );
 
     // Parquet file must exist in the output dir.
-    let parquet = files_with_extension(out_dir.path(), "parquet");
+    let parquet = files_with_extension(&rig.out_dir(), "parquet");
     assert!(
         !parquet.is_empty(),
         "at least 1 parquet file must exist after apply; out_dir: {:?}",
-        out_dir.path()
+        &rig.out_dir()
     );
     // Back the round-trip claim with an independent destination read.
     assert_eq!(
-        total_parquet_rows(out_dir.path()),
+        total_parquet_rows(&rig.out_dir()),
         30,
         "full plan+apply must land all 30 rows"
     );
@@ -162,30 +149,25 @@ fn plan_and_apply_chunked_export_round_trip_uses_precomputed_ranges() {
 
     // 150 rows / chunk_size 50 → exactly 3 chunks.
     let table = seed_pg_numeric_table(150);
-    let out_dir = tempfile::tempdir().unwrap();
     let cfg_dir = tempfile::tempdir().unwrap();
 
     let mode_block = "mode: chunked\n    chunk_column: id\n    chunk_size: 50".to_string();
-    let yaml = pg_url_env_config(table.name(), &mode_block, out_dir.path());
-    let cfg = write_config(&cfg_dir, &yaml);
+    let rig = pg_url_env_rig(table.name(), &mode_block);
     let plan_path = cfg_dir.path().join("plan.json");
 
     // ── rivet plan ────────────────────────────────────────────────────────────
-    let plan_out = std::process::Command::new(RIVET_BIN)
-        .args([
+    let plan_out = rig.cli_env(
+        &[
             "plan",
-            "--config",
-            cfg.to_str().unwrap(),
             "--export",
             table.name(),
             "--format",
             "json",
             "--output",
             plan_path.to_str().unwrap(),
-        ])
-        .env("DATABASE_URL", POSTGRES_URL)
-        .output()
-        .expect("spawn rivet plan");
+        ],
+        &[("DATABASE_URL", POSTGRES_URL)],
+    );
 
     assert!(
         plan_out.status.success(),
@@ -217,11 +199,10 @@ fn plan_and_apply_chunked_export_round_trip_uses_precomputed_ranges() {
     );
 
     // ── rivet apply ───────────────────────────────────────────────────────────
-    let apply_out = std::process::Command::new(RIVET_BIN)
-        .args(["apply", plan_path.to_str().unwrap()])
-        .env("DATABASE_URL", POSTGRES_URL)
-        .output()
-        .expect("spawn rivet apply");
+    let apply_out = run_rivet_env(
+        &["apply", plan_path.to_str().unwrap()],
+        &[("DATABASE_URL", POSTGRES_URL)],
+    );
 
     assert!(
         apply_out.status.success(),
@@ -231,7 +212,7 @@ fn plan_and_apply_chunked_export_round_trip_uses_precomputed_ranges() {
     );
 
     // 3 chunks → 3 parquet files.
-    let parquet = files_with_extension(out_dir.path(), "parquet");
+    let parquet = files_with_extension(&rig.out_dir(), "parquet");
     assert_eq!(
         parquet.len(),
         3,
@@ -240,12 +221,12 @@ fn plan_and_apply_chunked_export_round_trip_uses_precomputed_ranges() {
     // Back the chunked round-trip with an independent destination read: all 150
     // rows across the 3 chunks, distinct ids 0..150 (no drop/dup at boundaries).
     assert_eq!(
-        total_parquet_rows(out_dir.path()),
+        total_parquet_rows(&rig.out_dir()),
         150,
         "3 chunks must land all 150 rows"
     );
     assert_eq!(
-        dir_parquet_id_set(out_dir.path()),
+        dir_parquet_id_set(&rig.out_dir()),
         (0..150).collect::<std::collections::BTreeSet<i64>>(),
         "chunked round-trip must hold every source id 0..150"
     );
@@ -293,30 +274,25 @@ fn apply_replay_case(extra_mode_lines: &str) {
     require_alive(LiveService::Postgres);
 
     let table = seed_pg_numeric_table(150);
-    let out_dir = tempfile::tempdir().unwrap();
     let cfg_dir = tempfile::tempdir().unwrap();
 
     let mode_block =
         format!("mode: chunked\n    chunk_column: id\n    chunk_size: 50{extra_mode_lines}");
-    let yaml = pg_url_env_config(table.name(), &mode_block, out_dir.path());
-    let cfg = write_config(&cfg_dir, &yaml);
+    let rig = pg_url_env_rig(table.name(), &mode_block);
     let plan_path = cfg_dir.path().join("plan.json");
 
-    let plan_out = std::process::Command::new(RIVET_BIN)
-        .args([
+    let plan_out = rig.cli_env(
+        &[
             "plan",
-            "--config",
-            cfg.to_str().unwrap(),
             "--export",
             table.name(),
             "--format",
             "json",
             "--output",
             plan_path.to_str().unwrap(),
-        ])
-        .env("DATABASE_URL", POSTGRES_URL)
-        .output()
-        .expect("spawn rivet plan");
+        ],
+        &[("DATABASE_URL", POSTGRES_URL)],
+    );
     assert!(
         plan_out.status.success(),
         "rivet plan (chunked) must exit 0; stderr:\n{}",
@@ -351,18 +327,17 @@ fn apply_replay_case(extra_mode_lines: &str) {
         c.batch_execute(&sql).expect("insert rows after planning");
     }
 
-    let apply_out = std::process::Command::new(RIVET_BIN)
-        .args(["apply", plan_path.to_str().unwrap()])
-        .env("DATABASE_URL", POSTGRES_URL)
-        .output()
-        .expect("spawn rivet apply");
+    let apply_out = run_rivet_env(
+        &["apply", plan_path.to_str().unwrap()],
+        &[("DATABASE_URL", POSTGRES_URL)],
+    );
     assert!(
         apply_out.status.success(),
         "rivet apply (chunked) must exit 0; stderr:\n{}",
         String::from_utf8_lossy(&apply_out.stderr)
     );
 
-    let parquet = files_with_extension(out_dir.path(), "parquet");
+    let parquet = files_with_extension(&rig.out_dir(), "parquet");
     assert_eq!(
         parquet.len(),
         3,
@@ -370,12 +345,12 @@ fn apply_replay_case(extra_mode_lines: &str) {
          grown table; found: {parquet:?}"
     );
     assert_eq!(
-        total_parquet_rows(out_dir.path()),
+        total_parquet_rows(&rig.out_dir()),
         150,
         "apply must move only the rows its plan covered"
     );
     assert_eq!(
-        dir_parquet_id_set(out_dir.path()),
+        dir_parquet_id_set(&rig.out_dir()),
         (0..150).collect::<std::collections::BTreeSet<i64>>(),
         "the ids must be exactly the planned range — rows added after planning \
          belong to the next run, not this artifact"
@@ -390,25 +365,14 @@ fn plan_pretty_format_prints_summary_to_stdout() {
     require_alive(LiveService::Postgres);
 
     let table = seed_pg_numeric_table(10);
-    let out_dir = tempfile::tempdir().unwrap();
     let cfg_dir = tempfile::tempdir().unwrap();
 
-    let yaml = pg_url_env_config(table.name(), "mode: full", out_dir.path());
-    let cfg = write_config(&cfg_dir, &yaml);
+    let rig = pg_url_env_rig(table.name(), "mode: full");
 
-    let plan_out = std::process::Command::new(RIVET_BIN)
-        .args([
-            "plan",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            table.name(),
-            "--format",
-            "pretty",
-        ])
-        .env("DATABASE_URL", POSTGRES_URL)
-        .output()
-        .expect("spawn rivet plan --format pretty");
+    let plan_out = rig.cli_env(
+        &["plan", "--export", table.name(), "--format", "pretty"],
+        &[("DATABASE_URL", POSTGRES_URL)],
+    );
 
     assert!(
         plan_out.status.success(),
@@ -437,46 +401,29 @@ fn plan_json_redacts_plaintext_url_credentials() {
     require_alive(LiveService::Postgres);
 
     let table = seed_pg_numeric_table(5);
-    let out_dir = tempfile::tempdir().unwrap();
     let cfg_dir = tempfile::tempdir().unwrap();
 
     // Config uses a plaintext URL with embedded password.
     // The POSTGRES_URL is "postgresql://rivet:rivet@127.0.0.1:5432/rivet".
-    let yaml = format!(
-        r#"
-source:
-  type: postgres
-  url: "{POSTGRES_URL}"
-
-exports:
-  - name: {name}
-    query: "SELECT id, name FROM {name}"
-    mode: full
-    format: parquet
-    destination:
-      type: local
-      path: {out}
-"#,
-        name = table.name(),
-        out = out_dir.path().display()
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
+    // Plaintext URL ON PURPOSE: this test asserts the credential is redacted
+    // into the plan artifact, so it must NOT use url_env.
+    let rig = Rig::pg_batch(table.name())
+        .query(&format!("SELECT id, name FROM {name}", name = table.name()))
+        .mode("full");
     let plan_path = cfg_dir.path().join("plan.json");
 
-    let plan_out = std::process::Command::new(RIVET_BIN)
-        .args([
+    let plan_out = rig.cli_env(
+        &[
             "plan",
-            "--config",
-            cfg.to_str().unwrap(),
             "--export",
             table.name(),
             "--format",
             "json",
             "--output",
             plan_path.to_str().unwrap(),
-        ])
-        .output()
-        .expect("spawn rivet plan");
+        ],
+        &[],
+    );
 
     assert!(
         plan_out.status.success(),
@@ -506,29 +453,24 @@ fn apply_rejects_expired_plan_without_force() {
     require_alive(LiveService::Postgres);
 
     let table = seed_pg_numeric_table(10);
-    let out_dir = tempfile::tempdir().unwrap();
     let cfg_dir = tempfile::tempdir().unwrap();
 
-    let yaml = pg_url_env_config(table.name(), "mode: full", out_dir.path());
-    let cfg = write_config(&cfg_dir, &yaml);
+    let rig = pg_url_env_rig(table.name(), "mode: full");
     let plan_path = cfg_dir.path().join("plan.json");
 
     // Generate a fresh plan.
-    let plan_out = std::process::Command::new(RIVET_BIN)
-        .args([
+    let plan_out = rig.cli_env(
+        &[
             "plan",
-            "--config",
-            cfg.to_str().unwrap(),
             "--export",
             table.name(),
             "--format",
             "json",
             "--output",
             plan_path.to_str().unwrap(),
-        ])
-        .env("DATABASE_URL", POSTGRES_URL)
-        .output()
-        .expect("spawn rivet plan");
+        ],
+        &[("DATABASE_URL", POSTGRES_URL)],
+    );
     assert!(plan_out.status.success(), "plan generation must succeed");
 
     // Patch created_at to make the plan > 24 h old.
@@ -538,11 +480,10 @@ fn apply_rejects_expired_plan_without_force() {
     std::fs::write(&stale_path, &stale_json).expect("write stale plan");
 
     // Apply without --force must reject.
-    let apply_out = std::process::Command::new(RIVET_BIN)
-        .args(["apply", stale_path.to_str().unwrap()])
-        .env("DATABASE_URL", POSTGRES_URL)
-        .output()
-        .expect("spawn rivet apply");
+    let apply_out = run_rivet_env(
+        &["apply", stale_path.to_str().unwrap()],
+        &[("DATABASE_URL", POSTGRES_URL)],
+    );
 
     assert!(
         !apply_out.status.success(),
@@ -566,29 +507,24 @@ fn apply_force_flag_bypasses_expired_plan() {
     require_alive(LiveService::Postgres);
 
     let table = seed_pg_numeric_table(10);
-    let out_dir = tempfile::tempdir().unwrap();
     let cfg_dir = tempfile::tempdir().unwrap();
 
-    let yaml = pg_url_env_config(table.name(), "mode: full", out_dir.path());
-    let cfg = write_config(&cfg_dir, &yaml);
+    let rig = pg_url_env_rig(table.name(), "mode: full");
     let plan_path = cfg_dir.path().join("plan.json");
 
     // Generate plan.
-    let plan_out = std::process::Command::new(RIVET_BIN)
-        .args([
+    let plan_out = rig.cli_env(
+        &[
             "plan",
-            "--config",
-            cfg.to_str().unwrap(),
             "--export",
             table.name(),
             "--format",
             "json",
             "--output",
             plan_path.to_str().unwrap(),
-        ])
-        .env("DATABASE_URL", POSTGRES_URL)
-        .output()
-        .expect("spawn rivet plan");
+        ],
+        &[("DATABASE_URL", POSTGRES_URL)],
+    );
     assert!(plan_out.status.success(), "plan generation must succeed");
 
     // Patch to make it stale.
@@ -598,11 +534,10 @@ fn apply_force_flag_bypasses_expired_plan() {
     std::fs::write(&stale_path, &stale_json).expect("write stale plan");
 
     // Apply WITH --force must succeed despite staleness.
-    let apply_out = std::process::Command::new(RIVET_BIN)
-        .args(["apply", "--force", stale_path.to_str().unwrap()])
-        .env("DATABASE_URL", POSTGRES_URL)
-        .output()
-        .expect("spawn rivet apply --force");
+    let apply_out = run_rivet_env(
+        &["apply", "--force", stale_path.to_str().unwrap()],
+        &[("DATABASE_URL", POSTGRES_URL)],
+    );
 
     assert!(
         apply_out.status.success(),
@@ -612,15 +547,15 @@ fn apply_force_flag_bypasses_expired_plan() {
     );
 
     // Data must actually be exported.
-    let parquet = files_with_extension(out_dir.path(), "parquet");
+    let parquet = files_with_extension(&rig.out_dir(), "parquet");
     assert!(
         !parquet.is_empty(),
         "parquet file must exist after forced apply; out_dir: {:?}",
-        out_dir.path()
+        &rig.out_dir()
     );
     // "Data must actually be exported" — back it with a destination read.
     assert_eq!(
-        total_parquet_rows(out_dir.path()),
+        total_parquet_rows(&rig.out_dir()),
         10,
         "forced apply must still land all 10 rows"
     );
@@ -635,35 +570,20 @@ fn plan_param_flag_substitutes_in_query() {
 
     // Seed 40 rows (ids 0–39); plan with param max_id=19 → 20 rows.
     let table = seed_pg_numeric_table(40);
-    let out_dir = tempfile::tempdir().unwrap();
     let cfg_dir = tempfile::tempdir().unwrap();
 
-    let yaml = format!(
-        r#"
-source:
-  type: postgres
-  url_env: DATABASE_URL
-
-exports:
-  - name: {name}
-    query: "SELECT id, name FROM {name} WHERE id <= ${{max_id}}"
-    mode: full
-    format: parquet
-    destination:
-      type: local
-      path: {out}
-"#,
-        name = table.name(),
-        out = out_dir.path().display()
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
+    // `${max_id}` stays escaped as `${{max_id}}` inside the format! — it is a
+    // rivet PARAMETER placeholder that must survive into the YAML, not a Rust
+    // interpolation.
+    let rig = pg_url_env_rig(table.name(), "mode: full").query(&format!(
+        "SELECT id, name FROM {name} WHERE id <= ${{max_id}}",
+        name = table.name()
+    ));
     let plan_path = cfg_dir.path().join("plan_param.json");
 
-    let plan_out = std::process::Command::new(RIVET_BIN)
-        .args([
+    let plan_out = rig.cli_env(
+        &[
             "plan",
-            "--config",
-            cfg.to_str().unwrap(),
             "--export",
             table.name(),
             "--param",
@@ -672,10 +592,9 @@ exports:
             "json",
             "--output",
             plan_path.to_str().unwrap(),
-        ])
-        .env("DATABASE_URL", POSTGRES_URL)
-        .output()
-        .expect("spawn rivet plan --param");
+        ],
+        &[("DATABASE_URL", POSTGRES_URL)],
+    );
 
     assert!(
         plan_out.status.success(),
@@ -694,11 +613,10 @@ exports:
     );
 
     // Apply the plan and verify the row count.
-    let apply_out = std::process::Command::new(RIVET_BIN)
-        .args(["apply", plan_path.to_str().unwrap()])
-        .env("DATABASE_URL", POSTGRES_URL)
-        .output()
-        .expect("spawn rivet apply");
+    let apply_out = run_rivet_env(
+        &["apply", plan_path.to_str().unwrap()],
+        &[("DATABASE_URL", POSTGRES_URL)],
+    );
 
     assert!(
         apply_out.status.success(),
@@ -707,7 +625,7 @@ exports:
         String::from_utf8_lossy(&apply_out.stdout)
     );
 
-    let parquet_files = files_with_extension(out_dir.path(), "parquet");
+    let parquet_files = files_with_extension(&rig.out_dir(), "parquet");
     assert!(
         !parquet_files.is_empty(),
         "at least one parquet file must exist after apply"
@@ -715,7 +633,8 @@ exports:
 
     // Verify exactly 20 rows (ids 0..=19) were written: query the state DB.
     // total_rows lives in export_metrics, not run_journal (journal stores a JSON blob).
-    let db_path = cfg_dir.path().join(".rivet_state.db");
+    // The state DB lives NEXT TO THE CONFIG, and the config is now the rig's.
+    let db_path = rig.config_path().parent().unwrap().join(".rivet_state.db");
     let conn = rusqlite::Connection::open(&db_path).expect("open state db after apply");
     let rows_written: i64 = conn
         .query_row(
@@ -731,7 +650,7 @@ exports:
     );
     // Back the export_metrics count with an independent destination read.
     assert_eq!(
-        total_parquet_rows(out_dir.path()),
+        total_parquet_rows(&rig.out_dir()),
         20,
         "param max_id=19 must physically land exactly 20 rows at the destination"
     );
@@ -744,10 +663,7 @@ exports:
 fn apply_missing_plan_file_exits_nonzero() {
     require_alive(LiveService::Postgres);
 
-    let apply_out = std::process::Command::new(RIVET_BIN)
-        .args(["apply", "/tmp/rivet_nonexistent_plan_xyz.json"])
-        .output()
-        .expect("spawn rivet apply");
+    let apply_out = run_rivet_env(&["apply", "/tmp/rivet_nonexistent_plan_xyz.json"], &[]);
 
     assert!(
         !apply_out.status.success(),
@@ -783,33 +699,29 @@ fn incremental_keyset_apply_rotates_run_id_across_repeated_applies() {
     .unwrap();
     let _guard = PgTable::adopt(table.clone());
 
-    let out_dir = tempfile::tempdir().unwrap();
     let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        "source:\n  type: postgres\n  url_env: DATABASE_URL\nexports:\n  - name: {table}\n    \
-         table: {table}\n    mode: chunked\n    chunk_by_key: k\n    chunk_checkpoint: true\n    \
-         keyset_incremental: true\n    chunk_size: 40\n    format: parquet\n    \
-         destination:\n      type: local\n      path: {out}\n",
-        out = out_dir.path().display(),
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
+    // `table:` rather than `query:` — the keyset planner needs the shortcut form.
+    let rig = Rig::pg_batch(&table)
+        .source_url_env("DATABASE_URL")
+        .mode("chunked")
+        .export_line("chunk_by_key: k")
+        .export_line("chunk_checkpoint: true")
+        .export_line("keyset_incremental: true")
+        .export_line("chunk_size: 40");
     let plan_path = cfg_dir.path().join("plan.json");
 
-    let plan = std::process::Command::new(RIVET_BIN)
-        .args([
+    let plan = rig.cli_env(
+        &[
             "plan",
-            "--config",
-            cfg.to_str().unwrap(),
             "--export",
             &table,
             "--format",
             "json",
             "--output",
             plan_path.to_str().unwrap(),
-        ])
-        .env("DATABASE_URL", POSTGRES_URL)
-        .output()
-        .expect("spawn plan");
+        ],
+        &[("DATABASE_URL", POSTGRES_URL)],
+    );
     assert!(
         plan.status.success(),
         "plan stderr:\n{}",
@@ -817,11 +729,10 @@ fn incremental_keyset_apply_rotates_run_id_across_repeated_applies() {
     );
 
     let apply = |label: &str| {
-        let out = std::process::Command::new(RIVET_BIN)
-            .args(["apply", plan_path.to_str().unwrap()])
-            .env("DATABASE_URL", POSTGRES_URL)
-            .output()
-            .expect("spawn apply");
+        let out = run_rivet_env(
+            &["apply", plan_path.to_str().unwrap()],
+            &[("DATABASE_URL", POSTGRES_URL)],
+        );
         assert!(
             out.status.success(),
             "{label} stderr:\n{}",
@@ -842,7 +753,7 @@ fn incremental_keyset_apply_rotates_run_id_across_repeated_applies() {
     apply("apply 2");
 
     assert_eq!(
-        dir_manifest_copy_count(out_dir.path()),
+        dir_manifest_copy_count(&rig.out_dir()),
         2,
         "each apply must rotate the run_id → two distinct manifest-<run_id>.json copies; 1 means the apply wrapper left the resume anchor frozen (the run_id-collision silent-delta-skip class)"
     );

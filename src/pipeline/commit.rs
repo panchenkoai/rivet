@@ -78,11 +78,17 @@ pub(in crate::pipeline) fn accumulate_column_checksums(
     part: &std::collections::BTreeMap<String, u64>,
 ) {
     for (name, sum) in part {
-        *acc.entry(name.clone()).or_insert(0) ^= *sum;
+        // wrapping_add, not XOR: the combiner must be commutative (parts arrive
+        // in no fixed order) WITHOUT being annihilating. Under `^` two parts
+        // whose column checksums coincide — a duplicated part, or two parts of
+        // identical duplicated values — cancelled to zero, and the run published
+        // a checksum that verified anything. Same fold as `value_checksum::Fold::Sum`.
+        let e = acc.entry(name.clone()).or_insert(0);
+        *e = e.wrapping_add(*sum);
     }
 }
 
-/// Record the run-wide XOR-combined checksums + key column into the summary, so
+/// Record the run-wide sum-combined checksums + key column into the summary, so
 /// `finalize_manifest` writes Form B and `rivet validate` can re-verify the
 /// Arrow→Parquet encode / post-write fault Form A cannot see. The single harvest
 /// seam every runner goes through (single mode passes its one sink's map directly;
@@ -176,7 +182,10 @@ pub(crate) fn write_part_file(
     let (fingerprint, md5) =
         manifest_writer::compute_part_checksums(tmp_path).unwrap_or_else(|e| {
             log::warn!("part checksums failed for '{file_name}' (not fatal): {e:#}");
-            ("xxh3:0000000000000000".to_string(), String::new())
+            (
+                crate::manifest::SCHEMA_FINGERPRINT_UNAVAILABLE.to_string(),
+                String::new(),
+            )
         });
     // Fail-fast transit check (ADR-0001 I1): when the store reported its own
     // checksum, it computed it from the bytes it received — a mismatch with our
@@ -320,15 +329,16 @@ pub(crate) fn record_part(
     // ADR-0001 I7: file-log (manifest) write failure is non-fatal — the file is
     // already durable at the destination; log and continue.
     if let Some(st) = state
-        && let Err(e) = st.record_file(
-            &summary.run_id,
-            &plan.export_name,
-            &part.file_name,
-            part.rows,
-            part.bytes as i64,
-            plan.format.label(),
-            Some(plan.compression.label()),
-        )
+        && let Err(e) = st.record_durable_part(crate::state::DurablePart {
+            run_id: &summary.run_id,
+            export_name: &plan.export_name,
+            file_name: &part.file_name,
+            rows: part.rows,
+            bytes: part.bytes as i64,
+            format: plan.format.label(),
+            compression: Some(plan.compression.label()),
+            mode: plan.strategy.mode_label(),
+        })
     {
         log::warn!(
             "export '{}': file_log write failed for '{}' (file was produced): {:#}",
@@ -359,6 +369,7 @@ mod tests {
     fn test_plan() -> ResolvedRunPlan {
         ResolvedRunPlan {
             export_name: "orders".into(),
+            source_table: None,
             base_query: "SELECT 1".into(),
             strategy: ExtractionStrategy::Snapshot,
             format: FormatType::Parquet,

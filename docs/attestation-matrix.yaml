@@ -1,0 +1,139 @@
+# Attestation matrix — every number rivet PUBLISHES, and who checks it.
+#
+# The sibling ledgers grade coverage: does a test exist for this behaviour. This
+# one grades HONESTY: for each claim rivet writes down about its own work, who
+# verifies that claim, and is the verifier independent of the thing that produced
+# it. A claim nobody checks is not a lie, but it is a number an operator is asked
+# to trust on rivet's word alone, and this file is where that is admitted rather
+# than assumed.
+#
+# It exists because the class kept biting. The row hash was recomputed by rivet's
+# OWN `enrich` — a deliberate decision, written into `src/lib.rs` as an argument
+# against a second implementation drifting — and that decision made a
+# non-injective canonical form invisible for four months. The value checksum
+# folded per-cell hashes with XOR, so a column of duplicates checksummed to zero
+# and `validate --depth full` returned PASSED on a part whose bytes had changed.
+# Both were found by asking this file's question, not by any test.
+#
+# ── vocabulary ───────────────────────────────────────────────────────────────
+#   independent  the checker is NOT the producer: a different implementation, a
+#                different library, or the other party (the object store, the
+#                source database, DuckDB). A divergence means something.
+#   self         rivet checks its own output with its own code. Useful for
+#                detecting DRIFT (did the data change since?), structurally blind
+#                to a defect in the SPEC, because both sides share it.
+#   internal     the claim is only checked against ANOTHER claim of rivet's (a
+#                sum against its parts). Consistent-and-wrong passes.
+#   none         nothing checks it.
+#
+# `negative_proof` is what raises a `self` row above its station: a cell that
+# CORRUPTS the artifact and requires the check to fail. Without one, "rivet
+# verifies it" means only that the code path runs.
+#
+# Guarded by tests/offline/attestation_matrix_guard.rs — every claim names a
+# verifier or says `none`, every `independent` names its evidence, and the count
+# of unverified claims is shrink-only.
+
+claims:
+  - id: row_hash_column
+    what: "`_rivet_row_hash` — the per-row change-detection digest."
+    verified_by: "gate cell `row_hash`: DuckDB re-reads the parquet, a Python implementation rebuilds the canonical image from the spec in src/enrich.rs and hashes it with `xxhash`, and the digests are compared; a second check asserts injectivity on a probe carrying the v1 collision pair."
+    independence: independent
+    evidence: "dev/release_oracle/rowhash.py; PASS on postgres/mysql/mssql 2026-08-02"
+    note: "the IN-TREE auditor recomputes with rivet's own `enrich` by design — that is a `self` check and stays one; this row is about the gate's second opinion."
+
+  - id: column_checksums_form_b
+    what: "`column_checksums` — per-column value digests re-derived from the written Parquet."
+    verified_by: "`rivet validate --depth full` re-reads every part and recompares."
+    independence: self
+    negative_proof: "gate cell `corruption_is_detected` (batch) and `cdc_corruption_is_detected` (CDC): a same-length in-place byte flip must produce exit 3 naming the diverging column. Both RED-proven against the live defect."
+    evidence: "dev/release_oracle/corruption.py; PASS on postgres/mysql/mssql 2026-08-02"
+
+  - id: column_checksums_form_a
+    what: "the source-side value digest, computed from `CellSource` as rows are read."
+    verified_by: "compared against Form B at the end of every run — a genuine cross-check between two different extractions of the same values."
+    independence: self
+    note: "Form A shares the writer's own rendering, so the pair detects an Arrow-build fault and cannot detect a shared misreading of the source. Its accessors gained their first unit tests on 2026-08-02."
+
+  - id: checksum_render
+    what: "which fold produced `column_checksums` (`xxh3-64-sum-v2`; absent ⇒ the v1 XOR)."
+    verified_by: "the corruption cells assert the marker is present before corrupting anything — without it a reader silently falls back to the annihilating fold."
+    independence: self
+    evidence: "dev/release_oracle/corruption.py"
+    note: "self by construction — the marker says which fold rivet used, checked by rivet. What it CANNOT catch is a marker that is right about a fold which is itself wrong; that is the fold's own row above, and the reason this one exists at all is that a manifest carrying checksums with NO marker silently reads as v1."
+
+  - id: part_size_bytes
+    what: "each part's byte length as recorded at commit."
+    verified_by: "`rivet validate` head-checks every committed part against the destination."
+    independence: independent
+    evidence: "the OBJECT STORE reports the size; rivet only compares. Observed catching a rewritten part: RIVET_VERIFY_PART_SIZE_MISMATCH, exit 3."
+
+  - id: part_content_md5
+    what: "each part's content digest, when the destination returns one."
+    verified_by: "`validate` compares it where present; the pretty output separates `N md5` from `N size-only` so a reader can see which parts got the stronger check."
+    independence: independent
+    evidence: "the STORE computes the digest; rivet only compares. `validate`'s pretty output separates `N md5` from `N size-only`, so which parts got the stronger check is visible rather than implied."
+    note: "conditional on the store: a local destination reports no md5, and those parts are size-only. The count is surfaced rather than hidden, which is the right shape — but a local-destination run is NOT content-verified by this claim."
+
+  - id: part_rows
+    what: "each part's declared row count."
+    verified_by: "`rivet validate --depth full` reads each part's Parquet FOOTER and compares `num_rows` to the manifest's declared `rows`, in the same pass that already fetched the body for Form B — a metadata parse, not a decode."
+    independence: independent
+    evidence: "the PARQUET FILE's own footer is the other party, written by the parquet encoder rather than by rivet's bookkeeping. Reported under its own code `RIVET_VERIFY_PART_ROW_COUNT`, not folded into the value-checksum verdict: the bytes may be perfectly intact and it is the manifest that is wrong, so an operator told `value checksum` would hunt corruption that is not there. Verified 2026-08-02 by skewing one part's declared count and recomputing the run total so the manifest stayed SELF-consistent — the exact shape `validate_self_consistency` cannot see."
+
+  - id: run_row_count
+    what: "the run's total row count."
+    verified_by: "the release oracle counts rows with the STORE's own client plus DuckDB and compares — 150000 per engine per store."
+    independence: independent
+    evidence: "dev/release_oracle/scenarios.py::sc_integrity_types"
+
+  - id: success_marker
+    what: "`_SUCCESS` — the run-completed marker, carrying a fingerprint of the manifest."
+    verified_by: "`validate` recomputes the fingerprint from the manifest it read."
+    independence: internal
+    evidence: "observed rejecting a hand-edited manifest: RIVET_VERIFY_SUCCESS_STALE."
+    note: "ties the marker to the MANIFEST, and neither of them to the data. A manifest that is internally perfect and describes parts that were never written passes this check; only the part-level and value-level rows above reach the bytes."
+
+  - id: files_committed
+    what: "`export_metrics.files_committed` — how many parts the run says it committed."
+    verified_by: "scenario-artifact class `committed_matches_parts` compares it to the parquet actually under the prefix."
+    independence: independent
+    evidence: "docs/scenario-artifact-matrix.yaml; the two sides had never been compared to each other before 2026-08-02 — each was graded only as `>0`."
+
+  - id: run_status_terminal
+    what: "the run-status ledger row: `running` while a run is in flight, terminal after."
+    verified_by: "scenario matrix asserts no `running` row survives a COMPLETED run (12 scenarios) — the class that leaked a row since 0.22.0 and made gc defer forever."
+    independence: internal
+    note: "read back from the same store rivet wrote. It catches a leak, not a lie."
+
+  - id: loaded_source_run_ids
+    what: "the load's skip set — which source runs are already consumed."
+    verified_by: "scenario `load_racing_an_active_run`: an IN-FLIGHT run must not appear."
+    independence: internal
+    evidence: "the class that stranded a CDC run's later parts FOREVER since 0.20.0."
+    note: "read back from the store rivet wrote it to, so it catches the skip set disagreeing with the run ledger — not the skip set disagreeing with what was actually loaded. A row wrongly absent means re-appending; wrongly present means silent loss, and only the first is loud."
+
+  - id: reconcile_verdict
+    what: "`rivet reconcile` — per-partition source counts against the recorded export."
+    verified_by: "gate cell `reconcile_and_validate_cover_both_sides`: source drift must be caught by at least one of reconcile/validate, and destination loss likewise."
+    independence: independent
+    evidence: "the SOURCE database is the other party. Measured: reconcile exits 3 on source drift and 0 on a deleted destination part; validate is the inverse. Neither alone covers both."
+
+  - id: plan_integrity
+    what: "`resolved_plan_integrity` — the sealed plan artifact's hash."
+    verified_by: "`rivet apply` recomputes it over the whole serialized plan and refuses a mismatch."
+    independence: internal
+    note: "detects tampering and version drift, not whether the plan is RIGHT."
+
+  - id: cdc_checkpoint_position
+    what: "the CDC resume position written after a durable part."
+    verified_by: "per-engine two-run live tests (capture, change, resume) plus fault hooks that crash between flush and ack."
+    independence: independent
+    evidence: "the SOURCE's own log position is the other party — a wrong checkpoint shows up as re-read or skipped changes."
+
+  - id: schema_fingerprint
+    what: "the run's schema fingerprint, used for drift detection between runs."
+    verified_by: "gate cell `schema_fingerprint_moves_with_the_schema`: four real DDL changes (add / rename / retype / drop a column) must each move the fingerprint, and a control re-export of an untouched table must leave it put."
+    independence: independent
+    evidence: "the DDL is the other party — the change is applied to the database, not asserted in rivet's terms. RED-proven 2026-08-02 by declaring a rename insensitive: the cell reports the fingerprint moved when it was told to expect otherwise."
+    note: "an exact independent DIGEST is not available and pretending otherwise would be worse than admitting it: the fingerprint hashes `<name>\t<data_type>` where `data_type` is rivet's own rendering of the Arrow type, so a second implementation would reproduce that naming and be a copy rather than a witness. What is checked is the PROPERTY — sensitivity to a real change, and insensitivity to none — which is exactly what drift detection depends on and exactly what a same-function comparison cannot establish."

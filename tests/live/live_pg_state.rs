@@ -228,6 +228,7 @@ fn pg_load_ledger_round_trip() {
     let Some(s) = pg_store() else { return };
     let target = format!("pg.d.load_ledger_{}", chrono::Utc::now().timestamp_micros());
     let rec = LoadRecord {
+        source_ident: "postgres:public.orders".into(),
         load_id: format!("Lpg_{}", chrono::Utc::now().timestamp_micros()),
         export_name: "pg_orders".into(),
         target_table: target.clone(),
@@ -263,6 +264,7 @@ fn pg_failed_load_leaves_runs_retryable() {
     let Some(s) = pg_store() else { return };
     let target = format!("pg.d.retry_{}", chrono::Utc::now().timestamp_micros());
     let rec = |id: &str, status: &str, rows: i64| LoadRecord {
+        source_ident: String::new(),
         load_id: id.into(),
         export_name: "pg_orders".into(),
         target_table: target.clone(),

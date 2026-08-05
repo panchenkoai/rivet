@@ -314,3 +314,21 @@ END
 EXEC(N'CREATE TABLE ext.wide_cols (id BIGINT PRIMARY KEY' + @cols + N')');
 INSERT INTO ext.wide_cols (id) VALUES (1),(2),(3),(4),(5);
 GO
+
+-- ── row_hash injectivity probe ───────────────────────────────────────────────
+-- See seeds/common/postgres.sql for the full rationale. Rows 1 and 2 are the
+-- pair render id v1 could not tell apart; rows 3 and 4 are absence versus a
+-- PRESENT value of length zero. The gate exports this twice: `row_hash: true`
+-- for digest parity against an independent implementation, and `row_hash: [a,b]`
+-- for injectivity — which needs the key OUT of coverage to be able to fail.
+CREATE TABLE dbo.row_hash_probe (
+    id INT PRIMARY KEY,
+    a  NVARCHAR(50) NULL,
+    b  NVARCHAR(50) NULL
+);
+
+INSERT INTO dbo.row_hash_probe (id, a, b) VALUES
+    (1, 'a' + NCHAR(31), 'b'),
+    (2, 'a',             NCHAR(31) + 'b'),
+    (3, NULL,            'x'),
+    (4, '',              'x');

@@ -261,6 +261,24 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --lib -- plan::validate::tests
 
+  # release-compat REMOVED from PR CI (2026-08-04).
+  #
+  # It downloaded the previous release and compared CLI surface / schema / config
+  # verdicts against it — a real class (the `verify` field once broke every
+  # user's plan.json for two months while the suite stayed green). But its
+  # download step globbed `rivet-x86_64-unknown-linux-gnu*` while the release
+  # assets are named `rivet-<TAG>-x86_64-unknown-linux-gnu.tar.gz`, so it matched
+  # nothing and failed on EVERY PR for at least three releases. A gate that is
+  # red regardless of the diff grades nothing and trains people to ignore it.
+  #
+  # The coverage did not go away: `dev/release_oracle`'s `release regression` leg
+  # does the same comparison against the DOWNLOADED previous release, locally,
+  # before a tag — format-compat plus perf and RSS. That is the gate that has to
+  # be green to ship, and unlike this one it actually runs.
+  #
+  # nightly-live.yml::release-compat-artifacts is untouched — it covers the
+  # `artifacts` axis, which needs a live postgres.
+
   test-types:
     name: Type mapping contracts (semantic gate)
     runs-on: ubuntu-latest
@@ -632,7 +650,7 @@ jobs:
       # MSSQL driver's unavoidable tiberius→rustls-0.21 advisories failed the
       # gate; documenting + tracking them in one place keeps the gate green
       # while still catching every *fixable* future advisory.
-      - uses: taiki-e/install-action@v2.83.2
+      - uses: taiki-e/install-action@v2.84.0
         with:
           tool: cargo-audit
       - run: cargo audit

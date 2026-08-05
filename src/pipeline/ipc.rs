@@ -117,9 +117,18 @@ impl ChildEvent {
 /// `true` iff `RIVET_IPC_EVENTS` is set to a non-empty value (i.e., this
 /// process is a child spawned by a parent that wants events).
 pub fn ipc_events_enabled() -> bool {
-    std::env::var(ENV_IPC_EVENTS)
-        .map(|v| !v.is_empty())
-        .unwrap_or(false)
+    ipc_events_enabled_from(std::env::var(ENV_IPC_EVENTS).ok().as_deref())
+}
+
+/// The decision itself, split from the env read so it can be tested.
+///
+/// `ipc_events_enabled()` reads process-global state, which a parallel test
+/// cannot mutate safely — so its only guard used to be `let _ =
+/// ipc_events_enabled();`, an assertion-free call that proved nothing about the
+/// default and could not fail if the polarity were inverted. The env lookup is
+/// the untestable half; the rule is not.
+pub(crate) fn ipc_events_enabled_from(raw: Option<&str>) -> bool {
+    matches!(raw, Some(v) if !v.is_empty())
 }
 
 /// Emit one event to stdout as a single JSON line.  Errors are logged at
@@ -230,12 +239,26 @@ mod tests {
         assert_eq!(ev.export_name(), "orders");
     }
 
+    /// An UNSET or EMPTY variable means the in-process UI channel, not the
+    /// child-event JSON stream — so `emit_ui` must not start writing JSON lines
+    /// to stdout of its own accord.
+    ///
+    /// The previous guard was `let _ = ipc_events_enabled();` with no assertion:
+    /// it proved the function does not panic and nothing else. Inverting the
+    /// polarity — making an unset variable mean ENABLED, which would put JSON on
+    /// the stdout of every ordinary run — left it green. The env read is what a
+    /// parallel test cannot touch; the RULE is not, so the rule is what this
+    /// pins, through the same function production calls.
     #[test]
-    fn ipc_events_enabled_false_by_default() {
-        // We cannot assert global env state safely in parallel tests, but we
-        // can at least verify the helper handles an empty string as off.
-        // (We don't mutate env here to avoid races.)
-        // SAFETY: this test only reads.
-        let _ = ipc_events_enabled();
+    fn ipc_events_are_off_unless_the_variable_is_set_and_non_empty() {
+        assert!(!ipc_events_enabled_from(None), "unset ⇒ off");
+        assert!(!ipc_events_enabled_from(Some("")), "empty ⇒ off");
+        assert!(ipc_events_enabled_from(Some("1")), "set ⇒ on");
+        assert!(
+            ipc_events_enabled_from(Some("0")),
+            "any non-empty value is on — the variable is a presence flag, not a \
+             boolean, and pinning that stops a future reader from 'fixing' it into \
+             a parser that would silently disable an operator's RIVET_IPC_EVENTS=0"
+        );
     }
 }

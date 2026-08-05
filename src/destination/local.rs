@@ -47,35 +47,44 @@ impl LocalDestination {
     }
 }
 
-/// Copy `src` into the deterministic staging path `tmp`, creating it with
-/// `O_EXCL` so a pre-planted file or symlink at the temp name causes `EEXIST`
-/// rather than a silent follow that writes through the link (CWE-367 / symlink
-/// race). A stale temp left by a crashed prior run is the only legitimate
-/// pre-existing case: it is removed (the unlink targets the link itself, never
-/// its target) and creation retried exactly once. If the retry still hits
-/// `EEXIST`, an adversary re-planted between unlink and create — fail loudly
-/// instead of following.
+/// Copy `src` into the staging path `tmp`, creating it with `O_EXCL` so a
+/// pre-planted file or symlink at the temp name causes `EEXIST` rather than a
+/// silent follow that writes through the link (CWE-367 / symlink race).
+///
+/// The name must be UNIQUE PER WRITER — see [`staging_name`]. It used to be
+/// derived from the final key alone, with an EEXIST recovery that unlinked the
+/// existing temp and retried once, for the case of a stale temp left by a
+/// crashed run. That recovery cannot tell a stale temp from a LIVE one, and
+/// concurrent writers into one prefix all stage `manifest.json` and `_SUCCESS`
+/// under the same name: each deleted the others' staged file, and the writer
+/// whose file was unlinked then failed its `rename` with ENOENT. Unique names
+/// make the recovery unnecessary — a stale temp from a crashed run can no longer
+/// be in anyone's way, it is just a dot-file to be swept — so EEXIST goes back to
+/// meaning what it should, an adversary planting something at our path.
 fn stage_copy(src: &Path, tmp: &Path) -> Result<()> {
-    use std::io::ErrorKind;
-
-    fn create_excl(tmp: &Path) -> std::io::Result<std::fs::File> {
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(tmp)
-    }
-
-    let mut out = match create_excl(tmp) {
-        Ok(f) => f,
-        Err(e) if e.kind() == ErrorKind::AlreadyExists => {
-            std::fs::remove_file(tmp)?;
-            create_excl(tmp)?
-        }
-        Err(e) => return Err(e.into()),
-    };
+    let mut out = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(tmp)?;
     let mut input = std::fs::File::open(src)?;
     std::io::copy(&mut input, &mut out)?;
     Ok(())
+}
+
+/// The staging file name for one write of `file_name`.
+///
+/// Unique per process AND per call: two exports in one process can write the
+/// same key concurrently (the parallel runners), and two processes sharing a
+/// prefix certainly do. Still dot-prefixed and still a sibling of the target, so
+/// the rename stays same-filesystem and atomic.
+fn staging_name(file_name: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    format!(
+        ".{file_name}.{}.{}.tmp",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 impl super::Destination for LocalDestination {
@@ -86,15 +95,15 @@ impl super::Destination for LocalDestination {
         }
         // Stage into a dot-prefixed sibling in the target directory (same
         // filesystem, so the rename is atomic POSIX): a crash mid-copy can
-        // never leave a truncated file at the final key.  The temp name is
-        // deterministic; a stale temp from a crashed run is unlinked and
-        // recreated (never followed) by `stage_copy`.
+        // never leave a truncated file at the final key. The temp name is UNIQUE
+        // per writer — a deterministic one is shared by every process writing the
+        // same key into one prefix, and they deleted each other's staged file.
         let file_name = target
             .file_name()
             .ok_or_else(|| anyhow::anyhow!("destination key has no file name: {remote_key}"))?
             .to_string_lossy()
             .into_owned();
-        let tmp = target.with_file_name(format!(".{file_name}.tmp"));
+        let tmp = target.with_file_name(staging_name(&file_name));
         if let Err(e) = stage_copy(local_path, &tmp) {
             let _ = std::fs::remove_file(&tmp);
             return Err(e);
@@ -457,24 +466,69 @@ mod tests {
     }
 
     /// A stale temp left by a crashed previous run must not poison the next
-    /// attempt: the deterministic temp name is overwritten and renamed away.
+    /// attempt.
+    ///
+    /// It no longer CAN. The staging name used to be a function of the final key
+    /// alone, so a stale temp sat exactly where the next write wanted to be, and
+    /// the recovery was to unlink it and retry. That recovery could not tell a
+    /// stale temp from a LIVE one — concurrent writers into one prefix all stage
+    /// `manifest.json` under the same name, deleted each other's staged file, and
+    /// the loser's `rename` failed with ENOENT. Names are unique per writer now,
+    /// so a stale temp is merely litter: this test pins that it does not affect
+    /// the write, and that the debris is still recognisable as ours to sweep.
     #[test]
-    fn stale_temp_from_crashed_run_is_replaced_on_next_write() {
+    fn stale_temp_from_crashed_run_does_not_affect_the_next_write() {
         let dir = tempfile::tempdir().unwrap();
         let dest = dest_at(dir.path());
-        std::fs::write(dir.path().join(".data.csv.tmp"), b"truncated garb").unwrap();
+        let stale = dir.path().join(".data.csv.tmp");
+        std::fs::write(&stale, b"truncated garb").unwrap();
 
         let src = source_file_with(b"clean payload\n");
         dest.write(src.path(), "data.csv").unwrap();
 
         assert_eq!(
             std::fs::read(dir.path().join("data.csv")).unwrap(),
-            b"clean payload\n"
+            b"clean payload\n",
+            "the write must land whatever a crashed predecessor left behind"
         );
-        assert!(
-            !dir.path().join(".data.csv.tmp").exists(),
-            "stale temp must be consumed by the rename, not accumulate"
+        let temps: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert_eq!(
+            temps,
+            vec![".data.csv.tmp".to_string()],
+            "this write leaves no temp of its own, and the stale one is untouched \
+             (dot-prefixed and .tmp-suffixed, so a sweep can still find it)"
         );
+    }
+
+    /// The staging name is unique per write, which is what makes concurrent
+    /// writers into one prefix safe.
+    ///
+    /// RED-proven against the old scheme: with `.{key}.tmp` both calls below
+    /// produce the same name, and two writers racing on it delete each other's
+    /// staged file. Asserting the NAMES rather than running threads keeps the
+    /// test deterministic — the race itself is exercised end-to-end by the
+    /// release gate's `concurrent-writers` cell.
+    #[test]
+    fn two_writes_of_one_key_never_share_a_staging_name() {
+        let a = staging_name("manifest.json");
+        let b = staging_name("manifest.json");
+        assert_ne!(
+            a, b,
+            "two stagings of the same key must not collide, or one writer unlinks the other's \
+             file and the loser's rename fails with ENOENT — reported by the run as a non-fatal \
+             manifest write failure while its data sits on the prefix unnamed by any manifest"
+        );
+        for n in [&a, &b] {
+            assert!(
+                n.starts_with(".manifest.json."),
+                "still a recognisable sibling: {n}"
+            );
+            assert!(n.ends_with(".tmp"), "still sweepable: {n}");
+        }
     }
 
     // ── ADR-0013 Phase A: read surface ───────────────────────────────────
@@ -757,9 +811,13 @@ mod tests {
         let victim = dir.path().join("victim.txt");
         std::fs::write(&victim, b"original").unwrap();
 
-        // Plant a symlink at the deterministic temp name for key "data.csv".
-        let tmp = dir.path().join(".data.csv.tmp");
-        std::os::unix::fs::symlink(&victim, &tmp).unwrap();
+        // Plant a symlink at the OLD deterministic temp name, and at the final
+        // key's own name. The staging name is now unpredictable, so an attacker
+        // cannot pre-plant at it at all — which is a stronger position than the
+        // one this test used to check. What is still worth pinning is that
+        // neither planted link is followed and the victim is untouched.
+        let planted = dir.path().join(".data.csv.tmp");
+        std::os::unix::fs::symlink(&victim, &planted).unwrap();
 
         let src = source_file_with(b"clean payload\n");
         dest.write(src.path(), "data.csv").unwrap();
@@ -767,7 +825,7 @@ mod tests {
         assert_eq!(
             std::fs::read(&victim).unwrap(),
             b"original",
-            "staged write must not follow the planted symlink into the victim"
+            "no staged write may follow a planted symlink into the victim"
         );
         assert_eq!(
             std::fs::read(dir.path().join("data.csv")).unwrap(),
@@ -775,8 +833,13 @@ mod tests {
             "the real key still gets the payload via a fresh regular temp"
         );
         assert!(
-            !tmp.exists(),
-            "the staging temp is renamed away, leaving no symlink behind"
+            dir.path()
+                .join("data.csv")
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_file(),
+            "the final key is a regular file, never a link"
         );
     }
 

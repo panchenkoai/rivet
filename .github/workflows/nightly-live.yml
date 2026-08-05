@@ -394,6 +394,46 @@ jobs:
   # against continuous churn; asserts zero gaps across the whole window and a
   # flat RSS trend (last-quarter peak <= 1.5x first-quarter). Sundays only —
   # gate on the schedule day so the nightly stays fast.
+  release-compat-artifacts:
+    name: Cross-version artifact exchange (plan/apply, run/validate)
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Download the previous release binary
+        # Downloaded, never rebuilt: the release profile is fat-LTO, and the
+        # published asset is what users actually run.
+        run: |
+          set -euo pipefail
+          PREV=$(gh release list --limit 20 --json tagName,isPrerelease \
+                   --jq '[.[] | select(.isPrerelease == false) | .tagName][0]')
+          echo "baseline release: $PREV"
+          gh release download "$PREV" \
+            --pattern 'rivet-x86_64-unknown-linux-gnu*' --dir baseline --clobber
+          cd baseline
+          for f in *; do case "$f" in *.tar.gz) tar xzf "$f";; esac; done
+          BIN=$(find . -type f -name rivet | head -1)
+          test -n "$BIN" || { echo "no rivet binary in the release asset"; exit 1; }
+          chmod +x "$BIN"
+          echo "RIVET_BASELINE=$PWD/$BIN" >> "$GITHUB_ENV"
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - name: Start postgres
+        run: docker compose up -d postgres
+      - name: Exchange artifacts between the two versions
+        # The axis the offline PR gate cannot run: an artifact written by one
+        # version consumed by the other. It is where the sealed-plan integrity
+        # break surfaced — a `#[serde(default)]` field that deserialized fine
+        # and still shifted the plan's hash, failing apply in BOTH directions.
+        run: |
+          cargo build --bin rivet
+          python3 -m dev.pytools.release_compat artifacts
+      - name: Stop services
+        if: always()
+        run: docker compose down -v || true
+
   soak-cdc:
     name: CDC soak (weekly)
     timeout-minutes: 60

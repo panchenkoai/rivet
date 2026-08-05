@@ -62,6 +62,12 @@ pub(crate) struct TableOutput<'a> {
 /// binlog connection) and ONE checkpoint, because the resume position is a
 /// property of the stream, not of a table.
 pub(crate) struct SinkConfig<'a> {
+    /// The rivet EXPORT these tables belong to (`exports[].name`). Recorded into
+    /// every manifest's `export_family`, so the load's shared-prefix guard
+    /// compares what the writer knew instead of re-deriving it from the table
+    /// string — which is what made the drain and the snapshot leg read as two
+    /// different exports whenever `name:` differed from `table:`.
+    pub export_name: String,
     pub outputs: Vec<TableOutput<'a>>,
     pub engine: super::CdcEngine,
     pub format: FormatType,
@@ -75,6 +81,10 @@ pub(crate) struct SinkConfig<'a> {
     pub started_at: String,
     /// RFC3339 stamp used as both `finished_at` and the run id seed.
     pub run_id: String,
+    /// The central ledger, so every part reaches the DATABASE as it becomes
+    /// durable — not just the manifest beside it. `None` only where there is no
+    /// state store to write to (the unit sinks, which have no database).
+    pub state: Option<&'a crate::state::StateStore>,
 }
 
 /// When to roll a part: at a transaction boundary, once the buffer reaches the row
@@ -102,9 +112,9 @@ struct TableSink<'a> {
     buf: Vec<ChangeEvent>,
     parts: Vec<PartRecord>,
     seq: usize,
-    /// Finding #38: per-column value checksums, XOR-accumulated across parts
+    /// Finding #38: per-column value checksums, sum-accumulated across parts
     /// (the same combining rule `validate_recorded_checksums` applies on
-    /// re-read) — recorded into the manifest so `rivet validate` Form B
+    /// re-read — see `value_checksum::Fold`) — recorded into the manifest so `rivet validate` Form B
     /// covers CDC prefixes instead of silently skipping the value leg.
     column_sums: std::collections::BTreeMap<String, u64>,
 }
@@ -118,6 +128,7 @@ impl TableSink<'_> {
         engine: super::CdcEngine,
         format: FormatType,
         run_token: &str,
+        ledger: Option<(&crate::state::StateStore, &str, &str)>,
     ) -> Result<()> {
         if self.buf.is_empty() {
             return Ok(());
@@ -144,7 +155,55 @@ impl TableSink<'_> {
             &self.out.row_hash,
         )?;
         for (name, sum) in sums {
-            *self.column_sums.entry(name).or_insert(0) ^= sum;
+            // wrapping_add, not XOR — the same fold `Fold::Sum` applies on
+            // re-read. Under `^` two parts whose column checksums coincide
+            // cancelled to zero, so a CDC prefix could publish a checksum that
+            // verified anything.
+            let e = self.column_sums.entry(name).or_insert(0);
+            *e = e.wrapping_add(sum);
+        }
+        // The part is durable at the destination NOW — so the ledger learns
+        // about it NOW, at the same seam the batch path uses (`commit.rs`
+        // `record_file`), and strictly BEFORE the checkpoint/ack that
+        // `roll_all` performs next.
+        //
+        // Without this the state DB was not a record of a CDC run at all: it
+        // got `begin_run` at the start and one aggregate `export_metrics` row at
+        // finalize, and NOTHING per part — so a run that died mid-stream left
+        // durable, manifest-covered rows the database had never heard of. The
+        // manifest was finer-grained AND earlier than the ledger, which inverts
+        // the intended relationship: the database is the record, the manifest is
+        // its projection at the destination.
+        //
+        // Non-fatal, matching ADR-0001 I7: the file is already durable, so a
+        // ledger write failure is logged, never a reason to fail a run whose
+        // data is safe.
+        // The ledger key is (run_id, file_name), and the part name carries only
+        // this sink's OWN sequence — `cdc-<run_token>-000000` — so in a
+        // multi-table CDC export every table's first part has the SAME name.
+        // The files do not collide (each table writes under its own sub-prefix,
+        // `cdc_job::dest_for_table`), but the ledger rows did: `record_durable_part`
+        // deletes-then-inserts on that key, so each roll erased the sibling
+        // table's row and the projected aggregate under-reported both parts and
+        // rows. Qualify the LEDGER name with the table — the same distinction the
+        // destination already makes — rather than renaming the object on disk.
+        let ledger_name = ledger_part_name(&self.out.table, &part.file_name);
+        if let Some((state, export_name, run_id)) = ledger
+            && let Err(e) = state.record_durable_part(crate::state::DurablePart {
+                run_id,
+                export_name,
+                file_name: &ledger_name,
+                rows: part.rows,
+                bytes: part.bytes as i64,
+                format: format.label(),
+                compression: Some(part_compression(format).label()),
+                mode: "cdc",
+            })
+        {
+            log::warn!(
+                "cdc: ledger write failed for '{}' (the part IS durable): {e:#}",
+                part.file_name
+            );
         }
         self.parts.push(part);
         self.seq += 1;
@@ -191,15 +250,22 @@ fn roll_all(
     stream: &mut dyn ChangeStream,
     engine: super::CdcEngine,
     format: FormatType,
+    export_name: &str,
     run_token: &str,
     checkpoint: Option<&Path>,
     last_commit: &Option<Position>,
     unacked_commit: &mut bool,
     run_id: &str,
     started_at: &str,
+    state: Option<&crate::state::StateStore>,
 ) -> Result<()> {
     for s in sinks.iter_mut() {
-        s.flush_buffered(engine, format, run_token)?;
+        s.flush_buffered(
+            engine,
+            format,
+            run_token,
+            state.map(|st| (st, export_name, run_id)),
+        )?;
     }
     // Fault point: the parts are durable but the checkpoint/ack have NOT run. A
     // crash here must re-read on resume (at-least-once) — never lose the change.
@@ -218,6 +284,7 @@ fn roll_all(
                 engine,
                 &s.column_sums,
                 &s.out,
+                export_name,
                 format,
                 run_id,
                 started_at,
@@ -247,10 +314,20 @@ fn roll_all(
 /// asks the [`RolloverPolicy`] (on totals across tables); the durable
 /// flush→checkpoint→ack sequence lives in [`roll_all`]. Returns one manifest
 /// per output, in `outputs` order.
+/// Drain the stream to files, returning WHAT WAS MADE DURABLE alongside the
+/// outcome.
+///
+/// The tuple is the point. This returned `Result<Vec<RunManifest>>`, so an
+/// error discarded the manifests entirely and the caller had nothing to record
+/// but zeros — see the comment on the drain closure below. `(manifests, result)`
+/// mirrors `mongo_parallel::range_worker`, which was changed to the same shape
+/// for the same reason: durable work and run outcome are independent facts, and
+/// a type that can only express one of them forces the caller to lie about the
+/// other.
 pub(crate) fn run_to_files(
     stream: &mut dyn ChangeStream,
     cfg: SinkConfig<'_>,
-) -> Result<Vec<RunManifest>> {
+) -> (Vec<RunManifest>, Result<()>) {
     let run_token = run_token(&cfg.run_id);
     let mut sinks: Vec<TableSink<'_>> = cfg
         .outputs
@@ -296,87 +373,118 @@ pub(crate) fn run_to_files(
     // toward the open bound (finite WAL); a pass yielding zero has drained to the
     // bound.
     let mut hit_max = false;
-    loop {
-        let mut yielded_this_pass = 0usize;
-        while let Some(ev) = stream.next_change() {
-            let mut ev = ev?;
-            yielded_this_pass += 1;
-            txn_seq.stamp(&mut ev);
-            // The commit boundary is a property of the STREAM, not of any routed
-            // table — record it BEFORE the routing filter. MySQL marks only the
-            // LAST event of a transaction committed; if that event lands on an
-            // uncaptured table (audit-log-written-last is a common ORM shape),
-            // filtering first would drop the boundary, stall the checkpoint
-            // forever, and duplicate the captured rows on every scheduler cycle.
-            let committed = ev.committed;
-            if committed {
-                last_commit = Some(ev.position.clone());
-                unacked_commit = true;
+    // The drain is wrapped so that an error does NOT discard what is already
+    // durable. Every `?` below used to abandon `sinks`, whose `parts` list the
+    // parts this run flushed, checkpointed and ACKED — so a run that captured
+    // and acked N rows and then failed reported 0 rows / 0 files / no
+    // FileWritten events, while the object store held the data and the source
+    // was advanced past it. The data was never at risk (`roll_all` writes a
+    // durable run-unique manifest before each ack), but every RECORD of it was:
+    // an operator reading "failed, 0 rows" concludes nothing was captured and
+    // re-runs, and the changes are already gone from the log.
+    let drain: Result<()> = (|| {
+        loop {
+            let mut yielded_this_pass = 0usize;
+            while let Some(ev) = stream.next_change() {
+                let mut ev = ev?;
+                yielded_this_pass += 1;
+                txn_seq.stamp(&mut ev);
+                // The commit boundary is a property of the STREAM, not of any routed
+                // table — record it BEFORE the routing filter. MySQL marks only the
+                // LAST event of a transaction committed; if that event lands on an
+                // uncaptured table (audit-log-written-last is a common ORM shape),
+                // filtering first would drop the boundary, stall the checkpoint
+                // forever, and duplicate the captured rows on every scheduler cycle.
+                let committed = ev.committed;
+                if committed {
+                    last_commit = Some(ev.position.clone());
+                    unacked_commit = true;
+                }
+                // Routing is a BLOCK, not a `continue`: the soft cap below must run
+                // for every event, because a commit boundary is a STREAM property
+                // that can land on an UNCAPTURED table (the `commit_boundary_on_an_
+                // uncaptured_table_…` shape). A `continue` here made the cap dead on
+                // exactly those streams — unbounded overshoot. An uncaptured event
+                // simply skips the block, which also drops its deferred poison, as
+                // the `continue` used to.
+                if let Some(sink) = sinks
+                    .iter_mut()
+                    .find(|s| table_matches(&s.out.table, &ev.schema, &ev.table))
+                {
+                    // Confirmed routed to a captured table → surface any deferred
+                    // decode error (uncaptured tables' poison never applies).
+                    ev.raise_poison()?;
+                    total_bytes += ev.estimated_bytes();
+                    sink.buf.push(ev);
+                    total_rows += 1;
+                    emitted += 1;
+                    if policy.should_roll(total_rows, total_bytes, committed) {
+                        roll_all(
+                            &mut sinks,
+                            stream,
+                            cfg.engine,
+                            cfg.format,
+                            &cfg.export_name,
+                            &run_token,
+                            checkpoint,
+                            &last_commit,
+                            &mut unacked_commit,
+                            &cfg.run_id,
+                            &cfg.started_at,
+                            cfg.state,
+                        )?;
+                        total_rows = 0;
+                        total_bytes = 0;
+                    }
+                }
+                // SOFT cap, judged at the COMMIT BOUNDARY — the same treatment
+                // `should_roll` gives every other budget. Judged per event, the cap
+                // cut a transaction mid-flight: the partial tail flushed as a real
+                // part and the end-of-pass roll skipped checkpoint AND ack, so every
+                // later run re-read the same transaction forever (on PostgreSQL the
+                // slot then pins WAL until the disk fills). It runs AFTER the routed
+                // push — the boundary event itself must be captured before stopping,
+                // or the ack advances past an unwritten row — and OUTSIDE the routed
+                // block, so a boundary on an uncaptured table still honours it.
+                if committed && cfg.max_events.is_some_and(|m| emitted >= m) {
+                    hit_max = true;
+                    break;
+                }
             }
-            let Some(sink) = sinks
-                .iter_mut()
-                .find(|s| table_matches(&s.out.table, &ev.schema, &ev.table))
-            else {
-                continue; // not a captured table — its deferred poison never applies
-            };
-            // Confirmed routed to a captured table → surface any deferred decode
-            // error (uncaptured tables' poison was dropped by the `continue`).
-            ev.raise_poison()?;
-            total_bytes += ev.estimated_bytes();
-            sink.buf.push(ev);
-            total_rows += 1;
-            emitted += 1;
-            if policy.should_roll(total_rows, total_bytes, committed) {
+            // End-of-pass roll: flush any buffered captured tail AND ack the consumed
+            // span. Fires when a captured table has buffered rows OR when a commit
+            // boundary is unacked — the latter advances the slot past an
+            // uncaptured-only span (bug-hunt K) and, in the re-drain loop, is what
+            // lets the next pass slide forward. `roll_all` flushes nothing when the
+            // buffers are empty; it just persists the checkpoint + acks. The
+            // checkpoint only ever lands on `last_commit` (a transaction boundary),
+            // so a `max_events` stop mid-span still checkpoints a whole transaction.
+            if unacked_commit || sinks.iter().any(|s| !s.buf.is_empty()) {
                 roll_all(
                     &mut sinks,
                     stream,
                     cfg.engine,
                     cfg.format,
+                    &cfg.export_name,
                     &run_token,
                     checkpoint,
                     &last_commit,
                     &mut unacked_commit,
                     &cfg.run_id,
                     &cfg.started_at,
+                    cfg.state,
                 )?;
                 total_rows = 0;
                 total_bytes = 0;
             }
-            if cfg.max_events.is_some_and(|m| emitted >= m) {
-                hit_max = true;
+            // A pass that yielded nothing has drained to the bound; `max_events`
+            // stops the whole run at the cap.
+            if hit_max || yielded_this_pass == 0 {
                 break;
             }
         }
-        // End-of-pass roll: flush any buffered captured tail AND ack the consumed
-        // span. Fires when a captured table has buffered rows OR when a commit
-        // boundary is unacked — the latter advances the slot past an
-        // uncaptured-only span (bug-hunt K) and, in the re-drain loop, is what
-        // lets the next pass slide forward. `roll_all` flushes nothing when the
-        // buffers are empty; it just persists the checkpoint + acks. The
-        // checkpoint only ever lands on `last_commit` (a transaction boundary),
-        // so a `max_events` stop mid-span still checkpoints a whole transaction.
-        if unacked_commit || sinks.iter().any(|s| !s.buf.is_empty()) {
-            roll_all(
-                &mut sinks,
-                stream,
-                cfg.engine,
-                cfg.format,
-                &run_token,
-                checkpoint,
-                &last_commit,
-                &mut unacked_commit,
-                &cfg.run_id,
-                &cfg.started_at,
-            )?;
-            total_rows = 0;
-            total_bytes = 0;
-        }
-        // A pass that yielded nothing has drained to the bound; `max_events`
-        // stops the whole run at the cap.
-        if hit_max || yielded_this_pass == 0 {
-            break;
-        }
-    }
+        Ok(())
+    })();
 
     // Fault point: all parts durable + acked, terminal manifest (+`_SUCCESS`) not
     // yet written. A crash here is recoverable WITHOUT re-capturing acked data:
@@ -386,13 +494,22 @@ pub(crate) fn run_to_files(
     // marker is missing, which the next cycle's terminal write supplies.
     crate::test_hook::maybe_panic_at("cdc_before_manifest");
 
-    // Clean end → write each table's run manifest + _SUCCESS (bounded-run concept).
+    // Built from `sinks` on BOTH paths. On the clean path this also writes the
+    // terminal manifest + `_SUCCESS`; on the error path the parts are already
+    // covered by the per-roll run-unique manifest `roll_all` wrote before each
+    // ack, so the manifest is built for the CALLER's accounting and no
+    // `_SUCCESS` is claimed — the run did not succeed.
     let mut manifests = Vec::with_capacity(sinks.len());
+    // A failure to write the TERMINAL manifest becomes the run's outcome, but
+    // must not discard the manifests either — the parts it describes are
+    // durable regardless of whether the marker landed.
+    let mut write_err: Option<anyhow::Error> = None;
     for s in &sinks {
         let manifest = build_manifest(
             cfg.engine,
             &s.column_sums,
             &s.out,
+            &cfg.export_name,
             cfg.format,
             &cfg.run_id,
             &cfg.started_at,
@@ -401,10 +518,23 @@ pub(crate) fn run_to_files(
         // write_manifest leaves the canonical `manifest.json` (latest-run pointer)
         // AND an immutable run-unique copy, so a prefix accumulating several
         // `until_current` cycles keeps EACH run's manifest for cross-run reconcile.
-        write_manifest(s.out.dest, &manifest)?;
+        //
+        // Only on the clean path: writing `_SUCCESS` for a run that FAILED would
+        // tell every downstream reader the prefix is complete. A failed run's
+        // parts stay declared by the per-roll manifest, which carries no marker.
+        if drain.is_ok()
+            && write_err.is_none()
+            && let Err(e) = write_manifest(s.out.dest, &manifest)
+        {
+            write_err = Some(e);
+        }
         manifests.push(manifest);
     }
-    Ok(manifests)
+    match (drain, write_err) {
+        (Err(e), _) => (manifests, Err(e)),
+        (Ok(()), Some(e)) => (manifests, Err(e)),
+        (Ok(()), None) => (manifests, Ok(())),
+    }
 }
 
 /// Build the sink schema once, on the first flush — refining decimal scales from
@@ -690,11 +820,7 @@ fn flush(
     };
 
     let tmp = NamedTempFile::new()?;
-    let compression = match format {
-        FormatType::Csv => CompressionType::None,
-        FormatType::Parquet => CompressionType::Zstd,
-    };
-    let fmt = crate::format::create_format(format, compression, None, None);
+    let fmt = crate::format::create_format(format, part_compression(format), None, None);
     let writer: Box<dyn std::io::Write + Send> = Box::new(tmp.reopen()?);
     let mut w = fmt.create_writer(schema, writer)?;
     w.write_batch(&batch)?;
@@ -705,12 +831,46 @@ fn flush(
     Ok((part, col_sums))
 }
 
+/// The name a CDC part is recorded under in `file_log`.
+///
+/// The ledger key is `(run_id, file_name)` and a part's own name carries only its
+/// sink's sequence — `cdc-<run_token>-000000` — so in a MULTI-TABLE cdc export
+/// every table's first part is called the same thing. The objects do not collide
+/// (each table writes under its own sub-prefix, `cdc_job::dest_for_table`), but
+/// the ledger rows did: `record_durable_part` deletes-then-inserts on that key,
+/// so each roll erased the sibling table's row and the projected aggregate
+/// under-reported both parts and rows.
+///
+/// One function so the sink and its test agree by CONSTRUCTION rather than by two
+/// copies of a format string.
+pub(crate) fn ledger_part_name(table: &str, file_name: &str) -> String {
+    format!("{table}/{file_name}")
+}
+
+/// How a CDC part is compressed, per format — the ONE place that decides.
+///
+/// It was two places: the writer picked `None` for CSV and `Zstd` for Parquet,
+/// and `build_manifest`, sixty lines below, wrote the literal `"zstd"` for both.
+/// So a `format: csv` CDC export shipped plain-text parts under a manifest
+/// advertising zstd. Nothing in the pipeline reads the field back, which is why
+/// it survived — but the manifest is the contract a cross-boundary consumer
+/// decodes by, and a batch CSV export records the truth (`plan.compression
+/// .label()`), so the two legs described the same artifact differently.
+pub(crate) fn part_compression(format: FormatType) -> CompressionType {
+    match format {
+        FormatType::Csv => CompressionType::None,
+        FormatType::Parquet => CompressionType::Zstd,
+    }
+}
+
 /// Assemble one table's `RunManifest` from its committed parts (hand-built — no
 /// plan coupling; `record_part` is the plan-bound path the batch export uses).
+#[allow(clippy::too_many_arguments)] // the export identity joined an existing 7-arg builder
 fn build_manifest(
     engine: super::CdcEngine,
     column_sums: &std::collections::BTreeMap<String, u64>,
     out: &TableOutput<'_>,
+    export_name: &str,
     format: FormatType,
     run_id: &str,
     started_at: &str,
@@ -720,6 +880,11 @@ fn build_manifest(
         manifest_version: MANIFEST_VERSION,
         mode: "cdc".to_string(),
         run_id: run_id.to_string(),
+        // `export_name` stays the TABLE string — established wire format that
+        // multiplexed loads key sub-prefixes on. The FAMILY is the parent
+        // export, recorded so the load guard can group the drain with its
+        // snapshot leg without guessing from either string.
+        export_family: export_name.to_string(),
         export_name: out.table.clone(),
         started_at: started_at.to_string(),
         // A real finish instant (RFC3339) — NOT the run_id. The field is parsed as
@@ -748,7 +913,7 @@ fn build_manifest(
         // never advertise a contract this run did not apply.
         row_hash: crate::enrich::RowHashContract::of(&out.row_hash),
         format: format.label().to_string(),
-        compression: "zstd".to_string(),
+        compression: part_compression(format).label().to_string(),
         schema_fingerprint: String::new(),
         row_count: parts.iter().map(|p| p.rows).sum(),
         part_count: parts.len() as u32,
@@ -765,6 +930,10 @@ fn build_manifest(
                 status: PartStatus::Committed,
             })
             .collect(),
+        // Stamped because this manifest DOES carry checksums: without the
+        // marker a reader falls back to the v1 (annihilating XOR) fold and
+        // reports every CDC prefix as corrupt.
+        checksum_render: Some(crate::source::value_checksum::CHECKSUM_RENDER_ID.to_string()),
         column_checksums: Some(
             column_sums
                 .iter()
@@ -848,10 +1017,15 @@ mod tests {
             acked: Vec::new(),
         };
         let cfg = SinkConfig {
+            export_name: "t".into(),
             checkpoint: Some(ckpt.clone()),
             ..cfg(dest.as_ref(), &cols, FormatType::Parquet, 10)
         };
-        run_to_files(&mut stream, cfg).unwrap();
+        {
+            let (m, r) = run_to_files(&mut stream, cfg);
+            r.unwrap();
+            m
+        };
         assert!(
             Position::load(&ckpt).unwrap().is_some(),
             "the stream's commit boundary must advance the checkpoint even when \
@@ -880,8 +1054,11 @@ mod tests {
             acked: Vec::new(),
         };
         let cfg = cfg(dest.as_ref(), &cols, FormatType::Parquet, 10);
-        run_to_files(&mut stream, cfg)
-            .expect("poison on an uncaptured table must be dropped, never bail the run");
+        {
+            let (mm, r) = run_to_files(&mut stream, cfg);
+            r.expect("poison on an uncaptured table must be dropped, never bail the run");
+            mm
+        };
     }
 
     // The safety half: a poison on a CAPTURED table still fails loud (the deferral
@@ -901,7 +1078,9 @@ mod tests {
             acked: Vec::new(),
         };
         let cfg = cfg(dest.as_ref(), &cols, FormatType::Parquet, 10);
-        let err = run_to_files(&mut stream, cfg).expect_err("poison on a captured table must bail");
+        let err = run_to_files(&mut stream, cfg)
+            .1
+            .expect_err("poison on a captured table must bail");
         assert!(
             format!("{err:#}").contains("REPLICA IDENTITY FULL"),
             "must surface the deferred message, got: {err:#}"
@@ -957,7 +1136,9 @@ mod tests {
             acked: Vec::new(),
         };
         let cfg = cfg(dest.as_ref(), &cols, FormatType::Parquet, 10);
-        let err = run_to_files(&mut stream, cfg).expect_err("arity drift must fail");
+        let err = run_to_files(&mut stream, cfg)
+            .1
+            .expect_err("arity drift must fail");
         assert!(
             err.to_string().contains("WRONG columns"),
             "must explain the misalignment: {err}"
@@ -1022,11 +1203,14 @@ mod tests {
         };
         // rollover=2 over 3 committed events ⇒ ≥1 mid-stream roll+ack, each of
         // which the stream's `ack` gates on a durable Success manifest.
-        run_to_files(
-            &mut stream,
-            cfg(dest.as_ref(), &cols, FormatType::Parquet, 2),
-        )
-        .unwrap();
+        {
+            let (m, r) = run_to_files(
+                &mut stream,
+                cfg(dest.as_ref(), &cols, FormatType::Parquet, 2),
+            );
+            r.unwrap();
+            m
+        };
         assert!(
             stream.ack_count >= 1,
             "the fixture must exercise at least one ack"
@@ -1035,6 +1219,74 @@ mod tests {
         assert!(
             dir.path().join("_SUCCESS").exists(),
             "_SUCCESS at clean end"
+        );
+    }
+
+    /// A drain that commits parts and THEN fails must report those parts.
+    ///
+    /// `run_to_files` returned `Result<Vec<RunManifest>>`, so any error threw the
+    /// manifests away and `cdc_job` had nothing to record but hard-coded zeros.
+    /// The CDC sink rolls many times per run (flush -> per-roll manifest ->
+    /// checkpoint -> ack), so a run that captured and ACKED N rows before
+    /// failing reported "failed, 0 rows, 0 files" over an object store holding
+    /// the parts and a source already advanced past them. No data was lost —
+    /// every RECORD of it was, which is worse than it sounds: an operator
+    /// reading that re-runs expecting to recapture changes the log no longer has.
+    ///
+    /// The fixture must roll at least one part BEFORE the error, or it proves
+    /// nothing — a stream that fails on its first event has no durable work to
+    /// forget. `rollover: 2` with three good events guarantees one committed
+    /// part, then the fourth read fails.
+    #[test]
+    fn a_failed_drain_still_reports_the_parts_it_made_durable() {
+        struct FailAfter {
+            events: VecDeque<ChangeEvent>,
+            acked: Vec<Position>,
+        }
+        impl ChangeStream for FailAfter {
+            fn next_change(&mut self) -> Option<Result<ChangeEvent>> {
+                match self.events.pop_front() {
+                    Some(e) => Some(Ok(e)),
+                    // Exhausted -> the read itself fails, mid-drain.
+                    None => Some(Err(anyhow::anyhow!("stream read failed mid-drain"))),
+                }
+            }
+            fn ack(&mut self, position: &Position) -> Result<()> {
+                self.acked.push(position.clone());
+                Ok(())
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let dest = local_dest(&dir);
+        let cols = int_col();
+        let mut stream = FailAfter {
+            events: VecDeque::from(vec![insert(1), insert(2), insert(3)]),
+            acked: Vec::new(),
+        };
+        let (manifests, outcome) = run_to_files(
+            &mut stream,
+            cfg(dest.as_ref(), &cols, FormatType::Parquet, 2),
+        );
+
+        assert!(outcome.is_err(), "the drain must report the failure");
+        // Fixture integrity: without a committed+acked part this test would pass
+        // against the pre-fix code for the wrong reason.
+        assert!(
+            !stream.acked.is_empty(),
+            "fixture is inert — nothing was acked, so there is no durable work to forget"
+        );
+        let rows: i64 = manifests.iter().map(|m| m.row_count).sum();
+        let parts: usize = manifests.iter().map(|m| m.part_count as usize).sum();
+        assert!(
+            rows > 0 && parts > 0,
+            "a failed drain reported {rows} rows / {parts} parts — the durable work was \
+             discarded with the error, which is exactly what made `cdc_job` record zeros"
+        );
+        // A failed run must NOT claim the prefix is complete.
+        assert!(
+            !dir.path().join("_SUCCESS").exists(),
+            "_SUCCESS must not be written for a run that failed"
         );
     }
 
@@ -1078,11 +1330,14 @@ mod tests {
             acked: Vec::new(),
         };
         // 3 events, roll at 2 ⇒ part0=[1,2], part1=[3]
-        let manifests = run_to_files(
-            &mut stream,
-            cfg(dest.as_ref(), &cols, FormatType::Parquet, 2),
-        )
-        .unwrap();
+        let manifests = {
+            let (m, r) = run_to_files(
+                &mut stream,
+                cfg(dest.as_ref(), &cols, FormatType::Parquet, 2),
+            );
+            r.unwrap();
+            m
+        };
         let manifest = &manifests[0];
 
         assert_eq!(manifest.part_count, 2, "rollover=2 over 3 events ⇒ 2 parts");
@@ -1105,6 +1360,322 @@ mod tests {
     // name (`cdc-000000`) silently overwrites the prior run's part AFTER the
     // source has already been acked past those changes: unrecoverable loss
     // (not in the slot, not in the destination).
+    /// Every durable CDC part reaches the DATABASE, not only the manifest.
+    ///
+    /// The database is meant to be the record of what a run produced and the
+    /// manifest its projection at the destination. For CDC it was the other way
+    /// round: `cdc_job` wrote `begin_run` at the start and one aggregate
+    /// `export_metrics` row at finalize, and the sink — which knows about parts —
+    /// never touched the state store at all. So the manifest was both FINER
+    /// (per part) and EARLIER (written before each ack, deliberately, so a crash
+    /// keeps the data visible) than the ledger, and a run that died mid-stream
+    /// left durable rows the database had never heard of. The batch path has
+    /// recorded each part through `commit.rs::record_file` all along; this is
+    /// the same seam on the CDC side.
+    ///
+    /// The oracle is the LEDGER, read back after a real `run_to_files` — the
+    /// value observed at the boundary, produced by the real writer, not a count
+    /// the test hands itself. `rollover: 2` over five changes so there is more
+    /// than one part: with a single part any per-part loop and any
+    /// write-once-at-the-end both look identical.
+    /// TWO tables in one CDC export: every table's parts must survive in the
+    /// ledger, not just the last one to flush.
+    ///
+    /// The part name carries only its own sink's sequence, so table `a` and table
+    /// `b` both produce `cdc-<run_token>-000000`. The objects are fine — each
+    /// table writes under its own sub-prefix — but `file_log` is keyed
+    /// `(run_id, file_name)` and `record_durable_part` deletes-then-inserts on
+    /// that key, so each roll erased the sibling's row. The projected run
+    /// aggregate then under-reported both parts and rows, and no single-table
+    /// test could see it: at N=1 there is no sibling to erase.
+    #[test]
+    fn two_tables_in_one_cdc_export_do_not_erase_each_others_ledger_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest_a = local_dest(&dir);
+        let dir_b = tempfile::tempdir().unwrap();
+        let dest_b = local_dest(&dir_b);
+        let cols = int_col();
+        let state = crate::state::StateStore::open_in_memory().expect("in-memory state");
+
+        let ev = |table: &str, id: i64| {
+            let mut e = insert(id);
+            e.table = table.into();
+            e
+        };
+        let mut stream = FakeStream {
+            events: VecDeque::from(vec![ev("a", 1), ev("b", 2), ev("a", 3), ev("b", 4)]),
+            acked: Vec::new(),
+        };
+
+        let base = cfg(dest_a.as_ref(), &cols, FormatType::Parquet, 1);
+        let manifests = {
+            let (m, r) = run_to_files(
+                &mut stream,
+                SinkConfig {
+                    state: Some(&state),
+                    outputs: vec![
+                        TableOutput {
+                            table: "a".into(),
+                            columns: cols.clone(),
+                            dest: dest_a.as_ref(),
+                            dest_uri: String::new(),
+                            row_hash: crate::config::RowHash::All(false),
+                        },
+                        TableOutput {
+                            table: "b".into(),
+                            columns: cols.clone(),
+                            dest: dest_b.as_ref(),
+                            dest_uri: String::new(),
+                            row_hash: crate::config::RowHash::All(false),
+                        },
+                    ],
+                    ..base
+                },
+            );
+            r.unwrap();
+            m
+        };
+
+        let manifest_parts: usize = manifests.iter().map(|m| m.parts.len()).sum();
+        assert!(
+            manifests.len() == 2 && manifest_parts >= 2,
+            "fixture is inert — both tables must have produced parts, or there is no sibling \
+             row to erase; got {} manifest(s), {manifest_parts} part(s)",
+            manifests.len()
+        );
+
+        let logged = state.list_files_for_run("r").expect("read file_log");
+        assert_eq!(
+            logged.len(),
+            manifest_parts,
+            "the two manifests list {manifest_parts} part(s) between them and the ledger kept \
+             {} — a table's parts were erased by its sibling's, so every sum over file_log \
+             under-reports the run",
+            logged.len()
+        );
+        for table in ["a", "b"] {
+            assert!(
+                logged
+                    .iter()
+                    .any(|r| r.file_name.starts_with(&format!("{table}/"))),
+                "table '{table}' has no row in the ledger at all"
+            );
+        }
+    }
+
+    #[test]
+    fn every_durable_cdc_part_is_recorded_in_the_state_db_not_just_the_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = local_dest(&dir);
+        let cols = int_col();
+        let state = crate::state::StateStore::open_in_memory().expect("in-memory state");
+        let mut stream = FakeStream {
+            events: VecDeque::from(vec![insert(1), insert(2), insert(3), insert(4), insert(5)]),
+            acked: Vec::new(),
+        };
+        let manifest = {
+            let (m, r) = run_to_files(
+                &mut stream,
+                SinkConfig {
+                    state: Some(&state),
+                    ..cfg(dest.as_ref(), &cols, FormatType::Parquet, 2)
+                },
+            );
+            r.unwrap();
+            m
+        };
+
+        let logged = state.list_files_for_run("r").expect("read file_log");
+        let parts = &manifest[0].parts;
+        assert!(
+            parts.len() > 1,
+            "fixture must produce SEVERAL parts, or a per-part ledger write and a single \
+             write-at-the-end are indistinguishable; got {}",
+            parts.len()
+        );
+        assert_eq!(
+            logged.len(),
+            parts.len(),
+            "the manifest lists {} part(s) and the ledger recorded {} — every part the run made \
+             durable must be IN THE DATABASE, or a crashed run leaves rows nothing in the state \
+             store knows about",
+            parts.len(),
+            logged.len()
+        );
+        for p in parts {
+            let row = logged
+                .iter()
+                .find(|r| r.file_name == ledger_part_name("t", &p.path))
+                .unwrap_or_else(|| {
+                    panic!("part '{}' is in the manifest but not in file_log", p.path)
+                });
+            assert_eq!(
+                row.row_count, p.rows,
+                "ledger and manifest disagree about how many rows '{}' holds",
+                p.path
+            );
+            assert_eq!(row.export_name, "t", "the ledger row must name the export");
+        }
+    }
+
+    /// A run in flight has an aggregate in the DATABASE, and a finished run has
+    /// exactly ONE.
+    ///
+    /// Two halves, and the second is the dangerous one. Writing progress is easy;
+    /// writing it as a NEW row each roll would leave a five-roll run as five
+    /// `export_metrics` rows, and every consumer that sums `total_rows` across
+    /// runs would report five times the data — a far worse defect than the gap it
+    /// closes. So the progress row is keyed on the run and the terminal write
+    /// clears it.
+    ///
+    /// The oracle is the ledger itself, read back around a real `run_to_files`:
+    /// during the run the row must exist and carry the totals so far; after the
+    /// terminal write there must be exactly one row and it must not say
+    /// `running`. `rollover: 2` over five changes so several rolls happen — with
+    /// one roll a per-roll upsert and a single write are indistinguishable, and
+    /// the duplicate-row failure cannot appear at all.
+    #[test]
+    fn a_cdc_run_has_exactly_one_metrics_row_and_it_exists_before_the_run_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = local_dest(&dir);
+        let cols = int_col();
+        let state = crate::state::StateStore::open_in_memory().expect("in-memory state");
+        let mut stream = FakeStream {
+            events: VecDeque::from(vec![insert(1), insert(2), insert(3), insert(4), insert(5)]),
+            acked: Vec::new(),
+        };
+        let manifest = {
+            let (m, r) = run_to_files(
+                &mut stream,
+                SinkConfig {
+                    state: Some(&state),
+                    ..cfg(dest.as_ref(), &cols, FormatType::Parquet, 2)
+                },
+            );
+            r.unwrap();
+            m
+        };
+        assert!(
+            manifest[0].parts.len() > 1,
+            "fixture must roll more than once, or neither half of this test can fail"
+        );
+
+        // The sink never reaches finalize (that is `cdc_job`'s job), so what the
+        // ledger holds here is precisely the in-flight row the old code never
+        // wrote at all.
+        let rows = state
+            .get_metrics(Some("t"), 100)
+            .expect("read export_metrics");
+        assert_eq!(
+            rows.len(),
+            1,
+            "a run must leave ONE aggregate row, not one per roll — {} rows would make every \
+             sum over export_metrics count this run {} times",
+            rows.len(),
+            rows.len()
+        );
+        assert_eq!(
+            rows[0].status, "running",
+            "an unfinished run reads as running"
+        );
+        assert_eq!(
+            rows[0].total_rows, 5,
+            "the in-flight aggregate must carry the rows made durable so far"
+        );
+
+        // The terminal write replaces it rather than adding to it.
+        state
+            .record_metric_full(&crate::state::MetricRow {
+                export_name: "t".into(),
+                run_id: "r".into(),
+                total_rows: 5,
+                status: "success".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let after = state
+            .get_metrics(Some("t"), 100)
+            .expect("read export_metrics");
+        assert_eq!(
+            after.len(),
+            1,
+            "the terminal row must REPLACE the in-flight one; {} rows means a finished run is \
+             double-counted forever",
+            after.len()
+        );
+        assert_eq!(after[0].status, "success");
+    }
+
+    /// The manifest must describe the compression the part actually has.
+    ///
+    /// The writer picked `None` for CSV and `Zstd` for Parquet; `build_manifest`
+    /// wrote the literal `"zstd"` for both. So a `format: csv` CDC export shipped
+    /// PLAIN-TEXT parts under a manifest advertising zstd — a cross-boundary
+    /// consumer that decodes by the field gets a zstd error on a readable file,
+    /// and the batch leg, which records `plan.compression.label()`, describes the
+    /// same artifact differently.
+    ///
+    /// The oracle is the FILE, not the other branch of the same match: the
+    /// assertion reads the bytes the run actually wrote and requires the manifest
+    /// to agree with them. Comparing the manifest to `part_compression` would
+    /// share the producer's opinion and pass on any consistent lie. Both formats
+    /// run, because with one the match arm is unobservable — the literal `"zstd"`
+    /// was RIGHT for parquet, which is exactly how it stayed for months.
+    #[test]
+    fn a_cdc_manifest_declares_the_compression_the_part_actually_has() {
+        for (format, ext) in [(FormatType::Csv, "csv"), (FormatType::Parquet, "parquet")] {
+            let dir = tempfile::tempdir().unwrap();
+            let dest = local_dest(&dir);
+            let cols = int_col();
+            let mut stream = FakeStream {
+                events: VecDeque::from(vec![insert(1), insert(2)]),
+                acked: Vec::new(),
+            };
+            let manifest = {
+                let (m, r) = run_to_files(&mut stream, cfg(dest.as_ref(), &cols, format, 10));
+                r.unwrap();
+                m
+            };
+            let declared = &manifest[0].compression;
+
+            let part = std::fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .find(|p| p.extension().is_some_and(|e| e == ext))
+                .unwrap_or_else(|| panic!("{format:?}: no .{ext} part was written"));
+            let bytes = std::fs::read(&part).unwrap();
+
+            // What the bytes say they are, decided WITHOUT asking rivet: a zstd
+            // frame opens with the magic 28 B5 2F FD; a plain CSV opens with its
+            // header text; a Parquet file opens with "PAR1" and carries its codec
+            // inside, which `compression:` is describing.
+            let zstd_framed = bytes.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]);
+            match format {
+                FormatType::Csv => {
+                    assert!(
+                        !zstd_framed && bytes.starts_with(b"__op"),
+                        "the CSV part is plain text, so the manifest cannot say it is compressed"
+                    );
+                    assert_eq!(
+                        declared, "none",
+                        "the CSV part on disk is uncompressed plain text and the manifest \
+                         declares `{declared}` — the sidecar is describing a different file \
+                         than the one beside it"
+                    );
+                }
+                FormatType::Parquet => {
+                    assert!(bytes.starts_with(b"PAR1"), "not a parquet file");
+                    assert_eq!(
+                        declared, "zstd",
+                        "parquet parts are written with the zstd codec and the manifest must \
+                         still say so — a fix for the CSV arm that flips this one has moved \
+                         the defect rather than removed it"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn roast_second_run_into_same_prefix_must_not_clobber_prior_parts() {
         let dir = tempfile::tempdir().unwrap();
@@ -1116,28 +1687,36 @@ mod tests {
             events: VecDeque::from(vec![insert(1), insert(2)]),
             acked: Vec::new(),
         };
-        run_to_files(
-            &mut run1,
-            SinkConfig {
-                run_id: "t_cdc_20260702T100000000".into(),
-                ..cfg(dest.as_ref(), &cols, FormatType::Csv, 10)
-            },
-        )
-        .unwrap();
+        {
+            let (m, r) = run_to_files(
+                &mut run1,
+                SinkConfig {
+                    export_name: "t".into(),
+                    run_id: "t_cdc_20260702T100000000".into(),
+                    ..cfg(dest.as_ref(), &cols, FormatType::Csv, 10)
+                },
+            );
+            r.unwrap();
+            m
+        };
 
         // Cycle 2 (a later scheduler tick, distinct run id) captures change 3.
         let mut run2 = FakeStream {
             events: VecDeque::from(vec![insert(3)]),
             acked: Vec::new(),
         };
-        run_to_files(
-            &mut run2,
-            SinkConfig {
-                run_id: "t_cdc_20260702T100500000".into(),
-                ..cfg(dest.as_ref(), &cols, FormatType::Csv, 10)
-            },
-        )
-        .unwrap();
+        {
+            let (m, r) = run_to_files(
+                &mut run2,
+                SinkConfig {
+                    export_name: "t".into(),
+                    run_id: "t_cdc_20260702T100500000".into(),
+                    ..cfg(dest.as_ref(), &cols, FormatType::Csv, 10)
+                },
+            );
+            r.unwrap();
+            m
+        };
 
         // The union of both cycles must be readable from the prefix: 3 data rows.
         let mut data_rows = 0usize;
@@ -1175,27 +1754,35 @@ mod tests {
             events: VecDeque::from(vec![insert(1), insert(2)]),
             acked: Vec::new(),
         };
-        run_to_files(
-            &mut run1,
-            SinkConfig {
-                run_id: "t_cdc_20260702T100000000".into(),
-                ..cfg(dest.as_ref(), &cols, FormatType::Csv, 10)
-            },
-        )
-        .unwrap();
+        {
+            let (m, r) = run_to_files(
+                &mut run1,
+                SinkConfig {
+                    export_name: "t".into(),
+                    run_id: "t_cdc_20260702T100000000".into(),
+                    ..cfg(dest.as_ref(), &cols, FormatType::Csv, 10)
+                },
+            );
+            r.unwrap();
+            m
+        };
 
         let mut run2 = FakeStream {
             events: VecDeque::from(vec![insert(3)]),
             acked: Vec::new(),
         };
-        run_to_files(
-            &mut run2,
-            SinkConfig {
-                run_id: "t_cdc_20260702T100500000".into(),
-                ..cfg(dest.as_ref(), &cols, FormatType::Csv, 10)
-            },
-        )
-        .unwrap();
+        {
+            let (m, r) = run_to_files(
+                &mut run2,
+                SinkConfig {
+                    export_name: "t".into(),
+                    run_id: "t_cdc_20260702T100500000".into(),
+                    ..cfg(dest.as_ref(), &cols, FormatType::Csv, 10)
+                },
+            );
+            r.unwrap();
+            m
+        };
 
         let run_unique: Vec<String> = std::fs::read_dir(dir.path())
             .unwrap()
@@ -1266,6 +1853,7 @@ mod tests {
         rollover: usize,
     ) -> SinkConfig<'a> {
         SinkConfig {
+            export_name: "t".into(),
             outputs: vec![TableOutput {
                 table: "t".into(),
                 columns: cols.to_vec(),
@@ -1281,7 +1869,128 @@ mod tests {
             rollover_memory_bytes: None,
             started_at: "2026-06-23T00:00:00Z".into(),
             run_id: "r".into(),
+            // The unit sinks write to a tempdir with no database behind them.
+            state: None,
         }
+    }
+
+    /// `max_events` must be a SOFT cap that lands on a commit boundary — the same
+    /// treatment `should_roll` gives every other budget. The hard break sat inside
+    /// the per-event loop with no boundary condition, so a transaction larger than
+    /// the cap (or one straddling it with no earlier commit in the pass) was cut
+    /// mid-flight: the partial transaction flushed as a real part — violating
+    /// `roll_all`'s own "never split a transaction across parts" doc — and the
+    /// end-of-pass roll skipped checkpoint AND ack (no commit boundary seen), so
+    /// the next run resumed at the same transaction, re-read it, wrote another
+    /// run-uniquely-named part, and reported success. Every cycle. On PostgreSQL
+    /// the self-rescue is disabled too (`release_empty_frontier` bails once data
+    /// was yielded), so the slot pins WAL until the disk fills.
+    ///
+    /// Fixture note: FIVE events, ONE transaction (committed only on the last),
+    /// cap = 3 — past the activation threshold on both counts (a cap the fixture
+    /// never reaches, or a fixture of single-event transactions, cannot express
+    /// the defect: with per-event commits the cap always lands on a boundary).
+    /// The hole the first soft-cap placement left: the cap check sat in the
+    /// ROUTED section, but a commit boundary can land on an UNCAPTURED table
+    /// (the exact stream shape `commit_boundary_on_an_uncaptured_table_still_
+    /// advances_the_checkpoint` exists for) — and the routing `continue` skipped
+    /// the check entirely. A stream of transactions committing on uncaptured
+    /// tables then NEVER fires the cap: unbounded overshoot, the opposite
+    /// failure of the hard cut the soft cap replaced. Found by the focused hunt
+    /// over the fix branch, before merge.
+    #[test]
+    fn max_events_fires_at_a_commit_boundary_on_an_uncaptured_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = local_dest(&dir);
+        let cols = int_col();
+        let ckpt = dir.path().join("ckpt");
+
+        // Tx1: three captured uncommitted rows, boundary on an UNCAPTURED table.
+        let mut events: VecDeque<ChangeEvent> = (1..=3)
+            .map(|id| ChangeEvent {
+                committed: false,
+                ..insert(id)
+            })
+            .collect();
+        events.push_back(ChangeEvent {
+            table: "other".into(),
+            ..insert(4)
+        });
+        // Tx2: two more captured rows the cap must NOT reach.
+        events.push_back(ChangeEvent {
+            committed: false,
+            ..insert(5)
+        });
+        events.push_back(insert(6));
+        let mut stream = FakeStream {
+            events,
+            acked: Vec::new(),
+        };
+
+        let mut c = cfg(dest.as_ref(), &cols, FormatType::Parquet, 100);
+        c.max_events = Some(3);
+        c.checkpoint = Some(ckpt);
+        let manifests = {
+            let (mm, r) = run_to_files(&mut stream, c);
+            r.expect("run");
+            mm
+        };
+
+        let rows: i64 = manifests.iter().map(|m| m.row_count).sum();
+        assert_eq!(
+            rows, 3,
+            "the cap must fire at the uncaptured-table boundary after 3 routed \
+             events — capturing tx2 means the cap is dead on this stream shape"
+        );
+    }
+
+    #[test]
+    fn max_events_stops_at_a_commit_boundary_never_inside_a_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = local_dest(&dir);
+        let cols = int_col();
+        let ckpt = dir.path().join("ckpt");
+
+        let mut events: VecDeque<ChangeEvent> = (1..=4)
+            .map(|id| ChangeEvent {
+                committed: false,
+                ..insert(id)
+            })
+            .collect();
+        events.push_back(insert(5)); // the commit boundary
+        let mut stream = FakeStream {
+            events,
+            acked: Vec::new(),
+        };
+
+        let mut c = cfg(dest.as_ref(), &cols, FormatType::Parquet, 100);
+        c.max_events = Some(3);
+        c.checkpoint = Some(ckpt.clone());
+        let manifests = {
+            let (mm, r) = run_to_files(&mut stream, c);
+            r.expect("run");
+            mm
+        };
+
+        // The whole 5-row transaction is durable — the cap deferred to the
+        // boundary instead of cutting after event 3…
+        let rows: i64 = manifests.iter().map(|m| m.row_count).sum();
+        assert_eq!(
+            rows, 5,
+            "the cap must include the whole transaction, not cut it at 3"
+        );
+        // …and the durable sequence RAN: the boundary was acked and the
+        // checkpoint written, so the next run does NOT re-read this transaction.
+        assert_eq!(
+            stream.acked.len(),
+            1,
+            "the commit boundary must be acked exactly once"
+        );
+        assert!(
+            ckpt.exists(),
+            "the checkpoint must be written — without it every later run re-reads \
+             and re-writes this same transaction forever"
+        );
     }
 
     #[test]
@@ -1303,11 +2012,14 @@ mod tests {
             events,
             acked: Vec::new(),
         };
-        let manifest = &run_to_files(
-            &mut stream,
-            cfg(dest.as_ref(), &cols, FormatType::Parquet, 2),
-        )
-        .unwrap()[0];
+        let manifest = &{
+            let (m, r) = run_to_files(
+                &mut stream,
+                cfg(dest.as_ref(), &cols, FormatType::Parquet, 2),
+            );
+            r.unwrap();
+            m
+        }[0];
         assert_eq!(
             manifest.part_count, 1,
             "the 5-row transaction must not split at rollover=2"
@@ -1337,7 +2049,11 @@ mod tests {
             events: VecDeque::from(vec![del]),
             acked: Vec::new(),
         };
-        run_to_files(&mut stream, cfg(dest.as_ref(), &cols, FormatType::Csv, 10)).unwrap();
+        {
+            let (m, r) = run_to_files(&mut stream, cfg(dest.as_ref(), &cols, FormatType::Csv, 10));
+            r.unwrap();
+            m
+        };
         let csv = std::fs::read_to_string(dir.path().join("cdc-r-000000.csv")).unwrap();
         assert!(csv.contains("delete"), "row marked __op=delete:\n{csv}");
         assert!(
@@ -1355,8 +2071,11 @@ mod tests {
             events: VecDeque::from(vec![insert(10), insert(20)]),
             acked: Vec::new(),
         };
-        let manifest =
-            &run_to_files(&mut stream, cfg(dest.as_ref(), &cols, FormatType::Csv, 10)).unwrap()[0];
+        let manifest = &{
+            let (m, r) = run_to_files(&mut stream, cfg(dest.as_ref(), &cols, FormatType::Csv, 10));
+            r.unwrap();
+            m
+        }[0];
         assert_eq!(manifest.row_count, 2);
         let csv = std::fs::read_to_string(dir.path().join("cdc-r-000000.csv")).unwrap();
         let lines: Vec<&str> = csv.lines().collect();
@@ -1380,11 +2099,14 @@ mod tests {
             events: VecDeque::new(),
             acked: Vec::new(),
         };
-        let manifest = &run_to_files(
-            &mut stream,
-            cfg(dest.as_ref(), &cols, FormatType::Parquet, 10),
-        )
-        .unwrap()[0];
+        let manifest = &{
+            let (m, r) = run_to_files(
+                &mut stream,
+                cfg(dest.as_ref(), &cols, FormatType::Parquet, 10),
+            );
+            r.unwrap();
+            m
+        }[0];
         assert_eq!(manifest.row_count, 0);
         assert_eq!(manifest.part_count, 0);
         assert!(
@@ -1411,7 +2133,11 @@ mod tests {
         };
         // cfg() wires an output for table "t" only — routing IS the filter.
         let c = cfg(dest.as_ref(), &cols, FormatType::Parquet, 10);
-        let manifest = &run_to_files(&mut stream, c).unwrap()[0];
+        let manifest = &{
+            let (m, r) = run_to_files(&mut stream, c);
+            r.unwrap();
+            m
+        }[0];
         assert_eq!(
             manifest.row_count, 2,
             "only the two 't' changes are kept; 'other' is filtered out"
@@ -1436,6 +2162,7 @@ mod tests {
         rollover: usize,
     ) -> SinkConfig<'a> {
         SinkConfig {
+            export_name: "t".into(),
             outputs: vec![
                 TableOutput {
                     table: "a".into(),
@@ -1460,6 +2187,8 @@ mod tests {
             rollover_memory_bytes: None,
             started_at: "2026-06-23T00:00:00Z".into(),
             run_id: "r".into(),
+            // The unit sinks write to a tempdir with no database behind them.
+            state: None,
         }
     }
 
@@ -1479,17 +2208,20 @@ mod tests {
             ]),
             acked: Vec::new(),
         };
-        let manifests = run_to_files(
-            &mut stream,
-            two_outputs(
-                dest_a.as_ref(),
-                dest_b.as_ref(),
-                &cols,
-                FormatType::Csv,
-                100,
-            ),
-        )
-        .unwrap();
+        let manifests = {
+            let (m, r) = run_to_files(
+                &mut stream,
+                two_outputs(
+                    dest_a.as_ref(),
+                    dest_b.as_ref(),
+                    &cols,
+                    FormatType::Csv,
+                    100,
+                ),
+            );
+            r.unwrap();
+            m
+        };
 
         assert_eq!(manifests.len(), 2, "one manifest per table");
         assert_eq!(manifests[0].export_name, "a");
@@ -1523,11 +2255,14 @@ mod tests {
             ]),
             acked: Vec::new(),
         };
-        let manifests = run_to_files(
-            &mut stream,
-            two_outputs(dest_a.as_ref(), dest_b.as_ref(), &cols, FormatType::Csv, 3),
-        )
-        .unwrap();
+        let manifests = {
+            let (m, r) = run_to_files(
+                &mut stream,
+                two_outputs(dest_a.as_ref(), dest_b.as_ref(), &cols, FormatType::Csv, 3),
+            );
+            r.unwrap();
+            m
+        };
 
         assert_eq!(manifests[0].row_count, 2, "table a: both rows in its part");
         assert_eq!(
@@ -1558,17 +2293,20 @@ mod tests {
             ]),
             acked: Vec::new(),
         };
-        let manifests = run_to_files(
-            &mut stream,
-            two_outputs(
-                dest_a.as_ref(),
-                dest_b.as_ref(),
-                &cols,
-                FormatType::Csv,
-                100,
-            ),
-        )
-        .unwrap();
+        let manifests = {
+            let (m, r) = run_to_files(
+                &mut stream,
+                two_outputs(
+                    dest_a.as_ref(),
+                    dest_b.as_ref(),
+                    &cols,
+                    FormatType::Csv,
+                    100,
+                ),
+            );
+            r.unwrap();
+            m
+        };
 
         assert_eq!(manifests[0].row_count, 1);
         assert_eq!(manifests[1].row_count, 1, "the tail is still made durable");
@@ -1621,7 +2359,7 @@ mod tests {
         let res = run_to_files(&mut stream, c);
 
         assert!(
-            res.is_err(),
+            res.1.is_err(),
             "a destination write failure must fail the run"
         );
         assert!(

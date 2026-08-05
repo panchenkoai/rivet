@@ -73,6 +73,52 @@ test-live: sweep-test-db
 # the 1M-row `max_pressure` test stays manual (override SEED_ARGS to change).
 SEED_ARGS ?= --users 1000 --orders-per-user 5 --events-per-user 5 --page-views 5000 --content-items 60000
 
+# ── Release-size fixture ────────────────────────────────────────────────────
+# The PRE-RELEASE size. `live_content_load::pg_full_content_export_max_pressure`
+# asserts `content_items >= 1_000_000` and FAILS — it does not skip — below that,
+# so `cargo test --release -- --ignored` (release-checklist §2) cannot pass on a
+# standard-seeded stand. That is a gate that reports red for a fixture reason,
+# which is exactly the noise a go/no-go check must not produce.
+#
+# Fixed in the SEED rather than in the test, because the seed is the canonical
+# generator and the DEFAULT profile is deterministic by construction: `fast`
+# generates every row SQL-side from a series (`generate_series` / a chunked
+# range), and `fast.rs` + `mssql.rs` contain ZERO `rand::rng()` calls. The same
+# command therefore yields byte-identical fixtures on PostgreSQL, MySQL and SQL
+# Server, which is what makes a cross-engine comparison meaningful.
+#
+# The claim is now TRUE and measured; it was not before, in two layers. The
+# comment said "no RNG anywhere in `src/bin/seed/`" — false, `copy_pg.rs` and
+# `insert.rs` call `rand::rng()` in ten places (those are the `realistic` /
+# `insert` profiles, which remain non-deterministic BY DESIGN and must never be
+# used for a cross-engine comparison). Correcting only that would still have
+# left the sentence wrong, because `fast.rs` called SQL-side `random()` five
+# times: postgres drew `balance` / `is_active` / `bio` and two page_views
+# columns at random, so the DEFAULT profile was not reproducible even run to
+# run. Worse, the two engines that WERE deterministic disagreed: MySQL wrote
+# `bio` when `i %% 3 = 0` and SQL Server when `i %% 3 <> 0` — inverted, and the
+# same inversion on `page_views.user_id`.
+#
+# All five sites now use SQL Server's index-derived formulas, which had no
+# randomness to begin with. Verified engine-neutrally: exporting `users` from
+# each engine and hashing the parquet through DuckDB yields one digest,
+# 4b7ee9027565608f23ca39aae2d10f23, on all three. A hash computed with each
+# engine's OWN string concatenation does NOT agree — that is type rendering,
+# not data, and it is why the check has to go through a neutral reader.
+#
+# NOT the default: 1M content_items is ~17x the standard 60k (~1 min), and the
+# everyday `make seed-db` should stay fast. Run this before the release matrix.
+RELEASE_SEED_ARGS ?= --users 1000 --orders-per-user 5 --events-per-user 5 --page-views 5000 --content-items 1000000
+
+# `--target all` covers postgres + mysql + sqlserver in ONE invocation. It used
+# to be two calls naming postgres and mysql, which silently left SQL Server on
+# whatever an earlier run had put there — and a stand where the engines hold
+# DIFFERENT row counts makes every cross-engine comparison meaningless, which is
+# the one thing this fixture exists to enable. Measured 2026-08-04, before the
+# fix: postgres 1000/5000/1000521, mysql 1000/5000/1000000, mssql 150000/500/150000.
+seed-release: seed-build
+	RIVET_SEED_I_KNOW=1 target/debug/seed --target all $(RELEASE_SEED_ARGS)
+
 seed-build:
 	cargo build --bin seed --features dev-seed
 

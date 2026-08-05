@@ -21,10 +21,7 @@ fn init_pg_schema_wide_discovers_seeded_table() {
 
     let table = seed_pg_numeric_table(10);
 
-    let out = std::process::Command::new(RIVET_BIN)
-        .args(["init", "--source", POSTGRES_URL])
-        .output()
-        .expect("spawn rivet init");
+    let out = run_rivet(&["init", "--source", POSTGRES_URL]);
 
     assert!(
         out.status.success(),
@@ -85,10 +82,7 @@ fn init_pg_single_table_emits_valid_config_that_passes_check() {
     let cfg_dir = tempfile::tempdir().unwrap();
 
     // ── Step 1: rivet init --table <seeded_table> ──────────────────────────
-    let out = std::process::Command::new(RIVET_BIN)
-        .args(["init", "--source", POSTGRES_URL, "--table", table.name()])
-        .output()
-        .expect("spawn rivet init");
+    let out = run_rivet(&["init", "--source", POSTGRES_URL, "--table", table.name()]);
 
     assert!(
         out.status.success(),
@@ -120,10 +114,7 @@ fn init_pg_single_table_emits_valid_config_that_passes_check() {
     std::fs::write(&cfg_path, &yaml_with_url).expect("write patched config");
 
     // ── Step 3: rivet check against the emitted YAML ───────────────────────
-    let check = std::process::Command::new(RIVET_BIN)
-        .args(["check", "--config", cfg_path.to_str().unwrap()])
-        .output()
-        .expect("spawn rivet check");
+    let check = run_rivet(&["check", "--config", cfg_path.to_str().unwrap()]);
 
     assert!(
         check.status.success(),
@@ -144,18 +135,15 @@ fn init_pg_out_flag_writes_file_and_nothing_to_stdout() {
     let out_dir = tempfile::tempdir().unwrap();
     let yaml_path = out_dir.path().join("scaffold.yaml");
 
-    let out = std::process::Command::new(RIVET_BIN)
-        .args([
-            "init",
-            "--source",
-            POSTGRES_URL,
-            "--table",
-            table.name(),
-            "--output",
-            yaml_path.to_str().unwrap(),
-        ])
-        .output()
-        .expect("spawn rivet init --out");
+    let out = run_rivet(&[
+        "init",
+        "--source",
+        POSTGRES_URL,
+        "--table",
+        table.name(),
+        "--output",
+        yaml_path.to_str().unwrap(),
+    ]);
 
     assert!(
         out.status.success(),
@@ -200,10 +188,7 @@ fn init_mysql_schema_wide_discovers_seeded_table() {
 
     let table = seed_mysql_numeric_table(10);
 
-    let out = std::process::Command::new(RIVET_BIN)
-        .args(["init", "--source", MYSQL_URL])
-        .output()
-        .expect("spawn rivet init mysql");
+    let out = run_rivet(&["init", "--source", MYSQL_URL]);
 
     assert!(
         out.status.success(),
@@ -233,14 +218,11 @@ fn init_unreachable_url_exits_nonzero_with_actionable_message() {
     // nowhere to test the error path.
     require_alive(LiveService::Postgres);
 
-    let out = std::process::Command::new(RIVET_BIN)
-        .args([
-            "init",
-            "--source",
-            "postgresql://bad:bad@127.0.0.1:19999/bad",
-        ])
-        .output()
-        .expect("spawn rivet init with bad url");
+    let out = run_rivet(&[
+        "init",
+        "--source",
+        "postgresql://bad:bad@127.0.0.1:19999/bad",
+    ]);
 
     assert!(
         !out.status.success(),

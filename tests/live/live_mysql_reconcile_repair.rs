@@ -23,60 +23,27 @@ use crate::common::*;
 
 /// Seed a row_count-row MySQL table, write a chunked config with checkpoint,
 /// run the export, then return the config path (plus the table RAII guard).
-fn seed_and_run_chunked(
-    row_count: i64,
-    chunk_size: u32,
-) -> (
-    MysqlTable,
-    tempfile::TempDir,
-    tempfile::TempDir,
-    std::path::PathBuf,
-) {
+fn seed_and_run_chunked(row_count: i64, chunk_size: u32) -> (MysqlTable, Rig) {
     let table = seed_mysql_numeric_table(row_count);
-    let out_dir = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
+    // The rig owns its config and destination dirs, so the two TempDirs this
+    // helper returned purely to keep alive are gone with the tuple.
+    let rig = Rig::mysql_batch(table.name())
+        .query(&format!("SELECT id, name FROM {}", table.name()))
+        .mode("chunked")
+        .export_line("chunk_column: id")
+        // Braces here were INTERPOLATION in the old format!; emitting them as a
+        // plain literal makes the YAML invalid — the trap that broke two MySQL
+        // chunked tests silently.
+        .export_line(&format!("chunk_size: {chunk_size}"))
+        .export_line("chunk_checkpoint: true");
 
-    let yaml = format!(
-        r#"
-source:
-  type: mysql
-  url: "{MYSQL_URL}"
-
-exports:
-  - name: {name}
-    query: "SELECT id, name FROM {name}"
-    mode: chunked
-    chunk_column: id
-    chunk_size: {chunk_size}
-    chunk_checkpoint: true
-    format: parquet
-    destination:
-      type: local
-      path: {out}
-"#,
-        name = table.name(),
-        out = out_dir.path().display()
-    );
-
-    let cfg = write_config(&cfg_dir, &yaml);
-
-    let run_out = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            table.name(),
-        ])
-        .output()
-        .expect("spawn rivet run (setup)");
+    let run_out = rig.run_args(&["--export", table.name()]);
     assert!(
         run_out.status.success(),
-        "setup mysql export must succeed; stderr:\n{}",
+        "setup export must succeed; stderr:\n{}",
         String::from_utf8_lossy(&run_out.stderr)
     );
-
-    (table, out_dir, cfg_dir, cfg)
+    (table, rig)
 }
 
 // ─── RR1: reconcile pretty — all partitions match ────────────────────────────
@@ -86,18 +53,9 @@ exports:
 fn mysql_reconcile_all_match_exits_zero_with_pretty_output() {
     require_alive(LiveService::Mysql);
 
-    let (table, out, _cfg_dir, cfg) = seed_and_run_chunked(100, 50);
+    let (table, rig) = seed_and_run_chunked(100, 50);
 
-    let result = std::process::Command::new(RIVET_BIN)
-        .args([
-            "reconcile",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            table.name(),
-        ])
-        .output()
-        .expect("spawn rivet reconcile");
+    let result = rig.cli(&["reconcile", "--export", table.name()]);
 
     assert!(
         result.status.success(),
@@ -118,7 +76,7 @@ fn mysql_reconcile_all_match_exits_zero_with_pretty_output() {
     // chain. Re-read the destination parquet and count physically (matrix
     // audit: self-oracle class) — the verdict and the physical rows must agree.
     assert_eq!(
-        total_parquet_rows(out.path()),
+        total_parquet_rows(&rig.out_dir()),
         100,
         "destination parquet must physically hold every source row, independent of the reconcile verdict"
     );
@@ -131,20 +89,9 @@ fn mysql_reconcile_all_match_exits_zero_with_pretty_output() {
 fn mysql_reconcile_format_json_emits_valid_json_report() {
     require_alive(LiveService::Mysql);
 
-    let (table, _out, _cfg_dir, cfg) = seed_and_run_chunked(100, 50);
+    let (table, rig) = seed_and_run_chunked(100, 50);
 
-    let result = std::process::Command::new(RIVET_BIN)
-        .args([
-            "reconcile",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            table.name(),
-            "--format",
-            "json",
-        ])
-        .output()
-        .expect("spawn rivet reconcile --format json");
+    let result = rig.cli(&["reconcile", "--export", table.name(), "--format", "json"]);
 
     assert!(
         result.status.success(),
@@ -188,23 +135,19 @@ fn mysql_reconcile_format_json_emits_valid_json_report() {
 fn mysql_reconcile_format_json_output_flag_writes_report_to_file() {
     require_alive(LiveService::Mysql);
 
-    let (table, _out, cfg_dir, cfg) = seed_and_run_chunked(100, 50);
-    let report_path = cfg_dir.path().join("reconcile_report.json");
+    let (table, rig) = seed_and_run_chunked(100, 50);
+    let report_dir = tempfile::tempdir().unwrap();
+    let report_path = report_dir.path().join("reconcile_report.json");
 
-    let result = std::process::Command::new(RIVET_BIN)
-        .args([
-            "reconcile",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            table.name(),
-            "--format",
-            "json",
-            "--output",
-            report_path.to_str().unwrap(),
-        ])
-        .output()
-        .expect("spawn rivet reconcile --format json --output");
+    let result = rig.cli(&[
+        "reconcile",
+        "--export",
+        table.name(),
+        "--format",
+        "json",
+        "--output",
+        report_path.to_str().unwrap(),
+    ]);
 
     assert!(
         result.status.success(),
@@ -232,23 +175,19 @@ fn mysql_reconcile_format_json_output_flag_writes_report_to_file() {
 fn mysql_repair_report_flag_uses_precomputed_reconcile_json() {
     require_alive(LiveService::Mysql);
 
-    let (table, _out, cfg_dir, cfg) = seed_and_run_chunked(100, 50);
-    let reconcile_path = cfg_dir.path().join("reconcile.json");
+    let (table, rig) = seed_and_run_chunked(100, 50);
+    let report_dir = tempfile::tempdir().unwrap();
+    let reconcile_path = report_dir.path().join("reconcile.json");
 
-    let rec_out = std::process::Command::new(RIVET_BIN)
-        .args([
-            "reconcile",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            table.name(),
-            "--format",
-            "json",
-            "--output",
-            reconcile_path.to_str().unwrap(),
-        ])
-        .output()
-        .expect("spawn rivet reconcile --format json --output");
+    let rec_out = rig.cli(&[
+        "reconcile",
+        "--export",
+        table.name(),
+        "--format",
+        "json",
+        "--output",
+        reconcile_path.to_str().unwrap(),
+    ]);
 
     assert!(
         rec_out.status.success(),
@@ -260,18 +199,13 @@ fn mysql_repair_report_flag_uses_precomputed_reconcile_json() {
         "reconcile must write the report file"
     );
 
-    let repair_out = std::process::Command::new(RIVET_BIN)
-        .args([
-            "repair",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            table.name(),
-            "--report",
-            reconcile_path.to_str().unwrap(),
-        ])
-        .output()
-        .expect("spawn rivet repair --report");
+    let repair_out = rig.cli(&[
+        "repair",
+        "--export",
+        table.name(),
+        "--report",
+        reconcile_path.to_str().unwrap(),
+    ]);
 
     assert!(
         repair_out.status.success(),
@@ -293,18 +227,9 @@ fn mysql_repair_report_flag_uses_precomputed_reconcile_json() {
 fn mysql_repair_dryrun_exits_zero_when_nothing_to_repair() {
     require_alive(LiveService::Mysql);
 
-    let (table, _out, _cfg_dir, cfg) = seed_and_run_chunked(100, 50);
+    let (table, rig) = seed_and_run_chunked(100, 50);
 
-    let result = std::process::Command::new(RIVET_BIN)
-        .args([
-            "repair",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            table.name(),
-        ])
-        .output()
-        .expect("spawn rivet repair (dry-run)");
+    let result = rig.cli(&["repair", "--export", table.name()]);
 
     assert!(
         result.status.success(),
@@ -326,19 +251,9 @@ fn mysql_repair_dryrun_exits_zero_when_nothing_to_repair() {
 fn mysql_repair_execute_flag_exits_zero_when_nothing_to_repair() {
     require_alive(LiveService::Mysql);
 
-    let (table, _out, _cfg_dir, cfg) = seed_and_run_chunked(100, 50);
+    let (table, rig) = seed_and_run_chunked(100, 50);
 
-    let result = std::process::Command::new(RIVET_BIN)
-        .args([
-            "repair",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            table.name(),
-            "--execute",
-        ])
-        .output()
-        .expect("spawn rivet repair --execute");
+    let result = rig.cli(&["repair", "--export", table.name(), "--execute"]);
 
     assert!(
         result.status.success(),
@@ -354,20 +269,9 @@ fn mysql_repair_execute_flag_exits_zero_when_nothing_to_repair() {
 fn mysql_repair_format_json_emits_valid_json_plan() {
     require_alive(LiveService::Mysql);
 
-    let (table, _out, _cfg_dir, cfg) = seed_and_run_chunked(100, 50);
+    let (table, rig) = seed_and_run_chunked(100, 50);
 
-    let result = std::process::Command::new(RIVET_BIN)
-        .args([
-            "repair",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            table.name(),
-            "--format",
-            "json",
-        ])
-        .output()
-        .expect("spawn rivet repair --format json");
+    let result = rig.cli(&["repair", "--export", table.name(), "--format", "json"]);
 
     assert!(
         result.status.success(),

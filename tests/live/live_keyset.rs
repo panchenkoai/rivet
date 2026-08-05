@@ -70,6 +70,13 @@ fn read_uid_set(dir: &std::path::Path) -> (usize, BTreeSet<String>) {
 #[test]
 #[ignore = "live: requires docker compose postgres"]
 fn keyset_export_records_form_b_checksums_and_validate_passes() {
+    // chunk_size 1000 over 2000 rows, NOT 500: each part must span MORE THAN ONE
+    // read batch (PROBE_BATCH_SIZE = 500). At one batch per part the write-side
+    // fold is applied exactly once from zero, so `0 ^ s` and `0 + s` are equal and
+    // the test cannot tell the two folds apart. Every Form B fixture here used
+    // 500 and all of them stayed green through a fold change that broke the
+    // write/read agreement for every export past 500 rows — measured: 500 rows
+    // exit 0, 501 exit 3.
     require_alive(LiveService::Postgres);
     let table = unique_name("keyset_formb");
     let mut c = pg_connect();
@@ -80,18 +87,14 @@ fn keyset_export_records_form_b_checksums_and_validate_passes() {
     ))
     .unwrap();
     let _guard = PgTable::adopt(table.clone());
-
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let out_dir = tempfile::tempdir().unwrap();
     let export = unique_name("keyset_formb_exp");
     // TEXT key + chunk_by_key → keyset, chunk_size 500 → 4 pages (cross-page XOR).
-    let yaml = format!(
-        "source: {{type: postgres, url: \"{POSTGRES_URL}\"}}\nexports:\n  - name: {export}\n    \
-         table: {table}\n    mode: chunked\n    chunk_by_key: k\n    chunk_size: 500\n    \
-         format: parquet\n    destination: {{type: local, path: {out}}}\n",
-        out = out_dir.path().display(),
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
+    let rig = Rig::pg_batch(&table)
+        .export_named(&export)
+        .mode("chunked")
+        .export_line("chunk_by_key: k")
+        .export_line("chunk_size: 1000");
+    let cfg = rig.config_path();
     let r = run_rivet_export(&cfg, &export);
     assert!(
         r.status.success(),
@@ -101,7 +104,7 @@ fn keyset_export_records_form_b_checksums_and_validate_passes() {
 
     // (1) The manifest records Form B checksums (RED before the harvest — empty).
     let manifest: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(out_dir.path().join("manifest.json")).expect("manifest.json"),
+        &std::fs::read_to_string(rig.out_dir().join("manifest.json")).expect("manifest.json"),
     )
     .expect("parse manifest");
     let checksums = manifest["column_checksums"].as_array();
@@ -152,17 +155,13 @@ fn keyset_export_persists_v18_forensics_columns() {
     ))
     .unwrap();
     let _guard = PgTable::adopt(table.clone());
-
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let out_dir = tempfile::tempdir().unwrap();
     let export = unique_name("keyset_forensics_exp");
-    let yaml = format!(
-        "source: {{type: postgres, url: \"{POSTGRES_URL}\"}}\nexports:\n  - name: {export}\n    \
-         table: {table}\n    mode: chunked\n    chunk_by_key: id\n    chunk_size: 500\n    \
-         format: parquet\n    destination: {{type: local, path: {out}}}\n",
-        out = out_dir.path().display(),
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
+    let rig = Rig::pg_batch(&table)
+        .export_named(&export)
+        .mode("chunked")
+        .export_line("chunk_by_key: id")
+        .export_line("chunk_size: 1000");
+    let cfg = rig.config_path();
     let r = run_rivet_export(&cfg, &export);
     assert!(
         r.status.success(),
@@ -247,23 +246,20 @@ fn keyset_export_refuses_to_clobber_a_cdc_manifest() {
     ))
     .unwrap();
     let _guard = PgTable::adopt(table.clone());
-
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let out_dir = tempfile::tempdir().unwrap();
-    // A prior CDC run's manifest already sits at the destination prefix.
+    let export = unique_name("keyset_guard_exp");
+    let rig = Rig::pg_batch(&table)
+        .export_named(&export)
+        .mode("chunked")
+        .export_line("chunk_by_key: k")
+        .export_line("chunk_size: 50");
+    let cfg = rig.config_path();
+    // A prior CDC run's manifest already sits at the destination prefix. Written
+    // AFTER config_path(), which is what materialises the destination dir.
     std::fs::write(
-        out_dir.path().join("manifest.json"),
+        rig.out_dir().join("manifest.json"),
         br#"{"manifest_version":1,"run_id":"prior-cdc","mode":"cdc","parts":[]}"#,
     )
     .unwrap();
-    let export = unique_name("keyset_guard_exp");
-    let yaml = format!(
-        "source: {{type: postgres, url: \"{POSTGRES_URL}\"}}\nexports:\n  - name: {export}\n    \
-         table: {table}\n    mode: chunked\n    chunk_by_key: k\n    chunk_size: 50\n    \
-         format: parquet\n    destination: {{type: local, path: {out}}}\n",
-        out = out_dir.path().display(),
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
     let r = run_rivet_export(&cfg, &export);
     assert!(
         !r.status.success(),
@@ -295,18 +291,14 @@ fn chunked_export_records_form_b_checksums_and_validate_passes() {
     ))
     .unwrap();
     let _guard = PgTable::adopt(table.clone());
-
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let out_dir = tempfile::tempdir().unwrap();
     let export = unique_name("chunked_formb_exp");
     // Integer chunk_column → range chunking (the chunked runner), chunk_size 500.
-    let yaml = format!(
-        "source: {{type: postgres, url: \"{POSTGRES_URL}\"}}\nexports:\n  - name: {export}\n    \
-         table: {table}\n    mode: chunked\n    chunk_column: id\n    chunk_size: 500\n    \
-         format: parquet\n    destination: {{type: local, path: {out}}}\n",
-        out = out_dir.path().display(),
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
+    let rig = Rig::pg_batch(&table)
+        .export_named(&export)
+        .mode("chunked")
+        .export_line("chunk_column: id")
+        .export_line("chunk_size: 1000");
+    let cfg = rig.config_path();
     let r = run_rivet_export(&cfg, &export);
     assert!(
         r.status.success(),
@@ -315,7 +307,7 @@ fn chunked_export_records_form_b_checksums_and_validate_passes() {
     );
 
     let manifest: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(out_dir.path().join("manifest.json")).expect("manifest.json"),
+        &std::fs::read_to_string(rig.out_dir().join("manifest.json")).expect("manifest.json"),
     )
     .expect("parse manifest");
     assert!(
@@ -361,18 +353,15 @@ fn chunked_checkpoint_export_records_form_b_checksums_and_validate_passes() {
     ))
     .unwrap();
     let _guard = PgTable::adopt(table.clone());
-
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let out_dir = tempfile::tempdir().unwrap();
     let export = unique_name("ckpt_formb_exp");
     // chunk_checkpoint: true routes to the CHECKPOINT runner (not exec.rs).
-    let yaml = format!(
-        "source: {{type: postgres, url: \"{POSTGRES_URL}\"}}\nexports:\n  - name: {export}\n    \
-         table: {table}\n    mode: chunked\n    chunk_column: id\n    chunk_size: 500\n    \
-         chunk_checkpoint: true\n    format: parquet\n    destination: {{type: local, path: {out}}}\n",
-        out = out_dir.path().display(),
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
+    let rig = Rig::pg_batch(&table)
+        .export_named(&export)
+        .mode("chunked")
+        .export_line("chunk_column: id")
+        .export_line("chunk_size: 1000")
+        .export_line("chunk_checkpoint: true");
+    let cfg = rig.config_path();
     let r = run_rivet_export(&cfg, &export);
     assert!(
         r.status.success(),
@@ -381,7 +370,7 @@ fn chunked_checkpoint_export_records_form_b_checksums_and_validate_passes() {
     );
 
     let manifest: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(out_dir.path().join("manifest.json")).expect("manifest.json"),
+        &std::fs::read_to_string(rig.out_dir().join("manifest.json")).expect("manifest.json"),
     )
     .expect("parse manifest");
     assert!(
@@ -442,15 +431,12 @@ fn keyset_varchar_pk_roundtrips_full_keyset_across_pages() {
     // Chunked mode, no chunk_column / chunk_by_key → auto-keyset on the unique
     // varchar PK. chunk_size 500 → 6 pages, so page boundaries are exercised.
     let export = unique_name("keyset_rt_exp");
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let out_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        "source:\n  type: mysql\n  url: \"{MYSQL_URL}\"\nexports:\n  - name: {export}\n    \
-         table: {table}\n    mode: chunked\n    chunk_size: 500\n    format: parquet\n    \
-         compression: zstd\n    destination:\n      type: local\n      path: {out}\n",
-        out = out_dir.path().display(),
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
+    let rig = Rig::mysql_batch(&table)
+        .export_named(&export)
+        .mode("chunked")
+        .export_line("chunk_size: 1000")
+        .export_line("compression: zstd");
+    let cfg = rig.config_path();
     let out = run_rivet_export(&cfg, &export);
     assert!(
         out.status.success(),
@@ -459,7 +445,7 @@ fn keyset_varchar_pk_roundtrips_full_keyset_across_pages() {
     );
 
     // Multiple page files (one per keyset page).
-    let files = files_with_extension(out_dir.path(), "parquet");
+    let files = files_with_extension(&rig.out_dir(), "parquet");
     assert!(
         files.len() >= 2,
         "expected multiple keyset page files for {N} rows at chunk_size 500, got {}",
@@ -468,7 +454,7 @@ fn keyset_varchar_pk_roundtrips_full_keyset_across_pages() {
 
     // The union of all pages must reproduce the source key set exactly — no row
     // dropped or duplicated at a `WHERE uid > last` boundary.
-    let (count, keys) = read_uid_set(out_dir.path());
+    let (count, keys) = read_uid_set(&rig.out_dir());
     let expected: BTreeSet<String> = (1..=N).map(|n| format!("id-{n:06}")).collect();
     assert_eq!(
         count, N,
@@ -529,15 +515,13 @@ fn keyset_parallel_reads_every_row_once_across_workers() {
     // worker still pages twice, so BOTH the inter-worker boundary and the
     // intra-worker `WHERE uid > last` boundary are exercised in one run.
     let export = unique_name("keyset_par_exp");
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let out_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        "source:\n  type: mysql\n  url: \"{MYSQL_URL}\"\nexports:\n  - name: {export}\n    \
-         table: {table}\n    mode: chunked\n    parallel: 4\n    chunk_size: 500\n    \
-         format: parquet\n    compression: zstd\n    destination:\n      type: local\n      path: {out}\n",
-        out = out_dir.path().display(),
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
+    let rig = Rig::mysql_batch(&table)
+        .export_named(&export)
+        .mode("chunked")
+        .export_line("parallel: 4")
+        .export_line("chunk_size: 1000")
+        .export_line("compression: zstd");
+    let cfg = rig.config_path();
     let out = run_rivet_export(&cfg, &export);
     assert!(
         out.status.success(),
@@ -548,7 +532,7 @@ fn keyset_parallel_reads_every_row_once_across_workers() {
     // (1) SELF-ORACLE: the parallel runner is the only path that stamps `pk_w{id}`
     // into part names. Assert it ran — else the union check below is satisfied by a
     // silent sequential fall-back and proves nothing about parallelism.
-    let parts = files_with_extension(out_dir.path(), "parquet");
+    let parts = files_with_extension(&rig.out_dir(), "parquet");
     let parallel_parts = parts
         .iter()
         .filter(|p| {
@@ -569,7 +553,7 @@ fn keyset_parallel_reads_every_row_once_across_workers() {
     // (2) STRUCTURAL PARITY: the union of every worker's pages is the whole key set,
     // no row dropped at a boundary (RED at `< hi`: 2997/3000) or duplicated across
     // two workers' overlapping ranges (would inflate count past N).
-    let (count, keys) = read_uid_set(out_dir.path());
+    let (count, keys) = read_uid_set(&rig.out_dir());
     let expected: BTreeSet<String> = (1..=N).map(|n| format!("id-{n:06}")).collect();
     assert_eq!(
         count, N,
@@ -613,15 +597,13 @@ fn keyset_parallel_pg_uuid_key_fans_out_not_collapses() {
     .unwrap();
 
     let export = unique_name("pg_par_uuid_exp");
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let out_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        "source: {{type: postgres, url: \"{POSTGRES_URL}\"}}\nexports:\n  - name: {export}\n    \
-         table: public.{table}\n    mode: chunked\n    chunk_by_key: id\n    parallel: 4\n    \
-         chunk_size: 500\n    format: parquet\n    destination: {{type: local, path: {out}}}\n",
-        out = out_dir.path().display(),
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
+    let rig = Rig::pg_batch(&format!("public.{table}"))
+        .export_named(&export)
+        .mode("chunked")
+        .export_line("chunk_by_key: id")
+        .export_line("parallel: 4")
+        .export_line("chunk_size: 1000");
+    let cfg = rig.config_path();
     let r = run_rivet_export(&cfg, &export);
     assert!(
         r.status.success(),
@@ -630,7 +612,7 @@ fn keyset_parallel_pg_uuid_key_fans_out_not_collapses() {
     );
 
     // Fan-out proof: ≥2 distinct pk_w{id} workers (a collapse = only pk_w0).
-    let workers: BTreeSet<String> = files_with_extension(out_dir.path(), "parquet")
+    let workers: BTreeSet<String> = files_with_extension(&rig.out_dir(), "parquet")
         .iter()
         .filter_map(|p| p.file_name().and_then(|n| n.to_str()).map(String::from))
         .filter_map(|n| {
@@ -648,7 +630,7 @@ fn keyset_parallel_pg_uuid_key_fans_out_not_collapses() {
 
     // Completeness: every uuid round-trips (PG's first-party parallel completeness
     // check — the gap the bughunt flagged as absent).
-    let (count, keys) = read_uuid_set_fixed(out_dir.path(), "id");
+    let (count, keys) = read_uuid_set_fixed(&rig.out_dir(), "id");
     let expected: BTreeSet<String> = (1..=N)
         .map(|n| format!("00000000-0000-0000-0000-{n:012x}"))
         .collect();
@@ -696,16 +678,14 @@ fn keyset_parallel_crash_resume_writes_a_complete_destination_manifest() {
     // parallel: 4 + chunk_checkpoint → per-range crash-recovery. Small chunk_size so
     // each ~500-row range pages several times (a crash mid-range is mid-page-set).
     let export = unique_name("keyset_par_crash_exp");
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let out_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        "source:\n  type: mysql\n  url: \"{MYSQL_URL}\"\nexports:\n  - name: {export}\n    \
-         table: {table}\n    mode: chunked\n    chunk_by_key: uid\n    parallel: 4\n    \
-         chunk_checkpoint: true\n    chunk_size: 200\n    format: parquet\n    \
-         destination:\n      type: local\n      path: {out}\n",
-        out = out_dir.path().display(),
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
+    let rig = Rig::mysql_batch(&table)
+        .export_named(&export)
+        .mode("chunked")
+        .export_line("chunk_by_key: uid")
+        .export_line("parallel: 4")
+        .export_line("chunk_checkpoint: true")
+        .export_line("chunk_size: 200");
+    let cfg = rig.config_path();
 
     // Run 1: HARD-EXIT (process dies) right after range 0's atomic checkpoint commit
     // — range 0 is durably `done`, ranges 1-3 wrote parts to disk but never committed.
@@ -736,7 +716,7 @@ fn keyset_parallel_crash_resume_writes_a_complete_destination_manifest() {
     // MANIFEST-DRIVEN completeness: the destination manifest must declare ALL 2000
     // rows — the pre-crash done range must be rehydrated, not orphaned.
     let m: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(out_dir.path().join("manifest.json")).unwrap())
+        serde_json::from_slice(&std::fs::read(rig.out_dir().join("manifest.json")).unwrap())
             .expect("destination manifest.json must exist + parse");
     assert_eq!(
         m["row_count"].as_i64(),
@@ -747,7 +727,7 @@ fn keyset_parallel_crash_resume_writes_a_complete_destination_manifest() {
 
     // And the physical union is complete with no duplicate keys (the crashed
     // ranges' partial parts were overwritten by the re-run, not accumulated).
-    let (count, keys) = read_uid_set(out_dir.path());
+    let (count, keys) = read_uid_set(&rig.out_dir());
     let expected: BTreeSet<String> = (1..=2000).map(|n| format!("id-{n:06}")).collect();
     assert_eq!(
         count, 2000,
@@ -794,16 +774,15 @@ fn keyset_parallel_incremental_second_run_captures_only_new_keys() {
     seed(&mut conn, 1, 1000);
 
     let export = unique_name("keyset_par_inc_exp");
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let out_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        "source:\n  type: mysql\n  url: \"{MYSQL_URL}\"\nexports:\n  - name: {export}\n    \
-         table: {table}\n    mode: chunked\n    chunk_by_key: uid\n    parallel: 4\n    \
-         chunk_checkpoint: true\n    keyset_incremental: true\n    chunk_size: 200\n    \
-         format: parquet\n    destination:\n      type: local\n      path: {out}\n",
-        out = out_dir.path().display(),
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
+    let rig = Rig::mysql_batch(&table)
+        .export_named(&export)
+        .mode("chunked")
+        .export_line("chunk_by_key: uid")
+        .export_line("parallel: 4")
+        .export_line("chunk_checkpoint: true")
+        .export_line("keyset_incremental: true")
+        .export_line("chunk_size: 200");
+    let cfg = rig.config_path();
     let run = |label: &str| {
         let out = run_rivet_export(&cfg, &export);
         assert!(
@@ -815,13 +794,13 @@ fn keyset_parallel_incremental_second_run_captures_only_new_keys() {
 
     // Run 1: all 1000, anchor persisted at the max key (id-001000).
     run("run 1");
-    let (count1, _) = read_uid_set(out_dir.path());
+    let (count1, _) = read_uid_set(&rig.out_dir());
     assert_eq!(count1, 1000, "run 1 must export all seeded rows");
 
     // Run 2 on the UNCHANGED source: anchor floor = id-001000 → ZERO new rows; the
     // total across files stays 1000 (a re-read would double it to 2000).
     run("run 2 (unchanged)");
-    let (count2, _) = read_uid_set(out_dir.path());
+    let (count2, _) = read_uid_set(&rig.out_dir());
     assert_eq!(
         count2, 1000,
         "unchanged incremental re-run must add zero rows (got {count2}) — 2000 = a full re-read"
@@ -831,7 +810,7 @@ fn keyset_parallel_incremental_second_run_captures_only_new_keys() {
     // N workers.
     seed(&mut conn, 1001, 1500);
     run("run 3 (after insert)");
-    let (count3, keys3) = read_uid_set(out_dir.path());
+    let (count3, keys3) = read_uid_set(&rig.out_dir());
     assert_eq!(
         count3, 1500,
         "incremental must add ONLY the 500 new keys (got {count3}); 2500 = a full re-read"
@@ -886,15 +865,13 @@ fn keyset_checkpoint_crash_resume_writes_a_complete_destination_manifest() {
     .unwrap();
 
     let export = unique_name("keyset_m5_exp");
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let out_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        "source:\n  type: mysql\n  url: \"{MYSQL_URL}\"\nexports:\n  - name: {export}\n    \
-         table: {table}\n    mode: chunked\n    chunk_by_key: uid\n    chunk_checkpoint: true\n    \
-         chunk_size: 300\n    format: parquet\n    destination:\n      type: local\n      path: {out}\n",
-        out = out_dir.path().display(),
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
+    let rig = Rig::mysql_batch(&table)
+        .export_named(&export)
+        .mode("chunked")
+        .export_line("chunk_by_key: uid")
+        .export_line("chunk_checkpoint: true")
+        .export_line("chunk_size: 300");
+    let cfg = rig.config_path();
 
     // Crash after page 0 commits (300 rows durable, cursor advanced, no manifest).
     let crash = std::process::Command::new(RIVET_BIN)
@@ -921,7 +898,7 @@ fn keyset_checkpoint_crash_resume_writes_a_complete_destination_manifest() {
     // MANIFEST-DRIVEN: the destination manifest.json must declare all 1000 rows —
     // page 0 (pre-crash) must be rehydrated, not orphaned.
     let m: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(out_dir.path().join("manifest.json")).unwrap())
+        serde_json::from_slice(&std::fs::read(rig.out_dir().join("manifest.json")).unwrap())
             .expect("destination manifest.json must exist + parse");
     assert_eq!(
         m["row_count"].as_i64(),
@@ -965,16 +942,14 @@ fn keyset_checkpoint_resume_second_run_captures_only_new_keys() {
     // the whole table on a clean re-run; this flag is what makes a clean re-run
     // pull only new keys (the behaviour this test asserts).
     let export = unique_name("keyset_ckpt_exp");
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let out_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        "source:\n  type: mysql\n  url: \"{MYSQL_URL}\"\nexports:\n  - name: {export}\n    \
-         table: {table}\n    mode: chunked\n    chunk_by_key: uid\n    chunk_checkpoint: true\n    \
-         keyset_incremental: true\n    \
-         chunk_size: 300\n    format: parquet\n    destination:\n      type: local\n      path: {out}\n",
-        out = out_dir.path().display(),
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
+    let rig = Rig::mysql_batch(&table)
+        .export_named(&export)
+        .mode("chunked")
+        .export_line("chunk_by_key: uid")
+        .export_line("chunk_checkpoint: true")
+        .export_line("keyset_incremental: true")
+        .export_line("chunk_size: 300");
+    let cfg = rig.config_path();
 
     let run = |label: &str| {
         let out = run_rivet_export(&cfg, &export);
@@ -992,13 +967,13 @@ fn keyset_checkpoint_resume_second_run_captures_only_new_keys() {
 
     // Run 1: exports all 1000, persists high-water key id-001000.
     run("run 1");
-    let (count1, _) = read_uid_set(out_dir.path());
+    let (count1, _) = read_uid_set(&rig.out_dir());
     assert_eq!(count1, 1000, "run 1 must export all seeded rows");
 
     // Run 2 on the UNCHANGED source: resume floor is id-001000 → ZERO new rows,
     // no file written; the total across files stays 1000 (no re-read).
     run("run 2 (unchanged)");
-    let (count2, _) = read_uid_set(out_dir.path());
+    let (count2, _) = read_uid_set(&rig.out_dir());
     assert_eq!(
         count2, 1000,
         "unchanged resume must add zero rows (got {count2}) — a re-read would double it"
@@ -1007,7 +982,7 @@ fn keyset_checkpoint_resume_second_run_captures_only_new_keys() {
     // Insert 500 rows with HIGHER keys, then resume: only those 500 are read.
     seed(&mut conn, 1001, 1500);
     run("run 3 (after insert)");
-    let (count3, keys3) = read_uid_set(out_dir.path());
+    let (count3, keys3) = read_uid_set(&rig.out_dir());
     assert_eq!(
         count3, 1500,
         "resume must add ONLY the 500 new keys (got {count3}); 2500 would mean a full re-read"
@@ -1021,7 +996,7 @@ fn keyset_checkpoint_resume_second_run_captures_only_new_keys() {
     // (`manifest-<run>.json`, reconcile's artifact) span every run — a resumed
     // run clobbering a prior manifest is silent to the parquet re-read.
     assert_eq!(
-        dir_manifest_copy_total_rows(out_dir.path()),
+        dir_manifest_copy_total_rows(&rig.out_dir()),
         1500,
         "run-unique manifest copies must sum run 1 (1000) + run 3 (500); a clobbered manifest is silent to the parquet re-read"
     );
@@ -1060,15 +1035,13 @@ fn keyset_checkpoint_without_incremental_rereads_on_a_clean_rerun() {
 
     // chunk_checkpoint: true but NO keyset_incremental → crash-recovery ONLY.
     let export = unique_name("keyset_safe_exp");
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let out_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        "source:\n  type: mysql\n  url: \"{MYSQL_URL}\"\nexports:\n  - name: {export}\n    \
-         table: {table}\n    mode: chunked\n    chunk_by_key: uid\n    chunk_checkpoint: true\n    \
-         chunk_size: 300\n    format: parquet\n    destination:\n      type: local\n      path: {out}\n",
-        out = out_dir.path().display(),
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
+    let rig = Rig::mysql_batch(&table)
+        .export_named(&export)
+        .mode("chunked")
+        .export_line("chunk_by_key: uid")
+        .export_line("chunk_checkpoint: true")
+        .export_line("chunk_size: 300");
+    let cfg = rig.config_path();
     let run = |label: &str| {
         let out = run_rivet_export(&cfg, &export);
         assert!(
@@ -1080,7 +1053,7 @@ fn keyset_checkpoint_without_incremental_rereads_on_a_clean_rerun() {
 
     // Run 1 completes cleanly → the in-progress run_id is cleared at finalize.
     run("run 1");
-    let (count1, _) = read_uid_set(out_dir.path());
+    let (count1, _) = read_uid_set(&rig.out_dir());
     assert_eq!(count1, 1000, "run 1 must export all seeded rows");
 
     // Run 2 on the UNCHANGED source: a CLEAN re-run without keyset_incremental
@@ -1088,7 +1061,7 @@ fn keyset_checkpoint_without_incremental_rereads_on_a_clean_rerun() {
     // to 2000. A total of 1000 would mean checkpoint silently implied incremental
     // (the pre-split staleness bug this test guards).
     run("run 2 (clean re-run)");
-    let (count2, keys2) = read_uid_set(out_dir.path());
+    let (count2, keys2) = read_uid_set(&rig.out_dir());
     assert_eq!(
         count2, 2000,
         "clean re-run must FULLY re-read (2000 rows across both runs); {count2} == 1000 would be a silent incremental skip"
@@ -1130,15 +1103,13 @@ fn keyset_fresh_run_crash_before_first_page_does_not_skip_the_table() {
     .unwrap();
 
     let export = unique_name("keyset_stale_exp");
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let out_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        "source:\n  type: mysql\n  url: \"{MYSQL_URL}\"\nexports:\n  - name: {export}\n    \
-         table: {table}\n    mode: chunked\n    chunk_by_key: uid\n    chunk_checkpoint: true\n    \
-         chunk_size: 300\n    format: parquet\n    destination:\n      type: local\n      path: {out}\n",
-        out = out_dir.path().display(),
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
+    let rig = Rig::mysql_batch(&table)
+        .export_named(&export)
+        .mode("chunked")
+        .export_line("chunk_by_key: uid")
+        .export_line("chunk_checkpoint: true")
+        .export_line("chunk_size: 300");
+    let cfg = rig.config_path();
 
     // Run 1: full export of all 1000; on data-completion resume_run_id is cleared
     // and last_cursor_value = the final key id-001000.
@@ -1148,7 +1119,7 @@ fn keyset_fresh_run_crash_before_first_page_does_not_skip_the_table() {
         "run 1 stderr:\n{}",
         String::from_utf8_lossy(&r1.stderr)
     );
-    let (count1, _) = read_uid_set(out_dir.path());
+    let (count1, _) = read_uid_set(&rig.out_dir());
     assert_eq!(count1, 1000, "run 1 must export all 1000");
 
     // Run 2: a FRESH run that crashes right after open (no page committed).
@@ -1174,7 +1145,7 @@ fn keyset_fresh_run_crash_before_first_page_does_not_skip_the_table() {
         "run 3 stderr:\n{}",
         String::from_utf8_lossy(&r3.stderr)
     );
-    let (count3, keys3) = read_uid_set(out_dir.path());
+    let (count3, keys3) = read_uid_set(&rig.out_dir());
     assert_eq!(
         count3, 2000,
         "recovery must re-read all 1000 (total 2000); {count3} == 1000 means Run 3 resumed from a STALE cursor and silently skipped the whole table"
@@ -1211,15 +1182,13 @@ fn keyset_failure_after_data_complete_does_not_resume_and_skip_on_the_next_run()
     .unwrap();
 
     let export = unique_name("keyset_gate_exp");
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let out_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        "source:\n  type: mysql\n  url: \"{MYSQL_URL}\"\nexports:\n  - name: {export}\n    \
-         table: {table}\n    mode: chunked\n    chunk_by_key: uid\n    chunk_checkpoint: true\n    \
-         chunk_size: 300\n    format: parquet\n    destination:\n      type: local\n      path: {out}\n",
-        out = out_dir.path().display(),
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
+    let rig = Rig::mysql_batch(&table)
+        .export_named(&export)
+        .mode("chunked")
+        .export_line("chunk_by_key: uid")
+        .export_line("chunk_checkpoint: true")
+        .export_line("chunk_size: 300");
+    let cfg = rig.config_path();
 
     // Run 1: commits ALL 1000, then fails AFTER data-completion (a stand-in for a
     // post-data gate rejection). Data-completion has already cleared resume_run_id.
@@ -1248,7 +1217,7 @@ fn keyset_failure_after_data_complete_does_not_resume_and_skip_on_the_next_run()
         "run 2 stderr:\n{}",
         String::from_utf8_lossy(&r2.stderr)
     );
-    let (count2, _) = read_uid_set(out_dir.path());
+    let (count2, _) = read_uid_set(&rig.out_dir());
     assert_eq!(
         count2, 2000,
         "the re-run after a post-data failure must FULLY re-read (total 2000); {count2} == 1000 means a stale resume anchor silently skipped the table"
@@ -1287,16 +1256,14 @@ fn keyset_incremental_crash_before_finalize_rehydrates_not_orphans_the_manifest(
     // Incremental keyset (append-only opt-in). chunk_checkpoint implied by the
     // planner, but set explicitly too for clarity.
     let export = unique_name("keyset_inc_orphan_exp");
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let out_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        "source:\n  type: mysql\n  url: \"{MYSQL_URL}\"\nexports:\n  - name: {export}\n    \
-         table: {table}\n    mode: chunked\n    chunk_by_key: uid\n    chunk_checkpoint: true\n    \
-         keyset_incremental: true\n    \
-         chunk_size: 300\n    format: parquet\n    destination:\n      type: local\n      path: {out}\n",
-        out = out_dir.path().display(),
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
+    let rig = Rig::mysql_batch(&table)
+        .export_named(&export)
+        .mode("chunked")
+        .export_line("chunk_by_key: uid")
+        .export_line("chunk_checkpoint: true")
+        .export_line("keyset_incremental: true")
+        .export_line("chunk_size: 300");
+    let cfg = rig.config_path();
 
     // Run 1: commits all 1000 pages under R1, then crashes AFTER data-complete but
     // BEFORE finalize_manifest — so NO destination manifest for R1 is written.
@@ -1325,7 +1292,7 @@ fn keyset_incremental_crash_before_finalize_rehydrates_not_orphans_the_manifest(
         String::from_utf8_lossy(&r2.stderr)
     );
     assert_eq!(
-        dir_manifest_copy_total_rows(out_dir.path()),
+        dir_manifest_copy_total_rows(&rig.out_dir()),
         1000,
         "an incremental crash before finalize must rehydrate all 1000 committed rows into the manifest; 0 means the pages were orphaned (silent manifest-level row loss)"
     );
@@ -1379,15 +1346,11 @@ fn snapshot_pg_uuid_pk_roundtrips_full_uuid_set() {
     .unwrap();
 
     let export = unique_name("pg_snap_uuid_exp");
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let out_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        "source:\n  type: postgres\n  url: \"{POSTGRES_URL}\"\nexports:\n  - name: {export}\n    \
-         table: public.{table}\n    mode: full\n    format: parquet\n    compression: zstd\n    \
-         destination:\n      type: local\n      path: {out}\n",
-        out = out_dir.path().display(),
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
+    let rig = Rig::pg_batch(&format!("public.{table}"))
+        .export_named(&export)
+        .mode("full")
+        .export_line("compression: zstd");
+    let cfg = rig.config_path();
     let out = run_rivet_export(&cfg, &export);
     assert!(
         out.status.success(),
@@ -1396,7 +1359,7 @@ fn snapshot_pg_uuid_pk_roundtrips_full_uuid_set() {
     );
 
     // Single file expected — mode: full produces one part.
-    let files = files_with_extension(out_dir.path(), "parquet");
+    let files = files_with_extension(&rig.out_dir(), "parquet");
     assert_eq!(
         files.len(),
         1,
@@ -1409,7 +1372,7 @@ fn snapshot_pg_uuid_pk_roundtrips_full_uuid_set() {
     // `FixedSizeBinary(16)` with `arrow.uuid` extension type metadata
     // (per ADR-0014 §"UUID / JSON / Binary") → parquet
     // `LogicalType::Uuid`.
-    let (count, keys) = read_uuid_set_fixed(out_dir.path(), "id");
+    let (count, keys) = read_uuid_set_fixed(&rig.out_dir(), "id");
     let expected: BTreeSet<String> = (1..=N)
         .map(|n| format!("00000000-0000-0000-0000-{n:012x}"))
         .collect();
@@ -1460,15 +1423,12 @@ fn keyset_mysql_uuid_pk_roundtrips_full_keyset_across_pages() {
     .unwrap();
 
     let export = unique_name("mysql_keyset_uuid_exp");
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let out_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        "source:\n  type: mysql\n  url: \"{MYSQL_URL}\"\nexports:\n  - name: {export}\n    \
-         table: {table}\n    mode: chunked\n    chunk_size: 500\n    format: parquet\n    \
-         compression: zstd\n    destination:\n      type: local\n      path: {out}\n",
-        out = out_dir.path().display(),
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
+    let rig = Rig::mysql_batch(&table)
+        .export_named(&export)
+        .mode("chunked")
+        .export_line("chunk_size: 1000")
+        .export_line("compression: zstd");
+    let cfg = rig.config_path();
     let out = run_rivet_export(&cfg, &export);
     assert!(
         out.status.success(),
@@ -1476,14 +1436,14 @@ fn keyset_mysql_uuid_pk_roundtrips_full_keyset_across_pages() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    let files = files_with_extension(out_dir.path(), "parquet");
+    let files = files_with_extension(&rig.out_dir(), "parquet");
     assert!(
         files.len() >= 2,
         "expected multiple keyset page files for {N} rows at chunk_size 500, got {}",
         files.len()
     );
 
-    let (count, keys) = read_uid_set_named(out_dir.path(), "id");
+    let (count, keys) = read_uid_set_named(&rig.out_dir(), "id");
     // MySQL HEX() returns uppercase hex; lowercase below would mismatch if not
     // normalized. We use lowercase on both sides for consistency with the PG
     // expectation and the BTreeSet ordering.
@@ -1531,16 +1491,14 @@ fn keyset_checkpoint_resume_pg_second_run_captures_only_new_keys() {
     .unwrap();
 
     let export = unique_name("pg_keyset_ckpt_exp");
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let out_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        "source:\n  type: postgres\n  url: \"{POSTGRES_URL}\"\nexports:\n  - name: {export}\n    \
-         table: public.{table}\n    mode: chunked\n    chunk_by_key: uid\n    chunk_checkpoint: true\n    \
-         keyset_incremental: true\n    \
-         chunk_size: 300\n    format: parquet\n    destination:\n      type: local\n      path: {out}\n",
-        out = out_dir.path().display(),
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
+    let rig = Rig::pg_batch(&format!("public.{table}"))
+        .export_named(&export)
+        .mode("chunked")
+        .export_line("chunk_by_key: uid")
+        .export_line("chunk_checkpoint: true")
+        .export_line("keyset_incremental: true")
+        .export_line("chunk_size: 300");
+    let cfg = rig.config_path();
 
     let run = |label: &str| {
         let out = run_rivet_export(&cfg, &export);
@@ -1555,11 +1513,11 @@ fn keyset_checkpoint_resume_pg_second_run_captures_only_new_keys() {
     };
 
     run("run 1");
-    assert_eq!(read_uid_set(out_dir.path()).0, 800, "run 1 exports all 800");
+    assert_eq!(read_uid_set(&rig.out_dir()).0, 800, "run 1 exports all 800");
 
     run("run 2 (unchanged)");
     assert_eq!(
-        read_uid_set(out_dir.path()).0,
+        read_uid_set(&rig.out_dir()).0,
         800,
         "unchanged resume adds zero rows — a re-read would double it"
     );
@@ -1570,7 +1528,7 @@ fn keyset_checkpoint_resume_pg_second_run_captures_only_new_keys() {
     ))
     .unwrap();
     run("run 3 (after insert)");
-    let (count3, keys3) = read_uid_set(out_dir.path());
+    let (count3, keys3) = read_uid_set(&rig.out_dir());
     assert_eq!(
         count3, 1200,
         "resume adds ONLY the 400 new keys (got {count3}); 2000 would mean a full re-read"
@@ -1582,7 +1540,7 @@ fn keyset_checkpoint_resume_pg_second_run_captures_only_new_keys() {
     );
     // Dest manifest copies (reconcile's artifact), not just the parquet re-read.
     assert_eq!(
-        dir_manifest_copy_total_rows(out_dir.path()),
+        dir_manifest_copy_total_rows(&rig.out_dir()),
         1200,
         "run-unique manifest copies must sum run 1 (800) + run 3 (400); a clobbered manifest is silent to the parquet re-read"
     );
@@ -1620,17 +1578,14 @@ fn keyset_checkpoint_resume_mssql_second_run_captures_only_new_keys() {
     seed(1, 1000);
 
     let export = unique_name("ms_keyset_ckpt_exp");
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let out_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        "source:\n  type: mssql\n  url: \"{MSSQL_URL}\"\n  tls:\n    accept_invalid_certs: true\n\
-         exports:\n  - name: {export}\n    table: dbo.{table}\n    mode: chunked\n    \
-         chunk_by_key: uid\n    chunk_checkpoint: true\n    keyset_incremental: true\n    \
-         chunk_size: 300\n    format: parquet\n    \
-         destination:\n      type: local\n      path: {out}\n",
-        out = out_dir.path().display(),
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
+    let rig = Rig::mssql_batch(&format!("dbo.{table}"))
+        .export_named(&export)
+        .mode("chunked")
+        .export_line("chunk_by_key: uid")
+        .export_line("chunk_checkpoint: true")
+        .export_line("keyset_incremental: true")
+        .export_line("chunk_size: 300");
+    let cfg = rig.config_path();
 
     let run = |label: &str| {
         let out = run_rivet_export(&cfg, &export);
@@ -1646,21 +1601,21 @@ fn keyset_checkpoint_resume_mssql_second_run_captures_only_new_keys() {
 
     run("run 1");
     assert_eq!(
-        read_uid_set(out_dir.path()).0,
+        read_uid_set(&rig.out_dir()).0,
         1000,
         "run 1 exports all 1000"
     );
 
     run("run 2 (unchanged)");
     assert_eq!(
-        read_uid_set(out_dir.path()).0,
+        read_uid_set(&rig.out_dir()).0,
         1000,
         "unchanged resume adds zero rows — a re-read would double it"
     );
 
     seed(1001, 1500);
     run("run 3 (after insert)");
-    let (count3, keys3) = read_uid_set(out_dir.path());
+    let (count3, keys3) = read_uid_set(&rig.out_dir());
     assert_eq!(
         count3, 1500,
         "resume adds ONLY the 500 new keys (got {count3}); 2500 would mean a full re-read"
@@ -1672,7 +1627,7 @@ fn keyset_checkpoint_resume_mssql_second_run_captures_only_new_keys() {
     );
     // Dest manifest copies (reconcile's artifact), not just the parquet re-read.
     assert_eq!(
-        dir_manifest_copy_total_rows(out_dir.path()),
+        dir_manifest_copy_total_rows(&rig.out_dir()),
         1500,
         "run-unique manifest copies must sum run 1 (1000) + run 3 (500); a clobbered manifest is silent to the parquet re-read"
     );
@@ -1717,18 +1672,16 @@ fn keyset_pg_uuid_pk_via_explicit_chunk_by_key_roundtrips_full_set() {
     .unwrap();
 
     let export = unique_name("pg_keyset_uuid_explicit_exp");
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let out_dir = tempfile::tempdir().unwrap();
     // `chunk_by_key: id` opts into keyset paging on a UUID column despite
     // PG's planner default of refusing auto-resolution for non-int PKs.
     // chunk_size 500 → 6 pages, exercising every page boundary.
-    let yaml = format!(
-        "source:\n  type: postgres\n  url: \"{POSTGRES_URL}\"\nexports:\n  - name: {export}\n    \
-         table: public.{table}\n    mode: chunked\n    chunk_by_key: id\n    chunk_size: 500\n    \
-         format: parquet\n    compression: zstd\n    destination:\n      type: local\n      path: {out}\n",
-        out = out_dir.path().display(),
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
+    let rig = Rig::pg_batch(&format!("public.{table}"))
+        .export_named(&export)
+        .mode("chunked")
+        .export_line("chunk_by_key: id")
+        .export_line("chunk_size: 1000")
+        .export_line("compression: zstd");
+    let cfg = rig.config_path();
     let out = run_rivet_export(&cfg, &export);
     assert!(
         out.status.success(),
@@ -1737,7 +1690,7 @@ fn keyset_pg_uuid_pk_via_explicit_chunk_by_key_roundtrips_full_set() {
     );
 
     // ≥2 page files prove pagination ran.
-    let files = files_with_extension(out_dir.path(), "parquet");
+    let files = files_with_extension(&rig.out_dir(), "parquet");
     assert!(
         files.len() >= 2,
         "expected multiple keyset page files for {N} rows at chunk_size 500, got {}",
@@ -1747,7 +1700,7 @@ fn keyset_pg_uuid_pk_via_explicit_chunk_by_key_roundtrips_full_set() {
     // Exact UUID set round-trip across the pages — the page boundary
     // value (`E'<uuid>'` literal cast on the server) survives the
     // FixedSizeBinary(16) → UUID-string → next-page WHERE clause cycle.
-    let (count, keys) = read_uuid_set_fixed(out_dir.path(), "id");
+    let (count, keys) = read_uuid_set_fixed(&rig.out_dir(), "id");
     let expected: BTreeSet<String> = (1..=N)
         .map(|n| format!("00000000-0000-0000-0000-{n:012x}"))
         .collect();
@@ -1852,4 +1805,101 @@ fn read_uuid_set_fixed(dir: &std::path::Path, col: &str) -> (usize, BTreeSet<Str
         }
     }
     (count, keys)
+}
+
+/// ARRAY columns must reach the value checksum — measured gap, not a hypothesis.
+///
+/// Stubbing `CellSource::list` to `None` passed the whole `--lib` cycle AND the
+/// whole live suite, including every existing Form-B test. The cause was
+/// upstream of all of them: `seeds/common/postgres.sql` declared no array column
+/// at all, so no export ever carried a LIST cell through the checksum path, and
+/// such a column contributed NOTHING to the source-side sum with nobody to
+/// notice.
+///
+/// The same missing fixture is why `_rivet_row_hash` shipped collapsing
+/// `['a, b']` with `['a','b']`, and `[NULL]` with `[""]` and `[]` (fixed
+/// 2026-08-01; its injectivity now has unit coverage of its own). Arrays landed
+/// 2026-05-12 and reached neither mechanism — one gap, two blind oracles.
+///
+/// The seed's `array_matrix` carries one column per element type
+/// `list_elem_covered` claims to check, with distinct per-position values so an
+/// ordering or index bug cannot hide behind equal elements, inner NULLs, and an
+/// EMPTY array beside a NULL array.
+#[test]
+#[ignore = "live: requires docker compose up -d postgres with the golden seed"]
+fn array_columns_reach_the_value_checksum() {
+    require_alive(LiveService::Postgres);
+    // The FIXTURE precondition, checked first and named in full when missing.
+    //
+    // This test's `#[ignore]` says it needs "docker compose up -d postgres with
+    // the golden seed" — and that was UNREACHABLE by the documented command
+    // until 2026-08-05: the root compose mounts `dev/postgres/init.sql`, not
+    // `seeds/common/postgres.sql`, and the former carried no array column. The
+    // table reached a stand only if somebody applied the golden SQL by hand, so
+    // on a clean checkout this failed with an export error about a missing
+    // relation — indistinguishable, to a reader, from a product regression.
+    //
+    // Init scripts run ONLY on an empty data directory, so pulling the fix does
+    // not repair an EXISTING stand. Hence the command, spelled out.
+    if let Ok(mut c) = postgres::Client::connect(POSTGRES_URL, postgres::NoTls) {
+        let present: bool = c
+            .query_one("SELECT to_regclass('public.array_matrix') IS NOT NULL", &[])
+            .map(|r| r.get(0))
+            .unwrap_or(false);
+        assert!(
+            present,
+            "fixture `array_matrix` is absent — a STAND problem, not a rivet one.\n\
+             It lives in dev/postgres/init.sql, which docker runs only on a FRESH data \
+             directory. Apply it to a running stand with:\n  \
+             docker exec -i rivet-postgres-1 psql -U rivet -d rivet < dev/postgres/init.sql"
+        );
+    }
+    let export = unique_name("array_matrix_exp");
+    let rig = Rig::pg_batch("array_matrix")
+        .export_named(&export)
+        .mode("full");
+    let cfg = rig.config_path();
+    let r = run_rivet_export(&cfg, &export);
+    assert!(
+        r.status.success(),
+        "array_matrix export must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(rig.out_dir().join("manifest.json")).expect("manifest.json"),
+    )
+    .expect("parse manifest");
+    let checksums = manifest["column_checksums"]
+        .as_array()
+        .expect("column_checksums must be recorded");
+    let named: Vec<&str> = checksums
+        .iter()
+        .filter_map(|c| c["name"].as_str())
+        .collect();
+    for col in ["bools", "i16s", "i32s", "i64s", "f32s", "f64s", "texts"] {
+        assert!(
+            named.contains(&col),
+            "array column `{col}` must be COVERED by the value checksum — a LIST cell \
+             that contributes nothing is a silently weakened integrity oracle; got {named:?}"
+        );
+    }
+
+    // And the two sides must agree on them: `validate` re-reads the parts and
+    // recomputes side B against the recorded side A.
+    let v = std::process::Command::new(RIVET_BIN)
+        .args([
+            "validate",
+            "--config",
+            cfg.to_str().unwrap(),
+            "--export",
+            &export,
+        ])
+        .output()
+        .expect("spawn rivet validate");
+    assert!(
+        v.status.success(),
+        "validate must re-verify the ARRAY columns' checksums; stderr:\n{}",
+        String::from_utf8_lossy(&v.stderr)
+    );
 }

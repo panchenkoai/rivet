@@ -137,9 +137,9 @@ pub(crate) fn run_chunked_parallel_checkpoint(
     // per chunk against the same on-disk SQLite (the connection is not Sync).
     // The post-scope drain uses the main-thread `state` reference + state=None
     // to commit::record_part so file_log is not double-written.
-    let config_path_owned = config_path.to_string();
     let fmt_label = plan.format.label();
     let comp_label = plan.compression.label();
+    let mode_label = plan.strategy.mode_label();
 
     let shared_destination =
         std::sync::Arc::new(destination::create_destination(&plan.destination)?);
@@ -170,9 +170,9 @@ pub(crate) fn run_chunked_parallel_checkpoint(
             let shared_fingerprint = &shared_fingerprint;
             let plan_w = plan_for_workers.clone();
             let cp_w = cp_for_workers.clone();
-            let config_path_w = config_path_owned.clone();
             let fmt_label_w = fmt_label;
             let comp_label_w = comp_label;
+            let mode_label_w = mode_label;
             let pb_w = pb_cp_handle.clone();
             let streamed_rows = std::sync::Arc::clone(&streamed_rows);
 
@@ -265,9 +265,11 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                             let mut thread_src = match source::create_source(&plan_w.source) {
                                 Ok(s) => s,
                                 Err(e) => {
-                                    if attempt < plan_w.tuning.max_retries
-                                        && classify_error(&e).is_transient()
-                                    {
+                                    if crate::pipeline::retry::should_retry(crate::pipeline::retry::Attempt {
+                                        attempt,
+                                        max_retries: plan_w.tuning.max_retries,
+                                        error: &e,
+                                    }) {
                                         last_err = Some(e);
                                         continue;
                                     }
@@ -347,9 +349,11 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                             match export_attempt {
                                 Ok(v) => return Ok(v),
                                 Err(e) => {
-                                    if attempt < plan_w.tuning.max_retries
-                                        && classify_error(&e).is_transient()
-                                    {
+                                    if crate::pipeline::retry::should_retry(crate::pipeline::retry::Attempt {
+                                        attempt,
+                                        max_retries: plan_w.tuning.max_retries,
+                                        error: &e,
+                                    }) {
                                         last_err = Some(e);
                                         continue;
                                     }
@@ -361,6 +365,18 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                             .unwrap_or_else(|| anyhow::anyhow!("chunk failed after retries")))
                     })();
 
+                    // Test-only, mirroring the sequential runner: make ONE chunk
+                    // fail without killing the process, so the worker-error and
+                    // chunk-completion guards below can be exercised. A panic hook
+                    // cannot reach them — they only run once the workers join,
+                    // which a crashed process never does.
+                    let result = match crate::test_hook::maybe_error_at_index(
+                        "chunk_export",
+                        chunk_index,
+                    ) {
+                        Err(msg) => Err(anyhow::anyhow!(msg)),
+                        Ok(()) => result,
+                    };
                     match result {
                         Ok((rows, parts, chunk_checksums, chunk_key)) => {
                             agg_rows.fetch_add(rows as i64, Ordering::Relaxed);
@@ -376,17 +392,33 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                             let fname_for_state: Option<String> = if parts.is_empty() {
                                 None
                             } else {
-                                match StateStore::open(&config_path_w) {
+                                // Reopen from the REF, not from `config_path`.
+                                // `rivet apply` dispatches this runner with an
+                                // empty config_path (job.rs — it is a
+                                // display-only hint there), and
+                                // `StateStore::open("")` resolves to
+                                // `./.rivet_state.db` in the process CWD. Every
+                                // durable-part row and the running aggregate
+                                // landed in a stray database while the real
+                                // state DB got none — invisible on a clean run,
+                                // and on recovery the resume found the chunks
+                                // `completed` with no file_log to rehydrate, so
+                                // it declared a manifest with zero parts over
+                                // parquet that was already on the destination.
+                                match StateStore::open_at_ref(&state_ref) {
                                     Ok(store) => {
                                         for rec in &parts {
-                                            if let Err(e) = store.record_file(
-                                                run_id_arc.as_str(),
-                                                &plan_w.export_name,
-                                                &rec.file_name,
-                                                rec.rows,
-                                                rec.bytes as i64,
-                                                fmt_label_w,
-                                                Some(comp_label_w),
+                                            if let Err(e) = store.record_durable_part(
+                                                crate::state::DurablePart {
+                                                    run_id: run_id_arc.as_str(),
+                                                    export_name: &plan_w.export_name,
+                                                    file_name: &rec.file_name,
+                                                    rows: rec.rows,
+                                                    bytes: rec.bytes as i64,
+                                                    format: fmt_label_w,
+                                                    compression: Some(comp_label_w),
+                                                    mode: mode_label_w,
+                                                },
                                             ) {
                                                 log::warn!(
                                                     "export '{}': file_log write failed for parallel checkpoint chunk '{}' (file was produced): {:#}",
