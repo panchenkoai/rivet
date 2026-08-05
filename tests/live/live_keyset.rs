@@ -1829,6 +1829,31 @@ fn read_uuid_set_fixed(dir: &std::path::Path, col: &str) -> (usize, BTreeSet<Str
 #[ignore = "live: requires docker compose up -d postgres with the golden seed"]
 fn array_columns_reach_the_value_checksum() {
     require_alive(LiveService::Postgres);
+    // The FIXTURE precondition, checked first and named in full when missing.
+    //
+    // This test's `#[ignore]` says it needs "docker compose up -d postgres with
+    // the golden seed" — and that was UNREACHABLE by the documented command
+    // until 2026-08-05: the root compose mounts `dev/postgres/init.sql`, not
+    // `seeds/common/postgres.sql`, and the former carried no array column. The
+    // table reached a stand only if somebody applied the golden SQL by hand, so
+    // on a clean checkout this failed with an export error about a missing
+    // relation — indistinguishable, to a reader, from a product regression.
+    //
+    // Init scripts run ONLY on an empty data directory, so pulling the fix does
+    // not repair an EXISTING stand. Hence the command, spelled out.
+    if let Ok(mut c) = postgres::Client::connect(POSTGRES_URL, postgres::NoTls) {
+        let present: bool = c
+            .query_one("SELECT to_regclass('public.array_matrix') IS NOT NULL", &[])
+            .map(|r| r.get(0))
+            .unwrap_or(false);
+        assert!(
+            present,
+            "fixture `array_matrix` is absent — a STAND problem, not a rivet one.\n\
+             It lives in dev/postgres/init.sql, which docker runs only on a FRESH data \
+             directory. Apply it to a running stand with:\n  \
+             docker exec -i rivet-postgres-1 psql -U rivet -d rivet < dev/postgres/init.sql"
+        );
+    }
     let export = unique_name("array_matrix_exp");
     let rig = Rig::pg_batch("array_matrix")
         .export_named(&export)

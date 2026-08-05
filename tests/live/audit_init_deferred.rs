@@ -21,6 +21,24 @@ fn init_mssql_single_table_emits_valid_config_that_passes_check() {
 
     let cfg_dir = tempfile::tempdir().unwrap();
 
+    // FIXTURE precondition. `dbo.orders` is the CANONICAL cross-engine table,
+    // created by `seed --target mssql`; a stand that has only had
+    // `dev/mssql/init.sql` applied does not have it (that file's 500-row probe
+    // is `dbo.planning_probe` since 2026-08-05, and before that it was a
+    // DIFFERENT `dbo.orders` with an incompatible schema). Without this check
+    // the failure is an assertion about decimal precision, which reads as a
+    // product regression rather than an unseeded stand.
+    let has_canonical_shape = mssql_query_i64(
+        "SELECT count(*) FROM sys.columns \
+         WHERE object_id = OBJECT_ID('dbo.orders') AND name = 'price'",
+    );
+    assert_eq!(
+        has_canonical_shape, 1,
+        "`dbo.orders` has no `price` column, so this stand does not carry the canonical \
+         cross-engine seed — a STAND problem, not a rivet one. Seed it with:\n  \
+         RIVET_SEED_I_KNOW=1 cargo run --bin seed --features dev-seed -- --target mssql"
+    );
+
     // ── init --table dbo.orders ────────────────────────────────────────────
     let out = std::process::Command::new(RIVET_BIN)
         .args(["init", "--source", MSSQL_URL, "--table", "dbo.orders"])
