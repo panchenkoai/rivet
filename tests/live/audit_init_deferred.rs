@@ -21,49 +21,64 @@ fn init_mssql_single_table_emits_valid_config_that_passes_check() {
 
     let cfg_dir = tempfile::tempdir().unwrap();
 
-    // FIXTURE precondition. `dbo.orders` is the CANONICAL cross-engine table,
-    // created by `seed --target mssql`; a stand that has only had
-    // `dev/mssql/init.sql` applied does not have it (that file's 500-row probe
-    // is `dbo.planning_probe` since 2026-08-05, and before that it was a
-    // DIFFERENT `dbo.orders` with an incompatible schema). Without this check
-    // the failure is an assertion about decimal precision, which reads as a
-    // product regression rather than an unseeded stand.
-    let has_canonical_shape = mssql_query_i64(
+    // FIXTURE precondition, and the table is DELIBERATELY the one that a plain
+    // `docker compose up -d mssql` provisions.
+    //
+    // This test used to scaffold `dbo.orders`, which `dev/mssql/init.sql` and
+    // the canonical Rust seed BOTH created with incompatible schemas — the seed
+    // DROP+CREATEs, so whichever ran last won (fixed 2026-08-05 by renaming the
+    // init-time probe to `dbo.planning_probe` and leaving `orders` to the seed).
+    //
+    // The first attempt at that fix pointed this test at the SEED's `orders`
+    // instead, and that was an over-correction: it made a test that had always
+    // worked on a bare compose-up require a separate manual seeding step, and
+    // the very next clean checkout hit the precondition. What this test actually
+    // needs is ANY table with a DECIMAL column — not the cross-engine fixture —
+    // so it uses the probe the documented setup already creates.
+    let probe_present = mssql_query_i64(
         "SELECT count(*) FROM sys.columns \
-         WHERE object_id = OBJECT_ID('dbo.orders') AND name = 'price'",
+         WHERE object_id = OBJECT_ID('dbo.planning_probe') AND name = 'amount'",
     );
     assert_eq!(
-        has_canonical_shape, 1,
-        "`dbo.orders` has no `price` column, so this stand does not carry the canonical \
-         cross-engine seed — a STAND problem, not a rivet one. Seed it with:\n  \
-         RIVET_SEED_I_KNOW=1 cargo run --bin seed --features dev-seed -- --target mssql"
+        probe_present, 1,
+        "`dbo.planning_probe` is absent — a STAND problem, not a rivet one. It comes from \
+         dev/mssql/init.sql, which docker runs only on a FRESH data directory, so an \
+         existing stand does not get it by pulling. Apply it to a running one with:\n  \
+         docker exec -i rivet-mssql-1 /opt/mssql-tools18/bin/sqlcmd -C -S localhost \
+         -U sa -P 'Rivet_Passw0rd!' -d rivet -i /dev/stdin < dev/mssql/init.sql"
     );
 
-    // ── init --table dbo.orders ────────────────────────────────────────────
+    // ── init --table dbo.planning_probe ────────────────────────────────────
     let out = std::process::Command::new(RIVET_BIN)
-        .args(["init", "--source", MSSQL_URL, "--table", "dbo.orders"])
+        .args([
+            "init",
+            "--source",
+            MSSQL_URL,
+            "--table",
+            "dbo.planning_probe",
+        ])
         .output()
         .expect("spawn rivet init (mssql)");
 
     assert!(
         out.status.success(),
-        "rivet init --table dbo.orders must exit 0; stderr:\n{}",
+        "rivet init --table dbo.planning_probe must exit 0; stderr:\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
 
     let yaml = String::from_utf8_lossy(&out.stdout);
-    // SQL Server scaffold: `type: mssql`, schema-qualified `FROM dbo.orders`.
+    // SQL Server scaffold: `type: mssql`, schema-qualified `FROM dbo.planning_probe`.
     assert!(
         yaml.contains("type: mssql"),
         "emitted YAML must declare `type: mssql`; got:\n{yaml}"
     );
     assert!(
-        yaml.contains("  - name: orders"),
-        "dbo.orders must own a dedicated export block; got:\n{yaml}"
+        yaml.contains("  - name: planning_probe"),
+        "dbo.planning_probe must own a dedicated export block; got:\n{yaml}"
     );
     assert!(
-        yaml.contains("dbo.orders"),
-        "emitted YAML must reference the schema-qualified `dbo.orders`; got:\n{yaml}"
+        yaml.contains("dbo.planning_probe"),
+        "emitted YAML must reference the schema-qualified `dbo.planning_probe`; got:\n{yaml}"
     );
     // Exactly one export (single-table init).
     let export_count = yaml.matches("  - name:").count();
@@ -71,22 +86,12 @@ fn init_mssql_single_table_emits_valid_config_that_passes_check() {
         export_count, 1,
         "single-table init must emit exactly 1 export; got {export_count}:\n{yaml}"
     );
-    // A DECIMAL column must ride through with its declared precision/scale
-    // (catalog hint), so no unbounded-decimal REVIEW marker.
-    //
-    // Asserted against `price DECIMAL(10,2)` from the CANONICAL seed
-    // (`src/bin/seed/mssql.rs`), not `amount DECIMAL(12,2)` from
-    // `dev/mssql/init.sql`. Both used to create `dbo.orders`, with incompatible
-    // schemas and the seed doing a DROP+CREATE, so whichever ran last won — and
-    // this assertion was green only because nobody ran `seed --target mssql`.
-    // Nobody did, because `seed-release` named postgres and mysql and silently
-    // skipped SQL Server; fixing that coverage gap on 2026-08-04 is what
-    // surfaced the collision. `orders` now belongs to the seed alone (the
-    // init-time probe was renamed `dbo.planning_probe`), so this test depends
-    // on the fixture that every engine shares.
+    // The `amount DECIMAL(12,2)` column (dev/mssql/init.sql, `dbo.planning_probe`)
+    // must ride through with its declared precision/scale (catalog hint), so no
+    // unbounded-decimal REVIEW marker.
     assert!(
-        yaml.contains("price: decimal(10,2)"),
-        "DECIMAL(10,2) must scaffold with its catalog precision/scale; got:\n{yaml}"
+        yaml.contains("amount: decimal(12,2)"),
+        "DECIMAL(12,2) must scaffold with its catalog precision/scale; got:\n{yaml}"
     );
 
     // ── swap url_env → literal url so `rivet check` can connect ─────────────
