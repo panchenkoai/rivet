@@ -75,6 +75,20 @@ impl Eng {
         }
     }
 
+    /// The matrix's TIMEZONE-AWARE timestamp column, per engine.
+    ///
+    /// The names genuinely differ (`created_at_ts` on MySQL, `created_at_tz` on
+    /// PostgreSQL and SQL Server), and the value-consumer guard needs to point
+    /// its uniqueness gate at THIS column rather than at `id`: an integer key
+    /// renders on every build, so a check over it cannot notice a rendering
+    /// failure — the guard's own uniqueness leg was inert until it aimed here.
+    fn tz_column(self) -> &'static str {
+        match self {
+            Eng::My => "created_at_ts",
+            Eng::Pg | Eng::Ms => "created_at_tz",
+        }
+    }
+
     fn rig(self, table: &str) -> Rig {
         match self {
             Eng::Pg => Rig::pg_batch(&format!("public.{table}")),
@@ -1205,6 +1219,99 @@ fn run_csv(eng: Eng) {
         lines > 100,
         "csv must have a header + rows; got {lines} lines"
     );
+}
+
+/// THE GUARD: every type the fixture carries must survive every mechanism that
+/// CONSUMES a cell value — in one export, so adding a column to the matrix
+/// exercises all of them at once and none can be forgotten.
+///
+/// Three consumers exist and each renders a value independently:
+///
+///   `enrich::row_hash_array`      the `_rivet_row_hash` meta column
+///   `ExportSink::track_checksum`  the per-column value checksum `validate` re-reads
+///   `quality::check_uniqueness`   the `unique_columns` gate
+///
+/// Every defect this guard exists for had the same shape: a type the product
+/// PRODUCES met a consumer nobody had run it through, and the consumer degraded
+/// to a value instead of refusing.
+///
+///   2026-03-28  `_rivet_row_hash` shipped hashing arrays by their rendered text,
+///               so `["a, b"]` and `["a","b"]` collided. Arrays landed six weeks
+///               later and nobody asked whether the hash could canonicalise one.
+///   2026-08-05  a timestamp with a NAMED timezone — 278 of 1184 columns in a real
+///               production database — could not be rendered at all. `row_hash`
+///               swallowed it (empty cell in the hash) until 0.24.0 and then
+///               refused, costing 63 of 65 exports. The type matrix had carried
+///               `created_at_ts TIMESTAMP(6)` the whole time; the row_hash test
+///               ran over a two-INTEGER table instead.
+///
+/// So the guard is not "does the fixture contain the type" — it did — but "does
+/// the type reach every consumer". Executable rather than declarative on
+/// purpose: a ledger of type × mechanism would need updating by the same person
+/// who forgot the mechanism.
+fn run_type_matrix_through_every_value_consumer(eng: Eng) {
+    eng.require();
+    let table = "rivet_type_matrix".to_string();
+    let rig = eng
+        .rig(&table)
+        .duckdb_oracle()
+        .mode("full")
+        // consumer 1: the row hash, over EVERY column (no declared subset)
+        .export_line("meta_columns:")
+        .export_line("  row_hash: true")
+        // consumer 3: the uniqueness gate, over the primary key
+        .export_line("quality:")
+        .export_line(&format!("  unique_columns: [{}]", eng.tz_column()))
+        .export_line("  unique_max_entries: 100000");
+    let cfg = rig.config_path();
+
+    // consumer 2: `--validate` re-reads the parts and re-checks the per-column
+    // value checksums the sink recorded while writing.
+    let out = run_rivet_env(
+        &["run", "--config", cfg.to_str().unwrap(), "--validate"],
+        &[("RUST_LOG", "warn")],
+    );
+    assert!(
+        out.status.success(),
+        "the type matrix must survive row_hash + value checksum + quality in ONE export. \
+         A failure here means a type the product can PRODUCE reached a consumer that \
+         cannot handle it.\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Not just "exit 0": the hash must actually DISTINGUISH the rows. A consumer
+    // that silently drops a cell still exits 0 — that is precisely how this class
+    // hides — so read the output back with a decoder rivet does not share.
+    let dir = rig.oracle_dir();
+    let rows = duckdb_parquet_rows(dir);
+    assert!(
+        rows > 1,
+        "the matrix must have >1 row to distinguish anything"
+    );
+    let distinct = duckdb_parquet_distinct(dir, "_rivet_row_hash");
+    assert_eq!(
+        distinct, rows,
+        "{rows} matrix rows hashed to {distinct} distinct values — a collision over \
+         distinct rows means a consumer swallowed the cells that differ"
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d postgres with the golden seed"]
+fn stand_type_matrix_every_consumer_postgres() {
+    run_type_matrix_through_every_value_consumer(Eng::Pg);
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mysql with the golden seed"]
+fn stand_type_matrix_every_consumer_mysql() {
+    run_type_matrix_through_every_value_consumer(Eng::My);
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mssql with the golden seed"]
+fn stand_type_matrix_every_consumer_mssql() {
+    run_type_matrix_through_every_value_consumer(Eng::Ms);
 }
 
 #[test]
