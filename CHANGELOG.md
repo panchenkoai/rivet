@@ -1,5 +1,100 @@
 # Changelog
 
+## 0.24.2 — 2026-08-05
+
+A durability-accounting release. Every fix here is a case where rivet did the
+work correctly and then mis-recorded it — the data was on disk, the source was
+advanced, and the run's own books said otherwise. Nothing in this release
+changes a config or an output format.
+
+### Fixed — silent data loss
+
+- **A text UUID went 100% NULL.** The `FixedSizeBinary(16)` cell builder nulled
+  anything that was not exactly 16 bytes, and PostgreSQL's `test_decoding`
+  renders a uuid as 36 characters of text — so the whole column was NULL while
+  every count and sum check passed. Both the builder and the value checksum now
+  parse the text form, because fixing only the builder would have turned correct
+  exports into checksum failures.
+- **A dropped replication slot was silently recreated at the CURRENT WAL
+  position** whenever no checkpoint was configured, skipping every change since
+  the slot went away. It is now refused.
+- **`NaN` / `±Infinity` were nulled by a string column override** — the one path
+  that could still carry them.
+- **SQL Server date-window literals depended on `DATEFORMAT`,** so a server not
+  running `us_english` read every window wrong.
+- **The value checksum annihilated duplicates,** which meant `rivet validate`
+  verified nothing on any table with repeated values.
+
+### Fixed — the run's books disagreed with the disk
+
+- **A failed CDC run reported 0 rows over parts it had already committed and
+  ACKED.** The drain rolls many times per run; an error discarded the manifests
+  entirely, so the metric row read `failed, 0 rows, 0 files` while the object
+  store held the parts and the source had moved past them. An operator reading
+  that re-runs for changes the log no longer has. `run_to_files` now returns what
+  it made durable alongside the outcome.
+- **The parallel-keyset and Mongo-parallel drains bailed ABOVE their own
+  `record_part`,** handing the retry guard a zero while parts sat on disk.
+- **A resumed run's durable parts were hidden by a stale manifest** —
+  rehydration ran only when no manifest existed.
+- **An unwritten manifest reported success.** It now fails the run.
+- **`rivet load` recorded an IN-FLIGHT run as consumed,** stranding every part
+  that run wrote afterwards.
+
+### Fixed — writer and reader addressed different places
+
+- **`rivet apply` wrote its ledger to the current working directory.** The
+  chunk-checkpoint worker was handed an empty config path, which resolved to
+  `./.rivet_state.db` — so a resumed run found its chunks complete and its file
+  log empty, and declared a zero-part manifest over parquet already on disk.
+- **`mode: cdc` never expanded `{date}` in a destination.** Expansion is a side
+  effect of building a plan, and the CDC path returns before `build_plan`, so the
+  drain created a directory named, literally, `{date}` while `rivet validate`
+  resolved the template to today's date and reported an empty destination.
+- **Concurrent writers into one local prefix deleted each other's staged
+  files,** because each staged its write under a name derived from the final key
+  alone.
+
+### Fixed — state backends
+
+- **Shape tracking never worked on the PostgreSQL backend at all** — the code
+  ran, runs succeeded, and `export_shape` stayed empty on one backend while
+  filling on the other.
+- **Migration v21 was missing from the PostgreSQL ladder,** and nothing offline
+  said so.
+- **Parallel writers against an empty backend killed each other's migrations.**
+  They are now serialised.
+
+### Added — verification
+
+- **An independent read-back oracle.** Completeness claims across the live suite
+  now go through DuckDB, a decoder rivet does not share, instead of re-reading
+  outputs with the code that wrote them.
+- **A blessed-path gate cell:** `init → doctor → check → plan → apply → validate
+  → reconcile` in ONE traversal, per engine × read strategy × store × state
+  backend, asserting every artifact and comparing source, manifest and DuckDB.
+  Measured before adding it: no test in the repository drove even three of those
+  five subcommands in a single body.
+- **State-backend parity read by one decoder.** DuckDB attaches the SQLite file
+  and the Postgres store in a single session, so a surviving difference is data
+  rather than rendering.
+- **A full BigQuery cycle** in the gate: export to real GCS → load → verify by
+  `bq query` → drop, with the drop verified rather than assumed.
+
+### Fixed — fixtures and the gate itself
+
+- **The canonical seed was never uniform.** The default profile called SQL-side
+  `random()` in five places, and the two engines that WERE deterministic
+  disagreed with each other (MySQL wrote `bio` when `i % 3 = 0`, SQL Server when
+  `i % 3 <> 0`). `seed-release` also named two engines and skipped SQL Server.
+  All three SQL engines now produce a byte-identical fixture, verified by
+  exporting each and hashing the parquet through DuckDB.
+- **`dbo.orders` had two owners** with incompatible schemas, one of which
+  DROP+CREATEs; the init-time probe is now `dbo.planning_probe`.
+- **Three false-greens in the release gate:** an unreadable state-DB query
+  scored as clean, the GCS concurrency leg rendered a verdict without counting
+  rows and then deleted the evidence, and two empty parity profiles "agreed".
+
 ## 0.24.1 — 2026-07-31
 
 ### Fixed
