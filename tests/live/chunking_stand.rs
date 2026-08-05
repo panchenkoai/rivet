@@ -1108,9 +1108,24 @@ fn stand_time_window_mssql() {
 /// the columns actually land in a real export (previously unit-only).
 fn run_meta_columns(eng: Eng) {
     eng.require();
-    let (table, _guard) = seed_dense(eng, 200);
+    // The GOLDEN TYPE MATRIX, not `seed_dense`.
+    //
+    // This used to run over `seed_dense` — two columns, `BIGINT` and `INT` — so
+    // it proved the meta columns LAND and nothing about what they contain. The
+    // gap was not theoretical: `_rivet_row_hash` could not render a timestamp
+    // whose timezone is a NAME (`Some("UTC")` — what a MySQL `TIMESTAMP` maps
+    // to), and on a production config that cost 63 of 65 exports on 2026-08-05.
+    // The matrix has carried `created_at_ts TIMESTAMP(6)` the whole time; this
+    // test simply never looked at it, so four months of green meant only that
+    // two integers could be hashed.
+    //
+    // Measured on the type matrix's real output: `created_at_dt` is a naive
+    // TIMESTAMP and `created_at_ts` is TIMESTAMP WITH TIME ZONE — both forms in
+    // one export, which is the point.
+    let table = "rivet_type_matrix".to_string();
     let rig = eng
         .rig(&table)
+        .duckdb_oracle()
         .mode("full")
         .export_line("meta_columns:")
         .export_line("  exported_at: true")
@@ -1133,6 +1148,38 @@ fn run_meta_columns(eng: Eng) {
     assert!(
         cols.iter().any(|c| c == "_rivet_row_hash"),
         "output must carry _rivet_row_hash; got {cols:?}"
+    );
+    // PRESENCE is not content. The column landed for four months while the
+    // temporal cells contributed NOTHING to it — before 2026-08-04 an
+    // unrenderable value was swallowed (`.ok()` → skip), so two rows differing
+    // only in a timestamp hashed identically. Assert the matrix's own temporal
+    // columns are in the export AND that the hash actually varies across its
+    // rows, which it cannot do if the cells were dropped.
+    // Assert the PROPERTY, not a column name: the three engines name their
+    // temporal columns differently (`created_at_ts` on MySQL, `created_at_tz`
+    // on PostgreSQL), and a name list would pass on one engine and lie on the
+    // others. What must hold everywhere is that the export carries a
+    // TIMEZONE-AWARE timestamp — the exact shape `row_hash` could not render.
+    let dir = rig.oracle_dir();
+    let described = duckdb_run_sql_json(&format!(
+        "DESCRIBE SELECT * FROM read_parquet('{dir}/**/*.parquet')"
+    ));
+    let schema = duckdb_parse_describe(&described);
+    assert!(
+        schema.values().any(|t| t.contains("WITH TIME ZONE")),
+        "the type matrix must contribute a TIMEZONE-AWARE timestamp — that is the \
+         shape row_hash could not render, and hashing it is the point of this test; \
+         got {schema:?}"
+    );
+    // Read back with DuckDB — a decoder rivet does not share — so the claim is
+    // not rivet re-reading its own rendering.
+    let rows = duckdb_parquet_rows(dir);
+    let distinct = duckdb_parquet_distinct(dir, "_rivet_row_hash");
+    assert_eq!(
+        distinct, rows,
+        "{rows} matrix rows produced {distinct} distinct hashes — equal rows with fewer \
+         distinct hashes is exactly what a SWALLOWED cell looks like: the differing \
+         column contributed nothing"
     );
 }
 
@@ -1164,6 +1211,24 @@ fn run_csv(eng: Eng) {
 #[ignore = "live: requires docker compose up -d postgres"]
 fn stand_meta_columns_postgres() {
     run_meta_columns(Eng::Pg);
+}
+
+// Per ENGINE, not one standing in for three. `meta_columns` is engine-agnostic
+// enrichment, which is why this ran on PostgreSQL alone — but the TYPE it must
+// survive is not: a MySQL `TIMESTAMP` and a SQL Server `DATETIME2` resolve
+// through different mappings to reach `Some("UTC")`, and the production failure
+// that motivated this test was on MySQL, the one engine it did not cover.
+
+#[test]
+#[ignore = "live: requires docker compose up -d mysql"]
+fn stand_meta_columns_mysql() {
+    run_meta_columns(Eng::My);
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mssql"]
+fn stand_meta_columns_mssql() {
+    run_meta_columns(Eng::Ms);
 }
 
 #[test]
