@@ -200,7 +200,7 @@ fn roast_rapid_incremental_runs_into_same_prefix_must_not_clobber_prior_parts() 
 
     // The union of all deltas must be every id — no run's part was clobbered.
     assert_eq!(
-        dir_parquet_id_set(out.path()),
+        duckdb_dir_parquet_id_set(out.path()),
         (0..N).collect::<std::collections::BTreeSet<i64>>(),
         "every incremental delta must survive; a clobbered part is silent data loss"
     );
@@ -277,7 +277,7 @@ fn pg_incremental_cursor_survives_a_non_utc_session_timezone() {
     );
 
     assert_eq!(
-        dir_parquet_id_set(out.path()),
+        duckdb_dir_parquet_id_set(out.path()),
         (1..=4).collect::<std::collections::BTreeSet<i64>>(),
         "a non-UTC session must not skip the offset-window rows (3,4) — the incremental \
          cursor boundary must be parsed as UTC, not the session zone"

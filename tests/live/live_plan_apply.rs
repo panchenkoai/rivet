@@ -226,7 +226,7 @@ fn plan_and_apply_chunked_export_round_trip_uses_precomputed_ranges() {
         "3 chunks must land all 150 rows"
     );
     assert_eq!(
-        dir_parquet_id_set(&rig.out_dir()),
+        duckdb_dir_parquet_id_set(&rig.out_dir()),
         (0..150).collect::<std::collections::BTreeSet<i64>>(),
         "chunked round-trip must hold every source id 0..150"
     );
@@ -350,7 +350,7 @@ fn apply_replay_case(extra_mode_lines: &str) {
         "apply must move only the rows its plan covered"
     );
     assert_eq!(
-        dir_parquet_id_set(&rig.out_dir()),
+        duckdb_dir_parquet_id_set(&rig.out_dir()),
         (0..150).collect::<std::collections::BTreeSet<i64>>(),
         "the ids must be exactly the planned range — rows added after planning \
          belong to the next run, not this artifact"

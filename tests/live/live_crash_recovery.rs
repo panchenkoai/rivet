@@ -26,7 +26,7 @@ use crate::common::*;
 /// assert the no-row-loss superset invariant the state-DB assertions cannot see.
 fn parquet_ids_and_rows(dir: &std::path::Path) -> (std::collections::BTreeSet<i64>, i64) {
     (
-        dir_parquet_id_set(dir),
+        duckdb_dir_parquet_id_set(dir),
         duckdb_total_parquet_rows(dir) as i64,
     )
 }

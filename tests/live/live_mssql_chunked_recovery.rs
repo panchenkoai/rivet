@@ -164,7 +164,7 @@ fn mssql_chunked_crash_after_first_chunk_complete_resume_finishes_export() {
         "destination must hold exactly 150 rows (no re-run, no dup)"
     );
     assert_eq!(
-        dir_parquet_id_set(&rig.out_dir()).len(),
+        duckdb_dir_parquet_id_set(&rig.out_dir()).len(),
         150,
         "150 distinct source ids must be present at the destination"
     );
@@ -246,7 +246,7 @@ fn mssql_chunked_crash_after_chunk_file_before_commit_resume_reruns_chunk_atleas
     // Destination re-read: every source id present (no loss) despite the
     // at-least-once chunk-0 re-run; physical rows >= source (the dup is surplus).
     assert_eq!(
-        dir_parquet_id_set(&rig.out_dir()).len(),
+        duckdb_dir_parquet_id_set(&rig.out_dir()).len(),
         150,
         "every seeded id must survive the at-least-once re-run (no loss)"
     );
@@ -356,7 +356,7 @@ fn mssql_parallel_chunked_crash_after_chunk_complete_resume_finishes_with_no_dup
         "destination must hold exactly ROW_COUNT rows — no parallel double-write"
     );
     assert_eq!(
-        dir_parquet_id_set(&rig.out_dir()).len() as i64,
+        duckdb_dir_parquet_id_set(&rig.out_dir()).len() as i64,
         ROW_COUNT,
         "ROW_COUNT distinct source ids must be present"
     );
@@ -461,7 +461,7 @@ fn mssql_parallel_chunked_crash_after_chunk_file_stuck_running_resume_reruns_chu
     // Destination re-read: every source id survives the stuck-running reset +
     // at-least-once re-run (no loss); physical rows >= source (dup is surplus).
     assert_eq!(
-        dir_parquet_id_set(&rig.out_dir()).len() as i64,
+        duckdb_dir_parquet_id_set(&rig.out_dir()).len() as i64,
         ROW_COUNT,
         "every seeded id must land after stuck-running reset + at-least-once re-run"
     );

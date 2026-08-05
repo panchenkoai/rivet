@@ -519,7 +519,7 @@ fn mssql_cdc_initial_snapshot_covers_preexisting_rows_then_streams() {
     run_rivet_ok(&cfg);
     assert_eq!(manifest_rows(&out.join("snapshot")), 2);
     assert_eq!(
-        dir_parquet_id_set(&out.join("snapshot"))
+        duckdb_dir_parquet_id_set(&out.join("snapshot"))
             .into_iter()
             .collect::<Vec<i64>>(),
         vec![1, 2],
@@ -1057,7 +1057,7 @@ fn mssql_cdc_column_added_via_new_capture_instance_is_captured() {
     std::fs::create_dir_all(&out1).unwrap();
     run_rivet_ok(&mssql_cdc_config(&d, &table, &ci1, &ckpt1, &out1));
     assert!(
-        !dir_parquet_has_column(&out1, "w"),
+        !duckdb_dir_parquet_has_column(&out1, "w"),
         "ci1 predates the added column"
     );
 
@@ -1081,11 +1081,11 @@ fn mssql_cdc_column_added_via_new_capture_instance_is_captured() {
     std::fs::create_dir_all(&out2).unwrap();
     run_rivet_ok(&mssql_cdc_config(&d, &table, &ci2, &ckpt2, &out2));
     assert!(
-        dir_parquet_has_column(&out2, "w"),
+        duckdb_dir_parquet_has_column(&out2, "w"),
         "the new capture instance must expose the column added after ci1"
     );
     assert!(
-        dir_parquet_distinct_strings(&out2, "w").contains("hello"),
+        duckdb_dir_parquet_distinct_strings(&out2, "w").contains("hello"),
         "the added column's value must be captured, not nulled"
     );
 }
@@ -1146,7 +1146,8 @@ fn mssql_cdc_until_current_terminates_under_sustained_writes() {
         elapsed.is_some(),
         "until_current must terminate under sustained writes (killed at the 30s ceiling)"
     );
-    let ids: std::collections::BTreeSet<i64> = dir_parquet_i64(&out, "id").into_iter().collect();
+    let ids: std::collections::BTreeSet<i64> =
+        duckdb_dir_parquet_i64(&out, "id").into_iter().collect();
     for i in 0..30 {
         assert!(
             ids.contains(&i),
@@ -1225,8 +1226,9 @@ fn roast_mssql_until_current_open_bound_two_runs_lose_nothing() {
         "run 2 (no writers) must drain the tail and exit"
     );
 
-    let got: std::collections::BTreeSet<i64> =
-        dir_parquet_i64(&rig.out_dir(), "id").into_iter().collect();
+    let got: std::collections::BTreeSet<i64> = duckdb_dir_parquet_i64(&rig.out_dir(), "id")
+        .into_iter()
+        .collect();
     let sum: i64 = got.iter().sum();
     assert_eq!(
         got.len() as i64,
@@ -1313,7 +1315,8 @@ fn roast_mssql_cdc_large_transaction_is_atomic_across_a_mid_flush_crash() {
         .dest_path(out.clone());
     run_rivet_ok(&rig2.config_path());
 
-    let got: std::collections::BTreeSet<i64> = dir_parquet_i64(&out, "id").into_iter().collect();
+    let got: std::collections::BTreeSet<i64> =
+        duckdb_dir_parquet_i64(&out, "id").into_iter().collect();
     let want: std::collections::BTreeSet<i64> = (0..12).collect();
     assert_eq!(
         got,

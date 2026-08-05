@@ -97,7 +97,7 @@ exports:
     // The invariant: the destination, re-read independently, is a COMPLETE
     // superset of the source — every id present at least once (no loss), with
     // at-least-once duplication the only allowed surplus.
-    let ids = dir_parquet_id_set(out.path());
+    let ids = duckdb_dir_parquet_id_set(out.path());
     let expected: std::collections::BTreeSet<i64> = (0..N).collect();
     let missing: Vec<i64> = expected.difference(&ids).copied().collect();
     assert!(

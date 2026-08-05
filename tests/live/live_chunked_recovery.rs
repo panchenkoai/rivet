@@ -111,7 +111,7 @@ fn manifest_total_rows(cfg: &std::path::Path, export: &str) -> i64 {
 fn parquet_physical_and_distinct_ids(dir: &std::path::Path) -> (i64, i64) {
     (
         duckdb_total_parquet_rows(dir) as i64,
-        dir_parquet_id_set(dir).len() as i64,
+        duckdb_dir_parquet_id_set(dir).len() as i64,
     )
 }
 

@@ -161,7 +161,7 @@ fn mssql_roast_rapid_incremental_runs_into_same_prefix_must_not_clobber_prior_pa
     }
 
     assert_eq!(
-        dir_parquet_id_set(out.path()),
+        duckdb_dir_parquet_id_set(out.path()),
         (0..N).collect::<std::collections::BTreeSet<i64>>(),
         "every incremental delta must survive; a clobbered part is silent data loss"
     );

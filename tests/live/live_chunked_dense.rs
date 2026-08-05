@@ -60,7 +60,7 @@ const GRP_CASE: &str = "CASE WHEN n <= 200 THEN n WHEN n <= 800 THEN 5000 ELSE 5
 /// Parquet, not rivet's counters. Distinguishes LOSS (missing id) from
 /// DUPLICATION (count > ROWS) so the failure message names the actual fault.
 fn assert_each_id_exactly_once(dir: &std::path::Path, ctx: &str) {
-    let ids = dir_parquet_ids(dir);
+    let ids = duckdb_dir_parquet_ids(dir);
     let set: BTreeSet<i64> = ids.iter().copied().collect();
     let expected: BTreeSet<i64> = (1..=ROWS).collect();
 

@@ -221,7 +221,7 @@ fn mysql_crash_after_source_read_leaves_state_completely_clean() {
         "recovery file must hold all 10 rows"
     );
     assert_eq!(
-        dir_parquet_id_set(out.path()),
+        duckdb_dir_parquet_id_set(out.path()),
         (1..=10).collect::<std::collections::BTreeSet<i64>>(),
         "recovery must surface every source id (1..=10)"
     );
@@ -284,7 +284,7 @@ fn mysql_crash_after_file_write_leaves_file_but_no_manifest_or_cursor() {
     // source (every id present — no loss across orphan+recovery), with
     // at-least-once duplication the only surplus.
     assert_eq!(
-        dir_parquet_id_set(out.path()),
+        duckdb_dir_parquet_id_set(out.path()),
         (1..=8).collect::<std::collections::BTreeSet<i64>>(),
         "recovery must leave every source id (1..=8) — a missing id is row LOSS"
     );
@@ -337,7 +337,7 @@ fn mysql_crash_after_manifest_update_leaves_file_and_manifest_but_no_cursor() {
     assert!(cursor_value(&cfg, &export).is_some());
     // Destination re-read: complete superset of the source (no loss).
     assert_eq!(
-        dir_parquet_id_set(out.path()),
+        duckdb_dir_parquet_id_set(out.path()),
         (1..=7).collect::<std::collections::BTreeSet<i64>>(),
         "recovery must leave every source id (1..=7) — a missing id is row LOSS"
     );
@@ -408,7 +408,7 @@ fn mysql_crash_after_cursor_commit_is_recoverable_with_full_state() {
         "committed file must hold all 6 rows once"
     );
     assert_eq!(
-        dir_parquet_id_set(out.path()),
+        duckdb_dir_parquet_id_set(out.path()),
         (1..=6).collect::<std::collections::BTreeSet<i64>>(),
         "committed file must hold every source id (1..=6)"
     );

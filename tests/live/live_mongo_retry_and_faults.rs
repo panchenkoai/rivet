@@ -55,7 +55,7 @@ fn mongo_export_survives_transient_latency_added_via_toxiproxy() {
     let rig = proxied(&db);
     rig.run_ok();
     assert_eq!(
-        dir_parquet_distinct_strings(&rig.out_dir(), "_id").len(),
+        duckdb_dir_parquet_distinct_strings(&rig.out_dir(), "_id").len(),
         8000,
         "latency must not lose rows"
     );
@@ -107,7 +107,7 @@ fn mongo_export_recovers_after_mid_stream_proxy_disable_then_enable_with_retries
     // at-least-once (committed parts + a full re-export can leave duplicate ROWS),
     // so assert on the DISTINCT _id set — the completeness oracle, dup-immune.
     assert_eq!(
-        dir_parquet_distinct_strings(&rig.out_dir(), "_id").len(),
+        duckdb_dir_parquet_distinct_strings(&rig.out_dir(), "_id").len(),
         100_000,
         "a mid-stream outage must never lose a row — recovered in place or safely re-run",
     );
