@@ -1735,3 +1735,120 @@ fn stand_environment_profile_mysql() {
 fn stand_environment_profile_mssql() {
     run_environment_profile(Eng::Ms);
 }
+
+// ─── range bounds that cannot be read must not become an empty export ────────
+
+/// A range-chunked export whose min/max the planner cannot read as `i64` must
+/// NOT report success having written nothing.
+///
+/// `detect::detect` reads the window bounds as
+/// `src.query_scalar(min|max)?.and_then(|s| s.trim().parse::<i64>().ok()).unwrap_or(0)`
+/// (src/pipeline/chunked/detect.rs:316-323). Three different inputs land on the
+/// same `0`, and only the first is legitimate:
+///
+///   1. the scalar is NULL — the table really is empty, one empty window is right;
+///   2. the text does not parse as `i64` — a DECIMAL/NUMERIC/float key;
+///   3. `query_scalar` cannot render the type at all — PostgreSQL's
+///      (src/source/postgres/mod.rs) tries i64, i32, f64, timestamp, date, uuid,
+///      String and falls through to `Ok(None)`; NUMERIC matches no arm.
+///
+/// With min = max = 0 the plan is the single window `(0, 0)` and the runner
+/// emits `WHERE col BETWEEN 0 AND 0`. PostgreSQL compares numeric to integer
+/// happily, so the query is VALID and returns nothing: the export writes no
+/// parts and reports `status: success`, exit 0.
+///
+/// Measured on this stand, `numeric(20,0)` PK with 100 rows:
+///   `chunk_column `id` range 0 .. 0` → `0 rows  0 files  0 B` → `status: success`
+/// One hundred rows of a hundred, gone, with a green run.
+///
+/// PER-ENGINE, and the matrix is what established it: only PostgreSQL goes RED.
+/// MySQL and SQL Server return the DECIMAL bound as the text `"1"`, which parses
+/// as `i64` and chunks correctly — they are the CONTROL arms here, not padding.
+/// PostgreSQL is alone in case 3: its `query_scalar` renders no numeric OID at
+/// all, so the bound never reaches the parser. Stating this as "decimal keys are
+/// broken" would have been wrong on two engines out of three; the engine axis is
+/// what made the claim precise enough to act on.
+///
+/// The plan-time guard does not save it: `build.rs` only verifies the column is
+/// integer-family when introspection SUCCEEDED, and the `query:`-form path warns
+/// and emits the Chunked plan anyway. The warning is also wrong about the
+/// damage — it says "silently drops rows between windows" when the outcome is
+/// every row.
+///
+/// Two things in the same file show this is an oversight, not a decision. Sixty
+/// lines above, the DATE branch hard-errors on both a NULL bound and an
+/// unparseable one (detect.rs:240-266). And the shared, error-RETURNING
+/// `parse_scalar_i64` (src/scalar.rs:52) is used at detect.rs:25 for the
+/// `COUNT(*)` — where a wrong value is harmless — and not for the bounds, where
+/// it is catastrophic.
+///
+/// The existing unit test `integer_range_null_minmax_collapses_to_zero_zero`
+/// pins case 1 with `null(), null()`, which is correct for an EMPTY table. No
+/// test covers a NON-empty table whose bounds cannot be read — that is the hole
+/// this fills.
+// AUDIT-RED chunk-bounds-collapse: unreadable min/max → `unwrap_or(0)` → one `BETWEEN 0 AND 0` window → 0 of N rows exported, status success, exit 0. Asserts CORRECT behavior; expected to FAIL until fixed.
+fn run_unreadable_range_bounds_must_not_export_nothing(eng: Eng) {
+    eng.require();
+    const ROWS: i64 = 100;
+    let (table, _guard) = seed_decimal_pk(eng, ROWS);
+
+    // `query:` rather than `table:` on purpose: with `table:` the planner
+    // introspects the column type and refuses at plan time, which is the
+    // behaviour we WANT. The curated-query form is what `rivet init` emits for
+    // every non-keyset chunked export, and it is the shape that reaches the
+    // runner unchecked.
+    let rig = eng
+        .rig(&table)
+        .mode("chunked")
+        .query(&format!("SELECT dkey, v FROM {table}"))
+        .export_line("chunk_column: dkey")
+        .export_line("chunk_size: 10");
+    let cfg = rig.config_path();
+    let out = run_rivet_env(
+        &["run", "--config", cfg.to_str().unwrap()],
+        &[("RUST_LOG", "warn")],
+    );
+
+    // Either outcome is acceptable — refuse loudly, or export the rows. What
+    // must never happen is the third: exit 0 having written nothing.
+    if !out.status.success() {
+        return; // refused: correct
+    }
+    // DuckDB, not the parquet crate rivet wrote with: a symmetric read/write
+    // fault cannot be seen by the reader that shares the writer's code.
+    let got = duckdb_total_parquet_rows(&rig.out_dir()) as i64;
+    assert_eq!(
+        got,
+        ROWS,
+        "range-chunked export of {ROWS} rows on a {} DECIMAL key reported SUCCESS but wrote \
+         {} row(s). The bounds could not be parsed as i64, so both collapsed to 0 and the plan \
+         became the single window `BETWEEN 0 AND 0`. A run that exits 0 having exported nothing \
+         is the worst of the three possible outcomes: refusing would be safe, exporting would be \
+         correct, and this is neither.\nstderr:\n{}",
+        match eng {
+            Eng::Pg => "PostgreSQL numeric",
+            Eng::My => "MySQL decimal",
+            Eng::Ms => "SQL Server decimal",
+        },
+        got,
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn stand_unreadable_range_bounds_must_not_export_nothing_postgres() {
+    run_unreadable_range_bounds_must_not_export_nothing(Eng::Pg);
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mysql"]
+fn stand_unreadable_range_bounds_must_not_export_nothing_mysql() {
+    run_unreadable_range_bounds_must_not_export_nothing(Eng::My);
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mssql"]
+fn stand_unreadable_range_bounds_must_not_export_nothing_mssql() {
+    run_unreadable_range_bounds_must_not_export_nothing(Eng::Ms);
+}
