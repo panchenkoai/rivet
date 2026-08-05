@@ -17,12 +17,14 @@ const PORT: u16 = 27017;
 /// `_id`) and at-least-once (rows ≥ source). Shared by both crash-window tests.
 fn crash_then_recover_is_lossless(hook: &str, tag: &str) {
     require_alive(LiveService::Mongo);
+    require_alive(LiveService::DuckDb);
     let db = unique_name(tag);
     MongoTest::connect(PORT, &db).seed_int_id("t", 5000); // 5 keyset pages
 
     let rig = Rig::mongo_batch("t")
         .source_url(&MongoTest::url(PORT, &db))
-        .mongo("page_size: 1000");
+        .mongo("page_size: 1000")
+        .duckdb_oracle();
 
     // Crash mid-export: a file (and, for after_manifest_update, a manifest row)
     // exists, but the run aborts before finalising.
@@ -35,14 +37,14 @@ fn crash_then_recover_is_lossless(hook: &str, tag: &str) {
     // Recover: a clean re-run (same rig → same config + destination) must
     // complete and surface EVERY source row.
     rig.run_ok();
-    assert_eq!(
-        dir_parquet_distinct_strings(&rig.out_dir(), "_id").len(),
+    // Read by DuckDB, which does not share rivet's parquet codec. AT-LEAST-ONCE,
+    // not exact: the orphaned crash page may legitimately duplicate on recovery,
+    // so distinct must be exact while the total may exceed it.
+    duckdb_assert_at_least_once(
+        rig.oracle_dir(),
+        "_id",
         5000,
-        "recovery must lose NOTHING — every source _id present after the crash"
-    );
-    assert!(
-        total_parquet_rows(&rig.out_dir()) >= 5000,
-        "recovery is at-least-once — the orphaned crash page may duplicate, never lose"
+        "recovery after a mid-export crash",
     );
 }
 
@@ -67,26 +69,28 @@ fn mongo_batch_two_rapid_runs_into_same_prefix_do_not_clobber() {
     // (LocalDestination idempotent_overwrite). The batch-mode twin of the SQL
     // full_mode_repeated_run tests and the CDC roast_second_run clobber test.
     require_alive(LiveService::Mongo);
+    require_alive(LiveService::DuckDb);
     let db = unique_name("mongo_clobber");
     MongoTest::connect(PORT, &db).seed_int_id("t", 100);
     let rig = Rig::mongo_batch("t")
         .source_url(&MongoTest::url(PORT, &db))
-        .mongo("page_size: 50");
+        .mongo("page_size: 50")
+        .duckdb_oracle();
 
     rig.run_ok();
     rig.run_ok(); // rapid second run into the SAME prefix, no sleep
 
     // Two full snapshots of 100 rows → 200 physical rows if neither run clobbered
     // the other, and every source _id is still present.
-    assert_eq!(
-        total_parquet_rows(&rig.out_dir()),
+    // DuckDB, not the parquet crate rivet writes with. Both numbers stated:
+    // 200 rows over 100 distinct is CORRECT here — two full
+    // snapshots into one prefix — so neither "complete" nor "at least once" fits.
+    duckdb_assert_rows_and_distinct(
+        rig.oracle_dir(),
+        "_id",
         200,
-        "two rapid full runs must each materialise all 100 rows — no clobber"
-    );
-    assert_eq!(
-        dir_parquet_distinct_strings(&rig.out_dir(), "_id").len(),
         100,
-        "both snapshots hold every source _id"
+        "two rapid full runs must each materialise all 100 rows — no clobber",
     );
     // The parquet re-read above is a proxy; assert the dest manifest COPIES
     // (`manifest-<run>.json`, what reconcile / a warehouse autoloader read) also
@@ -109,25 +113,27 @@ fn mongo_batch_two_rapid_runs_into_same_prefix_do_not_clobber() {
 #[ignore = "live: requires docker compose up -d mongo"]
 fn mongo_parallel_two_rapid_runs_into_same_prefix_do_not_clobber() {
     require_alive(LiveService::Mongo);
+    require_alive(LiveService::DuckDb);
     let db = unique_name("mongo_par_clobber");
     MongoTest::connect(PORT, &db).seed_int_id("t", 100);
     let rig = Rig::mongo_batch("t")
         .source_url(&MongoTest::url(PORT, &db))
         .mongo("page_size: 30")
-        .export_line("parallel: 4");
+        .export_line("parallel: 4")
+        .duckdb_oracle();
 
     rig.run_ok();
     rig.run_ok(); // rapid second parallel run into the SAME prefix, no sleep
 
-    assert_eq!(
-        total_parquet_rows(&rig.out_dir()),
+    // DuckDB, not the parquet crate rivet writes with. Both numbers stated:
+    // 200 rows over 100 distinct is CORRECT here — two full
+    // snapshots into one prefix — so neither "complete" nor "at least once" fits.
+    duckdb_assert_rows_and_distinct(
+        rig.oracle_dir(),
+        "_id",
         200,
-        "two rapid parallel:4 runs must each materialise all 100 rows — no worker-part clobber"
-    );
-    assert_eq!(
-        dir_parquet_distinct_strings(&rig.out_dir(), "_id").len(),
         100,
-        "both parallel snapshots hold every source _id"
+        "two rapid parallel:4 runs must each materialise all 100 rows — no worker-part clobber",
     );
     assert_eq!(
         dir_manifest_copy_total_rows(&rig.out_dir()),

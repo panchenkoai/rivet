@@ -1037,6 +1037,47 @@ fn mysql_decimal_to_decimal256(
 }
 
 #[cfg(test)]
+mod time_parse_tests {
+    use super::parse_time_str_to_micros;
+
+    /// `parse_time_str_to_micros` had NO direct test — every arithmetic operator
+    /// in it was reachable only through a full MySQL export, so the mutation
+    /// baseline carried EIGHTEEN uncaught operator mutants for this one
+    /// function. Each value below is chosen so no two operators agree: h=1
+    /// (1*3600 = 3600 vs 1+3600 = 3601), m=2 (2*60 = 120 vs 2+60 = 62), and a
+    /// fraction whose digit count differs from 6 so the `6 - us_digits` exponent
+    /// is observable at all.
+    #[test]
+    fn parse_time_str_to_micros_pins_every_arithmetic_step() {
+        // (1*3600 + 2*60 + 3) * 1e6 + 456789
+        assert_eq!(
+            parse_time_str_to_micros("01:02:03.456789"),
+            Some(3_723_456_789),
+            "hours, minutes, seconds and a full 6-digit fraction"
+        );
+        // A SHORT fraction: 1 digit means scale 10^(6-1), so ".5" is 500_000 µs.
+        // A `+` in that exponent would scale by 10^7 instead.
+        assert_eq!(
+            parse_time_str_to_micros("00:00:01.5"),
+            Some(1_500_000),
+            "a 1-digit fraction scales by 10^(6-1), not 10^(6+1)"
+        );
+        // No fraction: the `us_part` addend is 0, and the rest still holds.
+        assert_eq!(parse_time_str_to_micros("02:00:00"), Some(7_200_000_000));
+        // Negation applies to the WHOLE value, after the sum.
+        assert_eq!(
+            parse_time_str_to_micros("-01:02:03.456789"),
+            Some(-3_723_456_789)
+        );
+        // Over-long fractions truncate at 6 digits, never round or error.
+        assert_eq!(parse_time_str_to_micros("00:00:00.1234567"), Some(123_456));
+        // Malformed input is None — never a panic, never a silent zero.
+        assert_eq!(parse_time_str_to_micros("not a time"), None);
+        assert_eq!(parse_time_str_to_micros("01:02"), None);
+    }
+}
+
+#[cfg(test)]
 mod scale_int_overflow_tests {
     use super::{derive_decimal_ps, narrow, scale_int_to_i128};
 
@@ -1210,7 +1251,22 @@ mod int64_bytes_dispatch_tests {
 // Asserts CORRECT behavior; expected to FAIL until the fix lands.
 #[cfg(test)]
 mod roast_mysql_bit_decode_tests {
+    use super::{
+        MysqlCellSource, TimeUnit, build_array, mysql_native_type_name, mysql_type_to_rivet,
+    };
+    use super::{RivetTimeUnit, RivetType};
     use std::io::{Read, Write};
+
+    /// How long any socket in the fake harness waits.
+    ///
+    /// Deliberately SHORT. Under `cargo mutants` a mutation can break the fake
+    /// server's own protocol, and every fetch then sat on a 10-second read
+    /// timeout — with dozens of fetches per test that exceeded the mutant budget
+    /// and 43 of 278 mutants TIMED OUT, which is neither caught nor missed but
+    /// UNMEASURED. Everything here talks to localhost against an in-process
+    /// server, so a second is already generous; a longer wait only buys a slower
+    /// way to learn the same failure.
+    const FAKE_IO_TIMEOUT: Duration = Duration::from_secs(1);
     use std::net::{TcpListener, TcpStream};
     use std::sync::Arc;
     use std::time::Duration;
@@ -1292,30 +1348,47 @@ mod roast_mysql_bit_decode_tests {
     }
 
     /// ColumnDefinition41 for a `BIT(16)` column named `b`.
-    fn bit16_column_definition() -> Vec<u8> {
+    /// One `ColumnDefinition41` packet body, the wire shape the server sends to
+    /// describe a result-set column. Every field the two mapping functions read
+    /// — `character_set`, `column_length`, `column_type`, `flags`, `decimals` —
+    /// is a parameter, so a test can hand the real driver any column MySQL can
+    /// describe without needing a MySQL.
+    fn column_definition(
+        name: &str,
+        character_set: u16,
+        column_length: u32,
+        column_type: u8,
+        flags: u16,
+        decimals: u8,
+    ) -> Vec<u8> {
         let mut p = Vec::new();
         lenc_bytes(&mut p, b"def"); // catalog (fixed value)
         lenc_bytes(&mut p, b""); // schema
         lenc_bytes(&mut p, b"t"); // table
         lenc_bytes(&mut p, b"t"); // org_table
-        lenc_bytes(&mut p, b"b"); // name
-        lenc_bytes(&mut p, b"b"); // org_name
+        lenc_bytes(&mut p, name.as_bytes()); // name
+        lenc_bytes(&mut p, name.as_bytes()); // org_name
         p.push(0x0c); // length of fixed-length fields
-        p.extend_from_slice(&63u16.to_le_bytes()); // character set: binary
-        p.extend_from_slice(&16u32.to_le_bytes()); // column_length: BIT(16)
-        p.push(0x10); // column type: MYSQL_TYPE_BIT
-        p.extend_from_slice(&0x0020u16.to_le_bytes()); // flags: UNSIGNED
-        p.push(0); // decimals
+        p.extend_from_slice(&character_set.to_le_bytes());
+        p.extend_from_slice(&column_length.to_le_bytes());
+        p.push(column_type);
+        p.extend_from_slice(&flags.to_le_bytes());
+        p.push(decimals);
         p.extend_from_slice(&[0, 0]); // filler
         p
+    }
+
+    fn bit16_column_definition() -> Vec<u8> {
+        // charset 63 = binary, BIT(16), MYSQL_TYPE_BIT (0x10), UNSIGNED.
+        column_definition("b", 63, 16, 0x10, 0x0020, 0)
     }
 
     /// Serve exactly one connection: handshake, auth OK, then answer the first
     /// COM_QUERY with one BIT(16) row whose raw wire bytes are [0x31, 0x32].
     fn serve_one_bit16_query(listener: TcpListener) {
         let (mut s, _) = listener.accept().expect("fake MySQL server: accept");
-        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-        s.set_write_timeout(Some(Duration::from_secs(10))).unwrap();
+        s.set_read_timeout(Some(FAKE_IO_TIMEOUT)).unwrap();
+        s.set_write_timeout(Some(FAKE_IO_TIMEOUT)).unwrap();
 
         // ── connection phase (seq 0..=2) ──
         write_packet(&mut s, 0, &handshake_greeting());
@@ -1337,6 +1410,884 @@ mod roast_mysql_bit_decode_tests {
         let _ = s.read(&mut buf);
     }
 
+    /// Serve one connection whose single result set has `defs.len()` columns and
+    /// exactly one all-NULL row. The row exists only so the client hands back a
+    /// `mysql::Row` carrying the column metadata — the metadata IS the subject.
+    fn serve_one_metadata_query(listener: TcpListener, defs: Vec<Vec<u8>>) {
+        let (mut s, _) = listener.accept().expect("fake MySQL server: accept");
+        s.set_read_timeout(Some(FAKE_IO_TIMEOUT)).unwrap();
+        s.set_write_timeout(Some(FAKE_IO_TIMEOUT)).unwrap();
+
+        write_packet(&mut s, 0, &handshake_greeting());
+        let _handshake_response = read_packet(&mut s);
+        write_packet(&mut s, 2, &[0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00]);
+
+        let _com_query = read_packet(&mut s);
+        let n = u8::try_from(defs.len()).expect("fixture stays under the 251-column lenc boundary");
+        let mut seq = 1u8;
+        write_packet(&mut s, seq, &[n]); // column count
+        for def in &defs {
+            seq += 1;
+            write_packet(&mut s, seq, def);
+        }
+        seq += 1;
+        write_packet(&mut s, seq, &[0xfe, 0x00, 0x00, 0x02, 0x00]); // EOF after metadata
+        seq += 1;
+        write_packet(&mut s, seq, &vec![0xfb; defs.len()]); // one row, every cell NULL
+        seq += 1;
+        write_packet(&mut s, seq, &[0xfe, 0x00, 0x00, 0x02, 0x00]); // EOF after rows
+
+        let mut buf = [0u8; 64];
+        let _ = s.read(&mut buf);
+    }
+
+    /// One BINARY-protocol row packet: header, null bitmap, then the non-NULL
+    /// values already encoded in their per-type binary form.
+    ///
+    /// The bitmap is the fiddly part of the format and the reason this is a
+    /// function rather than a literal: it is `ceil((n + 7 + 2) / 8)` bytes and
+    /// column `i` lives at bit `(i + 2) % 8` of byte `(i + 2) / 8` — the two-bit
+    /// offset is reserved, and getting it wrong shifts every NULL by two columns
+    /// instead of failing.
+    fn binary_row_packet(cells: &[Option<Vec<u8>>]) -> Vec<u8> {
+        let n = cells.len();
+        let mut p = vec![0x00u8]; // packet header for a binary resultset row
+        let mut bitmap = vec![0u8; (n + 9) / 8];
+        for (i, c) in cells.iter().enumerate() {
+            if c.is_none() {
+                bitmap[(i + 2) / 8] |= 1 << ((i + 2) % 8);
+            }
+        }
+        p.extend_from_slice(&bitmap);
+        for c in cells.iter().flatten() {
+            p.extend_from_slice(c);
+        }
+        p
+    }
+
+    /// Serve one connection speaking the BINARY (prepared-statement) protocol.
+    ///
+    /// This is the protocol that matters: rivet's export loop runs every query
+    /// through `exec_iter` — its own comment says "query_iter returns a
+    /// Text-protocol result, exec_iter Binary" — so `build_array` receives
+    /// `Value::Int`/`Value::UInt` for integers, NOT the `Value::Bytes` a text
+    /// resultset yields for everything. A fixture built on the text server would
+    /// therefore exercise arms production never takes: correct assertions on an
+    /// input the product does not produce.
+    ///
+    /// Flow: COM_STMT_PREPARE -> prepare-ok (+ column defs, since rivet binds no
+    /// parameters, num_params is 0 and the param block is absent) -> COM_STMT_
+    /// EXECUTE -> a normal resultset whose ROWS are in binary form.
+    fn serve_one_binary_query(
+        listener: TcpListener,
+        defs: Vec<Vec<u8>>,
+        rows: Vec<Vec<Option<Vec<u8>>>>,
+    ) {
+        let (mut s, _) = listener.accept().expect("fake MySQL server: accept");
+        s.set_read_timeout(Some(FAKE_IO_TIMEOUT)).unwrap();
+        s.set_write_timeout(Some(FAKE_IO_TIMEOUT)).unwrap();
+
+        write_packet(&mut s, 0, &handshake_greeting());
+        let _handshake_response = read_packet(&mut s);
+        write_packet(&mut s, 2, &[0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00]);
+
+        let ncol = u8::try_from(defs.len()).expect("fixture stays under 251 columns");
+        let eof = [0xfe, 0x00, 0x00, 0x02, 0x00];
+
+        loop {
+            let cmd = read_packet(&mut s);
+            match cmd.first() {
+                // COM_STMT_PREPARE
+                Some(0x16) => {
+                    let mut ok = vec![0x00];
+                    ok.extend_from_slice(&1u32.to_le_bytes()); // statement id
+                    ok.extend_from_slice(&u16::from(ncol).to_le_bytes()); // num_columns
+                    ok.extend_from_slice(&0u16.to_le_bytes()); // num_params
+                    ok.push(0x00); // reserved
+                    ok.extend_from_slice(&0u16.to_le_bytes()); // warnings
+                    let mut seq = 1u8;
+                    write_packet(&mut s, seq, &ok);
+                    for def in &defs {
+                        seq += 1;
+                        write_packet(&mut s, seq, def);
+                    }
+                    if !defs.is_empty() {
+                        seq += 1;
+                        write_packet(&mut s, seq, &eof);
+                    }
+                }
+                // COM_STMT_EXECUTE
+                Some(0x17) => {
+                    let mut seq = 1u8;
+                    write_packet(&mut s, seq, &[ncol]);
+                    for def in &defs {
+                        seq += 1;
+                        write_packet(&mut s, seq, def);
+                    }
+                    seq += 1;
+                    write_packet(&mut s, seq, &eof);
+                    for r in &rows {
+                        assert_eq!(r.len(), defs.len(), "every fixture row must be full width");
+                        seq += 1;
+                        write_packet(&mut s, seq, &binary_row_packet(r));
+                    }
+                    seq += 1;
+                    write_packet(&mut s, seq, &eof);
+                }
+                // COM_QUIT, or the connection went away
+                Some(0x01) | None => break,
+                // COM_STMT_CLOSE has no reply; anything else gets a bare OK.
+                Some(0x19) => {}
+                Some(_) => write_packet(&mut s, 1, &[0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00]),
+            }
+        }
+    }
+
+    /// Fetch real `mysql::Row`s over the BINARY protocol.
+    ///
+    /// The seam that makes `build_array` testable at all: it takes `&[mysql::Row]`
+    /// and a `Row` has no public constructor — it can only be DECODED from the
+    /// wire. Writing wire bytes and letting the driver decode them means the
+    /// values under test arrive by exactly the path production values do.
+    fn fetch_binary_rows(defs: Vec<Vec<u8>>, cells: Vec<Vec<Option<Vec<u8>>>>) -> Vec<mysql::Row> {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake MySQL server");
+        let port = listener.local_addr().expect("local_addr").port();
+        let server = std::thread::spawn(move || serve_one_binary_query(listener, defs, cells));
+
+        let opts = OptsBuilder::new()
+            .ip_or_hostname(Some("127.0.0.1"))
+            .tcp_port(port)
+            .user(Some("root"))
+            .pass(Some(""))
+            .prefer_socket(false)
+            .max_allowed_packet(Some(16 * 1024 * 1024))
+            .tcp_connect_timeout(Some(FAKE_IO_TIMEOUT))
+            .read_timeout(Some(FAKE_IO_TIMEOUT))
+            .write_timeout(Some(FAKE_IO_TIMEOUT));
+        let mut conn = Conn::new(opts).expect("connect to fake MySQL server");
+        let rows: Vec<mysql::Row> = conn
+            .exec("SELECT * FROM t", ())
+            .expect("binary-protocol resultset decodes");
+        drop(conn);
+        server.join().expect("fake MySQL server thread");
+        rows
+    }
+
+    /// Drive a set of column definitions through a real `mysql::Conn` and return
+    /// the `(native_type_name, rivet_type)` pair rivet derives for each.
+    fn map_columns(defs: Vec<Vec<u8>>) -> Vec<(String, RivetType)> {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake MySQL server");
+        let port = listener.local_addr().expect("local_addr").port();
+        let server = std::thread::spawn(move || serve_one_metadata_query(listener, defs));
+
+        let opts = OptsBuilder::new()
+            .ip_or_hostname(Some("127.0.0.1"))
+            .tcp_port(port)
+            .user(Some("root"))
+            .pass(Some(""))
+            .prefer_socket(false)
+            .max_allowed_packet(Some(16 * 1024 * 1024))
+            .tcp_connect_timeout(Some(FAKE_IO_TIMEOUT))
+            .read_timeout(Some(FAKE_IO_TIMEOUT))
+            .write_timeout(Some(FAKE_IO_TIMEOUT));
+        let mut conn = Conn::new(opts).expect("connect to fake MySQL server");
+
+        let mapped = {
+            let mut result = conn.query_iter("SELECT * FROM t").expect("COM_QUERY");
+            let row_set = result.iter().expect("one result set");
+            let rows: Vec<mysql::Row> = row_set.map(|r| r.expect("row decodes")).collect();
+            assert_eq!(rows.len(), 1, "fake server sent exactly one row");
+            rows[0]
+                .columns()
+                .iter()
+                .map(|c| (mysql_native_type_name(c), mysql_type_to_rivet(c)))
+                .collect()
+        };
+        drop(conn);
+        server.join().expect("fake MySQL server thread");
+        mapped
+    }
+
+    /// Smoke test for the binary-protocol server: does the real driver accept the
+    /// prepare/execute dialogue at all, and does an INT arrive as a TYPED value?
+    ///
+    /// `Value::Int` is the whole point. Over the text protocol the same column
+    /// arrives as `Value::Bytes(b"42")`, so this assertion is what distinguishes
+    /// the protocol the export loop uses from the one that is easy to fake.
+    #[test]
+    fn the_binary_protocol_server_yields_typed_values_not_text() {
+        use mysql::consts::ColumnType::*;
+        let defs = vec![column_definition("i", 33, 11, MYSQL_TYPE_LONG as u8, 0, 0)];
+        let rows = fetch_binary_rows(defs, vec![vec![Some(42i32.to_le_bytes().to_vec())]]);
+        assert_eq!(rows.len(), 1, "one row");
+        assert_eq!(
+            rows[0].as_ref(0),
+            Some(&Value::Int(42)),
+            "the binary protocol must yield a TYPED Int — text would give Bytes(b\"42\")"
+        );
+    }
+
+    // ── binary-protocol cell producers ──────────────────────────────────────
+    // One per `mysql::Value` variant `build_array` matches on. Which variant a
+    // column yields is decided by its TYPE and flags, not by the bytes, so these
+    // pair a column definition with the matching binary encoding.
+    const F_UNSIGNED: u16 = 32;
+    const CS_BIN: u16 = 63;
+    const CS_UTF8: u16 = 33;
+
+    fn lenc_of(v: &[u8]) -> Vec<u8> {
+        let mut o = Vec::new();
+        lenc_bytes(&mut o, v);
+        o
+    }
+
+    /// `Value::Int` — a signed BIGINT.
+    fn v_int(v: i64) -> (Vec<u8>, Vec<u8>) {
+        use mysql::consts::ColumnType::*;
+        (
+            column_definition("c", CS_UTF8, 20, MYSQL_TYPE_LONGLONG as u8, 0, 0),
+            v.to_le_bytes().to_vec(),
+        )
+    }
+
+    /// `Value::UInt` — and the value MUST exceed `i64::MAX` to actually get one.
+    ///
+    /// Measured, because the obvious assumption is wrong: the driver types a
+    /// binary integer by MAGNITUDE, not by the column's UNSIGNED flag.
+    /// `v_uint(200)` yields `Value::Int(200)`; only `v_uint(18e18)` yields
+    /// `Value::UInt`. A fixture that sets the flag and passes a small number
+    /// feeds the Int arm while reading as though it covered the UInt one — it
+    /// passes, for the wrong reason. That is exactly how the first version of
+    /// this grid left five `Value::UInt` arms unfed while looking complete;
+    /// mutation testing named them, the green did not.
+    fn v_uint(v: u64) -> (Vec<u8>, Vec<u8>) {
+        use mysql::consts::ColumnType::*;
+        (
+            column_definition("c", CS_UTF8, 20, MYSQL_TYPE_LONGLONG as u8, F_UNSIGNED, 0),
+            v.to_le_bytes().to_vec(),
+        )
+    }
+
+    /// `Value::Bytes` — the text-ish fallback every arm also accepts.
+    fn v_bytes(v: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        use mysql::consts::ColumnType::*;
+        (
+            column_definition("c", CS_UTF8, 255, MYSQL_TYPE_VAR_STRING as u8, 0, 0),
+            lenc_of(v),
+        )
+    }
+
+    /// `Value::Bytes` from a BINARY column (charset 63) — same variant, but the
+    /// bytes are not text.
+    fn v_blob(v: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        use mysql::consts::ColumnType::*;
+        (
+            column_definition("c", CS_BIN, 65535, MYSQL_TYPE_BLOB as u8, 0, 0),
+            lenc_of(v),
+        )
+    }
+
+    fn v_float(v: f32) -> (Vec<u8>, Vec<u8>) {
+        use mysql::consts::ColumnType::*;
+        (
+            column_definition("c", CS_UTF8, 12, MYSQL_TYPE_FLOAT as u8, 0, 31),
+            v.to_le_bytes().to_vec(),
+        )
+    }
+
+    fn v_double(v: f64) -> (Vec<u8>, Vec<u8>) {
+        use mysql::consts::ColumnType::*;
+        (
+            column_definition("c", CS_UTF8, 22, MYSQL_TYPE_DOUBLE as u8, 0, 31),
+            v.to_le_bytes().to_vec(),
+        )
+    }
+
+    /// `Value::Date` — the 11-byte DATETIME form (length, year u16, month, day,
+    /// hour, minute, second, micros u32). The shorter 4- and 7-byte forms exist;
+    /// the full one is used so every component is non-zero and therefore
+    /// observable (a zero component cannot distinguish a dropped field).
+    fn v_date(y: u16, mo: u8, d: u8, h: u8, mi: u8, s: u8, us: u32) -> (Vec<u8>, Vec<u8>) {
+        use mysql::consts::ColumnType::*;
+        let mut b = vec![11u8];
+        b.extend_from_slice(&y.to_le_bytes());
+        b.extend_from_slice(&[mo, d, h, mi, s]);
+        b.extend_from_slice(&us.to_le_bytes());
+        (
+            column_definition("c", CS_BIN, 26, MYSQL_TYPE_DATETIME as u8, 0, 6),
+            b,
+        )
+    }
+
+    /// `Value::Time` — the 12-byte TIME form (length, sign, days u32, h, m, s,
+    /// micros u32).
+    fn v_time(neg: bool, days: u32, h: u8, m: u8, s: u8, us: u32) -> (Vec<u8>, Vec<u8>) {
+        use mysql::consts::ColumnType::*;
+        let mut b = vec![12u8, u8::from(neg)];
+        b.extend_from_slice(&days.to_le_bytes());
+        b.extend_from_slice(&[h, m, s]);
+        b.extend_from_slice(&us.to_le_bytes());
+        (
+            column_definition("c", CS_BIN, 17, MYSQL_TYPE_TIME as u8, 0, 6),
+            b,
+        )
+    }
+
+    /// Build every case's array from ONE fetch.
+    ///
+    /// A server per case is correct and unusable: at ~35 cases that is 35 TCP
+    /// listeners and 35 threads for one test, which under `cargo mutants` timed
+    /// out 43 of 278 mutants — and a timeout is neither caught nor missed, it is
+    /// UNMEASURED. Every case becomes a COLUMN of one resultset instead, so the
+    /// whole grid costs one connection.
+    /// A column definition paired with the binary bytes of one cell.
+    type Cell = (Vec<u8>, Vec<u8>);
+
+    fn arrays_for(cases: &[(&'static str, Cell, DataType, &'static str)]) -> Vec<Arc<dyn Array>> {
+        let defs: Vec<Vec<u8>> = cases.iter().map(|(_, (d, _), _, _)| d.clone()).collect();
+        let row: Vec<Option<Vec<u8>>> = cases
+            .iter()
+            .map(|(_, (_, b), _, _)| Some(b.clone()))
+            .collect();
+        let rows = fetch_binary_rows(defs, vec![row]);
+        assert_eq!(rows.len(), 1, "one row");
+        cases
+            .iter()
+            .enumerate()
+            .map(|(i, (label, _, dt, _))| {
+                build_array(dt, i, &rows, false, "c", None)
+                    .unwrap_or_else(|e| panic!("{label}: build_array errored: {e}"))
+            })
+            .collect()
+    }
+
+    /// One fetch for a single case — kept for the assertions that need a lone
+    /// column (the temporal grid grades raw primitives one type at a time).
+    fn one_array(cell: Cell, dt: &DataType, label: &str) -> Arc<dyn Array> {
+        let (def, bytes) = cell;
+        let rows = fetch_binary_rows(vec![def], vec![vec![Some(bytes)]]);
+        assert_eq!(rows.len(), 1, "{label}: one row");
+        build_array(dt, 0, &rows, false, "c", None)
+            .unwrap_or_else(|e| panic!("{label}: build_array errored: {e}"))
+    }
+
+    /// Every `CellSource` accessor, over the BINARY protocol.
+    ///
+    /// `MysqlCellSource` feeds value-checksum Form A — the number rivet publishes
+    /// to attest that what it read is what it wrote. A wrong accessor does not
+    /// corrupt the data; it corrupts the ATTESTATION, which is worse, because the
+    /// artifact then carries a checksum that agrees with itself. All sixteen
+    /// accessors take `&[mysql::Row]`, so none had a unit test until the binary
+    /// harness existed — 65 standing baseline entries between them.
+    ///
+    /// Expectations are derived from what the quantity MEANS (an unscaled
+    /// integer, days since the epoch, microseconds since it) and written by hand,
+    /// never read back from a run.
+    #[test]
+    fn every_cell_source_accessor_reads_the_binary_value_it_should() {
+        use crate::source::value_checksum::CellSource;
+
+        // ONE resultset, ONE connection, one fake server — for the whole grid.
+        //
+        // The first version fetched per assertion, which is 13 TCP servers and 13
+        // threads for one test. Correct, and unusable under `cargo mutants`: 43 of
+        // 278 mutants TIMED OUT, and a timeout is neither caught nor missed, it is
+        // UNMEASURED — 15% of the result silently absent. A checksum grid that
+        // cannot be graded is not much better than no grid.
+        //
+        // Row 0 carries a value in every column; row 1 is all NULL, so absence is
+        // tested through the same fetch instead of another server.
+        let cases: Vec<(&str, Cell)> = vec![
+            ("bool_true", v_int(1)),
+            ("bool_false", v_int(0)),
+            ("i16", v_int(-12345)),
+            ("i32", v_int(-2_000_000_000)),
+            ("i64", v_int(-9_000_000_000_000_000_000)),
+            ("u64", v_uint(18_000_000_000_000_000_000)),
+            ("f32", v_float(0.5)),
+            ("f64", v_double(-1.25)),
+            ("dec", v_bytes(b"150.05")),
+            ("utf8", v_bytes("h\u{e9}llo".as_bytes())),
+            ("bin", v_blob(&[0xde, 0xad])),
+            ("date_ts", v_date(2026, 6, 23, 10, 0, 0, 123_456)),
+            ("time", v_time(false, 0, 13, 45, 30, 123_456)),
+        ];
+        let col = |name: &str| cases.iter().position(|(n, _)| *n == name).expect("column");
+        let defs: Vec<Vec<u8>> = cases.iter().map(|(_, (d, _))| d.clone()).collect();
+        let row0: Vec<Option<Vec<u8>>> = cases.iter().map(|(_, (_, b))| Some(b.clone())).collect();
+        let row1: Vec<Option<Vec<u8>>> = cases.iter().map(|_| None).collect();
+        let rows = fetch_binary_rows(defs, vec![row0, row1]);
+        let s = MysqlCellSource { rows: &rows };
+
+        assert_eq!(s.num_rows(), 2);
+        assert_eq!(s.boolean(col("bool_true"), 0), Some(true));
+        assert_eq!(s.boolean(col("bool_false"), 0), Some(false));
+        assert_eq!(s.int16(col("i16"), 0), Some(-12345));
+        assert_eq!(s.int32(col("i32"), 0), Some(-2_000_000_000));
+        assert_eq!(s.int64(col("i64"), 0), Some(-9_000_000_000_000_000_000));
+        // Only a magnitude past i64::MAX actually yields Value::UInt — see v_uint.
+        assert_eq!(s.uint64(col("u64"), 0), Some(18_000_000_000_000_000_000));
+        assert_eq!(s.float32(col("f32"), 0), Some(0.5));
+        assert_eq!(s.float64(col("f64"), 0), Some(-1.25));
+        // decimal keeps the UNSCALED integer: 150.05 at scale 2 is 15005.
+        assert_eq!(s.decimal128(col("dec"), 0, 2), Some(15005));
+        assert_eq!(
+            s.utf8(col("utf8"), 0).as_deref(),
+            // The accessor hands back BYTES, not a validated str — the checksum
+            // folds the exact wire bytes, so an invalid sequence must not be
+            // silently replaced on the way in.
+            Some("h\u{e9}llo".as_bytes())
+        );
+        assert_eq!(s.binary(col("bin"), 0).as_deref(), Some(&[0xde, 0xad][..]));
+        // 2026-06-23 is 20627 days after 1970-01-01; the same instant at
+        // 10:00:00.123456 is 1_782_208_800_123_456 microseconds after it.
+        assert_eq!(s.date32(col("date_ts"), 0), Some(20627));
+        assert_eq!(s.ts_micros(col("date_ts"), 0), Some(1_782_208_800_123_456));
+        // 13:45:30.123456 is 49_530_123_456 microseconds after midnight. No zero
+        // components: at midnight the multiply, add and divide are indistinguishable.
+        assert_eq!(s.time64_micros(col("time"), 0), Some(49_530_123_456));
+
+        // Row 1 is all NULL. Absence must read as absent through EVERY accessor,
+        // never as a zero — a checksum that folds NULL and 0 to one value attests
+        // they are the same.
+        assert_eq!(s.int64(col("i64"), 1), None, "NULL is absent, never 0");
+        assert_eq!(s.boolean(col("bool_true"), 1), None);
+        assert_eq!(s.float64(col("f64"), 1), None);
+        assert_eq!(s.utf8(col("utf8"), 1), None);
+        assert_eq!(s.date32(col("date_ts"), 1), None);
+        assert_eq!(s.time64_micros(col("time"), 1), None);
+    }
+
+    /// The FULL `DataType` x `Value` dispatch grid of `build_array`, over the
+    /// BINARY protocol.
+    ///
+    /// `build_array` dispatches TWICE: first on the target Arrow type, then, inside
+    /// each arm, on which `mysql::Value` variant the wire produced. The first
+    /// version of this fixture fed ONE value per Arrow arm and looked complete —
+    /// it was a diagonal, not a grid. Mutation testing named the difference: 54
+    /// missed mutants, of which 22 were unfed `Value::` sub-arms and 24 were
+    /// operators sitting INSIDE those sub-arms, unreachable by construction.
+    ///
+    /// Which variant arrives is decided by the column's TYPE and FLAGS, so each
+    /// row here pairs a producer with a target type. Only the binary protocol
+    /// yields the typed variants at all: `exec_iter` is what rivet's export loop
+    /// uses, and a text-protocol fixture would grade only the `Bytes` fallback.
+    ///
+    /// The oracle is arrow's own renderer against a hand-written literal — never a
+    /// value recomputed with the conversion under test. Temporal cells are graded
+    /// on their raw primitive instead, in
+    /// `build_array_temporal_grid_converts_to_independently_computed_values`,
+    /// because a render format is arrow's business but the NUMBER is rivet's.
+    #[test]
+    fn build_array_covers_every_value_variant_of_every_arrow_arm() {
+        use arrow::util::display::array_value_to_string;
+
+        let ts = DataType::Timestamp(TimeUnit::Microsecond, None);
+        /// (label, the (column-definition, binary-cell) pair, target type, expected render)
+        type GridCase = (&'static str, Cell, DataType, &'static str);
+        let cases: Vec<GridCase> = vec![
+            // Boolean: any non-zero is true, and the Bytes path reads BIT bytes
+            // big-endian (b"1" is 0x31 = 49, not the digit one).
+            ("bool/int", v_int(1), DataType::Boolean, "true"),
+            ("bool/int0", v_int(0), DataType::Boolean, "false"),
+            ("bool/uint", v_uint(u64::MAX), DataType::Boolean, "true"),
+            ("bool/bytes", v_bytes(b"1"), DataType::Boolean, "true"),
+            // Int16 / Int32 / Int64 / UInt64: three producers each.
+            ("i16/int", v_int(-12345), DataType::Int16, "-12345"),
+            ("i16/bytes", v_bytes(b"-42"), DataType::Int16, "-42"),
+            (
+                "i32/int",
+                v_int(-2000000000),
+                DataType::Int32,
+                "-2000000000",
+            ),
+            (
+                "i32/uint",
+                v_uint(2000000000),
+                DataType::Int32,
+                "2000000000",
+            ),
+            ("i32/bytes", v_bytes(b"-42"), DataType::Int32, "-42"),
+            (
+                "i64/int",
+                v_int(-9000000000000000000),
+                DataType::Int64,
+                "-9000000000000000000",
+            ),
+            ("i64/bytes", v_bytes(b"-42"), DataType::Int64, "-42"),
+            // The value that MUST NOT ride a signed builder — why UInt64 is an arm.
+            (
+                "u64/uint",
+                v_uint(18000000000000000000),
+                DataType::UInt64,
+                "18000000000000000000",
+            ),
+            ("u64/int", v_int(42), DataType::UInt64, "42"),
+            (
+                "utf8/uint_big",
+                v_uint(u64::MAX),
+                DataType::Utf8,
+                "18446744073709551615",
+            ),
+            ("u64/bytes", v_bytes(b"123"), DataType::UInt64, "123"),
+            // Float32 / Float64 accept BOTH float widths plus text.
+            ("f32/float", v_float(0.5), DataType::Float32, "0.5"),
+            ("f32/double", v_double(1.5), DataType::Float32, "1.5"),
+            ("f32/bytes", v_bytes(b"2.5"), DataType::Float32, "2.5"),
+            ("f64/double", v_double(-1.25), DataType::Float64, "-1.25"),
+            ("f64/float", v_float(0.5), DataType::Float64, "0.5"),
+            ("f64/bytes", v_bytes(b"2.5"), DataType::Float64, "2.5"),
+            // Utf8 is the widest arm: it stringifies every variant.
+            (
+                "utf8/bytes",
+                v_bytes("h\u{e9}llo".as_bytes()),
+                DataType::Utf8,
+                "h\u{e9}llo",
+            ),
+            ("utf8/int", v_int(42), DataType::Utf8, "42"),
+            ("utf8/float", v_float(0.5), DataType::Utf8, "0.5"),
+            ("utf8/double", v_double(-1.25), DataType::Utf8, "-1.25"),
+            // A DATETIME asked for as text: the arm formats the components itself
+            // rather than deferring to a Display impl, so it needs its own cell.
+            (
+                "utf8/date",
+                v_date(2026, 6, 23, 10, 0, 0, 123_456),
+                DataType::Utf8,
+                "2026-06-23 10:00:00.123456",
+            ),
+            // Binary / FixedSizeBinary.
+            (
+                "binary/bytes",
+                v_blob(&[0xde, 0xad]),
+                DataType::Binary,
+                "dead",
+            ),
+            (
+                "fsb/bytes16",
+                v_blob(&[
+                    0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+                    0x0e, 0x0f, 0x10,
+                ]),
+                DataType::FixedSizeBinary(16),
+                "0102030405060708090a0b0c0d0e0f10",
+            ),
+            // …and the 36-char TEXT rendering of a uuid, which must ALSO land as
+            // the 16 canonical bytes. This is the exact shape that once nulled a
+            // whole column on PostgreSQL CDC.
+            (
+                "fsb/uuid_text",
+                v_bytes(b"01020304-0506-0708-090a-0b0c0d0e0f10"),
+                DataType::FixedSizeBinary(16),
+                "0102030405060708090a0b0c0d0e0f10",
+            ),
+            // Decimal keeps its exact text through to the sink.
+            (
+                "dec128/bytes",
+                v_bytes(b"150.05"),
+                DataType::Decimal128(10, 2),
+                "150.05",
+            ),
+            (
+                "dec256/bytes",
+                v_bytes(b"150.05"),
+                DataType::Decimal256(50, 2),
+                "150.05",
+            ),
+            // The Bytes fallbacks of the temporal arms (their typed halves are
+            // graded numerically in the sibling test).
+            (
+                "date32/bytes",
+                v_bytes(b"2026-06-23"),
+                DataType::Date32,
+                "2026-06-23",
+            ),
+            (
+                "ts/bytes",
+                v_bytes(b"2026-06-23 10:00:00"),
+                ts.clone(),
+                "2026-06-23T10:00:00",
+            ),
+        ];
+
+        let arrays = arrays_for(&cases);
+        let mut wrong = Vec::new();
+        for ((label, _, _, want), arr) in cases.iter().zip(&arrays) {
+            let got = array_value_to_string(arr.as_ref(), 0).expect("renderable");
+            if got != *want {
+                wrong.push(format!("{label}: want {want:?}, got {got:?}"));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "build_array diverged from its documented conversion on the BINARY \
+             protocol (the one `exec_iter` uses):\n  {}",
+            wrong.join("\n  ")
+        );
+    }
+
+    /// The grid cells whose correct answer is an ERROR or a NULL, not a value.
+    ///
+    /// These are only reachable through `Value::UInt`, and only with a magnitude
+    /// past `i64::MAX` — the same measured quirk that hid them in the first place.
+    /// A `BIGINT UNSIGNED` past the signed range must FAIL LOUD rather than wrap
+    /// into a negative, and a negative signed value asked for an unsigned column
+    /// must null rather than reinterpret its bits. Both are silent-corruption
+    /// contracts, so a test that only checks the happy path is the wrong shape.
+    #[test]
+    fn build_array_fails_loud_instead_of_wrapping_an_out_of_range_unsigned() {
+        for (label, dt) in [
+            ("i16", DataType::Int16),
+            ("i32", DataType::Int32),
+            ("i64", DataType::Int64),
+        ] {
+            let (def, bytes) = v_uint(u64::MAX);
+            let rows = fetch_binary_rows(vec![def], vec![vec![Some(bytes)]]);
+            let got = build_array(&dt, 0, &rows, false, "c", None);
+            assert!(
+                got.is_err(),
+                "{label}: u64::MAX must ERROR on a signed builder, not wrap — got {:?}",
+                got.map(|a| a.len())
+            );
+        }
+
+        // The `*v >= 0` guard on UInt64's signed input: a negative can neither be
+        // represented nor bit-reinterpreted, so it must fall through to NULL.
+        let (def, bytes) = v_int(-1);
+        let rows = fetch_binary_rows(vec![def], vec![vec![Some(bytes)]]);
+        let arr = build_array(&DataType::UInt64, 0, &rows, false, "c", None)
+            .expect("a negative into UInt64 is a NULL, not an error");
+        assert!(
+            arr.is_null(0),
+            "a negative signed value must NULL on an unsigned builder, never \
+             reinterpret its bits as a huge positive"
+        );
+    }
+
+    /// The temporal half of the grid, graded on the RAW primitive.
+    ///
+    /// A rendered timestamp is arrow's formatting choice; the integer underneath is
+    /// rivet's arithmetic, and that is what can silently drift. Each expectation
+    /// below was computed independently of this codebase (days since epoch, micros
+    /// since epoch, micros since midnight) rather than read back from a run.
+    #[test]
+    fn build_array_temporal_grid_converts_to_independently_computed_values() {
+        use arrow::array::{Date32Array, Time64MicrosecondArray, TimestampMicrosecondArray};
+
+        // 2026-06-23 is 20627 days after 1970-01-01.
+        let a = one_array(
+            v_date(2026, 6, 23, 10, 0, 0, 123_456),
+            &DataType::Date32,
+            "date32/date",
+        );
+        let d = a.as_any().downcast_ref::<Date32Array>().expect("Date32");
+        assert_eq!(d.value(0), 20627, "Date32 must be days since the epoch");
+
+        // 2026-06-23T10:00:00.123456Z is 1_782_208_800_123_456 microseconds after it.
+        let a = one_array(
+            v_date(2026, 6, 23, 10, 0, 0, 123_456),
+            &DataType::Timestamp(TimeUnit::Microsecond, None),
+            "ts/date",
+        );
+        let t = a
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .expect("Timestamp");
+        assert_eq!(t.value(0), 1_782_208_800_123_456, "micros since the epoch");
+
+        // 13:45:30.123456 is 49_530_123_456 microseconds after midnight. Every
+        // component is non-zero on purpose: at 00:00:00 the multiply, the add and
+        // the divide in that expression all yield 0 and cannot be told apart.
+        let a = one_array(
+            v_time(false, 0, 13, 45, 30, 123_456),
+            &DataType::Time64(TimeUnit::Microsecond),
+            "time64/time",
+        );
+        let t = a
+            .as_any()
+            .downcast_ref::<Time64MicrosecondArray>()
+            .expect("Time64");
+        assert_eq!(t.value(0), 49_530_123_456, "micros since midnight");
+
+        // A negative TIME, and one carrying whole DAYS — MySQL's TIME is a signed
+        // interval, not a clock reading, so both are representable and both were
+        // unexercised.
+        let a = one_array(
+            v_time(true, 2, 1, 0, 0, 0),
+            &DataType::Time64(TimeUnit::Microsecond),
+            "time64/negative_days",
+        );
+        let t = a
+            .as_any()
+            .downcast_ref::<Time64MicrosecondArray>()
+            .expect("Time64");
+        assert_eq!(t.value(0), -(2 * 86_400 + 3_600) * 1_000_000);
+
+        // The Bytes fallback of the time arm.
+        let a = one_array(
+            v_bytes(b"13:45:30.123456"),
+            &DataType::Time64(TimeUnit::Microsecond),
+            "time64/bytes",
+        );
+        let t = a
+            .as_any()
+            .downcast_ref::<Time64MicrosecondArray>()
+            .expect("Time64");
+        assert_eq!(t.value(0), 49_530_123_456);
+    }
+
+    /// The MySQL wire type map, asserted end-to-end against a REAL driver parse.
+    ///
+    /// Both `mysql_native_type_name` and `mysql_type_to_rivet` read a
+    /// `mysql::Column` — a driver type with no public constructor — so for a long
+    /// time neither had a unit test at all, and the whole map was covered only
+    /// indirectly by live MySQL runs. That left the branch structure unguarded:
+    /// stubbing either function's arms survived the entire offline suite.
+    ///
+    /// The oracle is INDEPENDENT of the code under test on both sides. The input
+    /// is a wire packet built from the MySQL protocol spec (type bytes 0..=19 and
+    /// 245..=254, `UNSIGNED_FLAG`=32, `ENUM_FLAG`=256, `SET_FLAG`=2048, charset
+    /// 63 = binary) and parsed by the driver, not by rivet; the expected side is
+    /// a hand-written literal per row. Nothing here recomputes an expectation
+    /// with the mapping logic it is grading.
+    ///
+    /// Every row is a distinction rivet MAKES — a pair that shares a wire type
+    /// and diverges on one metadata field is the point (signed vs unsigned,
+    /// display width 1 vs not, charset 63 vs not, ENUM_FLAG vs SET_FLAG), because
+    /// a fixture with only one side of each pair cannot see the guard collapse.
+    #[test]
+    fn the_mysql_wire_type_map_is_exhaustive_and_stable() {
+        const UNSIGNED: u16 = 32;
+        const ENUM_F: u16 = 256;
+        const SET_F: u16 = 2048;
+        const BIN: u16 = 63; // charset 63 = binary
+        const UTF8: u16 = 33;
+        let us = RivetTimeUnit::Microsecond;
+
+        // (label, charset, column_length, type byte, flags, decimals, native, rivet)
+        // Hand-aligned on purpose: this is a TABLE, and one row per line is what
+        // makes a missing or duplicated wire type visible at a glance. rustfmt
+        // explodes an 8-tuple into nine lines apiece and the table stops reading
+        // as one.
+        // The wire type is written as the DRIVER'S OWN CONSTANT, never a bare
+        // byte. Two reasons, and the second is load-bearing: `247` tells a reader
+        // nothing, and `the_fixture_exercises_every_wire_type_the_mapper_branches_on`
+        // compares the `MYSQL_TYPE_*` tokens in this table against the ones the two
+        // functions match on. That guard is only possible because the names appear
+        // here literally — a table of bare bytes cannot be checked against the code.
+        use mysql::consts::ColumnType::*;
+        type WireCase = (&'static str, u16, u32, u8, u16, u8, &'static str, RivetType);
+        #[rustfmt::skip]
+        let cases: Vec<WireCase> = vec![
+            // ── integers: the signed/unsigned widening ladder ──
+            ("tiny1",   UTF8, 1,  MYSQL_TYPE_TINY as u8, 0, 0, "tinyint(1)", RivetType::Bool),
+            ("tiny",    UTF8, 4,  MYSQL_TYPE_TINY as u8, 0, 0, "tinyint", RivetType::Int16),
+            // TINYINT UNSIGNED still fits i16 — the name carries the sign, the type need not.
+            ("tinyu",   UTF8, 3,  MYSQL_TYPE_TINY as u8, UNSIGNED, 0, "tinyint unsigned", RivetType::Int16),
+            ("short",   UTF8, 6,  MYSQL_TYPE_SHORT as u8, 0, 0, "smallint", RivetType::Int16),
+            ("shortu",  UTF8, 5,  MYSQL_TYPE_SHORT as u8, UNSIGNED, 0, "smallint unsigned", RivetType::Int32),
+            ("int24",   UTF8, 9,  MYSQL_TYPE_INT24 as u8, 0, 0, "int", RivetType::Int32),
+            ("int24u",  UTF8, 8,  MYSQL_TYPE_INT24 as u8, UNSIGNED, 0, "int unsigned", RivetType::Int64),
+            ("long",    UTF8, 11, MYSQL_TYPE_LONG as u8, 0, 0, "int", RivetType::Int32),
+            ("longu",   UTF8, 10, MYSQL_TYPE_LONG as u8, UNSIGNED, 0, "int unsigned", RivetType::Int64),
+            ("big",     UTF8, 20, MYSQL_TYPE_LONGLONG as u8, 0, 0, "bigint", RivetType::Int64),
+            // BIGINT UNSIGNED is the one integer that does NOT fit a signed Arrow type.
+            ("bigu",    UTF8, 20, MYSQL_TYPE_LONGLONG as u8, UNSIGNED, 0, "bigint unsigned", RivetType::UInt64),
+            ("year",    UTF8, 4,  MYSQL_TYPE_YEAR as u8, 0, 0, "year", RivetType::Int16),
+            // ── floats ──
+            ("f32",     UTF8, 12, MYSQL_TYPE_FLOAT as u8, 0, 31, "float", RivetType::Float32),
+            ("f64",     UTF8, 22, MYSQL_TYPE_DOUBLE as u8, 0, 31, "double", RivetType::Float64),
+            // ── decimal: precision is DERIVED, so vary sign and scale ──
+            // signed, scale>0: length 12 = precision 10 + point + sign
+            ("dec_s",   UTF8, 12, MYSQL_TYPE_NEWDECIMAL as u8, 0, 2, "decimal",
+             RivetType::Decimal { precision: 10, scale: 2 }),
+            // unsigned, scale>0: no sign byte, so the same precision needs one less
+            ("dec_u",   UTF8, 11, MYSQL_TYPE_NEWDECIMAL as u8, UNSIGNED, 2, "decimal",
+             RivetType::Decimal { precision: 10, scale: 2 }),
+            // signed, scale 0: no point byte
+            ("dec_i",   UTF8, 11, MYSQL_TYPE_NEWDECIMAL as u8, 0, 0, "decimal",
+             RivetType::Decimal { precision: 10, scale: 0 }),
+            // the pre-5.0 DECIMAL oid shares NEWDECIMAL's arm — exercised so the
+            // alias cannot fall out of that arm unnoticed (see the guard).
+            ("dec_old", UTF8, 11, MYSQL_TYPE_DECIMAL as u8, 0, 0, "decimal",
+             RivetType::Decimal { precision: 10, scale: 0 }),
+            // ── strings: charset 63 splits text from bytes on the SAME wire type ──
+            ("varchar",   UTF8, 255, MYSQL_TYPE_VAR_STRING as u8, 0, 0, "varchar", RivetType::String),
+            ("varbinary", BIN,  255, MYSQL_TYPE_VAR_STRING as u8, 0, 0, "varbinary", RivetType::Binary),
+            ("char",      UTF8, 10,  MYSQL_TYPE_STRING as u8, 0, 0, "char", RivetType::String),
+            ("binary",    BIN,  10,  MYSQL_TYPE_STRING as u8, 0, 0, "binary", RivetType::Binary),
+            // MYSQL_TYPE_VARCHAR is a THIRD spelling sharing the same arm.
+            ("varchar_oid", UTF8, 255, MYSQL_TYPE_VARCHAR as u8, 0, 0, "varchar", RivetType::String),
+            // ── ENUM/SET ride the string wire types and are told apart by FLAG ──
+            ("enum",    UTF8, 10, MYSQL_TYPE_STRING as u8, ENUM_F, 0, "enum", RivetType::Enum),
+            ("set",     UTF8, 10, MYSQL_TYPE_STRING as u8, SET_F, 0, "set", RivetType::Enum),
+            // …and BOTH functions also carry a belt-and-suspenders arm for the
+            // DEDICATED oids, which some drivers/protocol configurations do
+            // surface. Those arms are a SEPARATE branch from the flag path above:
+            // covering only the common spelling left `delete match arm
+            // MYSQL_TYPE_ENUM` / `…_SET` alive in both functions — the three
+            // survivors of this table's first mutation run, now dead.
+            ("enum_oid", UTF8, 10, MYSQL_TYPE_ENUM as u8, 0, 0, "enum", RivetType::Enum),
+            ("set_oid",  UTF8, 10, MYSQL_TYPE_SET as u8, 0, 0, "set", RivetType::Enum),
+            // ── blobs: same charset-63 split, and FOUR oids share one arm ──
+            ("blob",     BIN,  65535, MYSQL_TYPE_BLOB as u8, 0, 0, "blob", RivetType::Binary),
+            ("textblob", UTF8, 65535, MYSQL_TYPE_BLOB as u8, 0, 0, "blob", RivetType::Text),
+            ("tinyblob", BIN,  255,   MYSQL_TYPE_TINY_BLOB as u8, 0, 0, "blob", RivetType::Binary),
+            ("medblob",  BIN,  16777215, MYSQL_TYPE_MEDIUM_BLOB as u8, 0, 0, "blob", RivetType::Binary),
+            ("longblob", UTF8, 4294967295, MYSQL_TYPE_LONG_BLOB as u8, 0, 0, "blob", RivetType::Text),
+            ("json",     UTF8, 4294967295, MYSQL_TYPE_JSON as u8, 0, 0, "json", RivetType::Json),
+            // ── temporal: DATETIME is naive, TIMESTAMP is UTC — the whole point ──
+            // Each of these has a `*2` (or NEWDATE) alias sharing its arm; both
+            // spellings are exercised so a future split of the arm cannot silently
+            // leave one half untested.
+            ("date",      BIN, 10, MYSQL_TYPE_DATE as u8, 0, 0, "date", RivetType::Date),
+            // MYSQL_TYPE_NEWDATE (0x0e) is deliberately ABSENT and cannot be added:
+            // the driver's `TryFrom<u8> for ColumnType` skips 0x0e entirely (its
+            // list steps 0x0d -> 0x0f), so a column definition carrying it fails
+            // the resultset parse with `Unknown column type 14` before rivet's
+            // mapper is ever called — measured, not assumed. Both mappers keep a
+            // NEWDATE arm; it is unreachable through the client protocol, and the
+            // guard records it as such rather than demanding an impossible row.
+            ("time",      BIN, 10, MYSQL_TYPE_TIME as u8, 0, 0, "time", RivetType::Time { unit: us }),
+            ("time2",     BIN, 10, MYSQL_TYPE_TIME2 as u8, 0, 0, "time", RivetType::Time { unit: us }),
+            ("datetime",  BIN, 19, MYSQL_TYPE_DATETIME as u8, 0, 0, "datetime",
+             RivetType::Timestamp { unit: us, timezone: None }),
+            ("datetime2", BIN, 19, MYSQL_TYPE_DATETIME2 as u8, 0, 0, "datetime",
+             RivetType::Timestamp { unit: us, timezone: None }),
+            ("ts",        BIN, 19, MYSQL_TYPE_TIMESTAMP as u8, 0, 0, "timestamp",
+             RivetType::Timestamp { unit: us, timezone: Some("UTC".into()) }),
+            ("ts2",       BIN, 19, MYSQL_TYPE_TIMESTAMP2 as u8, 0, 0, "timestamp",
+             RivetType::Timestamp { unit: us, timezone: Some("UTC".into()) }),
+            // ── BIT: width 1 is a boolean, wider is an integer that must not truncate ──
+            ("bit1",  BIN, 1,  MYSQL_TYPE_BIT as u8, UNSIGNED, 0, "bit(1)", RivetType::Bool),
+            ("bit16", BIN, 16, MYSQL_TYPE_BIT as u8, UNSIGNED, 0, "bit", RivetType::Int64),
+        ];
+
+        let defs = cases
+            .iter()
+            .map(|(name, cs, len, ty, flags, dec, _, _)| {
+                column_definition(name, *cs, *len, *ty, *flags, *dec)
+            })
+            .collect();
+        let got = map_columns(defs);
+        assert_eq!(got.len(), cases.len(), "one mapping per column definition");
+
+        let mut wrong = Vec::new();
+        for ((label, .., want_name, want_type), (got_name, got_type)) in cases.iter().zip(&got) {
+            if got_name != want_name || got_type != want_type {
+                wrong.push(format!(
+                    "{label}: want ({want_name}, {want_type:?}), got ({got_name}, {got_type:?})"
+                ));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "the MySQL wire type map diverged from its spec. Each line is a column \
+             the driver parsed from a protocol-shaped packet, mapped by rivet, and \
+             compared to a hand-written expectation:\n  {}",
+            wrong.join("\n  ")
+        );
+    }
+
     // ROAST-RED mysql-bit-decode: BIT(16) value 0x3132 must decode to 12594,
     // not to atoi(b"12") = 12.
     // Asserts CORRECT behavior; expected to FAIL until the fix lands.
@@ -1353,9 +2304,9 @@ mod roast_mysql_bit_decode_tests {
             .pass(Some(""))
             .prefer_socket(false)
             .max_allowed_packet(Some(16 * 1024 * 1024))
-            .tcp_connect_timeout(Some(Duration::from_secs(10)))
-            .read_timeout(Some(Duration::from_secs(10)))
-            .write_timeout(Some(Duration::from_secs(10)));
+            .tcp_connect_timeout(Some(FAKE_IO_TIMEOUT))
+            .read_timeout(Some(FAKE_IO_TIMEOUT))
+            .write_timeout(Some(FAKE_IO_TIMEOUT));
         let mut conn = Conn::new(opts).expect("connect to fake MySQL server");
 
         let rows: Vec<mysql::Row> = {

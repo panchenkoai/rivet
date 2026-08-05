@@ -104,41 +104,19 @@ fn mssql_chunked_crash_after_first_chunk_complete_resume_finishes_export() {
 
     let table = seed_mssql_numeric_table(150);
     let export = unique_name("ms_c1_crash_complete");
-    let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        r#"
-source:
-  type: mssql
-  url: "{MSSQL_URL}"
-  tls:
-    accept_invalid_certs: true
-exports:
-  - name: {export}
-    query: "SELECT id, name FROM {table_name}"
-    mode: chunked
-    chunk_column: id
-    chunk_size: 50
-    chunk_checkpoint: true
-    format: parquet
-    destination: {{type: local, path: {dir}}}
-"#,
-        table_name = table.name(),
-        dir = out.path().display()
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
+    let rig = Rig::mssql_batch(&export)
+        .query(&format!("SELECT id, name FROM {}", table.name()))
+        .mode("chunked")
+        .export_line("chunk_column: id")
+        .export_line("chunk_size: 50")
+        .export_line("chunk_checkpoint: true")
+        .duckdb_oracle();
+    let cfg = rig.config_path();
 
-    let crash = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            &export,
-        ])
-        .env("RIVET_TEST_PANIC_AT", "after_chunk_complete:0")
-        .output()
-        .expect("spawn rivet");
+    let crash = rig.run_args_env(
+        &["--export", &export],
+        &[("RIVET_TEST_PANIC_AT", "after_chunk_complete:0")],
+    );
     assert!(
         !crash.status.success(),
         "crash run must exit non-zero; stderr:\n{}",
@@ -157,17 +135,7 @@ exports:
         "chunk 1 must still be 'pending' after crash"
     );
 
-    let resume = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            &export,
-            "--resume",
-        ])
-        .output()
-        .expect("spawn rivet resume");
+    let resume = rig.run_args(&["--export", &export, "--resume"]);
     assert!(
         resume.status.success(),
         "--resume must succeed; stderr:\n{}",
@@ -191,12 +159,12 @@ exports:
     );
     // Destination re-read: chunk 0 not re-run → exactly 150 rows, 150 distinct ids.
     assert_eq!(
-        total_parquet_rows(out.path()),
+        total_parquet_rows(&rig.out_dir()),
         150,
         "destination must hold exactly 150 rows (no re-run, no dup)"
     );
     assert_eq!(
-        dir_parquet_id_set(out.path()).len(),
+        dir_parquet_id_set(&rig.out_dir()).len(),
         150,
         "150 distinct source ids must be present at the destination"
     );
@@ -211,41 +179,19 @@ fn mssql_chunked_crash_after_chunk_file_before_commit_resume_reruns_chunk_atleas
 
     let table = seed_mssql_numeric_table(150);
     let export = unique_name("ms_c2_crash_file");
-    let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        r#"
-source:
-  type: mssql
-  url: "{MSSQL_URL}"
-  tls:
-    accept_invalid_certs: true
-exports:
-  - name: {export}
-    query: "SELECT id, name FROM {table_name}"
-    mode: chunked
-    chunk_column: id
-    chunk_size: 50
-    chunk_checkpoint: true
-    format: parquet
-    destination: {{type: local, path: {dir}}}
-"#,
-        table_name = table.name(),
-        dir = out.path().display()
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
+    let rig = Rig::mssql_batch(&export)
+        .query(&format!("SELECT id, name FROM {}", table.name()))
+        .mode("chunked")
+        .export_line("chunk_column: id")
+        .export_line("chunk_size: 50")
+        .export_line("chunk_checkpoint: true")
+        .duckdb_oracle();
+    let cfg = rig.config_path();
 
-    let crash = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            &export,
-        ])
-        .env("RIVET_TEST_PANIC_AT", "after_chunk_file:0")
-        .output()
-        .expect("spawn rivet");
+    let crash = rig.run_args_env(
+        &["--export", &export],
+        &[("RIVET_TEST_PANIC_AT", "after_chunk_file:0")],
+    );
     assert!(
         !crash.status.success(),
         "crash run must exit non-zero; stderr:\n{}",
@@ -268,17 +214,7 @@ exports:
     // back-to-back sub-second runs must not collide — sleeping here would
     // mask exactly that regression (matrix audit: sleep-masked class).
 
-    let resume = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            &export,
-            "--resume",
-        ])
-        .output()
-        .expect("spawn rivet resume");
+    let resume = rig.run_args(&["--export", &export, "--resume"]);
     assert!(
         resume.status.success(),
         "--resume must succeed; stderr:\n{}",
@@ -302,7 +238,7 @@ exports:
         200,
         "50 rows × 4 manifest entries = 200 (chunk 0 counted twice due to at-least-once)"
     );
-    let parquet_files = files_with_extension(out.path(), "parquet");
+    let parquet_files = files_with_extension(&rig.out_dir(), "parquet");
     assert!(
         parquet_files.len() >= 3,
         "at least 3 parquet files must exist (one per chunk); found: {parquet_files:?}"
@@ -310,12 +246,12 @@ exports:
     // Destination re-read: every source id present (no loss) despite the
     // at-least-once chunk-0 re-run; physical rows >= source (the dup is surplus).
     assert_eq!(
-        dir_parquet_id_set(out.path()).len(),
+        dir_parquet_id_set(&rig.out_dir()).len(),
         150,
         "every seeded id must survive the at-least-once re-run (no loss)"
     );
     assert!(
-        total_parquet_rows(out.path()) as i64 >= 150,
+        total_parquet_rows(&rig.out_dir()) as i64 >= 150,
         "at-least-once: physical destination rows must be >= source (150)"
     );
 }
@@ -337,42 +273,20 @@ fn mssql_parallel_chunked_crash_after_chunk_complete_resume_finishes_with_no_dup
 
     let table = seed_mssql_numeric_table(ROW_COUNT);
     let export = unique_name("ms_c3_parallel_crash_complete");
-    let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        r#"
-source:
-  type: mssql
-  url: "{MSSQL_URL}"
-  tls:
-    accept_invalid_certs: true
-exports:
-  - name: {export}
-    query: "SELECT id, name FROM {table_name}"
-    mode: chunked
-    chunk_column: id
-    chunk_size: {CHUNK_SIZE}
-    chunk_checkpoint: true
-    parallel: 4
-    format: parquet
-    destination: {{type: local, path: {dir}}}
-"#,
-        table_name = table.name(),
-        dir = out.path().display()
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
+    let rig = Rig::mssql_batch(&export)
+        .query(&format!("SELECT id, name FROM {}", table.name()))
+        .mode("chunked")
+        .export_line("chunk_column: id")
+        .export_line(&format!("chunk_size: {CHUNK_SIZE}"))
+        .export_line("chunk_checkpoint: true")
+        .export_line("parallel: 4")
+        .duckdb_oracle();
+    let cfg = rig.config_path();
 
-    let crash = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            &export,
-        ])
-        .env("RIVET_TEST_PANIC_AT", "after_chunk_complete:0")
-        .output()
-        .expect("spawn rivet");
+    let crash = rig.run_args_env(
+        &["--export", &export],
+        &[("RIVET_TEST_PANIC_AT", "after_chunk_complete:0")],
+    );
     assert!(
         !crash.status.success(),
         "crash run must exit non-zero (worker panic propagated through scope); stderr:\n{}",
@@ -401,17 +315,7 @@ exports:
     // back-to-back sub-second runs must not collide — sleeping here would
     // mask exactly that regression (matrix audit: sleep-masked class).
 
-    let resume = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            &export,
-            "--resume",
-        ])
-        .output()
-        .expect("spawn rivet resume");
+    let resume = rig.run_args(&["--export", &export, "--resume"]);
     assert!(
         resume.status.success(),
         "--resume must succeed; stderr:\n{}",
@@ -447,17 +351,17 @@ exports:
 
     // Destination re-read: no parallel double-write → exactly ROW_COUNT rows + distinct.
     assert_eq!(
-        total_parquet_rows(out.path()) as i64,
+        total_parquet_rows(&rig.out_dir()) as i64,
         ROW_COUNT,
         "destination must hold exactly ROW_COUNT rows — no parallel double-write"
     );
     assert_eq!(
-        dir_parquet_id_set(out.path()).len() as i64,
+        dir_parquet_id_set(&rig.out_dir()).len() as i64,
         ROW_COUNT,
         "ROW_COUNT distinct source ids must be present"
     );
 
-    let parquet_files = files_with_extension(out.path(), "parquet");
+    let parquet_files = files_with_extension(&rig.out_dir(), "parquet");
     assert!(
         parquet_files.len() >= EXPECTED_CHUNKS as usize,
         "at least {EXPECTED_CHUNKS} parquet files must exist; found {}: {parquet_files:?}",
@@ -478,42 +382,20 @@ fn mssql_parallel_chunked_crash_after_chunk_file_stuck_running_resume_reruns_chu
 
     let table = seed_mssql_numeric_table(ROW_COUNT);
     let export = unique_name("ms_c4_parallel_stuck_running");
-    let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        r#"
-source:
-  type: mssql
-  url: "{MSSQL_URL}"
-  tls:
-    accept_invalid_certs: true
-exports:
-  - name: {export}
-    query: "SELECT id, name FROM {table_name}"
-    mode: chunked
-    chunk_column: id
-    chunk_size: {CHUNK_SIZE}
-    chunk_checkpoint: true
-    parallel: 1
-    format: parquet
-    destination: {{type: local, path: {dir}}}
-"#,
-        table_name = table.name(),
-        dir = out.path().display()
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
+    let rig = Rig::mssql_batch(&export)
+        .query(&format!("SELECT id, name FROM {}", table.name()))
+        .mode("chunked")
+        .export_line("chunk_column: id")
+        .export_line(&format!("chunk_size: {CHUNK_SIZE}"))
+        .export_line("chunk_checkpoint: true")
+        .export_line("parallel: 1")
+        .duckdb_oracle();
+    let cfg = rig.config_path();
 
-    let crash = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            &export,
-        ])
-        .env("RIVET_TEST_PANIC_AT", "after_chunk_file:0")
-        .output()
-        .expect("spawn rivet");
+    let crash = rig.run_args_env(
+        &["--export", &export],
+        &[("RIVET_TEST_PANIC_AT", "after_chunk_file:0")],
+    );
     assert!(
         !crash.status.success(),
         "crash run must exit non-zero; stderr:\n{}",
@@ -538,20 +420,10 @@ exports:
 
     // Resume with parallel: 2 — proves reset works regardless of worker
     // count change between crash and resume.
-    let yaml_resume = yaml.replace("parallel: 1", "parallel: 2");
+    let yaml_resume = rig.yaml().replace("parallel: 1", "parallel: 2");
     std::fs::write(&cfg, yaml_resume).expect("rewrite config for resume");
 
-    let resume = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            &export,
-            "--resume",
-        ])
-        .output()
-        .expect("spawn rivet resume");
+    let resume = rig.run_args(&["--export", &export, "--resume"]);
     assert!(
         resume.status.success(),
         "--resume must succeed; stderr:\n{}",
@@ -589,16 +461,16 @@ exports:
     // Destination re-read: every source id survives the stuck-running reset +
     // at-least-once re-run (no loss); physical rows >= source (dup is surplus).
     assert_eq!(
-        dir_parquet_id_set(out.path()).len() as i64,
+        dir_parquet_id_set(&rig.out_dir()).len() as i64,
         ROW_COUNT,
         "every seeded id must land after stuck-running reset + at-least-once re-run"
     );
     assert!(
-        total_parquet_rows(out.path()) as i64 >= ROW_COUNT,
+        total_parquet_rows(&rig.out_dir()) as i64 >= ROW_COUNT,
         "at-least-once: physical destination rows must be >= ROW_COUNT"
     );
 
-    let parquet_files = files_with_extension(out.path(), "parquet");
+    let parquet_files = files_with_extension(&rig.out_dir(), "parquet");
     assert!(
         parquet_files.len() >= EXPECTED_CHUNKS as usize,
         "at least {EXPECTED_CHUNKS} parquet files must exist; found {}: {parquet_files:?}",

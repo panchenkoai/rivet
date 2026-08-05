@@ -69,12 +69,21 @@ class Timing:
 
     `wall` is the string as it is PRINTED (kept verbatim from the parse so the
     log reads identically to the bash), `secs` the value actually COMPARED, and
-    `rss` peak resident bytes.
+    `rss` peak resident bytes, and `ok` whether the timed command actually
+    SUCCEEDED.
+
+    `ok` exists because a failed run still yields a perfectly plausible
+    measurement — a binary that refuses to start reports ~11 MB and 0.01s, which
+    reads as "leaner and faster" rather than "never ran". Measured 2026-08-03:
+    the prev binary failed on all four engines and the report said
+    `prev[users=11MB events=11MB flat×1.00]`, which a reader would take as a 3x
+    RSS regression in the current tree.
     """
 
     wall: str
     secs: float
     rss: int
+    ok: bool = True
 
 
 # `/usr/bin/time` speaks two dialects: BSD/macOS `-l` and GNU `-v`. Detect by
@@ -157,11 +166,12 @@ def _regr_time(binary: Path | str, *args: str) -> Timing:
     about if this ever fires on a container with no coreutils `time`.
     """
     flag = "-l" if _is_bsd_time() else "-v"
-    p = run([str(_TIME_BIN), flag, str(binary), *args], timeout=None)
+    p = run([str(_TIME_BIN), flag, str(binary), *args], timeout=None,
+            env=_ISOLATED_STATE)
     # The report goes to stderr, mixed with whatever the timed command wrote
     # there — the same stream the bash captured into its temp file.
     wall, secs = _parse_wall(p.stderr)
-    return Timing(wall, secs, _parse_rss(p.stderr))
+    return Timing(wall, secs, _parse_rss(p.stderr), p.returncode == 0)
 
 
 def _tolerance(raw: str) -> float:
@@ -175,6 +185,26 @@ def _tolerance(raw: str) -> float:
 
 
 # ── source access ──────────────────────────────────────────────────────────────
+# This cell's whole design is one state DB PER BINARY (see `_regr_cfg`), so that
+# the current tree's schema upgrade never touches the previous release's state.
+# `--state-url` defeats that: `__main__` sets `RIVET_STATE_URL` process-wide and
+# every child inherits it, so both binaries meet ONE Postgres state DB — and the
+# published binary correctly refuses a schema the current tree just migrated
+# ("state(pg): migration incomplete — expected schema v19 but reached v20").
+#
+# Measured 2026-08-03: the whole cell failed on the Postgres pass for exactly
+# this reason (`prev-export-failed`, and every later fragment was a consequence
+# of a baseline that never ran), while the same prev binary with its own SQLite
+# state exported 100000 rows into 4 parts, exit 0. Left alone, this cell can
+# NEVER pass on a Postgres pass once the tree adds a migration — which is
+# precisely when a cross-version check earns its keep.
+#
+# An empty value means "SQLite beside the config" (verified against the PUBLISHED
+# binary, not just the current tree), and `run`'s env MERGES over os.environ, so
+# clearing requires the empty string rather than a missing key.
+_ISOLATED_STATE = {"RIVET_STATE_URL": ""}
+
+
 def _regr_psql(url: str, sql: str) -> Proc:
     """Run `sql` against the regression source, via the container publishing its
     port (the URL points at a docker-published 127.0.0.1 port, so `psql` inside
@@ -306,13 +336,13 @@ INSERT INTO regr_probe SELECT g, md5(g::text), (g%1000)+0.25, '2025-01-01'::time
     # ── format: prev WRITES → cur READS its manifest + parts (the upgrade path) ──
     pe = work / "prev_fmt"
     _regr_cfg(src, pe)
-    if not run([str(prev), "run", "-c", str(pe / "c.yaml")], timeout=None).ok:
+    if not run([str(prev), "run", "-c", str(pe / "c.yaml")], timeout=None, env=_ISOLATED_STATE).ok:
         fails.append("prev-export-failed ")
     # cur validates prev's OUTPUT from cur's OWN env, so cur's state-schema
     # upgrade never touches prev's state DB.
     ce = work / "cur_fmt"
     _regr_cfg(src, ce, pe / "out")
-    validated = run([str(rivet_bin()), "validate", "-c", str(ce / "c.yaml")], timeout=None)
+    validated = run([str(rivet_bin()), "validate", "-c", str(ce / "c.yaml")], timeout=None, env=_ISOLATED_STATE)
     if "passed" not in validated.out.lower():
         fails.append("cur-cannot-read-prev-output(format-break) ")
 
@@ -336,8 +366,8 @@ INSERT INTO regr_probe SELECT g, md5(g::text), (g%1000)+0.25, '2025-01-01'::time
     pp, pc = work / "perf_prev", work / "perf_cur"
     _regr_cfg(src, pp)
     _regr_cfg(src, pc)
-    run([str(prev), "run", "-c", str(pp / "c.yaml")], timeout=None)
-    run([str(rivet_bin()), "run", "-c", str(pc / "c.yaml")], timeout=None)
+    run([str(prev), "run", "-c", str(pp / "c.yaml")], timeout=None, env=_ISOLATED_STATE)
+    run([str(rivet_bin()), "run", "-c", str(pc / "c.yaml")], timeout=None, env=_ISOLATED_STATE)
     for d in (pp / "out", pc / "out"):
         shutil.rmtree(d, ignore_errors=True)
         d.mkdir(parents=True, exist_ok=True)
@@ -422,14 +452,22 @@ def verify_scale_memory(led: Ledger) -> None:
             _scale_cfg(engine, url, large, ldir)
             st = _regr_time(binary, "run", "-c", str(sdir / "c.yaml"))
             lt = _regr_time(binary, "run", "-c", str(ldir / "c.yaml"))
-            ratio = f"{lt.rss / st.rss:.2f}" if st.rss > 0 else "NA"
-            report += (
-                f" {label}[{small}={st.rss // _MIB}MB "
-                f"{large}={lt.rss // _MIB}MB flat×{ratio}]"
-            )
+            if not (st.ok and lt.ok):
+                # Never print a number for a run that did not happen: a failed
+                # binary's ~11 MB reads as a lean baseline and invites exactly
+                # the wrong conclusion about the other column.
+                report += f" {label}[RUN FAILED — no measurement]"
+            else:
+                ratio = f"{lt.rss / st.rss:.2f}" if st.rss > 0 else "NA"
+                report += (
+                    f" {label}[{small}={st.rss // _MIB}MB "
+                    f"{large}={lt.rss // _MIB}MB flat×{ratio}]"
+                )
             # Only the CURRENT binary is asserted on; prev is reported for
             # context, since a prev that also buffers is not a reason to ship.
-            if label == "cur" and not (st.rss > 0 and lt.rss > 0 and lt.rss <= st.rss * tol_n):
+            if label == "cur" and not (st.ok and lt.ok):
+                fails.append("cur-run-failed(no RSS measurement to assert on) ")
+            elif label == "cur" and not (st.rss > 0 and lt.rss > 0 and lt.rss <= st.rss * tol_n):
                 fails.append(
                     f"rss-NOT-flat(cur {large}={lt.rss // _MIB}MB > "
                     f"{small}={st.rss // _MIB}MB ×{tol} — buffering, not streaming) "

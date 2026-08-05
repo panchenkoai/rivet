@@ -19,13 +19,36 @@ pub struct Rig {
     tables: Vec<String>,
     query: Option<String>,
     source_lines: Vec<String>,
-    mode: &'static str,
+    mode: String,
     format: &'static str,
     cdc_lines: Vec<String>,
     extra_lines: Vec<String>,
     dest_override: Option<PathBuf>,
+    /// When set, the source declares `url_env: <name>` INSTEAD of an inline
+    /// `url:`. See [`Rig::source_url_env`].
+    url_env: Option<String>,
+    /// Additional exports rendered after the primary one. See [`Rig::also_export`].
+    extra_exports: Vec<SecondaryExport>,
+    /// Container-visible twin of `dest_override`, set by [`Rig::duckdb_oracle`].
+    oracle_container_dir: Option<String>,
     ckpt_override: Option<PathBuf>,
     dir: tempfile::TempDir,
+}
+
+/// A non-primary export in a multi-export config, with its OWN destination.
+///
+/// The three affordances below exist because `live_cli_flags.rs` could not use
+/// the rig AT ALL, and the reasons were structural rather than neglect: five of
+/// its nineteen configs declare TWO exports (this), its tests drive `check` /
+/// `validate` / `doctor` rather than `run` ([`Rig::cli`]), and its signal tests
+/// need a LIVE child process to kill ([`Rig::spawn_args_env`]). A seam that
+/// cannot express a third of a file is why that file grew its own harness.
+#[derive(Clone)]
+struct SecondaryExport {
+    name: String,
+    query: String,
+    mode: String,
+    lines: Vec<String>,
 }
 
 impl Rig {
@@ -37,11 +60,14 @@ impl Rig {
             tables: vec![table.to_string()],
             query: None,
             source_lines: Vec::new(),
-            mode: "full",
+            mode: "full".to_string(),
             format: "parquet",
             cdc_lines: Vec::new(),
             extra_lines: Vec::new(),
             dest_override: None,
+            url_env: None,
+            extra_exports: Vec::new(),
+            oracle_container_dir: None,
             ckpt_override: None,
             dir: tempfile::tempdir().expect("rig tempdir"),
         }
@@ -49,7 +75,7 @@ impl Rig {
 
     pub fn mysql_cdc(table: &str) -> Self {
         let mut r = Self::new("mysql", super::env::MYSQL_CDC_URL, table);
-        r.mode = "cdc";
+        r.mode = "cdc".to_string();
         r.cdc_lines.push("until_current: true".into());
         r.cdc_lines.push("__CKPT__".into()); // resolved at render time
         r.cdc_lines
@@ -59,7 +85,7 @@ impl Rig {
 
     pub fn mssql_cdc(table: &str, capture_instance: &str) -> Self {
         let mut r = Self::new("mssql", super::env::MSSQL_CDC_URL, table);
-        r.mode = "cdc";
+        r.mode = "cdc".to_string();
         r.cdc_lines
             .push(format!("capture_instance: {capture_instance}"));
         r.cdc_lines.push("__CKPT__".into()); // resolved at render time
@@ -68,7 +94,7 @@ impl Rig {
 
     pub fn pg_cdc(table: &str, slot: &str) -> Self {
         let mut r = Self::new("postgres", super::env::POSTGRES_CDC_URL, table);
-        r.mode = "cdc";
+        r.mode = "cdc".to_string();
         r.cdc_lines.push("until_current: true".into());
         r.cdc_lines.push(format!("slot: {slot}"));
         r
@@ -104,7 +130,7 @@ impl Rig {
     /// `.source_url(&MongoTest::url(PORT, &db))`.
     pub fn mongo_cdc(table: &str) -> Self {
         let mut r = Self::new("mongo", super::env::MONGO_RS_URL, table);
-        r.mode = "cdc";
+        r.mode = "cdc".to_string();
         r.cdc_lines.push("until_current: true".into());
         r.cdc_lines.push("__CKPT__".into()); // resolved at render time
         r
@@ -112,8 +138,10 @@ impl Rig {
 
     /// Export mode (`full` / `incremental` / `chunked`); CDC constructors
     /// set `cdc`.
-    pub fn mode(mut self, mode: &'static str) -> Self {
-        self.mode = mode;
+    /// `String`, not `&'static str`: a mode derived at runtime is a real need —
+    /// `live_plan_apply.rs` builds one from a mode BLOCK shared across its tests.
+    pub fn mode(mut self, mode: &str) -> Self {
+        self.mode = mode.to_string();
         self
     }
 
@@ -167,6 +195,129 @@ impl Rig {
         self
     }
 
+    /// Name the EXPORT independently of the table it reads.
+    ///
+    /// `Rig::<engine>_batch(t)` names the export after the table, which is right
+    /// for the common case and wrong whenever a test needs a unique export name
+    /// for isolation while reading a fixed table — `live_keyset.rs` does this in
+    /// 23 places, driving runs with `--export <unique>` against `table: <fixed>`.
+    /// Without this the config declares one name and the CLI asks for another,
+    /// which fails at RUN time, not compile time.
+    pub fn export_named(mut self, name: &str) -> Self {
+        self.name = name.to_string();
+        self
+    }
+
+    /// Declare the source URL through an ENV VAR (`url_env:`) instead of inline.
+    ///
+    /// Load-bearing for plan/apply round-trips, not a style choice: an inline URL
+    /// carries credentials, which are REDACTED into the plan artifact, so `rivet
+    /// apply` then cannot reconnect. Every plan/apply test therefore needs this
+    /// shape, which is why `live_plan_apply.rs` had its own config builder.
+    pub fn source_url_env(mut self, var: &str) -> Self {
+        self.url_env = Some(var.to_string());
+        self
+    }
+
+    /// Declare a SECOND (third, …) export in the same config, with its own
+    /// destination directory — reachable via [`Rig::out_dir_for`].
+    ///
+    /// Multi-export configs are how `--export` selection, per-export failure
+    /// isolation and wave ordering get tested; a single-export rig cannot state
+    /// those cases at all.
+    pub fn also_export(mut self, name: &str, query: &str) -> Self {
+        self.extra_exports.push(SecondaryExport {
+            name: name.to_string(),
+            query: query.to_string(),
+            mode: "full".to_string(),
+            lines: Vec::new(),
+        });
+        self
+    }
+
+    /// Extra export-level lines for the most recently added [`Rig::also_export`].
+    pub fn also_export_line(mut self, line: &str) -> Self {
+        self.extra_exports
+            .last_mut()
+            .expect("also_export_line needs a preceding also_export")
+            .lines
+            .push(line.to_string());
+        self
+    }
+
+    /// Destination directory of a named export — the primary or any secondary.
+    pub fn out_dir_for(&self, name: &str) -> PathBuf {
+        if name == self.name {
+            return self.out_dir();
+        }
+        self.dir.path().join(format!("out_{name}"))
+    }
+
+    /// Run an ARBITRARY subcommand against this rig's config: `rivet <args…>
+    /// --config <cfg>`.
+    ///
+    /// NOT for `apply`, which takes a PLAN PATH rather than `--config` — use
+    /// `run_rivet_env` directly there. This method appends the config flag, so it
+    /// fits the subcommands that read one: `plan`, `check`, `validate`, `doctor`.
+    ///
+    /// `run_args`/`run_args_env` hard-code the `run` subcommand, so a test for
+    /// `check`, `validate`, `doctor` or `init` had no way through the rig and
+    /// dropped to a raw `Command`. The config flag is appended, which clap
+    /// accepts in any position.
+    pub fn cli(&self, args: &[&str]) -> std::process::Output {
+        self.cli_env(args, &[])
+    }
+
+    /// [`Rig::cli`] with environment variables — needed wherever the config
+    /// declares `url_env:`, since the process must be able to resolve it.
+    pub fn cli_env(&self, args: &[&str], envs: &[(&str, &str)]) -> std::process::Output {
+        let cfg = self.config_path();
+        let mut all: Vec<&str> = args.to_vec();
+        all.push("--config");
+        all.push(cfg.to_str().unwrap());
+        super::runner::run_rivet_env(&all, envs)
+    }
+
+    /// Spawn `rivet run` and hand back the LIVE child, output discarded.
+    ///
+    /// For tests that must act on a running process — signal it, inspect its
+    /// children, watch the staged `.tmp` appear — rather than wait for an exit
+    /// status. `run_args_env` blocks until completion and so cannot express them.
+    /// The caller owns the `Child` and must reap it.
+    pub fn spawn_args_env(&self, extra: &[&str], envs: &[(&str, &str)]) -> std::process::Child {
+        let cfg = self.config_path();
+        let mut cmd = std::process::Command::new(super::runner::RIVET_BIN);
+        cmd.args(["run", "--config", cfg.to_str().unwrap()]);
+        cmd.args(extra);
+        for (k, v) in envs {
+            cmd.env(k, v);
+        }
+        cmd.stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn rivet")
+    }
+
+    /// Run `rivet run --config <rig cfg>` plus `extra` args, with `envs` set.
+    ///
+    /// The affordance the crash-recovery files were bypassing the rig for: they
+    /// built their YAML through `Rig` and then dropped to a raw
+    /// `Command::new(RIVET_BIN)` because the rig could express an env var OR a
+    /// config, never extra ARGS (`--export`, `--resume`) alongside a fault
+    /// injection. That one gap accounted for most of the hand-rolled invocations
+    /// in `live_chunked_recovery.rs` and its siblings.
+    pub fn run_args_env(&self, extra: &[&str], envs: &[(&str, &str)]) -> std::process::Output {
+        let cfg = self.config_path();
+        let mut args: Vec<&str> = vec!["run", "--config", cfg.to_str().unwrap()];
+        args.extend_from_slice(extra);
+        super::runner::run_rivet_env(&args, envs)
+    }
+
+    /// `run_args_env` with no env — a plain run with extra flags.
+    pub fn run_args(&self, extra: &[&str]) -> std::process::Output {
+        self.run_args_env(extra, &[])
+    }
+
     /// Run with an extra environment variable (fault injection); returns the
     /// raw output — the caller asserts success or failure.
     pub fn run_with_env(&self, key: &str, val: &str) -> std::process::Output {
@@ -209,11 +360,21 @@ impl Rig {
 
     /// Materialized config path — for bespoke invocations (`validate`,
     /// custom envs) the rig doesn't wrap.
+    /// The export name this rig rendered into the config — the key
+    /// `export_metrics` rows are stored under, so a test can read the run's own
+    /// metrics without re-deriving the name it did not choose.
+    pub fn export_name(&self) -> &str {
+        &self.name
+    }
+
     pub fn config_path(&self) -> PathBuf {
         // Materialization point: the ONLY place the rig touches the
         // filesystem (yaml()/render() stay pure — the offline goldens were
         // mkdir-ing /tmp/o as a side effect of rendering a string).
         std::fs::create_dir_all(self.out_dir()).unwrap();
+        for e in &self.extra_exports {
+            std::fs::create_dir_all(self.out_dir_for(&e.name)).unwrap();
+        }
         let cfg = self.dir.path().join("rig.yaml");
         std::fs::write(&cfg, self.render()).unwrap();
         cfg
@@ -247,25 +408,53 @@ impl Rig {
             .map(|l| format!("    {l}\n"))
             .collect();
         let source = if self.source_lines.is_empty() {
-            format!(
-                "source: {{ type: {}, url: \"{}\" }}",
-                self.source_type, self.source_url
-            )
+            match &self.url_env {
+                Some(v) => format!("source: {{ type: {}, url_env: {v} }}", self.source_type),
+                None => format!(
+                    "source: {{ type: {}, url: \"{}\" }}",
+                    self.source_type, self.source_url
+                ),
+            }
         } else {
             let extra: String = self
                 .source_lines
                 .iter()
                 .map(|l| format!("  {l}\n"))
                 .collect();
-            format!(
-                "source:\n  type: {}\n  url: \"{}\"\n{extra}",
-                self.source_type, self.source_url
-            )
+            match &self.url_env {
+                Some(v) => format!(
+                    "source:\n  type: {}\n  url_env: {v}\n{extra}",
+                    self.source_type
+                ),
+                None => format!(
+                    "source:\n  type: {}\n  url: \"{}\"\n{extra}",
+                    self.source_type, self.source_url
+                ),
+            }
             .trim_end()
             .to_string()
         };
+        // Secondary exports (see `Rig::also_export`) each get their OWN
+        // destination, which is what the multi-export configs under test
+        // actually declare — per-export failure isolation is only observable
+        // when the outputs are separable.
+        let secondaries: String = self
+            .extra_exports
+            .iter()
+            .map(|e| {
+                let lines: String = e.lines.iter().map(|l| format!("    {l}\n")).collect();
+                format!(
+                    "  - name: {n}\n    query: \"{q}\"\n    mode: {m}\n    format: {f}\n{lines}    destination: {{ type: local, path: \"{o}\" }}\n",
+                    n = e.name,
+                    q = e.query,
+                    m = e.mode,
+                    f = self.format,
+                    o = self.out_dir_for(&e.name).display(),
+                )
+            })
+            .collect();
         let yaml = format!(
-            "{source}\nexports:\n  - name: {name}\n    {tables}\n    mode: {mode}\n    format: {fmt}\n{cdc}{extra}    destination: {{ type: local, path: \"{out}\" }}\n",
+            "{source}\nexports:\n  - name: {name}\n    {tables}\n    mode: {mode}\n    format: {fmt}\n{cdc}{extra}    destination: {{ type: local, path: \"{out}\" }}\n{secondaries}",
             name = self.name,
             tables = tables,
             mode = self.mode,
@@ -309,6 +498,50 @@ impl Rig {
     pub fn run(&self) -> std::process::Output {
         let cfg = self.config_path();
         super::runner::run_rivet(&["run", "--config", cfg.to_str().unwrap()])
+    }
+
+    /// Put the destination under the shared bind mount so the DuckDB validator
+    /// container can read it, enabling [`Rig::assert_complete`].
+    ///
+    /// Needed because the rig's own tempdir is invisible inside the container.
+    /// Call it at construction; a test that does not need an independent decoder
+    /// should not pay the container round-trip.
+    pub fn duckdb_oracle(mut self) -> Self {
+        // The label MUST be unique per rig, not per table. Deriving it from
+        // `self.name` collided immediately: five Mongo tests all export a
+        // collection called `bench`, so they shared one directory, ran in
+        // parallel, and read each other's parquet — DuckDB reported 19000 rows /
+        // 14000 distinct where each expected 5000. `live_shared_workdir` also
+        // CLEARS the directory it hands back, so they were deleting each other's
+        // output as well. Loud, but only because the oracle is strict.
+        let (host, container) =
+            super::env::live_shared_workdir(&super::unique_name(&format!("rig_{}", self.name)));
+        self.dest_override = Some(host);
+        self.oracle_container_dir = Some(container);
+        self
+    }
+
+    /// Assert the destination holds exactly `expected` rows, all distinct on
+    /// `column` — read by DuckDB, which does NOT share rivet's parquet codec.
+    ///
+    /// `read_all_parts` / `total_parquet_rows` decode with the same crate rivet
+    /// encodes with, so a fault in that shared path cancels out and the claim
+    /// passes over corrupt output. This is the reader that does not.
+    ///
+    /// Requires [`Rig::duckdb_oracle`] at construction.
+    pub fn assert_complete(&self, column: &str, expected: i64, what: &str) {
+        let dir = self
+            .oracle_container_dir
+            .as_deref()
+            .expect("assert_complete needs Rig::duckdb_oracle() at construction");
+        super::duckdb::duckdb_assert_complete(dir, column, expected, what);
+    }
+
+    /// The container-visible destination path, for a bespoke DuckDB query.
+    pub fn oracle_dir(&self) -> &str {
+        self.oracle_container_dir
+            .as_deref()
+            .expect("oracle_dir needs Rig::duckdb_oracle() at construction")
     }
 
     /// Run and read every parquet part back — the canonical
@@ -525,6 +758,93 @@ impl CdcScenario {
 #[cfg(test)]
 mod rig_render_goldens {
     use super::*;
+
+    /// `url_env:` replaces the inline `url:` in both source-render shapes.
+    ///
+    /// Pins the affordance `live_plan_apply.rs` needed. Not cosmetic: an inline
+    /// URL carries credentials, which are redacted into the plan artifact, so a
+    /// subsequent `rivet apply` cannot reconnect. Every plan/apply test uses this
+    /// shape — which is why that file had its own config builder rather than a
+    /// stray preference for one.
+    #[test]
+    fn source_url_env_replaces_the_inline_url_in_both_render_shapes() {
+        // Inline shape (postgres: no extra source lines).
+        let flat = Rig::pg_batch("t")
+            .source_url_env("DATABASE_URL")
+            .dest_path("/tmp/o".into())
+            .yaml();
+        assert!(
+            flat.contains("source: { type: postgres, url_env: DATABASE_URL }"),
+            "inline source must carry url_env:\n{flat}"
+        );
+        assert!(
+            !flat.contains("url: \""),
+            "…and must NOT also emit an inline url, or the credential is back:\n{flat}"
+        );
+
+        // Multi-line shape (mssql: carries tls lines).
+        let nested = Rig::mssql_batch("t")
+            .source_url_env("MSSQL_URL")
+            .dest_path("/tmp/o".into())
+            .yaml();
+        assert!(
+            nested.contains("url_env: MSSQL_URL"),
+            "multi-line source must carry url_env:\n{nested}"
+        );
+        assert!(
+            !nested.contains("url: \""),
+            "…and must not keep the inline url beside it:\n{nested}"
+        );
+        assert!(
+            nested.contains("accept_invalid_certs: true"),
+            "the engine's own source lines must survive:\n{nested}"
+        );
+    }
+
+    /// A second export renders as its own block with its OWN destination.
+    ///
+    /// Pins the affordance that `live_cli_flags.rs` needed and the rig did not
+    /// have: five of its nineteen configs declare two exports, so a third of
+    /// that file could not go through the seam at all and grew a hand-rolled
+    /// template instead.
+    ///
+    /// The destinations must DIFFER, which is the load-bearing half — per-export
+    /// failure isolation and `--export` selection are only observable when the
+    /// outputs are separable. The paths themselves live under the rig's tempdir
+    /// and so are not pinned; that they are distinct is.
+    #[test]
+    fn a_second_export_renders_its_own_block_and_its_own_destination() {
+        let rig = Rig::pg_batch("primary")
+            .also_export("secondary", "SELECT id FROM other")
+            .also_export_line("chunk_size: 10");
+        let yaml = rig.yaml();
+
+        assert_eq!(
+            yaml.matches("- name:").count(),
+            2,
+            "both exports must render:\n{yaml}"
+        );
+        assert!(
+            yaml.contains("- name: secondary"),
+            "the secondary export is missing:\n{yaml}"
+        );
+        assert!(
+            yaml.contains(r#"query: "SELECT id FROM other""#),
+            "the secondary keeps its own query:\n{yaml}"
+        );
+        assert!(
+            yaml.contains("    chunk_size: 10\n"),
+            "also_export_line attaches to the secondary:\n{yaml}"
+        );
+        assert_ne!(
+            rig.out_dir_for("primary"),
+            rig.out_dir_for("secondary"),
+            "each export needs a separable destination, or per-export failure \
+             isolation cannot be observed"
+        );
+        let dests: Vec<&str> = yaml.matches("path: ").collect();
+        assert_eq!(dests.len(), 2, "one destination per export:\n{yaml}");
+    }
 
     /// The full constructor surface, pinned as rendered YAML — the rig's own
     /// contract test. Any drift in the render is a diff HERE first, offline,

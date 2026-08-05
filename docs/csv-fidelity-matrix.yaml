@@ -75,3 +75,8 @@ scenarios:
     what: "a cell whose value begins with =/+/-/@ (spreadsheet formula triggers) is written verbatim — RFC-4180-faithful output."
     no_silent_loss:          { na: "the value is written faithfully and completely — no loss" }
     no_corruption_on_escape: { na: "faithful RFC-4180 output is CORRECT, not corruption: a leading =/+/-/@ is not injection into rivet's own SQL/command/URI surface, only a downstream-spreadsheet concern (round-7 deferred by-design; documented spreadsheet-unsafe rather than silently prefixed, which would corrupt the real data)" }
+
+  - id: cdc_manifest_declares_the_real_compression
+    what: "a CDC export's manifest declares the compression the part ACTUALLY has. The writer picks None for CSV and Zstd for Parquet; `build_manifest` wrote the literal \"zstd\" for both, so a `format: csv` CDC prefix shipped plain-text parts under a manifest advertising zstd (the batch leg records `plan.compression.label()` — the truth — so the two legs described the same artifact differently). Found by the format axis of the CDC sweep; the oracle is the FILE's own bytes (a zstd frame's 28 B5 2F FD magic vs the CSV header text), never the other arm of the same match."
+    no_silent_loss:          { na: "the rows are all present and readable — the defect is in the SIDECAR's description of the file, not in the file" }
+    no_corruption_on_escape: { test: a_cdc_manifest_declares_the_compression_the_part_actually_has }

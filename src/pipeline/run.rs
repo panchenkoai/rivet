@@ -798,7 +798,7 @@ mod wave_grouping_tests {
 /// generic (1). The chosen error's typed marker then rides up so `classify_exit`
 /// exits the process on the scariest reason rather than whichever export happened
 /// to fail first. Returns `None` for an empty slice.
-fn representative_failure_idx(failures: &[anyhow::Error]) -> Option<usize> {
+pub(crate) fn representative_failure_idx(failures: &[anyhow::Error]) -> Option<usize> {
     let rank = |e: &anyhow::Error| match crate::error::classify_exit(e) {
         c if c == crate::error::ExitClass::DataIntegrity.code() => 3,
         c if c == crate::error::ExitClass::SchemaDrift.code() => 2,

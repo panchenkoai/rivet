@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value as Json;
 
+use crate::config::TlsConfig;
 use crate::error::Result;
 use value::RivetValue;
 
@@ -468,7 +469,68 @@ pub(crate) enum CdcEngine {
     Mongo,
 }
 
+/// What image of a row this source can actually supply per change event.
+///
+/// rivet's change stream is a WHOLE-ROW image per event, and whether the source
+/// can produce one is a SERVER setting, not a rivet setting. Each engine has its
+/// own knob, so the question was being asked in two different layers with a third
+/// engine not asked at all:
+///
+///   mysql    `binlog_row_image`         inside the stream's `open`
+///   postgres `REPLICA IDENTITY`         a layer up, in `run_capture`
+///   mongo    —                          whole by construction (UpdateLookup)
+///   mssql    `@captured_column_list`    nowhere
+///
+/// One enum makes the answers comparable and moves the POLICY — refuse, warn, or
+/// proceed — out of each engine's prose into one place. A new engine then cannot
+/// forget: the method is a hole the compiler makes it fill.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RowImage {
+    /// Every column, on every event. Nothing to say.
+    Whole,
+    /// Inserts and updates carry the whole new row; DELETE carries only the key.
+    /// Not corruption — a delete's job is to name the key that is gone — but it
+    /// moves any per-row hash computed over deletes, so it is worth one line.
+    KeyOnlyDeletes { why: String },
+    /// The event cannot represent the row. Capturing would record events that are
+    /// wrong rather than merely thin, so this is refused.
+    Partial { why: String },
+}
+
 impl CdcEngine {
+    /// Ask the source what it can supply for the tables about to be captured.
+    ///
+    /// Best-effort by construction: a catalog the reader cannot query answers
+    /// `Whole`. Refusing on a permission error would lock out sources that are
+    /// fine, and this check exists to catch a CONFIGURATION, not to police access.
+    pub(crate) fn row_image(
+        &self,
+        url: &str,
+        tls: Option<&TlsConfig>,
+        tables: &[String],
+        opts: &CdcEngineOpts,
+    ) -> RowImage {
+        match self {
+            Self::Mysql => crate::source::mysql::cdc::MysqlChangeStream::row_image(url, tls),
+            Self::Postgres => {
+                crate::source::postgres::cdc::PgChangeStream::row_image(url, tls, tables)
+            }
+            Self::Mssql => {
+                // The gate must grade the instance the poll will READ; anything
+                // else either sums across instances (masking a partial one) or
+                // matches a same-named table in another schema.
+                let ci = match opts {
+                    CdcEngineOpts::Mssql { capture_instance } => capture_instance.as_deref(),
+                    _ => None,
+                };
+                crate::source::mssql::cdc::row_image(url, tls, tables, ci)
+            }
+            // The reader requests `FullDocumentType::UpdateLookup`, so the
+            // post-image is the whole document whatever the server is set to.
+            Self::Mongo => RowImage::Whole,
+        }
+    }
+
     pub(crate) fn from_url(url: &str) -> Result<Self> {
         if url.starts_with("mysql://") {
             Ok(Self::Mysql)
@@ -654,9 +716,27 @@ pub(crate) fn create_change_stream(
                 }),
                 None => None,
             };
+            // Was that position an ANCHOR or a resume? Only an anchor may be
+            // floored up to the instance's start; a resume position below the
+            // change table's min LSN is retention loss and must THROW. Absent on
+            // a legacy checkpoint ⇒ treated as a resume, the loud direction.
+            let from_is_pin = match cfg.checkpoint.as_deref() {
+                Some(p) => Position::load(p)?
+                    .and_then(|pos| pos.0.get("pinned").and_then(|v| v.as_bool()))
+                    .unwrap_or(false),
+                None => false,
+            };
             Ok(Box::new(
                 crate::source::mssql::cdc::MssqlChangeStream::from_url(
-                    url, ci, from_lsn, tls, peek, cfg.drain,
+                    url,
+                    ci,
+                    crate::source::mssql::cdc::Resume {
+                        from_lsn,
+                        from_is_pin,
+                    },
+                    tls,
+                    peek,
+                    cfg.drain,
                 )
                 .context(MSSQL_CDC_HINT)?,
             ))
@@ -845,6 +925,10 @@ pub(crate) struct CaptureOutput<'a> {
 /// `outputs` carries one entry per captured table: several tables ride ONE stream
 /// (one slot / one binlog connection) and one checkpoint.
 pub(crate) struct CdcCapture<'a> {
+    /// `exports[].name` — recorded into each manifest's `export_family` so the
+    /// load's shared-prefix guard groups the drain with its snapshot leg by what
+    /// was WRITTEN, not by re-deriving it from the table string.
+    pub export_name: String,
     pub cdc_cfg: CdcConfig,
     pub outputs: Vec<CaptureOutput<'a>>,
     pub format: crate::config::FormatType,
@@ -854,30 +938,74 @@ pub(crate) struct CdcCapture<'a> {
     /// RFC3339 stamps the caller owns (`Utc::now()` is theirs to call).
     pub run_id: String,
     pub started_at: String,
+    /// The central ledger. A `mode: cdc` run passes its store so every part is
+    /// recorded in the DATABASE as it becomes durable; the `rivet cdc` CLI has
+    /// no state store and passes `None`.
+    pub state: Option<&'a crate::state::StateStore>,
 }
 
 /// Open the change stream (with the engine's permission/TLS gate), resolve each
 /// table's typed schema, and drive the commit-seam file sink — the single place
 /// the typed CDC capture is assembled. Returns one `RunManifest` per output, in
-/// `outputs` order.
-pub(crate) fn run_capture(cap: CdcCapture<'_>) -> Result<Vec<crate::manifest::RunManifest>> {
+/// `outputs` order — PAIRED with the outcome, so a run that failed after
+/// committing parts still hands the caller what it made durable. Returning a
+/// bare `Result` discarded exactly that, and the caller recorded zeros.
+pub(crate) fn run_capture(cap: CdcCapture<'_>) -> (Vec<crate::manifest::RunManifest>, Result<()>) {
     let url = cap.cdc_cfg.url.clone();
     let tls = cap.cdc_cfg.tls.clone();
     let checkpoint = cap.cdc_cfg.checkpoint.clone();
     // Derive the peek bound from the ONE rollover the sink also uses — so the
     // PG peek is always ≥ the part rollover (never starves). The single source
     // of truth for both is `cap.rollover`.
-    let mut stream = create_change_stream(&cap.cdc_cfg, PeekBound::Sized(cap.rollover))?;
+    // Setup failures happen BEFORE anything is durable, so an empty manifest
+    // list is the truth here — unlike the drain, where it was a lie.
+    let mut stream = match create_change_stream(&cap.cdc_cfg, PeekBound::Sized(cap.rollover)) {
+        Ok(s) => s,
+        Err(e) => return (Vec::new(), Err(e)),
+    };
     // Fault point: stream (and any server-side anchor) opened, nothing read.
     crate::test_hook::maybe_panic_at("cdc_after_open");
-    let engine = CdcEngine::from_url(&url)?;
+    let engine = match CdcEngine::from_url(&url) {
+        Ok(e) => e,
+        Err(e) => return (Vec::new(), Err(e)),
+    };
+    let cap_tables: Vec<String> = cap.outputs.iter().map(|o| o.table.clone()).collect();
     let mut outputs = Vec::with_capacity(cap.outputs.len());
     // ONE resolver session serves every table (was: 2 fresh connections per
     // table per run — the multi-table per-cycle cost the roast flagged).
     crate::test_hook::maybe_panic_at("cdc_before_resolve");
-    let mut resolver = CdcSchemaResolver::connect(&url, tls.as_ref())?;
+    // ONE place decides what each verdict MEANS. The captured tables are known
+    // here and nowhere earlier, which is why the question is asked at this seam
+    // rather than inside each stream's `open`: scoped to what is actually being
+    // captured, the answer is one line an operator can act on instead of a census
+    // of the database (a first cut counted every table and said "704").
+    match engine.row_image(&url, tls.as_ref(), &cap_tables, &cap.cdc_cfg.engine) {
+        RowImage::Whole => {}
+        RowImage::KeyOnlyDeletes { why } => log::warn!(
+            "{} cdc: {why}. Counts still reconcile, but a per-row hash over deletes will differ \
+             from the same table's batch export.",
+            engine.label()
+        ),
+        RowImage::Partial { why } => {
+            return (
+                Vec::new(),
+                Err(anyhow::anyhow!(
+                    "{} cdc: {why}. Capturing under this setting would report success over \
+                     events that cannot represent the row.",
+                    engine.label()
+                )),
+            );
+        }
+    }
+    let mut resolver = match CdcSchemaResolver::connect(&url, tls.as_ref()) {
+        Ok(r) => r,
+        Err(e) => return (Vec::new(), Err(e)),
+    };
     for o in cap.outputs {
-        let columns = resolver.resolve(&o.table, &o.overrides)?;
+        let columns = match resolver.resolve(&o.table, &o.overrides) {
+            Ok(c) => c,
+            Err(e) => return (Vec::new(), Err(e)),
+        };
         outputs.push(sink::TableOutput {
             table: o.table,
             columns,
@@ -887,6 +1015,7 @@ pub(crate) fn run_capture(cap: CdcCapture<'_>) -> Result<Vec<crate::manifest::Ru
         });
     }
     let sink_cfg = sink::SinkConfig {
+        export_name: cap.export_name,
         outputs,
         engine,
         format: cap.format,
@@ -896,6 +1025,7 @@ pub(crate) fn run_capture(cap: CdcCapture<'_>) -> Result<Vec<crate::manifest::Ru
         rollover_memory_bytes: cap.rollover_memory_bytes,
         started_at: cap.started_at,
         run_id: cap.run_id,
+        state: cap.state,
     };
     sink::run_to_files(stream.as_mut(), sink_cfg)
 }

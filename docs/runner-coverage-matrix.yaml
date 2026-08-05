@@ -20,6 +20,32 @@
 # durability ordering) that have no such telltale; splitting the collapsed families into
 # real per-variant columns is a tracked follow-up.
 #
+# PER-VARIANT VERIFICATION PASS, 2026-08-04. The follow-up above was DISCHARGED as an
+# audit rather than as new columns: all EIGHT commit loops were read individually
+# against all thirteen scenarios below (single; chunked_{sequential,parallel};
+# {sequential,parallel}_checkpoint; keyset_{sequential,parallel}; mongo_parallel), and
+# every claimed absence was then handed to an independent agent instructed to REFUTE it.
+# Result: no collapsed family was hiding a divergence — zero new gaps. The columns stayed
+# at four because 96 cells of prose would restate one fact (the families agree today)
+# while adding a second ledger to keep in sync; the pass is recorded here instead.
+#
+# Three findings that are worth keeping, none of them a gap:
+#   * shape_drift_warn reads `absent` on six variants if you ask "is it applied", and
+#     `na` if you ask "should it be" — the `na` cells below are the honest answer, but
+#     note the distinction is DESIGN, not structure. It is the one row where a future
+#     reader could mistake the two.
+#   * durable_manifest_before_advance on keyset_parallel LOOKS absent at
+#     keyset.rs:716-722 (st.update before the manifest) and is not: the anchor+ranges
+#     persist first (keyset.rs:375-377), resume ignores the cursor (keyset.rs:323), and
+#     job.rs:1091-1099 keeps the anchor across a manifest gap. Cost one refutation pass
+#     to establish; recorded so it does not cost another.
+#   * files_committed_on_abort on mongo_parallel is genuinely not applied — the drain
+#     bails at `let out = res?` (mongo_parallel.rs:106) ABOVE the record_part calls
+#     (:121-131). Harm is bounded to the worker-0 case (a later worker's failure leaves
+#     files_committed > 0, so decide_export_retry bails correctly) and to ORPHANS rather
+#     than duplicates, because the stamp is re-minted per invocation (:64). That is the
+#     defect the `na` cell below already names as tracked-separately, now measured.
+#
 # Round-8 proved this class is real AND recurring: `on_schema_drift: fail` returned
 # exit 0 on keyset + parallel-Mongo because the drift gate lived only in single/chunked.
 # Building this ledger then surfaced a bigger one — value-checksum Form B was absent on
@@ -41,6 +67,18 @@
 engines: [single, chunked, keyset, mongo_parallel]
 
 scenarios:
+  - id: failed_chunk_fails_the_run
+    what: "a chunk/worker that FAILS (not crashes) must fail the run rather than ship a short export. Measured 2026-08-03: disabling the sequential guard (`pending > 0`) left 14 live tests green while a run shipped 100 of 150 rows as SUCCESS; disabling BOTH parallel-checkpoint guards left 56 green. Every prior test injected a PANIC, and a panic never reaches a guard that only runs once the loop finishes — hence the RIVET_TEST_ERROR_AT=chunk_export:N hook these tests added."
+    single:         { na: "no chunk loop to continue past — a failed single export IS the run's failure (run_single_export returns Err); the retry side is decide_export_retry's own matrix" }
+    # BOTH checkpoint runners are proven; the cell names the sequential one and
+    # `a_failed_chunk_must_fail_the_parallel_run_not_ship_a_short_export` covers
+    # the parallel twin. The parallel case goes RED only with BOTH its guards
+    # disabled — the worker-error bail and the completion count are redundant
+    # there, and the test says so in its own body rather than claiming two proofs.
+    chunked:        { test: a_failed_chunk_must_fail_the_run_not_ship_a_short_export }
+    keyset:         { test: parallel_keyset_worker_error_still_counts_the_durable_parts_postgres }
+    mongo_parallel: { na: "the drain does `let out = res?` — the FIRST worker error propagates immediately, so there is no keep-going path and therefore no end-of-run guard that can silently fail to fire. The residual risk is the opposite one (a later worker's parts unrecorded because the bail preceded their drain), which is the durable-part-count scenario, not this one" }
+
   - id: schema_drift_gate
     what: "on_schema_drift enforcement — a drifted schema under `fail` aborts (exit 4). Each runner bypasses run_single_export, so each must re-apply the gate (check_from_sink_schema / check_from_type_mappings). Round-8: keyset + mongo_parallel had SILENTLY dropped it (exit 0 on drift)."
     single:         { test: schema_drift_removed_column_is_detected }
@@ -61,6 +99,13 @@ scenarios:
     chunked:        { test: chunked_export_records_form_b_checksums_and_validate_passes }
     keyset:         { test: keyset_export_records_form_b_checksums_and_validate_passes }
     mongo_parallel: { test: mongo_parallel_export_records_form_b_checksum }
+
+  - id: files_committed_on_abort
+    what: "the retry duplicate guard's ONLY input. `decide_export_retry` bails with BailDuplicateGuard when summary.files_committed > 0 (pipeline/single.rs), and commit::record_part is the sole production site that raises it — so a runner that aborts BEFORE its record_part drain reports ZERO while its successful workers' parts are already durable, and a TRANSIENT failure retries the whole export over them. Found by the third hunt: keyset_parallel bailed above the drain since 0.23.0. Measured pre-fix — 4 parts on disk, `retry 1/2` + `retry 2/2`; with a range whose output SHRANK between attempts (mid-backoff DELETE) the earlier attempt's extra part survived unoverwritten: 751 rows / 750 distinct, id 501 duplicated. NOTE the reason the existing tests missed it, because it generalises: decide_export_retry's unit matrix FEEDS files_committed as a parameter (0/2/5) and is correct on every input, while the keyset worker-error live test DELETES the orphan parts before its clean re-run (a vacuous-oracle guard its own comment explains). Neither observes the VALUE one layer hands the other — this row exists to make that boundary a per-runner obligation."
+    single:         { na: "no fan-out to abort mid-way: run_single_export records each part as it commits, so an error after N parts leaves files_committed = N by construction. This is the shape the other runners must reproduce, not a cell to prove." }
+    chunked:        { na: "records INSIDE the per-chunk loop — write_sink_parts then record_part per chunk (chunked/exec.rs:131-150), so an error on chunk N leaves files_committed = the parts of chunks 0..N-1 by construction. Same shape as single: there is no drain-after-the-fact to abort above." }
+    keyset:         { test: parallel_keyset_worker_error_still_counts_the_durable_parts_postgres }
+    mongo_parallel: { na: "records inside the collection loop — `for (w, res) in results { let out = res?; ... record_part }` (mongo_parallel.rs:105-132), so workers before the failing index have ALREADY recorded when `?` fires. A worker-0 failure still reports zero, but mongo_parallel re-mints its part stamp per invocation (mongo_parallel.rs:64), so a retry collides with nothing to overwrite and leaves both copies — a DIFFERENT defect (orphan accumulation, not a bypassed guard), tracked separately." }
 
   - id: guard_manifest_mode
     what: "cross-shape manifest guard — a batch export must REFUSE to overwrite a prior CDC manifest at the same prefix (and vice versa), or the two silently destroy each other's audit trail. Each batch runner calls guard_manifest_mode at run start. Round-11 (graph-surfaced): the TWO chunk-checkpoint runners (run_chunked_{sequential,parallel}_checkpoint — distinct large functions the grep-driven pass folded into 'chunked') were the ONLY batch runners that bypassed it, so a chunked-checkpoint export clobbered a CDC prefix silently."

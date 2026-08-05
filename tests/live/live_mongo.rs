@@ -30,26 +30,19 @@ fn batch(db: &str, table: &str) -> Rig {
 #[ignore = "live: requires docker compose up -d mongo"]
 fn mongo_batch_keyset_no_loss_or_dup() {
     require_alive(LiveService::Mongo);
+    require_alive(LiveService::DuckDb);
     let db = unique_name("mkeyset");
     MongoTest::connect(PORT, &db).seed_int_id("bench", 5000);
 
     // page_size 2000 → 3 pages: exercises page boundaries.
-    let rig = batch(&db, "bench").mongo("page_size: 2000");
+    let rig = batch(&db, "bench").duckdb_oracle().mongo("page_size: 2000");
     rig.run_ok();
 
-    assert_eq!(
-        dir_parquet_distinct_strings(&rig.out_dir(), "_id").len(),
-        5000,
-        "distinct _id must equal source (no loss)"
-    );
-    // Distinct count alone hides duplicates (a doc emitted twice keeps the same
-    // distinct set) — assert total == distinct so a dup fails loudly (bug-hunt:
-    // the four 'no loss OR dup' tests only checked distinct).
-    assert_eq!(
-        total_parquet_rows(&rig.out_dir()),
-        5000,
-        "total rows must equal distinct — no duplicate export"
-    );
+    // Read by DuckDB, which does not share rivet's parquet codec — the
+    // previous pair decoded with the same crate rivet encodes with, so a
+    // fault in that shared path cancelled out. Total and distinct together:
+    // fewer rows is loss, fewer distinct is duplication.
+    rig.assert_complete("_id", 5000, "distinct _id must equal source (no loss)");
     assert!(
         dir_parquet_has_column(&rig.out_dir(), "document"),
         "blob document column present"
@@ -60,24 +53,25 @@ fn mongo_batch_keyset_no_loss_or_dup() {
 #[ignore = "live: requires docker compose up -d mongo"]
 fn mongo_batch_parallel_integer_id_no_loss_or_dup() {
     require_alive(LiveService::Mongo);
+    require_alive(LiveService::DuckDb);
     let db = unique_name("mpar");
     MongoTest::connect(PORT, &db).seed_int_id("bench", 5000);
 
     // parallel: 4 on an INTEGER _id — impossible before Bson range bounds.
     let rig = batch(&db, "bench")
+        .duckdb_oracle()
         .mongo("page_size: 1000")
         .export_line("parallel: 4");
     rig.run_ok();
 
-    assert_eq!(
-        dir_parquet_distinct_strings(&rig.out_dir(), "_id").len(),
+    // Read by DuckDB, which does not share rivet's parquet codec — the
+    // previous pair decoded with the same crate rivet encodes with, so a
+    // fault in that shared path cancelled out. Total and distinct together:
+    // fewer rows is loss, fewer distinct is duplication.
+    rig.assert_complete(
+        "_id",
         5000,
-        "parallel _id-range union must be the whole collection"
-    );
-    assert_eq!(
-        total_parquet_rows(&rig.out_dir()),
-        5000,
-        "parallel ranges must not double-count at a boundary (total == distinct)"
+        "parallel _id-range union must be the whole collection",
     );
 }
 
@@ -112,6 +106,58 @@ fn mongo_parallel_export_records_form_b_checksum() {
     );
 }
 
+/// `files_committed` is `decide_export_retry`'s ONLY input, and `commit::record_part`
+/// is the sole production site that raises it. `run_mongo_parallel` used to drain
+/// with `let out = res?` ABOVE its `record_part` calls, so ONE worker's failure
+/// abandoned both its own durable pages and every LATER worker's — the guard read
+/// ZERO while parquet sat on the destination, and a transient failure retried the
+/// whole export over live data.
+///
+/// The Mongo twin of `parallel_keyset_worker_error_still_counts_the_durable_parts_postgres`.
+/// It needs an error that RETURNS, not a panic: a crashed run never reaches the
+/// drain at all, so the entire `RIVET_TEST_PANIC_AT` vocabulary is structurally
+/// blind to this — hence `RIVET_TEST_ERROR_AT=mongo_parallel_worker:0`.
+///
+/// Worker 0 is the injection point on purpose. It fails before writing anything,
+/// so its own contribution is zero and the assertion turns purely on whether
+/// workers 1..3 — which DID write — are counted. Pre-fix that was 0 of them.
+///
+/// The oracle is the LEDGER, not the files: raw parquet under a failed prefix is
+/// `gc_orphans` debris, not evidence about what the run reported.
+#[test]
+#[ignore = "live: requires docker compose up -d mongo"]
+fn mongo_parallel_worker_error_still_counts_the_durable_parts() {
+    require_alive(LiveService::Mongo);
+    let db = unique_name("mwcnt");
+    MongoTest::connect(PORT, &db).seed_int_id("bench", 4000);
+    let rig = batch(&db, "bench")
+        .mongo("page_size: 500")
+        .export_line("parallel: 4");
+    let out = rig.run_with_env("RIVET_TEST_ERROR_AT", "mongo_parallel_worker:0");
+    assert!(
+        !out.status.success(),
+        "a worker mid-range error must fail the run"
+    );
+
+    // The surviving workers DID write parquet — the premise of the whole test.
+    let on_disk = files_with_extension(&rig.out_dir(), "parquet").len();
+    assert!(
+        on_disk > 0,
+        "fixture is inert: the surviving workers wrote no parts, so there is \
+         nothing for the retry guard to protect"
+    );
+
+    // …and the run must SAY so. This is the assertion that goes RED pre-fix.
+    let sdb = StateDb::next_to_config(&rig.config_path());
+    let run_id = sdb.latest_run_id(rig.export_name());
+    assert_eq!(
+        sdb.metrics_row(&run_id).files_committed,
+        Some(on_disk as i64),
+        "a failed parallel-Mongo run must count the parts it left durable \
+         ({on_disk} on disk) — the retry guard reads this and nothing else"
+    );
+}
+
 /// Cross-shape manifest guard on the MONGO-PARALLEL runner: a batch parallel
 /// export must refuse to overwrite a prior CDC manifest at the same prefix.
 /// Proves the mongo_parallel column of the runner-coverage matrix — the last
@@ -143,23 +189,23 @@ fn mongo_parallel_export_refuses_to_clobber_a_cdc_manifest() {
 #[ignore = "live: requires docker compose up -d mongo"]
 fn mongo_batch_typed_cursor_pages_string_id() {
     require_alive(LiveService::Mongo);
+    require_alive(LiveService::DuckDb);
     let db = unique_name("mstr");
     MongoTest::connect(PORT, &db).seed_string_id("bench", 4000);
 
     // Keyset a STRING _id — the typed cursor token round-trips it; a display-only
     // cursor would mis-order (was an actionable error before A').
-    let rig = batch(&db, "bench").mongo("page_size: 1500");
+    let rig = batch(&db, "bench").duckdb_oracle().mongo("page_size: 1500");
     rig.run_ok();
 
-    assert_eq!(
-        dir_parquet_distinct_strings(&rig.out_dir(), "_id").len(),
+    // Read by DuckDB, which does not share rivet's parquet codec — the
+    // previous pair decoded with the same crate rivet encodes with, so a
+    // fault in that shared path cancelled out. Total and distinct together:
+    // fewer rows is loss, fewer distinct is duplication.
+    rig.assert_complete(
+        "_id",
         4000,
-        "string-_id keyset must read the whole collection (no loss)"
-    );
-    assert_eq!(
-        total_parquet_rows(&rig.out_dir()),
-        4000,
-        "no duplicate rows across string-_id page boundaries (total == distinct)"
+        "string-_id keyset must read the whole collection (no loss)",
     );
 }
 
@@ -167,6 +213,7 @@ fn mongo_batch_typed_cursor_pages_string_id() {
 #[ignore = "live: requires docker compose up -d mongo"]
 fn mongo_batch_parallel_objectid_and_string_id() {
     require_alive(LiveService::Mongo);
+    require_alive(LiveService::DuckDb);
     // ObjectId (the Mongo default) and String `_id` — the `$sample` `_id`-range
     // fan-out must tile either ordered type completely, not just integers.
     for (seed_objectid, tag) in [(true, "mpoid"), (false, "mpstr")] {
@@ -178,19 +225,19 @@ fn mongo_batch_parallel_objectid_and_string_id() {
             m.seed_string_id("bench", 5000);
         }
         let rig = batch(&db, "bench")
+            .duckdb_oracle()
             .mongo("page_size: 1000")
             .export_line("parallel: 4");
         rig.run_ok();
         let kind = if seed_objectid { "ObjectId" } else { "String" };
-        assert_eq!(
-            dir_parquet_distinct_strings(&rig.out_dir(), "_id").len(),
+        // Read by DuckDB, which does not share rivet's parquet codec — the
+        // previous pair decoded with the same crate rivet encodes with, so a
+        // fault in that shared path cancelled out. Total and distinct together:
+        // fewer rows is loss, fewer distinct is duplication.
+        rig.assert_complete(
+            "_id",
             5000,
-            "parallel over {kind} _id must read the whole collection"
-        );
-        assert_eq!(
-            total_parquet_rows(&rig.out_dir()),
-            5000,
-            "parallel over {kind} _id must not duplicate at a range boundary"
+            &format!("parallel over {kind} _id must read the whole collection"),
         );
     }
 }
@@ -284,13 +331,16 @@ fn mongo_run_reconcile_matches_source_count() {
 #[ignore = "live: requires docker compose up -d mongo"]
 fn mongo_batch_resume_reads_only_new_since_last_run() {
     require_alive(LiveService::Mongo);
+    require_alive(LiveService::DuckDb);
     let db = unique_name("mresume");
     let m = MongoTest::connect(PORT, &db);
     m.seed_int_id("t", 2000);
 
     // The SAME rig across both runs — the keyset checkpoint persists in the
     // export state keyed by its (stable) config + destination.
-    let rig = batch(&db, "t").mongo("page_size: 500, resume: true");
+    let rig = batch(&db, "t")
+        .duckdb_oracle()
+        .mongo("page_size: 500, resume: true");
     rig.run_ok();
     assert_eq!(
         dir_parquet_distinct_strings(&rig.out_dir(), "_id").len(),
@@ -304,15 +354,14 @@ fn mongo_batch_resume_reads_only_new_since_last_run() {
 
     // Run 2 (resume) must read ONLY the 500 new — not rescan the first 2000.
     rig.run_ok();
-    assert_eq!(
-        dir_parquet_distinct_strings(&rig.out_dir(), "_id").len(),
+    // Read by DuckDB, which does not share rivet's parquet codec — the
+    // previous pair decoded with the same crate rivet encodes with, so a
+    // fault in that shared path cancelled out. Total and distinct together:
+    // fewer rows is loss, fewer distinct is duplication.
+    rig.assert_complete(
+        "_id",
         2500,
-        "resume must union to the full set with no loss"
-    );
-    assert_eq!(
-        total_parquet_rows(&rig.out_dir()),
-        2500,
-        "resume must add only the new rows — 4500 would mean run 2 rescanned"
+        "resume must union to the full set with no loss",
     );
     // Dest manifest copies (reconcile's artifact), not just the parquet re-read:
     // must span both runs (2000 + 500) — a resumed run clobbering a prior

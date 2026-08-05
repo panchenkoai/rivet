@@ -40,15 +40,26 @@ VALUES
 GO
 
 -- Larger table for chunked-mode / keyset planning probes.
-IF OBJECT_ID('dbo.orders', 'U') IS NOT NULL DROP TABLE dbo.orders;
+--
+-- NOT named `dbo.orders`. That name belongs to the canonical cross-engine seed
+-- (`src/bin/seed/mssql.rs`), which creates `orders` with the same shape and row
+-- count as PostgreSQL and MySQL — the fixture every cross-engine comparison
+-- rests on. This file used to create `dbo.orders` too, with an incompatible
+-- schema (`id, name, amount`) and only 500 rows, and the seed DROP+CREATEs, so
+-- whichever ran last won. The conflict stayed invisible for as long as nobody
+-- ran `seed --target mssql` — and nobody did, because `seed-release` named
+-- postgres and mysql and skipped SQL Server. Closing that gap on 2026-08-04
+-- broke `init_mssql_single_table_emits_valid_config_that_passes_check`, which
+-- had been asserting against this file's schema.
+IF OBJECT_ID('dbo.planning_probe', 'U') IS NOT NULL DROP TABLE dbo.planning_probe;
 GO
-CREATE TABLE dbo.orders (
+CREATE TABLE dbo.planning_probe (
     id     BIGINT       NOT NULL PRIMARY KEY,
     name   NVARCHAR(50) NOT NULL,
     amount DECIMAL(12,2) NOT NULL
 );
 GO
-INSERT INTO dbo.orders (id, name, amount)
+INSERT INTO dbo.planning_probe (id, name, amount)
 SELECT TOP (500)
     ROW_NUMBER() OVER (ORDER BY (SELECT NULL)),
     CONCAT(N'order_', ROW_NUMBER() OVER (ORDER BY (SELECT NULL))),

@@ -278,7 +278,14 @@ fn pg_full_content_export_max_pressure() {
             .expect("count")
             .get(0)
     };
-    assert!(count >= 1_000_000, "need at least 1M rows, got {count}");
+    assert!(
+        count >= 1_000_000,
+        "content_items has {count} rows; this pressure test needs >= 1M.\n\
+         Seed the release-size fixture first: `make seed-release`.\n\
+         The standard `make seed-db` uses 60k (fast for everyday work); the 1M \
+         fixture is the pre-release size and comes from the SAME canonical, \
+         deterministic seed."
+    );
 
     let ckpt_before = pg_checkpoints_req();
 
@@ -347,9 +354,34 @@ fn pg_full_content_export_max_pressure() {
         ckpt_after.unwrap_or(0) - ckpt_before.unwrap_or(0),
     );
 
-    assert_eq!(
-        sink.total_rows as i64, count,
-        "MVCC: exported {} but table had {}",
-        sink.total_rows, count
+    // The export must have seen a CONSISTENT SNAPSHOT, which under a concurrent
+    // inserter is a range, not an equality. `count` was taken before the export;
+    // a sibling in this file (`pg_content_export_under_update_pressure`) inserts
+    // into the SAME shared `content_items` while this runs, so an exact match
+    // against a count taken at a different instant is a race, not an invariant —
+    // it failed with 1000012 exported vs 1000007 counted, which is a correct
+    // snapshot plus five rows that arrived afterwards.
+    //
+    // The range still catches what this test exists for: a lost row puts the
+    // export BELOW the pre-count, and a duplicated one puts it ABOVE the
+    // post-count. Only concurrent inserts live between them, and those are
+    // legitimate.
+    let count_after: i64 = {
+        use postgres::{Client, NoTls};
+        let mut c = Client::connect(POSTGRES_URL, NoTls).unwrap();
+        c.query_one("SELECT COUNT(*) FROM content_items", &[])
+            .expect("count after")
+            .get(0)
+    };
+    let exported = sink.total_rows as i64;
+    assert!(
+        exported >= count,
+        "MVCC: exported {exported} but the table held at least {count} before the \
+         export began — rows were LOST from the snapshot"
+    );
+    assert!(
+        exported <= count_after,
+        "MVCC: exported {exported} but the table held only {count_after} after the \
+         export finished — rows were DUPLICATED in the snapshot"
     );
 }

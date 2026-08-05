@@ -1,0 +1,551 @@
+"""The NEGATIVE half of verification: `rivet validate` must FAIL on real corruption.
+
+Every other cell in this gate asks "does a good run come out green?". This one
+asks the question that actually decides whether verification means anything:
+**when the data on disk is wrong, does rivet say so?**
+
+It exists because the answer was no. On 2026-08-02 a part was corrupted in place
+— one byte inside a dictionary page, `x` -> `y`, file length unchanged, manifest
+and `_SUCCESS` untouched — and `rivet validate --depth full` returned PASSED,
+exit 0, while DuckDB and rivet's own Arrow reader both read the changed values.
+The cause was the value-checksum fold: per-cell hashes were combined with XOR,
+which annihilates (`h ^ h == 0`), so a column of duplicated values checksummed to
+zero regardless of content and corruption of it was invisible. The fold is now a
+wrapping sum, versioned in the manifest as `checksum_render`.
+
+A fix with no negative test is a fix that regresses quietly, so this runs per
+engine, and it is deliberately shaped to fail if verification weakens in any of
+three ways: the corruption goes undetected, the failure is reported as an
+operational error rather than data-integrity (exit 3), or the message stops
+naming which column diverged.
+
+The corruption is byte-level ON PURPOSE. Rewriting the part with DuckDB also
+works, but it changes the file LENGTH, so the size check fires first and the
+value checksum is never reached — the test would then pass while proving nothing
+about Form B. Same-length in-place mutation is the only shape that isolates it.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+from pathlib import Path
+
+try:
+    from .core import Ledger, have, rivet, run
+    from .scenarios import NO_TIMEOUT, _failed, _passed, _skipped, work_dir
+except ImportError:  # pragma: no cover - depends on how the driver is invoked
+    from core import Ledger, have, rivet, run  # type: ignore
+    from scenarios import NO_TIMEOUT, _failed, _passed, _skipped, work_dir  # type: ignore
+
+__all__ = ["verify_corruption_is_detected"]
+
+#: Same seeded probe the row-hash cell uses — it carries duplicated values
+#: (`x` twice), which is exactly the shape the old XOR fold cancelled to zero.
+PROBE = {
+    "postgres": "public.row_hash_probe",
+    "mysql": "row_hash_probe",
+    "mssql": "dbo.row_hash_probe",
+}
+
+#: rivet's data-integrity exit code. A corrupted part must be classified as
+#: verified-WRONG, not as could-not-verify (exit 1) — an operator triaging exit 1
+#: looks for a broken credential, not for corrupt data.
+EXIT_DATA_INTEGRITY = 3
+
+
+def _export(engine: str, url: str, table: str, dest: Path) -> Path | None:
+    yaml_path = work_dir() / f"corrupt_{os.getpid()}_{engine}.yaml"
+    shutil.rmtree(dest, ignore_errors=True)
+    dest.mkdir(parents=True, exist_ok=True)
+    tls = "\n  tls: {accept_invalid_certs: true}" if engine == "mssql" else ""
+    yaml_path.write_text(
+        f"source:\n"
+        f"  type: {engine}\n"
+        f"  url_env: ORACLE_URL{tls}\n"
+        f"exports:\n"
+        f"  - name: corrupt_probe\n"
+        f"    table: {table}\n"
+        f"    mode: full\n"
+        f"    format: parquet\n"
+        f"    destination: {{type: local, path: {dest}/}}\n"
+    )
+    if not rivet("run", "-c", str(yaml_path), env={"ORACLE_URL": url}, timeout=NO_TIMEOUT).ok:
+        return None
+    return yaml_path
+
+
+def _flip_one_byte(part: Path) -> tuple[int, int] | None:
+    """Change one value byte in place. Returns (offset, size) or None.
+
+    The file LENGTH must not change — that is the whole point. A rewrite trips
+    the size check and never reaches the value checksum.
+    """
+    body = bytearray(part.read_bytes())
+    before = len(body)
+    i = body.find(b"x")
+    if i < 0:
+        return None
+    body[i] = ord("y")
+    part.write_bytes(bytes(body))
+    return i, before
+
+
+def verify_corruption_is_detected(led: Ledger, engine: str, tag: str, url: str) -> None:
+    table = PROBE.get(engine)
+    if table is None:
+        _skipped(
+            led, engine, tag, "corruption_is_detected", "-",
+            f"corruption-detected: no probe table for {engine} (the golden seed is SQL-engine only)",
+            "no probe",
+        )
+        return
+    if not have("duckdb"):
+        _skipped(led, engine, tag, "corruption_is_detected", "-", "corruption-detected: duckdb absent", "no duckdb")
+        return
+
+    dest = work_dir() / f"corrupt_{engine}_{tag.replace('.', '_')}"
+    cfg = _export(engine, url, table, dest)
+    if cfg is None:
+        _failed(led, engine, tag, "corruption_is_detected", "-", f"corruption-detected[{engine}]: export failed", "export")
+        return
+
+    # A clean run must be GREEN first: a cell that only ever sees red proves the
+    # command fails, not that it discriminates.
+    clean = rivet("validate", "-c", str(cfg), "--depth", "full", timeout=NO_TIMEOUT)
+    if not clean.ok:
+        _failed(
+            led, engine, tag, "corruption_is_detected", "-",
+            f"corruption-detected[{engine}]: validate FAILED on an untouched export — "
+            f"the negative test cannot mean anything until the positive one holds: {clean.out[-200:]}",
+            "clean red",
+        )
+        return
+
+    # The manifest must say which fold produced its checksums; without the marker
+    # a reader silently falls back to the v1 (annihilating) fold.
+    manifest = dest / "manifest.json"
+    render = None
+    if manifest.exists():
+        try:
+            render = json.loads(manifest.read_text()).get("checksum_render")
+        except (OSError, json.JSONDecodeError):
+            render = None
+    if not render:
+        _failed(
+            led, engine, tag, "corruption_is_detected", "-",
+            f"corruption-detected[{engine}]: the manifest records no `checksum_render` — a reader "
+            f"cannot tell which fold produced these checksums and falls back to the annihilating one",
+            "no render id",
+        )
+        return
+
+    parts = sorted(dest.rglob("*.parquet"))
+    if not parts:
+        _failed(led, engine, tag, "corruption_is_detected", "-", f"corruption-detected[{engine}]: no part written", "no part")
+        return
+    flipped = _flip_one_byte(parts[0])
+    if flipped is None:
+        _failed(
+            led, engine, tag, "corruption_is_detected", "-",
+            f"corruption-detected[{engine}]: the probe part contains no 'x' byte to flip — the "
+            f"golden seed's row_hash_probe drifted, so this cell would silently test nothing",
+            "no target byte",
+        )
+        return
+    offset, size_before = flipped
+    if parts[0].stat().st_size != size_before:
+        _failed(
+            led, engine, tag, "corruption_is_detected", "-",
+            f"corruption-detected[{engine}]: the flip changed the file length — the size check "
+            f"would fire first and the VALUE checksum would never be reached",
+            "size changed",
+        )
+        return
+
+    bad = rivet("validate", "-c", str(cfg), "--depth", "full", timeout=NO_TIMEOUT)
+    text = (bad.out or "") + (getattr(bad, "err", "") or "")
+    if bad.ok:
+        _failed(
+            led, engine, tag, "corruption_is_detected", "-",
+            f"corruption-detected[{engine}]: validate PASSED on a part whose bytes were changed "
+            f"in place at offset {offset} — verification is not verifying",
+            "undetected",
+        )
+        return
+    if bad.returncode != EXIT_DATA_INTEGRITY:
+        _failed(
+            led, engine, tag, "corruption_is_detected", "-",
+            f"corruption-detected[{engine}]: corruption reported with exit {bad.returncode}, expected "
+            f"{EXIT_DATA_INTEGRITY} (data-integrity). An operator triaging exit 1 hunts a broken "
+            f"credential, not corrupt data",
+            "wrong exit",
+        )
+        return
+    if "value checksum mismatch" not in text or "column 'b'" not in text:
+        _failed(
+            led, engine, tag, "corruption_is_detected", "-",
+            f"corruption-detected[{engine}]: failed, but not as a value-checksum mismatch naming the "
+            f"diverging column — a verdict that cannot say WHAT diverged sends the operator hunting: "
+            f"{text[-200:]}",
+            "unnamed",
+        )
+        return
+
+    _passed(
+        led, engine, tag, "corruption_is_detected", "-",
+        f"corruption-detected[{engine}]: clean export verifies; a same-length in-place byte flip is "
+        f"caught as a value-checksum mismatch on column 'b' (exit {EXIT_DATA_INTEGRITY})",
+    )
+
+
+# ── CDC ──────────────────────────────────────────────────────────────────────
+# The CDC sink keeps its OWN per-column accumulator and writes its own manifests,
+# so proving the batch path detects corruption says nothing about this one. The
+# same fold defect lived here (`column_sums` combined with XOR) and the same
+# render marker had to be stamped — it was briefly left `None`, which would have
+# made every CDC prefix read as corrupt.
+#
+# Capture goes to a LOCAL destination rather than the object store the e2e cell
+# uses: the corruption must be a byte flip IN PLACE, and a download / edit /
+# re-upload round trip through a store client rewrites the object.
+
+
+def _read_values(part: Path) -> str | None:
+    """Everything a reader returns from this part, as one comparable blob.
+
+    DuckDB, not rivet: the question is whether a byte flip is visible to ANY
+    reader, and asking rivet would make the check depend on the code it grades.
+    `None` when the file cannot be read at all — which is itself a corruption, but
+    a different one than "the value changed", and the caller wants the second.
+    """
+    if not have("duckdb"):
+        return None
+    p = run(
+        [
+            "duckdb",
+            "-noheader",
+            "-list",
+            "-c",
+            f"SELECT * FROM read_parquet('{part}') ORDER BY ALL",
+        ]
+    )
+    return p.stdout if p.ok else None
+
+
+def verify_cdc_corruption_is_detected(led: Ledger, engine: str, tag: str, url: str) -> None:
+    """Positive and negative for a CDC prefix: clean capture verifies, a flipped
+    byte in a captured part does not."""
+    try:
+        from . import cdc as cdc_mod
+    except ImportError:  # pragma: no cover
+        import cdc as cdc_mod  # type: ignore
+
+    spec = cdc_mod._ENGINES.get(engine)
+    uvar = f"RIVET_CDC_{engine.upper()}_URL"
+    cdc_url = os.environ.get(uvar, "")
+    if spec is None or not cdc_url:
+        _skipped(
+            led, engine, tag, "cdc_corruption_is_detected", "-",
+            f"cdc-corruption[{engine}]: no {uvar} (the CDC stand is opt-in, like the e2e cell)",
+            "no url",
+        )
+        return
+
+    work = work_dir() / f"cdccorrupt_{engine}_{tag.replace('.', '_')}"
+    work.mkdir(parents=True, exist_ok=True)
+    cdc_block = spec.setup(cdc_url, work)
+    if cdc_block is None:
+        _failed(led, engine, tag, "cdc_corruption_is_detected", "-", f"cdc-corruption[{engine}]: source setup failed", "setup")
+        return
+
+    out = work / "out"
+    tls = "\n  tls: { accept_invalid_certs: true }" if engine == "mssql" else ""
+    cfg = work / "cdc_local.yaml"
+    cfg.write_text(
+        "source:\n"
+        f"  type: {engine}\n"
+        f'  url: "{cdc_url}"{tls}\n'
+        "exports:\n"
+        "  - name: orc_cdc_probe\n"
+        "    table: orc_cdc_probe\n"
+        "    mode: cdc\n"
+        "    format: parquet\n"
+        f"    {cdc_block}\n"
+        "    destination:\n"
+        f"      type: local\n"
+        f"      path: {out}\n"
+    )
+    try:
+        # anchor, then real changes, then capture them
+        rivet("run", "-c", str(cfg), timeout=NO_TIMEOUT)
+        spec.changes(cdc_url)
+        rivet("run", "-c", str(cfg), timeout=NO_TIMEOUT)
+
+        parts = sorted(out.rglob("*.parquet"))
+        if not parts:
+            _failed(
+                led, engine, tag, "cdc_corruption_is_detected", "-",
+                f"cdc-corruption[{engine}]: the capture wrote no part — nothing to corrupt, so a "
+                f"green here would mean nothing",
+                "no part",
+            )
+            return
+
+        clean = rivet("validate", "-c", str(cfg), "--depth", "full", timeout=NO_TIMEOUT)
+        if not clean.ok:
+            _failed(
+                led, engine, tag, "cdc_corruption_is_detected", "-",
+                f"cdc-corruption[{engine}]: validate FAILED on an untouched CDC prefix — the "
+                f"negative half cannot mean anything until the positive one holds: {clean.out[-200:]}",
+                "clean red",
+            )
+            return
+
+        manifests = sorted(out.rglob("manifest.json"))
+        render = None
+        for m in manifests:
+            try:
+                render = json.loads(m.read_text()).get("checksum_render")
+            except (OSError, json.JSONDecodeError):
+                render = None
+            if render:
+                break
+        if not render:
+            _failed(
+                led, engine, tag, "cdc_corruption_is_detected", "-",
+                f"cdc-corruption[{engine}]: no `checksum_render` in any CDC manifest — a reader "
+                f"falls back to the annihilating v1 fold and the prefix reads as corrupt",
+                "no render id",
+            )
+            return
+
+        target = parts[0]
+        original = target.read_bytes()
+        size_before = len(original)
+        # Target a SOURCE column, not a rivet-added one. The value checksum covers
+        # the source's own columns and deliberately omits the CDC meta columns
+        # (`op`, the lsn/position blob), so flipping a byte in `op` changes the
+        # data and is CORRECTLY not reported — the first cut did exactly that and
+        # read as "the CDC leg is not verifying" when the leg was fine. The probe's
+        # `meta` column carries the json `{"k": N}`; its key byte is a source value.
+        #
+        # BUT a literal is not necessarily a VALUE. A parquet file carries the
+        # column's min/max STATISTICS in its footer, uncompressed, so `"k"` occurs
+        # there too — and on Mongo, whose `document` column compresses well enough
+        # that the data page holds no literal at all, the first occurrence IS the
+        # footer. Flipping it changes no value any reader returns, `validate`
+        # correctly passes, and the cell reported the product as broken. So each
+        # candidate is flipped and the part is RE-READ: only a flip DuckDB can see
+        # is a corruption worth asking `validate` about. A mutation that changes
+        # nothing proves nothing.
+        before = _read_values(target)
+        idx = None
+        anchor = -1
+        while True:
+            anchor = original.find(b'"k"', anchor + 1)
+            if anchor < 0:
+                break
+            body = bytearray(original)
+            body[anchor + 1] = ord("j")
+            target.write_bytes(bytes(body))
+            after = _read_values(target)
+            if after is not None and before is not None and after != before:
+                idx = anchor + 1
+                break
+
+        # SECOND TIER, when no literal is corruptible. On Mongo every `"k"` in the
+        # part is footer statistics — the `document` column compresses, so its data
+        # page holds no literal at all — and stopping at a SKIP would leave the one
+        # engine whose CDC shape differs most as the one engine nothing grades.
+        # A flip inside a COMPRESSED data page makes the part unreadable, which is
+        # a different corruption than a changed value but the same question: with
+        # the data on disk wrong, does rivet say so? Reported as the shape it
+        # actually proved, never as the value-checksum leg.
+        unreadable = False
+        if idx is None:
+            for probe in range(64, min(len(original), 1024), 16):
+                body = bytearray(original)
+                body[probe] ^= 0xFF
+                target.write_bytes(bytes(body))
+                if _read_values(target) is None:
+                    idx, unreadable = probe, True
+                    break
+        if idx is None:
+            target.write_bytes(original)
+            _skipped(
+                led, engine, tag, "cdc_corruption_is_detected", "-",
+                f"cdc-corruption[{engine}]: no same-length flip of this part was observable to a "
+                f"reader at all — neither a changed value nor an unreadable file. A mutation that "
+                f"changes nothing cannot grade `validate`, so SKIP rather than pass",
+                "no observable flip",
+            )
+            return
+        if target.stat().st_size != size_before:
+            _failed(led, engine, tag, "cdc_corruption_is_detected", "-",
+                    f"cdc-corruption[{engine}]: the flip changed the file length", "size changed")
+            return
+
+        bad = rivet("validate", "-c", str(cfg), "--depth", "full", timeout=NO_TIMEOUT)
+        text = (bad.out or "") + (getattr(bad, "err", "") or "")
+        if bad.ok:
+            _failed(
+                led, engine, tag, "cdc_corruption_is_detected", "-",
+                f"cdc-corruption[{engine}]: validate PASSED on a CDC part whose bytes were changed "
+                f"in place at offset {idx} — the CDC leg of verification is not verifying",
+                "undetected",
+            )
+            return
+        if unreadable:
+            # The second tier proved the unreadable-part leg, not the value
+            # checksum — say which, so the row cannot be read as coverage it does
+            # not have. rivet must still report data-integrity, not an
+            # operational error: an operator triaging exit 1 goes looking for a
+            # broken credential.
+            if bad.returncode != EXIT_DATA_INTEGRITY:
+                _failed(
+                    led, engine, tag, "cdc_corruption_is_detected", "-",
+                    f"cdc-corruption[{engine}]: an unreadable CDC part failed with exit "
+                    f"{bad.returncode}, not {EXIT_DATA_INTEGRITY} — corrupt data must classify as "
+                    f"verified-WRONG, never as could-not-verify: {text[-160:]}",
+                    "wrong exit",
+                )
+                return
+            _passed(
+                led, engine, tag, "cdc_corruption_is_detected", "-",
+                f"cdc-corruption[{engine}]: clean capture verifies; a same-length flip at offset "
+                f"{idx} makes the part unreadable and validate reports data-integrity (exit "
+                f"{bad.returncode}). NOTE: this engine's part holds no corruptible literal — every "
+                f"`\"k\"` is footer statistics — so this grades the unreadable-part leg, NOT the "
+                f"value checksum",
+            )
+            return
+        if "value checksum mismatch" not in text:
+            _failed(
+                led, engine, tag, "cdc_corruption_is_detected", "-",
+                f"cdc-corruption[{engine}]: failed, but not as a value-checksum mismatch: {text[-200:]}",
+                "wrong reason",
+            )
+            return
+        _passed(
+            led, engine, tag, "cdc_corruption_is_detected", "-",
+            f"cdc-corruption[{engine}]: clean capture verifies; a same-length byte flip in a "
+            f"captured part is caught as a value-checksum mismatch",
+        )
+    finally:
+        spec.cleanup(cdc_url, work)
+
+
+# ── reconcile × validate: the division of labour, pinned ─────────────────────
+# Measured, because the two commands are easy to mistake for one:
+#
+#   source rows deleted        -> reconcile exit 3 (names the partition + diff)
+#                                 validate  exit 0  (the destination is intact)
+#   destination part deleted   -> reconcile exit 0  ("all partitions match")
+#                                 validate  exit 3
+#
+# reconcile compares the SOURCE against the recorded per-partition counts;
+# validate compares the DESTINATION against the manifest. Neither alone verifies
+# "what I can read equals what the source held" — only the pair does, and nothing
+# makes an operator run both. So this cell asserts the DISJUNCTION: each fault
+# must be caught by at least one command, and it reports which. Framed that way an
+# improvement (reconcile learning to check the destination too) does not redden it,
+# while a regression — a fault neither notices — does.
+
+
+def verify_reconcile_and_validate_cover_both_sides(led: Ledger, engine: str, tag: str, url: str) -> None:
+    if engine != "postgres":
+        _skipped(
+            led, engine, tag, "reconcile_and_validate_cover_both_sides", "-",
+            f"reconcile-coverage: runs on postgres only — the property is command-level, not "
+            f"engine-level, and one engine's chunked export exercises it",
+            "one engine",
+        )
+        return
+
+    work = work_dir() / f"recon_{tag.replace('.', '_')}"
+    out = work / "out"
+    out.mkdir(parents=True, exist_ok=True)
+    table = "public.recon_probe"
+    cfg = work / "recon.yaml"
+    cfg.write_text(
+        f"source:\n  type: postgres\n  url_env: ORACLE_URL\n"
+        f"exports:\n"
+        f"  - name: recon_probe\n"
+        f"    table: {table}\n"
+        f"    mode: chunked\n"
+        f"    chunk_column: id\n"
+        f"    chunk_size: 250\n"
+        f"    chunk_checkpoint: true\n"
+        f"    format: parquet\n"
+        f"    destination: {{ type: local, path: {out} }}\n"
+    )
+    env = {"ORACLE_URL": url}
+
+    def psql(sql: str) -> bool:
+        from .core import run  # local import: only this cell shells to psql
+
+        return run(["psql", url, "-v", "ON_ERROR_STOP=1", "-c", sql], timeout=120).ok
+
+    if not psql(
+        "DROP TABLE IF EXISTS recon_probe; "
+        "CREATE TABLE recon_probe(id INT PRIMARY KEY, v TEXT); "
+        "INSERT INTO recon_probe SELECT g,'v'||g FROM generate_series(1,1000) g;"
+    ):
+        _skipped(led, engine, tag, "reconcile_and_validate_cover_both_sides", "-", "reconcile-coverage: psql absent", "no psql")
+        return
+
+    def rec() -> int:
+        return rivet("reconcile", "-c", str(cfg), "-e", "recon_probe", env=env, timeout=NO_TIMEOUT).returncode
+
+    def val() -> int:
+        return rivet("validate", "-c", str(cfg), "--depth", "full", env=env, timeout=NO_TIMEOUT).returncode
+
+    try:
+        if not rivet("run", "-c", str(cfg), env=env, timeout=NO_TIMEOUT).ok:
+            _failed(led, engine, tag, "reconcile_and_validate_cover_both_sides", "-", "reconcile-coverage: export failed", "export")
+            return
+        # A cell whose checks only ever go red discriminates nothing.
+        if rec() != 0 or val() != 0:
+            _failed(
+                led, engine, tag, "reconcile_and_validate_cover_both_sides", "-",
+                "reconcile-coverage: a CLEAN chunked export must satisfy both commands before "
+                "either negative means anything",
+                "clean red",
+            )
+            return
+
+        # Fault 1 — the SOURCE drifts under a completed export.
+        psql("DELETE FROM recon_probe WHERE id BETWEEN 100 AND 149;")
+        r1, v1 = rec(), val()
+        psql("INSERT INTO recon_probe SELECT g,'v'||g FROM generate_series(100,149) g;")
+
+        # Fault 2 — exported DATA disappears from the destination.
+        parts = sorted(out.rglob("*.parquet"))
+        if not parts:
+            _failed(led, engine, tag, "reconcile_and_validate_cover_both_sides", "-", "reconcile-coverage: no part", "no part")
+            return
+        parts[0].unlink()
+        r2, v2 = rec(), val()
+
+        missed = []
+        if r1 == 0 and v1 == 0:
+            missed.append("source drift went unnoticed by BOTH reconcile and validate")
+        if r2 == 0 and v2 == 0:
+            missed.append("a deleted destination part went unnoticed by BOTH reconcile and validate")
+        if missed:
+            _failed(
+                led, engine, tag, "reconcile_and_validate_cover_both_sides", "-",
+                "reconcile-coverage: " + "; ".join(missed),
+                "uncovered",
+            )
+            return
+        _passed(
+            led, engine, tag, "reconcile_and_validate_cover_both_sides", "-",
+            f"reconcile-coverage: source drift caught by "
+            f"{'reconcile' if r1 else 'validate'} (exit {r1 or v1}); destination loss caught by "
+            f"{'validate' if v2 else 'reconcile'} (exit {v2 or r2}) — both sides covered by the pair",
+        )
+    finally:
+        psql("DROP TABLE IF EXISTS recon_probe;")

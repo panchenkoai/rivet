@@ -93,20 +93,19 @@ fn full_mode_repeated_run_accumulates_manifest_entries() {
     // rapid-fire is the run-uniqueness contract (regressed for months at
     // second-granularity; see roast_rapid_incremental_runs_...).
     require_alive(LiveService::Postgres);
+    require_alive(LiveService::DuckDb);
     let table = seed_pg_numeric_table(10);
-    let out = tempfile::tempdir().unwrap();
     let export_name = unique_name("qa12_full");
 
-    let yaml = Rig::pg_batch(&export_name)
+    let rig = Rig::pg_batch(&export_name)
         .query(&format!(
             r#"SELECT id, name, amount FROM {table_name}"#,
             table_name = table.name()
         ))
         .mode("full")
         .export_line(r#"columns: { amount: "decimal(12,2)" }"#)
-        .dest_path(out.path().to_path_buf())
-        .yaml();
-    let (_cfgdir, cfg) = cfg_dir_with(&yaml);
+        .duckdb_oracle();
+    let cfg = rig.config_path();
 
     let r1 = run_rivet_export(&cfg, &export_name);
     assert!(r1.status.success(), "first full run failed");
@@ -114,7 +113,7 @@ fn full_mode_repeated_run_accumulates_manifest_entries() {
     let r2 = run_rivet_export(&cfg, &export_name);
     assert!(r2.status.success(), "second full run failed");
 
-    let files = files_with_extension(out.path(), "parquet");
+    let files = files_with_extension(&rig.out_dir(), "parquet");
     assert_eq!(
         files.len(),
         2,
@@ -123,13 +122,15 @@ fn full_mode_repeated_run_accumulates_manifest_entries() {
     // Re-read the destination (not rivet's file count): two full runs of 10 rows
     // each → 20 physical rows, distinct ids 0..10. Proves both re-exports
     // materialised every row, not just that two files appeared.
+    // DuckDB, not the parquet crate rivet writes with — a fault in the shared
+    // encode/decode path would otherwise cancel out.
     assert_eq!(
-        total_parquet_rows(out.path()),
+        duckdb_parquet_rows(rig.oracle_dir()),
         20,
         "two full runs must each materialise all 10 rows"
     );
     assert_eq!(
-        dir_parquet_id_set(out.path()),
+        duckdb_distinct_i64_set(rig.oracle_dir(), "id"),
         (0..10).collect::<std::collections::BTreeSet<i64>>(),
         "full re-export must hold every source id (0..10)"
     );
@@ -140,7 +141,7 @@ fn full_mode_repeated_run_accumulates_manifest_entries() {
     // the cell's name ("accumulates manifest entries") demands — and it is
     // fix-sensitive, unlike the `file_log` ledger which accumulates regardless.
     assert_eq!(
-        dir_manifest_copy_total_rows(out.path()),
+        dir_manifest_copy_total_rows(&rig.out_dir()),
         20,
         "run-unique manifest copies must sum both runs' rows; a clobbered manifest is silent to the parquet re-read"
     );
@@ -290,6 +291,7 @@ fn incremental_second_run_on_unchanged_source_exports_zero_new_rows() {
     // config file.  The second run with the same config must see that
     // cursor and produce zero additional files (since source is unchanged).
     require_alive(LiveService::Postgres);
+    require_alive(LiveService::DuckDb);
 
     // Seed a table with an `updated_at` column we can use as a cursor.
     let table_name = unique_name("qa12_inc");
@@ -306,14 +308,12 @@ fn incremental_second_run_on_unchanged_source_exports_zero_new_rows() {
     let _guard = PgTable::adopt(table_name.clone());
 
     let export_name = unique_name("qa12_inc_exp");
-    let out = tempfile::tempdir().unwrap();
-    let yaml = Rig::pg_batch(&export_name)
+    let rig = Rig::pg_batch(&export_name)
         .query(&format!(r#"SELECT id, updated_at FROM {table_name}"#))
         .mode("incremental")
         .export_line("cursor_column: updated_at")
-        .dest_path(out.path().to_path_buf())
-        .yaml();
-    let (_cfgdir, cfg) = cfg_dir_with(&yaml);
+        .duckdb_oracle();
+    let cfg = rig.config_path();
 
     // Run #1 — must pick up every row.
     let r1 = run_rivet_export(&cfg, &export_name);
@@ -322,17 +322,19 @@ fn incremental_second_run_on_unchanged_source_exports_zero_new_rows() {
         "first incremental run failed; stderr:\n{}",
         String::from_utf8_lossy(&r1.stderr)
     );
-    let files_after_first = files_with_extension(out.path(), "parquet").len();
+    let files_after_first = files_with_extension(&rig.out_dir(), "parquet").len();
     assert_eq!(files_after_first, 1, "first run must produce one file");
     // Re-read the destination: the "picks up every row" claim must be backed by
     // the actual rows, not just one file appearing.
+    // DuckDB, not the parquet crate rivet writes with — a fault in the shared
+    // encode/decode path would otherwise cancel out.
     assert_eq!(
-        total_parquet_rows(out.path()),
+        duckdb_parquet_rows(rig.oracle_dir()),
         15,
         "first incremental run must export all 15 seeded rows"
     );
     assert_eq!(
-        dir_parquet_id_set(out.path()),
+        duckdb_distinct_i64_set(rig.oracle_dir(), "id"),
         (1..=15).collect::<std::collections::BTreeSet<i64>>(),
         "first incremental run must contain ids 1..=15"
     );
@@ -345,7 +347,7 @@ fn incremental_second_run_on_unchanged_source_exports_zero_new_rows() {
         "second incremental run (no new rows) must still exit 0; stderr:\n{}",
         String::from_utf8_lossy(&r2.stderr)
     );
-    let files_after_second = files_with_extension(out.path(), "parquet").len();
+    let files_after_second = files_with_extension(&rig.out_dir(), "parquet").len();
     assert_eq!(
         files_after_second, files_after_first,
         "incremental second run on unchanged source must not produce duplicates"
@@ -358,6 +360,7 @@ fn incremental_third_run_picks_up_newly_inserted_rows() {
     // After a clean incremental cycle, inserting new rows with higher
     // updated_at values must be picked up by the next run — and only those.
     require_alive(LiveService::Postgres);
+    require_alive(LiveService::DuckDb);
 
     let table_name = unique_name("qa12_inc2");
     let mut c = pg_connect();
@@ -373,18 +376,16 @@ fn incremental_third_run_picks_up_newly_inserted_rows() {
     let _guard = PgTable::adopt(table_name.clone());
 
     let export_name = unique_name("qa12_inc2_exp");
-    let out = tempfile::tempdir().unwrap();
-    let yaml = Rig::pg_batch(&export_name)
+    let rig = Rig::pg_batch(&export_name)
         .query(&format!(r#"SELECT id, updated_at FROM {table_name}"#))
         .mode("incremental")
         .export_line("cursor_column: updated_at")
-        .dest_path(out.path().to_path_buf())
-        .yaml();
-    let (_cfgdir, cfg) = cfg_dir_with(&yaml);
+        .duckdb_oracle();
+    let cfg = rig.config_path();
 
     // Run #1 — exports rows 1..5.
     assert!(run_rivet_export(&cfg, &export_name).status.success());
-    let files_1 = files_with_extension(out.path(), "parquet").len();
+    let files_1 = files_with_extension(&rig.out_dir(), "parquet").len();
 
     // Insert new rows with higher updated_at.
     c.batch_execute(&format!(
@@ -401,7 +402,7 @@ fn incremental_third_run_picks_up_newly_inserted_rows() {
 
     // Run #2 — must pick up rows 6..10.
     assert!(run_rivet_export(&cfg, &export_name).status.success());
-    let files_2 = files_with_extension(out.path(), "parquet").len();
+    let files_2 = files_with_extension(&rig.out_dir(), "parquet").len();
     assert_eq!(
         files_2,
         files_1 + 1,
@@ -411,12 +412,14 @@ fn incremental_third_run_picks_up_newly_inserted_rows() {
     // exactly — proves the second run picked up the newly-inserted rows 6..10
     // and the first run's rows are still present (no loss across runs).
     assert_eq!(
-        dir_parquet_id_set(out.path()),
+        duckdb_distinct_i64_set(rig.oracle_dir(), "id"),
         (1..=10).collect::<std::collections::BTreeSet<i64>>(),
         "after the second run the destination must hold ids 1..=10 exactly"
     );
+    // DuckDB, not the parquet crate rivet writes with — a fault in the shared
+    // encode/decode path would otherwise cancel out.
     assert_eq!(
-        total_parquet_rows(out.path()),
+        duckdb_parquet_rows(rig.oracle_dir()),
         10,
         "two incremental runs must export each of the 10 rows exactly once"
     );
@@ -528,7 +531,7 @@ fn full_mode_resume_flag_is_rejected() {
     // exports, the flag must produce a diagnostic rather than silently ignoring it.
     require_alive(LiveService::Postgres);
     let table = seed_pg_numeric_table(10);
-    let export_name = unique_name("qa12_full_resume");
+    let export_name = unique_name("qa12_full_norsm");
     let out = tempfile::tempdir().unwrap();
     let yaml = Rig::pg_batch(&export_name)
         .query(&format!(
@@ -552,9 +555,22 @@ fn full_mode_resume_flag_is_rejected() {
     // silently succeed as if resume had an effect.  The export itself may succeed
     // (the warning does not block execution), but the operator must be informed.
     let stderr = String::from_utf8_lossy(&result.stderr);
+    // Assert the RULE the validator emits, not a substring the fixture supplies
+    // for free. The old condition was
+    //   stderr.contains("resume") || contains("checkpoint") || contains("warn")
+    // and the export name itself contained "resume" — so it passed on the
+    // fixture's own name, with `--resume` on the command line as a second free
+    // hit. Deleting check_resume_without_checkpoint from src/plan/validate.rs
+    // left all three engines green.
     assert!(
-        stderr.contains("resume") || stderr.contains("checkpoint") || stderr.contains("warn"),
-        "--resume on full-mode export must produce a diagnostic; stderr:\n{stderr}"
+        stderr.contains("resume-no-checkpoint"),
+        "--resume on a full-mode export must emit the resume-no-checkpoint rule, \
+         not merely mention the word; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("has no effect unless"),
+        "…and it must say the flag does NOTHING, which is the actionable half; \
+         stderr:\n{stderr}"
     );
 }
 

@@ -37,10 +37,29 @@ impl StateStore {
     /// Upsert per-column max byte lengths, keeping the running maximum.
     pub fn store_shape_stats(&self, export_name: &str, stats: &HashMap<String, u64>) -> Result<()> {
         let now = chrono::Utc::now().to_rfc3339();
+        // Portable across BOTH state backends, and it has to be said explicitly
+        // because the previous form was not: `MAX(a, b)` is a scalar function in
+        // SQLite and an AGGREGATE in PostgreSQL, and a bare `max_byte_len` inside
+        // `DO UPDATE SET` is ambiguous to PostgreSQL between the existing row and
+        // `excluded`. The state layer translates only placeholders (`?N` -> `$N`),
+        // so the SQLite spelling reached PostgreSQL verbatim and every upsert
+        // failed with `column reference "max_byte_len" is ambiguous`.
+        //
+        // It failed at WARN level, so runs kept reporting success while
+        // `export_shape` stayed EMPTY on the Postgres backend — shape tracking,
+        // and the value-growth warning built on it, had never once worked there.
+        // Found by tracing what a single run writes to the meta-DB.
+        //
+        // CASE + an explicit table qualifier is accepted identically by both
+        // (verified against a live PostgreSQL and an in-memory SQLite: 10 -> stays
+        // 10 on 5 -> 99 on 99), so this needs no dialect branch.
         let sql = "INSERT INTO export_shape (export_name, column_name, max_byte_len, updated_at)
                  VALUES (?1, ?2, ?3, ?4)
                  ON CONFLICT(export_name, column_name) DO UPDATE SET
-                     max_byte_len = MAX(max_byte_len, excluded.max_byte_len),
+                     max_byte_len = CASE
+                         WHEN excluded.max_byte_len > export_shape.max_byte_len
+                         THEN excluded.max_byte_len
+                         ELSE export_shape.max_byte_len END,
                      updated_at   = excluded.updated_at";
         for (col, &max_bytes) in stats {
             self.execute(

@@ -44,6 +44,28 @@ impl<'a> FromSql<'a> for PgNumericWire<'a> {
     }
 }
 
+/// PostgreSQL's own text for a non-finite `numeric`, or `None` for a finite one
+/// (and for a payload too short to carry a sign field).
+///
+/// These three values have no decimal literal, which is why
+/// [`numeric_wire_normalized_plain`] returns `None` for them and the Decimal path
+/// turns that into a loud error. But a value rendered AS TEXT loses nothing —
+/// `NaN` round-trips through a string column exactly — so a `columns: { c:
+/// string }` override must emit these rather than degrade them to NULL, which is
+/// what it used to do: the `or_else` fallback ran `from_utf8` over the BINARY
+/// wire header, failed, and produced a null indistinguishable from a real one.
+pub fn numeric_wire_special_text(wire: &[u8]) -> Option<&'static str> {
+    let mut cur = Cursor::new(wire);
+    let _ndigits = cur.read_u16::<BigEndian>().ok()?;
+    let _weight = cur.read_i16::<BigEndian>().ok()?;
+    match cur.read_u16::<BigEndian>().ok()? {
+        NUMERIC_NAN => Some("NaN"),
+        NUMERIC_PINF => Some("Infinity"),
+        NUMERIC_NINF => Some("-Infinity"),
+        _ => None,
+    }
+}
+
 /// Plain decimal text suitable for [`crate::types::decimal::decimal_str_to_scaled_i128`].
 ///
 /// NaN / ±Infinity payloads yield `None` (no deterministic decimal literal).

@@ -94,6 +94,36 @@ pub fn retry_backoff_ms(base_ms: u64, attempt: u32, extra_ms: u64) -> u64 {
 /// (rivet-raised, robust to wording), then structured Postgres SQLSTATE /
 /// MySQL error codes, then a string fallback for errors that carry no
 /// structured signal (IO, cloud credentials, driver-native timeout prose).
+/// Should another attempt be made after a failure?
+///
+/// Budget left AND an error that can recover — the one rule every runner needs,
+/// so it lives here rather than being re-typed per runner. It was written out
+/// five times across three runners (`single`, chunked sequential, chunked
+/// parallel, twice each for the connect and the export leg), each copy free to
+/// drift and none of them tested. That is the shape this repo keeps paying for:
+/// a rule each runner re-applies drifts one runner at a time.
+///
+/// `<`, not `<=`: `attempt` is zero-based, so `attempt == max_retries` is the
+/// LAST permitted attempt and retrying from it runs `max_retries + 1` times.
+/// `&&`, not `||`: a permanent failure (auth, TLS) would otherwise be retried
+/// into the same wall while the operator waits out the full backoff for an
+/// answer the first attempt already had.
+pub struct Attempt<'a> {
+    /// Zero-based index of the attempt that just failed.
+    pub attempt: u32,
+    /// Budget from the tuning profile.
+    pub max_retries: u32,
+    /// The failure being judged.
+    pub error: &'a anyhow::Error,
+}
+
+pub fn should_retry(a: Attempt<'_>) -> bool {
+    // Named rather than three positional arguments: `attempt` and `max_retries`
+    // are both `u32`, so a swapped call site compiles, runs, and silently changes
+    // the budget — the kind of edit no test distinguishes from the correct one.
+    a.attempt < a.max_retries && classify_error(a.error).is_transient()
+}
+
 pub fn classify_error(err: &anyhow::Error) -> RetryClass {
     // --- Typed marker: rivet-raised statement-duration timeout (deterministic) ---
     // Downcast the TYPE so permanence does not depend on the Display wording.
@@ -405,6 +435,55 @@ pub(crate) fn is_transient(err: &anyhow::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    /// The rule all three runners now share. Before it was one function it
+    /// was five hand-written copies, none of them tested.
+    #[test]
+    fn a_connect_retry_needs_both_budget_and_a_recoverable_error() {
+        assert!(
+            should_retry(Attempt {
+                attempt: 0,
+                max_retries: 3,
+                error: &transient_err()
+            }),
+            "budget left and a recoverable error is the whole retry case"
+        );
+        assert!(
+            !should_retry(Attempt {
+                attempt: 3,
+                max_retries: 3,
+                error: &transient_err()
+            }),
+            "attempt is zero-based, so attempt == max_retries is the LAST permitted attempt — \
+             retrying from it runs max_retries + 1 times"
+        );
+        assert!(
+            !should_retry(Attempt {
+                attempt: 2,
+                max_retries: 3,
+                error: &permanent_err()
+            }),
+            "an auth failure is retried into the same wall; the operator waits out the full \
+             backoff for an answer the first attempt already had"
+        );
+        assert!(
+            !should_retry(Attempt {
+                attempt: 0,
+                max_retries: 0,
+                error: &transient_err()
+            }),
+            "max_retries: 0 means exactly one attempt, recoverable or not"
+        );
+    }
+
+    fn transient_err() -> anyhow::Error {
+        anyhow::anyhow!("connection reset by peer")
+    }
+
+    fn permanent_err() -> anyhow::Error {
+        anyhow::anyhow!("permission denied for table users")
+    }
+
     use super::*;
 
     #[test]

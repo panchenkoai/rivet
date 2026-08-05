@@ -773,7 +773,11 @@ fn two_cdc_exports_with_the_same_explicit_slot_are_rejected() {
 
 #[test]
 fn two_mysql_cdc_exports_defaulting_to_the_same_server_id_are_rejected() {
-    let yaml = cdc_pair_yaml("mysql", "", "");
+    let yaml = cdc_pair_yaml(
+        "mysql",
+        "cdc: { checkpoint: /tmp/ck_a }",
+        "cdc: { checkpoint: /tmp/ck_b }",
+    );
     let err = Config::from_yaml(&yaml).unwrap_err();
     let msg = format!("{err:#}");
     assert!(
@@ -811,8 +815,8 @@ fn cdc_exports_with_distinct_resources_validate_fine() {
 fn mysql_cdc_exports_with_distinct_server_ids_validate_fine() {
     let yaml = cdc_pair_yaml(
         "mysql",
-        "cdc: { server_id: 4271 }",
-        "cdc: { server_id: 4272 }",
+        "cdc: { server_id: 4271, checkpoint: /tmp/ck_a }",
+        "cdc: { server_id: 4272, checkpoint: /tmp/ck_b }",
     );
     Config::from_yaml(&yaml).expect("distinct server_ids must validate");
 }

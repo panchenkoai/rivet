@@ -12,7 +12,7 @@
 
 use std::io::Write;
 
-use rivet::state::StateStore;
+use rivet::state::{FilePart, StateStore};
 
 // =============================================================================
 // Task 1.3 — Corrupted state handling
@@ -115,15 +115,15 @@ fn fresh_db_opens_and_is_functional_end_to_end() {
 
     store.update("orders", "2024-01-01T00:00:00Z").unwrap();
     store
-        .record_file(
-            "run-1",
-            "orders",
-            "orders_202401.parquet",
-            100,
-            1024,
-            "parquet",
-            Some("zstd"),
-        )
+        .record_file(FilePart {
+            run_id: "run-1",
+            export_name: "orders",
+            file_name: "orders_202401.parquet",
+            rows: 100,
+            bytes: 1024,
+            format: "parquet",
+            compression: Some("zstd"),
+        })
         .unwrap();
     assert_eq!(
         store.get("orders").unwrap().last_cursor_value.as_deref(),

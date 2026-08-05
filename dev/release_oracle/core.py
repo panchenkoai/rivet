@@ -248,7 +248,7 @@ def engine_container(engine: str, tag: str) -> str:
 def remove_engine_containers() -> None:
     ps = docker("ps", "-aq", "--filter", f"name={ENGINE_PREFIX}")
     for cid in ps.stdout.split():
-        docker("rm", "-f", cid)
+        docker("rm", "-fv", cid)
 
 
 def container_for_port(port: int) -> str | None:

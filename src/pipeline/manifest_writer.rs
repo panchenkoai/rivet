@@ -24,7 +24,7 @@
 use std::io::Read;
 use std::path::Path;
 
-use crate::destination::{Destination, WriteCommitProtocol};
+use crate::destination::Destination;
 use crate::error::Result;
 use crate::journal::PlanSnapshot;
 use crate::manifest::{
@@ -47,6 +47,7 @@ use crate::pipeline::summary::RunSummary;
 pub struct ManifestBuilder {
     run_id: String,
     export_name: String,
+    export_family: String,
     started_at: chrono::DateTime<chrono::Utc>,
     source: ManifestSource,
     destination: ManifestDestination,
@@ -58,6 +59,8 @@ pub struct ManifestBuilder {
     /// [`set_column_checksums`](Self::set_column_checksums) from the sink
     /// accumulator. `None` → omitted from the manifest.
     column_checksums: Option<Vec<ColumnChecksum>>,
+    /// Which fold produced them — see `manifest::RunManifest::checksum_render`.
+    checksum_render: Option<String>,
     /// The column the Form B checksum is keyed to (cursor/key column); `None` =
     /// un-keyed. Recorded so `validate` re-keys identically.
     checksum_key_column: Option<String>,
@@ -77,6 +80,11 @@ impl ManifestBuilder {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         plan: &PlanSnapshot,
+        // The export FAMILY (parent for a synthesized CDC snapshot leg, the
+        // export's own name otherwise) — passed rather than folded from the
+        // name, and rather than widened into `PlanSnapshot`, a persisted
+        // journal wire type.
+        export_family: &str,
         run_id: &str,
         started_at: chrono::DateTime<chrono::Utc>,
         schema_fingerprint: String,
@@ -86,8 +94,10 @@ impl ManifestBuilder {
         destination_uri: String,
     ) -> Self {
         Self {
+            checksum_render: None,
             run_id: run_id.to_string(),
             export_name: plan.export_name.clone(),
+            export_family: export_family.to_string(),
             started_at,
             source: ManifestSource {
                 engine: source_engine.to_string(),
@@ -126,6 +136,10 @@ impl ManifestBuilder {
     ) {
         self.column_checksums = Some(checksums);
         self.checksum_key_column = key_column;
+        // Stamp the fold that produced them. Without this a reader cannot tell
+        // v1's annihilating XOR from v2's sum and would compare incomparable
+        // numbers — reporting either false corruption or none at all.
+        self.checksum_render = Some(crate::source::value_checksum::CHECKSUM_RENDER_ID.to_string());
     }
 
     /// Record a committed part.  Must be called only after `dest.write()`
@@ -193,9 +207,16 @@ impl ManifestBuilder {
             .count() as u32;
         let finished_at = chrono::Utc::now();
         RunManifest {
+            checksum_render: self.checksum_render.clone(),
             manifest_version: crate::manifest::MANIFEST_VERSION,
             mode: "batch".to_string(),
             run_id: self.run_id,
+            // The family the PLAN carries — the parent for a synthesized CDC
+            // snapshot leg, the export's own name otherwise. Folding the name
+            // here instead recorded family `daily` for a user export named
+            // `daily__snapshot_v2`, silently merging it with a real sibling
+            // export `daily` and disarming the shared-prefix guard.
+            export_family: self.export_family,
             export_name: self.export_name,
             started_at: self.started_at.to_rfc3339(),
             finished_at: finished_at.to_rfc3339(),
@@ -371,7 +392,7 @@ fn write_manifest_inner(
     emit_success_marker: bool,
     write_canonical: bool,
 ) -> Result<WriteOutcome> {
-    if dest.capabilities().commit_protocol == WriteCommitProtocol::Streaming {
+    if !dest.capabilities().commit_protocol.leaves_objects_at_rest() {
         log::info!(
             "destination is streaming; manifest.json / _SUCCESS not written (ADR-0012 §Artifacts)"
         );
@@ -458,6 +479,7 @@ mod tests {
     fn builder_starts_empty() {
         let b = ManifestBuilder::new(
             &plan_snapshot(),
+            "e",
             "run_001",
             chrono::Utc::now(),
             "xxh3:0000000000000000".into(),
@@ -477,6 +499,7 @@ mod tests {
     fn builder_aggregates_parts_into_self_consistent_manifest() {
         let mut b = ManifestBuilder::new(
             &plan_snapshot(),
+            "e",
             "run_002",
             chrono::Utc::now(),
             "xxh3:0123456789abcdef".into(),
@@ -513,6 +536,7 @@ mod tests {
     fn builder_records_started_and_finished_in_order() {
         let b = ManifestBuilder::new(
             &plan_snapshot(),
+            "e",
             "run_003",
             chrono::Utc::now(),
             "xxh3:0".into(),
@@ -533,6 +557,7 @@ mod tests {
     fn builder_carries_status_through_finalize() {
         let b = ManifestBuilder::new(
             &plan_snapshot(),
+            "e",
             "run_004",
             chrono::Utc::now(),
             "xxh3:0".into(),
@@ -632,6 +657,7 @@ mod tests {
     fn build_manifest_with_run(status: ManifestStatus, run_id: &str) -> RunManifest {
         let mut b = ManifestBuilder::new(
             &plan_snapshot(),
+            "e",
             run_id,
             chrono::Utc::now(),
             "xxh3:0123456789abcdef".into(),
@@ -670,6 +696,7 @@ mod tests {
         // silently absent from the manifest strips validate of its value leg.
         let mut b = ManifestBuilder::new(
             &plan_snapshot(),
+            "e",
             "run_ck",
             chrono::Utc::now(),
             "xxh3:0".into(),
@@ -703,6 +730,7 @@ mod tests {
         // range breaks the incremental continuity audit trail.
         let mut b = ManifestBuilder::new(
             &plan_snapshot(),
+            "e",
             "run_cr",
             chrono::Utc::now(),
             "xxh3:0".into(),

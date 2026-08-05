@@ -440,3 +440,23 @@ CREATE TABLE ext_unindexed_id (id BIGINT NOT NULL, label TEXT NOT NULL, amount I
 INSERT INTO ext_unindexed_id (id, label, amount)
 WITH RECURSIVE seq AS (SELECT 1 n UNION ALL SELECT n+1 FROM seq WHERE n < 150000)
 SELECT n, CONCAT('row', n), n % 100 FROM seq;
+
+-- ── row_hash injectivity probe ───────────────────────────────────────────────
+-- See seeds/common/postgres.sql for the full rationale. Rows 1 and 2 are the
+-- pair that render id v1 could not tell apart: with fields joined by a bare \x1f
+-- and no length, ('a'||US,'b') and ('a',US||'b') build the SAME bytes. Rows 3
+-- and 4 are absence versus a PRESENT value of length zero.
+-- The gate exports this twice — with `row_hash: true` for digest parity against
+-- an independent implementation, and with `row_hash: [a, b]` for injectivity,
+-- which needs the primary key OUT of the coverage to be able to fail at all.
+CREATE TABLE row_hash_probe (
+    id INT PRIMARY KEY,
+    a  TEXT,
+    b  TEXT
+);
+
+INSERT INTO row_hash_probe (id, a, b) VALUES
+    (1, CONCAT('a', CHAR(31)), 'b'),
+    (2, 'a',                   CONCAT(CHAR(31), 'b')),
+    (3, NULL,                  'x'),
+    (4, '',                    'x');

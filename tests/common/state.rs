@@ -10,6 +10,7 @@
 #![allow(dead_code)]
 
 use rusqlite::Connection;
+use rusqlite::OptionalExtension;
 
 /// One `export_metrics` row, read in a single query. Only the columns the
 /// live-metrics tests assert on are surfaced; extend as callers need more.
@@ -66,6 +67,25 @@ impl StateDb {
             )
             .expect("an export_metrics row must exist after the run")
             .expect("export_metrics.run_id must be set by the run path")
+    }
+
+    /// The persisted incremental cursor for `export`, or `None` when the export
+    /// has no `export_state` row at all.
+    ///
+    /// This is the value that decides where the NEXT run starts, so it is the
+    /// only honest oracle for "did this run skip past a window": rivet's own
+    /// summary and exit code describe the run that just ended, not the one that
+    /// inherits its cursor.
+    pub fn cursor_value(&self, export: &str) -> Option<String> {
+        self.conn
+            .query_row(
+                "SELECT last_cursor_value FROM export_state WHERE export_name = ?1",
+                [export],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .expect("query export_state")
+            .flatten()
     }
 
     /// The full `export_metrics` row for `run_id`, read in one query.

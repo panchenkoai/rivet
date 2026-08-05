@@ -593,12 +593,56 @@ RED-proven. Three rules fell out, each bitten at least twice:
    When a test needs artificial separation (time, ordering, uniqueness) that
    the product claims to provide, stop and check the product first.
 
+Scope honesty, first and most expensive: **`cargo mutants -- --lib` on a
+live-only path reports 100% survival and means NOTHING.** Both chunk-checkpoint
+runners measured 84 of 84 MISSED — not 84 gaps, but proof that no unit test
+executes those files at all, since they need a real source and destination. The
+same scoping inflates every `src/pipeline/` survivor count. Read a survivor as
+"no UNIT test", then decide whether the honest oracle is a unit test or a live
+one, and PROVE which by mutating and running the live suite: `total_rows += `
+→ `*=` (single) looked like a glaring hole and four live tests caught it;
+`apply_m8_resume_decisions` stubbed to `Ok(Default::default())` — named in this
+file as a lib-suite survivor — is caught by three. What the live suite did NOT
+catch was worth the search: see the failed-chunk guard below.
+
 Scope honesty: mutation testing measures assertion SENSITIVITY on code that
 exists. It cannot see a missing behaviour (the manifest-clobber fix itself was
 invisible to it — an independent-oracle harness caught that), nor a test and
 code that agree on a wrong spec. Layers: matrices (coverage exists) → mutants
 (assertions bite) → live suites (integration) → independent-oracle harness
 (absent behaviour). One layer's green is not another layer's proof.
+
+## A guard that only runs at the END of a loop is invisible to every PANIC test
+
+A fault hook that kills the process cannot reach code that runs after the loop
+finishes — a crashed run never gets there. So a guard placed at the end of a
+runner ("not every claimed chunk completed", "no worker reported an error") is
+untestable by the entire existing crash-injection vocabulary, and looks covered
+because the crash tests around it are green.
+
+Measured 2026-08-03: disabling the sequential chunk-checkpoint guard
+(`pending > 0` → `pending < 0`) left 14 live tests green — 9 chunked-recovery,
+1 crash-soak, 4 chaos — while the run shipped **100 of 150 rows with status
+`success`**. Disabling BOTH parallel-checkpoint guards (the worker-error bail
+and the completion count) left 56 green. Every one of those tests injects
+`RIVET_TEST_PANIC_AT`; none of them can reach the guard.
+
+The fixture the class needs is an error that RETURNS, not one that kills:
+`maybe_error_at_index` existed for exactly this but was wired only into keyset,
+so the chunked runners got the hook (`RIVET_TEST_ERROR_AT=chunk_export:N`) as
+part of the fix. Process rule: **for any check that runs after a loop/join,
+there must be a test whose failure is RETURNED rather than crashed** — and the
+oracle is the LEDGER, not parquet on disk. The first draft of the parallel test
+counted files and read "300 of 150 rows": a worker retries its chunk internally
+and each attempt writes a part before the error discards its record (measured:
+303 files for 299 recorded). Those are unmanifested parts of a FAILED run — the
+`gc_orphans` case, not a loss. Raw artifacts under a failed prefix are not
+evidence about what the run delivered.
+
+Corollary on redundant guards: the parallel test goes RED only when BOTH guards
+are off. Say that in the test body rather than presenting it as two proofs —
+the same load-bearing / belt-and-suspenders distinction the `until_current`
+rule already insists on.
 
 ## A per-export feature must be wired into EVERY runner — the runner-bypass class
 
@@ -836,3 +880,62 @@ Scope honesty: this class is invisible to mutation testing of the PRODUCT, since
 the fixture-only assertion never executes the mutated code. It is found by asking
 of each assertion: *what change in rivet would turn this red?* If the answer is
 "none — only editing the fixture", it is this defect.
+
+## A correct test of correct logic on a FABRICATED input proves nothing about the caller
+
+Three distinct defects hide under the phrase "the test is fake", and conflating
+them wastes the fix. Separate them by asking *where the wrong value comes from*:
+
+1. **Fixture against itself** — the test holds both sides of the comparison, so
+   only editing the fixture can turn it red (the class above).
+2. **A test that routes AROUND the defect** — usually honest, and often says so
+   in its own comment. It closes nothing, but it lies to nobody.
+3. **A correct test of correct logic, fed an input the product never produces.**
+   The assertion bites. The logic is right. The defect lives one layer up, in
+   whatever HANDS that logic its input — and nothing in the suite looks there.
+
+The third is the one to learn, because every existing safety net misses it.
+`decide_export_retry` (`src/pipeline/single.rs`) refuses to retry once parts are
+durable, and its unit matrix feeds `files_committed` = 0 / 2 / 5 and checks every
+arm — a genuinely sensitive test. Meanwhile `run_keyset_parallel` bailed on a
+worker error ABOVE its `record_part` drain, so the decider was handed `0` with
+four parquet files already on disk and correctly decided "retry". Both halves
+correct; the seam wrong, since 0.23.0. Measured: a transient worker error left 4
+parts on disk and produced `retry 1/2` then `retry 2/2`; because keyset part
+names key off the stable `run_id`, attempt N+1 normally overwrites attempt N — so
+the damage only surfaces when a range's output SHRINKS between attempts (a
+mid-backoff `DELETE`), where attempt 1's extra part survived unoverwritten: 751
+rows / 750 distinct, one id in two files.
+
+**Mutation testing is structurally blind here.** Mutate inside the decider and
+the matrix goes red; mutate the SUPPLIER of its input and nothing does, because
+no test observes that value. The same blindness applies to any check whose test
+constructs its own subject: a hash test that builds the value it hashes, a guard
+test that builds the manifest it guards, a resolver test that re-implements the
+resolution rule in a closure.
+
+Process rule: **for any value that crosses a layer boundary and decides
+something, one test must observe it AT the boundary, produced by the real
+producer — not supplied by the test.** Concretely: read it back from the
+artifact the product wrote (a metrics row, a manifest, a summary), or call the
+one function that computes it and assert on THAT. Then RED-prove against a
+mutant in the PRODUCER, not in the consumer.
+
+Three misses in a single session say how easy this is to get wrong, twice while
+actively trying not to. A guard test hand-set `export_family` to a value no
+production writer emits (green against the very fold it was written to catch); the
+rewrite replaced the hand-set value with a CLOSURE re-implementing the rule
+(still green against the same mutant); only extracting `ExportConfig::family()`
+and calling it from the test made the mutant bite. A third — the running-marker
+family — could not be closed at all, because its writer is cloud-only and no unit
+test can observe what it records; that test now states in its own doc that it
+pins the READ side only and names the structural fix. **A test you cannot make
+RED should say so where a reader will see it, not pass quietly.**
+
+Template: `parallel_keyset_worker_error_still_counts_the_durable_parts_postgres`
+(`tests/live/live_keyset_parallel.rs`) — it injects the worker error, asserts the
+fixture is not inert (parts really were written), then reads `files_committed`
+from the run's own metrics row. RED against the pre-fix order (`left: Some(0)`,
+`right: Some(4)`) while the pre-existing worker-error test stays GREEN against
+the same mutant. When a new test and an old one disagree about a mutant, the
+disagreement is the finding: the old test's blind spot has a name and a boundary.

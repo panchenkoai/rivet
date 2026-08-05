@@ -21,6 +21,10 @@ pub struct LoadRecord {
     pub rows_loaded: i64,
     pub status: String,
     pub finished_at: String,
+    /// WHICH SOURCE these rows came from (`engine:schema.table`), so a later load
+    /// of the same target from a DIFFERENT database is refusable. Empty when the
+    /// manifests did not say — treated as unknown, never as a mismatch.
+    pub source_ident: String,
 }
 
 impl StateStore {
@@ -65,9 +69,15 @@ impl StateStore {
                     for rid in &rec.source_run_ids {
                         tx.execute(
                             "INSERT OR REPLACE INTO loaded_source_run
-                               (target_table, source_run_id, load_id, loaded_at)
-                             VALUES (?1, ?2, ?3, ?4)",
-                            rusqlite::params![rec.target_table, rid, rec.load_id, rec.finished_at],
+                               (target_table, source_run_id, load_id, loaded_at, source_ident)
+                             VALUES (?1, ?2, ?3, ?4, ?5)",
+                            rusqlite::params![
+                                rec.target_table,
+                                rid,
+                                rec.load_id,
+                                rec.finished_at,
+                                rec.source_ident,
+                            ],
                         )?;
                     }
                 }
@@ -108,12 +118,19 @@ impl StateStore {
                     for rid in &rec.source_run_ids {
                         tx.execute(
                             "INSERT INTO loaded_source_run
-                               (target_table, source_run_id, load_id, loaded_at)
-                             VALUES ($1, $2, $3, $4)
+                               (target_table, source_run_id, load_id, loaded_at, source_ident)
+                             VALUES ($1, $2, $3, $4, $5)
                              ON CONFLICT (target_table, source_run_id) DO UPDATE SET
-                                 load_id   = excluded.load_id,
-                                 loaded_at = excluded.loaded_at",
-                            &[&rec.target_table, rid, &rec.load_id, &rec.finished_at],
+                                 load_id      = excluded.load_id,
+                                 loaded_at    = excluded.loaded_at,
+                                 source_ident = excluded.source_ident",
+                            &[
+                                &rec.target_table,
+                                rid,
+                                &rec.load_id,
+                                &rec.finished_at,
+                                &rec.source_ident,
+                            ],
                         )?;
                     }
                 }
@@ -125,6 +142,21 @@ impl StateStore {
 
     /// The extraction run_ids already loaded into `target_table` — the skip set
     /// an incremental load filters its candidate manifests against.
+    /// The DISTINCT non-empty source identities a target table has been loaded
+    /// from. More than one means two different databases wrote the same
+    /// warehouse table — the second silently replaced the first.
+    pub fn loaded_source_idents(&self, target_table: &str) -> Result<Vec<String>> {
+        let mut out = self.query(
+            "SELECT DISTINCT source_ident FROM loaded_source_run \
+             WHERE target_table = ?1 AND source_ident IS NOT NULL AND source_ident <> ''",
+            &[target_table.into()],
+            |r| r.text(0),
+        )?;
+        out.sort();
+        out.dedup();
+        Ok(out)
+    }
+
     pub fn loaded_source_run_ids(&self, target_table: &str) -> Result<HashSet<String>> {
         Ok(self
             .query(
@@ -145,6 +177,9 @@ impl StateStore {
         const COLS: &str = "load_id, export_name, target_table, warehouse, mode, \
                             source_run_ids, rows_loaded, status, finished_at";
         let build = |r: &dyn super::row::StateRow| LoadRecord {
+            // Reading back a historical row: the identity is not part of the
+            // load_run projection, and no caller of this reader needs it.
+            source_ident: String::new(),
             load_id: r.text(0),
             export_name: r.text(1),
             target_table: r.text(2),
@@ -179,6 +214,7 @@ mod tests {
 
     fn rec(load_id: &str, target: &str, runs: &[&str], rows: i64, status: &str) -> LoadRecord {
         LoadRecord {
+            source_ident: String::new(),
             load_id: load_id.into(),
             export_name: "customers".into(),
             target_table: target.into(),
@@ -189,6 +225,64 @@ mod tests {
             status: status.into(),
             finished_at: format!("2026-01-01T00:00:0{}Z", load_id.len() % 10),
         }
+    }
+
+    /// The source-ownership guard reads `loaded_source_idents`; this asserts the
+    /// value it reads is the value `store_load` WROTE, on the default backend.
+    ///
+    /// It was not: the SQLite arm inserted four columns and omitted
+    /// `source_ident` entirely (the Postgres arm wrote all five), so
+    /// `loaded_source_idents` — which filters `IS NOT NULL AND <> ''` — always
+    /// came back empty, and the guard that refuses "two sources into one
+    /// warehouse table" never fired on the backend almost everyone runs. It also
+    /// explains an asymmetry in the release gate: its BigQuery stage loads three
+    /// engines into one table and PASSED on the SQLite pass while failing on the
+    /// Postgres one.
+    ///
+    /// Nothing caught it because the shared `rec()` fixture sets
+    /// `source_ident: String::new()` — the empty string the reader filters out.
+    /// A field can only be tested by a fixture that crosses its threshold, and a
+    /// value that decides something must be observed AT the boundary, produced by
+    /// the real producer rather than handed over by the test.
+    #[test]
+    fn a_load_records_the_source_identity_the_ownership_guard_reads_back() {
+        let s = StateStore::open_in_memory().unwrap();
+        let mut r = rec("L1", "p.d.orders", &["r1"], 100, "success");
+        r.source_ident = "postgres:public.orders".into();
+        s.store_load(&r).unwrap();
+
+        assert_eq!(
+            s.loaded_source_idents("p.d.orders").unwrap(),
+            vec!["postgres:public.orders".to_string()],
+            "the guard cannot refuse a second source if the first one's identity was never stored"
+        );
+
+        // A SECOND source into the same table is what the guard exists to catch,
+        // so both identities must be visible to it — one row is not enough to
+        // prove the reader distinguishes them.
+        let mut r2 = rec("L2", "p.d.orders", &["r2"], 50, "success");
+        r2.source_ident = "mysql:rivet.orders".into();
+        s.store_load(&r2).unwrap();
+        let mut got = s.loaded_source_idents("p.d.orders").unwrap();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                "mysql:rivet.orders".to_string(),
+                "postgres:public.orders".to_string()
+            ],
+            "two sources under one target table must both be recorded — that pair IS the refusal"
+        );
+
+        // An empty ident stays filtered: a stateless/legacy load must not be
+        // mistaken for a competing source.
+        let mut r3 = rec("L3", "p.d.other", &["r3"], 10, "success");
+        r3.source_ident = String::new();
+        s.store_load(&r3).unwrap();
+        assert!(
+            s.loaded_source_idents("p.d.other").unwrap().is_empty(),
+            "an unidentified load must not manufacture a phantom owner"
+        );
     }
 
     #[test]

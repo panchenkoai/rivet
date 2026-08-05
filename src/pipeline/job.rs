@@ -417,8 +417,19 @@ fn resolve_final_result(
     failed: bool,
     run_result: crate::error::Result<()>,
     reconcile_gate: crate::error::Result<()>,
+    manifest_gap: Option<String>,
 ) -> crate::error::Result<()> {
-    if failed { run_result } else { reconcile_gate }
+    if failed {
+        return run_result;
+    }
+    // The manifest gap outranks the reconcile verdict. Reconcile answers "is the
+    // data right?"; this answers "is the data REACHABLE?" — and an unreachable
+    // prefix makes the first question moot. Ordered before so the exit code names
+    // the condition an operator must act on first.
+    if let Some(why) = manifest_gap {
+        return Err(anyhow::anyhow!(why));
+    }
+    reconcile_gate
 }
 
 fn reconcile_run_gate(
@@ -628,6 +639,36 @@ pub(crate) fn synthetic_failed_summary(export_name: &str, err: &anyhow::Error) -
 /// regression. A shared seam makes the wiring structural, not a per-wrapper
 /// checklist. No-op for a non-keyset strategy, and for a FAILED run (the anchor
 /// must survive a failure so the next run rehydrates rather than orphans).
+/// Did this run end in a state where its keyset resume anchor must be KEPT?
+///
+/// The anchor (`resume_run_id` + the per-range recovery rows) is what lets the
+/// next run adopt pages this one already made durable. Clearing it on a run that
+/// did not actually complete strands them: the parts are on the prefix, and the
+/// only mechanism that would pick them up is gone.
+///
+/// `failed` alone is not that question. It is `result.is_err()`, computed before
+/// the manifest is written — so a run whose PARTS landed but whose MANIFEST did
+/// not has `failed == false` while being, by then, a failed run: the status is
+/// corrected to "failed", the cursor is held back, and the process exits
+/// non-zero. Clearing the anchor there discarded the resume path for pages that
+/// no manifest names, which is the strand-the-durable-rows shape this repo has
+/// already paid for once.
+///
+/// Deliberately NOT folded into `failed` itself: `resolve_final_result` returns
+/// `run_result` when `failed`, so widening that variable would make a
+/// manifest-gap run exit 0 with an Ok result. Two questions, two names.
+pub(super) struct RunOutcome<'a> {
+    /// `result.is_err()` — the export/quality verdict, computed BEFORE the
+    /// manifest is written.
+    pub failed: bool,
+    /// `Some(why)` when `finalize_manifest` could not write the manifest.
+    pub manifest_gap: &'a Option<String>,
+}
+
+pub(super) fn keyset_anchor_survives(o: RunOutcome<'_>) -> bool {
+    o.failed || o.manifest_gap.is_some()
+}
+
 fn finalize_keyset_anchor(
     state: &StateStore,
     plan: &ResolvedRunPlan,
@@ -649,7 +690,7 @@ fn finalize_keyset_anchor(
 /// the live run too. The `prefix` recorded in the ledger is the run's write URI,
 /// which `gc_orphans` matches at-or-under its load prefix. Best-effort: a miss
 /// only makes gc over-defer cleanup, so it warns rather than failing the export.
-fn ledger_begin_run(state: &StateStore, plan: &ResolvedRunPlan, run_id: &str) {
+fn ledger_begin_run(state: &StateStore, plan: &ResolvedRunPlan, export_family: &str, run_id: &str) {
     let prefix = super::finalize::destination_uri_for_manifest(&plan.destination);
     let started_at = chrono::Utc::now().to_rfc3339();
     if let Err(e) = state.begin_run(run_id, &plan.export_name, &prefix, &started_at) {
@@ -658,11 +699,36 @@ fn ledger_begin_run(state: &StateStore, plan: &ResolvedRunPlan, run_id: &str) {
             plan.export_name
         );
     }
-    super::finalize::write_running_manifest(plan, run_id, &started_at);
+    super::finalize::write_running_manifest(plan, export_family, run_id, &started_at);
 }
 
 /// Transition a run to its terminal status in the run-status ledger at finalize.
 /// Best-effort — mirrors the manifest status written alongside.
+/// Close the run-status row(s) this run owns — BOTH of them when a resume
+/// adopted a different id than the one the ledger was opened under.
+///
+/// A chunk-checkpoint resume replaces `summary.run_id` with the crashed run's id
+/// (`chunked::ensure_chunk_checkpoint_plan`), so the row opened at the start is
+/// no longer named by the summary. Closing only the summary's id leaves the
+/// opening row `running` forever, and `has_active_run_on_prefix` then reports a
+/// live writer on that prefix for good — `gc_orphans` defers cleanup
+/// indefinitely, with no later run to supersede it.
+///
+/// One function because the two job wrappers had drifted: `run_export_job`
+/// closed both, `run_export_job_with_chunk_source` — which dispatches to the very
+/// checkpoint runners that DO the adopting — closed one.
+fn ledger_finish_owned_runs(
+    state: &StateStore,
+    export_name: &str,
+    opened_as: &str,
+    summary: &RunSummary,
+) {
+    ledger_finish_run(state, export_name, &summary.run_id, &summary.status);
+    if opened_as != summary.run_id {
+        ledger_finish_run(state, export_name, opened_as, &summary.status);
+    }
+}
+
 fn ledger_finish_run(state: &StateStore, export_name: &str, run_id: &str, status: &str) {
     let finished_at = chrono::Utc::now().to_rfc3339();
     if let Err(e) = state.finish_run(run_id, status, &finished_at) {
@@ -804,7 +870,18 @@ pub(super) fn run_export_job(
     // Record this run `running` BEFORE any part lands — in the ledger + a bucket
     // marker manifest — the authority `gc_orphans` reads to spare a live extract's
     // committed-but-not-yet-manifested parts. (finish_run transitions it below.)
-    ledger_begin_run(state, &plan, &summary.run_id);
+    ledger_begin_run(state, &plan, &export.family(), &summary.run_id);
+    // The id the LEDGER row was opened under. A chunk-checkpoint RESUME adopts the
+    // prior run's id (chunked/mod.rs) — `summary.run_id` changes AFTER this point —
+    // and `finish_run` is a bare UPDATE, so closing the run under the adopted id
+    // matched no row and left this one `running` forever.
+    //
+    // That leak is not cosmetic: `has_active_run_on_prefix` keeps answering true,
+    // so `gc_orphans` defers cleanup, and since the load now excludes active runs
+    // from the consumed set (dispatch.rs), every later load on that prefix
+    // re-appends instead of recording progress — until an unrelated newer run of
+    // the same export happens to supersede it.
+    let ledger_run_id = summary.run_id.clone();
     // Failure forensics at open: source schema + server limits, so a run that fails
     // before finalize still explains itself (export_schema is otherwise success-only).
     capture_open_forensics(&plan, state, &mut summary);
@@ -958,7 +1035,7 @@ pub(super) fn run_export_job(
     // written just below is a PROJECTION of this record, so both carry the same
     // status. A crash before here leaves the row `running`; supersession by a
     // later run reconciles it (no age timer).
-    ledger_finish_run(state, &plan.export_name, &summary.run_id, &summary.status);
+    ledger_finish_owned_runs(state, &plan.export_name, &ledger_run_id, &summary);
     // Order matters: write the manifest first, then run the manifest-aware
     // `--validate` pass against the destination, then persist the metrics
     // row, then write the run report.  The report sees the verification
@@ -968,12 +1045,37 @@ pub(super) fn run_export_job(
     // permanently saying validated=pass for a run whose report says it
     // failed.  The notification fires last so it carries the most complete
     // summary.
-    finalize_manifest(&plan, state, &summary, "export");
+    // A run whose manifest never landed is NOT a success, whatever its rows say.
+    // The parts are durable and the counts are right — and no manifest names them,
+    // so the loader will not read them. Reporting success there is a claim the
+    // artifacts do not support.
+    //
+    // The status has already been printed and the ledger row already closed by
+    // this point, so both are corrected: the metrics row is written below and
+    // picks up the new status, and the ledger row is re-closed. The manifest
+    // itself cannot be re-written to say `failed` — failing to write it is the
+    // problem.
+    let manifest_gap = finalize_manifest(&plan, &export.family(), state, &summary, "export");
+    if let Some(why) = &manifest_gap {
+        summary.status = "failed".into();
+        summary.error_message = Some(why.clone());
+        ledger_finish_owned_runs(state, &plan.export_name, &ledger_run_id, &summary);
+    }
     // Round-2 audit #12: advance the incremental cursor now that the destination
     // manifest is durable — never before. A failure here is at-least-once safe (the
     // data + manifest are durable; the next run re-exports from the prior cursor),
     // so log loudly rather than fail a run whose write cycle already succeeded.
-    if let Err(e) = commit_incremental_cursor(state, &plan, &summary) {
+    //
+    // "now that the manifest is durable" was a PREMISE, not a check: the cursor
+    // advanced even when the manifest write had just failed, so the next run
+    // started past data nothing described. Guarded now.
+    if manifest_gap.is_some() {
+        log::error!(
+            "export '{}': incremental cursor NOT advanced — the manifest did not land, so the \
+             next run must re-export this window rather than skip past it",
+            summary.export_name,
+        );
+    } else if let Err(e) = commit_incremental_cursor(state, &plan, &summary) {
         log::error!(
             "export '{}': cursor advance failed AFTER the manifest was written — the next run \
              re-exports from the prior cursor (at-least-once, no loss): {:#}",
@@ -986,7 +1088,15 @@ pub(super) fn run_export_job(
     // later run isn't treated as a resume of this finished one. Clearing AFTER the
     // manifest write is the same ordering as the cursor advance: a crash before here
     // leaves resume_run_id set, so the next run rehydrates rather than orphans.
-    finalize_keyset_anchor(state, &plan, &summary.export_name, failed);
+    finalize_keyset_anchor(
+        state,
+        &plan,
+        &summary.export_name,
+        keyset_anchor_survives(RunOutcome {
+            failed,
+            manifest_gap: &manifest_gap,
+        }),
+    );
     if plan.validate {
         finalize_validate_manifest(&plan, &mut summary, "export");
     }
@@ -1000,7 +1110,7 @@ pub(super) fn run_export_job(
     finalize_run_report(config_path, &summary, "export");
     crate::notify::maybe_send(config.notifications.as_ref(), &summary);
 
-    let final_result = resolve_final_result(failed, result, reconcile_gate);
+    let final_result = resolve_final_result(failed, result, reconcile_gate, manifest_gap);
     (final_result, summary)
 }
 
@@ -1055,7 +1165,12 @@ pub(crate) fn run_export_job_with_chunk_source(
     let rss_sampler = crate::resource::RssPeakSampler::start(rss_before, 100);
     let mut summary = RunSummary::new(plan);
     summary.apply_context = apply_context;
-    ledger_begin_run(state, plan, &summary.run_id);
+    ledger_begin_run(state, plan, &plan.export_name, &summary.run_id);
+    // The id the ledger row was opened under. A chunk-checkpoint resume — which
+    // THIS wrapper dispatches to — replaces `summary.run_id` with the crashed
+    // run's, so the opening row must be closed by name or it stays `running`
+    // forever.
+    let ledger_run_id = summary.run_id.clone();
     // Runner parity: the apply/chunk-source path is a SEPARATE runner from
     // run_export_job, so it must re-apply open forensics itself (server_context +
     // schema-at-open) or an apply-run failure records neither — the runner-bypass
@@ -1097,11 +1212,32 @@ pub(crate) fn run_export_job_with_chunk_source(
     }
 
     summary.print();
-    ledger_finish_run(state, &plan.export_name, &summary.run_id, &summary.status);
-    finalize_manifest(plan, state, &summary, "apply");
+    ledger_finish_owned_runs(state, &plan.export_name, &ledger_run_id, &summary);
+    // Apply replays a SEALED artifact and has no ExportConfig — correctly:
+    // the family is the export's own name here. The one export whose family
+    // differs (the CDC snapshot leg) is synthesized by `cdc_job` at runtime and
+    // never reaches plan/apply, which refuses `mode: cdc` at build_plan entry.
+    // The manifest gap is handled EXACTLY as `run_export_job` handles it, and the
+    // duplication is the point: this wrapper reaches `run_with_reconnect` for a
+    // plain incremental plan, so it sets `cursor_high` and can advance the cursor
+    // just like the run path. Binding the verdict only there left `rivet apply`
+    // reporting success, advancing the cursor past a window no manifest names, and
+    // skipping it on the next run — the same defect, undone one runner over.
+    let manifest_gap = finalize_manifest(plan, &plan.export_name, state, &summary, "apply");
+    if let Some(why) = &manifest_gap {
+        summary.status = "failed".into();
+        summary.error_message = Some(why.clone());
+        ledger_finish_owned_runs(state, &plan.export_name, &ledger_run_id, &summary);
+    }
     // Round-2 audit #12: incremental cursor advance AFTER the manifest is durable
-    // (see run_export_job). No-op for the chunked/Precomputed apply path.
-    if let Err(e) = commit_incremental_cursor(state, plan, &summary) {
+    // (see run_export_job) — and never when it did not land.
+    if manifest_gap.is_some() {
+        log::error!(
+            "apply '{}': incremental cursor NOT advanced — the manifest did not land, so the \
+             next run must re-export this window rather than skip past it",
+            summary.export_name,
+        );
+    } else if let Err(e) = commit_incremental_cursor(state, plan, &summary) {
         log::error!(
             "apply '{}': cursor advance failed AFTER the manifest was written — the next run \
              re-exports from the prior cursor (at-least-once, no loss): {:#}",
@@ -1116,7 +1252,15 @@ pub(crate) fn run_export_job_with_chunk_source(
     // here; a wrapper that skips it strands resume_run_id forever, so the next apply
     // is misread as a resume, reuses the frozen run_id, and the run-unique manifest
     // sidecar collides across runs (round-3 wrapper-bypass regression).
-    finalize_keyset_anchor(state, plan, &summary.export_name, failed);
+    finalize_keyset_anchor(
+        state,
+        plan,
+        &summary.export_name,
+        keyset_anchor_survives(RunOutcome {
+            failed,
+            manifest_gap: &manifest_gap,
+        }),
+    );
     if plan.validate {
         finalize_validate_manifest(plan, &mut summary, "apply");
     }
@@ -1132,11 +1276,109 @@ pub(crate) fn run_export_job_with_chunk_source(
     }
     finalize_run_report(config_path, &summary, "apply");
 
-    if failed { result } else { Ok(()) }
+    // Same fold as the run path: an export failure wins, otherwise an unwritten
+    // manifest fails the run. `apply` has no reconcile flag, so that leg is `Ok`.
+    resolve_final_result(failed, result, Ok(()), manifest_gap)
 }
 
 #[cfg(test)]
 mod tests {
+
+    /// A resume that ADOPTS a prior run's id must still close the row the ledger
+    /// was opened under — both wrappers, through one seam.
+    ///
+    /// The row is opened with the new run's id; a chunk-checkpoint resume then
+    /// replaces `summary.run_id` with the crashed run's. Closing only the
+    /// summary's id leaves the opening row `running` with nothing to supersede
+    /// it, and `has_active_run_on_prefix` reports a live writer on that prefix
+    /// forever — so `gc_orphans` defers cleanup indefinitely.
+    ///
+    /// Asserted on the STATE the run leaves behind, read back from the store,
+    /// rather than on a count of calls.
+    #[test]
+    fn an_adopted_run_id_does_not_strand_the_row_the_ledger_opened() {
+        let state = crate::state::StateStore::open_in_memory().expect("in-memory state");
+        let export = "orders";
+        let opened_as = "run_new";
+        let adopted = "run_crashed";
+
+        // Both rows exist and are `running`: the crashed one from its own earlier
+        // run, the new one from this run's start. Two rows is the whole point —
+        // with one there is nothing to strand.
+        let prefix = "file:///out";
+        for rid in [adopted, opened_as] {
+            state
+                .begin_run(rid, export, prefix, "2026-01-01T00:00:00Z")
+                .expect("open a run-status row");
+        }
+        assert_eq!(
+            state.active_run_ids_on_prefix(prefix).unwrap().len(),
+            2,
+            "fixture is inert — two open rows are the whole point"
+        );
+
+        let summary = crate::pipeline::summary::RunSummary {
+            run_id: adopted.into(),
+            export_name: export.into(),
+            status: "success".into(),
+            ..Default::default()
+        };
+        ledger_finish_owned_runs(&state, export, opened_as, &summary);
+
+        let still_active = state.active_run_ids_on_prefix(prefix).unwrap();
+        assert!(
+            still_active.is_empty(),
+            "these run(s) are still marked active after the run ended: {still_active:?} — a \
+             permanently running row makes gc_orphans defer this prefix forever, with no later \
+             run to supersede it"
+        );
+    }
+
+    /// The keyset resume anchor must outlive a run that did not finish — and
+    /// "did not finish" includes a run whose PARTS landed but whose MANIFEST did
+    /// not, which `failed` (computed from `result.is_err()` before the manifest
+    /// is written) reports as a success.
+    ///
+    /// Clearing the anchor there wipes `resume_run_id` and the per-range recovery
+    /// rows, so the next run cannot adopt pages already on the prefix that no
+    /// manifest names — they are unreachable from both ends. Found by an
+    /// adversarial pass over this branch; the manifest-gap handling that made the
+    /// status "failed" did not widen the flag this decision reads.
+    #[test]
+    fn a_run_whose_manifest_did_not_land_keeps_its_keyset_resume_anchor() {
+        let gap = Some("the manifest write FAILED".to_string());
+
+        assert!(
+            keyset_anchor_survives(RunOutcome {
+                failed: false,
+                manifest_gap: &gap
+            }),
+            "parts are durable and nothing names them — the anchor is the only way back to them"
+        );
+        assert!(
+            keyset_anchor_survives(RunOutcome {
+                failed: true,
+                manifest_gap: &None
+            }),
+            "an export failure keeps its anchor, as it always did"
+        );
+        assert!(
+            keyset_anchor_survives(RunOutcome {
+                failed: true,
+                manifest_gap: &gap
+            }),
+            "both at once is still a run that did not finish"
+        );
+        assert!(
+            !keyset_anchor_survives(RunOutcome {
+                failed: false,
+                manifest_gap: &None
+            }),
+            "a genuinely complete run MUST clear it, or the next run is misread as a resume of \
+             this finished one and reuses its frozen run_id"
+        );
+    }
+
     use super::*;
 
     #[test]
@@ -1202,7 +1444,7 @@ mod tests {
         // `run --reconcile` actually RETURNS the gate rather than Ok. Un-hooking
         // the fold reopens the bug; this test then goes red.
         let gate: crate::error::Result<()> = Err(DataIntegrityError::new("mismatch").into());
-        let out = resolve_final_result(false, Ok(()), gate);
+        let out = resolve_final_result(false, Ok(()), gate, None);
         assert!(
             out.is_err(),
             "a reconcile mismatch on a successful export must surface as the run result"
@@ -1211,12 +1453,21 @@ mod tests {
 
         // An export/quality failure takes precedence over the reconcile gate.
         let qfail: crate::error::Result<()> = Err(DataIntegrityError::new("quality").into());
-        assert!(resolve_final_result(true, qfail, Ok(())).is_err());
+        assert!(resolve_final_result(true, qfail, Ok(()), None).is_err());
 
         // Clean run: no export failure, no reconcile mismatch → Ok. (A --validate
         // verified-wrong verdict is NON-fatal by design — ADR-0001 §I7; a hard gate
         // is the standalone `rivet validate` command, not `run --validate`.)
-        assert!(resolve_final_result(false, Ok(()), Ok(())).is_ok());
+        assert!(resolve_final_result(false, Ok(()), Ok(()), None).is_ok());
+        // A run whose manifest never landed is not a success, even with the
+        // export and the reconcile both green: the parts are durable and no
+        // manifest names them, so the loader cannot reach them.
+        let gap = resolve_final_result(false, Ok(()), Ok(()), Some("no manifest".into()));
+        assert!(
+            gap.is_err(),
+            "an unwritten manifest must fail the run — reporting success there is a claim the \
+             artifacts do not support"
+        );
     }
 
     #[test]
@@ -1327,6 +1578,7 @@ mod tests {
     fn chunked_plan_with_quality(quality: Option<QualityConfig>) -> ResolvedRunPlan {
         ResolvedRunPlan {
             export_name: "orders".into(),
+            source_table: None,
             base_query: "SELECT id FROM orders".into(),
             strategy: ExtractionStrategy::Chunked(ChunkedPlan {
                 column: "id".into(),

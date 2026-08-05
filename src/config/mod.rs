@@ -1301,13 +1301,28 @@ impl Config {
             );
         }
 
-        // MongoDB change streams have NO server-side resume anchor (unlike a
-        // PostgreSQL slot): the checkpoint file IS the anchor. Without it, every
-        // run re-anchors at "now" and silently loses every change since the last
-        // run — so `mode: cdc` on mongo requires `cdc.checkpoint:` ALWAYS, not
-        // only under `initial: snapshot` (bug-hunt find).
+        // MongoDB change streams and the MySQL binlog have NO server-side resume
+        // anchor (unlike a PostgreSQL slot, or SQL Server's change table whose
+        // min-LSN floors a missing from-LSN into an over-read): the checkpoint
+        // file IS the anchor. Without it every run re-anchors at "now" and
+        // silently loses every change since the last one — so `mode: cdc` on
+        // these two requires `cdc.checkpoint:` ALWAYS, not only under
+        // `initial: snapshot`.
+        //
+        // MySQL was left out when this rule was first added for mongo, and the
+        // hole was total: `cdc.initial` absent skips the `initial.is_some()` rule
+        // above, and the run-time backstop that would catch it —
+        // `CdcEngine::ensure_anchor`, which demands a checkpoint for
+        // Mysql|Mssql|Mongo — is unreachable, because its only production caller
+        // sits inside `initial_snapshot_pending`, which returns early when
+        // `cdc.initial.is_none()`. Measured on a live stand: two runs with three
+        // changes between them captured ZERO events, both exiting 0. `rivet
+        // doctor` already prints the exact diagnosis, but `run` never invokes it.
         if export.mode == ExportMode::Cdc
-            && self.source.source_type == SourceType::Mongo
+            && matches!(
+                self.source.source_type,
+                SourceType::Mongo | SourceType::Mysql
+            )
             && export
                 .cdc
                 .as_ref()
@@ -1315,11 +1330,12 @@ impl Config {
                 .is_none()
         {
             anyhow::bail!(
-                "export '{}': MongoDB `mode: cdc` requires `cdc.checkpoint:` — a change \
-                 stream has no server-side resume anchor, so without the checkpoint file \
-                 each run re-anchors at the current time and silently loses every change \
+                "export '{}': {:?} `mode: cdc` requires `cdc.checkpoint:` — this engine has \
+                 no server-side resume anchor, so without the checkpoint file each run \
+                 re-anchors at the current position and silently loses every change \
                  between runs.",
-                export.name
+                export.name,
+                self.source.source_type
             );
         }
 

@@ -155,12 +155,15 @@ fn export_recovers_after_mid_stream_proxy_disable_then_enable_with_retries() {
     // the reconnect path.
     let _g = toxiproxy_guard();
     require_alive(LiveService::Postgres);
+    require_alive(LiveService::DuckDb);
     require_alive(LiveService::Toxiproxy);
     reset_postgres_proxy();
 
     let table = seed_pg_numeric_table(50);
     let export_name = unique_name("qa42_midstream");
-    let out = tempfile::tempdir().unwrap();
+    // Output lands in the shared bind mount so the DuckDB container can read
+    // it — the oracle below must not share rivet's own parquet codec.
+    let (out_host, out_container) = duckdb_shared_workdir("qa42_midstream_oracle");
     let cfg_dir = tempfile::tempdir().unwrap();
     let yaml = Rig::pg_batch(&export_name)
         .source_url(POSTGRES_TOXI_URL)
@@ -172,7 +175,7 @@ fn export_recovers_after_mid_stream_proxy_disable_then_enable_with_retries() {
         .export_line("tuning:")
         .export_line("  max_retries: 3")
         .export_line("  retry_backoff_ms: 200")
-        .dest_path(out.path().to_path_buf())
+        .dest_path(out_host.clone())
         .yaml();
     let cfg_path = write_config(&cfg_dir, &yaml);
 
@@ -192,9 +195,26 @@ fn export_recovers_after_mid_stream_proxy_disable_then_enable_with_retries() {
         "export must recover after transient proxy outage; stderr:\n{}",
         String::from_utf8_lossy(&out_run.stderr),
     );
-    // Row-count sanity: a single file was produced and contains 50 rows.
-    let files = files_with_extension(out.path(), "parquet");
-    assert_eq!(files.len(), 1);
+    // The comment here used to promise "a single file was produced and contains
+    // 50 rows" while asserting only the FILE COUNT — so an in-place retry that
+    // dropped rows at the reconnect boundary, which is precisely the hazard this
+    // test exists for, passed as long as one file appeared. Assert the rows.
+    // FILE count stays on read_dir: counting directory entries never goes
+    // through rivet's codec, so a container round-trip would buy nothing.
+    let files = files_with_extension(&out_host, "parquet");
+    assert_eq!(files.len(), 1, "one part expected; got {files:?}");
+
+    // ROWS go through DuckDB. `total_parquet_rows` decodes with the SAME parquet
+    // crate rivet encodes with, so a fault in that shared path cancels out and
+    // the assertion passes over corrupt output. DuckDB does not share it.
+    // Distinct is asserted alongside the total because a retry can satisfy one
+    // and break the other: fewer rows is loss, fewer distinct is duplication.
+    duckdb_assert_complete(
+        &out_container,
+        "id",
+        50,
+        "a retry across a mid-stream connection death",
+    );
 }
 
 // ─── Task 4.1: retry counter & classification at runtime ───────────────────

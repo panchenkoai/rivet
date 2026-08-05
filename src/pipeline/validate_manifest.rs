@@ -244,6 +244,13 @@ pub enum Failure {
     /// cannot see (a flipped bit inside a data page). Verified-wrong, so it fails
     /// the verdict and classifies as data-integrity (exit 3), not could-not-verify.
     ValueChecksumMismatch { detail: String },
+    /// `--depth full` found a part whose DECLARED row count disagrees with the
+    /// rows the file holds. Distinct from a value mismatch on purpose: the bytes
+    /// may be perfectly intact and it is the manifest that is wrong, so an
+    /// operator told "value checksum" would go looking for corruption in the
+    /// data. Verified-wrong either way — every consumer that SUMS the declared
+    /// counts inherits the error.
+    PartRowCountMismatch { detail: String },
     /// `--depth full` re-read a CDC export's parts and the `__pos` continuity
     /// check found a gap/duplicate in the change positions — the exported change
     /// stream is incomplete or reordered. Verified-wrong (same class as a value
@@ -336,6 +343,7 @@ impl Failure {
             Failure::PartSizeMismatch { .. } => "RIVET_VERIFY_PART_SIZE_MISMATCH",
             Failure::PartChecksumMismatch { .. } => "RIVET_VERIFY_PART_CHECKSUM_MISMATCH",
             Failure::ValueChecksumMismatch { .. } => "RIVET_VERIFY_VALUE_CHECKSUM",
+            Failure::PartRowCountMismatch { .. } => "RIVET_VERIFY_PART_ROW_COUNT",
             Failure::CdcPositionViolation { .. } => "RIVET_VERIFY_CDC_POSITION",
             Failure::SuccessMarkerMalformed { .. } => "RIVET_VERIFY_SUCCESS_MALFORMED",
             Failure::SuccessMarkerStale { .. } => "RIVET_VERIFY_SUCCESS_STALE",
@@ -374,6 +382,9 @@ impl std::fmt::Display for Failure {
                 "part {} size mismatch at {}: manifest {}, dest {}",
                 part_id, path, expected, actual
             ),
+            Failure::PartRowCountMismatch { detail } => {
+                write!(f, "part row count disagrees with the part: {}", detail)
+            }
             Failure::ValueChecksumMismatch { detail } => {
                 write!(
                     f,
@@ -882,11 +893,13 @@ mod tests {
             .filter(|p| p.status == PartStatus::Committed)
             .count() as u32;
         RunManifest {
+            checksum_render: None,
             row_hash: None,
             mode: "batch".to_string(),
             manifest_version: MANIFEST_VERSION,
             run_id: "r".into(),
             export_name: "public.orders".into(),
+            export_family: String::new(),
             started_at: "2026-05-21T12:00:00Z".into(),
             finished_at: "2026-05-21T12:01:00Z".into(),
             status,

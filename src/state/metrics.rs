@@ -142,10 +142,92 @@ impl StateStore {
         })
     }
 
+    /// Drop a run's in-flight `running` aggregate. Only ever called by
+    /// [`record_metric_full`], immediately before the terminal row replaces it.
+    fn clear_running_metric(&self, run_id: &str) -> Result<()> {
+        let sql = "DELETE FROM export_metrics WHERE run_id = ?1 AND status = 'running'";
+        match &self.conn {
+            StateConn::Sqlite(c) => {
+                c.execute(sql, rusqlite::params![run_id])?;
+            }
+            StateConn::Postgres(client) => {
+                client.borrow_mut().execute(&pg_sql(sql), &[&run_id])?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Refresh the run's in-flight aggregate FROM `file_log`.
+    ///
+    /// A projection, not a second opinion: the totals are summed from the parts
+    /// this run has actually recorded, so the aggregate cannot drift from them and
+    /// no caller has to accumulate anything. Called by
+    /// [`StateStore::record_durable_part`], which is the only place that should.
+    ///
+    /// ONE row per run, always. `export_metrics` used to appear only at finalize,
+    /// so a run that died mid-stream had parts and no aggregate. Writing a NEW row
+    /// per part instead would be worse than the gap: a five-part run would be five
+    /// rows and every sum over the table would count it five times. Hence UPDATE
+    /// the run's `running` row, INSERT only when there is none, and let
+    /// [`record_metric_full`] clear it when the terminal row lands.
+    pub(super) fn project_running_aggregate(
+        &self,
+        run_id: &str,
+        export_name: &str,
+        mode: &str,
+        format: &str,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let upd = "UPDATE export_metrics SET \
+                   total_rows = (SELECT coalesce(sum(row_count),0) FROM file_log WHERE run_id = ?1), \
+                   files_produced = (SELECT count(*) FROM file_log WHERE run_id = ?1), \
+                   files_committed = (SELECT count(*) FROM file_log WHERE run_id = ?1), \
+                   bytes_written = (SELECT coalesce(sum(bytes),0) FROM file_log WHERE run_id = ?1), \
+                   run_at = ?2 \
+                   WHERE run_id = ?1 AND status = 'running'";
+        let ins = "INSERT INTO export_metrics (export_name, run_id, run_at, duration_ms, \
+                   total_rows, status, mode, format, files_produced, files_committed, \
+                   bytes_written, retries) \
+                   SELECT ?1, ?2, ?3, 0, coalesce(sum(row_count),0), 'running', ?4, ?5, \
+                          count(*), count(*), coalesce(sum(bytes),0), 0 \
+                   FROM file_log WHERE run_id = ?2 \
+                   ON CONFLICT DO NOTHING";
+        // INSERT-if-absent then UPDATE, never UPDATE-else-INSERT.
+        //
+        // The old order was a read-then-write race: the parallel chunk-checkpoint
+        // runner gives every worker its OWN connection, so two workers finishing
+        // their first chunk together both saw the UPDATE affect zero rows and both
+        // inserted — two `running` aggregates for one run, in the table that is
+        // supposed to hold exactly one. `ON CONFLICT DO NOTHING` makes the insert
+        // idempotent against the v21 partial unique index, and the UPDATE that
+        // follows recomputes the whole projection from `file_log`, so the final
+        // row is correct no matter which worker won or in what order they ran.
+        match &self.conn {
+            StateConn::Sqlite(c) => {
+                c.execute(
+                    ins,
+                    rusqlite::params![export_name, run_id, now, mode, format],
+                )?;
+                c.execute(upd, rusqlite::params![run_id, now])?;
+            }
+            StateConn::Postgres(client) => {
+                let mut c = client.borrow_mut();
+                c.execute(&pg_sql(ins), &[&export_name, &run_id, &now, &mode, &format])?;
+                c.execute(&pg_sql(upd), &[&run_id, &now])?;
+            }
+        }
+        Ok(())
+    }
+
     /// Insert one fully-populated `export_metrics` row (all v1 + v9 columns).
     /// The production run/apply path builds the complete [`MetricRow`]; the
     /// 15-field [`record_metric`] shim covers callers with only the core signals.
+    ///
+    /// Clears this run's in-flight `running` row first, so a run leaves exactly
+    /// ONE row at rest — see [`record_metric_progress`] for why that matters more
+    /// than keeping the progress history.
     pub fn record_metric_full(&self, m: &MetricRow) -> Result<()> {
+        self.clear_running_metric(&m.run_id)?;
         let now = chrono::Utc::now().to_rfc3339();
         let sql = "INSERT INTO export_metrics (
              export_name, run_id, run_at, duration_ms, total_rows, peak_rss_mb,
@@ -374,6 +456,79 @@ impl StateStore {
 
 #[cfg(test)]
 mod tests {
+
+    /// The DATABASE must refuse a second in-flight aggregate for one run.
+    ///
+    /// Scope, stated plainly because it matters: this pins the CONSTRAINT, not
+    /// the interleaving. `project_running_aggregate` was UPDATE-else-INSERT, and
+    /// the parallel chunk-checkpoint runner opens a connection PER WORKER, so two
+    /// workers finishing their first chunk together could both see the UPDATE
+    /// affect zero rows and both insert. That window lives INSIDE one call, so no
+    /// black-box test can force it — two sequential calls never duplicate, and a
+    /// two-thread version passed 3/3 against the unfixed code. A test that cannot
+    /// be made RED should say so rather than pass quietly.
+    ///
+    /// What CAN be pinned is what makes the interleaving harmless whichever way
+    /// it lands: a partial unique index (v21) on `run_id` where the row is
+    /// `running`. With it the loser's insert is a no-op (`ON CONFLICT DO
+    /// NOTHING`) and the UPDATE that follows recomputes the projection from
+    /// `file_log` regardless of order. Without it, the second row lands — which
+    /// is what this asserts, by trying.
+    #[test]
+    fn the_database_refuses_a_second_running_aggregate_for_one_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = StateStore::open_at_path(&dir.path().join("state.db")).expect("open");
+        st.record_file(crate::state::FilePart {
+            run_id: "r1",
+            export_name: "orders",
+            file_name: "part0.parquet",
+            rows: 10,
+            bytes: 100,
+            format: "parquet",
+            compression: None,
+        })
+        .expect("seed a durable part");
+
+        st.project_running_aggregate("r1", "orders", "chunked", "parquet")
+            .expect("first projection");
+
+        // The raw insert a losing worker would issue. It must not add a row.
+        let second = st.execute(
+            "INSERT INTO export_metrics (export_name, run_id, run_at, duration_ms, total_rows, \
+             status, mode, format, files_produced, files_committed, bytes_written, retries) \
+             VALUES ('orders', 'r1', '2026-01-01T00:00:00Z', 0, 10, 'running', 'chunked', \
+             'parquet', 1, 1, 100, 0)",
+            &[],
+        );
+        let n: i64 = st
+            .query(
+                "SELECT count(*) FROM export_metrics WHERE run_id = ?1 AND status = 'running'",
+                &["r1".into()],
+                |r| r.i64(0),
+            )
+            .expect("count running rows")
+            .into_iter()
+            .next()
+            .unwrap_or(0);
+        assert_eq!(
+            n, 1,
+            "a second in-flight aggregate landed for one run (insert returned {second:?}); \
+             every read of export_metrics then counts this run more than once, which is exactly \
+             what projecting instead of appending was supposed to prevent"
+        );
+
+        // A TERMINAL row is a different thing and must still be allowed — the
+        // index is partial on purpose, and a run legitimately gets one per attempt.
+        st.execute(
+            "INSERT INTO export_metrics (export_name, run_id, run_at, duration_ms, total_rows, \
+             status, mode, format, files_produced, files_committed, bytes_written, retries) \
+             VALUES ('orders', 'r1', '2026-01-01T00:00:01Z', 5, 10, 'success', 'chunked', \
+             'parquet', 1, 1, 100, 0)",
+            &[],
+        )
+        .expect("a terminal row must not be blocked by the running-row index");
+    }
+
     use super::*;
 
     fn store() -> StateStore {

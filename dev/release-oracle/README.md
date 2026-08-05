@@ -73,6 +73,47 @@ RIVET_CDC_STATE_URL      postgresql://…                          # the state-p
 
 Regenerate the snapshot golden on purpose with `python3 -m dev.release_oracle --bless-cdc`.
 
+### The rest of the environment — and why a SKIP tally is the first thing to read
+
+The CDC block above is only part of it. A gate run with none of the below is
+**95 PASS / 60 SKIP** and still prints `RELEASE-READY`, which is literally true
+("every non-skipped cell is green") and nearly meaningless. With everything set
+it is **~125 PASS / ~36 SKIP**. Always read the SKIP count before the verdict.
+
+```
+RIVET_PREV_RELEASE_BIN      /path/to/DOWNLOADED release binary   # release regression + scale baseline
+RIVET_REGRESSION_SOURCE_URL postgresql://…                       # a PG the cell may seed regr_probe into
+RIVET_SCALE_<ENGINE>_URL    …                                    # batch-tier DBs, per engine
+BQ_ORACLE_PROJECT           …                                    # BigQuery golden stage
+BQ_ORACLE_DATASET           …                                    # one dataset PER SOURCE is derived from this
+```
+
+`RIVET_PREV_RELEASE_BIN` must be a **downloaded release asset**
+(`gh release download vX.Y.Z --pattern "*-$(uname -m)-apple-darwin.tar.gz"`), never a
+locally rebuilt parent: the release profile is fat-LTO, so a rebuild costs minutes and
+compares against an approximation instead of what users actually run.
+
+Two traps measured on 2026-08-03, both of which reported a plausible number rather
+than an error:
+
+* **The batch and CDC tiers of the dev stand are different servers with different
+  auth.** The CDC mongo takes `rivet:rivet` + `authSource=admin`; the BATCH mongo
+  (`:27105`) has **no auth at all** and refuses those credentials. Copying the CDC URL
+  shape gave `scale[mongo]` an authentication failure whose dead process measured
+  ~15 MB — and the cell reported `flat×1.01` **PASS**. The batch mongo also has no
+  `users` collection (it holds `orders` 200k / `events` 500k), so
+  `RIVET_SCALE_MONGO_SMALL=orders` is required or the export reads zero rows.
+* **`--state-url` is process-wide.** `__main__` sets `RIVET_STATE_URL` for every child,
+  which defeats the per-binary state isolation the regression and scale cells build on
+  purpose: the previous release meets a schema the current tree just migrated and
+  refuses to start (`expected schema v19 but reached v20`). Those cells now pin
+  `RIVET_STATE_URL=""` themselves. If you add a cell that runs a DIFFERENT binary
+  version, pin it too.
+
+Both cells now print `RUN FAILED — no measurement` instead of a number when a
+timed run does not succeed. A measurement of a process that died is not a
+measurement, and next to a real one it reads as a regression that is not there.
+
 ## Release build path (pre-tag preflight)
 
 The scenarios above prove **correctness of what ships**; they assume a working binary

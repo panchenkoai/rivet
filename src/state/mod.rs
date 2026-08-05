@@ -23,7 +23,7 @@ mod shape;
 #[allow(unused_imports)]
 pub use checkpoint::ChunkTaskInfo;
 #[allow(unused_imports)]
-pub use file_log::FileRecord;
+pub use file_log::{DurablePart, FilePart, FileRecord};
 #[allow(unused_imports)]
 pub use keyset_range::{KeysetRangePart, KeysetRangeRow};
 pub use load_journal_store::LoadRecord;
@@ -380,6 +380,47 @@ const MIGRATIONS: &[(i64, &str)] = &[
             PRIMARY KEY (export_name, range_index)
         );",
     ),
+    // v20: WHICH SOURCE a target table was last loaded from.
+    //
+    // The ledger keyed loads on (target_table, source_run_id) and recorded
+    // nothing about WHERE the rows came from, so two configs pointed at one
+    // `dataset.table` from different databases were indistinguishable — the
+    // second load replaced the first's rows and both reported success. The
+    // prefix-level guard (`ensure_single_source`) catches them when they SHARE a
+    // bucket prefix; separate prefixes into one warehouse table needed this.
+    //
+    // Nullable and additive: rows written before this column exists read NULL,
+    // and the guard treats NULL as "unknown, do not block" — an upgrade must not
+    // start refusing loads that were fine yesterday.
+    (
+        20,
+        "ALTER TABLE loaded_source_run ADD COLUMN source_ident TEXT;",
+    ),
+    // v21: ONE in-flight aggregate row per run, enforced by the database.
+    //
+    // `project_running_aggregate` was UPDATE-else-INSERT, which is not atomic:
+    // the parallel chunk-checkpoint runner gives every worker thread its own
+    // connection, so two finishing their first chunk together both saw the UPDATE
+    // affect zero rows and both INSERTed. The run then had two `running`
+    // aggregates — in the table this branch made the record of a run — and the
+    // whole point of projecting instead of appending is that a run has exactly
+    // one.
+    //
+    // The DELETE first: an existing database may already hold duplicates from
+    // that race, and the index cannot be created over them. It keeps the highest
+    // `id` per run (the most recently written projection) and drops the rest;
+    // both are projections of the same `file_log` rows, so no information is lost.
+    //
+    // PARTIAL on `status = 'running'`: terminal rows are written by
+    // `record_metric_full` and a run legitimately has one per attempt.
+    (
+        21,
+        "DELETE FROM export_metrics WHERE status = 'running' AND id NOT IN (
+             SELECT max(id) FROM export_metrics WHERE status = 'running' GROUP BY run_id
+         );
+         CREATE UNIQUE INDEX IF NOT EXISTS export_metrics_one_running_per_run
+             ON export_metrics(run_id) WHERE status = 'running';",
+    ),
 ];
 
 /// PostgreSQL-compatible DDL.  Column types differ from SQLite (BIGSERIAL,
@@ -683,6 +724,37 @@ const PG_MIGRATIONS: &[(i64, &str)] = &[
             PRIMARY KEY (export_name, range_index)
         );",
     ),
+    // v20: WHICH SOURCE a target table was last loaded from.
+    //
+    // The ledger keyed loads on (target_table, source_run_id) and recorded
+    // nothing about WHERE the rows came from, so two configs pointed at one
+    // `dataset.table` from different databases were indistinguishable — the
+    // second load replaced the first's rows and both reported success. The
+    // prefix-level guard (`ensure_single_source`) catches them when they SHARE a
+    // bucket prefix; separate prefixes into one warehouse table needed this.
+    //
+    // Nullable and additive: rows written before this column exists read NULL,
+    // and the guard treats NULL as "unknown, do not block" — an upgrade must not
+    // start refusing loads that were fine yesterday.
+    (
+        20,
+        "ALTER TABLE loaded_source_run ADD COLUMN IF NOT EXISTS source_ident TEXT;",
+    ),
+    // v21: ONE in-flight aggregate row per run — see the SQLite ladder for why.
+    //
+    // PostgreSQL needs `ctid` rather than `id NOT IN (SELECT max(id) …)`: the
+    // column exists on both, but keeping the ladders as close as the dialects
+    // allow matters less than the DELETE being correct here. Partial unique
+    // indexes work the same on both.
+    (
+        21,
+        "DELETE FROM export_metrics a
+             WHERE a.status = 'running'
+               AND a.id < (SELECT max(b.id) FROM export_metrics b
+                            WHERE b.run_id = a.run_id AND b.status = 'running');
+         CREATE UNIQUE INDEX IF NOT EXISTS export_metrics_one_running_per_run
+             ON export_metrics(run_id) WHERE status = 'running';",
+    ),
 ];
 
 // ─── SQL helpers ──────────────────────────────────────────────────────────────
@@ -796,6 +868,44 @@ fn get_current_version(conn: &Connection) -> i64 {
 }
 
 fn migrate(conn: &Connection) -> Result<()> {
+    // ONE writer migrates at a time. `BEGIN IMMEDIATE` takes the database's write
+    // lock before anything is read, so the version this process sees cannot be
+    // stale by the time it acts on it; the others block on `busy_timeout` and
+    // find the work already done.
+    //
+    // Without it, several rivet processes starting together against an EMPTY
+    // state db each read version 0 and each apply the whole ladder. Measured on
+    // four concurrent exports, five rounds out of five had failures:
+    // `migration v8 failed: no such table: file_manifest` (one process renamed it
+    // while another was still looking for the old name), `already another table
+    // or index with this name: file_log`, `duplicate column name:
+    // files_committed`. That is the first day of a shared deployment — provision
+    // the backend, start the exports — and most of them died on startup.
+    //
+    // The guard is advisory-by-transaction rather than a lock table: an aborted
+    // process releases it by dying, so a crashed migrator cannot wedge the next
+    // one.
+    // Discarding this result would defeat the whole guard: `BEGIN IMMEDIATE`
+    // returns SQLITE_BUSY when the write lock is not obtained within
+    // `busy_timeout`, and continuing anyway runs the ladder unprotected —
+    // exactly the concurrent-migration case above. It does not corrupt silently
+    // (the unprotected ladder hits the errors quoted above and they propagate),
+    // but the operator is then handed "no such table: file_manifest" instead of
+    // the truth, which names neither the cause nor the remedy.
+    conn.execute_batch("BEGIN IMMEDIATE;").map_err(|e| {
+        anyhow::anyhow!(
+            "state: could not acquire the migration lock within the busy timeout ({e}). \
+             Another rivet process is migrating this state database; wait for it to finish \
+             and retry. Running the migration ladder without the lock is what produces \
+             'no such table' / 'duplicate column' failures on a shared backend."
+        )
+    })?;
+    let out = migrate_locked(conn);
+    let _ = conn.execute_batch(if out.is_ok() { "COMMIT;" } else { "ROLLBACK;" });
+    out
+}
+
+fn migrate_locked(conn: &Connection) -> Result<()> {
     ensure_schema_version_table(conn);
 
     let current = get_current_version(conn);
@@ -828,8 +938,13 @@ fn migrate(conn: &Connection) -> Result<()> {
     for &(ver, sql) in MIGRATIONS {
         if ver > current {
             log::debug!("state: applying migration v{}", ver);
+            // No inner BEGIN/COMMIT: `migrate` already holds the write
+            // transaction, and SQLite does not nest. The atomicity the inner
+            // pair provided is now the outer one's, which is strictly stronger —
+            // a failure rolls back the whole ladder rather than leaving the db
+            // at a half-applied version.
             let atomic_sql = format!(
-                "BEGIN;\n{}\nINSERT INTO schema_version (version) VALUES ({});\nCOMMIT;",
+                "{}\nINSERT INTO schema_version (version) VALUES ({});",
                 sql, ver
             );
             conn.execute_batch(&atomic_sql)
@@ -856,7 +971,32 @@ fn migrate(conn: &Connection) -> Result<()> {
 
 // ─── PostgreSQL migration ─────────────────────────────────────────────────────
 
+/// The advisory-lock key for state migrations. An arbitrary constant, chosen
+/// once: any two rivet processes must agree, and nothing else uses the space.
+const PG_MIGRATION_LOCK: i64 = 0x7269_7665_745f_6d69_u64 as i64; // "rivet_mi"
+
 fn migrate_pg(client: &mut postgres::Client) -> Result<()> {
+    // ONE writer migrates at a time, across PROCESSES and HOSTS. A session
+    // advisory lock is the right instrument: it is held for the connection, so a
+    // process that dies mid-migration releases it, and it needs no table of its
+    // own (which would itself have to be created race-free).
+    //
+    // `CREATE TABLE IF NOT EXISTS` is NOT race-free in PostgreSQL — concurrent
+    // creators collide in the catalog — and even past it each migration ran in
+    // its own transaction with no coordination, so two clients both read version
+    // N and both applied N+1. Measured on four concurrent exports against an
+    // EMPTY schema: THREE of the four died with `state(pg): create version table:
+    // db error`, at the very first statement. One survived. That is the first day
+    // of a shared deployment.
+    client
+        .batch_execute(&format!("SELECT pg_advisory_lock({PG_MIGRATION_LOCK});"))
+        .map_err(|e| anyhow::anyhow!("state(pg): take migration lock: {:#}", e))?;
+    let out = migrate_pg_locked(client);
+    let _ = client.batch_execute(&format!("SELECT pg_advisory_unlock({PG_MIGRATION_LOCK});"));
+    out
+}
+
+fn migrate_pg_locked(client: &mut postgres::Client) -> Result<()> {
     client
         .batch_execute("CREATE TABLE IF NOT EXISTS rivet_schema_version (version BIGINT NOT NULL);")
         .map_err(|e| anyhow::anyhow!("state(pg): create version table: {:#}", e))?;
@@ -1024,7 +1164,55 @@ impl StateStore {
         Self::open_sqlite(config_path)
     }
 
+    /// Reopen the store a [`StateRef`] points at.
+    ///
+    /// The reconnection seam for parallel chunk workers, which cannot share one
+    /// `StateStore` across threads. It exists because the alternative — handing a
+    /// worker the CONFIG PATH and re-deriving the location — silently writes to
+    /// the wrong database whenever that string is not a real config path: `rivet
+    /// apply` dispatches its chunk-checkpoint runner with `""`, and
+    /// `Path::new("").parent()` is `None`, so the fallback lands on
+    /// `./.rivet_state.db` in the process CWD. A `StateRef` carries the resolved
+    /// location, so there is nothing left to re-derive.
+    pub fn open_at_ref(state_ref: &StateRef) -> Result<Self> {
+        match state_ref {
+            StateRef::Sqlite(db_path) => {
+                let conn = open_connection(db_path)?;
+                migrate(&conn)?;
+                Ok(Self {
+                    conn: StateConn::Sqlite(conn),
+                    state_ref: StateRef::Sqlite(db_path.clone()),
+                })
+            }
+            StateRef::Postgres(url) => Self::open_postgres(url),
+        }
+    }
+
     fn open_sqlite(config_path: &str) -> Result<Self> {
+        // An EMPTY path is never a location — it is a caller that had nothing to
+        // give and passed a placeholder. `Path::new("").parent()` is `None`, so
+        // the fallback below would silently resolve it to `./.rivet_state.db` in
+        // whatever the process CWD happens to be, CREATE that database, migrate
+        // it, and return a perfectly usable store pointed at the wrong file.
+        //
+        // That is not hypothetical: `rivet apply` dispatches its chunk-checkpoint
+        // runner with `""` (a display-only hint there), and the worker used it to
+        // reopen the ledger. Every durable-part row landed in a stray database
+        // while the real state DB got none — invisible on a clean run, and on
+        // recovery the resume found the chunks `completed` with no file_log to
+        // rehydrate, so it declared a manifest with zero parts over parquet
+        // already on the destination. Reopening from a `StateRef`
+        // ([`StateStore::open_at_ref`]) is the fix for that caller; refusing the
+        // empty path is the fix for the CLASS, so the next one fails loudly at
+        // the open instead of quietly at recovery.
+        if config_path.is_empty() {
+            anyhow::bail!(
+                "state: refusing to open a state database from an EMPTY path — \
+                 it would resolve to './{STATE_DB_NAME}' in the current working \
+                 directory rather than beside the config. Pass the config path, \
+                 or reopen from a StateRef with StateStore::open_at_ref()."
+            );
+        }
         let config_dir = std::path::Path::new(config_path)
             .parent()
             .unwrap_or(std::path::Path::new("."));
@@ -1097,7 +1285,95 @@ impl StateStore {
 // ─── Migration tests ──────────────────────────────────────────────────────────
 
 #[cfg(test)]
+mod empty_state_path_guard {
+    use super::*;
+
+    /// An empty config path must FAIL the open, not resolve to the CWD.
+    ///
+    /// `Path::new("").parent()` is `None`, so the fallback in `open_sqlite`
+    /// resolved it to `./.rivet_state.db` — creating, migrating and returning a
+    /// usable store pointed at the process working directory. `rivet apply`
+    /// dispatches its chunk-checkpoint runner with exactly that placeholder, and
+    /// the worker reopened the ledger from it: every durable-part row landed in a
+    /// stray database while the real state DB got none. Nothing failed, because
+    /// nothing looked — the clean-run manifest is built from the in-memory
+    /// summary. It surfaced only on RECOVERY, where the resume found the chunks
+    /// `completed` with no file_log to rehydrate and declared a manifest with
+    /// zero parts over parquet that was already durable.
+    ///
+    /// The sibling half of the fix is `open_at_ref`, so a worker never re-derives
+    /// a location from a string at all.
+    #[test]
+    fn an_empty_config_path_is_refused_rather_than_resolved_to_the_cwd() {
+        let msg = match StateStore::open("") {
+            Ok(_) => panic!(
+                "an empty path must not open a store — it silently becomes \
+                 ./.rivet_state.db in the process CWD"
+            ),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            msg.contains("EMPTY path"),
+            "the error must name the cause, not just fail: {msg}"
+        );
+        assert!(
+            msg.contains("open_at_ref"),
+            "…and name the seam that replaces it, since every caller that hits \
+             this is a worker that already holds a StateRef: {msg}"
+        );
+    }
+
+    /// A REAL path with no parent component still works — the guard is about
+    /// emptiness, not about parentlessness, and `:memory:` / a bare filename are
+    /// legitimate callers that must keep opening.
+    #[test]
+    fn a_bare_filename_still_opens_beside_itself() {
+        let d = tempfile::tempdir().unwrap();
+        let cfg = d.path().join("rivet.yaml");
+        std::fs::write(&cfg, "exports: []").unwrap();
+        assert!(
+            StateStore::open(cfg.to_str().unwrap()).is_ok(),
+            "a real config path must still open"
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
+
+    /// The two ladders must define the SAME versions.
+    ///
+    /// A migration added to one and not the other is not a slow divergence — it
+    /// breaks the missing backend on the next start, because `migrate` compares
+    /// the reached version against `SCHEMA_VERSION`, which is the LAST entry of
+    /// the SQLite ladder for both. Measured 2026-08-04: v21 went into
+    /// `MIGRATIONS` alone, and every Postgres-backed run died with
+    /// `state(pg): migration incomplete — expected schema v21 but reached v20` —
+    /// the release gate's state-parity, concurrent-writers and cdc-parity cells
+    /// all failed on that one omission, twenty minutes into a run.
+    ///
+    /// The SQL differs per dialect and always will; the VERSION SET must not.
+    #[test]
+    fn both_migration_ladders_define_the_same_versions() {
+        let sqlite: Vec<i64> = MIGRATIONS.iter().map(|(v, _)| *v).collect();
+        let pg: Vec<i64> = PG_MIGRATIONS.iter().map(|(v, _)| *v).collect();
+        assert_eq!(
+            sqlite, pg,
+            "the SQLite and PostgreSQL migration ladders disagree; the backend missing a \
+             version refuses to start, because SCHEMA_VERSION is the last SQLite entry for both"
+        );
+        assert_eq!(
+            SCHEMA_VERSION,
+            *sqlite.last().expect("the ladder is not empty"),
+            "SCHEMA_VERSION must be the ladder's last version"
+        );
+        // Ascending and unique, or `migrate` can skip or re-apply one.
+        assert!(
+            sqlite.windows(2).all(|w| w[0] < w[1]),
+            "migration versions must be strictly ascending: {sqlite:?}"
+        );
+    }
+
     use super::*;
 
     #[test]

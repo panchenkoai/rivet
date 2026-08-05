@@ -169,7 +169,11 @@ fn run_chunk_with_source_retries(
         let mut src = match source::create_source(&plan.source) {
             Ok(s) => s,
             Err(e) => {
-                if attempt < plan.tuning.max_retries && classify_error(&e).is_transient() {
+                if super::super::retry::should_retry(super::super::retry::Attempt {
+                    attempt,
+                    max_retries: plan.tuning.max_retries,
+                    error: &e,
+                }) {
                     last_err = Some(e);
                     continue;
                 }
@@ -195,7 +199,11 @@ fn run_chunk_with_source_retries(
         ) {
             Ok(v) => return Ok(v),
             Err(e) => {
-                if attempt < plan.tuning.max_retries && classify_error(&e).is_transient() {
+                if super::super::retry::should_retry(super::super::retry::Attempt {
+                    attempt,
+                    max_retries: plan.tuning.max_retries,
+                    error: &e,
+                }) {
                     last_err = Some(e);
                     continue;
                 }
@@ -297,16 +305,25 @@ pub(crate) fn run_chunked_sequential_checkpoint(
             end_key: ek.clone(),
         });
 
-        match run_chunk_with_source_retries(
-            &plan.base_query,
-            cp,
-            start,
-            end,
-            chunk_index,
-            plan,
-            summary,
-            Some((&pb_handle, &streamed_rows)),
-        ) {
+        // Test-only: make ONE chunk fail without killing the process, so the
+        // "not every claimed chunk completed" guard below can be exercised. A
+        // panic hook cannot reach it — the guard only runs when the loop
+        // finishes, which a crash never does.
+        let chunk_result = match crate::test_hook::maybe_error_at_index("chunk_export", chunk_index)
+        {
+            Err(msg) => Err(anyhow::anyhow!(msg)),
+            Ok(()) => run_chunk_with_source_retries(
+                &plan.base_query,
+                cp,
+                start,
+                end,
+                chunk_index,
+                plan,
+                summary,
+                Some((&pb_handle, &streamed_rows)),
+            ),
+        };
+        match chunk_result {
             Ok((rows, parts, chunk_checksums, key)) => {
                 summary.total_rows += rows as i64;
                 pb.inc(summary.total_rows);

@@ -833,6 +833,31 @@ mod tests {
         assert_eq!(rescale_i128(0, 38, 0).unwrap(), 0);
     }
 
+    // Both scale ARITHMETIC arms, with from_scale > 0 on purpose.
+    //
+    // Every other rescale test uses from_scale = 0 or equal scales, where
+    // `to_scale - from_scale` and `to_scale + from_scale` produce the SAME
+    // factor — so the whole suite was blind to a sign flip in either arm, and
+    // the mutation baseline recorded both as uncaught. The exponent is only
+    // observable when neither scale is zero and they differ.
+    #[test]
+    fn rescale_i128_scale_arithmetic_is_a_difference_not_a_sum() {
+        // Up-scale 1 -> 3: factor 10^(3-1) = 100. A `+` would give 10^4.
+        assert_eq!(
+            rescale_i128(123, 1, 3).unwrap(),
+            12_300,
+            "up-scale must multiply by 10^(to-from), not 10^(to+from)"
+        );
+        // Down-scale 3 -> 1: factor 10^(3-1) = 100, and 12_300 is divisible by
+        // it. A `+` would give 10^4, under which 12_300 has a remainder and the
+        // call would wrongly report a LOSSY rescale.
+        assert_eq!(
+            rescale_i128(12_300, 3, 1).unwrap(),
+            123,
+            "down-scale must divide by 10^(from-to), not 10^(from+to)"
+        );
+    }
+
     // SQL Server's max scale is 38; 10^38 still fits i128 (~1.7e38), so the
     // factor computation must not panic at the boundary in either direction.
     #[test]

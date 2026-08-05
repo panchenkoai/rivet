@@ -79,6 +79,62 @@ impl MysqlChangeStream {
     /// server streams to the current end and sends EOF instead of blocking —
     /// the catch-up backstop) AND pins the open-time coordinates as the stop
     /// ceiling (see [`Self::bound`]).
+    /// Refuse to capture from a binlog that cannot carry a whole row.
+    ///
+    /// `binlog_row_image` decides what MySQL writes per row event. At `FULL` (the
+    /// server default) every column is present in both images. At `MINIMAL` — and at
+    /// `NOBLOB` for the blob columns — MySQL writes only the key and the columns
+    /// that CHANGED, because that is all a replica needs to apply the statement.
+    ///
+    /// rivet's change stream is a FULL-ROW image per event: the parquet has every
+    /// column, and a consumer builds current state by taking the latest row per key.
+    /// A partial image cannot be turned into that, so the setting is not a
+    /// performance knob here — it decides whether the output means anything.
+    ///
+    /// Measured against a real server at `MINIMAL`, three changes to a three-column
+    /// table:
+    ///
+    ///     insert | 1 | 10.5000 | alpha        <- fine
+    ///     update |   |         |              <- NO KEY, no value: 99.9 is gone
+    ///     delete | 2 |         |              <- key only
+    ///
+    /// and the run printed `status: success`, `rows: 4`, with no warning of any
+    /// kind. An UPDATE row with a NULL key cannot even be applied to the right row,
+    /// so this is not degradation, it is a corrupt event that counts as captured.
+    ///
+    /// Hence a refusal rather than a warning: there is no partially-correct outcome
+    /// to let the operator choose. The check is one query at open, on the connection
+    /// that is about to dump.
+    pub(crate) fn row_image(url: &str, tls: Option<&TlsConfig>) -> super::super::cdc::RowImage {
+        use super::super::cdc::RowImage;
+        use mysql::prelude::Queryable;
+
+        let Ok(mut conn) = connect_conn(url, tls) else {
+            return RowImage::Whole;
+        };
+        let image: Option<String> = conn
+            .query_first("SELECT @@global.binlog_row_image")
+            .unwrap_or(None);
+        // An older MySQL / a MariaDB does not expose the variable. Absence is not
+        // evidence of a bad setting, and refusing on it would lock out binlogs
+        // that are fine.
+        let Some(image) = image else {
+            return RowImage::Whole;
+        };
+        if image.eq_ignore_ascii_case("FULL") {
+            return RowImage::Whole;
+        }
+        RowImage::Partial {
+            why: format!(
+                "the server has binlog_row_image = {image}, which writes only the key and the \
+                 CHANGED columns per row event. Measured against a real server at MINIMAL, an \
+                 UPDATE arrives with NULL for every column it did not touch — including the KEY, \
+                 which makes the event impossible to apply. Set `binlog_row_image = FULL` (the \
+                 server default) and re-run"
+            ),
+        }
+    }
+
     pub(crate) fn open(
         url: &str,
         server_id: u32,

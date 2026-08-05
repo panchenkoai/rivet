@@ -39,6 +39,70 @@ Narrow live filters for Tier 3 (mutate X → run only its guards):
    baseline fails the job. The baseline only shrinks (gap-ratchet discipline).
 3. **Weekly (devbox).** One Tier-3 module against its narrow live filter.
 
+## Why mutants survive — the degenerate-fixture rule
+
+Survivors come from two causes, and the second is the one worth naming because
+the code LOOKS covered. Of 64 closed on 2026-08-02:
+
+- **62 had no test at all** — `parse_time_str_to_micros`, the `Value::Time` arm
+  of `RivetValue::from_mysql`, `pg_interval_to_iso8601`, `pg_type_to_rivet`.
+  Pure functions reachable only through a live export, so the `--lib` cycle
+  never touched them. `src/source/postgres/arrow_convert.rs` — 1059 lines — had
+  no `#[cfg(test)]` module whatsoever.
+- **2 had EIGHT tests that could not SEE the mutation**, because the fixture
+  sat exactly where the mutated operators AGREE:
+
+`rescale_i128` (mssql decimals) had EIGHT unit tests and still lost both of its
+scale-arithmetic mutants — every test used `from_scale = 0` or equal scales, and
+at zero `to_scale - from_scale` and `to_scale + from_scale` compute the same
+factor. The suite could not distinguish the operators it existed to protect.
+
+So: **choose values such that no two operators produce the same result.**
+
+| component            | degenerate fixture      | working fixture | why                                            |
+| -------------------- | ----------------------- | --------------- | ---------------------------------------------- |
+| `h * 3600`           | `h = 0`                 | `h = 2`         | at 0 every operator yields 0                   |
+| `m * 60`             | `m = 0` or `m = 1`      | `m = 4`         | 4*60 = 240 vs 4+60 = 64 vs 4/60 = 0            |
+| `6 - us_digits`      | a 6-digit fraction      | 1 digit         | at 6 the exponent is 0 and `-` == `+`          |
+| `months / 12`        | `months = 12`           | `months = 25`   | 25/12 = 2, 25%12 = 1, 25*12 = 300 — all differ |
+| `to_scale - from`    | `from_scale = 0`        | 1 -> 3 and 3 -> 1 | at 0 the difference equals the sum            |
+
+The same shape appears without arithmetic. A `match` arm deleted from a type map
+drops that type to the `_` fallback — a SILENT schema change — so each arm needs
+its own row in a table test: remove one, exactly one row fails and names the
+type. Two traps inside that:
+
+- **arms that produce the same variant.** `TIMESTAMP` and `TIMESTAMPTZ` both map
+  to `Timestamp` and differ only in the timezone field; asserting the variant
+  would let the arms be swapped, losing the UTC semantics. Assert the FIELD.
+- **arms whose value is a diagnostic.** Bare `NUMERIC` is `Unsupported` on
+  purpose (the wire protocol carries no atttypmod), so the oracle is the REASON
+  text — it must still name the column-override escape, or the operator is told
+  "unsupported" with nowhere to go.
+
+### One pure function, one test
+
+Do not write a test per mutant. A single well-chosen fixture kills a whole
+function's arithmetic, measured four times in a row on 2026-08-02:
+`parse_time_str_to_micros` 13/13, `RivetValue::from_mysql` 10/10,
+`pg_interval_to_iso8601` 11/11, `pg_type_to_rivet` 12/12 — zero survivors each.
+
+### Count kills by MEASURING, never by reasoning
+
+Apply the mutant, run the test, watch it fail; only then delete the baseline
+line. Reading a test cannot tell you whether it bites — twice on 2026-08-02 a
+test that looked exhaustive did not, and the second one had been WRITTEN to close
+that exact mutant.
+
+### Verify "live-guarded" instead of believing it
+
+The baseline explains its adapter entries as caught by the live suites rather
+than the `--lib` cycle, and nothing tested that claim, because mutation runs use
+`--lib` only. Test it per group with one representative: inverting the MySQL
+boolean coercion in `build_array` (`*v != 0` -> `*v == 0`) DOES fail the live
+subset (`live_init::init_mysql_schema_wide_discovers_seeded_table`). For that
+class the claim holds — as a measurement now, not an assurance.
+
 ## Triage verdicts
 
 - **add-test** — write the unit test that kills it (e.g. the pilot's

@@ -77,6 +77,57 @@ pub(crate) fn chunk_part_filename(
     )
 }
 
+/// The chunk index encoded in a part produced by [`chunk_part_filename`].
+///
+/// Lives BESIDE the formatter on purpose: the two are one contract, and a reader
+/// that parses what a distant writer formats is how a name silently stops meaning
+/// what it used to. Returns `None` for anything not shaped like a chunk part
+/// (a single-mode part, a CDC part, an operator's stray file), so a caller can
+/// treat "not a chunk part" as its own case rather than guessing.
+pub(crate) fn chunk_index_of(file_name: &str) -> Option<&str> {
+    // Parse from the END. The writer appends `_chunk{idx}_{nonce}` last, so the
+    // FINAL `_chunk` is always its own — while the FIRST one might belong to the
+    // export's NAME. An export called `orders_chunk1_daily` made this read the
+    // name's digit instead of the writer's index, and the caller that filters
+    // rehydrated parts by completed-chunk status
+    // (`resume_m8::rehydrate_manifest_parts_from_file_log`) then dropped parts it
+    // could not account for. On a KEYSET export that is total: keyset writes no
+    // `chunk_task` rows at all, so the completed set is empty and every part whose
+    // name yielded an index was discarded from the reconstructed manifest —
+    // durable pages, silently absent, on the recovery path.
+    // Match the writer's SHAPE at the tail, not the first occurrence of a
+    // substring: the stem's last two fields must be `chunk{digits}` and the
+    // 16-hex nonce. Splitting on the first `_chunk` let an export NAMED
+    // `orders_chunk1_daily` answer for the writer — and a KEYSET page of that
+    // export, which carries no chunk token at all, was classified as chunk 1.
+    // `rehydrate_manifest_parts_from_file_log` then dropped it against a
+    // completed-chunk set that keyset never populates: durable pages silently
+    // missing from the manifest a resumed run declares.
+    let stem = file_name.rsplit_once('.').map_or(file_name, |(s, _)| s);
+    // Strip the ROTATION suffix first. `part_indexed_name` appends `_p{n}` AFTER
+    // the nonce whenever a chunk rotates past `max_file_size`, so the last field
+    // of a rotated part is `p0`, not the 16-hex nonce. Requiring the nonce last
+    // made every rotated part unclassified — and the caller
+    // (`resume_m8::rehydrate_manifest_parts_from_file_log`) treats "not a chunk
+    // part" as KEEP, so an interrupted chunk's abandoned siblings were resurrected
+    // into the manifest a resumed run declares, beside the replacements. The
+    // same normalization `attempt_key` performs, applied before the shape check
+    // rather than after it.
+    let stem = match stem.rsplit_once("_p") {
+        Some((h, n)) if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => h,
+        _ => stem,
+    };
+    let (head, nonce) = stem.rsplit_once('_')?;
+    if nonce.len() != 16 || !nonce.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let idx = head
+        .rsplit_once('_')
+        .map_or(head, |(_, f)| f)
+        .strip_prefix("chunk")?;
+    (!idx.is_empty() && idx.bytes().all(|b| b.is_ascii_digit())).then_some(idx)
+}
+
 // ─── Chunk source selection ───────────────────────────────────────────────────
 
 /// Determines how chunk ranges are obtained at execution time.
@@ -314,6 +365,60 @@ mod tests {
     //! no mocks, no docker. They are *intentionally* the only unit cover
     //! for this file's recovery logic; everything that touches a live
     //! `Source` is exercised by `tests/live_*.rs` instead.
+    /// An export whose NAME contains `_chunk<digits>_` must not fool the index
+    /// parser — and the fixture must cross that threshold, or the two ends of the
+    /// name are indistinguishable.
+    ///
+    /// The parser split on the FIRST `_chunk`, so `orders_chunk1_daily` fed it the
+    /// name's digit instead of the writer's index. On a KEYSET export that is
+    /// total loss on the recovery path: keyset writes no `chunk_task` rows, so
+    /// `rehydrate_manifest_parts_from_file_log`'s completed set is EMPTY and every
+    /// part whose name yielded an index was dropped from the reconstructed
+    /// manifest — durable pages silently absent from what the run declares.
+    #[test]
+    fn the_chunk_index_comes_from_the_writers_suffix_not_the_export_name() {
+        // Round-trip through the real formatter, so the reader is graded against
+        // what the writer actually emits rather than a hand-typed shape.
+        let name = chunk_part_filename("orders_chunk1_daily", 7, "parquet");
+        assert_eq!(
+            chunk_index_of(&name),
+            Some("7"),
+            "the writer wrote chunk 7; the export NAME's `_chunk1_` must not win: {name}"
+        );
+
+        // A plain name still works — the fix must not lose the ordinary case.
+        let plain = chunk_part_filename("orders", 12, "parquet");
+        assert_eq!(chunk_index_of(&plain), Some("12"), "{plain}");
+
+        // A ROTATED part — the shape `part_indexed_name` produces when a chunk
+        // exceeds `max_file_size`. Its last field is `p0`, not the nonce, and an
+        // earlier version of this parser therefore returned None for every one of
+        // them. The caller treats "not a chunk part" as KEEP, so an interrupted
+        // chunk's abandoned siblings were resurrected into a resumed run's
+        // manifest. Built through BOTH real writers, never typed by hand.
+        for i in 0..2 {
+            let rotated = crate::pipeline::commit::part_indexed_name(&name, i, 2);
+            assert_eq!(
+                chunk_index_of(&rotated),
+                Some("7"),
+                "a rotation sibling is still a part of chunk 7: {rotated}"
+            );
+        }
+
+        // A keyset part carries no chunk token and must stay unclassified, even
+        // when the export name contains one: classifying it makes the rehydration
+        // filter discard it against an empty completed set.
+        assert_eq!(
+            chunk_index_of("orders_chunk1_daily_20260101_000000_123_keyset3.parquet"),
+            None,
+            "a keyset page is not a chunk part — treating it as chunk 1 drops it on resume"
+        );
+
+        // Non-numeric and absent tokens stay `None`.
+        assert_eq!(chunk_index_of("orders_20260101_000000.parquet"), None);
+        assert_eq!(chunk_index_of("orders_20260101_chunkzz_aabb.parquet"), None);
+    }
+
     use super::*;
 
     #[test]
@@ -341,6 +446,7 @@ mod tests {
     fn make_plan(export_name: &str) -> ResolvedRunPlan {
         ResolvedRunPlan {
             export_name: export_name.into(),
+            source_table: None,
             base_query: "SELECT id FROM orders".into(),
             strategy: ExtractionStrategy::Chunked(ChunkedPlan {
                 column: "id".into(),

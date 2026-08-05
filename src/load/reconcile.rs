@@ -163,8 +163,18 @@ pub fn select_load_keys(new: &[(String, RunManifest)], all_parquet: &[String]) -
                 resolved_any = true;
             }
         }
-        if !resolved_any {
-            // Can't resolve this run to files — don't risk a partial selection.
+        // A manifest that DECLARES parts but resolves none is genuinely
+        // unresolvable — bail to the full listing rather than risk a partial
+        // selection. A manifest declaring NO parts is a different thing: the run
+        // legitimately produced nothing (a CDC cycle with no changes, the anchor
+        // cycle of `initial: snapshot`), and treating that as unresolvable
+        // dragged EVERY parquet under the prefix into the load while
+        // `expected_delta` still summed the manifests to zero — so the load
+        // appended rows nobody accounted for and rivet's own count gate fired:
+        // "appended 2 rows, expected 0 from the run manifests". Surfaced by the
+        // scenario-artifact matrix on SQL Server, where the async capture Agent
+        // makes an empty first cycle common; the mechanism is engine-independent.
+        if !resolved_any && !m.parts.is_empty() {
             return all_parquet.to_vec();
         }
     }
@@ -280,9 +290,15 @@ pub fn has_active_running_manifest(keyed: &[(String, RunManifest)]) -> bool {
 /// marker-GC sweep (delete the superseded). The ledger enforces the same rule in
 /// SQL — that copy cannot share this Rust.
 fn is_superseded(m: &RunManifest, keyed: &[(String, RunManifest)]) -> bool {
-    keyed
-        .iter()
-        .any(|(_, o)| o.export_name == m.export_name && o.started_at > m.started_at)
+    // FAMILY, not name: a CDC run's `running` marker carries the EXPORT name
+    // while the drain's terminal manifest carries the TABLE string, so with
+    // `name:` ≠ `table:` a name-only compare never matched — a crashed marker
+    // stayed "active" forever and gc over-deferred cleanup permanently. Same
+    // recorded-identity seam as `ensure_single_export`.
+    keyed.iter().any(|(_, o)| {
+        crate::manifest::identity_family(o, keyed) == crate::manifest::identity_family(m, keyed)
+            && o.started_at > m.started_at
+    })
 }
 
 /// Full/chunked loads care only about the LATEST snapshot: from `keyed` (all run
@@ -327,13 +343,28 @@ pub fn select_runs(
     loaded: &std::collections::HashSet<String>,
     mode: crate::load::plan::LoadMode,
 ) -> Vec<(String, RunManifest)> {
-    // A `running` manifest is a LIVE run's in-flight marker — never loadable (no
-    // committed parts). Drop it BEFORE selection so it neither becomes the
-    // "latest" full snapshot nor an incremental delta, either of which would
-    // make `reconcile` refuse the whole load on a non-Success run.
+    // Only a `Success` run is loadable, so drop every other status BEFORE
+    // selection. `Running` is a live run's in-flight marker (no committed
+    // parts); `Failed`/`Interrupted` is an ABORTED run whose parts are partial —
+    // its data comes back complete under a NEW run_id when the export is
+    // retried, and `gc_orphans` already classifies those parts as terminal
+    // debris to delete.
+    //
+    // Dropping only `Running` here was a permanent stall: `reconcile` bails on
+    // the first non-Success manifest it is handed, and nothing ever removes a
+    // Failed one (gc deletes `.parquet` and superseded Running markers, never a
+    // terminal manifest; `cleanup_source` runs only after a load that can no
+    // longer succeed). So ONE aborted run — a source drop mid-extract, a query
+    // error, a destination write failure — made every LATER successful run
+    // unloadable forever, with an error telling the operator to reconfigure
+    // prefixes, which is not the cause. Released since 0.20.0.
+    //
+    // Safe by construction for CDC: the drain writes `Success` unconditionally
+    // (source/cdc/sink.rs), so an acked part is never inside a Failed manifest.
+    // `Failed` originates only on the batch path (pipeline/finalize.rs).
     let keyed: Vec<(String, RunManifest)> = keyed
         .into_iter()
-        .filter(|(_, m)| m.status != ManifestStatus::Running)
+        .filter(|(_, m)| m.status == ManifestStatus::Success)
         .collect();
     match mode {
         crate::load::plan::LoadMode::Full => latest_full(keyed),
@@ -405,7 +436,7 @@ fn is_run_unique_manifest(base: &str) -> bool {
 pub fn ensure_single_export(keyed: &[(String, RunManifest)]) -> Result<()> {
     let mut names: std::collections::BTreeSet<&str> = keyed
         .iter()
-        .map(|(_, m)| crate::manifest::snapshot_family(m.export_name.as_str()))
+        .map(|(_, m)| crate::manifest::identity_family(m, keyed))
         .filter(|n| !n.is_empty())
         .collect();
     if names.len() > 1 {
@@ -416,6 +447,53 @@ pub fn ensure_single_export(keyed: &[(String, RunManifest)]) -> Result<()> {
              prefix would cross-contaminate the row count and could delete a sibling export's \
              parts. Give each export a DISTINCT destination prefix (or scope the load prefix to a \
              single export) and re-run.",
+            listed.len(),
+            listed.join(", ")
+        );
+    }
+    ensure_single_source(keyed)
+}
+
+/// One family is not one EXPORT when two different databases are called the same
+/// thing.
+///
+/// The family is the export NAME, so two configs that both call their export
+/// `orders` — because both databases have an `orders` table — are one family to
+/// every check above. Measured end to end: two sources wrote 600 rows into one
+/// GCS prefix under one name, and `rivet load` driven by the POSTGRES config put
+/// the MYSQL rows in the warehouse (`n=300, lo=10001`), reported `integrity ✓`,
+/// and exited 0. The postgres rows reached the warehouse from neither command.
+/// The second load then replaced the first's table with the same 300. Half the
+/// data absent, both commands green.
+///
+/// The manifest has always recorded WHICH SOURCE it came from, so the identity
+/// this guard needs is already on disk — including in artifacts written before
+/// this check existed, which is why the source is read rather than folded into
+/// `export_family` (that would only protect prefixes written after the change).
+///
+/// A single source is the norm and stays silent. Two are refused, because the
+/// alternatives both lose: loading one of them silently drops the other, and
+/// loading their union would double-count the ordinary case of repeated runs.
+fn ensure_single_source(keyed: &[(String, RunManifest)]) -> Result<()> {
+    // The ENGINE alone is already an identity — a batch manifest records
+    // `table: null` (the export's table lives in the plan, not here), so a
+    // filter that required a table dropped both sides and the guard stayed
+    // silent on the very case it was written for. Only a manifest with no engine
+    // at all has nothing to compare.
+    let sources: std::collections::BTreeSet<String> = keyed
+        .iter()
+        .map(|(_, m)| crate::manifest::identity_source(m))
+        .filter(|s| !s.is_empty())
+        .collect();
+    if sources.len() > 1 {
+        let listed: Vec<&str> = sources.iter().map(String::as_str).collect();
+        bail!(
+            "the load prefix holds manifests from {} DIFFERENT SOURCES ({}) under one export \
+             name. The warehouse table is named from the source table, so loading this prefix \
+             puts one source's rows in the table and leaves the other's unloaded — and a second \
+             load REPLACES the first. Both commands report success while half the data never \
+             arrives. Give each source its own destination prefix and its own export name, or \
+             load them into separate target tables.",
             listed.len(),
             listed.join(", ")
         );
@@ -535,10 +613,12 @@ mod tests {
     /// optionally, a probed `source_row_count`.
     fn manifest(run: &str, rows: i64, source: Option<i64>) -> RunManifest {
         RunManifest {
+            checksum_render: None,
             row_hash: None,
             manifest_version: crate::manifest::MANIFEST_VERSION,
             run_id: run.into(),
             export_name: "orders".into(),
+            export_family: String::new(),
             mode: "batch".into(),
             started_at: "t".into(),
             finished_at: "t".into(),
@@ -606,6 +686,54 @@ mod tests {
         assert!(ensure_single_export(&[orders, keyed(legacy)]).is_ok());
     }
 
+    /// Two DIFFERENT databases, ONE export name, one prefix — refuse.
+    ///
+    /// The family is the export name, so this arrangement is invisible to every
+    /// other check: an operator with two databases that both have `orders`, two
+    /// configs that both call the export `orders`, and one bucket prefix. What
+    /// actually happened, measured end to end before this guard: 600 rows on the
+    /// prefix, `rivet load` driven by the POSTGRES config loaded the MYSQL rows
+    /// (`n=300, lo=10001`), said `integrity ✓`, exited 0 — and the second load
+    /// replaced that table with the same 300. Half the data in the warehouse
+    /// from neither command, both green.
+    ///
+    /// The fixture varies ONLY the source. Same family, same name, same shape —
+    /// otherwise the older family guard would catch it and this one would never
+    /// be reached, which is the shape of a test that grades a check it does not
+    /// exercise.
+    #[test]
+    fn ensure_single_export_refuses_two_different_sources_under_one_name() {
+        let keyed = |m: RunManifest| ("gs://b/p/manifest-x.json".to_string(), m);
+        let mut pg = manifest("r1", 300, None);
+        pg.source.engine = "postgres".into();
+        pg.source.table = Some("orders".into());
+        let mut my = manifest("r2", 300, None);
+        my.source.engine = "mysql".into();
+        my.source.table = Some("orders".into());
+        assert_eq!(
+            pg.export_name, my.export_name,
+            "the fixture must share the name"
+        );
+
+        let err = ensure_single_export(&[keyed(pg.clone()), keyed(my.clone())])
+            .expect_err("two sources under one name must be refused, not silently half-loaded");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("DIFFERENT SOURCES") && msg.contains("postgres") && msg.contains("mysql"),
+            "the refusal must NAME both sources — an operator cannot act on `something is \
+             ambiguous`: {msg}"
+        );
+
+        // The ordinary case stays silent: many runs of ONE export from ONE source.
+        let mut again = manifest("r3", 300, None);
+        again.source.engine = "postgres".into();
+        again.source.table = Some("orders".into());
+        assert!(
+            ensure_single_export(&[keyed(pg), keyed(again)]).is_ok(),
+            "repeated runs of one export must not be refused — that is the normal load"
+        );
+    }
+
     /// Regression: the CDC `initial: snapshot` leg shares the drain's prefix BY
     /// DESIGN (`cdc_job` synthesizes `{export}__snapshot_{table}` pointed at the
     /// same destination). 0.24.0's cross-run manifest summing put both names in
@@ -623,6 +751,252 @@ mod tests {
         let mut foreign = manifest("r3", 10, None);
         foreign.export_name = "customers__snapshot_customers".into();
         assert!(ensure_single_export(&[drain, keyed(foreign)]).is_err());
+    }
+
+    /// The documented `initial: snapshot` config — `name: orders_cdc`,
+    /// `table: orders` (docs/reference/cdc.md) — could NOT be loaded even after
+    /// the 0.24.1 family fold: the drain writes `export_name` from the TABLE
+    /// string while the snapshot leg writes `{export.name}__snapshot_{table}`,
+    /// so the substring fold produced families `orders` and `orders_cdc` — two,
+    /// and the guard refused rivet's own output with advice to split a prefix
+    /// rivet shares by design. The RECORDED family closes it: both legs stamp
+    /// the parent export name at write time.
+    #[test]
+    fn recorded_family_reconciles_the_documented_name_ne_table_config() {
+        let keyed = |m: RunManifest| ("gs://b/p/manifest-x.json".to_string(), m);
+        // drain: export_name is the TABLE ("orders"), family records the export.
+        let mut drain = manifest("r1", 10, None);
+        drain.export_name = "orders".into();
+        drain.export_family = "orders_cdc".into();
+        // snapshot leg: synthesized name, same recorded family.
+        let mut snap = manifest("r2", 10, None);
+        snap.export_name = "orders_cdc__snapshot_orders".into();
+        snap.export_family = "orders_cdc".into();
+        assert!(
+            ensure_single_export(&[keyed(drain), keyed(snap)]).is_ok(),
+            "one export whose name differs from its table must reconcile as ONE family"
+        );
+    }
+
+    /// The inverse hole the substring fold had: an export the user literally
+    /// NAMED with the infix. Before the family was recorded, `daily__snapshot_v2`
+    /// folded to `daily` and silently DISARMED the shared-prefix guard — a real
+    /// sibling export could sum into the load and be wiped by cleanup.
+    ///
+    /// This test derives both families from `plan::build`, the code that
+    /// actually decides them, instead of hand-setting `export_family`. The
+    /// earlier version typed the expected value in — and passed against a
+    /// product that still mis-folded, because the batch writer folded the name
+    /// at write time. A fixture that states the answer cannot grade it.
+    #[test]
+    fn a_user_export_named_like_a_snapshot_leg_no_longer_disarms_the_guard() {
+        // Families as the PRODUCT computes them for two sibling batch exports.
+        let daily = crate::config::sample_export("daily");
+        let mut tricky = crate::config::sample_export("daily__snapshot_v2");
+        tricky.snapshot_parent = None; // a user name, not a synthesized leg
+        // Through the PRODUCT's own resolver — `plan::build` records exactly
+        // this into every manifest. A closure re-implementing the rule here is
+        // what let the previous version of this test survive the fold mutant.
+        assert_eq!(daily.family(), "daily");
+        assert_eq!(
+            tricky.family(),
+            "daily__snapshot_v2",
+            "a user export's name is its own family — folding it merges two exports"
+        );
+
+        let keyed = |m: RunManifest| ("gs://b/p/manifest-x.json".to_string(), m);
+        let mut a = manifest("r1", 10, None);
+        a.export_name = daily.name.clone();
+        a.export_family = daily.family();
+        let mut b = manifest("r2", 10, None);
+        b.export_name = tricky.name.clone();
+        b.export_family = tricky.family();
+        assert!(
+            ensure_single_export(&[keyed(a), keyed(b)]).is_err(),
+            "two distinct exports must refuse, even when one's NAME contains the infix"
+        );
+    }
+
+    /// The synthesized leg is the ONE case where the infix name does mean a
+    /// family: `cdc_job` sets `snapshot_parent`, so the leg and its drain share
+    /// a family even though their names differ.
+    #[test]
+    fn the_synthesized_snapshot_leg_takes_its_parents_family() {
+        let export = crate::config::sample_export("orders_cdc");
+        let leg = crate::pipeline::cdc_job::synth_snapshot_export_for_test(&export, "orders");
+        assert_eq!(
+            leg.snapshot_parent.as_deref(),
+            Some("orders_cdc"),
+            "the leg must RECORD its parent, not leave it to be re-derived"
+        );
+        assert!(
+            leg.name.contains(crate::manifest::SNAPSHOT_LEG_INFIX),
+            "sanity: the leg is the infix-named export"
+        );
+    }
+
+    /// UPGRADE COMPAT. `export_family` did not exist before this change, so a
+    /// prefix holds BOTH kinds for as long as the old manifests live: a legacy
+    /// CDC drain manifest carries `export_name` = the TABLE and no family (folds
+    /// to "orders"), while a post-upgrade drain records family = the EXPORT
+    /// ("orders_cdc"). Grouping naively then reports TWO families and the load
+    /// refuses rivet\'s own prefix — a regression the field itself would have
+    /// introduced, hitting every scheduled drain+load cadence with `name:` ≠
+    /// `table:` at its first post-upgrade load.
+    ///
+    /// A legacy manifest joins the family of a recorded manifest that shares its
+    /// `export_name` — precise, not permissive: the legacy drain's name IS the
+    /// recorded drain\'s name.
+    #[test]
+    fn a_legacy_manifest_joins_the_recorded_family_of_the_same_export() {
+        let keyed = |m: RunManifest| ("gs://b/p/manifest-x.json".to_string(), m);
+        let mut legacy = manifest("r1", 10, None);
+        legacy.export_name = "orders".into(); // the TABLE, as the old sink wrote
+        legacy.export_family = String::new(); // pre-upgrade: field absent
+        let mut fresh = manifest("r2", 10, None);
+        fresh.export_name = "orders".into();
+        fresh.export_family = "orders_cdc".into();
+        assert!(
+            ensure_single_export(&[keyed(legacy), keyed(fresh)]).is_ok(),
+            "a pre-upgrade manifest beside its post-upgrade successor is ONE export"
+        );
+    }
+
+    /// The other half: tolerance must not blind the guard. A legacy manifest of a
+    /// genuinely DIFFERENT export shares no name with the recorded one, so it
+    /// stays its own family and the prefix is still refused.
+    #[test]
+    fn a_legacy_manifest_of_another_export_is_still_refused() {
+        let keyed = |m: RunManifest| ("gs://b/p/manifest-x.json".to_string(), m);
+        let mut legacy = manifest("r1", 10, None);
+        legacy.export_name = "customers".into();
+        legacy.export_family = String::new();
+        let mut fresh = manifest("r2", 10, None);
+        fresh.export_name = "orders".into();
+        fresh.export_family = "orders_cdc".into();
+        assert!(
+            ensure_single_export(&[keyed(legacy), keyed(fresh)]).is_err(),
+            "a legacy manifest of a DIFFERENT export must still be refused"
+        );
+    }
+
+    /// DOCUMENTS the contract a snapshot leg\'s `running` marker must satisfy:
+    /// it carries the leg\'s FAMILY (the parent export), never its decorated
+    /// `{parent}__snapshot_{table}` name. A marker carrying the name would
+    /// belong to a family no other manifest under the prefix shares, so
+    /// `ensure_single_export` refuses the load — and since nothing can supersede
+    /// that marker, the prefix stays bricked until a human deletes the object.
+    /// The family is read back VERBATIM when recorded (`resolved_family`), so
+    /// the substring fold cannot rescue a wrong value: recording the name is
+    /// strictly worse than recording nothing.
+    ///
+    /// SCOPE, stated because a green test here is easy to over-read: this
+    /// exercises the READ side only. It builds the marker by hand and does NOT
+    /// go through `write_running_manifest`, so it stays green against a writer
+    /// that records the wrong family — verified by mutating the writer back and
+    /// watching this pass. The writer is cloud-only (it returns early for a
+    /// local destination, `pipeline/finalize.rs`), so no unit test can observe
+    /// it; the real closure is to route that hand-rolled `RunManifest` literal
+    /// through `ManifestBuilder`, which REQUIRES the family and would make the
+    /// two writers-for-one-run structurally unable to disagree.
+    #[test]
+    fn a_snapshot_legs_running_marker_documents_the_family_contract() {
+        let keyed = |m: RunManifest| ("gs://b/p/manifest-x.json".to_string(), m);
+        let mut drain = manifest("r1", 10, None);
+        drain.export_name = "orders".into();
+        drain.export_family = "sales".into();
+        let mut marker = manifest("r2", 0, None);
+        marker.export_name = "sales__snapshot_orders".into();
+        marker.export_family = "sales".into(); // the family, as the writer records
+        marker.status = ManifestStatus::Running;
+        assert!(
+            ensure_single_export(&[keyed(drain.clone()), keyed(marker.clone())]).is_ok(),
+            "a leg\'s marker belongs to its parent\'s family"
+        );
+        // And the failure this guards: the same marker carrying the NAME.
+        let mut wrong = marker;
+        wrong.export_family = "sales__snapshot_orders".into();
+        assert!(
+            ensure_single_export(&[keyed(drain), keyed(wrong)]).is_err(),
+            "recording the decorated name reads as a second export — the bricked prefix"
+        );
+    }
+
+    /// ONE aborted run must not brick the prefix. `reconcile` bails on the first
+    /// non-Success manifest it is handed, and nothing ever deletes a Failed one —
+    /// gc removes `.parquet` and superseded Running markers, never a terminal
+    /// manifest. So before this, run #7 failing made runs #8, #9, #10 unloadable
+    /// FOREVER, with an error blaming a shared prefix instead of naming the
+    /// cause; recovery was a human deleting one object from the bucket.
+    ///
+    /// The Failed run's own parts are deliberately NOT loaded: they are a
+    /// partial export whose data returns complete under a new run_id, and
+    /// `gc_orphans` already classifies them as terminal debris. Safe for CDC by
+    /// construction — the drain writes Success unconditionally, so an acked part
+    /// is never inside a Failed manifest.
+    #[test]
+    fn a_failed_manifest_does_not_block_the_successful_runs() {
+        let keyed = |m: RunManifest| ("gs://b/p/manifest-x.json".to_string(), m);
+        let mut failed = manifest("r7", 5, None);
+        failed.status = ManifestStatus::Failed;
+        let ok8 = manifest("r8", 10, None);
+        let ok9 = manifest("r9", 10, None);
+        let sel = select_runs(
+            vec![keyed(failed), keyed(ok8), keyed(ok9)],
+            &std::collections::HashSet::new(),
+            crate::load::plan::LoadMode::Cdc,
+        );
+        let ids: Vec<&str> = sel.iter().map(|(_, m)| m.run_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["r8", "r9"],
+            "the successful runs must still load; the aborted run is skipped, not fatal"
+        );
+        // …and what survives must pass reconcile, which is where the old bail hit.
+        let manifests: Vec<RunManifest> = sel.into_iter().map(|(_, m)| m).collect();
+        assert!(
+            reconcile(&manifests, false).is_ok(),
+            "reconcile must not see the aborted run at all"
+        );
+    }
+
+    /// A run that captured NOTHING must not turn the selection into a
+    /// full-prefix load.
+    ///
+    /// `select_load_keys` bails to `all_parquet` when a manifest "can't be
+    /// resolved to files" — a guard against a PARTIAL selection. But a manifest
+    /// with zero parts resolves to nothing for the ordinary reason that the run
+    /// legitimately produced nothing (a CDC cycle with no changes; the anchor
+    /// cycle of `initial: snapshot`), and it then dragged EVERY parquet under the
+    /// prefix into the load while `expected_delta` still summed the manifests to
+    /// 0 — so the load appended rows nobody accounted for and rivet's own count
+    /// gate fired: "appended 2 rows, expected 0 from the run manifests".
+    ///
+    /// Found by the scenario-artifact matrix on SQL Server, where the async
+    /// capture Agent makes an empty first cycle common — but the mechanism is
+    /// engine-independent: any zero-part manifest does it.
+    #[test]
+    fn a_zero_part_manifest_does_not_drag_the_whole_prefix_into_the_load() {
+        // The shared `manifest()` helper always declares ONE part, so it cannot
+        // express this case — an earlier version of this test used it and passed
+        // against the unfixed product, because a declared-but-absent part IS the
+        // unresolvable case the fallback is for. A zero-capture run is different:
+        // it declares nothing.
+        let mut empty = manifest("r_anchor", 0, None);
+        empty.parts = Vec::new();
+        empty.part_count = 0;
+        empty.row_count = 0;
+        let all = vec!["base/a.parquet".to_string(), "base/b.parquet".to_string()];
+        let picked = select_load_keys(
+            &[("gs://b/base/manifest-r_anchor.json".to_string(), empty)],
+            &all,
+        );
+        assert!(
+            picked.is_empty(),
+            "a run with no parts contributes no files; it must not fall back to the \
+             whole prefix (got {picked:?}), or the load appends rows the manifests \
+             never accounted for"
+        );
     }
 
     #[test]
