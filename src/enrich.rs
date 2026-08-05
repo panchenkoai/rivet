@@ -440,6 +440,58 @@ mod tests {
     use arrow::array::StringArray;
     use arrow::datatypes::Field;
 
+    /// A timestamp whose timezone is a NAME must hash, not refuse.
+    ///
+    /// Arrow's `ArrayFormatter` rejects `Timestamp(_, Some("UTC"))` unless the
+    /// `chrono-tz` feature is on — "only offset based timezones supported
+    /// without chrono-tz feature". rivet maps EVERY timestamp to
+    /// `Some("UTC")` (`types/mapping.rs`), so `meta_columns.row_hash` bailed on
+    /// every temporal column with
+    ///
+    ///   row_hash: column 'action_date' has type Timestamp(µs, "UTC") which
+    ///   Arrow cannot render
+    ///
+    /// Measured on a real MySQL config, 2026-08-05: 63 of 65 finished exports
+    /// failed on exactly this, and the run recorded them as `failed` with zero
+    /// rows. Nothing in the suite caught it because a NAIVE timestamp and an
+    /// OFFSET timezone (`+03:00`) both render fine — only the NAMED form, which
+    /// is the only form rivet produces, does not.
+    ///
+    /// This test is the reason the feature cannot be dropped again: without
+    /// `chrono-tz` it fails at the `unwrap`, naming the column.
+    #[test]
+    fn row_hash_covers_a_named_timezone_timestamp() {
+        use arrow::array::TimestampMicrosecondArray;
+        let ts = TimestampMicrosecondArray::from(vec![Some(1_700_000_000_000_000i64), Some(1i64)])
+            .with_timezone("UTC".to_string());
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(
+                "action_date",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                true,
+            ),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![1, 2])), Arc::new(ts)],
+        )
+        .unwrap();
+
+        let hashes = row_hash_array(&batch, &["id".to_string(), "action_date".to_string()]).expect(
+            "a named-timezone timestamp must hash — if this is an Arrow render error, the \
+                 `chrono-tz` feature has been dropped from the arrow dependency",
+        );
+        let h = hashes.as_any().downcast_ref::<Int64Array>().unwrap();
+        // Two rows differing ONLY in the timestamp must not collide: proves the
+        // value reached the hash rather than being rendered as a constant.
+        assert_ne!(
+            h.value(0),
+            h.value(1),
+            "rows differing only in the timestamp collided — the column did not reach the hash"
+        );
+    }
+
     fn sample_batch() -> (SchemaRef, RecordBatch) {
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
