@@ -41,6 +41,7 @@ claims:
     independence: independent
     evidence: "dev/release_oracle/rowhash.py; PASS on postgres/mysql/mssql 2026-08-02"
     note: "the IN-TREE auditor recomputes with rivet's own `enrich` by design — that is a `self` check and stays one; this row is about the gate's second opinion."
+    type_coverage: "every RivetType via `rivet_type_matrix`, run through row_hash on all three SQL engines by `stand_type_matrix_every_consumer_*` (tests/live/chunking_stand.rs). ADDED 2026-08-05 after the gap it closes: the gate cell verified the hash INDEPENDENTLY and still missed `Timestamp(µs, Some(\"UTC\"))` — 278 of 1184 columns in a real production database — because its probe did not carry that type. `verified_by` says WHO checks; this field says WHAT they saw, and the second question is the one that went unasked for four months."
 
   - id: column_checksums_form_b
     what: "`column_checksums` — per-column value digests re-derived from the written Parquet."
@@ -48,12 +49,14 @@ claims:
     independence: self
     negative_proof: "gate cell `corruption_is_detected` (batch) and `cdc_corruption_is_detected` (CDC): a same-length in-place byte flip must produce exit 3 naming the diverging column. Both RED-proven against the live defect."
     evidence: "dev/release_oracle/corruption.py; PASS on postgres/mysql/mssql 2026-08-02"
+    type_coverage: "every RivetType via `rivet_type_matrix`, exercised through the sink's `track_checksum` and re-read by `--validate` in `stand_type_matrix_every_consumer_*` — the SAME export that exercises row_hash, so a type cannot reach one consumer and miss the other."
 
   - id: column_checksums_form_a
     what: "the source-side value digest, computed from `CellSource` as rows are read."
     verified_by: "compared against Form B at the end of every run — a genuine cross-check between two different extractions of the same values."
     independence: self
     note: "Form A shares the writer's own rendering, so the pair detects an Arrow-build fault and cannot detect a shared misreading of the source. Its accessors gained their first unit tests on 2026-08-02."
+    type_coverage: "every RivetType via `rivet_type_matrix`, same export as Form B (they are compared to each other at the end of every run, so a type absent from one is absent from both)."
 
   - id: checksum_render
     what: "which fold produced `column_checksums` (`xxh3-64-sum-v2`; absent ⇒ the v1 XOR)."
