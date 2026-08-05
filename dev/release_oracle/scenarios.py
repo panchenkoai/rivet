@@ -828,6 +828,22 @@ def run_scenarios(led: Ledger, engine: str, tag: str, url: str) -> None:
         sc_load(led, engine, tag, url, store)
     if engine == "postgres":
         sc_gc_survival(led, engine, tag, url)
+    # The COMMAND CHAIN, end to end. Both of these were registered in
+    # docs/release-gate-matrix.yaml as `test` while `verify_blessed_path` had no
+    # caller anywhere in the tree — the matrix guard checks that a gate function
+    # has a ROW, not that anything calls it, so a dead check reads as coverage.
+    # `every_test_cell_has_a_call_site` now closes that.
+    from . import blessed_flow, blessed_path
+
+    state_url = os.environ.get("RIVET_GATE_STATE_URL", "") or os.environ.get(
+        "RIVET_CDC_STATE_URL", ""
+    )
+    blessed_path.verify_blessed_path(led, engine, tag, url, state_url=state_url)
+    blessed_flow.sc_blessed_flow(led, engine, tag, url, state_url=state_url)
+    # Does the chain above have working oracles at all? Breaks each artifact
+    # class and requires the matching stage to go RED — a green stage that was
+    # never red is unverified, and this module's own first draft had one.
+    blessed_flow.sc_not_inert(led, engine, url, state_url)
 
 
 # ── state-migration parity PREFLIGHT (source-agnostic, runs once) ────────────

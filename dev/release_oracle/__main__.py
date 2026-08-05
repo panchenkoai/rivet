@@ -44,7 +44,17 @@ import time
 from pathlib import Path
 
 from .core import Ledger, Status, engine_container, docker, have, remove_engine_containers, rivet, rivet_bin, run, HERE, ROOT
-from . import bigquery, cdc, concurrency, gifs, regression, release_path, scenarios, state_parity
+from . import (
+    bigquery,
+    blessed_flow,
+    cdc,
+    concurrency,
+    gifs,
+    regression,
+    release_path,
+    scenarios,
+    state_parity,
+)
 
 
 def matrix_cfg(*args: str) -> str:
@@ -182,6 +192,10 @@ def preflight(led: Ledger, *, bless_gifs: bool = False) -> None:
     scenarios.verify_state_migrations(led)
     scenarios.verify_inflight_run_stays_loadable(led)
     scenarios.verify_coverage_matrices(led)
+    # Cheap and container-free: the flag surface is read from `rivet --help`,
+    # so it belongs with the file-level guards rather than after twenty
+    # minutes of bring-up.
+    blessed_flow.verify_flag_surface(led)
     # The instructional GIFs are documentation that can go stale silently — they
     # are binary assets, so no test reads them and no diff flags them. Placed
     # among the cheap file-level guards, before anything spends twenty minutes on
