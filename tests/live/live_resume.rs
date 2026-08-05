@@ -704,3 +704,109 @@ fn incremental_manifest_ships_contiguous_cursor_range() {
     );
     assert_eq!(e2["cursor_high"], "7", "run 2 covered up to id 7");
 }
+
+// ─── a NULL cursor cell must not disable incremental ─────────────────────────
+
+/// One row whose cursor cell is NULL must not stop the incremental cursor from
+/// advancing.
+///
+/// `ExportSink::on_batch` assigns the high-water mark UNCONDITIONALLY
+/// (src/pipeline/sink/mod.rs:730-732), and `extract_last_cursor_value` returns
+/// `None` when the LAST ROW's cursor cell is NULL — silently, with no log.
+/// Incremental queries always append `ORDER BY <cursor>` and PostgreSQL sorts
+/// NULLs LAST in ASC, so a single NULL-cursor row is the last row of the last
+/// batch and overwrites the good mark accumulated from every prior batch. Two
+/// `if let Some(..)` with no else then swallow it, so nothing is recorded and
+/// nothing is committed.
+///
+/// Measured on this stand — 20 dated rows plus ONE with `updated_at IS NULL`:
+///
+///   with the NULL row      21, 21, 21 rows   `export_state` EMPTY
+///   without it (control)   20,  0,  0 rows   `export_state` → 2026-…T19:44:23
+///
+/// Three runs put 63 rows at the destination for a 21-row table, every run
+/// reporting success with mode `incremental`. Unbounded: the stored cursor is
+/// never written, so the unfiltered branch is taken forever and the NULL row is
+/// re-included every time, re-arming the wipe.
+///
+/// The CONTROL arm is what makes this a causal claim rather than an observation:
+/// the same table, same config, same prefix shape, with only the NULL row
+/// removed, advances the cursor and exports 0 on the second run. Nothing else
+/// differs.
+///
+/// PostgreSQL-specific by collation of NULL ordering — MySQL and SQL Server sort
+/// NULLs FIRST in ASC, so the last row carries a real value there and the mark
+/// survives. `rivet init` discovers and emits nullable cursor candidates (it
+/// notes "Primary cursor candidate is nullable; consider coalesce" — a
+/// suggestion, not a requirement), so this config is one init away.
+// AUDIT-RED null-cursor-wipe: a NULL in the ASC-last row wipes the incremental high-water mark; the cursor is never written and every run re-exports the whole table. Asserts CORRECT behavior; expected to FAIL until fixed.
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn roast_a_null_cursor_cell_must_not_freeze_the_incremental_cursor() {
+    require_alive(LiveService::Postgres);
+
+    let table = unique_name("null_cursor");
+    let mut c = pg_connect();
+    c.batch_execute(&format!(
+        "CREATE TABLE {table} (id int PRIMARY KEY, updated_at timestamptz, v text);
+         INSERT INTO {table} SELECT g, now() - (g||' min')::interval, 'v'||g
+           FROM generate_series(1,20) g;
+         INSERT INTO {table} VALUES (99, NULL, 'null_cursor_row');"
+    ))
+    .unwrap();
+    let _guard = PgTable::adopt(table.clone());
+
+    // The fixture is only expressive if the NULL row really is ASC-LAST — that
+    // is the whole mechanism. Assert it rather than assume the collation.
+    let last: i32 = c
+        .query_one(
+            &format!("SELECT id FROM {table} ORDER BY updated_at ASC LIMIT 1 OFFSET 20"),
+            &[],
+        )
+        .expect("order probe")
+        .get(0);
+    assert_eq!(
+        last, 99,
+        "fixture is inert: the NULL-cursor row is not ASC-last on this server, so the wipe \
+         cannot occur and a green result would mean nothing"
+    );
+
+    let out = tempfile::tempdir().unwrap();
+    let rig = Rig::pg_batch(&format!("public.{table}"))
+        .mode("incremental")
+        .export_line("cursor_column: updated_at")
+        .dest_path(out.path().to_path_buf());
+    let cfg = rig.config_path();
+
+    let mut per_run = Vec::new();
+    for _ in 0..3 {
+        let o = run_rivet_env(
+            &["run", "--config", cfg.to_str().unwrap()],
+            &[("RUST_LOG", "warn")],
+        );
+        assert!(
+            o.status.success(),
+            "incremental run must succeed; stderr:\n{}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+        per_run.push(duckdb_total_parquet_rows(out.path()));
+    }
+
+    // Run 1 reads everything; runs 2 and 3 must add nothing. The cumulative
+    // count is read from the destination by DuckDB, so a "0 new rows" claim by
+    // rivet cannot satisfy it.
+    assert_eq!(
+        per_run[0], 21,
+        "first run must export all 21 rows, got {}",
+        per_run[0]
+    );
+    assert_eq!(
+        per_run[2], 21,
+        "after three incremental runs the destination holds {} rows for a 21-row table \
+         ({:?} cumulative). One row has a NULL cursor cell and sorts ASC-LAST on PostgreSQL, so \
+         it overwrites the high-water mark with None; nothing is recorded, nothing is committed, \
+         and every run re-reads the whole table forever. The same fixture without that one row \
+         exports 20 then 0 then 0.",
+        per_run[2], per_run
+    );
+}
