@@ -290,3 +290,110 @@ exports:
          reported fidelity={fidelity:?}\nstdout:\n{stdout}"
     );
 }
+
+// ─── a scale-0 override truncates money, and only scale 0 does ───────────────
+
+/// A `columns:` override that drops non-zero fractional digits must behave the
+/// same at scale 0 as at every other scale: refuse, not truncate.
+///
+/// `decimal_str_to_scaled_i128` refuses a lossy down-scale by returning `None`
+/// so the caller fails loudly — its own comment says the guard exists "rather
+/// than silently truncating financial digits". But the scale-0 arm
+/// short-circuits before ever reaching it (src/types/decimal.rs:95, and the
+/// i256 twin at :161 identically):
+///
+///   ("123.45",   0) -> Some(123)    the cents are gone
+///   ("-99.99",   0) -> Some(-99)
+///   ("1.234567", 2) -> None         the guard fires
+///   ("1.500",    2) -> Some(150)    trailing zeros drop harmlessly, correct
+///
+/// End to end on this stand, `numeric(10,2)` overridden to `decimal(20,0)`:
+///
+///   source   1=123.45  2=-99.99  3=1000.01  4=5.50
+///   parquet  1=123     2=-99     3=1000     4=5      status: success
+///
+/// The product's own behaviour one scale over IS the specification, and this
+/// test carries it as the control arm: `numeric(18,6)` overridden to
+/// `decimal(20,2)` FAILS the run —
+/// `cannot parse DECIMAL "1.234567" as decimal(scale=2)`. Same class of loss,
+/// same override mechanism, opposite outcome; the only difference is that the
+/// target scale is 0.
+///
+/// Distinct from its sibling `audit_type_report_flags_lossy_scale_reduction`,
+/// which is GREEN: that one asserts `check --type-report` labels the column
+/// `lossy`, and it does. The diagnostic was fixed; the RUN was not. Nothing
+/// asserted the exported VALUES — and that sibling could not have, because its
+/// fixture (`orders.price`) holds 5000 rows and not one of them has a non-zero
+/// cent, so no truncation is expressible in it.
+// AUDIT-RED decimal-scale0: a scale-0 `columns:` override silently truncates cents while every other scale fails loudly. Asserts CORRECT behavior; expected to FAIL until fixed.
+#[test]
+#[ignore = "live: postgres"]
+fn audit_scale_zero_override_must_not_silently_truncate() {
+    require_alive(LiveService::Postgres);
+
+    let table = unique_name("audit_scale0");
+    let mut c = postgres::Client::connect(POSTGRES_URL, postgres::NoTls).expect("connect");
+    c.batch_execute(&format!(
+        "CREATE TABLE {table} (id int PRIMARY KEY, amount numeric(10,2));
+         INSERT INTO {table} VALUES (1, 123.45), (2, -99.99), (3, 1000.01), (4, 5.50);"
+    ))
+    .expect("seed");
+    // The fixture MUST carry non-zero cents or the test cannot express the bug —
+    // the sibling test's table does not, which is why it never saw this.
+    let fractional: i64 = c
+        .query_one(
+            &format!("SELECT count(*) FROM {table} WHERE amount <> trunc(amount)"),
+            &[],
+        )
+        .expect("count")
+        .get(0);
+    assert!(
+        fractional >= 3,
+        "fixture is inert: {fractional} row(s) have a non-zero fractional part"
+    );
+
+    let out = tempfile::tempdir().unwrap();
+    let yaml = format!(
+        r#"
+source: {{type: postgres, url: "{POSTGRES_URL}"}}
+exports:
+  - name: {table}
+    table: "public.{table}"
+    mode: full
+    format: parquet
+    columns:
+      amount: "decimal(20,0)"
+    destination: {{type: local, path: {dir}}}
+"#,
+        dir = out.path().display()
+    );
+    let (_cfgdir, cfgpath) = cfg(&yaml);
+    let run = std::process::Command::new(RIVET_BIN)
+        .args(["run", "--config", cfgpath.to_str().unwrap()])
+        .output()
+        .expect("spawn rivet run");
+
+    let _ = c.execute(&format!("DROP TABLE IF EXISTS {table}"), &[]);
+
+    // Refusing is the correct outcome — it is what scale 2 already does.
+    if !run.status.success() {
+        return;
+    }
+    // It ran. Then the values must be intact. DuckDB, not the parquet crate
+    // rivet wrote with.
+    let got = duckdb_dir_parquet_distinct_strings(out.path(), "CAST(amount AS VARCHAR)");
+    let truncated: Vec<&String> = got.iter().filter(|s| !s.contains('.')).collect();
+    assert!(
+        truncated.is_empty(),
+        "a scale-0 `columns:` override exported {} of {} values with the fractional part REMOVED, \
+         and the run exited 0 with no warning: {:?}\n\n\
+         The same override one scale over refuses: `numeric(18,6)` -> `decimal(20,2)` fails the \
+         run with `cannot parse DECIMAL \"1.234567\" as decimal(scale=2)`. The loss is identical \
+         in kind; only the target scale differs. src/types/decimal.rs short-circuits scale 0 \
+         (line 95, and the i256 twin at 161) before the lossy-down-scale guard whose own comment \
+         says it exists \"rather than silently truncating financial digits\".",
+        truncated.len(),
+        got.len(),
+        got
+    );
+}
