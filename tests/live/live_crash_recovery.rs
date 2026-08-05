@@ -25,7 +25,10 @@ use crate::common::*;
 /// destination — re-reads the files, NOT rivet's state DB. Lets a recovery test
 /// assert the no-row-loss superset invariant the state-DB assertions cannot see.
 fn parquet_ids_and_rows(dir: &std::path::Path) -> (std::collections::BTreeSet<i64>, i64) {
-    (dir_parquet_id_set(dir), total_parquet_rows(dir) as i64)
+    (
+        dir_parquet_id_set(dir),
+        duckdb_total_parquet_rows(dir) as i64,
+    )
 }
 
 /// RAII guard — drops a Postgres table on scope exit.

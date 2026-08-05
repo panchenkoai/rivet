@@ -107,7 +107,7 @@ exports:
         missing.len(),
         &missing.iter().take(20).collect::<Vec<_>>()
     );
-    let physical = total_parquet_rows(out.path()) as i64;
+    let physical = duckdb_total_parquet_rows(out.path()) as i64;
     assert!(
         physical >= N,
         "[{fault}] at-least-once: physical destination rows ({physical}) must be >= source ({N})"

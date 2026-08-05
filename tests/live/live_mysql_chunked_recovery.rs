@@ -159,7 +159,7 @@ fn mysql_chunked_crash_after_first_chunk_complete_resume_finishes_export() {
     );
     // Destination re-read: chunk 0 not re-run → exactly 150 rows, 150 distinct ids.
     assert_eq!(
-        total_parquet_rows(&rig.out_dir()),
+        duckdb_total_parquet_rows(&rig.out_dir()),
         150,
         "destination must hold exactly 150 rows (no re-run, no dup)"
     );
@@ -251,7 +251,7 @@ fn mysql_chunked_crash_after_chunk_file_before_commit_resume_reruns_chunk_atleas
         "every seeded id must survive the at-least-once re-run (no loss)"
     );
     assert!(
-        total_parquet_rows(&rig.out_dir()) as i64 >= 150,
+        duckdb_total_parquet_rows(&rig.out_dir()) as i64 >= 150,
         "at-least-once: physical destination rows must be >= source (150)"
     );
 }
@@ -358,7 +358,7 @@ fn mysql_parallel_chunked_crash_after_chunk_complete_resume_finishes_with_no_dup
     // Destination re-read: no parallel double-write → exactly ROW_COUNT rows,
     // ROW_COUNT distinct ids.
     assert_eq!(
-        total_parquet_rows(&rig.out_dir()) as i64,
+        duckdb_total_parquet_rows(&rig.out_dir()) as i64,
         ROW_COUNT,
         "destination must hold exactly ROW_COUNT rows — no parallel double-write"
     );
@@ -473,7 +473,7 @@ fn mysql_parallel_chunked_crash_after_chunk_file_stuck_running_resume_reruns_chu
         "every seeded id must land after stuck-running reset + at-least-once re-run"
     );
     assert!(
-        total_parquet_rows(&rig.out_dir()) as i64 >= ROW_COUNT,
+        duckdb_total_parquet_rows(&rig.out_dir()) as i64 >= ROW_COUNT,
         "at-least-once: physical destination rows must be >= ROW_COUNT"
     );
 }

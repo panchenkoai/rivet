@@ -17,6 +17,54 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 use super::files_with_extension;
 
+/// Stage a host directory of Parquet under the shared bind mount and hand back
+/// its in-container path, so a value claim can be read by DuckDB instead of by
+/// the same `parquet` crate rivet wrote it with.
+///
+/// The bridge exists because of a NAMESPACE boundary, not a data one. Tests
+/// write to their own `tempfile::tempdir()` — a real directory the host reads
+/// fine — but the validator containers have exactly ONE path mounted
+/// (`tests/.live-tmp` → `/work`), so from inside them that tempdir does not
+/// exist. The failure then surfaces as `0 rows` or "no files match", which
+/// reads as data loss and costs an hour before anyone suspects the mount. (It
+/// cost exactly that on 2026-08-05, when three tests run from a secondary git
+/// worktree failed and a merge was suspected first.)
+///
+/// Copying rather than moving: the caller still owns its directory and may
+/// assert on it afterwards. Test outputs here are kilobytes, and one DuckDB
+/// round trip is ~38 ms, so the copy is not the cost that matters.
+fn stage_for_duckdb(dir: &Path) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let label = format!(
+        "stage_{}_{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    );
+    let (host, container) = super::live_shared_workdir(&label);
+    for f in files_with_extension(dir, "parquet") {
+        let name = f.file_name().expect("parquet file has a name");
+        std::fs::copy(&f, host.join(name))
+            .unwrap_or_else(|e| panic!("stage {} for duckdb: {e}", f.display()));
+    }
+    container
+}
+
+/// Row count of every `.parquet` under `dir`, read by DuckDB.
+///
+/// The independent-decoder twin of [`total_parquet_rows`]. rivet writes Parquet
+/// with the `parquet` crate and the old helper read it back with the SAME
+/// crate, so a symmetric write/read fault is invisible by construction — the
+/// class that let a whole column render as empty for four months. DuckDB shares
+/// no code with the writer.
+pub fn duckdb_total_parquet_rows(dir: &Path) -> usize {
+    if files_with_extension(dir, "parquet").is_empty() {
+        return 0; // an empty destination is a legitimate expected value
+    }
+    let c = stage_for_duckdb(dir);
+    super::duckdb_parquet_rows(&c) as usize
+}
+
 /// Row count of a single `.parquet` file.
 pub fn parquet_rows(path: &Path) -> usize {
     let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));

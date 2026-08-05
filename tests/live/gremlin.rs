@@ -270,7 +270,7 @@ fn gremlin_auto_shrink_total_rows_correct_under_quality_gate() {
     // (which reads the same internal counter) would still pass while the
     // destination silently lost rows.
     assert_eq!(
-        total_parquet_rows(out.path()),
+        duckdb_total_parquet_rows(out.path()),
         2000,
         "auto_shrink must write all 2000 rows to the destination across its splits"
     );

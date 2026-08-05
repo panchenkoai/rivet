@@ -107,7 +107,7 @@ fn mssql_full_mode_repeated_run_accumulates_manifest_entries() {
     // when the manifest sidecar clobbers; the copies' summed row_count is RED
     // pre-fix (one clobbered manifest.json held only the last run's rows).
     assert_eq!(
-        total_parquet_rows(out.path()),
+        duckdb_total_parquet_rows(out.path()),
         20,
         "two full runs of 10 rows must materialise 20 physical rows"
     );

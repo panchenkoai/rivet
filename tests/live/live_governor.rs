@@ -33,7 +33,7 @@ use std::time::Duration;
 
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
-fn total_parquet_rows(dir: &std::path::Path) -> usize {
+fn duckdb_total_parquet_rows(dir: &std::path::Path) -> usize {
     let mut n = 0;
     for path in files_with_extension(dir, "parquet") {
         let bytes = std::fs::read(&path).unwrap();
@@ -105,7 +105,7 @@ exports:
         "governor must activate for adaptive + parallel>1; stderr:\n{stderr}"
     );
     assert_eq!(
-        total_parquet_rows(out_dir.path()),
+        duckdb_total_parquet_rows(out_dir.path()),
         N,
         "every row must round-trip through the governed parallel run"
     );
@@ -254,7 +254,7 @@ exports:
          (a 'backed off' parallelism adjustment); stderr:\n{stderr}"
     );
     assert_eq!(
-        total_parquet_rows(out_dir.path()),
+        duckdb_total_parquet_rows(out_dir.path()),
         ROWS as usize,
         "every exported row must round-trip despite concurrent writes to the same rows"
     );

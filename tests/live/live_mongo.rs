@@ -321,7 +321,7 @@ fn mongo_run_reconcile_matches_source_count() {
     // Independent oracle: the verdict is rivet's own counter chain — also
     // physically re-read the destination (matrix audit: self-oracle class).
     assert_eq!(
-        total_parquet_rows(&rig.out_dir()),
+        duckdb_total_parquet_rows(&rig.out_dir()),
         3000,
         "destination parquet must physically hold every source document, independent of the reconcile verdict"
     );
@@ -400,7 +400,7 @@ fn mongo_batch_read_concern_snapshot_empty_first_run_then_populated() {
     // Empty first run: snapshot read of a 0-doc collection reads nothing, cleanly.
     rig.run_ok();
     assert_eq!(
-        total_parquet_rows(&rig.out_dir()),
+        duckdb_total_parquet_rows(&rig.out_dir()),
         0,
         "empty snapshot run must read 0, not hang or phantom-read"
     );
@@ -433,7 +433,7 @@ fn mongo_batch_no_cursor_timeout_false_empty_first_run_then_populated() {
 
     rig.run_ok();
     assert_eq!(
-        total_parquet_rows(&rig.out_dir()),
+        duckdb_total_parquet_rows(&rig.out_dir()),
         0,
         "empty first run reads 0 with no_cursor_timeout: false"
     );

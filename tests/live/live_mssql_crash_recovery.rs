@@ -219,7 +219,7 @@ fn mssql_crash_after_source_read_leaves_state_completely_clean() {
     assert!(cursor_value(&cfg, &export).is_some());
     // Re-read the destination (not the state DB): recovery file holds all 10 rows.
     assert_eq!(
-        total_parquet_rows(out.path()),
+        duckdb_total_parquet_rows(out.path()),
         10,
         "recovery file must hold all 10 rows"
     );
@@ -290,7 +290,7 @@ fn mssql_crash_after_file_write_leaves_file_but_no_manifest_or_cursor() {
         "recovery must leave every source id (1..=8) — a missing id is row LOSS"
     );
     assert!(
-        total_parquet_rows(out.path()) as i64 >= 8,
+        duckdb_total_parquet_rows(out.path()) as i64 >= 8,
         "at-least-once: physical destination rows must be >= source (8)"
     );
 }
@@ -343,7 +343,7 @@ fn mssql_crash_after_manifest_update_leaves_file_and_manifest_but_no_cursor() {
         "recovery must leave every source id (1..=7) — a missing id is row LOSS"
     );
     assert!(
-        total_parquet_rows(out.path()) as i64 >= 7,
+        duckdb_total_parquet_rows(out.path()) as i64 >= 7,
         "at-least-once: physical destination rows must be >= source (7)"
     );
 }
@@ -403,7 +403,7 @@ fn mssql_crash_after_cursor_commit_is_recoverable_with_full_state() {
     );
     // Destination re-read: committed file holds every source row exactly once.
     assert_eq!(
-        total_parquet_rows(out.path()),
+        duckdb_total_parquet_rows(out.path()),
         6,
         "committed file must hold all 6 rows once"
     );

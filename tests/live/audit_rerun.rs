@@ -70,7 +70,7 @@ exports:
 
 /// Total Parquet rows across every `*.parquet` file directly under `dir`.
 /// Mirrors what a glob reader (`read_parquet('<dir>/*.parquet')`) would count.
-fn total_parquet_rows(dir: &Path) -> i64 {
+fn duckdb_total_parquet_rows(dir: &Path) -> i64 {
     let mut total = 0i64;
     for path in files_with_extension(dir, "parquet") {
         let bytes =
@@ -204,7 +204,7 @@ fn audit_chunked_rerun_does_not_double() {
         String::from_utf8_lossy(&first.stderr)
     );
     assert_eq!(
-        total_parquet_rows(out.path()),
+        duckdb_total_parquet_rows(out.path()),
         ROWS,
         "sanity: after one chunked run the prefix must hold exactly {ROWS} rows"
     );
@@ -232,7 +232,7 @@ fn audit_chunked_rerun_does_not_double() {
 
     // Otherwise: a glob reader over the prefix must see exactly the source row
     // count, not 2x.  Currently the orphaned first-run parts double it.
-    let rows_on_disk = total_parquet_rows(out.path());
+    let rows_on_disk = duckdb_total_parquet_rows(out.path());
     assert_eq!(
         rows_on_disk, ROWS,
         "silent re-run doubling: a glob over the prefix counts {rows_on_disk} rows after two \
