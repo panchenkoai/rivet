@@ -1852,3 +1852,165 @@ fn stand_unreadable_range_bounds_must_not_export_nothing_mysql() {
 fn stand_unreadable_range_bounds_must_not_export_nothing_mssql() {
     run_unreadable_range_bounds_must_not_export_nothing(Eng::Ms);
 }
+
+// ─── a PARTIAL unique index is not a unique key ──────────────────────────────
+
+/// Seed the soft-delete shape: a column carrying duplicates, plus a unique index
+/// that only covers the live rows.
+///
+/// `dups` rows share one key value and are all soft-deleted, so the partial index
+/// permits them; `live` rows have distinct keys and `deleted_at IS NULL`. On
+/// MySQL — which cannot express a partial index at all — the closest honest
+/// equivalent is a plain NON-unique index, which is the control this matrix
+/// needs: the probe must refuse that key.
+fn seed_partial_unique(eng: Eng, dups: i64, live: i64) -> (String, StandCleanup) {
+    let table = unique_name("stand_partuk");
+    let guard = StandCleanup(eng, table.clone());
+    match eng {
+        Eng::Pg => {
+            let mut c = pg_connect();
+            c.batch_execute(&format!(
+                "CREATE TABLE {table} (k TEXT NOT NULL, deleted_at TIMESTAMPTZ, v TEXT NOT NULL);
+                 INSERT INTO {table} SELECT 'dup', now(), 'd'||g FROM generate_series(1,{dups}) g;
+                 INSERT INTO {table} SELECT 'u'||lpad(g::text,4,'0'), NULL, 'l'||g
+                   FROM generate_series(1,{live}) g;
+                 CREATE UNIQUE INDEX {table}_live ON {table} (k) WHERE deleted_at IS NULL;
+                 ANALYZE {table};"
+            ))
+            .unwrap();
+        }
+        Eng::My => {
+            let mut c = mysql_connect();
+            c.query_drop(format!(
+                "CREATE TABLE {table} (k VARCHAR(64) NOT NULL, deleted_at DATETIME NULL, \
+                 v VARCHAR(32) NOT NULL, KEY {table}_k (k))"
+            ))
+            .unwrap();
+            c.query_drop(format!(
+                "SET SESSION cte_max_recursion_depth = {}",
+                dups + live + 10
+            ))
+            .unwrap();
+            c.query_drop(format!(
+                "INSERT INTO {table} (k, deleted_at, v) \
+                 WITH RECURSIVE s AS (SELECT 1 n UNION ALL SELECT n+1 FROM s WHERE n < {dups}) \
+                 SELECT 'dup', NOW(), CONCAT('d', n) FROM s"
+            ))
+            .unwrap();
+            c.query_drop(format!(
+                "INSERT INTO {table} (k, deleted_at, v) \
+                 WITH RECURSIVE s AS (SELECT 1 n UNION ALL SELECT n+1 FROM s WHERE n < {live}) \
+                 SELECT CONCAT('u', LPAD(n, 4, '0')), NULL, CONCAT('l', n) FROM s"
+            ))
+            .unwrap();
+        }
+        Eng::Ms => {
+            mssql_exec(&format!(
+                "CREATE TABLE {table} (k VARCHAR(64) NOT NULL, deleted_at DATETIME2 NULL, \
+                 v VARCHAR(32) NOT NULL)"
+            ));
+            mssql_exec(&format!(
+                "INSERT INTO {table} (k, deleted_at, v) SELECT 'dup', SYSDATETIME(), \
+                 CONCAT('d', value) FROM GENERATE_SERIES(CAST(1 AS BIGINT), CAST({dups} AS BIGINT))"
+            ));
+            mssql_exec(&format!(
+                "INSERT INTO {table} (k, deleted_at, v) \
+                 SELECT CONCAT('u', RIGHT('0000' + CAST(value AS VARCHAR(8)), 4)), NULL, \
+                 CONCAT('l', value) FROM GENERATE_SERIES(CAST(1 AS BIGINT), CAST({live} AS BIGINT))"
+            ));
+            // A FILTERED unique index — SQL Server's spelling of a partial index.
+            mssql_exec(&format!(
+                "CREATE UNIQUE INDEX {table}_live ON {table} (k) WHERE deleted_at IS NULL"
+            ));
+            mssql_exec(&format!("UPDATE STATISTICS {table}"));
+        }
+    }
+    (table, guard)
+}
+
+/// A keyset key backed only by a PARTIAL (filtered) unique index must not be
+/// accepted — the index does not make the key unique over the rows being read.
+///
+/// Keyset's entire correctness argument is that the key is GLOBALLY unique, so
+/// `WHERE k > <last> ORDER BY k LIMIT n` cannot skip a row sharing the boundary
+/// key. The introspection that is supposed to supply that guarantee asks
+/// `i.indisunique AND i.indnkeyatts = 1 AND a.attnotnull` on PostgreSQL
+/// (src/source/postgres/mod.rs:380) and `i.is_unique = 1 AND c.is_nullable = 0`
+/// on SQL Server (src/source/mssql/mod.rs:1132). Neither excludes a PARTIAL /
+/// FILTERED index — `i.indpred IS NOT NULL` on PG, `i.has_filter = 1` on MSSQL —
+/// and PG additionally never checks `i.indisvalid`.
+///
+/// The shape is not exotic; it is the standard soft-delete index:
+///   `CREATE UNIQUE INDEX ON users (email) WHERE deleted_at IS NULL`
+/// Duplicates are legal among the soft-deleted rows, so a run of them straddles
+/// a page boundary and everything past the first page is skipped.
+///
+/// Measured on this stand (postgres, 50 duplicate + 50 distinct, page size 10):
+///   `rivet check` → `Strategy: keyset(k, size=10)`, `Verdict: ACCEPTABLE`
+///   `rivet run`   → `status: success`, 60 of 100 rows
+/// and the reason the loss survives every ordinary check: the duplicate key
+/// contributes exactly ONE page (10 of its 50 rows), so all 51 DISTINCT key
+/// values are present. A `count(DISTINCT k)` comparison against the source
+/// matches perfectly while 40 rows are gone.
+///
+/// MySQL is the CONTROL arm, not padding: it cannot express a partial index, so
+/// its `NON_UNIQUE = 0` genuinely means globally unique and the equivalent seed
+/// (a plain non-unique index) must be REFUSED. The guard is real on the one
+/// engine that never needed it.
+// AUDIT-RED keyset-partial-unique: a partial/filtered unique index is accepted as a keyset key; duplicates past the first page are dropped, status success. Asserts CORRECT behavior; expected to FAIL until fixed.
+fn run_partial_unique_index_is_not_a_keyset_key(eng: Eng) {
+    eng.require();
+    const DUPS: i64 = 50;
+    const LIVE: i64 = 50;
+    let (table, _guard) = seed_partial_unique(eng, DUPS, LIVE);
+
+    let rig = eng
+        .rig(&table)
+        .mode("chunked")
+        .export_line("chunk_by_key: k")
+        .export_line("chunk_size: 10");
+    let cfg = rig.config_path();
+    let out = run_rivet_env(
+        &["run", "--config", cfg.to_str().unwrap()],
+        &[("RUST_LOG", "warn")],
+    );
+
+    // Refusing is the correct outcome — the key is not unique over the read set.
+    if !out.status.success() {
+        return;
+    }
+    // If it ran, it must have read EVERY row. DuckDB, not the parquet crate
+    // rivet wrote with.
+    let got = duckdb_total_parquet_rows(&rig.out_dir()) as i64;
+    assert_eq!(
+        got,
+        DUPS + LIVE,
+        "keyset over a key backed only by a PARTIAL/FILTERED unique index reported SUCCESS with \
+         {} of {} rows. {} duplicate rows share one key; the seek emits one page of them and then \
+         asks for `k > <that key>`, dropping the rest. The loss is invisible to a DISTINCT check \
+         — every distinct key value is still present — so counts of distinct values agree with \
+         the source while whole rows are gone.\nstderr:\n{}",
+        got,
+        DUPS + LIVE,
+        DUPS,
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn stand_partial_unique_index_is_not_a_keyset_key_postgres() {
+    run_partial_unique_index_is_not_a_keyset_key(Eng::Pg);
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mysql"]
+fn stand_partial_unique_index_is_not_a_keyset_key_mysql() {
+    run_partial_unique_index_is_not_a_keyset_key(Eng::My);
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mssql"]
+fn stand_partial_unique_index_is_not_a_keyset_key_mssql() {
+    run_partial_unique_index_is_not_a_keyset_key(Eng::Ms);
+}
