@@ -194,7 +194,12 @@ def _source_rows(engine: str, url: str, table: str) -> int:
                           "-h-1", "-W", "-Q",
                           f"SET NOCOUNT ON; SELECT count(*) FROM {table}").stdout.strip()
     elif engine == "mongo":
-        out = docker_exec(c, "mongosh", "--quiet", "rivet", "--eval",
+        # `mongosh` does not exist on 4.4 — see `scenarios.mongo_shell`. Asking
+        # for it there returned nothing, which this function turned into -1 and
+        # the oracle read as "source unreachable", SKIPping the comparison on the
+        # oldest gridded version. `countDocuments({})` and not the no-arg form:
+        # the legacy shell rejects it.
+        out = docker_exec(c, scenarios.mongo_shell(c), "--quiet", "rivet", "--eval",
                           f"print(db.{table}.countDocuments({{}}))").stdout.strip()
     else:
         return -1
@@ -560,7 +565,15 @@ def sc_bq_cycle(led: Ledger, engine: str, tag: str, url: str, table: str) -> Non
     """
     proj = os.environ.get("BQ_ORACLE_PROJECT") or run(
         ["gcloud", "config", "get-value", "project"]).stdout.strip()
-    dset = os.environ.get("BQ_ORACLE_DATASET", "rivet_blessed")
+    # PER SOURCE, which is what the gate's README already promises this variable
+    # does ("one dataset PER SOURCE is derived from this") and what this line did
+    # not do. `rivet load` derives the warehouse table from `table:`, so every
+    # engine's `users` landed on ONE table and rivet's cross-source guard refused
+    # the second one — correctly, and on six cells: mysql 8.0/8.4, mssql 2022 and
+    # mongo 4.4/5/6/7/8, each after postgres had already claimed
+    # `rivet_blessed.users`. The guard doing its job is not the same as the gate
+    # being configured right.
+    dset = os.environ.get("BQ_ORACLE_DATASET", "rivet_blessed") + "_" + engine
     bucket = os.environ.get("BQ_ORACLE_BUCKET", "rivet_data_test")
     if not have("bq") or not proj:
         led.skipped(engine, tag, "blessed:bq", "bigquery",

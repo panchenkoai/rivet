@@ -426,9 +426,7 @@ def _source_count_distinct(engine: str, url: str, table: str, id_col: str) -> st
         # mongo:4.4 ships the legacy `mongo` shell, 5.0+ ships `mongosh`. Pick
         # whichever the container actually has, or the count comes back as an OCI
         # "executable not found" string and the gate false-fails on good data.
-        shell = "mongosh"
-        if not docker_exec(container, "sh", "-c", "command -v mongosh >/dev/null 2>&1").ok:
-            shell = "mongo"
+        shell = mongo_shell(container)
         # countDocuments({}) NOT countDocuments() — the legacy 4.4 shell rejects
         # the no-arg form ("match filter must be an expression in an object").
         return docker_exec(
@@ -437,6 +435,25 @@ def _source_count_distinct(engine: str, url: str, table: str, id_col: str) -> st
             f"print(db.{table}.countDocuments({{}})+' '+db.{table}.distinct('_id').length)",
         ).stdout.strip()
     return ""
+
+
+def mongo_shell(container: str) -> str:
+    """`mongosh`, or the legacy `mongo` on an image that predates it.
+
+    Mongo 4.4 ships only the old shell — `mongosh` became standard in 5.0. A
+    caller that assumes the new name gets "executable not found" and, if it
+    parses the empty output as a count, a silent -1 that reads as "the source is
+    unreachable". That is what happened to `blessed_path._source_rows`: every
+    mongo 4.4 oracle cell SKIPped with `source=-1 duckdb=150000` while 5, 6, 7
+    and 8 passed, so the one version most likely to expose an old-shell
+    incompatibility was the one version not being compared.
+
+    Extracted here because the knowledge already existed in this file and a
+    second caller had gone without it; a third would too.
+    """
+    if docker_exec(container, "sh", "-c", "command -v mongosh >/dev/null 2>&1").ok:
+        return "mongosh"
+    return "mongo"
 
 
 def _fidelity_check(engine: str, key: str, got: str) -> bool:

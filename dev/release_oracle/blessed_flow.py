@@ -1363,6 +1363,17 @@ def sc_not_inert(led: Ledger, engine: str, url: str, state_url: str) -> None:
     victim.unlink()
     got = _flow_rows(dest)
     want = blessed_path._source_rows(engine, url, cell.table)
+    if want < 0:
+        # An UNREADABLE source count cannot grade anything, and comparing against
+        # the sentinel is worse than not comparing: on mongo 4.4 — whose image
+        # ships no `mongosh`, so the count came back -1 — the negative control
+        # read "the oracle moved to 150000" and reported a false alarm about a
+        # false alarm. The `oracle` stage one layer up already SKIPs on this;
+        # the probe must too.
+        led.skipped(engine, "flow", "flow:inert", "local",
+                    f"inertness · {engine} — source count unreadable, cannot grade sensitivity")
+        victim.write_bytes(keep)
+        return
     _bit(led, engine, got == want,
          f"inertness (negative control) · one redundant copy removed → oracle still reads "
          f"{got} == source {want}",
