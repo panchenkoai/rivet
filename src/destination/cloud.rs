@@ -33,7 +33,7 @@ use opendal::layers::RetryLayer;
 use crate::config::DestinationConfig;
 use crate::error::Result;
 
-/// Process-wide ceiling on RAM held in one-shot upload buffers.
+/// Default ceiling on RAM held in one-shot upload buffers.
 ///
 /// A single-PUT upload (`op.write`) must buffer the whole part so the store
 /// computes and stores a content MD5 the listing exposes (the only way to get
@@ -42,27 +42,31 @@ use crate::error::Result;
 /// (`parallel`, default 4, operator-tunable).  Rather than a per-part magic
 /// threshold that still multiplies by concurrency, a part one-shots only if it
 /// fits in the *remaining* shared budget; otherwise it streams (memory-bounded,
-/// size-only verification).  Total one-shot RAM is thus capped here regardless
-/// of how many workers upload at once, and any part larger than the whole
-/// budget always streams.
-const ONESHOT_BUDGET_BYTES: i64 = 64 * 1024 * 1024;
-static ONESHOT_BUDGET: AtomicI64 = AtomicI64::new(ONESHOT_BUDGET_BYTES);
+/// size-only verification).  Total one-shot RAM is thus capped for an export
+/// regardless of how many workers upload at once, and any part larger than the
+/// whole budget always streams.  Operators override the budget per destination
+/// with `oneshot_budget_mb`; `None` resolves to this default.
+const DEFAULT_ONESHOT_BUDGET_BYTES: i64 = 64 * 1024 * 1024;
 
-/// Releases the reserved bytes back to [`ONESHOT_BUDGET`] on drop — so the
-/// budget is restored even if the upload errors out.
-struct OneShotReservation(i64);
-impl Drop for OneShotReservation {
-    fn drop(&mut self) {
-        ONESHOT_BUDGET.fetch_add(self.0, Ordering::Relaxed);
+/// Resolve a destination's one-shot upload budget from config: `None` keeps the
+/// 64 MB default, a value maps megabytes to bytes (`0` disables one-shot
+/// uploads entirely).
+fn resolve_oneshot_budget(config: &DestinationConfig) -> i64 {
+    match config.oneshot_budget_mb {
+        Some(mb) => i64::try_from(mb)
+            .unwrap_or(i64::MAX)
+            .saturating_mul(1024 * 1024),
+        None => DEFAULT_ONESHOT_BUDGET_BYTES,
     }
 }
 
-/// Reserve `size` bytes for a one-shot buffer if the budget allows, else `None`
-/// (caller streams).  Parts larger than the whole budget never fit, so they
-/// always stream.
-fn reserve_oneshot(size: u64) -> Option<OneShotReservation> {
-    let size = i64::try_from(size).unwrap_or(i64::MAX);
-    take_from(&ONESHOT_BUDGET, size).then_some(OneShotReservation(size))
+/// Releases the reserved bytes back to the budget it was taken from on drop —
+/// so the budget is restored even if the upload errors out.
+struct OneShotReservation<'a>(&'a AtomicI64, i64);
+impl Drop for OneShotReservation<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_add(self.1, Ordering::Relaxed);
+    }
 }
 
 /// Optimistic atomic reserve: subtract `size`; if that would overdraw, undo and
@@ -109,6 +113,10 @@ pub(crate) struct CloudDestination<B: CloudBackend> {
     _runtime: Arc<tokio::runtime::Runtime>,
     op: blocking::Operator,
     prefix: String,
+    /// Remaining one-shot upload budget for THIS destination (one per export),
+    /// shared by all of the export's parallel workers. Initialized from
+    /// `oneshot_budget_mb` in config; see [`resolve_oneshot_budget`].
+    oneshot_budget: AtomicI64,
     _backend: PhantomData<fn() -> B>,
 }
 
@@ -193,8 +201,18 @@ impl<B: CloudBackend> CloudDestination<B> {
             _runtime: runtime,
             op,
             prefix,
+            oneshot_budget: AtomicI64::new(resolve_oneshot_budget(config)),
             _backend: PhantomData,
         })
+    }
+
+    /// Reserve `size` bytes for a one-shot buffer from this destination's
+    /// budget if it allows, else `None` (caller streams).  Parts larger than
+    /// the whole budget never fit, so they always stream.
+    fn reserve_oneshot(&self, size: u64) -> Option<OneShotReservation<'_>> {
+        let size = i64::try_from(size).unwrap_or(i64::MAX);
+        take_from(&self.oneshot_budget, size)
+            .then_some(OneShotReservation(&self.oneshot_budget, size))
     }
 }
 
@@ -202,7 +220,8 @@ impl<B: CloudBackend> super::Destination for CloudDestination<B> {
     fn write(&self, local_path: &Path, remote_key: &str) -> Result<super::WriteOutcome> {
         let key = format!("{}{}", self.prefix, remote_key);
         let size = std::fs::metadata(local_path)?.len();
-        // One-shot upload when the part fits the shared memory budget: a single
+        // One-shot upload when the part fits this destination's memory budget:
+        // a single
         // PUT (S3 `PutObject` / GCS upload / Azure `Put Blob`) makes the store
         // compute and store a content checksum the listing then exposes for
         // no-download verification.  This is what lets `--validate` md5-check
@@ -210,7 +229,7 @@ impl<B: CloudBackend> super::Destination for CloudDestination<B> {
         // single `Put Blob`, never for the `Put Block List` the streaming
         // writer produces (each `write()` past the first stages a block).
         // Otherwise stream — memory-bounded, size-only for those parts.
-        let outcome = if let Some(_reservation) = reserve_oneshot(size) {
+        let outcome = if let Some(_reservation) = self.reserve_oneshot(size) {
             let body = std::fs::read(local_path)?;
             let meta = self.op.write(&key, body)?;
             // The single-PUT response carries the store's own checksum: GCS /
@@ -335,7 +354,9 @@ impl<B: CloudBackend> super::Destination for CloudDestination<B> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AtomicI64, CloudDestination, Ordering, normalize_prefix, take_from};
+    use super::{
+        AtomicI64, CloudDestination, Ordering, normalize_prefix, resolve_oneshot_budget, take_from,
+    };
     use crate::config::{DestinationConfig, DestinationType};
     use crate::destination::gcs::GcsBackend;
 
@@ -376,6 +397,78 @@ mod tests {
         // proves the *behavioral* fail-fast against a closed port.)
         CloudDestination::<GcsBackend>::new_with_retries(&cfg, 0)
             .expect("no-retry probe destination must build");
+    }
+
+    #[test]
+    fn oneshot_budget_resolution_defaults_to_64mb() {
+        // The field is optional: an unset `oneshot_budget_mb` must keep today's
+        // 64 MB process behavior for a single export.
+        let cfg = DestinationConfig::default();
+        assert_eq!(
+            resolve_oneshot_budget(&cfg),
+            64 * 1024 * 1024,
+            "unset budget resolves to the 64 MB default"
+        );
+    }
+
+    #[test]
+    fn oneshot_budget_resolution_uses_configured_megabytes() {
+        let doubled = DestinationConfig {
+            oneshot_budget_mb: Some(128),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_oneshot_budget(&doubled),
+            128 * 1024 * 1024,
+            "128 MB configured maps to 128 MiB of one-shot buffer"
+        );
+
+        let zero = DestinationConfig {
+            oneshot_budget_mb: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_oneshot_budget(&zero),
+            0,
+            "0 MB configured disables one-shot uploads"
+        );
+    }
+
+    #[test]
+    fn configured_budget_moves_the_oneshot_switch_point() {
+        // The same part decides one-shot vs stream differently as the operator
+        // halves or doubles the budget — this is the knob's observable effect.
+        let default = AtomicI64::new(resolve_oneshot_budget(&DestinationConfig::default()));
+        assert!(
+            take_from(&default, 40 * 1024 * 1024),
+            "40 MB part one-shots under the default 64 MB budget"
+        );
+
+        let halved = AtomicI64::new(resolve_oneshot_budget(&DestinationConfig {
+            oneshot_budget_mb: Some(32),
+            ..Default::default()
+        }));
+        assert!(
+            !take_from(&halved, 40 * 1024 * 1024),
+            "the same 40 MB part streams under a halved 32 MB budget"
+        );
+        assert!(
+            take_from(&halved, 20 * 1024 * 1024),
+            "a 20 MB part still one-shots under 32 MB"
+        );
+
+        let doubled = AtomicI64::new(resolve_oneshot_budget(&DestinationConfig {
+            oneshot_budget_mb: Some(128),
+            ..Default::default()
+        }));
+        assert!(
+            take_from(&doubled, 100 * 1024 * 1024),
+            "a 100 MB part one-shots under a doubled 128 MB budget"
+        );
+        assert!(
+            !take_from(&doubled, 200 * 1024 * 1024),
+            "a 200 MB part still streams under 128 MB"
+        );
     }
 
     #[test]

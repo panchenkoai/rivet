@@ -1072,6 +1072,16 @@
         "allow_anonymous": {
           "type": "boolean",
           "default": false
+        },
+        "oneshot_budget_mb": {
+          "description": "Cap on the total RAM one-shot (single-PUT) upload buffers may hold, in\nMB. `None` = 64 (the default). A one-shot PUT must buffer the whole part\nin memory so the store can compute and store a content checksum; parts\nthat don't fit instead stream (memory-bounded, size-only verification).\n`0` disables one-shot uploads entirely. Applies per destination instance\n(one per export), shared by all of that export's parallel workers.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0,
+          "default": null
         }
       },
       "additionalProperties": false,

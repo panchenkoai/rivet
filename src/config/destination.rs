@@ -46,6 +46,14 @@ pub struct DestinationConfig {
     pub sas_token_env: Option<String>,
     #[serde(default)]
     pub allow_anonymous: bool,
+    /// Cap on the total RAM one-shot (single-PUT) upload buffers may hold, in
+    /// MB. `None` = 64 (the default). A one-shot PUT must buffer the whole part
+    /// in memory so the store can compute and store a content checksum; parts
+    /// that don't fit instead stream (memory-bounded, size-only verification).
+    /// `0` disables one-shot uploads entirely. Applies per destination instance
+    /// (one per export), shared by all of that export's parallel workers.
+    #[serde(default)]
+    pub oneshot_budget_mb: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, Copy, PartialEq, Eq, Default)]
@@ -83,5 +91,32 @@ mod tests {
         assert_eq!(DestinationType::Gcs.label(), "gcs");
         assert_eq!(DestinationType::Azure.label(), "azure");
         assert_eq!(DestinationType::Stdout.label(), "stdout");
+    }
+
+    #[test]
+    fn oneshot_budget_mb_is_optional_and_parses() {
+        // `deny_unknown_fields` is on: the field must be a *known* optional key
+        // so an old config (without it) and a new one (with it) both load.
+        let omitted: DestinationConfig = serde_yaml_ng::from_str(
+            "type: local\n\
+             path: ./out\n",
+        )
+        .expect("legacy config without the field must parse");
+        assert_eq!(omitted.oneshot_budget_mb, None);
+
+        let set: DestinationConfig = serde_yaml_ng::from_str(
+            "type: s3\n\
+             bucket: b\n\
+             oneshot_budget_mb: 128\n",
+        )
+        .expect("config with the field must parse");
+        assert_eq!(set.oneshot_budget_mb, Some(128));
+
+        let zero: DestinationConfig = serde_yaml_ng::from_str(
+            "type: gcs\n\
+             oneshot_budget_mb: 0\n",
+        )
+        .expect("0 is a valid disable value");
+        assert_eq!(zero.oneshot_budget_mb, Some(0));
     }
 }
