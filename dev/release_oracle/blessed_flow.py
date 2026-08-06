@@ -566,7 +566,11 @@ def run_cell(led: Ledger, cell: Cell, url: str, state_url: str, tag: str = "live
     them at once. A teardown that only runs on the happy path is a leak with
     extra steps.
     """
-    tag = "flow"
+    # `tag` is the engine VERSION and arrives from the caller. It used to be
+    # hard-coded to the literal "flow" here, which put "flow" in the ledger's
+    # VERSION column for all four gridded postgres versions — and, once the
+    # prefix started using it, silently undid that fix by shadowing the
+    # parameter. The gate caught the inert fix on the very next run.
     slug = f"{cell.pipeline}_{cell.lifecycle}_{cell.store}_{cell.state}"
     work = scenarios.work_dir() / f"flow_{cell.engine}{tag}_{slug}_{cell.table}"
     shutil.rmtree(work, ignore_errors=True)
@@ -627,7 +631,10 @@ def run_cell(led: Ledger, cell: Cell, url: str, state_url: str, tag: str = "live
 def _run_chain(led: Ledger, cell: Cell, url: str, state_url: str, work: Path,
                cdc_block: str, tag: str = "live") -> None:
     """Walk one cell's whole chain, recording a row per stage."""
-    tag = "flow"
+    # NOT re-bound here. `tag` is the engine version, passed in — a literal
+    # "flow" at this line shadowed the parameter and made the version-scoped
+    # prefix inert while looking correct at its definition. Twice, in two
+    # functions, before the gate's readback said so out loud.
     slug = f"{cell.pipeline}_{cell.lifecycle}_{cell.store}_{cell.state}"
     dest_dir = work / "out"
     # The work root's name makes the prefix unique PER GATE INVOCATION. Without
