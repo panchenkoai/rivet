@@ -719,12 +719,12 @@ fn incremental_manifest_ships_contiguous_cursor_range() {
 /// `if let Some(..)` with no else then swallow it, so nothing is recorded and
 /// nothing is committed.
 ///
-/// Measured on this stand — 20 dated rows plus ONE with `updated_at IS NULL`:
+/// Measured on this stand — 20 dated rows plus 25 with `updated_at IS NULL`:
 ///
-///   with the NULL row      21, 21, 21 rows   `export_state` EMPTY
-///   without it (control)   20,  0,  0 rows   `export_state` → 2026-…T19:44:23
+///   with the NULL rows     45, 45, 45 rows   `export_state` EMPTY
+///   without them (control) 20,  0,  0 rows   `export_state` → 2026-…T19:44:23
 ///
-/// Three runs put 63 rows at the destination for a 21-row table, every run
+/// Three runs put 135 rows at the destination for a 45-row table, every run
 /// reporting success with mode `incremental`. Unbounded: the stored cursor is
 /// never written, so the unfiltered branch is taken forever and the NULL row is
 /// re-included every time, re-arming the wipe.
@@ -751,7 +751,8 @@ fn roast_a_null_cursor_cell_must_not_freeze_the_incremental_cursor() {
         "CREATE TABLE {table} (id int PRIMARY KEY, updated_at timestamptz, v text);
          INSERT INTO {table} SELECT g, now() - (g||' min')::interval, 'v'||g
            FROM generate_series(1,20) g;
-         INSERT INTO {table} VALUES (99, NULL, 'null_cursor_row');"
+         INSERT INTO {table} SELECT 100 + g, NULL, 'null_'||g
+           FROM generate_series(1,25) g;"
     ))
     .unwrap();
     let _guard = PgTable::adopt(table.clone());
@@ -760,13 +761,13 @@ fn roast_a_null_cursor_cell_must_not_freeze_the_incremental_cursor() {
     // is the whole mechanism. Assert it rather than assume the collation.
     let last: i32 = c
         .query_one(
-            &format!("SELECT id FROM {table} ORDER BY updated_at ASC LIMIT 1 OFFSET 20"),
+            &format!("SELECT id FROM {table} ORDER BY updated_at ASC LIMIT 1 OFFSET 44"),
             &[],
         )
         .expect("order probe")
         .get(0);
-    assert_eq!(
-        last, 99,
+    assert!(
+        last > 100,
         "fixture is inert: the NULL-cursor row is not ASC-last on this server, so the wipe \
          cannot occur and a green result would mean nothing"
     );
@@ -775,6 +776,12 @@ fn roast_a_null_cursor_cell_must_not_freeze_the_incremental_cursor() {
     let rig = Rig::pg_batch(&format!("public.{table}"))
         .mode("incremental")
         .export_line("cursor_column: updated_at")
+        // A SMALL batch on purpose: 25 NULL-cursor rows at batch_size 10 means
+        // the final batches are ENTIRELY null, which is the case the backward
+        // scan cannot rescue and only the "never erase the mark" half covers.
+        // With a single NULL row the second half is belt-and-suspenders; this
+        // fixture makes it load-bearing, so both halves are proven.
+        .export_line("tuning: {batch_size: 10}")
         .dest_path(out.path().to_path_buf());
     let cfg = rig.config_path();
 
@@ -796,17 +803,21 @@ fn roast_a_null_cursor_cell_must_not_freeze_the_incremental_cursor() {
     // count is read from the destination by DuckDB, so a "0 new rows" claim by
     // rivet cannot satisfy it.
     assert_eq!(
-        per_run[0], 21,
-        "first run must export all 21 rows, got {}",
+        per_run[0], 45,
+        "first run must export all 45 rows, got {}",
         per_run[0]
     );
     assert_eq!(
-        per_run[2], 21,
-        "after three incremental runs the destination holds {} rows for a 21-row table \
-         ({:?} cumulative). One row has a NULL cursor cell and sorts ASC-LAST on PostgreSQL, so \
-         it overwrites the high-water mark with None; nothing is recorded, nothing is committed, \
-         and every run re-reads the whole table forever. The same fixture without that one row \
-         exports 20 then 0 then 0.",
+        per_run[2], 45,
+        "after three incremental runs the destination holds {} rows for a 45-row table \
+         ({:?} cumulative). 25 rows have a NULL cursor cell and sort ASC-LAST on PostgreSQL, so \
+         they overwrite the high-water mark with None; nothing is recorded, nothing is \
+         committed, and every run re-reads the whole table forever. The same fixture without \
+         them exports 20 then 0 then 0.\n\nThe fixture is sized for BOTH halves of the fix: 25 \
+         null rows at batch_size 10 means the final batches are ENTIRELY null, which the \
+         last-non-null scan cannot rescue and only the never-erase-the-mark guard covers. With a \
+         single null row the second half is belt-and-suspenders; here each half fails this test \
+         on its own.",
         per_run[2], per_run
     );
 }
