@@ -1526,7 +1526,18 @@ fn mssql_cdc_case_only_table_mismatch_must_not_silently_drop_events() {
     // accepts it everywhere EXCEPT rivet's own byte-exact router.
     let cfg = mssql_cdc_config(&d, &table.to_lowercase(), ci, &ckpt, out.path());
 
-    run_rivet_ok(&cfg); // anchor
+    // The anchor run is where a catalog cross-check would fire, so it must be
+    // allowed to REFUSE rather than asserted to succeed — refusing is the
+    // outcome this test wants.
+    let anchor = run_rivet_env(&["run", "--config", cfg.to_str().unwrap()], &[]);
+    if !anchor.status.success() {
+        let why = String::from_utf8_lossy(&anchor.stderr);
+        assert!(
+            why.contains("no configured table matches"),
+            "the anchor run failed for an unrelated reason:\n{why}"
+        );
+        return; // refused at open, before any checkpoint could advance — correct
+    }
     mssql_cdc_exec(&format!(
         "INSERT INTO dbo.{table} VALUES (1,'a'),(2,'b'),(3,'c'); \
          UPDATE dbo.{table} SET v='B' WHERE id=2; \

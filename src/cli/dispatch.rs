@@ -279,6 +279,11 @@ fn dispatch_cdc(a: CdcArgs) -> Result<()> {
             },
             CdcEngine::Postgres => CdcEngineOpts::Postgres { slot: a.slot },
             CdcEngine::Mssql => CdcEngineOpts::Mssql {
+                // The `rivet cdc` CLI names no tables — it captures whatever the
+                // capture instance emits — so there is nothing to cross-check
+                // against and the guard stays off. Config mode (`mode: cdc`)
+                // supplies them.
+                configured_tables: Vec::new(),
                 capture_instance: a.capture_instance,
             },
             CdcEngine::Mongo => CdcEngineOpts::Mongo { canonical: false },
