@@ -178,6 +178,35 @@ pub(super) fn finalize_manifest(
         }
     };
 
+    // A HEALTHY no-op describes nothing, so it must not describe the prefix.
+    //
+    // `"skipped"` is a real production status — `single.rs` sets it when a run
+    // reads 0 rows under `skip_empty: true`, the ordinary outcome of an
+    // incremental export with nothing new past the cursor. It used to fall
+    // through the `_` arm below to `Interrupted`, and `write_manifest` then
+    // OVERWROTE the canonical manifest with a zero-part interrupted document
+    // while leaving the previous good run's `_SUCCESS` in place, now stale.
+    //
+    // Measured: run 1 exported 10 rows (manifest success, 1 part, _SUCCESS); run
+    // 2 found nothing new and left `manifest.json` saying `interrupted, 0 parts,
+    // 0 rows` over a prefix still holding the parquet. `rivet validate` then
+    // refused the export — `[RIVET_VERIFY_SUCCESS_STALE]` plus the 10 delivered
+    // rows reported as an `untracked object` — after a run that did nothing
+    // wrong.
+    //
+    // The same early return the no-plan-snapshot case above takes, for the same
+    // reason: there is no committed work to describe. The run itself is recorded
+    // where run history belongs — `export_metrics`, `file_log`, `run_status` —
+    // and the prefix keeps describing the last run that actually delivered.
+    if summary.status == "skipped" && summary.manifest_parts.is_empty() {
+        log::debug!(
+            "{} '{}': skipped run wrote no parts — leaving the prefix's manifest as it stands",
+            kind,
+            summary.export_name
+        );
+        return None;
+    }
+
     let status = match summary.status.as_str() {
         "success" => ManifestStatus::Success,
         "failed" => ManifestStatus::Failed,
