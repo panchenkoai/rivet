@@ -31,9 +31,18 @@
 
 use std::path::PathBuf;
 
+/// dispatch.rs up to its `#[cfg(test)]` module.
+///
+/// The test module builds `LoadSection` values and so mentions `cleanup_source`
+/// without deleting anything — it caught one on the first run. The subject here
+/// is production wiring; a fixture naming the flag is not a delete site.
 fn dispatch_src() -> String {
     let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/cli/dispatch.rs");
-    std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("read {}: {e}", p.display()))
+    let all = std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("read {}: {e}", p.display()));
+    match all.find("\n#[cfg(test)]") {
+        Some(i) => all[..i].to_string(),
+        None => all,
+    }
 }
 
 /// Split a Rust source into `fn` bodies keyed by name, by brace depth.
@@ -90,22 +99,10 @@ fn fn_bodies(src: &str) -> Vec<(String, String)> {
 /// or incremental export the source side has already advanced (slot acked,
 /// cursor committed), so those rows then exist in neither the source log, nor
 /// the destination, nor the warehouse.
-/// STATUS: RED against current code, and `#[ignore]`d for that reason rather
-/// than because it needs anything to be running.
-///
-/// The live suite has a convention for a guard that documents an open finding
-/// (`AUDIT-RED … expected to FAIL until fixed`) because that suite is run with
-/// `--ignored` and its reds are visible. The offline suite has no such
-/// convention: it is the green gate every commit is measured against, so a red
-/// test here would read as a broken build rather than as a recorded finding.
-///
-/// So it is opt-in: `cargo test --test offline_suite -- --ignored
-/// cleanup_source_must_consult`. Remove the `#[ignore]` in the same commit that
-/// gates the delete — at that point it becomes a real regression guard and
-/// belongs in the gate.
-// AUDIT-RED destructive-delete-gate: cleanup_source wipes the whole prefix with no live-run check, while the strictly gentler gc_orphans on the same prefix consults the ledger. Asserts CORRECT behavior; expected to FAIL until fixed.
+/// GREEN as of the commit that gated the delete; it was written RED and opt-in
+/// while the finding was open, and joins the gate now that it guards a fix
+/// rather than recording a gap.
 #[test]
-#[ignore = "AUDIT-RED: open finding — cleanup_source is ungated; run with --ignored"]
 fn cleanup_source_must_consult_the_active_run_ledger() {
     let src = dispatch_src();
     let bodies = fn_bodies(&src);
@@ -115,15 +112,19 @@ fn cleanup_source_must_consult_the_active_run_ledger() {
         bodies.len()
     );
 
-    // The sites that turn the flag into a delete target.
+    // Every function that reads the flag at all. Detection is on `cleanup_source`
+    // rather than on a particular expression shape: the first version keyed on
+    // `… .then_some(..)` and went blind the moment the construction was extracted
+    // into a helper — it said so loudly instead of passing, which is the only
+    // reason this is not a silently dead guard today.
     let deleters: Vec<&(String, String)> = bodies
         .iter()
-        .filter(|(_, b)| b.contains("cleanup_source") && b.contains("then_some"))
+        .filter(|(n, b)| b.contains("cleanup_source") && n != "cleanup_source")
         .collect();
     assert!(
         !deleters.is_empty(),
-        "no `cleanup_source … then_some(..)` site found in dispatch.rs — the wiring moved, and \
-         this guard now checks nothing. Re-point it at the new delete-target construction."
+        "no function in dispatch.rs reads `cleanup_source` — the wiring moved, and this guard \
+         now checks nothing. Re-point it at the new delete-target construction."
     );
 
     // The signal the gentler delete already uses, in the same file.
@@ -133,9 +134,23 @@ fn cleanup_source_must_consult_the_active_run_ledger() {
          gate is gone, which is a bigger problem than the one this guard was written for."
     );
 
+    // Reaching the ledger through ONE named helper counts. A guard that demanded
+    // the call be inline would forbid the obvious refactor — and the obvious
+    // refactor is what a fix looks like when three call sites share one rule.
+    let reaches_ledger = |body: &str| -> bool {
+        if body.contains("has_active_run_on_prefix") {
+            return true;
+        }
+        bodies.iter().any(|(callee, cbody)| {
+            !callee.is_empty()
+                && body.contains(&format!("{callee}("))
+                && cbody.contains("has_active_run_on_prefix")
+        })
+    };
+
     let ungated: Vec<&str> = deleters
         .iter()
-        .filter(|(_, b)| !b.contains("has_active_run_on_prefix"))
+        .filter(|(_, b)| !reaches_ledger(b))
         .map(|(n, _)| n.as_str())
         .collect();
 
