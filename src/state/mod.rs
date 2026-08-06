@@ -21,7 +21,7 @@ mod shape;
 // Items below may not be explicitly named by all internal callers (often used
 // as inferred return types), but are part of the public integration-test API.
 #[allow(unused_imports)]
-pub use checkpoint::ChunkTaskInfo;
+pub use checkpoint::{ChunkTaskInfo, StrategySnapshot};
 #[allow(unused_imports)]
 pub use file_log::{DurablePart, FilePart, FileRecord};
 #[allow(unused_imports)]
@@ -421,6 +421,26 @@ const MIGRATIONS: &[(i64, &str)] = &[
          CREATE UNIQUE INDEX IF NOT EXISTS export_metrics_one_running_per_run
              ON export_metrics(run_id) WHERE status = 'running';",
     ),
+    (
+        22,
+        "CREATE TABLE IF NOT EXISTS strategy_snapshot (
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             export_name TEXT NOT NULL,
+             source_schema TEXT,
+             source_table TEXT NOT NULL,
+             row_estimate BIGINT,
+             total_bytes BIGINT,
+             avg_row_bytes BIGINT,
+             chosen_mode TEXT NOT NULL,
+             strategy_kind TEXT,
+             key_column TEXT,
+             chunk_size BIGINT,
+             rivet_version TEXT NOT NULL,
+             captured_at TEXT NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS idx_strategy_snapshot_export
+             ON strategy_snapshot(export_name, id DESC);",
+    ),
 ];
 
 /// PostgreSQL-compatible DDL.  Column types differ from SQLite (BIGSERIAL,
@@ -754,6 +774,26 @@ const PG_MIGRATIONS: &[(i64, &str)] = &[
                             WHERE b.run_id = a.run_id AND b.status = 'running');
          CREATE UNIQUE INDEX IF NOT EXISTS export_metrics_one_running_per_run
              ON export_metrics(run_id) WHERE status = 'running';",
+    ),
+    (
+        22,
+        "CREATE TABLE IF NOT EXISTS strategy_snapshot (
+             id BIGSERIAL PRIMARY KEY,
+             export_name TEXT NOT NULL,
+             source_schema TEXT,
+             source_table TEXT NOT NULL,
+             row_estimate BIGINT,
+             total_bytes BIGINT,
+             avg_row_bytes BIGINT,
+             chosen_mode TEXT NOT NULL,
+             strategy_kind TEXT,
+             key_column TEXT,
+             chunk_size BIGINT,
+             rivet_version TEXT NOT NULL,
+             captured_at TEXT NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS idx_strategy_snapshot_export
+             ON strategy_snapshot(export_name, id DESC);",
     ),
 ];
 

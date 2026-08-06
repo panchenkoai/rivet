@@ -751,3 +751,107 @@ mod tests {
         );
     }
 }
+
+/// One table's SHAPE at the moment a strategy was chosen for it.
+///
+/// Recorded by `rivet init`, which reads every one of these facts from the
+/// catalog to make the choice and — before this — threw them away. The config it
+/// writes carries the DECISION; nothing carried the EVIDENCE, so six months
+/// later there is no way to ask "what did the table look like when we picked
+/// this?" without guessing.
+///
+/// The field pipeline's own generator already works this way: its
+/// `aa_imports_config.json` stores `table_size_gb` beside `copying_strategy`,
+/// which is exactly what makes their choices auditable. This is that idea with
+/// the two facts they omit and today's failures needed — the ROW WIDTH and the
+/// KEY — plus a timestamp, because a snapshot with no date cannot tell you it
+/// has gone stale.
+///
+/// Why those two. `aa_import_partnerize` was 94k rows — BELOW the 100k threshold
+/// that routes to `mode: full` — and 1010 bytes per row, four to ten times wider
+/// than its siblings. It is the one that crossed the statement timeout. The
+/// threshold counted rows where the cost is bytes, and the byte figure was read
+/// and discarded. Separately, `ref_id` on the versioned tables is indexed but
+/// NOT unique (2.16 rows per key, measured), which is why keyset is impossible
+/// there — a property of the data that no config field records.
+///
+/// INIT ONLY, deliberately: writing this on every run would show a shape
+/// DRIFTING away from the strategy that suits it, which is the more useful
+/// signal and the larger feature. This is the decision point alone.
+#[derive(Debug, Clone)]
+pub struct StrategySnapshot {
+    pub export_name: String,
+    pub source_schema: Option<String>,
+    pub source_table: String,
+    pub row_estimate: Option<i64>,
+    /// Physical size from the catalog — `DATA_LENGTH` on MySQL, `pg_total_
+    /// relation_size` on PostgreSQL. `None` where the engine has no scan-free
+    /// figure (SQL Server and Mongo do not populate it), and `None` is recorded
+    /// as `None` rather than 0: "unknown" and "empty" are different answers.
+    pub total_bytes: Option<i64>,
+    pub avg_row_bytes: Option<i64>,
+    pub chosen_mode: String,
+    /// `keyset` / `range` / `full` / `incremental` — the shape the scaffold
+    /// emitted, which is finer than `mode:` alone (both keyset and range are
+    /// `mode: chunked`).
+    pub strategy_kind: Option<String>,
+    pub key_column: Option<String>,
+    pub chunk_size: Option<i64>,
+}
+
+impl StateStore {
+    /// Append a strategy snapshot. Append-only: a later `init` over the same
+    /// config adds a row rather than replacing one, so the sequence shows how
+    /// the answer changed.
+    pub fn record_strategy_snapshot(&self, s: &StrategySnapshot) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let ver = env!("CARGO_PKG_VERSION");
+        let sql = "INSERT INTO strategy_snapshot (
+                 export_name, source_schema, source_table, row_estimate, total_bytes,
+                 avg_row_bytes, chosen_mode, strategy_kind, key_column, chunk_size,
+                 rivet_version, captured_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)";
+        match &self.conn {
+            StateConn::Sqlite(c) => {
+                c.execute(
+                    sql,
+                    rusqlite::params![
+                        s.export_name,
+                        s.source_schema,
+                        s.source_table,
+                        s.row_estimate,
+                        s.total_bytes,
+                        s.avg_row_bytes,
+                        s.chosen_mode,
+                        s.strategy_kind,
+                        s.key_column,
+                        s.chunk_size,
+                        ver,
+                        now,
+                    ],
+                )?;
+            }
+            StateConn::Postgres(client) => {
+                let mut c = client.borrow_mut();
+                c.execute(
+                    &pg_sql(sql),
+                    &[
+                        &s.export_name,
+                        &s.source_schema,
+                        &s.source_table,
+                        &s.row_estimate,
+                        &s.total_bytes,
+                        &s.avg_row_bytes,
+                        &s.chosen_mode,
+                        &s.strategy_kind,
+                        &s.key_column,
+                        &s.chunk_size,
+                        &ver,
+                        &now,
+                    ],
+                )?;
+            }
+        }
+        Ok(())
+    }
+}

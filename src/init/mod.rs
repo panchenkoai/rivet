@@ -443,7 +443,7 @@ pub fn init(
     mode_override: Option<&str>,
 ) -> Result<()> {
     yaml_destination.validate()?;
-    let (text, yaml_decimal_review) = match format {
+    let (text, yaml_decimal_review, snapshots) = match format {
         InitFormat::Yaml => init_yaml(
             source_url,
             provenance,
@@ -474,6 +474,9 @@ pub fn init(
             (
                 init_discovery_json(source_url, table, schema, filter)?,
                 false,
+                // `--discover` writes a SURVEY, not a config — there is no
+                // strategy decision to record the evidence for.
+                Vec::new(),
             )
         }
     };
@@ -481,6 +484,7 @@ pub fn init(
     match output {
         Some(path) => {
             write_config_output(path, &text)?;
+            record_strategy_snapshots(path, &snapshots);
             let label_written = match format {
                 InitFormat::Yaml => "Config",
                 InitFormat::DiscoveryJson => "Discovery artifact",
@@ -681,13 +685,14 @@ fn init_yaml(
     dest: &InitYamlDestination,
     filter: &TableFilter,
     mode_override: Option<&str>,
-) -> Result<(String, bool)> {
+) -> Result<(String, bool, Vec<crate::state::StrategySnapshot>)> {
     if let Some(t) = table {
         let info = introspect_single_table(source_url, t, schema)?;
         let hint = yaml_scaffold::table_has_unbounded_decimal_columns(&info);
+        let snaps = vec![snapshot_of(&info, mode_override)];
         let yaml =
             yaml_scaffold::generate_config(&info, source_url, provenance, dest, mode_override)?;
-        return Ok((yaml, hint));
+        return Ok((yaml, hint, snaps));
     }
     let infos = introspect_all(source_url, schema, filter)?;
     if infos.is_empty() {
@@ -705,7 +710,31 @@ fn init_yaml(
         dest,
         mode_override,
     )?;
-    Ok((yaml, hint))
+    let snaps = infos
+        .iter()
+        .map(|i| snapshot_of(i, mode_override))
+        .collect();
+    Ok((yaml, hint, snaps))
+}
+
+/// The decision plus the EVIDENCE it was made from, for the state store.
+///
+/// Every field here is something `init` already read from the catalog to make
+/// the choice; before this they were discarded the moment the YAML was written.
+fn snapshot_of(info: &TableInfo, mode_override: Option<&str>) -> crate::state::StrategySnapshot {
+    let d = yaml_scaffold::decided_strategy(info, mode_override);
+    crate::state::StrategySnapshot {
+        export_name: info.table.clone(),
+        source_schema: (!info.schema.is_empty()).then(|| info.schema.clone()),
+        source_table: info.table.clone(),
+        row_estimate: (info.row_estimate > 0).then_some(info.row_estimate),
+        total_bytes: info.total_bytes,
+        avg_row_bytes: info.avg_row_bytes(),
+        chosen_mode: d.mode,
+        strategy_kind: Some(d.kind.to_string()),
+        key_column: d.key_column,
+        chunk_size: d.chunk_size,
+    }
 }
 
 fn init_discovery_json(
@@ -911,6 +940,38 @@ fn schema_scope_label(source_url: &str, schema: Option<&str>, n: usize) -> Resul
     })
 }
 
+/// Persist the shape each strategy was chosen from, into the state store the
+/// runs will use — the one beside the config just written.
+///
+/// Best-effort and NEVER fatal: `init`'s product is the config, and a scaffold
+/// that fails because an audit row could not be written would be trading the
+/// thing the user asked for against a convenience. A failure is logged at
+/// `debug`, matching how the run path treats its own harm-metric write.
+///
+/// Only on the `-o <path>` route, deliberately: without an output path there is
+/// no config, so there is no `.rivet_state.db` beside one and nowhere the run
+/// would later look. Printing a scaffold to stdout leaves no trace by design.
+fn record_strategy_snapshots(config_path: &str, snapshots: &[crate::state::StrategySnapshot]) {
+    if snapshots.is_empty() {
+        return;
+    }
+    let store = match crate::state::StateStore::open(config_path) {
+        Ok(s) => s,
+        Err(e) => {
+            log::debug!("init: strategy snapshot skipped (state store unavailable): {e:#}");
+            return;
+        }
+    };
+    for s in snapshots {
+        if let Err(e) = store.record_strategy_snapshot(s) {
+            log::debug!(
+                "init: strategy snapshot for '{}' not written (informational): {e:#}",
+                s.export_name
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1099,6 +1160,92 @@ mod tests {
             vec![col("id", "uuid", true), col("n", "int", false)],
         );
         assert_eq!(small_uuid.suggest_mode(), "full");
+    }
+
+    /// The snapshot's decision must be the one the YAML actually carries.
+    ///
+    /// `decided_strategy` feeds the strategy snapshot; `generate_config` writes
+    /// the config. They share the same underlying rules, and this asserts they
+    /// still AGREE — by parsing what the scaffold emitted, not by re-deriving
+    /// the rule a second time. A snapshot that describes a choice the config did
+    /// not make is worse than no snapshot: it is an audit trail that lies.
+    ///
+    /// The matrix crosses the three shapes the scaffold can pick, so a change to
+    /// any one arm is caught rather than only the one an author remembered.
+    #[test]
+    fn decided_strategy_agrees_with_the_generated_yaml() {
+        let cases: Vec<(&str, TableInfo)> = vec![
+            (
+                "single int PK, large → keyset",
+                make_table(
+                    2_000_000,
+                    vec![col("id", "bigint", true), col("name", "text", false)],
+                ),
+            ),
+            (
+                "no single PK, int column, large → range",
+                make_table(
+                    2_000_000,
+                    vec![col("order_id", "bigint", false), col("name", "text", false)],
+                ),
+            ),
+            (
+                "small → full",
+                make_table(10, vec![col("id", "bigint", true)]),
+            ),
+        ];
+        for (label, info) in cases {
+            let d = yaml_scaffold::decided_strategy(&info, None);
+            let yaml = yaml_scaffold::generate_config(
+                &info,
+                "postgresql://localhost/db",
+                &super::SourceProvenance::Inline,
+                &Default::default(),
+                None,
+            )
+            .expect("scaffold");
+            // COMMENTS STRIPPED. The keyset scaffold's hint line mentions
+            // `chunk_column:` as the alternative to consider, and matching raw
+            // text read that as the config choosing range — the first run of
+            // this test failed on exactly that. Compare against what the config
+            // SAYS, not what it discusses.
+            let yaml: String = yaml
+                .lines()
+                .filter(|l| !l.trim_start().starts_with('#'))
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            assert!(
+                yaml.contains(&format!("mode: {}", d.mode)),
+                "{label}: snapshot says mode {:?}, YAML says otherwise:\n{yaml}",
+                d.mode
+            );
+            // The KIND is not written as a field — it is implied by which key
+            // line the scaffold emitted, so that is what gets compared.
+            let (expect, forbid) = match d.kind {
+                "keyset" => ("chunk_by_key:", Some("chunk_column:")),
+                "range" => ("chunk_column:", Some("chunk_by_key:")),
+                _ => ("mode:", None),
+            };
+            assert!(
+                yaml.contains(expect),
+                "{label}: snapshot kind {:?} implies `{expect}` in the YAML:\n{yaml}",
+                d.kind
+            );
+            if let Some(f) = forbid {
+                assert!(
+                    !yaml.contains(f),
+                    "{label}: snapshot kind {:?} but the YAML also carries `{f}`:\n{yaml}",
+                    d.kind
+                );
+            }
+            if let Some(k) = &d.key_column {
+                assert!(
+                    yaml.contains(k),
+                    "{label}: snapshot names key {k:?}, absent from the YAML:\n{yaml}"
+                );
+            }
+        }
     }
 
     #[test]
