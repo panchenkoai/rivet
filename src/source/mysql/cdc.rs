@@ -405,7 +405,16 @@ fn refuse_compressed_binlog(conn: &mut Conn) -> Result<()> {
         .query_first("SELECT @@global.binlog_transaction_compression")
         .ok()
         .flatten();
-    if !binlog_compression_is_on(raw.as_deref()) {
+    compression_refusal(raw.as_deref())
+}
+
+/// The verdict on the server's reply, split from the connection so both
+/// DIRECTIONS are testable offline. Folded into `refuse_compressed_binlog` this
+/// was a `!` that only a live server could flip: deleting it (refuse when the
+/// binlog is PLAIN, stream when it is compressed — the exact inversion of the
+/// guard) survived the whole offline suite while breaking every MySQL CDC run.
+fn compression_refusal(raw: Option<&str>) -> Result<()> {
+    if !binlog_compression_is_on(raw) {
         return Ok(());
     }
     anyhow::bail!(
@@ -592,6 +601,27 @@ mod tests {
             !binlog_compression_is_on(None),
             "no such variable (pre-8.0.20 / MariaDB) is not a compressed source"
         );
+    }
+
+    /// The predicate above says what the reply MEANS; this says what the guard
+    /// DOES with it, which is the half a live server used to hold hostage. Both
+    /// directions, because a guard that refuses everything and a guard that
+    /// refuses nothing are the same bug from opposite sides — deleting the `!`
+    /// turns one into the other and this is what notices.
+    #[test]
+    fn compression_refusal_blocks_a_compressed_binlog_and_only_that() {
+        let err = compression_refusal(Some("ON")).expect_err("ON must refuse");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("binlog_transaction_compression") && msg.contains("capture NOTHING"),
+            "the refusal must name the setting and the harm: {msg}"
+        );
+        for ok in [Some("OFF"), Some("0"), Some(""), None] {
+            assert!(
+                compression_refusal(ok).is_ok(),
+                "{ok:?} is not a compressed binlog — the run must proceed"
+            );
+        }
     }
 
     // The `mysql-cdc` instance (cdc profile, :3307) — binlog + a REPLICATION grant.

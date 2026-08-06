@@ -4685,7 +4685,6 @@ fn roast_pg_cdc_destination_placeholders_resolve_like_the_batch_path() {
     );
 }
 
-
 /// The binlog-compression guard, live.
 ///
 /// `binlog_transaction_compression` (MySQL 8.0.20+) packs a transaction's
@@ -4696,13 +4695,30 @@ fn roast_pg_cdc_destination_placeholders_resolve_like_the_batch_path() {
 /// worst shape a CDC bug can take, and the operator's own instinct (shrink the
 /// binlog) is what triggers it.
 ///
-/// Until the payload is expanded, the run must REFUSE. Flipping a server global
-/// under a shared stand needs a guard that restores it even on panic — the same
-/// discipline as the timezone test above.
+/// Until the payload is expanded, the run must REFUSE.
+///
+/// RUNS AGAINST THE BATCH MYSQL (:3306), NOT THE CDC ONE, and that is the point
+/// rather than an accident. The setting is a server GLOBAL, so while this test
+/// holds it ON every concurrent reader of that server's binlog is refused too —
+/// and `cargo test` runs the file's 30-odd CDC tests in parallel against :3307.
+/// The first CI run proved it: `cdc_update_and_delete_carry_full_types` failed
+/// with THIS guard's message, 553 passed / 1 failed, and nothing was wrong with
+/// either test. The Drop guard restores the setting but cannot help a test that
+/// is already mid-run.
+///
+/// :3306 has `log_bin=ON`, `binlog_format=ROW` and the REPLICATION grants — so
+/// the guard's subject exists — while nothing in the suite reads its binlog
+/// (`Rig::mysql_cdc` is wired to `MYSQL_CDC_URL`; only `mysql_batch` uses this
+/// one, and a batch SELECT does not care how the binlog is packed). Isolating
+/// the fixture removes the shared mutable state; serialising 60 call sites
+/// behind a lock would only coordinate it, and slow every CDC test to do so.
+///
+/// The restore guard stays anyway: a panic here must not leave a server global
+/// flipped for whatever runs next.
 #[test]
-#[ignore = "live: requires the cdc-profile MySQL (:3307)"]
+#[ignore = "live: requires docker compose up -d mysql (:3306, log_bin=ON)"]
 fn mysql_cdc_refuses_a_compressed_binlog_instead_of_capturing_nothing() {
-    let root_url = MYSQL_CDC_URL.replace("rivet:rivet@", "root:rivet@");
+    let root_url = MYSQL_URL.replace("rivet:rivet@", "root:rivet@");
     let mut admin = match mysql::Conn::new(mysql::Opts::from_url(&root_url).unwrap()) {
         Ok(c) => c,
         Err(e) => panic!("cdc-profile MySQL admin connection: {e}"),
@@ -4732,20 +4748,43 @@ fn mysql_cdc_refuses_a_compressed_binlog_instead_of_capturing_nothing() {
     let _restore = CompressionGuard(root_url.clone());
 
     let tbl = unique_name("cdc_compressed");
-    let mut c = conn();
+    // Everything in this test talks to :3306 — the isolated server, see above.
+    let batch_conn =
+        || mysql::Conn::new(mysql::Opts::from_url(MYSQL_URL).unwrap()).expect("batch mysql");
+    let mut c = batch_conn();
     c.query_drop(format!("DROP TABLE IF EXISTS {tbl}")).unwrap();
     c.query_drop(format!("CREATE TABLE {tbl} (id INT PRIMARY KEY, v INT)"))
         .unwrap();
-    let _guard = Table(tbl.clone());
+    struct BatchTable(String);
+    impl Drop for BatchTable {
+        fn drop(&mut self) {
+            if let Ok(mut c) = mysql::Conn::new(mysql::Opts::from_url(MYSQL_URL).unwrap()) {
+                let _ = c.query_drop(format!("DROP TABLE IF EXISTS {}", self.0));
+            }
+        }
+    }
+    let _guard = BatchTable(tbl.clone());
 
     let d = tempfile::tempdir().unwrap();
     let out = d.path().join("out");
     let ckpt = d.path().join("cdc.ckpt");
     std::fs::create_dir_all(&out).unwrap();
 
+    // `cdc_config` (the file's shared helper) points at :3307; every run here
+    // must go to the isolated :3306 instead, so the config is built locally.
+    let cfg_into = |dest: &std::path::Path| {
+        write_config(
+            &d,
+            &Rig::mysql_cdc(&tbl)
+                .source_url(MYSQL_URL)
+                .checkpoint_path(ckpt.clone())
+                .dest_path(dest.to_path_buf())
+                .yaml(),
+        )
+    };
     // The refusal must come from the OPEN, before any capture claim — so it
     // fires on the anchoring run, not only once changes exist.
-    let cfg = cdc_config(&d, &tbl, &ckpt, &out);
+    let cfg = cfg_into(&out);
     let out_text = {
         let o = run_rivet(&["run", "--config", cfg.to_str().unwrap()]);
         assert!(
@@ -4776,7 +4815,7 @@ fn mysql_cdc_refuses_a_compressed_binlog_instead_of_capturing_nothing() {
     let out2 = d.path().join("out2");
     std::fs::create_dir_all(&out1).unwrap();
     std::fs::create_dir_all(&out2).unwrap();
-    run_rivet_ok(&cdc_config(&d, &tbl, &ckpt, &out1)); // anchors
+    run_rivet_ok(&cfg_into(&out1)); // anchors
     // A FRESH connection for the write. `binlog_transaction_compression` is
     // captured into the SESSION at connect time, so `c` — opened while the
     // global was ON — still writes compressed transactions no matter what the
@@ -4784,11 +4823,11 @@ fn mysql_cdc_refuses_a_compressed_binlog_instead_of_capturing_nothing() {
     // captured 0 rows: an accidental second demonstration of the very bug the
     // guard exists for, and the same session-state trap the timezone test
     // above documents.)
-    let mut fresh = conn();
+    let mut fresh = batch_conn();
     fresh
         .query_drop(format!("INSERT INTO {tbl} VALUES (1, 10), (2, 20)"))
         .unwrap();
-    run_rivet_ok(&cdc_config(&d, &tbl, &ckpt, &out2));
+    run_rivet_ok(&cfg_into(&out2));
     assert_eq!(
         manifest_rows(&out2),
         2,
