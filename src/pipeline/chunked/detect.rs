@@ -313,14 +313,81 @@ pub(crate) fn detect_and_generate_chunks(
     let min_sql = crate::sql::aggregate_sql(source_type, "min", chunk_column, base_query);
     let max_sql = crate::sql::aggregate_sql(source_type, "max", chunk_column, base_query);
 
-    let min_val = src
-        .query_scalar(&min_sql)?
-        .and_then(|s| s.trim().parse::<i64>().ok())
-        .unwrap_or(0);
-    let max_val = src
-        .query_scalar(&max_sql)?
-        .and_then(|s| s.trim().parse::<i64>().ok())
-        .unwrap_or(0);
+    // An UNREADABLE bound is not zero. Three different inputs used to land on the
+    // same `unwrap_or(0)` and only the first is legitimate:
+    //
+    //   1. the scalar is NULL — the table really is empty, and one empty window
+    //      is the right plan (`integer_range_null_minmax_collapses_to_zero_zero`);
+    //   2. the text does not parse as a whole integer — a DECIMAL/NUMERIC/float key;
+    //   3. `query_scalar` cannot render the type at all — PostgreSQL's tries
+    //      i64, i32, f64, timestamp, date, uuid, String and falls through to
+    //      `Ok(None)`, and no arm matches a numeric OID.
+    //
+    // Cases 2 and 3 made min = max = 0, so the plan became the single window
+    // `WHERE col BETWEEN 0 AND 0`. PostgreSQL compares numeric to integer
+    // happily, so the query was VALID and returned nothing: a 100-row table
+    // exported 0 rows with `status: success` and exit 0 (measured; the sparsity
+    // diagnostic even reassured, since a span of 1 over a 100-row estimate reads
+    // as perfectly dense).
+    //
+    // Case 3 is indistinguishable from case 1 at this layer — both arrive as
+    // `None` — so emptiness is CHECKED rather than assumed. The extra COUNT runs
+    // only on the None path, i.e. only when something is already unusual.
+    //
+    // The parse is STRICT, deliberately not the float-tolerant `parse_scalar_i64`
+    // used for the row count above: that one reads "998.75" as 998, and a max
+    // bound rounded DOWN drops every row above it — trading a loud zero-row
+    // export for a quiet partial one. The DATE branch sixty lines up already
+    // hard-errors on both an absent and an unparseable bound; this matches it.
+    let strict_i64 = |text: &str| -> Option<i64> {
+        let t = text.trim();
+        if let Ok(v) = t.parse::<i64>() {
+            return Some(v);
+        }
+        // Accept a float rendering ONLY when it carries no fraction — some
+        // drivers stringify an integer min/max as `42.0`.
+        match t.split_once('.') {
+            Some((head, frac)) if frac.bytes().all(|b| b == b'0') => head.parse::<i64>().ok(),
+            _ => None,
+        }
+    };
+    let read_bound = |src: &mut dyn Source, raw: Option<String>, which: &str| -> Result<i64> {
+        match raw {
+            Some(text) => strict_i64(&text).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "export '{}': {}({}) = {:?} is not a whole integer — range chunking slices \
+                     with an integer BETWEEN, so a fractional key silently drops rows between \
+                     windows. Use `chunk_by_key:` (keyset — any orderable unique indexed key) \
+                     or an integer column.",
+                    export_name,
+                    which,
+                    chunk_column,
+                    text
+                )
+            }),
+            None => {
+                let rows = query_wrapped_row_count(src, base_query)?;
+                if rows <= 0 {
+                    return Ok(0); // genuinely empty — the one legitimate zero
+                }
+                Err(anyhow::anyhow!(
+                    "export '{}': {}({}) returned no readable value although the table has ~{} \
+                     row(s) — the driver cannot render this key's type (PostgreSQL `numeric` is \
+                     the known case). Range chunking would plan the single window `BETWEEN 0 AND \
+                     0` and export NOTHING while reporting success. Use `chunk_by_key:` (keyset) \
+                     or an integer column.",
+                    export_name,
+                    which,
+                    chunk_column,
+                    rows
+                ))
+            }
+        }
+    };
+    let min_raw = src.query_scalar(&min_sql)?;
+    let min_val = read_bound(src, min_raw, "min")?;
+    let max_raw = src.query_scalar(&max_sql)?;
+    let max_val = read_bound(src, max_raw, "max")?;
 
     let effective_chunk_size = if let Some(count) = chunk_count {
         let span = (max_val - min_val).max(0) as usize + 1;
@@ -514,12 +581,58 @@ mod tests {
         assert_eq!(chunks[9], (901, 1000));
     }
 
+    /// An EMPTY table plans one empty window — the single legitimate zero.
+    ///
+    /// Renamed from `…_collapses_to_zero_zero`: the zero is now REACHED rather
+    /// than fallen into. An absent bound used to be indistinguishable from an
+    /// unrenderable one, so both produced `(0,0)`; the emptiness is checked now,
+    /// which is why the script carries a `0` row count for each bound probe.
     #[test]
-    fn integer_range_null_minmax_collapses_to_zero_zero() {
-        // NULL min/max → unwrap_or(0) on both → single chunk (0,0)
-        let mut src = ScriptedSource::new([null(), null(), ok("0")]);
+    fn integer_range_empty_table_plans_one_empty_window() {
+        // min → NULL, count → 0, max → NULL, count → 0, then the sparsity estimate.
+        let mut src = ScriptedSource::new([null(), ok("0"), null(), ok("0"), ok("0")]);
         let chunks = detect(&mut src, 100, false, None).unwrap();
         assert_eq!(chunks, vec![(0, 0)]);
+    }
+
+    /// The case that made the rename necessary: the table HAS rows and the
+    /// driver cannot render the key's type, so the bound arrives as `None` for a
+    /// reason that has nothing to do with emptiness. PostgreSQL `numeric` is the
+    /// known instance — its `query_scalar` matches no arm and falls to `Ok(None)`.
+    /// Measured before the fix: 100 rows in, 0 rows out, `status: success`.
+    #[test]
+    fn unrenderable_bound_on_a_non_empty_table_is_an_error() {
+        let mut src = ScriptedSource::new([null(), ok("100")]);
+        let err = detect(&mut src, 10, false, None)
+            .expect_err("a None bound over a NON-empty table must abort, not plan (0,0)");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("no readable value") && msg.contains("chunk_by_key"),
+            "the error must name the cause and the escape; got: {msg}"
+        );
+    }
+
+    /// A NON-EMPTY table whose bounds cannot be read as i64 must ERROR, not
+    /// silently become the single window `BETWEEN 0 AND 0`.
+    ///
+    /// Distinct from `integer_range_null_minmax_collapses_to_zero_zero` above,
+    /// which pins the one legitimate zero: NULL bounds mean the table is empty
+    /// and one empty window is right. Nothing covered a table that HAS rows and
+    /// whose key the reader cannot render — the case that exported 0 of 100 rows
+    /// with `status: success`.
+    #[test]
+    fn unparseable_integer_range_bounds_are_an_error_not_a_zero_window() {
+        // The count reply is scripted third because the None path does not fire
+        // here — the bounds ARE readable, they are simply not whole integers.
+        let mut src = ScriptedSource::new([ok("1.50"), ok("998.75"), ok("100")]);
+        let err = detect(&mut src, 10, false, None).expect_err(
+            "an unreadable bound must abort the plan, not collapse to (0,0) and export nothing",
+        );
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("not a whole integer") && msg.contains("chunk_by_key"),
+            "the error must name the problem and the escape; got: {msg}"
+        );
     }
 
     #[test]
