@@ -495,8 +495,13 @@ exports:
         String::from_utf8_lossy(&applied.stdout),
         String::from_utf8_lossy(&applied.stderr)
     );
+    // Asserting only "did not succeed" would pass on ANY failure — including the
+    // post-run invariant that also fires when the gate is absent. Measured: with
+    // the gate removed the run still failed, and this test still went green, for
+    // entirely the wrong reason. It must fail ON DRIFT.
+    let refused_for_drift = !applied.status.success() && applied_text.contains("schema drift");
     assert!(
-        !applied.status.success(),
+        refused_for_drift,
         "`rivet apply` of a CHUNKED plan exported against a source whose schema had changed and \
          exited 0, while `rivet run` with the SAME config and the SAME `on_schema_drift: fail` \
          refused the identical drift (control arm above). The gate lives in `prepare_chunk_plan`, \

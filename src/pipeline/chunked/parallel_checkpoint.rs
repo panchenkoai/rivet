@@ -60,7 +60,13 @@ pub(crate) fn run_chunked_parallel_checkpoint(
             // pre-chunk drift check (ADR-0021), then closes before workers spawn.
             ChunkSource::Detect => super::prepare_chunk_plan_fresh(plan, state, summary)?,
             ChunkSource::Precomputed(ranges) => {
-                summary.chunks_precomputed = true; // drift gate skipped by contract
+                // Ranges come from the artifact; the DRIFT GATE still runs.
+                summary.chunks_precomputed = true;
+                // No ranges ⇒ no rows will be read, so there is nothing for the
+                // gate to protect and no reason to open a connection to say so.
+                if !ranges.is_empty() {
+                    super::check_drift_only_fresh(plan, state, summary)?;
+                }
                 ranges
             }
         }
