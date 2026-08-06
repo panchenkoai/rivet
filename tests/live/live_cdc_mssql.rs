@@ -1463,3 +1463,104 @@ fn mssql_a_partial_capture_instance_is_refused_even_beside_a_complete_sibling() 
          instances; stderr:\n{stderr}"
     );
 }
+
+// ─── the config's table name is a label; the catalog is the truth ────────────
+
+/// A `table:` that differs from the catalog only in CASE must not silently
+/// capture nothing while the checkpoint advances past the changes.
+///
+/// `MssqlChangeStream::open` takes each event's `(schema, table)` from the
+/// catalog — `cdc.change_tables` / `OBJECT_NAME` — which is right. But the SINK
+/// routes with the raw config string through `table_matches`
+/// (src/source/cdc/sink.rs:220), a byte-exact Rust comparison. Nothing ever
+/// compares the two, and SQL Server's default collation is case-INSENSITIVE, so
+/// `table: dbo.casetest` against a real `dbo.CaseTest` resolves its schema
+/// perfectly (`SELECT * FROM dbo.casetest` returns a full, correct column list)
+/// while `table_matches("dbo.casetest", "dbo", "CaseTest")` is false for every
+/// event.
+///
+/// This is the `product_catalog` finding's sibling with the opposite ending. That
+/// one dropped 100% of events for six of eight tables and at-least-once saved it
+/// — flush → checkpoint → ack never ran for the unrouted tables, so one fixed
+/// run recovered everything. Here the commit boundary is recorded BEFORE the
+/// routing filter and the end-of-pass roll fires on `unacked_commit` alone, so
+/// the checkpoint advances over events that were never captured.
+///
+/// Measured on this stand — 6 rows in `cdc.dbo_CaseTest_CT`, config lowercase:
+///
+///   run                          0 rows, 0 files, status success
+///   checkpoint written           {"lsn":"0000006b000021a80005"}
+///   re-run, case FIXED           0 rows — the LSN is already past them
+///   re-run, case fixed + ckpt deleted   5 rows   ← they were there all along
+///
+/// The last two lines are the control pair, and they are what separates "lost"
+/// from "deferred": the change rows never left the change table, so the only
+/// thing that skipped them was the advanced checkpoint. Recovery costs deleting
+/// the checkpoint and re-reading from the retention floor; past retention there
+/// is nothing to re-read.
+// AUDIT-RED cdc-case-identity: a case-only `table:` mismatch routes ZERO events while the checkpoint advances past them — the changes are unrecoverable without discarding the checkpoint. Asserts CORRECT behavior; expected to FAIL until fixed.
+#[test]
+#[ignore = "live: requires docker compose mssql with SQL Server Agent + CDC"]
+fn mssql_cdc_case_only_table_mismatch_must_not_silently_drop_events() {
+    let _serial = CDC_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+
+    // Mixed case ON PURPOSE — `unique_name` lowercases, and the whole mechanism
+    // is a catalog name the config spells differently.
+    let table = format!("CaseIdent{}", std::process::id() % 100_000);
+    let table = table.as_str();
+    let ci = &format!("dbo_{table}");
+    mssql_cdc_drop_table(&format!("dbo.{table}"));
+    mssql_cdc_exec(&format!(
+        "CREATE TABLE dbo.{table} (id int PRIMARY KEY, v nvarchar(50))"
+    ));
+    enable_cdc(table, ci);
+    let _guard = MssqlCdcTable {
+        table: table.to_string(),
+        ci: ci.clone(),
+    };
+
+    let d = tempfile::tempdir().unwrap();
+    let out = tempfile::tempdir().unwrap();
+    let ckpt = d.path().join("cdc.ckpt");
+    // The config names the table in a case the catalog does not use. SQL Server
+    // accepts it everywhere EXCEPT rivet's own byte-exact router.
+    let cfg = mssql_cdc_config(&d, &table.to_lowercase(), ci, &ckpt, out.path());
+
+    run_rivet_ok(&cfg); // anchor
+    mssql_cdc_exec(&format!(
+        "INSERT INTO dbo.{table} VALUES (1,'a'),(2,'b'),(3,'c'); \
+         UPDATE dbo.{table} SET v='B' WHERE id=2; \
+         DELETE FROM dbo.{table} WHERE id=3;"
+    ));
+    wait_for_capture(ci, 6);
+
+    let o = run_rivet_env(&["run", "--config", cfg.to_str().unwrap()], &[]);
+    // Refusing at open — a catalog cross-check — is the correct outcome.
+    if !o.status.success() {
+        return;
+    }
+
+    let captured = read_cdc_changes(out.path()).len();
+    if captured > 0 {
+        return; // routed correctly; nothing to guard
+    }
+
+    // Captured nothing. The only acceptable version of that is a checkpoint that
+    // did NOT move, leaving the events for the next run (at-least-once). Prove
+    // which happened: the change rows are still there, so a correctly-cased
+    // re-run against the SAME checkpoint must find them.
+    let still_in_ct = mssql_cdc_query_i64(&format!("SELECT COUNT(*) FROM cdc.{ci}_CT"));
+    let fixed = mssql_cdc_config(&d, &format!("dbo.{table}"), ci, &ckpt, out.path());
+    let _ = run_rivet_env(&["run", "--config", fixed.to_str().unwrap()], &[]);
+    let after_fix = read_cdc_changes(out.path()).len();
+
+    panic!(
+        "a case-only `table:` mismatch captured 0 of the {still_in_ct} change row(s) and exited 0. \
+         Re-running with the case FIXED against the same checkpoint recovered {after_fix} — the \
+         change rows never left the change table, so the checkpoint advanced past events that \
+         were never captured. `MssqlChangeStream::open` reads identity from the catalog; the sink \
+         routes with the raw config string through the byte-exact `table_matches` \
+         (src/source/cdc/sink.rs:220), and nothing compares the two. SQL Server's default \
+         collation is case-insensitive, so every other layer accepted the name."
+    );
+}
