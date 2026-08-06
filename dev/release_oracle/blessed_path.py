@@ -307,6 +307,17 @@ def sc_blessed_path(
     env = dict(scenarios._store_env(url))
     if state_url:
         env["RIVET_STATE_URL"] = state_url
+    else:
+        # NEUTRALISE an inherited one. `__main__` sets `RIVET_STATE_URL` on the
+        # PROCESS when the gate is pointed at a Postgres backend ("one variable
+        # decides the backend for the WHOLE gate"), and `run()` merges os.environ
+        # into every cell — so this module's SQLite cells wrote their ledger to
+        # Postgres and then looked for a `.rivet_state.db` that was never
+        # created. 84 cells failed that way on the gate's first full pass, each
+        # with its own message correctly naming the cause: "apply recorded its
+        # ledger elsewhere". An empty value is not a Postgres URL, so
+        # `StateStore::open` falls back to SQLite (`url.starts_with("postgres")`).
+        env["RIVET_STATE_URL"] = ""
 
     # ── init ──────────────────────────────────────────────────────────────────
     cfg = work / "rivet.yaml"

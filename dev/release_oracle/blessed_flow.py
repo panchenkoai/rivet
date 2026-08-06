@@ -556,7 +556,7 @@ def _manifest_files(prefix: Path) -> list[str] | None:
     return sorted(set(out))
 
 
-def run_cell(led: Ledger, cell: Cell, url: str, state_url: str) -> None:
+def run_cell(led: Ledger, cell: Cell, url: str, state_url: str, tag: str = "live") -> None:
     """Walk one cell's chain, with the CDC fixture raised and torn down around it.
 
     The teardown is a `finally` because on PostgreSQL it drops a replication
@@ -568,7 +568,7 @@ def run_cell(led: Ledger, cell: Cell, url: str, state_url: str) -> None:
     """
     tag = "flow"
     slug = f"{cell.pipeline}_{cell.lifecycle}_{cell.store}_{cell.state}"
-    work = scenarios.work_dir() / f"flow_{cell.engine}_{slug}_{cell.table}"
+    work = scenarios.work_dir() / f"flow_{cell.engine}{tag}_{slug}_{cell.table}"
     shutil.rmtree(work, ignore_errors=True)
     work.mkdir(parents=True, exist_ok=True)
 
@@ -618,14 +618,14 @@ def run_cell(led: Ledger, cell: Cell, url: str, state_url: str) -> None:
         cell.table = _CDC_TABLE.get(cell.engine, cell.table)
 
     try:
-        _run_chain(led, cell, url, state_url, work, cdc_block)
+        _run_chain(led, cell, url, state_url, work, cdc_block, tag)
     finally:
         if cell.pipeline == "cdc":
             cdc._ENGINES[cell.engine].cleanup(url, work)
 
 
 def _run_chain(led: Ledger, cell: Cell, url: str, state_url: str, work: Path,
-               cdc_block: str) -> None:
+               cdc_block: str, tag: str = "live") -> None:
     """Walk one cell's whole chain, recording a row per stage."""
     tag = "flow"
     slug = f"{cell.pipeline}_{cell.lifecycle}_{cell.store}_{cell.state}"
@@ -637,7 +637,13 @@ def _run_chain(led: Ledger, cell: Cell, url: str, state_url: str, work: Path,
     # it counts only manifested parts in a fresh tempdir; the cloud path had no
     # such filter, and the same defect came back one store over. Same shape as
     # the CDC leg's `oracle-cdc/<work-root>/…`.
-    prefix = (f"flow/{scenarios.work_dir().name}/{cell.engine}/{slug}/"
+    # The VERSION TAG belongs in the prefix, not just the engine. The gate runs
+    # this matrix once per gridded version — postgres 13, 14, 16, 18 — and
+    # `cell.engine` is "postgres" for all four, so they shared one object-store
+    # prefix and the readback counted every earlier version's parts as this
+    # one's: 450000 rows read from a 150000-row table (3x), then 750000 (5x) as
+    # the run progressed. Caught by the gate itself on its first full pass.
+    prefix = (f"flow/{scenarios.work_dir().name}/{cell.engine}{tag}/{slug}/"
               f"{cell.table.replace('.', '_')}")
     mark = 0
 
@@ -938,7 +944,9 @@ def _load_leg(led: Ledger, cell: Cell, tag: str, work: Path, env: dict, url: str
         return
 
     tbl = cell.table.split(".")[-1]
-    pfx = f"flow/{cell.engine}/{cell.pipeline}/{tbl}"
+    # Version-scoped for the same reason the readback prefix is: the gate runs
+    # this once per gridded version and `cell.engine` does not distinguish them.
+    pfx = f"flow/{cell.engine}{tag}/{cell.pipeline}/{tbl}"
     lcfg = work / "load.yaml"
     tls = "\n  tls: {accept_invalid_certs: true}" if cell.engine == "mssql" else ""
     lcfg.write_text(
@@ -962,7 +970,9 @@ def _load_leg(led: Ledger, cell: Cell, tag: str, work: Path, env: dict, url: str
         return
     # Unique per cell: the id is what the ledger check scopes on, and a shared
     # one would let one cell's rows satisfy another's assertion.
-    load_id = f"flow-{cell.engine}-{cell.lifecycle}-{cell.state}-{scenarios.work_dir().name}"
+    load_id = (
+        f"flow-{cell.engine}-{cell.lifecycle}-{cell.state}-{scenarios.work_dir().name}"
+    )
     p = rivet("load", "-c", str(lcfg), "--rivet-bin", str(rivet_bin()),
               "--run-id", load_id, env=env, timeout=scenarios.NO_TIMEOUT)
     if not p.ok:
@@ -1103,7 +1113,7 @@ def sc_blessed_flow(led: Ledger, engine: str, tag: str, url: str,
                         f"{cell.engine} {cell.label} — {cell.store} store not up")
             continue
         before = sum(1 for c in led.cells if c.status.value == "FAIL")
-        run_cell(led, cell, u, state_url)
+        run_cell(led, cell, u, state_url, tag)
         after = sum(1 for c in led.cells if c.status.value == "FAIL")
         verdicts[key] = "fail" if after > before else "pass"
         # Written after EVERY cell, not at the end: a matrix killed at minute ten
