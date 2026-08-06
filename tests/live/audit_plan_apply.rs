@@ -377,3 +377,133 @@ exports:
         "a run whose manifest did not land must not report success; stderr:\n{stderr}"
     );
 }
+
+// ─── the drift gate must survive the plan → apply handoff ────────────────────
+
+/// `on_schema_drift: fail` must mean the same thing whether the export is run
+/// directly or applied from a plan artifact.
+///
+/// The gate lives inside `prepare_chunk_plan` (src/pipeline/chunked/mod.rs:186,
+/// the sole caller of `check_from_type_mappings`), which only the
+/// `ChunkSource::Detect` arm reaches. `rivet apply plan.json` supplies
+/// `ChunkSource::Precomputed` for any artifact carrying chunk ranges, and all
+/// four chunked runners then set `summary.chunks_precomputed = true` with the
+/// comment `// drift gate skipped by contract`.
+///
+/// The contract they cite is "drift was evaluated on the original planning run
+/// that produced the ranges". That is not what happens: `src/plan/` contains no
+/// drift evaluation at all — `plan/build.rs:153` only COPIES the policy
+/// (`schema_drift_policy: export.on_schema_drift`) into the artifact. And even a
+/// planning-time evaluation would not help, because the drift this guards
+/// against happens BETWEEN plan and apply. That window is the entire reason the
+/// plan → review → apply workflow exists.
+///
+/// Measured on this stand — one config, one source state, `on_schema_drift:
+/// fail`, a column dropped after the plan was sealed:
+///
+///   rivet run    ERROR schema drift detected — aborting (on_schema_drift: fail)
+///                      removed: dropme
+///   rivet apply  status: success, 500 rows
+///
+/// The `run` arm is the CONTROL and it is what makes this a contradiction rather
+/// than an observation: the same policy, the same drift, refused one way and
+/// honoured the other. The non-chunked half of `apply` also applies the gate
+/// (single.rs:481), so the split is not even "apply skips it" — it is "apply
+/// skips it for chunked exports", which are the ones moving the most data.
+// AUDIT-RED plan-apply-drift: `apply` of a chunked plan skips `on_schema_drift`, exporting against a changed source and exiting 0, while `run` with the same config refuses. Asserts CORRECT behavior; expected to FAIL until fixed.
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn audit_apply_honours_on_schema_drift_for_a_chunked_plan() {
+    require_alive(LiveService::Postgres);
+
+    let table = unique_name("audit_drift");
+    let mut c = postgres::Client::connect(POSTGRES_URL, postgres::NoTls).expect("connect");
+    c.batch_execute(&format!(
+        "CREATE TABLE {table} (id int PRIMARY KEY, keepme text, dropme text);
+         INSERT INTO {table} SELECT g, 'k'||g, 'd'||g FROM generate_series(1,500) g;"
+    ))
+    .expect("seed");
+    let _guard = PgTable::adopt(table.clone());
+
+    let out = tempfile::tempdir().unwrap();
+    let cfgdir = tempfile::tempdir().unwrap();
+    let yaml = format!(
+        r#"
+source: {{type: postgres, url_env: DATABASE_URL}}
+exports:
+  - name: {table}
+    table: "public.{table}"
+    mode: chunked
+    chunk_column: id
+    chunk_size: 100
+    on_schema_drift: fail
+    format: parquet
+    destination: {{type: local, path: {dir}}}
+"#,
+        dir = out.path().display()
+    );
+    let cfg = write_config(&cfgdir, &yaml);
+    let env = [("DATABASE_URL", POSTGRES_URL)];
+
+    // 1. A first run records the schema the drift gate will compare against.
+    let first = run_rivet_env(&["run", "--config", cfg.to_str().unwrap()], &env);
+    assert!(
+        first.status.success(),
+        "first run must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+
+    // 2. Seal a plan against that schema.
+    let plan = cfgdir.path().join("plan.json");
+    let planned = run_rivet_env(
+        &[
+            "plan",
+            "--config",
+            cfg.to_str().unwrap(),
+            "--output",
+            plan.to_str().unwrap(),
+            "--format",
+            "json",
+        ],
+        &env,
+    );
+    assert!(
+        planned.status.success() && plan.is_file(),
+        "plan must be written; stderr:\n{}",
+        String::from_utf8_lossy(&planned.stderr)
+    );
+
+    // 3. The source changes between review and execution — the window the
+    //    plan/apply workflow is FOR.
+    c.batch_execute(&format!("ALTER TABLE {table} DROP COLUMN dropme"))
+        .expect("drop column");
+
+    // 4. CONTROL: the same config, run directly, must refuse. If this passes,
+    //    the fixture never produced drift and the apply arm below proves nothing.
+    let control = run_rivet_env(&["run", "--config", cfg.to_str().unwrap()], &env);
+    let control_text = String::from_utf8_lossy(&control.stderr).into_owned();
+    assert!(
+        !control.status.success() && control_text.contains("schema drift"),
+        "fixture is inert: `rivet run` did NOT refuse after the column was dropped, so there is \
+         no drift for `apply` to skip.\nstderr:\n{control_text}"
+    );
+
+    // 5. The same policy, the same drift, through the plan artifact.
+    let applied = run_rivet_env(&["apply", plan.to_str().unwrap()], &env);
+    let applied_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&applied.stdout),
+        String::from_utf8_lossy(&applied.stderr)
+    );
+    assert!(
+        !applied.status.success(),
+        "`rivet apply` of a CHUNKED plan exported against a source whose schema had changed and \
+         exited 0, while `rivet run` with the SAME config and the SAME `on_schema_drift: fail` \
+         refused the identical drift (control arm above). The gate lives in `prepare_chunk_plan`, \
+         which only the `Detect` arm reaches; a precomputed artifact sets \
+         `chunks_precomputed = true` and skips it \"by contract\". The cited contract — that \
+         drift was evaluated on the planning run — does not hold: `src/plan/` evaluates no \
+         drift, it only copies the policy, and the drift here happened AFTER the plan was \
+         sealed.\n\napply said:\n{applied_text}"
+    );
+}
