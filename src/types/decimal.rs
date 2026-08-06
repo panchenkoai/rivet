@@ -93,6 +93,16 @@ pub fn decimal_str_to_scaled_i128(s: &str, scale: i8) -> Option<i128> {
     };
 
     let frac_aligned: i128 = if scale_u == 0 {
+        // Scale 0 is a down-scale like any other: dropping "45" from "123.45"
+        // loses the cents. It used to short-circuit here, BEFORE the
+        // lossy-down-scale guard below, so a `columns:` override declaring
+        // `decimal(20,0)` over a `numeric(10,2)` truncated every value and the
+        // run exited 0 with no warning — while the SAME override one scale over
+        // failed loudly (`cannot parse DECIMAL "1.234567" as decimal(scale=2)`).
+        // The behaviour at scale 2 is the specification; zero was escaping it.
+        if frac_part.bytes().any(|b| b != b'0') {
+            return None;
+        }
         0
     } else if frac_part.len() < scale_u as usize {
         // Pad right with zeros: "0.1" with scale=2 → frac "10" → 10
@@ -159,6 +169,11 @@ pub fn decimal_str_to_scaled_i256(s: &str, scale: i8) -> Option<i256> {
         i256::from_string(int_part)?
     };
     let frac_aligned = if scale_u == 0 {
+        // See the i128 sibling: scale 0 is a down-scale and must honour the same
+        // loss guard, not bypass it.
+        if frac_part.bytes().any(|b| b != b'0') {
+            return None;
+        }
         i256::ZERO
     } else if frac_part.len() < scale_u as usize {
         let mut buf = String::with_capacity(scale_u as usize);
@@ -211,6 +226,33 @@ fn pow10_i256(n: u32) -> Option<i256> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Scale 0 refuses a lossy down-scale like every other scale.
+    ///
+    /// It used to short-circuit before the guard, so a `columns:` override
+    /// declaring `decimal(20,0)` over a `numeric(10,2)` silently truncated every
+    /// value — money losing its cents on a run that exited 0. The control is the
+    /// line below it: the SAME override one scale over already failed loudly, and
+    /// that behaviour is the specification zero was escaping.
+    #[test]
+    fn scale_zero_refuses_a_lossy_down_scale() {
+        assert_eq!(decimal_str_to_scaled_i128("123.45", 0), None);
+        assert_eq!(decimal_str_to_scaled_i128("-99.99", 0), None);
+        assert_eq!(decimal_str_to_scaled_i128("0.01", 0), None);
+        // the control: the same loss at another scale was always refused
+        assert_eq!(decimal_str_to_scaled_i128("1.234567", 2), None);
+    }
+
+    /// …and still accepts what is NOT a loss, or the fix would have broken every
+    /// integer-valued decimal.
+    #[test]
+    fn scale_zero_still_accepts_whole_values() {
+        assert_eq!(decimal_str_to_scaled_i128("123", 0), Some(123));
+        assert_eq!(decimal_str_to_scaled_i128("-42", 0), Some(-42));
+        // trailing zeros drop harmlessly — the value is unchanged
+        assert_eq!(decimal_str_to_scaled_i128("123.00", 0), Some(123));
+        assert_eq!(decimal_str_to_scaled_i128("7.0", 0), Some(7));
+    }
     use super::*;
 
     #[test]
