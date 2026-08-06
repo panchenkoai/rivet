@@ -130,6 +130,16 @@ SCENARIOS: dict[str, dict] = {
 }
 
 
+def cloud_prefix(engine: str, tag: str, table: str, scenario: str) -> str:
+    """The object-store prefix for one cell, unique per gate invocation.
+
+    ONE function so the write side and the readback cannot drift apart — they
+    are two call sites of the same string, and a prefix that differs between
+    them reads as "the export wrote nothing".
+    """
+    return f"blessed/{scenarios.work_dir().name}/{engine}/{tag}/{table}/{scenario}"
+
+
 def _duckdb_ok() -> bool:
     """Is there a usable DuckDB? The oracle is worthless if its absence is
     indistinguishable from agreement — `_duckdb_list` returns "" on exit 127
@@ -344,7 +354,13 @@ def sc_blessed_path(
     if store == "local":
         dest_block = f"    destination: {{type: local, path: {dest_dir}/}}"
     else:
-        raw = scenarios.store_dest(store, BUCKET, f"blessed/{engine}/{tag}/{table}/{scenario}")
+        # The work root's name makes this unique PER GATE INVOCATION. Without
+        # it two runs into the same bucket accumulate and the readback counts the
+        # earlier one's parts as this one's — measured on the gate's first
+        # back-to-back pass: `source=150000 duckdb=300000 manifest=150000`, with
+        # the manifest correctly reporting 150000 the whole time. Same token the
+        # CDC leg and blessed_flow already carry.
+        raw = scenarios.store_dest(store, BUCKET, cloud_prefix(engine, tag, table, scenario))
         if not raw:
             led.skipped(engine, tag, "blessed:init", store, f"{store} — no destination block")
             _downstream_unreached(led, engine, tag, store, "init")
@@ -488,7 +504,7 @@ def sc_blessed_path(
         if store == "local":
             duck_rows, duck_files = _parquet_rows_and_files(dest_dir)
         else:
-            pfx = f"blessed/{engine}/{tag}/{table}/{scenario}"
+            pfx = cloud_prefix(engine, tag, table, scenario)
             got = scenarios.store_readback(store, BUCKET, pfx, work)
             duck_rows = int(got.splitlines()[0]) if got.strip().isdigit() else -1
             duck_files = -1  # the readback helper reports rows only
