@@ -368,6 +368,9 @@ pub(crate) fn run_chunked_sequential_checkpoint(
             }
             Err(e) => {
                 let msg = crate::redact::redact_error(&e);
+                // The classifier already knows whether another attempt can help;
+                // the chunk layer used to re-dispatch regardless.
+                let retryable = crate::pipeline::retry::is_transient(&e);
                 log::error!(
                     "export '{}': chunk {} failed: {}",
                     plan.export_name,
@@ -379,7 +382,7 @@ pub(crate) fn run_chunked_sequential_checkpoint(
                     error: msg.clone(),
                     attempt: 1,
                 });
-                state.fail_chunk_task(&run_id, chunk_index, &msg)?;
+                state.fail_chunk_task(&run_id, chunk_index, &msg, retryable)?;
             }
         }
     }

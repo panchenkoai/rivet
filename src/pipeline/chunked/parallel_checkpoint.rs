@@ -207,6 +207,7 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                                 run_id_arc.as_str(),
                                 chunk_index,
                                 "invalid start_key",
+                                false, // a malformed key parses the same way every time
                             );
                             continue;
                         }
@@ -219,6 +220,7 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                                 run_id_arc.as_str(),
                                 chunk_index,
                                 "invalid end_key",
+                                false, // a malformed key parses the same way every time
                             );
                             continue;
                         }
@@ -483,6 +485,7 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                                 run_id_arc.as_str(),
                                 chunk_index,
                                 &msg,
+                                crate::pipeline::retry::is_transient(&e),
                             );
                             poison::lock_recover(errors)
                                 .push(format!("chunk {}: {}", chunk_index, msg));

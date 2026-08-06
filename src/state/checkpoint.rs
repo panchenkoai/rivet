@@ -289,10 +289,37 @@ impl StateStore {
         Ok(())
     }
 
-    pub fn fail_chunk_task(&self, run_id: &str, chunk_index: i64, err: &str) -> Result<()> {
+    /// Mark a chunk failed.
+    ///
+    /// `retryable` is the CALLER's verdict on the error, not a guess made here:
+    /// the pipeline holds the typed error and already classifies it
+    /// (`retry::classify_error`), while this layer sees only text. When it is
+    /// false the attempt counter is driven to the run's cap, so
+    /// `claim_next_chunk_task` — whose predicate is `attempts <
+    /// max_chunk_attempts` — will not hand the chunk out again.
+    ///
+    /// Before this, the classification stopped at the inner retry loop and the
+    /// chunk-level re-claim re-dispatched a deterministically failing chunk to
+    /// exhaustion. Measured in the field: 15 chunks x 4 attempts x a 300 s
+    /// statement timeout, 300 minutes of production query time for nothing.
+    /// Exhausting the counter rather than adding a column keeps the existing
+    /// claim predicate as the single place that decides eligibility.
+    pub fn fail_chunk_task(
+        &self,
+        run_id: &str,
+        chunk_index: i64,
+        err: &str,
+        retryable: bool,
+    ) -> Result<()> {
         let now = chrono::Utc::now().to_rfc3339();
-        let sql = "UPDATE chunk_task SET status = 'failed', last_error = ?1, updated_at = ?2
-             WHERE run_id = ?3 AND chunk_index = ?4";
+        let sql = if retryable {
+            "UPDATE chunk_task SET status = 'failed', last_error = ?1, updated_at = ?2
+             WHERE run_id = ?3 AND chunk_index = ?4"
+        } else {
+            "UPDATE chunk_task SET status = 'failed', last_error = ?1, updated_at = ?2,
+                    attempts = (SELECT max_chunk_attempts FROM chunk_run WHERE run_id = ?3)
+             WHERE run_id = ?3 AND chunk_index = ?4"
+        };
         match &self.conn {
             StateConn::Sqlite(c) => {
                 c.execute(sql, rusqlite::params![err, now, run_id, chunk_index])?;
@@ -305,15 +332,24 @@ impl StateStore {
         Ok(())
     }
 
+    /// The parallel workers' twin of [`Self::fail_chunk_task`] — same contract,
+    /// including `retryable`.
     pub fn fail_chunk_task_at_ref(
         state_ref: &StateRef,
         run_id: &str,
         chunk_index: i64,
         err: &str,
+        retryable: bool,
     ) -> Result<()> {
         let now = chrono::Utc::now().to_rfc3339();
-        let sql = "UPDATE chunk_task SET status = 'failed', last_error = ?1, updated_at = ?2
-             WHERE run_id = ?3 AND chunk_index = ?4";
+        let sql = if retryable {
+            "UPDATE chunk_task SET status = 'failed', last_error = ?1, updated_at = ?2
+             WHERE run_id = ?3 AND chunk_index = ?4"
+        } else {
+            "UPDATE chunk_task SET status = 'failed', last_error = ?1, updated_at = ?2,
+                    attempts = (SELECT max_chunk_attempts FROM chunk_run WHERE run_id = ?3)
+             WHERE run_id = ?3 AND chunk_index = ?4"
+        };
         match state_ref {
             StateRef::Sqlite(db_path) => {
                 let conn = open_connection(db_path)?;
@@ -590,6 +626,59 @@ mod tests {
         assert!(s.create_chunk_run("run_4", "orders", "h", 1).is_ok());
     }
 
+    /// A chunk that failed for a DETERMINISTIC reason must not be re-claimed.
+    ///
+    /// `retry.rs` already classifies a MySQL statement timeout (3024) as
+    /// PERMANENT and `should_retry` honours it — inside one chunk's attempt. The
+    /// chunk-level re-claim then re-dispatches the same chunk anyway, because it
+    /// tests only `attempts < max_chunk_attempts` with no notion of WHY the
+    /// attempt failed. Measured in the field: a 6M-row export burned 97.9 minutes
+    /// on 15 chunks x 4 attempts x 300s, every attempt hitting the same wall,
+    /// 300 minutes of source query time against a production replica for nothing.
+    ///
+    /// The classification is correct; the layer above never asks. Same shape as
+    /// the runner-bypass class — a value computed right and dropped on the floor.
+    #[test]
+    fn a_permanently_failed_chunk_is_not_reclaimed() {
+        let (_dir, s) = store_on_disk();
+        s.create_chunk_run("run_p", "orders", "h", 4).unwrap();
+        s.insert_chunk_tasks("run_p", &[(1, 5)]).unwrap();
+        s.claim_next_chunk_task("run_p").unwrap().expect("claim");
+
+        // The exact text the field produced.
+        s.fail_chunk_task(
+            "run_p",
+            0,
+            "mysql: statement timeout after 300s (max_execution_time from \
+             tuning.statement_timeout_s) — this query exceeded its time budget (ERROR 3024)",
+            false,
+        )
+        .unwrap();
+
+        assert!(
+            s.claim_next_chunk_task("run_p").unwrap().is_none(),
+            "a chunk that failed on a deterministic error was re-claimed; the next attempt runs \
+             the identical query against the identical data and cannot succeed. Retrying it to \
+             the attempt cap spends the source's time budget N times over."
+        );
+    }
+
+    /// The control: a TRANSIENT failure must still be retried, or the fix above
+    /// would have turned a retry budget into a one-shot.
+    #[test]
+    fn a_transiently_failed_chunk_is_still_reclaimed() {
+        let (_dir, s) = store_on_disk();
+        s.create_chunk_run("run_t", "orders", "h", 4).unwrap();
+        s.insert_chunk_tasks("run_t", &[(1, 5)]).unwrap();
+        s.claim_next_chunk_task("run_t").unwrap().expect("claim");
+        s.fail_chunk_task("run_t", 0, "connection reset by peer", true)
+            .unwrap();
+        assert!(
+            s.claim_next_chunk_task("run_t").unwrap().is_some(),
+            "a transient failure must still be retried"
+        );
+    }
+
     #[test]
     fn chunk_claim_complete_and_finalize() {
         let (_dir, s) = store_on_disk();
@@ -620,13 +709,16 @@ mod tests {
         s.create_chunk_run("run_b", "orders", "ab", 2).unwrap();
         s.insert_chunk_tasks("run_b", &[(1, 2)]).unwrap();
 
+        // `true` — this test's subject is the ATTEMPT CAP, so the failures must be
+        // retryable ones; a permanent failure is exhausted on the spot and is
+        // covered by `a_permanently_failed_chunk_is_not_reclaimed`.
         let t = s.claim_next_chunk_task("run_b").unwrap().unwrap();
         assert_eq!(t.0, 0);
-        s.fail_chunk_task("run_b", 0, "boom").unwrap();
+        s.fail_chunk_task("run_b", 0, "boom", true).unwrap();
 
         let t2 = s.claim_next_chunk_task("run_b").unwrap().unwrap();
         assert_eq!(t2.0, 0);
-        s.fail_chunk_task("run_b", 0, "again").unwrap();
+        s.fail_chunk_task("run_b", 0, "again", true).unwrap();
 
         assert!(s.claim_next_chunk_task("run_b").unwrap().is_none());
         assert_eq!(s.count_chunk_tasks_not_completed("run_b").unwrap(), 1);
