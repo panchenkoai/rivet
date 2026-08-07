@@ -4706,12 +4706,22 @@ fn roast_pg_cdc_destination_placeholders_resolve_like_the_batch_path() {
 /// either test. The Drop guard restores the setting but cannot help a test that
 /// is already mid-run.
 ///
-/// :3306 has `log_bin=ON`, `binlog_format=ROW` and the REPLICATION grants — so
-/// the guard's subject exists — while nothing in the suite reads its binlog
+/// :3306 has `log_bin=ON` and `binlog_format=ROW` (MySQL 8 defaults) — so the
+/// guard's subject exists — while nothing in the suite reads its binlog
 /// (`Rig::mysql_cdc` is wired to `MYSQL_CDC_URL`; only `mysql_batch` uses this
 /// one, and a batch SELECT does not care how the binlog is packed). Isolating
 /// the fixture removes the shared mutable state; serialising 60 call sites
 /// behind a lock would only coordinate it, and slow every CDC test to do so.
+///
+/// It connects as ROOT, unlike every other test here, because the batch stand
+/// grants `rivet` only `ALL ON rivet.*` — `dev/mysql/init.sql` hands out no
+/// REPLICATION SLAVE / REPLICATION CLIENT, so a CDC open as `rivet` dies with
+/// ERROR 1227 BEFORE it can reach the compression guard, and the test would
+/// assert on the wrong refusal. (A locally-hand-granted container hides this:
+/// the first CI run after the move failed on exactly that gap. Widening the
+/// stand's grants would be the other fix, and the wrong one — it hands every
+/// batch test a privilege it must not need.) Root is what the compose file
+/// declares, so it exists everywhere the suite runs.
 ///
 /// The restore guard stays anyway: a panic here must not leave a server global
 /// flipped for whatever runs next.
@@ -4776,7 +4786,7 @@ fn mysql_cdc_refuses_a_compressed_binlog_instead_of_capturing_nothing() {
         write_config(
             &d,
             &Rig::mysql_cdc(&tbl)
-                .source_url(MYSQL_URL)
+                .source_url(&root_url)
                 .checkpoint_path(ckpt.clone())
                 .dest_path(dest.to_path_buf())
                 .yaml(),
