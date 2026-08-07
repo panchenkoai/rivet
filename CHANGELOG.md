@@ -1,5 +1,81 @@
 # Changelog
 
+## 0.24.3 — 2026-08-07
+
+Nine silent-loss fixes, one loud refusal, and the layers that found them. Every
+defect here reported success while the data was wrong, missing, or about to be
+deleted — none of them changes a config or an output format.
+
+### Fixed — the run said success and the data disagreed
+
+- **`_rivet_row_hash` failed on every named-timezone timestamp.** Arrow refuses
+  to render `Timestamp(_, Some("UTC"))` — the only form rivet emits — without
+  the `chrono-tz` feature, so `meta_columns.row_hash` errored on any temporal
+  column. On a real MySQL config that cost 63 of 65 exports. The feature is on,
+  and the type matrix now runs through every value consumer per engine.
+- **The uniqueness check silently skipped every value it could not render** —
+  it reported "no duplicates" over rows it never examined. An unrenderable
+  PRESENT value now fails the check loudly.
+- **An unreadable range bound exported ZERO rows as `success`.** A `min`/`max`
+  the bound prober could not parse collapsed to an empty window instead of an
+  error; a whole table could vanish behind a green run.
+- **A partial or filtered unique index was accepted as a keyset key.** Keyset
+  pagination over `WHERE`-filtered index entries pages only the indexed subset;
+  the planner now requires a full unique index (`indpred IS NULL` /
+  `has_filter = 0`).
+- **`scale: 0` bypassed the lossy-down-scale guard** — a decimal column
+  override to scale 0 truncated `1.05` to `1` silently, on both the i128 and
+  i256 paths. Both twins now refuse, and both are tested.
+- **A NULL cursor cell froze the incremental cursor forever.** The cursor
+  advanced from the last row of each batch; a NULL there kept the old boundary
+  and every later run re-read from it. The cursor now advances from the last
+  NON-NULL cell.
+- **SQL Server CDC dropped 100% of a table's events on a case-only name
+  mismatch** while the checkpoint advanced past them. The adapter now resolves
+  identity through `cdc.change_tables` and refuses a table the catalog spells
+  differently — before the checkpoint moves.
+- **MySQL CDC captured NOTHING under `binlog_transaction_compression = ON`**
+  and said nothing: the reader matches event types individually and a
+  compressed transaction hides them all inside one `Transaction_payload_event`.
+  Measured: anchor, insert two rows, resume ⇒ 0 of 2, empty stderr. The run now
+  REFUSES with the setting named and the retention alternative spelled out.
+- **A deterministically failed chunk was retried to the attempt cap.** A
+  permanent error (SQL syntax, missing column) burned every attempt with the
+  same failure; `fail_chunk_task` now distinguishes retryable from permanent.
+
+### Fixed — one layer up
+
+- **A healthy no-op run invalidated its own prefix:** a `skipped` run with no
+  parts overwrote the manifest, making the previous good delivery unverifiable
+  (`[RIVET_VERIFY_SUCCESS_STALE]`). It now leaves the prefix's manifest alone —
+  and a skipped run that DID commit parts still describes them.
+- **`rivet apply` of a chunked plan ignored `on_schema_drift`** — the gate was
+  wired into the single runner only. The runner-bypass class, again; the
+  chunked path now runs the same drift check.
+- **`rivet check` blessed two configs `rivet plan` refuses** (`query:` +
+  `chunk_size_memory_mb`, `query:` + `chunk_by_key`). The rule now lives in ONE
+  function (`plan::build::chunked_without_table_error`) asked by both, so the
+  preflight and the runner cannot drift apart again.
+- **`cleanup_source` deleted source rows without asking the run ledger** — a
+  concurrent extract's in-flight prefix could be wiped. The wipe is now gated
+  on the state store's run-status, like `gc_orphans`.
+
+### Added
+
+- **`strategy_snapshot` (state schema v22, SQLite + PostgreSQL):** `rivet init`
+  records the table shape each strategy decision was derived from — row
+  estimate, key span, index — so a strategy is reproducible and auditable
+  after the fact.
+- **The whole journey as one gate matrix:** `plan → apply → run → validate →
+  load` across `pipeline × lifecycle × store × state × engine` (144 declared
+  cells, 76 runnable, every `na` with a written reason), with the flag surface
+  rotated per cell and `--rerun-failed`. `make release-oracle-full` assembles
+  the environment and judges the release; the previous-release baseline is the
+  DOWNLOADED asset, never a rebuilt parent.
+- **Independent read-back oracles in the live suite:** row counts, ids,
+  per-column and schema claims verified through DuckDB — a decoder rivet does
+  not link — instead of re-reading outputs with the code that wrote them.
+
 ## 0.24.2 — 2026-08-05
 
 A durability-accounting release. Every fix here is a case where rivet did the
