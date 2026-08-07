@@ -233,6 +233,13 @@ def _flags_for(cell_ix: int, pipeline: str, lifecycle: str, store: str) -> dict[
 
     if pipeline == "batch":
         f["plan"] = ["--format", "json"]
+        # `--annotate-waves` (0.24.4, #150) on a third of the batch cells: the
+        # blessed config is init-generated IN this cell, so overwriting its
+        # waves is safe by construction — and the cell then proves plan's
+        # write-back path end to end. The OTHER two thirds prove the new
+        # default: a plan run leaves the config's schedule untouched.
+        if _rot(seed + "waves", 3) == 0:
+            f["plan"] += ["--annotate-waves"]
         f["apply"] = []
         if lifecycle == "resume":
             # `--resume` on a tree that never crashed resumes nothing — the flag

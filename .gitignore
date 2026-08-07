@@ -124,3 +124,6 @@ __pycache__/
 # committed. Its absence is what makes the tracked docker-compose.yaml the
 # single reproducible definition.
 /docker-compose.override.yaml
+
+# downloaded previous-release binary — the release gate's regression baseline
+/.gate-baseline/
