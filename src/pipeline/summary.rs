@@ -1133,6 +1133,7 @@ mod tests {
         };
         use crate::tuning::SourceTuning;
         let plan = ResolvedRunPlan {
+            upload_parallelism: 1,
             export_name: "orders".into(),
             source_table: None,
             base_query: "SELECT 1".into(),
@@ -1268,6 +1269,7 @@ mod tests {
         };
         use crate::tuning::SourceTuning;
         let plan = ResolvedRunPlan {
+            upload_parallelism: 1,
             export_name: "events".into(),
             source_table: None,
             base_query: "SELECT 1".into(),
@@ -1342,6 +1344,7 @@ mod tests {
         };
         use crate::tuning::SourceTuning;
         ResolvedRunPlan {
+            upload_parallelism: 1,
             export_name: export_name.into(),
             source_table: None,
             base_query: "SELECT 1".into(),

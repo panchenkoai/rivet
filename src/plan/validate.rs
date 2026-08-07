@@ -227,6 +227,7 @@ mod tests {
 
     fn base_plan() -> ResolvedRunPlan {
         ResolvedRunPlan {
+            upload_parallelism: 1,
             export_name: "test".into(),
             source_table: None,
             base_query: "SELECT 1".into(),

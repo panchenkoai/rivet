@@ -54,7 +54,10 @@ pub(crate) mod destination;
 /// patch" disclaimer as the other lib modules in this file.
 #[doc(hidden)]
 pub mod destination_for_tests {
-    pub use crate::destination::{Destination, ObjectMeta, create_destination};
+    pub use crate::destination::{
+        Destination, DestinationCapabilities, ObjectMeta, WriteCommitProtocol, WriteOutcome,
+        create_destination,
+    };
 }
 // Public since §5h: the auditor recomputes `_rivet_row_hash` over re-extracted
 // sample rows, and it must do so with THIS function. A reimplementation on the

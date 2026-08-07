@@ -695,6 +695,7 @@ mod tests {
 
     fn minimal_plan() -> ResolvedRunPlan {
         ResolvedRunPlan {
+            upload_parallelism: 1,
             export_name: "orders".into(),
             source_table: None,
             base_query: "SELECT * FROM orders".into(),

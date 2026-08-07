@@ -124,6 +124,10 @@ pub struct ResolvedRunPlan {
     pub shape_drift_warn_factor: f64,
     /// Parquet row group tuning (resolved from export config). `None` = library default.
     pub parquet: Option<ParquetConfig>,
+    /// Bounded concurrent part uploads for the single-file runner (default 1 =
+    /// the sequential upload loop). Resolved from `exports[].upload_parallelism`.
+    #[serde(default)]
+    pub upload_parallelism: usize,
 }
 
 /// Resolved incremental cursor semantics (Epic D / ADR-0007).
