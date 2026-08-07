@@ -217,7 +217,7 @@ impl TableSink<'_> {
 /// (`public.orders` — matches schema AND table). Adapters always emit schema
 /// and table separately; comparing the config string verbatim against the
 /// bare event table silently routed ZERO events for qualified configs.
-pub(super) fn table_matches(cfg: &str, schema: &str, table: &str) -> bool {
+pub(crate) fn table_matches(cfg: &str, schema: &str, table: &str) -> bool {
     // Full-name match FIRST: a MongoDB collection name may contain dots
     // (`my.coll`) and has no schema qualifier, so splitting it into a bogus
     // `schema.table` dropped every event (bug-hunt: 0-row success forever). This

@@ -838,11 +838,16 @@ impl RunSummary {
             // diagnosis (`resumed`) AND the raw `--resume` flag (`is_resume_run`) — a
             // resume that crashed before its first commit adopts nothing yet still
             // skipped the gate.
-            if !self.resumed
-                && !is_resume_run
-                && !self.chunks_precomputed
-                && self.schema_changed.is_none()
-            {
+            //
+            // `chunks_precomputed` is NO LONGER an exemption. It was one because
+            // `rivet apply` of a chunked artifact skipped the gate "by contract",
+            // and the contract was false — `src/plan/` evaluates no drift, it only
+            // copies the policy, and the drift being guarded against happens
+            // BETWEEN plan and apply. The precomputed arms now call
+            // `check_drift_only`, so they leave `schema_changed = Some(_)` like
+            // every other path, and an exemption here would go back to excusing
+            // exactly the bypass this invariant exists to catch.
+            if !self.resumed && !is_resume_run && self.schema_changed.is_none() {
                 return Err(
                     "state_backed success committed parts but schema_changed is None — \
                      the on_schema_drift gate was never applied (no runner called \
@@ -1616,18 +1621,21 @@ mod tests {
             "a non-run_export run must not be held to the facade contract"
         );
 
-        // `rivet apply` with PRECOMPUTED chunk boundaries legitimately skips the
-        // drift gate too: the gate lives inside `prepare_chunk_plan`, whose own
-        // contract says a precomputed source never calls it ("drift was evaluated
-        // on the original planning run that produced the ranges"). Without this
-        // exemption the guard reads a correct apply as a runner-bypass — which is
-        // exactly what happened the moment `apply` was fixed to actually replay
-        // its artifact instead of re-detecting: every chunked apply started
-        // aborting at finalize with exit 101.
+        // `rivet apply` with PRECOMPUTED chunk boundaries is NO LONGER exempt.
+        //
+        // It was, on the stated grounds that "drift was evaluated on the original
+        // planning run that produced the ranges" — which was false: `src/plan/`
+        // evaluates no drift, and the drift being guarded against happens BETWEEN
+        // plan and apply. Measured: `rivet run` aborted on a dropped column while
+        // `rivet apply` of the same `on_schema_drift: fail` exported 500 rows and
+        // exited 0. The precomputed arms now call `check_drift_only`, so they
+        // leave `schema_changed = Some(_)` like every other path and need no
+        // exemption — and an exemption would go back to excusing the very bypass
+        // this invariant exists to catch.
         let mut applied = base();
         applied.chunks_precomputed = true;
         applied.column_checksums.push(ck());
-        // schema_changed stays None
+        applied.schema_changed = Some(false); // the gate ran, as it now must
         assert!(
             applied.check_post_run_invariants(false).is_ok(),
             "an apply replaying precomputed chunks must not trip the drift-gate branch"

@@ -70,7 +70,7 @@ exports:
 
 /// Total Parquet rows across every `*.parquet` file directly under `dir`.
 /// Mirrors what a glob reader (`read_parquet('<dir>/*.parquet')`) would count.
-fn total_parquet_rows(dir: &Path) -> i64 {
+fn duckdb_total_parquet_rows(dir: &Path) -> i64 {
     let mut total = 0i64;
     for path in files_with_extension(dir, "parquet") {
         let bytes =
@@ -204,7 +204,7 @@ fn audit_chunked_rerun_does_not_double() {
         String::from_utf8_lossy(&first.stderr)
     );
     assert_eq!(
-        total_parquet_rows(out.path()),
+        duckdb_total_parquet_rows(out.path()),
         ROWS,
         "sanity: after one chunked run the prefix must hold exactly {ROWS} rows"
     );
@@ -232,11 +232,129 @@ fn audit_chunked_rerun_does_not_double() {
 
     // Otherwise: a glob reader over the prefix must see exactly the source row
     // count, not 2x.  Currently the orphaned first-run parts double it.
-    let rows_on_disk = total_parquet_rows(out.path());
+    let rows_on_disk = duckdb_total_parquet_rows(out.path());
     assert_eq!(
         rows_on_disk, ROWS,
         "silent re-run doubling: a glob over the prefix counts {rows_on_disk} rows after two \
          chunked runs of a {ROWS}-row source — the first run's parts were orphaned, not replaced, \
          and the second run neither refused nor warned.\nstderr:\n{second_stderr}"
+    );
+}
+
+// ─── (c) a healthy no-op run must not clobber the canonical manifest ─────────
+
+/// An incremental run that finds nothing new is a HEALTHY outcome, and it must
+/// not leave the prefix describing itself as interrupted.
+///
+/// `finalize_manifest` maps the run's status with
+/// `match summary.status.as_str() { "success" => Success, "failed" => Failed,
+/// _ => Interrupted }` (src/pipeline/finalize.rs:181-185). But `"skipped"` is a
+/// real production value: `single.rs:361` sets it for a completely healthy run
+/// that read 0 rows under `skip_empty: true`, and nothing rewrites it before
+/// finalize. So the healthy no-op falls through the `_` arm.
+///
+/// `write_manifest` then sets `emit_success_marker = matches!(status, Success)`
+/// — false — while still passing `write_canonical = true`
+/// (manifest_writer.rs:358-360), so the canonical `manifest.json` is
+/// OVERWRITTEN with an `interrupted`, zero-part document and the `_SUCCESS`
+/// marker from the previous good run is left in place, now stale.
+///
+/// Measured on this stand — incremental into a stable prefix, `skip_empty: true`:
+///
+///   run 1 (10 rows)      manifest.json  success      1 part   10 rows   _SUCCESS ✓
+///   run 2 (no new rows)  manifest.json  interrupted  0 parts   0 rows   _SUCCESS ✓ stale
+///   on disk after both:  1 parquet holding the 10 rows
+///
+/// and the consequence, from rivet's own verifier:
+///
+///   _SUCCESS:  INCONSISTENT
+///   failure:   [RIVET_VERIFY_SUCCESS_STALE] _SUCCESS body … != manifest fingerprint …
+///   warning:   [RIVET_VERIFY_UNTRACKED_OBJECT] untracked object: …parquet (1669 bytes)
+///   Error: rivet validate: 1 export(s) failed verification
+///
+/// The delivered rows become an "untracked object" and the export stops passing
+/// verification — after a run that did nothing wrong. The run-unique manifest
+/// copies both survive, so the data is recoverable; the canonical pointer and
+/// the marker are what desync.
+///
+/// Asserted on `validate`'s verdict rather than on the manifest's status string:
+/// what matters is that a healthy no-op leaves a prefix a consumer still trusts,
+/// not which enum arm it took to get there.
+// AUDIT-RED skipped-status-fallthrough: a healthy `skipped` run writes an `interrupted` canonical manifest over a good one and leaves a stale _SUCCESS, so validate fails. Asserts CORRECT behavior; expected to FAIL until fixed.
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn audit_a_healthy_noop_run_does_not_invalidate_the_prefix() {
+    require_alive(LiveService::Postgres);
+
+    let table = seed_pg_numeric_table(10);
+    let out = tempfile::tempdir().unwrap();
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let yaml = format!(
+        r#"
+source:
+  type: postgres
+  url: "{POSTGRES_URL}"
+
+exports:
+  - name: {name}
+    table: "public.{name}"
+    mode: incremental
+    cursor_column: created_at
+    skip_empty: true
+    format: parquet
+    destination:
+      type: local
+      path: {out}
+"#,
+        name = table.name(),
+        out = out.path().display()
+    );
+    let cfg = write_config(&cfg_dir, &yaml);
+
+    let first = run_rivet_with_warn_log(&["run", "--config", cfg.to_str().unwrap()]);
+    assert!(
+        first.status.success(),
+        "first run must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let rows_after_first = duckdb_total_parquet_rows(out.path());
+    assert!(
+        rows_after_first > 0,
+        "fixture is inert: the first run wrote no rows, so the second cannot be a no-op over \
+         anything worth protecting"
+    );
+
+    // Second run: nothing new past the cursor. This is the healthy path.
+    let second = run_rivet_with_warn_log(&["run", "--config", cfg.to_str().unwrap()]);
+    assert!(
+        second.status.success(),
+        "the no-op run must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+
+    // The data is still there — the question is whether the prefix still says so.
+    assert_eq!(
+        duckdb_total_parquet_rows(out.path()),
+        rows_after_first,
+        "the no-op run changed the data on disk"
+    );
+
+    let v = std::process::Command::new(RIVET_BIN)
+        .args(["validate", "--config", cfg.to_str().unwrap()])
+        .output()
+        .expect("spawn rivet validate");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&v.stdout),
+        String::from_utf8_lossy(&v.stderr)
+    );
+    assert!(
+        v.status.success(),
+        "after a HEALTHY no-op incremental run (nothing new past the cursor), the prefix no \
+         longer verifies. `finalize_manifest` maps the run's `skipped` status through its `_` arm \
+         to `Interrupted`, so the canonical manifest.json is overwritten with a zero-part \
+         interrupted document while the previous run's _SUCCESS marker is left behind, now \
+         stale. The {rows_after_first} delivered row(s) are still on disk and are reported as an \
+         untracked object.\n\nvalidate said:\n{text}"
     );
 }

@@ -220,6 +220,49 @@ fn full_strategy(config: &Config, export: &ExportConfig) -> ExtractionStrategy {
 ///
 /// Steps 1–3 each only fire on PG with `table:` shortcut; everything else
 /// falls back to the original "explicit column required" path.
+/// Why a `mode: chunked` export with no `table:` cannot be planned — `None`
+/// when it can.
+///
+/// PURE, and deliberately reachable from outside the planner. `rivet check`
+/// resolved its own view of the config and printed `Verdict: ACCEPTABLE` for
+/// two shapes `plan` refuses outright (`query:` + `chunk_size_memory_mb`,
+/// `query:` + `chunk_by_key`) — a preflight blessing a config that cannot run
+/// is the diagnostic-bypass class at its sharpest, because the operator reads
+/// the verdict and stops looking. One function, both callers: the planner
+/// bails on it, the preflight reports it (`src/preflight/mod.rs`).
+///
+/// Mirrors the fast path above: an explicit `chunk_column:` with no memory
+/// budget plans fine without a relation, so that shape is `None` here too.
+pub(crate) fn chunked_without_table_error(export: &ExportConfig) -> Option<String> {
+    if export.table.is_some() {
+        return None;
+    }
+    // The no-probe fast path: explicit column, no budget to divide.
+    if export.chunk_column.is_some() && export.chunk_size_memory_mb.is_none() {
+        return None;
+    }
+    if export.chunk_by_key.is_some() {
+        return Some(format!(
+            "export '{}': `chunk_by_key:` needs the `table:` shortcut so the planner can \
+             verify the key is backed by a unique index (an unindexed ORDER BY key would \
+             filesort the whole table). Set `table:` instead of `query:`.",
+            export.name
+        ));
+    }
+    if export.chunk_size_memory_mb.is_some() {
+        return Some(format!(
+            "export '{}': `chunk_size_memory_mb:` only applies with the `table:` shortcut — \
+             set `table:` (preferred) or remove `chunk_size_memory_mb:` and keep an explicit `chunk_size:`",
+            export.name
+        ));
+    }
+    Some(format!(
+        "export '{}': chunked mode requires 'chunk_column' \
+         (auto-resolve from PK is only supported with the `table:` shortcut)",
+        export.name
+    ))
+}
+
 fn resolve_chunked_strategy(
     config: &Config,
     export: &ExportConfig,
@@ -306,27 +349,14 @@ fn resolve_chunked_strategy(
     }
 
     // Anything beyond the fast path requires the `table:` shortcut so we have
-    // a known relation to probe in either Postgres or MySQL.
+    // a known relation to probe in either Postgres or MySQL. The rule lives in
+    // `chunked_without_table_error` so the PREFLIGHT can ask the same question
+    // — `rivet check` used to bless configs this bails on (see that function).
     let Some(tbl) = export.table.as_ref() else {
-        if export.chunk_by_key.is_some() {
-            anyhow::bail!(
-                "export '{}': `chunk_by_key:` needs the `table:` shortcut so the planner can \
-                 verify the key is backed by a unique index (an unindexed ORDER BY key would \
-                 filesort the whole table). Set `table:` instead of `query:`.",
-                export.name
-            );
-        }
-        if export.chunk_size_memory_mb.is_some() {
-            anyhow::bail!(
-                "export '{}': `chunk_size_memory_mb:` only applies with the `table:` shortcut — \
-                 set `table:` (preferred) or remove `chunk_size_memory_mb:` and keep an explicit `chunk_size:`",
-                export.name
-            );
-        }
         anyhow::bail!(
-            "export '{}': chunked mode requires 'chunk_column' \
-             (auto-resolve from PK is only supported with the `table:` shortcut)",
-            export.name
+            "{}",
+            chunked_without_table_error(export)
+                .expect("no `table:` in chunked mode past the fast path is always an error")
         );
     };
 
@@ -791,6 +821,53 @@ mod tests {
             },
             ..crate::config::sample_export("test_export")
         }
+    }
+
+    /// The rule `rivet check` and `rivet plan` now share, in every direction.
+    ///
+    /// RED-proven the expensive way: the live audit
+    /// (`check_must_not_accept_a_config_the_planner_refuses`) failed in CI on
+    /// two of these shapes while `check` still had its own opinion. The unit
+    /// test exists so the next regression is caught before a live stack is
+    /// needed — and so a mutant that flips one arm has something to bite.
+    #[test]
+    fn chunked_without_table_names_the_reason_and_spares_the_fast_path() {
+        let base = || ExportConfig {
+            mode: crate::config::ExportMode::Chunked,
+            table: None,
+            query: Some("SELECT * FROM t".into()),
+            ..minimal_export()
+        };
+
+        // The fast path: an explicit column with no budget plans without a
+        // relation, so the preflight must NOT refuse it.
+        let mut ok = base();
+        ok.chunk_column = Some("id".into());
+        assert_eq!(chunked_without_table_error(&ok), None);
+
+        // …and a `table:` is always fine, whatever else is set.
+        let mut with_table = base();
+        with_table.table = Some("public.t".into());
+        with_table.query = None;
+        with_table.chunk_by_key = Some("id".into());
+        assert_eq!(chunked_without_table_error(&with_table), None);
+
+        // The three refusals, each naming its own knob rather than a generic
+        // "bad config" — the operator has to know WHICH line to change.
+        let mut by_key = base();
+        by_key.chunk_by_key = Some("id".into());
+        let m = chunked_without_table_error(&by_key).expect("chunk_by_key needs a relation");
+        assert!(m.contains("chunk_by_key"), "{m}");
+
+        let mut budget = base();
+        budget.chunk_column = Some("id".into());
+        budget.chunk_size_memory_mb = Some(64);
+        let m = chunked_without_table_error(&budget).expect("a budget needs a row width");
+        assert!(m.contains("chunk_size_memory_mb"), "{m}");
+
+        let bare = base();
+        let m = chunked_without_table_error(&bare).expect("no column, no table, no plan");
+        assert!(m.contains("chunk_column"), "{m}");
     }
 
     #[test]

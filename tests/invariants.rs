@@ -56,7 +56,10 @@ fn i5_failed_chunk_task_retryable_within_max_attempts() {
     let (idx, _, _) = state.claim_next_chunk_task("run-2").unwrap().unwrap();
     assert_eq!(idx, 0);
     state
-        .fail_chunk_task("run-2", 0, "transient network error")
+        // `true` — this invariant is about the ATTEMPT BUDGET, so the failure must
+        // be a retryable one. A permanent failure exhausts the budget on the spot
+        // (state::checkpoint::tests::a_permanently_failed_chunk_is_not_reclaimed).
+        .fail_chunk_task("run-2", 0, "transient network error", true)
         .unwrap();
 
     // Attempt 2: still claimable (failed but attempts=1 < max=3).
@@ -83,7 +86,11 @@ fn i5_failed_chunk_task_not_retryable_beyond_max_attempts() {
 
     // Only attempt: claim → fail.
     state.claim_next_chunk_task("run-3").unwrap().unwrap();
-    state.fail_chunk_task("run-3", 0, "fatal error").unwrap();
+    // `true` — the subject here is max_chunk_attempts = 1 exhausting on its own,
+    // not the error class doing it.
+    state
+        .fail_chunk_task("run-3", 0, "fatal error", true)
+        .unwrap();
 
     // Must not be reclaimable.
     let none = state.claim_next_chunk_task("run-3").unwrap();

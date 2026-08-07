@@ -44,5 +44,18 @@ exclude_re = [
     # RED-proven against `delete !`), and the read itself is live-guarded by
     # mysql_cdc_refuses_a_compressed_binlog_instead_of_capturing_nothing, which
     # flips the server global and asserts the run fails.
+    # `hash_value`'s per-DataType arms are a typed FAST PATH, not a behaviour:
+    # deleting one falls through to the `_` arm, which hashes the value's
+    # rendered TEXT instead of its bytes. The digest is a `HashSet<u64>` key
+    # inside one uniqueness check and is never persisted, compared across runs,
+    # or shown — so a different-but-injective digest satisfies the same
+    # contract. Demonstrated rather than argued: with the `Int64` arm deleted,
+    # `uniqueness_fails` (an Int64 column carrying a duplicate) still reports
+    # the duplicate, and all 25 quality unit tests plus 12 live uniqueness
+    # tests stay green. What WOULD be a real bug — a present value that cannot
+    # be hashed at all being silently skipped — is guarded by
+    # `uniqueness_refuses_when_a_present_value_cannot_be_hashed`, which does
+    # not depend on which arm renders it.
+    "delete match arm .* in hash_value",
     "replace refuse_compressed_binlog -> Result<\\(\\)> with Ok\\(\\(\\)\\)",
 ]

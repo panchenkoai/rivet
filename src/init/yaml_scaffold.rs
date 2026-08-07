@@ -1461,3 +1461,64 @@ mod tests {
         );
     }
 }
+
+/// What the scaffold DECIDED for a table, as data rather than as YAML text.
+///
+/// Exists so the strategy snapshot written to the state store and the config
+/// written to disk come from ONE rule. Re-deriving the decision for the snapshot
+/// would be the self-oracle shape this repo has paid for: two copies of a rule
+/// agree until one is edited, and then the audit trail describes a choice that
+/// was never made.
+///
+/// `agrees_with_the_generated_yaml` keeps them honest — it parses what
+/// `generate_config` actually emitted and compares, so the check's oracle is the
+/// artifact rather than a second implementation.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct DecidedStrategy {
+    pub mode: String,
+    /// Finer than `mode:` — both keyset and range are `mode: chunked`.
+    pub kind: &'static str,
+    pub key_column: Option<String>,
+    pub chunk_size: Option<i64>,
+}
+
+pub(crate) fn decided_strategy(
+    info: &crate::init::TableInfo,
+    mode_override: Option<&str>,
+) -> DecidedStrategy {
+    let mode = mode_override
+        .map(str::to_string)
+        .unwrap_or_else(|| info.suggest_mode().to_string());
+    match mode.as_str() {
+        "chunked" => {
+            let size = info.suggest_chunk_size() as i64;
+            if let Some(pk) = info.keysettable_pk_column() {
+                DecidedStrategy {
+                    mode,
+                    kind: "keyset",
+                    key_column: Some(pk.to_string()),
+                    chunk_size: Some(size),
+                }
+            } else {
+                DecidedStrategy {
+                    mode,
+                    kind: "range",
+                    key_column: info.best_chunk_column().map(str::to_string),
+                    chunk_size: Some(size),
+                }
+            }
+        }
+        "incremental" => DecidedStrategy {
+            kind: "incremental",
+            key_column: info.cursor_candidates().first().map(|c| c.column.clone()),
+            chunk_size: None,
+            mode,
+        },
+        _ => DecidedStrategy {
+            kind: "full",
+            key_column: None,
+            chunk_size: None,
+            mode,
+        },
+    }
+}

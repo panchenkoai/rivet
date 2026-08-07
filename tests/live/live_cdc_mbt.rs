@@ -51,6 +51,39 @@ struct OpCounts {
     deletes: i64,
 }
 
+/// Run one autocommit statement, retrying the two outcomes InnoDB is CONTRACTED
+/// to hand a concurrent writer, and return the rows it affected.
+///
+/// Four threads hammering 60 shared keys with UPDATE/DELETE in random order is
+/// exactly the shape that produces `ERROR 1213 Deadlock found` — InnoDB picks a
+/// victim, rolls its transaction back, and expects the client to reissue. The
+/// writers used to `.unwrap()`, so a deadlock panicked one thread, its `Table`
+/// guard dropped the fixture, and the other three then died on
+/// `ERROR 1146 doesn't exist` — a cascade that reads like a rivet bug and is
+/// four threads' worth of ordinary lock contention (CI, run 31139785655).
+///
+/// Retrying is exact rather than approximate here: the victim's statement is
+/// rolled back WHOLE (single statement == whole transaction under autocommit),
+/// so it affected nothing, and only the successful attempt is counted. The
+/// conservation identity the test checks downstream stays honest.
+///
+/// Anything that is NOT a lock outcome still panics — this must not become a
+/// blanket retry that hides a real error.
+fn exec_serializable(c: &mut mysql::PooledConn, sql: &str) -> i64 {
+    use mysql::prelude::Queryable;
+    for attempt in 0..8 {
+        match c.query_drop(sql) {
+            Ok(()) => return c.affected_rows() as i64,
+            Err(mysql::Error::MySqlError(e)) if e.code == 1213 || e.code == 1205 => {
+                // 1213 deadlock, 1205 lock wait timeout — both mean "reissue".
+                std::thread::sleep(std::time::Duration::from_millis(5 * (attempt + 1)));
+            }
+            Err(e) => panic!("writer statement failed: {sql}\n{e}"),
+        }
+    }
+    panic!("writer statement still deadlocking after 8 attempts: {sql}")
+}
+
 #[test]
 #[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
 fn cdc_concurrent_writers_capture_converges_to_source_state() {
@@ -91,26 +124,29 @@ fn cdc_concurrent_writers_capture_converges_to_source_state() {
                         // 40%: upsert-style insert (fails silently on dup via
                         // IGNORE — affected==0 then, so conservation stays exact)
                         0..=3 => {
-                            c.query_drop(format!(
-                                "INSERT IGNORE INTO {tbl} VALUES ({id}, {val}, 'w{t}-{val}')"
-                            ))
-                            .unwrap();
-                            counts.inserts += c.affected_rows() as i64;
+                            counts.inserts += exec_serializable(
+                                &mut c,
+                                &format!(
+                                    "INSERT IGNORE INTO {tbl} VALUES ({id}, {val}, 'w{t}-{val}')"
+                                ),
+                            );
                         }
                         // 40%: update (affected==0 when the row is absent OR
                         // the values are unchanged — both excluded from counts)
                         4..=7 => {
-                            c.query_drop(format!(
-                                "UPDATE {tbl} SET v = {val}, w = 'u{t}-{val}' WHERE id = {id}"
-                            ))
-                            .unwrap();
-                            counts.updates += c.affected_rows() as i64;
+                            counts.updates += exec_serializable(
+                                &mut c,
+                                &format!(
+                                    "UPDATE {tbl} SET v = {val}, w = 'u{t}-{val}' WHERE id = {id}"
+                                ),
+                            );
                         }
                         // 20%: delete
                         _ => {
-                            c.query_drop(format!("DELETE FROM {tbl} WHERE id = {id}"))
-                                .unwrap();
-                            counts.deletes += c.affected_rows() as i64;
+                            counts.deletes += exec_serializable(
+                                &mut c,
+                                &format!("DELETE FROM {tbl} WHERE id = {id}"),
+                            );
                         }
                     }
                 }

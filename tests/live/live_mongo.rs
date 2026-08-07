@@ -44,7 +44,7 @@ fn mongo_batch_keyset_no_loss_or_dup() {
     // fewer rows is loss, fewer distinct is duplication.
     rig.assert_complete("_id", 5000, "distinct _id must equal source (no loss)");
     assert!(
-        dir_parquet_has_column(&rig.out_dir(), "document"),
+        duckdb_dir_parquet_has_column(&rig.out_dir(), "document"),
         "blob document column present"
     );
 }
@@ -269,7 +269,7 @@ fn mongo_batch_type_fidelity_document_is_verbatim_extjson() {
     let rig = batch(&db, "t");
     rig.run_ok();
 
-    let docs = dir_parquet_distinct_strings(&rig.out_dir(), "document");
+    let docs = duckdb_dir_parquet_distinct_strings(&rig.out_dir(), "document");
     let doc_text = docs.iter().next().expect("one document");
     assert!(
         doc_text.contains("9007199254740993"),
@@ -321,7 +321,7 @@ fn mongo_run_reconcile_matches_source_count() {
     // Independent oracle: the verdict is rivet's own counter chain — also
     // physically re-read the destination (matrix audit: self-oracle class).
     assert_eq!(
-        total_parquet_rows(&rig.out_dir()),
+        duckdb_total_parquet_rows(&rig.out_dir()),
         3000,
         "destination parquet must physically hold every source document, independent of the reconcile verdict"
     );
@@ -343,7 +343,7 @@ fn mongo_batch_resume_reads_only_new_since_last_run() {
         .mongo("page_size: 500, resume: true");
     rig.run_ok();
     assert_eq!(
-        dir_parquet_distinct_strings(&rig.out_dir(), "_id").len(),
+        duckdb_dir_parquet_distinct_strings(&rig.out_dir(), "_id").len(),
         2000
     );
 
@@ -400,7 +400,7 @@ fn mongo_batch_read_concern_snapshot_empty_first_run_then_populated() {
     // Empty first run: snapshot read of a 0-doc collection reads nothing, cleanly.
     rig.run_ok();
     assert_eq!(
-        total_parquet_rows(&rig.out_dir()),
+        duckdb_total_parquet_rows(&rig.out_dir()),
         0,
         "empty snapshot run must read 0, not hang or phantom-read"
     );
@@ -409,7 +409,7 @@ fn mongo_batch_read_concern_snapshot_empty_first_run_then_populated() {
     m.seed_int_id("t", 1500);
     rig.run_ok();
     assert_eq!(
-        dir_parquet_distinct_strings(&rig.out_dir(), "_id").len(),
+        duckdb_dir_parquet_distinct_strings(&rig.out_dir(), "_id").len(),
         1500,
         "snapshot read_concern must read the whole collection on the second run"
     );
@@ -433,7 +433,7 @@ fn mongo_batch_no_cursor_timeout_false_empty_first_run_then_populated() {
 
     rig.run_ok();
     assert_eq!(
-        total_parquet_rows(&rig.out_dir()),
+        duckdb_total_parquet_rows(&rig.out_dir()),
         0,
         "empty first run reads 0 with no_cursor_timeout: false"
     );
@@ -441,7 +441,7 @@ fn mongo_batch_no_cursor_timeout_false_empty_first_run_then_populated() {
     m.seed_int_id("t", 1200);
     rig.run_ok();
     assert_eq!(
-        dir_parquet_distinct_strings(&rig.out_dir(), "_id").len(),
+        duckdb_dir_parquet_distinct_strings(&rig.out_dir(), "_id").len(),
         1200,
         "no_cursor_timeout: false must not truncate the paged scan on the populated run"
     );
@@ -477,7 +477,7 @@ fn mongo_keyset_on_heterogeneous_id_errors_loudly_full_scan_still_works() {
     let fs = batch(&db, "t");
     fs.run_ok();
     assert_eq!(
-        dir_parquet_distinct_strings(&fs.out_dir(), "_id").len(),
+        duckdb_dir_parquet_distinct_strings(&fs.out_dir(), "_id").len(),
         2000,
         "full scan must read every _id across both types"
     );
@@ -503,7 +503,7 @@ fn roast_resume_must_not_bypass_heterogeneous_id_guard() {
     let rig = batch(&db, "t").mongo("page_size: 40, resume: true");
     rig.run_ok();
     assert_eq!(
-        dir_parquet_distinct_strings(&rig.out_dir(), "_id").len(),
+        duckdb_dir_parquet_distinct_strings(&rig.out_dir(), "_id").len(),
         100
     );
 
@@ -556,7 +556,7 @@ fn roast_null_and_object_id_must_not_slip_past_the_bracket_guard() {
     let fs = batch(&db, "t");
     fs.run_ok();
     assert_eq!(
-        dir_parquet_distinct_strings(&fs.out_dir(), "_id").len(),
+        duckdb_dir_parquet_distinct_strings(&fs.out_dir(), "_id").len(),
         4,
         "full scan must read every doc across the null and object bands"
     );
@@ -614,7 +614,7 @@ fn roast_nan_id_refused_for_keyset_and_parallel_full_scan_complete() {
     let fs = batch(&db, "t");
     fs.run_ok();
     assert_eq!(
-        dir_parquet_distinct_strings(&fs.out_dir(), "_id").len(),
+        duckdb_dir_parquet_distinct_strings(&fs.out_dir(), "_id").len(),
         4,
         "full scan must read every doc including the NaN _id"
     );

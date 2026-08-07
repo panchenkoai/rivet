@@ -728,7 +728,14 @@ impl BatchSink for ExportSink {
         // Extract cursor value inline so the batch can be freed immediately after
         // on_batch returns — avoids holding one full batch in memory for the rest of the run.
         if let (Some(col), Some(schema)) = (&self.cursor_column, &self.schema) {
-            self.last_cursor_value = extract_last_cursor_value(batch, col, schema);
+            // Only ADVANCE the mark, never erase it. A batch with no readable
+            // cursor value (every row NULL) says nothing about progress; the
+            // unconditional assignment let it overwrite the good mark
+            // accumulated from every prior batch with None, after which nothing
+            // was recorded and nothing committed.
+            if let Some(v) = extract_last_cursor_value(batch, col, schema) {
+                self.last_cursor_value = Some(v);
+            }
         }
         Ok(())
     }

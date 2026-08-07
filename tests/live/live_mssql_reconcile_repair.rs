@@ -77,7 +77,7 @@ fn mssql_reconcile_all_match_exits_zero_with_pretty_output() {
     // chain. Re-read the destination parquet and count physically (matrix
     // audit: self-oracle class) — the verdict and the physical rows must agree.
     assert_eq!(
-        total_parquet_rows(&rig.out_dir()),
+        duckdb_total_parquet_rows(&rig.out_dir()),
         100,
         "destination parquet must physically hold every source row, independent of the reconcile verdict"
     );

@@ -371,6 +371,17 @@ pub(crate) fn introspect_pg_table_for_chunking(
     // failing at runtime AFTER a partial write, and stops `rivet check` from
     // green-lighting it (#dogfood: keyset on a DECIMAL PK check=ACCEPTABLE, run
     // failed after 100/250 rows "could not read the key value … unsupported type").
+    // `indpred IS NULL` excludes a PARTIAL index and `indisvalid` an INVALID one.
+    // Keyset's whole correctness argument is that the key is GLOBALLY unique, so
+    // `WHERE k > <last> ORDER BY k LIMIT n` cannot skip a row sharing the
+    // boundary key. A partial unique index guarantees uniqueness only over the
+    // rows it covers — and the standard soft-delete shape,
+    // `CREATE UNIQUE INDEX ON users (email) WHERE deleted_at IS NULL`, permits
+    // duplicates among everything else. Measured: 50 duplicate + 50 distinct
+    // keys at page size 10 exported 60 of 100 rows with `status: success`, the
+    // duplicate contributing exactly ONE page. All 51 distinct values were
+    // present, so a `count(DISTINCT)` check against the source matched perfectly
+    // while 40 rows were gone.
     let keyset_rows = client.query(
         "SELECT a.attname::text, i.indisprimary \
          FROM pg_index i \
@@ -378,6 +389,7 @@ pub(crate) fn introspect_pg_table_for_chunking(
          JOIN pg_type t ON t.oid = a.atttypid \
          WHERE i.indrelid = (($1::text || '.' || $2::text)::regclass) \
            AND i.indisunique AND i.indnkeyatts = 1 AND a.attnotnull \
+           AND i.indpred IS NULL AND i.indisvalid \
            AND t.typname <> 'numeric'",
         &[&schema, &table],
     )?;

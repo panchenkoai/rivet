@@ -532,6 +532,8 @@ fn run_cdc_inner(
                 },
                 crate::config::SourceType::Mssql => CdcEngineOpts::Mssql {
                     capture_instance: cdc.capture_instance.clone(),
+                    // The same strings the sink will route by — see the field's doc.
+                    configured_tables: wired.iter().map(|(t, _, _)| t.clone()).collect(),
                 },
                 crate::config::SourceType::Mongo => {
                     CdcEngineOpts::Mongo {

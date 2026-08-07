@@ -107,7 +107,7 @@ fn mssql_full_mode_repeated_run_accumulates_manifest_entries() {
     // when the manifest sidecar clobbers; the copies' summed row_count is RED
     // pre-fix (one clobbered manifest.json held only the last run's rows).
     assert_eq!(
-        total_parquet_rows(out.path()),
+        duckdb_total_parquet_rows(out.path()),
         20,
         "two full runs of 10 rows must materialise 20 physical rows"
     );
@@ -161,7 +161,7 @@ fn mssql_roast_rapid_incremental_runs_into_same_prefix_must_not_clobber_prior_pa
     }
 
     assert_eq!(
-        dir_parquet_id_set(out.path()),
+        duckdb_dir_parquet_id_set(out.path()),
         (0..N).collect::<std::collections::BTreeSet<i64>>(),
         "every incremental delta must survive; a clobbered part is silent data loss"
     );

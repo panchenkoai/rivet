@@ -279,6 +279,11 @@ fn dispatch_cdc(a: CdcArgs) -> Result<()> {
             },
             CdcEngine::Postgres => CdcEngineOpts::Postgres { slot: a.slot },
             CdcEngine::Mssql => CdcEngineOpts::Mssql {
+                // The `rivet cdc` CLI names no tables — it captures whatever the
+                // capture instance emits — so there is nothing to cross-check
+                // against and the guard stays off. Config mode (`mode: cdc`)
+                // supplies them.
+                configured_tables: Vec::new(),
                 capture_instance: a.capture_instance,
             },
             CdcEngine::Mongo => CdcEngineOpts::Mongo { canonical: false },
@@ -939,6 +944,65 @@ fn require_pk<'a>(plan: &'a load::plan::LoadPlan, mode: &str) -> Result<&'a [Str
 /// (`has_active_running_manifest`, the cross-boundary signal a stateless /
 /// foreign-host load reads when it cannot see the extract's state DB). Only when
 /// NEITHER says active does a no-manifest part count as dead crash debris.
+/// Is a run writing into this prefix right now?
+///
+/// The verdict `maybe_gc_orphans` already computes, extracted so the DESTRUCTIVE
+/// delete can ask the same question. `cleanup_source` recursively removes the
+/// whole prefix — every part, every manifest, `_SUCCESS` — while `gc_orphans`
+/// removes only parts no `Success` manifest references. The gentler of the two
+/// consulted the ledger and the total one did not, which is the guard placed in
+/// inverse proportion to what it protects. `src/load/plan.rs` states the
+/// relationship in its own words: gc_orphans is "strictly gentler than
+/// `cleanup_source`, which wipes the whole prefix".
+///
+/// Conservative in both directions, deliberately: a ledger query ERROR counts as
+/// active (a delete that spares too much costs disk; one that deletes a live
+/// run's committed parts costs data, and on a CDC or incremental export the
+/// source side has already advanced past them). No state store at all —
+/// a stateless or foreign-host load — falls back to the manifest signal alone,
+/// exactly as the orphan path does.
+fn prefix_has_active_run(plan: &load::plan::LoadPlan, state: Option<&StateStore>) -> bool {
+    let ledger_active = match state {
+        Some(s) => s.has_active_run_on_prefix(&plan.gcs_prefix).unwrap_or(true),
+        None => false,
+    };
+    if ledger_active {
+        return true;
+    }
+    match load::open_store(&plan.destination)
+        .and_then(|st| load::reconcile::fetch_manifests_keyed(&st, &plan.gcs_prefix))
+    {
+        Ok(keyed) => load::reconcile::has_active_running_manifest(&keyed),
+        // Cannot read the manifests → cannot rule a live run out. Spare.
+        Err(_) => true,
+    }
+}
+
+/// The delete target for `cleanup_source`, or `None` when a run is writing here.
+///
+/// Refusing is announced, not silent: an operator who asked for cleanup and did
+/// not get it must know the prefix still holds the staged Parquet.
+fn cleanup_target<'a>(
+    plan: &'a load::plan::LoadPlan,
+    store: &'a crate::destination::gcs::GcsStore,
+    state: Option<&StateStore>,
+) -> Option<(&'a crate::destination::gcs::GcsStore, &'a str)> {
+    if !plan.load.cleanup_source {
+        return None;
+    }
+    if prefix_has_active_run(plan, state) {
+        eprintln!(
+            "  cleanup [{}]: SKIPPED — a run is writing into {} right now. Deleting the prefix \
+             would remove parts that run has already committed, and on a CDC/incremental export \
+             the source position has advanced past them. Re-run the load once the extract has \
+             finished.",
+            plan.table, plan.gcs_prefix
+        );
+        return None;
+    }
+    Some((store, plan.gcs_prefix.as_str()))
+}
+
 fn maybe_gc_orphans(plan: &load::plan::LoadPlan, state: Option<&StateStore>) {
     let store = match load::open_store(&plan.destination) {
         Ok(s) => s,
@@ -1338,10 +1402,7 @@ fn load_one_cdc(
         |loader, store, inputs| {
             // The driver gates the appended delta against the manifests' summed
             // `row_count` and cleans up (only) after the gate passes.
-            let cleanup = plan
-                .load
-                .cleanup_source
-                .then_some((store, plan.gcs_prefix.as_str()));
+            let cleanup = cleanup_target(plan, store, state);
             let report = load::run_load_cdc(
                 loader,
                 &plan.table,
@@ -1401,10 +1462,7 @@ fn load_one_incremental(
             );
         },
         |loader, store, inputs| {
-            let cleanup = plan
-                .load
-                .cleanup_source
-                .then_some((store, plan.gcs_prefix.as_str()));
+            let cleanup = cleanup_target(plan, store, state);
             let report = load::run_load_incremental(
                 loader,
                 &plan.table,
@@ -1462,10 +1520,7 @@ fn load_one(
             );
         },
         |loader, store, inputs| {
-            let cleanup = plan
-                .load
-                .cleanup_source
-                .then_some((store, plan.gcs_prefix.as_str()));
+            let cleanup = cleanup_target(plan, store, state);
             let report = load::run_load(
                 loader,
                 &plan.table,

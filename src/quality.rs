@@ -17,77 +17,123 @@ use xxhash_rust::xxh3::xxh3_64;
 use crate::config::QualityConfig;
 use crate::error::Result;
 
-/// Hash a single non-null array value using typed dispatch to avoid string formatting.
-/// Returns `None` for null values; caller skips those in uniqueness tracking.
-fn hash_value(array: &dyn Array, row: usize) -> Option<u64> {
+/// Hash a single array value using typed dispatch to avoid string formatting.
+///
+/// The return distinguishes the two reasons there may be no hash, because
+/// conflating them made a uniqueness check pass over rows it never examined:
+///
+///   `Ok(None)`  the cell is NULL — skip it, which is correct for uniqueness.
+///   `Err(_)`    the cell is PRESENT but its type could not be rendered. The
+///               caller must NOT treat this as "nothing to compare".
+///
+/// Both used to be `None`. Arrow's `ArrayFormatter` refuses a timestamp whose
+/// timezone is a NAME (`Some("UTC")` — the only form rivet emits) without the
+/// `chrono-tz` feature, so `unique: true` on any temporal column silently
+/// examined ZERO rows and reported no duplicates. The feature is now on
+/// (`Cargo.toml`), which removes that trigger — but the conflation was the
+/// defect, and it would return with the next unrenderable type.
+fn hash_value(array: &dyn Array, row: usize) -> Result<Option<u64>> {
     if array.is_null(row) {
-        return None;
+        return Ok(None);
     }
     let h = match array.data_type() {
         DataType::Boolean => {
-            let v = array.as_any().downcast_ref::<BooleanArray>()?.value(row);
+            let v = array
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("quality: column is not a BooleanArray despite its DataType")
+                })?
+                .value(row);
             xxh3_64(&[v as u8])
         }
         DataType::Int8 => xxh3_64(
             &array
                 .as_any()
-                .downcast_ref::<Int8Array>()?
+                .downcast_ref::<Int8Array>()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("quality: column is not a Int8Array despite its DataType")
+                })?
                 .value(row)
                 .to_le_bytes(),
         ),
         DataType::Int16 => xxh3_64(
             &array
                 .as_any()
-                .downcast_ref::<Int16Array>()?
+                .downcast_ref::<Int16Array>()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("quality: column is not a Int16Array despite its DataType")
+                })?
                 .value(row)
                 .to_le_bytes(),
         ),
         DataType::Int32 => xxh3_64(
             &array
                 .as_any()
-                .downcast_ref::<Int32Array>()?
+                .downcast_ref::<Int32Array>()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("quality: column is not a Int32Array despite its DataType")
+                })?
                 .value(row)
                 .to_le_bytes(),
         ),
         DataType::Int64 => xxh3_64(
             &array
                 .as_any()
-                .downcast_ref::<Int64Array>()?
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("quality: column is not a Int64Array despite its DataType")
+                })?
                 .value(row)
                 .to_le_bytes(),
         ),
         DataType::UInt8 => xxh3_64(
             &array
                 .as_any()
-                .downcast_ref::<UInt8Array>()?
+                .downcast_ref::<UInt8Array>()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("quality: column is not a UInt8Array despite its DataType")
+                })?
                 .value(row)
                 .to_le_bytes(),
         ),
         DataType::UInt16 => xxh3_64(
             &array
                 .as_any()
-                .downcast_ref::<UInt16Array>()?
+                .downcast_ref::<UInt16Array>()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("quality: column is not a UInt16Array despite its DataType")
+                })?
                 .value(row)
                 .to_le_bytes(),
         ),
         DataType::UInt32 => xxh3_64(
             &array
                 .as_any()
-                .downcast_ref::<UInt32Array>()?
+                .downcast_ref::<UInt32Array>()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("quality: column is not a UInt32Array despite its DataType")
+                })?
                 .value(row)
                 .to_le_bytes(),
         ),
         DataType::UInt64 => xxh3_64(
             &array
                 .as_any()
-                .downcast_ref::<UInt64Array>()?
+                .downcast_ref::<UInt64Array>()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("quality: column is not a UInt64Array despite its DataType")
+                })?
                 .value(row)
                 .to_le_bytes(),
         ),
         DataType::Float32 => {
             let bits = array
                 .as_any()
-                .downcast_ref::<Float32Array>()?
+                .downcast_ref::<Float32Array>()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("quality: column is not a Float32Array despite its DataType")
+                })?
                 .value(row)
                 .to_bits();
             xxh3_64(&bits.to_le_bytes())
@@ -95,7 +141,10 @@ fn hash_value(array: &dyn Array, row: usize) -> Option<u64> {
         DataType::Float64 => {
             let bits = array
                 .as_any()
-                .downcast_ref::<Float64Array>()?
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("quality: column is not a Float64Array despite its DataType")
+                })?
                 .value(row)
                 .to_bits();
             xxh3_64(&bits.to_le_bytes())
@@ -103,53 +152,91 @@ fn hash_value(array: &dyn Array, row: usize) -> Option<u64> {
         DataType::Decimal128(_, _) => xxh3_64(
             &array
                 .as_any()
-                .downcast_ref::<Decimal128Array>()?
+                .downcast_ref::<Decimal128Array>()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("quality: column is not a Decimal128Array despite its DataType")
+                })?
                 .value(row)
                 .to_le_bytes(),
         ),
         DataType::Date32 => xxh3_64(
             &array
                 .as_any()
-                .downcast_ref::<Date32Array>()?
+                .downcast_ref::<Date32Array>()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("quality: column is not a Date32Array despite its DataType")
+                })?
                 .value(row)
                 .to_le_bytes(),
         ),
         DataType::Date64 => xxh3_64(
             &array
                 .as_any()
-                .downcast_ref::<Date64Array>()?
+                .downcast_ref::<Date64Array>()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("quality: column is not a Date64Array despite its DataType")
+                })?
                 .value(row)
                 .to_le_bytes(),
         ),
         DataType::Utf8 => xxh3_64(
             array
                 .as_any()
-                .downcast_ref::<StringArray>()?
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("quality: column is not a StringArray despite its DataType")
+                })?
                 .value(row)
                 .as_bytes(),
         ),
         DataType::LargeUtf8 => xxh3_64(
             array
                 .as_any()
-                .downcast_ref::<LargeStringArray>()?
+                .downcast_ref::<LargeStringArray>()
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "quality: column is not a LargeStringArray despite its DataType"
+                    )
+                })?
                 .value(row)
                 .as_bytes(),
         ),
-        DataType::Binary => xxh3_64(array.as_any().downcast_ref::<BinaryArray>()?.value(row)),
+        DataType::Binary => xxh3_64(
+            array
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("quality: column is not a BinaryArray despite its DataType")
+                })?
+                .value(row),
+        ),
         DataType::LargeBinary => xxh3_64(
             array
                 .as_any()
-                .downcast_ref::<LargeBinaryArray>()?
+                .downcast_ref::<LargeBinaryArray>()
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "quality: column is not a LargeBinaryArray despite its DataType"
+                    )
+                })?
                 .value(row),
         ),
         _ => {
             // Fallback for exotic types (Timestamp variants, Duration, etc.)
             let options = arrow::util::display::FormatOptions::default();
-            let fmt = arrow::util::display::ArrayFormatter::try_new(array, &options).ok()?;
+            let fmt =
+                arrow::util::display::ArrayFormatter::try_new(array, &options).map_err(|e| {
+                    anyhow::anyhow!(
+                        "quality: a PRESENT value of type {} cannot be rendered ({e}), so it \
+                         cannot take part in a uniqueness check. Skipping it silently would \
+                         report 'no duplicates' over rows never examined.",
+                        array.data_type()
+                    )
+                })?;
             xxh3_64(fmt.value(row).to_string().as_bytes())
         }
     };
-    Some(h)
+    Ok(Some(h))
 }
 
 #[derive(Debug, Clone)]
@@ -375,6 +462,7 @@ pub fn check_uniqueness(
         let mut seen: HashSet<u64> = HashSet::new();
         let mut duplicates = 0usize;
         let mut capped = false;
+        let mut unhashable: Option<String> = None;
 
         'batches: for batch in batches {
             if let Ok(idx) = batch.schema().index_of(col_name) {
@@ -384,13 +472,35 @@ pub fn check_uniqueness(
                         capped = true;
                         break 'batches;
                     }
-                    if let Some(h) = hash_value(col.as_ref(), row)
-                        && !seen.insert(h)
-                    {
-                        duplicates += 1;
+                    // An UNRENDERABLE cell is not an absent one. Both used to be
+                    // `None` and both were skipped, which is how `unique: true`
+                    // on a named-timezone timestamp examined ZERO rows and
+                    // reported no duplicates.
+                    match hash_value(col.as_ref(), row) {
+                        Ok(Some(h)) => {
+                            if !seen.insert(h) {
+                                duplicates += 1;
+                            }
+                        }
+                        Ok(None) => {} // NULL — correctly excluded from uniqueness
+                        Err(e) => {
+                            unhashable = Some(format!("{e:#}"));
+                            break 'batches;
+                        }
                     }
                 }
             }
+        }
+
+        // Reported BEFORE the duplicate verdict: a check that could not read its
+        // column has no verdict to give, and "0 duplicates" over zero examined
+        // rows is exactly the shape of a gate that passes on nothing.
+        if let Some(why) = unhashable {
+            issues.push(QualityIssue {
+                severity: Severity::Fail,
+                message: format!("column '{col_name}': uniqueness check DID NOT RUN — {why}"),
+            });
+            continue;
         }
 
         if capped {
@@ -723,6 +833,55 @@ mod tests {
     // (CLAUDE.md "never a silent no-op"). The old code skipped a missing
     // uniqueness column (index_of → Err → 0 dups → pass) and treated a missing
     // null-ratio column as 0 nulls (unwrap_or(0) → pass); both vanished.
+
+    /// A PRESENT cell that cannot be hashed must FAIL the check, not shrink it.
+    ///
+    /// `hash_value` returned `None` for two unrelated reasons — "this cell is
+    /// NULL" and "I cannot render this type" — and the caller skipped both. So
+    /// `unique: true` on a column Arrow refuses examined ZERO rows and reported
+    /// no duplicates: a gate passing over data it never read.
+    ///
+    /// The trigger was real. Arrow's `ArrayFormatter` rejects a timestamp whose
+    /// timezone is a NAME unless the `chrono-tz` feature is on — the refusal
+    /// that cost 63 of 65 exports on a production MySQL config, 2026-08-05.
+    ///
+    /// SCOPE, stated because it changes what this proves: with `chrono-tz` on,
+    /// `Some("UTC")` — the only zone rivet emits — renders, so rivet's own
+    /// output can no longer reach the Err arm. An UNPARSEABLE zone still can,
+    /// and that is what this uses. The test therefore pins the CONTRACT ("a
+    /// present-but-unhashable value fails the check") rather than a live
+    /// production path. It is RED-proven against the conflation: restore the
+    /// silent skip and it fails.
+    #[test]
+    fn uniqueness_refuses_when_a_present_value_cannot_be_hashed() {
+        use arrow::array::{ArrayRef, TimestampMicrosecondArray};
+
+        // Two IDENTICAL values: were they hashable, the check would find a
+        // duplicate. Either outcome is acceptable; a clean pass is not.
+        let arr: ArrayRef = Arc::new(
+            TimestampMicrosecondArray::from(vec![1_700_000_000_000_000i64; 2])
+                .with_timezone("Mars/Olympus".to_string()),
+        );
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "seen_at",
+            arr.data_type().clone(),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![arr]).unwrap();
+
+        let issues = check_uniqueness(&[batch], &["seen_at".into()], None);
+        assert!(
+            !issues.is_empty(),
+            "an unhashable PRESENT value produced a clean pass — the rows were skipped, \
+             which is the defect: the check reports 'no duplicates' over nothing"
+        );
+        assert_eq!(issues[0].severity, Severity::Fail);
+        assert!(
+            issues[0].message.contains("DID NOT RUN"),
+            "the message must say the check did not run, not that the data is clean: {}",
+            issues[0].message
+        );
+    }
 
     #[test]
     fn uniqueness_missing_column_is_loud_fail() {

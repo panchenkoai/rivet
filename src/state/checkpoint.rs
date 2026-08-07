@@ -289,10 +289,37 @@ impl StateStore {
         Ok(())
     }
 
-    pub fn fail_chunk_task(&self, run_id: &str, chunk_index: i64, err: &str) -> Result<()> {
+    /// Mark a chunk failed.
+    ///
+    /// `retryable` is the CALLER's verdict on the error, not a guess made here:
+    /// the pipeline holds the typed error and already classifies it
+    /// (`retry::classify_error`), while this layer sees only text. When it is
+    /// false the attempt counter is driven to the run's cap, so
+    /// `claim_next_chunk_task` — whose predicate is `attempts <
+    /// max_chunk_attempts` — will not hand the chunk out again.
+    ///
+    /// Before this, the classification stopped at the inner retry loop and the
+    /// chunk-level re-claim re-dispatched a deterministically failing chunk to
+    /// exhaustion. Measured in the field: 15 chunks x 4 attempts x a 300 s
+    /// statement timeout, 300 minutes of production query time for nothing.
+    /// Exhausting the counter rather than adding a column keeps the existing
+    /// claim predicate as the single place that decides eligibility.
+    pub fn fail_chunk_task(
+        &self,
+        run_id: &str,
+        chunk_index: i64,
+        err: &str,
+        retryable: bool,
+    ) -> Result<()> {
         let now = chrono::Utc::now().to_rfc3339();
-        let sql = "UPDATE chunk_task SET status = 'failed', last_error = ?1, updated_at = ?2
-             WHERE run_id = ?3 AND chunk_index = ?4";
+        let sql = if retryable {
+            "UPDATE chunk_task SET status = 'failed', last_error = ?1, updated_at = ?2
+             WHERE run_id = ?3 AND chunk_index = ?4"
+        } else {
+            "UPDATE chunk_task SET status = 'failed', last_error = ?1, updated_at = ?2,
+                    attempts = (SELECT max_chunk_attempts FROM chunk_run WHERE run_id = ?3)
+             WHERE run_id = ?3 AND chunk_index = ?4"
+        };
         match &self.conn {
             StateConn::Sqlite(c) => {
                 c.execute(sql, rusqlite::params![err, now, run_id, chunk_index])?;
@@ -305,15 +332,24 @@ impl StateStore {
         Ok(())
     }
 
+    /// The parallel workers' twin of [`Self::fail_chunk_task`] — same contract,
+    /// including `retryable`.
     pub fn fail_chunk_task_at_ref(
         state_ref: &StateRef,
         run_id: &str,
         chunk_index: i64,
         err: &str,
+        retryable: bool,
     ) -> Result<()> {
         let now = chrono::Utc::now().to_rfc3339();
-        let sql = "UPDATE chunk_task SET status = 'failed', last_error = ?1, updated_at = ?2
-             WHERE run_id = ?3 AND chunk_index = ?4";
+        let sql = if retryable {
+            "UPDATE chunk_task SET status = 'failed', last_error = ?1, updated_at = ?2
+             WHERE run_id = ?3 AND chunk_index = ?4"
+        } else {
+            "UPDATE chunk_task SET status = 'failed', last_error = ?1, updated_at = ?2,
+                    attempts = (SELECT max_chunk_attempts FROM chunk_run WHERE run_id = ?3)
+             WHERE run_id = ?3 AND chunk_index = ?4"
+        };
         match state_ref {
             StateRef::Sqlite(db_path) => {
                 let conn = open_connection(db_path)?;
@@ -590,6 +626,59 @@ mod tests {
         assert!(s.create_chunk_run("run_4", "orders", "h", 1).is_ok());
     }
 
+    /// A chunk that failed for a DETERMINISTIC reason must not be re-claimed.
+    ///
+    /// `retry.rs` already classifies a MySQL statement timeout (3024) as
+    /// PERMANENT and `should_retry` honours it — inside one chunk's attempt. The
+    /// chunk-level re-claim then re-dispatches the same chunk anyway, because it
+    /// tests only `attempts < max_chunk_attempts` with no notion of WHY the
+    /// attempt failed. Measured in the field: a 6M-row export burned 97.9 minutes
+    /// on 15 chunks x 4 attempts x 300s, every attempt hitting the same wall,
+    /// 300 minutes of source query time against a production replica for nothing.
+    ///
+    /// The classification is correct; the layer above never asks. Same shape as
+    /// the runner-bypass class — a value computed right and dropped on the floor.
+    #[test]
+    fn a_permanently_failed_chunk_is_not_reclaimed() {
+        let (_dir, s) = store_on_disk();
+        s.create_chunk_run("run_p", "orders", "h", 4).unwrap();
+        s.insert_chunk_tasks("run_p", &[(1, 5)]).unwrap();
+        s.claim_next_chunk_task("run_p").unwrap().expect("claim");
+
+        // The exact text the field produced.
+        s.fail_chunk_task(
+            "run_p",
+            0,
+            "mysql: statement timeout after 300s (max_execution_time from \
+             tuning.statement_timeout_s) — this query exceeded its time budget (ERROR 3024)",
+            false,
+        )
+        .unwrap();
+
+        assert!(
+            s.claim_next_chunk_task("run_p").unwrap().is_none(),
+            "a chunk that failed on a deterministic error was re-claimed; the next attempt runs \
+             the identical query against the identical data and cannot succeed. Retrying it to \
+             the attempt cap spends the source's time budget N times over."
+        );
+    }
+
+    /// The control: a TRANSIENT failure must still be retried, or the fix above
+    /// would have turned a retry budget into a one-shot.
+    #[test]
+    fn a_transiently_failed_chunk_is_still_reclaimed() {
+        let (_dir, s) = store_on_disk();
+        s.create_chunk_run("run_t", "orders", "h", 4).unwrap();
+        s.insert_chunk_tasks("run_t", &[(1, 5)]).unwrap();
+        s.claim_next_chunk_task("run_t").unwrap().expect("claim");
+        s.fail_chunk_task("run_t", 0, "connection reset by peer", true)
+            .unwrap();
+        assert!(
+            s.claim_next_chunk_task("run_t").unwrap().is_some(),
+            "a transient failure must still be retried"
+        );
+    }
+
     #[test]
     fn chunk_claim_complete_and_finalize() {
         let (_dir, s) = store_on_disk();
@@ -620,13 +709,16 @@ mod tests {
         s.create_chunk_run("run_b", "orders", "ab", 2).unwrap();
         s.insert_chunk_tasks("run_b", &[(1, 2)]).unwrap();
 
+        // `true` — this test's subject is the ATTEMPT CAP, so the failures must be
+        // retryable ones; a permanent failure is exhausted on the spot and is
+        // covered by `a_permanently_failed_chunk_is_not_reclaimed`.
         let t = s.claim_next_chunk_task("run_b").unwrap().unwrap();
         assert_eq!(t.0, 0);
-        s.fail_chunk_task("run_b", 0, "boom").unwrap();
+        s.fail_chunk_task("run_b", 0, "boom", true).unwrap();
 
         let t2 = s.claim_next_chunk_task("run_b").unwrap().unwrap();
         assert_eq!(t2.0, 0);
-        s.fail_chunk_task("run_b", 0, "again").unwrap();
+        s.fail_chunk_task("run_b", 0, "again", true).unwrap();
 
         assert!(s.claim_next_chunk_task("run_b").unwrap().is_none());
         assert_eq!(s.count_chunk_tasks_not_completed("run_b").unwrap(), 1);
@@ -657,5 +749,109 @@ mod tests {
             s.list_export_names_with_in_progress_chunk_runs().unwrap(),
             vec!["alpha".to_string(), "beta".to_string()]
         );
+    }
+}
+
+/// One table's SHAPE at the moment a strategy was chosen for it.
+///
+/// Recorded by `rivet init`, which reads every one of these facts from the
+/// catalog to make the choice and — before this — threw them away. The config it
+/// writes carries the DECISION; nothing carried the EVIDENCE, so six months
+/// later there is no way to ask "what did the table look like when we picked
+/// this?" without guessing.
+///
+/// The field pipeline's own generator already works this way: its
+/// `aa_imports_config.json` stores `table_size_gb` beside `copying_strategy`,
+/// which is exactly what makes their choices auditable. This is that idea with
+/// the two facts they omit and today's failures needed — the ROW WIDTH and the
+/// KEY — plus a timestamp, because a snapshot with no date cannot tell you it
+/// has gone stale.
+///
+/// Why those two. `aa_import_partnerize` was 94k rows — BELOW the 100k threshold
+/// that routes to `mode: full` — and 1010 bytes per row, four to ten times wider
+/// than its siblings. It is the one that crossed the statement timeout. The
+/// threshold counted rows where the cost is bytes, and the byte figure was read
+/// and discarded. Separately, `ref_id` on the versioned tables is indexed but
+/// NOT unique (2.16 rows per key, measured), which is why keyset is impossible
+/// there — a property of the data that no config field records.
+///
+/// INIT ONLY, deliberately: writing this on every run would show a shape
+/// DRIFTING away from the strategy that suits it, which is the more useful
+/// signal and the larger feature. This is the decision point alone.
+#[derive(Debug, Clone)]
+pub struct StrategySnapshot {
+    pub export_name: String,
+    pub source_schema: Option<String>,
+    pub source_table: String,
+    pub row_estimate: Option<i64>,
+    /// Physical size from the catalog — `DATA_LENGTH` on MySQL, `pg_total_
+    /// relation_size` on PostgreSQL. `None` where the engine has no scan-free
+    /// figure (SQL Server and Mongo do not populate it), and `None` is recorded
+    /// as `None` rather than 0: "unknown" and "empty" are different answers.
+    pub total_bytes: Option<i64>,
+    pub avg_row_bytes: Option<i64>,
+    pub chosen_mode: String,
+    /// `keyset` / `range` / `full` / `incremental` — the shape the scaffold
+    /// emitted, which is finer than `mode:` alone (both keyset and range are
+    /// `mode: chunked`).
+    pub strategy_kind: Option<String>,
+    pub key_column: Option<String>,
+    pub chunk_size: Option<i64>,
+}
+
+impl StateStore {
+    /// Append a strategy snapshot. Append-only: a later `init` over the same
+    /// config adds a row rather than replacing one, so the sequence shows how
+    /// the answer changed.
+    pub fn record_strategy_snapshot(&self, s: &StrategySnapshot) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let ver = env!("CARGO_PKG_VERSION");
+        let sql = "INSERT INTO strategy_snapshot (
+                 export_name, source_schema, source_table, row_estimate, total_bytes,
+                 avg_row_bytes, chosen_mode, strategy_kind, key_column, chunk_size,
+                 rivet_version, captured_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)";
+        match &self.conn {
+            StateConn::Sqlite(c) => {
+                c.execute(
+                    sql,
+                    rusqlite::params![
+                        s.export_name,
+                        s.source_schema,
+                        s.source_table,
+                        s.row_estimate,
+                        s.total_bytes,
+                        s.avg_row_bytes,
+                        s.chosen_mode,
+                        s.strategy_kind,
+                        s.key_column,
+                        s.chunk_size,
+                        ver,
+                        now,
+                    ],
+                )?;
+            }
+            StateConn::Postgres(client) => {
+                let mut c = client.borrow_mut();
+                c.execute(
+                    &pg_sql(sql),
+                    &[
+                        &s.export_name,
+                        &s.source_schema,
+                        &s.source_table,
+                        &s.row_estimate,
+                        &s.total_bytes,
+                        &s.avg_row_bytes,
+                        &s.chosen_mode,
+                        &s.strategy_kind,
+                        &s.key_column,
+                        &s.chunk_size,
+                        &ver,
+                        &now,
+                    ],
+                )?;
+            }
+        }
+        Ok(())
     }
 }

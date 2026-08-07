@@ -31,11 +31,24 @@ pub(crate) fn extract_last_cursor_value(
 ) -> Option<String> {
     let col_idx = schema.index_of(cursor_column).ok()?;
     let array = batch.column(col_idx);
-    let last_row = batch.num_rows().checked_sub(1)?;
 
-    if array.is_null(last_row) {
-        return None;
-    }
+    // The last NON-NULL row, not simply the last row.
+    //
+    // Incremental queries append `ORDER BY <cursor>`, and PostgreSQL sorts NULLs
+    // LAST in ASC — so on a nullable cursor column the final row of the final
+    // batch carries no value, and returning None here handed the caller nothing
+    // to record. The high-water mark was then never written and the export
+    // re-read the whole table on every run, forever (measured: 21 rows exported
+    // three times over, `export_state` empty throughout).
+    //
+    // Scanning back finds the real maximum: the rows are ordered by this very
+    // column, so the last non-null IS the greatest value present. MySQL and SQL
+    // Server sort NULLs FIRST and were never affected — this restores their
+    // behaviour on PostgreSQL rather than inventing one.
+    //
+    // An all-NULL batch still yields None, which the caller must treat as "this
+    // batch says nothing" and NOT as "reset the mark" — see `ExportSink::on_batch`.
+    let last_row = (0..batch.num_rows()).rev().find(|&i| !array.is_null(i))?;
 
     match array.data_type() {
         DataType::Int16 => Some(
@@ -390,12 +403,60 @@ mod tests {
         assert_eq!(extract_last_cursor_value(&batch, "id", &schema), None);
     }
 
+    /// A NULL in the last row must not hide the value above it.
+    ///
+    /// This test used to assert `None` for exactly this batch — it pinned the
+    /// mechanism as if it were the contract. On PostgreSQL, which sorts NULLs
+    /// LAST in ASC, that None was then written over the high-water mark
+    /// accumulated from every prior batch, the cursor was never committed, and
+    /// the export re-read the whole table on every run forever. The rows are
+    /// ordered BY this column, so the last non-null is the greatest value
+    /// present; that is what the mark should be.
     #[test]
-    fn cursor_null_last_row_returns_none() {
+    fn cursor_null_last_row_uses_the_last_non_null() {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![Arc::new(Int64Array::from(vec![Some(1), None]))],
+        )
+        .unwrap();
+        assert_eq!(
+            extract_last_cursor_value(&batch, "id", &schema),
+            Some("1".to_string())
+        );
+    }
+
+    /// Several trailing NULLs are the realistic shape — a soft-deleted or
+    /// never-touched population all sorts to the end together.
+    #[test]
+    fn cursor_many_trailing_nulls_still_find_the_maximum() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![
+                Some(1),
+                Some(7),
+                None,
+                None,
+                None,
+            ]))],
+        )
+        .unwrap();
+        assert_eq!(
+            extract_last_cursor_value(&batch, "id", &schema),
+            Some("7".to_string())
+        );
+    }
+
+    /// The control: a batch with NOTHING readable genuinely says nothing, and
+    /// must still report None so the caller keeps the mark it already has rather
+    /// than inventing one.
+    #[test]
+    fn cursor_all_null_batch_reports_nothing() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![None, None]))],
         )
         .unwrap();
         assert_eq!(extract_last_cursor_value(&batch, "id", &schema), None);

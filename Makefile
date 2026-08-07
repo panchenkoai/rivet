@@ -169,5 +169,94 @@ seed-garbage-mysql:
 seed-garbage-mssql:
 	docker compose exec -T mssql /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 'Rivet_Passw0rd!' -C -d rivet -b -i /dev/stdin < dev/garbage/mssql.sql
 
-release-oracle:  ## Release gate: every engine×version × scenario against local MinIO/fake-gcs/Azurite + a BigQuery golden. Green everywhere ⇒ releasable.
+release-oracle:  ## Release gate, BARE: only what is already in your shell. Read the SKIP count — with nothing set it is ~95 PASS / 60 SKIP and still prints RELEASE-READY.
 	python3 -m dev.release_oracle
+
+# ─── the gate's environment, assembled ────────────────────────────────────────
+#
+# Every URL below points at the CANONICAL dev stand in docker-compose.yaml, and
+# every one is `?=` so a caller can override a single service without editing
+# this file.
+#
+# WHY THIS EXISTS. The gate is env-driven and SKIPs — never silently passes —
+# when a URL is absent. That is the honest behaviour and it has a trap: a run
+# with none of these set is ~95 PASS / 60 SKIP and prints RELEASE-READY, which
+# is literally true ("every non-skipped cell is green") and nearly meaningless.
+# Assembling twenty variables by hand before every release means the verdict
+# depends on someone remembering them. It did: the first end-to-end pass with
+# the full environment surfaced SIX latent defects in the gate's own scaffolding
+# that no partial run could reach.
+#
+# The CDC ports are NOT the batch ports. `mysql-cdc` is 3307 and `mssql-cdc` is
+# 1434 — separate services with binlog / CDC + Agent enabled. Pointing the CDC
+# legs at 3306/1433 makes them fail in a way that reads like a product defect.
+RIVET_ORACLE_POSTGRES_URL ?= postgresql://rivet:rivet@127.0.0.1:5432/rivet
+RIVET_ORACLE_MYSQL_URL    ?= mysql://rivet:rivet@127.0.0.1:3306/rivet
+RIVET_ORACLE_MSSQL_URL    ?= mssql://sa:Rivet_Passw0rd!@127.0.0.1:1433/rivet
+RIVET_ORACLE_MONGO_URL    ?= mongodb://127.0.0.1:27017/rivet
+RIVET_CDC_POSTGRES_URL    ?= postgresql://rivet:rivet@127.0.0.1:5434/rivet
+RIVET_CDC_MYSQL_URL       ?= mysql://rivet:rivet@127.0.0.1:3307/rivet
+RIVET_CDC_MSSQL_URL       ?= mssql://sa:Rivet_Passw0rd!@127.0.0.1:1434/rivet
+# `directConnection=true`, not `replicaSet=rs0`: the set advertises a member
+# address the host cannot resolve, so the driver reports ReplicaSetNoPrimary and
+# every mongo CDC cell dies at init.
+RIVET_CDC_MONGO_URL       ?= mongodb://127.0.0.1:27018/rivet?directConnection=true
+# One Postgres state DB serves every "grade the other backend" leg.
+RIVET_GATE_STATE_URL      ?= postgresql://rivet:rivet@127.0.0.1:5433/rivet_state
+RIVET_SWEEP_STATE_CONTAINER ?= rivet-postgres-state-1
+RIVET_CONC_SRC_CONTAINER  ?= rivet-postgres-1
+# Not hard-coded to anyone's project: whatever `gcloud` is pointed at. Empty ⇒
+# the BigQuery legs SKIP with that reason, which is correct on a machine with no
+# warehouse.
+BQ_ORACLE_PROJECT         ?= $(shell gcloud config get-value project 2>/dev/null)
+BQ_ORACLE_DATASET         ?= rivet_blessed
+BQ_ORACLE_BUCKET          ?= rivet_data_test
+PREV_RELEASE_DIR          ?= target/prev-release
+
+GATE_ENV = \
+  RIVET_ORACLE_POSTGRES_URL='$(RIVET_ORACLE_POSTGRES_URL)' \
+  RIVET_ORACLE_MYSQL_URL='$(RIVET_ORACLE_MYSQL_URL)' \
+  RIVET_ORACLE_MSSQL_URL='$(RIVET_ORACLE_MSSQL_URL)' \
+  RIVET_ORACLE_MONGO_URL='$(RIVET_ORACLE_MONGO_URL)' \
+  RIVET_REGRESSION_SOURCE_URL='$(RIVET_ORACLE_POSTGRES_URL)' \
+  RIVET_CDC_POSTGRES_URL='$(RIVET_CDC_POSTGRES_URL)' \
+  RIVET_CDC_MYSQL_URL='$(RIVET_CDC_MYSQL_URL)' \
+  RIVET_CDC_MSSQL_URL='$(RIVET_CDC_MSSQL_URL)' \
+  RIVET_CDC_MONGO_URL='$(RIVET_CDC_MONGO_URL)' \
+  RIVET_CDC_STATE_URL='$(RIVET_GATE_STATE_URL)' \
+  RIVET_CONC_STATE_URL='$(RIVET_GATE_STATE_URL)' \
+  RIVET_GATE_STATE_URL='$(RIVET_GATE_STATE_URL)' \
+  RIVET_TEST_STATE_URL='$(RIVET_GATE_STATE_URL)' \
+  RIVET_SWEEP_STATE_CONTAINER='$(RIVET_SWEEP_STATE_CONTAINER)' \
+  RIVET_CONC_SRC_CONTAINER='$(RIVET_CONC_SRC_CONTAINER)' \
+  RIVET_CONC_SRC_URL='$(RIVET_ORACLE_POSTGRES_URL)' \
+  BQ_ORACLE_PROJECT='$(BQ_ORACLE_PROJECT)' \
+  BQ_ORACLE_DATASET='$(BQ_ORACLE_DATASET)' \
+  BQ_ORACLE_BUCKET='$(BQ_ORACLE_BUCKET)'
+
+release-oracle-prev-bin:  ## Download the PREVIOUS release binary (the regression + scale baseline). A downloaded asset, never a locally rebuilt parent.
+	@mkdir -p $(PREV_RELEASE_DIR)
+	@tag=$$(gh release list --limit 1 --json tagName -q '.[0].tagName'); \
+	 arch=$$(uname -m); os=$$(uname -s | tr 'A-Z' 'a-z'); \
+	 [ "$$arch" = "arm64" ] && arch=aarch64; \
+	 case "$$os" in darwin) triple="$$arch-apple-darwin";; *) triple="$$arch-unknown-linux-gnu";; esac; \
+	 echo "  downloading $$tag ($$triple) — the artifact users actually run"; \
+	 gh release download "$$tag" --pattern "rivet-$$tag-$$triple.tar.gz" --dir $(PREV_RELEASE_DIR) --clobber; \
+	 tar -xzf "$(PREV_RELEASE_DIR)/rivet-$$tag-$$triple.tar.gz" -C $(PREV_RELEASE_DIR); \
+	 chmod +x "$(PREV_RELEASE_DIR)/rivet-$$tag-$$triple/rivet"; \
+	 echo "  $$($(PREV_RELEASE_DIR)/rivet-$$tag-$$triple/rivet --version) → $(PREV_RELEASE_DIR)/rivet-$$tag-$$triple/rivet"
+
+release-oracle-full: release-oracle-prev-bin  ## Release gate with the WHOLE environment against the local dev stand. This is the one a release is judged by.
+	@# The gate grades `target/release/rivet`. A stale one grades yesterday's
+	@# code, and `cargo package` poisons the fingerprints so cargo reports
+	@# `Fresh` on a binary that predates your edits — drop the snapshot first.
+	@rm -rf target/package
+	cargo build --release
+	@prev=$$(ls -d $(PREV_RELEASE_DIR)/rivet-v*/rivet 2>/dev/null | tail -1); \
+	 echo "  previous release: $${prev:-<none — the regression + scale legs will SKIP>}"; \
+	 env $(GATE_ENV) RIVET_PREV_RELEASE_BIN="$$prev" python3 -m dev.release_oracle $(ARGS)
+
+release-oracle-bless: release-oracle-prev-bin  ## Re-capture the verdict + duckdb-type goldens. Deliberate: a golden must be written by rivet's own code, never edited by hand.
+	@rm -rf target/package
+	cargo build --release
+	env $(GATE_ENV) python3 -m dev.release_oracle --bless-local $(ARGS)

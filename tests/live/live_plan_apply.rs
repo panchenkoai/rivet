@@ -134,7 +134,7 @@ fn plan_and_apply_full_export_round_trip() {
     );
     // Back the round-trip claim with an independent destination read.
     assert_eq!(
-        total_parquet_rows(&rig.out_dir()),
+        duckdb_total_parquet_rows(&rig.out_dir()),
         30,
         "full plan+apply must land all 30 rows"
     );
@@ -221,12 +221,12 @@ fn plan_and_apply_chunked_export_round_trip_uses_precomputed_ranges() {
     // Back the chunked round-trip with an independent destination read: all 150
     // rows across the 3 chunks, distinct ids 0..150 (no drop/dup at boundaries).
     assert_eq!(
-        total_parquet_rows(&rig.out_dir()),
+        duckdb_total_parquet_rows(&rig.out_dir()),
         150,
         "3 chunks must land all 150 rows"
     );
     assert_eq!(
-        dir_parquet_id_set(&rig.out_dir()),
+        duckdb_dir_parquet_id_set(&rig.out_dir()),
         (0..150).collect::<std::collections::BTreeSet<i64>>(),
         "chunked round-trip must hold every source id 0..150"
     );
@@ -345,12 +345,12 @@ fn apply_replay_case(extra_mode_lines: &str) {
          grown table; found: {parquet:?}"
     );
     assert_eq!(
-        total_parquet_rows(&rig.out_dir()),
+        duckdb_total_parquet_rows(&rig.out_dir()),
         150,
         "apply must move only the rows its plan covered"
     );
     assert_eq!(
-        dir_parquet_id_set(&rig.out_dir()),
+        duckdb_dir_parquet_id_set(&rig.out_dir()),
         (0..150).collect::<std::collections::BTreeSet<i64>>(),
         "the ids must be exactly the planned range — rows added after planning \
          belong to the next run, not this artifact"
@@ -555,7 +555,7 @@ fn apply_force_flag_bypasses_expired_plan() {
     );
     // "Data must actually be exported" — back it with a destination read.
     assert_eq!(
-        total_parquet_rows(&rig.out_dir()),
+        duckdb_total_parquet_rows(&rig.out_dir()),
         10,
         "forced apply must still land all 10 rows"
     );
@@ -650,7 +650,7 @@ fn plan_param_flag_substitutes_in_query() {
     );
     // Back the export_metrics count with an independent destination read.
     assert_eq!(
-        total_parquet_rows(&rig.out_dir()),
+        duckdb_total_parquet_rows(&rig.out_dir()),
         20,
         "param max_id=19 must physically land exactly 20 rows at the destination"
     );

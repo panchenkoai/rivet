@@ -57,6 +57,7 @@ try:  # imported as part of the package
         port_of,
         rivet,
         run,
+        wait_until,
     )
 except ImportError:  # run directly out of dev/release_oracle/
     import scenarios  # type: ignore[no-redef]
@@ -71,6 +72,7 @@ except ImportError:  # run directly out of dev/release_oracle/
         port_of,
         rivet,
         run,
+        wait_until,
     )
 
 CDC_HOOK_FLUSH = "cdc_after_flush_before_ack"  # flushed to store, anchor NOT yet advanced
@@ -306,14 +308,49 @@ def _cdc_mssql(url: str, work: Path) -> str | None:
     p = _sqlcmd(
         url,
         sql=(
+            # DISABLE BEFORE DROP, and guard on the capture instance rather than
+            # on a join to sys.tables.
+            #
+            # The original order was DROP TABLE first, then
+            # `IF EXISTS (cdc.change_tables ct JOIN sys.tables t ON
+            # ct.source_object_id = t.object_id WHERE t.name='orc_cdc_probe')`.
+            # Dropping the table ORPHANS its change table — the row survives in
+            # cdc.change_tables but `source_object_id` no longer resolves, so the
+            # join finds nothing, the disable is skipped, and the next
+            # `sp_cdc_enable_table` fails with 22926: "capture instance name
+            # 'dbo_orc_cdc_probe' already exists". It alternated pass/fail run to
+            # run, which read as a race and is not one: it is order-dependent
+            # state the guard could no longer see.
+            "IF EXISTS (SELECT 1 FROM cdc.change_tables WHERE capture_instance = 'dbo_orc_cdc_probe')\n"
+            "  EXEC sys.sp_cdc_disable_table @source_schema='dbo', @source_name='orc_cdc_probe', @capture_instance='dbo_orc_cdc_probe';\n"
             "IF OBJECT_ID('dbo.orc_cdc_probe') IS NOT NULL DROP TABLE dbo.orc_cdc_probe;\n"
             "CREATE TABLE dbo.orc_cdc_probe (id int PRIMARY KEY, amount decimal(18,4), meta nvarchar(200));\n"
-            "IF EXISTS (SELECT 1 FROM cdc.change_tables ct JOIN sys.tables t ON ct.source_object_id=t.object_id WHERE t.name='orc_cdc_probe')\n"
-            "  EXEC sys.sp_cdc_disable_table @source_schema='dbo', @source_name='orc_cdc_probe', @capture_instance='all';\n"
             "EXEC sys.sp_cdc_enable_table @source_schema='dbo', @source_name='orc_cdc_probe', @role_name=NULL, @capture_instance='dbo_orc_cdc_probe';\n"
         ),
     )
     if not p.ok:
+        return None
+    # `sp_cdc_enable_table` returning success does NOT mean the capture instance
+    # is queryable: `fn_cdc_get_min_lsn` stays NULL until the capture job has run
+    # once, and rivet's own preflight reads exactly that function. So the fixture
+    # is not ready when the enable call returns — it is ready when the LSN is.
+    #
+    # Every mssql CDC cell of blessed_flow failed at `doctor` on this
+    # ("fn_cdc_get_min_lsn returned NULL — the capture instance does not exist"),
+    # which is the preflight being right about a fixture that had lied about
+    # being up. Waiting on the enable call's exit code is waiting on the wrong
+    # signal; a `time.sleep` here would be the same guess with a nicer face.
+    ready = wait_until(
+        lambda: "NULL"
+        not in _sqlcmd(
+            url,
+            q="SET NOCOUNT ON; SELECT ISNULL(CONVERT(varchar(64), "
+            "sys.fn_cdc_get_min_lsn('dbo_orc_cdc_probe'), 1), 'NULL')",
+        ).stdout,
+        tries=20,
+        delay=1.5,
+    )
+    if not ready:
         return None
     return (
         "cdc: { capture_instance: dbo_orc_cdc_probe, until_current: true, "

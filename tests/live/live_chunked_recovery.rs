@@ -110,8 +110,8 @@ fn manifest_total_rows(cfg: &std::path::Path, export: &str) -> i64 {
 /// alone would wave through); `distinct` proves the de-duplicated logical total.
 fn parquet_physical_and_distinct_ids(dir: &std::path::Path) -> (i64, i64) {
     (
-        total_parquet_rows(dir) as i64,
-        dir_parquet_id_set(dir).len() as i64,
+        duckdb_total_parquet_rows(dir) as i64,
+        duckdb_dir_parquet_id_set(dir).len() as i64,
     )
 }
 
@@ -1078,7 +1078,7 @@ fn a_failed_chunk_must_fail_the_run_not_ship_a_short_export() {
 
     // The fixture must not be inert: the OTHER chunks have to have run, or the
     // run failed for an unrelated reason and proves nothing about the guard.
-    let rows = total_parquet_rows(out.path());
+    let rows = duckdb_total_parquet_rows(out.path());
     assert!(
         rows > 0 && rows < 150,
         "fixture is inert — expected a PARTIAL export (some chunks written, one failed), \

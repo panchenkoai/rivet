@@ -253,7 +253,7 @@ fn walkdir_parquet_ids(root: &std::path::Path, marker: &str) -> std::collections
             } else if p.extension().is_some_and(|x| x == "parquet")
                 && p.to_string_lossy().contains(marker)
             {
-                for id in dir_parquet_distinct_strings(p.parent().unwrap(), "_id") {
+                for id in duckdb_dir_parquet_distinct_strings(p.parent().unwrap(), "_id") {
                     ids.insert(id);
                 }
             }

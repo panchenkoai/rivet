@@ -21,7 +21,7 @@ fn mongo_readonly_login_exports_despite_denied_harm_probe() {
     let rig = Rig::mongo_batch("t").source_url(&mongo_auth_reader_url());
     rig.run_ok();
     assert_eq!(
-        dir_parquet_distinct_strings(&rig.out_dir(), "_id").len(),
+        duckdb_dir_parquet_distinct_strings(&rig.out_dir(), "_id").len(),
         3,
         "the read-only export must still read every document"
     );

@@ -66,3 +66,49 @@ SELECT TOP (500)
     CAST(ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS DECIMAL(12,2)) * 1.5
 FROM sys.all_objects a CROSS JOIN sys.all_objects b;
 GO
+
+-- ─── Type-matrix demo, the SQL Server twin of the PG/MySQL fixture ──────────
+--
+-- `dev/postgres/init.sql` and `dev/mysql/init.sql` have declared
+-- `rivet_type_matrix` for a long time; this file did not, and the cross-engine
+-- stand tests that read it (`chunking_stand::stand_meta_columns_mssql`,
+-- `stand_type_matrix_every_consumer_mssql`) passed locally only because a
+-- hand-created table happened to sit in a long-lived container. On a fresh CI
+-- stand they failed with `Invalid object name 'dbo.rivet_type_matrix'`. The
+-- fixture belongs to the stand, so it is declared here — same four rows and the
+-- same semantic columns as PostgreSQL, in the T-SQL types rivet maps them to.
+--
+-- `created_at` (datetime2) and `created_at_tz` (datetimeoffset) are the pair
+-- that matters: naive and zone-carrying in one export, which is what makes the
+-- row-hash / checksum / uniqueness consumers face a real timestamp instead of
+-- two integers.
+IF OBJECT_ID('dbo.rivet_type_matrix', 'U') IS NOT NULL DROP TABLE dbo.rivet_type_matrix;
+GO
+CREATE TABLE dbo.rivet_type_matrix (
+    id            BIGINT           NOT NULL PRIMARY KEY,
+    label         NVARCHAR(100)    NOT NULL,
+    amount        DECIMAL(18,2)    NULL,
+    fee           DECIMAL(18,6)    NULL,
+    created_at    DATETIME2(6)     NOT NULL,
+    created_at_tz DATETIMEOFFSET(6) NOT NULL,
+    raw_bytes     VARBINARY(64)    NOT NULL,
+    uid           UNIQUEIDENTIFIER NOT NULL,
+    attrs         NVARCHAR(MAX)    NULL
+);
+GO
+INSERT INTO dbo.rivet_type_matrix
+    (id, label, amount, fee, created_at, created_at_tz, raw_bytes, uid, attrs)
+VALUES
+  (1, N'payments-like', 0.10, 0.000001,
+      '2035-08-07T09:08:07.987654', '2035-08-07T09:08:07.987654+00:00',
+      0x00FF012345, 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380011', N'{"tier":"gold","n":1}'),
+  (2, N'payments-like', 0.20, 0.000002,
+      '2019-02-03T03:07:06.554433', '2019-02-03T08:07:06.554433+05:00',
+      0xDEADBEEF, 'B0EEBC99-9C0B-4EF8-BB6D-6BB9BD380022', N'["a","b"]'),
+  (3, N'payments-like', 999999999999.99, 10.123456,
+      '2020-01-15T00:00:00.000001', '2020-01-15T00:00:00.000001+00:00',
+      0xCAFE, 'C0EEBC99-9C0B-4EF8-BB6D-6BB9BD380033', N'{"big":true}'),
+  (4, N'payments-like', -100.05, -0.123456,
+      '2021-06-30T12:59:59.999999', '2021-06-30T12:59:59.999999+00:00',
+      0x00, 'D0EEBC99-9C0B-4EF8-BB6D-6BB9BD380044', N'{}');
+GO

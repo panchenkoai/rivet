@@ -31,10 +31,10 @@ pub(crate) fn run_chunked_sequential(
         // Detect: compute ranges + run the pre-chunk drift check once (ADR-0021).
         super::ChunkSource::Detect => super::prepare_chunk_plan(src, plan, state, summary)?,
         super::ChunkSource::Precomputed(ranges) => {
-            // Records that the drift gate was skipped BY CONTRACT, not by a
-            // runner forgetting its facade — `prepare_chunk_plan` is its only
-            // caller and a precomputed source deliberately does not call it.
+            // Ranges come from the artifact; the DRIFT GATE still runs. It does
+            // not depend on them.
             summary.chunks_precomputed = true;
+            super::check_drift_only(src, plan, state, summary)?;
             ranges
         }
     };
@@ -193,7 +193,13 @@ pub(crate) fn run_chunked_parallel(
         // drift check (ADR-0021), then closes before the workers open theirs.
         super::ChunkSource::Detect => super::prepare_chunk_plan_fresh(plan, state, summary)?,
         super::ChunkSource::Precomputed(ranges) => {
-            summary.chunks_precomputed = true; // drift gate skipped by contract
+            // Ranges come from the artifact; the DRIFT GATE still runs.
+            summary.chunks_precomputed = true;
+            // No ranges ⇒ no rows will be read, so there is nothing for the gate
+            // to protect and no reason to open a connection to say so.
+            if !ranges.is_empty() {
+                super::check_drift_only_fresh(plan, state, summary)?;
+            }
             ranges
         }
     };

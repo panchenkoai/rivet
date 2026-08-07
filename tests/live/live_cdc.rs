@@ -1652,7 +1652,9 @@ exports:
     );
     assert_eq!(manifest_rows(&out), 0, "nothing to drain yet");
     assert_eq!(
-        dir_parquet_id_set(&snap).into_iter().collect::<Vec<i64>>(),
+        duckdb_dir_parquet_id_set(&snap)
+            .into_iter()
+            .collect::<Vec<i64>>(),
         vec![1, 2],
         "snapshot parquet must hold exactly the pre-existing ids (independent re-read)"
     );
@@ -2085,7 +2087,7 @@ exports:
     let _slot = Slot(slot.clone());
     assert_eq!(manifest_rows(&out.join("snapshot")), 2);
     assert_eq!(
-        dir_parquet_id_set(&out.join("snapshot"))
+        duckdb_dir_parquet_id_set(&out.join("snapshot"))
             .into_iter()
             .collect::<Vec<i64>>(),
         vec![1, 2],
@@ -2934,7 +2936,7 @@ fn roast_pg_cdc_crash_in_a_re_drain_pass_stays_at_least_once() {
     let rig2 = Rig::pg_cdc(&a, &slot).dest_path(out.clone());
     run_rivet_ok(&rig2.config_path());
 
-    let ids = dir_parquet_i64(&out, "id");
+    let ids = duckdb_dir_parquet_i64(&out, "id");
     let distinct: std::collections::BTreeSet<i64> = ids.iter().copied().collect();
     let want: std::collections::BTreeSet<i64> = (0..12).collect();
     assert_eq!(
@@ -3004,7 +3006,8 @@ fn roast_pg_cdc_large_transaction_is_atomic_across_a_mid_flush_crash() {
     let rig2 = Rig::pg_cdc(&tbl, &slot).dest_path(out.clone());
     run_rivet_ok(&rig2.config_path());
 
-    let got: std::collections::BTreeSet<i64> = dir_parquet_i64(&out, "id").into_iter().collect();
+    let got: std::collections::BTreeSet<i64> =
+        duckdb_dir_parquet_i64(&out, "id").into_iter().collect();
     let want: std::collections::BTreeSet<i64> = (0..12).collect();
     assert_eq!(
         got,
@@ -3064,7 +3067,8 @@ fn roast_mysql_cdc_large_transaction_is_atomic_across_a_mid_flush_crash() {
     // Run 2 resumes from the checkpoint the crash left behind.
     run_rivet_ok(&rig.config_path());
 
-    let got: std::collections::BTreeSet<i64> = dir_parquet_i64(&out, "id").into_iter().collect();
+    let got: std::collections::BTreeSet<i64> =
+        duckdb_dir_parquet_i64(&out, "id").into_iter().collect();
     let want: std::collections::BTreeSet<i64> = (0..12).collect();
     assert_eq!(
         got,
@@ -3267,7 +3271,7 @@ fn pg_cdc_column_added_mid_stream_is_captured() {
     std::fs::create_dir_all(&out1).unwrap();
     run_rivet_ok(&pg_cdc_config(&d, &tbl, &slot, &out1));
     assert!(
-        !dir_parquet_has_column(&out1, "w"),
+        !duckdb_dir_parquet_has_column(&out1, "w"),
         "run 1 predates the added column"
     );
 
@@ -3282,7 +3286,7 @@ fn pg_cdc_column_added_mid_stream_is_captured() {
     std::fs::create_dir_all(&out2).unwrap();
     run_rivet_ok(&pg_cdc_config(&d, &tbl, &slot, &out2));
     assert!(
-        dir_parquet_has_column(&out2, "w"),
+        duckdb_dir_parquet_has_column(&out2, "w"),
         "run 2 must re-resolve and pick up the column added between runs"
     );
     assert_eq!(parquet_one_string(&out2, "w"), "hello");
@@ -3346,7 +3350,8 @@ fn pg_cdc_until_current_terminates_under_sustained_writes() {
         "until_current must terminate under sustained writes (killed at the 30s ceiling)"
     );
     // Termination must NOT come from dropping the backlog.
-    let ids: std::collections::BTreeSet<i64> = dir_parquet_i64(&out, "id").into_iter().collect();
+    let ids: std::collections::BTreeSet<i64> =
+        duckdb_dir_parquet_i64(&out, "id").into_iter().collect();
     for i in 0..30 {
         assert!(
             ids.contains(&i),
@@ -3404,7 +3409,8 @@ fn cdc_until_current_terminates_under_sustained_writes() {
         elapsed.is_some(),
         "until_current must terminate under sustained writes (killed at the 30s ceiling)"
     );
-    let ids: std::collections::BTreeSet<i64> = dir_parquet_i64(&out, "id").into_iter().collect();
+    let ids: std::collections::BTreeSet<i64> =
+        duckdb_dir_parquet_i64(&out, "id").into_iter().collect();
     for i in 0..30 {
         assert!(
             ids.contains(&i),
@@ -3492,8 +3498,9 @@ fn roast_pg_until_current_open_bound_two_runs_lose_nothing() {
         "run 2 (no writers) must drain the tail and exit"
     );
 
-    let got: std::collections::BTreeSet<i64> =
-        dir_parquet_i64(&rig.out_dir(), "id").into_iter().collect();
+    let got: std::collections::BTreeSet<i64> = duckdb_dir_parquet_i64(&rig.out_dir(), "id")
+        .into_iter()
+        .collect();
     let want: std::collections::BTreeSet<i64> = c
         .query(&format!("SELECT id FROM {tbl}"), &[])
         .unwrap()
@@ -3565,8 +3572,9 @@ fn roast_mysql_until_current_open_bound_two_runs_lose_nothing() {
         "run 2 (no writers) must drain the tail and exit"
     );
 
-    let got: std::collections::BTreeSet<i64> =
-        dir_parquet_i64(&rig.out_dir(), "id").into_iter().collect();
+    let got: std::collections::BTreeSet<i64> = duckdb_dir_parquet_i64(&rig.out_dir(), "id")
+        .into_iter()
+        .collect();
     let want: std::collections::BTreeSet<i64> = c
         .query_map(format!("SELECT id FROM {tbl}"), |id: i64| id)
         .unwrap()
@@ -3684,7 +3692,8 @@ fn roast_pg_cdc_reaches_open_bound_past_a_large_empty_ddl_span() {
         .dest_path(out.clone());
     run_rivet_ok(&rig.config_path());
 
-    let got: std::collections::BTreeSet<i64> = dir_parquet_i64(&out, "id").into_iter().collect();
+    let got: std::collections::BTreeSet<i64> =
+        duckdb_dir_parquet_i64(&out, "id").into_iter().collect();
     let want: std::collections::BTreeSet<i64> = (0..12).collect();
     assert_eq!(
         got,
@@ -3894,8 +3903,9 @@ fn roast_pg_cdc_reaches_open_bound_past_a_large_uncaptured_transaction() {
         .cdc("rollover: 5");
     run_rivet_ok(&rig.config_path());
 
-    let got: std::collections::BTreeSet<i64> =
-        dir_parquet_i64(&rig.out_dir(), "id").into_iter().collect();
+    let got: std::collections::BTreeSet<i64> = duckdb_dir_parquet_i64(&rig.out_dir(), "id")
+        .into_iter()
+        .collect();
     let want: std::collections::BTreeSet<i64> = (0..30).collect();
     assert_eq!(
         got,
@@ -4064,7 +4074,7 @@ fn roast_pg_cdc_captures_a_silent_update_a_watermark_sync_would_miss() {
         vec![(1, "insert".to_string()), (1, "update".to_string())],
         "CDC must capture the insert AND the silent update the watermark missed — got {ops:?}"
     );
-    let vcs: Vec<i64> = dir_parquet_i64(&out, "v");
+    let vcs: Vec<i64> = duckdb_dir_parquet_i64(&out, "v");
     assert_eq!(
         vcs,
         vec![0, 42],
@@ -4638,6 +4648,25 @@ fn roast_pg_cdc_destination_placeholders_resolve_like_the_batch_path() {
         &[&slot],
     )
     .unwrap();
+    // Drop the slot even if an assertion below panics. The file's other tests
+    // use a TRAILING `pg_drop_replication_slot`, which leaks whenever the test
+    // fails before reaching it — and a leaked logical slot is not inert: it
+    // pins WAL and counts against `max_replication_slots` (32 here). Measured
+    // 2026-08-05: this test alone left 25 of 32 slots held after a day of runs,
+    // and the PG CDC tests then began failing in the parallel suite with
+    // symptoms that looked like anything but slot exhaustion.
+    struct SlotGuard(String);
+    impl Drop for SlotGuard {
+        fn drop(&mut self) {
+            if let Ok(mut c) = postgres::Client::connect(POSTGRES_CDC_URL, postgres::NoTls) {
+                let _ = c.execute(
+                    &format!("SELECT pg_drop_replication_slot('{}')", self.0),
+                    &[],
+                );
+            }
+        }
+    }
+    let _slot_guard = SlotGuard(slot.clone());
     c.batch_execute(&format!(
         "INSERT INTO {tbl} (id, v) VALUES (1, 'a'), (2, 'b'), (3, 'c');"
     ))

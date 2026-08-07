@@ -241,3 +241,70 @@ fn gaps_do_not_exceed_the_ratchet() {
          wire the check (flip gap -> test / gate the version) and LOWER the ratchet"
     );
 }
+
+/// A `test` cell must name a check the gate actually RUNS — not one it merely defines.
+///
+/// The sibling guard above asks whether every `def verify_*` has a matrix row.
+/// That is the weaker half of the question, and the gap between the two halves
+/// was live: `blessed_path.verify_blessed_path` was registered `test` for all
+/// four engines and had **no caller anywhere in the tree**. It was dead code
+/// wearing four green cells, and every signal a reader has — the matrix, the
+/// definition, the guard — agreed it was covered.
+///
+/// So this asks the other half: for every gate function, is there a CALL SITE?
+/// A call is an occurrence of `name(` that is not the `def`. Cross-module calls
+/// (`blessed_flow.verify_blessed_flow(...)`) and same-module ones both count;
+/// what does not count is the definition alone.
+#[test]
+fn every_gate_function_has_a_call_site() {
+    let sources: Vec<(String, String)> = gate_py()
+        .iter()
+        .map(|p| {
+            (
+                p.file_name().unwrap().to_string_lossy().to_string(),
+                fs::read_to_string(p).unwrap_or_else(|e| panic!("read {}: {e}", p.display())),
+            )
+        })
+        .collect();
+    let all: String = sources
+        .iter()
+        .map(|(_, s)| s.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let mut defined: Vec<String> = Vec::new();
+    for line in all.lines() {
+        for prefix in ["def sc_", "def verify_"] {
+            if let Some(rest) = line.strip_prefix(prefix)
+                && rest.contains('(')
+            {
+                let bare = rest.split('(').next().unwrap().trim();
+                defined.push(format!("{}{bare}", &prefix[4..]));
+            }
+        }
+    }
+    assert!(
+        defined.len() > 10,
+        "found only {} gate functions — this guard is reading the wrong files",
+        defined.len()
+    );
+
+    let mut orphans: Vec<String> = Vec::new();
+    for f in &defined {
+        let needle = format!("{f}(");
+        let called = all
+            .lines()
+            .filter(|l| l.contains(&needle))
+            .any(|l| !l.trim_start().starts_with("def "));
+        if !called {
+            orphans.push(f.clone());
+        }
+    }
+    assert!(
+        orphans.is_empty(),
+        "these gate checks are DEFINED but never called — the matrix may register them \
+         as `test` while nothing runs them (this is exactly how verify_blessed_path sat \
+         dead behind four green cells): {}",
+        orphans.join(", ")
+    );
+}

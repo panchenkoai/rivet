@@ -428,7 +428,12 @@ fn classify_mongo_error(err: &mongodb::error::Error) -> Option<RetryClass> {
     }
 }
 
-#[cfg(test)]
+/// Is this error worth another attempt at all?
+///
+/// The one question the CHUNK layer needs answered. It used to be test-only,
+/// which is why the chunk-level re-claim had no way to ask it and re-dispatched
+/// a deterministically failing chunk to its attempt cap — 300 minutes of
+/// production query time on a 300 s statement timeout, measured in the field.
 pub(crate) fn is_transient(err: &anyhow::Error) -> bool {
     classify_error(err).is_transient()
 }

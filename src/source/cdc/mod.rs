@@ -311,7 +311,17 @@ pub(crate) enum CdcEngineOpts {
     /// PostgreSQL logical slot name.
     Postgres { slot: String },
     /// SQL Server capture instance (required for `sqlserver://`).
-    Mssql { capture_instance: Option<String> },
+    Mssql {
+        capture_instance: Option<String>,
+        /// The `table:` values the CONFIG asked for.
+        ///
+        /// SQL Server resolves an event's identity from `cdc.change_tables`, but
+        /// the sink routes by byte-exact comparison against these strings. The
+        /// two were never compared, and SQL Server's default collation is
+        /// case-INSENSITIVE — so `table: dbo.orders` against a catalog
+        /// `dbo.Orders` resolved its schema perfectly and then matched no event.
+        configured_tables: Vec<String>,
+    },
     /// Render the `document` blob as canonical (type-tagged) extended JSON — the
     /// `source.mongo.json: canonical` mode, so a CDC stream and a full export
     /// produce identical text. Config-driven only; the CLI defaults to relaxed.
@@ -520,7 +530,9 @@ impl CdcEngine {
                 // else either sums across instances (masking a partial one) or
                 // matches a same-named table in another schema.
                 let ci = match opts {
-                    CdcEngineOpts::Mssql { capture_instance } => capture_instance.as_deref(),
+                    CdcEngineOpts::Mssql {
+                        capture_instance, ..
+                    } => capture_instance.as_deref(),
                     _ => None,
                 };
                 crate::source::mssql::cdc::row_image(url, tls, tables, ci)
@@ -698,7 +710,10 @@ pub(crate) fn create_change_stream(
                 .context(PG_CDC_HINT)?,
             ))
         }
-        CdcEngineOpts::Mssql { capture_instance } => {
+        CdcEngineOpts::Mssql {
+            capture_instance,
+            configured_tables,
+        } => {
             let ci = capture_instance.as_deref().ok_or_else(|| {
                 anyhow::anyhow!("sqlserver cdc requires --capture-instance (e.g. dbo_orders)")
             })?;
@@ -737,6 +752,7 @@ pub(crate) fn create_change_stream(
                     tls,
                     peek,
                     cfg.drain,
+                    configured_tables,
                 )
                 .context(MSSQL_CDC_HINT)?,
             ))

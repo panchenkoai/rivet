@@ -110,6 +110,19 @@ pub(super) fn finalize_run_report(config_path: &str, summary: &RunSummary, kind:
 ///
 /// The parts are still durable, which is exactly why this must be loud. Nothing
 /// about the failure is visible in the data; it is visible only here.
+/// A run that SKIPPED and committed no parts has nothing to describe.
+///
+/// Split out of `finalize_manifest` so the decision is reachable without a
+/// `ResolvedRunPlan` and a `StateStore` — the mutation gate found both halves
+/// of this condition unguarded (`==`→`!=` and `&&`→`||` both survived), and
+/// each inversion is a real regression: flipping the equality makes every
+/// SUCCESSFUL run skip its manifest, and widening the `&&` to `||` throws away
+/// the manifest of a skipped run that DID commit parts — the
+/// `[RIVET_VERIFY_SUCCESS_STALE]` shape this guard was added to end.
+pub(super) fn skipped_run_wrote_nothing(summary: &RunSummary) -> bool {
+    summary.status == "skipped" && summary.manifest_parts.is_empty()
+}
+
 pub(super) fn finalize_manifest(
     plan: &ResolvedRunPlan,
     // The export FAMILY (`ExportConfig::family()`), passed at RUNTIME and
@@ -177,6 +190,35 @@ pub(super) fn finalize_manifest(
             return None;
         }
     };
+
+    // A HEALTHY no-op describes nothing, so it must not describe the prefix.
+    //
+    // `"skipped"` is a real production status — `single.rs` sets it when a run
+    // reads 0 rows under `skip_empty: true`, the ordinary outcome of an
+    // incremental export with nothing new past the cursor. It used to fall
+    // through the `_` arm below to `Interrupted`, and `write_manifest` then
+    // OVERWROTE the canonical manifest with a zero-part interrupted document
+    // while leaving the previous good run's `_SUCCESS` in place, now stale.
+    //
+    // Measured: run 1 exported 10 rows (manifest success, 1 part, _SUCCESS); run
+    // 2 found nothing new and left `manifest.json` saying `interrupted, 0 parts,
+    // 0 rows` over a prefix still holding the parquet. `rivet validate` then
+    // refused the export — `[RIVET_VERIFY_SUCCESS_STALE]` plus the 10 delivered
+    // rows reported as an `untracked object` — after a run that did nothing
+    // wrong.
+    //
+    // The same early return the no-plan-snapshot case above takes, for the same
+    // reason: there is no committed work to describe. The run itself is recorded
+    // where run history belongs — `export_metrics`, `file_log`, `run_status` —
+    // and the prefix keeps describing the last run that actually delivered.
+    if skipped_run_wrote_nothing(summary) {
+        log::debug!(
+            "{} '{}': skipped run wrote no parts — leaving the prefix's manifest as it stands",
+            kind,
+            summary.export_name
+        );
+        return None;
+    }
 
     let status = match summary.status.as_str() {
         "success" => ManifestStatus::Success,
@@ -924,6 +966,53 @@ mod tests {
             shape_drift_warn_factor: 0.0,
             parquet: None,
         }
+    }
+
+    /// The four corners of "is there anything to describe".
+    ///
+    /// Both halves of the condition were unguarded until the mutation gate said
+    /// so — `==`→`!=` and `&&`→`||` each survived the whole suite. The table
+    /// below fails against either: invert the equality and the SUCCESS row
+    /// stops writing a manifest; widen the `&&` and the skipped-WITH-parts row
+    /// throws away a manifest that describes real committed data.
+    #[test]
+    fn only_a_skipped_run_with_no_parts_has_nothing_to_describe() {
+        let with_part = |status: &str| {
+            let mut s = RunSummary::stub_for_testing("r", String::from("e"));
+            s.status = status.into();
+            s.manifest_parts.push(crate::manifest::ManifestPart {
+                part_id: 1,
+                path: "part-000001.parquet".into(),
+                rows: 5,
+                size_bytes: 7,
+                content_fingerprint: "xxh3:1".into(),
+                content_md5: String::new(),
+                status: crate::manifest::PartStatus::Committed,
+            });
+            s
+        };
+        let bare = |status: &str| {
+            let mut s = RunSummary::stub_for_testing("r", String::from("e"));
+            s.status = status.into();
+            s
+        };
+
+        assert!(
+            skipped_run_wrote_nothing(&bare("skipped")),
+            "a skipped run with no parts is the one case that writes no manifest"
+        );
+        assert!(
+            !skipped_run_wrote_nothing(&with_part("skipped")),
+            "a skipped run that DID commit parts must still describe them"
+        );
+        assert!(
+            !skipped_run_wrote_nothing(&bare("success")),
+            "a successful run always writes its manifest, parts or not"
+        );
+        assert!(
+            !skipped_run_wrote_nothing(&with_part("failed")),
+            "a failed run's committed parts must reach the manifest too"
+        );
     }
 
     /// A summary that carries everything finalize_manifest is supposed to

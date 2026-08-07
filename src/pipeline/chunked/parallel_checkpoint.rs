@@ -60,7 +60,13 @@ pub(crate) fn run_chunked_parallel_checkpoint(
             // pre-chunk drift check (ADR-0021), then closes before workers spawn.
             ChunkSource::Detect => super::prepare_chunk_plan_fresh(plan, state, summary)?,
             ChunkSource::Precomputed(ranges) => {
-                summary.chunks_precomputed = true; // drift gate skipped by contract
+                // Ranges come from the artifact; the DRIFT GATE still runs.
+                summary.chunks_precomputed = true;
+                // No ranges ⇒ no rows will be read, so there is nothing for the
+                // gate to protect and no reason to open a connection to say so.
+                if !ranges.is_empty() {
+                    super::check_drift_only_fresh(plan, state, summary)?;
+                }
                 ranges
             }
         }
@@ -207,6 +213,7 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                                 run_id_arc.as_str(),
                                 chunk_index,
                                 "invalid start_key",
+                                false, // a malformed key parses the same way every time
                             );
                             continue;
                         }
@@ -219,6 +226,7 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                                 run_id_arc.as_str(),
                                 chunk_index,
                                 "invalid end_key",
+                                false, // a malformed key parses the same way every time
                             );
                             continue;
                         }
@@ -483,6 +491,7 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                                 run_id_arc.as_str(),
                                 chunk_index,
                                 &msg,
+                                crate::pipeline::retry::is_transient(&e),
                             );
                             poison::lock_recover(errors)
                                 .push(format!("chunk {}: {}", chunk_index, msg));

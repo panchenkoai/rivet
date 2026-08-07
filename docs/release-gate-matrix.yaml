@@ -51,6 +51,18 @@ scenarios:
     mysql:    test
     mssql:    test
     mongo:    test
+  - id: blessed_flow
+    what: "The WHOLE journey as ONE declared cross-product, not per-defect additions: pipeline{batch,cdc} x lifecycle{clean,repeat,resume} x store{local,s3,gcs} x state{sqlite,postgres} x engine = 144 cells, 76 runnable, 68 `na` each carrying its reason in the ledger. Where blessed_path walks init->apply for one strategy, this adds what that chain cannot reach: the CDC pipeline (plan/apply REFUSE a cdc export, so those cells run `run`), the crash-then-resume lifecycle (a fault hook kills the first apply, and the probe FAILS the cell if the hook did not stop it — a resume whose first run succeeded is a clean re-run wearing a flag), the repeat lifecycle asserted on the MANIFEST COPIES rather than the parquet (the data surviving is what makes a sidecar clobber invisible), and `load` with load_run/loaded_source_run. Values are read ONLY by DuckDB, and only from parts a manifest DECLARES as committed — counting every parquet under the prefix reads a crashed run's orphans as delivered data. State is scoped per-run (watermark on export_metrics, which has no run_id; run ids from the manifests for file_log/run_status): the first draft counted `export_name='flow'` and read 37 rows of unrelated history on a cell that wrote one."
+    postgres: test
+    mysql:    test
+    mssql:    test
+    mongo:    test
+  - id: not_inert
+    what: "The chain's own oracles must be able to go RED. Breaks each artifact class and requires the matching stage to fail: every declared part removed (oracle must stop agreeing with the source), no manifest (must report undelivered, not count the parquet lying next to it), a run id that never ran (state must refuse). Carries a NEGATIVE control too — removing ONE redundant copy of a repeated export must NOT move the oracle; the first draft demanded a failure there and went red against a correct oracle."
+    postgres: test
+    mysql:    test
+    mssql:    test
+    mongo:    test
   - id: verdicts
     what: "init -> the strategy per table matches the golden (keyset/full/range/name-trap), zero phantom heavy-chunk."
     postgres: test
@@ -84,6 +96,9 @@ scenarios:
 
 # ── Source-agnostic PREFLIGHTS (run ONCE before the engine loop, not per engine/version) ──
 preflights:
+  - id: flag_surface
+    what: "Every flag of every command in the chain is carried by some cell or excused BY NAME, with the surface DERIVED from `rivet <cmd> --help` rather than typed in. Found on its first run that init — the first stage of every chain — was being driven with one of its thirteen flags; --mode now tracks the pipeline axis and --s3-bucket/--gcs-bucket the store axis, so init's own scaffold is graded instead of discarded. The rotation that distributes flags across cells is keyed on a DIGEST of the coordinates, not the enumeration index: `% 3` over a nested cross-product aliased with the inner loops and drew --discover for every postgres-backend cell."
+    status: test        # verify_flag_surface (blessed_flow.py) — no containers, runs with the file-level guards
   - id: release_build_path
     what: "the RELEASE build/publish path itself, not `cargo build` (the stricter tooling the TAG runs, which failed AFTER publish for 0.16.0/0.16.1): Cargo.lock in sync (`cargo metadata --locked` — publish + Docker cook are `--locked`), the cargo-manifest strict parse (no multi-line inline tables, the cargo_manifest_chef guard) + JSON-schema regen (schema_drift guard), and `cargo chef prepare` (the Dockerfile's actual planner step, cheap — no compile). Full `docker build` opt-in via RIVET_ORACLE_DOCKER=1. Runs FIRST, before any cargo reconciles the working-tree lock."
     status: test        # verify_release_build_path (dev/release_oracle/release_path.py)

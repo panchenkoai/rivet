@@ -241,7 +241,9 @@ pub(crate) fn run_chunked_sequential_checkpoint(
             // Detect: compute ranges + run the pre-chunk drift check (ADR-0021).
             ChunkSource::Detect => super::prepare_chunk_plan(src, plan, Some(state), summary)?,
             ChunkSource::Precomputed(ranges) => {
-                summary.chunks_precomputed = true; // drift gate skipped by contract
+                // Ranges come from the artifact; the DRIFT GATE still runs.
+                summary.chunks_precomputed = true;
+                super::check_drift_only(src, plan, Some(state), summary)?;
                 ranges
             }
         }
@@ -368,6 +370,9 @@ pub(crate) fn run_chunked_sequential_checkpoint(
             }
             Err(e) => {
                 let msg = crate::redact::redact_error(&e);
+                // The classifier already knows whether another attempt can help;
+                // the chunk layer used to re-dispatch regardless.
+                let retryable = crate::pipeline::retry::is_transient(&e);
                 log::error!(
                     "export '{}': chunk {} failed: {}",
                     plan.export_name,
@@ -379,7 +384,7 @@ pub(crate) fn run_chunked_sequential_checkpoint(
                     error: msg.clone(),
                     attempt: 1,
                 });
-                state.fail_chunk_task(&run_id, chunk_index, &msg)?;
+                state.fail_chunk_task(&run_id, chunk_index, &msg, retryable)?;
             }
         }
     }

@@ -426,9 +426,7 @@ def _source_count_distinct(engine: str, url: str, table: str, id_col: str) -> st
         # mongo:4.4 ships the legacy `mongo` shell, 5.0+ ships `mongosh`. Pick
         # whichever the container actually has, or the count comes back as an OCI
         # "executable not found" string and the gate false-fails on good data.
-        shell = "mongosh"
-        if not docker_exec(container, "sh", "-c", "command -v mongosh >/dev/null 2>&1").ok:
-            shell = "mongo"
+        shell = mongo_shell(container)
         # countDocuments({}) NOT countDocuments() — the legacy 4.4 shell rejects
         # the no-arg form ("match filter must be an expression in an object").
         return docker_exec(
@@ -437,6 +435,25 @@ def _source_count_distinct(engine: str, url: str, table: str, id_col: str) -> st
             f"print(db.{table}.countDocuments({{}})+' '+db.{table}.distinct('_id').length)",
         ).stdout.strip()
     return ""
+
+
+def mongo_shell(container: str) -> str:
+    """`mongosh`, or the legacy `mongo` on an image that predates it.
+
+    Mongo 4.4 ships only the old shell — `mongosh` became standard in 5.0. A
+    caller that assumes the new name gets "executable not found" and, if it
+    parses the empty output as a count, a silent -1 that reads as "the source is
+    unreachable". That is what happened to `blessed_path._source_rows`: every
+    mongo 4.4 oracle cell SKIPped with `source=-1 duckdb=150000` while 5, 6, 7
+    and 8 passed, so the one version most likely to expose an old-shell
+    incompatibility was the one version not being compared.
+
+    Extracted here because the knowledge already existed in this file and a
+    second caller had gone without it; a third would too.
+    """
+    if docker_exec(container, "sh", "-c", "command -v mongosh >/dev/null 2>&1").ok:
+        return "mongosh"
+    return "mongo"
 
 
 def _fidelity_check(engine: str, key: str, got: str) -> bool:
@@ -828,6 +845,22 @@ def run_scenarios(led: Ledger, engine: str, tag: str, url: str) -> None:
         sc_load(led, engine, tag, url, store)
     if engine == "postgres":
         sc_gc_survival(led, engine, tag, url)
+    # The COMMAND CHAIN, end to end. Both of these were registered in
+    # docs/release-gate-matrix.yaml as `test` while `verify_blessed_path` had no
+    # caller anywhere in the tree — the matrix guard checks that a gate function
+    # has a ROW, not that anything calls it, so a dead check reads as coverage.
+    # `every_test_cell_has_a_call_site` now closes that.
+    from . import blessed_flow, blessed_path
+
+    state_url = os.environ.get("RIVET_GATE_STATE_URL", "") or os.environ.get(
+        "RIVET_CDC_STATE_URL", ""
+    )
+    blessed_path.verify_blessed_path(led, engine, tag, url, state_url=state_url)
+    blessed_flow.sc_blessed_flow(led, engine, tag, url, state_url=state_url)
+    # Does the chain above have working oracles at all? Breaks each artifact
+    # class and requires the matching stage to go RED — a green stage that was
+    # never red is unverified, and this module's own first draft had one.
+    blessed_flow.sc_not_inert(led, engine, url, state_url)
 
 
 # ── state-migration parity PREFLIGHT (source-agnostic, runs once) ────────────

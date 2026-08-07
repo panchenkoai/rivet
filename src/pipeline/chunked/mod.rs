@@ -162,8 +162,9 @@ use crate::state::StateStore;
 /// way `commit::record_part` shares the per-part tail (ADR-0018).
 ///
 /// `Precomputed`/resume chunk sources never call this — drift was evaluated on
-/// the original planning run that produced the ranges. Drift runs only when the
-/// runner is stateful (`state.is_some()`).
+/// the original planning run that produced the ranges — a claim that was FALSE
+/// (see [`check_drift_only`], which the precomputed arms now call instead).
+/// Drift runs only when the runner is stateful (`state.is_some()`).
 pub(super) fn prepare_chunk_plan(
     src: &mut dyn crate::source::Source,
     plan: &ResolvedRunPlan,
@@ -186,6 +187,52 @@ pub(super) fn prepare_chunk_plan(
         super::schema_drift::check_from_type_mappings(src, st, plan, summary)?;
     }
     Ok(ranges)
+}
+
+/// Run the pre-chunk drift gate WITHOUT computing ranges.
+///
+/// The gate compares the source's current column types against the stored ones;
+/// it has nothing to do with chunk boundaries. That is why a run whose ranges
+/// come from a plan artifact can — and must — still take it.
+///
+/// It used to be reachable only through [`prepare_chunk_plan`], which only the
+/// `ChunkSource::Detect` arm calls, so `rivet apply` of any chunked plan skipped
+/// `on_schema_drift` entirely. Four runners recorded that as
+/// `chunks_precomputed = true; // drift gate skipped by contract`, citing a
+/// contract that said drift "was evaluated on the original planning run that
+/// produced the ranges". It was not: `src/plan/` performs no drift evaluation —
+/// `plan/build.rs` only COPIES `on_schema_drift` into the artifact. And a
+/// planning-time check could not have helped anyway, because the drift this
+/// guards against happens BETWEEN plan and apply, which is the whole reason the
+/// plan → review → apply workflow exists.
+///
+/// Measured: one config, `on_schema_drift: fail`, a column dropped after the
+/// plan was sealed — `rivet run` aborted ("schema drift detected — removed:
+/// dropme") while `rivet apply` of the same policy exported 500 rows and exited
+/// 0. The non-chunked half of `apply` applied the gate throughout
+/// (`single.rs`), so the split was never "apply skips it" but "apply skips it
+/// for chunked exports" — the ones moving the most data.
+pub(super) fn check_drift_only(
+    src: &mut dyn crate::source::Source,
+    plan: &ResolvedRunPlan,
+    state: Option<&StateStore>,
+    summary: &mut RunSummary,
+) -> Result<()> {
+    let Some(st) = state else { return Ok(()) };
+    super::schema_drift::check_from_type_mappings(src, st, plan, summary)
+}
+
+/// [`check_drift_only`] for the parallel runners, which hold no `Source`: open a
+/// short-lived connection just for the type probe and drop it before the workers
+/// spawn — the same shape as [`prepare_chunk_plan_fresh`].
+pub(super) fn check_drift_only_fresh(
+    plan: &ResolvedRunPlan,
+    state: &StateStore,
+    summary: &mut RunSummary,
+) -> Result<()> {
+    let mut src = crate::source::create_source(&plan.source)
+        .map_err(|e| crate::pipeline::single::attach_connect_hint(e, &plan.source))?;
+    check_drift_only(&mut *src, plan, Some(state), summary)
 }
 
 /// Like [`prepare_chunk_plan`], but for the parallel runners that don't already

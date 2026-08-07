@@ -1129,7 +1129,8 @@ pub(crate) fn introspect_mssql_table_for_chunking(
              JOIN sys.types kt ON kt.user_type_id = c.user_type_id \
              JOIN sys.objects o ON o.object_id = i.object_id \
              JOIN sys.schemas s ON s.schema_id = o.schema_id \
-             WHERE i.is_unique = 1 AND c.is_nullable = 0 AND s.name = N'{}' AND o.name = N'{}' \
+             WHERE i.is_unique = 1 AND i.has_filter = 0 AND i.is_disabled = 0 \
+               AND c.is_nullable = 0 AND s.name = N'{}' AND o.name = N'{}' \
                AND kt.name NOT IN ('decimal', 'numeric') \
              GROUP BY i.object_id, i.index_id HAVING COUNT(*) = 1 \
            ) per_index GROUP BY col \

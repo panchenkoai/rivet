@@ -214,7 +214,7 @@ fn run_json_flag_prints_aggregate_summary_to_stdout() {
     );
     // Back the reported total_rows with an independent destination read.
     assert_eq!(
-        total_parquet_rows(out.path()),
+        duckdb_total_parquet_rows(out.path()),
         20,
         "destination must physically hold the 20 reported rows"
     );
@@ -264,7 +264,7 @@ fn run_summary_output_writes_json_to_file() {
     );
     // Back the "export succeeded" claim with an independent destination read.
     assert_eq!(
-        total_parquet_rows(out.path()),
+        duckdb_total_parquet_rows(out.path()),
         10,
         "destination must physically hold all 10 rows"
     );
@@ -331,7 +331,7 @@ exports:
     );
     // Back the reported count with an independent destination read.
     assert_eq!(
-        total_parquet_rows(out.path()),
+        duckdb_total_parquet_rows(out.path()),
         31,
         "destination must physically hold the 31 param-filtered rows"
     );
@@ -400,7 +400,7 @@ exports:
     );
     // Back the reported count with an independent destination read.
     assert_eq!(
-        total_parquet_rows(out.path()),
+        duckdb_total_parquet_rows(out.path()),
         11,
         "destination must physically hold the 11 param-filtered rows"
     );
@@ -454,7 +454,7 @@ fn run_reconcile_flag_exits_zero_when_counts_match() {
     );
     // Back the 25-row claim independently of rivet's reconcile/aggregate.
     assert_eq!(
-        total_parquet_rows(out.path()),
+        duckdb_total_parquet_rows(out.path()),
         25,
         "destination must physically hold all 25 rows"
     );
@@ -602,12 +602,12 @@ fn run_parallel_exports_flag_runs_both_exports() {
     // Back the success-count with independent destination reads of BOTH outputs —
     // separable destinations are the point of `also_export`.
     assert_eq!(
-        total_parquet_rows(&rig.out_dir_for(t1.name())),
+        duckdb_total_parquet_rows(&rig.out_dir_for(t1.name())),
         10,
         "export 1 destination must hold 10 rows"
     );
     assert_eq!(
-        total_parquet_rows(&rig.out_dir_for(t2.name())),
+        duckdb_total_parquet_rows(&rig.out_dir_for(t2.name())),
         10,
         "export 2 destination must hold 10 rows"
     );
@@ -684,12 +684,12 @@ exports:
     );
     // Back the success-count with independent destination reads of both outputs.
     assert_eq!(
-        total_parquet_rows(out1.path()),
+        duckdb_total_parquet_rows(out1.path()),
         10,
         "export 1 destination must hold 10 rows"
     );
     assert_eq!(
-        total_parquet_rows(out2.path()),
+        duckdb_total_parquet_rows(out2.path()),
         10,
         "export 2 destination must hold 10 rows"
     );
@@ -1371,7 +1371,7 @@ exports:
     // Back the chunked-completeness claim with an independent destination read:
     // both chunks' rows must physically land, not just be marked 'completed'.
     assert_eq!(
-        total_parquet_rows(out.path()),
+        duckdb_total_parquet_rows(out.path()),
         100,
         "both chunks' rows must reach the destination (100 total)"
     );

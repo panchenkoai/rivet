@@ -130,6 +130,16 @@ SCENARIOS: dict[str, dict] = {
 }
 
 
+def cloud_prefix(engine: str, tag: str, table: str, scenario: str) -> str:
+    """The object-store prefix for one cell, unique per gate invocation.
+
+    ONE function so the write side and the readback cannot drift apart — they
+    are two call sites of the same string, and a prefix that differs between
+    them reads as "the export wrote nothing".
+    """
+    return f"blessed/{scenarios.work_dir().name}/{engine}/{tag}/{table}/{scenario}"
+
+
 def _duckdb_ok() -> bool:
     """Is there a usable DuckDB? The oracle is worthless if its absence is
     indistinguishable from agreement — `_duckdb_list` returns "" on exit 127
@@ -184,7 +194,12 @@ def _source_rows(engine: str, url: str, table: str) -> int:
                           "-h-1", "-W", "-Q",
                           f"SET NOCOUNT ON; SELECT count(*) FROM {table}").stdout.strip()
     elif engine == "mongo":
-        out = docker_exec(c, "mongosh", "--quiet", "rivet", "--eval",
+        # `mongosh` does not exist on 4.4 — see `scenarios.mongo_shell`. Asking
+        # for it there returned nothing, which this function turned into -1 and
+        # the oracle read as "source unreachable", SKIPping the comparison on the
+        # oldest gridded version. `countDocuments({})` and not the no-arg form:
+        # the legacy shell rejects it.
+        out = docker_exec(c, scenarios.mongo_shell(c), "--quiet", "rivet", "--eval",
                           f"print(db.{table}.countDocuments({{}}))").stdout.strip()
     else:
         return -1
@@ -307,6 +322,17 @@ def sc_blessed_path(
     env = dict(scenarios._store_env(url))
     if state_url:
         env["RIVET_STATE_URL"] = state_url
+    else:
+        # NEUTRALISE an inherited one. `__main__` sets `RIVET_STATE_URL` on the
+        # PROCESS when the gate is pointed at a Postgres backend ("one variable
+        # decides the backend for the WHOLE gate"), and `run()` merges os.environ
+        # into every cell — so this module's SQLite cells wrote their ledger to
+        # Postgres and then looked for a `.rivet_state.db` that was never
+        # created. 84 cells failed that way on the gate's first full pass, each
+        # with its own message correctly naming the cause: "apply recorded its
+        # ledger elsewhere". An empty value is not a Postgres URL, so
+        # `StateStore::open` falls back to SQLite (`url.starts_with("postgres")`).
+        env["RIVET_STATE_URL"] = ""
 
     # ── init ──────────────────────────────────────────────────────────────────
     cfg = work / "rivet.yaml"
@@ -333,7 +359,13 @@ def sc_blessed_path(
     if store == "local":
         dest_block = f"    destination: {{type: local, path: {dest_dir}/}}"
     else:
-        raw = scenarios.store_dest(store, BUCKET, f"blessed/{engine}/{tag}/{table}/{scenario}")
+        # The work root's name makes this unique PER GATE INVOCATION. Without
+        # it two runs into the same bucket accumulate and the readback counts the
+        # earlier one's parts as this one's — measured on the gate's first
+        # back-to-back pass: `source=150000 duckdb=300000 manifest=150000`, with
+        # the manifest correctly reporting 150000 the whole time. Same token the
+        # CDC leg and blessed_flow already carry.
+        raw = scenarios.store_dest(store, BUCKET, cloud_prefix(engine, tag, table, scenario))
         if not raw:
             led.skipped(engine, tag, "blessed:init", store, f"{store} — no destination block")
             _downstream_unreached(led, engine, tag, store, "init")
@@ -477,7 +509,7 @@ def sc_blessed_path(
         if store == "local":
             duck_rows, duck_files = _parquet_rows_and_files(dest_dir)
         else:
-            pfx = f"blessed/{engine}/{tag}/{table}/{scenario}"
+            pfx = cloud_prefix(engine, tag, table, scenario)
             got = scenarios.store_readback(store, BUCKET, pfx, work)
             duck_rows = int(got.splitlines()[0]) if got.strip().isdigit() else -1
             duck_files = -1  # the readback helper reports rows only
@@ -533,7 +565,15 @@ def sc_bq_cycle(led: Ledger, engine: str, tag: str, url: str, table: str) -> Non
     """
     proj = os.environ.get("BQ_ORACLE_PROJECT") or run(
         ["gcloud", "config", "get-value", "project"]).stdout.strip()
-    dset = os.environ.get("BQ_ORACLE_DATASET", "rivet_blessed")
+    # PER SOURCE, which is what the gate's README already promises this variable
+    # does ("one dataset PER SOURCE is derived from this") and what this line did
+    # not do. `rivet load` derives the warehouse table from `table:`, so every
+    # engine's `users` landed on ONE table and rivet's cross-source guard refused
+    # the second one — correctly, and on six cells: mysql 8.0/8.4, mssql 2022 and
+    # mongo 4.4/5/6/7/8, each after postgres had already claimed
+    # `rivet_blessed.users`. The guard doing its job is not the same as the gate
+    # being configured right.
+    dset = os.environ.get("BQ_ORACLE_DATASET", "rivet_blessed") + "_" + engine
     bucket = os.environ.get("BQ_ORACLE_BUCKET", "rivet_data_test")
     if not have("bq") or not proj:
         led.skipped(engine, tag, "blessed:bq", "bigquery",

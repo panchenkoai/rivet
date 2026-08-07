@@ -1,5 +1,9 @@
 {
   "mongo": {
+    "content_items": {
+      "strategy": "full",
+      "verdict": "ACCEPTABLE"
+    },
     "orders": {
       "strategy": "full",
       "verdict": "DEGRADED"

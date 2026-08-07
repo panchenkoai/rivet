@@ -75,6 +75,20 @@ impl Eng {
         }
     }
 
+    /// The matrix's TIMEZONE-AWARE timestamp column, per engine.
+    ///
+    /// The names genuinely differ (`created_at_ts` on MySQL, `created_at_tz` on
+    /// PostgreSQL and SQL Server), and the value-consumer guard needs to point
+    /// its uniqueness gate at THIS column rather than at `id`: an integer key
+    /// renders on every build, so a check over it cannot notice a rendering
+    /// failure — the guard's own uniqueness leg was inert until it aimed here.
+    fn tz_column(self) -> &'static str {
+        match self {
+            Eng::My => "created_at_ts",
+            Eng::Pg | Eng::Ms => "created_at_tz",
+        }
+    }
+
     fn rig(self, table: &str) -> Rig {
         match self {
             Eng::Pg => Rig::pg_batch(&format!("public.{table}")),
@@ -1108,9 +1122,24 @@ fn stand_time_window_mssql() {
 /// the columns actually land in a real export (previously unit-only).
 fn run_meta_columns(eng: Eng) {
     eng.require();
-    let (table, _guard) = seed_dense(eng, 200);
+    // The GOLDEN TYPE MATRIX, not `seed_dense`.
+    //
+    // This used to run over `seed_dense` — two columns, `BIGINT` and `INT` — so
+    // it proved the meta columns LAND and nothing about what they contain. The
+    // gap was not theoretical: `_rivet_row_hash` could not render a timestamp
+    // whose timezone is a NAME (`Some("UTC")` — what a MySQL `TIMESTAMP` maps
+    // to), and on a production config that cost 63 of 65 exports on 2026-08-05.
+    // The matrix has carried `created_at_ts TIMESTAMP(6)` the whole time; this
+    // test simply never looked at it, so four months of green meant only that
+    // two integers could be hashed.
+    //
+    // Measured on the type matrix's real output: `created_at_dt` is a naive
+    // TIMESTAMP and `created_at_ts` is TIMESTAMP WITH TIME ZONE — both forms in
+    // one export, which is the point.
+    let table = "rivet_type_matrix".to_string();
     let rig = eng
         .rig(&table)
+        .duckdb_oracle()
         .mode("full")
         .export_line("meta_columns:")
         .export_line("  exported_at: true")
@@ -1133,6 +1162,38 @@ fn run_meta_columns(eng: Eng) {
     assert!(
         cols.iter().any(|c| c == "_rivet_row_hash"),
         "output must carry _rivet_row_hash; got {cols:?}"
+    );
+    // PRESENCE is not content. The column landed for four months while the
+    // temporal cells contributed NOTHING to it — before 2026-08-04 an
+    // unrenderable value was swallowed (`.ok()` → skip), so two rows differing
+    // only in a timestamp hashed identically. Assert the matrix's own temporal
+    // columns are in the export AND that the hash actually varies across its
+    // rows, which it cannot do if the cells were dropped.
+    // Assert the PROPERTY, not a column name: the three engines name their
+    // temporal columns differently (`created_at_ts` on MySQL, `created_at_tz`
+    // on PostgreSQL), and a name list would pass on one engine and lie on the
+    // others. What must hold everywhere is that the export carries a
+    // TIMEZONE-AWARE timestamp — the exact shape `row_hash` could not render.
+    let dir = rig.oracle_dir();
+    let described = duckdb_run_sql_json(&format!(
+        "DESCRIBE SELECT * FROM read_parquet('{dir}/**/*.parquet')"
+    ));
+    let schema = duckdb_parse_describe(&described);
+    assert!(
+        schema.values().any(|t| t.contains("WITH TIME ZONE")),
+        "the type matrix must contribute a TIMEZONE-AWARE timestamp — that is the \
+         shape row_hash could not render, and hashing it is the point of this test; \
+         got {schema:?}"
+    );
+    // Read back with DuckDB — a decoder rivet does not share — so the claim is
+    // not rivet re-reading its own rendering.
+    let rows = duckdb_parquet_rows(dir);
+    let distinct = duckdb_parquet_distinct(dir, "_rivet_row_hash");
+    assert_eq!(
+        distinct, rows,
+        "{rows} matrix rows produced {distinct} distinct hashes — equal rows with fewer \
+         distinct hashes is exactly what a SWALLOWED cell looks like: the differing \
+         column contributed nothing"
     );
 }
 
@@ -1160,10 +1221,121 @@ fn run_csv(eng: Eng) {
     );
 }
 
+/// THE GUARD: every type the fixture carries must survive every mechanism that
+/// CONSUMES a cell value — in one export, so adding a column to the matrix
+/// exercises all of them at once and none can be forgotten.
+///
+/// Three consumers exist and each renders a value independently:
+///
+///   `enrich::row_hash_array`      the `_rivet_row_hash` meta column
+///   `ExportSink::track_checksum`  the per-column value checksum `validate` re-reads
+///   `quality::check_uniqueness`   the `unique_columns` gate
+///
+/// Every defect this guard exists for had the same shape: a type the product
+/// PRODUCES met a consumer nobody had run it through, and the consumer degraded
+/// to a value instead of refusing.
+///
+///   2026-03-28  `_rivet_row_hash` shipped hashing arrays by their rendered text,
+///               so `["a, b"]` and `["a","b"]` collided. Arrays landed six weeks
+///               later and nobody asked whether the hash could canonicalise one.
+///   2026-08-05  a timestamp with a NAMED timezone — 278 of 1184 columns in a real
+///               production database — could not be rendered at all. `row_hash`
+///               swallowed it (empty cell in the hash) until 0.24.0 and then
+///               refused, costing 63 of 65 exports. The type matrix had carried
+///               `created_at_ts TIMESTAMP(6)` the whole time; the row_hash test
+///               ran over a two-INTEGER table instead.
+///
+/// So the guard is not "does the fixture contain the type" — it did — but "does
+/// the type reach every consumer". Executable rather than declarative on
+/// purpose: a ledger of type × mechanism would need updating by the same person
+/// who forgot the mechanism.
+fn run_type_matrix_through_every_value_consumer(eng: Eng) {
+    eng.require();
+    let table = "rivet_type_matrix".to_string();
+    let rig = eng
+        .rig(&table)
+        .duckdb_oracle()
+        .mode("full")
+        // consumer 1: the row hash, over EVERY column (no declared subset)
+        .export_line("meta_columns:")
+        .export_line("  row_hash: true")
+        // consumer 3: the uniqueness gate, over the primary key
+        .export_line("quality:")
+        .export_line(&format!("  unique_columns: [{}]", eng.tz_column()))
+        .export_line("  unique_max_entries: 100000");
+    let cfg = rig.config_path();
+
+    // consumer 2: `--validate` re-reads the parts and re-checks the per-column
+    // value checksums the sink recorded while writing.
+    let out = run_rivet_env(
+        &["run", "--config", cfg.to_str().unwrap(), "--validate"],
+        &[("RUST_LOG", "warn")],
+    );
+    assert!(
+        out.status.success(),
+        "the type matrix must survive row_hash + value checksum + quality in ONE export. \
+         A failure here means a type the product can PRODUCE reached a consumer that \
+         cannot handle it.\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Not just "exit 0": the hash must actually DISTINGUISH the rows. A consumer
+    // that silently drops a cell still exits 0 — that is precisely how this class
+    // hides — so read the output back with a decoder rivet does not share.
+    let dir = rig.oracle_dir();
+    let rows = duckdb_parquet_rows(dir);
+    assert!(
+        rows > 1,
+        "the matrix must have >1 row to distinguish anything"
+    );
+    let distinct = duckdb_parquet_distinct(dir, "_rivet_row_hash");
+    assert_eq!(
+        distinct, rows,
+        "{rows} matrix rows hashed to {distinct} distinct values — a collision over \
+         distinct rows means a consumer swallowed the cells that differ"
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d postgres with the golden seed"]
+fn stand_type_matrix_every_consumer_postgres() {
+    run_type_matrix_through_every_value_consumer(Eng::Pg);
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mysql with the golden seed"]
+fn stand_type_matrix_every_consumer_mysql() {
+    run_type_matrix_through_every_value_consumer(Eng::My);
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mssql with the golden seed"]
+fn stand_type_matrix_every_consumer_mssql() {
+    run_type_matrix_through_every_value_consumer(Eng::Ms);
+}
+
 #[test]
 #[ignore = "live: requires docker compose up -d postgres"]
 fn stand_meta_columns_postgres() {
     run_meta_columns(Eng::Pg);
+}
+
+// Per ENGINE, not one standing in for three. `meta_columns` is engine-agnostic
+// enrichment, which is why this ran on PostgreSQL alone — but the TYPE it must
+// survive is not: a MySQL `TIMESTAMP` and a SQL Server `DATETIME2` resolve
+// through different mappings to reach `Some("UTC")`, and the production failure
+// that motivated this test was on MySQL, the one engine it did not cover.
+
+#[test]
+#[ignore = "live: requires docker compose up -d mysql"]
+fn stand_meta_columns_mysql() {
+    run_meta_columns(Eng::My);
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mssql"]
+fn stand_meta_columns_mssql() {
+    run_meta_columns(Eng::Ms);
 }
 
 #[test]
@@ -1562,4 +1734,283 @@ fn stand_environment_profile_mysql() {
 #[ignore = "live: requires docker compose up -d mssql"]
 fn stand_environment_profile_mssql() {
     run_environment_profile(Eng::Ms);
+}
+
+// ─── range bounds that cannot be read must not become an empty export ────────
+
+/// A range-chunked export whose min/max the planner cannot read as `i64` must
+/// NOT report success having written nothing.
+///
+/// `detect::detect` reads the window bounds as
+/// `src.query_scalar(min|max)?.and_then(|s| s.trim().parse::<i64>().ok()).unwrap_or(0)`
+/// (src/pipeline/chunked/detect.rs:316-323). Three different inputs land on the
+/// same `0`, and only the first is legitimate:
+///
+///   1. the scalar is NULL — the table really is empty, one empty window is right;
+///   2. the text does not parse as `i64` — a DECIMAL/NUMERIC/float key;
+///   3. `query_scalar` cannot render the type at all — PostgreSQL's
+///      (src/source/postgres/mod.rs) tries i64, i32, f64, timestamp, date, uuid,
+///      String and falls through to `Ok(None)`; NUMERIC matches no arm.
+///
+/// With min = max = 0 the plan is the single window `(0, 0)` and the runner
+/// emits `WHERE col BETWEEN 0 AND 0`. PostgreSQL compares numeric to integer
+/// happily, so the query is VALID and returns nothing: the export writes no
+/// parts and reports `status: success`, exit 0.
+///
+/// Measured on this stand, `numeric(20,0)` PK with 100 rows:
+///   `chunk_column `id` range 0 .. 0` → `0 rows  0 files  0 B` → `status: success`
+/// One hundred rows of a hundred, gone, with a green run.
+///
+/// PER-ENGINE, and the matrix is what established it: only PostgreSQL goes RED.
+/// MySQL and SQL Server return the DECIMAL bound as the text `"1"`, which parses
+/// as `i64` and chunks correctly — they are the CONTROL arms here, not padding.
+/// PostgreSQL is alone in case 3: its `query_scalar` renders no numeric OID at
+/// all, so the bound never reaches the parser. Stating this as "decimal keys are
+/// broken" would have been wrong on two engines out of three; the engine axis is
+/// what made the claim precise enough to act on.
+///
+/// The plan-time guard does not save it: `build.rs` only verifies the column is
+/// integer-family when introspection SUCCEEDED, and the `query:`-form path warns
+/// and emits the Chunked plan anyway. The warning is also wrong about the
+/// damage — it says "silently drops rows between windows" when the outcome is
+/// every row.
+///
+/// Two things in the same file show this is an oversight, not a decision. Sixty
+/// lines above, the DATE branch hard-errors on both a NULL bound and an
+/// unparseable one (detect.rs:240-266). And the shared, error-RETURNING
+/// `parse_scalar_i64` (src/scalar.rs:52) is used at detect.rs:25 for the
+/// `COUNT(*)` — where a wrong value is harmless — and not for the bounds, where
+/// it is catastrophic.
+///
+/// The existing unit test `integer_range_null_minmax_collapses_to_zero_zero`
+/// pins case 1 with `null(), null()`, which is correct for an EMPTY table. No
+/// test covers a NON-empty table whose bounds cannot be read — that is the hole
+/// this fills.
+// AUDIT-RED chunk-bounds-collapse: unreadable min/max → `unwrap_or(0)` → one `BETWEEN 0 AND 0` window → 0 of N rows exported, status success, exit 0. Asserts CORRECT behavior; expected to FAIL until fixed.
+fn run_unreadable_range_bounds_must_not_export_nothing(eng: Eng) {
+    eng.require();
+    const ROWS: i64 = 100;
+    let (table, _guard) = seed_decimal_pk(eng, ROWS);
+
+    // `query:` rather than `table:` on purpose: with `table:` the planner
+    // introspects the column type and refuses at plan time, which is the
+    // behaviour we WANT. The curated-query form is what `rivet init` emits for
+    // every non-keyset chunked export, and it is the shape that reaches the
+    // runner unchecked.
+    let rig = eng
+        .rig(&table)
+        .mode("chunked")
+        .query(&format!("SELECT dkey, v FROM {table}"))
+        .export_line("chunk_column: dkey")
+        .export_line("chunk_size: 10");
+    let cfg = rig.config_path();
+    let out = run_rivet_env(
+        &["run", "--config", cfg.to_str().unwrap()],
+        &[("RUST_LOG", "warn")],
+    );
+
+    // Either outcome is acceptable — refuse loudly, or export the rows. What
+    // must never happen is the third: exit 0 having written nothing.
+    if !out.status.success() {
+        return; // refused: correct
+    }
+    // DuckDB, not the parquet crate rivet wrote with: a symmetric read/write
+    // fault cannot be seen by the reader that shares the writer's code.
+    let got = duckdb_total_parquet_rows(&rig.out_dir()) as i64;
+    assert_eq!(
+        got,
+        ROWS,
+        "range-chunked export of {ROWS} rows on a {} DECIMAL key reported SUCCESS but wrote \
+         {} row(s). The bounds could not be parsed as i64, so both collapsed to 0 and the plan \
+         became the single window `BETWEEN 0 AND 0`. A run that exits 0 having exported nothing \
+         is the worst of the three possible outcomes: refusing would be safe, exporting would be \
+         correct, and this is neither.\nstderr:\n{}",
+        match eng {
+            Eng::Pg => "PostgreSQL numeric",
+            Eng::My => "MySQL decimal",
+            Eng::Ms => "SQL Server decimal",
+        },
+        got,
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn stand_unreadable_range_bounds_must_not_export_nothing_postgres() {
+    run_unreadable_range_bounds_must_not_export_nothing(Eng::Pg);
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mysql"]
+fn stand_unreadable_range_bounds_must_not_export_nothing_mysql() {
+    run_unreadable_range_bounds_must_not_export_nothing(Eng::My);
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mssql"]
+fn stand_unreadable_range_bounds_must_not_export_nothing_mssql() {
+    run_unreadable_range_bounds_must_not_export_nothing(Eng::Ms);
+}
+
+// ─── a PARTIAL unique index is not a unique key ──────────────────────────────
+
+/// Seed the soft-delete shape: a column carrying duplicates, plus a unique index
+/// that only covers the live rows.
+///
+/// `dups` rows share one key value and are all soft-deleted, so the partial index
+/// permits them; `live` rows have distinct keys and `deleted_at IS NULL`. On
+/// MySQL — which cannot express a partial index at all — the closest honest
+/// equivalent is a plain NON-unique index, which is the control this matrix
+/// needs: the probe must refuse that key.
+fn seed_partial_unique(eng: Eng, dups: i64, live: i64) -> (String, StandCleanup) {
+    let table = unique_name("stand_partuk");
+    let guard = StandCleanup(eng, table.clone());
+    match eng {
+        Eng::Pg => {
+            let mut c = pg_connect();
+            c.batch_execute(&format!(
+                "CREATE TABLE {table} (k TEXT NOT NULL, deleted_at TIMESTAMPTZ, v TEXT NOT NULL);
+                 INSERT INTO {table} SELECT 'dup', now(), 'd'||g FROM generate_series(1,{dups}) g;
+                 INSERT INTO {table} SELECT 'u'||lpad(g::text,4,'0'), NULL, 'l'||g
+                   FROM generate_series(1,{live}) g;
+                 CREATE UNIQUE INDEX {table}_live ON {table} (k) WHERE deleted_at IS NULL;
+                 ANALYZE {table};"
+            ))
+            .unwrap();
+        }
+        Eng::My => {
+            let mut c = mysql_connect();
+            c.query_drop(format!(
+                "CREATE TABLE {table} (k VARCHAR(64) NOT NULL, deleted_at DATETIME NULL, \
+                 v VARCHAR(32) NOT NULL, KEY {table}_k (k))"
+            ))
+            .unwrap();
+            c.query_drop(format!(
+                "SET SESSION cte_max_recursion_depth = {}",
+                dups + live + 10
+            ))
+            .unwrap();
+            c.query_drop(format!(
+                "INSERT INTO {table} (k, deleted_at, v) \
+                 WITH RECURSIVE s AS (SELECT 1 n UNION ALL SELECT n+1 FROM s WHERE n < {dups}) \
+                 SELECT 'dup', NOW(), CONCAT('d', n) FROM s"
+            ))
+            .unwrap();
+            c.query_drop(format!(
+                "INSERT INTO {table} (k, deleted_at, v) \
+                 WITH RECURSIVE s AS (SELECT 1 n UNION ALL SELECT n+1 FROM s WHERE n < {live}) \
+                 SELECT CONCAT('u', LPAD(n, 4, '0')), NULL, CONCAT('l', n) FROM s"
+            ))
+            .unwrap();
+        }
+        Eng::Ms => {
+            mssql_exec(&format!(
+                "CREATE TABLE {table} (k VARCHAR(64) NOT NULL, deleted_at DATETIME2 NULL, \
+                 v VARCHAR(32) NOT NULL)"
+            ));
+            mssql_exec(&format!(
+                "INSERT INTO {table} (k, deleted_at, v) SELECT 'dup', SYSDATETIME(), \
+                 CONCAT('d', value) FROM GENERATE_SERIES(CAST(1 AS BIGINT), CAST({dups} AS BIGINT))"
+            ));
+            mssql_exec(&format!(
+                "INSERT INTO {table} (k, deleted_at, v) \
+                 SELECT CONCAT('u', RIGHT('0000' + CAST(value AS VARCHAR(8)), 4)), NULL, \
+                 CONCAT('l', value) FROM GENERATE_SERIES(CAST(1 AS BIGINT), CAST({live} AS BIGINT))"
+            ));
+            // A FILTERED unique index — SQL Server's spelling of a partial index.
+            mssql_exec(&format!(
+                "CREATE UNIQUE INDEX {table}_live ON {table} (k) WHERE deleted_at IS NULL"
+            ));
+            mssql_exec(&format!("UPDATE STATISTICS {table}"));
+        }
+    }
+    (table, guard)
+}
+
+/// A keyset key backed only by a PARTIAL (filtered) unique index must not be
+/// accepted — the index does not make the key unique over the rows being read.
+///
+/// Keyset's entire correctness argument is that the key is GLOBALLY unique, so
+/// `WHERE k > <last> ORDER BY k LIMIT n` cannot skip a row sharing the boundary
+/// key. The introspection that is supposed to supply that guarantee asks
+/// `i.indisunique AND i.indnkeyatts = 1 AND a.attnotnull` on PostgreSQL
+/// (src/source/postgres/mod.rs:380) and `i.is_unique = 1 AND c.is_nullable = 0`
+/// on SQL Server (src/source/mssql/mod.rs:1132). Neither excludes a PARTIAL /
+/// FILTERED index — `i.indpred IS NOT NULL` on PG, `i.has_filter = 1` on MSSQL —
+/// and PG additionally never checks `i.indisvalid`.
+///
+/// The shape is not exotic; it is the standard soft-delete index:
+///   `CREATE UNIQUE INDEX ON users (email) WHERE deleted_at IS NULL`
+/// Duplicates are legal among the soft-deleted rows, so a run of them straddles
+/// a page boundary and everything past the first page is skipped.
+///
+/// Measured on this stand (postgres, 50 duplicate + 50 distinct, page size 10):
+///   `rivet check` → `Strategy: keyset(k, size=10)`, `Verdict: ACCEPTABLE`
+///   `rivet run`   → `status: success`, 60 of 100 rows
+/// and the reason the loss survives every ordinary check: the duplicate key
+/// contributes exactly ONE page (10 of its 50 rows), so all 51 DISTINCT key
+/// values are present. A `count(DISTINCT k)` comparison against the source
+/// matches perfectly while 40 rows are gone.
+///
+/// MySQL is the CONTROL arm, not padding: it cannot express a partial index, so
+/// its `NON_UNIQUE = 0` genuinely means globally unique and the equivalent seed
+/// (a plain non-unique index) must be REFUSED. The guard is real on the one
+/// engine that never needed it.
+// AUDIT-RED keyset-partial-unique: a partial/filtered unique index is accepted as a keyset key; duplicates past the first page are dropped, status success. Asserts CORRECT behavior; expected to FAIL until fixed.
+fn run_partial_unique_index_is_not_a_keyset_key(eng: Eng) {
+    eng.require();
+    const DUPS: i64 = 50;
+    const LIVE: i64 = 50;
+    let (table, _guard) = seed_partial_unique(eng, DUPS, LIVE);
+
+    let rig = eng
+        .rig(&table)
+        .mode("chunked")
+        .export_line("chunk_by_key: k")
+        .export_line("chunk_size: 10");
+    let cfg = rig.config_path();
+    let out = run_rivet_env(
+        &["run", "--config", cfg.to_str().unwrap()],
+        &[("RUST_LOG", "warn")],
+    );
+
+    // Refusing is the correct outcome — the key is not unique over the read set.
+    if !out.status.success() {
+        return;
+    }
+    // If it ran, it must have read EVERY row. DuckDB, not the parquet crate
+    // rivet wrote with.
+    let got = duckdb_total_parquet_rows(&rig.out_dir()) as i64;
+    assert_eq!(
+        got,
+        DUPS + LIVE,
+        "keyset over a key backed only by a PARTIAL/FILTERED unique index reported SUCCESS with \
+         {} of {} rows. {} duplicate rows share one key; the seek emits one page of them and then \
+         asks for `k > <that key>`, dropping the rest. The loss is invisible to a DISTINCT check \
+         — every distinct key value is still present — so counts of distinct values agree with \
+         the source while whole rows are gone.\nstderr:\n{}",
+        got,
+        DUPS + LIVE,
+        DUPS,
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn stand_partial_unique_index_is_not_a_keyset_key_postgres() {
+    run_partial_unique_index_is_not_a_keyset_key(Eng::Pg);
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mysql"]
+fn stand_partial_unique_index_is_not_a_keyset_key_mysql() {
+    run_partial_unique_index_is_not_a_keyset_key(Eng::My);
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mssql"]
+fn stand_partial_unique_index_is_not_a_keyset_key_mssql() {
+    run_partial_unique_index_is_not_a_keyset_key(Eng::Ms);
 }

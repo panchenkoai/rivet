@@ -159,12 +159,12 @@ fn mysql_chunked_crash_after_first_chunk_complete_resume_finishes_export() {
     );
     // Destination re-read: chunk 0 not re-run → exactly 150 rows, 150 distinct ids.
     assert_eq!(
-        total_parquet_rows(&rig.out_dir()),
+        duckdb_total_parquet_rows(&rig.out_dir()),
         150,
         "destination must hold exactly 150 rows (no re-run, no dup)"
     );
     assert_eq!(
-        dir_parquet_id_set(&rig.out_dir()).len(),
+        duckdb_dir_parquet_id_set(&rig.out_dir()).len(),
         150,
         "150 distinct source ids must be present at the destination"
     );
@@ -246,12 +246,12 @@ fn mysql_chunked_crash_after_chunk_file_before_commit_resume_reruns_chunk_atleas
     // Destination re-read: every source id present (no loss) despite the
     // at-least-once chunk-0 re-run; physical rows >= source (the dup is surplus).
     assert_eq!(
-        dir_parquet_id_set(&rig.out_dir()).len(),
+        duckdb_dir_parquet_id_set(&rig.out_dir()).len(),
         150,
         "every seeded id must survive the at-least-once re-run (no loss)"
     );
     assert!(
-        total_parquet_rows(&rig.out_dir()) as i64 >= 150,
+        duckdb_total_parquet_rows(&rig.out_dir()) as i64 >= 150,
         "at-least-once: physical destination rows must be >= source (150)"
     );
 }
@@ -358,12 +358,12 @@ fn mysql_parallel_chunked_crash_after_chunk_complete_resume_finishes_with_no_dup
     // Destination re-read: no parallel double-write → exactly ROW_COUNT rows,
     // ROW_COUNT distinct ids.
     assert_eq!(
-        total_parquet_rows(&rig.out_dir()) as i64,
+        duckdb_total_parquet_rows(&rig.out_dir()) as i64,
         ROW_COUNT,
         "destination must hold exactly ROW_COUNT rows — no parallel double-write"
     );
     assert_eq!(
-        dir_parquet_id_set(&rig.out_dir()).len() as i64,
+        duckdb_dir_parquet_id_set(&rig.out_dir()).len() as i64,
         ROW_COUNT,
         "ROW_COUNT distinct source ids must be present"
     );
@@ -468,12 +468,12 @@ fn mysql_parallel_chunked_crash_after_chunk_file_stuck_running_resume_reruns_chu
     // Destination re-read: every source id survives the stuck-running reset +
     // at-least-once re-run (no loss); physical rows >= source (the dup is surplus).
     assert_eq!(
-        dir_parquet_id_set(&rig.out_dir()).len() as i64,
+        duckdb_dir_parquet_id_set(&rig.out_dir()).len() as i64,
         ROW_COUNT,
         "every seeded id must land after stuck-running reset + at-least-once re-run"
     );
     assert!(
-        total_parquet_rows(&rig.out_dir()) as i64 >= ROW_COUNT,
+        duckdb_total_parquet_rows(&rig.out_dir()) as i64 >= ROW_COUNT,
         "at-least-once: physical destination rows must be >= ROW_COUNT"
     );
 }

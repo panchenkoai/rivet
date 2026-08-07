@@ -367,6 +367,10 @@ impl MssqlChangeStream {
         tls: Option<&TlsConfig>,
         peek: crate::source::cdc::PeekBound,
         mode: DrainMode,
+        // The `table:` values the config asked for, checked against the catalog
+        // identity this stream will actually emit. Empty ⇒ no check (the
+        // `rivet cdc` CLI path supplies none).
+        configured_tables: &[String],
     ) -> Result<Self> {
         if !cfg
             .capture_instance
@@ -420,6 +424,44 @@ impl MssqlChangeStream {
                 .map(|(s, t)| (s.to_string(), t.to_string()))
                 .unwrap_or_else(|| (String::new(), cfg.capture_instance.clone()))
         });
+
+        // The config's name is a LABEL; this identity is the truth — and until
+        // now nothing compared them. The sink routes with
+        // `cdc::sink::table_matches`, a byte-exact comparison, while SQL Server's
+        // default collation is case-INSENSITIVE: `table: dbo.orders` against a
+        // catalog `dbo.Orders` resolves its schema perfectly (a full, correct
+        // column list) and then matches ZERO events.
+        //
+        // That is not merely a delay. The commit boundary is recorded BEFORE the
+        // routing filter and the end-of-pass roll fires on `unacked_commit`
+        // alone, so the checkpoint advances over events that were never
+        // captured. Measured: 6 change rows, 0 captured, exit 0 — and re-running
+        // with the case FIXED against the same checkpoint recovered NOTHING,
+        // while the same run with the checkpoint deleted recovered all 5 events.
+        // The rows never left the change table; only the advanced LSN skipped
+        // them.
+        //
+        // Checked with the SAME predicate the sink routes by, deliberately: a
+        // check that asks a different question is not a check.
+        if !configured_tables.is_empty()
+            && !configured_tables
+                .iter()
+                .any(|c| crate::source::cdc::sink::table_matches(c, &schema, &table))
+        {
+            anyhow::bail!(
+                "sqlserver cdc: capture instance '{}' emits changes for `{}.{}` (from \
+                 cdc.change_tables), but no configured table matches it — the config asks for \
+                 {:?}. Routing is byte-exact while SQL Server's collation is not, so every \
+                 event would be dropped AND the checkpoint would advance past it, losing the \
+                 changes for good. Set `table:` to `{}.{}` exactly as the catalog spells it.",
+                cfg.capture_instance,
+                schema,
+                table,
+                configured_tables,
+                schema,
+                table
+            );
+        }
 
         // Bounded run: snapshot the ceiling once, at open. A NULL max LSN (CDC
         // not enabled yet) keeps `bound = None` so the first poll surfaces the
@@ -476,6 +518,8 @@ impl MssqlChangeStream {
         tls: Option<&TlsConfig>,
         peek: crate::source::cdc::PeekBound,
         mode: DrainMode,
+        // Passed through to `open`, which cross-checks it against the catalog.
+        configured_tables: &[String],
     ) -> Result<Self> {
         // Refuse remote plaintext / unauthenticated TLS before any dial (the gate
         // the batch MssqlSource uses).
@@ -495,6 +539,7 @@ impl MssqlChangeStream {
             tls,
             peek,
             mode,
+            configured_tables,
         )
     }
 
@@ -1191,6 +1236,7 @@ mod tests {
             None,
             crate::source::cdc::PeekBound::Sized(10_000),
             DrainMode::Continuous,
+            &[], // no configured tables in this fixture → cross-check inactive
         )
         .unwrap();
         let mut ops = Vec::new();

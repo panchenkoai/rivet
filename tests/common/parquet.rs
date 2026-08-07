@@ -17,6 +17,133 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 use super::files_with_extension;
 
+/// Stage a host directory of Parquet under the shared bind mount and hand back
+/// its in-container path, so a value claim can be read by DuckDB instead of by
+/// the same `parquet` crate rivet wrote it with.
+///
+/// The bridge exists because of a NAMESPACE boundary, not a data one. Tests
+/// write to their own `tempfile::tempdir()` — a real directory the host reads
+/// fine — but the validator containers have exactly ONE path mounted
+/// (`tests/.live-tmp` → `/work`), so from inside them that tempdir does not
+/// exist. The failure then surfaces as `0 rows` or "no files match", which
+/// reads as data loss and costs an hour before anyone suspects the mount. (It
+/// cost exactly that on 2026-08-05, when three tests run from a secondary git
+/// worktree failed and a merge was suspected first.)
+///
+/// Copying rather than moving: the caller still owns its directory and may
+/// assert on it afterwards. Test outputs here are kilobytes, and one DuckDB
+/// round trip is ~38 ms, so the copy is not the cost that matters.
+fn stage_for_duckdb(dir: &Path) -> String {
+    // ONE stable directory per THREAD, contents cleared — never a fresh
+    // directory per call.
+    //
+    // The first version minted `stage_<pid>_<seq>` on every call: 193 new
+    // directories in a single parallel run, on a gRPC-FUSE bind mount whose
+    // documented failure mode (see `live_shared_workdir`) is that a container
+    // which has resolved a path keeps the OLD inode after a recreate and sees
+    // an empty directory forever. It showed up exactly as that comment
+    // predicts — green alone, one failure in the parallel suite, reading zero
+    // rows from a directory that was full.
+    //
+    // A per-thread name is stable across the thousands of calls one test binary
+    // makes, so the container resolves each path once and keeps seeing it.
+    let tid = format!("{:?}", std::thread::current().id());
+    let label = format!(
+        "stage_t{}",
+        tid.chars()
+            .filter(|c| c.is_ascii_digit())
+            .collect::<String>()
+    );
+    let (host, container) = super::live_shared_workdir(&label);
+    for f in files_with_extension(dir, "parquet") {
+        let name = f.file_name().expect("parquet file has a name");
+        std::fs::copy(&f, host.join(name))
+            .unwrap_or_else(|e| panic!("stage {} for duckdb: {e}", f.display()));
+    }
+    container
+}
+
+/// Row count of every `.parquet` under `dir`, read by DuckDB.
+///
+/// The independent-decoder twin of [`total_parquet_rows`]. rivet writes Parquet
+/// with the `parquet` crate and the old helper read it back with the SAME
+/// crate, so a symmetric write/read fault is invisible by construction — the
+/// class that let a whole column render as empty for four months. DuckDB shares
+/// no code with the writer.
+pub fn duckdb_total_parquet_rows(dir: &Path) -> usize {
+    if files_with_extension(dir, "parquet").is_empty() {
+        return 0; // an empty destination is a legitimate expected value
+    }
+    let c = stage_for_duckdb(dir);
+    super::duckdb_parquet_rows(&c) as usize
+}
+
+/// Every `id` value under `dir`, WITH multiplicity, read by DuckDB.
+///
+/// Multiplicity is the point: a completeness claim needs to tell LOSS (fewer
+/// values) from DUPLICATION (same count, fewer distinct), and a set cannot.
+pub fn duckdb_dir_parquet_ids(dir: &Path) -> Vec<i64> {
+    duckdb_dir_parquet_i64(dir, "id")
+}
+
+/// The distinct `id` values under `dir`, read by DuckDB.
+pub fn duckdb_dir_parquet_id_set(dir: &Path) -> BTreeSet<i64> {
+    duckdb_dir_parquet_ids(dir).into_iter().collect()
+}
+
+/// Every value of an integer column under `dir`, in file/row order, by DuckDB.
+pub fn duckdb_dir_parquet_i64(dir: &Path, col: &str) -> Vec<i64> {
+    if files_with_extension(dir, "parquet").is_empty() {
+        return Vec::new();
+    }
+    let c = stage_for_duckdb(dir);
+    let v = super::duckdb_run_sql_json(&format!(
+        "SELECT CAST({col} AS BIGINT) FROM read_parquet('{c}/**/*.parquet')"
+    ));
+    v["rows"]
+        .as_array()
+        .unwrap_or_else(|| panic!("duckdb returned no rows array for {col}"))
+        .iter()
+        .map(|r| {
+            r[0].as_str()
+                .unwrap_or_else(|| panic!("{col} cell is not a string: {r:?}"))
+                .parse::<i64>()
+                .unwrap_or_else(|e| panic!("{col} does not parse as i64: {e}"))
+        })
+        .collect()
+}
+
+/// The distinct values of a text column under `dir`, read by DuckDB.
+pub fn duckdb_dir_parquet_distinct_strings(dir: &Path, col: &str) -> BTreeSet<String> {
+    if files_with_extension(dir, "parquet").is_empty() {
+        return BTreeSet::new();
+    }
+    let c = stage_for_duckdb(dir);
+    let v = super::duckdb_run_sql_json(&format!(
+        "SELECT DISTINCT CAST({col} AS VARCHAR) FROM read_parquet('{c}/**/*.parquet') \
+         WHERE {col} IS NOT NULL"
+    ));
+    v["rows"]
+        .as_array()
+        .unwrap_or_else(|| panic!("duckdb returned no rows array for {col}"))
+        .iter()
+        .map(|r| r[0].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+/// Does any part under `dir` carry `col`? Answered from DuckDB's own schema
+/// read, so a column rivet believes it wrote is confirmed by a foreign decoder.
+pub fn duckdb_dir_parquet_has_column(dir: &Path, col: &str) -> bool {
+    if files_with_extension(dir, "parquet").is_empty() {
+        return false;
+    }
+    let c = stage_for_duckdb(dir);
+    let described = super::duckdb_run_sql_json(&format!(
+        "DESCRIBE SELECT * FROM read_parquet('{c}/**/*.parquet')"
+    ));
+    super::duckdb_parse_describe(&described).contains_key(col)
+}
+
 /// Row count of a single `.parquet` file.
 pub fn parquet_rows(path: &Path) -> usize {
     let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
