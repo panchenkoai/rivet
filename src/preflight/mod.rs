@@ -223,6 +223,22 @@ where
     exports.iter().map(|&e| diagnose(e)).collect()
 }
 
+/// The exports in this config the PLANNER would refuse, each with its reason.
+///
+/// Pure, and separate from [`check`] so the rule is testable without a live
+/// source — `check` itself needs one, so a mutant inside it (the `mode ==
+/// Chunked` filter, say) survives every offline test by construction. Asks
+/// `plan::build`'s own function rather than re-deriving the rule: two copies
+/// of "what is plannable" is exactly how the preflight and the runner drifted
+/// apart in the first place.
+pub(crate) fn unplannable_exports(exports: &[&ExportConfig]) -> Vec<String> {
+    exports
+        .iter()
+        .filter(|e| e.mode == crate::config::ExportMode::Chunked)
+        .filter_map(|e| crate::plan::build::chunked_without_table_error(e))
+        .collect()
+}
+
 pub fn check(
     config_path: &str,
     export_name: Option<&str>,
@@ -260,11 +276,7 @@ pub fn check(
     // Reported BEFORE the engine probe: the config is illegal on its face, so
     // connecting to say so would only delay the answer (and fail differently
     // when the source is unreachable).
-    let illegal: Vec<String> = exports
-        .iter()
-        .filter(|e| e.mode == crate::config::ExportMode::Chunked)
-        .filter_map(|e| crate::plan::build::chunked_without_table_error(e))
-        .collect();
+    let illegal = unplannable_exports(&exports);
     if !illegal.is_empty() {
         for why in &illegal {
             eprintln!("✗ {why}");
@@ -564,6 +576,53 @@ fn print_diagnostic(diag: &ExportDiagnostic) {
 
 #[cfg(test)]
 mod tests {
+
+    /// The preflight must refuse exactly what the planner refuses — no more.
+    ///
+    /// The `mode == Chunked` filter is the part a live-only `check` cannot have
+    /// tested: an `incremental` export with no `table:` is perfectly legal, and
+    /// a filter that forgot the mode would refuse it. Both directions, so
+    /// neither an over-strict nor an under-strict preflight passes.
+    #[test]
+    fn unplannable_lists_the_chunked_refusals_and_leaves_other_modes_alone() {
+        let chunked_no_table = ExportConfig {
+            mode: crate::config::ExportMode::Chunked,
+            table: None,
+            query: Some("SELECT * FROM t".into()),
+            chunk_by_key: Some("id".into()),
+            ..crate::config::sample_export("bad")
+        };
+        let incremental_no_table = ExportConfig {
+            mode: crate::config::ExportMode::Incremental,
+            table: None,
+            query: Some("SELECT * FROM t".into()),
+            ..crate::config::sample_export("fine")
+        };
+        let chunked_with_column = ExportConfig {
+            mode: crate::config::ExportMode::Chunked,
+            table: None,
+            query: Some("SELECT * FROM t".into()),
+            chunk_column: Some("id".into()),
+            ..crate::config::sample_export("fast_path")
+        };
+
+        let out = unplannable_exports(&[
+            &chunked_no_table,
+            &incremental_no_table,
+            &chunked_with_column,
+        ]);
+        assert_eq!(
+            out.len(),
+            1,
+            "only the chunked keyset export is refused: {out:?}"
+        );
+        assert!(out[0].contains("chunk_by_key"), "{}", out[0]);
+
+        assert!(
+            unplannable_exports(&[&incremental_no_table, &chunked_with_column]).is_empty(),
+            "a legal config must produce no refusals at all"
+        );
+    }
     use super::*;
     use crate::config::{DestinationConfig, DestinationType, ExportConfig, ExportMode, FormatType};
     use doctor::{

@@ -243,6 +243,35 @@ mod tests {
         assert_eq!(decimal_str_to_scaled_i128("1.234567", 2), None);
     }
 
+    /// The i256 TWIN of the two tests above.
+    ///
+    /// The scale-0 guard was fixed in both converters and tested in only one —
+    /// the ≥2-twins lesson, arriving by mutant: `cargo mutants --in-diff`
+    /// reported `replace != with == in decimal_str_to_scaled_i256` MISSED while
+    /// its i128 sibling was covered. Inverted, the guard refuses `1.00` (whose
+    /// fraction is all zeros — no loss) and ACCEPTS `1.05` at scale 0, which is
+    /// the truncation the guard exists to stop.
+    #[test]
+    fn scale_zero_guard_holds_on_the_i256_path_too() {
+        assert_eq!(decimal_str_to_scaled_i256("123.45", 0), None);
+        assert_eq!(decimal_str_to_scaled_i256("-99.99", 0), None);
+        assert_eq!(decimal_str_to_scaled_i256("0.01", 0), None);
+        // …and the non-loss cases still pass, or the guard would refuse every
+        // integer-valued wide decimal.
+        assert_eq!(
+            decimal_str_to_scaled_i256("123", 0),
+            Some(i256::from_i128(123))
+        );
+        assert_eq!(
+            decimal_str_to_scaled_i256("123.00", 0),
+            Some(i256::from_i128(123))
+        );
+        assert_eq!(
+            decimal_str_to_scaled_i256("-42.0", 0),
+            Some(i256::from_i128(-42))
+        );
+    }
+
     /// …and still accepts what is NOT a loss, or the fix would have broken every
     /// integer-valued decimal.
     #[test]
