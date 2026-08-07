@@ -35,8 +35,8 @@ const US: char = '\u{1f}';
 /// trust-certs the server certificate (encrypted, unverified) — the documented
 /// default for dev / self-signed setups. Add a `source.tls:` block to the
 /// generated config to enable strict validation for production runs.
-pub(super) fn connect(url: &str) -> Result<MssqlSource> {
-    MssqlSource::connect_with_tls(url, None)
+pub(super) fn connect(url: &str, tls: Option<&crate::config::TlsConfig>) -> Result<MssqlSource> {
+    MssqlSource::connect_with_tls(url, tls)
 }
 
 /// Base tables and views in a SQL Server schema (`information_schema.TABLES`).

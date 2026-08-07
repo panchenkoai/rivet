@@ -441,10 +441,16 @@ pub fn init(
     yaml_destination: InitYamlDestination,
     filter: &TableFilter,
     mode_override: Option<&str>,
+    // `--tls` / `--tls-ca` (#146): the posture for the introspection
+    // connection init itself opens AND the `source.tls:` block the scaffold
+    // records — one value, both uses, so the generated config connects the
+    // same way init just did.
+    tls: Option<&crate::config::TlsConfig>,
 ) -> Result<()> {
     yaml_destination.validate()?;
     let (text, yaml_decimal_review, snapshots) = match format {
         InitFormat::Yaml => init_yaml(
+            tls,
             source_url,
             provenance,
             table,
@@ -472,7 +478,7 @@ pub fn init(
                 );
             }
             (
-                init_discovery_json(source_url, table, schema, filter)?,
+                init_discovery_json(tls, source_url, table, schema, filter)?,
                 false,
                 // `--discover` writes a SURVEY, not a config — there is no
                 // strategy decision to record the evidence for.
@@ -598,6 +604,7 @@ fn resolve_single_table_schema<'a>(
 /// them. For MySQL, `--schema` selects the database via `USE`; for PG/MSSQL it
 /// is the introspection schema (defaulting to `public`/`dbo`).
 fn introspect_single_table(
+    tls: Option<&crate::config::TlsConfig>,
     source_url: &str,
     table: &str,
     schema_flag: Option<&str>,
@@ -605,7 +612,7 @@ fn introspect_single_table(
     let (eff_schema, table_name) = resolve_single_table_schema(table, schema_flag)?;
     Ok(match source_type(source_url)? {
         "postgres" => {
-            let mut client = postgres::connect(source_url)?;
+            let mut client = postgres::connect(source_url, tls)?;
             postgres::introspect(
                 &mut client,
                 eff_schema.as_deref().unwrap_or("public"),
@@ -613,7 +620,7 @@ fn introspect_single_table(
             )?
         }
         "mysql" => {
-            let mut conn = mysql::connect(source_url)?;
+            let mut conn = mysql::connect(source_url, tls)?;
             if let Some(db) = eff_schema.as_deref() {
                 // Guard (bughunt HIGH): `--schema` selecting a DIFFERENT database
                 // than the URL would introspect THAT db (via USE), but the
@@ -643,7 +650,7 @@ fn introspect_single_table(
             mysql::introspect(&mut conn, table_name)?
         }
         "mssql" => {
-            let mut conn = mssql::connect(source_url)?;
+            let mut conn = mssql::connect(source_url, tls)?;
             mssql::introspect(
                 &mut conn,
                 &mssql_table_schema(eff_schema.as_deref().unwrap_or("public")),
@@ -656,7 +663,7 @@ fn introspect_single_table(
             // schema got the URL's database instead. Mongo has no schema namespace
             // — refuse rather than mislead; the database lives in the URL.
             reject_mongo_schema(schema_flag)?;
-            let conn = mongo::connect(source_url)?;
+            let conn = mongo::connect(source_url, tls)?;
             mongo::introspect(&conn, table_name)?
         }
         _ => unreachable!(),
@@ -677,7 +684,10 @@ fn reject_mongo_schema(schema_flag: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)] // mirrors `init`'s own surface; a params
+// struct here would be a second InitYamlDestination
 fn init_yaml(
+    tls: Option<&crate::config::TlsConfig>,
     source_url: &str,
     provenance: &SourceProvenance,
     table: Option<&str>,
@@ -687,14 +697,20 @@ fn init_yaml(
     mode_override: Option<&str>,
 ) -> Result<(String, bool, Vec<crate::state::StrategySnapshot>)> {
     if let Some(t) = table {
-        let info = introspect_single_table(source_url, t, schema)?;
+        let info = introspect_single_table(tls, source_url, t, schema)?;
         let hint = yaml_scaffold::table_has_unbounded_decimal_columns(&info);
         let snaps = vec![snapshot_of(&info, mode_override)];
-        let yaml =
-            yaml_scaffold::generate_config(&info, source_url, provenance, dest, mode_override)?;
+        let yaml = yaml_scaffold::generate_config(
+            &info,
+            source_url,
+            provenance,
+            dest,
+            mode_override,
+            tls,
+        )?;
         return Ok((yaml, hint, snaps));
     }
-    let infos = introspect_all(source_url, schema, filter)?;
+    let infos = introspect_all(tls, source_url, schema, filter)?;
     if infos.is_empty() {
         return Err(no_tables_error(filter));
     }
@@ -709,6 +725,7 @@ fn init_yaml(
         &label,
         dest,
         mode_override,
+        tls,
     )?;
     let snaps = infos
         .iter()
@@ -738,13 +755,14 @@ fn snapshot_of(info: &TableInfo, mode_override: Option<&str>) -> crate::state::S
 }
 
 fn init_discovery_json(
+    tls: Option<&crate::config::TlsConfig>,
     source_url: &str,
     table: Option<&str>,
     schema: Option<&str>,
     filter: &TableFilter,
 ) -> Result<String> {
     let (infos, scope) = if let Some(t) = table {
-        let info = introspect_single_table(source_url, t, schema)?;
+        let info = introspect_single_table(tls, source_url, t, schema)?;
         let scope = match source_type(source_url)? {
             "postgres" => format!("table \"{}\".\"{}\"", info.schema, info.table),
             "mysql" => format!("table `{}`", info.table),
@@ -754,7 +772,7 @@ fn init_discovery_json(
         };
         (vec![info], scope)
     } else {
-        let infos = introspect_all(source_url, schema, filter)?;
+        let infos = introspect_all(tls, source_url, schema, filter)?;
         if infos.is_empty() {
             return Err(no_tables_error(filter));
         }
@@ -769,6 +787,15 @@ fn init_discovery_json(
         rivet_version: env!("CARGO_PKG_VERSION").to_string(),
         source_type: st.to_string(),
         scope,
+        tls_mode: tls.map(|t| {
+            match t.mode {
+                crate::config::TlsMode::Disable => "disable",
+                crate::config::TlsMode::Require => "require",
+                crate::config::TlsMode::VerifyCa => "verify-ca",
+                crate::config::TlsMode::VerifyFull => "verify-full",
+            }
+            .to_string()
+        }),
         tables,
     };
     artifact.to_json_pretty()
@@ -805,6 +832,7 @@ fn table_discovery(info: &TableInfo) -> TableDiscovery {
 }
 
 fn introspect_all(
+    tls: Option<&crate::config::TlsConfig>,
     source_url: &str,
     schema: Option<&str>,
     filter: &TableFilter,
@@ -817,7 +845,7 @@ fn introspect_all(
                 .unwrap_or("public");
             // One connection for the whole scan — a fresh client per table
             // would mean N+1 TCP+auth(+TLS) handshakes on large schemas.
-            let mut client = postgres::connect(source_url)?;
+            let mut client = postgres::connect(source_url, tls)?;
             let names = retain_filtered(postgres::list_tables(&mut client, sch)?, filter);
             let mut out = Vec::with_capacity(names.len());
             for n in names {
@@ -854,7 +882,7 @@ fn introspect_all(
             }
             // One pooled connection for the whole scan — a fresh Pool per
             // table would mean N+1 TCP+auth(+TLS) handshakes on large schemas.
-            let mut conn = mysql::connect(source_url)?;
+            let mut conn = mysql::connect(source_url, tls)?;
             let names = retain_filtered(mysql::list_tables(&mut conn, &db)?, filter);
             let mut out = Vec::with_capacity(names.len());
             for n in names {
@@ -869,7 +897,7 @@ fn introspect_all(
                 .unwrap_or("dbo");
             // One connection for the whole scan — `MssqlSource` owns its runtime
             // and block_on's each query, so reusing it avoids N+1 TLS logins.
-            let mut conn = mssql::connect(source_url)?;
+            let mut conn = mssql::connect(source_url, tls)?;
             let names = retain_filtered(mssql::list_tables(&mut conn, sch)?, filter);
             let mut out = Vec::with_capacity(names.len());
             for n in names {
@@ -884,7 +912,7 @@ fn introspect_all(
         }
         "mongo" => {
             reject_mongo_schema(schema)?;
-            let conn = mongo::connect(source_url)?;
+            let conn = mongo::connect(source_url, tls)?;
             let names = retain_filtered(mongo::list_tables(&conn)?, filter);
             let mut out = Vec::with_capacity(names.len());
             for n in names {
@@ -1202,6 +1230,7 @@ mod tests {
                 &super::SourceProvenance::Inline,
                 &Default::default(),
                 None,
+                None,
             )
             .expect("scaffold");
             // COMMENTS STRIPPED. The keyset scaffold's hint line mentions
@@ -1264,6 +1293,7 @@ mod tests {
             &super::SourceProvenance::Inline,
             &InitYamlDestination::default(),
             None,
+            None,
         )
         .unwrap();
         assert!(yaml.contains("mode: chunked"), "got:\n{yaml}");
@@ -1313,6 +1343,7 @@ mod tests {
             &super::SourceProvenance::Inline,
             &InitYamlDestination::default(),
             None,
+            None,
         )
         .unwrap();
         assert!(yaml.contains("mode: chunked"), "got:\n{yaml}");
@@ -1350,6 +1381,7 @@ mod tests {
             &super::SourceProvenance::Inline,
             &InitYamlDestination::default(),
             None,
+            None,
         )
         .unwrap();
         assert!(yaml.contains("mode: incremental"), "got:\n{yaml}");
@@ -1379,6 +1411,7 @@ mod tests {
             &super::SourceProvenance::Inline,
             r#"schema "public" (2)"#,
             &InitYamlDestination::default(),
+            None,
             None,
         )
         .unwrap();
@@ -1416,6 +1449,7 @@ mod tests {
             &super::SourceProvenance::Inline,
             &dest,
             None,
+            None,
         )
         .unwrap();
         assert!(yaml.contains("type: gcs"), "got:\n{yaml}");
@@ -1442,6 +1476,7 @@ mod tests {
             &super::SourceProvenance::Inline,
             &dest,
             None,
+            None,
         )
         .unwrap();
         assert!(
@@ -1467,6 +1502,7 @@ mod tests {
             "postgresql://localhost/db",
             &super::SourceProvenance::Inline,
             &dest,
+            None,
             None,
         )
         .unwrap();
@@ -1498,6 +1534,7 @@ mod tests {
             "postgresql://localhost/db",
             &super::SourceProvenance::Inline,
             &dest,
+            None,
             None,
         )
         .unwrap();
@@ -1596,6 +1633,7 @@ mod tests {
             &super::SourceProvenance::Inline,
             &dest,
             None,
+            None,
         )
         .unwrap();
         // Plain `bucket: true` would deserialize to the boolean `true`.
@@ -1627,6 +1665,7 @@ mod tests {
             &super::SourceProvenance::Inline,
             &dest,
             None,
+            None,
         )
         .unwrap();
         let parsed: serde_yaml_ng::Value =
@@ -1653,6 +1692,7 @@ mod tests {
             "postgresql://localhost/db",
             &super::SourceProvenance::Inline,
             &dest,
+            None,
             None,
         )
         .unwrap();

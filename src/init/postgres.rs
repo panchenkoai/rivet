@@ -12,12 +12,21 @@ use super::{ColumnInfo, TableInfo};
 /// config), so the transport-security policy comes from the URL's `sslmode`
 /// parameter; the connection itself goes through the same
 /// [`crate::source::postgres::connect_client`] path as doctor/check/run.
-pub(super) fn connect(url: &str) -> Result<Client> {
-    let tls = tls_mode_from_url(url).map(|mode| TlsConfig {
-        mode,
-        ..TlsConfig::default()
-    });
-    crate::source::postgres::connect_client(url, tls.as_ref())
+pub(super) fn connect(url: &str, tls: Option<&TlsConfig>) -> Result<Client> {
+    // An explicit `--tls` flag WINS over the URL's `sslmode` — the flag is the
+    // operator's direct statement, the URL parameter an inherited convention.
+    let from_url;
+    let tls = match tls {
+        Some(t) => Some(t),
+        None => {
+            from_url = tls_mode_from_url(url).map(|mode| TlsConfig {
+                mode,
+                ..TlsConfig::default()
+            });
+            from_url.as_ref()
+        }
+    };
+    crate::source::postgres::connect_client(url, tls)
 }
 
 /// Map the URL's `sslmode` query parameter to the [`TlsMode`] the shared TLS

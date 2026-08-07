@@ -563,6 +563,17 @@ pub(crate) fn require_url_has_host(url: &str) -> Result<()> {
 /// allowed there because the bytes never leave the box. An explicit
 /// `tls: { mode: disable }` is `Some(..)`, so it is the operator's opt-in to
 /// remote plaintext and is **not** refused here.
+/// Marker error for the TLS-required policy refusal, so callers whose remedy
+/// differs (init: a FLAG, not a config block) can recognize it by type.
+#[derive(Debug)]
+pub(crate) struct TlsRequiredError;
+impl std::fmt::Display for TlsRequiredError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "TLS required for a remote host")
+    }
+}
+impl std::error::Error for TlsRequiredError {}
+
 pub(crate) fn require_tls_or_loopback(url: &str, tls: Option<&TlsConfig>) -> Result<()> {
     // An explicit `tls: {..}` (including `mode: disable`) is the operator's
     // opt-in and is never refused here — including for a host-LESS URL, which a
@@ -591,7 +602,11 @@ pub(crate) fn require_tls_or_loopback(url: &str, tls: Option<&TlsConfig>) -> Res
              plaintext with `source.tls: { mode: disable }` if this network path is \
              already trusted.";
         log::error!("{msg}");
-        anyhow::bail!("{msg}");
+        // Typed, not just a string: `rivet init` has no config file to add a
+        // `tls:` block TO (it generates one), so its dispatch matches on this
+        // marker and re-prescribes the `--tls` flag instead — detection by
+        // downcast, never by string-matching the message (#146).
+        return Err(anyhow::Error::new(TlsRequiredError).context(msg));
     }
     Ok(())
 }

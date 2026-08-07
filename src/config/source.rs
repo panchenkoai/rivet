@@ -213,7 +213,13 @@ pub struct TlsConfig {
 }
 
 /// TLS enforcement mode, mirroring libpq's `sslmode` semantics where possible.
-#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, Copy, PartialEq, Eq, Default)]
+// `clap::ValueEnum` so `rivet init --tls <mode>` accepts exactly this enum — a
+// parallel CLI-only enum would be a second definition of the same four words,
+// and it would drift on the first variant change (#146). A regular comment,
+// not a doc comment: the doc text IS the schema description users see.
+#[derive(
+    Debug, Deserialize, Serialize, JsonSchema, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum,
+)]
 #[serde(rename_all = "kebab-case")]
 pub enum TlsMode {
     /// Plaintext. Use only inside trusted networks (loopback, cgroup-private).
