@@ -200,6 +200,14 @@ def _flags_for(cell_ix: int, pipeline: str, lifecycle: str, store: str) -> dict[
                       "--exclude", "nothing_matches_this"]
     else:
         f["init"] += ["--table", "TABLE"]  # resolved per engine by the executor
+    # `--tls disable` on half the cells (0.24.4, #146): loopback stands need no
+    # TLS, but the flag must (a) be accepted, (b) write `tls: { mode: disable }`
+    # into the scaffold, and (c) carry that block through check/plan/run — the
+    # whole chain then exercises a config with an explicit posture, which is
+    # what a trusted-VPC operator generates. verify-ca/verify-full cannot run
+    # here: the compose stand terminates no TLS (see FLAG_EXCUSED --tls-ca).
+    if _rot(seed + "tls", 2) == 1:
+        f["init"] += ["--tls", "disable"]
 
     # check: --type-report / --json / --target rotate, so all three are carried
     # somewhere without three runs of `check` per cell.
@@ -1192,6 +1200,9 @@ FLAG_EXCUSED = {
     "--source-file": "the file form of --source; same reader, and --source-env is the one ops use",
     "--s3-region": "carried with --s3-bucket on the s3 cells",
     "--gcs-credentials-file": "fake-gcs takes no credentials; the real path is the bigquery cycle's",
+    "--tls-ca": "verify-ca/full need a TLS-terminating server; the compose stand has none — the "
+                "CA path is unit-pinned (scaffold_records_the_tls_posture…) and refused-with-"
+                "disable is offline-tested",
 }
 
 
