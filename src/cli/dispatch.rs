@@ -169,7 +169,8 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             params,
             output,
             format,
-        } => dispatch_plan(config, export, params, output, format),
+            annotate_waves,
+        } => dispatch_plan(config, export, params, output, format, annotate_waves),
         Commands::Apply {
             plan_file,
             parallel_export_processes,
@@ -634,6 +635,7 @@ fn dispatch_plan(
     params: Vec<String>,
     output: Option<String>,
     format: PlanFormat,
+    annotate_waves: bool,
 ) -> Result<()> {
     let p = parse_params(&params)?;
     let p = if p.is_empty() { None } else { Some(p) };
@@ -644,7 +646,7 @@ fn dispatch_plan(
         PlanFormat::Pretty => pipeline::PlanOutputFormat::Pretty,
         PlanFormat::Json => pipeline::PlanOutputFormat::Json(output),
     };
-    pipeline::run_plan_command(&config, export.as_deref(), p.as_ref(), fmt)
+    pipeline::run_plan_command(&config, export.as_deref(), p.as_ref(), fmt, annotate_waves)
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -45,6 +45,7 @@ pub fn run_plan_command(
     export_name: Option<&str>,
     params: Option<&HashMap<String, String>>,
     format: PlanOutputFormat,
+    annotate_waves: bool,
 ) -> Result<()> {
     let config = Config::load_with_params(config_path, params)?;
     let config_dir = Path::new(config_path)
@@ -125,30 +126,35 @@ pub fn run_plan_command(
     // `parallel_safe = cost_class Low` (< 100K rows): a heavy table already
     // chunk-parallelizes internally, so two of them at once would overload the
     // source — only the small / cheap exports share a concurrent wave batch.
-    let mut fields: ExportFields = HashMap::new();
-    for a in &artifacts {
-        if let Some(p) = a.prioritization.as_ref() {
-            let rec = &p.export_recommendation;
-            // ...and not flagged `isolate_on_source` by the campaign (a shared,
-            // contended source group) — the campaign owns the "run alone" call,
-            // so a cheap export there still runs on its own.
-            let parallel_safe =
-                rec.cost_class == crate::plan::CostClass::Low && !rec.isolate_on_source;
-            fields.insert(
-                a.export_name.clone(),
-                vec![
-                    ("wave", rec.recommended_wave.to_string()),
-                    ("parallel_safe", parallel_safe.to_string()),
-                ],
-            );
-        }
-    }
+    let recs: Vec<(String, u32, bool)> = artifacts
+        .iter()
+        .filter_map(|a| {
+            a.prioritization.as_ref().map(|p| {
+                let rec = &p.export_recommendation;
+                // ...and not flagged `isolate_on_source` by the campaign (a
+                // shared, contended source group) — the campaign owns the "run
+                // alone" call, so a cheap export there still runs on its own.
+                let parallel_safe =
+                    rec.cost_class == crate::plan::CostClass::Low && !rec.isolate_on_source;
+                (a.export_name.clone(), rec.recommended_wave, parallel_safe)
+            })
+        })
+        .collect();
+    let (fields, preserved) = fields_to_write(&recs, &config, annotate_waves);
     if !fields.is_empty() {
         write_plan_fields_to_config(config_path, &fields)?;
-        log::info!(
-            "plan: recorded wave + parallel-safety for {} export(s) in {}",
+    }
+    // `warn`, not `info`: a command that MUTATES the operator's config file
+    // must say so at a level the default log setup shows — the info-level
+    // version of this line is how a hand-tuned 5-per-wave schedule silently
+    // became one 76-export wave (#150).
+    if !fields.is_empty() || preserved > 0 {
+        log::warn!(
+            "plan: annotated {} export(s) in {}; left {} untouched (wave/parallel_safe already \
+             set — rerun with --annotate-waves to overwrite)",
             fields.len(),
-            config_path
+            config_path,
+            preserved
         );
     }
 
@@ -517,6 +523,40 @@ fn print_compact_summary(artifacts: &[PlanArtifact], config_path: &str) {
 /// keyed by export name → ordered `(field, value)` pairs.
 type ExportFields = HashMap<String, Vec<(&'static str, String)>>;
 
+/// Which of the plan's recommendations may actually be WRITTEN into the
+/// operator's config: absent fields always; present fields only under
+/// `--annotate-waves`. Returns the fields plus how many exports were fully
+/// preserved (had every recommended field already set).
+///
+/// PURE, and per-FIELD rather than per-export: an export with a hand-set
+/// `wave:` but no `parallel_safe:` gets only the missing half. The operator's
+/// schedule is a decision; plan's job is to fill blanks, not to have opinions
+/// about decisions already made (#150 — the config-clobber class).
+fn fields_to_write(
+    recs: &[(String, u32, bool)],
+    config: &Config,
+    annotate_waves: bool,
+) -> (ExportFields, usize) {
+    let mut fields: ExportFields = HashMap::new();
+    let mut preserved = 0usize;
+    for (name, wave, parallel_safe) in recs {
+        let existing = config.exports.iter().find(|e| &e.name == name);
+        let mut items: Vec<(&'static str, String)> = Vec::new();
+        if annotate_waves || existing.is_none_or(|e| e.wave.is_none()) {
+            items.push(("wave", wave.to_string()));
+        }
+        if annotate_waves || existing.is_none_or(|e| e.parallel_safe.is_none()) {
+            items.push(("parallel_safe", parallel_safe.to_string()));
+        }
+        if items.is_empty() {
+            preserved += 1;
+        } else {
+            fields.insert(name.clone(), items);
+        }
+    }
+    (fields, preserved)
+}
+
 fn write_plan_fields_to_config(config_path: &str, fields: &ExportFields) -> Result<()> {
     if fields.is_empty() {
         return Ok(());
@@ -607,7 +647,82 @@ mod tests {
     use super::per_export_output_path;
     use std::path::Path;
 
-    use super::{ExportFields, apply_field_annotations};
+    use super::{ExportFields, apply_field_annotations, fields_to_write};
+
+    /// The additive contract (#150): plan fills BLANKS; a value the operator
+    /// set is untouched unless `--annotate-waves` says overwrite. Per FIELD —
+    /// a hand-set `wave:` with no `parallel_safe:` gets only the missing half.
+    ///
+    /// RED against the pre-fix behavior (every recommendation written
+    /// unconditionally): the hand-tuned case below would come back with a
+    /// `wave` entry and the test fails on the exact clobber the field hit —
+    /// a 5-per-wave split becoming one 76-export wave.
+    #[test]
+    fn plan_fills_blanks_and_never_clobbers_a_hand_set_schedule() {
+        let source = crate::config::SourceConfig {
+            source_type: crate::config::SourceType::Postgres,
+            url: Some("postgresql://localhost/test".into()),
+            url_env: None,
+            url_file: None,
+            host: None,
+            port: None,
+            user: None,
+            password: None,
+            password_env: None,
+            database: None,
+            environment: None,
+            tuning: None,
+            tls: None,
+            mongo: None,
+        };
+        let mut cfg = crate::config::Config {
+            source,
+            exports: vec![
+                crate::config::sample_export("hand_tuned"),
+                crate::config::sample_export("half_set"),
+                crate::config::sample_export("blank"),
+            ],
+            notifications: None,
+            parallel_exports: false,
+            parallel_export_processes: false,
+            load: None,
+        };
+        cfg.exports[0].wave = Some(7);
+        cfg.exports[0].parallel_safe = Some(false);
+        cfg.exports[1].wave = Some(7); // parallel_safe left blank
+        let recs = vec![
+            ("hand_tuned".to_string(), 2, true),
+            ("half_set".to_string(), 2, true),
+            ("blank".to_string(), 2, true),
+        ];
+
+        let (fields, preserved) = fields_to_write(&recs, &cfg, false);
+        assert!(
+            !fields.contains_key("hand_tuned"),
+            "a fully hand-set export must not be touched: {fields:?}"
+        );
+        assert_eq!(preserved, 1, "exactly the fully-set export is preserved");
+        let half: Vec<&str> = fields["half_set"].iter().map(|(k, _)| *k).collect();
+        assert_eq!(
+            half,
+            vec!["parallel_safe"],
+            "only the MISSING half is written"
+        );
+        let blank: Vec<&str> = fields["blank"].iter().map(|(k, _)| *k).collect();
+        assert_eq!(blank, vec!["wave", "parallel_safe"]);
+
+        // --annotate-waves is the explicit overwrite: everything is written.
+        let (fields, preserved) = fields_to_write(&recs, &cfg, true);
+        assert_eq!(preserved, 0);
+        assert_eq!(fields.len(), 3);
+        assert_eq!(
+            fields["hand_tuned"]
+                .iter()
+                .map(|(k, _)| *k)
+                .collect::<Vec<_>>(),
+            vec!["wave", "parallel_safe"]
+        );
+    }
 
     fn wave_fields(pairs: &[(&str, u32)]) -> ExportFields {
         pairs

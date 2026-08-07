@@ -99,6 +99,7 @@ mod tests {
             params: vec![],
             output: Some("out.json".into()),
             format: PlanFormat::Pretty,
+            annotate_waves: false,
         };
         assert!(validate_cli(&cmd).is_err());
     }
@@ -111,6 +112,7 @@ mod tests {
             params: vec![],
             output: Some("out.json".into()),
             format: PlanFormat::Json,
+            annotate_waves: false,
         };
         assert!(validate_cli(&cmd).is_ok());
     }
