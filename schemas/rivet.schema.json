@@ -1074,7 +1074,7 @@
           "default": false
         },
         "oneshot_budget_mb": {
-          "description": "Cap on the total RAM one-shot (single-PUT) upload buffers may hold, in\nMB. `None` = 64 (the default). A one-shot PUT must buffer the whole part\nin memory so the store can compute and store a content checksum; parts\nthat don't fit instead stream (memory-bounded, size-only verification).\n`0` disables one-shot uploads entirely. Applies per destination instance\n(one per export), shared by all of that export's parallel workers.",
+          "description": "Cap on the total RAM one-shot (single-PUT) upload buffers may hold, in\nMB. `None` (the default) draws from the shared process-wide 64 MB pool —\nthe historical behaviour, so N parallel exports do not multiply the\nceiling. A set value gives THIS destination its own pool of that size\n(N opt-in destinations ⇒ up to N × budget — the operator's choice).\n`0` disables one-shot uploads entirely (every part streams, size-only\nverification). A one-shot PUT must buffer the whole part in memory so the\nstore can compute and store a content checksum; parts that don't fit the\nbudget instead stream (memory-bounded). Applies per destination *instance*\n— the sequential chunked runner creates one instance per chunk, so a\nprivate pool re-arms each chunk there (harmless: only one instance is\nlive at a time).",
           "type": [
             "integer",
             "null"

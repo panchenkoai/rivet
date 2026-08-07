@@ -41,16 +41,78 @@ use crate::error::Result;
 /// buffering is unavoidable, so the risk is buffer × upload concurrency
 /// (`parallel`, default 4, operator-tunable).  Rather than a per-part magic
 /// threshold that still multiplies by concurrency, a part one-shots only if it
-/// fits in the *remaining* shared budget; otherwise it streams (memory-bounded,
-/// size-only verification).  Total one-shot RAM is thus capped for an export
-/// regardless of how many workers upload at once, and any part larger than the
-/// whole budget always streams.  Operators override the budget per destination
-/// with `oneshot_budget_mb`; `None` resolves to this default.
+/// fits in the *remaining* budget; otherwise it streams (memory-bounded,
+/// size-only verification).  Total one-shot RAM is thus capped regardless of
+/// how many workers upload at once, and any part larger than the whole budget
+/// always streams.
+///
+/// This is the PROCESS-WIDE ceiling: a destination whose `oneshot_budget_mb` is
+/// left unset draws from the shared [`PROCESS_WIDE_ONESHOT_BUDGET`] static, so
+/// N parallel exports with the default config stay at 1 × 64 MB of one-shot RAM
+/// — the historical behaviour.  Only a destination that opts in with an
+/// explicit `oneshot_budget_mb` gets its own pool (N opt-in destinations ⇒ up
+/// to N × budget), and that multiplication is the operator's decision, not a
+/// side effect.
 const DEFAULT_ONESHOT_BUDGET_BYTES: i64 = 64 * 1024 * 1024;
 
-/// Resolve a destination's one-shot upload budget from config: `None` keeps the
-/// 64 MB default, a value maps megabytes to bytes (`0` disables one-shot
-/// uploads entirely).
+/// The process-wide one-shot pool every destination with an unset
+/// `oneshot_budget_mb` draws from.  Keeping this static (rather than giving
+/// every destination its own 64 MB) preserves the historical whole-process
+/// ceiling: an unset field means "the global pool", so N parallel exports do
+/// not silently become N × 64 MB of one-shot RAM.  A configured value moves the
+/// destination off this pool onto its own [`OneShotPool::Owned`].
+static PROCESS_WIDE_ONESHOT_BUDGET: AtomicI64 = AtomicI64::new(DEFAULT_ONESHOT_BUDGET_BYTES);
+
+/// A destination's one-shot upload budget: either the process-wide pool (config
+/// `oneshot_budget_mb` unset) or a destination-private pool (config set).
+enum OneShotPool {
+    /// Unset → the historical whole-process 64 MB pool.  Two destinations with
+    /// the default config share one ceiling, exactly as before this field.
+    Shared(&'static AtomicI64),
+    /// Set → a pool of the configured size that no other destination draws
+    /// from, and whose reservations release back into only itself.
+    Owned(AtomicI64),
+}
+
+impl OneShotPool {
+    /// Pick the pool a config resolves to.  `None` shares the process-wide
+    /// static (no memory-behaviour change for unset configs); `Some(mb)` is an
+    /// explicit, destination-private budget (`0` = always stream).
+    fn from_config(config: &DestinationConfig) -> OneShotPool {
+        match config.oneshot_budget_mb {
+            None => OneShotPool::Shared(&PROCESS_WIDE_ONESHOT_BUDGET),
+            Some(_) => OneShotPool::Owned(AtomicI64::new(resolve_oneshot_budget(config))),
+        }
+    }
+
+    /// Optimistic atomic reserve (see [`take_from`]): true when the pool has
+    /// `size` left, false (and budget intact) when it does not.
+    fn reserve(&self, size: i64) -> bool {
+        match self {
+            OneShotPool::Shared(budget) => take_from(budget, size),
+            OneShotPool::Owned(budget) => take_from(budget, size),
+        }
+    }
+
+    /// Return `size` to the pool, matched to the reserve side — a shared pool
+    /// releases into the shared pool, an owned one into itself.
+    fn release(&self, size: i64) {
+        match self {
+            OneShotPool::Shared(budget) => {
+                budget.fetch_add(size, Ordering::Relaxed);
+            }
+            OneShotPool::Owned(budget) => {
+                budget.fetch_add(size, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+/// Resolve a configured `oneshot_budget_mb` to bytes: `None` keeps the 64 MB
+/// default, a value maps megabytes to bytes (`0` disables one-shot uploads
+/// entirely).  Note that `None` ALSO keeps the process-wide *pool* (see
+/// [`PROCESS_WIDE_ONESHOT_BUDGET`]) — this only computes the number a
+/// configured value's private pool starts at.
 fn resolve_oneshot_budget(config: &DestinationConfig) -> i64 {
     match config.oneshot_budget_mb {
         Some(mb) => i64::try_from(mb)
@@ -60,12 +122,12 @@ fn resolve_oneshot_budget(config: &DestinationConfig) -> i64 {
     }
 }
 
-/// Releases the reserved bytes back to the budget it was taken from on drop —
-/// so the budget is restored even if the upload errors out.
-struct OneShotReservation<'a>(&'a AtomicI64, i64);
+/// Releases the reserved bytes back to the pool it was taken from on drop — so
+/// the budget is restored even if the upload errors out.
+struct OneShotReservation<'a>(&'a OneShotPool, i64);
 impl Drop for OneShotReservation<'_> {
     fn drop(&mut self) {
-        self.0.fetch_add(self.1, Ordering::Relaxed);
+        self.0.release(self.1);
     }
 }
 
@@ -113,10 +175,10 @@ pub(crate) struct CloudDestination<B: CloudBackend> {
     _runtime: Arc<tokio::runtime::Runtime>,
     op: blocking::Operator,
     prefix: String,
-    /// Remaining one-shot upload budget for THIS destination (one per export),
-    /// shared by all of the export's parallel workers. Initialized from
-    /// `oneshot_budget_mb` in config; see [`resolve_oneshot_budget`].
-    oneshot_budget: AtomicI64,
+    /// Remaining one-shot upload budget for THIS destination — the shared
+    /// process-wide pool when `oneshot_budget_mb` is unset, a private pool when
+    /// it is set.  See [`OneShotPool`] and [`resolve_oneshot_budget`].
+    oneshot_budget: OneShotPool,
     _backend: PhantomData<fn() -> B>,
 }
 
@@ -201,7 +263,7 @@ impl<B: CloudBackend> CloudDestination<B> {
             _runtime: runtime,
             op,
             prefix,
-            oneshot_budget: AtomicI64::new(resolve_oneshot_budget(config)),
+            oneshot_budget: OneShotPool::from_config(config),
             _backend: PhantomData,
         })
     }
@@ -211,7 +273,8 @@ impl<B: CloudBackend> CloudDestination<B> {
     /// the whole budget never fit, so they always stream.
     fn reserve_oneshot(&self, size: u64) -> Option<OneShotReservation<'_>> {
         let size = i64::try_from(size).unwrap_or(i64::MAX);
-        take_from(&self.oneshot_budget, size)
+        self.oneshot_budget
+            .reserve(size)
             .then_some(OneShotReservation(&self.oneshot_budget, size))
     }
 }
@@ -355,7 +418,8 @@ impl<B: CloudBackend> super::Destination for CloudDestination<B> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AtomicI64, CloudDestination, Ordering, normalize_prefix, resolve_oneshot_budget, take_from,
+        AtomicI64, CloudDestination, DEFAULT_ONESHOT_BUDGET_BYTES, Ordering, normalize_prefix,
+        resolve_oneshot_budget, take_from,
     };
     use crate::config::{DestinationConfig, DestinationType};
     use crate::destination::gcs::GcsBackend;
@@ -469,6 +533,57 @@ mod tests {
             !take_from(&doubled, 200 * 1024 * 1024),
             "a 200 MB part still streams under 128 MB"
         );
+    }
+
+    #[test]
+    fn unset_budget_keeps_the_shared_process_wide_pool() {
+        // An unset `oneshot_budget_mb` must NOT give every destination its own
+        // 64 MB (that would silently multiply the default ceiling by the number
+        // of parallel exports).  Two default destinations must share ONE pool:
+        // the first's full-budget reservation empties it for the second.
+        let default_cfg = DestinationConfig {
+            destination_type: DestinationType::Gcs,
+            bucket: Some("rivet-pool-shared".into()),
+            allow_anonymous: true,
+            endpoint: Some("http://127.0.0.1:4443".into()),
+            ..Default::default()
+        };
+        let a = CloudDestination::<GcsBackend>::new_with_retries(&default_cfg, 0).unwrap();
+        let b = CloudDestination::<GcsBackend>::new_with_retries(&default_cfg, 0).unwrap();
+
+        let first = a
+            .reserve_oneshot(DEFAULT_ONESHOT_BUDGET_BYTES as u64)
+            .expect("first destination takes the whole shared 64 MB pool");
+        assert!(
+            b.reserve_oneshot(DEFAULT_ONESHOT_BUDGET_BYTES as u64)
+                .is_none(),
+            "second destination shares the drained pool: the default must not multiply"
+        );
+        drop(first); // release back into the shared pool for sibling tests
+    }
+
+    #[test]
+    fn configured_budget_gives_each_destination_its_own_pool() {
+        // The opt-in shape: an explicit `oneshot_budget_mb` buys a private pool,
+        // so two destinations can both hold a full 64 MB — the multiplication
+        // the operator asked for, not a default side effect.
+        let cfg = DestinationConfig {
+            destination_type: DestinationType::Gcs,
+            bucket: Some("rivet-pool-owned".into()),
+            allow_anonymous: true,
+            endpoint: Some("http://127.0.0.1:4443".into()),
+            oneshot_budget_mb: Some(64),
+            ..Default::default()
+        };
+        let a = CloudDestination::<GcsBackend>::new_with_retries(&cfg, 0).unwrap();
+        let b = CloudDestination::<GcsBackend>::new_with_retries(&cfg, 0).unwrap();
+
+        let _first = a
+            .reserve_oneshot(64 * 1024 * 1024)
+            .expect("a's private pool holds the full 64 MB");
+        let _second = b
+            .reserve_oneshot(64 * 1024 * 1024)
+            .expect("b's own pool is untouched by a: configured budgets do not share");
     }
 
     #[test]

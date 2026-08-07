@@ -47,11 +47,17 @@ pub struct DestinationConfig {
     #[serde(default)]
     pub allow_anonymous: bool,
     /// Cap on the total RAM one-shot (single-PUT) upload buffers may hold, in
-    /// MB. `None` = 64 (the default). A one-shot PUT must buffer the whole part
-    /// in memory so the store can compute and store a content checksum; parts
-    /// that don't fit instead stream (memory-bounded, size-only verification).
-    /// `0` disables one-shot uploads entirely. Applies per destination instance
-    /// (one per export), shared by all of that export's parallel workers.
+    /// MB. `None` (the default) draws from the shared process-wide 64 MB pool —
+    /// the historical behaviour, so N parallel exports do not multiply the
+    /// ceiling. A set value gives THIS destination its own pool of that size
+    /// (N opt-in destinations ⇒ up to N × budget — the operator's choice).
+    /// `0` disables one-shot uploads entirely (every part streams, size-only
+    /// verification). A one-shot PUT must buffer the whole part in memory so the
+    /// store can compute and store a content checksum; parts that don't fit the
+    /// budget instead stream (memory-bounded). Applies per destination *instance*
+    /// — the sequential chunked runner creates one instance per chunk, so a
+    /// private pool re-arms each chunk there (harmless: only one instance is
+    /// live at a time).
     #[serde(default)]
     pub oneshot_budget_mb: Option<u64>,
 }

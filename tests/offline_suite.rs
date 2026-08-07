@@ -42,6 +42,8 @@ mod format_fuzz;
 mod mssql_column_data_fixture_guard;
 #[path = "offline/mysql_wire_type_fixture_guard.rs"]
 mod mysql_wire_type_fixture_guard;
+#[path = "offline/oneshot_budget.rs"]
+mod oneshot_budget;
 #[path = "offline/perf_matrix_guard.rs"]
 mod perf_matrix_guard;
 #[path = "offline/planner_fuzz.rs"]
