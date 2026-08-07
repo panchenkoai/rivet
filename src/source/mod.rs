@@ -616,6 +616,26 @@ mod tls_gate_tests {
     use super::{host_is_loopback, host_port_span, require_tls_or_loopback};
     use crate::config::{TlsConfig, TlsMode};
 
+    /// The marker must be REACHABLE (downcast finds it on the chain) and must
+    /// SAY something (a `Display` stubbed to nothing turns `{:#}` chains into
+    /// a trailing colon and empty segment). Both halves lib-side, where the
+    /// marker lives — init's flag-naming remedy is tested bin-side.
+    #[test]
+    fn tls_required_error_is_downcastable_and_self_describing() {
+        let err = require_tls_or_loopback("mysql://u:p@203.0.113.9/db", None)
+            .expect_err("remote + no tls refuses");
+        assert!(
+            err.chain()
+                .any(|c| c.downcast_ref::<super::TlsRequiredError>().is_some()),
+            "the refusal must carry the typed marker"
+        );
+        let display = format!("{}", super::TlsRequiredError);
+        assert!(
+            display.contains("TLS required"),
+            "the marker's own text must name the policy: {display:?}"
+        );
+    }
+
     #[test]
     fn loopback_variants_are_loopback() {
         assert!(host_is_loopback(
