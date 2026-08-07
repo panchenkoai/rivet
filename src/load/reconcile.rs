@@ -480,10 +480,32 @@ fn ensure_single_source(keyed: &[(String, RunManifest)]) -> Result<()> {
     // filter that required a table dropped both sides and the guard stayed
     // silent on the very case it was written for. Only a manifest with no engine
     // at all has nothing to compare.
+    //
+    // …and that same `table: null` is why a coarser identity must not count as
+    // a DIFFERENT one. The CDC `initial: snapshot` leg is a synthesized BATCH
+    // export writing into the drain's own prefix by design, so it records
+    // `table: null` → `mysql`, while the drain records the table →
+    // `mysql:cashback_versions`. Comparing the two strings refused the
+    // ordinary snapshot → drain → load flow at the load step, on a prefix
+    // holding one table from one database (reproduced on the CDC pilot against
+    // 0.24.3: 5 drain manifests + 2 snapshot-leg manifests). `mysql` there
+    // means "this engine, table unrecorded" — an UNKNOWN, and an unknown is
+    // not evidence of a second source. Refuse only on evidence: a different
+    // engine, or two different NAMED tables. (The same blind spot as the
+    // export-family fold in #138, in the identity this guard added.)
     let sources: std::collections::BTreeSet<String> = keyed
         .iter()
         .map(|(_, m)| crate::manifest::identity_source(m))
         .filter(|s| !s.is_empty())
+        .filter(|s| {
+            // Drop an identity that is a strict PREFIX (at a segment boundary)
+            // of some other identity present — it is the same source, recorded
+            // with less detail.
+            !keyed.iter().any(|(_, other)| {
+                let o = crate::manifest::identity_source(other);
+                o.len() > s.len() && o.starts_with(s.as_str()) && o.as_bytes()[s.len()] == b':'
+            })
+        })
         .collect();
     if sources.len() > 1 {
         let listed: Vec<&str> = sources.iter().map(String::as_str).collect();
@@ -732,6 +754,69 @@ mod tests {
             ensure_single_export(&[keyed(pg), keyed(again)]).is_ok(),
             "repeated runs of one export must not be refused — that is the normal load"
         );
+    }
+
+    /// Regression (0.24.3, found on the CDC pilot): the SOURCE guard had the
+    /// same blind spot the export guard had — and refused the same flow, one
+    /// check later.
+    ///
+    /// The `initial: snapshot` leg is a synthesized BATCH export, and a batch
+    /// manifest records `table: null` (the table lives in the plan), so its
+    /// identity is the bare engine `mysql` while the drain's is
+    /// `mysql:orders`. Two strings, one source. Measured on a real prefix: 5
+    /// drain manifests + 2 snapshot-leg manifests ⇒ "manifests from 2
+    /// DIFFERENT SOURCES (mysql, mysql:cashback_versions)", and the pilot's
+    /// documented snapshot → drain → load flow could not load.
+    ///
+    /// A coarser identity is an UNKNOWN, not a second source. Refuse on
+    /// evidence — a different engine, or two different NAMED tables.
+    #[test]
+    fn ensure_single_source_admits_the_batch_legs_unrecorded_table() {
+        let keyed = |m: RunManifest| ("gs://b/p/manifest-x.json".to_string(), m);
+        let mut drain = manifest("r1", 10, None);
+        drain.source.engine = "mysql".into();
+        drain.source.table = Some("orders".into());
+        // The snapshot leg: same engine, table unrecorded (batch manifest).
+        let mut snap = manifest("r2", 10, None);
+        snap.source.engine = "mysql".into();
+        snap.source.table = None;
+        snap.export_name = drain.export_name.clone();
+        assert!(
+            ensure_single_export(&[keyed(drain.clone()), keyed(snap.clone())]).is_ok(),
+            "the batch leg's unrecorded table is the SAME source, less detail"
+        );
+        // Order must not matter.
+        assert!(ensure_single_export(&[keyed(snap.clone()), keyed(drain.clone())]).is_ok());
+
+        // What the guard was written for still fires: a different ENGINE…
+        let mut pg = manifest("r3", 10, None);
+        pg.source.engine = "postgres".into();
+        pg.source.table = Some("orders".into());
+        pg.export_name = drain.export_name.clone();
+        assert!(
+            ensure_single_export(&[keyed(drain.clone()), keyed(pg)]).is_err(),
+            "two engines under one name is still two sources"
+        );
+        // …and two different NAMED tables of one engine.
+        let mut other_tbl = manifest("r4", 10, None);
+        other_tbl.source.engine = "mysql".into();
+        other_tbl.source.table = Some("customers".into());
+        other_tbl.export_name = drain.export_name.clone();
+        assert!(
+            ensure_single_export(&[keyed(drain), keyed(other_tbl)]).is_err(),
+            "two named tables under one name is still two sources"
+        );
+        // A bare engine that is a prefix of NOTHING present is still its own
+        // identity — two unrecorded-table manifests from different engines
+        // must not silently pass.
+        let mut bare_my = manifest("r5", 10, None);
+        bare_my.source.engine = "mysql".into();
+        bare_my.source.table = None;
+        let mut bare_pg = manifest("r6", 10, None);
+        bare_pg.source.engine = "postgres".into();
+        bare_pg.source.table = None;
+        bare_pg.export_name = bare_my.export_name.clone();
+        assert!(ensure_single_export(&[keyed(bare_my), keyed(bare_pg)]).is_err());
     }
 
     /// Regression: the CDC `initial: snapshot` leg shares the drain's prefix BY
