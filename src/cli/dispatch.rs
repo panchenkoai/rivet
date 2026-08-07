@@ -1295,7 +1295,7 @@ fn execute_load<R>(
     done: impl FnOnce(&LoadInputs, &R),
 ) -> Result<Option<R>> {
     let store = load::open_store(&job.plan.destination)?;
-    let loader = load::build_loader(job.plan, job.run_id);
+    let loader = load::build_loader(job.plan, job.run_id, &store);
     let target_fqtn = loader.fqtn(&job.plan.table);
     let mut ctx = LoadCtx {
         state: job.state,
