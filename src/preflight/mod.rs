@@ -245,6 +245,36 @@ pub fn check(
         config.exports.iter().collect()
     };
 
+    // A preflight must never bless a config the RUNNER refuses.
+    //
+    // `check` resolved its own view of the strategy and printed `Verdict:
+    // ACCEPTABLE` for two shapes `plan::build` bails on — `query:` (no
+    // `table:`) with `chunk_size_memory_mb`, and the same with `chunk_by_key`.
+    // The operator reads ACCEPTABLE, schedules the export, and the run refuses
+    // the file: the trust the preflight exists to earn is spent on something
+    // that cannot run. Asking the planner's own rule (one function, both
+    // callers) is what keeps the two from drifting again — a re-implemented
+    // copy here would be a second definition, and it would drift on the first
+    // change.
+    //
+    // Reported BEFORE the engine probe: the config is illegal on its face, so
+    // connecting to say so would only delay the answer (and fail differently
+    // when the source is unreachable).
+    let illegal: Vec<String> = exports
+        .iter()
+        .filter(|e| e.mode == crate::config::ExportMode::Chunked)
+        .filter_map(|e| crate::plan::build::chunked_without_table_error(e))
+        .collect();
+    if !illegal.is_empty() {
+        for why in &illegal {
+            eprintln!("✗ {why}");
+        }
+        anyhow::bail!(
+            "rivet check: {} export(s) cannot be planned — `rivet run` would refuse this config",
+            illegal.len()
+        );
+    }
+
     let url = config.source.resolve_url()?;
     let tls = config.source.tls.as_ref();
     // Surface the plaintext-transport warning at preflight time too —
