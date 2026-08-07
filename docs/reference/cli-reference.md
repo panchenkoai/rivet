@@ -334,6 +334,19 @@ Generate a config scaffold from a live database (connect + introspect)
 * `--gcs-credentials-file <PATH>` — Optional path for `credentials_file:` on GCS scaffolds. Omit entirely to use ADC (`gcloud auth application-default login`) or `GOOGLE_APPLICATION_CREDENTIALS` — no key in YAML
 * `--s3-bucket <NAME>` — Scaffold `destination: type: s3` with this bucket (each export gets `prefix: exports/<table>/`). Incompatible with `--gcs-bucket` and `--discover`
 * `--s3-region <REGION>` — Optional AWS region for S3 scaffolds (when using `--s3-bucket`)
+* `--tls <MODE>` — TLS posture for BOTH the introspection connection init opens AND the `source.tls:` block written into the scaffold. Required (or `disable`, explicitly) for any non-loopback host — without it the TLS gate refuses before connecting, and at init time there is no config file to add a `tls:` block to yet
+
+  Possible values:
+  - `disable`:
+    Plaintext. Use only inside trusted networks (loopback, cgroup-private)
+  - `require`:
+    Require a TLS handshake; accept the server certificate without verifying issuer or hostname. Protects against passive sniffing, not MITM
+  - `verify-ca`:
+    TLS + verify certificate chains to the configured / system trust store. Does not check hostname (useful for IP-addressed or internal names)
+  - `verify-full`:
+    TLS + verify chain **and** hostname against the server cert's SAN/CN. Recommended default for production
+
+* `--tls-ca <PATH>` — PEM CA certificate for `--tls verify-ca` / `verify-full` against a private CA; written into the scaffold as `ca_file:`. Refused with `disable`/`require`, where it would be silently meaningless
 
 
 

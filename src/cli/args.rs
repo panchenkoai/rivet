@@ -308,6 +308,18 @@ pub enum Commands {
         /// Optional AWS region for S3 scaffolds (when using `--s3-bucket`).
         #[arg(long = "s3-region", value_name = "REGION", requires = "s3_bucket")]
         s3_region: Option<String>,
+        /// TLS posture for BOTH the introspection connection init opens AND the
+        /// `source.tls:` block written into the scaffold. Required (or `disable`,
+        /// explicitly) for any non-loopback host — without it the TLS gate
+        /// refuses before connecting, and at init time there is no config file
+        /// to add a `tls:` block to yet.
+        #[arg(long, value_enum, value_name = "MODE")]
+        tls: Option<crate::config::TlsMode>,
+        /// PEM CA certificate for `--tls verify-ca` / `verify-full` against a
+        /// private CA; written into the scaffold as `ca_file:`. Refused with
+        /// `disable`/`require`, where it would be silently meaningless.
+        #[arg(long = "tls-ca", value_name = "PATH", requires = "tls")]
+        tls_ca: Option<String>,
     },
     /// Generate an execution plan artifact (no data exported)
     Plan {

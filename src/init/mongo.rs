@@ -18,8 +18,8 @@ use crate::source::mongo::MongoSession;
 
 /// Connect once (ungated) so one session serves the whole `list_tables` +
 /// per-collection `introspect` scan.
-pub(super) fn connect(url: &str) -> Result<MongoSession> {
-    MongoSession::connect(url, None, false)
+pub(super) fn connect(url: &str, tls: Option<&crate::config::TlsConfig>) -> Result<MongoSession> {
+    MongoSession::connect(url, tls, false)
 }
 
 /// List the user collections in the URL's database, skipping the internal

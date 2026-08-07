@@ -143,6 +143,8 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             gcs_credentials_file,
             s3_bucket,
             s3_region,
+            tls,
+            tls_ca,
         } => dispatch_init(
             source,
             source_env,
@@ -158,6 +160,8 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             gcs_credentials_file,
             s3_bucket,
             s3_region,
+            tls,
+            tls_ca,
         ),
         Commands::Plan {
             config,
@@ -531,6 +535,8 @@ fn dispatch_init(
     gcs_credentials_file: Option<String>,
     s3_bucket: Option<String>,
     s3_region: Option<String>,
+    tls: Option<crate::config::TlsMode>,
+    tls_ca: Option<String>,
 ) -> Result<()> {
     if let Some(m) = mode.as_deref()
         && !matches!(
@@ -555,6 +561,7 @@ fn dispatch_init(
         s3_region,
     };
     let filter = init::TableFilter { include, exclude };
+    let tls_config = resolve_init_tls(tls, tls_ca)?;
     init::init(
         &source_url,
         &provenance,
@@ -565,7 +572,60 @@ fn dispatch_init(
         yaml_dest,
         &filter,
         mode.as_deref(),
+        tls_config.as_ref(),
     )
+    .map_err(|e| {
+        // The shared TLS gate prescribes a `source.tls:` config block — a
+        // remedy that does not EXIST at init time, because init is the command
+        // that creates the config. Recognized by TYPE (never by matching the
+        // message text) and re-prescribed as the flag (#146).
+        if e.chain().any(|c| {
+            c.downcast_ref::<crate::source::TlsRequiredError>()
+                .is_some()
+        }) {
+            e.context(
+                "rivet init has no config file to add a `tls:` block to (it generates one) — \
+                 re-run with `--tls verify-full` (add `--tls-ca <pem>` for a private CA), or \
+                 `--tls disable` if this network path is already trusted; the chosen posture \
+                 is written into the scaffold's `source.tls:` block",
+            )
+        } else {
+            e
+        }
+    })
+}
+
+/// `--tls` / `--tls-ca` → the [`TlsConfig`] init connects with and scaffolds.
+///
+/// PURE so both directions are offline-testable: a CA with a mode that cannot
+/// use one (`disable` / `require`) is refused loudly — silently ignoring it
+/// would let an operator believe their private CA is being verified while the
+/// connection skips verification entirely (#146).
+fn resolve_init_tls(
+    mode: Option<crate::config::TlsMode>,
+    ca: Option<String>,
+) -> Result<Option<crate::config::TlsConfig>> {
+    use crate::config::TlsMode;
+    let Some(mode) = mode else {
+        // clap enforces `--tls-ca requires --tls`, so ca is None here too.
+        return Ok(None);
+    };
+    if ca.is_some() && matches!(mode, TlsMode::Disable | TlsMode::Require) {
+        anyhow::bail!(
+            "--tls-ca is meaningless with `--tls {}`: that mode never verifies the server \
+             certificate, so the CA would be silently ignored. Use `--tls verify-ca` or \
+             `--tls verify-full` (or drop --tls-ca).",
+            match mode {
+                TlsMode::Disable => "disable",
+                _ => "require",
+            }
+        );
+    }
+    Ok(Some(crate::config::TlsConfig {
+        mode,
+        ca_file: ca,
+        ..Default::default()
+    }))
 }
 
 fn dispatch_plan(
@@ -1813,5 +1873,71 @@ mod load_ledger_tests {
         c.record_success(&["r1".into()], 3);
         c.record_skip();
         c.record_failed(&["r2".into()]);
+    }
+}
+
+#[cfg(test)]
+mod init_tls_tests {
+    use super::resolve_init_tls;
+    use crate::config::TlsMode;
+
+    /// Both directions of the pure resolver — an over-strict and an
+    /// under-strict `--tls-ca` handling are the same bug from opposite sides.
+    #[test]
+    fn tls_ca_pairs_only_with_verifying_modes() {
+        for mode in [TlsMode::VerifyCa, TlsMode::VerifyFull] {
+            let t = resolve_init_tls(Some(mode), Some("/ca.pem".into()))
+                .expect("verifying mode + CA is the intended pairing")
+                .expect("some config");
+            assert_eq!(t.ca_file.as_deref(), Some("/ca.pem"));
+        }
+        for mode in [TlsMode::Disable, TlsMode::Require] {
+            let err = resolve_init_tls(Some(mode), Some("/ca.pem".into()))
+                .expect_err("a CA that would be silently ignored must be refused");
+            assert!(err.to_string().contains("--tls-ca"), "{err}");
+        }
+        assert!(resolve_init_tls(None, None).unwrap().is_none());
+        // A bare mode carries no CA and no other TlsConfig noise.
+        let t = resolve_init_tls(Some(TlsMode::Disable), None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(t.mode, TlsMode::Disable);
+        assert!(t.ca_file.is_none() && !t.accept_invalid_certs);
+    }
+
+    /// The TLS gate's remedy, as `rivet init` sees it: a config-block
+    /// prescription is unreachable from the command that CREATES the config,
+    /// so init's dispatch must re-prescribe the FLAG. Recognized by TYPE via
+    /// the gate's marker error — this test goes through the real dispatch and
+    /// the real gate (TEST-NET address: the refusal fires before any socket).
+    #[test]
+    fn init_against_a_remote_host_names_the_flag_not_the_config_block() {
+        let err = super::dispatch_init(
+            Some("mysql://u:p@203.0.113.9:3306/db".into()),
+            None,
+            None,
+            None,
+            None,
+            vec![],
+            vec![],
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect_err("remote + no --tls must refuse");
+        let text = format!("{err:#}");
+        assert!(text.contains("--tls verify-full"), "{text}");
+        assert!(
+            err.chain().any(|c| c
+                .downcast_ref::<crate::source::TlsRequiredError>()
+                .is_some()),
+            "the refusal must carry the typed marker, not just prose"
+        );
     }
 }

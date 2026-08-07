@@ -190,7 +190,13 @@ jobs:
           git diff "origin/${{ github.base_ref }}"...HEAD > pr.diff
           # Exit code 2 = missed mutants (the gate's failure); 0 = all caught
           # or nothing to mutate in this diff.
-          cargo mutants --in-diff pr.diff -j 2 -- --lib
+          # --lib AND --bins: half this crate lives in the BINARY target
+          # (src/init, src/cli, declared in main.rs), so a lib-only mutation
+          # run reports the bin crate's unit tests as nonexistent — PR #154's
+          # first run scored 35/47 MISSED while direct unit tests for most of
+          # those mutants sat green in `cargo test --bin rivet`. Scope honesty:
+          # measure against every offline test target, then triage what's left.
+          cargo mutants --in-diff pr.diff -j 2 -- --lib --bins
 
   test:
     name: Tests

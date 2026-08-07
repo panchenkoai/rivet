@@ -46,8 +46,11 @@ pub(super) fn resolve_database_for_listing(url: &str, schema_cli: Option<&str>) 
 /// pool gets the lean constraints (no eager pre-connections). `init` runs
 /// before any YAML `tls:` block exists (it *generates* the config), so the
 /// connection stays plaintext, relying on the driver's own URL parsing.
-pub(super) fn connect(url: &str) -> Result<mysql::PooledConn> {
-    let pool = crate::source::mysql::connect_pool(url, None)?;
+pub(super) fn connect(
+    url: &str,
+    tls: Option<&crate::config::TlsConfig>,
+) -> Result<mysql::PooledConn> {
+    let pool = crate::source::mysql::connect_pool(url, tls)?;
     Ok(pool.get_conn()?)
 }
 

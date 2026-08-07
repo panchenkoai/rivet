@@ -12,12 +12,31 @@ use super::{ColumnInfo, TableInfo};
 /// config), so the transport-security policy comes from the URL's `sslmode`
 /// parameter; the connection itself goes through the same
 /// [`crate::source::postgres::connect_client`] path as doctor/check/run.
-pub(super) fn connect(url: &str) -> Result<Client> {
-    let tls = tls_mode_from_url(url).map(|mode| TlsConfig {
+pub(super) fn connect(url: &str, tls: Option<&TlsConfig>) -> Result<Client> {
+    // An explicit `--tls` flag WINS over the URL's `sslmode` — the flag is the
+    // operator's direct statement, the URL parameter an inherited convention.
+    let from_url;
+    let tls = match tls {
+        Some(t) => Some(t),
+        None => {
+            from_url = tls_from_url(url);
+            from_url.as_ref()
+        }
+    };
+    crate::source::postgres::connect_client(url, tls)
+}
+
+/// The URL's `sslmode`, as the [`TlsConfig`] the connection actually uses.
+///
+/// Split from `connect` (which needs a live server) so the CONSTRUCTION is
+/// unit-testable: the mutation gate showed `mode` could be dropped from this
+/// struct and nothing offline noticed — the URL's posture would silently fall
+/// back to the default.
+fn tls_from_url(url: &str) -> Option<TlsConfig> {
+    tls_mode_from_url(url).map(|mode| TlsConfig {
         mode,
         ..TlsConfig::default()
-    });
-    crate::source::postgres::connect_client(url, tls.as_ref())
+    })
 }
 
 /// Map the URL's `sslmode` query parameter to the [`TlsMode`] the shared TLS
@@ -148,6 +167,22 @@ pub(super) fn introspect(client: &mut Client, schema: &str, table: &str) -> Resu
 
 #[cfg(test)]
 mod tests {
+    /// The struct the URL's sslmode becomes must CARRY the mode — dropping the
+    /// field compiles (struct-update syntax fills the default) and silently
+    /// downgrades the posture. Named by the mutation gate on #154.
+    #[test]
+    fn url_sslmode_lands_in_the_config_it_builds() {
+        use crate::config::TlsMode;
+        // `require`, deliberately NOT `verify-full`: VerifyFull is TlsMode's
+        // `#[default]`, so a fixture equal to the default cannot see the
+        // delete-field mutant (struct-update fills the default back in) — the
+        // below-activation-threshold fixture lesson, caught on the first try.
+        let t = super::tls_from_url("postgresql://u:p@h/db?sslmode=require").expect("require maps");
+        assert_eq!(t.mode, TlsMode::Require);
+        assert!(!t.accept_invalid_certs && t.ca_file.is_none());
+        assert!(super::tls_from_url("postgresql://u:p@h/db").is_none());
+    }
+
     use super::tls_mode_from_url;
     use crate::config::TlsMode;
 
