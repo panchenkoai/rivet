@@ -37,4 +37,12 @@ exclude_re = [
     # RED-proven); the dispatch itself is live-guarded (query_scalar feeds
     # min/max bounds exercised by the live planner suites).
     "replace scalar_to_string -> Option<String>",
+    # refuse_compressed_binlog takes a live `mysql::Conn` to read
+    # @@global.binlog_transaction_compression — there is no offline caller, so a
+    # body stub is unkillable HERE by construction. The DECISION it makes was
+    # split out into `compression_refusal` (both directions unit-tested and
+    # RED-proven against `delete !`), and the read itself is live-guarded by
+    # mysql_cdc_refuses_a_compressed_binlog_instead_of_capturing_nothing, which
+    # flips the server global and asserts the run fails.
+    "replace refuse_compressed_binlog -> Result<\\(\\)> with Ok\\(\\(\\)\\)",
 ]

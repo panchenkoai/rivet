@@ -150,7 +150,9 @@ impl MysqlChangeStream {
         } else {
             None
         };
-        let conn = connect_conn(url, tls)?;
+        let mut conn = connect_conn(url, tls)?;
+        // Refuse a compressed binlog rather than read past it in silence.
+        refuse_compressed_binlog(&mut conn)?;
         let mut req = BinlogRequest::new(server_id)
             .with_filename(file.clone().into_bytes())
             .with_pos(pos);
@@ -377,6 +379,67 @@ impl MysqlChangeStream {
     }
 }
 
+/// Refuse to stream when the source packs transactions into
+/// `Transaction_payload_event` (MySQL 8.0.20+ `binlog_transaction_compression`).
+///
+/// This reader matches `Rotate`/`TableMap`/`Rows`/`Xid` and ignores anything
+/// else, so with compression ON every row event — they are all inside the
+/// payload — is skipped WITHOUT A WORD: the run reports success having
+/// captured nothing, and a bounded pipeline then reports "no changes" forever
+/// while the destination never receives a row. Measured on MySQL 8.0.46:
+/// anchor, insert two rows, resume ⇒ 0 of 2 events captured, empty stderr.
+///
+/// Compression is a natural thing for a DBA to enable (it shrinks the binlog
+/// 50-75% and the replication traffic with it), which is exactly why this
+/// must fail loudly instead of degrading. Expanding the payload is a
+/// supportable feature — `mysql_common` already ships
+/// `TransactionPayloadEvent::decompressed()` and
+/// `EventStreamReader::read_decompressed()`, and the inner events carry the
+/// OUTER payload's `end_log_pos`, so the commit-position semantics carry over
+/// unchanged — but until that lands, refusing is the only honest option.
+fn refuse_compressed_binlog(conn: &mut Conn) -> Result<()> {
+    // Pre-8.0.20 servers (and MariaDB) have no such variable: the query errors
+    // or returns nothing, and both mean "not compressed". Never let the ABSENCE
+    // of the setting block a source that cannot have the problem.
+    let raw: Option<String> = conn
+        .query_first("SELECT @@global.binlog_transaction_compression")
+        .ok()
+        .flatten();
+    compression_refusal(raw.as_deref())
+}
+
+/// The verdict on the server's reply, split from the connection so both
+/// DIRECTIONS are testable offline. Folded into `refuse_compressed_binlog` this
+/// was a `!` that only a live server could flip: deleting it (refuse when the
+/// binlog is PLAIN, stream when it is compressed — the exact inversion of the
+/// guard) survived the whole offline suite while breaking every MySQL CDC run.
+fn compression_refusal(raw: Option<&str>) -> Result<()> {
+    if !binlog_compression_is_on(raw) {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "mysql cdc: the source has binlog_transaction_compression = ON, and this reader cannot \
+         expand a Transaction_payload_event — it would capture NOTHING and report success. \
+         Turn it off for the replica rivet reads (SET GLOBAL binlog_transaction_compression = OFF; \
+         and remove it from my.cnf), then re-run. To shrink the binlog instead, cut RETENTION \
+         (binlog_expire_logs_seconds, or `CALL mysql.rds_set_configuration('binlog retention \
+         hours', N)` on RDS) — rivet's bounded cycle keeps lag at minutes, so retention only has \
+         to cover the longest outage you want to survive."
+    )
+}
+
+/// Whether the server's reply to `@@global.binlog_transaction_compression`
+/// means ON. MySQL renders a boolean system variable as `1`/`0` over the text
+/// protocol, but `ON`/`OFF` is what a human sees and what some proxies pass
+/// through — accept both, and treat anything unrecognized as OFF so a reply
+/// shape we did not anticipate cannot block a healthy source.
+fn binlog_compression_is_on(raw: Option<&str>) -> bool {
+    matches!(
+        raw.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("1") | Some("on") | Some("true")
+    )
+}
+
 /// Connect a MySQL `Conn`, applying the same TLS gate the batch path uses —
 /// refuse remote plaintext (CWE-319), and map an enforced `TlsConfig` to the
 /// driver's SSL options (`super::build_mysql_ssl_opts`).
@@ -517,6 +580,49 @@ impl ChangeStream for MysqlChangeStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The compression guard's decision, offline. Anything unrecognized — an
+    /// absent variable (pre-8.0.20, MariaDB), an empty reply, a shape we did
+    /// not anticipate — must read as OFF: the guard exists to stop a silent
+    /// LOSS, and blocking a healthy source because a reply looked unfamiliar
+    /// would be its own outage.
+    #[test]
+    fn binlog_compression_is_recognized_in_both_renderings_and_fails_open() {
+        for on in ["1", "ON", "on", " on ", "TRUE"] {
+            assert!(binlog_compression_is_on(Some(on)), "{on:?} means ON");
+        }
+        for off in ["0", "OFF", "off", "", "NONE", "ZSTD_unexpected"] {
+            assert!(
+                !binlog_compression_is_on(Some(off)),
+                "{off:?} must not block"
+            );
+        }
+        assert!(
+            !binlog_compression_is_on(None),
+            "no such variable (pre-8.0.20 / MariaDB) is not a compressed source"
+        );
+    }
+
+    /// The predicate above says what the reply MEANS; this says what the guard
+    /// DOES with it, which is the half a live server used to hold hostage. Both
+    /// directions, because a guard that refuses everything and a guard that
+    /// refuses nothing are the same bug from opposite sides — deleting the `!`
+    /// turns one into the other and this is what notices.
+    #[test]
+    fn compression_refusal_blocks_a_compressed_binlog_and_only_that() {
+        let err = compression_refusal(Some("ON")).expect_err("ON must refuse");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("binlog_transaction_compression") && msg.contains("capture NOTHING"),
+            "the refusal must name the setting and the harm: {msg}"
+        );
+        for ok in [Some("OFF"), Some("0"), Some(""), None] {
+            assert!(
+                compression_refusal(ok).is_ok(),
+                "{ok:?} is not a compressed binlog — the run must proceed"
+            );
+        }
+    }
 
     // The `mysql-cdc` instance (cdc profile, :3307) — binlog + a REPLICATION grant.
     const URL: &str = "mysql://rivet:rivet@127.0.0.1:3307/rivet";

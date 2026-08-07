@@ -4684,3 +4684,163 @@ fn roast_pg_cdc_destination_placeholders_resolve_like_the_batch_path() {
         literal.display()
     );
 }
+
+/// The binlog-compression guard, live.
+///
+/// `binlog_transaction_compression` (MySQL 8.0.20+) packs a transaction's
+/// `TableMap`/`Rows`/`Xid` into one `Transaction_payload_event`. This reader
+/// matches those event types individually and ignores everything else, so with
+/// compression ON it captures NOTHING and says nothing — measured on 8.0.46:
+/// anchor, insert two rows, resume ⇒ 0 of 2 events, empty stderr. That is the
+/// worst shape a CDC bug can take, and the operator's own instinct (shrink the
+/// binlog) is what triggers it.
+///
+/// Until the payload is expanded, the run must REFUSE.
+///
+/// RUNS AGAINST THE BATCH MYSQL (:3306), NOT THE CDC ONE, and that is the point
+/// rather than an accident. The setting is a server GLOBAL, so while this test
+/// holds it ON every concurrent reader of that server's binlog is refused too —
+/// and `cargo test` runs the file's 30-odd CDC tests in parallel against :3307.
+/// The first CI run proved it: `cdc_update_and_delete_carry_full_types` failed
+/// with THIS guard's message, 553 passed / 1 failed, and nothing was wrong with
+/// either test. The Drop guard restores the setting but cannot help a test that
+/// is already mid-run.
+///
+/// :3306 has `log_bin=ON` and `binlog_format=ROW` (MySQL 8 defaults) — so the
+/// guard's subject exists — while nothing in the suite reads its binlog
+/// (`Rig::mysql_cdc` is wired to `MYSQL_CDC_URL`; only `mysql_batch` uses this
+/// one, and a batch SELECT does not care how the binlog is packed). Isolating
+/// the fixture removes the shared mutable state; serialising 60 call sites
+/// behind a lock would only coordinate it, and slow every CDC test to do so.
+///
+/// It connects as ROOT, unlike every other test here, because the batch stand
+/// grants `rivet` only `ALL ON rivet.*` — `dev/mysql/init.sql` hands out no
+/// REPLICATION SLAVE / REPLICATION CLIENT, so a CDC open as `rivet` dies with
+/// ERROR 1227 BEFORE it can reach the compression guard, and the test would
+/// assert on the wrong refusal. (A locally-hand-granted container hides this:
+/// the first CI run after the move failed on exactly that gap. Widening the
+/// stand's grants would be the other fix, and the wrong one — it hands every
+/// batch test a privilege it must not need.) Root is what the compose file
+/// declares, so it exists everywhere the suite runs.
+///
+/// The restore guard stays anyway: a panic here must not leave a server global
+/// flipped for whatever runs next.
+#[test]
+#[ignore = "live: requires docker compose up -d mysql (:3306, log_bin=ON)"]
+fn mysql_cdc_refuses_a_compressed_binlog_instead_of_capturing_nothing() {
+    let root_url = MYSQL_URL.replace("rivet:rivet@", "root:rivet@");
+    let mut admin = match mysql::Conn::new(mysql::Opts::from_url(&root_url).unwrap()) {
+        Ok(c) => c,
+        Err(e) => panic!("cdc-profile MySQL admin connection: {e}"),
+    };
+    // Pre-8.0.20 servers have no such variable — the guard is a no-op there and
+    // so is this test. Skip rather than fail: the engine cannot have the bug.
+    let supported: Option<String> = admin
+        .query_first("SELECT @@global.binlog_transaction_compression")
+        .ok()
+        .flatten();
+    if supported.is_none() {
+        eprintln!("skip: server has no binlog_transaction_compression (pre-8.0.20)");
+        return;
+    }
+
+    struct CompressionGuard(String);
+    impl Drop for CompressionGuard {
+        fn drop(&mut self) {
+            if let Ok(mut c) = mysql::Conn::new(mysql::Opts::from_url(&self.0).unwrap()) {
+                let _ = c.query_drop("SET GLOBAL binlog_transaction_compression = OFF");
+            }
+        }
+    }
+    admin
+        .query_drop("SET GLOBAL binlog_transaction_compression = ON")
+        .expect("set global binlog_transaction_compression");
+    let _restore = CompressionGuard(root_url.clone());
+
+    let tbl = unique_name("cdc_compressed");
+    // Everything in this test talks to :3306 — the isolated server, see above.
+    let batch_conn =
+        || mysql::Conn::new(mysql::Opts::from_url(MYSQL_URL).unwrap()).expect("batch mysql");
+    let mut c = batch_conn();
+    c.query_drop(format!("DROP TABLE IF EXISTS {tbl}")).unwrap();
+    c.query_drop(format!("CREATE TABLE {tbl} (id INT PRIMARY KEY, v INT)"))
+        .unwrap();
+    struct BatchTable(String);
+    impl Drop for BatchTable {
+        fn drop(&mut self) {
+            if let Ok(mut c) = mysql::Conn::new(mysql::Opts::from_url(MYSQL_URL).unwrap()) {
+                let _ = c.query_drop(format!("DROP TABLE IF EXISTS {}", self.0));
+            }
+        }
+    }
+    let _guard = BatchTable(tbl.clone());
+
+    let d = tempfile::tempdir().unwrap();
+    let out = d.path().join("out");
+    let ckpt = d.path().join("cdc.ckpt");
+    std::fs::create_dir_all(&out).unwrap();
+
+    // `cdc_config` (the file's shared helper) points at :3307; every run here
+    // must go to the isolated :3306 instead, so the config is built locally.
+    let cfg_into = |dest: &std::path::Path| {
+        write_config(
+            &d,
+            &Rig::mysql_cdc(&tbl)
+                .source_url(&root_url)
+                .checkpoint_path(ckpt.clone())
+                .dest_path(dest.to_path_buf())
+                .yaml(),
+        )
+    };
+    // The refusal must come from the OPEN, before any capture claim — so it
+    // fires on the anchoring run, not only once changes exist.
+    let cfg = cfg_into(&out);
+    let out_text = {
+        let o = run_rivet(&["run", "--config", cfg.to_str().unwrap()]);
+        assert!(
+            !o.status.success(),
+            "a compressed binlog must FAIL the run, not capture nothing:\n{}",
+            String::from_utf8_lossy(&o.stdout)
+        );
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&o.stdout),
+            String::from_utf8_lossy(&o.stderr)
+        )
+    };
+    assert!(
+        out_text.contains("binlog_transaction_compression"),
+        "the refusal must name the setting so it is actionable:\n{out_text}"
+    );
+
+    // And with the setting off again the SAME table captures normally —
+    // proving the guard is the only thing that blocked it, not the fixture.
+    // A dir per run, like every other CDC test here: two runs into one prefix
+    // is the clobber scenario, not the capture assertion.
+    drop(_restore);
+    admin
+        .query_drop("SET GLOBAL binlog_transaction_compression = OFF")
+        .unwrap();
+    let out1 = d.path().join("out1");
+    let out2 = d.path().join("out2");
+    std::fs::create_dir_all(&out1).unwrap();
+    std::fs::create_dir_all(&out2).unwrap();
+    run_rivet_ok(&cfg_into(&out1)); // anchors
+    // A FRESH connection for the write. `binlog_transaction_compression` is
+    // captured into the SESSION at connect time, so `c` — opened while the
+    // global was ON — still writes compressed transactions no matter what the
+    // global says now. (The first version of this test used `c` here and
+    // captured 0 rows: an accidental second demonstration of the very bug the
+    // guard exists for, and the same session-state trap the timezone test
+    // above documents.)
+    let mut fresh = batch_conn();
+    fresh
+        .query_drop(format!("INSERT INTO {tbl} VALUES (1, 10), (2, 20)"))
+        .unwrap();
+    run_rivet_ok(&cfg_into(&out2));
+    assert_eq!(
+        manifest_rows(&out2),
+        2,
+        "with compression off the same table must capture both rows"
+    );
+}
