@@ -61,6 +61,35 @@ impl RunnerFrame {
         let f = Self::open(plan)?;
         Ok((std::sync::Arc::new(f.dest), f.ext))
     }
+
+    /// A destination + extension for a PER-ITERATION writer (each chunk / each
+    /// worker), where the cross-shape guard has ALREADY fired at run start.
+    ///
+    /// The guard is a run-start concern: it reads the prefix's existing
+    /// `manifest.json` to refuse a cross-shape overwrite. Re-running it on every
+    /// chunk is one remote GET per chunk for an answer that cannot change mid-run
+    /// — a 3000-chunk GCS export would pay 3000 serialized GETs (bug-hunt
+    /// 2026-08-08). The first `RunnerFrame::open` conversion over-applied the
+    /// guard to the sequential-checkpoint per-chunk writer, which on `main` had
+    /// created its destination WITHOUT a guard; this restores that, through the
+    /// frame so the lint stays satisfied.
+    ///
+    /// SAFE only because every module that calls this ALSO opens a GUARDED
+    /// frame at run start — pinned by `unguarded_callers_also_guard_at_run_start`
+    /// (a bare open_unguarded in a module with no guarded open is the exact
+    /// mistake this restore was undoing, so the lint refuses it).
+    pub(crate) fn open_unguarded(plan: &ResolvedRunPlan) -> Result<Self> {
+        let dest = destination::create_destination(&plan.destination)?;
+        let ext = crate::format::create_format(
+            plan.format,
+            plan.compression,
+            plan.compression_level,
+            None,
+        )
+        .file_extension()
+        .to_string();
+        Ok(Self { dest, ext })
+    }
 }
 
 #[cfg(test)]
@@ -113,6 +142,46 @@ mod tests {
             shape_drift_warn_factor: 0.0,
             parquet: None,
         }
+    }
+
+    /// The invariant open_unguarded's safety rests on: any module that opens an
+    /// UNGUARDED frame must ALSO open a guarded one (its run-start guard). A
+    /// module that only ever calls open_unguarded has no cross-shape guard at
+    /// all — the very hole the sequential-checkpoint restore was closing, so it
+    /// must never reappear.
+    #[test]
+    fn unguarded_callers_also_guard_at_run_start() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/pipeline");
+        let mut offenders = Vec::new();
+        let mut stack = vec![root];
+        while let Some(dir) = stack.pop() {
+            for e in std::fs::read_dir(&dir).unwrap() {
+                let path = e.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|x| x.to_str()) != Some("rs") {
+                    continue;
+                }
+                let t = std::fs::read_to_string(&path).unwrap();
+                // frame.rs defines both; skip the definition site.
+                if path.ends_with("frame.rs") {
+                    continue;
+                }
+                if t.contains("open_unguarded(")
+                    && !(t.contains("RunnerFrame::open(") || t.contains("open_shared("))
+                {
+                    offenders.push(path.display().to_string());
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "open_unguarded without a run-start guarded open in the same module — \
+             the per-iteration writer would have NO cross-shape guard:\n{}",
+            offenders.join("\n")
+        );
     }
 
     /// The frame's whole reason to exist: a destination obtained through it

@@ -97,7 +97,10 @@ fn export_one_chunk_range(
         return Ok((0, Vec::new(), std::collections::BTreeMap::new(), None));
     }
 
-    let frame = crate::pipeline::frame::RunnerFrame::open(plan)?;
+    // Per-chunk writer: the cross-shape guard already fired at run start
+    // (the probe frame in run_chunked_sequential_checkpoint). open_unguarded
+    // avoids a manifest GET per chunk — restores main's behavior here.
+    let frame = crate::pipeline::frame::RunnerFrame::open_unguarded(plan)?;
     let base = super::chunk_part_filename(&plan.export_name, chunk_index, &frame.ext);
     let dest = frame.dest;
     // Worker-safe half of commit (I1 + dest.write + fingerprint), draining

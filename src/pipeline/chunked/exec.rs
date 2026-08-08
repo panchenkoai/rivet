@@ -119,6 +119,9 @@ pub(crate) fn run_chunked_sequential(
         );
 
         if sink.total_rows > 0 {
+            // run_chunked_sequential's ONLY cross-shape guard is here, per
+            // chunk (as on main) — this path has no run-start guard, so the
+            // frame must stay GUARDED. open() preserves main's behavior exactly.
             let frame = crate::pipeline::frame::RunnerFrame::open(plan)?;
             let base = super::chunk_part_filename(&plan.export_name, i, &frame.ext);
             let dest = frame.dest;
