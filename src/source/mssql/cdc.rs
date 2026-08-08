@@ -30,7 +30,7 @@ use tiberius::{AuthMethod, Client, ColumnData, Config, EncryptionLevel, Row};
 use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 
-use crate::config::{TlsConfig, TlsMode};
+use crate::config::TlsConfig;
 use crate::error::Result;
 use crate::source::cdc::value::RivetValue;
 use crate::source::cdc::{ChangeEvent, ChangeOp, ChangeStream, DrainMode, Position};
@@ -833,7 +833,7 @@ async fn connect(
     // an explicit disable / accept-invalid, or for loopback (None — the
     // require_tls_or_loopback gate already ensured a remote host carries a tls block).
     match tls {
-        Some(c) if c.mode == TlsMode::Disable || c.accept_invalid_certs => config.trust_cert(),
+        Some(c) if crate::source::mssql::mssql_trusts_cert_without_verify(c) => config.trust_cert(),
         Some(c) => {
             if let Some(ca) = &c.ca_file {
                 config.trust_cert_ca(ca);

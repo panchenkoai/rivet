@@ -456,11 +456,39 @@ pub(crate) fn introspect_pg_table_for_chunking(
 /// the URL from silently winning over an enforced `tls:` block.
 fn pg_config_ssl_forced(url: &str) -> Result<postgres::Config> {
     use std::str::FromStr;
-    let mut config = postgres::Config::from_str(url).map_err(|e| {
+    // Strip the URL's own `sslmode` before parsing: we force Require below, so
+    // its value is irrelevant — AND tokio-postgres only accepts disable/prefer/
+    // require, rejecting the libpq-valid `verify-ca`/`verify-full` with a parse
+    // error (bug hunt 2026-08-08: init derived verify-full from such a URL and
+    // then failed to parse it, erroring every time). Dropping it makes any
+    // sslmode the operator wrote parseable; the connector decides verification.
+    let cleaned = strip_url_query_key(url, "sslmode");
+    let mut config = postgres::Config::from_str(&cleaned).map_err(|e| {
         anyhow::anyhow!("postgres: cannot parse source URL for TLS enforcement: {e}")
     })?;
     config.ssl_mode(postgres::config::SslMode::Require);
     Ok(config)
+}
+
+/// Remove a single query parameter (case-insensitive key) from a URL, leaving
+/// the rest of the query intact. Used to drop `sslmode` before handing the URL
+/// to a parser that would reject some of its values.
+fn strip_url_query_key(url: &str, key: &str) -> String {
+    let Some((base, query)) = url.split_once('?') else {
+        return url.to_string();
+    };
+    let kept: Vec<&str> = query
+        .split('&')
+        .filter(|pair| {
+            let k = pair.split('=').next().unwrap_or(pair);
+            !k.eq_ignore_ascii_case(key)
+        })
+        .collect();
+    if kept.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base}?{}", kept.join("&"))
+    }
 }
 
 pub(crate) fn connect_client(url: &str, tls: Option<&TlsConfig>) -> Result<Client> {
@@ -931,6 +959,11 @@ mod tests {
             "postgresql://u:p@h/db?sslmode=prefer",
             "postgresql://u:p@h/db", // no param → driver default is `prefer`
             "postgresql://u:p@h/db?sslmode=require",
+            // libpq-valid but tokio-postgres-REJECTED values: stripped, not fatal
+            "postgresql://u:p@h/db?sslmode=verify-ca",
+            "postgresql://u:p@h/db?sslmode=verify-full",
+            // sslmode alongside another param — only sslmode is dropped
+            "postgresql://u:p@h/db?application_name=x&sslmode=verify-full&connect_timeout=5",
         ] {
             let cfg =
                 super::pg_config_ssl_forced(url).unwrap_or_else(|e| panic!("parse {url}: {e}"));

@@ -110,12 +110,12 @@ pub struct MongoSession {
 
 impl MongoSession {
     /// Connect + `ping`. `gate` applies the shared remote-plaintext TLS refusal
-    /// (`require_tls_or_loopback`, CWE-319); `rivet init` passes `false` (dev
-    /// convenience, like the SQL init helpers), every other caller `true`.
-    pub fn connect(url: &str, tls: Option<&TlsConfig>, gate: bool) -> Result<Self> {
-        if gate {
-            crate::source::require_tls_or_loopback(url, tls)?;
-        }
+    /// (`require_tls_or_loopback`, CWE-319); every caller passes `true` — the SQL init helpers gate too, so init
+    /// is not an exception (bug hunt 2026-08-08 corrected the old `false`).
+    pub fn connect(url: &str, tls: Option<&TlsConfig>) -> Result<Self> {
+        // Always refuse remote plaintext (CWE-319) — the old `gate: bool` let
+        // init opt out, which was the bug hunt 2026-08-08 find. No opt-out now.
+        crate::source::require_tls_or_loopback(url, tls)?;
         // Small multi-thread runtime (not current-thread): the driver spawns
         // background SDAM/heartbeat tasks that must make progress independently
         // of our `block_on` calls, or connection monitoring starves.
@@ -190,7 +190,7 @@ impl MongoSource {
     /// `create_source` (with the config block) and the `doctor` / type-report
     /// probes (with `None`).
     pub fn connect(url: &str, tls: Option<&TlsConfig>, cfg: Option<&MongoConfig>) -> Result<Self> {
-        let session = MongoSession::connect(url, tls, true)?;
+        let session = MongoSession::connect(url, tls)?;
         let (canonical_json, snapshot, no_cursor_timeout) = match cfg {
             None => (false, false, true),
             Some(c) => (
@@ -874,7 +874,7 @@ pub(crate) fn sample_harm_counters(
     url: &str,
     tls: Option<&TlsConfig>,
 ) -> Option<Vec<(String, i64)>> {
-    let session = MongoSession::connect(url, tls, true).ok()?;
+    let session = MongoSession::connect(url, tls).ok()?;
     session.block_on(async {
         let status = session
             .client()
@@ -892,7 +892,7 @@ pub(crate) fn sample_harm_counters(
 /// collection. `None` on any failure — the diagnostic then shows an unknown
 /// row count, exactly as MySQL does when its estimate is untrustworthy.
 pub(crate) fn estimated_count(url: &str, tls: Option<&TlsConfig>, collection: &str) -> Option<i64> {
-    let session = MongoSession::connect(url, tls, true).ok()?;
+    let session = MongoSession::connect(url, tls).ok()?;
     session.block_on(async {
         let n = session
             .client()
