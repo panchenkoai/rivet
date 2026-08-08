@@ -70,10 +70,13 @@ pub mod destination_for_tests {
 /// `reqsign`'s token loader resolves service account → impersonated →
 /// external account → VM metadata and has NO `authorized_user` arm, so
 /// anything that talks to a Google API natively — this crate's GCS
-/// destination, and `rivet-pro`'s BigQuery client — needs this loader or it
-/// authenticates in CI and fails on a developer laptop. Exposing it is what
-/// keeps "never hand-roll a second auth path" true across BOTH repos rather
-/// than only inside this one.
+/// destination, and the first-party extension consumer's BigQuery client —
+/// needs this loader or it authenticates in CI and fails on a developer
+/// laptop. Exposing it is what keeps "never hand-roll a second auth path"
+/// true across both sides of the seam rather than only inside this crate.
+///
+/// (The consumer is named in docs/adr/0026, not here: the dependency-direction
+/// guard keeps the paid tier out of MIT sources, manifest and comments alike.)
 pub mod google_auth {
     pub use crate::destination::gcs_auth::{AdcUserTokenLoader, try_authorized_user_loader};
 }
