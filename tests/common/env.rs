@@ -111,9 +111,27 @@ pub const CLICKHOUSE_CONTAINER: &str = "rivet-clickhouse";
 /// and `rivet-clickhouse`. Tests write Parquet here from Rust, then read the
 /// same path from inside the container.
 pub fn live_shared_tmp_host() -> std::path::PathBuf {
-    let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join(".live-tmp");
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    // LOUD worktree footgun (bug hunt 2026-08-08). `docker compose` bind-mounts
+    // `./tests/.live-tmp` of the checkout it was STARTED from. A git WORKTREE
+    // has a different CARGO_MANIFEST_DIR, so a test run from a worktree writes
+    // Parquet into the worktree's tests/.live-tmp while the containers read the
+    // MAIN checkout's — the DuckDB oracle then sees 0 rows or another run's
+    // stale data and "fails" a correct build. Cost an hour of forensics once;
+    // never again silently. A worktree's `.git` is a FILE ("gitdir: …"), a real
+    // checkout's is a DIR — that is the cheap, reliable tell.
+    let git = root.join(".git");
+    if git.is_file() && std::env::var_os("RIVET_ALLOW_WORKTREE_LIVE").is_none() {
+        panic!(
+            "live tests are running from a git WORKTREE ({}), but the duckdb/clickhouse \
+             containers bind-mount tests/.live-tmp of the checkout `docker compose up` was \
+             started from — the paths diverge and the oracle reads the wrong directory. \
+             Run live tests from the main checkout (where you started the stand); or, if you \
+             genuinely started the stand from THIS worktree, set RIVET_ALLOW_WORKTREE_LIVE=1.",
+            root.display()
+        );
+    }
+    let dir = root.join("tests").join(".live-tmp");
     std::fs::create_dir_all(&dir).expect("create tests/.live-tmp");
     dir
 }
