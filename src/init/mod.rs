@@ -84,6 +84,18 @@ impl TableInfo {
     }
 
     /// Best candidate for `cursor_column`: prefer updated_at, then created_at, then any timestamp.
+    /// The cursor column init actually RECORDS and RENDERS — the scored top
+    /// candidate. `best_cursor_column` (name-preference) is kept for MODE
+    /// SELECTION ("is any cursor viable"), where only existence matters; but the
+    /// value written into the YAML and the strategy_snapshot must be ONE picker,
+    /// or the snapshot records a cursor the config does not contain (bug hunt
+    /// 2026-08-08). This is that one picker.
+    pub(crate) fn chosen_cursor_column(&self) -> Option<String> {
+        crate::init::candidates::cursor_candidates(self)
+            .first()
+            .map(|c| c.column.clone())
+    }
+
     pub(crate) fn best_cursor_column(&self) -> Option<&str> {
         let ts_cols: Vec<&ColumnInfo> = self
             .columns
