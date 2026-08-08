@@ -161,12 +161,26 @@ pub fn run_plan_command(
                 .map(|p| (a.export_name.clone(), p.export_recommendation.cost_class))
         })
         .collect();
+    // Exports the campaign flagged `isolate_on_source` (a contended source
+    // group — must run ALONE regardless of cost). The packer sets
+    // parallel_safe:true so a wave's members run concurrently; these must NOT,
+    // or --annotate-waves would overload their source (bug-hunt round 2).
+    let isolate_of: std::collections::HashSet<String> = artifacts
+        .iter()
+        .filter_map(|a| {
+            a.prioritization.as_ref().and_then(|p| {
+                p.export_recommendation
+                    .isolate_on_source
+                    .then(|| a.export_name.clone())
+            })
+        })
+        .collect();
     // `--annotate-waves` packs from MEASURED history (#150): the last
     // successful run's duration + peak RSS per export, read from the state
     // store plan already holds open. Exports with no history keep the cost
     // model's estimate — and each line below SAYS which one it stands on.
     let recs = if annotate_waves {
-        repack_from_history(recs, &cost_of, &state)
+        repack_from_history(recs, &cost_of, &isolate_of, &state)
     } else {
         recs
     };
@@ -578,6 +592,7 @@ type ExportFields = HashMap<String, Vec<(&'static str, String)>>;
 fn repack_from_history(
     recs: Vec<(String, u32, bool)>,
     cost_of: &std::collections::HashMap<String, crate::plan::CostClass>,
+    isolate_of: &std::collections::HashSet<String>,
     state: &crate::state::StateStore,
 ) -> Vec<(String, u32, bool)> {
     let mut measured_n = 0usize;
@@ -643,8 +658,13 @@ fn repack_from_history(
     recs.into_iter()
         .map(|(name, rec_wave, _)| {
             let w = wave_of.get(&name).copied().unwrap_or(rec_wave);
-            // parallel_safe: true — the packed wave IS the concurrency cap.
-            (name, w, true)
+            // parallel_safe: true so a packed wave's members run concurrently
+            // (the wave IS the cap) — EXCEPT an isolate_on_source export, which
+            // must run alone even among wave-mates, so run_waves keeps it in
+            // its own single-child batch (bug-hunt round 2: forcing true here
+            // discarded isolation and could overload a contended source).
+            let ps = !isolate_of.contains(&name);
+            (name, w, ps)
         })
         .collect()
 }
@@ -850,7 +870,8 @@ mod tests {
             .map(|(n, _, _)| (n.clone(), crate::plan::CostClass::High))
             .collect();
 
-        let packed = repack_from_history(recs, &cost_of, &state);
+        // No isolate_on_source exports in this fixture.
+        let packed = repack_from_history(recs, &cost_of, &std::collections::HashSet::new(), &state);
         let wave = |n: &str| packed.iter().find(|(m, _, _)| m == n).unwrap().1;
         // K=2 (High): measured 90s pairs with measured 1s in wave 1; the
         // history-less newcomer (flat 5s estimate) lands after the measured
@@ -871,6 +892,55 @@ mod tests {
             .map(|(n, _, _)| n.as_str())
             .collect();
         assert!(w1.contains(&"slowpoke"), "w1={w1:?}");
+    }
+
+    /// An isolate_on_source export must come out parallel_safe:FALSE even under
+    /// packing (bug-hunt round 2): the packer sets true so wave-mates run
+    /// concurrently, but a contended-source export must stay alone in its wave.
+    #[test]
+    fn repack_keeps_isolate_on_source_out_of_the_concurrent_batch() {
+        let state = crate::state::StateStore::open_in_memory().expect("state");
+        for n in ["lonely", "buddy"] {
+            state
+                .record_metric(
+                    n,
+                    &format!("{n}_r"),
+                    1000,
+                    10,
+                    Some(100),
+                    "success",
+                    None,
+                    None,
+                    None,
+                    None,
+                    1,
+                    100,
+                    0,
+                    None,
+                    None,
+                )
+                .expect("rec");
+        }
+        let recs = vec![
+            ("lonely".to_string(), 4, false),
+            ("buddy".to_string(), 4, true),
+        ];
+        let cost_of = recs
+            .iter()
+            .map(|(n, _, _)| (n.clone(), crate::plan::CostClass::Low))
+            .collect();
+        let mut isolate = std::collections::HashSet::new();
+        isolate.insert("lonely".to_string());
+        let packed = repack_from_history(recs, &cost_of, &isolate, &state);
+        let ps = |n: &str| packed.iter().find(|(m, _, _)| m == n).unwrap().2;
+        assert!(
+            !ps("lonely"),
+            "isolate_on_source export must be parallel_safe:false"
+        );
+        assert!(
+            ps("buddy"),
+            "a normal packed export stays parallel_safe:true"
+        );
     }
 
     /// --annotate-waves + --export is a category error: packing one export
