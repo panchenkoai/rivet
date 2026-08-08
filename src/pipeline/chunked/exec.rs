@@ -119,11 +119,9 @@ pub(crate) fn run_chunked_sequential(
         );
 
         if sink.total_rows > 0 {
-            let fmt =
-                format::create_format(plan.format, plan.compression, plan.compression_level, None);
-            let base = super::chunk_part_filename(&plan.export_name, i, fmt.file_extension());
-            let dest = destination::create_destination(&plan.destination)?;
-            crate::manifest::guard_manifest_mode(dest.as_ref(), "batch")?;
+            let frame = crate::pipeline::frame::RunnerFrame::open(plan)?;
+            let base = super::chunk_part_filename(&plan.export_name, i, &frame.ext);
+            let dest = frame.dest;
             // Shared commit path (I1→I2→I7 + counters + journal + fault hooks).
             // write_sink_parts drains every part the sink produced — the
             // final temp file plus anything maybe_split rotated at
@@ -300,10 +298,7 @@ pub(crate) fn run_chunked_parallel(
     // One destination (GCS/S3) instance for the whole export: `create_destination` wires a
     // dedicated Tokio runtime; creating one per chunk caused runtime shutdown races under load
     // (`dispatch task is gone: runtime dropped` from the HTTP client).
-    let shared_destination =
-        std::sync::Arc::new(destination::create_destination(&plan.destination)?);
-    // Finding #44 early check (see single.rs) — chunked writes share the fate.
-    crate::manifest::guard_manifest_mode(&**shared_destination, "batch")?;
+    let (shared_destination, _frame_ext) = crate::pipeline::frame::RunnerFrame::open_shared(plan)?;
     destination::log_capabilities(
         &plan.export_name,
         &**shared_destination,

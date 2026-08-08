@@ -12,12 +12,12 @@ use super::chunked::{run_chunked_sequential, run_chunked_sequential_checkpoint};
 use super::retry::{RetryClass, classify_error};
 use super::sink::{CompletedPart, ExportSink};
 use super::validate::validate_output;
+use crate::destination;
 use crate::error::{DataIntegrityError, Result};
 use crate::journal::RunEvent;
 use crate::plan::{ExtractionStrategy, ResolvedRunPlan};
 use crate::source::{self, Source};
 use crate::state::StateStore;
-use crate::{destination, format};
 
 pub(crate) fn run_with_reconnect(
     state: &StateStore,
@@ -385,13 +385,9 @@ pub(super) fn run_single_export(
         });
     }
 
-    let fmt = format::create_format(plan.format, plan.compression, plan.compression_level, None);
-    let ext = fmt.file_extension();
-    let dest = destination::create_destination(&plan.destination)?;
-    // Finding #44, early check: fail cleanly before the first part if this
-    // prefix already belongs to a CDC export (cross-shape manifests clobber
-    // each other; the write-seam guard is the backstop).
-    crate::manifest::guard_manifest_mode(dest.as_ref(), "batch")?;
+    let frame = super::frame::RunnerFrame::open(plan)?;
+    let (dest, ext) = (frame.dest, frame.ext);
+    let ext = ext.as_str();
 
     // ADR-0004: log backend capabilities; warn when non-retry-safe destination is configured with retries.
     destination::log_capabilities(

@@ -23,9 +23,9 @@ use super::{ChunkSource, chunked_plan, config_hint, ensure_chunk_checkpoint_plan
 use crate::error::Result;
 use crate::journal::RunEvent;
 use crate::plan::{ChunkedPlan, ResolvedRunPlan};
+use crate::resource;
 use crate::source::{self, Source};
 use crate::state::StateStore;
-use crate::{destination, format, resource};
 
 use super::math::build_chunk_query_sql;
 
@@ -97,9 +97,9 @@ fn export_one_chunk_range(
         return Ok((0, Vec::new(), std::collections::BTreeMap::new(), None));
     }
 
-    let fmt = format::create_format(plan.format, plan.compression, plan.compression_level, None);
-    let base = super::chunk_part_filename(&plan.export_name, chunk_index, fmt.file_extension());
-    let dest = destination::create_destination(&plan.destination)?;
+    let frame = crate::pipeline::frame::RunnerFrame::open(plan)?;
+    let base = super::chunk_part_filename(&plan.export_name, chunk_index, &frame.ext);
+    let dest = frame.dest;
     // Worker-safe half of commit (I1 + dest.write + fingerprint), draining
     // every part the sink produced (max_file_size rotation included).
     let recs = super::super::commit::write_sink_parts(
@@ -230,8 +230,8 @@ pub(crate) fn run_chunked_sequential_checkpoint(
     // bypassed it — graph-surfaced runner-bypass, same class as the Form B gap.
     // A resume of our own batch manifest matches mode and passes.
     {
-        let dest = destination::create_destination(&plan.destination)?;
-        crate::manifest::guard_manifest_mode(dest.as_ref(), "batch")?;
+        // Probe-only open: the guard must fire before any chunk work starts.
+        let _ = crate::pipeline::frame::RunnerFrame::open(plan)?;
     }
 
     let chunks = if plan.resume {

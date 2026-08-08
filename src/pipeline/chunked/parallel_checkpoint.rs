@@ -147,14 +147,11 @@ pub(crate) fn run_chunked_parallel_checkpoint(
     let comp_label = plan.compression.label();
     let mode_label = plan.strategy.mode_label();
 
-    let shared_destination =
-        std::sync::Arc::new(destination::create_destination(&plan.destination)?);
-    // Same cross-shape guard as single/keyset/exec: refuse to overwrite a CDC
-    // manifest with this batch export's manifest (they would silently destroy
-    // each other's audit trail). The two checkpoint runners were the ones that
-    // bypassed it — graph-surfaced runner-bypass, same class as the Form B gap.
-    // A resume of our own batch manifest matches mode and passes.
-    crate::manifest::guard_manifest_mode(&**shared_destination, "batch")?;
+    // The frame IS the fix for the history this file used to narrate here: the
+    // two checkpoint runners once bypassed the cross-shape guard entirely
+    // (runner-bypass class). Now the guard rides in the only door to a
+    // destination.
+    let (shared_destination, _frame_ext) = crate::pipeline::frame::RunnerFrame::open_shared(plan)?;
     destination::log_capabilities(
         &plan.export_name,
         &**shared_destination,
