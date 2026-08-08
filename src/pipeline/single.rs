@@ -17,7 +17,7 @@ use crate::journal::RunEvent;
 use crate::plan::{ExtractionStrategy, ResolvedRunPlan};
 use crate::source::{self, Source};
 use crate::state::StateStore;
-use crate::{destination, format};
+use crate::{destination, format, resource};
 
 pub(crate) fn run_with_reconnect(
     state: &StateStore,
@@ -408,39 +408,61 @@ pub(super) fn run_single_export(
     // (LocalDestination idempotent_overwrite) — a real incremental-delta loss.
     let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f");
 
-    for (part_idx, part) in sink.completed_parts.iter().enumerate() {
-        if plan.validate {
-            validate_output(part.tmp.path(), plan.format, part.rows)?;
-            summary.validated = Some(true);
-            summary
-                .journal
-                .record(RunEvent::ValidationResult { passed: true });
-        }
+    // (tmp_path, rows, file_name) per part. The `NamedTempFile`s stay owned by
+    // `sink` (which outlives the upload), so worker threads only borrow the
+    // paths while the files are alive on disk.
+    let parts: Vec<(std::path::PathBuf, usize, String)> = sink
+        .completed_parts
+        .iter()
+        .enumerate()
+        .map(|(part_idx, part)| {
+            let file_name = if has_parts {
+                format!("{}_{}_part{}.{}", plan.export_name, ts, part_idx, ext)
+            } else {
+                format!("{}_{}.{}", plan.export_name, ts, ext)
+            };
+            (part.tmp.path().to_path_buf(), part.rows, file_name)
+        })
+        .collect();
 
-        let file_name = if has_parts {
-            format!("{}_{}_part{}.{}", plan.export_name, ts, part_idx, ext)
-        } else {
-            format!("{}_{}.{}", plan.export_name, ts, ext)
-        };
-
-        // ADR-0001 I1→I2→I7 + the I2/I3 fault windows + the manifest/journal/
-        // counters all live in `commit::{write_part_file,record_part}` now (one
-        // home for the ordering that used to be copied across runners).
-        let rec = super::commit::write_part_file(
+    if plan.upload_parallelism > 1 && parts.len() > 1 {
+        commit_single_parts_parallel(
             dest.as_ref(),
-            part.tmp.path(),
-            part.rows as i64,
-            file_name,
-        )?;
-        super::commit::record_part(
             plan,
             summary,
             state,
-            &rec,
-            super::commit::PartKind::File {
-                part_index: part_idx,
-            },
-        );
+            &parts,
+            plan.upload_parallelism,
+        )?;
+    } else {
+        for (part_idx, (tmp_path, rows, file_name)) in parts.iter().enumerate() {
+            if plan.validate {
+                validate_output(tmp_path, plan.format, *rows)?;
+                summary.validated = Some(true);
+                summary
+                    .journal
+                    .record(RunEvent::ValidationResult { passed: true });
+            }
+
+            // ADR-0001 I1→I2→I7 + the I2/I3 fault windows + the manifest/journal/
+            // counters all live in `commit::{write_part_file,record_part}` now (one
+            // home for the ordering that used to be copied across runners).
+            let rec = super::commit::write_part_file(
+                dest.as_ref(),
+                tmp_path,
+                *rows as i64,
+                file_name.clone(),
+            )?;
+            super::commit::record_part(
+                plan,
+                summary,
+                state,
+                &rec,
+                super::commit::PartKind::File {
+                    part_index: part_idx,
+                },
+            );
+        }
     }
 
     // Round-2 audit #12: record the incremental cursor RANGE on the summary but do
@@ -541,6 +563,109 @@ pub(super) fn run_single_export(
     }
 
     log::info!("export '{}' completed successfully", plan.export_name);
+    Ok(())
+}
+
+/// Commit `single`'s parts with bounded concurrent uploads
+/// (`exports[].upload_parallelism > 1`).
+///
+/// Validation stays an inline pass — local disk + CPU, and it preserves the
+/// exact per-part `ValidationResult` journal events + fail-fast semantics.
+/// [`super::commit::write_part_file`] (commit Seam 1) is worker-safe by
+/// contract (touches no shared run state), so up to `parallelism` worker
+/// threads upload ready parts concurrently behind a [`crate::resource::Semaphore`]
+/// (at most `parallelism` in-flight network writes). The scope join is the
+/// barrier: no part is recorded until every upload finished or failed.
+/// [`super::commit::record_part`] (Seam 2) then runs ONLY on this thread, in
+/// `part_idx` ascending order, so the manifest / `FileWritten` journal / I7
+/// file-log ordering contract is preserved exactly.
+fn commit_single_parts_parallel(
+    dest: &dyn crate::destination::Destination,
+    plan: &ResolvedRunPlan,
+    summary: &mut RunSummary,
+    state: Option<&StateStore>,
+    parts: &[(std::path::PathBuf, usize, String)],
+    parallelism: usize,
+) -> Result<()> {
+    if plan.validate {
+        for (tmp_path, rows, _) in parts {
+            validate_output(tmp_path, plan.format, *rows)?;
+            summary.validated = Some(true);
+            summary
+                .journal
+                .record(RunEvent::ValidationResult { passed: true });
+        }
+    }
+
+    let semaphore = resource::Semaphore::new(parallelism);
+    // Each worker owns exactly one slot (its `part_idx`); the parent drains in
+    // ascending order post-join. `Option` because a failed worker leaves its
+    // slot empty — the manifest must never list a part that did not upload.
+    let records: std::sync::Mutex<Vec<Option<super::commit::PartRecord>>> =
+        std::sync::Mutex::new((0..parts.len()).map(|_| None).collect());
+    let errors: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+    std::thread::scope(|scope| {
+        for (part_idx, (tmp_path, rows, file_name)) in parts.iter().enumerate() {
+            semaphore.acquire();
+            let semaphore = &semaphore;
+            let tmp_path = tmp_path.clone();
+            let rows = *rows;
+            let file_name = file_name.clone();
+            let records = &records;
+            let errors = &errors;
+            scope.spawn(move || {
+                let result =
+                    super::commit::write_part_file(dest, &tmp_path, rows as i64, file_name);
+                semaphore.release();
+                match result {
+                    Ok(rec) => {
+                        let mut slots = records
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        slots[part_idx] = Some(rec);
+                    }
+                    Err(e) => {
+                        errors
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push(format!("part {part_idx}: {e:#}"));
+                    }
+                }
+            });
+        }
+    });
+
+    let errs = errors
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !errs.is_empty() {
+        anyhow::bail!(
+            "export '{}': {} part upload(s) failed:\n{}",
+            plan.export_name,
+            errs.len(),
+            errs.join("\n")
+        );
+    }
+
+    for (part_idx, rec) in records
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .into_iter()
+        .enumerate()
+    {
+        if let Some(rec) = rec {
+            super::commit::record_part(
+                plan,
+                summary,
+                state,
+                &rec,
+                super::commit::PartKind::File {
+                    part_index: part_idx,
+                },
+            );
+        }
+    }
     Ok(())
 }
 
@@ -676,6 +801,7 @@ mod tests {
 
     fn minimal_plan() -> ResolvedRunPlan {
         ResolvedRunPlan {
+            upload_parallelism: 1,
             export_name: "test_export".into(),
             source_table: None,
             base_query: "SELECT 1".into(),
@@ -974,5 +1100,363 @@ mod tests {
         assert!(!is_port_closed(&anyhow::anyhow!(
             "db error: FATAL: the database system is starting up"
         )));
+    }
+
+    // ── commit_single_parts_parallel: bounded concurrent uploads ─────────────
+    //
+    // The upload parallelism split (Seam 1 in workers, Seam 2 ordered on the
+    // parent) is the whole feature. These tests pin the two contracts a future
+    // refactor can silently break: writes actually OVERLAP (the point of the
+    // feature) and `record_part` still commits in `part_idx` order (the
+    // manifest/journal ordering invariant).
+
+    /// Destination stub that simulates a per-part network round-trip (sleep),
+    /// observes the max number of concurrently in-flight writes, copies each
+    /// part into `out_dir`, and can be told to fail one specific key.
+    struct LatencyDest {
+        latency_ms: u64,
+        fail_key: Option<String>,
+        in_flight: std::sync::atomic::AtomicUsize,
+        max_in_flight: std::sync::atomic::AtomicUsize,
+        written: std::sync::Mutex<Vec<String>>,
+        out_dir: std::path::PathBuf,
+    }
+
+    impl crate::destination::Destination for LatencyDest {
+        fn write(
+            &self,
+            local_path: &std::path::Path,
+            remote_key: &str,
+        ) -> crate::error::Result<crate::destination::WriteOutcome> {
+            let now = self
+                .in_flight
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            self.max_in_flight
+                .fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(self.latency_ms));
+            let result = (|| -> crate::error::Result<()> {
+                if self.fail_key.as_deref() == Some(remote_key) {
+                    anyhow::bail!("injected failure for {remote_key}");
+                }
+                let dst = self.out_dir.join(remote_key);
+                if let Some(parent) = dst.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::copy(local_path, &dst)?;
+                Ok(())
+            })();
+            self.in_flight
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            result?;
+            self.written
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(remote_key.to_string());
+            Ok(crate::destination::WriteOutcome::opaque())
+        }
+
+        fn capabilities(&self) -> crate::destination::DestinationCapabilities {
+            crate::destination::DestinationCapabilities {
+                commit_protocol: crate::destination::WriteCommitProtocol::FinalizeOnClose,
+                idempotent_overwrite: true,
+                retry_safe: true,
+                partial_write_risk: false,
+            }
+        }
+    }
+
+    fn staged_part(dir: &std::path::Path, name: &str) -> (std::path::PathBuf, usize) {
+        let p = dir.join(name);
+        std::fs::write(&p, format!("payload {name}").as_bytes()).unwrap();
+        (p, 42)
+    }
+
+    fn parts_vec(dir: &std::path::Path, n: usize) -> Vec<(std::path::PathBuf, usize, String)> {
+        (0..n)
+            .map(|i| {
+                let (p, rows) = staged_part(dir, &format!("local_part{i}.parquet"));
+                (p, rows, format!("out/part{i}.parquet"))
+            })
+            .collect()
+    }
+
+    /// With enough parallelism every part is uploaded concurrently (the writes
+    /// overlap in time), and `record_part` still commits in `part_idx` order.
+    #[test]
+    fn parallel_upload_overlaps_writes_and_commits_in_part_order() {
+        let plan = minimal_plan();
+        let mut summary = crate::pipeline::summary::RunSummary::new(&plan);
+        let src_dir = tempfile::tempdir().unwrap();
+        let out_dir = tempfile::tempdir().unwrap();
+        let dest = LatencyDest {
+            latency_ms: 150,
+            fail_key: None,
+            in_flight: std::sync::atomic::AtomicUsize::new(0),
+            max_in_flight: std::sync::atomic::AtomicUsize::new(0),
+            written: std::sync::Mutex::new(Vec::new()),
+            out_dir: out_dir.path().to_path_buf(),
+        };
+
+        let parts = parts_vec(src_dir.path(), 4);
+        commit_single_parts_parallel(&dest, &plan, &mut summary, None, &parts, 4)
+            .expect("parallel commit succeeds");
+
+        assert_eq!(summary.files_committed, 4, "every part must be committed");
+        assert_eq!(
+            summary.manifest_parts.len(),
+            4,
+            "manifest must list every part"
+        );
+        // Seam 2 runs on the parent in part_idx order → manifest order == 0..N.
+        for (i, p) in summary.manifest_parts.iter().enumerate() {
+            assert_eq!(p.path, format!("out/part{i}.parquet"), "manifest order");
+        }
+        // The whole point: 4 uploads overlapped. 150ms × 4 sequential would be
+        // ~600ms; with parallelism 4 the observed peak in-flight must be > 1.
+        let peak = dest.max_in_flight.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            peak >= 2,
+            "parallel uploads must overlap in time, observed peak {peak}"
+        );
+        // And every part actually landed on the destination.
+        for i in 0..4 {
+            assert!(
+                out_dir
+                    .path()
+                    .join("out")
+                    .join(format!("part{i}.parquet"))
+                    .exists(),
+                "part{i} must exist at the destination"
+            );
+        }
+    }
+
+    /// A failing worker aborts the whole commit AFTER the join, surfaces the
+    /// part index, and records NO part — the manifest must never list a part
+    /// whose upload failed.
+    #[test]
+    fn parallel_upload_failure_bails_with_part_index_and_records_nothing() {
+        let plan = minimal_plan();
+        let mut summary = crate::pipeline::summary::RunSummary::new(&plan);
+        let src_dir = tempfile::tempdir().unwrap();
+        let out_dir = tempfile::tempdir().unwrap();
+        let dest = LatencyDest {
+            latency_ms: 5,
+            fail_key: Some("out/part1.parquet".into()),
+            in_flight: std::sync::atomic::AtomicUsize::new(0),
+            max_in_flight: std::sync::atomic::AtomicUsize::new(0),
+            written: std::sync::Mutex::new(Vec::new()),
+            out_dir: out_dir.path().to_path_buf(),
+        };
+
+        let parts = parts_vec(src_dir.path(), 3);
+        let err = commit_single_parts_parallel(&dest, &plan, &mut summary, None, &parts, 3)
+            .expect_err("a failed worker must fail the commit");
+
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("part 1"),
+            "the error must name the failing part index, got: {msg}"
+        );
+        assert_eq!(
+            summary.files_committed, 0,
+            "a failed run must record no parts (no partial manifest)"
+        );
+        assert!(
+            summary.manifest_parts.is_empty(),
+            "a failed run must not list any part"
+        );
+    }
+
+    /// `upload_parallelism: 0` is clamped by the runner's `> 1` guard — the
+    /// function itself must also tolerate a ceiling of 1 (all workers serialize
+    /// through the semaphore).
+    #[test]
+    fn parallel_upload_with_parallelism_one_still_commits_in_order() {
+        let plan = minimal_plan();
+        let mut summary = crate::pipeline::summary::RunSummary::new(&plan);
+        let src_dir = tempfile::tempdir().unwrap();
+        let out_dir = tempfile::tempdir().unwrap();
+        let dest = LatencyDest {
+            latency_ms: 5,
+            fail_key: None,
+            in_flight: std::sync::atomic::AtomicUsize::new(0),
+            max_in_flight: std::sync::atomic::AtomicUsize::new(0),
+            written: std::sync::Mutex::new(Vec::new()),
+            out_dir: out_dir.path().to_path_buf(),
+        };
+
+        let parts = parts_vec(src_dir.path(), 3);
+        commit_single_parts_parallel(&dest, &plan, &mut summary, None, &parts, 1)
+            .expect("serialized commit succeeds");
+        assert_eq!(summary.files_committed, 3);
+        for (i, p) in summary.manifest_parts.iter().enumerate() {
+            assert_eq!(p.path, format!("out/part{i}.parquet"), "manifest order");
+        }
+        let peak = dest.max_in_flight.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(peak, 1, "ceiling 1 must serialize the uploads");
+    }
+
+    // ── run_single_export end-to-end with upload_parallelism ────────────────
+
+    /// Source that emits `batches` batches of `rows` rows each, so the sink's
+    /// `max_file_size` rotation produces several parts in ONE `single` run.
+    struct MultiBatchSource(usize, usize);
+
+    impl crate::source::Source for MultiBatchSource {
+        fn export(
+            &mut self,
+            _request: &crate::source::ExportRequest<'_>,
+            sink: &mut dyn crate::source::BatchSink,
+        ) -> crate::error::Result<()> {
+            let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+            sink.on_schema(Arc::clone(&schema))?;
+            for _ in 0..self.0 {
+                let ids: Vec<i64> = (0..self.1 as i64).collect();
+                let batch = RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![Arc::new(Int64Array::from(ids))],
+                )
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+                sink.on_batch(&batch)?;
+            }
+            Ok(())
+        }
+        fn query_scalar(&mut self, _sql: &str) -> crate::error::Result<Option<String>> {
+            Ok(None)
+        }
+        fn type_mappings(
+            &mut self,
+            _query: &str,
+            _overrides: &crate::types::ColumnOverrides,
+        ) -> crate::error::Result<Vec<crate::types::TypeMapping>> {
+            Ok(vec![])
+        }
+    }
+
+    /// The full `single` pipeline with `upload_parallelism > 1`: a source whose
+    /// `max_file_size` rotation yields several parts must upload them ALL,
+    /// record them in `part_index` order, and leave every part on disk.
+    #[test]
+    fn run_single_export_with_upload_parallelism_writes_all_parts_in_order() {
+        let out_dir = tempfile::tempdir().unwrap();
+        let mut plan = minimal_plan();
+        // Rotate every batch → several parts. parquet only flushes on a row-group
+        // close, so `max_file_size` needs a small pinned row group to engage.
+        plan.max_file_size_bytes = Some(1024);
+        plan.parquet = Some(crate::config::ParquetConfig {
+            row_group_strategy: Some(crate::config::RowGroupStrategy::FixedRows),
+            row_group_rows: Some(100),
+            ..Default::default()
+        });
+        plan.upload_parallelism = 2;
+        plan.destination = DestinationConfig {
+            destination_type: DestinationType::Local,
+            path: Some(out_dir.path().to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+
+        let (result, summary) = run(&mut MultiBatchSource(4, 5000), &plan);
+        result.expect("multi-part parallel run succeeds");
+
+        assert!(
+            summary.files_committed >= 2,
+            "expected several parts from max_file_size rotation, got {}",
+            summary.files_committed
+        );
+        assert_eq!(
+            summary.manifest_parts.len(),
+            summary.files_committed,
+            "manifest must list every committed part"
+        );
+        // record_part runs in part_index order → manifest paths are ascending.
+        let paths: Vec<&str> = summary
+            .manifest_parts
+            .iter()
+            .map(|p| p.path.as_str())
+            .collect();
+        let mut sorted = paths.clone();
+        sorted.sort();
+        assert_eq!(paths, sorted, "manifest parts must be in part_index order");
+        // Every part actually landed on the destination.
+        for p in &paths {
+            assert!(
+                out_dir.path().join(p).exists(),
+                "part '{p}' must exist at the destination"
+            );
+        }
+    }
+
+    // ── wall-time comparison: parallel vs the pre-feature sequential loop ────
+    //
+    // `#[ignore]`d because it sleeps (a latency-bound destination stub). Run:
+    //   cargo test --lib pipeline::single::tests::bench_parallel_upload_vs_sequential -- --ignored
+    // On a latency-bound link the parallel arm wins; on a zero-latency link the
+    // runtimes converge. The assertion is generous (parallel ≤ sequential + 10%)
+    // so it can never flake on shared CI, while still catching a regression that
+    // serializes the workers (which would make parallel SLOWER by construction).
+    #[test]
+    #[ignore]
+    fn bench_parallel_upload_vs_sequential() {
+        let plan = minimal_plan();
+        let mut seq_summary = crate::pipeline::summary::RunSummary::new(&plan);
+        let mut par_summary = crate::pipeline::summary::RunSummary::new(&plan);
+        let src_dir = tempfile::tempdir().unwrap();
+        let seq_out = tempfile::tempdir().unwrap();
+        let par_out = tempfile::tempdir().unwrap();
+
+        let make_dest = |out: &tempfile::TempDir| LatencyDest {
+            latency_ms: 200,
+            fail_key: None,
+            in_flight: std::sync::atomic::AtomicUsize::new(0),
+            max_in_flight: std::sync::atomic::AtomicUsize::new(0),
+            written: std::sync::Mutex::new(Vec::new()),
+            out_dir: out.path().to_path_buf(),
+        };
+
+        // 8 parts, 200 ms per network round-trip.
+        let parts = parts_vec(src_dir.path(), 8);
+
+        let seq_dest = make_dest(&seq_out);
+        let t0 = std::time::Instant::now();
+        for (i, (tmp, rows, name)) in parts.iter().enumerate() {
+            let rec = crate::pipeline::commit::write_part_file(
+                &seq_dest,
+                tmp,
+                *rows as i64,
+                name.clone(),
+            )
+            .unwrap();
+            crate::pipeline::commit::record_part(
+                &plan,
+                &mut seq_summary,
+                None,
+                &rec,
+                crate::pipeline::commit::PartKind::File { part_index: i },
+            );
+        }
+        let seq_elapsed = t0.elapsed();
+
+        let par_dest = make_dest(&par_out);
+        let t0 = std::time::Instant::now();
+        commit_single_parts_parallel(&par_dest, &plan, &mut par_summary, None, &parts, 8).unwrap();
+        let par_elapsed = t0.elapsed();
+
+        assert_eq!(seq_summary.files_committed, 8);
+        assert_eq!(par_summary.files_committed, 8);
+        eprintln!(
+            "sequential 8 × 200ms: {seq_elapsed:?}   parallel 8 × 200ms: {par_elapsed:?}   speedup {:.2}x",
+            seq_elapsed.as_secs_f64() / par_elapsed.as_secs_f64()
+        );
+        // 8 × 200ms sequential ≈ 1.6s. Parallel must not be slower than the
+        // sequential time plus a 10% allowance (it should be ~8× faster).
+        let allowance = seq_elapsed + Duration::from_millis(seq_elapsed.as_millis() as u64 / 10);
+        assert!(
+            par_elapsed <= allowance,
+            "parallel must not be slower than sequential ({} vs {})",
+            par_elapsed.as_millis(),
+            seq_elapsed.as_millis()
+        );
     }
 }

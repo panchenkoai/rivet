@@ -153,6 +153,7 @@ pub fn build_plan(
         schema_drift_policy: export.on_schema_drift,
         shape_drift_warn_factor: export.shape_drift_warn_factor.unwrap_or(2.0),
         parquet: export.parquet.clone(),
+        upload_parallelism: export.upload_parallelism,
     })
 }
 

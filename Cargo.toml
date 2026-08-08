@@ -181,6 +181,9 @@ harness = false
 name = "resource_aware"
 harness = false
 
+[[bench]]
+name = "concurrent_upload"
+harness = false
 [features]
 default = ["jemalloc"]
 jemalloc = ["tikv-jemallocator"]

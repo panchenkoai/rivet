@@ -68,6 +68,8 @@ mod state_compat;
 mod time_window;
 #[path = "offline/trust_artifacts_integration.rs"]
 mod trust_artifacts_integration;
+#[path = "offline/upload_parallelism.rs"]
+mod upload_parallelism;
 #[path = "offline/validate_historical.rs"]
 mod validate_historical;
 #[path = "offline/validate_regression.rs"]

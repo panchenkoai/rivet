@@ -1577,6 +1577,7 @@ mod tests {
 
     fn chunked_plan_with_quality(quality: Option<QualityConfig>) -> ResolvedRunPlan {
         ResolvedRunPlan {
+            upload_parallelism: 1,
             export_name: "orders".into(),
             source_table: None,
             base_query: "SELECT id FROM orders".into(),

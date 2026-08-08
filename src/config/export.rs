@@ -154,6 +154,21 @@ pub struct ExportConfig {
     #[serde(default = "default_parallel")]
     pub parallel: usize,
 
+    /// Bounded concurrent PART UPLOADS for the single-file runner (`mode:
+    /// full` / `incremental` / `time_window`). `single` materializes every part
+    /// as a local temp file, then uploads them one at a time — the network
+    /// round-trip of part N waits for part N-1. On a high-bandwidth-but-latency-
+    /// bound link (SSH tunnel, VPN, cross-region WAN) that latency is paid N
+    /// times in series; `upload_parallelism: K` uploads up to K ready parts
+    /// concurrently (semaphore-bounded, so at most K TCP connections) and
+    /// commits them in `part_index` order after all writes complete.
+    ///
+    /// Orthogonal to `parallel` (which fans out CHUNK/PAGE extraction on the
+    /// multi-part runners). A no-op when the export produces a single part.
+    /// Default `1` = the historical strictly-sequential upload loop.
+    #[serde(default = "default_upload_parallelism")]
+    pub upload_parallelism: usize,
+
     /// Advisory execution wave (1 = highest priority, run first). Written by
     /// `rivet plan` from the source-aware prioritization score (see ADR-0006)
     /// and consumed by `rivet apply`, which runs exports wave-by-wave in
@@ -622,6 +637,10 @@ fn default_parallel() -> usize {
     1
 }
 
+fn default_upload_parallelism() -> usize {
+    1
+}
+
 fn default_time_column_type() -> TimeColumnType {
     TimeColumnType::Timestamp
 }
@@ -836,6 +855,7 @@ pub(crate) fn sample_export(name: &str) -> ExportConfig {
         chunk_by_days: None,
         chunk_by_key: None,
         parallel: 1,
+        upload_parallelism: 1,
         wave: None,
         parallel_safe: None,
         time_column: None,

@@ -599,6 +599,13 @@
           "minimum": 0,
           "default": 1
         },
+        "upload_parallelism": {
+          "description": "Bounded concurrent PART UPLOADS for the single-file runner (`mode:\nfull` / `incremental` / `time_window`). `single` materializes every part\nas a local temp file, then uploads them one at a time — the network\nround-trip of part N waits for part N-1. On a high-bandwidth-but-latency-\nbound link (SSH tunnel, VPN, cross-region WAN) that latency is paid N\ntimes in series; `upload_parallelism: K` uploads up to K ready parts\nconcurrently (semaphore-bounded, so at most K TCP connections) and\ncommits them in `part_index` order after all writes complete.\n\nOrthogonal to `parallel` (which fans out CHUNK/PAGE extraction on the\nmulti-part runners). A no-op when the export produces a single part.\nDefault `1` = the historical strictly-sequential upload loop.",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0,
+          "default": 1
+        },
         "wave": {
           "description": "Advisory execution wave (1 = highest priority, run first). Written by\n`rivet plan` from the source-aware prioritization score (see ADR-0006)\nand consumed by `rivet apply`, which runs exports wave-by-wave in\nascending order. `None` = unscheduled (apply treats it as the last wave).\nOperators may hand-edit it; a later `rivet plan` refreshes it in place.",
           "type": [
