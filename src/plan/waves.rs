@@ -169,6 +169,34 @@ mod tests {
         assert_eq!(wall(&waves, &secs), 900.0 + 12.0);
     }
 
+    /// The RSS split is STRICT: `rss + next.peak_rss_mb > budget` — a member
+    /// that fills the budget EXACTLY still joins the wave. Two 100 MB Low-cost
+    /// exports (K=10, so only RSS can split them) with a 200 MB budget must pack
+    /// into ONE wave. The `>`→`>=` mutant (waves.rs:109) breaks at the exact-fit
+    /// boundary and makes two; a budget one below the fit proves the boundary is
+    /// where the assertion says it is.
+    #[test]
+    fn rss_split_is_strict_an_exact_fit_still_joins_the_wave() {
+        let items = vec![
+            item("a", 1, CostClass::Low, 10.0), // peak_rss_mb = 100 (helper default)
+            item("b", 1, CostClass::Low, 9.0),
+        ];
+        // budget == a.rss + b.rss exactly.
+        let waves = pack(&items, 200);
+        assert_eq!(
+            waves.len(),
+            1,
+            "exact fit must not split — `>=` would wrongly make two waves"
+        );
+        assert_eq!(waves[0].members, vec!["a", "b"]);
+        // One MB below the exact fit DOES split: the boundary is at the sum.
+        assert_eq!(
+            pack(&items, 199).len(),
+            2,
+            "199 < 200 must split into two waves"
+        );
+    }
+
     #[test]
     fn tiers_are_never_crossed_and_numbering_is_sequential() {
         let items = vec![

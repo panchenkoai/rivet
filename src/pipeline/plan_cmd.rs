@@ -36,6 +36,15 @@ pub enum PlanOutputFormat {
     Json(Option<String>),
 }
 
+/// `--annotate-waves` packs a schedule across the WHOLE config, so it is a
+/// category error when scoped to a single `--export` (packing one export alone
+/// rewrites its wave to 1 — bug hunt 2026-08-08). True ⇔ both are set: the
+/// `&&` must not soften to `||` (which would refuse a plain `--export`) — pinned
+/// by `refuse_annotate_scoped_to_export_only_when_both_set`.
+fn refuse_annotate_scoped_to_export(annotate_waves: bool, has_export: bool) -> bool {
+    annotate_waves && has_export
+}
+
 /// Entry point for `rivet plan`.
 ///
 /// Iterates over all matching exports, builds a `PlanArtifact` for each, and
@@ -52,7 +61,7 @@ pub fn run_plan_command(
     // packs that one export alone → wave 1, silently inverting its place in the
     // schedule (bug hunt 2026-08-08). The two are a category error; refuse them
     // together rather than write an incoherent wave.
-    if annotate_waves && export_name.is_some() {
+    if refuse_annotate_scoped_to_export(annotate_waves, export_name.is_some()) {
         anyhow::bail!(
             "--annotate-waves schedules the WHOLE config (each export's wave is relative to              the others) and cannot be scoped to --export: packing one export alone would              rewrite its wave to 1. Drop --export to annotate the whole config, or drop              --annotate-waves to plan just this export."
         );
@@ -804,7 +813,34 @@ mod tests {
     use super::per_export_output_path;
     use std::path::Path;
 
-    use super::{ExportFields, apply_field_annotations, fields_to_write, repack_from_history};
+    use super::{
+        ExportFields, apply_field_annotations, fields_to_write, refuse_annotate_scoped_to_export,
+        repack_from_history,
+    };
+
+    /// The refuse-guard fires ONLY when BOTH `--annotate-waves` and `--export`
+    /// are set — the `&&` must not become `||` (which would reject a plain
+    /// `--export`) nor invert. All four combinations, so the mutant that flips
+    /// the operator goes RED on the two rows it disagrees about.
+    #[test]
+    fn refuse_annotate_scoped_to_export_only_when_both_set() {
+        assert!(
+            refuse_annotate_scoped_to_export(true, true),
+            "both set → refuse"
+        );
+        assert!(
+            !refuse_annotate_scoped_to_export(true, false),
+            "annotate whole config → allow"
+        );
+        assert!(
+            !refuse_annotate_scoped_to_export(false, true),
+            "plain --export → allow (|| would wrongly refuse this)"
+        );
+        assert!(
+            !refuse_annotate_scoped_to_export(false, false),
+            "neither → allow"
+        );
+    }
 
     /// The packer's duration must come from the REAL producer — the state
     /// store's own recorder — not a value this test hand-feeds one layer down

@@ -58,4 +58,12 @@ exclude_re = [
     # not depend on which arm renders it.
     "delete match arm .* in hash_value",
     "replace refuse_compressed_binlog -> Result<\\(\\)> with Ok\\(\\(\\)\\)",
+    # `repack_from_history` converts each run's duration ms→s only to feed
+    # `PackItem.predicted_secs`, whose SOLE consumer is `waves::pack`'s
+    # duration-DESC sort. Scaling every duration by the same factor (`/`→`*`)
+    # is order-preserving, so the packed schedule is byte-identical — the
+    # mutant is equivalent by construction. The real neighbour bugs (the pack
+    # RSS boundary and the annotate/export refuse-guard) are unit-tested and
+    # RED-proven (rss_split_is_strict_*, refuse_annotate_scoped_to_export_*).
+    "replace / with \\* in repack_from_history",
 ]
