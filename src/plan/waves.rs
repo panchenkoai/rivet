@@ -87,23 +87,35 @@ pub(crate) fn pack(items: &[PackItem], rss_budget_mb: i64) -> Vec<PackedWave> {
         });
         let mut i = 0;
         while i < members.len() {
-            let k = k_for(members[i].cost_class);
-            let mut group = Vec::new();
+            let mut group: Vec<&PackItem> = Vec::new();
             let mut rss = 0i64;
-            while i < members.len() && group.len() < k {
+            while i < members.len() {
                 let m = members[i];
-                // The guard SPLITS a too-heavy group; it never drops a member.
-                // A group must hold at least one export or nothing terminates.
-                if !group.is_empty() && rss + m.peak_rss_mb > rss_budget_mb {
+                // K is the MOST RESTRICTIVE cost class in the group INCLUDING
+                // this candidate — not `members[i]`'s at the group's head. The
+                // members are sorted by DURATION, so the head can be a Low-cost
+                // export that merely ran long; taking its K=10 would widen a
+                // wave that also holds High-cost giants to ten concurrent heavy
+                // writers (bug hunt 2026-08-08). Recomputing the min as each
+                // member joins caps the wave at its heaviest member's K.
+                let k = group
+                    .iter()
+                    .map(|g| k_for(g.cost_class))
+                    .chain(std::iter::once(k_for(m.cost_class)))
+                    .min()
+                    .unwrap_or(1);
+                // Stop before over-filling past the running K, or past the RSS
+                // budget — but never leave a group empty (nothing would run).
+                if !group.is_empty() && (group.len() >= k || rss + m.peak_rss_mb > rss_budget_mb) {
                     break;
                 }
                 rss += m.peak_rss_mb;
-                group.push(m.name.clone());
+                group.push(m);
                 i += 1;
             }
             waves.push(PackedWave {
                 number,
-                members: group,
+                members: group.iter().map(|m| m.name.clone()).collect(),
             });
             number += 1;
         }
@@ -198,6 +210,37 @@ mod tests {
             waves.iter().all(|w| !w.members.is_empty()),
             "no empty waves"
         );
+    }
+
+    /// K is the heaviest member's, not the duration-front-runner's. A Low-cost
+    /// export that merely ran long must not widen a wave that holds High giants
+    /// to K=10 (bug hunt 2026-08-08).
+    #[test]
+    fn k_is_the_heaviest_class_in_the_group_not_the_front_runner() {
+        // One long-running Low export, then several High giants — one tier.
+        // Sorted by duration the Low one leads. It must NOT pull K to 10.
+        let mut items = vec![item("low_but_long", 4, CostClass::Low, 500.0)];
+        for n in 0..5 {
+            items.push(item(
+                &format!("giant{n}"),
+                4,
+                CostClass::High,
+                400.0 - n as f64,
+            ));
+        }
+        let waves = pack(&items, i64::MAX);
+        // The wave containing the giants must never exceed K=2 (High), even
+        // though a Low member shares the tier.
+        for w in &waves {
+            let has_giant = w.members.iter().any(|m| m.starts_with("giant"));
+            if has_giant {
+                assert!(
+                    w.members.len() <= 2,
+                    "a wave with a High giant must cap at K=2, got {:?}",
+                    w.members
+                );
+            }
+        }
     }
 
     #[test]
