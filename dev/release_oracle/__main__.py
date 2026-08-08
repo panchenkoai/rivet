@@ -126,6 +126,14 @@ def start_stores(led: Ledger) -> None:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(prog="release-oracle", add_help=True)
     ap.add_argument("--engines", default="", help="comma-separated subset, e.g. postgres,mysql")
+    ap.add_argument(
+        "--latest-only",
+        action="store_true",
+        default=bool(os.environ.get("RIVET_ORACLE_LATEST_ONLY")),
+        help="run only the LAST version of each engine family (fast dev loop). "
+        "The full version matrix is for release tags; a single-version pass "
+        "still covers every scenario × store × state-backend cell.",
+    )
     ap.add_argument("--no-cloud", action="store_true", help="local stage only (skip BigQuery)")
     ap.add_argument("--keep", action="store_true", help="leave engine containers up (debug)")
     ap.add_argument("--no-clean", action="store_true",
@@ -384,10 +392,21 @@ def engine_loop(led: Ledger, ns: argparse.Namespace) -> None:
     for engine in matrix_cfg("engines").split():
         if wanted and engine not in wanted:
             continue
-        for line in matrix_cfg("versions", engine).splitlines():
+        version_lines = [
+            l for l in matrix_cfg("versions", engine).splitlines() if len(l.split()) >= 3
+        ]
+        # --latest-only: keep just the last version of the family (the newest,
+        # matrix.yaml lists them ascending). Cuts the dev-loop wall roughly in
+        # proportion to the version count (postgres 4→1, mongo 5→1) while every
+        # scenario × store × state cell still runs once.
+        if ns.latest_only and version_lines:
+            skipped = len(version_lines) - 1
+            version_lines = version_lines[-1:]
+            if skipped:
+                led.add(engine, "-", "older-versions", "-", Status.SKIP,
+                        f"--latest-only: {skipped} older {engine} version(s) not run")
+        for line in version_lines:
             parts = line.split()
-            if len(parts) < 3:
-                continue
             tag, image, port = parts[0], parts[1], int(parts[2])
             led.phase(f"{engine} {tag} ({image})")
             url = bring_up(led, engine, tag, image, port)
