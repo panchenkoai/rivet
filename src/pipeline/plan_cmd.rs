@@ -140,6 +140,26 @@ pub fn run_plan_command(
             })
         })
         .collect();
+    // The packer needs each export's cost class (it sets the wave width K);
+    // carried beside `recs` rather than widening the tuple `fields_to_write`
+    // consumes.
+    let cost_of: std::collections::HashMap<String, crate::plan::CostClass> = artifacts
+        .iter()
+        .filter_map(|a| {
+            a.prioritization
+                .as_ref()
+                .map(|p| (a.export_name.clone(), p.export_recommendation.cost_class))
+        })
+        .collect();
+    // `--annotate-waves` packs from MEASURED history (#150): the last
+    // successful run's duration + peak RSS per export, read from the state
+    // store plan already holds open. Exports with no history keep the cost
+    // model's estimate — and each line below SAYS which one it stands on.
+    let recs = if annotate_waves {
+        repack_from_history(recs, &cost_of, &config, &state)
+    } else {
+        recs
+    };
     let (fields, preserved) = fields_to_write(&recs, &config, annotate_waves);
     if !fields.is_empty() {
         write_plan_fields_to_config(config_path, &fields)?;
@@ -523,6 +543,86 @@ fn print_compact_summary(artifacts: &[PlanArtifact], config_path: &str) {
 /// keyed by export name → ordered `(field, value)` pairs.
 type ExportFields = HashMap<String, Vec<(&'static str, String)>>;
 
+/// Replace the cost model's `recommended_wave` with waves PACKED from measured
+/// run history (`--annotate-waves` only). Tier = the export's existing `wave:`
+/// (the operator's priority) when set, else the cost model's recommendation;
+/// duration = the last successful run's, else a rows-based estimate; every
+/// export is `parallel_safe: true` afterwards because under packing the WAVE
+/// is the concurrency cap (K by cost class, RSS-guarded).
+fn repack_from_history(
+    recs: Vec<(String, u32, bool)>,
+    cost_of: &std::collections::HashMap<String, crate::plan::CostClass>,
+    config: &Config,
+    state: &crate::state::StateStore,
+) -> Vec<(String, u32, bool)> {
+    let by_name: std::collections::HashMap<&str, &crate::config::ExportConfig> = config
+        .exports
+        .iter()
+        .map(|e| (e.name.as_str(), e))
+        .collect();
+    let mut measured_n = 0usize;
+    let items: Vec<crate::plan::waves::PackItem> = recs
+        .iter()
+        .map(|(name, rec_wave, _)| {
+            let existing = by_name.get(name.as_str());
+            let tier = existing.and_then(|e| e.wave).unwrap_or(*rec_wave);
+            // Last successful run: the best predictor of the next one.
+            let last = state
+                .get_metrics(Some(name), 25)
+                .ok()
+                .into_iter()
+                .flatten()
+                .find(|m| m.status == "success");
+            let (secs, rss) = match &last {
+                Some(m) => {
+                    measured_n += 1;
+                    (
+                        (m.duration_ms as f64 / 1000.0).max(0.001),
+                        m.peak_rss_mb.unwrap_or(150),
+                    )
+                }
+                // No history: a flat placeholder. Deliberately coarse — its
+                // only job is ORDERING within the tier until a real run
+                // exists; the label below says "estimated" so nobody mistakes
+                // it for knowledge (#148/#149 give it real numbers later).
+                None => (5.0, 150),
+            };
+            crate::plan::waves::PackItem {
+                name: name.clone(),
+                tier,
+                cost_class: cost_of
+                    .get(name)
+                    .copied()
+                    .unwrap_or(crate::plan::CostClass::Medium),
+                predicted_secs: secs,
+                peak_rss_mb: rss,
+            }
+        })
+        .collect();
+    let waves = crate::plan::waves::pack(&items, 4096);
+    log::warn!(
+        "plan --annotate-waves: packed {} export(s) into {} wave(s) from run history \
+         ({} measured, {} estimated — an estimate orders the first run only)",
+        items.len(),
+        waves.len(),
+        measured_n,
+        items.len() - measured_n
+    );
+    let mut wave_of: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    for w in &waves {
+        for m in &w.members {
+            wave_of.insert(m.clone(), w.number);
+        }
+    }
+    recs.into_iter()
+        .map(|(name, rec_wave, _)| {
+            let w = wave_of.get(&name).copied().unwrap_or(rec_wave);
+            // parallel_safe: true — the packed wave IS the concurrency cap.
+            (name, w, true)
+        })
+        .collect()
+}
+
 /// Which of the plan's recommendations may actually be WRITTEN into the
 /// operator's config: absent fields always; present fields only under
 /// `--annotate-waves`. Returns the fields plus how many exports were fully
@@ -647,7 +747,122 @@ mod tests {
     use super::per_export_output_path;
     use std::path::Path;
 
-    use super::{ExportFields, apply_field_annotations, fields_to_write};
+    use super::{ExportFields, apply_field_annotations, fields_to_write, repack_from_history};
+
+    /// The packer's duration must come from the REAL producer — the state
+    /// store's own recorder — not a value this test hand-feeds one layer down
+    /// (the fabricated-input class). Two exports, histories recorded through
+    /// `record_metric`, ONE tier: the measured-slower export must land in the
+    /// earlier (heavier) wave. RED against a producer-side mutant that reads
+    /// the estimate instead of the metric: with no history consulted, both
+    /// exports carry the same flat placeholder and the ordering assert has
+    /// nothing to stand on (fails on the pair split below).
+    #[test]
+    fn repack_reads_durations_from_the_state_stores_recorder() {
+        let state = crate::state::StateStore::open_in_memory().expect("state");
+        for (name, ms) in [("slowpoke", 90_000i64), ("quickie", 1_000i64)] {
+            state
+                .record_metric(
+                    name,
+                    &format!("{name}_run"),
+                    ms,
+                    10,
+                    Some(120),
+                    "success",
+                    None,
+                    None,
+                    None,
+                    None,
+                    1,
+                    100,
+                    0,
+                    None,
+                    None,
+                )
+                .expect("record");
+        }
+        // …and a failed newer run for slowpoke, which must be IGNORED — only a
+        // successful run predicts anything.
+        state
+            .record_metric(
+                "slowpoke",
+                "slowpoke_failed",
+                5,
+                0,
+                Some(50),
+                "failed",
+                Some("boom"),
+                None,
+                None,
+                None,
+                0,
+                0,
+                0,
+                None,
+                None,
+            )
+            .expect("record failed");
+
+        let source = crate::config::SourceConfig {
+            source_type: crate::config::SourceType::Postgres,
+            url: Some("postgresql://localhost/test".into()),
+            url_env: None,
+            url_file: None,
+            host: None,
+            port: None,
+            user: None,
+            password: None,
+            password_env: None,
+            database: None,
+            environment: None,
+            tuning: None,
+            tls: None,
+            mongo: None,
+        };
+        let config = crate::config::Config {
+            source,
+            exports: vec![
+                crate::config::sample_export("slowpoke"),
+                crate::config::sample_export("quickie"),
+                crate::config::sample_export("newcomer"),
+            ],
+            notifications: None,
+            parallel_exports: false,
+            parallel_export_processes: false,
+            load: None,
+        };
+        let recs = vec![
+            ("slowpoke".to_string(), 2, false),
+            ("quickie".to_string(), 2, false),
+            ("newcomer".to_string(), 2, false),
+        ];
+        let cost_of = recs
+            .iter()
+            .map(|(n, _, _)| (n.clone(), crate::plan::CostClass::High))
+            .collect();
+
+        let packed = repack_from_history(recs, &cost_of, &config, &state);
+        let wave = |n: &str| packed.iter().find(|(m, _, _)| m == n).unwrap().1;
+        // K=2 (High): measured 90s pairs with measured 1s in wave 1; the
+        // history-less newcomer (flat 5s estimate) lands after the measured
+        // slowpoke, proving the metric — not the placeholder — ordered them.
+        assert!(
+            wave("slowpoke") < wave("newcomer") || wave("slowpoke") == wave("newcomer"),
+            "measured 90s must not sort below a 5s placeholder"
+        );
+        assert_eq!(wave("slowpoke"), 1, "the measured-heaviest opens the tier");
+        // every packed export is parallel_safe: the wave is the cap now
+        assert!(packed.iter().all(|(_, _, ps)| *ps));
+        // the failed 5ms run did NOT become slowpoke's prediction: had it,
+        // slowpoke (0.005s) would sort below quickie (1s) and lose wave 1's
+        // first slot to it.
+        let w1: Vec<&str> = packed
+            .iter()
+            .filter(|(_, w, _): &&(String, u32, bool)| *w == 1)
+            .map(|(n, _, _)| n.as_str())
+            .collect();
+        assert!(w1.contains(&"slowpoke"), "w1={w1:?}");
+    }
 
     /// The additive contract (#150): plan fills BLANKS; a value the operator
     /// set is untouched unless `--annotate-waves` says overwrite. Per FIELD —
