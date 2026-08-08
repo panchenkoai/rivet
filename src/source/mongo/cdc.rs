@@ -168,7 +168,7 @@ impl MongoChangeStream {
         mode: DrainMode,
     ) -> Result<Self> {
         let until_current = mode.is_bounded();
-        let session = MongoSession::connect(url, tls, true)?;
+        let session = MongoSession::connect(url, tls)?;
         let db_name = session.db().to_string();
         // The resume token persisted by a prior run (opaque JSON → driver token).
         // A corrupt / unreadable checkpoint is a LOUD error, never silently
@@ -345,7 +345,7 @@ fn probe_capability_on(session: &MongoSession) -> MongoCdcCapability {
 
 /// Connect + probe (for `rivet doctor` — a fresh connection).
 pub(crate) fn probe_capability(url: &str, tls: Option<&TlsConfig>) -> Result<MongoCdcCapability> {
-    let session = MongoSession::connect(url, tls, true)?;
+    let session = MongoSession::connect(url, tls)?;
     Ok(probe_capability_on(&session))
 }
 
