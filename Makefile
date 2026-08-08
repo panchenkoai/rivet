@@ -211,7 +211,12 @@ RIVET_CONC_SRC_CONTAINER  ?= rivet-postgres-1
 BQ_ORACLE_PROJECT         ?= $(shell gcloud config get-value project 2>/dev/null)
 BQ_ORACLE_DATASET         ?= rivet_blessed
 BQ_ORACLE_BUCKET          ?= rivet_data_test
-PREV_RELEASE_DIR          ?= target/prev-release
+# OUTSIDE target/: the oracle's first act is `cargo clean` (the gate builds the
+# binary it grades), which silently deleted a baseline downloaded into
+# target/prev-release — the regression leg then "declared-skipped" on every
+# single full run while the download step reported success. A baseline the
+# gate needs must live where the gate's own hygiene cannot eat it.
+PREV_RELEASE_DIR          ?= .gate-baseline
 
 GATE_ENV = \
   RIVET_ORACLE_POSTGRES_URL='$(RIVET_ORACLE_POSTGRES_URL)' \

@@ -335,6 +335,13 @@ pub enum Commands {
         /// Write plan JSON to this file (default: print summary to stdout)
         #[arg(short, long)]
         output: Option<String>,
+        /// Overwrite `wave:` / `parallel_safe:` values the config ALREADY has
+        /// with this plan's recommendations. Without this flag, plan only fills
+        /// in ABSENT fields — an operator's hand-tuned schedule is never
+        /// silently replaced (it was, before 0.24.4: a 5-per-wave split became
+        /// one 76-export wave after a read-only-looking `rivet plan`).
+        #[arg(long)]
+        annotate_waves: bool,
         /// Output format: "pretty" (human summary) or "json" (machine-readable)
         #[arg(long, default_value = "pretty")]
         format: PlanFormat,

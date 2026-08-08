@@ -362,6 +362,7 @@ Generate an execution plan artifact (no data exported)
 * `-e`, `--export <EXPORT>` — Plan only a specific export by name
 * `-p`, `--param <KEY=VALUE>` — Query parameter: key=value (repeatable)
 * `-o`, `--output <OUTPUT>` — Write plan JSON to this file (default: print summary to stdout)
+* `--annotate-waves` — Overwrite `wave:` / `parallel_safe:` values the config ALREADY has with this plan's recommendations. Without this flag, plan only fills in ABSENT fields — an operator's hand-tuned schedule is never silently replaced (it was, before 0.24.4: a 5-per-wave split became one 76-export wave after a read-only-looking `rivet plan`)
 * `--format <FORMAT>` — Output format: "pretty" (human summary) or "json" (machine-readable)
 
   Default value: `pretty`
