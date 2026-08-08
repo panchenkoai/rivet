@@ -158,6 +158,12 @@ pub fn run_plan_command(
         );
     }
 
+    // Pool-scheduler advisory (#166): show the makespan a bounded work-stealing
+    // pool would achieve from measured durations, so the operator can weigh it
+    // against the wave count. Printed only when we have real durations for more
+    // than one export (a single export has nothing to schedule).
+    print_pool_estimate(&artifacts, &state);
+
     emit_artifacts(&artifacts, &format, multi_export, config_path)?;
 
     Ok(())
@@ -418,6 +424,47 @@ fn compute_plan_data(
             row_estimate,
         }),
     }
+}
+
+/// Print the pool scheduler's predicted makespan (#166) beside the wave plan.
+/// Reads each export's last successful duration from the state store; skips
+/// silently when fewer than two exports have history (nothing to schedule).
+fn print_pool_estimate(artifacts: &[PlanArtifact], state: &StateStore) {
+    let items: Vec<super::pool::PoolItem> = artifacts
+        .iter()
+        .filter_map(|a| {
+            let last = state
+                .get_metrics(Some(&a.export_name), 20)
+                .ok()?
+                .into_iter()
+                .find(|m| m.status == "success")?;
+            Some(super::pool::PoolItem {
+                name: a.export_name.clone(),
+                predicted_secs: (last.duration_ms as f64 / 1000.0).max(0.001),
+            })
+        })
+        .collect();
+    if items.len() < 2 {
+        return;
+    }
+    let total: f64 = items.iter().map(|i| i.predicted_secs).sum();
+    println!(
+        "\n  Pool scheduler (measured, {} export(s) with history):",
+        items.len()
+    );
+    println!("    sequential: {:.0} min", total / 60.0);
+    for m in [2usize, 4, 6] {
+        let mk = super::pool::predicted_makespan_secs(&items, m);
+        let floor = super::pool::makespan_floor_secs(&items, m);
+        println!(
+            "    pool M={m}: {:.0} min  (floor max(longest,total/M) = {:.0})",
+            mk / 60.0,
+            floor / 60.0
+        );
+    }
+    println!(
+        "    (a bounded work-stealing pool; --annotate-waves packs the wave          alternative — see #166)"
+    );
 }
 
 fn emit_artifacts(
