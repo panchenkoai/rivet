@@ -14,7 +14,12 @@ const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 
 /// Scope stamped on minted tokens — opendal's default GCS scope (rivet never
 /// overrides the builder's scope). Informational to reqsign's signer; the
-/// refresh_token grant itself determines the actually granted scopes.
+/// refresh_token grant itself determines the actually granted scopes, which
+/// for an ADC `authorized_user` credential are whatever the user consented to
+/// at `gcloud auth application-default login` (cloud-platform in practice).
+/// That is why the SAME loader serves a BigQuery consumer without a
+/// BigQuery-specific scope: changing this string would not widen or narrow
+/// anything.
 const GCS_SCOPE: &str = "https://www.googleapis.com/auth/devstorage.read_write";
 
 /// Remaining validity below which a cached access token is treated as stale
@@ -49,7 +54,7 @@ struct TokenResponse {
 /// builder `.token()` is wrapped by opendal with a `usize::MAX` expiry —
 /// never refreshed — so exports longer than the ~1h TTL would die mid-run
 /// with 401s the RetryLayer cannot fix.)
-pub(crate) struct AdcUserTokenLoader {
+pub struct AdcUserTokenLoader {
     client_id: String,
     // SecOps: long-lived secrets; heap zeroed on drop, never logged.
     client_secret: Zeroizing<String>,
@@ -176,7 +181,7 @@ pub(crate) fn parse_token_response(data: &str) -> Result<(String, u64)> {
 /// `authorized_user` type (i.e. the caller should let OpenDAL handle
 /// credentials normally). No network I/O happens here — the first
 /// refresh_token grant runs on the first signed request.
-pub(crate) fn try_authorized_user_loader() -> Result<Option<AdcUserTokenLoader>> {
+pub fn try_authorized_user_loader() -> Result<Option<AdcUserTokenLoader>> {
     let path = match adc_path() {
         Some(p) if p.exists() => p,
         _ => return Ok(None),

@@ -8,6 +8,7 @@
 //!
 //! See docs/adr/0026-first-party-extension-seam.md for the full seam table.
 
+use rivet::google_auth::{AdcUserTokenLoader, try_authorized_user_loader};
 use rivet::types::TypeMapping;
 use rivet::types::target::{ExportTarget, TargetColumnSpec, TargetInput};
 
@@ -31,6 +32,19 @@ fn seam_variants() -> [ExportTarget; 4] {
     ]
 }
 
+/// The ADC loader's shape, compile-locked: a fallible probe returning an
+/// optional loader that implements reqsign's `GoogleTokenLoad` — the only
+/// property a consumer needs, since it is plugged into
+/// `GoogleTokenLoader::with_customized_token_loader`.
+fn seam_adc_loader() -> anyhow::Result<Option<AdcUserTokenLoader>> {
+    let loaded = try_authorized_user_loader()?;
+    fn assert_token_load<T: reqsign::GoogleTokenLoad>(_: &T) {}
+    if let Some(l) = &loaded {
+        assert_token_load(l);
+    }
+    Ok(loaded)
+}
+
 #[test]
 fn first_party_extension_seam_is_stable() {
     // Binding each item to an explicitly-typed function pointer double-locks
@@ -39,4 +53,8 @@ fn first_party_extension_seam_is_stable() {
     let _rt: fn(ExportTarget, &[TypeMapping]) -> Vec<TargetColumnSpec> = seam_resolve_table;
     let _rc: fn(ExportTarget, TargetInput<'_>) -> TargetColumnSpec = seam_resolve_column;
     assert_eq!(seam_variants().len(), 4);
+    // The ADC loader probe: it must COMPILE against the seam and must not
+    // panic on a machine with no ADC file (it returns Ok(None) there).
+    let _adc: fn() -> anyhow::Result<Option<AdcUserTokenLoader>> = seam_adc_loader;
+    assert!(seam_adc_loader().is_ok());
 }

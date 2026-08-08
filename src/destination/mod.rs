@@ -7,7 +7,7 @@
 pub mod azure;
 mod cloud;
 pub mod gcs;
-mod gcs_auth;
+pub(crate) mod gcs_auth;
 pub mod local;
 pub mod placeholder;
 pub mod s3;
