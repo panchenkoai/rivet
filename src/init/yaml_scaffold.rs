@@ -568,20 +568,35 @@ fn export_block_lines(
                 }
             }
         }
-        "incremental" => {
-            let cursor = info.best_cursor_column().unwrap_or("updated_at");
-            lines.push(format!(
+        "incremental" => match info.chosen_cursor_column() {
+            Some(cursor) => lines.push(format!(
                 "    cursor_column: {}",
-                yaml_quote_if_needed(cursor)
-            ));
-        }
+                yaml_quote_if_needed(&cursor)
+            )),
+            // No timestamp candidate: DO NOT emit a phantom `updated_at` (a
+            // column that may not exist — the run would fail at read time on a
+            // silent guess). Leave it for the operator; `rivet check` then fails
+            // loudly with "incremental mode requires cursor_column", which is
+            // the honest signal. The snapshot records None here too — they agree
+            // (bug hunt 2026-08-08: the old literal fallback diverged from the
+            // snapshot's None and named a phantom column).
+            None => lines.push(
+                "    # REVIEW: no timestamp column detected — set cursor_column: <col> manually"
+                    .to_string(),
+            ),
+        },
         "time_window" => {
             // time_window REQUIRES time_column (+ days_window) — omitting them
             // scaffolds a config that immediately fails `rivet check`
             // ("time_window mode requires time_column"). Seed from the best
             // timestamp column (same resolution as incremental's cursor).
-            let ts = info.best_cursor_column().unwrap_or("updated_at");
-            lines.push(format!("    time_column: {}", yaml_quote_if_needed(ts)));
+            match info.chosen_cursor_column() {
+                Some(ts) => lines.push(format!("    time_column: {}", yaml_quote_if_needed(&ts))),
+                None => lines.push(
+                    "    # REVIEW: no timestamp column detected — set time_column: <col> manually"
+                        .to_string(),
+                ),
+            }
             lines.push(
                 "    days_window: 7  # export the last N days on each run (half-open window; tune to your retention)"
                     .to_string(),
@@ -1106,6 +1121,64 @@ mod tests {
         }
     }
 
+    /// #159 (correctness): the cursor the YAML renders and the cursor the
+    /// strategy_snapshot records must be the SAME picker. They diverged — the
+    /// YAML used a name-preference pick with a phantom `updated_at` fallback,
+    /// the snapshot the scored pick with a None fallback — so the audit trail
+    /// could name a column the config did not contain.
+    #[test]
+    fn incremental_cursor_matches_between_yaml_and_snapshot() {
+        // A table whose scored top (updated_at) is unambiguous — both agree.
+        let info = make_table(vec![
+            col("id", "bigint"),
+            col("created_at", "timestamp"),
+            col("updated_at", "timestamp"),
+        ]);
+        let yaml = generate_config(
+            &info,
+            "postgresql://localhost/db",
+            &crate::init::SourceProvenance::Inline,
+            &Default::default(),
+            Some("incremental"),
+            None,
+        )
+        .expect("scaffold");
+        let snap_col = decided_strategy(&info, Some("incremental")).key_column;
+        // Extract the cursor_column the YAML rendered.
+        let rendered = yaml
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("cursor_column:"))
+            .map(|c| c.trim().to_string());
+        assert_eq!(
+            rendered, snap_col,
+            "YAML cursor and snapshot key_column must be the SAME picker"
+        );
+        assert_eq!(rendered.as_deref(), Some("updated_at"));
+
+        // No timestamp at all: the YAML must NOT emit a phantom cursor_column,
+        // and the snapshot records None — they still agree.
+        let bare = make_table(vec![col("id", "bigint"), col("name", "text")]);
+        let yaml2 = generate_config(
+            &bare,
+            "postgresql://localhost/db",
+            &crate::init::SourceProvenance::Inline,
+            &Default::default(),
+            Some("incremental"),
+            None,
+        )
+        .expect("scaffold");
+        assert!(
+            !yaml2
+                .lines()
+                .any(|l| l.trim().starts_with("cursor_column:")),
+            "no timestamp ⇒ no phantom cursor_column, just a REVIEW note:\n{yaml2}"
+        );
+        assert_eq!(
+            decided_strategy(&bare, Some("incremental")).key_column,
+            None
+        );
+    }
+
     /// #146: the scaffold records the SAME posture init connected with, so the
     /// generated config works against the same host with no hand edit.
     #[test]
@@ -1613,7 +1686,7 @@ pub(crate) fn decided_strategy(
         }
         "incremental" => DecidedStrategy {
             kind: "incremental",
-            key_column: info.cursor_candidates().first().map(|c| c.column.clone()),
+            key_column: info.chosen_cursor_column(),
             chunk_size: None,
             mode,
         },
