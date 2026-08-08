@@ -188,3 +188,67 @@ fn sec_loopback_plaintext_pg_is_allowed() {
         "loopback plaintext must NOT trigger a TLS-required refusal; stderr:\n{stderr}"
     );
 }
+
+/// TLS-honesty (bug hunt 2026-08-08): an enforced `tls:` block must not be
+/// silently overridden by the URL's own `sslmode`.
+///
+/// The local stand runs Postgres with `ssl = off`, so `verify-full` is
+/// genuinely unsatisfiable here — which is the point. With `?sslmode=disable`
+/// in the URL, tokio-postgres used to hand back a raw PLAINTEXT stream and
+/// never touch the connector, so the export SUCCEEDED in cleartext under a
+/// `verify-full` claim. After the fix (`pg_config_ssl_forced` forces
+/// `ssl_mode(Require)`), TLS is attempted, the ssl-off server declines, and the
+/// run REFUSES. The assertion is "does not silently succeed in plaintext".
+///
+/// RED against `main`: there the run exits 0 with a written CSV part.
+fn pg_tls_config(
+    tmp: &tempfile::TempDir,
+    url: &str,
+    out_dir: &str,
+    mode: &str,
+) -> std::path::PathBuf {
+    let yaml = format!(
+        r#"source:
+  type: postgres
+  url: "{url}"
+  tls: {{ mode: {mode} }}
+exports:
+  - name: sec_tls_honesty
+    query: "SELECT 1"
+    mode: full
+    format: csv
+    destination:
+      type: local
+      path: "{out_dir}"
+"#
+    );
+    write_config(tmp, &yaml)
+}
+
+#[test]
+#[ignore = "live: requires the local ssl-off Postgres stand"]
+fn sec_enforced_tls_is_not_overridden_by_url_sslmode_disable() {
+    require_alive(LiveService::Postgres);
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("out");
+    // Loopback host + an EXPLICIT sslmode=disable in the URL, plus an enforced
+    // tls block. The host is loopback so the require_tls_or_loopback gate does
+    // NOT fire — the ONLY thing that can refuse plaintext here is the driver
+    // actually honoring the enforced mode, which is what this pins.
+    let url = format!("{POSTGRES_URL}?sslmode=disable");
+    let cfg = pg_tls_config(&tmp, &url, out.to_str().unwrap(), "verify-full");
+
+    let r = run_rivet(&["run", "--config", cfg.to_str().unwrap()]);
+    let stderr = String::from_utf8_lossy(&r.stderr);
+    assert!(
+        !r.status.success(),
+        "verify-full over an ssl-off server must REFUSE, not export in plaintext; \
+         the URL's sslmode=disable must not win. stderr:\n{stderr}"
+    );
+    // And it must fail for a TLS/connection reason, not some unrelated error.
+    let low = stderr.to_lowercase();
+    assert!(
+        low.contains("tls") || low.contains("ssl") || looks_like_connection_error(&low),
+        "refusal must be TLS/connection-shaped, not an unrelated failure; stderr:\n{stderr}"
+    );
+}

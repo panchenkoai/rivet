@@ -95,7 +95,8 @@ impl PostgresSource {
             Some(cfg) if cfg.mode.is_enforced() => {
                 let connector = build_native_tls(cfg)?;
                 let make_tls = postgres_native_tls::MakeTlsConnector::new(connector);
-                let mut client = Client::connect(url, make_tls)?;
+                // Forced ssl_mode overrides the URL's sslmode; see connect_client.
+                let mut client = pg_config_ssl_forced(url)?.connect(make_tls)?;
                 let transaction_pooler = detect_pg_transaction_pooler(&mut client);
                 if transaction_pooler {
                     log::warn!(
@@ -438,6 +439,30 @@ pub(crate) fn introspect_pg_table_for_chunking(
 /// `crate::init::postgres::connect`). `tls = None` or `mode: disable` falls
 /// back to the insecure `NoTls` transport — a warning is logged from
 /// `create_source` so operators know TLS is off.
+/// Parse `url` into a `postgres::Config` and FORCE `ssl_mode(Require)`.
+///
+/// The bug this closes: `Client::connect(url, connector)` lets tokio-postgres
+/// decide TLS from the URL's own `sslmode` — so `?sslmode=disable`, or the
+/// driver's DEFAULT `prefer` against a server that declines TLS, returns a raw
+/// PLAINTEXT stream and never touches the connector we built. An operator who
+/// wrote `tls: { mode: verify-full }` (or `--tls verify-full`) then ships
+/// credentials and every row in cleartext under exit 0. Mongo fixed the
+/// identical class by overriding `opts.tls`; this is Postgres's override.
+///
+/// `ssl_mode(Require)` only forces TLS to be USED; the CONNECTOR
+/// (`build_native_tls`) still decides how strictly the cert is checked
+/// (require = accept-invalid, verify-ca = chain, verify-full = chain+host), so
+/// the four modes keep their meanings — this just stops `disable`/`prefer` in
+/// the URL from silently winning over an enforced `tls:` block.
+fn pg_config_ssl_forced(url: &str) -> Result<postgres::Config> {
+    use std::str::FromStr;
+    let mut config = postgres::Config::from_str(url).map_err(|e| {
+        anyhow::anyhow!("postgres: cannot parse source URL for TLS enforcement: {e}")
+    })?;
+    config.ssl_mode(postgres::config::SslMode::Require);
+    Ok(config)
+}
+
 pub(crate) fn connect_client(url: &str, tls: Option<&TlsConfig>) -> Result<Client> {
     // Refuse remote plaintext (no `tls:` block) before any dial (CWE-319).
     crate::source::require_tls_or_loopback(url, tls)?;
@@ -445,7 +470,10 @@ pub(crate) fn connect_client(url: &str, tls: Option<&TlsConfig>) -> Result<Clien
         Some(cfg) if cfg.mode.is_enforced() => {
             let connector = build_native_tls(cfg)?;
             let make_tls = postgres_native_tls::MakeTlsConnector::new(connector);
-            Ok(Client::connect(url, make_tls)?)
+            // Config::connect, NOT Client::connect(url, …): the forced
+            // ssl_mode(Require) overrides the URL's sslmode so the connector is
+            // actually used (see pg_config_ssl_forced).
+            Ok(pg_config_ssl_forced(url)?.connect(make_tls)?)
         }
         _ => Ok(Client::connect(url, NoTls)?),
     }
@@ -887,6 +915,35 @@ fn catalog_numeric_to_decimal_params(precision: i32, scale: i32) -> Option<(u8, 
 #[cfg(test)]
 mod tests {
     use super::catalog_numeric_to_decimal_params;
+
+    /// The TLS-honesty fix (bug hunt 2026-08-08): under an enforced `tls:`
+    /// block the connection's ssl_mode must be forced to Require REGARDLESS of
+    /// what the URL's own `sslmode` says — otherwise `?sslmode=disable` (or the
+    /// driver's default `prefer` against a TLS-declining server) silently wins
+    /// and the connector we built is never used, shipping cleartext under a
+    /// `verify-full` claim.
+    #[test]
+    fn enforced_tls_forces_ssl_mode_require_over_the_urls_sslmode() {
+        use postgres::config::SslMode;
+        // Every URL sslmode an operator might write — all must come out Require.
+        for url in [
+            "postgresql://u:p@h/db?sslmode=disable",
+            "postgresql://u:p@h/db?sslmode=prefer",
+            "postgresql://u:p@h/db", // no param → driver default is `prefer`
+            "postgresql://u:p@h/db?sslmode=require",
+        ] {
+            let cfg =
+                super::pg_config_ssl_forced(url).unwrap_or_else(|e| panic!("parse {url}: {e}"));
+            assert_eq!(
+                cfg.get_ssl_mode(),
+                SslMode::Require,
+                "enforced TLS must force Require, but {url} yielded {:?}",
+                cfg.get_ssl_mode()
+            );
+        }
+        // A malformed URL is a loud parse error, not a silent plaintext fallback.
+        assert!(super::pg_config_ssl_forced("not a url").is_err());
+    }
 
     // FROM-clause parser tests live in `from_parse.rs` alongside the parser.
 
