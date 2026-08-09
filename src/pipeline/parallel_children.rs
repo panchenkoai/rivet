@@ -226,6 +226,14 @@ pub(super) fn run_exports_as_child_processes(
         }
     }
 
+    // #153 heartbeat: silence between spawn and the first child event is
+    // indistinguishable from a hang (the field: ~2.5 min blank terminal). Emit
+    // an immediate parent-side line so silence reads as idle-by-design.
+    eprintln!(
+        "  … spawned {} export process(es); waiting for the first child event",
+        children.len()
+    );
+
     let mut failures = Vec::new();
     let mut wait_failures: HashMap<String, String> = HashMap::new();
     // Numeric exit codes of failed children, so the parent can re-derive the
@@ -327,8 +335,92 @@ pub(super) fn run_exports_as_child_processes(
         }
     }
 
+    // #153: a common-mode startup failure — surface ONE representative excerpt
+    // NOW (before the caller's end-of-batch full dump), so the operator sees the
+    // one message that explains the flood instead of scanning 70 identical cards.
+    // Representative message per failed child = its last stderr line (the error),
+    // else the wait/spawn reason. `any_success` = at least one child produced no
+    // failure record.
+    let any_success = exports.iter().any(|e| !all_failures.contains_key(&e.name));
+    let failed_msgs: Vec<(String, String)> = all_failures
+        .iter()
+        .map(|(name, reason)| {
+            let msg = stderr_snapshot
+                .get(name)
+                .and_then(|lines| lines.iter().rev().find(|l| !l.trim().is_empty()))
+                .cloned()
+                .unwrap_or_else(|| reason.clone());
+            (name.clone(), msg)
+        })
+        .collect();
+    if let Some(banner) = representative_error(&failed_msgs, any_success, 3) {
+        eprint!("{banner}");
+    }
+
     let result = aggregate_child_result(&failures, &child_exit_codes);
     (result, all_failures, stderr_dump)
+}
+
+/// #153: when K+ children fail with the SAME error class before any success,
+/// surface ONE representative excerpt instead of a silent wait then a flood of
+/// identical ✗ cards (the field: 70+ children failed on absent dest creds; the
+/// operator saw a blank terminal then 70 cards, none of which explained why).
+///
+/// Pure so the dedup/threshold is unit-tested. `failed` is `(name, last_stderr
+/// line)` per failed child; `any_success` suppresses the banner (a mixed batch
+/// is not a common-mode failure). Class key = the message with digits/hex/paths
+/// blanked, so `token for host-1` and `token for host-2` collapse to one class.
+/// Returns `None` below the threshold or on a mixed/empty batch.
+pub(super) fn representative_error(
+    failed: &[(String, String)],
+    any_success: bool,
+    threshold: usize,
+) -> Option<String> {
+    if any_success || failed.len() < threshold {
+        return None;
+    }
+    // Collapse each RUN of digits to one '#' (so host-1 and host-10 are one
+    // class, not two) and normalize whitespace.
+    let class_of = |msg: &str| -> String {
+        let mut out = String::with_capacity(msg.len());
+        let mut prev_digit = false;
+        for c in msg.chars() {
+            if c.is_ascii_digit() {
+                if !prev_digit {
+                    out.push('#');
+                }
+                prev_digit = true;
+            } else {
+                out.push(c);
+                prev_digit = false;
+            }
+        }
+        out.split_whitespace().collect::<Vec<_>>().join(" ")
+    };
+    let mut counts: std::collections::HashMap<String, (usize, String)> =
+        std::collections::HashMap::new();
+    for (_, msg) in failed {
+        let m = msg.trim();
+        if m.is_empty() {
+            continue;
+        }
+        let e = counts.entry(class_of(m)).or_insert((0, m.to_string()));
+        e.0 += 1;
+    }
+    let (n, sample) = counts.into_values().max_by_key(|(n, _)| *n)?;
+    if n < threshold {
+        return None;
+    }
+    let more = failed.len().saturating_sub(n);
+    let tail = if more > 0 {
+        format!(" (and {more} more child failure(s), not all this class)")
+    } else {
+        format!(" (all {n} children failed alike)")
+    };
+    Some(format!(
+        "\n  ⚠ {n} children failed with the same error before any succeeded — \
+         representative:\n      {sample}{tail}\n      (full per-child stderr follows at batch end)\n"
+    ))
 }
 
 /// Build the parent's final result from the children's outcomes. When any child
@@ -657,5 +749,61 @@ mod tests {
             "child stderr render leaked control bytes: {out:?}"
         );
         assert!(out.contains("pwned") && out.contains("boom"));
+    }
+}
+
+#[cfg(test)]
+mod representative_tests {
+    use super::representative_error;
+
+    #[test]
+    fn representative_collapses_a_common_mode_failure() {
+        // 70 children, same class (creds absent for different hosts) → ONE banner.
+        let failed: Vec<(String, String)> = (0..70)
+            .map(|i| {
+                (
+                    format!("t{i}"),
+                    format!("Error: could not obtain token for host-{i}"),
+                )
+            })
+            .collect();
+        let banner = representative_error(&failed, false, 3).expect("common-mode → banner");
+        assert!(banner.contains("70 children failed"), "{banner}");
+        assert!(banner.contains("could not obtain token"), "{banner}");
+    }
+
+    #[test]
+    fn representative_suppressed_on_mixed_or_below_threshold() {
+        let two: Vec<(String, String)> = (0..2)
+            .map(|i| (format!("t{i}"), "Error: x".into()))
+            .collect();
+        assert!(
+            representative_error(&two, false, 3).is_none(),
+            "below threshold"
+        );
+        let many: Vec<(String, String)> = (0..10)
+            .map(|i| (format!("t{i}"), "Error: x".into()))
+            .collect();
+        assert!(
+            representative_error(&many, true, 3).is_none(),
+            "a batch with a success is not a common-mode failure"
+        );
+    }
+
+    #[test]
+    fn representative_picks_the_dominant_class_when_mixed() {
+        let mut failed: Vec<(String, String)> = (0..8)
+            .map(|i| (format!("a{i}"), format!("Error: token for host-{i}")))
+            .collect();
+        failed.push(("b".into(), "Error: disk full".into()));
+        let banner = representative_error(&failed, false, 3).unwrap();
+        assert!(
+            banner.contains("8 children failed"),
+            "dominant class: {banner}"
+        );
+        assert!(
+            banner.contains("more child failure(s)"),
+            "names the tail: {banner}"
+        );
     }
 }
