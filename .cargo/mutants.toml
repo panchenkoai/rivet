@@ -66,4 +66,12 @@ exclude_re = [
     # RSS boundary and the annotate/export refuse-guard) are unit-tested and
     # RED-proven (rss_split_is_strict_*, refuse_annotate_scoped_to_export_*).
     "replace / with \\* in repack_from_history",
+    # The DECISION whether an MSSQL TLS posture trusts an unverified cert lives
+    # in `mssql_trusts_cert_without_verify`, unit-tested in both directions and
+    # RED-proven (Require/VerifyFull/accept_invalid combos). The match GUARD at
+    # its call site (`connect_with_tls`) takes a live `tiberius::Config` and only
+    # matters against a real TLS handshake — there is no offline caller, so the
+    # `guard -> true`/`-> false` mutant is unkillable HERE by construction. It is
+    # live-guarded by the blessed-path `init --tls` + MSSQL connect scenarios.
+    "replace match guard mssql_trusts_cert_without_verify\\(cfg\\) with (true|false) in MssqlSource::connect_with_tls",
 ]

@@ -486,7 +486,7 @@ fn commit_past_bound(file: &str, pos: u64, bound: Option<&(String, u64)>) -> boo
 }
 
 /// The numeric suffix of a binlog file name (`mysql-bin.000042` → 42).
-fn binlog_file_ordinal(name: &str) -> Option<u64> {
+pub(crate) fn binlog_file_ordinal(name: &str) -> Option<u64> {
     name.rsplit_once('.')?.1.parse().ok()
 }
 

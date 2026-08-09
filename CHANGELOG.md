@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **Extension seam (ADR-0026): `rivet::google_auth`** —
+  `AdcUserTokenLoader` and `try_authorized_user_loader()` are now `pub`.
+  `reqsign` resolves service account → impersonated → external account → VM
+  metadata and has NO `authorized_user` arm, so every native Google client
+  needs this loader or it authenticates in CI and fails on a developer
+  laptop. It was already implemented here for the GCS destination; exposing
+  it lets `rivet-pro`'s native BigQuery client delete its own copy — which
+  had surfaced the token endpoint's error body (Google echoes the submitted
+  `client_id`/`client_secret` back in some failure modes), kept the secrets
+  un-zeroed, and invented a lifetime when `expires_in` was absent. Additive:
+  nothing existing changed shape.
+
 ## 0.24.3 — 2026-08-07
 
 Nine silent-loss fixes, one loud refusal, and the layers that found them. Every

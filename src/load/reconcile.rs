@@ -498,9 +498,19 @@ fn ensure_single_source(keyed: &[(String, RunManifest)]) -> Result<()> {
         .map(|(_, m)| crate::manifest::identity_source(m))
         .filter(|s| !s.is_empty())
         .filter(|s| {
-            // Drop an identity that is a strict PREFIX (at a segment boundary)
-            // of some other identity present — it is the same source, recorded
-            // with less detail.
+            // Drop an identity that is the BARE ENGINE (no table recorded — the
+            // synthesized batch leg's `table: null`, #144) when a fuller
+            // identity for that engine is present: it is the same source with
+            // less detail. Only the colon-FREE engine folds — a `:`-bearing
+            // identity is a concrete engine:table and must never be treated as
+            // a coarser prefix of another, or two DIFFERENT tables/collections
+            // whose names share a `:` boundary (a Mongo collection literally
+            // named `orders:archive` vs `orders`) would silently fold into one
+            // source and the two-source guard would wrongly pass (bug hunt
+            // 2026-08-08).
+            if s.contains(':') {
+                return true; // concrete engine:table — never a coarsening
+            }
             !keyed.iter().any(|(_, other)| {
                 let o = crate::manifest::identity_source(other);
                 o.len() > s.len() && o.starts_with(s.as_str()) && o.as_bytes()[s.len()] == b':'
@@ -753,6 +763,38 @@ mod tests {
         assert!(
             ensure_single_export(&[keyed(pg), keyed(again)]).is_ok(),
             "repeated runs of one export must not be refused — that is the normal load"
+        );
+    }
+
+    /// A `:` in a collection/table name must not fold two DIFFERENT sources
+    /// into one (bug hunt 2026-08-08). Mongo collection `orders:archive` →
+    /// identity `mongo:orders:archive`; collection `orders` → `mongo:orders`.
+    /// The bare-engine fold used to treat `mongo:orders` as a coarsening of
+    /// `mongo:orders:archive` (both at a `:` boundary) and pass — two distinct
+    /// collections under one export name loading as one source.
+    #[test]
+    fn ensure_single_source_does_not_fold_two_colon_named_collections() {
+        let keyed = |m: RunManifest| ("gs://b/p/manifest-x.json".to_string(), m);
+        let mut a = manifest("r1", 10, None);
+        a.source.engine = "mongo".into();
+        a.source.table = Some("orders".into());
+        let mut b = manifest("r2", 10, None);
+        b.source.engine = "mongo".into();
+        b.source.table = Some("orders:archive".into());
+        b.export_name = a.export_name.clone();
+        assert!(
+            ensure_single_export(&[keyed(a.clone()), keyed(b.clone())]).is_err(),
+            "two collections whose names share a `:` boundary are TWO sources"
+        );
+        // …and the bare-engine fold it must NOT have broken still works:
+        // engine `mongo` (no table) folds into `mongo:orders`.
+        let mut bare = manifest("r3", 10, None);
+        bare.source.engine = "mongo".into();
+        bare.source.table = None;
+        bare.export_name = a.export_name.clone();
+        assert!(
+            ensure_single_export(&[keyed(a), keyed(bare)]).is_ok(),
+            "a bare engine is still the same source, less detail"
         );
     }
 

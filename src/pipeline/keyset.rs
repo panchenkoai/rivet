@@ -22,12 +22,12 @@
 use super::manifest_writer;
 use super::{RunSummary, sink::ExportSink};
 use crate::config::IncrementalCursorMode;
+use crate::destination;
 use crate::error::Result;
 use crate::plan::{ExtractionStrategy, IncrementalCursorPlan, KeysetPlan, ResolvedRunPlan};
 use crate::source::{self, Source};
 use crate::state::StateStore;
 use crate::types::CursorState;
-use crate::{destination, format};
 
 fn keyset_plan(plan: &ResolvedRunPlan) -> &KeysetPlan {
     match &plan.strategy {
@@ -423,12 +423,7 @@ fn run_keyset_parallel(
         page_size
     );
 
-    let dest = std::sync::Arc::new(destination::create_destination(&plan.destination)?);
-    crate::manifest::guard_manifest_mode(&**dest, "batch")?;
-
-    let ext = format::create_format(plan.format, plan.compression, plan.compression_level, None)
-        .file_extension()
-        .to_string();
+    let (dest, ext) = super::frame::RunnerFrame::open_shared(plan)?;
     // Part names key off the run_id, not a wall-clock stamp: unique per fresh run
     // AND stable across a resume, so a re-run range's parts OVERWRITE its crashed
     // partial parts (idempotent) instead of accumulating duplicates.
@@ -875,11 +870,8 @@ pub(crate) fn run_keyset(
     // Destination + manifest-mode guard (Finding #44) + run-unique part stamp are
     // fixed for the whole run — hoisted out of the page loop. Millisecond stamp:
     // two runs into the same prefix must not clobber (run-unique part-name rule).
-    let dest = destination::create_destination(&plan.destination)?;
-    crate::manifest::guard_manifest_mode(dest.as_ref(), "batch")?;
-    let ext = format::create_format(plan.format, plan.compression, plan.compression_level, None)
-        .file_extension()
-        .to_string();
+    let frame = super::frame::RunnerFrame::open(plan)?;
+    let (dest, ext) = (frame.dest, frame.ext);
     let stamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f").to_string();
 
     loop {

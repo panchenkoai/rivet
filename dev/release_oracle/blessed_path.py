@@ -336,18 +336,29 @@ def sc_blessed_path(
 
     # ── init ──────────────────────────────────────────────────────────────────
     cfg = work / "rivet.yaml"
+    # init WITH the TLS flag (#146), exercised end to end — not just "init exits
+    # 0". mssql's stand encrypts the login packet with a self-signed cert, so
+    # `require` (= TLS + accept-any after the 2026-08-08 fix) is its honest
+    # posture; the loopback SQL/Mongo stands serve plaintext, so `disable` is
+    # theirs. Either way the flag must REACH the scaffold's source.tls block.
+    init_tls = "require" if engine == "mssql" else "disable"
     p = rivet(
-        "init", "--source-env", "ORACLE_URL", "-o", str(cfg),
+        "init", "--source-env", "ORACLE_URL", "--tls", init_tls, "-o", str(cfg),
         env=env, timeout=scenarios.NO_TIMEOUT,
     )
     body = cfg.read_text() if cfg.is_file() else ""
+    # The posture init was ASKED for must be IN the generated config — the
+    # finding this closes: --tls cells that proved only "init exits 0" while the
+    # posture never entered the chain config.
+    tls_reflected = f"mode: {init_tls}" in body
     # Deliberately NOT parsed with a YAML library here. "Does the file parse"
     # is answered by feeding it to rivet's own parser — `check`, two stages
     # down, whose failure is a real failure of the chain. A private parse would
     # grade this module's YAML knowledge against init's, holding both sides of
     # the comparison; the repo has paid for that shape twice.
-    ok = bool(p.ok and body.strip() and "exports:" in body)
-    detail = f"config {cfg.name}, {len(body.splitlines())} lines" if ok else f"exit={p.returncode} file={cfg.is_file()}"
+    ok = bool(p.ok and body.strip() and "exports:" in body and tls_reflected)
+    detail = (f"config {cfg.name}, {len(body.splitlines())} lines, tls={init_tls}" if ok
+              else f"exit={p.returncode} file={cfg.is_file()} tls_reflected={tls_reflected}")
     if not _stage(led, engine, tag, store, "init", ok, detail):
         _downstream_unreached(led, engine, tag, store, "init")
         return
@@ -376,7 +387,9 @@ def sc_blessed_path(
         # correctly; the chain surfaced it as a doctor FAIL, which is the
         # handoff working exactly as intended.
         dest_block = "    destination:\n" + raw.rstrip("\n")
-    tls = "\n  tls: {accept_invalid_certs: true}" if engine == "mssql" else ""
+    # Carry init's OWN tls posture into the narrowed config (do not hand-write
+    # one) — the whole point is the chain runs over what init generated.
+    tls = f"\n  tls: {{ mode: {init_tls} }}"
     cfg.write_text(
         f"source:\n"
         f"  type: {engine}\n"

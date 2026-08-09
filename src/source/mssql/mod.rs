@@ -106,6 +106,20 @@ fn pct_decode(s: &str) -> String {
         .into_owned()
 }
 
+/// Does this TLS posture mean "encrypt, but do NOT verify the certificate"?
+///
+/// `Disable`, `Require`, and `accept_invalid_certs` all do — SQL Server always
+/// encrypts the login packet, so "disable" is really trust-any, and `Require`'s
+/// documented contract (config/source.rs) is "TLS, accept any cert", the SAME
+/// as PG/MySQL/Mongo implement it. Treating `Require` as strict verify (bug
+/// hunt 2026-08-08) made `--tls require` fail against SQL Server's default
+/// self-signed cert while the identical flag connected on the other three
+/// engines. Only `verify-ca`/`verify-full` (without accept_invalid_certs) fall
+/// through to real chain validation.
+pub(crate) fn mssql_trusts_cert_without_verify(cfg: &TlsConfig) -> bool {
+    cfg.mode == TlsMode::Disable || cfg.mode == TlsMode::Require || cfg.accept_invalid_certs
+}
+
 pub(crate) fn parse_mssql_url(url: &str) -> Result<MssqlUrl> {
     let rest = url
         .strip_prefix("sqlserver://")
@@ -197,9 +211,7 @@ impl MssqlSource {
             // analogue of PG/MySQL remote plaintext. It is the documented way
             // to keep trust-cert against a remote host the gate above would
             // otherwise have refused.
-            Some(cfg) if cfg.mode == TlsMode::Disable || cfg.accept_invalid_certs => {
-                config.trust_cert()
-            }
+            Some(cfg) if mssql_trusts_cert_without_verify(cfg) => config.trust_cert(),
             Some(cfg) => {
                 // Strict cert validation is ON here (mode verify-ca/verify-full,
                 // no accept_invalid_certs). The TLS backend is OpenSSL
@@ -1203,6 +1215,48 @@ pub(crate) fn introspect_mssql_table_for_chunking(
         avg_row_bytes: None,
         int_columns,
     })
+}
+
+#[cfg(test)]
+mod tls_posture_tests {
+    use super::mssql_trusts_cert_without_verify;
+    use crate::config::{TlsConfig, TlsMode};
+
+    fn cfg(mode: TlsMode, accept: bool) -> TlsConfig {
+        TlsConfig {
+            mode,
+            ca_file: None,
+            accept_invalid_certs: accept,
+            ..Default::default()
+        }
+    }
+
+    /// Require must trust-without-verify, matching its documented contract and
+    /// the three sibling engines — the bug hunt find was mssql treating it as
+    /// strict verify. verify-ca/full must NOT trust (real validation).
+    #[test]
+    fn require_trusts_like_its_siblings_verify_modes_do_not() {
+        assert!(
+            mssql_trusts_cert_without_verify(&cfg(TlsMode::Require, false)),
+            "Require = encrypt+accept-any, same as PG/MySQL/Mongo"
+        );
+        assert!(mssql_trusts_cert_without_verify(&cfg(
+            TlsMode::Disable,
+            false
+        )));
+        assert!(
+            mssql_trusts_cert_without_verify(&cfg(TlsMode::VerifyFull, true)),
+            "accept_invalid_certs forces trust regardless of mode"
+        );
+        assert!(!mssql_trusts_cert_without_verify(&cfg(
+            TlsMode::VerifyCa,
+            false
+        )));
+        assert!(!mssql_trusts_cert_without_verify(&cfg(
+            TlsMode::VerifyFull,
+            false
+        )));
+    }
 }
 
 #[cfg(test)]
