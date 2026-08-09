@@ -702,6 +702,7 @@ pub enum CdcInitialMode {
 /// `destination`, and `format` come from the export itself; this carries only the
 /// CDC-specific knobs (resume + per-engine stream params).
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct CdcExportConfig {
     /// First-run behaviour: `snapshot` = anchor → full snapshot → drain (see
     /// [`CdcInitialMode`]). Omitted ⇒ capture changes only, with no anchor step

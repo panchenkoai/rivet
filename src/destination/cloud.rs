@@ -217,10 +217,15 @@ impl<B: CloudBackend> super::Destination for CloudDestination<B> {
             // Azure as `content_md5` (base64), S3 as the ETag (hex MD5).  Hand
             // it back for the commit-time transit check.
             super::WriteOutcome {
-                content_md5: meta
-                    .content_md5()
-                    .map(str::to_string)
-                    .or_else(|| meta.etag().map(|e| e.trim_matches('"').to_string())),
+                // Use the store's REAL Content-MD5 header only (GCS / Azure
+                // return it, base64). Do NOT fall back to the S3 ETag: for an
+                // SSE-KMS / SSE-C object the ETag is NOT the object's MD5 (AWS
+                // documents this) yet is still a 32-hex string, so trusting it as
+                // an MD5 oracle mis-verifies the transit on any bucket with
+                // default encryption (bug hunt 2026-08-09). `None` here means the
+                // commit-time transit check is skipped for that part — the size
+                // check still runs — rather than checked against a wrong digest.
+                content_md5: meta.content_md5().map(str::to_string),
             }
         } else {
             let mut src = std::fs::File::open(local_path)?;

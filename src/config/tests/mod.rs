@@ -1387,7 +1387,7 @@ exports:
 "#,
     )
     .unwrap_err();
-    assert!(err.to_string().contains("0..10"), "got: {}", err);
+    assert!(err.to_string().contains("0..9"), "got: {}", err);
 }
 
 #[test]

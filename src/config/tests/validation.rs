@@ -1175,3 +1175,196 @@ proptest::proptest! {
         let _ = Config::from_yaml(&yaml);
     }
 }
+
+// ── keyset_incremental accept-but-break (roast 2026-08-09) ──────────────
+// keyset_incremental was absent from the `mode != chunked` reject-list, so
+// it was silently ignored outside chunked; and it needs a keyset key.
+
+#[test]
+fn keyset_incremental_without_chunked_mode_rejected() {
+    let yaml = r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: t
+    mode: full
+    table: events
+    keyset_incremental: true
+    format: parquet
+    destination:
+      type: local
+      path: ./out
+"#;
+    let msg = format!("{:#}", Config::from_yaml(yaml).unwrap_err());
+    assert!(msg.contains("keyset_incremental"), "names the knob: {msg}");
+    assert!(msg.contains("mode: chunked"), "points at the fix: {msg}");
+}
+
+#[test]
+fn keyset_incremental_requires_chunk_by_key() {
+    // Under chunked but with a RANGE chunk_column — no key to resume from.
+    let yaml = r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: t
+    mode: chunked
+    table: events
+    chunk_column: id
+    keyset_incremental: true
+    format: parquet
+    destination:
+      type: local
+      path: ./out
+"#;
+    let msg = format!("{:#}", Config::from_yaml(yaml).unwrap_err());
+    assert!(msg.contains("keyset_incremental"), "names the knob: {msg}");
+    assert!(msg.contains("chunk_by_key"), "points at the fix: {msg}");
+}
+
+#[test]
+fn keyset_incremental_accepted_under_chunked_with_key() {
+    // The false-reject guard: the legit form (chunked + chunk_by_key) LOADS.
+    let yaml = r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: t
+    mode: chunked
+    table: events
+    chunk_by_key: id
+    keyset_incremental: true
+    format: parquet
+    destination:
+      type: local
+      path: ./out
+"#;
+    assert!(
+        Config::from_yaml(yaml).is_ok(),
+        "keyset_incremental must be accepted under chunked + chunk_by_key"
+    );
+}
+
+// ── mongo resume without page_size (roast 2026-08-09) ───────────────────
+// resume is keyset-only; the full-scan path (no page_size) reads no
+// checkpoint, so resume: true was silently ignored.
+
+#[test]
+fn mongo_resume_without_page_size_rejected() {
+    let yaml = r#"
+source:
+  type: mongo
+  url: "mongodb://localhost/test"
+  mongo:
+    resume: true
+exports:
+  - name: t
+    mode: full
+    table: events
+    format: parquet
+    destination:
+      type: local
+      path: ./out
+"#;
+    let msg = format!("{:#}", Config::from_yaml(yaml).unwrap_err());
+    assert!(msg.contains("resume"), "names the knob: {msg}");
+    assert!(msg.contains("page_size"), "points at the fix: {msg}");
+}
+
+#[test]
+fn mongo_resume_accepted_with_page_size() {
+    let yaml = r#"
+source:
+  type: mongo
+  url: "mongodb://localhost/test"
+  mongo:
+    resume: true
+    page_size: 5000
+exports:
+  - name: t
+    mode: full
+    table: events
+    format: parquet
+    destination:
+      type: local
+      path: ./out
+"#;
+    assert!(
+        Config::from_yaml(yaml).is_ok(),
+        "resume must be accepted with page_size (keyset paging)"
+    );
+}
+
+// ── gzip level ceiling + CDC typo'd keys (roast 2026-08-09) ─────────────────
+
+#[test]
+fn gzip_compression_level_above_9_rejected() {
+    // parquet's GzipLevel maxes at 9; level 10 was accepted here but errors at
+    // write time. RED against the pre-fix `> 10` guard.
+    let yaml = r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: t
+    table: events
+    format: parquet
+    compression: gzip
+    compression_level: 10
+    destination:
+      type: local
+      path: ./out
+"#;
+    let msg = format!("{:#}", Config::from_yaml(yaml).unwrap_err());
+    assert!(msg.contains("gzip"), "names the codec: {msg}");
+    assert!(msg.contains("0..9"), "states the real ceiling: {msg}");
+}
+
+#[test]
+fn gzip_compression_level_9_accepted() {
+    let yaml = r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: t
+    table: events
+    format: parquet
+    compression: gzip
+    compression_level: 9
+    destination:
+      type: local
+      path: ./out
+"#;
+    assert!(Config::from_yaml(yaml).is_ok(), "level 9 is the valid max");
+}
+
+#[test]
+fn cdc_typoed_key_rejected_not_silently_defaulted() {
+    // `deny_unknown_fields` on CdcExportConfig: a mistyped knob (checkpont) must
+    // fail at load, not silently default checkpoint=None (RED against the struct
+    // without deny_unknown_fields).
+    let yaml = r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: t
+    mode: cdc
+    table: events
+    format: parquet
+    cdc:
+      checkpont: /tmp/x
+      slot: s
+    destination:
+      type: local
+      path: ./out
+"#;
+    assert!(
+        Config::from_yaml(yaml).is_err(),
+        "a typo'd CDC key must be rejected, not silently defaulted"
+    );
+}

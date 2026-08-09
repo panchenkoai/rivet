@@ -569,10 +569,23 @@ fn export_block_lines(
             }
         }
         "incremental" => match info.chosen_cursor_column() {
-            Some(cursor) => lines.push(format!(
-                "    cursor_column: {}",
-                yaml_quote_if_needed(&cursor)
-            )),
+            Some(cursor) => {
+                lines.push(format!(
+                    "    cursor_column: {}",
+                    yaml_quote_if_needed(&cursor)
+                ));
+                // If the chosen cursor is NULLABLE and a not-null sibling exists,
+                // scaffold coalesce mode — otherwise `WHERE cursor > $last` skips
+                // every NULL-cursor row (roast 2026-08-09, #173).
+                // suggest_cursor_fallback returns Some ONLY in exactly that case.
+                if let Some(fb) = crate::init::candidates::suggest_cursor_fallback(info) {
+                    lines.push("    incremental_cursor_mode: coalesce".to_string());
+                    lines.push(format!(
+                        "    cursor_fallback_column: {}",
+                        yaml_quote_if_needed(&fb)
+                    ));
+                }
+            }
             // No timestamp candidate: DO NOT emit a phantom `updated_at` (a
             // column that may not exist — the run would fail at read time on a
             // silent guess). Leave it for the operator; `rivet check` then fails
@@ -1179,6 +1192,51 @@ mod tests {
     /// YAML used a name-preference pick with a phantom `updated_at` fallback,
     /// the snapshot the scored pick with a None fallback — so the audit trail
     /// could name a column the config did not contain.
+    /// Coalesce scaffold (#173): a NULLABLE chosen cursor with a not-null sibling
+    /// must scaffold `incremental_cursor_mode: coalesce` + `cursor_fallback_column`,
+    /// else `WHERE cursor > $last` skips every NULL-cursor row. RED against a bare
+    /// cursor_column.
+    #[test]
+    fn incremental_scaffolds_coalesce_for_a_nullable_cursor_with_a_fallback() {
+        let c = |name: &str, ty: &str, pk: bool, nullable: bool| ColumnInfo {
+            name: name.into(),
+            data_type: ty.into(),
+            is_primary_key: pk,
+            is_nullable: nullable,
+            numeric_precision: None,
+            numeric_scale: None,
+        };
+        let info = TableInfo {
+            schema: "public".into(),
+            table: "events".into(),
+            row_estimate: 500_000,
+            total_bytes: Some(1 << 30),
+            columns: vec![
+                c("id", "bigint", true, false),
+                c("created_at", "timestamp", false, false),
+                c("updated_at", "timestamp", false, true),
+            ],
+        };
+        let yaml = generate_config(
+            &info,
+            "postgresql://localhost/db",
+            &crate::init::SourceProvenance::Inline,
+            &Default::default(),
+            Some("incremental"),
+            None,
+        )
+        .expect("scaffold");
+        assert!(yaml.contains("cursor_column: updated_at"), "{yaml}");
+        assert!(
+            yaml.contains("incremental_cursor_mode: coalesce"),
+            "nullable cursor must scaffold coalesce: {yaml}"
+        );
+        assert!(
+            yaml.contains("cursor_fallback_column: created_at"),
+            "coalesce needs a not-null fallback: {yaml}"
+        );
+    }
+
     #[test]
     fn incremental_cursor_matches_between_yaml_and_snapshot() {
         // A table whose scored top (updated_at) is unambiguous — both agree.

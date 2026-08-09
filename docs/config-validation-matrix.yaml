@@ -79,3 +79,29 @@ scenarios:
     what: "chunked mode with NO strategy at all (no chunk_column / chunk_by_key / chunk_count / chunk_by_days and no table:) is rejected at config-load — but chunk_by_key IS a strategy, so chunk_by_key + query: LOADS (the table: requirement is a plan-time concern, with an accurate 'needs table:' message). Fixes the dead-end that recommended chunk_by_key when it was already set (dogfood MED)."
     rejected_wrong_mode: { test: chunk_by_key_with_query_is_not_the_generic_pick_a_strategy_error }
     valid_form_accepted: { test: chunk_by_key_with_query_is_not_the_generic_pick_a_strategy_error }
+
+  # ── roast 2026-08-09 (full-project) ─────────────────────────────────────────
+  - id: keyset_incremental_outside_chunked
+    what: "keyset_incremental: true was ABSENT from the `mode != chunked` reject-list, so on `mode: full`/incremental/time_window it was silently ignored (accept-but-break, sibling of the chunk knobs). Now rejected naming the knob + `mode: chunked`; the legit chunked+chunk_by_key form still LOADS."
+    rejected_wrong_mode: { test: keyset_incremental_without_chunked_mode_rejected }
+    valid_form_accepted: { test: keyset_incremental_accepted_under_chunked_with_key }
+
+  - id: keyset_incremental_needs_key
+    what: "keyset_incremental under `mode: chunked` but with a RANGE chunk_column (no chunk_by_key) — nothing to resume from, silently ignored. Rejected naming chunk_by_key."
+    rejected_wrong_mode: { test: keyset_incremental_requires_chunk_by_key }
+    valid_form_accepted: { na: "the with-key accept form is covered by keyset_incremental_accepted_under_chunked_with_key" }
+
+  - id: mongo_resume_without_page_size
+    what: "source.mongo.resume: true with NO page_size — resume is keyset-only; the full-scan path (no page_size) reads no checkpoint, so resume was silently ignored (whole collection re-read every run). Now rejected naming page_size; resume + page_size still LOADS."
+    rejected_wrong_mode: { test: mongo_resume_without_page_size_rejected }
+    valid_form_accepted: { test: mongo_resume_accepted_with_page_size }
+
+  - id: gzip_level_above_9
+    what: "gzip compression_level 10 was accepted (guard was `> 10`) but parquet's GzipLevel maxes at 9 — it errored at write time. Now rejected at load naming the 0..9 ceiling; level 9 still LOADS."
+    rejected_wrong_mode: { test: gzip_compression_level_above_9_rejected }
+    valid_form_accepted: { test: gzip_compression_level_9_accepted }
+
+  - id: cdc_typoed_key
+    what: "a mistyped CDC knob (e.g. `checkpont`) was silently accepted and defaulted (checkpoint=None) — CdcExportConfig lacked deny_unknown_fields. Now rejected at load."
+    rejected_wrong_mode: { test: cdc_typoed_key_rejected_not_silently_defaulted }
+    valid_form_accepted: { na: "the accept side is every existing passing cdc config in this file + the cdc goldens" }

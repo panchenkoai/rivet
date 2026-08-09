@@ -433,6 +433,23 @@ impl Config {
                 );
             }
         }
+        // `resume` is a KEYSET feature: only the paged `_id`-seek path
+        // (`page_size` set) reads and advances a checkpoint. The full-scan path
+        // (no `page_size`) keeps no checkpoint, so `resume: true` is silently
+        // ignored — the whole collection re-reads every run (roast 2026-08-09,
+        // sibling of the parallel+resume reject above).
+        if let Some(m) = self.source.mongo.as_ref()
+            && m.resume
+            && m.page_size.is_none()
+        {
+            crate::config_bail!(
+                crate::error::codes::CONFIG_SOURCE_MODE_UNSUPPORTED,
+                "`source.mongo.resume: true` requires `source.mongo.page_size` (keyset paging) — \
+                 the full-scan path (no `page_size`) reads no checkpoint, so resume is silently \
+                 ignored and the whole collection re-reads every run. Set `page_size:` to enable \
+                 resume, or drop `resume`.",
+            );
+        }
         Ok(())
     }
 
@@ -987,9 +1004,12 @@ impl Config {
                     }
                 }
                 CompressionType::Gzip => {
-                    if level > 10 {
+                    // parquet's GzipLevel maxes at 9 (MAXIMUM_LEVEL); level 10 was
+                    // accepted here but panics/errors at write time in
+                    // GzipLevel::try_new (bug hunt 2026-08-09).
+                    if level > 9 {
                         anyhow::bail!(
-                            "export '{}': gzip compression_level must be 0..10, got {}",
+                            "export '{}': gzip compression_level must be 0..9, got {}",
                             export.name,
                             level
                         );
@@ -1200,6 +1220,13 @@ impl Config {
                 Some("chunk_max_attempts")
             } else if export.chunk_checkpoint {
                 Some("chunk_checkpoint")
+            } else if export.keyset_incremental {
+                // keyset_incremental (continue-from-high-water-key on a clean
+                // re-run) is a KEYSET feature — keyset runs under `mode: chunked`
+                // with `chunk_by_key`. Outside chunked it is silently ignored,
+                // the same accept-but-break class as the chunk knobs above
+                // (roast 2026-08-09).
+                Some("keyset_incremental")
             } else if export.chunk_size != default_chunk_size() {
                 Some("chunk_size")
             } else {
@@ -1217,6 +1244,20 @@ impl Config {
                     knob,
                 );
             }
+        }
+
+        // keyset_incremental continues from the last exported KEY on a clean
+        // re-run — it is meaningless without a keyset key. Under `mode: chunked`
+        // (the mode gate above already handled other modes) it still requires
+        // `chunk_by_key`; with a range `chunk_column` there is no key to resume
+        // from, so it would be silently ignored (roast 2026-08-09).
+        if export.keyset_incremental && export.chunk_by_key.is_none() {
+            anyhow::bail!(
+                "export '{}': `keyset_incremental: true` requires `chunk_by_key:` (it continues \
+                 from the last exported key) — it has no effect on a range `chunk_column` export.\n  \
+                 Hint: set `chunk_by_key: <indexed unique key>`, or remove `keyset_incremental`.",
+                export.name,
+            );
         }
 
         if export.cdc.is_some() && export.mode != ExportMode::Cdc {

@@ -56,6 +56,14 @@ pub(crate) fn run_chunked_sequential(
         std::collections::BTreeMap::new();
     let mut checksum_key_column: Option<String> = None;
 
+    // Run the cross-shape manifest guard ONCE, at run start — the answer cannot
+    // change mid-run, and re-running it per chunk cost one remote GET per chunk
+    // (a 3000-chunk GCS export paid 3000 serialized GETs). The per-chunk writer
+    // below now opens UNGUARDED, safe because this probe already guarded the
+    // prefix (roast 2026-08-09; the sequential-CHECKPOINT sibling already did
+    // this — run_chunked_sequential was the last per-chunk-guarded runner).
+    let _ = crate::pipeline::frame::RunnerFrame::open(plan)?;
+
     for (i, (start, end)) in chunks.iter().enumerate() {
         if !resource::check_memory(plan.tuning.memory_threshold_mb) {
             log::warn!("memory threshold exceeded, pausing 5s before chunk {}", i);
@@ -119,10 +127,11 @@ pub(crate) fn run_chunked_sequential(
         );
 
         if sink.total_rows > 0 {
-            // run_chunked_sequential's ONLY cross-shape guard is here, per
-            // chunk (as on main) — this path has no run-start guard, so the
-            // frame must stay GUARDED. open() preserves main's behavior exactly.
-            let frame = crate::pipeline::frame::RunnerFrame::open(plan)?;
+            // Guarded once at run start (above); per-chunk writers open UNGUARDED
+            // so a large chunked export pays ONE manifest GET, not one per chunk
+            // (roast 2026-08-09). Satisfies the unguarded_callers_also_guard lint
+            // because this file now opens a guarded frame at run start.
+            let frame = crate::pipeline::frame::RunnerFrame::open_unguarded(plan)?;
             let base = super::chunk_part_filename(&plan.export_name, i, &frame.ext);
             let dest = frame.dest;
             // Shared commit path (I1→I2→I7 + counters + journal + fault hooks).

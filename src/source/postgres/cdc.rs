@@ -137,6 +137,14 @@ impl PgChangeStream {
         if tables.is_empty() {
             return RowImage::Whole;
         }
+        // Same CWE-319 gate open() applies (:188): refuse a REMOTE plaintext
+        // probe. This best-effort catalog read carries the same credentials, so
+        // an ungated remote-plaintext connection here would leak them exactly
+        // where open() forbids it (#161). On refusal, fall back to Whole rather
+        // than dialing plaintext — open() will bail the run on the same config.
+        if require_tls_or_loopback(conn_str, tls).is_err() {
+            return RowImage::Whole;
+        }
         let Ok(mut client) = (match tls {
             Some(cfg) if cfg.mode.is_enforced() => crate::source::tls::build_native_tls(cfg)
                 .and_then(|c| {
@@ -211,7 +219,14 @@ impl PgChangeStream {
         // non-hex `bytea_output` corrupts every bytea, silently (verified via the
         // source-parity sweep under a flipped session). Immune to the DB default.
         client.batch_execute(
-            "SET datestyle = 'ISO, MDY'; SET bytea_output = 'hex'; SET intervalstyle = 'postgres';",
+            // extra_float_digits=3 pins SHORTEST-EXACT float text rendering. On a
+            // session where it is <= 0 (pre-PG12 default, or set for dump compat)
+            // float8out/float4out ROUND to ~15/~6 sig digits, so the text reader
+            // parses a lossy value while the batch binary path stays exact — a
+            // silent CDC-vs-batch float divergence (bug hunt 2026-08-09, same
+            // session-state-rendering class as datestyle/bytea/intervalstyle).
+            "SET datestyle = 'ISO, MDY'; SET bytea_output = 'hex'; \
+             SET intervalstyle = 'postgres'; SET extra_float_digits = 3;",
         )?;
         // A bounded run cannot work on a STANDBY: it pins its ceiling with
         // pg_current_wal_lsn() (unavailable during recovery) and a fresh run

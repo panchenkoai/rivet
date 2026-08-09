@@ -82,11 +82,7 @@ fn diagnose_mysql(
     // nor cursor_column, so without chunk_by_key here range_col is None and every
     // downstream probe (min/max, the index override) silently degrades keyset to
     // a false unindexed full-scan verdict. cursor_column last for incremental.
-    let range_col = export
-        .chunk_column
-        .as_deref()
-        .or(export.chunk_by_key.as_deref())
-        .or(export.cursor_column.as_deref());
+    let range_col = preflight_range_col(export);
     let effective_query = if let Some(order) = incremental_key_expr(export, SourceType::Mysql) {
         format!(
             "SELECT * FROM ({}) AS _rivet ORDER BY {}",
@@ -179,8 +175,7 @@ fn diagnose_mysql(
     // issues `WHERE chunk_col >= $lo AND chunk_col < $hi`, which would use
     // the index. Override `uses_index` from the catalog when the column is
     // the leading key of some index on the table.
-    let uses_index = if (matches!(export.mode, ExportMode::Chunked | ExportMode::Incremental)
-        || export.chunk_by_key.is_some())
+    let uses_index = if strategy_probes_index(export)
         && let Some(col) = range_col
         && let Some(table) = export
             .table

@@ -709,11 +709,18 @@ fn run_keyset_parallel(
     // are skipped, so their max is not re-observed). This is the incremental anchor
     // that iteration 2's cursor_high caveat deferred.
     if incremental && let Some(hi) = &anchor_ceiling {
+        // Set the pending cursor range ONLY — do NOT advance the persisted
+        // cursor here. `run_export_job` calls `commit_incremental_cursor` AFTER
+        // `finalize_manifest` and ONLY when there is no manifest gap, exactly as
+        // single mode defers it (single.rs commit_incremental_cursor). Advancing
+        // eagerly inside the runner (before the manifest is durable) meant a
+        // crash between this point and the manifest left the persisted cursor at
+        // `hi` with no manifest referencing the just-written rows — the next run
+        // seeks past them and they are lost (bug hunt 2026-08-09, HIGH: the
+        // audit-#12 advance-after-durable invariant, which single upholds and
+        // parallel keyset bypassed).
         summary.cursor_high = Some(hi.clone());
         summary.cursor_low = anchor_floor.clone();
-        if let Some(st) = state {
-            st.update(&plan.export_name, hi)?;
-        }
     }
     Ok(())
 }
