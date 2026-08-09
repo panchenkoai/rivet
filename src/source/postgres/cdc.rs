@@ -137,6 +137,14 @@ impl PgChangeStream {
         if tables.is_empty() {
             return RowImage::Whole;
         }
+        // Same CWE-319 gate open() applies (:188): refuse a REMOTE plaintext
+        // probe. This best-effort catalog read carries the same credentials, so
+        // an ungated remote-plaintext connection here would leak them exactly
+        // where open() forbids it (#161). On refusal, fall back to Whole rather
+        // than dialing plaintext — open() will bail the run on the same config.
+        if require_tls_or_loopback(conn_str, tls).is_err() {
+            return RowImage::Whole;
+        }
         let Ok(mut client) = (match tls {
             Some(cfg) if cfg.mode.is_enforced() => crate::source::tls::build_native_tls(cfg)
                 .and_then(|c| {
