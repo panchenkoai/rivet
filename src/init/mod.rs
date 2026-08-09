@@ -157,7 +157,12 @@ impl TableInfo {
                 let base = format!(
                     "auto: ~{} rows ≥ 100K threshold and chunk column '{}' is available",
                     fmt_row_estimate(self.row_estimate),
-                    self.best_chunk_column().unwrap_or("id"),
+                    // Name the REAL chunk key: a keyset table has no chunk_column
+                    // but a keysettable PK — falling back to a phantom 'id' named
+                    // a column that may not exist (roast 2026-08-09, #173).
+                    self.best_chunk_column()
+                        .or_else(|| self.keysettable_pk_column())
+                        .unwrap_or("id"),
                 );
                 // A chunked re-run re-reads the whole table. If a cursor column
                 // exists, point operators at incremental for scheduled re-runs —
