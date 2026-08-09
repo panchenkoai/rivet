@@ -375,6 +375,42 @@ pub(super) fn run_exports_as_child_processes(
 /// is not a common-mode failure). Class key = the message with digits/hex/paths
 /// blanked, so `token for host-1` and `token for host-2` collapse to one class.
 /// Returns `None` below the threshold or on a mixed/empty batch.
+/// The class KEY of one error message — variable tokens masked so per-child ids
+/// collapse to one common-mode class. A pure DIGIT run → `#` (host-1 / host-10
+/// are one class); a run mixing letters AND digits → `#` whole (a hex id, uuid,
+/// or random staging suffix like `aB3xQ9k` — digit-masking alone left `aB#xQ#k`,
+/// still per-child distinct, so the banner never fired: roast 2026-08-09). A
+/// pure-letter run (a real word) is KEPT. Whitespace normalized. Pure +
+/// directly unit-tested with exact expected strings.
+pub(super) fn error_class(msg: &str) -> String {
+    let mask_token = |tok: &str| -> String {
+        let has_digit = tok.chars().any(|c| c.is_ascii_digit());
+        let has_alpha = tok.chars().any(|c| c.is_ascii_alphabetic());
+        if has_digit && (has_alpha || tok.chars().all(|c| c.is_ascii_digit())) {
+            "#".to_string()
+        } else {
+            tok.to_string()
+        }
+    };
+    let mut out = String::with_capacity(msg.len());
+    let mut run = String::new();
+    for c in msg.chars() {
+        if c.is_ascii_alphanumeric() {
+            run.push(c);
+        } else {
+            if !run.is_empty() {
+                out.push_str(&mask_token(&run));
+                run.clear();
+            }
+            out.push(c);
+        }
+    }
+    if !run.is_empty() {
+        out.push_str(&mask_token(&run));
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 pub(super) fn representative_error(
     failed: &[(String, String)],
     any_success: bool,
@@ -383,43 +419,6 @@ pub(super) fn representative_error(
     if any_success || failed.len() < threshold {
         return None;
     }
-    // Collapse each RUN of digits to one '#' (so host-1 and host-10 are one
-    // class, not two) and normalize whitespace.
-    // Mask the VARIABLE tokens so per-child ids collapse to one class. A pure
-    // digit run → `#` (host-1 / host-10 are one class); a run mixing letters AND
-    // digits → `#` whole (a hex id, uuid, or random staging suffix like
-    // `aB3xQ9k` — digit-masking alone left `aB#xQ#k`, still per-child distinct,
-    // so the common-mode banner never fired: roast 2026-08-09, the doc claimed
-    // "hex/paths blanked" but only digits were). A pure-letter run (a real word)
-    // is kept. Whitespace normalized.
-    let class_of = |msg: &str| -> String {
-        let mask_token = |tok: &str| -> String {
-            let has_digit = tok.chars().any(|c| c.is_ascii_digit());
-            let has_alpha = tok.chars().any(|c| c.is_ascii_alphabetic());
-            if has_digit && (has_alpha || tok.chars().all(|c| c.is_ascii_digit())) {
-                "#".to_string()
-            } else {
-                tok.to_string()
-            }
-        };
-        let mut out = String::with_capacity(msg.len());
-        let mut run = String::new();
-        for c in msg.chars() {
-            if c.is_ascii_alphanumeric() {
-                run.push(c);
-            } else {
-                if !run.is_empty() {
-                    out.push_str(&mask_token(&run));
-                    run.clear();
-                }
-                out.push(c);
-            }
-        }
-        if !run.is_empty() {
-            out.push_str(&mask_token(&run));
-        }
-        out.split_whitespace().collect::<Vec<_>>().join(" ")
-    };
     let mut counts: std::collections::HashMap<String, (usize, String)> =
         std::collections::HashMap::new();
     for (_, msg) in failed {
@@ -427,7 +426,7 @@ pub(super) fn representative_error(
         if m.is_empty() {
             continue;
         }
-        let e = counts.entry(class_of(m)).or_insert((0, m.to_string()));
+        let e = counts.entry(error_class(m)).or_insert((0, m.to_string()));
         e.0 += 1;
     }
     let (n, sample) = counts.into_values().max_by_key(|(n, _)| *n)?;
@@ -777,7 +776,33 @@ mod tests {
 
 #[cfg(test)]
 mod representative_tests {
-    use super::representative_error;
+    use super::{error_class, representative_error};
+
+    /// #197 (roast 2026-08-09): direct exact-string coverage of error_class, the
+    /// pure class-key masker. Each assertion pins a mutant the banner-level tests
+    /// couldn\'t (over-masking still collapses to one class): pure-letter words
+    /// KEPT (399 `&&`→`||` would mask them), the trailing run flushed (418
+    /// `delete !` would drop the last token), mid-token runs flushed at
+    /// separators (411 `delete !` would fuse tokens).
+    #[test]
+    fn error_class_masks_variable_tokens_exactly() {
+        // digit run → #; host-1 / host-10 are one class.
+        assert_eq!(error_class("token for host-42"), "token for host-#");
+        // mixed alnum (random suffix / hex) → whole run to #.
+        assert_eq!(
+            error_class("dir /tmp/rivet-stage-aB3xQ9k: denied"),
+            "dir /tmp/rivet-stage-#: denied"
+        );
+        // pure-letter words are KEPT (399 `&&`→`||` masks them → RED).
+        assert_eq!(error_class("plain words only"), "plain words only");
+        // trailing alnum run (no trailing separator) is flushed (418 `!` → RED,
+        // it would drop "here").
+        assert_eq!(error_class("ends here"), "ends here");
+        // mid runs flush at each separator (411 `!` → RED, it would fuse to "ab").
+        assert_eq!(error_class("a b"), "a b");
+        // whitespace normalized.
+        assert_eq!(error_class("two   spaces"), "two spaces");
+    }
 
     #[test]
     fn representative_collapses_a_common_mode_failure() {
