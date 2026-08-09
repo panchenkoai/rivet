@@ -26,6 +26,7 @@ const HEAVY_ROWS: i64 = 120_000;
 const SMALL_ROWS: i64 = 15_000;
 
 #[test]
+#[ignore = "live: requires docker compose up -d postgres toxiproxy"]
 fn pool_apply_through_a_bandwidth_capped_link_is_exact_and_grades_itself() {
     let _lock = toxiproxy_guard();
     ensure_toxi_proxy("postgres", 15432, "postgres:5432");
@@ -104,6 +105,7 @@ fn pool_apply_through_a_bandwidth_capped_link_is_exact_and_grades_itself() {
 /// re-exporting — the wave path's resume contract, preserved verbatim by the
 /// pool. The union stays exact (no clobber, no double rows).
 #[test]
+#[ignore = "live: requires docker compose up -d postgres toxiproxy"]
 fn pool_apply_resume_skips_complete_exports_and_loses_nothing() {
     let _lock = toxiproxy_guard();
     ensure_toxi_proxy("postgres", 15432, "postgres:5432");
