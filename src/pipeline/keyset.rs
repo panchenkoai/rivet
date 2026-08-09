@@ -475,7 +475,86 @@ fn run_keyset_parallel(
     let range_first: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
     let errors: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
+    // #152: the OPT-2 concurrency governor, previously chunked-only. Each worker
+    // acquires a permit PER PAGE (the guard releases at each iteration's end, on
+    // every path), so shrinking the ceiling sheds workers at page granularity —
+    // the same shape the range-chunked runner uses at chunk granularity. `finished`
+    // counts workers that have exited (success OR error) so the governor's exit
+    // predicate can't be stranded by a failing worker.
+    let semaphore = crate::resource::Semaphore::new(parallel.max(1));
+    let finished = std::sync::atomic::AtomicUsize::new(0);
+    let governor_floor = plan
+        .tuning
+        .min_parallel
+        .unwrap_or(1)
+        .clamp(1, parallel.max(1));
+    let governor_on = plan.tuning.adaptive && parallel > 1;
+    let governor_monitor: Option<Box<dyn Source>> = if governor_on {
+        match source::create_source(&plan.source) {
+            Ok(s) => {
+                log::info!(
+                    "export '{}': adaptive concurrency governor active on keyset (parallel {}..{})",
+                    plan.export_name,
+                    governor_floor,
+                    parallel
+                );
+                Some(s)
+            }
+            Err(e) => {
+                log::warn!(
+                    "export '{}': keyset governor monitoring connection failed; parallelism stays static at {}: {:#}",
+                    plan.export_name,
+                    parallel,
+                    e
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let governor_log: Mutex<Vec<(usize, usize, String)>> = Mutex::new(Vec::new());
+
     std::thread::scope(|scope| {
+        // Governor thread — mirrors chunked/exec.rs: samples source pressure on
+        // its own monitoring connection and resizes the permit semaphore within
+        // [floor, parallel], self-terminating once every worker has finished.
+        if let Some(mut monitor) = governor_monitor {
+            let semaphore = &semaphore;
+            let finished = &finished;
+            let governor_log = &governor_log;
+            let total = pending.len();
+            let ceiling = parallel;
+            let floor = governor_floor;
+            let export_name = plan.export_name.as_str();
+            scope.spawn(move || {
+                let mut gov = crate::tuning::Governor::new(ceiling, floor, ceiling);
+                gov.run(
+                    &mut monitor,
+                    || finished.load(Ordering::Relaxed) >= total,
+                    |from, to| {
+                        semaphore.resize(to);
+                        let reason = if to < from {
+                            "source pressure rising: backed off"
+                        } else {
+                            "source pressure eased: recovered"
+                        };
+                        log::info!(
+                            "export '{}': keyset governor parallelism {} → {} ({})",
+                            export_name,
+                            from,
+                            to,
+                            reason
+                        );
+                        governor_log
+                            .lock()
+                            .unwrap()
+                            .push((from, to, reason.to_string()));
+                    },
+                );
+            });
+        }
+
         for (ridx, lo, hi) in pending.iter().cloned() {
             let dest = std::sync::Arc::clone(&dest);
             let (plan_r, key_plan_r, ext_r, tag_r, key_r) =
@@ -490,7 +569,18 @@ fn run_keyset_parallel(
                 &errors,
             );
             let (sref_r, rid_r, fmt_r, cmp_r) = (&state_ref, run_id.as_str(), fmt_label, cmp_label);
+            let sem_r = &semaphore;
+            let fin_r = &finished;
             scope.spawn(move || {
+                // Count this worker as finished on EVERY exit path (success or
+                // error) so the governor's exit predicate can't be stranded.
+                struct FinishGuard<'a>(&'a std::sync::atomic::AtomicUsize);
+                impl Drop for FinishGuard<'_> {
+                    fn drop(&mut self) {
+                        self.0.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                let _finish = FinishGuard(fin_r);
                 let mut wsrc = match source::create_source(&plan_r.source) {
                     Ok(s) => s,
                     Err(e) => {
@@ -513,6 +603,17 @@ fn run_keyset_parallel(
                     Option<String>,
                 )> = Vec::new();
                 loop {
+                    // #152: one permit per page (guard releases at the end of
+                    // THIS iteration on every path), so the governor sheds
+                    // workers at page granularity when it shrinks the ceiling.
+                    struct PermitGuard<'a>(&'a crate::resource::Semaphore);
+                    impl Drop for PermitGuard<'_> {
+                        fn drop(&mut self) {
+                            self.0.release();
+                        }
+                    }
+                    sem_r.acquire();
+                    let _permit = PermitGuard(sem_r);
                     // Test-only: simulate a per-worker SQL error mid-range (Err path,
                     // not a crash). The worker records it + returns; the post-join check
                     // bails, so the run fails cleanly with no _SUCCESS / finalized manifest.
@@ -701,6 +802,13 @@ fn run_keyset_parallel(
     }
     if let Some(sc) = fingerprint.get() {
         manifest_writer::record_run_schema_fingerprint(summary, sc);
+    }
+    // #152: drain the governor's off-thread decisions into the run journal
+    // (same as chunked) so a keyset run records when it shed/recovered workers.
+    for (from, to, reason) in governor_log.into_inner().unwrap() {
+        summary
+            .journal
+            .record(crate::journal::RunEvent::ParallelismAdjusted { from, to, reason });
     }
     // cursor_high = the highest populated range's max (forensics v18); see range_max.
     summary.cursor_high = highest_range_max(range_max.into_inner().unwrap());

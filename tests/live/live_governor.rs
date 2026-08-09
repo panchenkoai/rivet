@@ -346,3 +346,120 @@ exports:
         }
     }
 }
+
+/// #152: the SAME back-off, on the KEYSET runner. The governor was chunked-only;
+/// a `parallel: N` keyset export on a straining source adapted batches but never
+/// shed workers. Identical pressure workload, `chunk_by_key` instead of
+/// `chunk_column` — the run must arm the keyset governor and shed at least one
+/// worker under rising checkpoint pressure. RED against a build with the keyset
+/// governor wiring removed (batches still adapt, but no "backed off" line).
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn keyset_governor_backs_off_under_concurrent_write_pressure() {
+    require_alive(LiveService::Postgres);
+
+    const ROWS: i64 = 20_000;
+    let table = seed_pg_wide_table(ROWS, 1024);
+    let out_dir = tempfile::tempdir().unwrap();
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let yaml = format!(
+        r#"
+source:
+  type: postgres
+  url: "{POSTGRES_URL}"
+  tuning:
+    adaptive: true
+    min_parallel: 2
+    batch_size: 250
+    throttle_ms: 100
+exports:
+  - name: {name}
+    table: {name}
+    mode: chunked
+    chunk_by_key: id
+    chunk_size: 1000
+    parallel: 8
+    format: parquet
+    destination:
+      type: local
+      path: {out}
+"#,
+        name = table.name(),
+        out = out_dir.path().display(),
+    );
+    let cfg = write_config(&cfg_dir, &yaml);
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let table_name = table.name().to_string();
+    let writer = {
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            let mut c = pg_connect();
+            let mut k: i64 = 1;
+            while !stop.load(Ordering::Relaxed) {
+                let _ = c.batch_execute(&format!(
+                    "UPDATE {table_name} SET payload = repeat('z', 1024), updated_at = now() \
+                     WHERE id BETWEEN {k} AND {k} + 999; CHECKPOINT;"
+                ));
+                k += 1000;
+                if k > ROWS {
+                    k = 1;
+                }
+                std::thread::sleep(Duration::from_millis(70));
+            }
+        })
+    };
+    std::thread::sleep(Duration::from_millis(400));
+
+    let log_path = cfg_dir.path().join("rivet.stderr");
+    let log_file = std::fs::File::create(&log_path).unwrap();
+    let mut child = std::process::Command::new(RIVET_BIN)
+        .args([
+            "run",
+            "--config",
+            cfg.to_str().unwrap(),
+            "--export",
+            table.name(),
+        ])
+        .env("RUST_LOG", "info")
+        .env("RIVET_GOVERNOR_INTERVAL_MS", "200")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::from(log_file))
+        .spawn()
+        .expect("spawn rivet run");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    let status = loop {
+        match child.try_wait().expect("try_wait") {
+            Some(s) => break s,
+            None if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                stop.store(true, Ordering::Relaxed);
+                let _ = writer.join();
+                panic!("governed keyset run under write pressure did not finish within 120s");
+            }
+            None => std::thread::sleep(Duration::from_millis(100)),
+        }
+    };
+    stop.store(true, Ordering::Relaxed);
+    writer.join().expect("writer thread");
+
+    let stderr = std::fs::read_to_string(&log_path).unwrap_or_default();
+    assert!(
+        status.success(),
+        "governed keyset run must complete; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("adaptive concurrency governor active on keyset"),
+        "the KEYSET governor must arm for adaptive + parallel>1; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("backed off"),
+        "#152: under rising pressure the keyset governor must shed at least one worker; stderr:\n{stderr}"
+    );
+    assert_eq!(
+        duckdb_total_parquet_rows(out_dir.path()),
+        ROWS as usize,
+        "every row must round-trip through the governed keyset run"
+    );
+}
