@@ -253,10 +253,24 @@ fn sample_parallel_ranges(
     ceil: Option<&str>,
 ) -> Result<Vec<(usize, Option<String>, Option<String>, bool)>> {
     let bounds = sample_key_boundaries(src, plan, key, parallel, floor, ceil)?;
-    // The first range's floor + the last range's ceiling come from the incremental
-    // bounds (both None for a full pass): the first range seeks past `floor`, the
-    // last stops at `ceil` so a row arriving DURING the run is deferred, not
-    // double-counted (which keeps the anchor advance exact).
+    Ok(partition_ranges(&bounds, floor, ceil))
+}
+
+/// Pure partitioning half of [`sample_parallel_ranges`] (#161): fold N−1 sampled
+/// boundaries into N half-open `(lo_exclusive, hi_inclusive]` ranges whose union
+/// is exactly the `(floor, ceil]` key space — gap-free and overlap-free BY
+/// CONSTRUCTION (each range's `lo` IS the previous range's `hi`), which the
+/// property test asserts rather than trusts. The first range's floor + the last
+/// range's ceiling come from the incremental bounds (both None for a full pass):
+/// the first range seeks past `floor`, the last stops at `ceil` so a row
+/// arriving DURING the run is deferred, not double-counted (which keeps the
+/// anchor advance exact).
+#[allow(clippy::type_complexity)]
+fn partition_ranges(
+    bounds: &[String],
+    floor: Option<&str>,
+    ceil: Option<&str>,
+) -> Vec<(usize, Option<String>, Option<String>, bool)> {
     let mut ranges = Vec::with_capacity(bounds.len() + 1);
     let mut prev: Option<String> = floor.map(str::to_string);
     for (i, b) in bounds.iter().enumerate() {
@@ -265,7 +279,7 @@ fn sample_parallel_ranges(
     }
     let last = ranges.len();
     ranges.push((last, prev, ceil.map(str::to_string), false));
-    Ok(ranges)
+    ranges
 }
 
 /// Parallel keyset (feat/parallel-keyset). N ROW-percentile-range workers seek
@@ -1172,5 +1186,35 @@ mod tests {
                 (Some("k1000".to_string()), None),
             ]
         );
+    }
+
+    /// #161: the gap-free / overlap-free coverage property of the pure
+    /// partitioning fold, asserted rather than trusted — for ANY boundary set
+    /// and any floor/ceil, consecutive ranges CHAIN (each lo == previous hi),
+    /// the first lo == floor, the last hi == ceil, indices are dense.
+    #[test]
+    fn partition_ranges_cover_the_key_space_without_gaps_or_overlap() {
+        use proptest::prelude::*;
+        proptest!(|(
+            mut bounds in proptest::collection::vec("[0-9a-f]{1,8}", 0..12),
+            floor in proptest::option::of("[0-9a-f]{1,8}"),
+            ceil in proptest::option::of("[0-9a-f]{1,8}"),
+        )| {
+            bounds.sort();
+            bounds.dedup();
+            let ranges = partition_ranges(&bounds, floor.as_deref(), ceil.as_deref());
+            // N boundaries -> N+1 ranges, densely indexed.
+            prop_assert_eq!(ranges.len(), bounds.len() + 1);
+            for (i, r) in ranges.iter().enumerate() {
+                prop_assert_eq!(r.0, i, "dense range indices");
+                prop_assert!(!r.3, "ranges start not-done");
+            }
+            // Chain: first lo == floor, each next lo == previous hi, last hi == ceil.
+            prop_assert_eq!(ranges[0].1.as_deref(), floor.as_deref());
+            for w in ranges.windows(2) {
+                prop_assert_eq!(w[1].1.as_deref(), w[0].2.as_deref(), "no gap, no overlap");
+            }
+            prop_assert_eq!(ranges[ranges.len() - 1].2.as_deref(), ceil.as_deref());
+        });
     }
 }

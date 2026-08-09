@@ -105,19 +105,13 @@ impl MysqlChangeStream {
     /// Hence a refusal rather than a warning: there is no partially-correct outcome
     /// to let the operator choose. The check is one query at open, on the connection
     /// that is about to dump.
-    pub(crate) fn row_image(url: &str, tls: Option<&TlsConfig>) -> super::super::cdc::RowImage {
+    /// Pure verdict half of [`Self::row_image`] (#161, the compression_refusal
+    /// split): `@@global.binlog_row_image` → keep or refuse. `None` (older
+    /// MySQL / MariaDB without the variable) is NOT evidence of a bad setting —
+    /// refusing on absence would lock out binlogs that are fine. Unit-tested in
+    /// both directions; the connect+query half stays live-guarded.
+    pub(crate) fn row_image_verdict(image: Option<&str>) -> super::super::cdc::RowImage {
         use super::super::cdc::RowImage;
-        use mysql::prelude::Queryable;
-
-        let Ok(mut conn) = connect_conn(url, tls) else {
-            return RowImage::Whole;
-        };
-        let image: Option<String> = conn
-            .query_first("SELECT @@global.binlog_row_image")
-            .unwrap_or(None);
-        // An older MySQL / a MariaDB does not expose the variable. Absence is not
-        // evidence of a bad setting, and refusing on it would lock out binlogs
-        // that are fine.
         let Some(image) = image else {
             return RowImage::Whole;
         };
@@ -133,6 +127,19 @@ impl MysqlChangeStream {
                  server default) and re-run"
             ),
         }
+    }
+
+    pub(crate) fn row_image(url: &str, tls: Option<&TlsConfig>) -> super::super::cdc::RowImage {
+        use super::super::cdc::RowImage;
+        use mysql::prelude::Queryable;
+
+        let Ok(mut conn) = connect_conn(url, tls) else {
+            return RowImage::Whole;
+        };
+        let image: Option<String> = conn
+            .query_first("SELECT @@global.binlog_row_image")
+            .unwrap_or(None);
+        Self::row_image_verdict(image.as_deref())
     }
 
     pub(crate) fn open(
@@ -828,5 +835,32 @@ mod tests {
             RivetValue::Int(2),
             "resumed stream must start after the checkpoint, not re-read A"
         );
+    }
+
+    /// #161: both directions of the pure row-image verdict, RED against an
+    /// inverted/`Ok(())`-style mutant (the compression_refusal precedent).
+    #[test]
+    fn row_image_verdict_both_directions() {
+        use crate::source::cdc::RowImage;
+        // keep: FULL (any case) and ABSENT (older MySQL / MariaDB).
+        assert!(matches!(
+            MysqlChangeStream::row_image_verdict(Some("FULL")),
+            RowImage::Whole
+        ));
+        assert!(matches!(
+            MysqlChangeStream::row_image_verdict(Some("full")),
+            RowImage::Whole
+        ));
+        assert!(matches!(
+            MysqlChangeStream::row_image_verdict(None),
+            RowImage::Whole
+        ));
+        // refuse: MINIMAL / NOBLOB write partial rows.
+        for bad in ["MINIMAL", "noblob"] {
+            match MysqlChangeStream::row_image_verdict(Some(bad)) {
+                RowImage::Partial { why } => assert!(why.contains(bad), "{why}"),
+                other => panic!("{bad} must refuse, got {other:?}"),
+            }
+        }
     }
 }
