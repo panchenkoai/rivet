@@ -16,6 +16,7 @@ pub(crate) mod chunked;
 mod cli;
 pub(crate) mod commit;
 mod finalize;
+pub(crate) mod frame;
 pub(crate) mod ipc;
 mod job;
 mod keyset;

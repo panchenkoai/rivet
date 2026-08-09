@@ -56,6 +56,8 @@ mod resource_smoke;
 mod retry_integration;
 #[path = "offline/run_summary_contract.rs"]
 mod run_summary_contract;
+#[path = "offline/runner_frame_gate.rs"]
+mod runner_frame_gate;
 #[path = "offline/scenario_artifact_matrix_guard.rs"]
 mod scenario_artifact_matrix_guard;
 #[path = "offline/schema_drift.rs"]

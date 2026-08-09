@@ -25,7 +25,6 @@ use crate::error::Result;
 use crate::plan::{IncrementalCursorPlan, KeysetPlan, ResolvedRunPlan};
 use crate::source::mongo::MongoSource;
 use crate::state::StateStore;
-use crate::{destination, format};
 
 pub(crate) fn run_mongo_parallel(
     plan: &ResolvedRunPlan,
@@ -244,11 +243,8 @@ fn range_worker_pages(
 ) -> Result<()> {
     let mut src = MongoSource::connect(url, plan.source.tls.as_ref(), plan.source.mongo.as_ref())?
         .with_id_range(lo, hi);
-    let dest = destination::create_destination(&plan.destination)?;
-    crate::manifest::guard_manifest_mode(dest.as_ref(), "batch")?;
-    let ext = format::create_format(plan.format, plan.compression, plan.compression_level, None)
-        .file_extension()
-        .to_string();
+    let frame = super::frame::RunnerFrame::open(plan)?;
+    let (dest, ext) = (frame.dest, frame.ext);
 
     let mut last: Option<String> = None;
     let mut page = 0usize;
