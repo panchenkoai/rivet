@@ -616,10 +616,7 @@ fn resolve_init_tls(
             "--tls-ca is meaningless with `--tls {}`: that mode never verifies the server \
              certificate, so the CA would be silently ignored. Use `--tls verify-ca` or \
              `--tls verify-full` (or drop --tls-ca).",
-            match mode {
-                TlsMode::Disable => "disable",
-                _ => "require",
-            }
+            mode
         );
     }
     Ok(Some(crate::config::TlsConfig {
