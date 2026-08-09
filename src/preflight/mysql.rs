@@ -217,6 +217,7 @@ fn diagnose_mysql(
     let suggestion = build_suggestion(&verdict, row_estimate, uses_index, export);
 
     Ok(ExportDiagnostic {
+        row_source: None,
         export_name: export.name.clone(),
         strategy,
         mode: mode_str,

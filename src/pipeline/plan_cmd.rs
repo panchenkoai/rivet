@@ -308,7 +308,10 @@ fn build_plan_artifact(
 
     let (computed, plan_diagnostics, hints) = match preflight::get_export_diagnostic(config, export)
     {
-        Ok(diag) => {
+        Ok(mut diag) => {
+            // #149: measured beats declared — same overlay `check` applies, so
+            // the two surfaces quote the same figure with the same label.
+            crate::preflight::overlay_measured_rows(&mut diag, state);
             // The plan artifact's warnings stay flat strings (severity tags are a
             // `rivet check` surface); take each warning's message text.
             let mut warnings: Vec<String> =

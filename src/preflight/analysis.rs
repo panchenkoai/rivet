@@ -87,6 +87,70 @@ pub(crate) fn strategy_probes_index(export: &ExportConfig) -> bool {
     ) || export.chunk_by_key.is_some()
 }
 
+/// #149: measured beats declared — and the report SAYS which it stands on.
+///
+/// After one successful run, `export_metrics.total_rows` is EXACT; the catalog
+/// (`TABLE_ROWS`/`reltuples`) lied 2.5× in the field on a versioned table. The
+/// rule: the freshest measured figure wins UNLESS it is stale (older than
+/// [`ACTUALS_STALE_DAYS`]) AND the catalog diverges >2× from it — then the
+/// catalog wins and the fallback is SAID. A report that silently mixes sources
+/// is the diagnostic-bypass class; the label is the load-bearing half.
+pub(crate) const ACTUALS_STALE_DAYS: i64 = 14;
+
+pub(crate) fn choose_row_estimate(
+    catalog: Option<i64>,
+    measured: Option<(i64, chrono::DateTime<chrono::Utc>)>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> (Option<i64>, String) {
+    match (catalog, measured) {
+        (_, Some((rows, at))) => {
+            let stale = (now - at).num_days() > ACTUALS_STALE_DAYS;
+            let diverges = catalog.is_some_and(|c| {
+                let (lo, hi) = (rows.min(c), rows.max(c));
+                lo > 0 && hi / lo >= 2 || (lo == 0 && hi > 0)
+            });
+            if stale && diverges {
+                (
+                    catalog,
+                    format!(
+                        "catalog estimate — a measured figure from {} was set aside as stale \
+                         (>{}d old) and >2× divergent",
+                        at.format("%Y-%m-%d"),
+                        ACTUALS_STALE_DAYS
+                    ),
+                )
+            } else {
+                (Some(rows), format!("measured {}", at.format("%Y-%m-%d")))
+            }
+        }
+        (c, None) => (c, "catalog estimate".to_string()),
+    }
+}
+
+/// Overlay the state store's freshest successful actual onto a diagnostic —
+/// the one place `check`/`plan` swap catalog for measured, so the two surfaces
+/// cannot drift (#149). Best-effort: an unreadable store keeps the catalog.
+pub(crate) fn overlay_measured_rows(
+    diag: &mut super::ExportDiagnostic,
+    state: &crate::state::StateStore,
+) {
+    let measured = state
+        .get_metrics(Some(&diag.export_name), 25)
+        .ok()
+        .and_then(|ms| {
+            ms.into_iter()
+                .find(|m| m.status == "success")
+                .and_then(|m| {
+                    chrono::DateTime::parse_from_rfc3339(&m.run_at)
+                        .ok()
+                        .map(|t| (m.total_rows, t.with_timezone(&chrono::Utc)))
+                })
+        });
+    let (est, label) = choose_row_estimate(diag.row_estimate, measured, chrono::Utc::now());
+    diag.row_estimate = est;
+    diag.row_source = Some(label);
+}
+
 /// The operator-facing mode line shown in the `rivet check` diagnostic —
 /// `"chunked (column: id, size: 100000)"`, `"incremental (cursor: updated_at)"`,
 /// etc. Shared verbatim by all three engine `diagnose_*` paths, which differ
@@ -782,6 +846,77 @@ mod tests {
     fn derive_strategy_date_chunked() {
         let e = cfg("mode: chunked\nchunk_column: created_at\nchunk_by_days: 7\n");
         assert_eq!(derive_strategy(&e), "date-chunked(created_at, 7d)");
+    }
+
+    // ── #149: measured beats declared, and the label is load-bearing ─────────
+
+    #[test]
+    fn choose_row_estimate_rule_both_directions() {
+        use chrono::{Duration, Utc};
+        let now = Utc::now();
+        let fresh = Some((835_000_000i64, now - Duration::days(2)));
+        let stale = Some((835_000_000i64, now - Duration::days(30)));
+        // fresh actual beats the catalog, label says measured
+        let (est, src) = choose_row_estimate(Some(332_000_000), fresh, now);
+        assert_eq!(est, Some(835_000_000));
+        assert!(src.starts_with("measured "), "{src}");
+        // stale + >2x divergent falls back — and the fallback is SAID
+        let (est, src) = choose_row_estimate(Some(332_000_000), stale, now);
+        assert_eq!(est, Some(332_000_000));
+        assert!(src.contains("set aside as stale"), "{src}");
+        // stale but NOT divergent: the actual still wins (age alone is fine)
+        let (est, src) = choose_row_estimate(Some(800_000_000), stale, now);
+        assert_eq!(est, Some(835_000_000));
+        assert!(src.starts_with("measured "), "{src}");
+        // no actual: catalog, labelled as such
+        let (est, src) = choose_row_estimate(Some(100), None, now);
+        assert_eq!(est, Some(100));
+        assert_eq!(src, "catalog estimate");
+    }
+
+    /// The overlay through a REAL state store (RED against a catalog-only
+    /// path): a recorded success replaces the diagnostic's catalog figure and
+    /// the label names the source — the field 2.5x lie, ended.
+    #[test]
+    fn overlay_swaps_catalog_for_the_recorded_actual_and_says_so() {
+        let state = crate::state::StateStore::open_in_memory().unwrap();
+        state
+            .record_metric_full(&crate::state::MetricRow {
+                export_name: "versioned_giant".into(),
+                run_id: "r1".into(),
+                total_rows: 835_700_000,
+                status: "success".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let mut diag = super::super::ExportDiagnostic {
+            export_name: "versioned_giant".into(),
+            strategy: "chunked(id, size=100000)".into(),
+            mode: "chunked".into(),
+            cursor_column: None,
+            row_estimate: Some(331_966_196),
+            row_source: None,
+            avg_row_bytes: None,
+            cursor_min: None,
+            cursor_max: None,
+            scan_type: None,
+            uses_index: true,
+            verdict: super::super::HealthVerdict::Efficient,
+            warnings: Vec::new(),
+            recommended_profile: "balanced",
+            recommended_parallel: (1, "test"),
+            suggestion: None,
+        };
+        overlay_measured_rows(&mut diag, &state);
+        assert_eq!(diag.row_estimate, Some(835_700_000), "measured must win");
+        assert!(
+            diag.row_source
+                .as_deref()
+                .unwrap_or("")
+                .starts_with("measured "),
+            "the report must SAY it stands on the measurement: {:?}",
+            diag.row_source
+        );
     }
 
     // ── preflight_range_col / strategy_probes_index cover EVERY strategy ──────
