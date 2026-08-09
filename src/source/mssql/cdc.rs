@@ -128,6 +128,16 @@ pub(crate) fn row_image(
     let Ok(rows) = src.query_single_column(&sql) else {
         return RowImage::Whole;
     };
+    row_image_verdict(&rows)
+}
+
+/// Pure verdict half of [`row_image`] (#161, the compression_refusal split):
+/// each row is `name:got/all` (captured vs source column counts for the capture
+/// instance rivet reads); any instance with `got < all` is a PARTIAL capture —
+/// refuse. Malformed rows are skipped (best-effort, like the query itself).
+/// Unit-tested in both directions; the connect+query half stays live-guarded.
+pub(crate) fn row_image_verdict(rows: &[String]) -> crate::source::cdc::RowImage {
+    use crate::source::cdc::RowImage;
     let short: Vec<String> = rows
         .iter()
         .filter_map(|r| {
@@ -1251,5 +1261,28 @@ mod tests {
             vec![ChangeOp::Insert, ChangeOp::Update, ChangeOp::Delete],
             "CDC change table must yield insert(2), update-after(4), delete(1)"
         );
+    }
+
+    /// #161: both directions of the got/all capture-column verdict.
+    #[test]
+    fn row_image_verdict_both_directions() {
+        use crate::source::cdc::RowImage;
+        // keep: every instance captures every column; malformed rows skipped.
+        assert!(matches!(
+            row_image_verdict(&["orders_ci:5/5".into(), "garbage".into()]),
+            RowImage::Whole
+        ));
+        assert!(matches!(row_image_verdict(&[]), RowImage::Whole));
+        // refuse: any instance short of the source column count.
+        match row_image_verdict(&["orders_ci:3/5".into(), "items_ci:4/4".into()]) {
+            RowImage::Partial { why } => {
+                assert!(why.contains("orders_ci (3 of 5 columns)"), "{why}");
+                assert!(
+                    !why.contains("items_ci"),
+                    "complete instance must not be named: {why}"
+                );
+            }
+            other => panic!("partial capture must refuse, got {other:?}"),
+        }
     }
 }

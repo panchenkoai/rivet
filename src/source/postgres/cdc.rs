@@ -172,10 +172,20 @@ impl PgChangeStream {
         ) else {
             return RowImage::Whole;
         };
-        if rows.is_empty() {
+        let named: Vec<String> = rows.iter().map(|r| r.get::<_, String>(0)).collect();
+        Self::row_image_verdict(&named)
+    }
+
+    /// Pure verdict half of [`Self::row_image`] (#161, the compression_refusal
+    /// split): the captured tables whose REPLICA IDENTITY is not FULL — empty
+    /// means every table carries whole rows (keep); any named table downgrades
+    /// DELETEs to key-only (warn). Unit-tested in both directions; the
+    /// connect+query half stays live-guarded.
+    pub(crate) fn row_image_verdict(named: &[String]) -> crate::source::cdc::RowImage {
+        use crate::source::cdc::RowImage;
+        if named.is_empty() {
             return RowImage::Whole;
         }
-        let named: Vec<String> = rows.iter().map(|r| r.get::<_, String>(0)).collect();
         RowImage::KeyOnlyDeletes {
             why: format!(
                 "{} of the captured table(s) ({}) have REPLICA IDENTITY other than FULL, so a \
@@ -1668,6 +1678,7 @@ mod tests {
 
 #[cfg(test)]
 mod slot_creation_warning_tests {
+    use super::PgChangeStream;
     use super::slot_created_warning;
 
     /// A created slot means capture starts at the CURRENT WAL position, so
@@ -1698,5 +1709,22 @@ mod slot_creation_warning_tests {
             w.contains("cdc.checkpoint"),
             "must name the setting that upgrades this to a hard error: {w}"
         );
+    }
+
+    /// #161: both directions of the replica-identity verdict.
+    #[test]
+    fn row_image_verdict_both_directions() {
+        use crate::source::cdc::RowImage;
+        assert!(matches!(
+            PgChangeStream::row_image_verdict(&[]),
+            RowImage::Whole
+        ));
+        match PgChangeStream::row_image_verdict(&["orders".into(), "items".into()]) {
+            RowImage::KeyOnlyDeletes { why } => {
+                assert!(why.contains("2 of the captured table(s)"), "{why}");
+                assert!(why.contains("orders, items"), "{why}");
+            }
+            other => panic!("non-FULL identity must warn, got {other:?}"),
+        }
     }
 }

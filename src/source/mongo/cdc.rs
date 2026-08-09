@@ -104,6 +104,34 @@ fn token_data(v: &serde_json::Value) -> Option<String> {
     v.get("_data").and_then(|d| d.as_str()).map(String::from)
 }
 
+/// Pure bound verdicts (#161): Mongo was the only engine whose `until_current`
+/// stop rules lived inline in the drain loop instead of a testable transition
+/// (its siblings: MySQL `commit_past_bound`, PG `tx_disposition`, MSSQL
+/// `fill_sql`). Two rules, both unit-tested in both directions:
+///
+/// An EMPTY poll's disposition: the stream's resume token has silently advanced
+/// past the open-time `_data` target → the backlog is drained, STOP; no target
+/// (unbounded shouldn't reach here, and an unparseable boundary fails OPEN) →
+/// STOP; otherwise the backlog is still coming → POLL again.
+fn idle_poll_stops(advanced: Option<&str>, target: Option<&str>) -> bool {
+    match (advanced, target) {
+        (Some(cur), Some(tgt)) => cur > tgt,
+        (_, None) => true,
+        _ => false,
+    }
+}
+
+/// The TIME bound: an event whose `cluster_time` is past the open-time cluster
+/// time arrived AFTER we opened — a bounded run stops there (without it,
+/// sustained writes keep `next_if_any` yielding and the run never terminates).
+fn past_time_bound(
+    until_current: bool,
+    cluster_time: Option<mongodb::bson::Timestamp>,
+    bound: Option<mongodb::bson::Timestamp>,
+) -> bool {
+    until_current && matches!((cluster_time, bound), (Some(ct), Some(b)) if ct > b)
+}
+
 /// Persist a resume token as a [`Position`] LOSSLESSLY. A token can carry a BSON
 /// binary `_typeBits` field (for typed sort keys — e.g. an integer `_id`), and a
 /// plain `serde_json` round-trip mangles that binary, so the server rejects it on
@@ -441,11 +469,10 @@ impl ChangeStream for MongoChangeStream {
                             .and_then(|t| serde_json::to_value(&t).ok())
                             .as_ref()
                             .and_then(token_data);
-                        match (&advanced, &target) {
-                            (Some(cur), Some(tgt)) if cur > tgt => return None,
-                            (_, None) => return None,
-                            _ => continue, // backlog still coming — poll again
+                        if idle_poll_stops(advanced.as_deref(), target.as_deref()) {
+                            return None;
                         }
+                        continue; // backlog still coming — poll again
                     }
                     Err(e) => return Some(Err(anyhow::Error::from(e))),
                 }
@@ -462,10 +489,7 @@ impl ChangeStream for MongoChangeStream {
             // Without it, sustained writes keep `next_if_any` returning events and
             // the run never terminates (the `_data` target only fires on an empty
             // poll, which never happens under continuous writes).
-            if until_current
-                && let (Some(ct), Some(bound)) = (cse.cluster_time, bound_ts)
-                && ct > bound
-            {
+            if past_time_bound(until_current, cse.cluster_time, bound_ts) {
                 return None;
             }
 
@@ -547,5 +571,35 @@ mod tests {
                 "malformed resume token must be a clean Err, not a panic: {bad}"
             );
         }
+    }
+
+    /// #161: Mongo's until_current stop rules as pure transitions, both
+    /// directions each — the one engine whose bound lived inline in the drain
+    /// loop (siblings: commit_past_bound / tx_disposition / fill_sql).
+    #[test]
+    fn idle_poll_stops_both_directions() {
+        // stop: token advanced past the open-time target — backlog drained.
+        assert!(idle_poll_stops(Some("82AB"), Some("8299")));
+        // stop: no target (fail OPEN on an unparseable boundary).
+        assert!(idle_poll_stops(None, None));
+        assert!(idle_poll_stops(Some("82AB"), None));
+        // poll: backlog still coming (at or below the target, or no token yet).
+        assert!(!idle_poll_stops(Some("8299"), Some("82AB")));
+        assert!(!idle_poll_stops(Some("82AB"), Some("82AB")));
+        assert!(!idle_poll_stops(None, Some("82AB")));
+    }
+
+    #[test]
+    fn past_time_bound_both_directions() {
+        use mongodb::bson::Timestamp;
+        let t = |time: u32| Some(Timestamp { time, increment: 0 });
+        // stop: bounded run, event after the open-time cluster time.
+        assert!(past_time_bound(true, t(101), t(100)));
+        // keep: at/before the bound, daemon mode, or no bound.
+        assert!(!past_time_bound(true, t(100), t(100)));
+        assert!(!past_time_bound(true, t(99), t(100)));
+        assert!(!past_time_bound(false, t(101), t(100)));
+        assert!(!past_time_bound(true, t(101), None));
+        assert!(!past_time_bound(true, None, t(100)));
     }
 }
