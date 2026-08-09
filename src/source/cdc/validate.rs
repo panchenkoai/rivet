@@ -122,31 +122,59 @@ fn read_pos_column(body: Vec<u8>) -> Result<Vec<String>> {
 /// at `dest`/`prefix`. Returns the range covered and any ordering violations.
 pub(crate) fn check_positions(dest: &dyn Destination, prefix: &str) -> Result<PositionCheck> {
     let manifest_key = join_key(prefix, MANIFEST_FILENAME);
-    // Round-4: the canonical manifest.json can be ABSENT on a CDC prefix that
-    // crashed before its terminal write (the per-roll durability write now emits
-    // only the run-unique copy). Skip the position check gracefully — an empty,
-    // violation-free result — rather than propagating an opaque I/O error on a
-    // prefix whose data is intact (the run-unique manifests + parts are still there).
-    if dest.head(&manifest_key)?.is_none() {
+    // The canonical manifest.json is ABSENT on a daemon/crashed CDC prefix (the
+    // per-roll durability write emits only the run-unique copy). Do NOT report a
+    // false-clean OK over ZERO parts (roast 2026-08-09, #173): fall back to the
+    // run-unique copies (manifest-<run_id>.json) — the same set `load` reconciles
+    // — so validate actually checks the parts that are physically present. Only
+    // an empty result when there is NO manifest of any kind.
+    let manifests: Vec<RunManifest> = if dest.head(&manifest_key)?.is_some() {
+        vec![serde_json::from_slice(&dest.read(&manifest_key)?)?]
+    } else {
+        let mut copies = Vec::new();
+        for m in dest.list_prefix(prefix)? {
+            let base = m.key.rsplit('/').next().unwrap_or("");
+            if crate::manifest::is_run_unique_manifest_name(base) {
+                copies.push(serde_json::from_slice::<RunManifest>(&dest.read(&m.key)?)?);
+            }
+        }
+        copies
+    };
+    if manifests.is_empty() {
         return Ok(PositionCheck::default());
     }
-    let manifest: RunManifest = serde_json::from_slice(&dest.read(&manifest_key)?)?;
 
-    // IO half: read every part's __pos in part→row order.
-    let mut items: Vec<(u32, String)> = Vec::new();
-    for part in &manifest.parts {
-        let body = dest.read(&join_key(prefix, &part.path))?;
-        items.extend(
-            read_pos_column(body)?
-                .into_iter()
-                .map(|p| (part.part_id, p)),
-        );
+    // Check each manifest's parts INDEPENDENTLY: a run-unique copy is one run's
+    // full manifest, and __pos is one monotonic sequence WITHIN a run — not
+    // across runs — so concatenating parts from different runs would forge false
+    // backwards-violations. Sum parts/rows; collect every run's violations.
+    let (mut parts, mut rows) = (0usize, 0usize);
+    let (mut first, mut last): (Option<String>, Option<String>) = (None, None);
+    let mut violations = Vec::new();
+    for manifest in &manifests {
+        let mut items: Vec<(u32, String)> = Vec::new();
+        for part in &manifest.parts {
+            let body = dest.read(&join_key(prefix, &part.path))?;
+            items.extend(
+                read_pos_column(body)?
+                    .into_iter()
+                    .map(|p| (part.part_id, p)),
+            );
+        }
+        let (f, l, v) = check_order(&items);
+        parts += manifest.parts.len();
+        rows += items.len();
+        if first.is_none() {
+            first = f;
+        }
+        if l.is_some() {
+            last = l;
+        }
+        violations.extend(v);
     }
-
-    let (first, last, violations) = check_order(&items);
     Ok(PositionCheck {
-        parts: manifest.parts.len(),
-        rows: items.len(),
+        parts,
+        rows,
         first,
         last,
         violations,
