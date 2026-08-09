@@ -240,7 +240,7 @@ GATE_ENV = \
   BQ_ORACLE_BUCKET='$(BQ_ORACLE_BUCKET)'
 
 release-oracle-prev-bin:  ## Download the PREVIOUS release binary (the regression + scale baseline). A downloaded asset, never a locally rebuilt parent.
-	@mkdir -p $(PREV_RELEASE_DIR)
+	@rm -rf $(PREV_RELEASE_DIR) && mkdir -p $(PREV_RELEASE_DIR)  # exactly one baseline: `ls | tail` below must not pick a lexicographically-wrong version from an accumulating dir (bug hunt 2026-08-08)
 	@tag=$$(gh release list --limit 1 --json tagName -q '.[0].tagName'); \
 	 arch=$$(uname -m); os=$$(uname -s | tr 'A-Z' 'a-z'); \
 	 [ "$$arch" = "arm64" ] && arch=aarch64; \
@@ -257,7 +257,9 @@ release-oracle-full: release-oracle-prev-bin  ## Release gate with the WHOLE env
 	@# `Fresh` on a binary that predates your edits — drop the snapshot first.
 	@rm -rf target/package
 	cargo build --release
-	@prev=$$(ls -d $(PREV_RELEASE_DIR)/rivet-v*/rivet 2>/dev/null | tail -1); \
+	@# newest by mtime, not lexical order (accumulating dir would mis-tail)
+	@prev=$$(ls -t -d $(PREV_RELEASE_DIR)/rivet-v*/rivet 2>/dev/null | head -1); \
+
 	 echo "  previous release: $${prev:-<none — the regression + scale legs will SKIP>}"; \
 	 env $(GATE_ENV) RIVET_PREV_RELEASE_BIN="$$prev" python3 -m dev.release_oracle $(ARGS)
 
