@@ -332,67 +332,6 @@ impl StateStore {
         Ok(())
     }
 
-    /// The parallel workers' twin of [`Self::fail_chunk_task`] — same contract,
-    /// including `retryable`.
-    pub fn fail_chunk_task_at_ref(
-        state_ref: &StateRef,
-        run_id: &str,
-        chunk_index: i64,
-        err: &str,
-        retryable: bool,
-    ) -> Result<()> {
-        let now = chrono::Utc::now().to_rfc3339();
-        let sql = if retryable {
-            "UPDATE chunk_task SET status = 'failed', last_error = ?1, updated_at = ?2
-             WHERE run_id = ?3 AND chunk_index = ?4"
-        } else {
-            "UPDATE chunk_task SET status = 'failed', last_error = ?1, updated_at = ?2,
-                    attempts = (SELECT max_chunk_attempts FROM chunk_run WHERE run_id = ?3)
-             WHERE run_id = ?3 AND chunk_index = ?4"
-        };
-        match state_ref {
-            StateRef::Sqlite(db_path) => {
-                let conn = open_connection(db_path)?;
-                conn.execute(sql, rusqlite::params![err, now, run_id, chunk_index])?;
-            }
-            StateRef::Postgres(url) => {
-                let mut client = super::connect_pg(url)?;
-                client.execute(&pg_sql(sql), &[&err, &now, &run_id, &chunk_index])?;
-            }
-        }
-        Ok(())
-    }
-
-    pub fn complete_chunk_task_at_ref(
-        state_ref: &StateRef,
-        run_id: &str,
-        chunk_index: i64,
-        rows_written: i64,
-        file_name: Option<&str>,
-    ) -> Result<()> {
-        let now = chrono::Utc::now().to_rfc3339();
-        let sql = "UPDATE chunk_task
-             SET status = 'completed', rows_written = ?1, file_name = ?2, last_error = NULL, updated_at = ?3
-             WHERE run_id = ?4 AND chunk_index = ?5";
-        match state_ref {
-            StateRef::Sqlite(db_path) => {
-                let conn = open_connection(db_path)?;
-                conn.execute(
-                    sql,
-                    rusqlite::params![rows_written, file_name, now, run_id, chunk_index],
-                )?;
-            }
-            StateRef::Postgres(url) => {
-                let mut client = super::connect_pg(url)?;
-                client.execute(
-                    &pg_sql(sql),
-                    &[&rows_written, &file_name, &now, &run_id, &chunk_index],
-                )?;
-            }
-        }
-        Ok(())
-    }
-
     pub fn count_chunk_tasks_total(&self, run_id: &str) -> Result<usize> {
         let sql = "SELECT COUNT(*) FROM chunk_task WHERE run_id = ?1";
         match &self.conn {
