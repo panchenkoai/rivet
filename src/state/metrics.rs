@@ -22,6 +22,8 @@ pub struct ExportMetric {
     pub retries: i64,
     pub validated: Option<bool>,
     pub schema_changed: Option<bool>,
+    /// v23 — decoded bytes READ from the source (0 for pre-v23 rows).
+    pub bytes_read: i64,
 }
 
 /// Every column written to one `export_metrics` row.
@@ -390,10 +392,12 @@ impl StateStore {
             retries: r.opt_i64(13).unwrap_or(0),
             validated: r.opt_bool(14),
             schema_changed: r.opt_bool(15),
+            bytes_read: r.opt_i64(16).unwrap_or(0),
         };
         let cols = "export_name, run_id, run_at, duration_ms, total_rows, peak_rss_mb, \
                     status, error_message, tuning_profile, format, mode, \
-                    files_produced, bytes_written, retries, validated, schema_changed";
+                    files_produced, bytes_written, retries, validated, schema_changed, \
+                    bytes_read";
         match export_name {
             Some(name) => self.query(
                 &format!(

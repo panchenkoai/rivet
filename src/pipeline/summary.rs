@@ -557,6 +557,7 @@ impl RunSummary {
         rows.push(("files", fmt_thousands(self.files_produced as i64)));
         rows.extend(self.output_row());
         rows.extend(self.position_row());
+        rows.extend(self.bytes_read_row());
         rows.extend(self.bytes_row());
         rows.push(("duration", fmt_duration_ms(self.duration_ms)));
         rows.extend(self.peak_rss_row());
@@ -621,10 +622,20 @@ impl RunSummary {
         }
     }
 
-    /// `bytes` — only when something was written.
+    /// `bytes read` / `bytes written` — SEPARATE rows (read is the source
+    /// leg's decoded volume, written the parquet leg's; the pair is the
+    /// read-vs-write-bound signal the field 163-min run had neither of).
     fn bytes_row(&self) -> Option<Row> {
         if self.bytes_written > 0 {
-            Some(("bytes", format_bytes(self.bytes_written)))
+            Some(("bytes written", format_bytes(self.bytes_written)))
+        } else {
+            None
+        }
+    }
+
+    fn bytes_read_row(&self) -> Option<Row> {
+        if self.bytes_read > 0 {
+            Some(("bytes read", format_bytes(self.bytes_read)))
         } else {
             None
         }
