@@ -943,45 +943,47 @@ mod tests {
         let state = crate::state::StateStore::open_in_memory().expect("state");
         for (name, ms) in [("slowpoke", 90_000i64), ("quickie", 1_000i64)] {
             state
-                .record_metric(
-                    name,
-                    &format!("{name}_run"),
-                    ms,
-                    10,
-                    Some(120),
-                    "success",
-                    None,
-                    None,
-                    None,
-                    None,
-                    1,
-                    100,
-                    0,
-                    None,
-                    None,
-                )
+                .record_metric_full(&crate::state::MetricRow {
+                    export_name: name.to_string(),
+                    run_id: format!("{name}_run"),
+                    duration_ms: ms,
+                    total_rows: 10,
+                    peak_rss_mb: Some(120),
+                    status: "success".to_string(),
+                    error_message: None,
+                    tuning_profile: None,
+                    format: None,
+                    mode: None,
+                    files_produced: 1,
+                    bytes_written: 100,
+                    retries: 0,
+                    validated: None,
+                    schema_changed: None,
+                    ..Default::default()
+                })
                 .expect("record");
         }
         // …and a failed newer run for slowpoke, which must be IGNORED — only a
         // successful run predicts anything.
         state
-            .record_metric(
-                "slowpoke",
-                "slowpoke_failed",
-                5,
-                0,
-                Some(50),
-                "failed",
-                Some("boom"),
-                None,
-                None,
-                None,
-                0,
-                0,
-                0,
-                None,
-                None,
-            )
+            .record_metric_full(&crate::state::MetricRow {
+                export_name: "slowpoke".to_string(),
+                run_id: "slowpoke_failed".to_string(),
+                duration_ms: 5,
+                total_rows: 0,
+                peak_rss_mb: Some(50),
+                status: "failed".to_string(),
+                error_message: Some("boom".to_string()),
+                tuning_profile: None,
+                format: None,
+                mode: None,
+                files_produced: 0,
+                bytes_written: 0,
+                retries: 0,
+                validated: None,
+                schema_changed: None,
+                ..Default::default()
+            })
             .expect("record failed");
 
         let recs = vec![
@@ -1026,23 +1028,24 @@ mod tests {
         let state = crate::state::StateStore::open_in_memory().expect("state");
         for n in ["lonely", "buddy"] {
             state
-                .record_metric(
-                    n,
-                    &format!("{n}_r"),
-                    1000,
-                    10,
-                    Some(100),
-                    "success",
-                    None,
-                    None,
-                    None,
-                    None,
-                    1,
-                    100,
-                    0,
-                    None,
-                    None,
-                )
+                .record_metric_full(&crate::state::MetricRow {
+                    export_name: n.to_string(),
+                    run_id: format!("{n}_r"),
+                    duration_ms: 1000,
+                    total_rows: 10,
+                    peak_rss_mb: Some(100),
+                    status: "success".to_string(),
+                    error_message: None,
+                    tuning_profile: None,
+                    format: None,
+                    mode: None,
+                    files_produced: 1,
+                    bytes_written: 100,
+                    retries: 0,
+                    validated: None,
+                    schema_changed: None,
+                    ..Default::default()
+                })
                 .expect("rec");
         }
         let recs = vec![

@@ -97,53 +97,6 @@ pub struct MetricRow {
 /// Invariant I4 (Metric After Verdict) governs when `record_metric` is called:
 /// only after the terminal run outcome is determined.
 impl StateStore {
-    /// Back-compat shim: the original 15-field metric. Fills the v9 columns with
-    /// defaults (NULL) and delegates to [`record_metric_full`]. The production
-    /// run/apply path now builds a full [`MetricRow`]; this shim remains for the
-    /// unit + integration tests that only assert the core signals.
-    ///
-    /// `#[allow(dead_code)]`: the only non-test caller migrated to
-    /// `record_metric_full`, and the bin/lib dead-code pass can't see the uses
-    /// in `tests/*` (same reason `RunSummary::stub_for_testing` carries it).
-    #[allow(clippy::too_many_arguments, dead_code)]
-    pub fn record_metric(
-        &self,
-        export_name: &str,
-        run_id: &str,
-        duration_ms: i64,
-        total_rows: i64,
-        peak_rss_mb: Option<i64>,
-        status: &str,
-        error_message: Option<&str>,
-        tuning_profile: Option<&str>,
-        format: Option<&str>,
-        mode: Option<&str>,
-        files_produced: i64,
-        bytes_written: i64,
-        retries: i64,
-        validated: Option<bool>,
-        schema_changed: Option<bool>,
-    ) -> Result<()> {
-        self.record_metric_full(&MetricRow {
-            export_name: export_name.to_string(),
-            run_id: run_id.to_string(),
-            duration_ms,
-            total_rows,
-            peak_rss_mb,
-            status: status.to_string(),
-            error_message: error_message.map(str::to_string),
-            tuning_profile: tuning_profile.map(str::to_string),
-            format: format.map(str::to_string),
-            mode: mode.map(str::to_string),
-            files_produced,
-            bytes_written,
-            retries,
-            validated,
-            schema_changed,
-            ..Default::default()
-        })
-    }
-
     /// Drop a run's in-flight `running` aggregate. Only ever called by
     /// [`record_metric_full`], immediately before the terminal row replaces it.
     fn clear_running_metric(&self, run_id: &str) -> Result<()> {
@@ -542,41 +495,43 @@ mod tests {
     #[test]
     fn record_and_query_metrics() {
         let s = store();
-        s.record_metric(
-            "orders",
-            "run_001",
-            1200,
-            50000,
-            Some(142),
-            "success",
-            None,
-            Some("safe"),
-            Some("parquet"),
-            Some("full"),
-            1,
-            4096,
-            0,
-            Some(true),
-            Some(false),
-        )
+        s.record_metric_full(&crate::state::MetricRow {
+            export_name: "orders".to_string(),
+            run_id: "run_001".to_string(),
+            duration_ms: 1200,
+            total_rows: 50000,
+            peak_rss_mb: Some(142),
+            status: "success".to_string(),
+            error_message: None,
+            tuning_profile: Some("safe".to_string()),
+            format: Some("parquet".to_string()),
+            mode: Some("full".to_string()),
+            files_produced: 1,
+            bytes_written: 4096,
+            retries: 0,
+            validated: Some(true),
+            schema_changed: Some(false),
+            ..Default::default()
+        })
         .unwrap();
-        s.record_metric(
-            "orders",
-            "run_002",
-            300,
-            0,
-            Some(30),
-            "failed",
-            Some("timeout"),
-            Some("safe"),
-            Some("parquet"),
-            Some("full"),
-            0,
-            0,
-            2,
-            None,
-            None,
-        )
+        s.record_metric_full(&crate::state::MetricRow {
+            export_name: "orders".to_string(),
+            run_id: "run_002".to_string(),
+            duration_ms: 300,
+            total_rows: 0,
+            peak_rss_mb: Some(30),
+            status: "failed".to_string(),
+            error_message: Some("timeout".to_string()),
+            tuning_profile: Some("safe".to_string()),
+            format: Some("parquet".to_string()),
+            mode: Some("full".to_string()),
+            files_produced: 0,
+            bytes_written: 0,
+            retries: 2,
+            validated: None,
+            schema_changed: None,
+            ..Default::default()
+        })
         .unwrap();
 
         let metrics = s.get_metrics(Some("orders"), 10).unwrap();
@@ -667,15 +622,43 @@ mod tests {
     #[test]
     fn query_metrics_all_exports() {
         let s = store();
-        s.record_metric(
-            "orders", "r1", 100, 1000, None, "success", None, None, None, None, 1, 500, 0, None,
-            None,
-        )
+        s.record_metric_full(&crate::state::MetricRow {
+            export_name: "orders".to_string(),
+            run_id: "r1".to_string(),
+            duration_ms: 100,
+            total_rows: 1000,
+            peak_rss_mb: None,
+            status: "success".to_string(),
+            error_message: None,
+            tuning_profile: None,
+            format: None,
+            mode: None,
+            files_produced: 1,
+            bytes_written: 500,
+            retries: 0,
+            validated: None,
+            schema_changed: None,
+            ..Default::default()
+        })
         .unwrap();
-        s.record_metric(
-            "users", "r2", 200, 2000, None, "success", None, None, None, None, 1, 800, 0, None,
-            None,
-        )
+        s.record_metric_full(&crate::state::MetricRow {
+            export_name: "users".to_string(),
+            run_id: "r2".to_string(),
+            duration_ms: 200,
+            total_rows: 2000,
+            peak_rss_mb: None,
+            status: "success".to_string(),
+            error_message: None,
+            tuning_profile: None,
+            format: None,
+            mode: None,
+            files_produced: 1,
+            bytes_written: 800,
+            retries: 0,
+            validated: None,
+            schema_changed: None,
+            ..Default::default()
+        })
         .unwrap();
 
         let metrics = s.get_metrics(None, 10).unwrap();
@@ -686,23 +669,24 @@ mod tests {
     fn metrics_limit_works() {
         let s = store();
         for i in 0..10 {
-            s.record_metric(
-                "t",
-                &format!("r{}", i),
-                i * 100,
-                i,
-                None,
-                "success",
-                None,
-                None,
-                None,
-                None,
-                0,
-                0,
-                0,
-                None,
-                None,
-            )
+            s.record_metric_full(&crate::state::MetricRow {
+                export_name: "t".to_string(),
+                run_id: format!("r{}", i),
+                duration_ms: i * 100,
+                total_rows: i,
+                peak_rss_mb: None,
+                status: "success".to_string(),
+                error_message: None,
+                tuning_profile: None,
+                format: None,
+                mode: None,
+                files_produced: 0,
+                bytes_written: 0,
+                retries: 0,
+                validated: None,
+                schema_changed: None,
+                ..Default::default()
+            })
             .unwrap();
         }
         let metrics = s.get_metrics(Some("t"), 3).unwrap();

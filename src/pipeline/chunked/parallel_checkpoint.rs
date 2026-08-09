@@ -205,26 +205,28 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                     let start: i64 = match sk.parse() {
                         Ok(v) => v,
                         Err(_) => {
-                            let _ = StateStore::fail_chunk_task_at_ref(
-                                &state_ref,
-                                run_id_arc.as_str(),
-                                chunk_index,
-                                "invalid start_key",
-                                false, // a malformed key parses the same way every time
-                            );
+                            let _ = StateStore::open_at_ref(&state_ref).and_then(|st| {
+                                st.fail_chunk_task(
+                                    run_id_arc.as_str(),
+                                    chunk_index,
+                                    "invalid start_key",
+                                    false, // a malformed key parses the same way every time
+                                )
+                            });
                             continue;
                         }
                     };
                     let end: i64 = match ek.parse() {
                         Ok(v) => v,
                         Err(_) => {
-                            let _ = StateStore::fail_chunk_task_at_ref(
-                                &state_ref,
-                                run_id_arc.as_str(),
-                                chunk_index,
-                                "invalid end_key",
-                                false, // a malformed key parses the same way every time
-                            );
+                            let _ = StateStore::open_at_ref(&state_ref).and_then(|st| {
+                                st.fail_chunk_task(
+                                    run_id_arc.as_str(),
+                                    chunk_index,
+                                    "invalid end_key",
+                                    false, // a malformed key parses the same way every time
+                                )
+                            });
                             continue;
                         }
                     };
@@ -468,13 +470,14 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                             // crashing the process and leaving any in-flight workers'
                             // chunk_task rows as 'running' for the resume path to reset.
                             crate::test_hook::maybe_panic_at_chunk("after_chunk_file", chunk_index);
-                            let _ = StateStore::complete_chunk_task_at_ref(
-                                &state_ref,
-                                run_id_arc.as_str(),
-                                chunk_index,
-                                rows as i64,
-                                fname_for_state.as_deref(),
-                            );
+                            let _ = StateStore::open_at_ref(&state_ref).and_then(|st| {
+                                st.complete_chunk_task(
+                                    run_id_arc.as_str(),
+                                    chunk_index,
+                                    rows as i64,
+                                    fname_for_state.as_deref(),
+                                )
+                            });
                             crate::test_hook::maybe_panic_at_chunk(
                                 "after_chunk_complete",
                                 chunk_index,
@@ -483,13 +486,14 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                         }
                         Err(e) => {
                             let msg = crate::redact::redact_error(&e);
-                            let _ = StateStore::fail_chunk_task_at_ref(
-                                &state_ref,
-                                run_id_arc.as_str(),
-                                chunk_index,
-                                &msg,
-                                crate::pipeline::retry::is_transient(&e),
-                            );
+                            let _ = StateStore::open_at_ref(&state_ref).and_then(|st| {
+                                st.fail_chunk_task(
+                                    run_id_arc.as_str(),
+                                    chunk_index,
+                                    &msg,
+                                    crate::pipeline::retry::is_transient(&e),
+                                )
+                            });
                             poison::lock_recover(errors)
                                 .push(format!("chunk {}: {}", chunk_index, msg));
                         }
