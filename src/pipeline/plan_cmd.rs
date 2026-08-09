@@ -36,6 +36,15 @@ pub enum PlanOutputFormat {
     Json(Option<String>),
 }
 
+/// `--annotate-waves` packs a schedule across the WHOLE config, so it is a
+/// category error when scoped to a single `--export` (packing one export alone
+/// rewrites its wave to 1 — bug hunt 2026-08-08). True ⇔ both are set: the
+/// `&&` must not soften to `||` (which would refuse a plain `--export`) — pinned
+/// by `refuse_annotate_scoped_to_export_only_when_both_set`.
+fn refuse_annotate_scoped_to_export(annotate_waves: bool, has_export: bool) -> bool {
+    annotate_waves && has_export
+}
+
 /// Entry point for `rivet plan`.
 ///
 /// Iterates over all matching exports, builds a `PlanArtifact` for each, and
@@ -47,6 +56,16 @@ pub fn run_plan_command(
     format: PlanOutputFormat,
     annotate_waves: bool,
 ) -> Result<()> {
+    // --annotate-waves packs a SCHEDULE across the whole config: it assigns each
+    // export a wave relative to all the others. Scoped to a single --export it
+    // packs that one export alone → wave 1, silently inverting its place in the
+    // schedule (bug hunt 2026-08-08). The two are a category error; refuse them
+    // together rather than write an incoherent wave.
+    if refuse_annotate_scoped_to_export(annotate_waves, export_name.is_some()) {
+        anyhow::bail!(
+            "--annotate-waves schedules the WHOLE config (each export's wave is relative to              the others) and cannot be scoped to --export: packing one export alone would              rewrite its wave to 1. Drop --export to annotate the whole config, or drop              --annotate-waves to plan just this export."
+        );
+    }
     let config = Config::load_with_params(config_path, params)?;
     let config_dir = Path::new(config_path)
         .parent()
@@ -140,21 +159,71 @@ pub fn run_plan_command(
             })
         })
         .collect();
+    // The packer needs each export's cost class (it sets the wave width K);
+    // carried beside `recs` rather than widening the tuple `fields_to_write`
+    // consumes.
+    let cost_of: std::collections::HashMap<String, crate::plan::CostClass> = artifacts
+        .iter()
+        .filter_map(|a| {
+            a.prioritization
+                .as_ref()
+                .map(|p| (a.export_name.clone(), p.export_recommendation.cost_class))
+        })
+        .collect();
+    // Exports the campaign flagged `isolate_on_source` (a contended source
+    // group — must run ALONE regardless of cost). The packer sets
+    // parallel_safe:true so a wave's members run concurrently; these must NOT,
+    // or --annotate-waves would overload their source (bug-hunt round 2).
+    let isolate_of: std::collections::HashSet<String> = artifacts
+        .iter()
+        .filter_map(|a| {
+            a.prioritization.as_ref().and_then(|p| {
+                p.export_recommendation
+                    .isolate_on_source
+                    .then(|| a.export_name.clone())
+            })
+        })
+        .collect();
+    // `--annotate-waves` packs from MEASURED history (#150): the last
+    // successful run's duration + peak RSS per export, read from the state
+    // store plan already holds open. Exports with no history keep the cost
+    // model's estimate — and each line below SAYS which one it stands on.
+    let recs = if annotate_waves {
+        repack_from_history(recs, &cost_of, &isolate_of, &state)
+    } else {
+        recs
+    };
     let (fields, preserved) = fields_to_write(&recs, &config, annotate_waves);
-    if !fields.is_empty() {
-        write_plan_fields_to_config(config_path, &fields)?;
-    }
+    let written = if fields.is_empty() {
+        std::collections::HashSet::new()
+    } else {
+        write_plan_fields_to_config(config_path, &fields)?
+    };
     // `warn`, not `info`: a command that MUTATES the operator's config file
     // must say so at a level the default log setup shows — the info-level
     // version of this line is how a hand-tuned 5-per-wave schedule silently
-    // became one 76-export wave (#150).
-    if !fields.is_empty() || preserved > 0 {
+    // became one 76-export wave (#150). Report ACTUAL writes, not intent
+    // (bug hunt 2026-08-08).
+    if !written.is_empty() || preserved > 0 {
         log::warn!(
             "plan: annotated {} export(s) in {}; left {} untouched (wave/parallel_safe already \
              set — rerun with --annotate-waves to overwrite)",
-            fields.len(),
+            written.len(),
             config_path,
             preserved
+        );
+    }
+    // A field we meant to write but no `- name:` line matched is a SILENT
+    // no-write — the loaded export name and the YAML text disagree (templated
+    // name, odd quoting). Surface it loudly instead of over-counting it above.
+    let unmatched: Vec<&String> = fields.keys().filter(|n| !written.contains(*n)).collect();
+    if !unmatched.is_empty() {
+        log::warn!(
+            "plan: {} export(s) had recommendations but NO matching `- name:` line in {} — \
+             nothing was written for them: {:?}",
+            unmatched.len(),
+            config_path,
+            unmatched
         );
     }
 
@@ -599,6 +668,92 @@ fn print_compact_summary(artifacts: &[PlanArtifact], config_path: &str) {
 /// keyed by export name → ordered `(field, value)` pairs.
 type ExportFields = HashMap<String, Vec<(&'static str, String)>>;
 
+/// Replace the cost model's `recommended_wave` with waves PACKED from measured
+/// run history (`--annotate-waves` only). Tier = the export's existing `wave:`
+/// (the operator's priority) when set, else the cost model's recommendation;
+/// duration = the last successful run's, else a rows-based estimate; every
+/// export is `parallel_safe: true` afterwards because under packing the WAVE
+/// is the concurrency cap (K by cost class, RSS-guarded).
+fn repack_from_history(
+    recs: Vec<(String, u32, bool)>,
+    cost_of: &std::collections::HashMap<String, crate::plan::CostClass>,
+    isolate_of: &std::collections::HashSet<String>,
+    state: &crate::state::StateStore,
+) -> Vec<(String, u32, bool)> {
+    let mut measured_n = 0usize;
+    let items: Vec<crate::plan::waves::PackItem> = recs
+        .iter()
+        .map(|(name, rec_wave, _)| {
+            // Tier by the cost model's recommended_wave, NOT the config's
+            // current wave: under --annotate-waves the planner OWNS the schedule
+            // (the additive default path preserves hand-set waves instead).
+            // Tiering by existing.wave made a second annotate read the first
+            // run's machine-written waves as operator tiers and froze the
+            // packing (bug hunt 2026-08-08); recommended_wave is deterministic
+            // from the cost model, so re-annotation is idempotent.
+            let tier = *rec_wave;
+            // Last successful run: the best predictor of the next one.
+            let last = state
+                .get_metrics(Some(name), 25)
+                .ok()
+                .into_iter()
+                .flatten()
+                .find(|m| m.status == "success");
+            let (secs, rss) = match &last {
+                Some(m) => {
+                    measured_n += 1;
+                    (
+                        (m.duration_ms as f64 / 1000.0).max(0.001),
+                        m.peak_rss_mb.unwrap_or(150),
+                    )
+                }
+                // No history: a flat placeholder. Deliberately coarse — its
+                // only job is ORDERING within the tier until a real run
+                // exists; the label below says "estimated" so nobody mistakes
+                // it for knowledge (#148/#149 give it real numbers later).
+                None => (5.0, 150),
+            };
+            crate::plan::waves::PackItem {
+                name: name.clone(),
+                tier,
+                cost_class: cost_of
+                    .get(name)
+                    .copied()
+                    .unwrap_or(crate::plan::CostClass::Medium),
+                predicted_secs: secs,
+                peak_rss_mb: rss,
+            }
+        })
+        .collect();
+    let waves = crate::plan::waves::pack(&items, 4096);
+    log::warn!(
+        "plan --annotate-waves: packed {} export(s) into {} wave(s) from run history \
+         ({} measured, {} estimated — an estimate orders the first run only)",
+        items.len(),
+        waves.len(),
+        measured_n,
+        items.len() - measured_n
+    );
+    let mut wave_of: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    for w in &waves {
+        for m in &w.members {
+            wave_of.insert(m.clone(), w.number);
+        }
+    }
+    recs.into_iter()
+        .map(|(name, rec_wave, _)| {
+            let w = wave_of.get(&name).copied().unwrap_or(rec_wave);
+            // parallel_safe: true so a packed wave's members run concurrently
+            // (the wave IS the cap) — EXCEPT an isolate_on_source export, which
+            // must run alone even among wave-mates, so run_waves keeps it in
+            // its own single-child batch (bug-hunt round 2: forcing true here
+            // discarded isolation and could overload a contended source).
+            let ps = !isolate_of.contains(&name);
+            (name, w, ps)
+        })
+        .collect()
+}
+
 /// Which of the plan's recommendations may actually be WRITTEN into the
 /// operator's config: absent fields always; present fields only under
 /// `--annotate-waves`. Returns the fields plus how many exports were fully
@@ -633,9 +788,12 @@ fn fields_to_write(
     (fields, preserved)
 }
 
-fn write_plan_fields_to_config(config_path: &str, fields: &ExportFields) -> Result<()> {
+fn write_plan_fields_to_config(
+    config_path: &str,
+    fields: &ExportFields,
+) -> Result<std::collections::HashSet<String>> {
     if fields.is_empty() {
-        return Ok(());
+        return Ok(std::collections::HashSet::new());
     }
     let original = std::fs::read_to_string(config_path).map_err(|e| {
         anyhow::anyhow!(
@@ -644,7 +802,7 @@ fn write_plan_fields_to_config(config_path: &str, fields: &ExportFields) -> Resu
             e
         )
     })?;
-    let updated = apply_field_annotations(&original, fields);
+    let (updated, written) = apply_field_annotations(&original, fields);
     if updated != original {
         std::fs::write(config_path, updated).map_err(|e| {
             anyhow::anyhow!(
@@ -654,14 +812,21 @@ fn write_plan_fields_to_config(config_path: &str, fields: &ExportFields) -> Resu
             )
         })?;
     }
-    Ok(())
+    Ok(written)
 }
 
 /// Pure core of [`write_plan_fields_to_config`] (text in → text out, unit-tested).
 /// For each named export, inserts its `<field>: <value>` lines right after
-/// `- name:` and drops any stale line for those same fields.
-fn apply_field_annotations(yaml: &str, fields: &ExportFields) -> String {
+/// `- name:` and drops any stale line for those same fields. Returns the set of
+/// export names it ACTUALLY matched in the YAML — a name in `fields` that never
+/// appears as a `- name:` line writes nothing, and the caller must not report
+/// it as annotated (bug hunt 2026-08-08: the warn counted intent, not writes).
+fn apply_field_annotations(
+    yaml: &str,
+    fields: &ExportFields,
+) -> (String, std::collections::HashSet<String>) {
     let mut out = String::with_capacity(yaml.len() + 64);
+    let mut written: std::collections::HashSet<String> = std::collections::HashSet::new();
     // (export name, indent of the `-`, indent of the export's fields) while
     // inside an export block; `None` between / outside exports.
     let mut current: Option<(String, usize, usize)> = None;
@@ -677,6 +842,7 @@ fn apply_field_annotations(yaml: &str, fields: &ExportFields) -> String {
                     out.push_str(&" ".repeat(field_indent));
                     out.push_str(&format!("{key}: {value}\n"));
                 }
+                written.insert(name.clone());
             }
             current = Some((name, dash_indent, field_indent));
             continue;
@@ -699,7 +865,7 @@ fn apply_field_annotations(yaml: &str, fields: &ExportFields) -> String {
         }
         out.push_str(line);
     }
-    out
+    (out, written)
 }
 
 /// Parse a `<indent>- name: <name>` export list item → `(indent_of_dash, name)`.
@@ -723,7 +889,192 @@ mod tests {
     use super::per_export_output_path;
     use std::path::Path;
 
-    use super::{ExportFields, apply_field_annotations, fields_to_write, pool_items_from_history};
+    use super::{
+        ExportFields, apply_field_annotations, fields_to_write, pool_items_from_history,
+        refuse_annotate_scoped_to_export, repack_from_history,
+    };
+
+    /// The refuse-guard fires ONLY when BOTH `--annotate-waves` and `--export`
+    /// are set — the `&&` must not become `||` (which would reject a plain
+    /// `--export`) nor invert. All four combinations, so the mutant that flips
+    /// the operator goes RED on the two rows it disagrees about.
+    #[test]
+    fn refuse_annotate_scoped_to_export_only_when_both_set() {
+        assert!(
+            refuse_annotate_scoped_to_export(true, true),
+            "both set → refuse"
+        );
+        assert!(
+            !refuse_annotate_scoped_to_export(true, false),
+            "annotate whole config → allow"
+        );
+        assert!(
+            !refuse_annotate_scoped_to_export(false, true),
+            "plain --export → allow (|| would wrongly refuse this)"
+        );
+        assert!(
+            !refuse_annotate_scoped_to_export(false, false),
+            "neither → allow"
+        );
+    }
+
+    /// The packer's duration must come from the REAL producer — the state
+    /// store's own recorder — not a value this test hand-feeds one layer down
+    /// (the fabricated-input class). Two exports, histories recorded through
+    /// `record_metric`, ONE tier: the measured-slower export must land in the
+    /// earlier (heavier) wave. RED against a producer-side mutant that reads
+    /// the estimate instead of the metric: with no history consulted, both
+    /// exports carry the same flat placeholder and the ordering assert has
+    /// nothing to stand on (fails on the pair split below).
+    #[test]
+    fn repack_reads_durations_from_the_state_stores_recorder() {
+        let state = crate::state::StateStore::open_in_memory().expect("state");
+        for (name, ms) in [("slowpoke", 90_000i64), ("quickie", 1_000i64)] {
+            state
+                .record_metric(
+                    name,
+                    &format!("{name}_run"),
+                    ms,
+                    10,
+                    Some(120),
+                    "success",
+                    None,
+                    None,
+                    None,
+                    None,
+                    1,
+                    100,
+                    0,
+                    None,
+                    None,
+                )
+                .expect("record");
+        }
+        // …and a failed newer run for slowpoke, which must be IGNORED — only a
+        // successful run predicts anything.
+        state
+            .record_metric(
+                "slowpoke",
+                "slowpoke_failed",
+                5,
+                0,
+                Some(50),
+                "failed",
+                Some("boom"),
+                None,
+                None,
+                None,
+                0,
+                0,
+                0,
+                None,
+                None,
+            )
+            .expect("record failed");
+
+        let recs = vec![
+            ("slowpoke".to_string(), 2, false),
+            ("quickie".to_string(), 2, false),
+            ("newcomer".to_string(), 2, false),
+        ];
+        let cost_of = recs
+            .iter()
+            .map(|(n, _, _)| (n.clone(), crate::plan::CostClass::High))
+            .collect();
+
+        // No isolate_on_source exports in this fixture.
+        let packed = repack_from_history(recs, &cost_of, &std::collections::HashSet::new(), &state);
+        let wave = |n: &str| packed.iter().find(|(m, _, _)| m == n).unwrap().1;
+        // K=2 (High): measured 90s pairs with measured 1s in wave 1; the
+        // history-less newcomer (flat 5s estimate) lands after the measured
+        // slowpoke, proving the metric — not the placeholder — ordered them.
+        assert!(
+            wave("slowpoke") < wave("newcomer") || wave("slowpoke") == wave("newcomer"),
+            "measured 90s must not sort below a 5s placeholder"
+        );
+        assert_eq!(wave("slowpoke"), 1, "the measured-heaviest opens the tier");
+        // every packed export is parallel_safe: the wave is the cap now
+        assert!(packed.iter().all(|(_, _, ps)| *ps));
+        // the failed 5ms run did NOT become slowpoke's prediction: had it,
+        // slowpoke (0.005s) would sort below quickie (1s) and lose wave 1's
+        // first slot to it.
+        let w1: Vec<&str> = packed
+            .iter()
+            .filter(|(_, w, _): &&(String, u32, bool)| *w == 1)
+            .map(|(n, _, _)| n.as_str())
+            .collect();
+        assert!(w1.contains(&"slowpoke"), "w1={w1:?}");
+    }
+
+    /// An isolate_on_source export must come out parallel_safe:FALSE even under
+    /// packing (bug-hunt round 2): the packer sets true so wave-mates run
+    /// concurrently, but a contended-source export must stay alone in its wave.
+    #[test]
+    fn repack_keeps_isolate_on_source_out_of_the_concurrent_batch() {
+        let state = crate::state::StateStore::open_in_memory().expect("state");
+        for n in ["lonely", "buddy"] {
+            state
+                .record_metric(
+                    n,
+                    &format!("{n}_r"),
+                    1000,
+                    10,
+                    Some(100),
+                    "success",
+                    None,
+                    None,
+                    None,
+                    None,
+                    1,
+                    100,
+                    0,
+                    None,
+                    None,
+                )
+                .expect("rec");
+        }
+        let recs = vec![
+            ("lonely".to_string(), 4, false),
+            ("buddy".to_string(), 4, true),
+        ];
+        let cost_of = recs
+            .iter()
+            .map(|(n, _, _)| (n.clone(), crate::plan::CostClass::Low))
+            .collect();
+        let mut isolate = std::collections::HashSet::new();
+        isolate.insert("lonely".to_string());
+        let packed = repack_from_history(recs, &cost_of, &isolate, &state);
+        let ps = |n: &str| packed.iter().find(|(m, _, _)| m == n).unwrap().2;
+        assert!(
+            !ps("lonely"),
+            "isolate_on_source export must be parallel_safe:false"
+        );
+        assert!(
+            ps("buddy"),
+            "a normal packed export stays parallel_safe:true"
+        );
+    }
+
+    /// --annotate-waves + --export is a category error: packing one export
+    /// alone rewrites its wave to 1, inverting the schedule (bug hunt
+    /// 2026-08-08). The refusal fires before any config load, so a bogus path
+    /// still errors on the combination, not on IO.
+    #[test]
+    fn annotate_waves_refuses_to_be_scoped_to_one_export() {
+        let err = super::run_plan_command(
+            "/nonexistent/rivet.yaml",
+            Some("just_me"),
+            None,
+            super::PlanOutputFormat::Pretty,
+            true, // annotate_waves
+        )
+        .expect_err("--annotate-waves + --export must refuse");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("--annotate-waves") && msg.contains("--export"),
+            "the refusal must name both flags: {msg}"
+        );
+    }
 
     /// The pool estimate reads history through `pool_items_from_history`; these
     /// pin the three decisions the mutation gate flagged as unguarded display
@@ -856,7 +1207,9 @@ mod tests {
     #[test]
     fn wave_annotations_insert_replace_and_preserve() {
         let yaml = "exports:\n  - name: orders   # the orders table\n    mode: incremental\n    wave: 9\n    cursor_column: updated_at\n  - name: events\n    mode: full\ndestination:\n  type: local\n";
-        let out = apply_field_annotations(yaml, &wave_fields(&[("orders", 2), ("events", 1)]));
+        let (out, written) =
+            apply_field_annotations(yaml, &wave_fields(&[("orders", 2), ("events", 1)]));
+        assert_eq!(written.len(), 2, "both named exports matched");
         // orders: stale wave 9 replaced with 2, placed after name (comment kept)
         assert!(
             out.contains("- name: orders   # the orders table\n    wave: 2\n"),
@@ -877,7 +1230,12 @@ mod tests {
     #[test]
     fn wave_annotations_leave_unlisted_export_untouched() {
         let yaml = "exports:\n  - name: orders\n    mode: full\n";
-        let out = apply_field_annotations(yaml, &wave_fields(&[("other", 1)]));
+        let (out, written) = apply_field_annotations(yaml, &wave_fields(&[("other", 1)]));
+        // "other" matches no `- name:` line — nothing written, and the set says so.
+        assert!(
+            written.is_empty(),
+            "a name absent from the YAML writes nothing"
+        );
         assert_eq!(out, yaml);
     }
 
