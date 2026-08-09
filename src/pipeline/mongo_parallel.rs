@@ -70,6 +70,11 @@ pub(crate) fn run_mongo_parallel(
 
     // Fan out: each worker reads its disjoint slice, writes its parts, returns
     // (rows, PartRecords). Errors surface per worker and fail the whole run.
+    // ONE guarded open at run start (the cross-shape manifest GET), shared into
+    // every worker — N workers used to open GUARDED frames concurrently: N remote
+    // GETs for an answer that cannot change mid-run (roast 2026-08-09, #173; the
+    // chunked sibling was fixed the same way).
+    let (shared_dest, shared_ext) = super::frame::RunnerFrame::open_shared(plan)?;
     let results: Vec<(WorkerOutput, Result<()>)> = std::thread::scope(|s| {
         let handles: Vec<_> = ranges
             .iter()
@@ -80,7 +85,9 @@ pub(crate) fn run_mongo_parallel(
                 let stamp = &stamp;
                 // Bson bounds aren't Copy — clone the slice into the worker.
                 let (lo, hi) = (range.0.clone(), range.1.clone());
-                s.spawn(move || range_worker(url, plan, key_plan, kp, stamp, w, lo, hi))
+                let dest = std::sync::Arc::clone(&shared_dest);
+                let ext = &shared_ext;
+                s.spawn(move || range_worker(url, plan, key_plan, kp, stamp, w, lo, hi, dest, ext))
             })
             .collect();
         handles
@@ -217,6 +224,8 @@ fn range_worker(
     worker: usize,
     lo: mongodb::bson::Bson,
     hi: mongodb::bson::Bson,
+    dest: std::sync::Arc<Box<dyn crate::destination::Destination>>,
+    ext: &str,
 ) -> (WorkerOutput, Result<()>) {
     let mut out = WorkerOutput {
         rows: 0,
@@ -225,7 +234,9 @@ fn range_worker(
         column_checksums: std::collections::BTreeMap::new(),
         checksum_key_column: None,
     };
-    let res = range_worker_pages(url, plan, key_plan, kp, stamp, worker, lo, hi, &mut out);
+    let res = range_worker_pages(
+        url, plan, key_plan, kp, stamp, worker, lo, hi, dest, ext, &mut out,
+    );
     (out, res)
 }
 
@@ -239,12 +250,12 @@ fn range_worker_pages(
     worker: usize,
     lo: mongodb::bson::Bson,
     hi: mongodb::bson::Bson,
+    dest: std::sync::Arc<Box<dyn crate::destination::Destination>>,
+    ext: &str,
     out: &mut WorkerOutput,
 ) -> Result<()> {
     let mut src = MongoSource::connect(url, plan.source.tls.as_ref(), plan.source.mongo.as_ref())?
         .with_id_range(lo, hi);
-    let frame = super::frame::RunnerFrame::open(plan)?;
-    let (dest, ext) = (frame.dest, frame.ext);
 
     let mut last: Option<String> = None;
     let mut page = 0usize;
@@ -273,7 +284,7 @@ fn range_worker_pages(
             key_plan,
             kp.chunk_size,
             last.as_deref(),
-            dest.as_ref(),
+            &**dest,
             &base,
         )?
         else {
