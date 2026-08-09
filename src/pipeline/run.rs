@@ -834,30 +834,22 @@ pub(crate) fn run_pool(config_path: &str, force: bool, resume: bool, m: usize) -
     // (separate scheduler units with separate write legs), and the wall it would
     // reach. Shape-driven (M-free) via the pure planner; a warn, not info, so it
     // is visible at the default level exactly where a 51-min giant pins a refresh.
-    {
-        let mut by_secs: Vec<&super::pool::PoolItem> = items.iter().collect();
-        by_secs.sort_by(|a, b| b.predicted_secs.total_cmp(&a.predicted_secs));
-        if let [longest, second, ..] = by_secs.as_slice()
-            && let Some(n) = super::pool::split_factor(
-                longest.predicted_secs,
-                second.predicted_secs,
-                3.0,
-                m.max(2),
-            )
-        {
-            let split = super::pool::split_dominating(&items, 3.0, m.max(2));
-            let broken = super::pool::predicted_makespan_secs(&split, m);
-            log::warn!(
-                "apply --pool: export '{}' (~{:.1} min) dominates the pool floor — extra slots \
-                 cannot beat it. Split it into {} range sub-exports over its key (each a separate \
-                 scheduler unit with its own write leg) to drop the wall to ~{:.1} min. Give it a \
-                 `chunk_by_key:` and run each key range as its own export.",
-                longest.name,
-                longest.predicted_secs / 60.0,
-                n,
-                broken / 60.0,
-            );
-        }
+    if let Some((giant, n, broken)) = super::pool::advise_split(&items, m, 3.0, m.max(2)) {
+        let giant_secs = items
+            .iter()
+            .find(|i| i.name == giant)
+            .map(|i| i.predicted_secs)
+            .unwrap_or(0.0);
+        log::warn!(
+            "apply --pool: export '{}' (~{:.1} min) dominates the pool floor — extra slots cannot \
+             beat it. Split it into {} range sub-exports over its key (each a separate scheduler \
+             unit with its own write leg) to drop the wall to ~{:.1} min. Give it a `chunk_by_key:` \
+             and run each key range as its own export.",
+            giant,
+            giant_secs / 60.0,
+            n,
+            broken / 60.0,
+        );
     }
 
     let by_name: std::collections::HashMap<&str, &ExportConfig> =
@@ -919,6 +911,21 @@ pub(crate) fn run_pool(config_path: &str, force: bool, resume: bool, m: usize) -
                             }
                         }
                     };
+                    // Release the heavy slot on EVERY exit path — including a
+                    // PANIC inside run_export_job. Without the guard a panicking
+                    // heavy leaked heavy_running=true and every other worker
+                    // looped forever on next_eligible (only heavies left, one
+                    // "running") — the pool hung instead of failing (roast
+                    // 2026-08-09). The guard drops on normal end AND on unwind.
+                    struct HeavyGuard<'a>(&'a std::sync::atomic::AtomicBool, bool);
+                    impl Drop for HeavyGuard<'_> {
+                        fn drop(&mut self) {
+                            if self.1 {
+                                self.0.store(false, AtomicOrdering::SeqCst);
+                            }
+                        }
+                    }
+                    let _heavy = HeavyGuard(&heavy_running, !is_parallel_safe(export));
                     let pair = match StateStore::open(config_path) {
                         Ok(st) => job::run_export_job(
                             config_path,
@@ -938,9 +945,6 @@ pub(crate) fn run_pool(config_path: &str, force: bool, resume: bool, m: usize) -
                             (Err(err), summary)
                         }
                     };
-                    if !is_parallel_safe(export) {
-                        heavy_running.store(false, AtomicOrdering::SeqCst);
-                    }
                     collected.lock().unwrap().push(pair);
                 }
             });

@@ -139,6 +139,34 @@ pub(crate) fn split_dominating(items: &[PoolItem], r: f64, max_split: usize) -> 
     out
 }
 
+/// Should `apply --pool` advise splitting a dominating export, and if so into
+/// how many + to what wall? Returns `(name, n, broken_makespan_secs)`.
+///
+/// TWO gates, both required (roast 2026-08-09 caught a shape-only check that
+/// phantom-fired when the giant was NOT the floor):
+/// 1. the export must ACTUALLY be the floor — `longest > total/m` (else total/m
+///    is already the wall and a split buys nothing);
+/// 2. it must dominate by SHAPE — [`split_factor`] (> R× the next-longest).
+pub(crate) fn advise_split(
+    items: &[PoolItem],
+    m: usize,
+    r: f64,
+    max_split: usize,
+) -> Option<(String, usize, f64)> {
+    let mut by: Vec<&PoolItem> = items.iter().collect();
+    by.sort_by(|a, b| b.predicted_secs.total_cmp(&a.predicted_secs));
+    let [longest, second, ..] = by.as_slice() else {
+        return None;
+    };
+    let total: f64 = items.iter().map(|i| i.predicted_secs).sum();
+    if longest.predicted_secs <= total / m.max(1) as f64 {
+        return None; // total/m is the wall, not the giant — no split needed
+    }
+    let n = split_factor(longest.predicted_secs, second.predicted_secs, r, max_split)?;
+    let broken = predicted_makespan_secs(&split_dominating(items, r, max_split), m);
+    Some((longest.name.clone(), n, broken))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -201,6 +229,33 @@ mod tests {
             "the split MUST break the floor: {split_wall} < {unsplit_wall}"
         );
         assert_eq!(split_wall, 810.0, "reaches total/6 = 4860/6");
+    }
+
+    /// #167 advisory floor-gate (roast 2026-08-09): advise a split ONLY when the
+    /// giant is actually the floor. A 200s "giant" with 20×60s (total 1400, m=2 →
+    /// floor 700) must NOT advise — total/m is the wall, splitting buys nothing.
+    #[test]
+    fn advise_split_needs_the_giant_to_be_the_floor() {
+        // Giant IS the floor: 3060s + 30×60s, m=6 → floor 3060.
+        let mut dominating = vec![it("giant", 3060.0)];
+        for n in 0..30 {
+            dominating.push(it(&format!("s{n:02}"), 60.0));
+        }
+        let advice = advise_split(&dominating, 6, 3.0, 6);
+        assert!(advice.is_some(), "a real giant must be advised");
+        let (name, n, broken) = advice.unwrap();
+        assert_eq!(name, "giant");
+        assert!(n >= 2 && broken < 3060.0, "the split must drop the wall");
+
+        // Giant is NOT the floor: 200s + 20×60s, m=2 → floor max(200,700)=700.
+        let mut balanced = vec![it("tall", 200.0)];
+        for n in 0..20 {
+            balanced.push(it(&format!("s{n:02}"), 60.0));
+        }
+        assert!(
+            advise_split(&balanced, 2, 3.0, 2).is_none(),
+            "no advice when total/m is the wall — a split would be a false alarm"
+        );
     }
 
     #[test]
