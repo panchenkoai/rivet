@@ -142,23 +142,24 @@ fn pg_schema_drift_detection() {
 fn pg_metrics_record_and_query() {
     let Some(s) = pg_store() else { return };
 
-    s.record_metric(
-        "pg_metrics_export",
-        "run_pg_001",
-        1500,
-        100_000,
-        Some(256),
-        "success",
-        None,
-        Some("balanced"),
-        Some("parquet"),
-        Some("full"),
-        3,
-        1_048_576,
-        0,
-        Some(true),
-        Some(false),
-    )
+    s.record_metric_full(&rivet::state::MetricRow {
+        export_name: "pg_metrics_export".to_string(),
+        run_id: "run_pg_001".to_string(),
+        duration_ms: 1500,
+        total_rows: 100_000,
+        peak_rss_mb: Some(256),
+        status: "success".to_string(),
+        error_message: None,
+        tuning_profile: Some("balanced".to_string()),
+        format: Some("parquet".to_string()),
+        mode: Some("full".to_string()),
+        files_produced: 3,
+        bytes_written: 1_048_576,
+        retries: 0,
+        validated: Some(true),
+        schema_changed: Some(false),
+        ..Default::default()
+    })
     .unwrap();
 
     let metrics = s.get_metrics(Some("pg_metrics_export"), 10).unwrap();

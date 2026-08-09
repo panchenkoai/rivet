@@ -259,23 +259,24 @@ fn f4_retry_count_captured_in_metric() {
     let state = StateStore::open_in_memory().unwrap();
 
     state
-        .record_metric(
-            "sales",
-            "run-f",
-            8_500,  // duration_ms (across 3 attempts)
-            10_000, // total_rows
-            None,   // peak_rss_mb
-            "success",
-            None, // error_message
-            None, // tuning_profile
-            Some("parquet"),
-            Some("incremental"),
-            1,       // files_produced
-            409_600, // bytes_written
-            2,       // retries = 2 failed attempts before success
-            None,
-            None,
-        )
+        .record_metric_full(&rivet::state::MetricRow {
+            export_name: "sales".to_string(),
+            run_id: "run-f".to_string(),
+            duration_ms: 8_500, // across 3 attempts
+            total_rows: 10_000,
+            peak_rss_mb: None,
+            status: "success".to_string(),
+            error_message: None,
+            tuning_profile: None,
+            format: Some("parquet".to_string()),
+            mode: Some("incremental".to_string()),
+            files_produced: 1,
+            bytes_written: 409_600,
+            retries: 2, // 2 failed attempts before success
+            validated: None,
+            schema_changed: None,
+            ..Default::default()
+        })
         .unwrap();
 
     let metrics = state.get_metrics(Some("sales"), 1).unwrap();

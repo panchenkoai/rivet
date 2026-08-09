@@ -9,8 +9,7 @@
 use clap::CommandFactory;
 
 use super::args::{
-    Cli, Commands, PlanFormat, ReconcileFormat, SchemaKind, StateAction, ValidateDepth,
-    ValidateFormat,
+    Cli, Commands, PlanFormat, ReconcileFormat, SchemaKind, StateAction, ValidateFormat,
 };
 use super::params::{parse_params, resolve_init_source};
 use super::validate::validate_cli;
@@ -55,31 +54,7 @@ fn check_export_selection(config: &Config, export: Option<&str>) -> Result<()> {
 pub fn dispatch(cli: Cli) -> Result<()> {
     validate_cli(&cli.command)?;
     match cli.command {
-        Commands::Run {
-            config,
-            export,
-            validate,
-            reconcile,
-            resume,
-            force,
-            parallel_exports,
-            parallel_export_processes,
-            summary_output,
-            json,
-            params,
-        } => dispatch_run(
-            config,
-            export,
-            validate,
-            reconcile,
-            resume,
-            force,
-            parallel_exports,
-            parallel_export_processes,
-            summary_output,
-            json,
-            params,
-        ),
+        Commands::Run(args) => dispatch_run(args),
         Commands::Check {
             config,
             export,
@@ -163,30 +138,14 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             tls,
             tls_ca,
         ),
-        Commands::Plan {
-            config,
-            export,
-            params,
-            output,
-            format,
-            annotate_waves,
-        } => dispatch_plan(config, export, params, output, format, annotate_waves),
+        Commands::Plan(args) => dispatch_plan(args),
         Commands::Apply {
             plan_file,
             parallel_export_processes,
             resume,
             force,
         } => pipeline::run_apply_command(&plan_file, force, parallel_export_processes, resume),
-        Commands::Validate {
-            config,
-            export,
-            format,
-            depth,
-            output,
-            date,
-            run_id,
-            prefix,
-        } => dispatch_validate(config, export, format, depth, output, date, run_id, prefix),
+        Commands::Validate(args) => dispatch_validate(args),
         Commands::Reconcile {
             config,
             export,
@@ -194,15 +153,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             output,
             params,
         } => dispatch_reconcile(config, export, format, output, params),
-        Commands::Repair {
-            config,
-            export,
-            report,
-            execute,
-            format,
-            output,
-            params,
-        } => dispatch_repair(config, export, report, execute, format, output, params),
+        Commands::Repair(args) => dispatch_repair(args),
         Commands::Completions { shell } => {
             clap_complete::generate(shell, &mut Cli::command(), "rivet", &mut std::io::stdout());
             Ok(())
@@ -367,19 +318,20 @@ fn dispatch_cdc(a: CdcArgs) -> Result<()> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn dispatch_run(
-    config: String,
-    export: Option<String>,
-    validate: bool,
-    reconcile: bool,
-    resume: bool,
-    force: bool,
-    parallel_exports: bool,
-    parallel_export_processes: bool,
-    summary_output: Option<String>,
-    json: bool,
-    params: Vec<String>,
-) -> Result<()> {
+fn dispatch_run(args: crate::cli::args::RunArgs) -> Result<()> {
+    let crate::cli::args::RunArgs {
+        config,
+        export,
+        validate,
+        reconcile,
+        resume,
+        force,
+        parallel_exports,
+        parallel_export_processes,
+        summary_output,
+        json,
+        params,
+    } = args;
     let p = parse_params(&params)?;
     let p = if p.is_empty() { None } else { Some(p) };
     if let Some(name) = export.as_deref() {
@@ -626,14 +578,15 @@ fn resolve_init_tls(
     }))
 }
 
-fn dispatch_plan(
-    config: String,
-    export: Option<String>,
-    params: Vec<String>,
-    output: Option<String>,
-    format: PlanFormat,
-    annotate_waves: bool,
-) -> Result<()> {
+fn dispatch_plan(args: crate::cli::args::PlanArgs) -> Result<()> {
+    let crate::cli::args::PlanArgs {
+        config,
+        export,
+        params,
+        output,
+        annotate_waves,
+        format,
+    } = args;
     let p = parse_params(&params)?;
     let p = if p.is_empty() { None } else { Some(p) };
     if let Some(name) = export.as_deref() {
@@ -647,16 +600,17 @@ fn dispatch_plan(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn dispatch_validate(
-    config: String,
-    export: Option<String>,
-    format: ValidateFormat,
-    depth: ValidateDepth,
-    output: Option<String>,
-    date: Option<String>,
-    run_id: Option<String>,
-    prefix: Option<String>,
-) -> Result<()> {
+fn dispatch_validate(args: crate::cli::args::ValidateArgs) -> Result<()> {
+    let crate::cli::args::ValidateArgs {
+        config,
+        export,
+        format,
+        depth,
+        output,
+        date,
+        run_id,
+        prefix,
+    } = args;
     if let Some(name) = export.as_deref() {
         check_export_selection(&Config::load(&config)?, Some(name))?;
     }
@@ -706,15 +660,16 @@ fn dispatch_reconcile(
     pipeline::run_reconcile_command(&config, &export, p.as_ref(), fmt)
 }
 
-fn dispatch_repair(
-    config: String,
-    export: String,
-    report: Option<String>,
-    execute: bool,
-    format: ReconcileFormat,
-    output: Option<String>,
-    params: Vec<String>,
-) -> Result<()> {
+fn dispatch_repair(args: crate::cli::args::RepairArgs) -> Result<()> {
+    let crate::cli::args::RepairArgs {
+        config,
+        export,
+        report,
+        execute,
+        format,
+        output,
+        params,
+    } = args;
     let p = parse_params(&params)?;
     let p = if p.is_empty() { None } else { Some(p) };
     check_export_selection(

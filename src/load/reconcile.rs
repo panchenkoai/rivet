@@ -116,11 +116,11 @@ fn dedupe_by_run_id(keyed: Vec<(String, RunManifest)>) -> Vec<(String, RunManife
         .collect();
     keyed
         .iter()
-        .cloned()
         .filter(|(k, m)| {
             is_run_unique_manifest(k.rsplit('/').next().unwrap_or(""))
                 || !copy_run_ids.contains(m.run_id.as_str())
         })
+        .cloned()
         .collect()
 }
 
