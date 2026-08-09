@@ -79,6 +79,18 @@ pub(super) fn run_exports_as_child_processes(
 
     let (tx, rx) = mpsc::channel::<UiMessage>();
 
+    // #153 heartbeat: silence between spawn and the first child event is
+    // indistinguishable from a hang (the field: ~2.5 min blank terminal). Emit it
+    // BEFORE the UI thread starts drawing — a raw eprintln AFTER the renderer is
+    // live races its cursor and corrupts the card table in a TTY (roast
+    // 2026-08-09). Printed here, it scrolls above the cards the renderer then
+    // owns. Uses the intended count (exports.len()); per-child spawn failures
+    // surface as their own ✗ cards.
+    eprintln!(
+        "  … starting {} export process(es); waiting for the first child event",
+        exports.len()
+    );
+
     // `name_floor` (wave-wide max, from the caller) seeds the card table's name
     // column so it aligns from the first redraw and across batches.
     let n_cards = exports.len();
@@ -225,14 +237,6 @@ pub(super) fn run_exports_as_child_processes(
             }
         }
     }
-
-    // #153 heartbeat: silence between spawn and the first child event is
-    // indistinguishable from a hang (the field: ~2.5 min blank terminal). Emit
-    // an immediate parent-side line so silence reads as idle-by-design.
-    eprintln!(
-        "  … spawned {} export process(es); waiting for the first child event",
-        children.len()
-    );
 
     let mut failures = Vec::new();
     let mut wait_failures: HashMap<String, String> = HashMap::new();
@@ -381,19 +385,38 @@ pub(super) fn representative_error(
     }
     // Collapse each RUN of digits to one '#' (so host-1 and host-10 are one
     // class, not two) and normalize whitespace.
+    // Mask the VARIABLE tokens so per-child ids collapse to one class. A pure
+    // digit run → `#` (host-1 / host-10 are one class); a run mixing letters AND
+    // digits → `#` whole (a hex id, uuid, or random staging suffix like
+    // `aB3xQ9k` — digit-masking alone left `aB#xQ#k`, still per-child distinct,
+    // so the common-mode banner never fired: roast 2026-08-09, the doc claimed
+    // "hex/paths blanked" but only digits were). A pure-letter run (a real word)
+    // is kept. Whitespace normalized.
     let class_of = |msg: &str| -> String {
-        let mut out = String::with_capacity(msg.len());
-        let mut prev_digit = false;
-        for c in msg.chars() {
-            if c.is_ascii_digit() {
-                if !prev_digit {
-                    out.push('#');
-                }
-                prev_digit = true;
+        let mask_token = |tok: &str| -> String {
+            let has_digit = tok.chars().any(|c| c.is_ascii_digit());
+            let has_alpha = tok.chars().any(|c| c.is_ascii_alphabetic());
+            if has_digit && (has_alpha || tok.chars().all(|c| c.is_ascii_digit())) {
+                "#".to_string()
             } else {
-                out.push(c);
-                prev_digit = false;
+                tok.to_string()
             }
+        };
+        let mut out = String::with_capacity(msg.len());
+        let mut run = String::new();
+        for c in msg.chars() {
+            if c.is_ascii_alphanumeric() {
+                run.push(c);
+            } else {
+                if !run.is_empty() {
+                    out.push_str(&mask_token(&run));
+                    run.clear();
+                }
+                out.push(c);
+            }
+        }
+        if !run.is_empty() {
+            out.push_str(&mask_token(&run));
         }
         out.split_whitespace().collect::<Vec<_>>().join(" ")
     };
@@ -788,6 +811,31 @@ mod representative_tests {
             representative_error(&many, true, 3).is_none(),
             "a batch with a success is not a common-mode failure"
         );
+    }
+
+    /// #153 D2 (roast 2026-08-09): a per-child RANDOM ALPHANUMERIC token (a
+    /// staging-dir suffix, a hex id) must not defeat the common-mode banner —
+    /// the class key must collapse mixed alnum runs whole, not just digit runs.
+    /// RED against the digit-only class_of (which left aB#xQ#k per-child distinct).
+    #[test]
+    fn representative_collapses_random_alphanumeric_suffixes() {
+        let failed: Vec<(String, String)> = (0..40)
+            .map(|i| {
+                // e.g. aB3xQ9k — LETTERS differ per child (not just digits), so
+                // digit-masking alone leaves distinct classes; only whole-run
+                // masking collapses them.
+                let a = (b'a' + (i % 20) as u8) as char;
+                let b = (b'A' + ((i * 3) % 20) as u8) as char;
+                let suffix = format!("{a}{i}x{b}{}k", i * 7 + 3);
+                (
+                    format!("child{i}"),
+                    format!("Error: could not create staging dir /tmp/rivet-stage-{suffix}: Permission denied (os error 13)"),
+                )
+            })
+            .collect();
+        let banner = representative_error(&failed, false, 3)
+            .expect("random suffixes must still collapse to ONE common-mode class");
+        assert!(banner.contains("40 children failed"), "{banner}");
     }
 
     #[test]
