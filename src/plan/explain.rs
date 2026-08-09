@@ -299,6 +299,7 @@ mod tests {
 
     fn base_diag(mode: &str) -> ExportDiagnostic {
         ExportDiagnostic {
+            row_source: None,
             export_name: "t".into(),
             strategy: mode.into(),
             mode: mode.into(),

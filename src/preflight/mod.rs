@@ -5,6 +5,7 @@ mod analysis;
 // the two drifted unnoticed in the first place.
 #[cfg(test)]
 pub(crate) use analysis::diagnose_mode_str;
+pub(crate) use analysis::overlay_measured_rows;
 mod cdc_health;
 pub(crate) mod cursor_expr;
 mod doctor;
@@ -70,6 +71,11 @@ pub(crate) struct ExportDiagnostic {
     pub mode: String,
     pub cursor_column: Option<String>,
     pub row_estimate: Option<i64>,
+    /// WHERE the row figure came from (#149): `measured YYYY-MM-DD` when the
+    /// state store's freshest successful actual replaced the catalog, else
+    /// `catalog estimate` (with the set-aside said when a stale divergent
+    /// actual was skipped). None = overlay not run (no state in scope).
+    pub row_source: Option<String>,
     /// Average bytes per row from catalog/plan stats (PG EXPLAIN `width`,
     /// MSSQL `dm_db_partition_stats` pages/row). `None` when unavailable
     /// (e.g. MySQL, with no trustworthy scan-free estimate). Feeds the
@@ -123,6 +129,9 @@ impl Serialize for ExportDiagnostic {
         }
         if let Some(v) = &self.row_estimate {
             map.serialize_entry("row_estimate", v)?;
+            if let Some(src) = &self.row_source {
+                map.serialize_entry("row_source", src)?;
+            }
         }
         if let Some(v) = &self.avg_row_bytes {
             map.serialize_entry("avg_row_bytes", v)?;
@@ -307,6 +316,14 @@ pub fn check(
         SourceType::Mssql => mssql::check_mssql(&url, tls, &exports)?,
         SourceType::Mongo => mongo::check_mongo(&url, tls, &exports)?,
     };
+    // #149: measured beats declared — overlay the state store's actuals and
+    // label every row figure with its source. Best-effort (no state = catalog).
+    let mut diagnostics = diagnostics;
+    if let Ok(state) = crate::state::StateStore::open(config_path) {
+        for d in &mut diagnostics {
+            analysis::overlay_measured_rows(d, &state);
+        }
+    }
     if !json_output {
         for diag in &diagnostics {
             print_diagnostic(diag);
@@ -525,13 +542,18 @@ fn print_diagnostic(diag: &ExportDiagnostic) {
     println!("Export: {}", diag.export_name);
     println!("  Strategy:     {}", diag.strategy);
     println!("  Mode:         {}", diag.mode);
+    let src_suffix = diag
+        .row_source
+        .as_deref()
+        .map(|s| format!("  ({s})"))
+        .unwrap_or_default();
     if let Some(est) = diag.row_estimate {
         if est >= 1_000_000 {
-            println!("  Row estimate: ~{}M", est / 1_000_000);
+            println!("  Row estimate: ~{}M{src_suffix}", est / 1_000_000);
         } else if est >= 1_000 {
-            println!("  Row estimate: ~{}K", est / 1_000);
+            println!("  Row estimate: ~{}K{src_suffix}", est / 1_000);
         } else {
-            println!("  Row estimate: ~{}", est);
+            println!("  Row estimate: ~{}{src_suffix}", est);
         }
     }
     if let Some(w) = diag.avg_row_bytes {
@@ -653,6 +675,7 @@ mod tests {
     /// is true), and a couple of warnings.
     fn sample_diagnostic(name: &str) -> ExportDiagnostic {
         ExportDiagnostic {
+            row_source: None,
             export_name: name.to_string(),
             strategy: "incremental(updated_at)".to_string(),
             mode: "incremental".to_string(),

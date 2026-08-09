@@ -54,6 +54,7 @@ fn diagnose_mongo(
     let warnings = collect_warnings(export, row_estimate, None, None, None, None);
 
     Ok(ExportDiagnostic {
+        row_source: None,
         export_name: export.name.clone(),
         strategy,
         mode: "full".to_string(),
