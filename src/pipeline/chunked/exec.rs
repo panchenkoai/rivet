@@ -609,6 +609,7 @@ mod tests {
 
     fn chunked_plan_struct() -> ResolvedRunPlan {
         ResolvedRunPlan {
+            bytes_read: Default::default(),
             export_name: "orders".into(),
             source_table: None,
             base_query: "SELECT id FROM orders".into(),

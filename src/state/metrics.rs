@@ -45,6 +45,8 @@ pub struct MetricRow {
     pub mode: Option<String>,
     pub files_produced: i64,
     pub bytes_written: i64,
+    /// Decoded bytes READ from the source (plan-shared counter; v23).
+    pub bytes_read: i64,
     pub retries: i64,
     pub validated: Option<bool>,
     pub schema_changed: Option<bool>,
@@ -238,10 +240,10 @@ impl StateStore {
              chunk_size, parallel, source_type, destination_type, rivet_version,
              longest_chunk_ms, chunk_key,
              error_class, cursor_min, cursor_max, key_descriptor_json, offending_value,
-             server_context_json)
+             server_context_json, bytes_read)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
              ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31,
-             ?32, ?33, ?34, ?35, ?36, ?37, ?38)";
+             ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39)";
         match &self.conn {
             StateConn::Sqlite(c) => {
                 c.execute(
@@ -284,7 +286,8 @@ impl StateStore {
                         m.cursor_max,
                         m.key_descriptor_json,
                         m.offending_value,
-                        m.server_context_json
+                        m.server_context_json,
+                        m.bytes_read
                     ],
                 )?;
             }
@@ -331,6 +334,7 @@ impl StateStore {
                         &m.key_descriptor_json,
                         &m.offending_value,
                         &m.server_context_json,
+                        &m.bytes_read,
                     ],
                 )?;
             }

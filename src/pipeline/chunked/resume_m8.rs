@@ -666,6 +666,7 @@ mod tests {
         use crate::config::{DestinationConfig, DestinationType, SourceConfig, SourceType};
         use crate::tuning::SourceTuning;
         crate::plan::ResolvedRunPlan {
+            bytes_read: Default::default(),
             export_name: "orders".into(),
             source_table: None,
             base_query: "SELECT 1".into(),

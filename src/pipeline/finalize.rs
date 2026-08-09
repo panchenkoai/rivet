@@ -927,6 +927,7 @@ mod tests {
     fn fin_plan(dest: &std::path::Path) -> crate::plan::ResolvedRunPlan {
         use crate::config::{SourceConfig, SourceType};
         crate::plan::ResolvedRunPlan {
+            bytes_read: Default::default(),
             export_name: "public.orders".into(),
             source_table: None,
             base_query: "SELECT 1".into(),

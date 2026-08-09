@@ -492,6 +492,7 @@ mod tests {
 
     fn make_plan(export_name: &str) -> ResolvedRunPlan {
         ResolvedRunPlan {
+            bytes_read: Default::default(),
             export_name: export_name.into(),
             source_table: None,
             base_query: "SELECT id FROM orders".into(),

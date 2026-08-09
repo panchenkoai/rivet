@@ -67,6 +67,19 @@ pub struct KeysetPlan {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResolvedRunPlan {
     pub export_name: String,
+    /// Run-wide counter of decoded bytes READ from the source (in-memory Arrow
+    /// batch size, summed by every `ExportSink::on_batch` this run creates).
+    ///
+    /// Lives on the PLAN — the one value every runner, worker thread, and
+    /// per-chunk sink already receives — so accumulation is runner-agnostic BY
+    /// CONSTRUCTION (`Clone` shares the `Arc`, so a worker's plan clone feeds the
+    /// same counter): no per-runner harvest to forget, the exact runner-bypass
+    /// trap a per-sink field had (#175). Harvested ONCE into
+    /// `summary.bytes_read` by `run_export_job` after the runner returns.
+    /// `serde(skip)`: a runtime counter, not part of the serialized plan; a
+    /// deserialized plan starts a fresh one.
+    #[serde(skip, default)]
+    pub bytes_read: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// The export's declared source table (`table:`), carried VERBATIM.
     ///
     /// The manifest's source identity is built from this. It used to be derived

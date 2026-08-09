@@ -205,6 +205,7 @@ fn build_metric_row(
         mode: Some(summary.mode.clone()),
         files_produced: summary.files_produced as i64,
         bytes_written: summary.bytes_written as i64,
+        bytes_read: summary.bytes_read as i64,
         retries: summary.retries as i64,
         validated: summary.validated,
         schema_changed: summary.schema_changed,
@@ -580,6 +581,7 @@ pub(crate) fn synthetic_failed_summary(export_name: &str, err: &anyhow::Error) -
     );
     let journal = crate::journal::RunJournal::new(&run_id, export_name);
     RunSummary {
+        bytes_read: 0,
         cursor_column: None,
         cursor_low: None,
         cursor_high: None,
@@ -932,6 +934,10 @@ pub(super) fn run_export_job(
 
     let rss_peak = rss_sampler.stop();
     let rss_after = crate::resource::get_rss_mb();
+    // Harvest the run's bytes-read counter ONCE — every sink (per chunk, per
+    // worker) incremented plan.bytes_read, so this single read covers every
+    // runner by construction (#175).
+    summary.bytes_read = plan.bytes_read.load(std::sync::atomic::Ordering::Relaxed);
     summary.duration_ms = start.elapsed().as_millis() as i64;
     summary.peak_rss_mb = rss_peak.max(rss_after).max(rss_before) as i64;
 
@@ -1190,6 +1196,10 @@ pub(crate) fn run_export_job_with_chunk_source(
 
     let rss_peak = rss_sampler.stop();
     let rss_after = crate::resource::get_rss_mb();
+    // Harvest the run's bytes-read counter ONCE — every sink (per chunk, per
+    // worker) incremented plan.bytes_read, so this single read covers every
+    // runner by construction (#175).
+    summary.bytes_read = plan.bytes_read.load(std::sync::atomic::Ordering::Relaxed);
     summary.duration_ms = start.elapsed().as_millis() as i64;
     summary.peak_rss_mb = rss_peak.max(rss_after).max(rss_before) as i64;
 
@@ -1577,6 +1587,7 @@ mod tests {
 
     fn chunked_plan_with_quality(quality: Option<QualityConfig>) -> ResolvedRunPlan {
         ResolvedRunPlan {
+            bytes_read: Default::default(),
             export_name: "orders".into(),
             source_table: None,
             base_query: "SELECT id FROM orders".into(),
@@ -1822,6 +1833,7 @@ mod tests {
         summary.mode = "chunked".into();
         summary.files_produced = 7;
         summary.bytes_written = 4096;
+        summary.bytes_read = 65536;
         summary.retries = 2;
         summary.validated = Some(true);
         summary.schema_changed = Some(false);
@@ -1872,6 +1884,7 @@ mod tests {
             mode,
             files_produced,
             bytes_written,
+            bytes_read,
             retries,
             validated,
             schema_changed,
@@ -1915,6 +1928,7 @@ mod tests {
         assert_eq!(mode.as_deref(), Some("chunked"));
         assert_eq!(files_produced, 7);
         assert_eq!(bytes_written, 4096);
+        assert_eq!(bytes_read, 65536);
         assert_eq!(retries, 2);
         assert_eq!(validated, Some(true));
         assert_eq!(schema_changed, Some(false));
