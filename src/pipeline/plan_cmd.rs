@@ -158,6 +158,12 @@ pub fn run_plan_command(
         );
     }
 
+    // Pool-scheduler advisory (#166): show the makespan a bounded work-stealing
+    // pool would achieve from measured durations, so the operator can weigh it
+    // against the wave count. Printed only when we have real durations for more
+    // than one export (a single export has nothing to schedule).
+    print_pool_estimate(&artifacts, &state);
+
     emit_artifacts(&artifacts, &format, multi_export, config_path)?;
 
     Ok(())
@@ -420,6 +426,76 @@ fn compute_plan_data(
     }
 }
 
+/// Print the pool scheduler's predicted makespan (#166) beside the wave plan.
+/// Reads each export's last successful duration from the state store; skips
+/// silently when fewer than two exports have history (nothing to schedule).
+/// Pure core of `print_pool_estimate`: given each export's run history
+/// (`(status, duration_ms)` rows, newest first), keep the most-recent
+/// **successful** run of each and convert it to a `PoolItem`. Returns `None`
+/// when fewer than two exports have a success on record — nothing to schedule,
+/// so the estimate is skipped.
+///
+/// Extracted so the mutation gate can bite the three decisions the display
+/// glue used to hide: the `status == "success"` filter, the ms→s divide, and
+/// the `< 2` skip. RED-proven by `pool_items_from_history_*`.
+fn pool_items_from_history(
+    per_export: &[(String, Vec<(String, i64)>)],
+) -> Option<Vec<super::pool::PoolItem>> {
+    let items: Vec<super::pool::PoolItem> = per_export
+        .iter()
+        .filter_map(|(name, history)| {
+            let dur_ms = history
+                .iter()
+                .find(|(status, _)| status == "success")
+                .map(|(_, ms)| *ms)?;
+            Some(super::pool::PoolItem {
+                name: name.clone(),
+                predicted_secs: (dur_ms as f64 / 1000.0).max(0.001),
+            })
+        })
+        .collect();
+    if items.len() < 2 {
+        return None;
+    }
+    Some(items)
+}
+
+fn print_pool_estimate(artifacts: &[PlanArtifact], state: &StateStore) {
+    let per_export: Vec<(String, Vec<(String, i64)>)> = artifacts
+        .iter()
+        .map(|a| {
+            let history = state
+                .get_metrics(Some(&a.export_name), 20)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|m| (m.status, m.duration_ms))
+                .collect();
+            (a.export_name.clone(), history)
+        })
+        .collect();
+    let Some(items) = pool_items_from_history(&per_export) else {
+        return;
+    };
+    let total: f64 = items.iter().map(|i| i.predicted_secs).sum();
+    println!(
+        "\n  Pool scheduler (measured, {} export(s) with history):",
+        items.len()
+    );
+    println!("    sequential: {:.0} min", total / 60.0);
+    for m in [2usize, 4, 6] {
+        let mk = super::pool::predicted_makespan_secs(&items, m);
+        let floor = super::pool::makespan_floor_secs(&items, m);
+        println!(
+            "    pool M={m}: {:.0} min  (floor max(longest,total/M) = {:.0})",
+            mk / 60.0,
+            floor / 60.0
+        );
+    }
+    println!(
+        "    (a bounded work-stealing pool; --annotate-waves packs the wave          alternative — see #166)"
+    );
+}
+
 fn emit_artifacts(
     artifacts: &[PlanArtifact],
     format: &PlanOutputFormat,
@@ -647,7 +723,51 @@ mod tests {
     use super::per_export_output_path;
     use std::path::Path;
 
-    use super::{ExportFields, apply_field_annotations, fields_to_write};
+    use super::{ExportFields, apply_field_annotations, fields_to_write, pool_items_from_history};
+
+    /// The pool estimate reads history through `pool_items_from_history`; these
+    /// pin the three decisions the mutation gate flagged as unguarded display
+    /// glue: the `status == "success"` filter, the ms→s divide, and the `< 2`
+    /// skip. Each assertion goes RED against the mutant named beside it.
+    #[test]
+    fn pool_items_from_history_keeps_only_the_latest_success_and_converts_ms() {
+        // Two exports, each newest-first history. "big" has a failed newer run
+        // ahead of its success — the `== "success"` filter (mutant `!=`) must
+        // skip the failure and take the success.
+        let per_export = vec![
+            (
+                "big".to_string(),
+                vec![
+                    ("failed".to_string(), 999_000),
+                    ("success".to_string(), 120_000),
+                ],
+            ),
+            ("small".to_string(), vec![("success".to_string(), 30_000)]),
+        ];
+        let items = pool_items_from_history(&per_export).expect("two successes → Some");
+        assert_eq!(items.len(), 2);
+        let big = items.iter().find(|i| i.name == "big").unwrap();
+        // 120_000 ms / 1000 = 120 s — kills `/`→`*`/`%` (443) and the `!=`
+        // filter (would have taken the 999_000 failure → 999.0).
+        assert_eq!(big.predicted_secs, 120.0);
+        let small = items.iter().find(|i| i.name == "small").unwrap();
+        assert_eq!(small.predicted_secs, 30.0);
+    }
+
+    #[test]
+    fn pool_items_from_history_skips_when_fewer_than_two_have_history() {
+        // One export with a success, one with only a failure → a single item.
+        // The `< 2` skip (mutants `==`/`>`/`<=`) must return None: with `>` or
+        // `<=` a one-item schedule would print, and `==` would skip the valid
+        // two-item case above.
+        let one = vec![
+            ("only".to_string(), vec![("success".to_string(), 10_000)]),
+            ("nope".to_string(), vec![("failed".to_string(), 5_000)]),
+        ];
+        assert!(pool_items_from_history(&one).is_none());
+        // Zero items → None as well.
+        assert!(pool_items_from_history(&[]).is_none());
+    }
 
     /// The additive contract (#150): plan fills BLANKS; a value the operator
     /// set is untouched unless `--annotate-waves` says overwrite. Per FIELD —
