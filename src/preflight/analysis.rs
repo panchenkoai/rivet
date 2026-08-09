@@ -132,6 +132,7 @@ pub(crate) fn choose_row_estimate(
 /// cannot drift (#149). Best-effort: an unreadable store keeps the catalog.
 pub(crate) fn overlay_measured_rows(
     diag: &mut super::ExportDiagnostic,
+    export: &ExportConfig,
     state: &crate::state::StateStore,
 ) {
     // A measured `total_rows` is the TABLE SIZE only when the run read the whole
@@ -157,9 +158,30 @@ pub(crate) fn overlay_measured_rows(
                         .map(|t| (m.total_rows, t.with_timezone(&chrono::Utc)))
                 })
         });
+    let before = diag.row_estimate;
     let (est, label) = choose_row_estimate(diag.row_estimate, measured, chrono::Utc::now());
     diag.row_estimate = est;
     diag.row_source = Some(label);
+
+    // A2 (roast 2026-08-09): the engine diagnostics already computed verdict /
+    // profile / parallelism / suggestion from the CATALOG estimate, so before
+    // this the report printed a MEASURED number above decisions made for the
+    // catalog one (a 2.5× field lie ⇒ wrong profile/parallelism). When the
+    // overlay actually MOVED the estimate, recompute the row-estimate-scaled
+    // decisions from the truth. These depend only on fields the diagnostic
+    // already carries (uses_index, avg_row_bytes) + the export.
+    if est != before && est.is_some() {
+        diag.verdict = compute_verdict(
+            est,
+            diag.uses_index,
+            export.cursor_column.is_some(),
+            diag.avg_row_bytes,
+            export.parallel,
+        );
+        diag.recommended_profile = recommend_profile(est, diag.uses_index, export);
+        diag.recommended_parallel = recommend_parallelism(export, est, diag.uses_index);
+        diag.suggestion = build_suggestion(&diag.verdict, est, diag.uses_index, export);
+    }
 }
 
 /// Does this diagnostic's mode read the WHOLE table every run (so a measured
@@ -926,8 +948,17 @@ mod tests {
             recommended_parallel: (1, "test"),
             suggestion: None,
         };
-        overlay_measured_rows(&mut diag, &state);
+        let export = cfg("table: t\nmode: chunked\nchunk_column: id\nchunk_size: 100000\n");
+        // Seed a profile as if computed from the CATALOG (small) estimate.
+        diag.recommended_profile = "fast";
+        overlay_measured_rows(&mut diag, &export, &state);
         assert_eq!(diag.row_estimate, Some(835_700_000), "measured must win");
+        // A2: the profile must be RECOMPUTED from the measured 835M (a huge table
+        // is not "fast") — before the fix it kept the catalog-derived value.
+        assert_ne!(
+            diag.recommended_profile, "fast",
+            "verdict/profile must be recomputed from the measured estimate, not the catalog one"
+        );
         assert!(
             diag.row_source
                 .as_deref()
@@ -978,7 +1009,8 @@ mod tests {
             recommended_parallel: (1, "test"),
             suggestion: None,
         };
-        overlay_measured_rows(&mut diag, &state);
+        let export = cfg("table: t\nmode: incremental\ncursor_column: updated_at\n");
+        overlay_measured_rows(&mut diag, &export, &state);
         assert_eq!(
             diag.row_estimate,
             Some(300_000_000),

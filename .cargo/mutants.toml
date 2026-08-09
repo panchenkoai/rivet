@@ -97,5 +97,20 @@ exclude_re = [
     "replace == with != in run_pool",
     "impl Drop for HeavyGuard",
     "delete ! in run_pool",
+    # `check` (preflight/mod.rs) connects to the source and diagnoses every
+    # export — no offline caller, so its body stub / the `==` in the overlay
+    # export-match loop are unkillable HERE (live-only). It is live-guarded by
+    # audit_preflight_table + the check scenarios (cli/blessed-flow). The overlay
+    # DECISIONS are unit-tested in overlay_measured_rows.
+    "replace check -> Result<bool> with Ok",
+    "replace == with != in check",
+    # overlay_measured_rows: `est != before && est.is_some()` guards a RECOMPUTE
+    # that is IDEMPOTENT when the estimate is unchanged (recomputing verdict/
+    # profile from the same number yields the same values). `est` is None only
+    # when `before` is also None (choose_row_estimate returns the catalog when
+    # there is no measure), so `est != before && est.is_some()` never differs
+    # observably from the `||` form — the guard is a skip-redundant-work
+    # optimization, and the mutant is equivalent by construction.
+    "replace && with || in overlay_measured_rows",
     "replace match guard mssql_trusts_cert_without_verify\\(cfg\\) with (true|false) in MssqlSource::connect_with_tls",
 ]
