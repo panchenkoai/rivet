@@ -83,5 +83,19 @@ exclude_re = [
     # matters against a real TLS handshake — there is no offline caller, so the
     # `guard -> true`/`-> false` mutant is unkillable HERE by construction. It is
     # live-guarded by the blessed-path `init --tls` + MSSQL connect scenarios.
+    # run_pool (pipeline/run.rs) is the bounded work-stealing pool executor — it
+    # needs a live source, real exports, and spawned worker threads; there is no
+    # offline caller, so a body stub / operator-inversion is unkillable HERE by
+    # construction (the same live-only class as density_probe). Its DECISIONS are
+    # pure and unit-tested + RED-proven: next_eligible (heavy-serialization) and
+    # advise_split (floor+shape gate). The executor glue — the HeavyGuard reset,
+    # the giant-lookup for the advisory log line — is live-guarded by
+    # live_pool_toxiproxy (exact rows + the makespan contract) and
+    # pool_apply_two_heavy_exports_both_complete (the HeavyGuard reset between two
+    # heavies; a stubbed drop / deleted `!` deadlocks the second heavy).
+    "replace run_pool -> Result",
+    "replace == with != in run_pool",
+    "impl Drop for HeavyGuard",
+    "delete ! in run_pool",
     "replace match guard mssql_trusts_cert_without_verify\\(cfg\\) with (true|false) in MssqlSource::connect_with_tls",
 ]

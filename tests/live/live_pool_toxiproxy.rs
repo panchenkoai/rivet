@@ -140,3 +140,45 @@ fn pool_apply_resume_skips_complete_exports_and_loses_nothing() {
         5000
     );
 }
+
+/// #166 HeavyGuard reset (roast 2026-08-09): two NON-parallel_safe (heavy)
+/// exports must BOTH complete through --pool 2 — the second can only be claimed
+/// after the first releases heavy_running. A stubbed HeavyGuard::drop or a
+/// deleted `!is_parallel_safe` never resets the flag, so the second heavy is
+/// never eligible and the run deadlocks (caught here by the union row count,
+/// under the test's own wall-clock; the pool has no internal timeout).
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn pool_apply_two_heavy_exports_both_complete() {
+    let _lock = toxiproxy_guard();
+    ensure_toxi_proxy("postgres", 15432, "postgres:5432");
+    toxi_reset_toxics("postgres");
+
+    // Two heavy exports (parallel_safe ABSENT → heavy): they must serialize with
+    // each other yet both finish. If HeavyGuard never resets, the 2nd starves.
+    let rig = Rig::pg_batch("pool_h1")
+        .source_url(POSTGRES_TOXI_URL)
+        .query("SELECT g AS id, md5(g::text) AS p FROM generate_series(1, 8000) g")
+        .also_export(
+            "pool_h2",
+            "SELECT g AS id, md5(g::text) AS p FROM generate_series(1, 6000) g",
+        );
+    let cfg = rig.config_path();
+    let out = run_rivet_env(&["apply", cfg.to_str().unwrap(), "--pool", "2"], &[]);
+    assert!(
+        out.status.success(),
+        "both heavy exports must complete (a leaked heavy_running deadlocks #2):\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        duckdb_total_parquet_rows(&rig.out_dir()) as i64,
+        8000,
+        "heavy #1"
+    );
+    assert_eq!(
+        duckdb_total_parquet_rows(&rig.out_dir_for("pool_h2")) as i64,
+        6000,
+        "heavy #2 must not starve behind the first"
+    );
+    toxi_reset_toxics("postgres");
+}
