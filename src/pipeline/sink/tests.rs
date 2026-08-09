@@ -387,6 +387,7 @@ fn minimal_sink() -> ExportSink {
         part_rows: 0,
         cursor_column: None,
         last_cursor_value: None,
+        first_cursor_value: None,
         source_cursor: None,
         schema: None,
         dest_schema: None,
