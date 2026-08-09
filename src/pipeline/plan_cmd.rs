@@ -345,7 +345,11 @@ fn build_plan_artifact(
                 recommended_profile: diag.recommended_profile.to_string(),
                 strategy_rationale,
             };
-            let computed = compute_plan_data(&plan, diag.row_estimate, state)?;
+            let row_is_measured = diag
+                .row_source
+                .as_deref()
+                .is_some_and(|s| s.starts_with("measured"));
+            let computed = compute_plan_data(&plan, diag.row_estimate, row_is_measured, state)?;
             let hints = PrioritizationHints {
                 incremental_uses_index: diag.uses_index,
                 cursor_range_observed: diag.cursor_min.is_some() && diag.cursor_max.is_some(),
@@ -358,7 +362,7 @@ fn build_plan_artifact(
                 export.name,
                 e
             );
-            let computed = compute_plan_data(&plan, None, state)?;
+            let computed = compute_plan_data(&plan, None, false, state)?;
             let mut warnings = vec!["preflight diagnostics unavailable".into()];
             warnings.extend(validate_warnings);
             let plan_diagnostics = PlanDiagnostics {
@@ -440,6 +444,11 @@ fn build_plan_artifact(
 fn compute_plan_data(
     plan: &crate::plan::ResolvedRunPlan,
     row_estimate: Option<i64>,
+    // #149 (roast 2026-08-09): true when `row_estimate` is a MEASURED actual
+    // (from the state store's last whole-table run), so the chunked branch does
+    // NOT override it with the key-SPAN — which on a sparse key is the span, not
+    // the row count (950M..1.29B over 520K rows → 342M, worse than the measure).
+    row_is_measured: bool,
     state: &StateStore,
 ) -> Result<ComputedPlanData> {
     match &plan.strategy {
@@ -471,7 +480,13 @@ fn compute_plan_data(
                 chunk_ranges,
                 chunk_count,
                 cursor_snapshot: None,
-                row_estimate: chunked_estimate.or(row_estimate),
+                // A measured whole-table actual beats the key-span estimate;
+                // otherwise the span refines a stale catalog (fresh-ANALYZE PG).
+                row_estimate: if row_is_measured {
+                    row_estimate.or(chunked_estimate)
+                } else {
+                    chunked_estimate.or(row_estimate)
+                },
             })
         }
 

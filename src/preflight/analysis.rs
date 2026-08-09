@@ -134,6 +134,17 @@ pub(crate) fn overlay_measured_rows(
     diag: &mut super::ExportDiagnostic,
     state: &crate::state::StateStore,
 ) {
+    // A measured `total_rows` is the TABLE SIZE only when the run read the whole
+    // table — `mode: full` or a range-`chunked` pass. For incremental / keyset
+    // (which may continue from a cursor) a run's `total_rows` is the per-run
+    // DELTA, so overlaying it would report a 300M table as "~0 (measured)" after
+    // a quiet night (roast 2026-08-09, #149 mode-blindness). Gate conservatively:
+    // measure only the unambiguous whole-table modes; everything else keeps the
+    // catalog with its honest label.
+    if !is_whole_table_mode(&diag.mode) {
+        diag.row_source = Some("catalog estimate".to_string());
+        return;
+    }
     let measured = state
         .get_metrics(Some(&diag.export_name), 25)
         .ok()
@@ -149,6 +160,14 @@ pub(crate) fn overlay_measured_rows(
     let (est, label) = choose_row_estimate(diag.row_estimate, measured, chrono::Utc::now());
     diag.row_estimate = est;
     diag.row_source = Some(label);
+}
+
+/// Does this diagnostic's mode read the WHOLE table every run (so a measured
+/// `total_rows` IS the table size)? `full` and range-`chunked (column: …)` do;
+/// `incremental` and `keyset` may continue from a cursor and record a delta.
+/// The mode string is [`diagnose_mode_str`]'s output.
+pub(crate) fn is_whole_table_mode(mode: &str) -> bool {
+    mode == "full" || mode.starts_with("chunked (column")
 }
 
 /// The operator-facing mode line shown in the `rivet check` diagnostic —
@@ -892,7 +911,7 @@ mod tests {
         let mut diag = super::super::ExportDiagnostic {
             export_name: "versioned_giant".into(),
             strategy: "chunked(id, size=100000)".into(),
-            mode: "chunked".into(),
+            mode: "chunked (column: id, size: 100000)".into(),
             cursor_column: None,
             row_estimate: Some(331_966_196),
             row_source: None,
@@ -917,6 +936,55 @@ mod tests {
             "the report must SAY it stands on the measurement: {:?}",
             diag.row_source
         );
+    }
+
+    /// #149 mode-blindness (roast 2026-08-09): an INCREMENTAL run's total_rows is
+    /// the per-run DELTA, not the table — overlaying it reports a 300M table as
+    /// "~0 (measured)" after a quiet night. The overlay must keep the catalog for
+    /// non-whole-table modes. RED against the un-gated overlay.
+    #[test]
+    fn overlay_does_not_measure_an_incremental_delta_as_the_table() {
+        assert!(is_whole_table_mode("full"));
+        assert!(is_whole_table_mode("chunked (column: id, size: 100000)"));
+        assert!(!is_whole_table_mode("incremental (cursor: updated_at)"));
+        assert!(!is_whole_table_mode("keyset (key: id, size: 50000)"));
+
+        let state = crate::state::StateStore::open_in_memory().unwrap();
+        // A quiet incremental night: a successful run that captured ZERO rows.
+        state
+            .record_metric_full(&crate::state::MetricRow {
+                export_name: "big_incremental".into(),
+                run_id: "r1".into(),
+                total_rows: 0,
+                status: "success".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let mut diag = super::super::ExportDiagnostic {
+            export_name: "big_incremental".into(),
+            strategy: "incremental".into(),
+            mode: "incremental (cursor: updated_at)".into(),
+            cursor_column: Some("updated_at".into()),
+            row_estimate: Some(300_000_000),
+            row_source: None,
+            avg_row_bytes: None,
+            cursor_min: None,
+            cursor_max: None,
+            scan_type: None,
+            uses_index: true,
+            verdict: super::super::HealthVerdict::Efficient,
+            warnings: Vec::new(),
+            recommended_profile: "balanced",
+            recommended_parallel: (1, "test"),
+            suggestion: None,
+        };
+        overlay_measured_rows(&mut diag, &state);
+        assert_eq!(
+            diag.row_estimate,
+            Some(300_000_000),
+            "an incremental delta must NOT overwrite the table estimate"
+        );
+        assert_eq!(diag.row_source.as_deref(), Some("catalog estimate"));
     }
 
     // ── preflight_range_col / strategy_probes_index cover EVERY strategy ──────
