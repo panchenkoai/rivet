@@ -546,9 +546,21 @@ fn print_pool_estimate(artifacts: &[PlanArtifact], state: &StateStore) {
         return;
     };
     let total: f64 = items.iter().map(|i| i.predicted_secs).sum();
+    // Honesty: the estimate covers only exports with run history — a config with
+    // newly-added tables schedules more work than this, so an operator comparing
+    // the pool number against the (all-inclusive) wave plan must see the gap
+    // (roast 2026-08-09).
+    let excluded = per_export.len().saturating_sub(items.len());
+    let excluded_note = if excluded > 0 {
+        format!("; {excluded} without history excluded — real makespan is higher")
+    } else {
+        String::new()
+    };
     println!(
-        "\n  Pool scheduler (measured, {} export(s) with history):",
-        items.len()
+        "\n  Pool scheduler (measured, {} of {} export(s) with history{}):",
+        items.len(),
+        per_export.len(),
+        excluded_note
     );
     println!("    sequential: {:.0} min", total / 60.0);
     for m in [2usize, 4, 6] {

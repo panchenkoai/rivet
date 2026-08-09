@@ -39,18 +39,13 @@ impl RunnerFrame {
     /// must never clobber a CDC export's audit trail — finding #44), and
     /// derive the part-file extension. Fails BEFORE the first part.
     pub(crate) fn open(plan: &ResolvedRunPlan) -> Result<Self> {
-        let dest = destination::create_destination(&plan.destination)?;
-        crate::manifest::guard_manifest_mode(dest.as_ref(), "batch")?;
-
-        let ext = crate::format::create_format(
-            plan.format,
-            plan.compression,
-            plan.compression_level,
-            None,
-        )
-        .file_extension()
-        .to_string();
-        Ok(Self { dest, ext })
+        // open == open_unguarded + the run-start cross-shape guard; sharing the
+        // body keeps the two from drifting (roast 2026-08-09). The guard runs
+        // before the first part either way — nothing happens between build and
+        // guard that a manifest read could observe.
+        let frame = Self::open_unguarded(plan)?;
+        crate::manifest::guard_manifest_mode(frame.dest.as_ref(), "batch")?;
+        Ok(frame)
     }
 
     /// [`RunnerFrame::open`] for runners that share one destination across

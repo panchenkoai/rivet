@@ -61,7 +61,14 @@ pub(crate) fn scaffold_strategy(info: &TableInfo) -> String {
         },
         "incremental" => format!(
             "incremental({})",
-            info.best_cursor_column().unwrap_or("updated_at")
+            // Mirror yaml_scaffold::export_block_lines EXACTLY: it renders the
+            // cursor via chosen_cursor_column() (the scored picker), not
+            // best_cursor_column() (name-only) — and emits a REVIEW marker,
+            // never a phantom `updated_at`, when there is no candidate. Using
+            // best_ here re-implemented the product with a DIFFERENT picker,
+            // the exact self-oracle this golden exists to prevent (roast
+            // 2026-08-09; superseded fully by the #159 deletion).
+            info.chosen_cursor_column().as_deref().unwrap_or("?")
         ),
         other => other.to_string(), // "full"
     }
@@ -103,7 +110,14 @@ pub(crate) fn scaffold_full(info: &TableInfo, engine: &str) -> String {
         }
         "incremental" => format!(
             "incremental({})",
-            info.best_cursor_column().unwrap_or("updated_at")
+            // Mirror yaml_scaffold::export_block_lines EXACTLY: it renders the
+            // cursor via chosen_cursor_column() (the scored picker), not
+            // best_cursor_column() (name-only) — and emits a REVIEW marker,
+            // never a phantom `updated_at`, when there is no candidate. Using
+            // best_ here re-implemented the product with a DIFFERENT picker,
+            // the exact self-oracle this golden exists to prevent (roast
+            // 2026-08-09; superseded fully by the #159 deletion).
+            info.chosen_cursor_column().as_deref().unwrap_or("?")
         ),
         other => other.to_string(),
     }
