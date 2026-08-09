@@ -178,8 +178,13 @@ pub(super) fn density_probe(client: &mut Client, info: &mut super::TableInfo) {
 
     const PG_PROBE_LINE: i64 = 5_000_000;
     let catalog = info.row_estimate;
-    if catalog < PG_PROBE_LINE {
-        return; // policy: reltuples trusted below the line (density stays None)
+    // #148 (roast 2026-08-09): a never-analyzed table has reltuples -1, clamped
+    // to 0 at introspect — `0 < 5M` would skip the probe and trust 0 on a table
+    // that may hold 100M rows (the just-restored/just-migrated moment users run
+    // init). Probe when the figure is 0/unknown OR large; trust only a REAL
+    // small figure (1..5M) where reltuples is a fresh ANALYZE.
+    if (1..PG_PROBE_LINE).contains(&catalog) {
+        return;
     }
     let Some(key) = info.best_chunk_column().map(str::to_string) else {
         info.density = Some(DensityProbe {
@@ -218,6 +223,19 @@ pub(super) fn density_probe(client: &mut Client, info: &mut super::TableInfo) {
             Ok(r) => counts.push(r.get::<_, i64>(0)),
             Err(_) => return,
         }
+    }
+    let sampled: i64 = counts.iter().sum();
+    if !super::density::probe_trustworthy(sampled, offsets.len()) {
+        // #148 sparse-key guard: too few sampled rows to trust the extrapolation.
+        info.density = Some(DensityProbe {
+            rows: catalog,
+            density: 0.0,
+            method: EstimateMethod::Unverified,
+            catalog_rows: catalog,
+            k: offsets.len(),
+            w: PROBE_W,
+        });
+        return;
     }
     let (rows, density) = estimate_from_windows(min, max, &counts, PROBE_W);
     info.row_estimate = rows;

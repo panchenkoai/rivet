@@ -265,8 +265,17 @@ impl TableInfo {
     /// a fast engine's sequential scan. `None` when the size is unknown —
     /// callers then fall back to a row-count-only heuristic.
     pub(crate) fn avg_row_bytes(&self) -> Option<i64> {
+        // #148 (roast 2026-08-09): when the density probe CORRECTED row_estimate
+        // (frozen stats), total_bytes is still the FROZEN figure — the ratio
+        // mixes a corrected numerator with a stale denominator and defeats the
+        // wide-row parallelism guard. A probe re-samples rows, not bytes, so the
+        // per-row size is unknown after a correction; report None.
+        let probe_corrected = matches!(
+            &self.density,
+            Some(p) if p.method == crate::init::density::EstimateMethod::Probed
+        );
         match self.total_bytes {
-            Some(b) if self.row_estimate > 0 => Some(b / self.row_estimate),
+            Some(b) if self.row_estimate > 0 && !probe_corrected => Some(b / self.row_estimate),
             _ => None,
         }
     }
@@ -806,10 +815,19 @@ fn init_yaml(
 /// MSSQL's `dm_db_partition_stats` row counts are near-exact by construction —
 /// no probe needed; the snapshot still SAYS where the number came from (#148).
 fn mark_mssql_catalog_exact(info: &mut TableInfo) {
+    // #148 (roast 2026-08-09): dm_db_partition_stats yields 0 for a VIEW or when
+    // stats are unavailable — a documented UNKNOWN, not an exact count. Stamping
+    // `catalog-exact` on a 0 turns "unknown" into an audited "exactly 0 rows".
+    // Only a positive figure is genuinely catalog-exact; 0 is unverified.
+    let method = if info.row_estimate > 0 {
+        crate::init::density::EstimateMethod::CatalogExact
+    } else {
+        crate::init::density::EstimateMethod::Unverified
+    };
     info.density = Some(crate::init::density::DensityProbe {
         rows: info.row_estimate,
         density: 0.0,
-        method: crate::init::density::EstimateMethod::CatalogExact,
+        method,
         catalog_rows: info.row_estimate,
         k: 0,
         w: 0,
