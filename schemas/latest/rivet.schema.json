@@ -900,7 +900,8 @@
             "null"
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "CdcInitialMode": {
       "description": "What the FIRST CDC run does before draining changes.",
