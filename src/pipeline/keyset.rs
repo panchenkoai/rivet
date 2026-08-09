@@ -47,6 +47,9 @@ pub(crate) struct KeysetPage {
     pub(crate) rows: usize,
     pub(crate) schema: Option<arrow::datatypes::Schema>,
     pub(crate) next_cursor: Option<String>,
+    /// First observed key of this page (the run floor when it is page 1 of
+    /// range 0) — recorded so cursor_min lands in the metrics (#151).
+    pub(crate) first_cursor: Option<String>,
     /// This page's sink's per-column Form B value checksums — XOR-combined
     /// run-wide by `run_keyset` so the finalize manifest records Form B (previously
     /// dropped here, making `rivet validate`'s re-read a no-op on keyset exports).
@@ -133,6 +136,7 @@ pub(crate) fn read_keyset_page_bounded(
         // The source's own lossless token (Mongo BSON `_id`) when it reported
         // one, else the column-extracted string (every SQL engine).
         next_cursor: sink.effective_cursor(),
+        first_cursor: sink.first_cursor_value.clone(),
         column_checksums: std::mem::take(&mut sink.column_checksums),
         checksum_key_column,
     }))
@@ -468,6 +472,7 @@ fn run_keyset_parallel(
     // is skipped), which is acceptable — parallel keyset is a full snapshot, not an
     // incremental anchor, so its cursor range is descriptive, not a resume floor.
     let range_max: Mutex<Vec<Option<String>>> = Mutex::new(vec![None; total_ranges]);
+    let range_first: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
     let errors: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
     std::thread::scope(|scope| {
@@ -475,6 +480,7 @@ fn run_keyset_parallel(
             let dest = std::sync::Arc::clone(&dest);
             let (plan_r, key_plan_r, ext_r, tag_r, key_r) =
                 (plan, &key_plan, &ext, run_tag.as_str(), key.as_str());
+            let rfirst_r = &range_first;
             let (rows_r, parts_r, checks_r, fp_r, rmax_r, errs_r) = (
                 &rows,
                 &parts_mx,
@@ -552,6 +558,11 @@ fn run_keyset_parallel(
                             rows: p.rows,
                             bytes: p.bytes as i64,
                         });
+                    }
+                    if ridx == 0 && rfirst_r.lock().unwrap().is_none() {
+                        // Range 0 is the LOWEST range: its first key is the
+                        // run's observed floor (#151).
+                        *rfirst_r.lock().unwrap() = page.first_cursor.clone();
                     }
                     local_parts.extend(page.parts);
                     local_checks.push((page.column_checksums, page.checksum_key_column));
@@ -693,7 +704,9 @@ fn run_keyset_parallel(
     }
     // cursor_high = the highest populated range's max (forensics v18); see range_max.
     summary.cursor_high = highest_range_max(range_max.into_inner().unwrap());
-    summary.cursor_low = None; // a fresh parallel run seeks from the floor of each range
+    // #151: the observed floor = range 0's first key (the lowest range);
+    // the incremental block below overwrites this with the anchor floor.
+    summary.cursor_low = range_first.into_inner().unwrap();
 
     // Resume completeness: reconstruct the parts of the ranges that completed in a
     // PRIOR (crashed) run — they were not re-run, so they are absent from
@@ -938,6 +951,13 @@ pub(crate) fn run_keyset(
             summary.cursor_high = last.clone();
             break;
         };
+
+        // #151: the run's observed FLOOR — first page's first key. With
+        // cursor_min+max in the metrics, key density is derivable from the
+        // state DB alone (the keyset-vs-range input, no source round-trip).
+        if summary.cursor_low.is_none() {
+            summary.cursor_low = page.first_cursor.clone();
+        }
 
         // ADR-0012 M3: capture the dest schema fingerprint from the first
         // non-empty page; idempotent run-wide.

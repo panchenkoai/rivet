@@ -190,6 +190,11 @@ fn build_metric_row(
         crate::plan::ExtractionStrategy::Chunked(cp) => {
             (Some(cp.chunk_size as i64), Some(cp.parallel as i64))
         }
+        // #151: keyset runs demonstrably fanned N workers while the metric
+        // stayed NULL — the runner-bypass class, in a metrics field.
+        crate::plan::ExtractionStrategy::Keyset(kp) => {
+            (Some(kp.chunk_size as i64), Some(kp.parallel.max(1) as i64))
+        }
         _ => (None, None),
     };
     crate::state::MetricRow {

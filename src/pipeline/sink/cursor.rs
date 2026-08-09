@@ -29,6 +29,25 @@ pub(crate) fn extract_last_cursor_value(
     cursor_column: &str,
     schema: &SchemaRef,
 ) -> Option<String> {
+    extract_cursor_value_at(batch, cursor_column, schema, true)
+}
+
+/// First NON-NULL cursor value of the batch — the run's observed floor (#151:
+/// with min+max recorded, key density is derivable from the state DB alone).
+pub(crate) fn extract_first_cursor_value(
+    batch: &RecordBatch,
+    cursor_column: &str,
+    schema: &SchemaRef,
+) -> Option<String> {
+    extract_cursor_value_at(batch, cursor_column, schema, false)
+}
+
+fn extract_cursor_value_at(
+    batch: &RecordBatch,
+    cursor_column: &str,
+    schema: &SchemaRef,
+    from_end: bool,
+) -> Option<String> {
     let col_idx = schema.index_of(cursor_column).ok()?;
     let array = batch.column(col_idx);
 
@@ -48,7 +67,11 @@ pub(crate) fn extract_last_cursor_value(
     //
     // An all-NULL batch still yields None, which the caller must treat as "this
     // batch says nothing" and NOT as "reset the mark" — see `ExportSink::on_batch`.
-    let last_row = (0..batch.num_rows()).rev().find(|&i| !array.is_null(i))?;
+    let last_row = if from_end {
+        (0..batch.num_rows()).rev().find(|&i| !array.is_null(i))?
+    } else {
+        (0..batch.num_rows()).find(|&i| !array.is_null(i))?
+    };
 
     match array.data_type() {
         DataType::Int16 => Some(

@@ -6,7 +6,7 @@
 
 mod cursor;
 mod pipelined;
-pub(crate) use cursor::extract_last_cursor_value;
+pub(crate) use cursor::{extract_first_cursor_value, extract_last_cursor_value};
 pub(crate) use pipelined::PipelinedSink;
 
 use std::io::BufWriter;
@@ -49,6 +49,9 @@ pub(crate) struct ExportSink {
     pub(in crate::pipeline) cursor_column: Option<String>,
     /// Last extracted cursor value — set by `on_batch`, consumed by `run_single_export`.
     pub(in crate::pipeline) last_cursor_value: Option<String>,
+    /// First observed cursor value of the RUN (first non-null of the first
+    /// batch carrying one) — the floor for cursor_min metrics (#151).
+    pub(in crate::pipeline) first_cursor_value: Option<String>,
     /// A lossless keyset token the SOURCE reported via `set_source_cursor`
     /// (MongoDB's BSON `_id`), overriding the type-ambiguous string extracted
     /// from the output column. `effective_cursor()` prefers it. `None` for SQL.
@@ -144,6 +147,7 @@ impl ExportSink {
             part_rows: 0,
             cursor_column: plan.strategy.cursor_extract_column().map(str::to_string),
             last_cursor_value: None,
+            first_cursor_value: None,
             source_cursor: None,
             schema: None,
             dest_schema: None,
@@ -746,6 +750,9 @@ impl BatchSink for ExportSink {
             // unconditional assignment let it overwrite the good mark
             // accumulated from every prior batch with None, after which nothing
             // was recorded and nothing committed.
+            if self.first_cursor_value.is_none() {
+                self.first_cursor_value = extract_first_cursor_value(batch, col, schema);
+            }
             if let Some(v) = extract_last_cursor_value(batch, col, schema) {
                 self.last_cursor_value = Some(v);
             }
