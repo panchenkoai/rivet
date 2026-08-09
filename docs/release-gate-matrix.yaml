@@ -140,6 +140,10 @@ preflights:
     what: "prod topology — rivet reads a read-REPLICA, not the master (the 'we were handed a product, no master access' case). Drives tests/live/live_cdc_replica.rs: the mysql-replica re-logs the primary's replicated changes into its OWN binlog (log_replica_updates) and rivet captures from that. Needs the `replica` compose profile (mysql-primary :3308 → mysql-replica :3309); SKIP when down."
     infra: [mysql-replica]
     status: test        # verify_replica_read — drives cdc_reads_changes_from_a_replica
+  - id: pool_e2e
+    what: "the pool scheduler's e2e flow (#166): `apply --pool 2` on a multi-export config (one heavy + three parallel_safe) through a toxiproxy BANDWIDTH-CAPPED source — the shared-tunnel field pathology. Oracles: exact per-export rows (independent DuckDB readback), the predicted-vs-actual makespan contract on stdout (the model grades itself), and --resume defer-not-drop. Drives tests/live/live_pool_toxiproxy.rs; SKIP when toxiproxy :8474 is down."
+    backends: [postgres]
+    status: test        # verify_pool_e2e — drives live_pool_toxiproxy (both tests)
   - id: release_regression
     what: "regression vs the PREVIOUS RELEASE (not a golden, not the gate itself). B-format: the new binary must READ what the prev release WROTE — prev exports a 100K keyset+zstd fixture, cur `validate` re-reads its manifest+parts (PASSED) + DuckDB row-count == source (a format bump that can't read old artifacts silently breaks every existing user on upgrade). B-perf: cur wall <= the DOWNLOADED prev-release binary's wall × tol (default 1.5×; a 3× slowdown / RSS blow-up ships green through every correctness check), benchmarked against the artifact users actually run, never a rebuilt parent. Env: RIVET_PREV_RELEASE_BIN + RIVET_REGRESSION_SOURCE_URL; SKIP-if-absent."
     backends: [postgres]

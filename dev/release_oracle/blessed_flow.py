@@ -1209,9 +1209,10 @@ FLAG_EXCUSED = {
     "--gcs-credentials-file": "fake-gcs takes no credentials; the real path is the bigquery cycle's",
     "--pool": "pool mode schedules a whole CONFIG's exports (multi-export, duration-ordered); "
               "the blessed cell chain applies a sealed SINGLE-export plan artifact, where --pool "
-              "is a refusal by design. Carried by its dedicated e2e flow instead: "
-              "tests/live/live_pool_toxiproxy.rs (bandwidth-capped multi-export pool, exact rows "
-              "+ the predicted-vs-actual makespan contract).",
+              "is a refusal by design. Carried INSIDE the gate by its own stage instead: "
+              "scenarios.verify_pool_e2e drives tests/live/live_pool_toxiproxy.rs (bandwidth-"
+              "capped multi-export pool, exact rows + the predicted-vs-actual makespan "
+              "contract + resume defer-not-drop).",
     "--tls-ca": "verify-ca/full need a TLS-terminating server; the compose stand has none — the "
                 "CA path is unit-pinned (scaffold_records_the_tls_posture…) and refused-with-"
                 "disable is offline-tested",

@@ -69,6 +69,7 @@ __all__ = [
     "store_readback",
     "store_up",
     "verify_coverage_matrices",
+    "verify_pool_e2e",
     "verify_replica_read",
     "verify_state_migrations",
 ]
@@ -1126,6 +1127,53 @@ def verify_replica_read(led: Ledger) -> None:
         _failed(
             led, "replica", "read", "-", "-",
             f"replica read FAILED — rivet could not read from the replica (see {log_path})",
+            _first_match(p.out, r"FAILED|panic|assert|error"),
+        )
+
+
+def verify_pool_e2e(led: Ledger) -> None:
+    """The pool scheduler's e2e flow AS A GATE STAGE (#166 GA): drives the
+    dedicated toxiproxy scenario — `apply --pool 2` on a multi-export config
+    (one heavy + three parallel_safe) through a BANDWIDTH-CAPPED source link,
+    exact per-export rows via independent DuckDB readback, plus the
+    predicted-vs-actual makespan contract on stdout, and the --resume
+    defer-not-drop twin. The shared-link cap is the field pathology (60 workers
+    splitting one ~0.25 MB/s tunnel), so this is the honest shape to gate the
+    LPT model in — not an uncontended localhost.
+
+    Needs toxiproxy (:8474) and the main postgres (:5432); SKIP when down.
+    """
+    if not have("cargo"):
+        _skipped(led, "pool", "e2e", "-", "-", "pool e2e: cargo absent", "no cargo")
+        return
+    if not _tcp_open("127.0.0.1", 8474):
+        _skipped(
+            led, "pool", "e2e", "-", "-",
+            "pool e2e: no toxiproxy :8474 (docker compose up -d toxiproxy)",
+            "no toxiproxy",
+        )
+        return
+    led.phase(
+        "Pool scheduler e2e (apply --pool through a bandwidth-capped link — "
+        "exact rows + the predicted-vs-actual makespan contract)"
+    )
+    log_path = work_dir() / "pool_e2e.log"
+    p = run(
+        ["cargo", "test", "--manifest-path", str(ROOT / "Cargo.toml"), "--test", "live_suite",
+         "--", "--test-threads=1", "live_pool_toxiproxy"],
+        env={"RIVET_BIN": str(rivet_bin())},
+        timeout=NO_TIMEOUT,
+    )
+    log_path.write_text(p.out)
+    if p.ok and "test result: ok. 2 passed" in p.out:
+        _passed(
+            led, "pool", "e2e", "-", "-",
+            "pool e2e: bandwidth-capped --pool run exact + self-grading; resume defers, drops nothing",
+        )
+    else:
+        _failed(
+            led, "pool", "e2e", "-", "-",
+            f"pool e2e FAILED (see {log_path})",
             _first_match(p.out, r"FAILED|panic|assert|error"),
         )
 
