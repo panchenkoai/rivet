@@ -28,6 +28,13 @@ pub(crate) struct PoolItem {
     /// Predicted duration in seconds (last successful run, else an estimate —
     /// the same source the wave packer reads).
     pub predicted_secs: f64,
+    /// Whether this export may run CONCURRENTLY with another heavy one. Heavies
+    /// (`false`) serialize among themselves at run time (see
+    /// [`crate::pipeline::run`]'s `next_eligible`), so the makespan model must
+    /// too — else it predicts M-way parallelism an all-heavy config can never
+    /// reach (#166/#167 C3, roast 2026-08-09). Default `true` keeps the pure
+    /// tests that don't care about the constraint unchanged.
+    pub parallel_safe: bool,
 }
 
 /// LPT order: longest predicted duration first, ties broken by name so the
@@ -72,7 +79,15 @@ pub(crate) fn predicted_makespan_secs(items: &[PoolItem], workers: usize) -> f64
             .unwrap_or(0);
         slots[i] += d;
     }
-    slots.into_iter().fold(0.0, f64::max)
+    let greedy = slots.into_iter().fold(0.0, f64::max);
+    // Heavies serialize (C3): the true wall is at least their summed duration,
+    // which the constraint-free greedy LPT can under-predict for an all-heavy set.
+    let heavy: f64 = items
+        .iter()
+        .filter(|i| !i.parallel_safe)
+        .map(|i| i.predicted_secs)
+        .sum();
+    greedy.max(heavy)
 }
 
 /// The floor no scheduler can beat: `max(longest single export, total/M)`.
@@ -83,7 +98,17 @@ pub(crate) fn makespan_floor_secs(items: &[PoolItem], workers: usize) -> f64 {
     let w = workers.max(1) as f64;
     let total: f64 = items.iter().map(|i| i.predicted_secs).sum();
     let longest = items.iter().map(|i| i.predicted_secs).fold(0.0, f64::max);
-    longest.max(total / w)
+    // C3 (roast 2026-08-09): non-parallel_safe exports run ONE AT A TIME (the
+    // runtime heavy-serialization rule), so the wall is at least the SUM of all
+    // heavy durations — an all-heavy config cannot beat sequential however many
+    // slots. Without this floor the model advertised total/M on a config that
+    // degrades to sequential.
+    let heavy: f64 = items
+        .iter()
+        .filter(|i| !i.parallel_safe)
+        .map(|i| i.predicted_secs)
+        .sum();
+    longest.max(total / w).max(heavy)
 }
 
 /// #167: how many range sub-units a dominating export should split into so the
@@ -134,6 +159,7 @@ pub(crate) fn split_dominating(items: &[PoolItem], r: f64, max_split: usize) -> 
         out.push(PoolItem {
             name: format!("{}#{i}", longest.name),
             predicted_secs: piece,
+            parallel_safe: longest.parallel_safe,
         });
     }
     out
@@ -175,6 +201,16 @@ mod tests {
         PoolItem {
             name: name.into(),
             predicted_secs: secs,
+            parallel_safe: true,
+        }
+    }
+
+    /// A heavy (non-parallel_safe) item, for the C3 serialization-floor tests.
+    fn heavy(name: &str, secs: f64) -> PoolItem {
+        PoolItem {
+            name: name.into(),
+            predicted_secs: secs,
+            parallel_safe: false,
         }
     }
 
@@ -183,6 +219,56 @@ mod tests {
         let items = vec![it("b", 10.0), it("giant", 900.0), it("a", 10.0)];
         // giant first; the two 10s tie-break by name (a before b).
         assert_eq!(pool_order(&items), vec!["giant", "a", "b"]);
+    }
+
+    /// #166/#167 C3 (roast 2026-08-09): an ALL-HEAVY config cannot beat
+    /// sequential — heavies serialize among themselves — so both the floor and
+    /// the predicted makespan must be at least the SUM of heavy durations, never
+    /// the optimistic total/M. RED against the constraint-free model.
+    #[test]
+    fn makespan_honors_heavy_serialization() {
+        // 4 heavy exports, 600s each, M=4. Constraint-free LPT would say 600
+        // (one per slot); but heavies serialize → the true wall is 2400.
+        let items = vec![
+            heavy("a", 600.0),
+            heavy("b", 600.0),
+            heavy("c", 600.0),
+            heavy("d", 600.0),
+        ];
+        assert_eq!(
+            makespan_floor_secs(&items, 4),
+            2400.0,
+            "floor = sum of heavies"
+        );
+        assert_eq!(
+            predicted_makespan_secs(&items, 4),
+            2400.0,
+            "prediction must not advertise M-way parallelism an all-heavy set can't reach"
+        );
+
+        // Mixed: one heavy 600 + 6 safe 100 (total 1200), M=4. Safe ones fill
+        // slots; the heavy floor (600) is below total/M (300)? total/M=300, but
+        // greedy packs safes ~ they overlap the heavy → wall ~ max(600, ...). The
+        // heavy floor (600) is the binding one here, correctly.
+        let mixed = {
+            let mut v = vec![heavy("giant", 600.0)];
+            for n in 0..6 {
+                v.push(it(&format!("s{n}"), 100.0));
+            }
+            v
+        };
+        assert!(
+            predicted_makespan_secs(&mixed, 4) >= 600.0,
+            "the single heavy still floors the wall"
+        );
+        // A pure-safe set is unaffected (heavy sum = 0).
+        let safe = vec![
+            it("a", 100.0),
+            it("b", 100.0),
+            it("c", 100.0),
+            it("d", 100.0),
+        ];
+        assert_eq!(predicted_makespan_secs(&safe, 2), 200.0);
     }
 
     #[test]

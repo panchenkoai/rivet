@@ -538,6 +538,11 @@ fn pool_items_from_history(
             Some(super::pool::PoolItem {
                 name: name.clone(),
                 predicted_secs: (dur_ms as f64 / 1000.0).max(0.001),
+                // This history-only preview has no config in scope, so it cannot
+                // read parallel_safe; assume safe (optimistic). The authoritative
+                // heavy-serialization-aware prediction is run_pool's at apply time
+                // (#166/#167 C3), where the real flag is known.
+                parallel_safe: true,
             })
         })
         .collect();

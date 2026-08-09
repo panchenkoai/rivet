@@ -809,6 +809,7 @@ pub(crate) fn run_pool(config_path: &str, force: bool, resume: bool, m: usize) -
         .map(|e| super::pool::PoolItem {
             name: e.name.clone(),
             predicted_secs: last_success_secs(&state, &e.name).unwrap_or(5.0),
+            parallel_safe: is_parallel_safe(e),
         })
         .collect();
     let order = super::pool::pool_order(&items);
