@@ -110,6 +110,17 @@ pub(crate) fn stratified_offsets(min: i64, max: i64, k: usize, w: i64) -> Vec<i6
         .collect()
 }
 
+/// #148 sparse-key guard (roast 2026-08-09): the stratified grid can only
+/// estimate a key it actually SAMPLES. On a sparse/ID-encoded key (a Snowflake
+/// bigint whose span is ~4e17 over 10M rows), all K windows land in near-empty
+/// gaps, so `Σcount ≈ 0` and the extrapolation returns ~0 — replacing a sane
+/// catalog with garbage. Trust the probe only when the windows saw a floor of
+/// real rows (≥ K, i.e. ≥1 row/window on average); below that the key is too
+/// sparse for a windowed sample and the catalog stands, flagged `unverified`.
+pub(crate) fn probe_trustworthy(sampled_rows: i64, k: usize) -> bool {
+    k > 0 && sampled_rows >= k as i64
+}
+
 /// `rows ≈ span × Σcount/(sampled key-units)`; density = mean rows per
 /// key-unit. `counts[i]` is `COUNT(*) WHERE k BETWEEN off[i] AND off[i]+w-1`.
 /// Empty windows are DATA (a gappy key), not absence — they stay in the mean.
@@ -201,6 +212,19 @@ mod tests {
             "the 1 000 floor for tiny tables"
         );
         assert!(!span_agrees_with_claim(100, 1_500));
+    }
+
+    /// #148: a sparse key whose windows mostly miss must NOT replace the catalog.
+    #[test]
+    fn probe_trustworthy_rejects_a_sparse_sample() {
+        assert!(probe_trustworthy(500, 50), "dense: ~10 rows/window");
+        assert!(probe_trustworthy(50, 50), "exactly the floor (1/window)");
+        assert!(
+            !probe_trustworthy(3, 50),
+            "sparse: 3 rows across 50 windows"
+        );
+        assert!(!probe_trustworthy(0, 50), "all windows missed");
+        assert!(!probe_trustworthy(100, 0), "no windows");
     }
 
     #[test]

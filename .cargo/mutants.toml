@@ -37,6 +37,16 @@ exclude_re = [
     # RED-proven); the dispatch itself is live-guarded (query_scalar feeds
     # min/max bounds exercised by the live planner suites).
     "replace scalar_to_string -> Option<String>",
+    # density_probe (init/mysql.rs, init/postgres.rs) takes a live DB connection
+    # (mysql::PooledConn / postgres::Client) to run MIN/MAX + the windowed COUNTs
+    # — unkillable OFFLINE (the --in-diff gate has no DB). Its DECISION logic is
+    # extracted into pure, unit-tested helpers (stratified_offsets,
+    # estimate_from_windows, probe_trustworthy — all RED-proven), and the glue is
+    # live-guarded: init_probe_overrules_a_stale_table_rows_on_a_versioned_table
+    # (MySQL) + pg_density_probe_corrects_a_never_analyzed_table (PostgreSQL) fail
+    # against a stubbed probe or an inverted trustworthy guard on the real stand.
+    "replace density_probe with",
+    "delete ! in density_probe",
     # refuse_compressed_binlog takes a live `mysql::Conn` to read
     # @@global.binlog_transaction_compression — there is no offline caller, so a
     # body stub is unkillable HERE by construction. The DECISION it makes was

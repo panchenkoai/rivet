@@ -91,3 +91,60 @@ fn init_probe_overrules_a_stale_table_rows_on_a_versioned_table() {
         "probe must overrule the stale catalog (catalog={catalog}, true={true_rows}):\n{yaml}"
     );
 }
+
+/// #148 PG leg: a NEVER-ANALYZED table has reltuples -1 (clamped 0) — the gate
+/// now probes it (a 0/unknown catalog on a table that may hold real rows is
+/// exactly when the probe is needed). Fresh table, no ANALYZE, 60_000 rows:
+/// `init` must probe and scaffold `mode: chunked`, not trust the 0 into `full`.
+/// Live-covers the postgres.rs density_probe mutants the offline gate can't.
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn pg_density_probe_corrects_a_never_analyzed_table() {
+    require_alive(LiveService::Postgres);
+    let table = unique_name("pg_probe_fresh");
+    let mut c = pg_connect();
+    // Create + bulk-load but DELIBERATELY never ANALYZE → reltuples stays -1.
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {table};
+         CREATE TABLE {table} (id BIGINT PRIMARY KEY, payload INT NOT NULL);
+         INSERT INTO {table} SELECT g, g FROM generate_series(1, 150000) g;"
+    ))
+    .unwrap();
+    let reltuples: f32 = c
+        .query_one(
+            "SELECT reltuples FROM pg_class WHERE relname = $1",
+            &[&table],
+        )
+        .unwrap()
+        .get(0);
+    assert!(
+        reltuples <= 0.0,
+        "fixture must be un-analyzed (reltuples {reltuples} should be -1/0)"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let out_yaml = dir.path().join("probe.yaml");
+    let out = run_rivet_env(
+        &[
+            "init",
+            "--source",
+            POSTGRES_URL,
+            "--table",
+            &format!("public.{table}"),
+            "-o",
+            out_yaml.to_str().unwrap(),
+        ],
+        &[],
+    );
+    assert!(
+        out.status.success(),
+        "init: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let yaml = std::fs::read_to_string(&out_yaml).unwrap();
+    assert!(
+        yaml.contains("mode: chunked"),
+        "probe must overrule reltuples=-1 on a never-analyzed 150k table:\n{yaml}"
+    );
+    let _ = c.execute(&format!("DROP TABLE IF EXISTS {table}"), &[]);
+}

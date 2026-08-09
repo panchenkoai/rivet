@@ -223,6 +223,21 @@ pub(super) fn density_probe(conn: &mut mysql::PooledConn, info: &mut super::Tabl
             }
         }
     }
+    // #148 sparse-key guard: if the windows barely sampled any rows the key is
+    // too sparse for a windowed estimate — keep the catalog, flag unverified,
+    // rather than replace a sane figure with ~0 garbage.
+    let sampled: i64 = counts.iter().sum();
+    if !super::density::probe_trustworthy(sampled, offsets.len()) {
+        info.density = Some(DensityProbe {
+            rows: catalog,
+            density: 0.0,
+            method: EstimateMethod::Unverified,
+            catalog_rows: catalog,
+            k: offsets.len(),
+            w: PROBE_W,
+        });
+        return;
+    }
     let (rows, density) = estimate_from_windows(min, max, &counts, PROBE_W);
     info.row_estimate = rows;
     info.density = Some(DensityProbe {
