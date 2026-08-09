@@ -601,9 +601,12 @@ fn export_block_lines(
         "time_window" => {
             // time_window REQUIRES time_column (+ days_window) — omitting them
             // scaffolds a config that immediately fails `rivet check`
-            // ("time_window mode requires time_column"). Seed from the best
-            // timestamp column (same resolution as incremental's cursor).
-            match info.chosen_cursor_column() {
+            // ("time_window mode requires time_column"). Seed from a TIMESTAMP
+            // column (chosen_time_column, NOT chosen_cursor_column): the latter
+            // scores an integer surrogate PK as an incremental cursor, so on a
+            // timestamp-less table it would name `time_column: id` — a bigint
+            // compared to a timestamp window at run time (bug hunt 2026-08-09).
+            match info.chosen_time_column() {
                 Some(ts) => lines.push(format!("    time_column: {}", yaml_quote_if_needed(&ts))),
                 None => lines.push(
                     "    # REVIEW: no timestamp column detected — set time_column: <col> manually"
@@ -1132,6 +1135,56 @@ mod tests {
             numeric_precision: None,
             numeric_scale: None,
         }
+    }
+
+    /// Bug hunt 2026-08-09: `time_window`'s `time_column` MUST be a timestamp.
+    /// `chosen_cursor_column` scores an integer surrogate PK as an incremental
+    /// cursor, so on a timestamp-less table it returns the PK — reusing it here
+    /// scaffolded `time_column: id` (a bigint compared to a timestamp window at
+    /// run time). The timestamp-only `chosen_time_column` must yield None → the
+    /// honest REVIEW marker. RED against the `chosen_cursor_column` version.
+    #[test]
+    fn time_window_never_scaffolds_an_integer_pk_as_time_column() {
+        let id_pk = ColumnInfo {
+            name: "id".into(),
+            data_type: "bigint".into(),
+            is_primary_key: true,
+            is_nullable: false,
+            numeric_precision: None,
+            numeric_scale: None,
+        };
+        let info = TableInfo {
+            schema: "public".into(),
+            table: "orders".into(),
+            row_estimate: 1_000_000,
+            total_bytes: Some(1 << 30),
+            columns: vec![
+                id_pk,
+                col("customer_name", "text"),
+                col("amount", "numeric"),
+            ],
+        };
+        // the fixture actually exercises the surrogate-PK trap...
+        assert_eq!(info.chosen_cursor_column().as_deref(), Some("id"));
+        // ...and the timestamp-only picker refuses it.
+        assert_eq!(info.chosen_time_column(), None);
+        let yaml = generate_config(
+            &info,
+            "postgresql://localhost/db",
+            &crate::init::SourceProvenance::Inline,
+            &Default::default(),
+            Some("time_window"),
+            None,
+        )
+        .expect("scaffold");
+        assert!(
+            !yaml.contains("time_column: id"),
+            "must NOT scaffold the integer PK as a time_column:\n{yaml}"
+        );
+        assert!(
+            yaml.contains("REVIEW: no timestamp column detected"),
+            "must emit the honest REVIEW marker:\n{yaml}"
+        );
     }
 
     /// #159 (correctness): the cursor the YAML renders and the cursor the

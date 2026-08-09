@@ -96,6 +96,23 @@ impl TableInfo {
             .map(|c| c.column.clone())
     }
 
+    /// [`chosen_cursor_column`] RESTRICTED to a timestamp column — for
+    /// `time_window`, whose `time_column` MUST be a timestamp. An integer
+    /// surrogate PK is a valid INCREMENTAL cursor (monotonic ids) and
+    /// `cursor_candidates` scores it as one, so `chosen_cursor_column` can return
+    /// `id` on a timestamp-less table; scaffolding that as a `time_column`
+    /// compares a bigint against a timestamp window at run time — an error on
+    /// PostgreSQL, a silently-empty export on MySQL (bug hunt 2026-08-09). Same
+    /// scoring/order as `chosen_cursor_column` among the timestamp candidates, so
+    /// a table WITH a timestamp gets the same column both modes would; `None`
+    /// (no timestamp) drives the honest REVIEW marker instead of a wrong column.
+    pub(crate) fn chosen_time_column(&self) -> Option<String> {
+        crate::init::candidates::cursor_candidates(self)
+            .into_iter()
+            .find(|c| is_timestamp_type(&c.data_type))
+            .map(|c| c.column)
+    }
+
     pub(crate) fn best_cursor_column(&self) -> Option<&str> {
         let ts_cols: Vec<&ColumnInfo> = self
             .columns
@@ -168,6 +185,13 @@ impl TableInfo {
                 // exists, point operators at incremental for scheduled re-runs —
                 // the pilot showed a 655k-row table re-dumped 4× in 2 days under
                 // chunked, re-reading ~570k unchanged rows each time.
+                // Gate the incremental SUGGESTION on best_cursor_column
+                // (timestamp-only): incremental on an integer surrogate PK
+                // catches inserts but MISSES updates, so "pulls only changed
+                // rows" would be false advice — only suggest it when a real
+                // timestamp cursor exists (roast 2026-08-09: the incremental
+                // ARM below names chosen_, but this SUGGESTION must stay
+                // timestamp-gated, unlike an actual incremental export).
                 match self.best_cursor_column() {
                     Some(cursor) => format!(
                         "{base}. NOTE: chunked re-reads the whole table each run — for scheduled \
@@ -176,11 +200,21 @@ impl TableInfo {
                     None => base,
                 }
             }
-            "incremental" => format!(
-                "auto: ~{} rows ≥ 100K threshold; chunk column missing, falling back to incremental on '{}'",
-                fmt_row_estimate(self.row_estimate),
-                self.best_cursor_column().unwrap_or("updated_at"),
-            ),
+            "incremental" => match self.chosen_cursor_column() {
+                Some(cursor) => format!(
+                    "auto: ~{} rows ≥ 100K threshold; chunk column missing, falling back to \
+                     incremental on '{cursor}'",
+                    fmt_row_estimate(self.row_estimate),
+                ),
+                // No timestamp candidate: do NOT name a phantom `updated_at` —
+                // the scaffold emits a REVIEW marker here, so the rationale must
+                // agree (roast 2026-08-09).
+                None => format!(
+                    "auto: ~{} rows ≥ 100K threshold; chunk column missing — set cursor_column \
+                     manually (no timestamp column detected)",
+                    fmt_row_estimate(self.row_estimate),
+                ),
+            },
             "full" => {
                 // full is reached TWO ways: below the 100K threshold, OR above it
                 // with no usable chunk key / cursor column (e.g. a keyless table, or
@@ -1040,6 +1074,45 @@ mod tests {
             total_bytes: None,
             columns: cols,
         }
+    }
+
+    /// A3/A2 (roast 2026-08-09): where best_cursor_column (name-preference) and
+    /// chosen_cursor_column (scored) DIVERGE, every user-facing surface that
+    /// names the cursor must name the CHOSEN one — the column actually written as
+    /// cursor_column — not the name-preferred phantom. Fixture: `updated_at` is
+    /// nullable (name-preferred but -10) and `modified_at` is not-null (scores
+    /// higher). RED against `mode_rationale` reading `best_cursor_column`.
+    #[test]
+    fn mode_rationale_names_the_chosen_cursor_not_the_name_preferred_one() {
+        let nullable_ts = |name: &str| ColumnInfo {
+            name: name.into(),
+            data_type: "timestamp".into(),
+            is_primary_key: false,
+            is_nullable: true,
+            numeric_precision: None,
+            numeric_scale: None,
+        };
+        let info = make_table(
+            500_000,
+            vec![
+                col("payload", "text", false),
+                nullable_ts("updated_at"),
+                col("modified_at", "timestamp", false),
+            ],
+        );
+        // the divergence this test rests on (fixture is not inert)
+        assert_eq!(info.best_cursor_column(), Some("updated_at"));
+        assert_eq!(info.chosen_cursor_column().as_deref(), Some("modified_at"));
+        // the incremental rationale is printed next to `cursor_column: modified_at`
+        let r = info.mode_rationale("incremental");
+        assert!(
+            r.contains("modified_at"),
+            "must name the chosen cursor: {r}"
+        );
+        assert!(
+            !r.contains("updated_at"),
+            "must NOT name the name-preferred phantom: {r}"
+        );
     }
 
     #[test]

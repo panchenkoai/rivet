@@ -148,7 +148,12 @@ impl PgChangeStream {
         let Ok(mut client) = (match tls {
             Some(cfg) if cfg.mode.is_enforced() => crate::source::tls::build_native_tls(cfg)
                 .and_then(|c| {
-                    Client::connect(conn_str, postgres_native_tls::MakeTlsConnector::new(c))
+                    // Force ssl_mode(Require) so the connector is honored — the
+                    // same enforcement the batch path and open() use; without it
+                    // this catalog probe carries credentials in cleartext under
+                    // an enforced verify-full posture (roast 2026-08-09).
+                    super::pg_config_ssl_forced(conn_str)?
+                        .connect(postgres_native_tls::MakeTlsConnector::new(c))
                         .map_err(Into::into)
                 }),
             _ => Client::connect(conn_str, NoTls).map_err(Into::into),
@@ -197,10 +202,14 @@ impl PgChangeStream {
         let mut client = match tls {
             Some(cfg) if cfg.mode.is_enforced() => {
                 let connector = crate::source::tls::build_native_tls(cfg)?;
-                Client::connect(
-                    conn_str,
-                    postgres_native_tls::MakeTlsConnector::new(connector),
-                )?
+                // Force ssl_mode(Require) like the batch path — otherwise
+                // tokio-postgres picks TLS from the URL's sslmode and a
+                // `?sslmode=disable` (or a `prefer` downgrade) ships the CDC
+                // stream in cleartext, ignoring the connector we just built
+                // (roast 2026-08-09: the batch leg was fixed, the CDC leg was
+                // not — the exact posture verify-full is asked to forbid).
+                super::pg_config_ssl_forced(conn_str)?
+                    .connect(postgres_native_tls::MakeTlsConnector::new(connector))?
             }
             _ => Client::connect(conn_str, NoTls)?,
         };
