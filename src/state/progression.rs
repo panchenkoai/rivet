@@ -74,6 +74,17 @@ impl StateStore {
             .flatten())
     }
 
+    /// Stored chunked boundary index for `column`
+    /// (`last_committed_chunk_index` / `last_verified_chunk_index`) — `None` when
+    /// no row or the boundary isn't chunked (index NULL). `column` is a fixed
+    /// literal chosen by the caller, never user input.
+    fn chunk_boundary_index(&self, export_name: &str, column: &str) -> Result<Option<i64>> {
+        let sql = format!("SELECT {column} FROM export_progression WHERE export_name = ?1");
+        Ok(self
+            .query_opt(&sql, &[export_name.into()], |r| r.opt_i64(0))?
+            .flatten())
+    }
+
     /// Record a successful chunked-run commit: the highest completed `chunk_index` for this run.
     pub fn record_committed_chunked(
         &self,
@@ -81,6 +92,16 @@ impl StateStore {
         highest_chunk_index: i64,
         run_id: &str,
     ) -> Result<()> {
+        // Never REGRESS the committed boundary: a later run that committed FEWER
+        // chunks (a smaller re-run) must not lower it — mirror the
+        // cursor_advances guard record_committed_cursor uses (bug hunt
+        // 2026-08-09; the incremental path guarded, chunked did not).
+        if let Some(stored) =
+            self.chunk_boundary_index(export_name, "last_committed_chunk_index")?
+            && highest_chunk_index <= stored
+        {
+            return Ok(());
+        }
         let now = Utc::now().to_rfc3339();
         let sql = "INSERT INTO export_progression (
                 export_name,
@@ -112,6 +133,12 @@ impl StateStore {
         highest_chunk_index: i64,
         run_id: &str,
     ) -> Result<()> {
+        // Same no-regress guard as record_committed_chunked (bug hunt 2026-08-09).
+        if let Some(stored) = self.chunk_boundary_index(export_name, "last_verified_chunk_index")?
+            && highest_chunk_index <= stored
+        {
+            return Ok(());
+        }
         let now = Utc::now().to_rfc3339();
         let sql = "INSERT INTO export_progression (
                 export_name,
@@ -268,6 +295,33 @@ mod tests {
         let p = s.get_progression("orders").unwrap();
         assert!(p.committed.is_none());
         assert!(p.verified.is_none());
+    }
+
+    #[test]
+    fn committed_chunked_boundary_does_not_regress() {
+        // A later run that committed FEWER chunks must not lower the boundary —
+        // the same no-regress guard the incremental path has (bug hunt
+        // 2026-08-09). RED against the unconditional ON CONFLICT overwrite.
+        let s = store();
+        s.record_committed_chunked("orders", 40, "runA").unwrap();
+        s.record_committed_chunked("orders", 9, "runB").unwrap(); // must be ignored
+        let p = s.get_progression("orders").unwrap();
+        let idx = p
+            .committed
+            .expect("committed boundary present")
+            .chunk_index
+            .expect("chunked boundary carries a chunk_index");
+        assert_eq!(idx, 40, "boundary must not regress from 40 to 9");
+        // a genuine advance still moves it
+        s.record_committed_chunked("orders", 55, "runC").unwrap();
+        let idx2 = s
+            .get_progression("orders")
+            .unwrap()
+            .committed
+            .unwrap()
+            .chunk_index
+            .unwrap();
+        assert_eq!(idx2, 55, "a higher index must advance the boundary");
     }
 
     #[test]

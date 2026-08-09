@@ -1297,3 +1297,74 @@ exports:
         "resume must be accepted with page_size (keyset paging)"
     );
 }
+
+// ── gzip level ceiling + CDC typo'd keys (roast 2026-08-09) ─────────────────
+
+#[test]
+fn gzip_compression_level_above_9_rejected() {
+    // parquet's GzipLevel maxes at 9; level 10 was accepted here but errors at
+    // write time. RED against the pre-fix `> 10` guard.
+    let yaml = r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: t
+    table: events
+    format: parquet
+    compression: gzip
+    compression_level: 10
+    destination:
+      type: local
+      path: ./out
+"#;
+    let msg = format!("{:#}", Config::from_yaml(yaml).unwrap_err());
+    assert!(msg.contains("gzip"), "names the codec: {msg}");
+    assert!(msg.contains("0..9"), "states the real ceiling: {msg}");
+}
+
+#[test]
+fn gzip_compression_level_9_accepted() {
+    let yaml = r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: t
+    table: events
+    format: parquet
+    compression: gzip
+    compression_level: 9
+    destination:
+      type: local
+      path: ./out
+"#;
+    assert!(Config::from_yaml(yaml).is_ok(), "level 9 is the valid max");
+}
+
+#[test]
+fn cdc_typoed_key_rejected_not_silently_defaulted() {
+    // `deny_unknown_fields` on CdcExportConfig: a mistyped knob (checkpont) must
+    // fail at load, not silently default checkpoint=None (RED against the struct
+    // without deny_unknown_fields).
+    let yaml = r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: t
+    mode: cdc
+    table: events
+    format: parquet
+    cdc:
+      checkpont: /tmp/x
+      slot: s
+    destination:
+      type: local
+      path: ./out
+"#;
+    assert!(
+        Config::from_yaml(yaml).is_err(),
+        "a typo'd CDC key must be rejected, not silently defaulted"
+    );
+}

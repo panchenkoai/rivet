@@ -332,11 +332,18 @@ pub fn build_time_window_query(
 
     let condition = match time_type {
         TimeColumnType::Timestamp => {
-            format!(
-                "{} >= '{}'",
-                quoted_col,
-                truncated.format("%Y-%m-%d %H:%M:%S")
-            )
+            // SQL Server parses a space-separated `'YYYY-MM-DD hh:mm:ss'` literal
+            // per the login's DATEFORMAT (which follows LANGUAGE) — on a non-
+            // us_english login '2026-03-03 …' can be read as 3 May, silently
+            // shifting the window or erroring when the swapped month exceeds 12.
+            // ISO-8601 with a 'T' is DATEFORMAT/LANGUAGE-immune on MSSQL (mirrors
+            // partition.rs's date-literal rule); PG/MySQL keep the space form,
+            // which they parse ISO-unambiguously (bug hunt 2026-08-09).
+            let lit = match source_type {
+                crate::config::SourceType::Mssql => truncated.format("%Y-%m-%dT%H:%M:%S"),
+                _ => truncated.format("%Y-%m-%d %H:%M:%S"),
+            };
+            format!("{quoted_col} >= '{lit}'")
         }
         TimeColumnType::Unix => {
             format!("{} >= {}", quoted_col, truncated.and_utc().timestamp())
@@ -492,6 +499,28 @@ mod tests {
         );
         assert!(q.contains("\"created_at\" >= '"), "got: {}", q);
         assert!(q.contains("_rivet WHERE"));
+    }
+
+    #[test]
+    fn build_time_window_query_timestamp_mssql_is_dateformat_immune() {
+        // MSSQL must get an ISO-8601 'T' literal — a space-separated literal is
+        // parsed per the login's DATEFORMAT/LANGUAGE and shifts the window on a
+        // non-us_english login (bug hunt 2026-08-09). RED against the space form.
+        let q = build_time_window_query(
+            "SELECT * FROM events",
+            "created_at",
+            TimeColumnType::Timestamp,
+            7,
+            SourceType::Mssql,
+        );
+        assert!(
+            q.contains("] >= '") && q.contains("T00:00:00'"),
+            "MSSQL literal must be ISO-8601 with a 'T' separator: {q}"
+        );
+        assert!(
+            !q.contains(" 00:00:00'"),
+            "MSSQL literal must NOT use the DATEFORMAT-dependent space form: {q}"
+        );
     }
 
     #[test]

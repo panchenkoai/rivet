@@ -1004,9 +1004,12 @@ impl Config {
                     }
                 }
                 CompressionType::Gzip => {
-                    if level > 10 {
+                    // parquet's GzipLevel maxes at 9 (MAXIMUM_LEVEL); level 10 was
+                    // accepted here but panics/errors at write time in
+                    // GzipLevel::try_new (bug hunt 2026-08-09).
+                    if level > 9 {
                         anyhow::bail!(
-                            "export '{}': gzip compression_level must be 0..10, got {}",
+                            "export '{}': gzip compression_level must be 0..9, got {}",
                             export.name,
                             level
                         );

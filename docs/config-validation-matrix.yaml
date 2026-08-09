@@ -95,3 +95,13 @@ scenarios:
     what: "source.mongo.resume: true with NO page_size — resume is keyset-only; the full-scan path (no page_size) reads no checkpoint, so resume was silently ignored (whole collection re-read every run). Now rejected naming page_size; resume + page_size still LOADS."
     rejected_wrong_mode: { test: mongo_resume_without_page_size_rejected }
     valid_form_accepted: { test: mongo_resume_accepted_with_page_size }
+
+  - id: gzip_level_above_9
+    what: "gzip compression_level 10 was accepted (guard was `> 10`) but parquet's GzipLevel maxes at 9 — it errored at write time. Now rejected at load naming the 0..9 ceiling; level 9 still LOADS."
+    rejected_wrong_mode: { test: gzip_compression_level_above_9_rejected }
+    valid_form_accepted: { test: gzip_compression_level_9_accepted }
+
+  - id: cdc_typoed_key
+    what: "a mistyped CDC knob (e.g. `checkpont`) was silently accepted and defaulted (checkpoint=None) — CdcExportConfig lacked deny_unknown_fields. Now rejected at load."
+    rejected_wrong_mode: { test: cdc_typoed_key_rejected_not_silently_defaulted }
+    valid_form_accepted: { na: "the accept side is every existing passing cdc config in this file + the cdc goldens" }
