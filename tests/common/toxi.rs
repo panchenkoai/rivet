@@ -103,6 +103,26 @@ pub fn toxi_add_latency(proxy: &str, latency_ms: u64) -> String {
     toxic_name
 }
 
+/// Cap the proxy's throughput at `rate_kbps` KB/s — the SHARED-LINK simulator
+/// (#166 GA): the client field run showed 60 concurrent exports moving ~0.25
+/// MB/s AGGREGATE over one tunnel, i.e. per-connection parallelism split one
+/// ceiling instead of adding throughput. A pool run through this toxic is the
+/// honest test of the LPT model on a bandwidth-bound source: it must still
+/// complete correctly, and its makespan claim must not be trusted blindly.
+/// `stream`: "downstream" caps server→client (query results — the read leg).
+pub fn toxi_add_bandwidth(proxy: &str, rate_kbps: u64, stream: &str) -> String {
+    let toxic_name = unique_name("rivet_bw");
+    let payload = format!(
+        r#"{{"name":"{toxic_name}","type":"bandwidth","stream":"{stream}","toxicity":1.0,"attributes":{{"rate":{rate_kbps}}}}}"#
+    );
+    let (code, body) = toxi_admin("POST", &format!("/proxies/{proxy}/toxics"), Some(&payload));
+    assert!(
+        code == 200,
+        "add bandwidth to {proxy}: status {code}, body:\n{body}"
+    );
+    toxic_name
+}
+
 /// Cut the connection after `bytes` of downstream data — a DETERMINISTIC
 /// mid-stream network failure (unlike latency/timeout, the cut point does not
 /// depend on timing). Simulates a binlog/replication connection dying partway

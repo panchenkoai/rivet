@@ -20,12 +20,29 @@ use super::chunked::ChunkSource;
 use super::summary::ApplyContext;
 
 /// Entry point for `rivet apply <plan-file> [--parallel-export-processes] [--resume] [--force]`.
-pub fn run_apply_command(plan_file: &str, force: bool, parallel: bool, resume: bool) -> Result<()> {
+pub fn run_apply_command(
+    plan_file: &str,
+    force: bool,
+    parallel: bool,
+    resume: bool,
+    pool: Option<usize>,
+) -> Result<()> {
     // A YAML config selects the wave-ordered multi-export path (plan→apply
-    // cycle): run every export wave-by-wave in ascending `wave:` order. A JSON
-    // plan artifact falls through to the sealed single-export replay below.
+    // cycle): run every export wave-by-wave in ascending `wave:` order — or,
+    // with `--pool N`, as one bounded work-stealing pool (#166). A JSON plan
+    // artifact falls through to the sealed single-export replay below.
     if plan_file.ends_with(".yaml") || plan_file.ends_with(".yml") {
+        if let Some(m) = pool {
+            return super::run::run_pool(plan_file, force, resume, m);
+        }
         return super::run::run_waves(plan_file, force, parallel, resume);
+    }
+    if pool.is_some() {
+        anyhow::bail!(
+            "--pool schedules a whole CONFIG's exports (it needs the full set to order by \
+             duration) and does not apply to a sealed single-export plan artifact. Pass the \
+             YAML config instead: `rivet apply <config.yaml> --pool N`."
+        );
     }
     if parallel || resume {
         log::warn!(
@@ -400,7 +417,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let path = write_artifact(&dir, &artifact);
 
-        let err = run_apply_command(&path, false, false, false).unwrap_err();
+        let err = run_apply_command(&path, false, false, false, None).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("hours old") || msg.contains("24 h"),
@@ -418,7 +435,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let path = write_artifact(&dir, &artifact);
 
-        let err = run_apply_command(&path, false, false, false).unwrap_err();
+        let err = run_apply_command(&path, false, false, false, None).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("drifted") || msg.contains("cursor"),
@@ -430,8 +447,14 @@ mod tests {
 
     #[test]
     fn missing_plan_file_returns_error() {
-        let err = run_apply_command("/tmp/rivet_nonexistent_xyzxyz.json", false, false, false)
-            .unwrap_err();
+        let err = run_apply_command(
+            "/tmp/rivet_nonexistent_xyzxyz.json",
+            false,
+            false,
+            false,
+            None,
+        )
+        .unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("cannot read") || msg.contains("No such file"),
@@ -444,7 +467,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("plan.json");
         std::fs::write(&path, b"not valid json at all").unwrap();
-        let err = run_apply_command(path.to_str().unwrap(), false, false, false).unwrap_err();
+        let err = run_apply_command(path.to_str().unwrap(), false, false, false, None).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("invalid plan") || msg.contains("JSON") || msg.contains("expected"),
@@ -475,7 +498,7 @@ mod tests {
         let tampered = json.replace("SELECT 1", "SELECT * FROM secrets");
         std::fs::write(&path, &tampered).unwrap();
 
-        let err = run_apply_command(&path, false, false, false).unwrap_err();
+        let err = run_apply_command(&path, false, false, false, None).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("integrity check failed") && msg.contains("modified after planning"),
@@ -483,7 +506,7 @@ mod tests {
         );
 
         // And --force must NOT override it — a hand-edited contract is not opt-in.
-        let err_forced = run_apply_command(&path, true, false, false).unwrap_err();
+        let err_forced = run_apply_command(&path, true, false, false, None).unwrap_err();
         let msg_forced = format!("{err_forced:#}");
         assert!(
             msg_forced.contains("integrity check failed"),

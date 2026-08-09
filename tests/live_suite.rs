@@ -165,6 +165,8 @@ mod live_plan_apply;
 mod live_plan_output_ux;
 #[path = "live/live_pool_safety.rs"]
 mod live_pool_safety;
+#[path = "live/live_pool_toxiproxy.rs"]
+mod live_pool_toxiproxy;
 #[path = "live/live_reconcile_repair.rs"]
 mod live_reconcile_repair;
 #[path = "live/live_resume.rs"]

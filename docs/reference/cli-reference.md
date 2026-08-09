@@ -391,6 +391,7 @@ Execute a sealed plan artifact, or run a config's exports wave-by-wave
 * `--parallel-export-processes` — Run the cheap (low-cost) exports within each wave concurrently, as separate processes (same as `parallel_export_processes: true` in the config). Config-wave mode only; heavier exports — which already chunk-parallelize internally — still run one at a time
 * `--resume` — Config-wave mode: skip exports a prior run already completed (`_SUCCESS` present) and resume incomplete chunked exports from their checkpoints, so a re-run after a partial failure does not redo finished tables. Independent tables are never re-exported
 * `--force` — Skip staleness check (allow plans older than 24 h)
+* `--pool <N>` — Run the whole config as ONE bounded work-stealing pool of N export slots (config mode only, #166): exports start longest-first (LPT, by each export's last measured duration) and every freeing slot pulls the next — no wave barriers, so the wall approaches `max(longest, total/N)`. Priority `wave:` tiers are NOT honored (makespan mode); exports that are not `parallel_safe` never run concurrently with EACH OTHER (one heavy at a time; cheap exports backfill the remaining slots)
 
 
 
