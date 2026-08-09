@@ -89,7 +89,10 @@ impl StateStore {
                      AND NOT EXISTS (
                          SELECT 1 FROM run_status r2
                          WHERE r2.export_name = r.export_name
-                           AND r2.started_at > r.started_at)
+                           AND r2.started_at > r.started_at
+                           AND (rtrim(r2.prefix, '/') = rtrim(r.prefix, '/')
+                                OR r2.prefix LIKE rtrim(r.prefix, '/') || '/%'
+                                OR rtrim(r.prefix, '/') LIKE rtrim(r2.prefix, '/') || '/%'))
                    LIMIT 1";
         Ok(self.query_opt(sql, &[prefix.into()], |_| ())?.is_some())
     }
@@ -113,7 +116,10 @@ impl StateStore {
                      AND NOT EXISTS (
                          SELECT 1 FROM run_status r2
                          WHERE r2.export_name = r.export_name
-                           AND r2.started_at > r.started_at)";
+                           AND r2.started_at > r.started_at
+                           AND (rtrim(r2.prefix, '/') = rtrim(r.prefix, '/')
+                                OR r2.prefix LIKE rtrim(r.prefix, '/') || '/%'
+                                OR rtrim(r.prefix, '/') LIKE rtrim(r2.prefix, '/') || '/%'))";
         Ok(self
             .query(sql, &[prefix.into()], |r| r.text(0))?
             .into_iter()
