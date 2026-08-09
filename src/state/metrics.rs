@@ -172,7 +172,7 @@ impl StateStore {
     /// rows and every sum over the table would count it five times. Hence UPDATE
     /// the run's `running` row, INSERT only when there is none, and let
     /// [`record_metric_full`] clear it when the terminal row lands.
-    pub(super) fn project_running_aggregate(
+    pub(crate) fn project_running_aggregate(
         &self,
         run_id: &str,
         export_name: &str,

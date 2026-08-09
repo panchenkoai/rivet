@@ -98,6 +98,29 @@ pub fn fetch_manifests_keyed(
                 .with_context(|| format!("parsing manifest {key}"))?;
             Ok((key, m))
         })
+        .collect::<Result<Vec<_>>>()
+        .map(dedupe_by_run_id)
+}
+
+/// One manifest per RUN: the canonical `manifest.json` is a last-writer-wins
+/// POINTER to the latest run, so when its run_id is also present as an immutable
+/// `manifest-<run_id>.json` copy, keep the copy and drop the pointer (the
+/// double-count guard). A run_id present ONLY under the canonical name — a
+/// legacy run predating the run-unique copies — survives, so an upgraded prefix
+/// still counts it (#173).
+fn dedupe_by_run_id(keyed: Vec<(String, RunManifest)>) -> Vec<(String, RunManifest)> {
+    let copy_run_ids: std::collections::HashSet<&str> = keyed
+        .iter()
+        .filter(|(k, _)| is_run_unique_manifest(k.rsplit('/').next().unwrap_or("")))
+        .map(|(_, m)| m.run_id.as_str())
+        .collect();
+    keyed
+        .iter()
+        .cloned()
+        .filter(|(k, m)| {
+            is_run_unique_manifest(k.rsplit('/').next().unwrap_or(""))
+                || !copy_run_ids.contains(m.run_id.as_str())
+        })
         .collect()
 }
 
@@ -382,23 +405,13 @@ fn list_manifest_keys(store: &GcsStore, base: &str) -> Result<Vec<String>> {
         .into_iter()
         .filter(|k| is_manifest_key(k))
         .collect();
-    // A run into a shared prefix leaves BOTH the canonical `manifest.json`
-    // (last-writer-wins — a pointer to the LATEST run) and an immutable
-    // `manifest-<run_id>.json` copy (one per run). Sum the per-run copies so a
-    // prefix that accumulated several CDC/incremental cycles counts EVERY run;
-    // counting the canonical pointer too would double-count the latest. Fall
-    // back to the canonical name only when no per-run copy exists (a single
-    // batch run, or a legacy prefix predating the run-unique copy).
-    let run_unique: Vec<String> = all
-        .iter()
-        .filter(|k| is_run_unique_manifest(k.rsplit('/').next().unwrap_or("")))
-        .cloned()
-        .collect();
-    Ok(if run_unique.is_empty() {
-        all
-    } else {
-        run_unique
-    })
+    // Return EVERY manifest key — the canonical `manifest.json` pointer AND the
+    // immutable `manifest-<run_id>.json` copies. The double-count guard is a
+    // RUN-ID dedupe in `fetch_manifests_keyed` (post-parse), not a name filter
+    // here: the old "copies win when any exist" rule silently DROPPED a legacy
+    // run whose only record is the canonical name on a prefix that later gained
+    // run-unique copies — an upgrade-compat under-count (roast 2026-08-09, #173).
+    Ok(all)
 }
 
 /// A listed key is a run manifest iff its final path segment is the canonical
@@ -1619,24 +1632,58 @@ mod tests {
     }
 
     #[test]
-    fn list_manifest_keys_prefers_run_unique_copies_over_the_canonical_pointer() {
-        // A shared prefix that accumulated two runs holds the last-writer-wins
-        // `manifest.json` pointer AND one immutable per-run copy each. Summing
-        // must count the two run copies, never the pointer (double-count guard).
-        let (store, _g) = fs_store(&[
-            ("base/manifest.json", b"{}".to_vec()),
-            ("base/manifest-r1.json", b"{}".to_vec()),
-            ("base/manifest-r2.json", b"{}".to_vec()),
-            ("base/part-0.parquet", b"x".to_vec()), // data file: not a manifest
-        ]);
-        let mut keys = list_manifest_keys(&store, "base").unwrap();
-        keys.sort();
-        assert_eq!(
-            keys,
-            vec![
+    fn dedupe_drops_the_pointer_but_keeps_a_legacy_canonical_only_run() {
+        // The double-count guard moved from the KEY level to the RUN-ID level
+        // (#173): the canonical pointer is dropped when its run_id also exists
+        // as an immutable copy — but a LEGACY run whose only record IS the
+        // canonical name (pre-copy prefix that later gained copies) must
+        // survive. The old "copies win when any exist" key filter silently
+        // dropped it (upgrade-compat under-count); RED against that filter.
+        //
+        // Case 1: pointer's run_id (r2) is covered by a copy → pointer dropped.
+        let keyed = vec![
+            (
+                "base/manifest.json".to_string(),
+                serde_json::from_slice::<RunManifest>(&manifest_bytes("r2", 40, Some(40))).unwrap(),
+            ),
+            (
                 "base/manifest-r1.json".to_string(),
+                serde_json::from_slice::<RunManifest>(&manifest_bytes("r1", 100, Some(100)))
+                    .unwrap(),
+            ),
+            (
                 "base/manifest-r2.json".to_string(),
-            ]
+                serde_json::from_slice::<RunManifest>(&manifest_bytes("r2", 40, Some(40))).unwrap(),
+            ),
+        ];
+        let mut ids: Vec<String> = dedupe_by_run_id(keyed)
+            .into_iter()
+            .map(|(_, m)| m.run_id)
+            .collect();
+        ids.sort();
+        assert_eq!(ids, vec!["r1".to_string(), "r2".to_string()]);
+
+        // Case 2: the canonical names a LEGACY run (r0) no copy covers → kept.
+        let keyed = vec![
+            (
+                "base/manifest.json".to_string(),
+                serde_json::from_slice::<RunManifest>(&manifest_bytes("r0", 7, Some(7))).unwrap(),
+            ),
+            (
+                "base/manifest-r1.json".to_string(),
+                serde_json::from_slice::<RunManifest>(&manifest_bytes("r1", 100, Some(100)))
+                    .unwrap(),
+            ),
+        ];
+        let mut ids: Vec<String> = dedupe_by_run_id(keyed)
+            .into_iter()
+            .map(|(_, m)| m.run_id)
+            .collect();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec!["r0".to_string(), "r1".to_string()],
+            "a legacy canonical-only run must not be silently dropped"
         );
     }
 

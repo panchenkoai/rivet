@@ -579,6 +579,29 @@ fn run_keyset_parallel(
                         .push(format!("range {ridx}: checkpoint commit: {e:#}"));
                     return;
                 }
+                // Project the in-flight `running` aggregate from file_log, so the
+                // part-landed / aggregate-projected pair travels together on this
+                // runner like the other three (roast 2026-08-09, #173: keyset was
+                // the one runner whose mid-run metrics row lagged its parts).
+                // Best-effort observability over a fresh at-ref connection — the
+                // projection is race-safe by construction (INSERT ON CONFLICT +
+                // recompute-UPDATE) and never gates the checkpoint above.
+                if let Some(sref) = sref_r
+                    && let Err(e) = crate::state::StateStore::open_at_ref(sref).and_then(|st| {
+                        st.project_running_aggregate(
+                            rid_r,
+                            &plan_r.export_name,
+                            plan_r.strategy.mode_label(),
+                            plan_r.format.label(),
+                        )
+                    })
+                {
+                    log::warn!(
+                        "export '{}': running-aggregate projection failed for range {ridx} \
+                         (checkpoint is durable; metrics row will catch up at finalize): {e:#}",
+                        plan_r.export_name
+                    );
+                }
                 // Crash simulation: this range is now durably `done` in the state DB,
                 // but the run has NOT finalized — a resume must skip it (rehydrate its
                 // parts) and re-run only the ranges that never reached here.

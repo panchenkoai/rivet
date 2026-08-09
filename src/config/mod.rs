@@ -318,17 +318,11 @@ impl Config {
     /// check serde silently ignores unknown keys and the user gets unexpected
     /// defaults (e.g. batch_size=10 000 instead of the intended 1 000).
     fn check_misplaced_tuning_fields(yaml: &str) -> crate::error::Result<()> {
-        const TUNING_FIELDS: &[&str] = &[
-            "batch_size",
-            "batch_size_memory_mb",
-            "throttle_ms",
-            "statement_timeout_s",
-            "max_retries",
-            "retry_backoff_ms",
-            "lock_timeout_s",
-            "memory_threshold_mb",
-            "profile",
-        ];
+        // Every TuningConfig field — drift-guarded generatively against the
+        // struct's own JsonSchema (misplaced_tuning_list_covers_every_field):
+        // the old hand list froze at 9 of 14, so the newest five knobs misplaced
+        // at source-level were silently ignored (roast 2026-08-09, #173).
+        const TUNING_FIELDS: &[&str] = crate::config::TUNING_FIELD_NAMES;
 
         let root: serde_yaml_ng::Value = serde_yaml_ng::from_str(yaml)?;
 
@@ -2306,3 +2300,24 @@ mod sec_config_validation {
         );
     }
 }
+
+/// Every field of [`crate::tuning::TuningConfig`], for the misplaced-field
+/// detector. Kept in ONE place and generatively drift-guarded against the
+/// struct's JsonSchema, so a new tuning knob cannot be silently invisible to
+/// the misplaced-key check (#173).
+pub(crate) const TUNING_FIELD_NAMES: &[&str] = &[
+    "profile",
+    "batch_size",
+    "batch_size_memory_mb",
+    "throttle_ms",
+    "statement_timeout_s",
+    "max_retries",
+    "retry_backoff_ms",
+    "lock_timeout_s",
+    "memory_threshold_mb",
+    "max_batch_memory_mb",
+    "on_batch_memory_exceeded",
+    "adaptive",
+    "min_parallel",
+    "max_value_mb",
+];
