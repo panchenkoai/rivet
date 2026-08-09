@@ -173,6 +173,40 @@ impl TxnSeq {
     }
 }
 
+/// Closes a buffered source transaction (#158): the at-least-once contract's
+/// load-bearing rule, previously four inline copies inside live-server `fill`
+/// loops (mysql/pg/mssql), each re-deriving the same loss argument in prose —
+/// the exact shape that shipped the PG/MSSQL `committed:true`-on-every-event
+/// bugs (see CLAUDE.md's committed-flag section).
+///
+/// The rule: stamp the group's commit `position` on EVERY event, and mark ONLY
+/// its LAST event `committed`. The sink rolls (flush → checkpoint → ack) on a
+/// `committed` event, so marking every event committed would roll + checkpoint
+/// MID-transaction and a crash before the tail's flush would advance the resume
+/// position past the commit — resume reads strictly after it and skips the tail
+/// (an at-least-once break). Each engine's group DETECTION stays engine-side
+/// (XID / BEGIN…COMMIT / __$start_lsn run); only the CLOSE is shared here.
+pub(crate) struct TxnFramer;
+
+impl TxnFramer {
+    /// Frame one committed source transaction: `position = commit` on all,
+    /// `committed = true` on the last event only. Empty group is a no-op.
+    pub(crate) fn close_group(events: &mut [ChangeEvent], commit: &Position) {
+        let n = events.len();
+        for (i, ev) in events.iter_mut().enumerate() {
+            ev.position = commit.clone();
+            ev.committed = i + 1 == n;
+        }
+    }
+
+    /// Mongo's model: each change-stream event IS its own commit, so every
+    /// event is a boundary. A NAMED decision, not a divergence (#158). `position`
+    /// is already per-event here, so this only sets the flag.
+    pub(crate) fn single_event_commit(event: &mut ChangeEvent) {
+        event.committed = true;
+    }
+}
+
 impl ChangeEvent {
     /// Rough in-memory footprint of this buffered change — drives the sink's
     /// memory-budget rollover (`rollover_memory_mb`). The before/after value
@@ -1221,6 +1255,71 @@ mod tests {
                 "{bad:?} → {err}"
             );
         }
+    }
+
+    fn framer_ev(id: i64) -> super::ChangeEvent {
+        super::ChangeEvent {
+            op: super::ChangeOp::Insert,
+            schema: "public".into(),
+            table: "orders".into(),
+            before: None,
+            after: Some(vec![RivetValue::Int(id)]),
+            position: Position(serde_json::json!({ "lsn": "stale" })),
+            committed: false,
+            image_names: None,
+            seq: 0,
+            poison: None,
+        }
+    }
+
+    /// #158: the shared transaction close — commit position on ALL, committed on
+    /// the LAST only. RED against a `committed:true`-on-every-event mutant (the
+    /// exact shape that shipped the PG/MSSQL bugs).
+    #[test]
+    fn txn_framer_close_group_marks_only_the_last_committed() {
+        let commit = Position(serde_json::json!({ "lsn": "COMMIT" }));
+
+        // N-event group: every event gets the commit position; only the last
+        // is committed.
+        let mut g: Vec<super::ChangeEvent> = (0..4).map(framer_ev).collect();
+        super::TxnFramer::close_group(&mut g, &commit);
+        assert!(g.iter().all(|e| e.position == commit), "commit on all");
+        assert_eq!(
+            g.iter().map(|e| e.committed).collect::<Vec<_>>(),
+            vec![false, false, false, true],
+            "only the last event of a transaction is committed"
+        );
+
+        // 1-event group: that single event IS the boundary.
+        let mut one = vec![framer_ev(9)];
+        super::TxnFramer::close_group(&mut one, &commit);
+        assert!(one[0].committed && one[0].position == commit);
+
+        // Two groups back-to-back: each ends with exactly one committed.
+        let c1 = Position(serde_json::json!({ "lsn": "C1" }));
+        let c2 = Position(serde_json::json!({ "lsn": "C2" }));
+        let mut a: Vec<super::ChangeEvent> = (0..2).map(framer_ev).collect();
+        let mut b: Vec<super::ChangeEvent> = (0..3).map(framer_ev).collect();
+        super::TxnFramer::close_group(&mut a, &c1);
+        super::TxnFramer::close_group(&mut b, &c2);
+        assert_eq!(a.iter().filter(|e| e.committed).count(), 1);
+        assert_eq!(b.iter().filter(|e| e.committed).count(), 1);
+        assert!(a.iter().all(|e| e.position == c1));
+        assert!(b.iter().all(|e| e.position == c2));
+
+        // Empty group: no-op, no panic.
+        let mut empty: Vec<super::ChangeEvent> = Vec::new();
+        super::TxnFramer::close_group(&mut empty, &commit);
+        assert!(empty.is_empty());
+    }
+
+    /// Mongo's named single-event-commit model.
+    #[test]
+    fn txn_framer_single_event_commit_marks_the_event() {
+        let mut e = framer_ev(1);
+        assert!(!e.committed);
+        super::TxnFramer::single_event_commit(&mut e);
+        assert!(e.committed);
     }
 
     #[test]

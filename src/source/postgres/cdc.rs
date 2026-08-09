@@ -358,21 +358,15 @@ impl PgChangeStream {
                             self.yielded_data = true;
                         }
                         let commit = Position(json!({ "lsn": lsn }));
-                        // `committed` marks the COMMIT BOUNDARY, and the sink
-                        // only rolls (flush → checkpoint → ack) on a committed
-                        // event — "never split a transaction across parts". Every
-                        // event `parse_test_decoding` builds carries
-                        // `committed: true`, but they all belong to ONE source
-                        // transaction here, so mark ONLY THE LAST one committed
-                        // (mirroring MySQL's XID model). Otherwise a transaction
-                        // larger than `rollover` rolls + acks MID-transaction,
-                        // and a crash between that ack and the tail's flush loses
-                        // the un-flushed tail (the slot advanced past the commit,
-                        // so resume never re-reads it — an at-least-once break).
-                        let n = tx.len();
-                        for (i, mut ev) in tx.drain(..).enumerate() {
-                            ev.position = commit.clone();
-                            ev.committed = i + 1 == n;
+                        // #158: the shared close — commit LSN on all, committed on
+                        // the last only (BEGIN…COMMIT frames one transaction here).
+                        // Otherwise a transaction larger than `rollover` rolls +
+                        // acks MID-transaction and a crash before the tail's flush
+                        // loses it (the slot advanced past the commit — resume
+                        // never re-reads it, an at-least-once break).
+                        let mut group: Vec<ChangeEvent> = std::mem::take(&mut tx);
+                        crate::source::cdc::TxnFramer::close_group(&mut group, &commit);
+                        for ev in group {
                             self.pending.push_back(ev);
                         }
                         self.frontier = commit_lsn;

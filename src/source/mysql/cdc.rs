@@ -371,12 +371,12 @@ impl MysqlChangeStream {
                     return Ok(false);
                 }
                 let commit = Position(json!({ "file": self.file, "pos": log_pos }));
-                let tx: Vec<ChangeEvent> = self.tx.drain(..).collect();
+                let mut tx: Vec<ChangeEvent> = self.tx.drain(..).collect();
                 self.tx_bytes = 0;
-                let n = tx.len();
-                for (i, mut ev) in tx.into_iter().enumerate() {
-                    ev.position = commit.clone();
-                    ev.committed = i + 1 == n;
+                // #158: the shared close — commit position on all, committed on
+                // the last only (the XID marks the whole transaction's boundary).
+                crate::source::cdc::TxnFramer::close_group(&mut tx, &commit);
+                for ev in tx {
                     self.pending.push_back(ev);
                 }
             }
