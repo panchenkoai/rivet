@@ -681,14 +681,25 @@ impl MssqlChangeStream {
                 );
             }
         }
-        // Mark the commit boundary: a row is the last of its transaction when it
-        // is the final row of the batch OR the next row has a different start LSN.
-        let n = batch.len();
-        for i in 0..n {
-            let is_boundary = i + 1 == n || batch[i].0 != batch[i + 1].0;
-            batch[i].1.committed = is_boundary;
+        // #158: a batch holds one or more transactions, each a run of rows
+        // sharing `__$start_lsn`. Close EACH run through the shared framer —
+        // committed on the run's last row only (position is already the run's
+        // lsn, so close_group's position stamp is a no-op confirming it). The
+        // per-run split is MSSQL's engine-specific group detection; the CLOSE
+        // is shared. Marking every row committed would roll mid-transaction.
+        let lsns: Vec<String> = batch.iter().map(|(l, _)| l.clone()).collect();
+        let mut evs: Vec<ChangeEvent> = batch.into_iter().map(|(_, e)| e).collect();
+        let mut start = 0;
+        while start < evs.len() {
+            let mut end = start + 1;
+            while end < evs.len() && lsns[end] == lsns[start] {
+                end += 1;
+            }
+            let commit = Position(json!({ "lsn": lsns[start] }));
+            crate::source::cdc::TxnFramer::close_group(&mut evs[start..end], &commit);
+            start = end;
         }
-        for (_, ev) in batch {
+        for ev in evs {
             self.pending.push_back(ev);
         }
         match max_lsn {

@@ -424,7 +424,7 @@ fn to_change_event(
         _ => (None, Some(image)),
     };
 
-    Ok(ChangeEvent {
+    let mut ev = ChangeEvent {
         op,
         schema: db_name.to_string(),
         table,
@@ -432,12 +432,16 @@ fn to_change_event(
         after,
         // The per-event resume token is the exact re-open position.
         position: encode_resume_token(&cse.id)?,
-        // Every change-stream event is already committed (post-commit oplog).
-        committed: true,
+        committed: false,
         image_names: Some(std::sync::Arc::clone(&IMAGE_NAMES)),
         seq: 0, // stamped by TxnSeq as the stream is consumed
         poison: None,
-    })
+    };
+    // #158: Mongo's model — each change-stream event IS its own commit (post-
+    // commit oplog), so every event is a boundary. A NAMED decision via the
+    // shared framer, not an inline `committed: true` that reads as a divergence.
+    crate::source::cdc::TxnFramer::single_event_commit(&mut ev);
+    Ok(ev)
 }
 
 impl ChangeStream for MongoChangeStream {
