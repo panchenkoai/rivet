@@ -123,6 +123,7 @@ mod tests {
 
     fn table(cols: Vec<ColumnInfo>) -> TableInfo {
         TableInfo {
+            density: None,
             schema: "public".into(),
             table: "t".into(),
             row_estimate: 1_000,

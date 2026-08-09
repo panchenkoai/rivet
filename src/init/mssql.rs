@@ -124,6 +124,7 @@ pub(super) fn introspect(conn: &mut MssqlSource, schema: &str, table: &str) -> R
     }
 
     Ok(TableInfo {
+        density: None,
         schema: schema.to_string(),
         table: table.to_string(),
         row_estimate,

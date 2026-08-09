@@ -736,6 +736,16 @@ pub struct StrategySnapshot {
     pub strategy_kind: Option<String>,
     pub key_column: Option<String>,
     pub chunk_size: Option<i64>,
+    // ── v24: density-probe audit (#148) ──
+    /// The catalog's ORIGINAL row claim when a probe replaced it (None = the
+    /// snapshot's row_estimate IS the catalog figure).
+    pub catalog_rows: Option<i64>,
+    /// Rows per key-unit from the stratified sample (None = not probed).
+    pub density: Option<f64>,
+    /// probed / counted / catalog-exact / catalog-triaged / unverified.
+    pub estimate_method: Option<String>,
+    pub probe_k: Option<i64>,
+    pub probe_w: Option<i64>,
 }
 
 impl StateStore {
@@ -748,8 +758,10 @@ impl StateStore {
         let sql = "INSERT INTO strategy_snapshot (
                  export_name, source_schema, source_table, row_estimate, total_bytes,
                  avg_row_bytes, chosen_mode, strategy_kind, key_column, chunk_size,
-                 rivet_version, captured_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)";
+                 rivet_version, captured_at,
+                 catalog_rows, density, estimate_method, probe_k, probe_w
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                 ?13, ?14, ?15, ?16, ?17)";
         match &self.conn {
             StateConn::Sqlite(c) => {
                 c.execute(
@@ -767,6 +779,11 @@ impl StateStore {
                         s.chunk_size,
                         ver,
                         now,
+                        s.catalog_rows,
+                        s.density,
+                        s.estimate_method,
+                        s.probe_k,
+                        s.probe_w,
                     ],
                 )?;
             }
@@ -787,6 +804,11 @@ impl StateStore {
                         &s.chunk_size,
                         &ver,
                         &now,
+                        &s.catalog_rows,
+                        &s.density,
+                        &s.estimate_method,
+                        &s.probe_k,
+                        &s.probe_w,
                     ],
                 )?;
             }

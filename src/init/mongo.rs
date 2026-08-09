@@ -57,6 +57,7 @@ pub(super) fn introspect(session: &MongoSession, collection: &str) -> Result<Tab
         })
         .unwrap_or(0);
     Ok(TableInfo {
+        density: None,
         schema: session.db().to_string(),
         table: collection.to_string(),
         row_estimate: i64::try_from(count).unwrap_or(0),

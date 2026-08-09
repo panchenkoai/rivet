@@ -157,12 +157,78 @@ pub(super) fn introspect(client: &mut Client, schema: &str, table: &str) -> Resu
         .collect();
 
     Ok(TableInfo {
+        density: None,
         schema: schema.to_string(),
         table: table.to_string(),
         row_estimate,
         total_bytes,
         columns,
     })
+}
+
+/// First-run density probe (#148), PostgreSQL leg: `reltuples` after
+/// autovacuum is usually within a few %, so the probe runs only on LARGE
+/// tables (> 5M estimated), where a % error still moves absolute decisions
+/// (parallel scaling, duration prediction). Same stratified method as MySQL;
+/// best-effort (any error keeps the catalog figure, marked unverified only
+/// when we attempted and failed — an un-probed small table keeps density=None,
+/// i.e. "the catalog is trusted here by policy").
+pub(super) fn density_probe(client: &mut Client, info: &mut super::TableInfo) {
+    use super::density::*;
+
+    const PG_PROBE_LINE: i64 = 5_000_000;
+    let catalog = info.row_estimate;
+    if catalog < PG_PROBE_LINE {
+        return; // policy: reltuples trusted below the line (density stays None)
+    }
+    let Some(key) = info.best_chunk_column().map(str::to_string) else {
+        info.density = Some(DensityProbe {
+            rows: catalog,
+            density: 0.0,
+            method: EstimateMethod::Unverified,
+            catalog_rows: catalog,
+            k: 0,
+            w: 0,
+        });
+        return;
+    };
+    let q_ident = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
+    let rel = format!("{}.{}", q_ident(&info.schema), q_ident(&info.table));
+    let kq = q_ident(&key);
+    let Ok(row) = client.query_one(
+        &format!("SELECT MIN({kq})::bigint, MAX({kq})::bigint FROM {rel}"),
+        &[],
+    ) else {
+        return;
+    };
+    let (Some(min), Some(max)): (Option<i64>, Option<i64>) = (row.get(0), row.get(1)) else {
+        return;
+    };
+    let offsets = stratified_offsets(min, max, PROBE_K, PROBE_W);
+    if offsets.is_empty() {
+        return;
+    }
+    let mut counts = Vec::with_capacity(offsets.len());
+    for off in &offsets {
+        let hi = off.saturating_add(PROBE_W - 1);
+        match client.query_one(
+            &format!("SELECT COUNT(*) FROM {rel} WHERE {kq} BETWEEN {off} AND {hi}"),
+            &[],
+        ) {
+            Ok(r) => counts.push(r.get::<_, i64>(0)),
+            Err(_) => return,
+        }
+    }
+    let (rows, density) = estimate_from_windows(min, max, &counts, PROBE_W);
+    info.row_estimate = rows;
+    info.density = Some(DensityProbe {
+        rows,
+        density,
+        method: EstimateMethod::Probed,
+        catalog_rows: catalog,
+        k: offsets.len(),
+        w: PROBE_W,
+    });
 }
 
 #[cfg(test)]
