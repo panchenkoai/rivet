@@ -1,19 +1,30 @@
-//! Offline replay harness for the strategy-decision logic.
+//! Offline replay harness for the strategy-decision logic — the **first-init
+//! anchor**.
 //!
-//! The strategy `rivet init` scaffolds for a table is a PURE function of the
-//! table's catalog metadata — [`TableInfo`] (row estimate, physical bytes, column
-//! types + PK shape) — with NO row data. So a real hostile DB can be distilled
-//! into a checked-in catalog fixture (schema + stats, anonymized) and every
-//! strategy decision the field hit replayed deterministically offline. The messy
-//! production DB becomes a regression oracle with zero customer-data exposure.
+//! This locks the decision `rivet init` makes on its FIRST pass: from the
+//! table's CATALOG metadata alone — [`TableInfo`] (row estimate, physical bytes,
+//! column types + PK shape), with NO row data and NO prior-run history. That is a
+//! PURE function, so a real hostile DB is distilled into a checked-in catalog
+//! fixture (schema + stats, anonymized) and every strategy decision the field hit
+//! is replayed deterministically offline — the messy production DB becomes a
+//! regression oracle with zero customer-data exposure.
+//!
+//! COMPANION ANCHOR (#148/#149, not yet built): a SECOND-pass init that prefers
+//! the ACTUALS a full run recorded in the state DB (real durations / rows / peak
+//! RSS per export) over the catalog's estimate. That is a decision from a
+//! DIFFERENT input (run history, not catalog stats), so it earns its OWN anchor —
+//! a golden distilled from a real full run's metrics — rather than folding into
+//! this catalog-only one. Kept explicit here so the two inits stay
+//! distinguishable: catalog-estimate first run vs actuals-informed re-init.
 //!
 //! This is the same discipline as the coverage matrices, but the fixtures are
 //! DISTILLED from real hostile DBs instead of hand-authored: when a field run
 //! surfaces a table whose strategy is wrong, its (anonymized) catalog row is
 //! appended here and the decision is locked forever. `scaffold_strategy` calls the
 //! SAME `TableInfo` methods the scaffold uses (`suggest_mode`, `single_pk_column`,
-//! `best_chunk_column`, `best_cursor_column`), so the harness tests the real
-//! decision, never a re-implementation that could agree with a wrong spec.
+//! `best_chunk_column`, `chosen_cursor_column` — the scored picker the YAML and the
+//! strategy snapshot both use), so the harness tests the real decision, never a
+//! re-implementation that could agree with a wrong spec.
 //!
 //! ENGINE SCOPE — SQL only (PostgreSQL / MySQL / SQL Server). Those three share
 //! ONE `information_schema`-shaped introspection → the same `TableInfo` → the same
