@@ -68,7 +68,12 @@ fn parse_row_estimate(stdout: &str) -> i64 {
         .split('~')
         .nth(1)
         .unwrap_or_else(|| panic!("malformed Row estimate line: {line:?}"))
-        .trim();
+        // #149 appends a source label — `~5M  (catalog estimate)` /
+        // `(measured YYYY-MM-DD)`; take only the leading count token
+        // (split_whitespace also trims leading space).
+        .split_whitespace()
+        .next()
+        .unwrap_or("");
     if let Some(k) = raw.strip_suffix('K') {
         k.trim().parse::<i64>().expect("K-suffixed number") * 1_000
     } else if let Some(m) = raw.strip_suffix('M') {

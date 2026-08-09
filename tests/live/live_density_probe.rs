@@ -12,6 +12,7 @@ use crate::common::*;
 use mysql::prelude::Queryable;
 
 #[test]
+#[ignore = "live: requires docker compose up -d mysql"]
 fn init_probe_overrules_a_stale_table_rows_on_a_versioned_table() {
     let mut c = mysql_connect();
     c.query_drop("SET SESSION cte_max_recursion_depth = 60000")
