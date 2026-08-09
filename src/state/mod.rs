@@ -448,6 +448,17 @@ const MIGRATIONS: &[(i64, &str)] = &[
         23,
         "ALTER TABLE export_metrics ADD COLUMN bytes_read INTEGER;",
     ),
+    // v24: the first-run density probe's audit trail (#148) — where the
+    // snapshot's row figure CAME from (probed/counted/catalog-*/unverified),
+    // the catalog's original claim, and the probe shape.
+    (
+        24,
+        "ALTER TABLE strategy_snapshot ADD COLUMN catalog_rows INTEGER;
+        ALTER TABLE strategy_snapshot ADD COLUMN density REAL;
+        ALTER TABLE strategy_snapshot ADD COLUMN estimate_method TEXT;
+        ALTER TABLE strategy_snapshot ADD COLUMN probe_k INTEGER;
+        ALTER TABLE strategy_snapshot ADD COLUMN probe_w INTEGER;",
+    ),
 ];
 
 /// PostgreSQL-compatible DDL.  Column types differ from SQLite (BIGSERIAL,
@@ -805,6 +816,14 @@ const PG_MIGRATIONS: &[(i64, &str)] = &[
     (
         23,
         "ALTER TABLE export_metrics ADD COLUMN bytes_read BIGINT;",
+    ),
+    (
+        24,
+        "ALTER TABLE strategy_snapshot ADD COLUMN catalog_rows BIGINT;
+        ALTER TABLE strategy_snapshot ADD COLUMN density DOUBLE PRECISION;
+        ALTER TABLE strategy_snapshot ADD COLUMN estimate_method TEXT;
+        ALTER TABLE strategy_snapshot ADD COLUMN probe_k BIGINT;
+        ALTER TABLE strategy_snapshot ADD COLUMN probe_w BIGINT;",
     ),
 ];
 

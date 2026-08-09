@@ -1113,6 +1113,7 @@ mod tests {
 
     fn make_table(cols: Vec<ColumnInfo>) -> TableInfo {
         TableInfo {
+            density: None,
             schema: "public".into(),
             table: "payments".into(),
             row_estimate: 100,
@@ -1149,6 +1150,7 @@ mod tests {
             numeric_scale: None,
         };
         let info = TableInfo {
+            density: None,
             schema: "public".into(),
             table: "orders".into(),
             row_estimate: 1_000_000,
@@ -1202,6 +1204,7 @@ mod tests {
             numeric_scale: None,
         };
         let info = TableInfo {
+            density: None,
             schema: "public".into(),
             table: "events".into(),
             row_estimate: 500_000,
@@ -1430,6 +1433,7 @@ mod tests {
         // decimal overrides as QUALIFIED `table.column` keys (never a bare key
         // that would apply to every table).
         let orders = TableInfo {
+            density: None,
             schema: "app".into(),
             table: "orders".into(),
             row_estimate: 100,
@@ -1437,6 +1441,7 @@ mod tests {
             columns: vec![col("id", "bigint"), decimal_col("amount", 18, 2)],
         };
         let invoices = TableInfo {
+            density: None,
             schema: "app".into(),
             table: "invoices".into(),
             row_estimate: 100,
@@ -1549,6 +1554,7 @@ mod tests {
 
     fn chunked_table(rows: i64, cols: Vec<ColumnInfo>) -> TableInfo {
         TableInfo {
+            density: None,
             schema: "public".into(),
             table: "events".into(),
             row_estimate: rows,
@@ -1672,6 +1678,7 @@ mod tests {
     #[test]
     fn full_mode_pg_non_public_schema_emits_qualified_table() {
         let info = TableInfo {
+            density: None,
             schema: "billing".into(),
             table: "invoices".into(),
             row_estimate: 100,

@@ -152,6 +152,7 @@ mod tests {
     }
     fn tbl(rows: i64, bytes: i64, cols: Vec<ColumnInfo>) -> TableInfo {
         TableInfo {
+            density: None,
             schema: "s".into(),
             table: "t".into(),
             row_estimate: rows,

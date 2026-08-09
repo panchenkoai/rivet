@@ -97,6 +97,8 @@ mod live_crash_recovery;
 mod live_crash_soak;
 #[path = "live/live_cross_db_parity.rs"]
 mod live_cross_db_parity;
+#[path = "live/live_density_probe.rs"]
+mod live_density_probe;
 #[path = "live/live_destination_parity.rs"]
 mod live_destination_parity;
 #[path = "live/live_governor.rs"]

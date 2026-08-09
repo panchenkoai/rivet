@@ -3,6 +3,7 @@ mod candidates;
 /// Offline strategy-decision replay harness — test-only (no runtime caller).
 #[cfg(test)]
 mod catalog_replay;
+mod density;
 mod mongo;
 mod mssql;
 mod mysql;
@@ -49,6 +50,13 @@ pub(crate) struct TableInfo {
     /// Approximate physical size in bytes (heap + indexes), if available.
     pub total_bytes: Option<i64>,
     pub columns: Vec<ColumnInfo>,
+    /// First-run density probe (#148): when present, `row_estimate` above HAS
+    /// BEEN REPLACED by the sampled figure (the catalog's original lives in
+    /// `probe.catalog_rows`), so every downstream decision stands on the
+    /// measured number automatically. `serde(skip)`: a runtime measurement,
+    /// not part of the replayable catalog shape.
+    #[serde(skip, default)]
+    pub density: Option<crate::init::density::DensityProbe>,
 }
 
 impl TableInfo {
@@ -664,11 +672,13 @@ fn introspect_single_table(
     Ok(match source_type(source_url)? {
         "postgres" => {
             let mut client = postgres::connect(source_url, tls)?;
-            postgres::introspect(
+            let mut info = postgres::introspect(
                 &mut client,
                 eff_schema.as_deref().unwrap_or("public"),
                 table_name,
-            )?
+            )?;
+            postgres::density_probe(&mut client, &mut info);
+            info
         }
         "mysql" => {
             let mut conn = mysql::connect(source_url, tls)?;
@@ -698,15 +708,19 @@ fn introspect_single_table(
                 }
                 mysql::use_database(&mut conn, db)?;
             }
-            mysql::introspect(&mut conn, table_name)?
+            let mut info = mysql::introspect(&mut conn, table_name)?;
+            mysql::density_probe(&mut conn, &mut info);
+            info
         }
         "mssql" => {
             let mut conn = mssql::connect(source_url, tls)?;
-            mssql::introspect(
+            let mut info = mssql::introspect(
                 &mut conn,
                 &mssql_table_schema(eff_schema.as_deref().unwrap_or("public")),
                 table_name,
-            )?
+            )?;
+            mark_mssql_catalog_exact(&mut info);
+            info
         }
         "mongo" => {
             // #12 bughunt: --schema was silently ignored for Mongo (the cross-db
@@ -789,19 +803,45 @@ fn init_yaml(
 ///
 /// Every field here is something `init` already read from the catalog to make
 /// the choice; before this they were discarded the moment the YAML was written.
+/// MSSQL's `dm_db_partition_stats` row counts are near-exact by construction —
+/// no probe needed; the snapshot still SAYS where the number came from (#148).
+fn mark_mssql_catalog_exact(info: &mut TableInfo) {
+    info.density = Some(crate::init::density::DensityProbe {
+        rows: info.row_estimate,
+        density: 0.0,
+        method: crate::init::density::EstimateMethod::CatalogExact,
+        catalog_rows: info.row_estimate,
+        k: 0,
+        w: 0,
+    });
+}
+
 fn snapshot_of(info: &TableInfo, mode_override: Option<&str>) -> crate::state::StrategySnapshot {
     let d = yaml_scaffold::decided_strategy(info, mode_override);
     crate::state::StrategySnapshot {
         export_name: info.table.clone(),
         source_schema: (!info.schema.is_empty()).then(|| info.schema.clone()),
         source_table: info.table.clone(),
-        row_estimate: (info.row_estimate > 0).then_some(info.row_estimate),
+        row_estimate: info
+            .density
+            .as_ref()
+            .map(|p| p.rows)
+            .or((info.row_estimate > 0).then_some(info.row_estimate)),
         total_bytes: info.total_bytes,
         avg_row_bytes: info.avg_row_bytes(),
         chosen_mode: d.mode,
         strategy_kind: Some(d.kind.to_string()),
         key_column: d.key_column,
         chunk_size: d.chunk_size,
+        catalog_rows: info.density.as_ref().map(|p| p.catalog_rows),
+        density: info.density.as_ref().filter(|p| p.k > 0).map(|p| p.density),
+        estimate_method: info.density.as_ref().map(|p| p.method.label().to_string()),
+        probe_k: info
+            .density
+            .as_ref()
+            .filter(|p| p.k > 0)
+            .map(|p| p.k as i64),
+        probe_w: info.density.as_ref().filter(|p| p.w > 0).map(|p| p.w),
     }
 }
 
@@ -893,7 +933,10 @@ fn introspect_all(
             let mut out = Vec::with_capacity(names.len());
             for n in names {
                 match postgres::introspect(&mut client, sch, &n) {
-                    Ok(info) => out.push(info),
+                    Ok(mut info) => {
+                        postgres::density_probe(&mut client, &mut info);
+                        out.push(info)
+                    }
                     // Table may have been dropped between list_tables and introspect.
                     // Skip it rather than aborting the whole schema scan.
                     Err(e) if e.to_string().contains("not found or has no columns") => {}
@@ -929,7 +972,9 @@ fn introspect_all(
             let names = retain_filtered(mysql::list_tables(&mut conn, &db)?, filter);
             let mut out = Vec::with_capacity(names.len());
             for n in names {
-                out.push(mysql::introspect(&mut conn, &n)?);
+                let mut info = mysql::introspect(&mut conn, &n)?;
+                mysql::density_probe(&mut conn, &mut info);
+                out.push(info);
             }
             Ok(out)
         }
@@ -945,7 +990,10 @@ fn introspect_all(
             let mut out = Vec::with_capacity(names.len());
             for n in names {
                 match mssql::introspect(&mut conn, sch, &n) {
-                    Ok(info) => out.push(info),
+                    Ok(mut info) => {
+                        mark_mssql_catalog_exact(&mut info);
+                        out.push(info)
+                    }
                     // Dropped between list and introspect — skip, don't abort.
                     Err(e) if e.to_string().contains("not found or has no columns") => {}
                     Err(e) => return Err(e),
@@ -1060,6 +1108,7 @@ mod tests {
 
     fn make_table(rows: i64, cols: Vec<ColumnInfo>) -> TableInfo {
         TableInfo {
+            density: None,
             schema: "public".to_string(),
             table: "orders".to_string(),
             row_estimate: rows,
@@ -1474,6 +1523,7 @@ mod tests {
     #[test]
     fn generate_schema_config_emits_multiple_exports() {
         let a = TableInfo {
+            density: None,
             schema: "public".to_string(),
             table: "users".to_string(),
             row_estimate: 100,
@@ -1481,6 +1531,7 @@ mod tests {
             columns: vec![col("id", "bigint", true)],
         };
         let b = TableInfo {
+            density: None,
             schema: "public".to_string(),
             table: "orders".to_string(),
             row_estimate: 200,
