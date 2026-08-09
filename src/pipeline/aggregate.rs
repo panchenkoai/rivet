@@ -106,6 +106,7 @@ pub(super) fn entry_from_summary(s: &RunSummary) -> RunAggregateEntry {
         rows: s.total_rows,
         files: s.files_produced as i64,
         bytes: s.bytes_written,
+        bytes_read: s.bytes_read,
         duration_ms: s.duration_ms,
         mode: s.mode.clone(),
         error_message: s.error_message.clone(),
@@ -133,6 +134,7 @@ pub(super) fn build(
     let total_rows = entries.iter().map(|e| e.rows).sum();
     let total_files = entries.iter().map(|e| e.files).sum();
     let total_bytes = entries.iter().map(|e| e.bytes).sum();
+    let total_bytes_read = entries.iter().map(|e| e.bytes_read).sum();
 
     let id = format!("agg_{}", started_at.format("%Y%m%dT%H%M%S%3f"));
 
@@ -150,6 +152,7 @@ pub(super) fn build(
         total_rows,
         total_files,
         total_bytes,
+        total_bytes_read,
         per_export: entries,
     }
 }
@@ -171,8 +174,11 @@ pub(super) fn print(agg: &RunAggregate) {
     eprintln!("  status:      {}", status_line);
     eprintln!("  rows:        {}", agg.total_rows);
     eprintln!("  files:       {}", agg.total_files);
+    if agg.total_bytes_read > 0 {
+        eprintln!("  bytes read:  {}", format_bytes(agg.total_bytes_read));
+    }
     if agg.total_bytes > 0 {
-        eprintln!("  bytes:       {}", format_bytes(agg.total_bytes));
+        eprintln!("  bytes writ:  {}", format_bytes(agg.total_bytes));
     }
     eprintln!(
         "  duration:    {} (wall clock)",
@@ -360,6 +366,7 @@ pub(super) fn collect_child_entries(
                         rows: m.total_rows,
                         files: m.files_produced,
                         bytes: m.bytes_written.max(0) as u64,
+                        bytes_read: m.bytes_read.max(0) as u64,
                         duration_ms: m.duration_ms,
                         mode: m.mode.unwrap_or_default(),
                         error_message: m.error_message,
@@ -383,6 +390,7 @@ pub(super) fn collect_child_entries(
                 rows: 0,
                 files: 0,
                 bytes: 0,
+                bytes_read: 0,
                 duration_ms: 0,
                 mode: String::new(),
                 error_message: Some(
@@ -482,6 +490,7 @@ mod tests {
 
     fn entry(name: &str, status: &str, rows: i64, files: i64, bytes: u64) -> RunAggregateEntry {
         RunAggregateEntry {
+            bytes_read: 0,
             export_name: name.into(),
             status: status.into(),
             run_id: format!("{name}_run"),
@@ -585,6 +594,7 @@ mod tests {
 
     fn metric(name: &str, status: &str) -> ExportMetric {
         ExportMetric {
+            bytes_read: 0,
             export_name: name.into(),
             run_id: Some(format!("{name}_run")),
             run_at: "2026-06-09T12:00:00+00:00".into(),
