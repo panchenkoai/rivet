@@ -51,6 +51,11 @@ const DEFAULT_CHANNEL_DEPTH: usize = 3;
 enum SinkMsg {
     Schema(SchemaRef),
     Batch(RecordBatch),
+    /// A lossless keyset token from the source (Mongo's typed BSON `_id`) —
+    /// forwarded so the decorator is a FAITHFUL BatchSink: the trait's no-op
+    /// default silently swallowed it, a latent wrong-cursor bug the moment a
+    /// cursor-reporting runner is pipelined (roast 2026-08-09, #173).
+    SourceCursor(String),
 }
 
 /// A `BatchSink` that forwards schema/batches to a background encode worker.
@@ -99,6 +104,7 @@ impl PipelinedSink {
                     match msg {
                         SinkMsg::Schema(s) => sink.on_schema(s)?,
                         SinkMsg::Batch(b) => sink.on_batch(&b)?,
+                        SinkMsg::SourceCursor(t) => sink.set_source_cursor(t),
                     }
                 }
                 Ok(sink)
@@ -122,6 +128,7 @@ impl PipelinedSink {
                     match msg {
                         SinkMsg::Schema(s) => sink.on_schema(s)?,
                         SinkMsg::Batch(b) => sink.on_batch(&b)?,
+                        SinkMsg::SourceCursor(t) => sink.set_source_cursor(t),
                     }
                 }
                 Ok(sink)
@@ -164,6 +171,12 @@ impl PipelinedSink {
 impl BatchSink for PipelinedSink {
     fn on_schema(&mut self, schema: SchemaRef) -> Result<()> {
         self.send(SinkMsg::Schema(schema))
+    }
+
+    fn set_source_cursor(&mut self, token: String) {
+        // Best-effort like the underlying setter (no Result to surface): a
+        // closed channel means the worker already failed and finish() reports it.
+        let _ = self.send(SinkMsg::SourceCursor(token));
     }
 
     fn on_batch(&mut self, batch: &RecordBatch) -> Result<()> {

@@ -1229,3 +1229,20 @@ fn bytes_read_accumulates_across_sinks_sharing_the_plan_counter() {
         "both sinks must sum into the ONE run-wide counter"
     );
 }
+
+/// #173: PipelinedSink must FORWARD `set_source_cursor` — the trait's no-op
+/// default silently swallowed the source's lossless keyset token, a latent
+/// wrong-cursor bug the moment a cursor-reporting runner is pipelined. RED
+/// against removing the override / the worker's SourceCursor arm.
+#[test]
+fn pipelined_forwards_the_source_cursor_to_the_inner_sink() {
+    use crate::source::BatchSink;
+    let mut p = PipelinedSink::spawn_with_sink(minimal_sink());
+    p.set_source_cursor("bson:int64:42".to_string());
+    let sink = p.finish().expect("worker joins clean");
+    assert_eq!(
+        sink.source_cursor.as_deref(),
+        Some("bson:int64:42"),
+        "the token must reach the inner ExportSink through the decorator"
+    );
+}

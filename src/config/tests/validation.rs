@@ -1368,3 +1368,27 @@ exports:
         "a typo'd CDC key must be rejected, not silently defaulted"
     );
 }
+
+/// #173: the misplaced-tuning-field detector's list must cover EVERY
+/// TuningConfig field — derived generatively from the struct's own JsonSchema,
+/// so a new knob cannot be silently invisible to the check (the hand list froze
+/// at 9 of 14). RED against removing a name from TUNING_FIELD_NAMES.
+#[test]
+fn misplaced_tuning_list_covers_every_field() {
+    let schema = schemars::schema_for!(crate::tuning::TuningConfig);
+    let val = serde_json::to_value(&schema).unwrap();
+    let props: std::collections::BTreeSet<String> = val["properties"]
+        .as_object()
+        .expect("TuningConfig schema has properties")
+        .keys()
+        .cloned()
+        .collect();
+    let listed: std::collections::BTreeSet<String> = crate::config::TUNING_FIELD_NAMES
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    assert_eq!(
+        listed, props,
+        "TUNING_FIELD_NAMES must equal TuningConfig's own fields (schema-derived)"
+    );
+}
