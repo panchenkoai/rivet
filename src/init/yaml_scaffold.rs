@@ -208,12 +208,7 @@ fn config_header_lines(
 
 /// Render `--tls` / `--tls-ca` as the scaffold's `source.tls:` block.
 fn tls_line(t: &crate::config::TlsConfig) -> String {
-    let mode = match t.mode {
-        crate::config::TlsMode::Disable => "disable",
-        crate::config::TlsMode::Require => "require",
-        crate::config::TlsMode::VerifyCa => "verify-ca",
-        crate::config::TlsMode::VerifyFull => "verify-full",
-    };
+    let mode = t.mode.to_string();
     match (&t.ca_file, t.mode) {
         (Some(ca), _) => format!(
             "  tls: {{ mode: {mode}, ca_file: {} }}",

@@ -236,6 +236,19 @@ pub enum TlsMode {
     VerifyFull,
 }
 
+/// The kebab-case name serde/clap already own — ONE rendering for every
+/// user-facing surface (#162: three hand matches drifted-in-waiting).
+impl std::fmt::Display for TlsMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            TlsMode::Disable => "disable",
+            TlsMode::Require => "require",
+            TlsMode::VerifyCa => "verify-ca",
+            TlsMode::VerifyFull => "verify-full",
+        })
+    }
+}
+
 impl TlsMode {
     pub fn is_enforced(self) -> bool {
         !matches!(self, TlsMode::Disable)

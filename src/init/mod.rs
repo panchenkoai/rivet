@@ -838,15 +838,7 @@ fn init_discovery_json(
         rivet_version: env!("CARGO_PKG_VERSION").to_string(),
         source_type: st.to_string(),
         scope,
-        tls_mode: tls.map(|t| {
-            match t.mode {
-                crate::config::TlsMode::Disable => "disable",
-                crate::config::TlsMode::Require => "require",
-                crate::config::TlsMode::VerifyCa => "verify-ca",
-                crate::config::TlsMode::VerifyFull => "verify-full",
-            }
-            .to_string()
-        }),
+        tls_mode: tls.map(|t| t.mode.to_string()),
         tables,
     };
     artifact.to_json_pretty()
