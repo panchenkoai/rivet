@@ -273,6 +273,7 @@ mod tests {
 
     fn minimal_plan() -> ResolvedRunPlan {
         ResolvedRunPlan {
+            bytes_read: Default::default(),
             export_name: "test_export".into(),
             source_table: None,
             base_query: "SELECT 1".into(),

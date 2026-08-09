@@ -162,3 +162,10 @@ scenarios:
     chunked:        { na: "shared seam (run_export_job pre-dispatch)" }
     keyset:         { test: keyset_export_persists_v18_forensics_columns }
     mongo_parallel: { na: "shared seam (run_export_job pre-dispatch); the one distinct entry point is APPLY (run_export_job_with_chunk_source), which re-calls capture_open_forensics — job.rs, guarding the runner-bypass class this ledger exists for" }
+
+  - id: bytes_read_metric
+    what: "the v23 bytes_read metric (decoded Arrow bytes read from the source) must count EVERY runner's reads — a per-runner harvest would be the exact bypass class (a runner that forgets it reports 0). Wired shared-seam instead: the counter is an Arc on the PLAN (plan.bytes_read), every ExportSink::on_batch increments it (per-chunk sinks and plan-cloning workers share the Arc by construction), and run_export_job harvests it ONCE after the runner returns. No runner-specific code exists to forget (#175, 2026-08-09)."
+    single:         { na: "shared-seam: the sink increments plan.bytes_read; harvest is the single post-run read in run_export_job — proven once by bytes_read_accumulates_across_sinks_sharing_the_plan_counter (RED against dropping the fetch_add) + build_metric_row_maps_every_summary_and_plan_field (RED against dropping the mapping)" }
+    chunked:        { na: "shared-seam (per-chunk sinks share the plan Arc — the two-sink case the unit test exercises)" }
+    keyset:         { na: "shared-seam (worker plan clones share the Arc)" }
+    mongo_parallel: { na: "shared-seam (worker plan clones share the Arc)" }

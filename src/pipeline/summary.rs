@@ -77,6 +77,9 @@ pub struct RunSummary {
     pub total_rows: i64,
     pub files_produced: usize,
     pub bytes_written: u64,
+    /// Decoded bytes READ from the source this run (harvested once from the
+    /// plan's shared counter by `run_export_job` after the runner returns; v23).
+    pub bytes_read: u64,
     /// Incremented after each successful `dest.write()`. Non-zero means a previous
     /// attempt already committed data — retrying from the same cursor would duplicate rows.
     pub files_committed: usize,
@@ -248,6 +251,7 @@ impl RunSummary {
             total_rows: 0,
             files_produced: 0,
             bytes_written: 0,
+            bytes_read: 0,
             files_committed: 0,
             duration_ms: 0,
             peak_rss_mb: 0,
@@ -325,6 +329,7 @@ impl RunSummary {
             total_rows: 0,
             files_produced: 0,
             bytes_written: 0,
+            bytes_read: 0,
             files_committed: 0,
             duration_ms: 0,
             peak_rss_mb: 0,
@@ -1133,6 +1138,7 @@ mod tests {
         };
         use crate::tuning::SourceTuning;
         let plan = ResolvedRunPlan {
+            bytes_read: Default::default(),
             export_name: "orders".into(),
             source_table: None,
             base_query: "SELECT 1".into(),
@@ -1268,6 +1274,7 @@ mod tests {
         };
         use crate::tuning::SourceTuning;
         let plan = ResolvedRunPlan {
+            bytes_read: Default::default(),
             export_name: "events".into(),
             source_table: None,
             base_query: "SELECT 1".into(),
@@ -1342,6 +1349,7 @@ mod tests {
         };
         use crate::tuning::SourceTuning;
         ResolvedRunPlan {
+            bytes_read: Default::default(),
             export_name: export_name.into(),
             source_table: None,
             base_query: "SELECT 1".into(),

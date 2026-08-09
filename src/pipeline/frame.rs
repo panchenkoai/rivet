@@ -94,6 +94,7 @@ mod tests {
     fn local_plan(dir: &std::path::Path) -> ResolvedRunPlan {
         use crate::config::{DestinationConfig, DestinationType, SourceConfig, SourceType};
         ResolvedRunPlan {
+            bytes_read: Default::default(),
             export_name: "frame_probe".into(),
             source_table: None,
             base_query: "SELECT 1".into(),

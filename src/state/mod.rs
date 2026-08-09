@@ -441,6 +441,13 @@ const MIGRATIONS: &[(i64, &str)] = &[
          CREATE INDEX IF NOT EXISTS idx_strategy_snapshot_export
              ON strategy_snapshot(export_name, id DESC);",
     ),
+    // v23: decoded bytes READ from the source per run (in-memory Arrow batch
+    // size summed on the plan's shared counter by every sink) — the read-leg
+    // counterpart to bytes_written, so read-vs-write throughput is visible (#175).
+    (
+        23,
+        "ALTER TABLE export_metrics ADD COLUMN bytes_read INTEGER;",
+    ),
 ];
 
 /// PostgreSQL-compatible DDL.  Column types differ from SQLite (BIGSERIAL,
@@ -794,6 +801,10 @@ const PG_MIGRATIONS: &[(i64, &str)] = &[
          );
          CREATE INDEX IF NOT EXISTS idx_strategy_snapshot_export
              ON strategy_snapshot(export_name, id DESC);",
+    ),
+    (
+        23,
+        "ALTER TABLE export_metrics ADD COLUMN bytes_read BIGINT;",
     ),
 ];
 

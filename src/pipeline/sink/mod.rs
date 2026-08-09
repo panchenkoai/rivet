@@ -38,6 +38,10 @@ pub(crate) struct ExportSink {
     pub(in crate::pipeline) compression_level: Option<u32>,
     pub(in crate::pipeline) tmp: tempfile::NamedTempFile,
     pub(in crate::pipeline) total_rows: usize,
+    /// The RUN-wide bytes-read counter, shared from `plan.bytes_read` (every
+    /// sink this run creates — per chunk, per worker — increments the same
+    /// `Arc`, so accumulation is runner-agnostic by construction; see #175).
+    pub(in crate::pipeline) bytes_read: std::sync::Arc<std::sync::atomic::AtomicU64>,
     pub(in crate::pipeline) part_rows: usize,
     /// Cursor column name (with internal columns), set from plan at construction.
     /// When `Some`, `on_batch` extracts the last cursor value inline so we never
@@ -136,6 +140,7 @@ impl ExportSink {
             compression_level: plan.compression_level,
             tmp,
             total_rows: 0,
+            bytes_read: std::sync::Arc::clone(&plan.bytes_read),
             part_rows: 0,
             cursor_column: plan.strategy.cursor_extract_column().map(str::to_string),
             last_cursor_value: None,
@@ -703,6 +708,14 @@ impl BatchSink for ExportSink {
     }
 
     fn on_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+        // Bytes READ from the source: the in-memory Arrow size of the batch as
+        // received, BEFORE any internal-column strip. Incremented on the RUN's
+        // shared counter (plan.bytes_read), so every sink — per chunk, per
+        // worker — feeds one total with no per-runner harvest to forget (#175).
+        self.bytes_read.fetch_add(
+            batch.get_array_memory_size() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         // Avoid cloning the batch when no internal column needs to be stripped.
         let stripped: Option<RecordBatch> = match &self.strip_internal_column {
             Some(strip) if batch.schema().index_of(strip).is_ok() => {
