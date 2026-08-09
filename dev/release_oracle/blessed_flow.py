@@ -325,6 +325,57 @@ def _stage(led: Ledger, cell: Cell, tag: str, stage: str, ok: bool, detail: str)
     return ok
 
 
+# Console-surface contract — the STABLE lines an operator reads at each stage,
+# verified per CELL (engine × store × pipeline) inside the full blessed flow.
+#
+# This is the terminal-flow-in-the-logs guard. The GIF surface digest
+# (release_oracle/gifs.py) fingerprints only `--help`, by design — runtime output
+# like the `check` verdict block, the #149 Row-estimate SOURCE LABEL, and the
+# bytes read/written run summary is invisible to it and can go stale silently.
+# Here the gate already runs the real binary per engine and captures the
+# transcript; asserting the surface lines turns that capture into a contract.
+#
+# Each entry: (stream, must-appear substring). Add a line to pin a new console
+# surface — it is then checked for every engine × store the cell matrix covers.
+_SURFACE: dict[str, list[tuple[str, str]]] = {
+    # #149: the verdict block + the Row-estimate line (with its source label).
+    "check": [("stdout", "Strategy:"), ("stdout", "Row estimate:"), ("stdout", "Verdict:")],
+    # bytes_read surfacing: the read leg beside the write leg in the summary.
+    "apply": [("stderr", "bytes read"), ("stderr", "bytes written")],
+}
+# A stage's surface applies only to these pipelines (absent ⇒ all). `apply` is
+# batch-only; CDC's run summary does not carry a read-leg figure yet.
+_SURFACE_PIPELINES: dict[str, set[str]] = {"apply": {"batch"}}
+
+
+def _verify_surface(led: Ledger, cell: Cell, tag: str, stage: str, p) -> None:
+    """Assert the stage's console surface, as its own `flow:<stage>:surface` row.
+
+    Runs only on a SUCCEEDING stage — a failed stage's surface is the error, not
+    the summary. A missing required line is a FAIL: the operator-visible output
+    regressed even though the exit code did not (the class the GIF digest is
+    blind to)."""
+    reqs = _SURFACE.get(stage)
+    if not reqs:
+        return
+    pipes = _SURFACE_PIPELINES.get(stage)
+    if pipes is not None and cell.pipeline not in pipes:
+        return
+    missing = [
+        f"{stream}:{sub!r}"
+        for stream, sub in reqs
+        if sub not in ((p.stdout if stream == "stdout" else p.stderr) or "")
+    ]
+    name = f"flow:{stage}:surface"
+    msg = f"{cell.engine} {cell.label} · {stage} console-surface"
+    if missing:
+        led.failed(cell.engine, tag, name, cell.store,
+                   f"{msg} — MISSING {', '.join(missing)}", f"missing {len(missing)}")
+    else:
+        led.passed(cell.engine, tag, name, cell.store, msg,
+                   f"{len(reqs)} surface line(s) present")
+
+
 def _unreached(led: Ledger, cell: Cell, tag: str, after: str) -> None:
     steps = CHAIN[cell.pipeline]
     if after not in steps:
@@ -748,6 +799,8 @@ def _run_chain(led: Ledger, cell: Cell, url: str, state_url: str, work: Path,
         if not _stage(led, cell, tag, st, p.ok, f"exit={p.returncode} " + (p.out.strip().splitlines()[-1][:120] if p.ok and p.out.strip() else _why(p))):
             _unreached(led, cell, tag, st)
             return
+        # Console-surface: the check verdict block (per engine × store × pipeline).
+        _verify_surface(led, cell, tag, st, p)
 
     # ── the work: plan → apply (batch) or run (cdc) ──────────────────────────
     if cell.pipeline == "batch":
@@ -802,6 +855,8 @@ def _run_chain(led: Ledger, cell: Cell, url: str, state_url: str, work: Path,
         if not _stage(led, cell, tag, "apply", applied, f"{crash_note}exit={p.returncode} {_why(p) if not applied else ''}"):
             _unreached(led, cell, tag, "apply")
             return
+        # Console-surface: the run summary's read/write byte lines (batch apply).
+        _verify_surface(led, cell, tag, "apply", p)
     else:
         # Anchor first (an empty run that pins the position), THEN write the
         # changes, THEN capture. A capture run with no prior anchor tests the
