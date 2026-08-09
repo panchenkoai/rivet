@@ -304,6 +304,16 @@ pub enum Commands {
         /// Skip staleness check (allow plans older than 24 h)
         #[arg(long)]
         force: bool,
+        /// Run the whole config as ONE bounded work-stealing pool of N export
+        /// slots (config mode only, #166): exports start longest-first (LPT, by
+        /// each export's last measured duration) and every freeing slot pulls
+        /// the next — no wave barriers, so the wall approaches
+        /// `max(longest, total/N)`. Priority `wave:` tiers are NOT honored
+        /// (makespan mode); exports that are not `parallel_safe` never run
+        /// concurrently with EACH OTHER (one heavy at a time; cheap exports
+        /// backfill the remaining slots).
+        #[arg(long, value_name = "N", conflicts_with = "parallel_export_processes")]
+        pool: Option<usize>,
     },
     /// Targeted repair of chunks flagged by reconcile: emit a repair plan, or re-export only mismatched ranges.
     Repair(RepairArgs),

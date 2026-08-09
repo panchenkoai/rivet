@@ -1207,6 +1207,11 @@ FLAG_EXCUSED = {
     "--source-file": "the file form of --source; same reader, and --source-env is the one ops use",
     "--s3-region": "carried with --s3-bucket on the s3 cells",
     "--gcs-credentials-file": "fake-gcs takes no credentials; the real path is the bigquery cycle's",
+    "--pool": "pool mode schedules a whole CONFIG's exports (multi-export, duration-ordered); "
+              "the blessed cell chain applies a sealed SINGLE-export plan artifact, where --pool "
+              "is a refusal by design. Carried by its dedicated e2e flow instead: "
+              "tests/live/live_pool_toxiproxy.rs (bandwidth-capped multi-export pool, exact rows "
+              "+ the predicted-vs-actual makespan contract).",
     "--tls-ca": "verify-ca/full need a TLS-terminating server; the compose stand has none — the "
                 "CA path is unit-pinned (scaffold_records_the_tls_posture…) and refused-with-"
                 "disable is offline-tested",

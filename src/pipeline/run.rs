@@ -723,6 +723,252 @@ pub(crate) fn run_waves(
     Ok(())
 }
 
+/// Last successful run's duration for `name`, in seconds — the pool's
+/// predictor (the same source the wave packer reads). `None` = no history.
+fn last_success_secs(state: &StateStore, name: &str) -> Option<f64> {
+    state
+        .get_metrics(Some(name), 25)
+        .ok()?
+        .into_iter()
+        .find(|m| m.status == "success")
+        .map(|m| (m.duration_ms as f64 / 1000.0).max(0.001))
+}
+
+/// The pool's pick rule, pure for the mutation gate (#166): the first queued
+/// export a freeing slot may start. A `parallel_safe` export is always
+/// eligible; a non-safe (heavy) one only when NO other heavy export is
+/// currently running — heavies serialize among THEMSELVES (a big table already
+/// chunk-parallelizes internally; two at once overload the source) while cheap
+/// exports backfill the remaining slots. That is exactly the field ask: the
+/// giant runs, the small and medium ride alongside — but never two giants.
+fn next_eligible(safe_flags: &[bool], heavy_running: bool) -> Option<usize> {
+    safe_flags.iter().position(|&safe| safe || !heavy_running)
+}
+
+/// `rivet apply <config.yaml> --pool N` (#166): run the WHOLE config as one
+/// bounded work-stealing pool of `m` slots. Exports start longest-first (LPT by
+/// last measured duration; 5 s placeholder for history-less ones, which only
+/// orders their first run) and every freeing slot pulls the next eligible —
+/// no wave barriers, so the wall approaches `max(longest, total/m)`.
+///
+/// Deliberate semantics, stated once (see `pipeline::pool`):
+/// - PRIORITY `wave:` tiers are NOT honored — the pool is makespan mode for a
+///   full refresh with no inter-table ordering; ordered pipelines keep waves.
+/// - non-`parallel_safe` exports never co-run with EACH OTHER (see
+///   [`next_eligible`]); `--resume` skips `_SUCCESS`-complete exports and
+///   resumes checkpoints, exactly like waves.
+/// - a failed export is collected and the pool keeps draining (wave
+///   semantics); the run exits non-zero with the representative error.
+pub(crate) fn run_pool(config_path: &str, force: bool, resume: bool, m: usize) -> Result<()> {
+    let m = m.max(1);
+    let config = Config::load_with_params(config_path, None)?;
+    let config_dir = Path::new(config_path)
+        .parent()
+        .unwrap_or(Path::new("."))
+        .to_path_buf();
+    let opts = RunOptions {
+        validate: false,
+        reconcile: false,
+        resume,
+        force,
+        params: None,
+    };
+    // Pre-migrate the state DB once before worker threads race on DDL, and use
+    // this handle for the duration reads below.
+    let state = StateStore::open(config_path)?;
+
+    // Same skip-completed contract as the wave path (probe the EXPANDED
+    // destination for _SUCCESS under --resume).
+    let pending: Vec<&ExportConfig> = config
+        .exports
+        .iter()
+        .filter(|e| {
+            let ctx = crate::destination::placeholder::PlaceholderContext::for_today(&e.name);
+            let expanded =
+                crate::destination::placeholder::expand_destination(e.destination.clone(), &ctx);
+            let done = resume && finalize::destination_has_success(&expanded);
+            if done {
+                log::info!(
+                    "apply --pool: skipping '{}' — destination already complete (_SUCCESS)",
+                    e.name
+                );
+            }
+            !done
+        })
+        .collect();
+    if pending.is_empty() {
+        log::warn!("apply --pool: nothing to run (no exports, or all complete)");
+        return Ok(());
+    }
+
+    // LPT order + the makespan the model PREDICTS — printed up front and graded
+    // against the actual wall at the end, so every run improves trust in (or
+    // honestly indicts) the model.
+    let items: Vec<super::pool::PoolItem> = pending
+        .iter()
+        .map(|e| super::pool::PoolItem {
+            name: e.name.clone(),
+            predicted_secs: last_success_secs(&state, &e.name).unwrap_or(5.0),
+        })
+        .collect();
+    let order = super::pool::pool_order(&items);
+    let predicted_secs = super::pool::predicted_makespan_secs(&items, m);
+    let floor_secs = super::pool::makespan_floor_secs(&items, m);
+    let measured_n = pending
+        .iter()
+        .filter(|e| last_success_secs(&state, &e.name).is_some())
+        .count();
+    println!(
+        "  Pool: {} export(s) × {} slot(s) — predicted makespan ~{:.1} min (floor {:.1}; {} measured, {} estimated)",
+        pending.len(),
+        m,
+        predicted_secs / 60.0,
+        floor_secs / 60.0,
+        measured_n,
+        pending.len() - measured_n,
+    );
+
+    let by_name: std::collections::HashMap<&str, &ExportConfig> =
+        pending.iter().map(|e| (e.name.as_str(), *e)).collect();
+    let queue: std::sync::Mutex<std::collections::VecDeque<&ExportConfig>> = std::sync::Mutex::new(
+        order
+            .iter()
+            .filter_map(|n| by_name.get(n.as_str()).copied())
+            .collect(),
+    );
+    // Mutated ONLY while holding `queue` (claim) or after a heavy export
+    // finishes (release) — claim-side check+set is serialized by the queue
+    // lock, so two slots can never claim two heavies together.
+    let heavy_running = std::sync::atomic::AtomicBool::new(false);
+
+    // The same in-process ChildEvent UI the threads path uses: one card per
+    // export, a single UI thread owning stderr.
+    let name_floor = pending
+        .iter()
+        .map(|e| e.name.chars().count())
+        .max()
+        .unwrap_or(0);
+    let prev_multi = MULTI_EXPORT_MODE.swap(false, AtomicOrdering::Relaxed);
+    let (tx, rx) = std::sync::mpsc::channel::<parent_ui::UiMessage>();
+    ipc::install_in_process_tx(tx);
+    let n_cards = pending.len();
+    let ui_thread = std::thread::Builder::new()
+        .name("rivet-ui".to_string())
+        .spawn(move || parent_ui::run_ui(rx, name_floor, n_cards))
+        .ok();
+
+    let started_at = chrono::Utc::now();
+    let collected: std::sync::Mutex<Vec<(Result<()>, RunSummary)>> =
+        std::sync::Mutex::new(Vec::with_capacity(pending.len()));
+    std::thread::scope(|s| {
+        for _ in 0..m.min(pending.len()) {
+            s.spawn(|| {
+                loop {
+                    // Claim under the queue lock (heavy check+set serialized).
+                    let export = {
+                        let mut q = queue.lock().unwrap();
+                        if q.is_empty() {
+                            break;
+                        }
+                        let flags: Vec<bool> = q.iter().map(|e| is_parallel_safe(e)).collect();
+                        match next_eligible(&flags, heavy_running.load(AtomicOrdering::SeqCst)) {
+                            Some(i) => {
+                                let e = q.remove(i).unwrap();
+                                if !is_parallel_safe(e) {
+                                    heavy_running.store(true, AtomicOrdering::SeqCst);
+                                }
+                                e
+                            }
+                            None => {
+                                // Only heavies left while one runs: wait for it.
+                                drop(q);
+                                std::thread::sleep(std::time::Duration::from_millis(200));
+                                continue;
+                            }
+                        }
+                    };
+                    let pair = match StateStore::open(config_path) {
+                        Ok(st) => job::run_export_job(
+                            config_path,
+                            &config,
+                            export,
+                            &st,
+                            &config_dir,
+                            &opts,
+                        ),
+                        Err(e) => {
+                            let err = anyhow::anyhow!(
+                                "export '{}': failed to open state database: {:#}",
+                                export.name,
+                                e
+                            );
+                            let summary = job::synthetic_failed_summary(&export.name, &err);
+                            (Err(err), summary)
+                        }
+                    };
+                    if !is_parallel_safe(export) {
+                        heavy_running.store(false, AtomicOrdering::SeqCst);
+                    }
+                    collected.lock().unwrap().push(pair);
+                }
+            });
+        }
+    });
+    ipc::clear_in_process_tx();
+    if let Some(h) = ui_thread {
+        let _ = h.join();
+    }
+    MULTI_EXPORT_MODE.store(prev_multi, AtomicOrdering::Relaxed);
+
+    let finished_at = chrono::Utc::now();
+    let actual_secs = (finished_at - started_at).num_milliseconds() as f64 / 1000.0;
+    println!(
+        "  Pool: actual makespan {:.1} min vs predicted {:.1} min ({:+.0}%) — the model grades itself every run",
+        actual_secs / 60.0,
+        predicted_secs / 60.0,
+        if predicted_secs > 0.0 {
+            (actual_secs - predicted_secs) / predicted_secs * 100.0
+        } else {
+            0.0
+        },
+    );
+
+    let mut summaries: Vec<RunSummary> = Vec::new();
+    let mut failures: Vec<anyhow::Error> = Vec::new();
+    for (res, summary) in collected.into_inner().unwrap() {
+        if let Err(e) = res {
+            failures.push(e);
+        }
+        summaries.push(summary);
+    }
+    if pending.len() > 1 {
+        let entries = summaries
+            .iter()
+            .map(aggregate::entry_from_summary)
+            .collect();
+        let agg = aggregate::build(entries, started_at, finished_at, Some(config_path), "pool");
+        aggregate::print(&agg);
+        aggregate::persist(&state, &agg, None);
+    }
+    if !failures.is_empty() {
+        let primary_idx = representative_failure_idx(&failures).unwrap();
+        let primary = failures.remove(primary_idx);
+        if failures.is_empty() {
+            return Err(primary);
+        }
+        let others = failures
+            .iter()
+            .map(|e| format!("{e:#}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(primary.context(format!(
+            "{} export(s) failed in the pool; representative error follows (also: {others})",
+            failures.len() + 1
+        )));
+    }
+    Ok(())
+}
+
 /// Group exports by `wave:` in ascending order; an export with no `wave:` runs
 /// last (sorted as `u32::MAX`). Pure + unit-tested — the ordering is the
 /// contract `apply` depends on, so it does not hide inside [`run_waves`].
@@ -750,7 +996,27 @@ fn is_parallel_safe(export: &ExportConfig) -> bool {
 
 #[cfg(test)]
 mod wave_grouping_tests {
-    use super::{group_exports_by_wave, is_parallel_safe};
+    use super::{group_exports_by_wave, is_parallel_safe, next_eligible};
+
+    /// The pool's pick rule (#166), both directions — RED against `||`→`&&`
+    /// (which would starve every heavy export the moment slots are free) and
+    /// against dropping the heavy-serialization guard (two giants at once —
+    /// the exact overload the wave cost-gate exists to prevent).
+    #[test]
+    fn pool_next_eligible_serializes_heavies_and_backfills_safe() {
+        // No heavy running: the FIRST item is eligible whatever it is (LPT
+        // order must not be reshuffled when unconstrained).
+        assert_eq!(next_eligible(&[false, true], false), Some(0));
+        assert_eq!(next_eligible(&[true, false], false), Some(0));
+        // A heavy is running: the next heavy must WAIT; the first SAFE one
+        // backfills (the giant + small-and-medium field ask).
+        assert_eq!(next_eligible(&[false, true, false], true), Some(1));
+        assert_eq!(next_eligible(&[true, false], true), Some(0));
+        // Only heavies left while one runs: nothing eligible — the slot waits.
+        assert_eq!(next_eligible(&[false, false], true), None);
+        // Empty queue: nothing.
+        assert_eq!(next_eligible(&[], false), None);
+    }
 
     #[test]
     fn groups_ascending_with_unscheduled_last() {
