@@ -112,5 +112,13 @@ exclude_re = [
     # observably from the `||` form — the guard is a skip-redundant-work
     # optimization, and the mutant is equivalent by construction.
     "replace && with || in overlay_measured_rows",
+    # run_exports_as_child_processes SPAWNS child `rivet run` processes and drives
+    # the IPC card UI — it has no offline caller, so a body stub is unkillable
+    # HERE by construction (the live-only class, cf. run_pool / density_probe). Its
+    # pure decision — the common-mode representative-error class key — is extracted
+    # into `representative_error` (unit-tested + RED-proven, incl. random-alnum
+    # collapse), and the heartbeat + card flow are live-guarded by
+    # live_parallel_ux (common-mode banner + heartbeat) and the parallel-cards GIF.
+    "replace run_exports_as_child_processes ->",
     "replace match guard mssql_trusts_cert_without_verify\\(cfg\\) with (true|false) in MssqlSource::connect_with_tls",
 ]
