@@ -58,6 +58,35 @@ pub(crate) fn derive_strategy(export: &ExportConfig) -> String {
     }
 }
 
+/// The column the run actually SEEKS / RANGES / WINDOWS on — the index-probe
+/// subject shared by all three engine diagnostics. It MUST enumerate every
+/// strategy the runner can pick: `chunk_column` (range), `chunk_by_key` (keyset),
+/// `cursor_column` (incremental), `time_column` (time_window). A `.or()` chain
+/// shorter than the strategy set is the diagnostic-bypass class — roast
+/// 2026-08-09 caught `time_column` missing across all three engines, so every
+/// `time_window` export probed the wrong/absent column and reported a false
+/// "no index". Cross-check the arms against `derive_strategy` above.
+pub(crate) fn preflight_range_col(export: &ExportConfig) -> Option<&str> {
+    export
+        .chunk_column
+        .as_deref()
+        .or(export.chunk_by_key.as_deref())
+        .or(export.cursor_column.as_deref())
+        .or(export.time_column.as_deref())
+}
+
+/// Does this strategy read on an indexed key the catalog probe should confirm?
+/// Every seek/range/window/incremental strategy does; only a plain full scan
+/// does not. Enumerated from the mode + `chunk_by_key`, never a subset — the
+/// gate that guards the `preflight_range_col` probe (a strategy omitted here is
+/// silently degraded to the base-query plan hint / a hard `false`).
+pub(crate) fn strategy_probes_index(export: &ExportConfig) -> bool {
+    matches!(
+        export.mode,
+        ExportMode::Chunked | ExportMode::Incremental | ExportMode::TimeWindow
+    ) || export.chunk_by_key.is_some()
+}
+
 /// The operator-facing mode line shown in the `rivet check` diagnostic —
 /// `"chunked (column: id, size: 100000)"`, `"incremental (cursor: updated_at)"`,
 /// etc. Shared verbatim by all three engine `diagnose_*` paths, which differ
@@ -753,6 +782,58 @@ mod tests {
     fn derive_strategy_date_chunked() {
         let e = cfg("mode: chunked\nchunk_column: created_at\nchunk_by_days: 7\n");
         assert_eq!(derive_strategy(&e), "date-chunked(created_at, 7d)");
+    }
+
+    // ── preflight_range_col / strategy_probes_index cover EVERY strategy ──────
+    // Diagnostic-bypass class (roast 2026-08-09): a strategy the runner reads on
+    // but the index-probe subject omits → a false "no index". Both engine
+    // diagnostics now route through these shared seams, so one offline test
+    // guards all three (and any future engine). RED against dropping the
+    // time_column arm / the TimeWindow match.
+
+    #[test]
+    fn preflight_range_col_resolves_every_read_strategy() {
+        assert_eq!(
+            preflight_range_col(&cfg("mode: chunked\nchunk_column: id\n")),
+            Some("id"),
+            "range chunk reads on chunk_column"
+        );
+        assert_eq!(
+            preflight_range_col(&cfg("mode: chunked\nchunk_by_key: uuid\n")),
+            Some("uuid"),
+            "keyset reads on chunk_by_key"
+        );
+        assert_eq!(
+            preflight_range_col(&cfg("mode: incremental\ncursor_column: updated_at\n")),
+            Some("updated_at"),
+            "incremental reads on cursor_column"
+        );
+        assert_eq!(
+            preflight_range_col(&cfg("mode: time_window\ntime_column: ts\ndays_window: 7\n")),
+            Some("ts"),
+            "time_window reads on time_column — the arm the roast found missing"
+        );
+    }
+
+    #[test]
+    fn strategy_probes_index_gates_every_read_strategy_but_full() {
+        assert!(
+            strategy_probes_index(&cfg("mode: time_window\ntime_column: ts\ndays_window: 7\n")),
+            "time_window issues WHERE ts >= window_start on a btree — must probe the index"
+        );
+        assert!(strategy_probes_index(&cfg(
+            "mode: chunked\nchunk_by_key: id\n"
+        )));
+        assert!(strategy_probes_index(&cfg(
+            "mode: chunked\nchunk_column: id\n"
+        )));
+        assert!(strategy_probes_index(&cfg(
+            "mode: incremental\ncursor_column: c\n"
+        )));
+        assert!(
+            !strategy_probes_index(&cfg("mode: full\n")),
+            "a plain full scan reads no indexed key — must NOT probe"
+        );
     }
 
     // ── keyset (chunk_by_key) must be labelled keyset, never `chunked(?, …)` ──

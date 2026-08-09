@@ -76,11 +76,7 @@ fn diagnose_mssql(conn: &mut MssqlSource, export: &ExportConfig) -> Result<Expor
     // (incremental) — the run's real read column. Without chunk_by_key a keyset
     // table's range_col is None, so the index probe below never runs and the
     // verdict falls to a false "no index".
-    let range_col = export
-        .chunk_column
-        .as_deref()
-        .or(export.chunk_by_key.as_deref())
-        .or(export.cursor_column.as_deref());
+    let range_col = preflight_range_col(export);
 
     // Recover the base relation (`[schema.]table`) the probes key on. `init`
     // emits `query: SELECT cols FROM <table>`, and the `table:` shortcut emits
@@ -126,8 +122,7 @@ fn diagnose_mssql(conn: &mut MssqlSource, export: &ExportConfig) -> Result<Expor
     // drives the verdict, the same way the PG/MySQL catalog probe overrides
     // their EXPLAIN hint.
     let scan_type = None;
-    let uses_index = if (matches!(export.mode, ExportMode::Chunked | ExportMode::Incremental)
-        || export.chunk_by_key.is_some())
+    let uses_index = if strategy_probes_index(export)
         && let Some(col) = range_col
         && let Some(table) = base_table
     {

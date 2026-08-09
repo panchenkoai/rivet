@@ -57,11 +57,7 @@ fn diagnose_pg(
     // (incremental) — the column the run actually reads on. Omitting
     // chunk_by_key leaves keyset tables with range_col = None, which the index
     // override below reads as "no index" and reports a false UNSAFE.
-    let range_col = export
-        .chunk_column
-        .as_deref()
-        .or(export.chunk_by_key.as_deref())
-        .or(export.cursor_column.as_deref());
+    let range_col = preflight_range_col(export);
 
     let effective_query = if let Some(order) = incremental_key_expr(export, SourceType::Postgres) {
         format!(
@@ -122,8 +118,7 @@ fn diagnose_pg(
     // whose leading column is the range column? If yes, treat it as
     // indexed regardless of what EXPLAIN said for the base query. This
     // collapses the most common false-DEGRADED case (chunked on a PK).
-    let uses_index = if (matches!(export.mode, ExportMode::Chunked | ExportMode::Incremental)
-        || export.chunk_by_key.is_some())
+    let uses_index = if strategy_probes_index(export)
         && let Some(col) = range_col
         && let Some(table) = export
             .table
