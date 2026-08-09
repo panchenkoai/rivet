@@ -828,6 +828,38 @@ pub(crate) fn run_pool(config_path: &str, force: bool, resume: bool, m: usize) -
         pending.len() - measured_n,
     );
 
+    // #167: a single dominating export IS the floor — extra slots buy nothing
+    // past it. If one export's predicted duration dominates (R×3 the next), tell
+    // the operator the concrete floor-breaker: split it into N range sub-exports
+    // (separate scheduler units with separate write legs), and the wall it would
+    // reach. Shape-driven (M-free) via the pure planner; a warn, not info, so it
+    // is visible at the default level exactly where a 51-min giant pins a refresh.
+    {
+        let mut by_secs: Vec<&super::pool::PoolItem> = items.iter().collect();
+        by_secs.sort_by(|a, b| b.predicted_secs.total_cmp(&a.predicted_secs));
+        if let [longest, second, ..] = by_secs.as_slice()
+            && let Some(n) = super::pool::split_factor(
+                longest.predicted_secs,
+                second.predicted_secs,
+                3.0,
+                m.max(2),
+            )
+        {
+            let split = super::pool::split_dominating(&items, 3.0, m.max(2));
+            let broken = super::pool::predicted_makespan_secs(&split, m);
+            log::warn!(
+                "apply --pool: export '{}' (~{:.1} min) dominates the pool floor — extra slots \
+                 cannot beat it. Split it into {} range sub-exports over its key (each a separate \
+                 scheduler unit with its own write leg) to drop the wall to ~{:.1} min. Give it a \
+                 `chunk_by_key:` and run each key range as its own export.",
+                longest.name,
+                longest.predicted_secs / 60.0,
+                n,
+                broken / 60.0,
+            );
+        }
+    }
+
     let by_name: std::collections::HashMap<&str, &ExportConfig> =
         pending.iter().map(|e| (e.name.as_str(), *e)).collect();
     let queue: std::sync::Mutex<std::collections::VecDeque<&ExportConfig>> = std::sync::Mutex::new(

@@ -86,6 +86,59 @@ pub(crate) fn makespan_floor_secs(items: &[PoolItem], workers: usize) -> f64 {
     longest.max(total / w)
 }
 
+/// #167: how many range sub-units a dominating export should split into so the
+/// pool floor drops from `longest` toward `total/M`. SHAPE-driven (M-free, so
+/// the answer is stable across worker counts): an export dominates when its
+/// predicted duration exceeds `r ×` the next-longest (R≈3). N is chosen to cut
+/// the giant below that next-longest — `ceil(predicted / second_longest)` —
+/// capped at `max_split` and floored at 2. `None` = not dominating, leave it be.
+///
+/// Pure: the runtime decides HOW to realize the split (range sub-exports over
+/// the key span); this decides WHETHER and INTO HOW MANY.
+pub(crate) fn split_factor(
+    predicted_secs: f64,
+    second_longest_secs: f64,
+    r: f64,
+    max_split: usize,
+) -> Option<usize> {
+    if second_longest_secs <= 0.0 || predicted_secs <= r * second_longest_secs {
+        return None;
+    }
+    let n = (predicted_secs / second_longest_secs).ceil() as usize;
+    Some(n.clamp(2, max_split.max(2)))
+}
+
+/// Rewrite the item set with the single dominating export split into N equal
+/// sub-units (`<name>#0..<name>#N-1`, each `predicted/N`), summing to the
+/// original — the scheduler input after a split. A balanced set (nothing
+/// dominates) is returned untouched. Pure, for the makespan proof; the runtime
+/// mirrors this shape with real range sub-exports.
+pub(crate) fn split_dominating(items: &[PoolItem], r: f64, max_split: usize) -> Vec<PoolItem> {
+    if items.len() < 2 {
+        return items.to_vec();
+    }
+    // The dominating candidate = the single longest; its "second" = the next.
+    let mut sorted: Vec<&PoolItem> = items.iter().collect();
+    sorted.sort_by(|a, b| b.predicted_secs.total_cmp(&a.predicted_secs));
+    let (longest, second) = (sorted[0], sorted[1]);
+    let Some(n) = split_factor(longest.predicted_secs, second.predicted_secs, r, max_split) else {
+        return items.to_vec();
+    };
+    let piece = longest.predicted_secs / n as f64;
+    let mut out: Vec<PoolItem> = items
+        .iter()
+        .filter(|i| i.name != longest.name)
+        .cloned()
+        .collect();
+    for i in 0..n {
+        out.push(PoolItem {
+            name: format!("{}#{i}", longest.name),
+            predicted_secs: piece,
+        });
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -102,6 +155,58 @@ mod tests {
         let items = vec![it("b", 10.0), it("giant", 900.0), it("a", 10.0)];
         // giant first; the two 10s tie-break by name (a before b).
         assert_eq!(pool_order(&items), vec!["giant", "a", "b"]);
+    }
+
+    #[test]
+    fn split_factor_only_fires_on_a_dominating_export() {
+        // 3000s giant vs 300s next: 10x → dominates (R=3). N = ceil(3000/300)=10,
+        // capped at max_split.
+        assert_eq!(split_factor(3000.0, 300.0, 3.0, 8), Some(8));
+        assert_eq!(split_factor(3000.0, 300.0, 3.0, 20), Some(10));
+        // 2x the next: below R=3, not dominating.
+        assert_eq!(split_factor(600.0, 300.0, 3.0, 8), None);
+        // no second export: nothing to compare, no split.
+        assert_eq!(split_factor(3000.0, 0.0, 3.0, 8), None);
+        // just over threshold: still at least 2 pieces.
+        assert_eq!(split_factor(310.0, 100.0, 3.0, 8), Some(4));
+    }
+
+    /// The floor-breaker (#167), RED against the un-split floor. The field shape:
+    /// one 3060s giant dominates; splitting it lets M=6 approach total/6.
+    #[test]
+    fn splitting_the_giant_breaks_the_pool_floor() {
+        let mut items = vec![it("giant", 3060.0)];
+        for n in 0..30 {
+            items.push(it(&format!("s{n:02}"), 60.0)); // 30 × 60 = 1800s of small
+        }
+        // Un-split: the giant IS the floor at M=6 (3060 > total/6 = 4860/6 = 810).
+        assert_eq!(makespan_floor_secs(&items, 6), 3060.0);
+        let unsplit_wall = predicted_makespan_secs(&items, 6);
+        assert!(
+            unsplit_wall >= 3060.0,
+            "giant pins the wall: {unsplit_wall}"
+        );
+
+        // Split (R=3, giant 3060 vs next 60 → N capped at max_split=6): the giant
+        // becomes 6 × 510s units; the floor drops to total/6 and the pool reaches it.
+        let split = split_dominating(&items, 3.0, 6);
+        assert_eq!(
+            split.len(),
+            30 + 6,
+            "giant replaced by 6 sub-units alongside the 30 small"
+        );
+        let split_wall = predicted_makespan_secs(&split, 6);
+        assert!(
+            split_wall < unsplit_wall,
+            "the split MUST break the floor: {split_wall} < {unsplit_wall}"
+        );
+        assert_eq!(split_wall, 810.0, "reaches total/6 = 4860/6");
+    }
+
+    #[test]
+    fn split_dominating_leaves_a_balanced_set_untouched() {
+        let items = vec![it("a", 100.0), it("b", 120.0), it("c", 90.0)];
+        assert_eq!(split_dominating(&items, 3.0, 8).len(), 3);
     }
 
     #[test]
