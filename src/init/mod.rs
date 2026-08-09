@@ -1135,6 +1135,62 @@ mod tests {
         }
     }
 
+    /// #148 (roast 2026-08-09): avg_row_bytes must return None once the density
+    /// probe CORRECTED row_estimate — total_bytes is still frozen, so the ratio
+    /// would mix a corrected numerator with a stale denominator. Kills the
+    /// mod.rs:278 guard mutants (guard->true, &&->||, >->>=).
+    #[test]
+    fn avg_row_bytes_none_when_a_probe_corrected_the_rows() {
+        use crate::init::density::{DensityProbe, EstimateMethod};
+        // Frozen catalog 1000, probe corrected to 148_000; bytes still frozen.
+        let mut t = make_table(148_000, vec![]);
+        t.total_bytes = Some(4_000_000);
+        t.density = Some(DensityProbe {
+            rows: 148_000,
+            density: 3.0,
+            method: EstimateMethod::Probed,
+            catalog_rows: 1000,
+            k: 50,
+            w: 10_000,
+        });
+        assert_eq!(
+            t.avg_row_bytes(),
+            None,
+            "corrected rows + frozen bytes = unknown per-row"
+        );
+
+        // No probe correction (catalog trusted): the ratio is honest.
+        let mut t2 = make_table(1000, vec![]);
+        t2.total_bytes = Some(4_000_000);
+        assert_eq!(t2.avg_row_bytes(), Some(4000));
+        // Zero rows: None (no division).
+        let mut t3 = make_table(0, vec![]);
+        t3.total_bytes = Some(4_000_000);
+        assert_eq!(t3.avg_row_bytes(), None);
+    }
+
+    /// #148 (roast 2026-08-09): mark_mssql_catalog_exact must NOT stamp
+    /// catalog-exact on a 0 (a VIEW or stats-unavailable table yields 0 — a
+    /// documented UNKNOWN). Kills the mod.rs:822 mutants (stub, >->==, >-><, >->>=).
+    #[test]
+    fn mssql_catalog_exact_only_for_a_positive_count() {
+        use crate::init::density::EstimateMethod;
+        let mut base = make_table(500_000, vec![]);
+        mark_mssql_catalog_exact(&mut base);
+        assert_eq!(
+            base.density.as_ref().unwrap().method,
+            EstimateMethod::CatalogExact,
+            "a positive dm_db_partition_stats count IS catalog-exact"
+        );
+        let mut view = make_table(0, vec![]);
+        mark_mssql_catalog_exact(&mut view);
+        assert_eq!(
+            view.density.as_ref().unwrap().method,
+            EstimateMethod::Unverified,
+            "0 from a view / no-stats is UNKNOWN, not an audited exact 0"
+        );
+    }
+
     /// A3/A2 (roast 2026-08-09): where best_cursor_column (name-preference) and
     /// chosen_cursor_column (scored) DIVERGE, every user-facing surface that
     /// names the cursor must name the CHOSEN one — the column actually written as
