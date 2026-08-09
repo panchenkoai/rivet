@@ -321,7 +321,9 @@ pub fn check(
     let mut diagnostics = diagnostics;
     if let Ok(state) = crate::state::StateStore::open(config_path) {
         for d in &mut diagnostics {
-            analysis::overlay_measured_rows(d, &state);
+            if let Some(e) = exports.iter().find(|e| e.name == d.export_name) {
+                analysis::overlay_measured_rows(d, e, &state);
+            }
         }
     }
     if !json_output {
