@@ -79,6 +79,13 @@ scenarios:
     keyset:         { test: parallel_keyset_worker_error_still_counts_the_durable_parts_postgres }
     mongo_parallel: { na: "the drain does `let out = res?` — the FIRST worker error propagates immediately, so there is no keep-going path and therefore no end-of-run guard that can silently fail to fire. The residual risk is the opposite one (a later worker's parts unrecorded because the bail preceded their drain), which is the durable-part-count scenario, not this one" }
 
+  - id: adaptive_concurrency_governor
+    what: "OPT-2 governor sheds parallel workers under source pressure (backs off to min_parallel, recovers as pressure eases). Runner-bypass class on the SAFETY knob: it was chunked-only, so a `parallel: N` keyset export on a straining replica adapted batches but never shed workers (#152). Now wired into keyset per-page (permit-per-page semaphore + the same Governor loop + min_parallel floor); the run journal records each ParallelismAdjusted."
+    single:         { na: "single has no worker fan-out to govern (parallel is a multi-part-runner concept)" }
+    chunked:        { test: governor_backs_off_under_concurrent_write_pressure }
+    keyset:         { test: keyset_governor_backs_off_under_concurrent_write_pressure }
+    mongo_parallel: { na: "mongo_parallel spawns one thread per _id range with NO shared permit ceiling — the governor's resize target does not exist there. The reader-level adaptive batch sizing (engine pressure counters) still applies; the concurrency governor is a permit-ceiling mechanism and mongo_parallel has no ceiling to shrink. A future ceiling would take a `test` cell here." }
+
   - id: schema_drift_gate
     what: "on_schema_drift enforcement — a drifted schema under `fail` aborts (exit 4). Each runner bypasses run_single_export, so each must re-apply the gate (check_from_sink_schema / check_from_type_mappings). Round-8: keyset + mongo_parallel had SILENTLY dropped it (exit 0 on drift)."
     single:         { test: schema_drift_removed_column_is_detected }
