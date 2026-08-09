@@ -19,7 +19,12 @@ use crate::source::mongo::MongoSession;
 /// Connect once (ungated) so one session serves the whole `list_tables` +
 /// per-collection `introspect` scan.
 pub(super) fn connect(url: &str, tls: Option<&crate::config::TlsConfig>) -> Result<MongoSession> {
-    MongoSession::connect(url, tls, false)
+    // gate=true, matching PG init (connect_client) and MySQL init (connect_pool),
+    // both of which refuse remote plaintext. The old `false` + "like the SQL
+    // init helpers" comment was doubly wrong: the SQL helpers DO gate, and
+    // skipping it let `rivet init` dial a remote Mongo in cleartext with no
+    // refusal (bug hunt 2026-08-08).
+    MongoSession::connect(url, tls)
 }
 
 /// List the user collections in the URL's database, skipping the internal
