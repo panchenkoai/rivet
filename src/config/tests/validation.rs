@@ -1175,3 +1175,125 @@ proptest::proptest! {
         let _ = Config::from_yaml(&yaml);
     }
 }
+
+// ── keyset_incremental accept-but-break (roast 2026-08-09) ──────────────
+// keyset_incremental was absent from the `mode != chunked` reject-list, so
+// it was silently ignored outside chunked; and it needs a keyset key.
+
+#[test]
+fn keyset_incremental_without_chunked_mode_rejected() {
+    let yaml = r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: t
+    mode: full
+    table: events
+    keyset_incremental: true
+    format: parquet
+    destination:
+      type: local
+      path: ./out
+"#;
+    let msg = format!("{:#}", Config::from_yaml(yaml).unwrap_err());
+    assert!(msg.contains("keyset_incremental"), "names the knob: {msg}");
+    assert!(msg.contains("mode: chunked"), "points at the fix: {msg}");
+}
+
+#[test]
+fn keyset_incremental_requires_chunk_by_key() {
+    // Under chunked but with a RANGE chunk_column — no key to resume from.
+    let yaml = r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: t
+    mode: chunked
+    table: events
+    chunk_column: id
+    keyset_incremental: true
+    format: parquet
+    destination:
+      type: local
+      path: ./out
+"#;
+    let msg = format!("{:#}", Config::from_yaml(yaml).unwrap_err());
+    assert!(msg.contains("keyset_incremental"), "names the knob: {msg}");
+    assert!(msg.contains("chunk_by_key"), "points at the fix: {msg}");
+}
+
+#[test]
+fn keyset_incremental_accepted_under_chunked_with_key() {
+    // The false-reject guard: the legit form (chunked + chunk_by_key) LOADS.
+    let yaml = r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: t
+    mode: chunked
+    table: events
+    chunk_by_key: id
+    keyset_incremental: true
+    format: parquet
+    destination:
+      type: local
+      path: ./out
+"#;
+    assert!(
+        Config::from_yaml(yaml).is_ok(),
+        "keyset_incremental must be accepted under chunked + chunk_by_key"
+    );
+}
+
+// ── mongo resume without page_size (roast 2026-08-09) ───────────────────
+// resume is keyset-only; the full-scan path (no page_size) reads no
+// checkpoint, so resume: true was silently ignored.
+
+#[test]
+fn mongo_resume_without_page_size_rejected() {
+    let yaml = r#"
+source:
+  type: mongo
+  url: "mongodb://localhost/test"
+  mongo:
+    resume: true
+exports:
+  - name: t
+    mode: full
+    table: events
+    format: parquet
+    destination:
+      type: local
+      path: ./out
+"#;
+    let msg = format!("{:#}", Config::from_yaml(yaml).unwrap_err());
+    assert!(msg.contains("resume"), "names the knob: {msg}");
+    assert!(msg.contains("page_size"), "points at the fix: {msg}");
+}
+
+#[test]
+fn mongo_resume_accepted_with_page_size() {
+    let yaml = r#"
+source:
+  type: mongo
+  url: "mongodb://localhost/test"
+  mongo:
+    resume: true
+    page_size: 5000
+exports:
+  - name: t
+    mode: full
+    table: events
+    format: parquet
+    destination:
+      type: local
+      path: ./out
+"#;
+    assert!(
+        Config::from_yaml(yaml).is_ok(),
+        "resume must be accepted with page_size (keyset paging)"
+    );
+}
