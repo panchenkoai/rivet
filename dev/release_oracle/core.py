@@ -80,12 +80,24 @@ class Ledger:
         if colour is None:
             colour = sys.stdout.isatty() or os.environ.get("FORCE_COLOR") == "1"
         self._colour = colour
+        # Per-phase wall-clock, so the gate self-reports WHERE the 30–60 min goes
+        # (each `phase()` closes the previous one; `report()` prints the breakdown
+        # sorted slowest-first). Answers "what takes so long" every run, cheaply.
+        self._phase_times: list[tuple[str, float]] = []
+        self._cur_phase: str | None = None
+        self._phase_start: float = time.perf_counter()
 
     # ── printing ──
     def _c(self, code: str, text: str) -> str:
         return f"\033[{code}m{text}\033[0m" if self._colour else text
 
     def phase(self, msg: str) -> None:
+        # Close the previous phase's wall-clock before opening this one.
+        now = time.perf_counter()
+        if self._cur_phase is not None:
+            self._phase_times.append((self._cur_phase, now - self._phase_start))
+        self._cur_phase = msg
+        self._phase_start = now
         print(self._c("1;34", f"▸ {msg}"), flush=True)
 
     def ok(self, msg: str) -> None:
@@ -137,6 +149,18 @@ class Ledger:
                 f"{c.status.value} {c.detail}"
             )
         print()
+        # Wall-clock breakdown — the phases that actually cost the 30–60 min,
+        # slowest first. `phase("Release Oracle result")` above closed the last
+        # real phase, so `_phase_times` now holds every phase but this report line.
+        timed = [t for t in self._phase_times if not t[0].startswith("Release Oracle result")]
+        if timed:
+            total = sum(d for _, d in timed)
+            self.phase("Timing (wall-clock, slowest first)")
+            for name, dur in sorted(timed, key=lambda p: p[1], reverse=True)[:15]:
+                pct = (dur / total * 100.0) if total > 0 else 0.0
+                print(f"  {dur / 60.0:6.1f} min  {pct:4.0f}%  {name}")
+            print(f"  {total / 60.0:6.1f} min  total (sum of phases)")
+            print()
         if self.red:
             print(self._c("1;31", "  NOT RELEASABLE — one or more cells failed (see ✗ above)."))
             return 1

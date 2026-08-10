@@ -212,6 +212,7 @@ def preflight(led: Ledger, *, bless_gifs: bool = False) -> None:
     gifs.verify_gif_currency(led, bless=bless_gifs)
     scenarios.verify_replica_read(led)
     scenarios.verify_pool_e2e(led)
+    scenarios.verify_pool_split(led)
     cdc.verify_cdc_e2e(led)
     regression.verify_release_regression(led)
     regression.verify_scale_memory(led)

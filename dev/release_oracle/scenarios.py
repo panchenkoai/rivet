@@ -70,6 +70,7 @@ __all__ = [
     "store_up",
     "verify_coverage_matrices",
     "verify_pool_e2e",
+    "verify_pool_split",
     "verify_replica_read",
     "verify_state_migrations",
 ]
@@ -1153,32 +1154,76 @@ def verify_pool_e2e(led: Ledger) -> None:
             "no toxiproxy",
         )
         return
-    led.phase(
-        "Pool scheduler e2e (apply --pool through a bandwidth-capped link — "
-        "exact rows + the predicted-vs-actual makespan contract)"
+    _run_pool_module(
+        led,
+        test_filter="live_pool_toxiproxy::pool_apply",
+        scenario="e2e",
+        phase="Pool scheduler e2e (apply --pool through a bandwidth-capped link — "
+        "exact rows + the predicted-vs-actual makespan contract)",
+        ok_detail="pool e2e: bandwidth-capped --pool run exact + self-grading; resume defers, drops nothing",
     )
-    log_path = work_dir() / "pool_e2e.log"
+
+
+def verify_pool_split(led: Ledger) -> None:
+    """The `--pool --split` scenarios AS THEIR OWN GATE CELLS (#167): a dominating
+    export is broken into N range sub-exports over its key span. Three scenarios,
+    each an independent live oracle in tests/live/live_pool_toxiproxy.rs
+    (`pool_split_*`):
+
+      * realize — the split fires, the units share one prefix + fold to one
+        family, and the DuckDB union reads back every row once (no seam gap/dup);
+      * manifest coherence — validate does not flag a sibling unit's parts as
+        untracked, yet a true foreign orphan still is;
+      * per-unit resume — a crashed split re-runs ONLY the incomplete units on
+        `--resume` (skip complete, resume crashed), no gap/no dup.
+
+    Separate from `verify_pool_e2e` so the split coverage is a NAMED matrix cell,
+    not bundled invisibly into the pool cell. Needs toxiproxy (:8474) + postgres
+    (:5432); SKIP when down.
+    """
+    _run_pool_module(
+        led,
+        test_filter="live_pool_toxiproxy::pool_split",
+        scenario="split",
+        phase="Pool --split range sub-exports (#167): realize + manifest coherence "
+        "+ per-unit crash resume, each an independent DuckDB oracle",
+        ok_detail="pool split: units share one prefix/family (union exact), validate "
+        "coherent, per-unit resume recovers a crash with no gap/dup",
+    )
+
+
+def _run_pool_module(
+    led: Ledger, *, test_filter: str, scenario: str, phase: str, ok_detail: str
+) -> None:
+    """Run one `live_pool_toxiproxy` filter as a gate cell + emit a per-TEST ledger
+    row for each `pool_*` case the filter matched, so every scenario is visible in
+    the report (not just an aggregate pass/fail)."""
+    led.phase(phase)
+    log_path = work_dir() / f"pool_{scenario}.log"
     p = run(
         # `--ignored` is REQUIRED: the pool e2e tests carry #[ignore] (they need
-        # the live stand), added in the CI-tier split. Without it they are SKIPPED
-        # and the gate read "0 passed" as a FAIL (roast 2026-08-10). The pass check
-        # below is count-agnostic (0 failed AND at least one passed) so adding a
-        # pool test never silently breaks the gate the way pinning "2 passed" did.
+        # the live stand). The pass check is count-agnostic (0 failed AND at least
+        # one passed) so adding a pool test never silently breaks the gate the way
+        # pinning "N passed" did (roast 2026-08-10).
         ["cargo", "test", "--manifest-path", str(ROOT / "Cargo.toml"), "--test", "live_suite",
-         "--", "--ignored", "--test-threads=1", "live_pool_toxiproxy"],
+         "--", "--ignored", "--test-threads=1", test_filter],
         env={"RIVET_BIN": str(rivet_bin())},
         timeout=NO_TIMEOUT,
     )
     log_path.write_text(p.out)
+    # Per-test visibility: one ledger row per matched case (`test <mod>::<name> ... ok`).
+    for m in re.finditer(r"test live_pool_toxiproxy::(\w+) \.\.\. (ok|FAILED)", p.out):
+        name, res = m.group(1), m.group(2)
+        if res == "ok":
+            led.add("pool", scenario, name[:16], "-", Status.PASS, name)
+        else:
+            led.failed("pool", scenario, name[:16], "-", f"pool {scenario}: {name} FAILED")
     if p.ok and "0 failed" in p.out and "0 passed" not in p.out:
-        _passed(
-            led, "pool", "e2e", "-", "-",
-            "pool e2e: bandwidth-capped --pool run exact + self-grading; resume defers, drops nothing",
-        )
+        _passed(led, "pool", scenario, "-", "-", ok_detail)
     else:
         _failed(
-            led, "pool", "e2e", "-", "-",
-            f"pool e2e FAILED (see {log_path})",
+            led, "pool", scenario, "-", "-",
+            f"pool {scenario} FAILED (see {log_path})",
             _first_match(p.out, r"FAILED|panic|assert|error"),
         )
 
