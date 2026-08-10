@@ -597,7 +597,6 @@ fn run_keyset_parallel(
                 // Parts this range committed — recorded to file_log atomically with
                 // its `done` flip at completion (checkpoint only).
                 let mut range_parts: Vec<crate::state::KeysetRangePart> = Vec::new();
-                let mut local_parts: Vec<super::commit::PartRecord> = Vec::new();
                 let mut local_checks: Vec<(
                     std::collections::BTreeMap<String, u64>,
                     Option<String>,
@@ -621,6 +620,22 @@ fn run_keyset_parallel(
                         "keyset_parallel_worker",
                         ridx as i64,
                     ) {
+                        errs_r.lock().unwrap().push(format!("range {ridx}: {e}"));
+                        return;
+                    }
+                    // Test-only: a MID-RANGE error — fires only once this range has
+                    // ALREADY made page(s) durable (`pages > 0`), unlike the hook
+                    // above which fires at the range's first page (range writes
+                    // nothing). This is the fixture #200-1 needs: pre-failure pages
+                    // are on disk but the range never commits, so they must still
+                    // reach `files_committed` (published per-page below), not be
+                    // dropped with the uncommitted range.
+                    if pages > 0
+                        && let Err(e) = crate::test_hook::maybe_error_at_index(
+                            "keyset_parallel_worker_midrange",
+                            ridx as i64,
+                        )
+                    {
                         errs_r.lock().unwrap().push(format!("range {ridx}: {e}"));
                         return;
                     }
@@ -665,7 +680,19 @@ fn run_keyset_parallel(
                         // run's observed floor (#151).
                         *rfirst_r.lock().unwrap() = page.first_cursor.clone();
                     }
-                    local_parts.extend(page.parts);
+                    // Publish the parts THIS page just wrote to the destination to
+                    // the shared count IMMEDIATELY — the parquet is durable the
+                    // moment `read_keyset_page_bounded` returns, before the range's
+                    // checkpoint commit below. Deferring this to range-completion
+                    // (the old `local_parts` at line 741) dropped every page a
+                    // FAILED range had already made durable from `files_committed`,
+                    // handing `decide_export_retry` a short count — the same
+                    // durable-parts blind spot as the worker-level bail, one level
+                    // deeper (page granularity within a range, #200-1). Cursor
+                    // (`rmax`) and checksums stay commit-gated below — those feed
+                    // the SUMMARY and must reflect only committed data — but the
+                    // durability count must reflect what is physically on disk.
+                    parts_r.lock().unwrap().extend(page.parts);
                     local_checks.push((page.column_checksums, page.checksum_key_column));
                     let last_page = page.rows < page_size;
                     if !last_page {
@@ -738,7 +765,11 @@ fn run_keyset_parallel(
                 // Publish to the shared merge state ONLY after the checkpoint commits,
                 // so a failed commit does not leave half-merged summary state.
                 rmax_r.lock().unwrap()[ridx] = rmax;
-                parts_r.lock().unwrap().extend(local_parts);
+                // Parts were published per-page above (they are durable pre-commit);
+                // only the cursor and checksums — SUMMARY state — publish here, gated
+                // on the checkpoint commit so a failed commit leaves no half-merged
+                // summary (the parts count is intentionally NOT gated: it must show
+                // on-disk debris even for a range that failed to commit).
                 checks_r.lock().unwrap().extend(local_checks);
             });
         }
