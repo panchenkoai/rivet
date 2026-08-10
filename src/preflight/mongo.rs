@@ -51,7 +51,10 @@ fn diagnose_mongo(
     let verdict = compute_verdict(row_estimate, uses_index, false, None, export.parallel);
     let recommended_profile = recommend_profile(row_estimate, uses_index, export);
     let recommended_parallel = recommend_parallelism(export, row_estimate, uses_index);
-    let warnings = collect_warnings(export, row_estimate, None, None, None, None);
+    // Mongo's connection headroom (serverStatus().connections.available) — the
+    // analogue of PG/MySQL max_connections for the mongo_parallel worker count.
+    let db_max_connections = crate::source::mongo::max_connections(url, tls);
+    let warnings = collect_warnings(export, row_estimate, None, None, None, db_max_connections);
 
     Ok(ExportDiagnostic {
         row_source: None,
@@ -74,5 +77,8 @@ fn diagnose_mongo(
         // document source cannot do. Profile/parallel advice still rides the
         // fields above.
         suggestion: None,
+        chunk_min: None,
+        chunk_max: None,
+        db_max_connections: None,
     })
 }

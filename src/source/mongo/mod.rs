@@ -891,6 +891,33 @@ pub(crate) fn sample_harm_counters(
 /// `estimatedDocumentCount` reads collection metadata, never scans the
 /// collection. `None` on any failure — the diagnostic then shows an unknown
 /// row count, exactly as MySQL does when its estimate is untrustworthy.
+/// The server's connection headroom for the preflight connection-limit check —
+/// `serverStatus().connections.available` (free slots), the Mongo analogue of PG
+/// `max_connections` / MySQL `@@max_connections`. Defaults high (the pool cap is
+/// usually 65536 / ulimit-derived), so the warning is inert unless the server is
+/// tightly capped and `parallel` (the mongo_parallel worker count) would exhaust
+/// it. `None` on any probe failure (fail-soft, like `estimated_count`).
+pub(crate) fn max_connections(url: &str, tls: Option<&TlsConfig>) -> Option<u32> {
+    let session = MongoSession::connect(url, tls).ok()?;
+    session.block_on(async {
+        let status = session
+            .client()
+            .database("admin")
+            .run_command(mongodb::bson::doc! { "serverStatus": 1 })
+            .await
+            .ok()?;
+        let conns = status.get_document("connections").ok()?;
+        // `available` is the free headroom; current + available ≈ the cap. The
+        // check compares `parallel` against what is actually usable now.
+        let avail = conns
+            .get_i32("available")
+            .ok()
+            .map(|v| v as i64)
+            .or_else(|| conns.get_i64("available").ok())?;
+        u32::try_from(avail).ok()
+    })
+}
+
 pub(crate) fn estimated_count(url: &str, tls: Option<&TlsConfig>, collection: &str) -> Option<i64> {
     let session = MongoSession::connect(url, tls).ok()?;
     session.block_on(async {

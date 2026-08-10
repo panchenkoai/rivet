@@ -162,8 +162,8 @@ fn diagnose_pg(
         cursor_column: export.cursor_column.clone(),
         row_estimate,
         avg_row_bytes,
-        cursor_min: range_min,
-        cursor_max: range_max,
+        cursor_min: range_min.clone(),
+        cursor_max: range_max.clone(),
         scan_type,
         uses_index,
         verdict,
@@ -171,6 +171,9 @@ fn diagnose_pg(
         recommended_parallel,
         warnings,
         suggestion,
+        chunk_min: range_min.clone(),
+        chunk_max: range_max.clone(),
+        db_max_connections,
     })
 }
 

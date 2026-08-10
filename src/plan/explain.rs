@@ -315,6 +315,9 @@ mod tests {
             recommended_parallel: (1, "small dataset"),
             warnings: vec![],
             suggestion: None,
+            chunk_min: None,
+            chunk_max: None,
+            db_max_connections: None,
         }
     }
 
