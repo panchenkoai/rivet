@@ -1575,3 +1575,123 @@ fn mssql_cdc_case_only_table_mismatch_must_not_silently_drop_events() {
          collation is case-insensitive, so every other layer accepted the name."
     );
 }
+
+/// #200-3: the catalog-identity guard must also fire on the `rivet cdc` CLI path,
+/// not only in `mode: cdc` config mode. `dispatch.rs` hard-coded
+/// `configured_tables = Vec::new()` for the CLI, and `mssql/cdc.rs` disables the
+/// cross-check when that set is empty — so `rivet cdc --capture-instance X
+/// --table Y` opened WITHOUT the guard the config path has, and a `--table`
+/// spelled in a case the catalog does not use routes ZERO events while the
+/// checkpoint advances past them (the same silent drop the config-mode test above
+/// guards, on the sibling entry point).
+///
+/// The fix passes `--table` — which the CLI ALREADY routes/filters by — as
+/// `configured_tables`, so the guard has the same subject it does in config mode.
+/// The `--output` leg is used (durable sink + checkpoint), because the drop is
+/// only dangerous once a checkpoint can advance.
+// AUDIT-RED cdc-cli-identity: a case-only --table mismatch on the CLI path routes ZERO events while the checkpoint advances — expected to FAIL until the CLI passes --table as configured_tables.
+#[test]
+#[ignore = "live: requires docker compose mssql with SQL Server Agent + CDC"]
+fn mssql_cdc_cli_path_case_only_table_mismatch_must_not_silently_drop_events() {
+    let _serial = CDC_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+
+    let table = format!("CliIdent{}", std::process::id() % 100_000);
+    let table = table.as_str();
+    let ci = &format!("dbo_{table}");
+    mssql_cdc_drop_table(&format!("dbo.{table}"));
+    mssql_cdc_exec(&format!(
+        "CREATE TABLE dbo.{table} (id int PRIMARY KEY, v nvarchar(50))"
+    ));
+    enable_cdc(table, ci);
+    let _guard = MssqlCdcTable {
+        table: table.to_string(),
+        ci: ci.clone(),
+    };
+
+    let d = tempfile::tempdir().unwrap();
+    let out = tempfile::tempdir().unwrap();
+    let ckpt = d.path().join("cli.ckpt");
+
+    // The CLI invocation, mirroring config mode's mismatch: --table in a case the
+    // catalog does not use. The anchor is allowed to REFUSE (the guard firing at
+    // open is exactly the fix) — refusing before any checkpoint advances is the
+    // outcome this test wants.
+    let cli = |dir: &std::path::Path, tbl: &str| {
+        run_rivet_env(
+            &[
+                "cdc",
+                "--source",
+                MSSQL_CDC_URL,
+                "--capture-instance",
+                ci,
+                "--table",
+                tbl,
+                "--checkpoint",
+                ckpt.to_str().unwrap(),
+                "--output",
+                dir.to_str().unwrap(),
+            ],
+            &[],
+        )
+    };
+
+    let anchor = cli(out.path(), &table.to_lowercase());
+    if !anchor.status.success() {
+        let why = String::from_utf8_lossy(&anchor.stderr);
+        assert!(
+            why.contains("no configured table matches"),
+            "the CLI anchor run failed for an unrelated reason:\n{why}"
+        );
+        return; // refused at open, before any checkpoint could advance — correct
+    }
+
+    mssql_cdc_exec(&format!(
+        "INSERT INTO dbo.{table} VALUES (1,'a'),(2,'b'),(3,'c');"
+    ));
+    wait_for_capture(ci, 3);
+
+    let o = cli(out.path(), &table.to_lowercase());
+    if !o.status.success() {
+        return; // refused — the guard the fix adds; correct
+    }
+
+    // A 0-capture CDC run writes NO parquet parts (the sink rolls only on a
+    // committed event), so part presence is the robust "did it capture" signal —
+    // avoiding a cell-type parse of the CLI --output shape.
+    let captured = files_with_extension(out.path(), "parquet").len();
+    if captured > 0 {
+        return; // routed correctly; nothing to guard
+    }
+
+    // Captured nothing AND exited 0 — the pre-fix silent drop. Prove the changes
+    // were there all along: a correctly-cased CLI run against a FRESH checkpoint
+    // recovers them (parts appear on disk).
+    let still_in_ct = mssql_cdc_query_i64(&format!("SELECT COUNT(*) FROM cdc.{ci}_CT"));
+    let out_fixed = tempfile::tempdir().unwrap();
+    let fixed_ckpt = d.path().join("cli_fixed.ckpt");
+    let _ = run_rivet_env(
+        &[
+            "cdc",
+            "--source",
+            MSSQL_CDC_URL,
+            "--capture-instance",
+            ci,
+            "--table",
+            &format!("dbo.{table}"),
+            "--checkpoint",
+            fixed_ckpt.to_str().unwrap(),
+            "--output",
+            out_fixed.path().to_str().unwrap(),
+        ],
+        &[],
+    );
+    let after_fix = files_with_extension(out_fixed.path(), "parquet").len();
+
+    panic!(
+        "the `rivet cdc` CLI path captured 0 of the {still_in_ct} change row(s) on a case-only \
+         --table mismatch and exited 0; a correctly-cased run wrote {after_fix} part(s). The CLI \
+         passed configured_tables = Vec::new() (dispatch.rs), which disables the catalog-identity \
+         cross-check (mssql/cdc.rs), so the guard the config path has never fired here — every \
+         event was dropped while the checkpoint advanced past it."
+    );
+}
