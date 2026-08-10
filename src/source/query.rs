@@ -257,6 +257,40 @@ pub(crate) fn build_keyset_query_bounded(
     }
 }
 
+/// Restrict a base query to a half-open key window `(lo, hi]` — the whole-export
+/// bound a `--split` range sub-export carries (#167). Wraps the base as
+/// `SELECT * FROM (<base>) AS _rivet_split WHERE <key> > <lo> AND <key> <= <hi>`,
+/// with either side omitted when its bound is `None` (the first window has no
+/// floor, the last no ceil). No `ORDER BY`/`LIMIT`: the sub-export's own runner
+/// (full/chunked/keyset) wraps THIS query for its paging — the window is a pure
+/// row-set restriction. Both bounds use [`inline_literal`], the same
+/// injection-safe form the keyset upper bound uses, so a probed boundary value
+/// can never plant SQL. Returns the base unchanged when both bounds are `None`.
+pub(crate) fn wrap_key_range(
+    base_query: &str,
+    key_column: &str,
+    lo: Option<&str>,
+    hi: Option<&str>,
+    source_type: SourceType,
+) -> String {
+    if lo.is_none() && hi.is_none() {
+        return base_query.to_string();
+    }
+    let key = quote_ident(source_type, key_column);
+    let mut preds: Vec<String> = Vec::with_capacity(2);
+    if let Some(lo) = lo {
+        preds.push(format!("{key} > {}", inline_literal(source_type, lo)));
+    }
+    if let Some(hi) = hi {
+        preds.push(format!("{key} <= {}", inline_literal(source_type, hi)));
+    }
+    format!(
+        "SELECT * FROM ({base}) AS _rivet_split WHERE {preds}",
+        base = base_query,
+        preds = preds.join(" AND "),
+    )
+}
+
 /// In-SQL literal for a key value, per dialect — the injection-safe inline form
 /// (never a bind param). MySQL/PG/MSSQL all implicit-cast a quoted literal to the
 /// key's column type, so a numeric key compares correctly against `'250001'`.

@@ -52,6 +52,26 @@ pub enum SchemaDriftPolicy {
     /// next run will detect the same change again.
     Fail,
 }
+/// The synthesis marker a range sub-export carries under `apply --pool --split`
+/// (#167). Never deserialized from YAML — set only by the pool's synthesizer, so
+/// it needs no `JsonSchema`/`Deserialize`. The key window is HALF-OPEN `(lo, hi]`
+/// so N adjacent windows partition the key gap-free with no overlap (the same
+/// convention `keyset::partition_ranges` uses): `lo = None` is the run's floor
+/// (first window), `hi = None` is the ceil (last window).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SplitSynth {
+    /// The parent export's FAMILY — every sub-export folds to it so the load view
+    /// recombines them as one table.
+    pub parent: String,
+    /// The key column the window is expressed over (the export's `chunk_by_key` /
+    /// `chunk_column`).
+    pub key_column: String,
+    /// Exclusive lower bound (`key > lo`); `None` for the first window (no floor).
+    pub lo: Option<String>,
+    /// Inclusive upper bound (`key <= hi`); `None` for the last window (no ceil).
+    pub hi: Option<String>,
+}
+
 #[derive(Debug, Deserialize, JsonSchema, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct ExportConfig {
@@ -73,6 +93,18 @@ pub struct ExportConfig {
     /// config reference.
     #[serde(skip)]
     pub snapshot_parent: Option<String>,
+    /// Set ONLY on a range sub-export the pool synthesizes under `apply --pool
+    /// --split` (#167): a single dominating export is emitted as N units over its
+    /// key span, each a first-class scheduler unit the pool places concurrently,
+    /// so the giant stops being the makespan floor. Carries the parent FAMILY and
+    /// this unit's half-open key window `(lo, hi]`. `None` on every ordinary
+    /// export.
+    ///
+    /// `skip` (not `skip_serializing_if`): an internal synthesis marker like
+    /// [`snapshot_parent`](Self::snapshot_parent), never a user-writable key — it
+    /// must not appear in the schema or the config reference.
+    #[serde(skip)]
+    pub split: Option<SplitSynth>,
     #[serde(default)]
     pub query: Option<String>,
     pub query_file: Option<String>,
@@ -348,13 +380,23 @@ pub struct ExportConfig {
 impl ExportConfig {
     /// The export FAMILY this export's runs belong to: the RECORDED
     /// `snapshot_parent` for the CDC snapshot leg `cdc_job` synthesizes, the
+    /// parent family for a range sub-export the pool `--split` synthesizes, the
     /// export's own name for everything else.
     ///
     /// The single place this is decided. It used to be re-derived at each
     /// writer by folding the name on `__snapshot_`, which merged a user export
     /// literally named `daily__snapshot_v2` into family `daily` — silently
     /// disarming the load's shared-prefix guard against its sibling `daily`.
+    ///
+    /// A `--split` sub-export named `daily#0` MUST fold to family `daily` so the
+    /// load view recombines the N range units as ONE logical table (the
+    /// shared-prefix merge-back, #167) — the same fold `snapshot_parent` gives the
+    /// CDC snapshot leg, via a dedicated field so neither path triggers the
+    /// other's behaviour.
     pub fn family(&self) -> String {
+        if let Some(s) = &self.split {
+            return s.parent.clone();
+        }
         self.snapshot_parent
             .clone()
             .unwrap_or_else(|| self.name.clone())
@@ -816,6 +858,7 @@ pub enum PartitionGranularity {
 pub(crate) fn sample_export(name: &str) -> ExportConfig {
     ExportConfig {
         snapshot_parent: None,
+        split: None,
         name: name.into(),
         target: None,
         load: None,
@@ -873,6 +916,31 @@ pub(crate) fn sample_export(name: &str) -> ExportConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #167: a `--split` sub-export named `daily#0` must fold to family `daily`
+    /// so the load view recombines the N range units as one logical table. RED
+    /// against a `family()` that ignores `split` (returns the unit name `daily#0`,
+    /// which would give each range its own family and defeat the merge-back).
+    #[test]
+    fn split_subexport_folds_to_parent_family() {
+        let mut e = sample_export("daily#0");
+        assert_eq!(
+            e.family(),
+            "daily#0",
+            "no split marker → family is the name"
+        );
+        e.split = Some(SplitSynth {
+            parent: "daily".into(),
+            key_column: "id".into(),
+            lo: Some("1000".into()),
+            hi: Some("2000".into()),
+        });
+        assert_eq!(
+            e.family(),
+            "daily",
+            "a split sub-export must fold to the parent family for the merge-back"
+        );
+    }
 
     // ── ExportConfig::max_file_size_bytes ───────────────────────────────────
 

@@ -37,7 +37,24 @@ pub fn build_plan(
             export.name
         );
     }
-    let base_query = export.resolve_query(config_dir, params)?;
+    let base_query = {
+        let q = export.resolve_query(config_dir, params)?;
+        // #167: a `--split` range sub-export restricts the whole export to its key
+        // window `(lo, hi]`. Injected HERE (on the base query every runner wraps)
+        // so the bound is runner-agnostic by construction — full/chunked/keyset
+        // all page over the already-bounded set, the exact runner-bypass trap a
+        // per-runner filter would reintroduce.
+        match &export.split {
+            Some(s) => crate::source::query::wrap_key_range(
+                &q,
+                &s.key_column,
+                s.lo.as_deref(),
+                s.hi.as_deref(),
+                config.source.source_type,
+            ),
+            None => q,
+        }
+    };
 
     let merged = merge_tuning_config(config.source.tuning.as_ref(), export.tuning.as_ref());
     // When no `tuning.profile:` is set, fall back to the env-derived default —
@@ -124,7 +141,12 @@ pub fn build_plan(
         max_file_size_bytes: export.max_file_size_bytes(),
         skip_empty: export.skip_empty,
         meta_columns: export.meta_columns.clone(),
-        destination: expand_destination_templates(export.destination.clone(), &export.name),
+        // #167: a `--split` sub-export named `daily#0` must resolve `{export}` /
+        // `{table}` to its FAMILY (`daily`), not the unit name — so all N range
+        // units write into ONE shared prefix and the load view recombines them as
+        // one logical table (the merge-back). An ordinary export's family IS its
+        // name, so this is a no-op off the split path.
+        destination: expand_destination_templates(export.destination.clone(), &export.family()),
         quality: export.quality.clone(),
         tuning,
         tuning_profile_label,
@@ -891,6 +913,67 @@ mod tests {
         assert!(!plan.validate);
         assert!(!plan.reconcile);
         assert!(!plan.resume);
+    }
+
+    /// #167 Slice C: a `--split` sub-export's plan restricts `base_query` to its
+    /// key window `(lo, hi]`, injection-safe, on the base every runner wraps. RED
+    /// against a build_plan that ignores `export.split` (base_query stays the raw
+    /// query, so every range unit scans the WHOLE table — N× duplication, the
+    /// split's whole point defeated).
+    #[test]
+    fn split_subexport_plan_bounds_the_base_query_to_its_key_window() {
+        // Interior window (both bounds): WHERE id > 1000 AND id <= 2000.
+        let mut mid = minimal_export();
+        mid.name = "daily#1".into();
+        mid.query = Some("SELECT * FROM t".into());
+        mid.split = Some(crate::config::SplitSynth {
+            parent: "daily".into(),
+            key_column: "id".into(),
+            lo: Some("1000".into()),
+            hi: Some("2000".into()),
+        });
+        let plan = build_plan(
+            &minimal_config(),
+            &mid,
+            Path::new("."),
+            false,
+            false,
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(
+            plan.base_query.contains("SELECT * FROM t")
+                && plan.base_query.contains("> E'1000'")
+                && plan.base_query.contains("<= E'2000'"),
+            "interior window must bound both sides (PG literal form): {}",
+            plan.base_query
+        );
+
+        // First window (no floor): only the upper bound.
+        let mut first = mid.clone();
+        first.name = "daily#0".into();
+        first.split = Some(crate::config::SplitSynth {
+            parent: "daily".into(),
+            key_column: "id".into(),
+            lo: None,
+            hi: Some("1000".into()),
+        });
+        let plan0 = build_plan(
+            &minimal_config(),
+            &first,
+            Path::new("."),
+            false,
+            false,
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(
+            plan0.base_query.contains("<= E'1000'") && !plan0.base_query.contains(" > "),
+            "first window must have no floor: {}",
+            plan0.base_query
+        );
     }
 
     #[test]
