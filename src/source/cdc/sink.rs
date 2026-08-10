@@ -85,6 +85,12 @@ pub(crate) struct SinkConfig<'a> {
     /// durable — not just the manifest beside it. `None` only where there is no
     /// state store to write to (the unit sinks, which have no database).
     pub state: Option<&'a crate::state::StateStore>,
+    /// Cumulative DECODED bytes READ from the source this run (#196) — the read
+    /// leg, so a CDC run records bytes_read like a batch run instead of a false 0.
+    /// Accumulated per captured event; never reset (unlike the rollover buffer's
+    /// own byte counter). A shared Arc so the caller reads the total after the
+    /// drain. `Default` = a throwaway counter (unit sinks / tests that ignore it).
+    pub read_bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// When to roll a part: at a transaction boundary, once the buffer reaches the row
@@ -329,6 +335,7 @@ pub(crate) fn run_to_files(
     cfg: SinkConfig<'_>,
 ) -> (Vec<RunManifest>, Result<()>) {
     let run_token = run_token(&cfg.run_id);
+    let read_bytes = std::sync::Arc::clone(&cfg.read_bytes);
     let mut sinks: Vec<TableSink<'_>> = cfg
         .outputs
         .into_iter()
@@ -414,7 +421,9 @@ pub(crate) fn run_to_files(
                     // Confirmed routed to a captured table → surface any deferred
                     // decode error (uncaptured tables' poison never applies).
                     ev.raise_poison()?;
-                    total_bytes += ev.estimated_bytes();
+                    let eb = ev.estimated_bytes();
+                    total_bytes += eb;
+                    read_bytes.fetch_add(eb as u64, std::sync::atomic::Ordering::Relaxed);
                     sink.buf.push(ev);
                     total_rows += 1;
                     emitted += 1;
@@ -1871,6 +1880,7 @@ mod tests {
             run_id: "r".into(),
             // The unit sinks write to a tempdir with no database behind them.
             state: None,
+            read_bytes: Default::default(),
         }
     }
 
@@ -2189,6 +2199,7 @@ mod tests {
             run_id: "r".into(),
             // The unit sinks write to a tempdir with no database behind them.
             state: None,
+            read_bytes: Default::default(),
         }
     }
 
