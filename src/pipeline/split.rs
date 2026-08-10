@@ -43,28 +43,35 @@ fn windows(bounds: &[String]) -> Vec<(Option<String>, Option<String>)> {
     out
 }
 
-/// Whether an export may be split into range sub-exports. A split is only correct
-/// when (1) it has a single ordered key to partition over — `chunk_by_key` or
-/// `chunk_column` — and (2) its mode re-reads the whole range on each run
-/// (full/chunked/keyset), NOT incremental (which would need a per-sub-range
-/// cursor, out of v1) and NOT CDC (a stream, not a range scan). Returns the key
-/// column to split over, or `None` (leave the export whole).
+/// Whether an export may be split into range sub-exports, and on which key. A
+/// split is only correct when the export (1) has a single ordered key to
+/// partition over, (2) re-reads the whole range each run (NOT incremental — its
+/// cursor is a single per-export value; NOT CDC — a stream), AND (3) runs in a
+/// CHECKPOINT-RESUMABLE mode, so `--pool --split --resume` can resume a crashed
+/// unit from its own checkpoint (#167) rather than re-run it fresh and duplicate
+/// its partial parts. The two resumable shapes are `chunk_by_key` (keyset,
+/// resumable via its range checkpoint in any mode) and `chunk_column` in
+/// `mode: chunked` (range chunking, resumable via the chunk checkpoint).
+///
+/// A plain `mode: full` export (chunk_column ignored) is NOT split — it has no
+/// per-unit checkpoint, so a crashed unit could not resume without duplicating.
+/// Returns the key column, or `None` (leave the export whole).
 pub(crate) fn splittable_key(export: &ExportConfig) -> Option<String> {
-    // CDC is a stream, not a range scan — never splittable. A whole-table
-    // full/chunked/keyset scan is exactly what a range partition covers
-    // losslessly; incremental is excluded just below (its cursor is per-export).
     if export.mode == ExportMode::Cdc {
-        return None;
+        return None; // a stream, not a range scan
     }
     if export.cursor_column.is_some() {
-        // An incremental export (cursor set) is excluded even in chunked mode —
-        // the cursor high-water is a single per-export value, not per-range.
-        return None;
+        return None; // incremental: a single per-export cursor, not per-range
     }
-    export
-        .chunk_by_key
-        .clone()
-        .or_else(|| export.chunk_column.clone())
+    if let Some(key) = &export.chunk_by_key {
+        return Some(key.clone()); // keyset — resumable in any mode
+    }
+    if export.mode == ExportMode::Chunked
+        && let Some(col) = &export.chunk_column
+    {
+        return Some(col.clone()); // range chunking — resumable via chunk checkpoint
+    }
+    None
 }
 
 /// Realize a split: the dominating `base` export becomes `bounds.len() + 1` range
@@ -91,6 +98,14 @@ pub(crate) fn synthesize(
         .map(|(i, (lo, hi))| {
             let mut e = base.clone();
             e.name = format!("{}#{i}", base.name);
+            // Crash-recovery ON so `--pool --split --resume` resumes a crashed unit
+            // from its own checkpoint (#167 per-unit resume): the runner reuses the
+            // in-progress run_id, so the partial parts are OVERWRITTEN in place
+            // (cloud-safe — no delete needed) rather than duplicated. Completed
+            // units are skipped by the pool; never-started units run fresh. This is
+            // crash-recovery only (never the append-only keyset_incremental), so a
+            // clean re-run still does a full pass over the window.
+            e.chunk_checkpoint = true;
             e.split = Some(SplitSynth {
                 parent: parent.clone(),
                 key_column: key_column.to_string(),
@@ -140,6 +155,46 @@ pub(crate) fn probe_and_synthesize(
         return Ok(None);
     }
     Ok(Some(synthesize(giant, &key, &bounds)))
+}
+
+/// The set of split-unit export names that ALREADY completed into the shared
+/// prefix — a unit is complete iff it left a run-unique manifest COPY with status
+/// `Success` (the durable, mode-agnostic, cloud-safe completion signal; a crashed
+/// unit never finalizes one). `--pool --split --resume` reads this ONCE per giant
+/// and skips the named units, re-running only the rest (#167 per-unit resume).
+///
+/// `dest_config` is the giant's destination; it is expanded with the FAMILY (the
+/// same `{export}`→family resolution `build_plan` does for a split unit) so it
+/// points at the ONE shared prefix. Best-effort: any listing/read/parse failure
+/// yields an empty set (the unit is treated as incomplete and re-run — safe,
+/// never a skip that could drop data). Read-only.
+pub(crate) fn completed_units_in_prefix(
+    dest_config: &crate::config::DestinationConfig,
+    family: &str,
+) -> std::collections::BTreeSet<String> {
+    use crate::manifest::{ManifestStatus, RunManifest, is_run_unique_manifest_name};
+    let mut done = std::collections::BTreeSet::new();
+    let ctx = crate::destination::placeholder::PlaceholderContext::for_today(family);
+    let expanded = crate::destination::placeholder::expand_destination(dest_config.clone(), &ctx);
+    let Ok(dest) = crate::destination::create_destination(&expanded) else {
+        return done;
+    };
+    let Ok(listing) = dest.list_prefix("") else {
+        return done;
+    };
+    for meta in listing {
+        let base = meta.key.rsplit('/').next().unwrap_or("");
+        if !is_run_unique_manifest_name(base) {
+            continue;
+        }
+        if let Ok(bytes) = dest.read(&meta.key)
+            && let Ok(m) = serde_json::from_slice::<RunManifest>(&bytes)
+            && matches!(m.status, ManifestStatus::Success)
+        {
+            done.insert(m.export_name);
+        }
+    }
+    done
 }
 
 #[cfg(test)]

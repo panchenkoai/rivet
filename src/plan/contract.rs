@@ -95,6 +95,15 @@ pub struct ResolvedRunPlan {
     pub source_table: Option<String>,
     /// Final query string (params substituted, query_file loaded).
     pub base_query: String,
+    /// This plan is one range sub-export UNIT of a `--pool --split` (#167). Such
+    /// a unit shares its destination prefix with its N-1 siblings, so it must NOT
+    /// write the prefix-level `_SUCCESS` itself (that would falsely mark the whole
+    /// giant done the moment ONE unit finishes) and must NOT be blocked by the M8
+    /// resume guard on a sibling's `_SUCCESS`. The pool writes `_SUCCESS` once,
+    /// after ALL units complete. `#[serde(default)]` so old plan artifacts (no
+    /// field) deserialize as non-split.
+    #[serde(default)]
+    pub is_split_unit: bool,
     pub strategy: ExtractionStrategy,
     pub format: FormatType,
     pub compression: CompressionType,

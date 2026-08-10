@@ -1596,6 +1596,7 @@ mod tests {
             export_name: "orders".into(),
             source_table: None,
             base_query: "SELECT id FROM orders".into(),
+            is_split_unit: false,
             strategy: ExtractionStrategy::Chunked(ChunkedPlan {
                 column: "id".into(),
                 chunk_size: 100,

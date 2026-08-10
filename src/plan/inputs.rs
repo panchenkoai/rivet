@@ -138,6 +138,7 @@ mod tests {
             export_name: "test".into(),
             source_table: None,
             base_query: "SELECT 1".into(),
+            is_split_unit: false,
             strategy,
             format: FormatType::Parquet,
             compression: CompressionType::None,

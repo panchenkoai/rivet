@@ -783,15 +783,25 @@ pub(crate) fn run_pool(
     // this handle for the duration reads below.
     let state = StateStore::open(config_path)?;
 
-    // Same skip-completed contract as the wave path (probe the EXPANDED
-    // destination for _SUCCESS under --resume). OWNED (`.cloned()`) so a
-    // `--split` can splice synthesized range sub-exports into the set — they are
-    // fresh `ExportConfig`s with no config.exports slot to borrow, and everything
-    // downstream (`by_name`, `queue`) borrows from THIS vec.
+    // Skip-completed contract (probe the EXPANDED destination for _SUCCESS under
+    // --resume). OWNED (`.cloned()`) so a `--split` can splice synthesized range
+    // sub-exports into the set — they are fresh `ExportConfig`s with no
+    // config.exports slot to borrow, and everything downstream (`by_name`,
+    // `queue`) borrows from THIS vec.
+    //
+    // #167 per-unit resume: with `--split` the prefix-level _SUCCESS is AMBIGUOUS
+    // (a split prefix's _SUCCESS is written per-unit, so it is present the moment
+    // ONE unit finishes) — pre-skipping the giant on it would drop a partially-
+    // complete split. So when `--split` is set the pre-skip is deferred to a
+    // PER-UNIT skip AFTER the split (below); without `--split` the normal
+    // prefix-level skip applies here unchanged.
     let mut effective: Vec<ExportConfig> = config
         .exports
         .iter()
         .filter(|e| {
+            if split {
+                return true; // per-unit skip happens after the split
+            }
             let ctx = crate::destination::placeholder::PlaceholderContext::for_today(&e.name);
             let expanded =
                 crate::destination::placeholder::expand_destination(e.destination.clone(), &ctx);
@@ -832,6 +842,9 @@ pub(crate) fn run_pool(
     //    never a silent fall-back to the un-split giant.
     //  * `--split` NOT set → the pre-existing ADVISORY warn (tells the operator
     //    the concrete floor-breaker; they act on it).
+    // #167 per-unit resume: (destination, family) of the giant that was split, so
+    // the post-split skip can read which of its units already completed.
+    let mut split_info: Option<(crate::config::DestinationConfig, String)> = None;
     let advise = super::pool::advise_split(&items, m, 3.0, m.max(2));
     if split {
         match &advise {
@@ -844,6 +857,7 @@ pub(crate) fn run_pool(
                 match super::split::probe_and_synthesize(&config, &base, &config_dir, *n)? {
                     Some(units) => {
                         let realized = units.len();
+                        split_info = Some((base.destination.clone(), base.family()));
                         effective.retain(|e| &e.name != giant);
                         effective.extend(units);
                         items = build_items(&effective);
@@ -881,6 +895,52 @@ pub(crate) fn run_pool(
             n,
             broken / 60.0,
         );
+    }
+
+    // #167 per-unit resume: with `--split --resume`, skip PER UNIT (the pre-skip
+    // was deferred above because a split prefix's _SUCCESS is ambiguous). A split
+    // unit whose Success manifest copy is already in the shared prefix is done —
+    // drop it; the rest re-run (a crashed unit resumes its own checkpoint, a
+    // never-started one runs fresh — the per-unit resume flag is set at the call
+    // site below). Non-split exports still skip on their own prefix _SUCCESS.
+    if split && resume {
+        let completed_units = split_info
+            .as_ref()
+            .map(|(dest, family)| super::split::completed_units_in_prefix(dest, family))
+            .unwrap_or_default();
+        effective.retain(|e| match &e.split {
+            Some(_) => {
+                let done = completed_units.contains(&e.name);
+                if done {
+                    log::info!(
+                        "apply --pool --split: skipping unit '{}' — already complete (its \
+                         manifest copy is present)",
+                        e.name
+                    );
+                }
+                !done
+            }
+            None => {
+                let ctx = crate::destination::placeholder::PlaceholderContext::for_today(&e.name);
+                let expanded = crate::destination::placeholder::expand_destination(
+                    e.destination.clone(),
+                    &ctx,
+                );
+                let done = finalize::destination_has_success(&expanded);
+                if done {
+                    log::info!(
+                        "apply --pool: skipping '{}' — destination already complete (_SUCCESS)",
+                        e.name
+                    );
+                }
+                !done
+            }
+        });
+        if effective.is_empty() {
+            log::warn!("apply --pool: nothing to run (no exports, or all complete)");
+            return Ok(());
+        }
+        items = build_items(&effective);
     }
 
     // LPT order + the makespan the model PREDICTS (POST-split) — printed up front
@@ -979,14 +1039,26 @@ pub(crate) fn run_pool(
                     }
                     let _heavy = HeavyGuard(&heavy_running, !is_parallel_safe(export));
                     let pair = match StateStore::open(config_path) {
-                        Ok(st) => job::run_export_job(
-                            config_path,
-                            &config,
-                            export,
-                            &st,
-                            &config_dir,
-                            &opts,
-                        ),
+                        Ok(st) => {
+                            // #167 per-unit resume: a split unit resumes ONLY if it
+                            // has a checkpoint to resume (a crashed unit) — else it
+                            // runs fresh, so `--resume` never bails on a
+                            // never-started unit's "no in-progress checkpoint".
+                            // Non-split exports keep the run-wide resume flag.
+                            let mut unit_opts = opts;
+                            if export.split.is_some() {
+                                unit_opts.resume = resume
+                                    && st.has_resumable_checkpoint(&export.name).unwrap_or(false);
+                            }
+                            job::run_export_job(
+                                config_path,
+                                &config,
+                                export,
+                                &st,
+                                &config_dir,
+                                &unit_opts,
+                            )
+                        }
                         Err(e) => {
                             let err = anyhow::anyhow!(
                                 "export '{}': failed to open state database: {:#}",
@@ -1023,11 +1095,38 @@ pub(crate) fn run_pool(
 
     let mut summaries: Vec<RunSummary> = Vec::new();
     let mut failures: Vec<anyhow::Error> = Vec::new();
+    // #167: track whether every `--split` UNIT of the giant succeeded this run —
+    // the pool is the single writer of the prefix `_SUCCESS` (units suppress it),
+    // so the marker goes down only once the whole giant is complete.
+    let unit_prefix = split_info.as_ref().map(|(_, family)| format!("{family}#"));
+    let mut split_units_all_ok = true;
     for (res, summary) in collected.into_inner().unwrap() {
+        if let Some(pfx) = &unit_prefix
+            && summary.export_name.starts_with(pfx.as_str())
+            && (res.is_err() || summary.status != "success")
+        {
+            split_units_all_ok = false;
+        }
         if let Err(e) = res {
             failures.push(e);
         }
         summaries.push(summary);
+    }
+    // Every split unit succeeded → write the ONE prefix-level `_SUCCESS` the units
+    // deliberately suppressed (finalize wrote each unit's manifest + run-unique
+    // copy; this is the marker that says the whole giant is done). Best-effort: a
+    // missing marker only affects the resume-skip fast path, never data integrity.
+    if let Some((dest_config, family)) = &split_info
+        && split_units_all_ok
+    {
+        let ctx = crate::destination::placeholder::PlaceholderContext::for_today(family);
+        let expanded =
+            crate::destination::placeholder::expand_destination(dest_config.clone(), &ctx);
+        if let Err(e) = finalize::write_split_success_marker(&expanded) {
+            log::warn!(
+                "apply --pool --split: could not write the prefix _SUCCESS for '{family}': {e:#}"
+            );
+        }
     }
     if pending.len() > 1 {
         let entries = summaries

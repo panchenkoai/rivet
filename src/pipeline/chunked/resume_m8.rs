@@ -515,9 +515,24 @@ pub(crate) fn apply_m8_resume_decisions(
         .map(|f| f.file_name)
         .collect();
     let mut untracked_surplus = 0usize;
+    // #167: a `--split` unit SHARES its destination prefix with its N-1 siblings.
+    // A sibling's parts are untracked FROM THIS UNIT'S manifest and absent from
+    // THIS UNIT'S file_log, so the surplus scan would quarantine-MOVE them out of
+    // the prefix — silently dropping the sibling's committed rows (measured:
+    // 225k/300k, unit #0's resume moved unit #1's completed chunk to `_quarantine/`).
+    // A split unit owns only the objects named with ITS OWN part prefix
+    // (`<export_name>_…`); everything else under the prefix belongs to a sibling
+    // (or the pool) and is never this unit's surplus to move.
+    let own_part_prefix = plan.is_split_unit.then(|| format!("{}_", plan.export_name));
     for key in resume_plan.untracked.keys() {
         if committed_parts.contains(key.as_str()) {
             continue; // durably committed per file_log — not surplus, do not move
+        }
+        if let Some(prefix) = &own_part_prefix {
+            let base = key.rsplit('/').next().unwrap_or(key);
+            if !base.starts_with(prefix) {
+                continue; // a sibling split unit's part (shared prefix) — not ours
+            }
         }
         untracked_surplus += 1;
         quarantine_move(&*dest, key, run_id, &plan.export_name, &mut stats);
@@ -670,6 +685,7 @@ mod tests {
             export_name: "orders".into(),
             source_table: None,
             base_query: "SELECT 1".into(),
+            is_split_unit: false,
             strategy: crate::plan::ExtractionStrategy::Snapshot,
             format: crate::config::FormatType::Parquet,
             compression: crate::config::CompressionType::None,

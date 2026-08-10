@@ -438,3 +438,106 @@ fn pool_split_prefix_is_manifest_coherent() {
     );
     let _ = std::fs::remove_file(&orphan);
 }
+
+/// #167 per-unit resume: `apply --pool --split --resume` re-runs only the
+/// INCOMPLETE units of a crashed split — no gap (the unfinished window is
+/// re-run), no dup (a completed unit is skipped by its manifest copy; a crashed
+/// unit resumes its own checkpoint, reusing its run_id so the partial parts are
+/// overwritten in place). The two-run crash→resume proof the resume contract
+/// demands.
+///
+/// Run 1 splits and fails via `RIVET_TEST_ERROR_AT=chunk_export:1` (each ~half
+/// unit has 2 chunks at chunk_size 75k, so a unit errors on its 2nd chunk). Run 2
+/// resumes with no fault and must complete the whole table exactly once.
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn pool_split_resume_recovers_a_crashed_partial_with_no_gap_or_dup() {
+    require_alive(LiveService::Postgres);
+    const N: i64 = 300_000;
+    let table = unique_name("pr_resume");
+    let mut c = pg_connect();
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {table};
+         CREATE TABLE {table} AS SELECT g AS id, md5(g::text) AS a, md5((g*3)::text) AS b \
+           FROM generate_series(1, {N}) g;
+         ALTER TABLE {table} ADD PRIMARY KEY (id);"
+    ))
+    .unwrap();
+
+    let rig = Rig::pg_batch(&format!("public.{table}"))
+        .mode("chunked")
+        .export_line("chunk_column: id")
+        .export_line("chunk_size: 75000")
+        .export_line("parallel_safe: true")
+        .also_export(
+            "pr_resume_small",
+            "SELECT g AS id FROM generate_series(1, 100) g",
+        )
+        .also_export_line("parallel_safe: true");
+    let cfg = rig.config_path();
+
+    // Prime durations, clear, so the split fires on run 1.
+    assert!(
+        run_rivet_env(&["apply", cfg.to_str().unwrap(), "--pool", "2"], &[])
+            .status
+            .success(),
+        "priming run must succeed"
+    );
+    for d in [rig.out_dir(), rig.out_dir_for("pr_resume_small")] {
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+    }
+
+    // Run 1: split + crash a unit mid-way. The run FAILS, leaving a partial split.
+    let crashed = run_rivet_env(
+        &["apply", cfg.to_str().unwrap(), "--pool", "2", "--split"],
+        &[("RIVET_TEST_ERROR_AT", "chunk_export:1")],
+    );
+    assert!(
+        !crashed.status.success(),
+        "run 1 must fail (a unit errored mid-split):\n{}",
+        String::from_utf8_lossy(&crashed.stderr)
+    );
+    // The fixture is not inert: SOME of the giant's parts made it to disk, but not
+    // the whole table (a unit crashed).
+    let partial = duckdb_total_parquet_rows(&rig.out_dir()) as i64;
+    assert!(
+        partial < N,
+        "run 1 must leave the split INCOMPLETE (a unit crashed), got {partial} of {N}"
+    );
+
+    // Run 2: resume, no fault. Must complete the whole table exactly once.
+    let resumed = run_rivet_env(
+        &[
+            "apply",
+            cfg.to_str().unwrap(),
+            "--pool",
+            "2",
+            "--split",
+            "--resume",
+        ],
+        &[],
+    );
+    assert!(
+        resumed.status.success(),
+        "resume run must succeed:\n{}",
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+
+    let rows = duckdb_total_parquet_rows(&rig.out_dir()) as i64;
+    let ids = duckdb_dir_parquet_id_set(&rig.out_dir());
+    assert_eq!(
+        rows, N,
+        "after resume the giant must hold every row exactly once — no gap (unfinished \
+         window re-run) and no dup (completed units skipped, crashed unit's parts \
+         overwritten): got {rows}"
+    );
+    assert_eq!(
+        ids.len() as i64,
+        N,
+        "distinct ids must equal {N} — a resume that duplicated a completed unit's \
+         parts, or re-ran with a fresh run_id beside the survivors, fails here"
+    );
+
+    let _ = c.batch_execute(&format!("DROP TABLE IF EXISTS {table};"));
+}
