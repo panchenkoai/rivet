@@ -294,11 +294,139 @@ def verify_gc_survival(led: Ledger, *, bucket: str, pfx: str, cfg_text: str,
                    "spared, manifested parts untouched", "3 arms")
 
 
+def _bq_one_engine(
+    led: Ledger,
+    engine: str,
+    *,
+    proj: str,
+    dset: str,
+    bucket: str,
+    matrix: str,
+    work: Path,
+    bless: bool,
+    keep: bool,
+    up: Callable[..., str | None],
+    seed: Callable[..., str],
+) -> dict | None:
+    """One engine's whole BQ leg: export → load → read back → compare → clean up.
+
+    Fully self-contained PER ENGINE — its own dataset (`{dset}_{engine}`), GCS prefix
+    (`bq/{engine}`), config, and container — which is exactly why the outer loop can
+    run these concurrently (the per-dataset fix below removed the shared-table hazard
+    the old sequential-only comment warned about). Records its rows/spans into `led`
+    (a buffered child under parallelism) and returns the blessed rows (bless mode) or
+    None. The `bq {engine}: run/load/readback` spans answer whether the load and the
+    read-back SELECT actually speed up under parallelism or are BQ-rate-limited."""
+    versions = _matrix_cfg("versions", engine).splitlines()
+    fields = versions[0].split() if versions else []
+    image = fields[1] if len(fields) > 1 else ""
+    port = _PORTS[engine]
+
+    url = up(led, engine, _TAG, image, port)
+    if not url:
+        led.skipped("bigquery", engine, "golden", "-",
+                    f"BigQuery[{engine}]: bring-up failed", "bring-up")
+        return None
+    if seed(engine, _TAG, url):
+        led.skipped("bigquery", engine, "golden", "-",
+                    f"BigQuery[{engine}]: seed errors", "seed")
+        if not keep:
+            docker("rm", "-fv", engine_container(engine, _TAG))
+        return None
+
+    tlsblk = "\n  tls: {accept_invalid_certs: true}" if engine == "mssql" else ""
+    exp = matrix
+    # ONE DATASET PER SOURCE. Every engine exports a table called `rivet_type_matrix`
+    # and `rivet load` derives the warehouse table from that name, so a shared dataset
+    # would mean three databases writing one table last-write-wins — which `rivet load`
+    # refuses, and rightly (2026-08-03: postgres owned it, mysql/mssql failed). Three
+    # configs → three DESTINATIONS (own dataset + own GCS prefix), so the legs are
+    # independent and the ownership guard stays ARMED. This independence is what makes
+    # the outer loop safe to parallelise.
+    eng_dset = f"{dset}_{engine}"
+    run(["bq", f"--project_id={proj}", "mk", "-f", "--dataset", f"{proj}:{eng_dset}"])
+    pfx = f"release-oracle/bq/{engine}"
+    cfgf = work / f"bqload_{engine}.yaml"
+    cfgf.write_text(
+        "source:\n"
+        f"  type: {engine}\n"
+        f"  url_env: ORACLE_URL{tlsblk}\n"
+        "exports:\n"
+        f"  - name: {exp}\n"
+        f"    table: {matrix}\n"
+        "    mode: full\n"
+        "    format: parquet\n"
+        f"    destination: {{type: gcs, bucket: {bucket}, prefix: {pfx}/}}\n"
+        "load:\n"
+        "  target: bigquery\n"
+        f"  project: {proj}\n"
+        f"  dataset: {eng_dset}\n"
+    )
+
+    # Clear the prefix first: a leftover part from an earlier run would be loaded
+    # alongside this one's and the read-back would compare a union.
+    run(["gcloud", "storage", "rm", "-r", f"gs://{bucket}/{pfx}"])
+
+    got = ""
+    child = {"ORACLE_URL": url}
+    with led.span(f"bq {engine}: run"):
+        rp = rivet("run", "-c", str(cfgf), env=child, timeout=None)
+    lp = None
+    if rp.ok:
+        with led.span(f"bq {engine}: load"):
+            lp = rivet("load", "-c", str(cfgf), env=child, timeout=None)
+    if rp.ok and lp is not None and lp.ok:
+        with led.span(f"bq {engine}: readback"):
+            q = run(["bq", f"--project_id={proj}", "query", "--nouse_legacy_sql",
+                     "--format=prettyjson",
+                     f"SELECT * FROM `{proj}.{eng_dset}.{exp}` ORDER BY id"], timeout=None)
+            got = run(["python3", str(_LIB / "normalize_bq.py")], stdin=q.stdout).stdout.strip()
+    else:
+        failed_proc = rp if not rp.ok else lp
+        leg = "run" if not rp.ok else "load"
+        why = ((failed_proc.stderr or failed_proc.stdout or "").strip()
+               if failed_proc is not None else "")
+        tail = " / ".join(why.splitlines()[-3:]) if why else "no output captured"
+        led.failed("bigquery", engine, "golden", "-",
+                   f"BigQuery[{engine}]: rivet {leg} failed — {tail}", "load")
+
+    # gc_survival needs the prefix AS LOADED (a success manifest + real parts), so it
+    # runs here — after the read-back, before the wipe.
+    if got:
+        verify_gc_survival(led, bucket=bucket, pfx=pfx, cfg_text=cfgf.read_text(),
+                           work=work, child=child, engine=engine)
+
+    run(["gcloud", "storage", "rm", "-r", f"gs://{bucket}/{pfx}"])
+    run(["bq", f"--project_id={proj}", "rm", "-f", "-t", f"{eng_dset}.{exp}"])
+    if not keep:
+        docker("rm", "-fv", engine_container(engine, _TAG))
+    if not got:
+        # Either the run/load leg already recorded its FAIL, or the read-back itself
+        # produced nothing (KNOWN GAP from the bash: that case records no row).
+        return None
+
+    if bless:
+        rows = json.loads(got)
+        led.passed("bigquery", engine, "golden", "-",
+                   f"BigQuery[{engine}] blessed ({len(rows)} rows)", "blessed")
+        return rows
+    want = _load_golden().get(engine, {}).get(matrix)
+    if want is not None and _canon(json.loads(got)) == _canon(want):
+        led.ok(f"BigQuery[{engine}] matches golden")
+        led.add("bigquery", engine, "golden", "-", Status.PASS)
+    else:
+        led.failed("bigquery", engine, "golden", "-",
+                   f"BigQuery[{engine}] DIVERGED from golden — "
+                   "rivet type export or BQ mapping changed", "diverged")
+    return None
+
+
 def run_bigquery_golden(
     led: Ledger,
     *,
     bless: bool = False,
     keep: bool = False,
+    parallel: int = 1,
     bring_up: Callable[..., str | None] | None = None,
     seed_engine: Callable[..., str] | None = None,
 ) -> None:
@@ -327,141 +455,41 @@ def run_bigquery_golden(
     work = _work_dir()
     blessed: dict[str, dict[str, object]] = {}
 
-    for engine in _matrix_cfg("engines").split():
-        if engine == "mongo":
-            continue  # no type matrix (full-scan only)
-        port = _PORTS.get(engine)
-        if port is None:
-            continue
+    engines = [e for e in _matrix_cfg("engines").split()
+               if e != "mongo" and _PORTS.get(e) is not None]  # mongo: no type matrix
 
-        versions = _matrix_cfg("versions", engine).splitlines()
-        fields = versions[0].split() if versions else []
-        image = fields[1] if len(fields) > 1 else ""
-
-        url = _up(led, engine, _TAG, image, port)
-        if not url:
-            led.skipped("bigquery", engine, "golden", "-",
-                        f"BigQuery[{engine}]: bring-up failed", "bring-up")
-            continue
-        if _seed(engine, _TAG, url):
-            led.skipped("bigquery", engine, "golden", "-",
-                        f"BigQuery[{engine}]: seed errors", "seed")
-            if not keep:
-                docker("rm", "-fv", engine_container(engine, _TAG))
-            continue
-
-        tlsblk = "\n  tls: {accept_invalid_certs: true}" if engine == "mssql" else ""
-        # `rivet load` names the BigQuery table after the `table:` field, so every
-        # engine lands in the SAME `rivet_type_matrix` table. That is fine ONLY
-        # because engines run SEQUENTIALLY here — load → read back → drop, before
-        # the next engine starts. Parallelising this loop would silently have the
-        # engines overwrite each other's read-back.
-        exp = matrix
-        # ONE DATASET PER SOURCE. Every engine exports a table called
-        # `rivet_type_matrix`, and `rivet load` derives the warehouse table from
-        # that name — so a single shared dataset means three DIFFERENT databases
-        # writing one warehouse table, which `rivet load` refuses, and rightly:
-        # a dataset must not take a same-named table from another database
-        # last-write-wins. The first load lands, the next one FAILS and says so.
-        #
-        # Measured 2026-08-03 on the Postgres pass: postgres PASS, mysql and mssql
-        # "rivet run/load failed", with one ledger row naming postgres the owner
-        # of `rivet_type_matrix`. The SQLite pass passed only because its state
-        # was not shared, so the ledger had no memory across engines — the gate
-        # was expressing the forbidden pattern either way.
-        #
-        # The fix is where it belongs: these are already three separate configs,
-        # so they get three separate DESTINATIONS. Nothing is renamed, and the
-        # guard stays ARMED — if two sources ever do land in one dataset here,
-        # the gate goes red, which is the point.
-        eng_dset = f"{dset}_{engine}"
-        run(["bq", f"--project_id={proj}", "mk", "-f", "--dataset", f"{proj}:{eng_dset}"])
-        pfx = f"release-oracle/bq/{engine}"
-        cfgf = work / f"bqload_{engine}.yaml"
-        cfgf.write_text(
-            "source:\n"
-            f"  type: {engine}\n"
-            f"  url_env: ORACLE_URL{tlsblk}\n"
-            "exports:\n"
-            f"  - name: {exp}\n"
-            f"    table: {matrix}\n"
-            "    mode: full\n"
-            "    format: parquet\n"
-            f"    destination: {{type: gcs, bucket: {bucket}, prefix: {pfx}/}}\n"
-            "load:\n"
-            "  target: bigquery\n"
-            f"  project: {proj}\n"
-            f"  dataset: {eng_dset}\n"
-        )
-
-        # Clear the prefix first: a leftover part from an earlier run would be
-        # loaded alongside this one's and the read-back would compare a union.
-        run(["gcloud", "storage", "rm", "-r", f"gs://{bucket}/{pfx}"])
-
-        got = ""
-        # ORACLE_URL is scoped to the child rather than exported process-wide, so
-        # it cannot leak into a later stage that resolves `url_env`.
-        child = {"ORACLE_URL": url}
-        # Keep the Procs: `rivet load` refuses for REASONS an operator must read
-        # — most sharply "target table X was last loaded from <other source>",
-        # which is rivet telling you a dataset must not take a same-named table
-        # from another database. Reporting a bare "run/load failed" throws that
-        # sentence away and sends the reader digging through a 400-line log for
-        # something the cell already knew. (2026-08-03: it cost exactly that.)
-        rp = rivet("run", "-c", str(cfgf), env=child, timeout=None)
-        lp = rivet("load", "-c", str(cfgf), env=child, timeout=None) if rp.ok else None
-        if rp.ok and lp is not None and lp.ok:
-            q = run(["bq", f"--project_id={proj}", "query", "--nouse_legacy_sql",
-                     "--format=prettyjson",
-                     f"SELECT * FROM `{proj}.{eng_dset}.{exp}` ORDER BY id"], timeout=None)
-            # `normalize_bq.py` sorts rows by id and re-serializes with sorted
-            # keys, so a golden diff is a real change rather than row-order or
-            # key-order noise. Reused, not re-implemented.
-            got = run(["python3", str(_LIB / "normalize_bq.py")], stdin=q.stdout).stdout.strip()
-        else:
-            failed_proc = rp if not rp.ok else lp
-            leg = "run" if not rp.ok else "load"
-            why = ((failed_proc.stderr or failed_proc.stdout or "").strip()
-                   if failed_proc is not None else "")
-            # The LAST lines: anyhow prints the context chain last, so the tail
-            # carries the actual refusal rather than the setup noise above it.
-            tail = " / ".join(why.splitlines()[-3:]) if why else "no output captured"
-            led.failed("bigquery", engine, "golden", "-",
-                       f"BigQuery[{engine}]: rivet {leg} failed — {tail}", "load")
-
-        # gc_survival needs the prefix AS LOADED (a success manifest + real
-        # parts), so it runs here — after the read-back, before the wipe.
-        if got:
-            verify_gc_survival(led, bucket=bucket, pfx=pfx, cfg_text=cfgf.read_text(),
-                               work=work, child=child, engine=engine)
-
-        run(["gcloud", "storage", "rm", "-r", f"gs://{bucket}/{pfx}"])
-        run(["bq", f"--project_id={proj}", "rm", "-f", "-t", f"{eng_dset}.{exp}"])
-        if not keep:
-            docker("rm", "-fv", engine_container(engine, _TAG))
-        if not got:
-            # Either the run/load leg already recorded its FAIL, or the read-back
-            # itself produced nothing. KNOWN GAP, carried over from the bash: the
-            # second case records NO row at all, so an engine whose `bq query`
-            # failed simply vanishes from the report — and absence reads as green.
-            continue
-
-        if bless:
-            rows = json.loads(got)
+    def collect(engine: str, rows: dict | None) -> None:
+        if rows is not None:
             blessed.setdefault(engine, {})[matrix] = rows
-            led.passed("bigquery", engine, "golden", "-",
-                       f"BigQuery[{engine}] blessed ({len(rows)} rows)", "blessed")
-        else:
-            want = _load_golden().get(engine, {}).get(matrix)
-            if want is not None and _canon(json.loads(got)) == _canon(want):
-                # Split rather than `led.passed`, because the bash row carried no
-                # detail and this table is compared transcript-to-transcript.
-                led.ok(f"BigQuery[{engine}] matches golden")
-                led.add("bigquery", engine, "golden", "-", Status.PASS)
-            else:
-                led.failed("bigquery", engine, "golden", "-",
-                           f"BigQuery[{engine}] DIVERGED from golden — "
-                           "rivet type export or BQ mapping changed", "diverged")
+
+    kw = dict(proj=proj, dset=dset, bucket=bucket, matrix=matrix, work=work,
+              bless=bless, keep=keep, up=_up, seed=_seed)
+    cap = max(1, parallel)
+    if cap == 1 or len(engines) <= 1:
+        for engine in engines:
+            with led.span(f"bq {engine}: engine-total"):
+                collect(engine, _bq_one_engine(led, engine, **kw))
+    else:
+        # Each engine's leg is independent (own dataset/prefix/config/container), so
+        # race them — same buffered-child pattern as the engine matrix, so an engine's
+        # output stays contiguous. BQ load jobs are async per-table and queries are
+        # slot-scheduled, so concurrency is COST-neutral (identical bytes) and only
+        # compresses wall-clock; the `bq {engine}: load/readback` spans measure how
+        # much the load and the read-back SELECT actually parallelise vs BQ throttling.
+        from concurrent.futures import ThreadPoolExecutor
+        subs = {e: led.buffered_child() for e in engines}
+
+        def run_one(engine: str) -> tuple[str, dict | None]:
+            with subs[engine].span(f"bq {engine}: engine-total"):
+                return engine, _bq_one_engine(subs[engine], engine, **kw)
+
+        workers = min(cap, len(engines))
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            results = list(ex.map(run_one, engines))
+        for engine in engines:  # deterministic order, not completion order
+            subs[engine].flush_into(led)
+        for engine, rows in results:
+            collect(engine, rows)
 
     if bless:
         # The opt-in write, and the only one. NOTE (bash behaviour, kept): this

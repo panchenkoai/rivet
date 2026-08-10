@@ -221,8 +221,8 @@ class Ledger:
         # because spans in different engines overlap under `--engine-parallel`. This
         # is the "where does the time go INSIDE the calls" view.
         if self._spans:
-            self.phase("Timing — inside the engine matrix (per span; concurrent, so ranked not summed)")
-            for name, dur in sorted(self._spans, key=lambda p: p[1], reverse=True)[:25]:
+            self.phase("Timing — inside the parallel stages (per span; concurrent, so ranked not summed)")
+            for name, dur in sorted(self._spans, key=lambda p: p[1], reverse=True)[:40]:
                 print(f"  {dur / 60.0:6.1f} min  {name}")
             print()
         if self.red:

@@ -572,7 +572,7 @@ def main(argv: list[str] | None = None) -> int:
             # BQ stage's mysql leg still hit the initdb race and recorded
             # `SKIP seed` where the previous run had a PASS. One definition now.
             bigquery.run_bigquery_golden(led, bless=ns.bless_bigquery_golden,
-                                         keep=ns.keep,
+                                         keep=ns.keep, parallel=ns.engine_parallel,
                                          bring_up=bring_up, seed_engine=seed_engine)
         return led.report()
     finally:
