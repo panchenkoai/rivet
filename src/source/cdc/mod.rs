@@ -1000,7 +1000,10 @@ pub(crate) struct CdcCapture<'a> {
 /// `outputs` order — PAIRED with the outcome, so a run that failed after
 /// committing parts still hands the caller what it made durable. Returning a
 /// bare `Result` discarded exactly that, and the caller recorded zeros.
-pub(crate) fn run_capture(cap: CdcCapture<'_>) -> (Vec<crate::manifest::RunManifest>, Result<()>) {
+pub(crate) fn run_capture(
+    cap: CdcCapture<'_>,
+    read_bytes: &std::sync::Arc<std::sync::atomic::AtomicU64>,
+) -> (Vec<crate::manifest::RunManifest>, Result<()>) {
     let url = cap.cdc_cfg.url.clone();
     let tls = cap.cdc_cfg.tls.clone();
     let checkpoint = cap.cdc_cfg.checkpoint.clone();
@@ -1076,6 +1079,7 @@ pub(crate) fn run_capture(cap: CdcCapture<'_>) -> (Vec<crate::manifest::RunManif
         started_at: cap.started_at,
         run_id: cap.run_id,
         state: cap.state,
+        read_bytes: std::sync::Arc::clone(read_bytes),
     };
     sink::run_to_files(stream.as_mut(), sink_cfg)
 }
