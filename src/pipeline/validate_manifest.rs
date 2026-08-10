@@ -33,11 +33,11 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::destination::Destination;
+use crate::destination::{Destination, ObjectMeta};
 use crate::error::Result;
 use crate::manifest::{
-    MANIFEST_FILENAME, RunManifest, SUCCESS_FILENAME, join_key, parse_success_marker,
-    success_marker_body,
+    MANIFEST_FILENAME, PartStatus, RunManifest, SUCCESS_FILENAME, is_run_unique_manifest_name,
+    join_key, parse_success_marker, success_marker_body,
 };
 use crate::pipeline::manifest_reconcile::{PartPresence, reconcile_manifest_against_listing};
 
@@ -569,6 +569,58 @@ impl ManifestVerification {
 ///
 /// Regardless of depth, `depth_level` on the returned verdict records the
 /// level this pass ran at.
+/// Read every run-unique manifest COPY (`manifest-<run_id>.json`) named in the
+/// prefix listing. Best-effort: a copy that fails to read or parse is skipped —
+/// the untracked scan it feeds is advisory, so a bad sibling copy must never turn
+/// validate into an error (worst case a part it would have claimed stays flagged,
+/// the pre-#167 behaviour). The canonical `manifest.json` is not a copy and is
+/// excluded (it is already the primary manifest).
+fn read_sibling_manifests(dest: &dyn Destination, listing: &[ObjectMeta]) -> Vec<RunManifest> {
+    let mut out = Vec::new();
+    for meta in listing {
+        let base = meta.key.rsplit('/').next().unwrap_or("");
+        if !is_run_unique_manifest_name(base) {
+            continue;
+        }
+        if let Ok(bytes) = read_capped(dest, &meta.key, MANIFEST_MAX_BYTES)
+            && let Ok(m) = serde_json::from_slice::<RunManifest>(&bytes)
+        {
+            out.push(m);
+        }
+    }
+    out
+}
+
+/// The set of destination keys claimed by a SAME-FAMILY sibling run-unique
+/// manifest copy (#167 merge-back). A part is claimed only when a sibling of the
+/// SAME `export_family` declared it `Committed`, so a foreign export's parts under
+/// a mistakenly-shared prefix are still surfaced as untracked. Pure — the I/O
+/// (reading the copies) is [`read_sibling_manifests`]'s job.
+fn sibling_claimed_part_keys(
+    siblings: &[RunManifest],
+    canonical_family: &str,
+    manifest_dir: &str,
+) -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new();
+    if canonical_family.is_empty() {
+        // A legacy manifest with no family: never claim across copies — keep the
+        // pre-#167 behaviour (a legacy prefix is single-run, so there is nothing
+        // to claim, and folding by empty family could hide cross-contamination).
+        return out;
+    }
+    for m in siblings {
+        if m.export_family != canonical_family {
+            continue;
+        }
+        for p in &m.parts {
+            if p.status == PartStatus::Committed {
+                out.insert(join_key(manifest_dir, &p.path));
+            }
+        }
+    }
+    out
+}
+
 pub fn verify_at_destination(
     dest: &dyn Destination,
     manifest_dir: &str,
@@ -687,11 +739,27 @@ pub fn verify_at_destination(
     // the parts are physically present.
     let reconciliation = if depth.runs_part_reconcile() {
         match dest.list_prefix(manifest_dir) {
-            Ok(listing) => Some(reconcile_manifest_against_listing(
-                &manifest,
-                &listing,
-                manifest_dir,
-            )),
+            Ok(listing) => {
+                let mut rec = reconcile_manifest_against_listing(&manifest, &listing, manifest_dir);
+                // #167: a `--pool --split` prefix holds N run-unique manifest
+                // copies of ONE family, each declaring a DISJOINT set of parts.
+                // The canonical `manifest.json` lists only the LAST writer's
+                // parts, so every sibling unit's parts would read as untracked
+                // surplus — noise that also MASKS a genuine orphan. Claim any
+                // listed part a SAME-FAMILY sibling copy declared committed, so
+                // only truly foreign objects stay untracked. (Also cleans up the
+                // repeated-run / CDC-soak case, where the historical runs' parts
+                // are likewise declared by their own copies.) Safe by
+                // construction: this only NARROWS untracked — it can never add a
+                // failure — and a foreign family's parts are never claimed.
+                if !rec.untracked.is_empty() && !manifest.export_family.is_empty() {
+                    let siblings = read_sibling_manifests(dest, &listing);
+                    let claimed =
+                        sibling_claimed_part_keys(&siblings, &manifest.export_family, manifest_dir);
+                    rec.untracked.retain(|o| !claimed.contains(&o.key));
+                }
+                Some(rec)
+            }
             Err(e) => {
                 out.failures.push(Failure::ListPrefixError {
                     detail: format!("{e:#}"),
@@ -934,6 +1002,63 @@ mod tests {
         if matches!(m.status, ManifestStatus::Success) {
             std::fs::write(dir.join(SUCCESS_FILENAME), success_marker_body(&body)).unwrap();
         }
+    }
+
+    // ── #167 sibling-copy claim (manifest coherence under a shared prefix) ──
+
+    /// A same-family sibling copy's committed parts are claimed; a FOREIGN
+    /// family's are not. RED against claiming across families (which would hide a
+    /// cross-contamination the shared-prefix guard exists to surface).
+    #[test]
+    fn sibling_claimed_part_keys_claims_same_family_only() {
+        let unit = |name: &str, path: &str, fam: &str| {
+            let mut m = build_manifest(vec![part(0, 10, 100, "fp")], ManifestStatus::Success);
+            m.export_family = fam.into();
+            m.export_name = name.into();
+            m.parts[0].path = path.into();
+            m
+        };
+        let siblings = vec![
+            unit("daily#0", "daily#0_p.parquet", "daily"),
+            unit("daily#1", "daily#1_p.parquet", "daily"),
+            unit("other", "other_p.parquet", "other"),
+        ];
+        let claimed = sibling_claimed_part_keys(&siblings, "daily", "");
+        assert!(
+            claimed.contains("daily#0_p.parquet") && claimed.contains("daily#1_p.parquet"),
+            "same-family split units' parts must be claimed: {claimed:?}"
+        );
+        assert!(
+            !claimed.contains("other_p.parquet"),
+            "a FOREIGN family's part must NOT be claimed — cross-contamination must still surface"
+        );
+    }
+
+    /// A legacy canonical (empty family) claims nothing — pre-#167 behaviour, so
+    /// the widening never applies where a family cannot disambiguate.
+    #[test]
+    fn sibling_claimed_part_keys_empty_family_claims_nothing() {
+        let mut m = build_manifest(vec![part(0, 10, 100, "fp")], ManifestStatus::Success);
+        m.export_family = "daily".into();
+        m.parts[0].path = "p.parquet".into();
+        assert!(
+            sibling_claimed_part_keys(&[m], "", "").is_empty(),
+            "an empty canonical family must claim nothing"
+        );
+    }
+
+    /// A non-committed (quarantined) sibling part is NOT claimed — only durable
+    /// committed parts belong to the dataset.
+    #[test]
+    fn sibling_claimed_part_keys_skips_non_committed() {
+        let mut m = build_manifest(vec![part(0, 10, 100, "fp")], ManifestStatus::Success);
+        m.export_family = "daily".into();
+        m.parts[0].path = "q.parquet".into();
+        m.parts[0].status = PartStatus::Quarantined;
+        assert!(
+            sibling_claimed_part_keys(&[m], "daily", "").is_empty(),
+            "a quarantined part must not be claimed as a tracked dataset part"
+        );
     }
 
     // ── happy path ───────────────────────────────────────────────────────
