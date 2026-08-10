@@ -601,16 +601,16 @@ fn cdc_summary(
 
 /// Write the `export_metrics` row (built directly — no plan coupling, unlike the
 /// batch `build_metric_row`) so a CDC run is queryable like a batch run.
-fn record_metric(state: &StateStore, config: &Config, export: &ExportConfig, summary: &RunSummary) {
-    let source_type = config
-        .source
-        .resolve_url()
-        .ok()
-        .and_then(|u| CdcEngine::from_url(&u).ok().map(CdcEngine::label))
-        .map(|s| s.to_string());
+/// The CDC `export_metrics` row, extracted PURE so its field mapping (notably
+/// bytes_read — #196) is unit-tested without a live state store / Config.
+fn cdc_metric_row(
+    summary: &RunSummary,
+    source_type: Option<String>,
+    destination_type: Option<String>,
+) -> crate::state::MetricRow {
     // Only the fields a CDC run actually has; the batch-specific rest (chunk_size,
     // cursor, quality, …) stay at their MetricRow::default() (None / 0).
-    let row = crate::state::MetricRow {
+    crate::state::MetricRow {
         export_name: summary.export_name.clone(),
         run_id: summary.run_id.clone(),
         duration_ms: summary.duration_ms,
@@ -626,11 +626,22 @@ fn record_metric(state: &StateStore, config: &Config, export: &ExportConfig, sum
         bytes_read: summary.bytes_read as i64,
         files_committed: summary.files_committed as i64,
         source_type,
-        destination_type: Some(export.destination.destination_type.label().to_string()),
+        destination_type,
         rivet_version: Some(env!("CARGO_PKG_VERSION").to_string()),
         longest_chunk_ms: summary.journal.longest_chunk_ms(),
         ..Default::default()
-    };
+    }
+}
+
+fn record_metric(state: &StateStore, config: &Config, export: &ExportConfig, summary: &RunSummary) {
+    let source_type = config
+        .source
+        .resolve_url()
+        .ok()
+        .and_then(|u| CdcEngine::from_url(&u).ok().map(CdcEngine::label))
+        .map(|s| s.to_string());
+    let dest_type = Some(export.destination.destination_type.label().to_string());
+    let row = cdc_metric_row(summary, source_type, dest_type);
     if let Err(e) = state.record_metric_full(&row) {
         log::warn!(
             "cdc: failed to record metric for export '{}': {:#}",
@@ -648,6 +659,30 @@ mod tests {
     // A CDC export that requests batch-only meta_columns must WARN (the CDC sink
     // never injects them), not silently drop the request. Pure fn so this needs
     // no live stream.
+    /// #196: cdc_summary must carry bytes_read into the RunSummary (the CDC read
+    /// leg). RED against deleting the field (defaults to 0).
+    #[test]
+    fn cdc_summary_carries_bytes_read() {
+        let export = crate::config::sample_export("t");
+        let s = super::cdc_summary("r1", &export, "success", 100, 2, 5_000, 12_345, 50, None);
+        assert_eq!(s.bytes_read, 12_345, "read leg must reach the summary");
+        assert_eq!(s.bytes_written, 5_000);
+    }
+
+    /// #196: the CDC metrics row must carry bytes_read from the summary. RED
+    /// against deleting the field in cdc_metric_row (defaults to 0).
+    #[test]
+    fn cdc_metric_row_carries_bytes_read() {
+        let export = crate::config::sample_export("t");
+        let summary = super::cdc_summary("r1", &export, "success", 100, 2, 5_000, 98_765, 50, None);
+        let row = super::cdc_metric_row(&summary, Some("mysql".into()), Some("local".into()));
+        assert_eq!(
+            row.bytes_read, 98_765,
+            "read leg must reach the export_metrics row"
+        );
+        assert_eq!(row.bytes_written, 5_000);
+    }
+
     #[test]
     fn cdc_warns_when_meta_columns_are_requested_on_a_cdc_export() {
         let mut e = crate::config::sample_export("orders");
