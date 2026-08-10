@@ -361,6 +361,16 @@ def _verify_surface(led: Ledger, cell: Cell, tag: str, stage: str, p) -> None:
     pipes = _SURFACE_PIPELINES.get(stage)
     if pipes is not None and cell.pipeline not in pipes:
         return
+    # The `check` cell rotates `--json` on some cells (see _flags_for), which
+    # SUPPRESSES the entire human verdict block (preflight/mod.rs gates it behind
+    # `if !json_output`) and emits lowercase JSON keys instead. The human-surface
+    # substrings (Strategy:/Row estimate:/Verdict:) legitimately do not appear
+    # there, so this contract only applies to the HUMAN rendering — skip it when
+    # the stage ran under --json (roast 2026-08-10: the contract failed every
+    # --json check cell, an own-goal in #195). The JSON surface has its own
+    # golden shape and is not what this operator-readability check is about.
+    if "--json" in cell.flags.get(stage, []):
+        return
     missing = [
         f"{stream}:{sub!r}"
         for stream, sub in reqs

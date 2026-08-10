@@ -180,7 +180,15 @@ pub(crate) fn overlay_measured_rows(
         );
         diag.recommended_profile = recommend_profile(est, diag.uses_index, export);
         diag.recommended_parallel = recommend_parallelism(export, est, diag.uses_index);
-        diag.suggestion = build_suggestion(&diag.verdict, est, diag.uses_index, export);
+        // Only recompute the suggestion for engines that HAD one. diagnose_mongo
+        // deliberately emits `suggestion: None` (Mongo is full-only — the
+        // cursor/incremental advice build_suggestion produces is for a mode it
+        // cannot do), and it is the sole engine that never calls build_suggestion.
+        // Recomputing unconditionally re-introduced that SQL-only advice for Mongo
+        // (roast 2026-08-10). Keep None as None.
+        if diag.suggestion.is_some() {
+            diag.suggestion = build_suggestion(&diag.verdict, est, diag.uses_index, export);
+        }
     }
 }
 
@@ -966,6 +974,52 @@ mod tests {
                 .starts_with("measured "),
             "the report must SAY it stands on the measurement: {:?}",
             diag.row_source
+        );
+    }
+
+    /// #1 (roast 2026-08-10): Mongo emits suggestion: None (full-only — the
+    /// cursor/incremental advice does not apply). The overlay recompute must NOT
+    /// re-introduce it. RED against the unconditional build_suggestion recompute.
+    #[test]
+    fn overlay_keeps_a_none_suggestion_none_for_mongo() {
+        let state = crate::state::StateStore::open_in_memory().unwrap();
+        state
+            .record_metric_full(&crate::state::MetricRow {
+                export_name: "mongo_coll".into(),
+                run_id: "r1".into(),
+                total_rows: 12_000_000,
+                status: "success".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let mut diag = super::super::ExportDiagnostic {
+            export_name: "mongo_coll".into(),
+            strategy: "full".into(),
+            mode: "full".into(),
+            cursor_column: None,
+            row_estimate: Some(5_000_000),
+            row_source: None,
+            avg_row_bytes: None,
+            cursor_min: None,
+            cursor_max: None,
+            scan_type: None,
+            uses_index: false,
+            verdict: super::super::HealthVerdict::Degraded,
+            warnings: Vec::new(),
+            recommended_profile: "safe",
+            recommended_parallel: (1, "test"),
+            suggestion: None,
+        };
+        let export = cfg("table: coll\nmode: full\n");
+        overlay_measured_rows(&mut diag, &export, &state);
+        assert_eq!(
+            diag.row_estimate,
+            Some(12_000_000),
+            "measured overlay applied"
+        );
+        assert_eq!(
+            diag.suggestion, None,
+            "a None suggestion (Mongo) must stay None through the recompute"
         );
     }
 

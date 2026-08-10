@@ -270,9 +270,20 @@ impl TableInfo {
         // mixes a corrected numerator with a stale denominator and defeats the
         // wide-row parallelism guard. A probe re-samples rows, not bytes, so the
         // per-row size is unknown after a correction; report None.
+        // Any method that REPLACED row_estimate from a live re-count (Probed or
+        // Counted) leaves total_bytes on the FROZEN catalog figure — the ratio
+        // mixes a corrected numerator with a stale denominator either way (roast
+        // 2026-08-10: the Probed-only guard left the keyless Counted path exposed,
+        // and frozen TABLE_ROWS/DATA_LENGTH freeze together, the guard's own
+        // premise). CatalogTriaged/CatalogExact/Unverified keep row_estimate, so
+        // the ratio is honest there.
         let probe_corrected = matches!(
             &self.density,
-            Some(p) if p.method == crate::init::density::EstimateMethod::Probed
+            Some(p) if matches!(
+                p.method,
+                crate::init::density::EstimateMethod::Probed
+                    | crate::init::density::EstimateMethod::Counted
+            )
         );
         match self.total_bytes {
             Some(b) if self.row_estimate > 0 && !probe_corrected => Some(b / self.row_estimate),

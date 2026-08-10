@@ -786,6 +786,17 @@ fn run_keyset_parallel(
     }
     summary.total_rows += rows.into_inner();
 
+    // #152 (roast 2026-08-10): drain the governor's decisions into the journal
+    // BEFORE the error bail — the failure path is EXACTLY where the back-off
+    // forensics matter (was the source under pressure when it failed?). Draining
+    // after the bail lost every ParallelismAdjusted event on a failed run, unlike
+    // chunked/exec.rs which drains before its error check.
+    for (from, to, reason) in governor_log.into_inner().unwrap() {
+        summary
+            .journal
+            .record(crate::journal::RunEvent::ParallelismAdjusted { from, to, reason });
+    }
+
     if !errs.is_empty() {
         anyhow::bail!(
             "export '{}': parallel keyset failed on {} range(s): {}",
@@ -802,13 +813,6 @@ fn run_keyset_parallel(
     }
     if let Some(sc) = fingerprint.get() {
         manifest_writer::record_run_schema_fingerprint(summary, sc);
-    }
-    // #152: drain the governor's off-thread decisions into the run journal
-    // (same as chunked) so a keyset run records when it shed/recovered workers.
-    for (from, to, reason) in governor_log.into_inner().unwrap() {
-        summary
-            .journal
-            .record(crate::journal::RunEvent::ParallelismAdjusted { from, to, reason });
     }
     // cursor_high = the highest populated range's max (forensics v18); see range_max.
     summary.cursor_high = highest_range_max(range_max.into_inner().unwrap());

@@ -42,7 +42,13 @@ fn parallel_apply_common_mode_failure_shows_heartbeat_and_one_representative() {
         !result.status.success(),
         "a batch where every child fails must exit non-zero"
     );
-    // 1. heartbeat — silence is now idle-by-design, not unknown.
+    // 1. heartbeat PRESENCE — silence is now idle-by-design, not unknown.
+    //    NOTE (roast 2026-08-10): this pins the heartbeat is EMITTED, not the D1
+    //    TTY-ordering property (it corrupted the interactive card cursor). This
+    //    harness pipes stderr (non-TTY → the linear renderer, no cursor walk), so
+    //    it CANNOT reproduce the race. The ordering fix is correct-by-construction
+    //    (the eprintln is lexically before the UI-thread spawn); a PTY ordering
+    //    assertion is the proper guard and is deferred (needs a pty harness).
     assert!(
         stderr.contains("waiting for the first child event"),
         "#153-1: the parent must emit a spawn heartbeat:\n{stderr}"
