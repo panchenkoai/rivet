@@ -432,6 +432,38 @@ mod tests {
         );
     }
 
+    /// #167 resume coherence: `apply --pool --split --resume` must be REFUSED,
+    /// not silently mis-handled. A partial split leaves the shared prefix's
+    /// `_SUCCESS` (from the first unit to finish) which the skip-completed filter
+    /// reads as "the whole giant is done" → a silent GAP; a fresh re-run instead
+    /// DUPs. Refusing converts both silent failures into a clear error. RED
+    /// against removing the bail (run_pool then proceeds to "nothing to run" and
+    /// returns Ok, so `unwrap_err` panics).
+    #[test]
+    fn pool_split_refuses_resume() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cfg = dir.path().join("c.yaml");
+        std::fs::write(
+            &cfg,
+            "source: { type: postgres, url: \"postgresql://u:p@localhost/db\" }\nexports: []\n",
+        )
+        .unwrap();
+        let err = run_apply_command(
+            cfg.to_str().unwrap(),
+            false, // force
+            false, // parallel
+            true,  // resume
+            Some(2),
+            true, // split
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("does not support --resume") && msg.contains("--split"),
+            "expected a --split + --resume refusal, got: {msg}"
+        );
+    }
+
     // ── cursor drift ─────────────────────────────────────────────────────────
 
     #[test]

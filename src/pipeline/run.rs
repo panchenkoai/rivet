@@ -767,6 +767,30 @@ pub(crate) fn run_pool(
     split: bool,
 ) -> Result<()> {
     let m = m.max(1);
+    // #167 resume coherence: `--split --resume` is refused, LOUDLY. A range-split
+    // export's N units share ONE destination prefix, so a partial run cannot be
+    // resumed per-unit yet — the single prefix-level `_SUCCESS` cannot say WHICH
+    // units finished. Measured both silent failure modes on a partial split:
+    //   * `--resume`      → the shared `_SUCCESS` (written by the FIRST unit to
+    //                       finish) makes the skip-completed filter treat the whole
+    //                       giant as done → the incomplete unit is never re-run →
+    //                       a silent GAP (150k of 300k rows).
+    //   * fresh (no resume) → a re-run re-splits and writes NEW run-id part names
+    //                       beside the survivors → silent DUP (450k of 300k).
+    // Refusing converts the silent loss/dup into a clear error the operator can act
+    // on. Recovery: clear the prefix and re-run fresh, or drop `--split` to resume
+    // the export whole. (Per-unit split resume is tracked as a follow-up on #167.)
+    if split && resume {
+        anyhow::bail!(
+            "apply --pool --split does not support --resume: a range-split export's N \
+             sub-units share one destination prefix, so a partial run cannot be resumed \
+             per-unit — the prefix's single _SUCCESS cannot say which units finished, and \
+             resuming would either skip the whole export (dropping the unfinished unit's \
+             rows) or re-run it (duplicating the finished units'). Recover by clearing the \
+             destination prefix and re-running WITHOUT --resume, or drop --split to resume \
+             the export as a single unit."
+        );
+    }
     let config = Config::load_with_params(config_path, None)?;
     let config_dir = Path::new(config_path)
         .parent()
