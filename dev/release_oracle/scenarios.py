@@ -222,6 +222,33 @@ def _duckdb_list(sql: str) -> str:
     return run(["duckdb", "-noheader", "-list", "-c", sql]).stdout.strip()
 
 
+def duckdb_allnull_columns(path_glob: str) -> tuple[int, int]:
+    """Independent per-column null profile via DuckDB (never rivet's own summary).
+
+    Returns (n_all_null, n_cols): how many columns are 100% NULL while rows > 0, and
+    the total column count. That is the documented silent-loss class — a decode
+    regression (e.g. the FixedSizeBinary uuid path) nulling a WHOLE column while the
+    row count stays green and every count/sum check passes. `count(COLUMNS(*))` yields
+    one non-null count per column generically, so this needs no per-engine schema
+    knowledge and no column names. (-1, -1) = unreadable/empty (the row-count oracle
+    already SKIPs those); a genuinely present all-null column returns n_all_null > 0.
+    """
+    out = _duckdb_list(
+        f"SELECT count(*), count(COLUMNS(*)) FROM read_parquet('{path_glob}')"
+    )
+    if not out:
+        return (-1, -1)
+    vals = out.splitlines()[0].split("|")
+    try:
+        nums = [int(v) for v in vals]
+    except ValueError:
+        return (-1, -1)
+    rows, cols = nums[0], nums[1:]
+    if rows <= 0 or not cols:
+        return (-1, -1)
+    return (sum(1 for c in cols if c == 0), len(cols))
+
+
 def _duckdb_json_normalized(sql: str) -> str:
     """`duckdb -json -c SQL | lib/normalize_bq.py` — the canonical golden form.
 

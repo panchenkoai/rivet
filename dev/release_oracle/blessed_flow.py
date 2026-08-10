@@ -970,15 +970,27 @@ def _run_chain(led: Ledger, cell: Cell, url: str, state_url: str, work: Path,
                 # readable dataset is the UNION: 2x. That is the assertion — a
                 # clobbered second run reads back 1x and looks like a clean run.
                 mult = 2 if cell.lifecycle == "repeat" else 1
-                _stage(led, cell, tag, "oracle", duck == want * mult,
-                       f"duckdb={duck} source={want}x{mult}")
+                # Per-column null profile (local only — parts are on disk): a decode
+                # regression can null a WHOLE column while the row count matches (the
+                # documented uuid→FixedSizeBinary silent loss). Count-parity alone is
+                # blind to it.
+                n_null = 0
+                if cell.store == "local":
+                    nn, _nc = scenarios.duckdb_allnull_columns(f"{dest_dir}/**/*.parquet")
+                    n_null = max(0, nn)
+                _stage(led, cell, tag, "oracle", duck == want * mult and n_null == 0,
+                       f"duckdb={duck} source={want}x{mult}"
+                       + (f" · ALLNULL {n_null} cols" if n_null else ""))
         else:
-            # A change stream is not the table: the count is of CHANGES, which
-            # only the source's own write history predicts. What DuckDB can say
-            # independently is that the parts decode and are non-empty — a
-            # capture that wrote unreadable or zero rows fails here.
-            _stage(led, cell, tag, "oracle", duck > 0,
-                   f"duckdb={duck} changes decoded by an independent reader")
+            # A change stream is not the table: the count is of CHANGES. But the
+            # change set here is the SHARED, DETERMINISTIC cdc.changes() — cdc.py's
+            # e2e proves it is exactly CDC_EXPECT_EVENTS across every engine. So the
+            # floor is at-least-once: fewer than that means capture DROPPED a change
+            # (the old `duck > 0` passed with 4 of 5 lost). >= tolerates an
+            # at-least-once duplicate; < is a real loss.
+            want = cdc.CDC_EXPECT_EVENTS
+            _stage(led, cell, tag, "oracle", duck >= want,
+                   f"duckdb={duck} >= {want} deterministic changes (at-least-once floor)")
 
     # ── validate ─────────────────────────────────────────────────────────────
     p = rivet("validate", "-c", str(cfg), *cell.flags.get("validate", []),
