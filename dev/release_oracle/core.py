@@ -225,6 +225,27 @@ class Ledger:
             for name, dur in sorted(self._spans, key=lambda p: p[1], reverse=True)[:40]:
                 print(f"  {dur / 60.0:6.1f} min  {name}")
             print()
+            # Per-CELL rollup: a matrix cell span is named "cell <engine> <kind> …".
+            # There are too many to list flat, and the distribution — not any one
+            # cell — is what decides whether cell-level parallelism would pay. Bucket
+            # by "<engine> <kind>" and show count / sum / mean / max / slowest. Sums
+            # are within ONE engine's SEQUENTIAL cell loop, so they ARE additive; the
+            # gap between a group's SUM and its MAX is exactly the wall-clock a
+            # parallel cell loop could reclaim.
+            cells = [(n, d) for n, d in self._spans if n.startswith("cell ")]
+            if cells:
+                groups: dict[str, list[tuple[str, float]]] = {}
+                for n, d in cells:
+                    key = " ".join(n.split()[1:3])  # "<engine> <kind>"
+                    groups.setdefault(key, []).append((n, d))
+                self.phase("Timing — matrix cells per engine×kind (SUM is sequential; SUM−MAX = parallelisable slack)")
+                for key in sorted(groups, key=lambda k: sum(d for _, d in groups[k]), reverse=True):
+                    members = groups[key]
+                    tot = sum(d for _, d in members)
+                    mx_name, mx = max(members, key=lambda p: p[1])
+                    print(f"  {tot / 60.0:6.1f} min  {key:22} n={len(members):<3} "
+                          f"mean={tot / len(members):4.1f}s  max={mx:4.1f}s ({mx_name.split(maxsplit=3)[-1]})")
+                print()
         if self.red:
             print(self._c("1;31", "  NOT RELEASABLE — one or more cells failed (see ✗ above)."))
             return 1

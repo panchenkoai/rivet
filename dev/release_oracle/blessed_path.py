@@ -666,13 +666,15 @@ def verify_blessed_path(
                 led.skipped(engine, tag, f"blessed:{name}", "local",
                             f"{engine} {tag} {t} · {name} — not applicable to this table/engine")
                 continue
-            sc_blessed_path(led, engine, tag, url, t, store="local", scenario=name)
+            with led.span(f"cell {engine} path {name}/local/sq"):
+                sc_blessed_path(led, engine, tag, url, t, store="local", scenario=name)
     if state_url:
         for t in tables:
             for name, sc in SCENARIOS.items():
                 if sc["applies"](t, engine):
-                    sc_blessed_path(led, engine, tag, url, t, store="local",
-                                    state_url=state_url, scenario=name)
+                    with led.span(f"cell {engine} path {name}/local/pg"):
+                        sc_blessed_path(led, engine, tag, url, t, store="local",
+                                        state_url=state_url, scenario=name)
     else:
         led.skipped(
             engine, tag, "blessed:backend", "postgres",
@@ -687,6 +689,7 @@ def verify_blessed_path(
         for t in tables:
             for name, sc in SCENARIOS.items():
                 if sc["applies"](t, engine):
-                    sc_blessed_path(led, engine, tag, url, t, store="gcs", scenario=name)
+                    with led.span(f"cell {engine} path {name}/gcs/sq"):
+                        sc_blessed_path(led, engine, tag, url, t, store="gcs", scenario=name)
     else:
         led.skipped(engine, tag, "blessed:store", "gcs", f"{engine} {tag} · gcs — store not up")

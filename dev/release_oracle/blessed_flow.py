@@ -1197,7 +1197,8 @@ def sc_blessed_flow(led: Ledger, engine: str, tag: str, url: str,
                         f"{cell.engine} {cell.label} — {cell.store} store not up")
             continue
         before = sum(1 for c in led.cells if c.status.value == "FAIL")
-        run_cell(led, cell, u, state_url, tag)
+        with led.span(f"cell {engine} flow {cell.pipeline}/{cell.lifecycle}/{cell.store}/{cell.state}"):
+            run_cell(led, cell, u, state_url, tag)
         after = sum(1 for c in led.cells if c.status.value == "FAIL")
         verdicts[key] = "fail" if after > before else "pass"
         # Written after EVERY cell, not at the end: a matrix killed at minute ten
