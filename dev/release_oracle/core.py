@@ -86,10 +86,21 @@ class Ledger:
         self._phase_times: list[tuple[str, float]] = []
         self._cur_phase: str | None = None
         self._phase_start: float = time.perf_counter()
+        # Buffered mode: a per-ENGINE sub-ledger under parallel `engine_loop`
+        # collects its lines here instead of printing them, so concurrent engines
+        # do not interleave into an unreadable stream. The parent `flush_into`s
+        # each engine's block in engine order after the join. `None` = print live.
+        self._buf: list[str] | None = None
 
     # ── printing ──
     def _c(self, code: str, text: str) -> str:
         return f"\033[{code}m{text}\033[0m" if self._colour else text
+
+    def _emit(self, line: str) -> None:
+        if self._buf is None:
+            print(line, flush=True)
+        else:
+            self._buf.append(line)
 
     def phase(self, msg: str) -> None:
         # Close the previous phase's wall-clock before opening this one.
@@ -98,16 +109,33 @@ class Ledger:
             self._phase_times.append((self._cur_phase, now - self._phase_start))
         self._cur_phase = msg
         self._phase_start = now
-        print(self._c("1;34", f"▸ {msg}"), flush=True)
+        self._emit(self._c("1;34", f"▸ {msg}"))
 
     def ok(self, msg: str) -> None:
-        print(self._c("1;32", f"  ✓ {msg}"), flush=True)
+        self._emit(self._c("1;32", f"  ✓ {msg}"))
 
     def bad(self, msg: str) -> None:
-        print(self._c("1;31", f"  ✗ {msg}"), flush=True)
+        self._emit(self._c("1;31", f"  ✗ {msg}"))
 
     def skip(self, msg: str) -> None:
-        print(self._c("1;33", f"  ⊘ {msg}"), flush=True)
+        self._emit(self._c("1;33", f"  ⊘ {msg}"))
+
+    def buffered_child(self) -> "Ledger":
+        """A sub-ledger that BUFFERS output (for one parallel engine). Its cells +
+        buffered lines are folded back with `flush_into` after the engine finishes."""
+        child = Ledger(colour=self._colour)
+        child._buf = []
+        return child
+
+    def flush_into(self, parent: "Ledger") -> None:
+        """Fold this buffered child into `parent`: print its collected block (in one
+        contiguous run, so an engine's output is not interleaved with a sibling's)
+        and merge its cells. Per-phase timings are NOT merged — the parent's
+        wrapping phase already holds the parallel wall-clock; summing overlapping
+        child phases would overcount."""
+        for line in self._buf or []:
+            parent._emit(line)
+        parent.cells.extend(self.cells)
 
     # ── recording ──
     def add(

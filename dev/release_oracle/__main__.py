@@ -136,6 +136,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     ap.add_argument("--no-cloud", action="store_true", help="local stage only (skip BigQuery)")
     ap.add_argument("--keep", action="store_true", help="leave engine containers up (debug)")
+    ap.add_argument(
+        "--engine-parallel", type=int, default=3,
+        help="how many engines to run CONCURRENTLY in the engine loop (default 3). Each engine "
+             "owns its own containers/ports, and the scenarios race on the SHARED state backend "
+             "— which doubles as a real concurrent-writer test. The dominant serial cost is CDC "
+             "capture-job waits (sleep-for-the-agent), which overlap under parallelism, so the "
+             "engine-loop wall drops from sum(engines) toward max(engine). Set 1 for the old "
+             "serial behaviour, or lower if Docker memory is tight (MSSQL is the ~1.6 GiB hog).")
     ap.add_argument("--no-clean", action="store_true",
                     help="skip the clean rebuild (iteration only — a release must be gated on a "
                          "tree built from nothing)")
@@ -389,53 +397,82 @@ def seed_engine(engine: str, tag: str, url: str) -> str:
     return "; ".join(hits) or f"exit {p.returncode}"
 
 
+def _run_one_engine(led: Ledger, ns: argparse.Namespace, engine: str) -> None:
+    """One engine's whole leg: every gridded version brought up, seeded, and run
+    through the scenarios, then torn down. Takes `led` so a parallel caller can
+    hand it a BUFFERED sub-ledger (its output is flushed as one block afterwards)."""
+    version_lines = [
+        l for l in matrix_cfg("versions", engine).splitlines() if len(l.split()) >= 3
+    ]
+    # --latest-only: keep just the last version of the family (the newest,
+    # matrix.yaml lists them ascending). Cuts the dev-loop wall roughly in
+    # proportion to the version count (postgres 4→1, mongo 5→1) while every
+    # scenario × store × state cell still runs once.
+    if ns.latest_only and version_lines:
+        skipped = len(version_lines) - 1
+        version_lines = version_lines[-1:]
+        if skipped:
+            led.add(engine, "-", "older-versions", "-", Status.SKIP,
+                    f"--latest-only: {skipped} older {engine} version(s) not run")
+    for line in version_lines:
+        parts = line.split()
+        tag, image, port = parts[0], parts[1], int(parts[2])
+        led.phase(f"{engine} {tag} ({image})")
+        url = bring_up(led, engine, tag, image, port)
+        if not url:
+            led.add(engine, tag, "all", "-", Status.SKIP, "bring-up failed")
+            continue
+        # The seed is idempotent (DROP TABLE IF EXISTS …), so a transient
+        # failure is retried: a fresh container under load can drop the seed
+        # connection mid-stream, and crying wolf on that is worse than a retry.
+        err = ""
+        for attempt in range(3):
+            err = seed_engine(engine, tag, url)
+            if not err:
+                break
+            # Back off between attempts. Without this the three retries fire
+            # back-to-back and all land inside the SAME startup window, so a
+            # race the retry exists to absorb is retried three times in the
+            # few hundred ms during which it cannot possibly succeed — which
+            # is how a transient became a FAIL.
+            time.sleep(2.0 * (attempt + 1))
+        if err:
+            led.failed(engine, tag, "seed", "-", f"{engine}:{tag} seed had errors", err)
+            continue
+        led.ok("seeded")
+        scenarios.run_scenarios(led, engine, tag, url)
+        if not ns.keep:
+            docker("rm", "-fv", engine_container(engine, tag))
+
+
 def engine_loop(led: Ledger, ns: argparse.Namespace) -> None:
     wanted = [e for e in ns.engines.split(",") if e] if ns.engines else None
-    for engine in matrix_cfg("engines").split():
-        if wanted and engine not in wanted:
-            continue
-        version_lines = [
-            l for l in matrix_cfg("versions", engine).splitlines() if len(l.split()) >= 3
-        ]
-        # --latest-only: keep just the last version of the family (the newest,
-        # matrix.yaml lists them ascending). Cuts the dev-loop wall roughly in
-        # proportion to the version count (postgres 4→1, mongo 5→1) while every
-        # scenario × store × state cell still runs once.
-        if ns.latest_only and version_lines:
-            skipped = len(version_lines) - 1
-            version_lines = version_lines[-1:]
-            if skipped:
-                led.add(engine, "-", "older-versions", "-", Status.SKIP,
-                        f"--latest-only: {skipped} older {engine} version(s) not run")
-        for line in version_lines:
-            parts = line.split()
-            tag, image, port = parts[0], parts[1], int(parts[2])
-            led.phase(f"{engine} {tag} ({image})")
-            url = bring_up(led, engine, tag, image, port)
-            if not url:
-                led.add(engine, tag, "all", "-", Status.SKIP, "bring-up failed")
-                continue
-            # The seed is idempotent (DROP TABLE IF EXISTS …), so a transient
-            # failure is retried: a fresh container under load can drop the seed
-            # connection mid-stream, and crying wolf on that is worse than a retry.
-            err = ""
-            for attempt in range(3):
-                err = seed_engine(engine, tag, url)
-                if not err:
-                    break
-                # Back off between attempts. Without this the three retries fire
-                # back-to-back and all land inside the SAME startup window, so a
-                # race the retry exists to absorb is retried three times in the
-                # few hundred ms during which it cannot possibly succeed — which
-                # is how a transient became a FAIL.
-                time.sleep(2.0 * (attempt + 1))
-            if err:
-                led.failed(engine, tag, "seed", "-", f"{engine}:{tag} seed had errors", err)
-                continue
-            led.ok("seeded")
-            scenarios.run_scenarios(led, engine, tag, url)
-            if not ns.keep:
-                docker("rm", "-fv", engine_container(engine, tag))
+    engines = [e for e in matrix_cfg("engines").split() if not wanted or e in wanted]
+    cap = max(1, ns.engine_parallel)
+
+    # Serial (unchanged behaviour) when asked or with nothing to overlap.
+    if cap == 1 or len(engines) <= 1:
+        for engine in engines:
+            _run_one_engine(led, ns, engine)
+        return
+
+    # Parallel: each engine owns its own containers/ports; the scenarios race on
+    # the shared state backend (a real concurrent-writer test). The big serial
+    # cost — CDC capture-job waits — overlaps, so the wall drops toward the
+    # slowest single engine. Output would interleave, so each engine runs into a
+    # BUFFERED sub-ledger and its block is flushed IN ENGINE ORDER after the join.
+    workers = min(cap, len(engines))
+    led.phase(
+        f"Engine matrix — {len(engines)} engines, up to {workers} concurrent "
+        f"(wall ≈ slowest engine; scenarios race on the shared state backend)"
+    )
+    subs = {e: led.buffered_child() for e in engines}
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        list(ex.map(lambda e: _run_one_engine(subs[e], ns, e), engines))
+    for engine in engines:  # deterministic order, not completion order
+        subs[engine].flush_into(led)
 
 
 def main(argv: list[str] | None = None) -> int:
