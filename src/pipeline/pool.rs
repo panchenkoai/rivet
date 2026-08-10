@@ -188,8 +188,21 @@ pub(crate) fn advise_split(
     if longest.predicted_secs <= total / m.max(1) as f64 {
         return None; // total/m is the wall, not the giant — no split needed
     }
+    // The giant must be parallel_safe for a split to help: its range sub-exports
+    // inherit its heavy flag (split_dominating), so splitting a HEAVY giant just
+    // makes N heavy units that STILL serialize — the heavy-serialization floor
+    // (C3) is unchanged and the advice is a false promise (roast 2026-08-10: on
+    // the DEFAULT all-heavy config the advisory fired but the wall never moved).
+    if !longest.parallel_safe {
+        return None;
+    }
     let n = split_factor(longest.predicted_secs, second.predicted_secs, r, max_split)?;
     let broken = predicted_makespan_secs(&split_dominating(items, r, max_split), m);
+    // Only advise when the split ACTUALLY lowers the wall — never promise an
+    // improvement the model itself does not predict.
+    if broken >= predicted_makespan_secs(items, m) {
+        return None;
+    }
     Some((longest.name.clone(), n, broken))
 }
 
@@ -341,6 +354,19 @@ mod tests {
         assert!(
             advise_split(&balanced, 2, 3.0, 2).is_none(),
             "no advice when total/m is the wall — a split would be a false alarm"
+        );
+
+        // #4 (roast 2026-08-10): a HEAVY giant (the DEFAULT — parallel_safe unset)
+        // must NOT be advised: its range sub-exports inherit the heavy flag and
+        // STILL serialize (C3 floor unchanged), so the split promises a gain the
+        // model does not deliver. RED against advising a non-parallel_safe giant.
+        let mut all_heavy = vec![heavy("giant", 3060.0)];
+        for n in 0..30 {
+            all_heavy.push(heavy(&format!("s{n:02}"), 60.0));
+        }
+        assert!(
+            advise_split(&all_heavy, 6, 3.0, 6).is_none(),
+            "a heavy giant's split does not lower the wall (heavies serialize) — no advice"
         );
     }
 
