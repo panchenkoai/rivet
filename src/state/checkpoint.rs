@@ -180,6 +180,39 @@ impl StateStore {
         }
     }
 
+    /// Un-pin chunks a prior run gave up on so an explicit `--resume` retries them.
+    ///
+    /// `fail_chunk_task(retryable=false)` pins `attempts = max_chunk_attempts` to
+    /// stop the SAME run burning the whole timeout budget on a deterministic
+    /// failure (the 300-minutes-for-nothing case its doc names). But that pin also
+    /// makes `claim_next_chunk_task` — whose predicate is `attempts <
+    /// max_chunk_attempts` — skip the chunk FOREVER, so the run's own remediation
+    /// ("fix the errors, then `rivet run --resume`") could not actually re-run it:
+    /// resume rescued only `running` (crash) tasks, never `failed` ones, and the
+    /// operator's fix was silently never retried.
+    ///
+    /// `--resume` is a DELIBERATE operator action after fixing the cause, so it is
+    /// exactly the moment to give every failed chunk (pinned-permanent OR
+    /// budget-exhausted) a fresh attempt budget. Reset only `failed` tasks —
+    /// `completed` and `pending` are untouched, so it never re-does finished work.
+    /// Returns the number of chunks un-pinned.
+    pub fn reset_failed_chunk_tasks_for_resume(&self, run_id: &str) -> Result<usize> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let sql = "UPDATE chunk_task SET status = 'pending', attempts = 0, updated_at = ?1
+             WHERE run_id = ?2 AND status = 'failed'";
+        match &self.conn {
+            StateConn::Sqlite(c) => {
+                let n = c.execute(sql, rusqlite::params![now, run_id])?;
+                Ok(n)
+            }
+            StateConn::Postgres(client) => {
+                let mut c = client.borrow_mut();
+                let n = c.execute(&pg_sql(sql), &[&now, &run_id])?;
+                Ok(n as usize)
+            }
+        }
+    }
+
     /// Atomically claim the next pending or retryable failed chunk.
     pub fn claim_next_chunk_task(&self, run_id: &str) -> Result<Option<(i64, String, String)>> {
         Self::claim_next_chunk_task_at_ref(&self.state_ref, run_id)
@@ -599,6 +632,69 @@ mod tests {
             "a chunk that failed on a deterministic error was re-claimed; the next attempt runs \
              the identical query against the identical data and cannot succeed. Retrying it to \
              the attempt cap spends the source's time budget N times over."
+        );
+    }
+
+    /// #200-4: an explicit `--resume` must un-pin a permanently-failed chunk so
+    /// the operator's fix is actually retried. Without
+    /// `reset_failed_chunk_tasks_for_resume` the pin (`attempts =
+    /// max_chunk_attempts`) survives resume and `claim_next_chunk_task` skips the
+    /// chunk forever — the run's own "fix errors and --resume" hint is a lie.
+    /// RED: drop the reset call and the second claim stays `None`.
+    #[test]
+    fn resume_un_pins_a_permanently_failed_chunk() {
+        let (_dir, s) = store_on_disk();
+        s.create_chunk_run("run_r", "orders", "h", 4).unwrap();
+        s.insert_chunk_tasks("run_r", &[(1, 5)]).unwrap();
+        s.claim_next_chunk_task("run_r").unwrap().expect("claim");
+        s.fail_chunk_task("run_r", 0, "deterministic boom (ERROR 3024)", false)
+            .unwrap();
+        // Precondition: pinned, so a bare re-claim (what resume did before) skips it.
+        assert!(
+            s.claim_next_chunk_task("run_r").unwrap().is_none(),
+            "precondition: a permanently-failed chunk is not re-claimable while pinned"
+        );
+
+        // The resume un-pin the operator's `--resume` now performs.
+        let n = s.reset_failed_chunk_tasks_for_resume("run_r").unwrap();
+        assert_eq!(n, 1, "exactly the one failed chunk is re-queued");
+
+        // Now the operator's fix gets a real retry: the chunk is claimable again,
+        // and it is the SAME chunk (index 0, keyspace 1..5), attempts reset.
+        let claimed = s
+            .claim_next_chunk_task("run_r")
+            .unwrap()
+            .expect("the un-pinned chunk must be re-claimable after resume");
+        assert_eq!(claimed.0, 0, "the same chunk index");
+        assert_eq!((claimed.1.as_str(), claimed.2.as_str()), ("1", "5"));
+    }
+
+    /// The reset is surgical: a COMPLETED chunk is never re-queued (that would
+    /// re-do finished work), only `failed` ones are. RED against a `WHERE` that
+    /// forgets the `status = 'failed'` clause.
+    #[test]
+    fn resume_reset_leaves_completed_chunks_alone() {
+        let (_dir, s) = store_on_disk();
+        s.create_chunk_run("run_c", "orders", "h", 4).unwrap();
+        s.insert_chunk_tasks("run_c", &[(1, 5), (6, 10)]).unwrap();
+        // chunk 0 completes; chunk 1 fails permanently.
+        s.claim_next_chunk_task("run_c").unwrap().unwrap();
+        s.complete_chunk_task("run_c", 0, 3, Some("part0.csv"))
+            .unwrap();
+        s.claim_next_chunk_task("run_c").unwrap().unwrap();
+        s.fail_chunk_task("run_c", 1, "boom", false).unwrap();
+
+        let n = s.reset_failed_chunk_tasks_for_resume("run_c").unwrap();
+        assert_eq!(
+            n, 1,
+            "only the failed chunk is re-queued, not the completed one"
+        );
+        // The completed chunk stays completed: the only claimable task is chunk 1.
+        let claimed = s.claim_next_chunk_task("run_c").unwrap().expect("claim");
+        assert_eq!(claimed.0, 1, "the completed chunk 0 must not be re-queued");
+        assert!(
+            s.claim_next_chunk_task("run_c").unwrap().is_none(),
+            "chunk 0 stays completed — nothing else to claim"
         );
     }
 

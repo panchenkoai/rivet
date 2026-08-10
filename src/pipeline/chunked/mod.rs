@@ -311,6 +311,20 @@ pub(super) fn ensure_chunk_checkpoint_plan(
                         n
                     );
                 }
+                // Un-pin chunks a prior run gave up on (retryable budget
+                // exhausted OR permanent `retryable=false`): `--resume` is the
+                // operator's deliberate retry after fixing the cause, so the
+                // permanently-failed pin — which `claim_next_chunk_task` would
+                // otherwise skip forever — must be lifted here or the run's own
+                // "fix and --resume" remediation is a false promise (#200-4).
+                let f = state.reset_failed_chunk_tasks_for_resume(&rid)?;
+                if f > 0 {
+                    log::warn!(
+                        "export '{}': re-queued {} failed chunk task(s) for retry after resume",
+                        plan.export_name,
+                        f
+                    );
+                }
                 return Ok(rid);
             }
             None => {
