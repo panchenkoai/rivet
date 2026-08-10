@@ -358,7 +358,33 @@ def _cdc_mssql(url: str, work: Path) -> str | None:
     )
 
 
+def _mssql_max_lsn(url: str) -> str:
+    """The highest LSN the CDC capture job has PROCESSED, or 'NULL' if none yet.
+    Database-wide (`sys.fn_cdc_get_max_lsn`), so once the job ingests our
+    just-committed transaction it strictly advances past the value read before the
+    write — the precise "the capture job has caught up to my changes" signal that
+    a fixed `time.sleep` only guessed at."""
+    return _sqlcmd(
+        url,
+        q="SELECT ISNULL(CONVERT(varchar(64), sys.fn_cdc_get_max_lsn(), 1), 'NULL')",
+    ).stdout.strip()
+
+
+def _wait_mssql_captured(url: str, before: str) -> None:
+    """Poll until the capture job advances past `before` (the max-LSN read BEFORE
+    the write). Replaces a blind `time.sleep(8)`: it returns the instant the job
+    has captured our changes (often ~1-3s) and only waits out the full budget when
+    the Agent is genuinely slow — the same readiness-poll the fixture SETUP already
+    uses (`fn_cdc_get_min_lsn`), applied to the CHANGES too."""
+    wait_until(
+        lambda: _mssql_max_lsn(url) not in ("NULL", before),
+        tries=30,
+        delay=1.0,
+    )
+
+
 def _cdc_mssql_changes(url: str) -> None:
+    before = _mssql_max_lsn(url)
     _sqlcmd(
         url,
         sql=(
@@ -367,12 +393,13 @@ def _cdc_mssql_changes(url: str) -> None:
             "DELETE FROM dbo.orc_cdc_probe WHERE id=3;\n"
         ),
     )
-    time.sleep(8)  # let the CDC capture job populate the change table
+    _wait_mssql_captured(url, before)
 
 
 def _cdc_mssql_crashdelta(url: str) -> None:
+    before = _mssql_max_lsn(url)
     _sqlcmd(url, q='INSERT INTO dbo.orc_cdc_probe VALUES (4,4.4400,\'{"k":4}\');')
-    time.sleep(8)
+    _wait_mssql_captured(url, before)
 
 
 def _cdc_mssql_cleanup(url: str, work: Path) -> None:
