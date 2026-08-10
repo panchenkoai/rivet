@@ -33,6 +33,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -318,6 +319,36 @@ def docker_exec(container: str, *args: str, stdin: str | None = None, **kw) -> P
 
 def have(tool: str) -> bool:
     return shutil.which(tool) is not None
+
+
+# ── matrix cell concurrency ──────────────────────────────────────────────────────
+# The engine matrix is I/O-wait-bound (measured: ~62% CPU idle on 12 cores while
+# 4 engines run), so its many small, INDEPENDENT cells (own work-dir/prefix each)
+# can run concurrently to fill the idle cores. Engines ALSO run in parallel, so a
+# per-engine cell pool alone would oversubscribe (engines × pool); this ONE global
+# semaphore, shared by every engine's cell pool, caps TOTAL in-flight cells so the
+# shared state DB and source containers are not stampeded. Tune with --cell-parallel.
+_cell_parallel_n = 8
+_cell_gate = threading.BoundedSemaphore(_cell_parallel_n)
+
+
+def set_cell_parallel(n: int) -> None:
+    """Resize the global cell-concurrency cap (called once from main after arg parse)."""
+    global _cell_gate, _cell_parallel_n
+    _cell_parallel_n = max(1, n)
+    _cell_gate = threading.BoundedSemaphore(_cell_parallel_n)
+
+
+def cell_parallel() -> int:
+    """The configured cap value — for sizing a per-engine pool (the semaphore is the
+    real global limiter; this just avoids spawning far more threads than can ever run)."""
+    return _cell_parallel_n
+
+
+def cell_gate() -> threading.BoundedSemaphore:
+    """The shared limiter. Use as `with cell_gate(): run_cell(...)`. Read via a
+    function, not a captured value, so `set_cell_parallel` is honoured after import."""
+    return _cell_gate
 
 
 def wait_until(check, *, tries: int = 45, delay: float = 2.0) -> bool:

@@ -59,6 +59,10 @@ import json
 import os
 import re
 import shutil
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -66,6 +70,8 @@ from . import blessed_path, cdc, scenarios
 from .core import (
     run,
     Ledger,
+    cell_gate,
+    cell_parallel,
     container_for_port,
     docker_exec,
     have,
@@ -479,6 +485,13 @@ def _meta_rows(cell: Cell, work: Path, state_url: str, mark: int,
     evidence about this one.
     """
     ids = ", ".join(f"'{r}'" for r in run_ids) if run_ids else "''"
+    # export_metrics has no run_id, so it is scoped by a watermark (id > mark). Under
+    # CONCURRENT cells this can also count a sibling's row, so its ≥1 check is
+    # best-effort: it can only ever produce a false PASS (never a false fail — the
+    # count only inflates), and that is masked by the cell-scoped, sibling-proof
+    # checks below (artifacts/oracle read THIS cell's own work-dir/prefix; file_log
+    # and run_status are scoped by THIS cell's run_ids). The authoritative per-cell
+    # signals are those; export_metrics ≥1 is corroboration.
     got = {
         "export_metrics": _state_sql(cell, work, state_url,
                                      f"SELECT count(*) FROM export_metrics "
@@ -803,6 +816,14 @@ def _run_chain(led: Ledger, cell: Cell, url: str, state_url: str, work: Path,
     for st in ("doctor", "check"):
         args = [st, "-c", str(cfg), *cell.flags.get(st, [])]
         p = rivet(*args, env=env, timeout=scenarios.NO_TIMEOUT)
+        # Read-only source probes; a transient connection blip under the parallel
+        # matrix is a false alarm — retry like seed_engine (a real failure fails
+        # every attempt; _why below still surfaces an exhausted one).
+        for _ in range(2):
+            if p.ok:
+                break
+            time.sleep(1.5)
+            p = rivet(*args, env=env, timeout=scenarios.NO_TIMEOUT)
         if not _stage(led, cell, tag, st, p.ok, f"exit={p.returncode} " + (p.out.strip().splitlines()[-1][:120] if p.ok and p.out.strip() else _why(p))):
             _unreached(led, cell, tag, st)
             return
@@ -1013,7 +1034,15 @@ def _load_leg(led: Ledger, cell: Cell, tag: str, work: Path, env: dict, url: str
     # — so all four engines' `users` land on ONE table. rivet caught this itself
     # and refused ("last loaded from `postgres:users`"), which is the guard doing
     # its job; nine cells failed on a collision the matrix created.
-    dset = os.environ.get("BQ_ORACLE_DATASET", "rivet_blessed") + "_" + cell.engine
+    # PER CELL, not just per engine. rivet load derives the warehouse table from
+    # `table:`, so every cell's `users` lands on ONE table; under the PARALLEL matrix
+    # concurrent cells then drop the table each other is querying (RED-proven: "Not
+    # found: rivet_blessed_mssql.users"). A per-cell dataset gives each its own
+    # `{dset}.users`. Only ~6 slugs × N engines distinct names, reused every run (bq
+    # mk -f is idempotent), so this does not accumulate datasets.
+    _cell_slug = f"{cell.lifecycle}_{cell.store}_{cell.state}"
+    dset = (os.environ.get("BQ_ORACLE_DATASET", "rivet_blessed")
+            + f"_{cell.engine}_{_cell_slug}")
     if cell.store != "gcs" or cell.pipeline != "batch":
         led.skipped(cell.engine, tag, "flow:load", cell.store,
                     f"{cell.engine} {cell.label} · load — the warehouse leg runs on the "
@@ -1030,7 +1059,7 @@ def _load_leg(led: Ledger, cell: Cell, tag: str, work: Path, env: dict, url: str
     tbl = cell.table.split(".")[-1]
     # Version-scoped for the same reason the readback prefix is: the gate runs
     # this once per gridded version and `cell.engine` does not distinguish them.
-    pfx = f"flow/{cell.engine}{tag}/{cell.pipeline}/{tbl}"
+    pfx = f"flow/{cell.engine}{tag}/{cell.pipeline}/{_cell_slug}/{tbl}"
     lcfg = work / "load.yaml"
     tls = "\n  tls: {accept_invalid_certs: true}" if cell.engine == "mssql" else ""
     lcfg.write_text(
@@ -1171,6 +1200,10 @@ def sc_blessed_flow(led: Ledger, engine: str, tag: str, url: str,
         verdicts = {}
 
     cdc_url = cdc_url or os.environ.get(f"RIVET_CDC_{engine.upper()}_URL", "")
+    # Skips are decided SEQUENTIALLY (no rivet, just a ledger row, kept in
+    # declaration order); only the cells that actually run a chain go through the
+    # pool, so no-op work never occupies a slot.
+    tasks: list[tuple[Cell, str, str]] = []
     for cell in cells:
         key = f"{engine}/{cell.pipeline}/{cell.lifecycle}/{cell.store}/{cell.state}"
         why = cell.na_reason()
@@ -1196,18 +1229,55 @@ def sc_blessed_flow(led: Ledger, engine: str, tag: str, url: str,
             led.skipped(cell.engine, tag, "flow:chain", cell.store,
                         f"{cell.engine} {cell.label} — {cell.store} store not up")
             continue
-        before = sum(1 for c in led.cells if c.status.value == "FAIL")
-        with led.span(f"cell {engine} flow {cell.pipeline}/{cell.lifecycle}/{cell.store}/{cell.state}"):
-            run_cell(led, cell, u, state_url, tag)
-        after = sum(1 for c in led.cells if c.status.value == "FAIL")
-        verdicts[key] = "fail" if after > before else "pass"
-        # Written after EVERY cell, not at the end: a matrix killed at minute ten
-        # would otherwise leave nothing to resume from, which is the same defect
-        # the CDC checkpoint exists to prevent one layer down.
+        tasks.append((cell, key, u))
+
+    if not tasks:
+        return
+
+    # Cells are independent (own work-dir + own destination prefix), so run them
+    # concurrently. Each records into its OWN buffered child, so (a) its rows/spans
+    # stay contiguous instead of interleaving with a sibling's, and (b) its pass/fail
+    # is that child's alone — thread-safe, unlike counting FAILs on the shared ledger.
+    # cell_gate() caps concurrency ACROSS engines (which also run in parallel). Flush +
+    # verdict write happen under a lock as each cell completes, so a matrix killed
+    # mid-run still leaves a resumable verdicts file — the property the per-cell write
+    # has always guarded, preserved under parallelism.
+    lock = threading.Lock()
+    # cdc cells DESTRUCTIVELY set up the ONE shared source probe per engine
+    # (drop/create/enable orc_cdc_probe), so they cannot run concurrently WITH EACH
+    # OTHER on this engine — RED-proven: 12 "orc_cdc_probe does not exist" collisions.
+    # Each engine has its own lock (sc_blessed_flow is per-engine), so cdc still
+    # overlaps ACROSS the 4 engines; batch cells never take it.
+    cdc_lock = threading.Lock()
+
+    def run_one(task: tuple[Cell, str, str]) -> None:
+        cell, key, u = task
+        child = led.buffered_child()
+        # Take the per-engine cdc lock BEFORE the global slot, so a queued cdc cell
+        # does not hold a cell_gate() permit while it waits (that would starve batch
+        # cells). Non-cdc cells use a no-op context and never serialise.
+        serialize = cdc_lock if cell.pipeline == "cdc" else nullcontext()
         try:
-            vp.write_text(json.dumps(verdicts, indent=1, sort_keys=True))
-        except OSError:
-            pass
+            with serialize, cell_gate():
+                with child.span(
+                    f"cell {engine} flow {cell.pipeline}/{cell.lifecycle}/{cell.store}/{cell.state}"
+                ):
+                    run_cell(child, cell, u, state_url, tag)
+        except Exception as e:  # a raising cell must not abort the whole matrix
+            child.failed(cell.engine, tag, f"flow:{cell.pipeline}/{cell.lifecycle}",
+                         cell.store, f"{cell.engine} {cell.label} — cell raised: {e}", "raised")
+        failed = any(c.status.value == "FAIL" for c in child.cells)
+        with lock:
+            child.flush_into(led)
+            verdicts[key] = "fail" if failed else "pass"
+            try:
+                vp.write_text(json.dumps(verdicts, indent=1, sort_keys=True))
+            except OSError:
+                pass
+
+    workers = min(len(tasks), cell_parallel())
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        list(ex.map(run_one, tasks))
 
 
 def flag_coverage(cells: list[Cell]) -> dict[str, set[str]]:

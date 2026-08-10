@@ -77,9 +77,13 @@ import json
 import os
 import shutil
 import sqlite3
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from .core import Ledger, container_for_port, docker_exec, have, port_of, run, rivet
+from .core import (Ledger, cell_gate, cell_parallel, container_for_port, docker_exec,
+                   have, port_of, run, rivet)
 from . import scenarios
 
 BUCKET = "rivet-blessed"
@@ -405,7 +409,19 @@ def sc_blessed_path(
     # ── doctor / check ────────────────────────────────────────────────────────
     for stage in ("doctor", "check"):
         r = rivet(stage, "-c", str(cfg), env=env, timeout=scenarios.NO_TIMEOUT)
-        if not _stage(led, engine, tag, store, stage, r.ok, f"exit={r.returncode}"):
+        # doctor/check are READ-ONLY source probes. Under the parallel matrix a
+        # transient connection blip (many cells hitting one source at once) is a
+        # false alarm, not a config error — retry like seed_engine does ("a source
+        # under load can drop the connection; crying wolf is worse than a retry"). A
+        # real failure fails every attempt. Capture the last error line so an
+        # exhausted retry is diagnosable (it was `exit=1` and nothing else before).
+        for _ in range(2):
+            if r.ok:
+                break
+            time.sleep(1.5)
+            r = rivet(stage, "-c", str(cfg), env=env, timeout=scenarios.NO_TIMEOUT)
+        why = "" if r.ok else " " + ((r.stderr or r.stdout or "").strip().splitlines() or [""])[-1][:160]
+        if not _stage(led, engine, tag, store, stage, r.ok, f"exit={r.returncode}{why}"):
             _downstream_unreached(led, engine, tag, store, stage)
             return
 
@@ -660,36 +676,59 @@ def verify_blessed_path(
     """
     led.phase(f"blessed path · {engine} {tag}")
     tables = (table,) if table else GOLDEN_TABLES
+    # Collect the runnable cells across the three store×backend planes; skips are
+    # recorded inline (no rivet), the chains run through the pool. Each cell has its
+    # own work-dir + cloud prefix, so they are independent.
+    tasks: list[tuple[str, str, str, str, str]] = []  # (table, scenario, store, state_url, slug)
     for t in tables:
         for name, sc in SCENARIOS.items():
             if not sc["applies"](t, engine):
                 led.skipped(engine, tag, f"blessed:{name}", "local",
                             f"{engine} {tag} {t} · {name} — not applicable to this table/engine")
                 continue
-            with led.span(f"cell {engine} path {name}/local/sq"):
-                sc_blessed_path(led, engine, tag, url, t, store="local", scenario=name)
+            tasks.append((t, name, "local", "", "local/sq"))
     if state_url:
         for t in tables:
             for name, sc in SCENARIOS.items():
                 if sc["applies"](t, engine):
-                    with led.span(f"cell {engine} path {name}/local/pg"):
-                        sc_blessed_path(led, engine, tag, url, t, store="local",
-                                        state_url=state_url, scenario=name)
+                    tasks.append((t, name, "local", state_url, "local/pg"))
     else:
         led.skipped(
             engine, tag, "blessed:backend", "postgres",
             f"{engine} {tag} · postgres state backend — no --state-url given",
         )
-    # The warehouse cycle runs on ONE table per engine, deliberately: it costs a
-    # real GCS round-trip and a BigQuery job, and what it proves — that a
-    # foreign reader can decode what rivet wrote — does not multiply with the
-    # row count. The strategy axis is where breadth belongs.
-    sc_bq_cycle(led, engine, tag, url, tables[0])
     if scenarios.store_up("gcs"):
         for t in tables:
             for name, sc in SCENARIOS.items():
                 if sc["applies"](t, engine):
-                    with led.span(f"cell {engine} path {name}/gcs/sq"):
-                        sc_blessed_path(led, engine, tag, url, t, store="gcs", scenario=name)
+                    tasks.append((t, name, "gcs", "", "gcs/sq"))
     else:
         led.skipped(engine, tag, "blessed:store", "gcs", f"{engine} {tag} · gcs — store not up")
+
+    # The warehouse cycle runs on ONE table per engine, deliberately: it costs a
+    # real GCS round-trip and a BigQuery job, and what it proves — that a foreign
+    # reader can decode what rivet wrote — does not multiply with the row count. Kept
+    # sequential (one real BQ job; the BQ golden stage already parallelises engines).
+    sc_bq_cycle(led, engine, tag, url, tables[0])
+
+    if not tasks:
+        return
+    lock = threading.Lock()
+
+    def run_one(task: tuple[str, str, str, str, str]) -> None:
+        t, name, store, st, slug = task
+        child = led.buffered_child()
+        try:
+            with cell_gate():
+                with child.span(f"cell {engine} path {name}/{slug}"):
+                    sc_blessed_path(child, engine, tag, url, t, store=store,
+                                    state_url=st, scenario=name)
+        except Exception as e:  # a raising cell must not abort the matrix
+            child.failed(engine, tag, f"blessed:{name}", store,
+                         f"{engine} {tag} {t} · {name}/{slug} — cell raised: {e}", "raised")
+        with lock:
+            child.flush_into(led)
+
+    workers = min(len(tasks), cell_parallel())
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        list(ex.map(run_one, tasks))

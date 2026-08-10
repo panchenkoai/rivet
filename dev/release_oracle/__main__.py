@@ -137,6 +137,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--no-cloud", action="store_true", help="local stage only (skip BigQuery)")
     ap.add_argument("--keep", action="store_true", help="leave engine containers up (debug)")
     ap.add_argument(
+        "--cell-parallel", type=int, default=8,
+        help="global cap on concurrent MATRIX CELLS (blessed_flow/blessed_path) across "
+             "ALL engines. The matrix is I/O-bound (~62%% CPU idle at 4-way), so running "
+             "its independent cells concurrently fills the idle cores; this bounds the "
+             "total so the shared state DB / source containers are not stampeded.")
+    ap.add_argument(
         "--engine-parallel", type=int, default=3,
         help="how many engines to run CONCURRENTLY in the engine loop (default 3). Each engine "
              "owns its own containers/ports, and the scenarios race on the SHARED state backend "
@@ -507,6 +513,8 @@ def engine_loop(led: Ledger, ns: argparse.Namespace) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     ns = parse_args(argv)
+    from .core import set_cell_parallel
+    set_cell_parallel(ns.cell_parallel)
 
     if not rivet_bin().is_file() or not os.access(rivet_bin(), os.X_OK):
         print(f"rivet binary not found at {rivet_bin()} (build --release or set RIVET_BIN)", file=sys.stderr)
