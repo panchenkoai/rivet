@@ -987,8 +987,17 @@ def _run_chain(led: Ledger, cell: Cell, url: str, state_url: str, work: Path,
             # (the old `duck > 0` passed with 4 of 5 lost). >= tolerates an
             # at-least-once duplicate; < is a real loss.
             want = cdc.CDC_EXPECT_EVENTS
-            _stage(led, cell, tag, "oracle", duck >= want,
-                   f"duckdb={duck} >= {want} deterministic changes (at-least-once floor)")
+            # Per-column null profile too (mirrors the batch branch + cdc.py): a decode
+            # regression can null a WHOLE captured typed column (amount/meta) while the
+            # change COUNT holds — and local/gcs CDC cells were guarded NOWHERE (cdc.py
+            # only null-profiles s3). Local reads on-disk; cloud reads the copy _readback
+            # already pulled to work/pull_<store>.
+            prof = dest_dir if cell.store == "local" else (work / f"pull_{cell.store}")
+            nn, _nc = scenarios.duckdb_allnull_columns(f"{prof}/**/*.parquet")
+            n_null = max(0, nn)
+            _stage(led, cell, tag, "oracle", duck >= want and n_null == 0,
+                   f"duckdb={duck} >= {want} deterministic changes (at-least-once floor)"
+                   + (f" · ALLNULL {n_null} cols" if n_null else ""))
 
     # ── validate ─────────────────────────────────────────────────────────────
     p = rivet("validate", "-c", str(cfg), *cell.flags.get("validate", []),

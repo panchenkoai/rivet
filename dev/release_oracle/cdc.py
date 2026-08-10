@@ -698,7 +698,7 @@ def verify_cdc_e2e(led: Ledger) -> None:
         # 2. crash-recovery: an extra row (id=4) + crash at cdc_after_flush_before_ack →
         #    anchor held → recovery re-reads it (at-least-once, no loss).
         spec.crash_delta(url)
-        rivet("run", "-c", str(cap.yaml), env={"RIVET_TEST_PANIC_AT": CDC_HOOK_FLUSH})  # crash
+        crashp = rivet("run", "-c", str(cap.yaml), env={"RIVET_TEST_PANIC_AT": CDC_HOOK_FLUSH})  # crash
         rivet("run", "-c", str(cap.yaml))  # recover
         ids = _cdc_store_ids("s3", cap.bucket, cap.prefix, idc, work)
         # An id-SET membership test. The bash `grep -q 4` was a substring match —
@@ -713,6 +713,12 @@ def verify_cdc_e2e(led: Ledger) -> None:
             reasons.append("validate-not-PASSED")
         if not spop:
             reasons.append("state-not-populated")
+        if crashp.ok:
+            # The panic run MUST have crashed (non-zero exit). If it exited 0 the fault
+            # hook never fired — id=4 was acked normally, nothing was left un-acked, and
+            # the lost-tail invariant was never exercised: crashok would be green on a
+            # non-crash. (mirrors blessed_flow.py's `if c.ok: FAIL` for the batch path.)
+            reasons.append("crash-hook-inert[panic run exited 0 — cdc_after_flush_before_ack did not fire]")
         if not crashok:
             reasons.append(f"crash-lost-the-delta[ids={ids}]")
         if cdc_null > 0:
@@ -790,7 +796,7 @@ def _cdc_large_tx_atomic(led: Ledger) -> None:
     rivet("run", "-c", str(yaml))  # anchor
     # ONE transaction of 12 rows — larger than rollover 5. Must NOT split.
     _psql(url, sql="BEGIN;\nINSERT INTO orc_ltx SELECT g FROM generate_series(1,12) g;\nCOMMIT;\n")
-    rivet("run", "-c", str(yaml), env={"RIVET_TEST_PANIC_AT": CDC_HOOK_ACK})  # crash mid-flush
+    crashp = rivet("run", "-c", str(yaml), env={"RIVET_TEST_PANIC_AT": CDC_HOOK_ACK})  # crash mid-flush
     rivet("run", "-c", str(yaml))  # recover
     ids = _cdc_store_ids("s3", bkt, pfx, "id", work)
     cnt = sum(1 for t in ids.split(",") if re.fullmatch(r"[0-9]+", t.strip()))
@@ -800,7 +806,9 @@ def _cdc_large_tx_atomic(led: Ledger) -> None:
         f"SELECT pg_drop_replication_slot('{slot}') FROM pg_replication_slots WHERE slot_name='{slot}'; "
         "DROP TABLE IF EXISTS orc_ltx;",
     )
-    if cnt == 12:
+    # The crash MUST have fired: if the panic run exited 0 the hook never ran, no tail was
+    # left mid-flush, and 12/12 proves nothing about atomicity across a crash.
+    if cnt == 12 and not crashp.ok:
         led.passed(
             "postgres",
             "cdc",
@@ -808,6 +816,12 @@ def _cdc_large_tx_atomic(led: Ledger) -> None:
             "s3",
             "cdc large-tx-atomic: all 12 rows of the >rollover transaction survived the mid-flush crash",
             "12/12",
+        )
+    elif crashp.ok:
+        led.failed(
+            "postgres", "cdc", "large-tx-atomic", "s3",
+            "cdc large-tx-atomic: crash-hook INERT — the panic run exited 0, so no mid-flush "
+            f"crash was exercised (cnt={cnt}/12 proves nothing)", "crash-inert",
         )
     else:
         led.failed(
