@@ -386,6 +386,20 @@ pub fn write_manifest_without_success_marker(
     write_manifest_inner(dest, manifest, false, false)
 }
 
+/// Like [`write_manifest`] but WITHOUT the prefix-level `_SUCCESS` — keeps the
+/// canonical `manifest.json` + the run-unique copy. For a `--pool --split` UNIT
+/// (#167): the unit's canonical/copy are its record (validate reads the canonical,
+/// the load sums the copies), but the prefix `_SUCCESS` — which marks the WHOLE
+/// giant done — is written ONCE by the pool after every unit finishes, never by a
+/// single unit. Distinct from [`write_manifest_without_success_marker`], which
+/// also skips the canonical (the CDC per-roll case).
+pub fn write_manifest_keep_canonical_no_success(
+    dest: &dyn Destination,
+    manifest: &RunManifest,
+) -> Result<WriteOutcome> {
+    write_manifest_inner(dest, manifest, false, true)
+}
+
 fn write_manifest_inner(
     dest: &dyn Destination,
     manifest: &RunManifest,

@@ -138,7 +138,9 @@ pub(super) fn finalize_manifest(
     kind: &str,
 ) -> Option<String> {
     use crate::manifest::ManifestStatus;
-    use crate::pipeline::manifest_writer::{ManifestBuilder, WriteOutcome, write_manifest};
+    use crate::pipeline::manifest_writer::{
+        ManifestBuilder, WriteOutcome, write_manifest, write_manifest_keep_canonical_no_success,
+    };
 
     // Catch any future runner that drifts summary aggregates away from
     // manifest_parts (the bug parallel_checkpoint had before e9b0796), or that
@@ -334,7 +336,18 @@ pub(super) fn finalize_manifest(
         }
     };
 
-    match write_manifest(&*dest, &manifest) {
+    // #167: a `--split` unit shares its destination prefix with its N-1 siblings,
+    // so it must NOT write the prefix-level `_SUCCESS` — that would mark the WHOLE
+    // giant complete the moment the FIRST unit finishes (mis-skipping the rest on
+    // resume, and tripping the M8 resume guard on a sibling's marker). The unit
+    // writes its manifest + run-unique copy (its per-unit completion signal); the
+    // pool writes `_SUCCESS` ONCE, after every unit succeeds.
+    let write_result = if plan.is_split_unit {
+        write_manifest_keep_canonical_no_success(&*dest, &manifest)
+    } else {
+        write_manifest(&*dest, &manifest)
+    };
+    match write_result {
         Ok(WriteOutcome::Written { success_marker }) => {
             log::info!(
                 "{} '{}': manifest.json written ({} parts, {} rows){}",
@@ -486,8 +499,42 @@ pub(super) fn finalize_validate_manifest(
 /// I/O failures probing `_SUCCESS` (e.g. permission denied on the bucket
 /// we're about to write to) bubble up as `Err` so the operator sees the
 /// real problem before the run starts spending source query time.
+/// #167: write the ONE prefix-level `_SUCCESS` that a giant's `--split` units
+/// deliberately suppressed — the pool calls this after EVERY unit of the giant
+/// has succeeded. It fingerprints the canonical `manifest.json` already in the
+/// prefix (the last unit's, last-writer-wins) so `validate`'s marker-vs-manifest
+/// consistency check holds. `dest_config` must be the FAMILY-expanded prefix the
+/// units wrote to. Streaming destinations have no prefix (no-op).
+pub(crate) fn write_split_success_marker(
+    dest_config: &crate::config::DestinationConfig,
+) -> Result<()> {
+    use crate::manifest::{MANIFEST_FILENAME, SUCCESS_FILENAME, success_marker_body};
+    let dest = crate::destination::create_destination(dest_config)?;
+    if !dest.capabilities().commit_protocol.leaves_objects_at_rest() {
+        return Ok(());
+    }
+    let manifest_bytes = dest.read(MANIFEST_FILENAME)?;
+    let body = success_marker_body(&manifest_bytes);
+    let tmp = tempfile::NamedTempFile::new()?;
+    std::fs::write(tmp.path(), body.as_bytes())?;
+    dest.write(tmp.path(), SUCCESS_FILENAME)?;
+    Ok(())
+}
+
 pub(super) fn check_success_gate_for_resume(plan: &ResolvedRunPlan) -> Result<()> {
     use crate::manifest::SUCCESS_FILENAME;
+
+    // #167: a `--split` unit shares its prefix with siblings and never writes the
+    // prefix `_SUCCESS` itself (the pool does, once all units finish). A `_SUCCESS`
+    // present during a unit's resume was written by the POOL for a PRIOR fully-
+    // complete split — but the pool already skips a completed giant's units before
+    // they reach here, so a unit that DOES reach resume is part of an incomplete
+    // giant. Gating it on the (sibling-or-pool) marker would refuse legitimate
+    // per-unit resume, so the split unit is exempt — its own run-unique manifest
+    // copy is its completion signal, and the pool's per-unit skip is the real gate.
+    if plan.is_split_unit {
+        return Ok(());
+    }
 
     let dest = crate::destination::create_destination(&plan.destination)?;
     if !dest.capabilities().commit_protocol.leaves_objects_at_rest() {
@@ -931,6 +978,7 @@ mod tests {
             export_name: "public.orders".into(),
             source_table: None,
             base_query: "SELECT 1".into(),
+            is_split_unit: false,
             strategy: crate::plan::ExtractionStrategy::Snapshot,
             format: crate::config::FormatType::Parquet,
             compression: crate::config::CompressionType::None,

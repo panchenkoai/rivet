@@ -98,6 +98,7 @@ mod tests {
             export_name: "frame_probe".into(),
             source_table: None,
             base_query: "SELECT 1".into(),
+            is_split_unit: false,
             strategy: crate::plan::ExtractionStrategy::Snapshot,
             format: crate::config::FormatType::Parquet,
             compression: crate::config::CompressionType::None,

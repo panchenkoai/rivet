@@ -40,6 +40,11 @@ fn batch_writers_obtain_destinations_only_through_the_frame() {
             "chunked/resume_m8.rs",
             "M8 rehydration LISTS durable parts of a prior run; it writes nothing",
         ),
+        (
+            "split.rs",
+            "#167 --split resume: completed_units_in_prefix READS sibling units' \
+             manifest copies to decide per-unit skip — a reader, no parts written",
+        ),
     ];
 
     let mut offenders = Vec::new();

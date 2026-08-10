@@ -134,6 +134,7 @@ pub fn build_plan(
         bytes_read: Default::default(),
         source_table: export.table.clone(),
         base_query,
+        is_split_unit: export.split.is_some(),
         strategy,
         format: export.format,
         compression,

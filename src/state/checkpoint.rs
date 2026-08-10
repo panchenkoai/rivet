@@ -46,6 +46,19 @@ impl StateStore {
         }
     }
 
+    /// Whether this export has a resumable checkpoint — an in-progress chunk run
+    /// (range/keyset chunking) OR a persisted keyset resume run id. The pool uses
+    /// it to decide a `--split` unit's resume flag (#167): a crashed unit has
+    /// resumable state → resume it (reuse the run_id, overwrite the partial parts
+    /// in place); a never-started unit has none → run it fresh (so `--resume` does
+    /// not bail on "no in-progress checkpoint").
+    pub fn has_resumable_checkpoint(&self, export_name: &str) -> Result<bool> {
+        if self.find_in_progress_chunk_run(export_name)?.is_some() {
+            return Ok(true);
+        }
+        Ok(self.get_resume_run_id(export_name)?.is_some())
+    }
+
     /// Latest `in_progress` chunk run for this export, if any.
     pub fn find_in_progress_chunk_run(
         &self,
