@@ -238,11 +238,15 @@ fn dispatch_cdc(a: CdcArgs) -> Result<()> {
             },
             CdcEngine::Postgres => CdcEngineOpts::Postgres { slot: a.slot },
             CdcEngine::Mssql => CdcEngineOpts::Mssql {
-                // The `rivet cdc` CLI names no tables — it captures whatever the
-                // capture instance emits — so there is nothing to cross-check
-                // against and the guard stays off. Config mode (`mode: cdc`)
-                // supplies them.
-                configured_tables: Vec::new(),
+                // `--table` IS the routing filter on this path too (the NDJSON leg
+                // passes it to `run(...)`, the `--output` leg requires exactly
+                // one), so it is exactly the set the catalog-identity guard must
+                // cross-check against — a capture instance whose NAME splits to a
+                // different `schema.table` than the catalog spells would otherwise
+                // route/drop every event silently. Empty (`rivet cdc` with no
+                // `--table`) keeps the guard off: nothing named ⇒ nothing to
+                // cross-check, capture whatever the instance emits.
+                configured_tables: a.table.clone(),
                 capture_instance: a.capture_instance,
             },
             CdcEngine::Mongo => CdcEngineOpts::Mongo { canonical: false },

@@ -68,6 +68,24 @@ fn id_set_and_fanout(dir: &std::path::Path) -> (usize, BTreeSet<i64>, usize) {
     (count, keys, workers.len())
 }
 
+/// Parquet parts per range worker, keyed `w{ridx}` (the `_pk_w{ridx}_{page}` token
+/// in every part name). Lets a test assert a SPECIFIC range left N durable pages —
+/// needed to prove a mid-range failure's pre-failure pages are on disk (#200-1).
+fn worker_part_counts(dir: &std::path::Path) -> std::collections::BTreeMap<String, usize> {
+    let mut out: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for p in files_with_extension(dir, "parquet") {
+        if let Some(ridx) = p
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.split("_pk_w").nth(1))
+            .and_then(|s| s.split('_').next())
+        {
+            *out.entry(format!("w{ridx}")).or_default() += 1;
+        }
+    }
+    out
+}
+
 /// The shared scenario: run parallel keyset on an already-seeded `1..=n` integer
 /// key and assert (1) every row round-trips exactly once (structural parity across
 /// the N ranges) and (2) the run FANNED OUT to ≥2 workers (did not collapse).
@@ -790,6 +808,75 @@ fn parallel_keyset_worker_error_still_counts_the_durable_parts_postgres() {
         Some(on_disk as i64),
         "a failed parallel-keyset run must count the parts it left durable \
          ({on_disk} on disk) — the retry guard reads this and nothing else"
+    );
+
+    let mut c2 = pg_connect();
+    let _ = c2.batch_execute(&format!("DROP TABLE IF EXISTS {table};"));
+}
+
+/// #200-1: the SAME durable-parts blind spot, one level deeper — page granularity
+/// WITHIN a range. The worker-level template above fails a range at its FIRST page
+/// (`keyset_parallel_worker:2`), so the failing range writes nothing and every
+/// on-disk part belongs to a COMMITTED range — `files_committed == on_disk` holds
+/// even with the bug, because the bug only drops the parts of a range that both
+/// (a) wrote pages AND (b) never committed.
+///
+/// This fixture makes a range do exactly that: `keyset_parallel_worker_midrange:2`
+/// fires only after range 2 has already made page 0 durable, so range 2 leaves a
+/// parquet on disk yet never reaches its checkpoint commit. Pre-fix those parts
+/// lived in the worker's `local_parts`, published to the shared count ONLY at
+/// range completion — the mid-range `return` dropped them, so `files_committed`
+/// under-counted the debris the retry guard reads. RED before the per-page publish:
+/// `files_committed` = the committed ranges only, `on_disk` = those + range 2's
+/// page 0.
+///
+/// Needs ≥2 pages per range so page 0 lands before the mid-range fire: 4000 rows /
+/// `parallel: 4` = 1000-row ranges over `chunk_size: 500` = 2 pages each.
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn parallel_keyset_midrange_error_counts_pre_failure_page_parts_postgres() {
+    require_alive(LiveService::Postgres);
+    let table = unique_name("pk_midr");
+    let mut c = pg_connect();
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {table};
+         CREATE TABLE {table} (id BIGINT PRIMARY KEY, payload INT NOT NULL);
+         INSERT INTO {table} SELECT g, g FROM generate_series(1, 4000) g;"
+    ))
+    .unwrap();
+    let rig = parallel_keyset(Rig::pg_batch(&format!("public.{table}")));
+    let out = rig.run_with_env("RIVET_TEST_ERROR_AT", "keyset_parallel_worker_midrange:2");
+    assert!(
+        !out.status.success(),
+        "a worker mid-range error must fail the run"
+    );
+
+    // The premise: range 2 wrote page 0 to disk BEFORE the mid-range failure, and
+    // the committed ranges wrote their pages too. If range 2 wrote nothing this
+    // test degenerates into the worker-level one and proves nothing new.
+    let per_worker = worker_part_counts(&rig.out_dir());
+    let on_disk: usize = per_worker.values().sum();
+    assert!(
+        per_worker.get("w2").copied().unwrap_or(0) >= 1,
+        "fixture is inert for #200-1: range 2 must leave ≥1 durable page BEFORE it \
+         fails mid-range, got per-worker parts {per_worker:?}"
+    );
+    assert!(
+        on_disk > per_worker.get("w2").copied().unwrap_or(0),
+        "fixture needs committed ranges too, got {per_worker:?}"
+    );
+
+    // The seam: files_committed must count EVERY durable part on disk, including
+    // range 2's pre-failure page — the retry guard reads this and nothing else.
+    // RED pre-fix: files_committed omitted range 2's uncommitted-but-durable page.
+    let db = StateDb::next_to_config(&rig.config_path());
+    let run_id = db.latest_run_id(rig.export_name());
+    let m = db.metrics_row(&run_id);
+    assert_eq!(
+        m.files_committed,
+        Some(on_disk as i64),
+        "a mid-range failure must count the pages the failing range already made \
+         durable ({on_disk} on disk, per-worker {per_worker:?})"
     );
 
     let mut c2 = pg_connect();
