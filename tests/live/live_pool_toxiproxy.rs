@@ -182,3 +182,135 @@ fn pool_apply_two_heavy_exports_both_complete() {
     );
     toxi_reset_toxics("postgres");
 }
+
+/// #167 Slice E: `apply --pool --split` realizes the range split and the union
+/// reads back exactly — the completeness oracle the issue names (DuckDB over the
+/// shared prefix), no gap or dup at the range seams.
+///
+/// `advise_split` keys off RECORDED durations, so a FRESH run predicts the same
+/// default for every export and nothing dominates — the split only fires once the
+/// giant has a measured, dominating wall. So the flow mirrors real use: one
+/// `--pool` run PRIMES the durations, the outputs are cleared (durations persist
+/// in the state DB next to the config), then `--pool --split` runs. The giant now
+/// dominates → splits into N range sub-exports over `id`, all writing to ONE
+/// shared prefix under the family name; the union is exact.
+///
+/// Vacuous-oracle guard (this repo's rule): `union == HEAVY` passes whether or
+/// not the split fired — a giant run WHOLE is also complete. So the test also
+/// asserts the split ACTUALLY happened: the executor's log line AND range-unit
+/// part names (`pool_split_heavy#N`) on disk. RED if `--split` silently no-ops,
+/// and RED if any seam drops/dups a row (distinct != HEAVY).
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn pool_split_realizes_the_range_split_and_the_union_is_exact() {
+    const HEAVY: i64 = 200_000;
+    const SMALL: i64 = 1_000;
+
+    // The giant: chunked over `id` (splittable — a range key, no `table:` needed),
+    // parallel_safe so the split units may run concurrently. The small backfills.
+    let rig = Rig::pg_batch("pool_split_heavy")
+        .query(&format!(
+            "SELECT g AS id, md5(g::text) AS a, md5((g*3)::text) AS b \
+             FROM generate_series(1, {HEAVY}) g"
+        ))
+        .mode("chunked")
+        .export_line("chunk_column: id")
+        .export_line("chunk_size: 50000")
+        .export_line("parallel_safe: true")
+        .also_export(
+            "pool_split_small",
+            &format!("SELECT g AS id, md5(g::text) AS payload FROM generate_series(1, {SMALL}) g"),
+        )
+        .also_export_line("parallel_safe: true");
+    let cfg = rig.config_path();
+
+    // 1. Prime the durations — no split. The giant records a wall that dominates
+    //    the small (200k wide rows vs 1k), which is what `advise_split` reads next.
+    let prime = run_rivet_env(&["apply", cfg.to_str().unwrap(), "--pool", "2"], &[]);
+    assert!(
+        prime.status.success(),
+        "priming run must succeed:\n{}",
+        String::from_utf8_lossy(&prime.stderr)
+    );
+
+    // 2. Clear the outputs so the split run writes into clean prefixes. The state
+    //    DB (durations) lives next to the config, not under these dirs, so it
+    //    survives — the giant still reads as dominating on the next run.
+    for d in [rig.out_dir(), rig.out_dir_for("pool_split_small")] {
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+    }
+
+    // 3. The split run.
+    let out = run_rivet_env(
+        &["apply", cfg.to_str().unwrap(), "--pool", "2", "--split"],
+        &[],
+    );
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "split run must succeed:\n{log}");
+
+    // The split ACTUALLY fired (else the union oracle below is vacuous): the
+    // executor said so, AND range-unit parts landed on disk.
+    assert!(
+        log.contains("split 'pool_split_heavy' into"),
+        "the executor must report realizing the split:\n{log}"
+    );
+    let giant_range_parts: Vec<_> = files_with_extension(&rig.out_dir(), "parquet")
+        .into_iter()
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.contains("pool_split_heavy#"))
+        })
+        .collect();
+    assert!(
+        !giant_range_parts.is_empty(),
+        "range sub-export parts (pool_split_heavy#N) must be on disk — the split reached the writer"
+    );
+
+    // 4. The union is exact: every key once, no gap/dup at the range seams.
+    assert_eq!(
+        duckdb_total_parquet_rows(&rig.out_dir()) as i64,
+        HEAVY,
+        "the split union must read back every row of the giant exactly"
+    );
+    let ids = duckdb_dir_parquet_id_set(&rig.out_dir());
+    assert_eq!(
+        ids.len() as i64,
+        HEAVY,
+        "distinct ids must equal HEAVY — a seam that drops or duplicates a key fails here"
+    );
+    assert_eq!(
+        *ids.iter().next().unwrap(),
+        1,
+        "the floor key must be present"
+    );
+    assert_eq!(
+        *ids.iter().next_back().unwrap(),
+        HEAVY,
+        "the ceil key must be present (last window has no upper bound)"
+    );
+
+    // 5. Only the DOMINATING export is split — the small one runs whole.
+    let small_split: Vec<_> = files_with_extension(&rig.out_dir_for("pool_split_small"), "parquet")
+        .into_iter()
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.contains('#'))
+        })
+        .collect();
+    assert!(
+        small_split.is_empty(),
+        "the non-dominating export must not be split"
+    );
+    assert_eq!(
+        duckdb_total_parquet_rows(&rig.out_dir_for("pool_split_small")) as i64,
+        SMALL,
+        "the small export must still be exact"
+    );
+}
