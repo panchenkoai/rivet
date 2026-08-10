@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import time
 from pathlib import Path
 from typing import Callable
 
@@ -253,9 +254,22 @@ def verify_gc_survival(led: Ledger, *, bucket: str, pfx: str, cfg_text: str,
 
     fails: list[str] = []
 
+    def _gc_load_ok(tries: int = 3) -> bool:
+        # `rivet load` here hits REAL BigQuery/GCS, so a transient Google-side hiccup
+        # is an infra blip, not a gc-logic failure — retry like seed_engine/doctor
+        # (measured: one mssql arm-2 load flaked once and cleared on the very next run).
+        # A real gc failure fails every attempt.
+        p = rivet("load", "-c", str(gc_cfg), env=child, timeout=None)
+        for _ in range(tries - 1):
+            if p.ok:
+                break
+            time.sleep(2.0)
+            p = rivet("load", "-c", str(gc_cfg), env=child, timeout=None)
+        return p.ok
+
     # ── arm 1: no live run → the unmanifested part is debris → collected ──
     dead = plant_orphan("orphan-crash-debris.parquet")
-    if not rivet("load", "-c", str(gc_cfg), env=child, timeout=None).ok:
+    if not _gc_load_ok():
         led.failed(engine, "-", "gc_survival", "-",
                    f"gc_survival[{engine}]: the gc load itself failed", "load")
         return
@@ -278,7 +292,7 @@ def verify_gc_survival(led: Ledger, *, bucket: str, pfx: str, cfg_text: str,
     mk_remote = f"{base}/manifest-gc-survival-probe.json"
     run(["gcloud", "storage", "cp", str(mk_local), mk_remote], timeout=300)
 
-    if not rivet("load", "-c", str(gc_cfg), env=child, timeout=None).ok:
+    if not _gc_load_ok():
         fails.append("gc-load-failed-with-a-running-marker ")
     elif not exists(live):
         fails.append("inflight-part-DELETED(a live run's unmanifested part was collected) ")

@@ -687,6 +687,12 @@ def verify_cdc_e2e(led: Ledger) -> None:
         before = _runs_seen()  # the key set this cell will subtract, see _state_populated
         rivet("run", "-c", str(cap.yaml))
         n = _store_readback("s3", cap.bucket, cap.prefix, work)  # INDEPENDENT (DuckDB)
+        # Per-column null profile, independent of rivet: the change set writes typed
+        # columns (amount numeric, meta jsonb), and a decode regression can null a WHOLE
+        # captured column while n stays 5 and validate re-reads its own null parts green —
+        # the exact uuid→FixedSizeBinary silent-loss class, on the CDC pipeline it
+        # occurred on. The batch legs guard this; CDC did not. Same helper.
+        cdc_null, _cdc_cols = scenarios.duckdb_allnull_cloud("s3", cap.bucket, cap.prefix, work)
         vout = rivet("validate", "-c", str(cap.yaml)).out
         vp = "passed" in vout.lower()
         spop = _state_populated(work / ".rivet_state.db", before=before)
@@ -711,6 +717,8 @@ def verify_cdc_e2e(led: Ledger) -> None:
             reasons.append("state-not-populated")
         if not crashok:
             reasons.append(f"crash-lost-the-delta[ids={ids}]")
+        if cdc_null > 0:
+            reasons.append(f"cdc-allnull-column[{cdc_null} col(s) 100% NULL]")
         if not reasons:
             led.passed(
                 eng,

@@ -310,7 +310,12 @@ def verify_concurrent_writers_share_a_prefix(
                  "concurrent-writers: could not seed the probe table", "no seed")
         return
 
-    stamp = time.strftime("%H%M%S")
+    # Date + PID, not a bare %H%M%S: the export_prefix scopes the aggregates on the
+    # SHARED, never-reset Postgres ledger (WHERE export_name LIKE '<prefix>%'), so a
+    # date-less stamp lets a prior gate run at the same hh:mm:ss satisfy this run's
+    # counts. The PID makes it unique per gate invocation; the date removes the
+    # once-a-day collision.
+    stamp = time.strftime("%Y%m%d_%H%M%S") + f"_{os.getpid()}"
     work = work_dir() / f"conc_{stamp}"
     work.mkdir(parents=True, exist_ok=True)
 
