@@ -1159,13 +1159,18 @@ def verify_pool_e2e(led: Ledger) -> None:
     )
     log_path = work_dir() / "pool_e2e.log"
     p = run(
+        # `--ignored` is REQUIRED: the pool e2e tests carry #[ignore] (they need
+        # the live stand), added in the CI-tier split. Without it they are SKIPPED
+        # and the gate read "0 passed" as a FAIL (roast 2026-08-10). The pass check
+        # below is count-agnostic (0 failed AND at least one passed) so adding a
+        # pool test never silently breaks the gate the way pinning "2 passed" did.
         ["cargo", "test", "--manifest-path", str(ROOT / "Cargo.toml"), "--test", "live_suite",
-         "--", "--test-threads=1", "live_pool_toxiproxy"],
+         "--", "--ignored", "--test-threads=1", "live_pool_toxiproxy"],
         env={"RIVET_BIN": str(rivet_bin())},
         timeout=NO_TIMEOUT,
     )
     log_path.write_text(p.out)
-    if p.ok and "test result: ok. 2 passed" in p.out:
+    if p.ok and "0 failed" in p.out and "0 passed" not in p.out:
         _passed(
             led, "pool", "e2e", "-", "-",
             "pool e2e: bandwidth-capped --pool run exact + self-grading; resume defers, drops nothing",
