@@ -284,35 +284,39 @@ fn dispatch_cdc(a: CdcArgs) -> Result<()> {
     // `run_capture` derives the peek bound from this export's `rollover` (below),
     // so the sink and the stream share one source of truth for the part size.
     let now = chrono::Utc::now().to_rfc3339();
-    crate::source::cdc::run_capture(crate::source::cdc::CdcCapture {
-        // The CLI subcommand has no exports[] block; the table IS the export
-        // identity here, which keeps family == export_name == table — exactly
-        // the shape the load guard folds to one family.
-        export_name: a.table.join("+"),
-        cdc_cfg,
-        outputs: vec![crate::source::cdc::CaptureOutput {
-            table: tbl,
-            dest: dest.as_ref(),
-            dest_uri: dir,
-            // The ad-hoc CLI has no `columns:` surface; config-driven runs do.
-            overrides: crate::types::ColumnOverrides::new(),
-            // Likewise no `row_hash:` surface — a hash's covered column set is
-            // a contract the warehouse table carries, which needs a config file
-            // to declare.
-            row_hash: crate::config::RowHash::All(false),
-        }],
-        format: fmt,
-        max_events: a.max_events,
-        rollover: a.rollover,
-        rollover_memory_bytes: None,
-        run_id: now.clone(),
-        started_at: now,
-        // The ad-hoc `rivet cdc` subcommand runs without a config, and so
-        // without a state store to record into. A `mode: cdc` export — the
-        // supported path, and the one the sweep and the load read — passes its
-        // store, so every part reaches the database as it becomes durable.
-        state: None,
-    })
+    let __cdc_read_bytes = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    crate::source::cdc::run_capture(
+        crate::source::cdc::CdcCapture {
+            // The CLI subcommand has no exports[] block; the table IS the export
+            // identity here, which keeps family == export_name == table — exactly
+            // the shape the load guard folds to one family.
+            export_name: a.table.join("+"),
+            cdc_cfg,
+            outputs: vec![crate::source::cdc::CaptureOutput {
+                table: tbl,
+                dest: dest.as_ref(),
+                dest_uri: dir,
+                // The ad-hoc CLI has no `columns:` surface; config-driven runs do.
+                overrides: crate::types::ColumnOverrides::new(),
+                // Likewise no `row_hash:` surface — a hash's covered column set is
+                // a contract the warehouse table carries, which needs a config file
+                // to declare.
+                row_hash: crate::config::RowHash::All(false),
+            }],
+            format: fmt,
+            max_events: a.max_events,
+            rollover: a.rollover,
+            rollover_memory_bytes: None,
+            run_id: now.clone(),
+            started_at: now,
+            // The ad-hoc `rivet cdc` subcommand runs without a config, and so
+            // without a state store to record into. A `mode: cdc` export — the
+            // supported path, and the one the sweep and the load read — passes its
+            // store, so every part reaches the database as it becomes durable.
+            state: None,
+        },
+        &__cdc_read_bytes,
+    )
     // `.1` is the outcome; `.0` is what the drain made durable. The ad-hoc
     // subcommand has no state store and no summary to attribute parts to, so
     // there is nothing here to record them into — unlike `mode: cdc`, where

@@ -117,7 +117,8 @@ pub(super) fn run_cdc_export(
     // marker that self-destructs is worse than none: it retires the known issue
     // while leaving the hole open.
 
-    let result = run_cdc_inner(config, export, &run_id, state);
+    let read_bytes = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let result = run_cdc_inner(config, export, &run_id, state, &read_bytes);
     let duration_ms = started.elapsed().as_millis() as i64;
 
     // The manifests describe what was made DURABLE; `outcome` says whether the
@@ -133,6 +134,7 @@ pub(super) fn run_cdc_export(
     // changes the log no longer has. Any tool summing metric rows under-counted
     // by the same amount.
     let (manifests, outcome) = result;
+    let bytes_read = read_bytes.load(std::sync::atomic::Ordering::Relaxed);
     let bytes: u64 = manifests
         .iter()
         .flat_map(|m| &m.parts)
@@ -145,6 +147,7 @@ pub(super) fn run_cdc_export(
         manifests.iter().map(|m| m.row_count).sum(),
         manifests.iter().map(|m| m.part_count as usize).sum(),
         bytes,
+        bytes_read,
         duration_ms,
         outcome.as_ref().err().map(crate::redact::redact_error),
     );
@@ -406,6 +409,7 @@ fn run_cdc_inner(
     export: &ExportConfig,
     run_id: &str,
     state: &StateStore,
+    read_bytes: &std::sync::Arc<std::sync::atomic::AtomicU64>,
 ) -> (Vec<crate::manifest::RunManifest>, Result<()>) {
     let url = match config.source.resolve_url() {
         Ok(u) => u,
@@ -511,48 +515,49 @@ fn run_cdc_inner(
         );
     }
 
-    run_capture(CdcCapture {
-        export_name: export.name.clone(),
-        cdc_cfg: CdcConfig {
-            url,
-            checkpoint: cdc.checkpoint.as_ref().map(PathBuf::from),
-            drain: DrainMode::from_until_current(cdc.until_current),
-            tls: config.source.tls.clone(),
-            engine: match config.source.source_type {
-                crate::config::SourceType::Mysql => CdcEngineOpts::Mysql {
-                    server_id: cdc
-                        .server_id
-                        .unwrap_or(crate::config::DEFAULT_MYSQL_SERVER_ID),
-                },
-                crate::config::SourceType::Postgres => CdcEngineOpts::Postgres {
-                    slot: cdc
-                        .slot
-                        .clone()
-                        .unwrap_or_else(|| crate::config::DEFAULT_PG_SLOT.to_string()),
-                },
-                crate::config::SourceType::Mssql => CdcEngineOpts::Mssql {
-                    capture_instance: cdc.capture_instance.clone(),
-                    // The same strings the sink will route by — see the field's doc.
-                    configured_tables: wired.iter().map(|(t, _, _)| t.clone()).collect(),
-                },
-                crate::config::SourceType::Mongo => {
-                    CdcEngineOpts::Mongo {
+    run_capture(
+        CdcCapture {
+            export_name: export.name.clone(),
+            cdc_cfg: CdcConfig {
+                url,
+                checkpoint: cdc.checkpoint.as_ref().map(PathBuf::from),
+                drain: DrainMode::from_until_current(cdc.until_current),
+                tls: config.source.tls.clone(),
+                engine: match config.source.source_type {
+                    crate::config::SourceType::Mysql => CdcEngineOpts::Mysql {
+                        server_id: cdc
+                            .server_id
+                            .unwrap_or(crate::config::DEFAULT_MYSQL_SERVER_ID),
+                    },
+                    crate::config::SourceType::Postgres => CdcEngineOpts::Postgres {
+                        slot: cdc
+                            .slot
+                            .clone()
+                            .unwrap_or_else(|| crate::config::DEFAULT_PG_SLOT.to_string()),
+                    },
+                    crate::config::SourceType::Mssql => CdcEngineOpts::Mssql {
+                        capture_instance: cdc.capture_instance.clone(),
+                        // The same strings the sink will route by — see the field's doc.
+                        configured_tables: wired.iter().map(|(t, _, _)| t.clone()).collect(),
+                    },
+                    crate::config::SourceType::Mongo => CdcEngineOpts::Mongo {
                         canonical: config.source.mongo.as_ref().is_some_and(|m| {
                             matches!(m.json, crate::config::MongoJsonMode::Canonical)
                         }),
-                    }
-                }
+                    },
+                },
             },
+            outputs,
+            format: export.format,
+            max_events: cdc.max_events,
+            rollover: cdc.rollover.unwrap_or(100_000),
+            rollover_memory_bytes: cdc.rollover_memory_mb.map(|mb| mb * 1024 * 1024),
+            run_id: run_id.to_string(),
+            started_at: now,
+            state: Some(state),
         },
-        outputs,
-        format: export.format,
-        max_events: cdc.max_events,
-        rollover: cdc.rollover.unwrap_or(100_000),
-        rollover_memory_bytes: cdc.rollover_memory_mb.map(|mb| mb * 1024 * 1024),
-        run_id: run_id.to_string(),
-        started_at: now,
-        state: Some(state),
-    })
+        read_bytes,
+    )
 }
 
 /// Build the per-run summary (mirrors `synthetic_failed_summary`'s shape, for a
@@ -565,6 +570,7 @@ fn cdc_summary(
     total_rows: i64,
     files: usize,
     bytes: u64,
+    bytes_read: u64,
     duration_ms: i64,
     error_message: Option<String>,
 ) -> RunSummary {
@@ -580,6 +586,7 @@ fn cdc_summary(
         total_rows,
         files_produced: files,
         bytes_written: bytes,
+        bytes_read,
         files_committed: files,
         duration_ms,
         error_message,
@@ -616,6 +623,7 @@ fn record_metric(state: &StateStore, config: &Config, export: &ExportConfig, sum
         mode: Some("cdc".to_string()),
         files_produced: summary.files_produced as i64,
         bytes_written: summary.bytes_written as i64,
+        bytes_read: summary.bytes_read as i64,
         files_committed: summary.files_committed as i64,
         source_type,
         destination_type: Some(export.destination.destination_type.label().to_string()),
