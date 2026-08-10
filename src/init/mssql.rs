@@ -146,6 +146,7 @@ fn parse_columns_agg(agg: &str) -> Vec<ColumnInfo> {
                 return None;
             }
             Some(ColumnInfo {
+                is_indexed: f[2] == "1",
                 name: f[0].to_string(),
                 data_type: f[1].to_string(),
                 is_primary_key: f[2] == "1",

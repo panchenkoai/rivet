@@ -118,6 +118,7 @@ mod tests {
             is_nullable: nullable,
             numeric_precision: None,
             numeric_scale: None,
+            is_indexed: false,
         }
     }
 

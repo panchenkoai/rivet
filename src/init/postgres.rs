@@ -120,6 +120,21 @@ pub(super) fn introspect(client: &mut Client, schema: &str, table: &str) -> Resu
     let pk_cols: std::collections::HashSet<String> =
         pk_rows.iter().map(|r| r.get::<_, String>(0)).collect();
 
+    // Any indexed column (PK, unique, or secondary) — same shape as pk_rows
+    // minus `indisprimary`. Feeds ColumnInfo.is_indexed so the density probe
+    // (#199) samples only an indexed key, never an unindexed fallback.
+    let indexed_rows = client.query(
+        "SELECT a.attname
+         FROM pg_index i
+         JOIN pg_attribute a ON a.attrelid = i.indrelid
+             AND a.attnum = ANY(i.indkey)
+         WHERE i.indrelid = to_regclass($1 || '.' || $2)
+           AND i.indrelid IS NOT NULL",
+        &[&schema, &table],
+    )?;
+    let indexed_cols: std::collections::HashSet<String> =
+        indexed_rows.iter().map(|r| r.get::<_, String>(0)).collect();
+
     // Column metadata — including NULL-ability and numeric precision/scale for decimal columns.
     let col_rows = client.query(
         "SELECT column_name, data_type, is_nullable, numeric_precision, numeric_scale
@@ -145,7 +160,9 @@ pub(super) fn introspect(client: &mut Client, schema: &str, table: &str) -> Resu
             let numeric_precision: Option<i32> = row.get(3);
             let numeric_scale: Option<i32> = row.get(4);
             let is_primary_key = pk_cols.contains(&name);
+            let is_indexed = indexed_cols.contains(&name);
             ColumnInfo {
+                is_indexed,
                 name,
                 data_type,
                 is_primary_key,
@@ -186,7 +203,7 @@ pub(super) fn density_probe(client: &mut Client, info: &mut super::TableInfo) {
     if (1..PG_PROBE_LINE).contains(&catalog) {
         return;
     }
-    let Some(key) = info.best_chunk_column().map(str::to_string) else {
+    let Some(key) = info.best_indexed_chunk_column().map(str::to_string) else {
         info.density = Some(DensityProbe {
             rows: catalog,
             density: 0.0,

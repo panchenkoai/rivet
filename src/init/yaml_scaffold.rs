@@ -1130,6 +1130,7 @@ mod tests {
             is_nullable: true,
             numeric_precision: None,
             numeric_scale: None,
+            is_indexed: false,
         }
     }
 
@@ -1148,6 +1149,7 @@ mod tests {
             is_nullable: false,
             numeric_precision: None,
             numeric_scale: None,
+            is_indexed: false,
         };
         let info = TableInfo {
             density: None,
@@ -1202,6 +1204,7 @@ mod tests {
             is_nullable: nullable,
             numeric_precision: None,
             numeric_scale: None,
+            is_indexed: false,
         };
         let info = TableInfo {
             density: None,
@@ -1353,6 +1356,7 @@ mod tests {
         ColumnInfo {
             numeric_precision: Some(p),
             numeric_scale: Some(s),
+            is_indexed: false,
             ..col(name, "numeric")
         }
     }

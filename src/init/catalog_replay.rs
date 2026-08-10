@@ -148,8 +148,10 @@ mod tests {
             is_nullable: false,
             numeric_precision: None,
             numeric_scale: None,
+            is_indexed: false,
         }
     }
+
     fn tbl(rows: i64, bytes: i64, cols: Vec<ColumnInfo>) -> TableInfo {
         TableInfo {
             density: None,
