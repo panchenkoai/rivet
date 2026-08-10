@@ -1163,21 +1163,37 @@ def _load_rows(cell: Cell, work: Path, state_url: str, load_id: str,
 VERDICTS = "blessed-flow-verdicts.json"
 
 
-def _verdict_path() -> Path:
-    return Path(os.environ.get("RIVET_FLOW_VERDICTS", scenarios.work_dir() / VERDICTS))
+def _verdict_path(engine: str | None = None) -> Path:
+    base = Path(os.environ.get("RIVET_FLOW_VERDICTS", scenarios.work_dir() / VERDICTS))
+    # PER ENGINE. engine_loop runs the four engines' sc_blessed_flow concurrently, and
+    # each read-modify-overwrites this file under its OWN per-engine lock — so a shared
+    # path means the last engine to write CLOBBERS the others' resume anchors (a crashed
+    # matrix could then re-run only one engine's cells). A file per engine keeps each
+    # engine's incremental verdicts independent; failed_cells() unions them back.
+    if engine:
+        return base.with_name(f"{base.stem}.{engine}{base.suffix}")
+    return base
 
 
 def failed_cells(path: Path | None = None) -> set[str]:
     """The cell keys a previous run failed, for `only=`.
 
     The matrix is ~15 minutes; re-running all 76 cells to re-check four is how a
-    feedback loop gets long enough that people stop closing it.
+    feedback loop gets long enough that people stop closing it. Unions the per-engine
+    verdict files (see _verdict_path) plus any legacy shared file.
     """
-    p = path or _verdict_path()
-    try:
-        return {k for k, v in json.loads(p.read_text()).items() if v == "fail"}
-    except (OSError, json.JSONDecodeError):
-        return set()
+    if path is not None:
+        paths = [path]
+    else:
+        base = _verdict_path()
+        paths = [base, *sorted(base.parent.glob(f"{base.stem}.*{base.suffix}"))]
+    out: set[str] = set()
+    for p in paths:
+        try:
+            out |= {k for k, v in json.loads(p.read_text()).items() if v == "fail"}
+        except (OSError, json.JSONDecodeError):
+            continue
+    return out
 
 
 def sc_blessed_flow(led: Ledger, engine: str, tag: str, url: str,
@@ -1205,7 +1221,7 @@ def sc_blessed_flow(led: Ledger, engine: str, tag: str, url: str,
            f"{len(cells) - len(runnable)} na")
 
     verdicts: dict[str, str] = {}
-    vp = _verdict_path()
+    vp = _verdict_path(engine)  # per-engine: concurrent engines must not clobber
     try:
         verdicts = json.loads(vp.read_text())
     except (OSError, json.JSONDecodeError):

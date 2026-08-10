@@ -212,7 +212,13 @@ def _judge(
             f"{files} data file(s) on the prefix but the manifests claim {claimed_parts} parts — "
             f"a shortfall is one writer's part written at another's path"
         )
-    if rows_read is not None and rows_read != claimed_rows:
+    if rows_read is None:
+        problems.append(
+            "the DuckDB physical readback DID NOT RUN (no duckdb) — the only foreign-reader "
+            "oracle is absent, which is NOT the same as agreement; the manifest self-report "
+            "cannot vouch for itself"
+        )
+    elif rows_read != claimed_rows:
         problems.append(
             f"DuckDB reads {rows_read} rows from the prefix, the manifests claim {claimed_rows}"
         )

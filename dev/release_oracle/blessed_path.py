@@ -546,13 +546,17 @@ def sc_blessed_path(
         man_rows = int(man.get("row_count", -1)) if man else -1
         man_files = int(man.get("part_count", -1)) if man else -1
 
-        if want < 0 or duck_rows < 0:
+        if want < 0:
+            # Source truth unreachable → cannot compare, legitimately SKIP.
             led.skipped(
                 engine, tag, "blessed:oracle", store,
-                f"{engine} {tag} {store} · oracle — unreadable "
-                f"(source={want} duckdb={duck_rows})",
+                f"{engine} {tag} {store} · oracle — source unreachable (source={want})",
             )
         else:
+            # want>=0 and duckdb works (checked above): a duck_rows<0 here is an
+            # EMPTY/undelivered destination, NOT "unreadable" — it must FAIL, not SKIP
+            # (a run that reports success but delivered zero parts to the bucket used to
+            # read as release-ready). The compare below does exactly that: -1 != want.
             agree = duck_rows == want and (man_rows < 0 or man_rows == want)
             files_agree = duck_files < 0 or man_files < 0 or duck_files == man_files
             # Per-column null profile, independent of rivet: a decode regression can

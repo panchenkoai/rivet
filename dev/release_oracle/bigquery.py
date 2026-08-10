@@ -401,8 +401,15 @@ def _bq_one_engine(
     if not keep:
         docker("rm", "-fv", engine_container(engine, _TAG))
     if not got:
-        # Either the run/load leg already recorded its FAIL, or the read-back itself
-        # produced nothing (KNOWN GAP from the bash: that case records no row).
+        # A read-back that returns NOTHING after a SUCCESSFUL run+load is a failure of
+        # the INDEPENDENT oracle (Google's parquet reader via bq query), not a no-op —
+        # it used to record no row at all, so absence read as green. The run/load-failed
+        # path already recorded its FAIL above; only this (rp.ok and lp.ok) path did not.
+        if rp.ok and lp is not None and lp.ok:
+            led.failed("bigquery", engine, "golden", "-",
+                       f"BigQuery[{engine}]: run+load OK but the bq read-back returned nothing "
+                       f"({eng_dset}.{exp} empty) — the independent oracle saw zero rows",
+                       "empty-readback")
         return None
 
     if bless:
