@@ -314,3 +314,127 @@ fn pool_split_realizes_the_range_split_and_the_union_is_exact() {
         "the small export must still be exact"
     );
 }
+
+/// #167 GA-hardening: manifest coherence under the shared prefix.
+///
+/// A `--split` prefix holds N concurrent run-unique manifest copies of ONE
+/// family, each declaring a DISJOINT part set. Three coherence properties, each
+/// measured on the real prefix the split writes (not theorized):
+///
+/// 1. LOAD view (authoritative): the copies all fold to the parent family and
+///    their row_counts sum to the whole (`dir_manifest_copy_total_rows`) — so
+///    `rivet load`'s cross-run reconcile reads one table with the full count, not
+///    N families or one unit's rows. This is the silent-under-count guard.
+/// 2. VALIDATE view: `rivet validate` does NOT flag a sibling unit's parts as
+///    untracked — before the fix the canonical manifest (last writer) listed one
+///    unit and every other unit's parts read as untracked surplus.
+/// 3. SAFETY: a genuinely foreign object IS still flagged — the fix only claims
+///    SAME-FAMILY siblings, so a real orphan is not masked by the noise removal.
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn pool_split_prefix_is_manifest_coherent() {
+    const HEAVY: i64 = 200_000;
+    const SMALL: i64 = 1_000;
+
+    let rig = Rig::pg_batch("mcoh_giant")
+        .query(&format!(
+            "SELECT g AS id, md5(g::text) AS a, md5((g*3)::text) AS b \
+             FROM generate_series(1, {HEAVY}) g"
+        ))
+        .mode("chunked")
+        .export_line("chunk_column: id")
+        .export_line("chunk_size: 50000")
+        .export_line("parallel_safe: true")
+        .also_export(
+            "mcoh_small",
+            &format!("SELECT g AS id, md5(g::text) AS payload FROM generate_series(1, {SMALL}) g"),
+        )
+        .also_export_line("parallel_safe: true");
+    let cfg = rig.config_path();
+
+    // Prime durations, clear, then split (advise_split keys off recorded duration).
+    let prime = run_rivet_env(&["apply", cfg.to_str().unwrap(), "--pool", "2"], &[]);
+    assert!(
+        prime.status.success(),
+        "prime: {}",
+        String::from_utf8_lossy(&prime.stderr)
+    );
+    for d in [rig.out_dir(), rig.out_dir_for("mcoh_small")] {
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+    }
+    let split = run_rivet_env(
+        &["apply", cfg.to_str().unwrap(), "--pool", "2", "--split"],
+        &[],
+    );
+    let slog = format!(
+        "{}{}",
+        String::from_utf8_lossy(&split.stdout),
+        String::from_utf8_lossy(&split.stderr)
+    );
+    assert!(split.status.success(), "split run must succeed:\n{slog}");
+    assert!(
+        slog.contains("split 'mcoh_giant' into"),
+        "the split must have fired (else this test is vacuous):\n{slog}"
+    );
+
+    let giant = rig.out_dir();
+
+    // (1) LOAD coherence: >=2 unit copies, all folding to family "mcoh_giant",
+    //     summing to the whole. RED if a unit recorded its own name as the family
+    //     (the load would then see N families and REFUSE) or if a unit's rows
+    //     were dropped from the sum.
+    assert!(
+        dir_manifest_copy_count(&giant) >= 2,
+        "the split must write >=2 run-unique unit manifests, got {}",
+        dir_manifest_copy_count(&giant)
+    );
+    assert_eq!(
+        dir_manifest_copy_total_rows(&giant),
+        HEAVY,
+        "the run-unique manifest copies must sum to the whole table — the cross-run \
+         reconcile the loader runs"
+    );
+    for entry in std::fs::read_dir(&giant).unwrap() {
+        let p = entry.unwrap().path();
+        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if name.starts_with("manifest-") && name.ends_with(".json") {
+            let m: serde_json::Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+            assert_eq!(
+                m["export_family"].as_str(),
+                Some("mcoh_giant"),
+                "every split unit copy must fold to the parent family (load sees one table): {name}"
+            );
+        }
+    }
+
+    // (2) VALIDATE coherence: no sibling unit's parts flagged as untracked.
+    let v = run_rivet_env(&["validate", "--config", cfg.to_str().unwrap()], &[]);
+    let vlog = format!(
+        "{}{}",
+        String::from_utf8_lossy(&v.stdout),
+        String::from_utf8_lossy(&v.stderr)
+    );
+    assert!(
+        !vlog.contains("untracked object: mcoh_giant#"),
+        "a split unit's own parts must not be flagged untracked (the merge-back \
+         claims same-family siblings):\n{vlog}"
+    );
+
+    // (3) SAFETY: a genuinely foreign object under the prefix IS still flagged —
+    //     the fix narrows untracked to non-sibling objects, it does not blind it.
+    let orphan = giant.join("mcoh_foreign_orphan.parquet");
+    std::fs::write(&orphan, b"not a real rivet part").unwrap();
+    let v2 = run_rivet_env(&["validate", "--config", cfg.to_str().unwrap()], &[]);
+    let vlog2 = format!(
+        "{}{}",
+        String::from_utf8_lossy(&v2.stdout),
+        String::from_utf8_lossy(&v2.stderr)
+    );
+    assert!(
+        vlog2.contains("mcoh_foreign_orphan.parquet"),
+        "a true foreign orphan must STILL be flagged untracked — the fix must not \
+         mask a real orphan behind the sibling-claim:\n{vlog2}"
+    );
+    let _ = std::fs::remove_file(&orphan);
+}
