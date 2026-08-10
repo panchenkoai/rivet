@@ -281,6 +281,60 @@ def duckdb_allnull_cloud(store: str, bucket: str, prefix: str, work: Path) -> tu
     return (-1, -1)
 
 
+def _manifest_declared_parts(root: Path) -> list[str]:
+    """Absolute paths of the parts the manifest(s) under `root` DECLARE as committed — the
+    union across immutable manifest-*.json copies (plus the canonical manifest.json), i.e.
+    exactly what a consumer (`rivet load`) reads. Mirrors blessed_flow._manifest_files;
+    lives here so cdc.py can share it without a circular import."""
+    copies = sorted(root.rglob("manifest-*.json"))
+    docs = copies or ([root / "manifest.json"] if (root / "manifest.json").is_file() else [])
+    out: list[str] = []
+    for d in docs:
+        try:
+            art = json.loads(d.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        for f in art.get("parts", []) or []:
+            if isinstance(f, dict) and f.get("status") not in (None, "committed"):
+                continue
+            name = (f.get("path") or f.get("name")) if isinstance(f, dict) else f
+            if not name:
+                continue
+            cand = Path(name)
+            if not cand.is_absolute():
+                cand = d.parent / cand
+            if cand.is_file():
+                out.append(str(cand))
+    return sorted(set(out))
+
+
+def manifest_scoped_ids(store: str, bucket: str, prefix: str, work: Path, idc: str) -> str:
+    """Distinct id-set the store DELIVERS per its MANIFESTS (not raw parquet), comma-joined.
+
+    For the CDC crash oracle: at cdc_after_flush_before_ack the crashed run's part is durable
+    but UNMANIFESTED (the hook fires BEFORE write_manifest), so a raw `**/*.parquet` id-set is
+    fooled by that orphan — it cannot tell 'recovery re-read id=4' from 'id=4 left as an orphan
+    that rivet load never sees'. Reading only manifest-declared committed parts (what a consumer
+    reads) makes the orphan invisible, so a recovery that re-anchored PAST the un-acked change
+    reads back WITHOUT it. s3 only (the CDC store); '' if mc or a manifest is absent."""
+    if store != "s3" or not have("mc"):
+        return ""
+    dl = work / f"cdcmanifest_{random.randint(0, 32767)}"
+    shutil.rmtree(dl, ignore_errors=True)
+    dl.mkdir(parents=True, exist_ok=True)
+    alias = "rivetcdcmani"
+    run(["mc", "alias", "set", alias, "http://127.0.0.1:9000", MINIO_ACCESS_KEY, MINIO_SECRET_KEY])
+    if not run(["mc", "cp", "--recursive", f"{alias}/{bucket}/{prefix}/", str(dl)]).ok:
+        return ""
+    parts = _manifest_declared_parts(dl)
+    if not parts:
+        return ""
+    lst = ", ".join(f"'{f}'" for f in parts)
+    return _duckdb_list(
+        f"SELECT string_agg(DISTINCT CAST({idc} AS VARCHAR), ',') FROM read_parquet([{lst}])"
+    )
+
+
 def _duckdb_json_normalized(sql: str) -> str:
     """`duckdb -json -c SQL | lib/normalize_bq.py` — the canonical golden form.
 

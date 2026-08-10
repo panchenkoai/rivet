@@ -504,17 +504,15 @@ def _store_readback(store: str, bkt: str, pfx: str, work: Path) -> str:
     return scenarios.store_readback(store, bkt, pfx, work)
 
 
-def _cdc_store_ids(store: str, bkt: str, pfx: str, idc: str) -> str:
-    """The INDEPENDENT distinct id-set the store holds (never rivet) — the
-    completeness oracle, as a bare comma-joined string so it can be quoted
-    verbatim into a failure reason."""
-    if store != "s3":
-        return ""
-    return _duckdb(
-        _S3_PREAMBLE
-        + f"SELECT string_agg(DISTINCT CAST({idc} AS VARCHAR),',') "
-        f"FROM read_parquet('s3://{bkt}/{pfx}/**/*.parquet')"
-    )
+def _cdc_store_ids(store: str, bkt: str, pfx: str, idc: str, work) -> str:
+    """The INDEPENDENT distinct id-set the store DELIVERS per its MANIFESTS (never rivet,
+    never RAW parquet) — the crash-recovery completeness oracle. Raw `**/*.parquet` would
+    count the crashed run's flushed-but-UNMANIFESTED orphan (the cdc_after_flush_before_ack
+    hook fires BEFORE write_manifest), so it could not tell a real re-read on recovery from
+    an orphan a consumer (rivet load) never sees — a recovery that re-anchored PAST the
+    un-acked change would still read as green. manifest_scoped_ids reads only what a consumer
+    consumes, so the orphan is invisible and the lost re-read goes RED."""
+    return scenarios.manifest_scoped_ids(store, bkt, pfx, work, idc)
 
 
 @dataclass(frozen=True)
@@ -702,7 +700,7 @@ def verify_cdc_e2e(led: Ledger) -> None:
         spec.crash_delta(url)
         rivet("run", "-c", str(cap.yaml), env={"RIVET_TEST_PANIC_AT": CDC_HOOK_FLUSH})  # crash
         rivet("run", "-c", str(cap.yaml))  # recover
-        ids = _cdc_store_ids("s3", cap.bucket, cap.prefix, idc)
+        ids = _cdc_store_ids("s3", cap.bucket, cap.prefix, idc, work)
         # An id-SET membership test. The bash `grep -q 4` was a substring match —
         # equivalent on this probe's {1,2,3,4}, a false pass on any wider set.
         crashok = "4" in [t.strip() for t in ids.split(",")]
@@ -794,7 +792,7 @@ def _cdc_large_tx_atomic(led: Ledger) -> None:
     _psql(url, sql="BEGIN;\nINSERT INTO orc_ltx SELECT g FROM generate_series(1,12) g;\nCOMMIT;\n")
     rivet("run", "-c", str(yaml), env={"RIVET_TEST_PANIC_AT": CDC_HOOK_ACK})  # crash mid-flush
     rivet("run", "-c", str(yaml))  # recover
-    ids = _cdc_store_ids("s3", bkt, pfx, "id")
+    ids = _cdc_store_ids("s3", bkt, pfx, "id", work)
     cnt = sum(1 for t in ids.split(",") if re.fullmatch(r"[0-9]+", t.strip()))
     _psql(
         url,
