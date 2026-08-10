@@ -33,6 +33,13 @@ pub(crate) struct ColumnInfo {
     /// `None` when not applicable or when precision is unbounded.
     pub numeric_precision: Option<u32>,
     pub numeric_scale: Option<u32>,
+    /// `true` when the column is backed by an index (PK, unique, or secondary).
+    /// The density probe (#148/#199) only samples an INDEXED key — MIN/MAX + K
+    /// windowed COUNTs on an UNINDEXED fallback column is up to 51 sequential
+    /// scans of a large table inside `rivet init`. `#[serde(default)]` (false)
+    /// so pre-existing catalog-replay fixtures still parse.
+    #[serde(default)]
+    pub is_indexed: bool,
 }
 
 /// Table metadata used to generate the config scaffold and discovery artifact.
@@ -69,6 +76,24 @@ impl TableInfo {
             .or_else(|| {
                 // Fall back to first integer column
                 self.columns.iter().find(|c| is_integer_type(&c.data_type))
+            })
+            .map(|c| c.name.as_str())
+    }
+
+    /// Like [`best_chunk_column`](Self::best_chunk_column) but the fallback
+    /// integer column must be INDEXED (#199). The density probe runs MIN/MAX + K
+    /// windowed COUNTs on this key — on an UNINDEXED column that is up to 51
+    /// SEQUENTIAL SCANS of a large table inside `rivet init`. An integer PK is
+    /// always indexed; a non-PK integer key is used only when an index backs it,
+    /// else `None` (the probe then skips → catalog kept, unverified).
+    pub(crate) fn best_indexed_chunk_column(&self) -> Option<&str> {
+        self.columns
+            .iter()
+            .find(|c| c.is_primary_key && is_integer_type(&c.data_type))
+            .or_else(|| {
+                self.columns
+                    .iter()
+                    .find(|c| c.is_indexed && is_integer_type(&c.data_type))
             })
             .map(|c| c.name.as_str())
     }
@@ -1132,7 +1157,52 @@ mod tests {
             is_nullable: false,
             numeric_precision: None,
             numeric_scale: None,
+            is_indexed: false,
         }
+    }
+
+    /// #199: the density probe's key must be INDEXED. PK (always indexed) →
+    /// returned; an unindexed integer fallback → None (probe skips, no 51-scan);
+    /// an indexed non-PK integer → returned (the versioned KEY(ref_id) case #148
+    /// targets). RED against best_chunk_column (which returns the unindexed one).
+    #[test]
+    fn best_indexed_chunk_column_requires_an_index() {
+        let c = |n: &str, ty: &str, pk: bool, idx: bool| ColumnInfo {
+            name: n.into(),
+            data_type: ty.into(),
+            is_primary_key: pk,
+            is_nullable: false,
+            numeric_precision: None,
+            numeric_scale: None,
+            is_indexed: idx,
+        };
+        // integer PK → indexed → returned.
+        let t = make_table(1, vec![c("id", "bigint", true, true)]);
+        assert_eq!(t.best_indexed_chunk_column(), Some("id"));
+        // uuid PK + UNINDEXED integer fallback → None (no scan).
+        let t = make_table(
+            1,
+            vec![c("uid", "uuid", true, true), c("qty", "int", false, false)],
+        );
+        assert_eq!(
+            t.best_indexed_chunk_column(),
+            None,
+            "unindexed fallback must not be probed"
+        );
+        assert_eq!(
+            t.best_chunk_column(),
+            Some("qty"),
+            "but best_chunk_column still picks it"
+        );
+        // indexed non-PK integer → returned (versioned KEY(ref_id)).
+        let t = make_table(
+            1,
+            vec![
+                c("uid", "uuid", true, true),
+                c("ref_id", "bigint", false, true),
+            ],
+        );
+        assert_eq!(t.best_indexed_chunk_column(), Some("ref_id"));
     }
 
     fn make_table(rows: i64, cols: Vec<ColumnInfo>) -> TableInfo {
@@ -1217,6 +1287,7 @@ mod tests {
             is_nullable: true,
             numeric_precision: None,
             numeric_scale: None,
+            is_indexed: false,
         };
         let info = make_table(
             500_000,
@@ -1383,6 +1454,7 @@ mod tests {
                     is_nullable: false,
                     numeric_precision: Some(20),
                     numeric_scale: Some(0),
+                    is_indexed: false,
                 },
                 col("name", "text", false),
             ],
@@ -2138,6 +2210,7 @@ mod tests {
                     is_nullable: true,
                     numeric_precision: None,
                     numeric_scale: None,
+                    is_indexed: false,
                 },
             ],
         );

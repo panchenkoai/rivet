@@ -105,6 +105,7 @@ pub(super) fn introspect(conn: &mut mysql::PooledConn, table: &str) -> Result<Ta
         .map(
             |(name, data_type, column_key, nullable, numeric_precision, numeric_scale)| {
                 ColumnInfo {
+                    is_indexed: !column_key.is_empty(),
                     is_primary_key: column_key == "PRI",
                     is_nullable: nullable.eq_ignore_ascii_case("YES"),
                     name,
@@ -137,7 +138,7 @@ pub(super) fn density_probe(conn: &mut mysql::PooledConn, info: &mut super::Tabl
     use mysql::prelude::Queryable;
 
     let catalog = info.row_estimate;
-    let Some(key) = info.best_chunk_column().map(str::to_string) else {
+    let Some(key) = info.best_indexed_chunk_column().map(str::to_string) else {
         // No integer key to stratify on: small → honest COUNT(*); large → keep
         // the estimate but SAY so (never silently trust it).
         let method = if catalog < 1_000_000 {
