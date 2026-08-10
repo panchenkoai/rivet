@@ -380,10 +380,42 @@ impl MysqlChangeStream {
                     self.pending.push_back(ev);
                 }
             }
+            // #200-2: a compressed transaction. `binlog_transaction_compression`
+            // can be turned on AFTER this run opened (the open-time
+            // `refuse_compressed_binlog` guard saw it OFF and passed), or a
+            // compressed span can already sit in the binlog before the checkpoint
+            // (written while it was ON, then turned OFF). Either way a
+            // `Transaction_payload_event` reaches here, and this reader cannot
+            // expand it. The `_ => {}` arm below would SILENTLY skip it —
+            // capturing NOTHING for that transaction while the checkpoint advances
+            // past it (an at-least-once break, and the open-time refusal's
+            // remediation replays over the already-skipped span). Refuse loudly
+            // instead; the un-acked span is re-read from the checkpoint once
+            // compression is off.
+            Some(EventData::TransactionPayloadEvent(_)) => {
+                return Err(compressed_payload_refusal());
+            }
             _ => {}
         }
         Ok(true)
     }
+}
+
+/// The stream-time sibling of [`compression_refusal`]: a `Transaction_payload_event`
+/// reached the reader even though the OPEN-time check passed. Pure so both the
+/// message and the fact that it IS an error are testable offline — deleting the
+/// match arm that calls it (falling through to `_ => {}`) is exactly the silent-skip
+/// bug, which only a live compressed server would otherwise flip.
+fn compressed_payload_refusal() -> anyhow::Error {
+    anyhow::anyhow!(
+        "mysql cdc: encountered a Transaction_payload_event in the binlog — the source has \
+         binlog_transaction_compression enabled (turned on after this run opened, or a compressed \
+         span already in the binlog written while it was on), and this reader cannot expand it. \
+         Skipping it would capture NOTHING for that transaction while the checkpoint advanced past \
+         it — a silent data loss. Turn compression off for the replica rivet reads \
+         (SET GLOBAL binlog_transaction_compression = OFF; and remove it from my.cnf), then \
+         re-run: the un-acked span is re-read from the checkpoint."
+    )
 }
 
 /// Refuse to stream when the source packs transactions into
@@ -629,6 +661,24 @@ mod tests {
                 "{ok:?} is not a compressed binlog — the run must proceed"
             );
         }
+    }
+
+    /// #200-2: the open-time guard is not the whole story — compression turned on
+    /// AFTER open (or a compressed span already in the binlog) reaches `fill()` as
+    /// a `Transaction_payload_event`, which the reader cannot expand. Its arm must
+    /// REFUSE (naming the setting + the harm), never fall through to `_ => {}` and
+    /// silently skip the transaction while the checkpoint advances past it. Pure
+    /// message check here; the routing (arm calls this, not `_ => {}`) is proven
+    /// live by `mysql_cdc_compressed_payload_in_stream_refuses_not_skips`.
+    #[test]
+    fn compressed_payload_refusal_names_the_setting_and_the_harm() {
+        let msg = compressed_payload_refusal().to_string();
+        assert!(
+            msg.contains("Transaction_payload_event")
+                && msg.contains("binlog_transaction_compression")
+                && msg.contains("capture NOTHING"),
+            "the stream-time refusal must name the event, the setting, and the harm: {msg}"
+        );
     }
 
     // The `mysql-cdc` instance (cdc profile, :3307) — binlog + a REPLICATION grant.

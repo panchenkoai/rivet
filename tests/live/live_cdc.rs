@@ -4714,6 +4714,13 @@ fn roast_pg_cdc_destination_placeholders_resolve_like_the_batch_path() {
     );
 }
 
+/// Serialises the TWO :3306 binlog-compression tests. They both flip
+/// `SET GLOBAL binlog_transaction_compression` on the shared batch server, so
+/// running them in parallel races (one turns it OFF mid-way through the other's
+/// ON window). A dedicated lock for just these two is cheap — unlike serialising
+/// the 60 :3307 CDC call sites the isolation note below deliberately avoided.
+static COMPRESSION_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// The binlog-compression guard, live.
 ///
 /// `binlog_transaction_compression` (MySQL 8.0.20+) packs a transaction's
@@ -4757,6 +4764,7 @@ fn roast_pg_cdc_destination_placeholders_resolve_like_the_batch_path() {
 #[test]
 #[ignore = "live: requires docker compose up -d mysql (:3306, log_bin=ON)"]
 fn mysql_cdc_refuses_a_compressed_binlog_instead_of_capturing_nothing() {
+    let _serial = COMPRESSION_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let root_url = MYSQL_URL.replace("rivet:rivet@", "root:rivet@");
     let mut admin = match mysql::Conn::new(mysql::Opts::from_url(&root_url).unwrap()) {
         Ok(c) => c,
@@ -4871,5 +4879,134 @@ fn mysql_cdc_refuses_a_compressed_binlog_instead_of_capturing_nothing() {
         manifest_rows(&out2),
         2,
         "with compression off the same table must capture both rows"
+    );
+}
+
+/// #200-2: the STREAM-time sibling of the open-time guard above. Compression can
+/// be turned on AFTER a run has opened (the open-time `refuse_compressed_binlog`
+/// saw it OFF and passed), leaving a `Transaction_payload_event` in the binlog
+/// AHEAD of the checkpoint. The reader cannot expand it, and before the fix the
+/// `_ => {}` arm in `fill()` SILENTLY skipped it — the resume captured NOTHING for
+/// that transaction while the checkpoint advanced past it, an at-least-once break
+/// that every count/manifest check would call success.
+///
+/// The sequence forces exactly that: anchor with compression OFF (open-time guard
+/// passes), write a compressed transaction, then RESUME with compression still
+/// OFF at open (guard passes again) so the compressed span reaches `fill()`. The
+/// resume must FAIL loudly, not report a clean zero-capture.
+#[test]
+#[ignore = "live: requires docker compose up -d mysql (:3306, log_bin=ON, 8.0.20+)"]
+fn mysql_cdc_compressed_payload_in_stream_refuses_not_skips() {
+    let _serial = COMPRESSION_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root_url = MYSQL_URL.replace("rivet:rivet@", "root:rivet@");
+    let mut admin = match mysql::Conn::new(mysql::Opts::from_url(&root_url).unwrap()) {
+        Ok(c) => c,
+        Err(e) => panic!("cdc-profile MySQL admin connection: {e}"),
+    };
+    let supported: Option<String> = admin
+        .query_first("SELECT @@global.binlog_transaction_compression")
+        .ok()
+        .flatten();
+    if supported.is_none() {
+        eprintln!("skip: server has no binlog_transaction_compression (pre-8.0.20)");
+        return;
+    }
+
+    struct CompressionGuard(String);
+    impl Drop for CompressionGuard {
+        fn drop(&mut self) {
+            if let Ok(mut c) = mysql::Conn::new(mysql::Opts::from_url(&self.0).unwrap()) {
+                let _ = c.query_drop("SET GLOBAL binlog_transaction_compression = OFF");
+            }
+        }
+    }
+    let _restore = CompressionGuard(root_url.clone());
+    // Start from OFF so the anchor run's OPEN-time guard passes.
+    admin
+        .query_drop("SET GLOBAL binlog_transaction_compression = OFF")
+        .unwrap();
+
+    let tbl = unique_name("cdc_cmp_stream");
+    let mut c = mysql::Conn::new(mysql::Opts::from_url(MYSQL_URL).unwrap()).expect("batch mysql");
+    c.query_drop(format!("DROP TABLE IF EXISTS {tbl}")).unwrap();
+    c.query_drop(format!("CREATE TABLE {tbl} (id INT PRIMARY KEY, v TEXT)"))
+        .unwrap();
+    struct BatchTable(String);
+    impl Drop for BatchTable {
+        fn drop(&mut self) {
+            if let Ok(mut c) = mysql::Conn::new(mysql::Opts::from_url(MYSQL_URL).unwrap()) {
+                let _ = c.query_drop(format!("DROP TABLE IF EXISTS {}", self.0));
+            }
+        }
+    }
+    let _guard = BatchTable(tbl.clone());
+
+    let d = tempfile::tempdir().unwrap();
+    let ckpt = d.path().join("cdc.ckpt");
+    let cfg_into = |dest: &std::path::Path| {
+        write_config(
+            &d,
+            &Rig::mysql_cdc(&tbl)
+                .source_url(&root_url)
+                .checkpoint_path(ckpt.clone())
+                .dest_path(dest.to_path_buf())
+                .yaml(),
+        )
+    };
+
+    // 1) Anchor with compression OFF — pins the checkpoint at the current coords,
+    //    open-time guard passes cleanly.
+    let out1 = d.path().join("out1");
+    std::fs::create_dir_all(&out1).unwrap();
+    run_rivet_ok(&cfg_into(&out1));
+
+    // 2) Turn compression ON, then write a sizeable, highly-compressible
+    //    transaction from a FRESH session (the session captures the global at
+    //    connect) so MySQL packs it into a Transaction_payload_event in the binlog
+    //    AHEAD of the checkpoint.
+    admin
+        .query_drop("SET GLOBAL binlog_transaction_compression = ON")
+        .unwrap();
+    let mut writer = mysql::Conn::new(mysql::Opts::from_url(MYSQL_URL).unwrap()).expect("writer");
+    writer.query_drop("BEGIN").unwrap();
+    for i in 1..=50 {
+        writer
+            .query_drop(format!(
+                "INSERT INTO {tbl} VALUES ({i}, REPEAT('rivet-compressible-', 200))"
+            ))
+            .unwrap();
+    }
+    writer.query_drop("COMMIT").unwrap();
+
+    // 3) Turn compression OFF so the RESUME's open-time guard passes too — the
+    //    only thing that can catch the compressed span now is the stream-time arm.
+    admin
+        .query_drop("SET GLOBAL binlog_transaction_compression = OFF")
+        .unwrap();
+    let out2 = d.path().join("out2");
+    std::fs::create_dir_all(&out2).unwrap();
+    let o = run_rivet(&["run", "--config", cfg_into(&out2).to_str().unwrap()]);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&o.stdout),
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert!(
+        !o.status.success(),
+        "a compressed transaction in the stream must FAIL the resume, not silently \
+         skip it and report success:\n{text}"
+    );
+    assert!(
+        text.contains("Transaction_payload_event")
+            && text.contains("binlog_transaction_compression"),
+        "the stream-time refusal must name the event + the setting so it is actionable:\n{text}"
+    );
+    // The compressed rows were NOT captured (correct — refused, not skipped): the
+    // checkpoint did not advance past them, so once compression is truly off they
+    // re-read. The point of #200-2 is that rivet said so loudly instead of
+    // shipping a _SUCCESS over a hole.
+    assert!(
+        !out2.join("_SUCCESS").exists(),
+        "a refused resume must not write _SUCCESS"
     );
 }
