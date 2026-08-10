@@ -907,7 +907,17 @@ def sc_load(led: Ledger, engine: str, tag: str, url: str, store: str) -> None:
     if n and n == scnt:
         _passed(led, engine, tag, "load", store, f"load→{store} gcloud-verified {n} rows", n)
     elif not n:
-        _skipped(led, engine, tag, "load", store, f"{store} readback tool unavailable", "no readback tool")
+        # An EMPTY readback is a delivery failure, not an absent tool, on the stores that
+        # need no extra CLI: s3 (DuckDB httpfs) and gcs (the JSON-API pull) are always
+        # available, so "" there means the destination holds ZERO parts after a run that
+        # exited 0 — the exact "success but delivered nothing → release-ready" shape
+        # blessed_path already FAILs. Only azure (needs `az`) keeps the SKIP.
+        if store in ("s3", "gcs"):
+            _failed(led, engine, tag, "load", store,
+                    f"load→{store} delivered 0 rows (source {scnt}) — empty destination after a "
+                    f"0-exit run", "empty-destination")
+        else:
+            _skipped(led, engine, tag, "load", store, f"{store} readback tool unavailable", "no readback tool")
     else:
         _failed(
             led, engine, tag, "load", store,

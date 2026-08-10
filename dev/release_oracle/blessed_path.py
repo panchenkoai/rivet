@@ -531,7 +531,12 @@ def sc_blessed_path(
         ids = _run_ids(work)
         idlist = ", ".join(f"'{r}'" for r in ids) if ids else "''"
         scoped = {
-            "export_metrics": f"SELECT count(*) FROM export_metrics WHERE id > {pg_mark} AND export_name='blessed'",
+            # export_metrics DOES have a run_id (src/state/metrics.rs) — scope all three
+            # by run_id, not a watermark: under the parallel gate a concurrent sibling
+            # 'blessed' cell inserts id>mark rows on the shared ledger, so the watermark
+            # counted a sibling and an export_metrics-specific regression passed. run_id
+            # isolates THIS run regardless of concurrency. (pg_mark now vestigial.)
+            "export_metrics": f"SELECT count(*) FROM export_metrics WHERE run_id IN ({idlist})",
             "file_log":       f"SELECT count(*) FROM file_log WHERE run_id IN ({idlist})",
             "run_status":     f"SELECT count(*) FROM run_status WHERE run_id IN ({idlist})",
         }
@@ -544,7 +549,7 @@ def sc_blessed_path(
         else:
             missing = [t for t, n in got.items() if n < 1]
             ok = not missing
-            detail = (f"(export=blessed, id>{pg_mark}, {len(ids)} run id(s)): "
+            detail = (f"(export=blessed, {len(ids)} run id(s)): "
                       + ", ".join(f"{t}={n}" for t, n in got.items()))
     else:
         db = cfg.parent / ".rivet_state.db"

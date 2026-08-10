@@ -479,23 +479,20 @@ def _meta_rows(cell: Cell, work: Path, state_url: str, mark: int,
                run_ids: list[str]) -> tuple[bool, str]:
     """Did THIS run record itself, on whichever backend this cell uses?
 
-    Scoped three ways, one per table's own key: `export_metrics` by the
-    watermark (it has no run_id), `file_log` and `run_status` by the run ids the
-    manifests actually name. A count that a previous cell could satisfy is not
+    Scoped by run_id — ALL THREE tables. `export_metrics` DOES have a run_id column
+    (src/state/metrics.rs), so the old `id > mark` watermark (a workaround for a
+    limitation that never existed) is dropped: under the parallel gate a concurrent
+    sibling 'flow' cell inserts id>mark rows on the shared Postgres ledger, so the
+    watermark counted a sibling's row and an export_metrics-specific writer regression
+    passed GREEN. run_id scoping isolates THIS run regardless of concurrent writers, so
+    the check actually bites. (`mark` is now vestigial — kept only to avoid churning the
+    caller's _state_watermark this pass.) A count a previous cell could satisfy is not
     evidence about this one.
     """
     ids = ", ".join(f"'{r}'" for r in run_ids) if run_ids else "''"
-    # export_metrics has no run_id, so it is scoped by a watermark (id > mark). Under
-    # CONCURRENT cells this can also count a sibling's row, so its ≥1 check is
-    # best-effort: it can only ever produce a false PASS (never a false fail — the
-    # count only inflates), and that is masked by the cell-scoped, sibling-proof
-    # checks below (artifacts/oracle read THIS cell's own work-dir/prefix; file_log
-    # and run_status are scoped by THIS cell's run_ids). The authoritative per-cell
-    # signals are those; export_metrics ≥1 is corroboration.
     got = {
         "export_metrics": _state_sql(cell, work, state_url,
-                                     f"SELECT count(*) FROM export_metrics "
-                                     f"WHERE id > {mark} AND export_name = 'flow'"),
+                                     f"SELECT count(*) FROM export_metrics WHERE run_id IN ({ids})"),
         "file_log": _state_sql(cell, work, state_url,
                                f"SELECT count(*) FROM file_log WHERE run_id IN ({ids})"),
         "run_status": _state_sql(cell, work, state_url,
