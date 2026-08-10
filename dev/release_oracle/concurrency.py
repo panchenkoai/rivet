@@ -44,6 +44,7 @@ import shutil
 import subprocess
 import sys
 import time
+from typing import Callable
 from pathlib import Path
 
 try:
@@ -87,6 +88,18 @@ def _psql_state(container: str, sql: str) -> str | None:
     return p.stdout.strip() if p.ok else None
 
 
+def _sqlite_state(db: Path, sql: str) -> str | None:
+    """The scalar from a SQLite state file, or None when the query DID NOT RUN
+    (same "unreadable != clean" discipline as `_psql_state`). Used by the
+    shared-SQLite concurrent-writers leg: all writers open ONE `.rivet_state.db`,
+    so its rows are the SQLite backend's answer to the same three questions the
+    Postgres leg asks. The queries are ANSI SQL — identical on both backends."""
+    if not db.is_file():
+        return None
+    p = run(["sqlite3", str(db), sql])
+    return p.stdout.strip() if p.ok else None
+
+
 def _seed(src_container: str) -> bool:
     return run(
         [
@@ -114,13 +127,27 @@ def _config(path: Path, name: str, dest_block: str, src_url: str) -> None:
     )
 
 
-def _run_writers(cfgs: list[Path], state_url: str) -> tuple[list[int], str]:
+def _run_writers(cfgs: list[Path], state_url: str | None) -> tuple[list[int], str]:
     """Start every writer, THEN wait. Sequential `run()` calls would make this a
     consecutive-runs test wearing a concurrent name.
+
+    `state_url` selects the shared state backend every writer contends on:
+      * a Postgres URL → all writers set RIVET_STATE_URL to it (one Postgres DB);
+      * `None` → RIVET_STATE_URL is UNSET, so each writer falls back to the
+        beside-config `.rivet_state.db`. When the configs share a directory
+        (the shared-SQLite leg), that is ONE SQLite file every writer opens at
+        once — the SQLite concurrent-writer contract (lock/BUSY/WAL), untested
+        until now. Must remove the var, not just skip setting it: the gate exports
+        RIVET_GATE_STATE_URL → RIVET_STATE_URL into os.environ.
 
     Output is KEPT, not discarded: "writer exit codes [1,1,1,1]" with nothing to
     read is a cell that can only tell you it is unhappy.
     """
+    env = {**os.environ}
+    if state_url:
+        env["RIVET_STATE_URL"] = state_url
+    else:
+        env.pop("RIVET_STATE_URL", None)
     procs = [
         (
             c,
@@ -129,7 +156,7 @@ def _run_writers(cfgs: list[Path], state_url: str) -> tuple[list[int], str]:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
-                env={**os.environ, "RIVET_STATE_URL": state_url},
+                env=env,
             ),
         )
         for c in cfgs
@@ -162,7 +189,7 @@ def _judge(
     files: int,
     copies: list[dict],
     rows_read: int | None,
-    state_container: str,
+    state_query: Callable[[str], str | None],
     export_prefix: str,
 ) -> bool:
     """The five assertions, each named so a red cell says which one broke."""
@@ -195,8 +222,7 @@ def _judge(
             f"{WRITERS * ROWS}"
         )
 
-    dupes = _psql_state(
-        state_container,
+    dupes = state_query(
         f"SELECT count(*) FROM (SELECT run_id FROM export_metrics WHERE export_name LIKE "
         f"'{export_prefix}%' AND run_id IS NOT NULL GROUP BY run_id HAVING count(*) > 1) d",
     )
@@ -208,14 +234,13 @@ def _judge(
         problems.append(
             "the duplicate-export_metrics check DID NOT RUN — the state DB was "
             "unreadable, which is not the same as clean"
-        )
+    )
     elif dupes != "0":
         problems.append(
             f"{dupes} run(s) left MORE THAN ONE export_metrics row — under concurrency an "
             f"UPDATE-or-INSERT becomes two INSERTs, and every sum then double-counts"
         )
-    stuck = _psql_state(
-        state_container,
+    stuck = state_query(
         f"SELECT count(*) FROM run_status a WHERE a.export_name LIKE '{export_prefix}%' "
         f"AND a.status='running' AND NOT EXISTS (SELECT 1 FROM run_status b "
         f"WHERE b.export_name=a.export_name AND b.started_at > a.started_at)",
@@ -223,21 +248,20 @@ def _judge(
     if stuck is None:
         problems.append(
             "the stuck-active check DID NOT RUN — the state DB was unreadable"
-        )
+    )
     elif stuck != "0":
         problems.append(
             f"{stuck} run(s) still read as ACTIVE with nothing superseding them — gc_orphans "
             f"would defer on that prefix forever"
         )
-    meta_rows = _psql_state(
-        state_container,
+    meta_rows = state_query(
         f"SELECT coalesce(sum(total_rows),0) FROM export_metrics WHERE export_name LIKE "
         f"'{export_prefix}%' AND status='success'",
     )
     if meta_rows is None:
         problems.append(
             "the meta-row/manifest agreement check DID NOT RUN — the state DB was unreadable"
-        )
+    )
     elif meta_rows != str(claimed_rows):
         problems.append(
             f"the state DB records {meta_rows} rows for these runs, the manifests claim "
@@ -269,15 +293,8 @@ def verify_concurrent_writers_share_a_prefix(
     src_url: str,
     bucket: str | None = None,
 ) -> None:
-    """LOCAL leg, then the CLOUD leg when a bucket is given."""
-    if not state_url:
-        _skipped(
-            led, "-", "-", "concurrent_writers_share_a_prefix", "-",
-            "concurrent-writers: no shared state URL — the whole point is ONE backend for every "
-            "writer, and a per-writer SQLite file would prove the opposite of what is asked",
-            "no state url",
-        )
-        return
+    """SQLite-shared leg (always), then the Postgres LOCAL + CLOUD legs when a
+    state_url is given — the concurrent-writer contract on BOTH backends."""
     if not _rivet_bin().exists():
         _skipped(led, "-", "-", "concurrent_writers_share_a_prefix", "-",
                  "concurrent-writers: no rivet binary", "no binary")
@@ -291,7 +308,47 @@ def verify_concurrent_writers_share_a_prefix(
     work = work_dir() / f"conc_{stamp}"
     work.mkdir(parents=True, exist_ok=True)
 
-    # ── LOCAL ────────────────────────────────────────────────────────────────
+    # ── SQLITE (one shared file) ───────────────────────────────────────────────
+    # N writers, ONE directory → ONE beside-config `.rivet_state.db` they all open
+    # at once. This is the SQLite backend's concurrent-writer contract — file
+    # lock / SQLITE_BUSY / WAL — which the Postgres-only leg below never touched:
+    # the prior code SKIPPED without a Postgres URL, so SQLite under concurrency
+    # was unverified. A writer that dies on a BUSY it does not retry fails here.
+    if have("sqlite3"):
+        sq = work / "sqlite"
+        sq_dest = sq / "shared"
+        sq_dest.mkdir(parents=True, exist_ok=True)
+        sq_cfgs = []
+        for i in range(WRITERS):
+            c = sq / f"sqlite_{i}.yaml"  # same dir ⇒ shared sq/.rivet_state.db
+            _config(c, f"conc_{stamp}_s{i}", f"{{ type: local, path: {sq_dest} }}", src_url)
+            sq_cfgs.append(c)
+        exits, chatter = _run_writers(sq_cfgs, None)  # None ⇒ beside-config SQLite
+        sq_db = sq / ".rivet_state.db"
+        _judge(
+            led, "sqlite-shared",
+            exits=exits,
+            chatter=chatter,
+            files=len(list(sq_dest.rglob("*.parquet"))),
+            copies=[json.loads(p.read_text()) for p in sorted(sq_dest.rglob("manifest-*.json"))],
+            rows_read=_duckdb_count(f"{sq_dest}/*.parquet"),
+            state_query=lambda s: _sqlite_state(sq_db, s),
+            export_prefix=f"conc_{stamp}_s",
+        )
+    else:
+        _skipped(led, "-", "-", "concurrent_writers_share_a_prefix", "sqlite-shared",
+                 "concurrent-writers[sqlite-shared]: sqlite3 CLI absent", "no sqlite3")
+
+    if not state_url:
+        _skipped(
+            led, "-", "-", "concurrent_writers_share_a_prefix", "postgres",
+            "concurrent-writers[postgres]: no shared Postgres state URL — the SQLite-shared leg "
+            "ran; pass --state-url to also race the writers on one Postgres backend",
+            "no state url",
+        )
+        return
+
+    # ── LOCAL (Postgres state) ─────────────────────────────────────────────────
     dest = work / "shared"
     shutil.rmtree(dest, ignore_errors=True)
     dest.mkdir(parents=True, exist_ok=True)
@@ -313,7 +370,7 @@ def verify_concurrent_writers_share_a_prefix(
         files=files,
         copies=copies,
         rows_read=_duckdb_count(f"{dest}/*.parquet"),
-        state_container=state_container,
+        state_query=lambda s: _psql_state(state_container, s),
         export_prefix=f"conc_{stamp}_w",
     )
 
@@ -377,7 +434,7 @@ def verify_concurrent_writers_share_a_prefix(
         files=files,
         copies=copies,
         rows_read=rows_read,
-        state_container=state_container,
+        state_query=lambda s: _psql_state(state_container, s),
         export_prefix=f"conc_{stamp}_g",
     )
     run(["gsutil", "-m", "rm", "-r", f"gs://{bucket}/{pfx}"], timeout=600)
