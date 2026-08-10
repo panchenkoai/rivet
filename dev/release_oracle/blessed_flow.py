@@ -1281,6 +1281,14 @@ FLAG_EXCUSED = {
     "--tls-ca": "verify-ca/full need a TLS-terminating server; the compose stand has none — the "
                 "CA path is unit-pinned (scaffold_records_the_tls_posture…) and refused-with-"
                 "disable is offline-tested",
+    "--split": "splits a dominating export into range sub-exports UNDER --pool (needs a "
+               "multi-export config, a measured dominating duration, and a source to probe "
+               "the key span) — the sealed single-export plan cell cannot express it. Carried "
+               "INSIDE the gate by scenarios.verify_pool_e2e, which runs the whole "
+               "live_pool_toxiproxy module including "
+               "pool_split_realizes_the_range_split_and_the_union_is_exact (prime → clear → "
+               "--pool --split → DuckDB union exact, plus a vacuous-oracle guard that the "
+               "split actually fired).",
 }
 
 

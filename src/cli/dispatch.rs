@@ -145,9 +145,15 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             resume,
             force,
             pool,
-        } => {
-            pipeline::run_apply_command(&plan_file, force, parallel_export_processes, resume, pool)
-        }
+            split,
+        } => pipeline::run_apply_command(
+            &plan_file,
+            force,
+            parallel_export_processes,
+            resume,
+            pool,
+            split,
+        ),
         Commands::Validate(args) => dispatch_validate(args),
         Commands::Reconcile {
             config,

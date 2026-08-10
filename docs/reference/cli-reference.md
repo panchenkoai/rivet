@@ -392,6 +392,7 @@ Execute a sealed plan artifact, or run a config's exports wave-by-wave
 * `--resume` — Config-wave mode: skip exports a prior run already completed (`_SUCCESS` present) and resume incomplete chunked exports from their checkpoints, so a re-run after a partial failure does not redo finished tables. Independent tables are never re-exported
 * `--force` — Skip staleness check (allow plans older than 24 h)
 * `--pool <N>` — Run the whole config as ONE bounded work-stealing pool of N export slots (config mode only, #166): exports start longest-first (LPT, by each export's last measured duration) and every freeing slot pulls the next — no wave barriers, so the wall approaches `max(longest, total/N)`. Priority `wave:` tiers are NOT honored (makespan mode); exports that are not `parallel_safe` never run concurrently with EACH OTHER (one heavy at a time; cheap exports backfill the remaining slots)
+* `--split` — With `--pool`: when ONE export dominates the pool floor (its predicted duration ≫ the next-longest, #167), split it into N range sub-exports over its key span — separate scheduler units the pool places concurrently, so the giant stops being the makespan floor. The units share one destination prefix and fold to one family, so the load view reads them as a single logical table. Only full/chunked/keyset exports with a `chunk_by_key:`/`chunk_column:` are split (never incremental/CDC). Off by default; ignored without `--pool`
 
 
 
