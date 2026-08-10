@@ -59,7 +59,6 @@ import json
 import os
 import re
 import shutil
-import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -670,13 +669,11 @@ def run_cell(led: Ledger, cell: Cell, url: str, state_url: str, tag: str = "live
         # Retried: SQL Server's fixture disables and re-enables CDC on the table,
         # and `sp_cdc_enable_table` can fail while the previous capture job is
         # still shutting down. Six of eight mssql cells failed that way — a race
-        # in the fixture, reported as a source failure.
-        blk = spec.setup(url, work)
-        for _ in range(2):
-            if blk is not None:
-                break
-            time.sleep(3.0)
-            blk = spec.setup(url, work)
+        # in the fixture, reported as a source failure. The retry lives in
+        # `cdc.setup_with_retry` — ONE definition, shared with verify_cdc_e2e, so
+        # the preflight and engine-matrix setup paths cannot drift (they did:
+        # verify_cdc_e2e retried nothing and went RED on this very race).
+        blk = cdc.setup_with_retry(spec, url, work)
         if blk is None:
             _stage(led, cell, tag, "init", False, "cdc fixture setup failed on the source")
             _unreached(led, cell, tag, "init")

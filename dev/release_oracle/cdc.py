@@ -634,6 +634,27 @@ def _state_populated(
 
 
 # ── the CDC end-to-end preflight (once, env-driven, SKIP-if-absent) ──────────
+def setup_with_retry(spec, url: str, work: Path, *, tries: int = 3, delay: float = 3.0):
+    """Run a CDC fixture's `setup`, retrying a transient failure.
+
+    SQL Server's `sp_cdc_enable_table` can fail while the PREVIOUS capture job is
+    still shutting down — six of eight mssql cells once failed exactly this way,
+    and it read as a source failure when it is a fixture race. `blessed_flow` had
+    absorbed it with an inline retry loop for MONTHS while `verify_cdc_e2e` called
+    `setup` ONCE — so the preflight CDC[mssql] cell went RED on the same race the
+    engine-matrix cell shrugged off (measured: min_lsn populated in ~5s, so the
+    None came from `not p.ok` on the enable, not the readiness poll). This is the
+    ONE definition both paths now share, so they cannot drift again. The other
+    engines succeed on the first try, so the retry is a no-op for them."""
+    blk = spec.setup(url, work)
+    for _ in range(max(0, tries - 1)):
+        if blk is not None:
+            return blk
+        time.sleep(delay)
+        blk = spec.setup(url, work)
+    return blk
+
+
 def verify_cdc_e2e(led: Ledger) -> None:
     any_engine = False
     _export_store_creds()
@@ -651,7 +672,7 @@ def verify_cdc_e2e(led: Ledger) -> None:
         )
         work = _workdir()
         idc = spec.id_col
-        cdc_block = spec.setup(url, work)
+        cdc_block = setup_with_retry(spec, url, work)
         if cdc_block is None:
             led.failed(eng, "cdc", "e2e", "-", f"cdc[{eng}]: source setup failed", "setup")
             continue
