@@ -303,6 +303,32 @@ def _downstream_unreached(led: Ledger, engine: str, tag: str, store: str, after:
         )
 
 
+def _pg_query(state_url: str, sql: str) -> str | None:
+    """One scalar query against the Postgres state DB behind state_url. None if the
+    backing container cannot be resolved (caller turns that into a FAIL, not a pass)."""
+    port = port_of(state_url)
+    c = container_for_port(port) if port else None
+    if not c:
+        return None
+    db = state_url.rsplit("/", 1)[-1]
+    return docker_exec(c, "psql", "-U", "rivet", "-d", db, "-tA", "-c", sql).stdout.strip()
+
+
+def _run_ids(work: Path) -> list[str]:
+    """This cell's run ids, from `.rivet/runs/*/summary.json` (rivet writes it beside
+    the CONFIG for every run, cloud or local — no destination-manifest asymmetry).
+    Used to scope the shared Postgres ledger to THIS run, mirroring blessed_flow."""
+    out: list[str] = []
+    for f in sorted((work / ".rivet" / "runs").glob("*/summary.json")):
+        try:
+            rid = json.loads(f.read_text()).get("run_id")
+        except (OSError, json.JSONDecodeError):
+            continue
+        if rid:
+            out.append(rid)
+    return out
+
+
 def sc_blessed_path(
     led: Ledger,
     engine: str,
@@ -452,6 +478,14 @@ def sc_blessed_path(
     # a shape assertion is what stayed green for two months while apply
     # rejected every plan.json on disk (the `verify` field became required and
     # the fixture test never deserialized with the real type).
+    # Watermark BEFORE apply: export_metrics has no run_id, and every cell names its
+    # export 'blessed' on a shared long-lived Postgres ledger, so `id > pg_mark` is the
+    # only way to isolate THIS run's row (a constant-name count passes on history — the
+    # very defect this cell's docstring warns about; mirrors blessed_flow._state_watermark).
+    pg_mark = 0
+    if state_url:
+        w = _pg_query(state_url, "SELECT coalesce(max(id),0) FROM export_metrics")
+        pg_mark = int(w) if w and w.lstrip("-").isdigit() else 0
     r = rivet("apply", str(plan_path), env=env, timeout=scenarios.NO_TIMEOUT)
     if not _stage(led, engine, tag, store, "apply", r.ok, f"exit={r.returncode} {r.stderr[-200:]}"):
         _downstream_unreached(led, engine, tag, store, "apply")
@@ -488,27 +522,30 @@ def sc_blessed_path(
         # written against, and I wrote one. The backend is a separate SQL
         # implementation of the same contract; "the other pass covers it" is the
         # assumption, not the evidence.
-        port = port_of(state_url)
-        c = container_for_port(port) if port else None
-        if not c:
-            ok, detail = False, f"state backend container not resolvable from {state_url}"
+        # Scoped to THIS RUN, not just this export name. An unscoped count on the
+        # shared, long-lived Postgres ledger passes on history — the cell stayed green
+        # even if apply recorded NOTHING for this run (the exact defect the docstring
+        # above claims to prevent, caught by the harness bughunt). export_metrics has
+        # no run_id → the pre-apply watermark (id > pg_mark) isolates it; file_log and
+        # run_status ARE run-scoped → the exact rows this run wrote. Mirrors blessed_flow.
+        ids = _run_ids(work)
+        idlist = ", ".join(f"'{r}'" for r in ids) if ids else "''"
+        scoped = {
+            "export_metrics": f"SELECT count(*) FROM export_metrics WHERE id > {pg_mark} AND export_name='blessed'",
+            "file_log":       f"SELECT count(*) FROM file_log WHERE run_id IN ({idlist})",
+            "run_status":     f"SELECT count(*) FROM run_status WHERE run_id IN ({idlist})",
+        }
+        got = {}
+        for t, q in scoped.items():
+            out = _pg_query(state_url, q)
+            got[t] = int(out) if out and out.lstrip("-").isdigit() else -1
+        if got.get("export_metrics", -1) < 0:
+            ok, detail = False, f"state backend not queryable from {state_url}"
         else:
-            db = state_url.rsplit("/", 1)[-1]
-            # Scoped to THIS export. An unscoped count on a shared, long-lived
-            # state DB passes on history — the cell would stay green if apply
-            # recorded nothing at all today.
-            scoped = {
-                "export_metrics": "SELECT count(*) FROM export_metrics WHERE export_name='blessed'",
-                "file_log":       "SELECT count(*) FROM file_log WHERE export_name='blessed'",
-                "run_status":     "SELECT count(*) FROM run_status WHERE export_name='blessed'",
-            }
-            got = {}
-            for t, q in scoped.items():
-                out = docker_exec(c, "psql", "-U", "rivet", "-d", db, "-tA", "-c", q).stdout.strip()
-                got[t] = int(out) if out.lstrip("-").isdigit() else -1
             missing = [t for t, n in got.items() if n < 1]
             ok = not missing
-            detail = f"{db}@{c} (export=blessed): " + ", ".join(f"{t}={n}" for t, n in got.items())
+            detail = (f"(export=blessed, id>{pg_mark}, {len(ids)} run id(s)): "
+                      + ", ".join(f"{t}={n}" for t, n in got.items()))
     else:
         db = cfg.parent / ".rivet_state.db"
         counts = _state_counts(db)
