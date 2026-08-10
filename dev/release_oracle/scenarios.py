@@ -233,9 +233,13 @@ def duckdb_allnull_columns(path_glob: str) -> tuple[int, int]:
     knowledge and no column names. (-1, -1) = unreadable/empty (the row-count oracle
     already SKIPs those); a genuinely present all-null column returns n_all_null > 0.
     """
-    out = _duckdb_list(
-        f"SELECT count(*), count(COLUMNS(*)) FROM read_parquet('{path_glob}')"
+    return _allnull_parse(
+        _duckdb_list(f"SELECT count(*), count(COLUMNS(*)) FROM read_parquet('{path_glob}')")
     )
+
+
+def _allnull_parse(out: str) -> tuple[int, int]:
+    """Parse `count(*), count(COLUMNS(*))` (one `|`-joined row) into (n_all_null, n_cols)."""
     if not out:
         return (-1, -1)
     vals = out.splitlines()[0].split("|")
@@ -247,6 +251,34 @@ def duckdb_allnull_columns(path_glob: str) -> tuple[int, int]:
     if rows <= 0 or not cols:
         return (-1, -1)
     return (sum(1 for c in cols if c == 0), len(cols))
+
+
+def duckdb_allnull_cloud(store: str, bucket: str, prefix: str, work: Path) -> tuple[int, int]:
+    """Per-column null profile of a CLOUD prefix, read the SAME store-native way as
+    `store_readback` (s3 over httpfs, gcs via the JSON-API pull) — an INDEPENDENT DuckDB
+    oracle for the object-store path, where the documented uuid→FixedSizeBinary silent
+    loss actually happened. Returns (n_all_null, n_cols); (-1,-1) if unreadable/empty or
+    a store not profiled here (azure). Mirrors store_readback so the two agree on reads."""
+    cols = "count(*), count(COLUMNS(*))"
+    if store == "s3":
+        return _allnull_parse(_duckdb_list(
+            "INSTALL httpfs; LOAD httpfs; SET s3_endpoint='127.0.0.1:9000'; "
+            "SET s3_use_ssl=false; SET s3_url_style='path'; "
+            "SET s3_access_key_id='minioadmin'; SET s3_secret_access_key='minioadmin'; "
+            f"SELECT {cols} FROM read_parquet('s3://{bucket}/{prefix}/**/*.parquet')"
+        ))
+    if store == "gcs":
+        dl = work / f"nullprof_gcs_{random.randint(0, 32767)}"
+        dl.mkdir(parents=True, exist_ok=True)
+        got = run([PY, str(_asset("lib/gcs_pull.py")),
+                   "http://127.0.0.1:4443", bucket, prefix, str(dl)]).stdout.strip()
+        try:
+            if int(got) <= 0:
+                return (-1, -1)
+        except ValueError:
+            return (-1, -1)
+        return _allnull_parse(_duckdb_list(f"SELECT {cols} FROM read_parquet('{dl}/**/*.parquet')"))
+    return (-1, -1)
 
 
 def _duckdb_json_normalized(sql: str) -> str:

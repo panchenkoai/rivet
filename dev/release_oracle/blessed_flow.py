@@ -970,14 +970,15 @@ def _run_chain(led: Ledger, cell: Cell, url: str, state_url: str, work: Path,
                 # readable dataset is the UNION: 2x. That is the assertion — a
                 # clobbered second run reads back 1x and looks like a clean run.
                 mult = 2 if cell.lifecycle == "repeat" else 1
-                # Per-column null profile (local only — parts are on disk): a decode
-                # regression can null a WHOLE column while the row count matches (the
-                # documented uuid→FixedSizeBinary silent loss). Count-parity alone is
-                # blind to it.
-                n_null = 0
-                if cell.store == "local":
-                    nn, _nc = scenarios.duckdb_allnull_columns(f"{dest_dir}/**/*.parquet")
-                    n_null = max(0, nn)
+                # Per-column null profile: a decode/write regression can null a WHOLE
+                # column while the row count matches (the documented uuid→FixedSizeBinary
+                # silent loss — which happened on a CLOUD run). Count-parity is blind to
+                # it. Local reads the parts on disk; cloud reads the copy _readback ALREADY
+                # pulled to work/pull_<store> — so every store gets the same oracle, not
+                # just local (the GCS store is exactly where the real incident occurred).
+                prof = dest_dir if cell.store == "local" else (work / f"pull_{cell.store}")
+                nn, _nc = scenarios.duckdb_allnull_columns(f"{prof}/**/*.parquet")
+                n_null = max(0, nn)
                 _stage(led, cell, tag, "oracle", duck == want * mult and n_null == 0,
                        f"duckdb={duck} source={want}x{mult}"
                        + (f" · ALLNULL {n_null} cols" if n_null else ""))

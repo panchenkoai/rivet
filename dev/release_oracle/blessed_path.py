@@ -598,12 +598,17 @@ def sc_blessed_path(
             files_agree = duck_files < 0 or man_files < 0 or duck_files == man_files
             # Per-column null profile, independent of rivet: a decode regression can
             # null a WHOLE column while the row count stays correct (the documented
-            # uuid→FixedSizeBinary GCS incident). Local store only for now — the parts
-            # are on disk; the cloud path reads rows via store_readback, not a pulled
-            # dir. -1 means unreadable (the count oracle already SKIPs that).
-            n_null, n_cols = (-1, -1)
+            # uuid→FixedSizeBinary GCS incident — a CLOUD run). Local reads parts on
+            # disk; cloud reads them store-native via duckdb_allnull_cloud (the same
+            # read path as store_readback). -1 means unreadable (count oracle SKIPs that).
             if store == "local":
                 n_null, n_cols = scenarios.duckdb_allnull_columns(f"{dest_dir}/**/*.parquet")
+            else:
+                # Cloud (gcs here): read the parts store-native (same path as
+                # store_readback) — the GCS store is exactly where the documented
+                # uuid→null incident happened, so the profile must run here too.
+                pfx = cloud_prefix(engine, tag, table, scenario)
+                n_null, n_cols = scenarios.duckdb_allnull_cloud(store, BUCKET, pfx, work)
             cols_ok = n_null <= 0
             _stage(
                 led, engine, tag, store, "oracle", agree and files_agree and cols_ok,
