@@ -57,6 +57,18 @@ pub(super) fn diagnose_export_mssql(
     diagnose_mssql(&mut conn, export)
 }
 
+/// `@@MAX_CONNECTIONS` — SQL Server's configured `user connections` cap and the
+/// portable analogue of PG `max_connections` / MySQL `@@max_connections`. Read
+/// over the scalar seam; `None` when the probe fails (fail-soft, like the other
+/// engines) — the connection-limit check then only emits its skipped-note.
+fn fetch_max_connections_mssql(conn: &mut MssqlSource) -> Option<u32> {
+    conn.query_scalar("SELECT @@MAX_CONNECTIONS")
+        .ok()
+        .flatten()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .filter(|&n| n > 0)
+}
+
 fn diagnose_mssql(conn: &mut MssqlSource, export: &ExportConfig) -> Result<ExportDiagnostic> {
     let mode_str = diagnose_mode_str(export);
 
@@ -141,18 +153,20 @@ fn diagnose_mssql(conn: &mut MssqlSource, export: &ExportConfig) -> Result<Expor
     );
     let recommended_profile = recommend_profile(row_estimate, uses_index, export);
     let recommended_parallel = recommend_parallelism(export, row_estimate, uses_index);
-    // SQL Server has no portable per-user `max_connections` server variable
-    // readable over this seam (the cap is per-edition / Resource Governor), so
-    // the connection-limit warning is skipped — `None` makes `collect_warnings`
-    // emit the "check skipped" note only when parallel > 1, exactly like the
-    // PG/MySQL path when that probe fails.
+    // SQL Server's `@@MAX_CONNECTIONS` IS the portable analogue of PG
+    // max_connections / MySQL @@max_connections (the configured `user
+    // connections` cap; default 32767 ≈ unlimited, so the warning is inert on a
+    // default install and fires only when an admin lowers it). Read it over the
+    // same query_scalar seam so the connection-limit check has parity with the
+    // other engines.
+    let db_max_connections = fetch_max_connections_mssql(conn);
     let warnings = collect_warnings(
         export,
         row_estimate,
         avg_row_bytes,
         range_min.as_deref(),
         range_max.as_deref(),
-        None,
+        db_max_connections,
     );
     let suggestion = build_suggestion(&verdict, row_estimate, uses_index, export);
 
@@ -164,8 +178,8 @@ fn diagnose_mssql(conn: &mut MssqlSource, export: &ExportConfig) -> Result<Expor
         cursor_column: export.cursor_column.clone(),
         row_estimate,
         avg_row_bytes,
-        cursor_min: range_min,
-        cursor_max: range_max,
+        cursor_min: range_min.clone(),
+        cursor_max: range_max.clone(),
         scan_type,
         uses_index,
         verdict,
@@ -173,6 +187,9 @@ fn diagnose_mssql(conn: &mut MssqlSource, export: &ExportConfig) -> Result<Expor
         recommended_parallel,
         warnings,
         suggestion,
+        chunk_min: range_min.clone(),
+        chunk_max: range_max.clone(),
+        db_max_connections,
     })
 }
 

@@ -90,6 +90,14 @@ pub(crate) struct ExportDiagnostic {
     pub recommended_parallel: (u32, &'static str),
     pub warnings: Vec<analysis::Warning>,
     pub suggestion: Option<String>,
+    /// The three `collect_warnings` inputs NOT otherwise on the diagnostic —
+    /// stored so the #149 overlay can RE-RUN the row-estimate-scaled warnings
+    /// after it moves `row_estimate` (else the warnings keep quoting the catalog
+    /// figure while the verdict/row line stands on the measure — #202). Not
+    /// serialized (internal recompute inputs, not part of the JSON surface).
+    pub chunk_min: Option<String>,
+    pub chunk_max: Option<String>,
+    pub db_max_connections: Option<u32>,
 }
 
 // Hand-rolled `Serialize` (rather than `#[derive]`) so the JSON shape stays
@@ -696,6 +704,9 @@ mod tests {
                 analysis::Warning::new(analysis::Severity::High, "memory risk".to_string()),
             ],
             suggestion: Some("create an index".to_string()),
+            chunk_min: None,
+            chunk_max: None,
+            db_max_connections: None,
         }
     }
 

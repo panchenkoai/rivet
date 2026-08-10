@@ -189,6 +189,19 @@ pub(crate) fn overlay_measured_rows(
         if diag.suggestion.is_some() {
             diag.suggestion = build_suggestion(&diag.verdict, est, diag.uses_index, export);
         }
+        // #202: the warnings are row-estimate-scaled too (parallel-memory-risk,
+        // sparse-range, oversized-chunk) — re-run collect_warnings from the
+        // MEASURED figure so they don't keep quoting the catalog while the
+        // verdict/row line is measured. Inputs the diagnostic carries for exactly
+        // this recompute.
+        diag.warnings = collect_warnings(
+            export,
+            est,
+            diag.avg_row_bytes,
+            diag.chunk_min.as_deref(),
+            diag.chunk_max.as_deref(),
+            diag.db_max_connections,
+        );
     }
 }
 
@@ -955,6 +968,9 @@ mod tests {
             recommended_profile: "balanced",
             recommended_parallel: (1, "test"),
             suggestion: None,
+            chunk_min: None,
+            chunk_max: None,
+            db_max_connections: None,
         };
         let export = cfg("table: t\nmode: chunked\nchunk_column: id\nchunk_size: 100000\n");
         // Seed a profile as if computed from the CATALOG (small) estimate.
@@ -974,6 +990,57 @@ mod tests {
                 .starts_with("measured "),
             "the report must SAY it stands on the measurement: {:?}",
             diag.row_source
+        );
+    }
+
+    /// #202 (roast 2026-08-10): the overlay recomputes verdict/profile but left
+    /// diag.warnings on the CATALOG estimate — so a measured figure that crosses
+    /// a warning threshold (parallel-memory-risk at >5M rows) never surfaced. The
+    /// warnings must be re-run from the measured figure. RED against not
+    /// recomputing warnings.
+    #[test]
+    fn overlay_recomputes_row_scaled_warnings_from_the_measure() {
+        let state = crate::state::StateStore::open_in_memory().unwrap();
+        state
+            .record_metric_full(&crate::state::MetricRow {
+                export_name: "big_chunked".into(),
+                run_id: "r1".into(),
+                total_rows: 10_000_000, // > 5M → parallel-memory-risk fires
+                status: "success".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let export =
+            cfg("table: t\nmode: chunked\nchunk_column: id\nchunk_size: 100000\nparallel: 4\n");
+        let mut diag = super::super::ExportDiagnostic {
+            export_name: "big_chunked".into(),
+            strategy: "chunked(id, size=100000)".into(),
+            mode: "chunked (column: id, size: 100000)".into(),
+            cursor_column: None,
+            row_estimate: Some(1000), // catalog: small → no memory-risk warning
+            row_source: None,
+            avg_row_bytes: None,
+            cursor_min: None,
+            cursor_max: None,
+            scan_type: None,
+            uses_index: true,
+            verdict: super::super::HealthVerdict::Efficient,
+            warnings: Vec::new(), // as collect_warnings(1000, parallel=4) produced
+            recommended_profile: "fast",
+            recommended_parallel: (4, "test"),
+            suggestion: None,
+            chunk_min: None,
+            chunk_max: None,
+            db_max_connections: None,
+        };
+        overlay_measured_rows(&mut diag, &export, &state);
+        assert_eq!(diag.row_estimate, Some(10_000_000));
+        assert!(
+            diag.warnings
+                .iter()
+                .any(|w| w.message.contains("Parallel=4")),
+            "the parallel-memory-risk warning must be recomputed from the measured 10M rows: {:?}",
+            diag.warnings.iter().map(|w| &w.message).collect::<Vec<_>>()
         );
     }
 
@@ -1009,6 +1076,9 @@ mod tests {
             recommended_profile: "safe",
             recommended_parallel: (1, "test"),
             suggestion: None,
+            chunk_min: None,
+            chunk_max: None,
+            db_max_connections: None,
         };
         let export = cfg("table: coll\nmode: full\n");
         overlay_measured_rows(&mut diag, &export, &state);
@@ -1062,6 +1132,9 @@ mod tests {
             recommended_profile: "balanced",
             recommended_parallel: (1, "test"),
             suggestion: None,
+            chunk_min: None,
+            chunk_max: None,
+            db_max_connections: None,
         };
         let export = cfg("table: t\nmode: incremental\ncursor_column: updated_at\n");
         overlay_measured_rows(&mut diag, &export, &state);
