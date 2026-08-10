@@ -172,9 +172,21 @@ pub(super) fn density_probe(conn: &mut mysql::PooledConn, info: &mut super::Tabl
     };
     let tbl = info.table.replace('`', "``");
     let k_q = key.replace('`', "``");
-    let Ok(Some((Some(min), Some(max)))) = conn.query_first::<(Option<i64>, Option<i64>), _>(
-        format!("SELECT MIN(`{k_q}`), MAX(`{k_q}`) FROM `{tbl}`"),
-    ) else {
+    // Read MIN/MAX as TEXT and parse — never as (Option<i64>, Option<i64>): a
+    // BIGINT UNSIGNED key past i64::MAX (18446744073709551615) makes the mysql
+    // crate's FromRow PANIC on the i64 conversion (not a catchable Err), crashing
+    // `rivet init` (roast 2026-08-10, gate exit 101). Text always converts; a
+    // value that does not fit i64 (unsigned overflow), a non-integer key, or NULL
+    // (empty table) → skip the probe, keep the catalog, mark unverified — the
+    // stratified offsets are i64 arithmetic and cannot span such a key anyway.
+    let min_max = conn
+        .query_first::<(Option<String>, Option<String>), _>(format!(
+            "SELECT MIN(`{k_q}`), MAX(`{k_q}`) FROM `{tbl}`"
+        ))
+        .ok()
+        .flatten()
+        .and_then(|(lo, hi)| Some((lo?.parse::<i64>().ok()?, hi?.parse::<i64>().ok()?)));
+    let Some((min, max)) = min_max else {
         info.density = Some(DensityProbe {
             rows: catalog,
             density: 0.0,

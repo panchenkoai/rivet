@@ -148,3 +148,47 @@ fn pg_density_probe_corrects_a_never_analyzed_table() {
     );
     let _ = c.execute(&format!("DROP TABLE IF EXISTS {table}"), &[]);
 }
+
+/// #148 (roast 2026-08-10, gate exit 101): the MySQL density probe read
+/// MIN/MAX as (Option<i64>, Option<i64>); a BIGINT UNSIGNED key past i64::MAX
+/// made the mysql crate's FromRow PANIC (not a catchable Err), crashing
+/// `rivet init`. A table whose id reaches u64::MAX must init CLEANLY (the probe
+/// skips it as unverified — i64 offsets cannot span it). RED against the i64 read.
+#[test]
+#[ignore = "live: requires docker compose up -d mysql"]
+fn init_does_not_panic_on_a_bigint_unsigned_key_past_i64() {
+    let mut c = mysql_connect();
+    let name = unique_name("ubig_key");
+    c.query_drop(format!(
+        "CREATE TABLE {name} (id BIGINT UNSIGNED PRIMARY KEY, v INT NOT NULL)"
+    ))
+    .unwrap();
+    let _guard = MysqlTable::adopt(name.clone());
+    // Rows straddling i64::MAX so MIN fits i64 but MAX (u64::MAX) does not.
+    c.query_drop(format!(
+        "INSERT INTO {name} (id, v) VALUES (1, 1), (18446744073709551615, 2)"
+    ))
+    .unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let out_yaml = dir.path().join("u.yaml");
+    let out = run_rivet_env(
+        &[
+            "init",
+            "--source",
+            MYSQL_URL,
+            "--table",
+            &name,
+            "-o",
+            out_yaml.to_str().unwrap(),
+        ],
+        &[],
+    );
+    assert!(
+        out.status.success(),
+        "init must NOT panic on a BIGINT UNSIGNED key past i64 (exit {:?}):\n{}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out_yaml.exists(), "init must still scaffold a config");
+}
