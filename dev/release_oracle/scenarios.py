@@ -826,7 +826,8 @@ def run_scenarios(led: Ledger, engine: str, tag: str, url: str) -> None:
     # nothing — skip them.
     if _bless("BLESS_VERDICTS") or _bless("BLESS_DUCKDB"):
         return
-    sc_keyset_parallel(led, engine, tag, url)
+    with led.span(f"{engine}: keyset_parallel"):
+        sc_keyset_parallel(led, engine, tag, url)
     # The one integrity column a reader is asked to trust, checked by something
     # that is not rivet — see rowhash.py for why the in-tree auditor cannot.
     from . import corruption, rowhash
@@ -843,10 +844,12 @@ def run_scenarios(led: Ledger, engine: str, tag: str, url: str) -> None:
     from . import schema_drift
 
     schema_drift.verify_schema_fingerprint_moves_with_the_schema(led, engine, tag, url)
-    for store in cfg("stores").split():
-        sc_load(led, engine, tag, url, store)
+    with led.span(f"{engine}: load (all stores)"):
+        for store in cfg("stores").split():
+            sc_load(led, engine, tag, url, store)
     if engine == "postgres":
-        sc_gc_survival(led, engine, tag, url)
+        with led.span(f"{engine}: gc_survival"):
+            sc_gc_survival(led, engine, tag, url)
     # The COMMAND CHAIN, end to end. Both of these were registered in
     # docs/release-gate-matrix.yaml as `test` while `verify_blessed_path` had no
     # caller anywhere in the tree — the matrix guard checks that a gate function
@@ -857,8 +860,10 @@ def run_scenarios(led: Ledger, engine: str, tag: str, url: str) -> None:
     state_url = os.environ.get("RIVET_GATE_STATE_URL", "") or os.environ.get(
         "RIVET_CDC_STATE_URL", ""
     )
-    blessed_path.verify_blessed_path(led, engine, tag, url, state_url=state_url)
-    blessed_flow.sc_blessed_flow(led, engine, tag, url, state_url=state_url)
+    with led.span(f"{engine}: blessed_path"):
+        blessed_path.verify_blessed_path(led, engine, tag, url, state_url=state_url)
+    with led.span(f"{engine}: blessed_flow"):
+        blessed_flow.sc_blessed_flow(led, engine, tag, url, state_url=state_url)
     # Does the chain above have working oracles at all? Breaks each artifact
     # class and requires the matching stage to go RED — a green stage that was
     # never red is unverified, and this module's own first draft had one.

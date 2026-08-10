@@ -34,6 +34,7 @@ import shutil
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -91,6 +92,15 @@ class Ledger:
         # do not interleave into an unreadable stream. The parent `flush_into`s
         # each engine's block in engine order after the join. `None` = print live.
         self._buf: list[str] | None = None
+        # Named sub-spans INSIDE a phase — the granularity `phase()` cannot give
+        # under the PARALLEL engine matrix, where every engine collapses into one
+        # wrapping phase and the buffered children's `_phase_times` are dropped at
+        # merge (summing overlapping child phases would overcount). A `span` is a
+        # single wall-clock ("mssql: blessed_flow", "postgres: seed"); `flush_into`
+        # folds a child's spans into the parent, and `report()` prints them as a
+        # SEPARATE breakdown that is honest about the overlap — spans in different
+        # engines run concurrently, so they are ranked, never summed into a total.
+        self._spans: list[tuple[str, float]] = []
 
     # ── printing ──
     def _c(self, code: str, text: str) -> str:
@@ -120,6 +130,19 @@ class Ledger:
     def skip(self, msg: str) -> None:
         self._emit(self._c("1;33", f"  ⊘ {msg}"))
 
+    @contextmanager
+    def span(self, name: str):
+        """Time a named step inside a phase (e.g. one scenario of one engine).
+        Records a single wall-clock into `_spans`; survives the buffered-child
+        merge that drops `_phase_times`, so the parallel engine matrix's internals
+        are visible in the final timing breakdown. Nesting is fine — a span and a
+        sub-span it contains are ranked independently, not netted."""
+        t0 = time.perf_counter()
+        try:
+            yield
+        finally:
+            self._spans.append((name, time.perf_counter() - t0))
+
     def buffered_child(self) -> "Ledger":
         """A sub-ledger that BUFFERS output (for one parallel engine). Its cells +
         buffered lines are folded back with `flush_into` after the engine finishes."""
@@ -136,6 +159,10 @@ class Ledger:
         for line in self._buf or []:
             parent._emit(line)
         parent.cells.extend(self.cells)
+        # Spans DO travel (unlike _phase_times): each is a per-engine wall-clock
+        # the parent reports ranked, not summed, so overlap across engines is not
+        # double-counted. This is the only window into the parallel matrix.
+        parent._spans.extend(self._spans)
 
     # ── recording ──
     def add(
@@ -188,6 +215,15 @@ class Ledger:
                 pct = (dur / total * 100.0) if total > 0 else 0.0
                 print(f"  {dur / 60.0:6.1f} min  {pct:4.0f}%  {name}")
             print(f"  {total / 60.0:6.1f} min  total (sum of phases)")
+            print()
+        # Inside-the-phase breakdown — the per-engine / per-scenario spans that the
+        # opaque "Engine matrix" phase hides. Ranked slowest-first; NOT summed,
+        # because spans in different engines overlap under `--engine-parallel`. This
+        # is the "where does the time go INSIDE the calls" view.
+        if self._spans:
+            self.phase("Timing — inside the engine matrix (per span; concurrent, so ranked not summed)")
+            for name, dur in sorted(self._spans, key=lambda p: p[1], reverse=True)[:25]:
+                print(f"  {dur / 60.0:6.1f} min  {name}")
             print()
         if self.red:
             print(self._c("1;31", "  NOT RELEASABLE — one or more cells failed (see ✗ above)."))

@@ -147,6 +147,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--no-clean", action="store_true",
                     help="skip the clean rebuild (iteration only — a release must be gated on a "
                          "tree built from nothing)")
+    ap.add_argument("--fast-clean", action="store_true",
+                    help="rebuild removing ONLY target/package (the documented `cargo package` "
+                         "fingerprint poison), not the whole target/ — keeps the binary=HEAD "
+                         "guarantee via cargo's own honest fingerprints while skipping the full "
+                         "dependency recompile. NOT a cache: no external keying heuristic can "
+                         "return a stale artifact. The tag verdict should still use the full "
+                         "clean (default); this is for fast pre-tag hunt passes.")
     ap.add_argument("--state-url", default="",
                     help="state backend for EVERY cell (default: SQLite beside each config). "
                          "A gate pass grades ONE backend; run it twice to grade both.")
@@ -161,7 +168,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return ns
 
 
-def clean_tree_and_build(led: Ledger) -> bool:
+def clean_tree_and_build(led: Ledger, *, fast: bool = False) -> bool:
     """Step ZERO: gate a binary built from nothing.
 
     A release must be graded on a tree with no history in it. `cargo package`
@@ -176,13 +183,26 @@ def clean_tree_and_build(led: Ledger) -> bool:
     So the gate starts by deleting the target directory and its own scratch, then
     builds `--release` itself. It costs one full compile; it buys the guarantee
     that the binary every cell below exercises is the code in the tree.
+
+    `fast=True` removes ONLY `target/package` — the exact directory the poison
+    lives in — instead of the whole `target/`. Cargo's own fingerprints are honest
+    once that snapshot is gone (every freshness-lie this repo has hit was
+    package-related), so the binary=HEAD guarantee holds while the dependency
+    recompile is skipped. This is NOT a compilation cache: there is no external
+    hash-keying heuristic (sccache's build-script / env / include! edge cases) that
+    can hand back a stale object — it is cargo's normal, sound incremental build
+    with the one known liar deleted. The full clean stays the default for the tag
+    verdict; `fast` is for the fast pre-tag hunt passes.
     """
     led.phase("Clean tree — the gate builds the binary it grades")
     for stale in ("/tmp/rivet_conc", "/tmp/rivet_iso", "/tmp/rivet_sweep", "/tmp/rivet_cdc_sweep"):
         shutil.rmtree(stale, ignore_errors=True)
     for lock in Path("/tmp").glob(".rivet_cdc_sweep*.lock"):
         lock.unlink(missing_ok=True)
-    if not run(["cargo", "clean"], cwd=ROOT, timeout=600).ok:
+    if fast:
+        # Delete ONLY the poison directory; cargo's honest fingerprints do the rest.
+        shutil.rmtree(ROOT / "target" / "package", ignore_errors=True)
+    elif not run(["cargo", "clean"], cwd=ROOT, timeout=600).ok:
         led.failed("-", "-", "clean_tree", "-",
                    "clean tree: `cargo clean` failed — the gate cannot vouch for the binary it "
                    "is about to grade")
@@ -195,9 +215,11 @@ def clean_tree_and_build(led: Ledger) -> bool:
             f"anything: {(build.err or build.out)[-300:]}",
         )
         return False
+    how = ("target/package removed (fast: cargo fingerprints trusted, binary=HEAD)"
+           if fast else "target/ removed and the release binary rebuilt from nothing")
     led.passed(
         "-", "-", "clean_tree", "-",
-        f"clean tree: target/ removed and the release binary rebuilt from nothing ({rivet_bin()})",
+        f"clean tree: {how} ({rivet_bin()})",
     )
     return True
 
@@ -418,7 +440,8 @@ def _run_one_engine(led: Ledger, ns: argparse.Namespace, engine: str) -> None:
         parts = line.split()
         tag, image, port = parts[0], parts[1], int(parts[2])
         led.phase(f"{engine} {tag} ({image})")
-        url = bring_up(led, engine, tag, image, port)
+        with led.span(f"{engine}: bring-up"):
+            url = bring_up(led, engine, tag, image, port)
         if not url:
             led.add(engine, tag, "all", "-", Status.SKIP, "bring-up failed")
             continue
@@ -426,7 +449,8 @@ def _run_one_engine(led: Ledger, ns: argparse.Namespace, engine: str) -> None:
         # failure is retried: a fresh container under load can drop the seed
         # connection mid-stream, and crying wolf on that is worse than a retry.
         err = ""
-        for attempt in range(3):
+        with led.span(f"{engine}: seed"):
+          for attempt in range(3):
             err = seed_engine(engine, tag, url)
             if not err:
                 break
@@ -469,8 +493,14 @@ def engine_loop(led: Ledger, ns: argparse.Namespace) -> None:
     subs = {e: led.buffered_child() for e in engines}
     from concurrent.futures import ThreadPoolExecutor
 
+    def _run(e: str) -> None:
+        # The per-engine total wall-clock — the "which engine is the long pole"
+        # number the opaque matrix phase can't give under parallelism.
+        with subs[e].span(f"{e}: engine-total"):
+            _run_one_engine(subs[e], ns, e)
+
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        list(ex.map(lambda e: _run_one_engine(subs[e], ns, e), engines))
+        list(ex.map(_run, engines))
     for engine in engines:  # deterministic order, not completion order
         subs[engine].flush_into(led)
 
@@ -528,7 +558,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  state backend under test: {backend}")
         print("  a pass grades ONE backend; --state-url runs the same cells against the other")
 
-        if not ns.no_clean and not clean_tree_and_build(led):
+        if not ns.no_clean and not clean_tree_and_build(led, fast=ns.fast_clean):
             return 1
         start_stores(led)
         preflight(led, bless_gifs=ns.bless_gifs)
