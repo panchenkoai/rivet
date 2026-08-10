@@ -759,7 +759,13 @@ fn next_eligible(safe_flags: &[bool], heavy_running: bool) -> Option<usize> {
 ///   resumes checkpoints, exactly like waves.
 /// - a failed export is collected and the pool keeps draining (wave
 ///   semantics); the run exits non-zero with the representative error.
-pub(crate) fn run_pool(config_path: &str, force: bool, resume: bool, m: usize) -> Result<()> {
+pub(crate) fn run_pool(
+    config_path: &str,
+    force: bool,
+    resume: bool,
+    m: usize,
+    split: bool,
+) -> Result<()> {
     let m = m.max(1);
     let config = Config::load_with_params(config_path, None)?;
     let config_dir = Path::new(config_path)
@@ -778,8 +784,11 @@ pub(crate) fn run_pool(config_path: &str, force: bool, resume: bool, m: usize) -
     let state = StateStore::open(config_path)?;
 
     // Same skip-completed contract as the wave path (probe the EXPANDED
-    // destination for _SUCCESS under --resume).
-    let pending: Vec<&ExportConfig> = config
+    // destination for _SUCCESS under --resume). OWNED (`.cloned()`) so a
+    // `--split` can splice synthesized range sub-exports into the set — they are
+    // fresh `ExportConfig`s with no config.exports slot to borrow, and everything
+    // downstream (`by_name`, `queue`) borrows from THIS vec.
+    let mut effective: Vec<ExportConfig> = config
         .exports
         .iter()
         .filter(|e| {
@@ -795,57 +804,78 @@ pub(crate) fn run_pool(config_path: &str, force: bool, resume: bool, m: usize) -
             }
             !done
         })
+        .cloned()
         .collect();
-    if pending.is_empty() {
+    if effective.is_empty() {
         log::warn!("apply --pool: nothing to run (no exports, or all complete)");
         return Ok(());
     }
 
-    // LPT order + the makespan the model PREDICTS — printed up front and graded
-    // against the actual wall at the end, so every run improves trust in (or
-    // honestly indicts) the model.
-    let items: Vec<super::pool::PoolItem> = pending
-        .iter()
-        .map(|e| super::pool::PoolItem {
-            name: e.name.clone(),
-            predicted_secs: last_success_secs(&state, &e.name).unwrap_or(5.0),
-            parallel_safe: is_parallel_safe(e),
-        })
-        .collect();
-    let order = super::pool::pool_order(&items);
-    let predicted_secs = super::pool::predicted_makespan_secs(&items, m);
-    let floor_secs = super::pool::makespan_floor_secs(&items, m);
-    let measured_n = pending
-        .iter()
-        .filter(|e| last_success_secs(&state, &e.name).is_some())
-        .count();
-    println!(
-        "  Pool: {} export(s) × {} slot(s) — predicted makespan ~{:.1} min (floor {:.1}; {} measured, {} estimated)",
-        pending.len(),
-        m,
-        predicted_secs / 60.0,
-        floor_secs / 60.0,
-        measured_n,
-        pending.len() - measured_n,
-    );
+    let build_items = |exps: &[ExportConfig]| -> Vec<super::pool::PoolItem> {
+        exps.iter()
+            .map(|e| super::pool::PoolItem {
+                name: e.name.clone(),
+                predicted_secs: last_success_secs(&state, &e.name).unwrap_or(5.0),
+                parallel_safe: is_parallel_safe(e),
+            })
+            .collect()
+    };
+    let mut items = build_items(&effective);
 
-    // #167: a single dominating export IS the floor — extra slots buy nothing
-    // past it. If one export's predicted duration dominates (R×3 the next), tell
-    // the operator the concrete floor-breaker: split it into N range sub-exports
-    // (separate scheduler units with separate write legs), and the wall it would
-    // reach. Shape-driven (M-free) via the pure planner; a warn, not info, so it
-    // is visible at the default level exactly where a 51-min giant pins a refresh.
-    if let Some((giant, n, broken)) = super::pool::advise_split(&items, m, 3.0, m.max(2)) {
+    // #167: a single dominating export IS the pool floor — extra slots buy
+    // nothing past it until the giant is itself divisible. The pure planner
+    // ([`pool::advise_split`], shape-driven / M-free) decides WHETHER + into how
+    // many; what happens next depends on the opt-in `--split`:
+    //  * `--split` set → REALIZE it: probe the giant's key span and splice N range
+    //    sub-exports into the set, so the pool places them concurrently and the
+    //    floor breaks. An explicit opt-in, so a probe failure is LOUD (returned),
+    //    never a silent fall-back to the un-split giant.
+    //  * `--split` NOT set → the pre-existing ADVISORY warn (tells the operator
+    //    the concrete floor-breaker; they act on it).
+    let advise = super::pool::advise_split(&items, m, 3.0, m.max(2));
+    if split {
+        match &advise {
+            Some((giant, n, broken)) => {
+                let base = effective
+                    .iter()
+                    .find(|e| &e.name == giant)
+                    .expect("advise_split names an export in the set")
+                    .clone();
+                match super::split::probe_and_synthesize(&config, &base, &config_dir, *n)? {
+                    Some(units) => {
+                        let realized = units.len();
+                        effective.retain(|e| &e.name != giant);
+                        effective.extend(units);
+                        items = build_items(&effective);
+                        log::warn!(
+                            "apply --pool --split: split '{giant}' into {realized} range \
+                             sub-export(s) over its key — predicted wall ~{:.1} min (was the \
+                             single-export floor). The units share one prefix and fold to family \
+                             '{giant}', so the load view reads them as one table.",
+                            broken / 60.0,
+                        );
+                    }
+                    None => log::warn!(
+                        "apply --pool --split: '{giant}' dominates the floor but is not splittable \
+                         (needs a `chunk_by_key:`/`chunk_column:`, and not incremental/CDC) — \
+                         running it whole."
+                    ),
+                }
+            }
+            None => log::info!(
+                "apply --pool --split: no export dominates the pool floor — nothing to split."
+            ),
+        }
+    } else if let Some((giant, n, broken)) = &advise {
         let giant_secs = items
             .iter()
-            .find(|i| i.name == giant)
+            .find(|i| &i.name == giant)
             .map(|i| i.predicted_secs)
             .unwrap_or(0.0);
         log::warn!(
             "apply --pool: export '{}' (~{:.1} min) dominates the pool floor — extra slots cannot \
-             beat it. Split it into {} range sub-exports over its key (each a separate scheduler \
-             unit with its own write leg) to drop the wall to ~{:.1} min. Give it a `chunk_by_key:` \
-             and run each key range as its own export.",
+             beat it. Re-run with `--split` to split it into {} range sub-exports over its key \
+             (separate scheduler units, one shared prefix) and drop the wall to ~{:.1} min.",
             giant,
             giant_secs / 60.0,
             n,
@@ -853,6 +883,27 @@ pub(crate) fn run_pool(config_path: &str, force: bool, resume: bool, m: usize) -
         );
     }
 
+    // LPT order + the makespan the model PREDICTS (POST-split) — printed up front
+    // and graded against the actual wall at the end, so every run improves trust
+    // in (or honestly indicts) the model.
+    let order = super::pool::pool_order(&items);
+    let predicted_secs = super::pool::predicted_makespan_secs(&items, m);
+    let floor_secs = super::pool::makespan_floor_secs(&items, m);
+    let measured_n = effective
+        .iter()
+        .filter(|e| last_success_secs(&state, &e.name).is_some())
+        .count();
+    println!(
+        "  Pool: {} export(s) × {} slot(s) — predicted makespan ~{:.1} min (floor {:.1}; {} measured, {} estimated)",
+        effective.len(),
+        m,
+        predicted_secs / 60.0,
+        floor_secs / 60.0,
+        measured_n,
+        effective.len() - measured_n,
+    );
+
+    let pending: Vec<&ExportConfig> = effective.iter().collect();
     let by_name: std::collections::HashMap<&str, &ExportConfig> =
         pending.iter().map(|e| (e.name.as_str(), *e)).collect();
     let queue: std::sync::Mutex<std::collections::VecDeque<&ExportConfig>> = std::sync::Mutex::new(

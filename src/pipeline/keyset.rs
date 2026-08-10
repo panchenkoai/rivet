@@ -175,7 +175,7 @@ fn nth_row_clause(st: crate::config::SourceType, off: i64) -> String {
 /// key, so the union of ranges reads every row exactly once regardless of the
 /// sample's balance. Fewer boundaries than requested (a repeated value at two
 /// percentiles) just yields fewer, larger ranges — never a gap or an overlap.
-fn sample_key_boundaries(
+pub(crate) fn sample_key_boundaries(
     src: &mut dyn Source,
     plan: &ResolvedRunPlan,
     key: &str,

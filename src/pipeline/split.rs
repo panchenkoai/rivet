@@ -20,7 +20,10 @@
 //! sub-range to carry its own cursor (non-trivial); [`splittable_key`] refuses it
 //! so a split is never silently lossy.
 
-use crate::config::{ExportConfig, ExportMode, SplitSynth};
+use std::path::Path;
+
+use crate::config::{Config, ExportConfig, ExportMode, SplitSynth};
+use crate::error::Result;
 
 /// The N half-open key windows `(lo, hi]` that partition the whole key span,
 /// given `n - 1` interior boundary values (ascending). The union is the entire
@@ -40,18 +43,12 @@ fn windows(bounds: &[String]) -> Vec<(Option<String>, Option<String>)> {
     out
 }
 
-// NOTE: `splittable_key` + `synthesize` are consumed by the pool executor
-// (`run::run_pool` under `apply --pool --split`), wired in the same change set
-// (#167 Slice D). The `allow(dead_code)` bridges the intermediate commit where
-// the pure synthesizer + its tests land before the runtime caller; it is removed
-// once the executor calls them.
 /// Whether an export may be split into range sub-exports. A split is only correct
 /// when (1) it has a single ordered key to partition over — `chunk_by_key` or
 /// `chunk_column` — and (2) its mode re-reads the whole range on each run
 /// (full/chunked/keyset), NOT incremental (which would need a per-sub-range
 /// cursor, out of v1) and NOT CDC (a stream, not a range scan). Returns the key
 /// column to split over, or `None` (leave the export whole).
-#[allow(dead_code)]
 pub(crate) fn splittable_key(export: &ExportConfig) -> Option<String> {
     // CDC is a stream, not a range scan — never splittable. A whole-table
     // full/chunked/keyset scan is exactly what a range partition covers
@@ -79,7 +76,6 @@ pub(crate) fn splittable_key(export: &ExportConfig) -> Option<String> {
 /// Pure and total: it does not probe the source (the caller supplies `bounds`),
 /// so it is unit-testable without a database. Returns the base unchanged in a
 /// one-element vec if `bounds` is empty (nothing to split into).
-#[allow(dead_code)]
 pub(crate) fn synthesize(
     base: &ExportConfig,
     key_column: &str,
@@ -104,6 +100,46 @@ pub(crate) fn synthesize(
             e
         })
         .collect()
+}
+
+/// Probe the giant's key span and realize the split into `n` range sub-exports.
+///
+/// The RUNTIME half of the synthesis: it opens a source connection to sample the
+/// `n - 1` ROW-percentile key boundaries (`keyset::sample_key_boundaries`, an
+/// index-only OFFSET skip — the same sampler the parallel-keyset runner uses),
+/// then hands them to the pure [`synthesize`]. Bounded to full/chunked/keyset via
+/// [`splittable_key`]; returns `None` (leave the giant whole) when it is not
+/// splittable or the probe finds too few distinct keys to partition — a
+/// degenerate split is never worse than not splitting.
+///
+/// Errors from the probe are RETURNED, not swallowed: `--split` is an explicit
+/// opt-in, so a probe that cannot run is a loud failure the operator asked for,
+/// not a silent fall-back to the un-split giant (which would quietly deliver the
+/// makespan they were trying to avoid).
+pub(crate) fn probe_and_synthesize(
+    config: &Config,
+    giant: &ExportConfig,
+    config_dir: &Path,
+    n: usize,
+) -> Result<Option<Vec<ExportConfig>>> {
+    let Some(key) = splittable_key(giant) else {
+        return Ok(None);
+    };
+    if n < 2 {
+        return Ok(None);
+    }
+    // Build the giant's OWN plan (base_query = the whole table; no split marker
+    // yet) so the boundary sample runs over exactly the rows the sub-exports will
+    // cover. `resume=false`: the probe is read-only.
+    let plan = crate::plan::build_plan(config, giant, config_dir, false, false, false, None)?;
+    let mut src = crate::source::create_source(&plan.source)?;
+    let bounds = super::keyset::sample_key_boundaries(src.as_mut(), &plan, &key, n, None, None)?;
+    if bounds.is_empty() {
+        // Too few distinct keys to partition (a tiny or single-valued key) —
+        // splitting would make one real unit plus empties. Leave it whole.
+        return Ok(None);
+    }
+    Ok(Some(synthesize(giant, &key, &bounds)))
 }
 
 #[cfg(test)]

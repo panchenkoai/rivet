@@ -314,6 +314,16 @@ pub enum Commands {
         /// backfill the remaining slots).
         #[arg(long, value_name = "N", conflicts_with = "parallel_export_processes")]
         pool: Option<usize>,
+        /// With `--pool`: when ONE export dominates the pool floor (its predicted
+        /// duration ≫ the next-longest, #167), split it into N range sub-exports
+        /// over its key span — separate scheduler units the pool places
+        /// concurrently, so the giant stops being the makespan floor. The units
+        /// share one destination prefix and fold to one family, so the load view
+        /// reads them as a single logical table. Only full/chunked/keyset exports
+        /// with a `chunk_by_key:`/`chunk_column:` are split (never incremental/CDC).
+        /// Off by default; ignored without `--pool`.
+        #[arg(long, requires = "pool")]
+        split: bool,
     },
     /// Targeted repair of chunks flagged by reconcile: emit a repair plan, or re-export only mismatched ranges.
     Repair(RepairArgs),
