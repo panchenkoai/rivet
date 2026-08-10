@@ -681,6 +681,19 @@ mod tests {
             "read leg must reach the export_metrics row"
         );
         assert_eq!(row.bytes_written, 5_000);
+        // The engine labels are threaded straight through — pin them so the
+        // metric row is attributable (source/dest engine per CDC run), not just
+        // the byte counts. RED against deleting either field in cdc_metric_row.
+        assert_eq!(
+            row.source_type.as_deref(),
+            Some("mysql"),
+            "source engine must reach the export_metrics row"
+        );
+        assert_eq!(
+            row.destination_type.as_deref(),
+            Some("local"),
+            "destination engine must reach the export_metrics row"
+        );
     }
 
     #[test]
