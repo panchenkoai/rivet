@@ -300,6 +300,9 @@ pub(super) fn finalize_manifest(
         source_table,
         destination_uri_for_manifest(&plan.destination),
     );
+    // Record this unit's split window (if any) so --split --resume can reconstruct the
+    // exact original partition from the prior run's manifests instead of re-sampling.
+    builder.set_split_window(plan.split_window.clone());
     for part in &summary.manifest_parts {
         builder.record_part(
             part.part_id,
@@ -735,6 +738,7 @@ pub(super) fn write_running_manifest(
     };
     let manifest = RunManifest {
         row_hash: None,
+        split_window: None, // the running marker is overwritten by the terminal manifest
         manifest_version: MANIFEST_VERSION,
         run_id: run_id.to_string(),
         export_family: export_family.to_string(),
@@ -974,6 +978,7 @@ mod tests {
     fn fin_plan(dest: &std::path::Path) -> crate::plan::ResolvedRunPlan {
         use crate::config::{SourceConfig, SourceType};
         crate::plan::ResolvedRunPlan {
+            split_window: None,
             bytes_read: Default::default(),
             export_name: "public.orders".into(),
             source_table: None,

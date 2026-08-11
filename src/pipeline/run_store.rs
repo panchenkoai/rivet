@@ -163,6 +163,7 @@ mod tests {
 
     fn test_plan(export_name: &str) -> ResolvedRunPlan {
         ResolvedRunPlan {
+            split_window: None,
             bytes_read: Default::default(),
             export_name: export_name.into(),
             source_table: None,

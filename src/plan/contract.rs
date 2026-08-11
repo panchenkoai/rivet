@@ -104,6 +104,16 @@ pub struct ResolvedRunPlan {
     /// field) deserialize as non-split.
     #[serde(default)]
     pub is_split_unit: bool,
+    /// For a `--pool --split` unit: the `(lo, hi]` key window it covers, threaded from the
+    /// export's `SplitSynth` so `finalize` records it in the manifest — the durable anchor
+    /// that lets `--split --resume` reconstruct the EXACT partition instead of re-sampling.
+    /// `#[serde(default)]` so old plan artifacts deserialize as `None`; `skip_serializing_if`
+    /// so a NON-split plan serializes BYTE-IDENTICALLY to before this field existed — the
+    /// plan.json integrity hash is unchanged, avoiding the cross-version plan-artifact break
+    /// the `finalize_manifest` docstring warns of (a split-unit plan is internal/ephemeral,
+    /// synthesized by the pool, never a released artifact).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub split_window: Option<crate::manifest::SplitWindow>,
     pub strategy: ExtractionStrategy,
     pub format: FormatType,
     pub compression: CompressionType,

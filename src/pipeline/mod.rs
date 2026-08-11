@@ -274,6 +274,7 @@ mod tests {
 
     fn minimal_plan() -> ResolvedRunPlan {
         ResolvedRunPlan {
+            split_window: None,
             bytes_read: Default::default(),
             export_name: "test_export".into(),
             source_table: None,

@@ -227,6 +227,7 @@ mod tests {
 
     fn base_plan() -> ResolvedRunPlan {
         ResolvedRunPlan {
+            split_window: None,
             bytes_read: Default::default(),
             export_name: "test".into(),
             source_table: None,

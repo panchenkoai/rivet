@@ -67,6 +67,10 @@ pub struct ManifestBuilder {
     /// What this run's `_rivet_row_hash` covers. Taken from the plan snapshot so
     /// the manifest cannot claim a contract the run did not actually apply.
     row_hash: Option<crate::enrich::RowHashContract>,
+    /// For an `apply --pool --split` range sub-export: the `(lo, hi]` key window this unit
+    /// covered, set from the plan's split marker so `--split --resume` reconstructs the exact
+    /// partition. `None` for a non-split export.
+    split_window: Option<crate::manifest::SplitWindow>,
 }
 
 impl ManifestBuilder {
@@ -95,6 +99,7 @@ impl ManifestBuilder {
     ) -> Self {
         Self {
             checksum_render: None,
+            split_window: None, // set later via set_split_window from the plan's SplitSynth
             run_id: run_id.to_string(),
             export_name: plan.export_name.clone(),
             export_family: export_family.to_string(),
@@ -232,7 +237,15 @@ impl ManifestBuilder {
             column_checksums: self.column_checksums,
             checksum_key_column: self.checksum_key_column,
             row_hash: self.row_hash,
+            split_window: self.split_window,
         }
+    }
+
+    /// Record the split window this unit covered (from the plan's `SplitSynth`), so
+    /// `--split --resume` reconstructs the exact original partition. No-op (`None`) for a
+    /// non-split export.
+    pub fn set_split_window(&mut self, window: Option<crate::manifest::SplitWindow>) {
+        self.split_window = window;
     }
 }
 

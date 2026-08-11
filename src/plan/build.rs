@@ -135,6 +135,13 @@ pub fn build_plan(
         source_table: export.table.clone(),
         base_query,
         is_split_unit: export.split.is_some(),
+        // Thread the split window into the plan so finalize records it in the manifest —
+        // the durable anchor for exact-partition resume (SplitSynth → manifest::SplitWindow).
+        split_window: export.split.as_ref().map(|s| crate::manifest::SplitWindow {
+            key_column: s.key_column.clone(),
+            lo: s.lo.clone(),
+            hi: s.hi.clone(),
+        }),
         strategy,
         format: export.format,
         compression,

@@ -300,6 +300,65 @@ pub fn dir_manifest_copy_total_rows(dir: &Path) -> i64 {
     total
 }
 
+/// The set of `id` values DECLARED by the run-unique manifest copies under `dir`
+/// — the orphan-immune twin of [`duckdb_dir_parquet_id_set`]. A raw-disk id-set
+/// counts every `.parquet` present, INCLUDING crash orphans a manifest never
+/// referenced; this reads only the parts the manifest copies actually declare, so
+/// it answers "what would `rivet load` (manifest-authoritative) deliver". The
+/// oracle a split-RESUME completeness claim needs: a re-sampled resume that shifts
+/// the partition drops the crashed unit's ORIGINAL key range from the manifest
+/// while the raw disk still shows the orphaned pre-crash parts (false-clean).
+///
+/// Reads by BASENAME to match [`stage_for_duckdb`], which flattens all parquet
+/// into one staging dir by file name; part names are run-unique so basenames do
+/// not collide across units.
+pub fn dir_manifest_copy_id_set(dir: &Path) -> BTreeSet<i64> {
+    let mut declared: BTreeSet<String> = BTreeSet::new();
+    for path in files_with_extension(dir, "json") {
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        if !(name.starts_with("manifest-") && name.ends_with(".json")) {
+            continue; // the bare `manifest.json` pointer, or a foreign file
+        }
+        let bytes = std::fs::read(&path).expect("read manifest copy");
+        let v: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("parse manifest copy JSON");
+        for part in v
+            .get("parts")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if let Some(p) = part.get("path").and_then(serde_json::Value::as_str) {
+                let base = p.rsplit('/').next().unwrap_or(p);
+                declared.insert(base.to_string());
+            }
+        }
+    }
+    if declared.is_empty() {
+        return BTreeSet::new();
+    }
+    let c = stage_for_duckdb(dir);
+    let list = declared
+        .iter()
+        .map(|b| format!("'{c}/{b}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let v = super::duckdb_run_sql_json(&format!(
+        "SELECT DISTINCT CAST(id AS BIGINT) FROM read_parquet([{list}])"
+    ));
+    v["rows"]
+        .as_array()
+        .unwrap_or_else(|| panic!("duckdb returned no rows array for manifest id-set"))
+        .iter()
+        .map(|r| {
+            r[0].as_str()
+                .expect("id cell is not a string")
+                .parse::<i64>()
+                .expect("id does not parse as i64")
+        })
+        .collect()
+}
+
 /// Count the DISTINCT run-unique manifest copies (`manifest-<run_id>.json`) in
 /// `dir` — one per run_id. Two runs into the same prefix that each rotate their
 /// run_id leave two files; a run that reuses (freezes) a prior run_id overwrites
