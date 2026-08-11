@@ -48,12 +48,13 @@ from pathlib import Path
 from tempfile import mkdtemp
 
 try:  # importable both as a package module and as a plain sibling file
-    from .core import HERE, ROOT, Ledger, Status, docker, docker_exec, have, rivet, rivet_bin, run
+    from .core import HERE, ROOT, Ledger, Proc, Status, docker, docker_exec, have, rivet, rivet_bin, run
 except ImportError:  # pragma: no cover - depends on how the driver is invoked
     from core import (  # type: ignore
         HERE,
         ROOT,
         Ledger,
+        Proc,
         Status,
         docker,
         docker_exec,
@@ -617,8 +618,13 @@ def _export_local(
     mode: str,
     fmt: str = "parquet",
     parallel: int | None = None,
-) -> bool:
-    """Export one table to a LOCAL dir. mode: chunked|full, fmt: parquet|csv."""
+) -> Proc:
+    """Export one table to a LOCAL dir. mode: chunked|full, fmt: parquet|csv.
+
+    Returns the Proc (not a bool) so a caller can tell an intended REFUSAL (rivet exits
+    non-zero with a specific message, e.g. CSV cannot serialize an array column) from a
+    real export FAILURE — conflating the two let a broken CSV export read as the golden
+    refusal. Callers that only need success use `.ok`."""
     yaml_path = work_dir() / f"ex_{os.getpid()}_{table.replace('.', '_')}_{fmt}.yaml"
     shutil.rmtree(dest_dir, ignore_errors=True)
     if engine == "mongo":
@@ -641,7 +647,7 @@ def _export_local(
         f"    format: {fmt}\n"
         f"    destination: {{type: local, path: {dest_dir}/}}\n"
     )
-    return rivet("run", "-c", str(yaml_path), env={"ORACLE_URL": url}, timeout=NO_TIMEOUT).ok
+    return rivet("run", "-c", str(yaml_path), env={"ORACLE_URL": url}, timeout=NO_TIMEOUT)
 
 
 # ── verdicts: init+check → {table: {strategy, verdict}} == GOLDEN ────────────
@@ -742,7 +748,7 @@ def sc_integrity_types(led: Ledger, engine: str, tag: str, url: str) -> None:
     out.mkdir(parents=True, exist_ok=True)
 
     # (1) users loss/dup — all engines.
-    if _export_local(engine, url, "users", out / "users", "chunked"):
+    if _export_local(engine, url, "users", out / "users", "chunked").ok:
         scnt = _source_count_distinct(engine, url, "users", "id")
         id_col = "_id" if engine == "mongo" else "id"
         dcnt = _duckdb_list(
@@ -760,7 +766,7 @@ def sc_integrity_types(led: Ledger, engine: str, tag: str, url: str) -> None:
     #     tests/type_roundtrip/fixtures/<eng>_schema.sql.
     if engine != "mongo":
         for tmt in ("rivet_type_matrix",):
-            if _export_local(engine, url, tmt, out / tmt, "full"):
+            if _export_local(engine, url, tmt, out / tmt, "full").ok:
                 got = _duckdb_json_normalized(
                     f"SELECT * FROM read_parquet('{out}/{tmt}/**/*.parquet') ORDER BY id"
                 )
@@ -778,11 +784,17 @@ def sc_integrity_types(led: Ledger, engine: str, tag: str, url: str) -> None:
             # way a fixed truth the compare asserts, and a regression that starts
             # emitting a corrupted array flips it.
             csv_dir = out / f"{tmt}_csv"
-            exported = _export_local(engine, url, tmt, csv_dir, "full", "csv")
+            pc = _export_local(engine, url, tmt, csv_dir, "full", "csv")
             # bash 3.2 has no globstar, so its `**/*.csv` was really one level
             # deep — mirrored here rather than an unbounded rglob.
             has_csv = bool(list(csv_dir.glob("*/*.csv")) or list(csv_dir.glob("*.csv")))
-            if exported and has_csv:
+            # rivet's INTENDED refusal exits non-zero with a specific message
+            # (src/format/csv.rs: "CSV cannot serialize column ..."). Only THAT is the
+            # golden refusal; any other non-zero exit is a real export FAILURE and must
+            # not read as the refusal sentinel (the old elif conflated the two, so a
+            # broken csv export on postgres — whose golden IS the refusal — passed green).
+            refused = (not pc.ok) and re.search(r"cannot serialize|unrepresentable", pc.out, re.IGNORECASE)
+            if pc.ok and has_csv:
                 gotc = _duckdb_json_normalized(
                     f"SELECT * FROM read_csv('{csv_dir}/**/*.csv', all_varchar=true, header=true) "
                     f"ORDER BY id"
@@ -791,10 +803,15 @@ def sc_integrity_types(led: Ledger, engine: str, tag: str, url: str) -> None:
                     fails += f"{tmt}-csv-readback "
                 elif not _fidelity_check(engine, f"{tmt}__csv", gotc):
                     fails += f"{tmt}-CSV-DIVERGED "
-            elif not _fidelity_check(
-                engine, f"{tmt}__csv", '{"csv_writer":"refused-unrepresentable-column"}'
-            ):
-                fails += f"{tmt}-CSV-REFUSAL-CHANGED "
+            elif refused:
+                if not _fidelity_check(
+                    engine, f"{tmt}__csv", '{"csv_writer":"refused-unrepresentable-column"}'
+                ):
+                    fails += f"{tmt}-CSV-REFUSAL-CHANGED "
+            else:
+                # not the intended refusal, yet no readable csv: a real export failure
+                # (or an empty write) — a bug, not the golden refusal.
+                fails += f"{tmt}-CSV-EXPORT-FAILED[exit={pc.returncode}] "
 
     if _bless("BLESS_DUCKDB"):
         _passed(led, engine, tag, "integrity_types", "-", f"blessed duckdb-types[{engine}]", "blessed")
@@ -829,7 +846,7 @@ def sc_keyset_parallel(led: Ledger, engine: str, tag: str, url: str) -> None:
         return
     out = work_dir() / f"kp_{engine}_{_tag(tag)}"
     out.mkdir(parents=True, exist_ok=True)
-    if not _export_local(engine, url, "users", out / "users", "chunked", "parquet", 4):
+    if not _export_local(engine, url, "users", out / "users", "chunked", "parquet", 4).ok:
         _failed(led, engine, tag, "keyset_parallel", "-", f"keyset_parallel[{engine}]: export failed", "export")
         return
 

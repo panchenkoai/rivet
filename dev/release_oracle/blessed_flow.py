@@ -1102,8 +1102,12 @@ def _load_leg(led: Ledger, cell: Cell, tag: str, work: Path, env: dict, url: str
         return
     # Unique per cell: the id is what the ledger check scopes on, and a shared
     # one would let one cell's rows satisfy another's assertion.
+    # + PID: work_dir().name is STABLE across gate invocations when RIVET_ORACLE_WORK is
+    # set, so without a per-invocation token the load_id repeats and _load_rows' `LIKE
+    # load_id%` count on the shared, never-reset Postgres ledger passes on a PRIOR run's
+    # rows. rivet records THIS load under this id (--run-id), so the scoping isolates it.
     load_id = (
-        f"flow-{cell.engine}-{cell.lifecycle}-{cell.state}-{scenarios.work_dir().name}"
+        f"flow-{cell.engine}-{cell.lifecycle}-{cell.state}-{scenarios.work_dir().name}-{os.getpid()}"
     )
     p = rivet("load", "-c", str(lcfg), "--rivet-bin", str(rivet_bin()),
               "--run-id", load_id, env=env, timeout=scenarios.NO_TIMEOUT)
