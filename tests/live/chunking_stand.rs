@@ -2177,13 +2177,19 @@ fn stand_partial_unique_index_is_not_a_keyset_key_mssql() {
 // RESUME mechanism is per-engine (PG slot-free chunk checkpoint, MySQL, MSSQL
 // from-LSN-free chunk checkpoint), so it is proven empirically on each. GOOD
 // data = a dense contiguous key (`seed_dense`); JUNK data = a gappy key with a
-// hole the interior split boundaries fall into (`seed_gappy_split`). The dense
-// runs also GROW the source between crash and resume — the input that would
-// shift a re-sampled partition and drop the crashed unit's original range.
+// hole the interior split boundaries fall into (`seed_gappy_split`). BOTH the
+// dense and the gappy runs GROW the source between crash and resume — the input
+// that shifts a re-sampled partition and drops the crashed unit's original range.
+// The growth is what makes these go RED against the finding-2 mutant: on an
+// UNCHANGED source the re-sample (`sample_key_boundaries`, pure over the row set)
+// reproduces the persisted partition byte-for-byte, so a no-growth resume cannot
+// tell reconstruct from re-sample and the test would be vacuous.
 //
-// 150k rows so the giant's scan time dominates fixed per-export overhead and
-// `advise_split` reliably realizes the split (a few-thousand-row giant is all
-// overhead — its predicted duration does not clear 3× the sibling's).
+// 300k rows so the giant's scan time DECISIVELY dominates fixed per-export overhead
+// and `advise_split` reliably realizes the split, matching the proven-stable size of
+// the `pool_split_resume_*` toxiproxy tests. A smaller giant is mostly fixed overhead
+// (its predicted duration does not clear 3× the sibling's), so the split — and thus
+// the crash the test needs — becomes timing-flaky across engines/CI runners.
 
 fn dense_ids(n: i64) -> std::collections::BTreeSet<i64> {
     (1..=n).collect()
@@ -2193,12 +2199,12 @@ fn dense_ids(n: i64) -> std::collections::BTreeSet<i64> {
 #[ignore = "live: requires docker compose up -d postgres"]
 fn stand_pool_split_resume_grows_postgres() {
     Eng::Pg.require();
-    let (table, _g) = seed_dense(Eng::Pg, 150_000);
+    let (table, _g) = seed_dense(Eng::Pg, 300_000);
     run_pool_split_resume(
         Eng::Pg,
         &table,
-        &dense_ids(150_000),
-        Some((150_001, 225_000)),
+        &dense_ids(300_000),
+        Some((300_001, 450_000)),
     );
 }
 
@@ -2206,12 +2212,12 @@ fn stand_pool_split_resume_grows_postgres() {
 #[ignore = "live: requires docker compose up -d mysql"]
 fn stand_pool_split_resume_grows_mysql() {
     Eng::My.require();
-    let (table, _g) = seed_dense(Eng::My, 150_000);
+    let (table, _g) = seed_dense(Eng::My, 300_000);
     run_pool_split_resume(
         Eng::My,
         &table,
-        &dense_ids(150_000),
-        Some((150_001, 225_000)),
+        &dense_ids(300_000),
+        Some((300_001, 450_000)),
     );
 }
 
@@ -2219,12 +2225,12 @@ fn stand_pool_split_resume_grows_mysql() {
 #[ignore = "live: requires docker compose up -d mssql"]
 fn stand_pool_split_resume_grows_mssql() {
     Eng::Ms.require();
-    let (table, _g) = seed_dense(Eng::Ms, 150_000);
+    let (table, _g) = seed_dense(Eng::Ms, 300_000);
     run_pool_split_resume(
         Eng::Ms,
         &table,
-        &dense_ids(150_000),
-        Some((150_001, 225_000)),
+        &dense_ids(300_000),
+        Some((300_001, 450_000)),
     );
 }
 
@@ -2232,22 +2238,22 @@ fn stand_pool_split_resume_grows_mssql() {
 #[ignore = "live: requires docker compose up -d postgres"]
 fn stand_pool_split_gappy_key_postgres() {
     Eng::Pg.require();
-    let (table, _g, ids) = seed_gappy_split(Eng::Pg, 75_000);
-    run_pool_split_resume(Eng::Pg, &table, &ids, None);
+    let (table, _g, ids) = seed_gappy_split(Eng::Pg, 150_000);
+    run_pool_split_resume(Eng::Pg, &table, &ids, Some((450_001, 525_000)));
 }
 
 #[test]
 #[ignore = "live: requires docker compose up -d mysql"]
 fn stand_pool_split_gappy_key_mysql() {
     Eng::My.require();
-    let (table, _g, ids) = seed_gappy_split(Eng::My, 75_000);
-    run_pool_split_resume(Eng::My, &table, &ids, None);
+    let (table, _g, ids) = seed_gappy_split(Eng::My, 150_000);
+    run_pool_split_resume(Eng::My, &table, &ids, Some((450_001, 525_000)));
 }
 
 #[test]
 #[ignore = "live: requires docker compose up -d mssql"]
 fn stand_pool_split_gappy_key_mssql() {
     Eng::Ms.require();
-    let (table, _g, ids) = seed_gappy_split(Eng::Ms, 75_000);
-    run_pool_split_resume(Eng::Ms, &table, &ids, None);
+    let (table, _g, ids) = seed_gappy_split(Eng::Ms, 150_000);
+    run_pool_split_resume(Eng::Ms, &table, &ids, Some((450_001, 525_000)));
 }

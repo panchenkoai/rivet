@@ -241,13 +241,16 @@ pub(crate) fn completed_units_in_prefix(
 /// re-sample (`sample_key_boundaries` is offset/percentile-based, so a source that grew
 /// between crash and resume yields DIFFERENT boundaries, and skipping completed units by
 /// ordinal name then covers a different key range than was exported → silent gap). Instead we
-/// read every unit manifest (any status — a crashed unit's Failed manifest still carries its
-/// window) and rebuild the boundary list POSITIONALLY by ordinal (`{giant}#i`), never by
-/// value-sorting the strings (a numeric key would sort lexically wrong). Each boundary `i` is
-/// `unit#i.hi` = `unit#(i+1).lo`, so it survives one unit crashing (recovered from a neighbor);
-/// a gap from ADJACENT crashes truncates to a COARSER but still-COMPLETE partition (safe — no
-/// loss, just less parallelism). Returns `None` (caller re-samples: a genuine first run) when
-/// no unit windows are found. Read-only.
+/// read every COMPLETED unit's manifest (a Success/terminal manifest carries its window; a
+/// HARD-crashed unit leaves none) and rebuild the boundary list POSITIONALLY by ordinal
+/// (`{giant}#i`), never by value-sorting the strings (a numeric key would sort lexically
+/// wrong). Each boundary `i` is `unit#i.hi` = `unit#(i+1).lo`, so it survives ONE unit
+/// crashing (recovered from a neighbor). Two ADJACENT crashes lose the boundary between them;
+/// the fill logic below reconstructs the FULL ordinal partition anyway (an unrecoverable
+/// interior boundary becomes an empty window, never a truncation) so a surviving completed
+/// unit above the gap is neither re-covered (dup) nor abandoned to a re-sample (gap). Returns
+/// `None` (caller re-samples: a genuine first run) only when NO unit windows are found at all.
+/// Read-only.
 pub(crate) fn reconstruct_units_from_prefix(
     dest_config: &crate::config::DestinationConfig,
     family: &str,
@@ -295,16 +298,47 @@ pub(crate) fn reconstruct_units_from_prefix(
         }
     }
     let key = key?;
-    // Take boundaries contiguously from position 0; a gap (adjacent crashes) stops here,
-    // yielding a coarser-but-complete partition rather than a wrong one.
-    let mut boundaries = Vec::new();
-    let mut i = 0;
-    while let Some(v) = bmap.get(&i) {
-        boundaries.push(v.clone());
-        i += 1;
+    // Rebuild the FULL boundary vector [0..=max_pos], preserving the ORIGINAL unit
+    // COUNT and ordinals. A run of ADJACENT crashes can leave an interior boundary
+    // position that NEITHER a hi nor a lo could supply — a HARD crash (SIGKILL / OOM /
+    // tunnel drop) writes no window-bearing manifest at all (the running marker carries
+    // `split_window: None` and is cloud-only), so two adjacent hard-crashed units lose
+    // the boundary between them. We FILL such a hole rather than truncate:
+    //   * forward-fill carries the last known boundary down into the hole (the
+    //     intervening unit becomes an empty `(b, b]` window — harmless, exports 0 rows);
+    //   * a LEADING hole (position 0 unrecoverable) is then back-filled from the first
+    //     known boundary.
+    // This keeps every COMPLETED unit at its exact original ordinal+window so the
+    // name-based skip still lines up, and covers each gap exactly once. The earlier
+    // "take contiguously from 0, stop at the first gap" was wrong TWO ways, both proven
+    // by the adversarial pre-merge review: (1) a leading gap left `boundaries` empty →
+    // `None` → the caller re-samples → the exact finding-2 silent GAP; (2) an interior
+    // gap DISCARDED every recoverable higher boundary → a coarser open-ended tail unit
+    // RE-COVERED a surviving completed unit above the gap → DUPLICATE rows (distinct
+    // part names, so no overwrite; both manifest-declared → double-counted at load).
+    // (A trailing adjacent crash lowers `max_pos` naturally, so the last unit is an
+    // open `(b, None]` that absorbs the crashed tail — no completed unit sits above it,
+    // so that coarsening is genuinely loss- AND dup-free.)
+    let &max_pos = bmap.keys().next_back()?; // no interior boundaries → None (first run)
+    let mut boundaries: Vec<Option<String>> =
+        (0..=max_pos).map(|i| bmap.get(&i).cloned()).collect();
+    let mut last: Option<String> = None;
+    for slot in boundaries.iter_mut() {
+        match slot.as_ref() {
+            Some(v) => last = Some(v.clone()),
+            None => slot.clone_from(&last),
+        }
     }
-    if boundaries.is_empty() {
-        return None;
+    let mut next: Option<String> = None;
+    for slot in boundaries.iter_mut().rev() {
+        match slot.as_ref() {
+            Some(v) => next = Some(v.clone()),
+            None => slot.clone_from(&next),
+        }
+    }
+    let boundaries: Vec<String> = boundaries.into_iter().flatten().collect();
+    if boundaries.len() != max_pos + 1 {
+        return None; // impossible given >=1 recovered boundary; never emit a partial set
     }
     Some(synthesize(giant, &key, &boundaries))
 }
@@ -508,6 +542,98 @@ mod tests {
         // Names must line up with ordinals so the pool's completed-unit skip stays correct.
         let names: Vec<&str> = units.iter().map(|u| u.name.as_str()).collect();
         assert_eq!(names, vec!["daily#0", "daily#1", "daily#2", "daily#3"]);
+    }
+
+    // Helper: the (lo, hi) window of each reconstructed unit, in ordinal order.
+    fn wins_of(units: &[ExportConfig]) -> Vec<(Option<String>, Option<String>)> {
+        units
+            .iter()
+            .map(|u| {
+                let s = u
+                    .split
+                    .as_ref()
+                    .expect("reconstructed unit carries a split window");
+                (s.lo.clone(), s.hi.clone())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn reconstruct_covers_a_leading_adjacent_crash_instead_of_re_sampling() {
+        // Two ADJACENT LOW-end units (#0, #1) HARD-crash — no manifest at all (a
+        // SIGKILL/OOM leaves none). #2 and #3 completed. Boundary position 0 is then
+        // unrecoverable (needs #0.hi or #1.lo). The OLD "contiguous-from-0" loop found
+        // nothing at position 0, returned None, and the caller RE-SAMPLED the (grown)
+        // source → the exact finding-2 silent gap. Reconstruct must instead back-fill the
+        // leading hole and rebuild the FULL 4-unit partition, so the completed #2/#3 keep
+        // their exact windows and #0 covers the whole crashed leading range.
+        let dir = tempfile::tempdir().unwrap();
+        let mut giant = sample_export("daily");
+        giant.mode = ExportMode::Chunked;
+        giant.chunk_by_key = Some("id".into());
+        giant.destination.path = Some(dir.path().to_string_lossy().into_owned());
+
+        // #0, #1 crashed (no manifest); #2, #3 completed.
+        write_unit_manifest(dir.path(), "daily#2", "r2", Some("500"), Some("750"));
+        write_unit_manifest(dir.path(), "daily#3", "r3", Some("750"), None);
+
+        let units = reconstruct_units_from_prefix(&giant.destination, "daily", &giant)
+            .expect("a leading adjacent crash must NOT collapse to None (that re-samples)");
+        assert_eq!(
+            wins_of(&units),
+            vec![
+                (None, Some("500".into())), // #0 covers the crashed (None,250]+(250,500]
+                (Some("500".into()), Some("500".into())), // #1 empty (interior hole filled)
+                (Some("500".into()), Some("750".into())), // #2 exact (completed, skipped)
+                (Some("750".into()), None), // #3 exact (completed, skipped)
+            ],
+            "leading hole must be back-filled into a full 4-unit partition, not re-sampled"
+        );
+    }
+
+    #[test]
+    fn reconstruct_fills_an_interior_adjacent_crash_without_overlapping_a_survivor() {
+        // #0 and #3 completed; #1 and #2 both HARD-crash (no manifest). The interior
+        // boundary between #1 and #2 is unrecoverable. The OLD loop stopped at that gap,
+        // DISCARDED the recoverable higher boundary (750), and synthesized a coarse
+        // open-ended #1=(250,None] that RE-COVERED the completed #3=(750,None] → duplicate
+        // rows at load. Reconstruct must keep the full 4-unit partition: the crashed span
+        // becomes a bounded (250,750] unit (plus an empty filler) that ends exactly where
+        // the surviving #3 begins — no overlap.
+        let dir = tempfile::tempdir().unwrap();
+        let mut giant = sample_export("daily");
+        giant.mode = ExportMode::Chunked;
+        giant.chunk_by_key = Some("id".into());
+        giant.destination.path = Some(dir.path().to_string_lossy().into_owned());
+
+        // #0, #3 completed; #1, #2 crashed (no manifest).
+        write_unit_manifest(dir.path(), "daily#0", "r0", None, Some("250"));
+        write_unit_manifest(dir.path(), "daily#3", "r3", Some("750"), None);
+
+        let units = reconstruct_units_from_prefix(&giant.destination, "daily", &giant)
+            .expect("reconstruct");
+        assert_eq!(
+            wins_of(&units),
+            vec![
+                (None, Some("250".into())),               // #0 exact (completed, skipped)
+                (Some("250".into()), Some("250".into())), // #1 empty (interior hole filled)
+                (Some("250".into()), Some("750".into())), // #2 covers the crashed span, BOUNDED
+                (Some("750".into()), None),               // #3 exact (completed, skipped)
+            ],
+            "the re-run unit must end at 750 (where completed #3 begins) — never an \
+             open-ended window that re-covers #3 and duplicates its rows"
+        );
+        // The load-bearing invariant: no reconstructed unit's window overlaps the
+        // surviving completed #3 = (750, None].
+        let overlaps_survivor = units.iter().any(|u| {
+            let s = u.split.as_ref().unwrap();
+            // a unit overlaps (750, +inf) iff its hi is None (open to +inf) AND it is not #3 itself
+            s.hi.is_none() && s.lo.as_deref() != Some("750")
+        });
+        assert!(
+            !overlaps_survivor,
+            "no re-run unit may be open-ended below the surviving #3 boundary (would dup)"
+        );
     }
 
     #[test]
