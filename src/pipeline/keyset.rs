@@ -302,6 +302,25 @@ fn partition_ranges(
 /// parts from `file_log`) and re-runs the rest from their `lo` — the run_id-based
 /// part names make the re-run OVERWRITE the crashed range's partial parts rather
 /// than accumulate duplicates. Without `chunk_checkpoint`, a fresh full pass.
+/// A stable, filename-safe tag for a keyset page's SEEK cursor — the sequential-checkpoint part
+/// name keys off it so a resume re-reading from the SAME seek OVERWRITES its rehydrated part
+/// (idempotent) instead of writing a differently-named duplicate. `None` (the first page's seek)
+/// → "start". A key VALUE → a FNV-1a hash (stable across rivet versions, unlike std's SipHash, so
+/// a resume — possibly a newer binary — reproduces the same tag for the same seek).
+fn seek_tag(seek: Option<&str>) -> String {
+    match seek {
+        None => "start".to_string(),
+        Some(v) => {
+            let mut h: u64 = 0xcbf29ce484222325;
+            for b in v.as_bytes() {
+                h ^= u64::from(*b);
+                h = h.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            format!("{h:016x}")
+        }
+    }
+}
+
 fn run_keyset_parallel(
     src: &mut dyn Source,
     plan: &ResolvedRunPlan,
@@ -1005,15 +1024,31 @@ pub(crate) fn run_keyset(
         std::collections::BTreeMap::new();
     let mut checksum_key_column: Option<String> = None;
 
-    // Destination + manifest-mode guard (Finding #44) + run-unique part stamp are
-    // fixed for the whole run — hoisted out of the page loop. Millisecond stamp:
-    // two runs into the same prefix must not clobber (run-unique part-name rule).
+    // Destination + manifest-mode guard (Finding #44) fixed for the whole run — hoisted out of
+    // the page loop. Part names key off the SANITIZED RUN_ID (stable across a resume, unique per
+    // fresh run — the run-unique part-name rule), NOT a per-invocation wall-clock stamp: a
+    // wall-clock stamp gave every resume a NEW name, so a crash in the after_manifest_update
+    // window (file_log written, cursor NOT advanced) left the pre-crash page REHYDRATED while the
+    // re-read wrote a differently-named copy — a durable MANIFEST duplicate (measured 300/1000
+    // rows on a live mysql keyset resume; convergence round-1 HIGH). Matches the parallel path.
     let frame = super::frame::RunnerFrame::open(plan)?;
     let (dest, ext) = (frame.dest, frame.ext);
-    let stamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f").to_string();
+    let run_tag = sanitize_run_id(&summary.run_id);
 
     loop {
-        let base = format!("{}_{}_keyset{}.{}", plan.export_name, stamp, pages, ext);
+        // Name the part by the SEEK cursor (`last`), not the per-invocation page counter: a
+        // re-read from the SAME seek (the un-advanced-cursor crash window) reproduces the SAME
+        // page and OVERWRITES its rehydrated part idempotently; a re-read from an ADVANCED cursor
+        // (a crash AFTER the cursor moved) has a different seek → a different name → both parts
+        // are kept. The seek is known BEFORE the read, so the name is stable at write time. The
+        // single-cursor analog of the parallel path's per-range `pk_w{range_index}` identity.
+        let base = format!(
+            "{}_{}_keyset_{}.{}",
+            plan.export_name,
+            run_tag,
+            seek_tag(last.as_deref()),
+            ext
+        );
         let Some(page) = read_keyset_page(
             src,
             plan,
@@ -1190,6 +1225,32 @@ pub(crate) fn run_keyset(
 mod tests {
     use super::*;
     use crate::config::SourceType;
+
+    // ── seek_tag: the sequential-checkpoint part-name identity ────────────────
+    const FNV_ID_000300: &str = "c4c7be0f3cc9638a"; // FNV-1a of "id-000300", pinned
+
+    #[test]
+    fn seek_tag_is_deterministic_and_distinguishes_seeks() {
+        // The dedup invariant the after_manifest_update fix rests on: the SAME seek must yield the
+        // SAME tag (so a re-read overwrites its rehydrated part), DIFFERENT seeks different tags
+        // (so an advanced-cursor re-read is kept alongside). Deterministic across calls/versions
+        // (FNV-1a), so a resume — possibly a newer binary — reproduces the crash run's names.
+        assert_eq!(seek_tag(None), "start");
+        assert_eq!(seek_tag(Some("id-000300")), seek_tag(Some("id-000300")));
+        assert_ne!(seek_tag(Some("id-000300")), seek_tag(Some("id-000600")));
+        assert_ne!(seek_tag(Some("id-000300")), seek_tag(None));
+        // Pinned literal (FNV-1a of "id-000300") — if the hash constants ever change, a
+        // mid-recovery upgrade would stop overwriting the rehydrated part and re-introduce the
+        // dup; this catches that regression.
+        assert_eq!(seek_tag(Some("id-000300")), FNV_ID_000300);
+        // 16 lowercase hex chars, always.
+        let t = seek_tag(Some("anything"));
+        assert_eq!(t.len(), 16);
+        assert!(
+            t.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
+    }
 
     // ── highest_range_max: cursor_high = the top populated range's max ────────
     #[test]

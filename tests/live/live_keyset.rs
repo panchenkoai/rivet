@@ -908,6 +908,82 @@ fn keyset_checkpoint_crash_resume_writes_a_complete_destination_manifest() {
     );
 }
 
+/// Convergence round-1 finding #3 (MEASURED): a sequential-keyset `chunk_checkpoint`
+/// resume DUPLICATES a page when the crash lands in the `after_manifest_update` window —
+/// the file_log row is written but the cursor is NOT yet advanced (commit.rs:352). On resume
+/// the pre-crash page's part is rehydrated from file_log (a keyset name has no chunk-nonce, so
+/// the superseded-attempt filter is skipped and it is kept), AND the loop re-reads from the
+/// un-advanced cursor and writes the SAME rows under a NEW per-invocation stamp — so the
+/// manifest declares that page TWICE. The existing crash test above uses `after_keyset_page:0`
+/// (AFTER the advance), so it never exercised this window. This crashes at
+/// `after_manifest_update` and asserts the destination manifest declares EXACTLY the source
+/// row count — it currently declares MORE (the measured duplication). RED against the bug.
+#[test]
+#[ignore = "live: requires docker compose up -d mysql"]
+fn keyset_checkpoint_crash_in_manifest_window_must_not_duplicate_a_page() {
+    require_alive(LiveService::Mysql);
+    let table = unique_name("keyset_dup");
+    let _guard = DropTable(table.clone());
+    let mut conn = mysql_connect();
+    conn.query_drop(format!("DROP TABLE IF EXISTS {table}"))
+        .unwrap();
+    conn.query_drop(format!(
+        "CREATE TABLE {table} (uid VARCHAR(40) NOT NULL PRIMARY KEY, payload INT NOT NULL)"
+    ))
+    .unwrap();
+    conn.query_drop("SET SESSION cte_max_recursion_depth = 20000")
+        .unwrap();
+    conn.query_drop(format!(
+        "INSERT INTO {table} (uid, payload) \
+         WITH RECURSIVE seq AS (SELECT 1 n UNION ALL SELECT n+1 FROM seq WHERE n < 1000) \
+         SELECT CONCAT('id-', LPAD(n, 6, '0')), n FROM seq"
+    ))
+    .unwrap();
+
+    let export = unique_name("keyset_dup_exp");
+    let rig = Rig::mysql_batch(&table)
+        .export_named(&export)
+        .mode("chunked")
+        .export_line("chunk_by_key: uid")
+        .export_line("chunk_checkpoint: true")
+        .export_line("chunk_size: 300");
+    let cfg = rig.config_path();
+
+    // Crash in the I3 window: page 0's file_log row is written, cursor NOT advanced.
+    let crash = std::process::Command::new(RIVET_BIN)
+        .args([
+            "run",
+            "--config",
+            cfg.to_str().unwrap(),
+            "--export",
+            &export,
+        ])
+        .env("RIVET_TEST_PANIC_AT", "after_manifest_update")
+        .output()
+        .expect("spawn rivet");
+    assert!(!crash.status.success(), "crash run must exit non-zero");
+
+    // Resume (NO panic env) — the cursor was never advanced, so it re-reads page 0.
+    let resume = run_rivet_export(&cfg, &export);
+    assert!(
+        resume.status.success(),
+        "resume must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&resume.stderr)
+    );
+
+    let m: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(rig.out_dir().join("manifest.json")).unwrap())
+            .expect("destination manifest.json must exist + parse");
+    let declared = m["row_count"].as_i64().unwrap_or(-1);
+    assert_eq!(
+        declared,
+        1000,
+        "the destination manifest must declare EXACTLY the 1000 source rows — it declared \
+         {declared} ({} duplicated), the after_manifest_update rehydrate+re-read dup",
+        declared - 1000
+    );
+}
+
 #[test]
 #[ignore = "live: requires docker compose up -d mysql"]
 fn keyset_checkpoint_resume_second_run_captures_only_new_keys() {

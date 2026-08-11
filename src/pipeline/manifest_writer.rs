@@ -328,6 +328,25 @@ pub fn record_committed_part_with_fingerprint(
     // write at len()=4 would get part_id=5 — duplicate).  Take max+1 of
     // existing part_ids instead.  Empty list → 1, matching the historical
     // first-part value.
+    // Dedup by PATH: a resume that re-reads a page whose REHYDRATED part shares this run's stable
+    // part name (keyset seek_tag / a chunked stable name) OVERWRITES the file on disk — the
+    // manifest must then carry ONE entry, not both, or finalize double-counts the page's rows (the
+    // after_manifest_update dup — measured 300/1000 on a live keyset resume, convergence round-1
+    // HIGH). Two parts sharing a path is never valid (each is a distinct file), so the re-read is
+    // authoritative: keep the existing part_id, refresh the payload in place. A first-time write
+    // (the common case) never collides and falls through to the push below unchanged.
+    if let Some(existing) = summary
+        .manifest_parts
+        .iter_mut()
+        .find(|p| p.path == relative_path)
+    {
+        existing.rows = rows;
+        existing.size_bytes = size_bytes;
+        existing.content_fingerprint = content_fingerprint;
+        existing.content_md5 = content_md5;
+        existing.status = PartStatus::Committed;
+        return;
+    }
     let part_id = summary
         .manifest_parts
         .iter()
