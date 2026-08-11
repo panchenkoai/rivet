@@ -146,6 +146,12 @@ const MATRICES: &[(&str, usize)] = &[
     // document column cannot structurally drift). 0 gaps — every runner × feature cell
     // is a test or a justified n/a.
     ("docs/runner-coverage-matrix.yaml", 0),
+    // Pool-split — `apply --pool --split` per (strategy × source engine). Split is a
+    // scheduler layer above the runners (each unit runs through chunked/keyset), so its
+    // per-engine behaviour (boundary probe, crash-recovery, finding-2 exact-partition
+    // resume) is proven on every SQL engine via the Rig stand + a DuckDB manifest oracle;
+    // Mongo is `na` (no inline SQL range literal → left whole). 0 gaps.
+    ("docs/pool-split-matrix.yaml", 0),
     // CDC per-type value fidelity — the change-stream sibling of type-fidelity, the
     // axis where findings #2 (MSSQL MONEY>2^53), #3 (MySQL ENUM cross-db) and #4
     // (BIT(64) bit 63) lived: batch correct, CDC/edge sibling not. Workhorse cells
