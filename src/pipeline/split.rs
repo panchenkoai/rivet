@@ -308,6 +308,10 @@ pub(crate) fn reconstruct_units_from_prefix(
     // i.e. unit#i.hi and unit#(i+1).lo — collected from BOTH so a single crashed unit's
     // boundaries survive via its neighbours.
     let mut bmap: std::collections::BTreeMap<usize, String> = std::collections::BTreeMap::new();
+    // Which ordinals left a manifest — a unit that completed (or at least window-committed). Used
+    // to decide whether the reconstructed OPEN TAIL is a genuine completed tail or a WIDENED one
+    // absorbing a trailing crash (below).
+    let mut manifested: std::collections::HashSet<usize> = std::collections::HashSet::new();
     for m in read_unit_manifests(dest_config, family) {
         let (Some(w), Some(ord)) = (
             m.split_window.as_ref(),
@@ -317,6 +321,7 @@ pub(crate) fn reconstruct_units_from_prefix(
         ) else {
             continue; // not a unit of THIS giant, or not a split manifest
         };
+        manifested.insert(ord);
         key.get_or_insert_with(|| w.key_column.clone());
         if let Some(h) = &w.hi {
             bmap.insert(ord, h.clone()); // boundary[ord]
@@ -393,6 +398,28 @@ pub(crate) fn reconstruct_units_from_prefix(
         if (i > 0 && filled.contains(&(i - 1))) || filled.contains(&i) {
             unit.chunk_checkpoint = false;
         }
+    }
+    // The OPEN-ENDED tail unit `(b_max, None]` is the ONE unit whose window can have WIDENED
+    // undetectably: a TRAILING adjacent crash (the top K units hard-crash with no manifest)
+    // lowers `max_pos`, so the reconstructed tail absorbs the crashed units' key range while
+    // keeping its name — but its two boundary positions are BOTH real (its lo is a surviving
+    // bmap key; its open top is not a `filled` hole), so the loop above never marks it fresh.
+    // On the PARALLEL keyset runner that is a silent loss: the tail reloads its OLD persisted
+    // ranges, and the DONE `hi=None` range (physically capped at the old ceil by run-1's
+    // base_query) is skipped from `pending` and merely rehydrated — so the widened region
+    // `(old_ceil, max]` is scanned by nobody (post-0.24.3 convergence HIGH; a prior window-
+    // fingerprint guard was reverted because the persisted outer bounds are always (None,None),
+    // making runtime detection impossible). The tail's ordinal is `max_pos + 1`; if that ordinal
+    // left NO manifest it either crashed or absorbed a trailing crash — its window may have
+    // widened, so run it FRESH (re-sample over the CURRENT window; the pre-crash orphan parts are
+    // unmanifested + gc'd, no dup/loss). If the tail ordinal DID leave a manifest it is a genuine
+    // completed/exact tail (skipped by the pool, or resumed at its true window) and keeps its
+    // checkpoint — so an interior single-crash resume is untouched. Cost: a tail re-read only on a
+    // tail-crash resume.
+    if !manifested.contains(&(max_pos + 1))
+        && let Some(tail) = units.last_mut()
+    {
+        tail.chunk_checkpoint = false;
     }
     Some(units)
 }
@@ -633,6 +660,45 @@ mod tests {
         assert!(
             reconstruct_units_from_prefix(&giant.destination, "daily", &giant).is_none(),
             "a resume must not resurrect a split for a config that is no longer splittable"
+        );
+    }
+
+    #[test]
+    fn reconstruct_runs_the_open_tail_fresh_after_a_trailing_adjacent_crash() {
+        // #0, #1 completed; the top TWO units #2, #3 both HARD-crash (no manifest). max_pos drops
+        // to 1, so reconstruct's tail #2 WIDENS from its original (500,750] to the open (500,None],
+        // absorbing crashed #3's key range. Its boundaries are both "real" (lo=500 is a bmap key,
+        // the open top is not a `filled` hole), so the interior fresh-marking never fires. On the
+        // PARALLEL keyset runner that widened tail would reload its OLD ranges and SKIP the done
+        // hi=None range (rehydrated only to run-1's ceil) — silently dropping (750, max]
+        // (post-0.24.3 convergence HIGH). The open tail must therefore run FRESH. RED against the
+        // pre-fix reconstruct (tail kept chunk_checkpoint=true).
+        let dir = tempfile::tempdir().unwrap();
+        let mut giant = sample_export("daily");
+        giant.mode = ExportMode::Chunked;
+        giant.chunk_by_key = Some("id".into());
+        giant.destination.path = Some(dir.path().to_string_lossy().into_owned());
+
+        // #0, #1 completed; #2, #3 crashed (no manifest) — a trailing double-crash.
+        write_unit_manifest(dir.path(), "daily#0", "r0", None, Some("250"));
+        write_unit_manifest(dir.path(), "daily#1", "r1", Some("250"), Some("500"));
+
+        let units = reconstruct_units_from_prefix(&giant.destination, "daily", &giant)
+            .expect("reconstruct");
+        assert_eq!(
+            wins_of(&units),
+            vec![
+                (None, Some("250".into())),               // #0 exact (completed, skipped)
+                (Some("250".into()), Some("500".into())), // #1 exact (completed, skipped)
+                (Some("500".into()), None),               // #2 WIDENED tail — must run fresh
+            ],
+            "a trailing double-crash rebuilds a 3-unit partition with an open widened tail"
+        );
+        assert_eq!(
+            units.iter().map(|u| u.chunk_checkpoint).collect::<Vec<_>>(),
+            vec![true, true, false],
+            "the open tail must run FRESH (chunk_checkpoint=false) so the widened region is \
+             re-sampled, not resumed from stale ranges that skip the done hi=None range"
         );
     }
 

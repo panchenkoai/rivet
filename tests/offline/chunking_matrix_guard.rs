@@ -378,6 +378,7 @@ fn pool_split_shared_seam_scenarios_name_existing_regression_tests() {
         "reconstruct_covers_a_leading_adjacent_crash_instead_of_re_sampling",
         "reconstruct_fills_an_interior_adjacent_crash_without_overlapping_a_survivor",
         "reconstruct_keeps_checkpoint_for_an_exactly_recovered_single_crash",
+        "reconstruct_runs_the_open_tail_fresh_after_a_trailing_adjacent_crash",
         "verify_over_a_split_prefix_catches_a_missing_non_last_unit_part",
         "split_unit_manifests_folds_every_same_family_split_sibling",
         "latest_full_over_a_split_family_selects_every_unit_not_just_the_last",
