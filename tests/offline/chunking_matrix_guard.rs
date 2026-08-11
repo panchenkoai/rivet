@@ -364,6 +364,46 @@ fn matrix_every_mapped_test_exists() {
     }
 }
 
+/// The engine-agnostic `na`-shared-seam scenarios in pool-split-matrix.yaml name their RED-proven
+/// regression test in `what` (not a `test:` cell, so [`matrix_every_mapped_test_exists`] does not
+/// reach them). Those tests ARE the regression barrier — the matrix only maps each split bug this
+/// session found to the guard that keeps it fixed. Assert every named test still EXISTS, so a
+/// renamed/deleted guard fails loud here instead of silently unmapping a bug's coverage.
+#[test]
+fn pool_split_shared_seam_scenarios_name_existing_regression_tests() {
+    let fns = all_fn_names();
+    // The regression tests the pool-split-matrix na-shared-seam `what` fields cite, one per split
+    // bug found in the post-0.24.3 review + the #217/#218 bughunts. Keep in sync with the matrix.
+    const NAMED: &[&str] = &[
+        "reconstruct_covers_a_leading_adjacent_crash_instead_of_re_sampling",
+        "reconstruct_fills_an_interior_adjacent_crash_without_overlapping_a_survivor",
+        "reconstruct_keeps_checkpoint_for_an_exactly_recovered_single_crash",
+        "verify_over_a_split_prefix_catches_a_missing_non_last_unit_part",
+        "split_unit_manifests_folds_every_same_family_split_sibling",
+        "latest_full_over_a_split_family_selects_every_unit_not_just_the_last",
+        "latest_full_over_a_split_family_takes_the_newest_run_per_unit",
+        "select_runs_full_refuses_a_mixed_generation_split_prefix",
+        "incremental_and_cdc_exports_are_not_splittable",
+        "reconstruct_refuses_to_resurrect_a_now_unsplittable_export_on_resume",
+        "mongo_source_is_not_range_split_capable",
+    ];
+    // Cross-check the list against the matrix text so a `what` that stops naming a test (or names a
+    // new one) is caught — the list must not drift from the ledger it guards.
+    let matrix_text = std::fs::read_to_string("docs/pool-split-matrix.yaml").unwrap();
+    for name in NAMED {
+        assert!(
+            fns.contains(*name),
+            "pool-split-matrix names regression test `{name}` in a `what` field, but no `fn {name}` \
+             exists under src/ or tests/ — a renamed/deleted split-bug guard unmapped its coverage"
+        );
+        assert!(
+            matrix_text.contains(name),
+            "regression test `{name}` is in the guard list but no longer cited by any \
+             pool-split-matrix `what` — drop it here or re-cite it there"
+        );
+    }
+}
+
 #[test]
 fn matrix_gaps_do_not_exceed_ratchet() {
     for (path, ceiling) in MATRICES {
