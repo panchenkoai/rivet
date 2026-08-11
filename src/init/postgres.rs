@@ -203,19 +203,46 @@ pub(super) fn density_probe(client: &mut Client, info: &mut super::TableInfo) {
     if (1..PG_PROBE_LINE).contains(&catalog) {
         return;
     }
+    let q_ident = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
+    let rel = format!("{}.{}", q_ident(&info.schema), q_ident(&info.table));
     let Some(key) = info.best_indexed_chunk_column().map(str::to_string) else {
-        info.density = Some(DensityProbe {
-            rows: catalog,
-            density: 0.0,
-            method: EstimateMethod::Unverified,
-            catalog_rows: catalog,
-            k: 0,
-            w: 0,
+        // No integer-indexed chunk key to probe density with — a uuid/text PK is keysettable but
+        // not density-probeable here. If the catalog figure is the clamped/unknown 0 (the
+        // just-restored/just-migrated moment we probe FOR), trusting it scaffolds `mode: full` on
+        // a possibly-huge table. Match MySQL's leg: an honest COUNT(*) when the catalog is
+        // small/unknown (< 1M) — correct-but-slow beats fast-but-wrong; a genuinely large catalog
+        // (>= 5M, the only other way to reach here) is trusted as-is (no scan of a huge table).
+        let counted = (catalog < 1_000_000)
+            .then(|| {
+                client
+                    .query_one(&format!("SELECT COUNT(*)::bigint FROM {rel}"), &[])
+                    .ok()
+                    .and_then(|r| r.try_get::<_, i64>(0).ok())
+            })
+            .flatten();
+        info.density = Some(match counted {
+            Some(n) => {
+                info.row_estimate = n;
+                DensityProbe {
+                    rows: n,
+                    density: 0.0,
+                    method: EstimateMethod::Counted,
+                    catalog_rows: catalog,
+                    k: 0,
+                    w: 0,
+                }
+            }
+            None => DensityProbe {
+                rows: catalog,
+                density: 0.0,
+                method: EstimateMethod::Unverified,
+                catalog_rows: catalog,
+                k: 0,
+                w: 0,
+            },
         });
         return;
     };
-    let q_ident = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
-    let rel = format!("{}.{}", q_ident(&info.schema), q_ident(&info.table));
     let kq = q_ident(&key);
     let Ok(row) = client.query_one(
         &format!("SELECT MIN({kq})::bigint, MAX({kq})::bigint FROM {rel}"),

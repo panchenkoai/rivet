@@ -149,6 +149,66 @@ fn pg_density_probe_corrects_a_never_analyzed_table() {
     let _ = c.execute(&format!("DROP TABLE IF EXISTS {table}"), &[]);
 }
 
+/// PG density probe on a never-analyzed table with a NON-INTEGER (uuid) PK: the
+/// integer-only density path is skipped (best_indexed_chunk_column requires an
+/// integer key), so before the COUNT(*) fallback the probe trusted `reltuples`
+/// clamped to 0 and init scaffolded `mode: full` on a possibly-huge just-restored
+/// table (the exact restore/migrate moment init is run). Now, matching MySQL's
+/// leg, a small/unknown catalog triggers an honest COUNT(*) so the real size wins.
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn pg_density_probe_counts_a_never_analyzed_non_integer_pk_table() {
+    require_alive(LiveService::Postgres);
+    let table = unique_name("pg_probe_uuid");
+    let mut c = pg_connect();
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {table};
+         CREATE TABLE {table} (id UUID PRIMARY KEY, payload INT NOT NULL);
+         INSERT INTO {table} SELECT gen_random_uuid(), g FROM generate_series(1, 150000) g;"
+    ))
+    .unwrap();
+    let reltuples: f32 = c
+        .query_one(
+            "SELECT reltuples FROM pg_class WHERE relname = $1",
+            &[&table],
+        )
+        .unwrap()
+        .get(0);
+    assert!(
+        reltuples <= 0.0,
+        "fixture must be un-analyzed (reltuples {reltuples} should be -1/0)"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let out_yaml = dir.path().join("probe.yaml");
+    let out = run_rivet_env(
+        &[
+            "init",
+            "--source",
+            POSTGRES_URL,
+            "--table",
+            &format!("public.{table}"),
+            "-o",
+            out_yaml.to_str().unwrap(),
+        ],
+        &[],
+    );
+    assert!(
+        out.status.success(),
+        "init: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let yaml = std::fs::read_to_string(&out_yaml).unwrap();
+    // The COUNT(*) fallback corrects row_estimate 0 → 150000, so init must NOT scaffold the
+    // small-table `mode: full`. Before the fallback it trusted 0 and wrote `mode: full`.
+    assert!(
+        !yaml.contains("mode: full"),
+        "a never-analyzed 150k uuid-PK table must not scaffold `mode: full` (COUNT(*) fallback \
+         should overrule reltuples=0):\n{yaml}"
+    );
+    let _ = c.execute(&format!("DROP TABLE IF EXISTS {table}"), &[]);
+}
+
 /// #148 (roast 2026-08-10, gate exit 101): the MySQL density probe read
 /// MIN/MAX as (Option<i64>, Option<i64>); a BIGINT UNSIGNED key past i64::MAX
 /// made the mysql crate's FromRow PANIC (not a catchable Err), crashing
