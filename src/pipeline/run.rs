@@ -854,7 +854,26 @@ pub(crate) fn run_pool(
                     .find(|e| &e.name == giant)
                     .expect("advise_split names an export in the set")
                     .clone();
-                match super::split::probe_and_synthesize(&config, &base, &config_dir, *n)? {
+                // On --resume, RECONSTRUCT the exact partition the prior run used from its
+                // units' persisted windows — never re-sample (finding 2: sample_key_boundaries
+                // is offset/percentile-based, so a source that grew between crash and resume
+                // yields different boundaries, and the name-based skip below then covers a
+                // different key range than was exported → silent gap). Re-probe only when there
+                // is no prior split in the prefix (a genuine first run).
+                let units_opt = match resume
+                    .then(|| {
+                        super::split::reconstruct_units_from_prefix(
+                            &base.destination,
+                            &base.family(),
+                            &base,
+                        )
+                    })
+                    .flatten()
+                {
+                    Some(u) => Some(u),
+                    None => super::split::probe_and_synthesize(&config, &base, &config_dir, *n)?,
+                };
+                match units_opt {
                     Some(units) => {
                         let realized = units.len();
                         split_info = Some((base.destination.clone(), base.family()));

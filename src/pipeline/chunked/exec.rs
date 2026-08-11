@@ -609,6 +609,7 @@ mod tests {
 
     fn chunked_plan_struct() -> ResolvedRunPlan {
         ResolvedRunPlan {
+            split_window: None,
             bytes_read: Default::default(),
             export_name: "orders".into(),
             source_table: None,

@@ -326,6 +326,29 @@ pub struct RunManifest {
     /// Optional for back-compat; older manifests omit it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub row_hash: Option<crate::enrich::RowHashContract>,
+    /// For an `apply --pool --split` range sub-export: the `(lo, hi]` key window THIS unit
+    /// covered. Persisted so `--split --resume` RECONSTRUCTS the exact original partition
+    /// from the prior run's manifests instead of RE-SAMPLING — the boundary sampler
+    /// (`keyset::sample_key_boundaries`) is offset/percentile-based, so it is unstable under
+    /// inserts/deletes: a source that grew between crash and resume shifts the boundaries,
+    /// and skipping completed units by ordinal name then covers a DIFFERENT key range than
+    /// was exported, silently dropping rows. `None` for a non-split export. Serde-default so
+    /// pre-existing manifests still parse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub split_window: Option<SplitWindow>,
+}
+
+/// The half-open key window `(lo, hi]` an `apply --pool --split` sub-export covered.
+/// `lo = None` ⇒ no floor (first unit), `hi = None` ⇒ no ceil (last unit) — the same
+/// defer-nothing convention `pipeline::split::windows` builds. Persisted in
+/// [`RunManifest::split_window`] so split resume reconstructs the exact original partition.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SplitWindow {
+    pub key_column: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lo: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hi: Option<String>,
 }
 
 /// Status of the run *as recorded by the writer*.
@@ -552,6 +575,7 @@ mod tests {
             .filter(|p| p.status == PartStatus::Committed)
             .count() as u32;
         RunManifest {
+            split_window: None,
             checksum_render: None,
             row_hash: None,
             mode: "batch".to_string(),

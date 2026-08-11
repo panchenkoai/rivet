@@ -643,6 +643,7 @@ mod tests {
         let row_count = parts.iter().map(|p| p.rows).sum();
         let part_count = parts.len() as u32;
         RunManifest {
+            split_window: None,
             checksum_render: None,
             row_hash: None,
             mode: "batch".to_string(),
@@ -690,6 +691,7 @@ mod tests {
         use crate::config::{DestinationConfig, DestinationType, SourceConfig, SourceType};
         use crate::tuning::SourceTuning;
         crate::plan::ResolvedRunPlan {
+            split_window: None,
             bytes_read: Default::default(),
             export_name: "orders".into(),
             source_table: None,

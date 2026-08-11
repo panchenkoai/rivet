@@ -887,6 +887,7 @@ fn build_manifest(
 ) -> RunManifest {
     RunManifest {
         manifest_version: MANIFEST_VERSION,
+        split_window: None, // CDC is a stream, never range-split
         mode: "cdc".to_string(),
         run_id: run_id.to_string(),
         // `export_name` stays the TABLE string — established wire format that

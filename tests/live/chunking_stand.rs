@@ -96,6 +96,187 @@ impl Eng {
             Eng::Ms => Rig::mssql_batch(&format!("dbo.{table}")),
         }
     }
+
+    /// The schema-qualified table name to embed in a raw `also_export` query —
+    /// same qualification [`Eng::rig`] applies to the main export's `table:`.
+    fn qualified(self, table: &str) -> String {
+        match self {
+            Eng::Pg => format!("public.{table}"),
+            Eng::My => table.to_string(),
+            Eng::Ms => format!("dbo.{table}"),
+        }
+    }
+}
+
+/// Append `id`s `lo..=hi` (payload = id) to a `(id BIGINT PK, payload INT)` stand
+/// table — the source-GROWTH leg of the split-resume scenario, per engine.
+fn insert_dense_range(eng: Eng, table: &str, lo: i64, hi: i64) {
+    match eng {
+        Eng::Pg => {
+            let mut c = pg_connect();
+            c.batch_execute(&format!(
+                "INSERT INTO {table} (id, payload) SELECT g, g FROM generate_series({lo}, {hi}) g"
+            ))
+            .unwrap();
+        }
+        Eng::My => {
+            let mut c = mysql_connect();
+            c.query_drop(format!(
+                "SET SESSION cte_max_recursion_depth = {}",
+                hi - lo + 10
+            ))
+            .unwrap();
+            c.query_drop(format!(
+                "INSERT INTO {table} (id, payload) \
+                 WITH RECURSIVE seq AS (SELECT {lo} n UNION ALL SELECT n+1 FROM seq WHERE n < {hi}) \
+                 SELECT n, n FROM seq"
+            ))
+            .unwrap();
+        }
+        Eng::Ms => {
+            mssql_exec(&format!(
+                "INSERT INTO {table} (id, payload) \
+                 SELECT value, value FROM GENERATE_SERIES(CAST({lo} AS BIGINT), CAST({hi} AS BIGINT))"
+            ));
+        }
+    }
+}
+
+/// Seed a GAPPY (but not sparse) `(id BIGINT PK, payload INT)` table at split
+/// scale: two dense blocks of `block` rows separated by a `block`-wide hole
+/// (`1..=block` and `2*block+1..=3*block`), `2*block` rows over a span of
+/// `3*block` (ratio ~1.5, below the sparse floor so the split is not refused).
+/// The interior split boundaries land in or beside the hole — the exact shape a
+/// re-sample would place differently after growth. Returns the table, cleanup,
+/// and the full id set.
+fn seed_gappy_split(
+    eng: Eng,
+    block: i64,
+) -> (String, StandCleanup, std::collections::BTreeSet<i64>) {
+    let (table, guard) = seed_dense(eng, block); // 1..=block
+    insert_dense_range(eng, &table, 2 * block + 1, 3 * block); // the far block, past the hole
+    let ids: std::collections::BTreeSet<i64> =
+        (1..=block).chain(2 * block + 1..=3 * block).collect();
+    (table, guard, ids)
+}
+
+/// Split+pool crash-resume across a stand shape — the engine-agnostic proof of
+/// finding 2 (split-window persistence). `table` holds `original_ids`; a small
+/// sibling export makes the giant the clear long pole so `advise_split` realizes
+/// the split into the pool. Run 1 splits and crashes a unit mid-way; if `grow`
+/// is set the source then GAINS rows `grow.0..=grow.1` (the input that shifts a
+/// re-sampled partition); run 2 resumes. The manifest must DECLARE every
+/// ORIGINAL id afterwards — read with the orphan-immune `dir_manifest_copy_id_set`
+/// (a crash leaves pre-shift orphans a raw read would miscount). Whether the new
+/// rows also land depends on which unit held the open window, so only the
+/// original-snapshot guarantee is asserted.
+fn run_pool_split_resume(
+    eng: Eng,
+    table: &str,
+    original_ids: &std::collections::BTreeSet<i64>,
+    grow: Option<(i64, i64)>,
+) {
+    // Default arm: RANGE chunking (`chunk_column`), crashed mid-chunk via the chunked
+    // runner's `chunk_export` error hook.
+    run_pool_split_resume_with(
+        eng,
+        table,
+        original_ids,
+        grow,
+        "chunk_column: id",
+        ("RIVET_TEST_ERROR_AT", "chunk_export:1"),
+    );
+}
+
+/// As [`run_pool_split_resume`] but with the key STRATEGY line and the mid-run crash
+/// hook parameterised, so the identical split→crash→(grow)→resume proof runs over BOTH
+/// range chunking (`chunk_column` + `chunk_export` error) AND keyset (`chunk_by_key` +
+/// the `after_keyset_page` PANIC — the keyset runner has no `chunk_export` hook, and a
+/// panic is the hard-crash-with-no-manifest shape the reconstruct fill must survive).
+fn run_pool_split_resume_with(
+    eng: Eng,
+    table: &str,
+    original_ids: &std::collections::BTreeSet<i64>,
+    grow: Option<(i64, i64)>,
+    key_line: &str,
+    crash: (&str, &str),
+) {
+    let n = original_ids.len() as i64;
+    let chunk = (n / 4).max(1); // 2 units of n/2 → 2 chunks/pages each → the hook fires
+    let sibling_q = format!("SELECT id FROM {} WHERE id <= 100", eng.qualified(table));
+    let rig = eng
+        .rig(table)
+        .mode("chunked")
+        .export_line(key_line)
+        .export_line(&format!("chunk_size: {chunk}"))
+        .export_line("parallel_safe: true")
+        .also_export("split_sibling", &sibling_q)
+        .also_export_line("parallel_safe: true");
+    let cfg = rig.config_path();
+
+    // Prime durations, clear, so the split fires on run 1.
+    assert!(
+        run_rivet_env(&["apply", cfg.to_str().unwrap(), "--pool", "2"], &[])
+            .status
+            .success(),
+        "priming run must succeed"
+    );
+    for d in [rig.out_dir(), rig.out_dir_for("split_sibling")] {
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+    }
+
+    // Run 1: split + crash a unit mid-way.
+    let crashed = run_rivet_env(
+        &["apply", cfg.to_str().unwrap(), "--pool", "2", "--split"],
+        &[crash],
+    );
+    assert!(
+        !crashed.status.success(),
+        "run 1 must fail (a unit errored mid-split):\n{}",
+        String::from_utf8_lossy(&crashed.stderr)
+    );
+    let partial = duckdb_total_parquet_rows(&rig.out_dir()) as i64;
+    assert!(
+        partial < n,
+        "run 1 must leave the split INCOMPLETE (a unit crashed), got {partial} of {n}"
+    );
+
+    // Optional source growth between the crash and the resume.
+    if let Some((lo, hi)) = grow {
+        insert_dense_range(eng, table, lo, hi);
+    }
+
+    // Run 2: split + resume — must reconstruct the ORIGINAL partition.
+    let resumed = run_rivet_env(
+        &[
+            "apply",
+            cfg.to_str().unwrap(),
+            "--pool",
+            "2",
+            "--split",
+            "--resume",
+        ],
+        &[],
+    );
+    assert!(
+        resumed.status.success(),
+        "resume run must succeed:\n{}",
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+
+    let declared = dir_manifest_copy_id_set(&rig.out_dir());
+    let missing: Vec<i64> = original_ids
+        .iter()
+        .copied()
+        .filter(|id| !declared.contains(id))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "resume must preserve every ORIGINAL id in the manifest: {} of {n} missing (e.g. {:?})",
+        missing.len(),
+        &missing[..missing.len().min(8)]
+    );
 }
 
 /// Drops the stand's temp table on scope exit, per engine.
@@ -2013,4 +2194,157 @@ fn stand_partial_unique_index_is_not_a_keyset_key_mysql() {
 #[ignore = "live: requires docker compose up -d mssql"]
 fn stand_partial_unique_index_is_not_a_keyset_key_mssql() {
     run_partial_unique_index_is_not_a_keyset_key(Eng::Ms);
+}
+
+// ─── Split+pool crash-resume across engines, on GOOD and JUNK stand data ───────
+//
+// Finding 2 (split-window persistence) is engine-agnostic in the code but the
+// RESUME mechanism is per-engine (PG slot-free chunk checkpoint, MySQL, MSSQL
+// from-LSN-free chunk checkpoint), so it is proven empirically on each. GOOD
+// data = a dense contiguous key (`seed_dense`); JUNK data = a gappy key with a
+// hole the interior split boundaries fall into (`seed_gappy_split`). BOTH the
+// dense and the gappy runs GROW the source between crash and resume — the input
+// that shifts a re-sampled partition and drops the crashed unit's original range.
+// The growth is what makes these go RED against the finding-2 mutant: on an
+// UNCHANGED source the re-sample (`sample_key_boundaries`, pure over the row set)
+// reproduces the persisted partition byte-for-byte, so a no-growth resume cannot
+// tell reconstruct from re-sample and the test would be vacuous.
+//
+// 300k rows so the giant's scan time DECISIVELY dominates fixed per-export overhead
+// and `advise_split` reliably realizes the split, matching the proven-stable size of
+// the `pool_split_resume_*` toxiproxy tests. A smaller giant is mostly fixed overhead
+// (its predicted duration does not clear 3× the sibling's), so the split — and thus
+// the crash the test needs — becomes timing-flaky across engines/CI runners.
+
+fn dense_ids(n: i64) -> std::collections::BTreeSet<i64> {
+    (1..=n).collect()
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn stand_pool_split_resume_grows_postgres() {
+    Eng::Pg.require();
+    let (table, _g) = seed_dense(Eng::Pg, 300_000);
+    run_pool_split_resume(
+        Eng::Pg,
+        &table,
+        &dense_ids(300_000),
+        Some((300_001, 450_000)),
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mysql"]
+fn stand_pool_split_resume_grows_mysql() {
+    Eng::My.require();
+    let (table, _g) = seed_dense(Eng::My, 300_000);
+    run_pool_split_resume(
+        Eng::My,
+        &table,
+        &dense_ids(300_000),
+        Some((300_001, 450_000)),
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mssql"]
+fn stand_pool_split_resume_grows_mssql() {
+    Eng::Ms.require();
+    let (table, _g) = seed_dense(Eng::Ms, 300_000);
+    run_pool_split_resume(
+        Eng::Ms,
+        &table,
+        &dense_ids(300_000),
+        Some((300_001, 450_000)),
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn stand_pool_split_gappy_key_postgres() {
+    Eng::Pg.require();
+    let (table, _g, ids) = seed_gappy_split(Eng::Pg, 150_000);
+    run_pool_split_resume(Eng::Pg, &table, &ids, Some((450_001, 525_000)));
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mysql"]
+fn stand_pool_split_gappy_key_mysql() {
+    Eng::My.require();
+    let (table, _g, ids) = seed_gappy_split(Eng::My, 150_000);
+    run_pool_split_resume(Eng::My, &table, &ids, Some((450_001, 525_000)));
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mssql"]
+fn stand_pool_split_gappy_key_mssql() {
+    Eng::Ms.require();
+    let (table, _g, ids) = seed_gappy_split(Eng::Ms, 150_000);
+    run_pool_split_resume(Eng::Ms, &table, &ids, Some((450_001, 525_000)));
+}
+
+// ─── Split+pool crash-resume on a KEYSET key (chunk_by_key), across engines ─────
+//
+// The runner-bypass check the review demanded: `chunk_by_key` (keyset) IS splittable
+// (splittable_key returns Some for it — only CDC and cursor_column/incremental are
+// refused), and the split window is applied at the SHARED build_plan seam
+// (wrap_key_range), so it composes with the keyset runner exactly as with range
+// chunking. These prove keyset pool-split works END-TO-END across a crash (split →
+// crash → grow → resume → every original id declared), per engine via the Rig + DuckDB
+// manifest oracle.
+//
+// SCOPE (honest): these do NOT isolate the finding-2 reconstruct mutant. The single
+// keyset runner has only PANIC hooks (`after_keyset_page`), no returning-error hook
+// like the chunked runner's `chunk_export`; a panic kills the whole pool process with
+// both giant units mid-page, so NO completed giant unit survives to misalign against a
+// re-sample — with reconstruct disabled the resume simply re-runs both fresh and still
+// completes (verified: the mutant stays GREEN here). The finding-2 reconstruct
+// guarantee is RUNNER-AGNOSTIC (it operates on the manifests, not the runner) and is
+// RED-proven by the unit tests `reconstruct_{covers_a_leading,fills_an_interior}_
+// adjacent_crash_*`; the RANGE stand tests above (`stand_pool_split_resume_grows_*`,
+// `stand_pool_split_gappy_key_*`) are the live finding-2 guards that DO bite the mutant.
+
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn stand_pool_split_keyset_recovers_a_crash_postgres() {
+    Eng::Pg.require();
+    let (table, _g) = seed_dense(Eng::Pg, 300_000);
+    run_pool_split_resume_with(
+        Eng::Pg,
+        &table,
+        &dense_ids(300_000),
+        Some((300_001, 450_000)),
+        "chunk_by_key: id",
+        ("RIVET_TEST_PANIC_AT", "after_keyset_page:1"),
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mysql"]
+fn stand_pool_split_keyset_recovers_a_crash_mysql() {
+    Eng::My.require();
+    let (table, _g) = seed_dense(Eng::My, 300_000);
+    run_pool_split_resume_with(
+        Eng::My,
+        &table,
+        &dense_ids(300_000),
+        Some((300_001, 450_000)),
+        "chunk_by_key: id",
+        ("RIVET_TEST_PANIC_AT", "after_keyset_page:1"),
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mssql"]
+fn stand_pool_split_keyset_recovers_a_crash_mssql() {
+    Eng::Ms.require();
+    let (table, _g) = seed_dense(Eng::Ms, 300_000);
+    run_pool_split_resume_with(
+        Eng::Ms,
+        &table,
+        &dense_ids(300_000),
+        Some((300_001, 450_000)),
+        "chunk_by_key: id",
+        ("RIVET_TEST_PANIC_AT", "after_keyset_page:1"),
+    );
 }

@@ -1592,6 +1592,7 @@ mod tests {
 
     fn chunked_plan_with_quality(quality: Option<QualityConfig>) -> ResolvedRunPlan {
         ResolvedRunPlan {
+            split_window: None,
             bytes_read: Default::default(),
             export_name: "orders".into(),
             source_table: None,

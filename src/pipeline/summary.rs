@@ -1149,6 +1149,7 @@ mod tests {
         };
         use crate::tuning::SourceTuning;
         let plan = ResolvedRunPlan {
+            split_window: None,
             bytes_read: Default::default(),
             export_name: "orders".into(),
             source_table: None,
@@ -1286,6 +1287,7 @@ mod tests {
         };
         use crate::tuning::SourceTuning;
         let plan = ResolvedRunPlan {
+            split_window: None,
             bytes_read: Default::default(),
             export_name: "events".into(),
             source_table: None,
@@ -1362,6 +1364,7 @@ mod tests {
         };
         use crate::tuning::SourceTuning;
         ResolvedRunPlan {
+            split_window: None,
             bytes_read: Default::default(),
             export_name: export_name.into(),
             source_table: None,

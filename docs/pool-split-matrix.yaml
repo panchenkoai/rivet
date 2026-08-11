@@ -1,0 +1,58 @@
+# Pool-split coverage matrix — `apply --pool --split` breaks the single-export
+# makespan floor by synthesizing N range sub-exports over the giant's key span
+# (#167). Split is a SCHEDULER layer above the runners: each unit is a first-class
+# export that runs through the chunked or keyset runner, so its per-engine behaviour
+# (probe boundaries via inline_literal, crash-recovery, resume) must be proven on
+# EVERY SQL engine — the same runner-bypass discipline as docs/runner-coverage-matrix.yaml,
+# one axis over (strategy × engine) instead of (feature × runner).
+#
+# Columns are the four source engines (the generative column guard requires every
+# SourceType). The three SQL engines range-split; Mongo is an `na` column on every
+# scenario, by construction:
+#   * Mongo — no inline SQL range literal (`inline_literal` is unreachable), so
+#     `source_type_supports_split` leaves a Mongo giant WHOLE (it fans out via its own
+#     keyset/parallel path). Every cell is `na`.
+#   * incremental (`cursor_column`) and CDC — refused by `splittable_key` (a single
+#     per-export cursor / a stream is not a range to partition), so a split is never
+#     silently lossy. Not scenarios here.
+#
+# The finding-2 RECONSTRUCT guarantee (resume rebuilds the EXACT persisted partition
+# instead of re-sampling `sample_key_boundaries`, which shifts under source growth) is
+# RUNNER-AGNOSTIC — it operates on the unit manifests, not the runner — and is RED-proven
+# at the unit level by `reconstruct_covers_a_leading_adjacent_crash_instead_of_re_sampling`
+# and `reconstruct_fills_an_interior_adjacent_crash_without_overlapping_a_survivor`
+# (both go RED against the pre-fix "truncate at the first gap" loop). The RANGE live
+# scenarios below ALSO bite the reconstruct mutant end-to-end (they grow the source, so a
+# re-sample diverges → fingerprint-mismatch abort with reconstruct disabled). The keyset
+# live scenario does NOT isolate the mutant (the single keyset runner has only panic hooks,
+# no returning-error hook, so no completed giant unit survives a crash to misalign a
+# re-sample) — it proves the keyset split path works end-to-end across a crash; its
+# finding-2 guarantee rests on the runner-agnostic unit tests. Said in the cell `what`.
+#
+# All cells verify through the canonical Rig stand + an INDEPENDENT DuckDB oracle
+# (`dir_manifest_copy_id_set` — manifest-declared parts, orphan-immune; a raw parquet
+# read counts crash orphans and reads false-clean). 0 gaps.
+
+engines: [postgres, mysql, mssql, mongo]
+
+scenarios:
+  - id: range_split_resume_after_source_growth
+    what: "GOOD data (dense contiguous key). --pool --split, crash a unit mid-chunk (chunk_export error hook), GROW the source +50%, resume. Every ORIGINAL id must be declared by the manifest — reconstruct rebuilds the exact partition, never a re-sample. RED-proven vs the reconstruct mutant (grow shifts the re-sampled boundary → chunk-plan-fingerprint abort with reconstruct disabled)."
+    postgres: { test: stand_pool_split_resume_grows_postgres }
+    mysql:    { test: stand_pool_split_resume_grows_mysql }
+    mssql:    { test: stand_pool_split_resume_grows_mssql }
+    mongo:    { na: "no inline SQL range literal (inline_literal is unreachable for Mongo) — source_type_supports_split leaves a Mongo giant WHOLE; it fans out via its own keyset/parallel path, never a range split" }
+
+  - id: range_split_junk_gappy_key
+    what: "JUNK data (a gappy key: two dense blocks separated by a hole the interior split boundaries fall into, below the sparse floor so the split is not refused). --pool --split, crash, grow, resume — the split survives a gappy key with no gap/dup. Also grows, so it too bites the reconstruct mutant."
+    postgres: { test: stand_pool_split_gappy_key_postgres }
+    mysql:    { test: stand_pool_split_gappy_key_mysql }
+    mssql:    { test: stand_pool_split_gappy_key_mssql }
+    mongo:    { na: "no inline SQL range literal (inline_literal is unreachable for Mongo) — source_type_supports_split leaves a Mongo giant WHOLE; it fans out via its own keyset/parallel path, never a range split" }
+
+  - id: keyset_split_crash_resume_completes
+    what: "chunk_by_key (keyset) IS splittable; the split window is applied at the shared build_plan seam (wrap_key_range) so it composes with the keyset runner. --pool --split, crash a unit (after_keyset_page PANIC — the keyset runner has no chunk_export hook), grow, resume → every original id declared. Proves keyset pool-split works END-TO-END across a crash. Does NOT isolate the finding-2 mutant (single keyset has only panic hooks → no completed survivor to misalign a re-sample); that guarantee is the runner-agnostic reconstruct_* unit tests'."
+    postgres: { test: stand_pool_split_keyset_recovers_a_crash_postgres }
+    mysql:    { test: stand_pool_split_keyset_recovers_a_crash_mysql }
+    mssql:    { test: stand_pool_split_keyset_recovers_a_crash_mssql }
+    mongo:    { na: "no inline SQL range literal (inline_literal is unreachable for Mongo) — source_type_supports_split leaves a Mongo giant WHOLE; it fans out via its own keyset/parallel path, never a range split" }

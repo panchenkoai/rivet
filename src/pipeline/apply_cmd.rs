@@ -286,6 +286,7 @@ mod tests {
 
     fn unreachable_plan() -> ResolvedRunPlan {
         ResolvedRunPlan {
+            split_window: None,
             bytes_read: Default::default(),
             export_name: "orders".into(),
             source_table: None,

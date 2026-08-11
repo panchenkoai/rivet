@@ -581,6 +581,7 @@ mod tests {
         };
         // A finalized run: 2 committed parts, 20 rows.
         let manifest = RunManifest {
+            split_window: None,
             checksum_render: None,
             row_hash: None,
             manifest_version: MANIFEST_VERSION,
