@@ -539,5 +539,20 @@ fn pool_split_resume_recovers_a_crashed_partial_with_no_gap_or_dup() {
          parts, or re-ran with a fresh run_id beside the survivors, fails here"
     );
 
+    // MANIFEST-authoritative oracle (the raw parquet count above is blind to it): the
+    // resuming unit's pre-crash COMPLETED-chunk parts must be DECLARED by the manifest,
+    // not merely present on disk. On resume the unit's M8 preamble reads the SHARED
+    // canonical manifest.json (last-writer-wins → a completed SIBLING's run_id), takes the
+    // foreign-manifest branch, and must still rehydrate ITS OWN committed parts from
+    // file_log — else they sit on disk unmanifested and `rivet load` (manifest-authoritative)
+    // silently misses them. Sum of the run-unique manifest copies must equal the whole table.
+    assert_eq!(
+        dir_manifest_copy_total_rows(&rig.out_dir()),
+        N,
+        "the manifest copies must DECLARE every row after resume — a resuming split unit \
+         whose canonical manifest is a sibling's (foreign run_id) must rehydrate its own \
+         pre-crash committed parts, else they are on disk but unmanifested (silent load loss)"
+    );
+
     let _ = c.batch_execute(&format!("DROP TABLE IF EXISTS {table};"));
 }

@@ -22,7 +22,7 @@
 
 use std::path::Path;
 
-use crate::config::{Config, ExportConfig, ExportMode, SplitSynth};
+use crate::config::{Config, ExportConfig, ExportMode, SourceType, SplitSynth};
 use crate::error::Result;
 
 /// The N half-open key windows `(lo, hi]` that partition the whole key span,
@@ -56,6 +56,15 @@ fn windows(bounds: &[String]) -> Vec<(Option<String>, Option<String>)> {
 /// A plain `mode: full` export (chunk_column ignored) is NOT split — it has no
 /// per-unit checkpoint, so a crashed unit could not resume without duplicating.
 /// Returns the key column, or `None` (leave the export whole).
+/// Whether a source can be RANGE-SPLIT into `WHERE key > lo AND key <= hi` sub-exports.
+/// MongoDB cannot: it has no inline SQL range literal ([`crate::source::query::inline_literal`]
+/// is `unreachable!()` for it — a key window is expressed through the driver, not a textual
+/// predicate), so a split unit would PANIC at plan build. `--pool --split` therefore leaves a
+/// Mongo giant WHOLE (its own keyset/parallel path fans out differently) rather than crash.
+pub(crate) fn source_type_supports_split(st: SourceType) -> bool {
+    !matches!(st, SourceType::Mongo)
+}
+
 pub(crate) fn splittable_key(export: &ExportConfig) -> Option<String> {
     if export.mode == ExportMode::Cdc {
         return None; // a stream, not a range scan
@@ -137,6 +146,12 @@ pub(crate) fn probe_and_synthesize(
     config_dir: &Path,
     n: usize,
 ) -> Result<Option<Vec<ExportConfig>>> {
+    // MongoDB has no inline SQL range literal, so a range-split unit would panic at plan
+    // build (inline_literal is unreachable for Mongo). Leave a Mongo giant whole — fail
+    // fast BEFORE the boundary probe, never crash. Every SQL engine range-splits normally.
+    if !source_type_supports_split(config.source.source_type) {
+        return Ok(None);
+    }
     let Some(key) = splittable_key(giant) else {
         return Ok(None);
     };
@@ -148,6 +163,30 @@ pub(crate) fn probe_and_synthesize(
     // cover. `resume=false`: the probe is read-only.
     let plan = crate::plan::build_plan(config, giant, config_dir, false, false, false, None)?;
     let mut src = crate::source::create_source(&plan.source)?;
+    // NULL-keyed guard for a RANGE split (chunk_column). Each unit's window is
+    // `key > lo AND key <= hi`, which excludes NULL (SQL 3-valued logic), and the
+    // per-unit `bail_if_null_keyed` is BLIND on a split unit because it probes the
+    // already-windowed subquery — so NULL-keyed rows would be SILENTLY DROPPED while
+    // every unit reports success. The un-split chunked path bails loudly (and
+    // chunk_dense covers NULLs); the split cannot, so refuse it here against the WHOLE
+    // table's key domain, before any unit runs. Keyset (chunk_by_key) keys are
+    // planner-enforced NOT NULL — exempt; only chunk_column/dense range keys can be null.
+    if giant.chunk_by_key.is_none() && giant.chunk_column.is_some() {
+        let probe =
+            crate::sql::null_key_probe_sql(config.source.source_type, &key, &plan.base_query);
+        if src.as_mut().query_scalar(&probe)?.is_some() {
+            anyhow::bail!(
+                "export '{}': `--pool --split` over chunk_column '{}' would SILENTLY DROP \
+                 NULL-keyed rows — each range sub-export's window excludes NULL, and unlike the \
+                 un-split path (which bails or, with chunk_dense, covers them) the split has no \
+                 way to carry them. Fix one of: use a NOT NULL column; add `WHERE {} IS NOT NULL` \
+                 to drop them explicitly; or run this export with `mode: full` (unsplit).",
+                giant.name,
+                key,
+                key
+            );
+        }
+    }
     let bounds = super::keyset::sample_key_boundaries(src.as_mut(), &plan, &key, n, None, None)?;
     if bounds.is_empty() {
         // Too few distinct keys to partition (a tiny or single-valued key) —
@@ -290,5 +329,18 @@ mod tests {
         let mut nokey = sample_export("n");
         nokey.mode = ExportMode::Chunked;
         assert!(splittable_key(&nokey).is_none());
+    }
+
+    #[test]
+    fn mongo_source_is_not_range_split_capable() {
+        // inline_literal is unreachable!() for Mongo, so a range split would PANIC at plan
+        // build — probe_and_synthesize must leave a Mongo giant whole. Every SQL engine splits.
+        assert!(
+            !source_type_supports_split(SourceType::Mongo),
+            "Mongo has no inline SQL range literal — range-splitting it would panic"
+        );
+        assert!(source_type_supports_split(SourceType::Postgres));
+        assert!(source_type_supports_split(SourceType::Mysql));
+        assert!(source_type_supports_split(SourceType::Mssql));
     }
 }

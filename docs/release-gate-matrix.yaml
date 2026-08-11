@@ -141,9 +141,13 @@ preflights:
     infra: [mysql-replica]
     status: test        # verify_replica_read — drives cdc_reads_changes_from_a_replica
   - id: pool_e2e
-    what: "the pool scheduler's e2e flow (#166): `apply --pool 2` on a multi-export config (one heavy + three parallel_safe) through a toxiproxy BANDWIDTH-CAPPED source — the shared-tunnel field pathology. Oracles: exact per-export rows (independent DuckDB readback), the predicted-vs-actual makespan contract on stdout (the model grades itself), and --resume defer-not-drop. Drives tests/live/live_pool_toxiproxy.rs; SKIP when toxiproxy :8474 is down."
+    what: "the pool scheduler's e2e flow (#166): `apply --pool 2` on a multi-export config (one heavy + three parallel_safe) through a toxiproxy BANDWIDTH-CAPPED source — the shared-tunnel field pathology. Oracles: exact per-export rows (independent DuckDB readback), the predicted-vs-actual makespan contract on stdout (the model grades itself), and --resume defer-not-drop. Drives the `pool_apply_*` cases in tests/live/live_pool_toxiproxy.rs; SKIP when toxiproxy :8474 is down."
     backends: [postgres]
-    status: test        # verify_pool_e2e — drives live_pool_toxiproxy (both tests)
+    status: test        # verify_pool_e2e — drives live_pool_toxiproxy::pool_apply_* (bandwidth / resume / two-heavy)
+  - id: pool_split
+    what: "the `--pool --split` range sub-export flow (#167): a dominating export is broken into N range sub-exports over its key span — separate scheduler units sharing ONE prefix + folding to ONE family. THREE independent DuckDB oracles (`pool_split_*` in tests/live/live_pool_toxiproxy.rs), each a NAMED gate cell: (1) realize — the split fires and the union reads back every row once, no seam gap/dup; (2) manifest coherence — validate does not flag a sibling unit's parts as untracked yet a true orphan still is; (3) per-unit crash resume — `--resume` re-runs ONLY the incomplete units (skip complete, resume crashed), no gap/no dup. SKIP when toxiproxy :8474 is down."
+    backends: [postgres]
+    status: test        # verify_pool_split — drives live_pool_toxiproxy::pool_split_* (realize / coherence / resume)
   - id: release_regression
     what: "regression vs the PREVIOUS RELEASE (not a golden, not the gate itself). B-format: the new binary must READ what the prev release WROTE — prev exports a 100K keyset+zstd fixture, cur `validate` re-reads its manifest+parts (PASSED) + DuckDB row-count == source (a format bump that can't read old artifacts silently breaks every existing user on upgrade). B-perf: cur wall <= the DOWNLOADED prev-release binary's wall × tol (default 1.5×; a 3× slowdown / RSS blow-up ships green through every correctness check), benchmarked against the artifact users actually run, never a rebuilt parent. Env: RIVET_PREV_RELEASE_BIN + RIVET_REGRESSION_SOURCE_URL; SKIP-if-absent."
     backends: [postgres]

@@ -59,7 +59,10 @@ import json
 import os
 import re
 import shutil
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -67,6 +70,8 @@ from . import blessed_path, cdc, scenarios
 from .core import (
     run,
     Ledger,
+    cell_gate,
+    cell_parallel,
     container_for_port,
     docker_exec,
     have,
@@ -474,16 +479,20 @@ def _meta_rows(cell: Cell, work: Path, state_url: str, mark: int,
                run_ids: list[str]) -> tuple[bool, str]:
     """Did THIS run record itself, on whichever backend this cell uses?
 
-    Scoped three ways, one per table's own key: `export_metrics` by the
-    watermark (it has no run_id), `file_log` and `run_status` by the run ids the
-    manifests actually name. A count that a previous cell could satisfy is not
+    Scoped by run_id — ALL THREE tables. `export_metrics` DOES have a run_id column
+    (src/state/metrics.rs), so the old `id > mark` watermark (a workaround for a
+    limitation that never existed) is dropped: under the parallel gate a concurrent
+    sibling 'flow' cell inserts id>mark rows on the shared Postgres ledger, so the
+    watermark counted a sibling's row and an export_metrics-specific writer regression
+    passed GREEN. run_id scoping isolates THIS run regardless of concurrent writers, so
+    the check actually bites. (`mark` is now vestigial — kept only to avoid churning the
+    caller's _state_watermark this pass.) A count a previous cell could satisfy is not
     evidence about this one.
     """
     ids = ", ".join(f"'{r}'" for r in run_ids) if run_ids else "''"
     got = {
         "export_metrics": _state_sql(cell, work, state_url,
-                                     f"SELECT count(*) FROM export_metrics "
-                                     f"WHERE id > {mark} AND export_name = 'flow'"),
+                                     f"SELECT count(*) FROM export_metrics WHERE run_id IN ({ids})"),
         "file_log": _state_sql(cell, work, state_url,
                                f"SELECT count(*) FROM file_log WHERE run_id IN ({ids})"),
         "run_status": _state_sql(cell, work, state_url,
@@ -670,13 +679,11 @@ def run_cell(led: Ledger, cell: Cell, url: str, state_url: str, tag: str = "live
         # Retried: SQL Server's fixture disables and re-enables CDC on the table,
         # and `sp_cdc_enable_table` can fail while the previous capture job is
         # still shutting down. Six of eight mssql cells failed that way — a race
-        # in the fixture, reported as a source failure.
-        blk = spec.setup(url, work)
-        for _ in range(2):
-            if blk is not None:
-                break
-            time.sleep(3.0)
-            blk = spec.setup(url, work)
+        # in the fixture, reported as a source failure. The retry lives in
+        # `cdc.setup_with_retry` — ONE definition, shared with verify_cdc_e2e, so
+        # the preflight and engine-matrix setup paths cannot drift (they did:
+        # verify_cdc_e2e retried nothing and went RED on this very race).
+        blk = cdc.setup_with_retry(spec, url, work)
         if blk is None:
             _stage(led, cell, tag, "init", False, "cdc fixture setup failed on the source")
             _unreached(led, cell, tag, "init")
@@ -806,6 +813,14 @@ def _run_chain(led: Ledger, cell: Cell, url: str, state_url: str, work: Path,
     for st in ("doctor", "check"):
         args = [st, "-c", str(cfg), *cell.flags.get(st, [])]
         p = rivet(*args, env=env, timeout=scenarios.NO_TIMEOUT)
+        # Read-only source probes; a transient connection blip under the parallel
+        # matrix is a false alarm — retry like seed_engine (a real failure fails
+        # every attempt; _why below still surfaces an exhausted one).
+        for _ in range(2):
+            if p.ok:
+                break
+            time.sleep(1.5)
+            p = rivet(*args, env=env, timeout=scenarios.NO_TIMEOUT)
         if not _stage(led, cell, tag, st, p.ok, f"exit={p.returncode} " + (p.out.strip().splitlines()[-1][:120] if p.ok and p.out.strip() else _why(p))):
             _unreached(led, cell, tag, st)
             return
@@ -952,15 +967,37 @@ def _run_chain(led: Ledger, cell: Cell, url: str, state_url: str, work: Path,
                 # readable dataset is the UNION: 2x. That is the assertion — a
                 # clobbered second run reads back 1x and looks like a clean run.
                 mult = 2 if cell.lifecycle == "repeat" else 1
-                _stage(led, cell, tag, "oracle", duck == want * mult,
-                       f"duckdb={duck} source={want}x{mult}")
+                # Per-column null profile: a decode/write regression can null a WHOLE
+                # column while the row count matches (the documented uuid→FixedSizeBinary
+                # silent loss — which happened on a CLOUD run). Count-parity is blind to
+                # it. Local reads the parts on disk; cloud reads the copy _readback ALREADY
+                # pulled to work/pull_<store> — so every store gets the same oracle, not
+                # just local (the GCS store is exactly where the real incident occurred).
+                prof = dest_dir if cell.store == "local" else (work / f"pull_{cell.store}")
+                nn, _nc = scenarios.duckdb_allnull_columns(f"{prof}/**/*.parquet")
+                n_null = max(0, nn)
+                _stage(led, cell, tag, "oracle", duck == want * mult and n_null == 0,
+                       f"duckdb={duck} source={want}x{mult}"
+                       + (f" · ALLNULL {n_null} cols" if n_null else ""))
         else:
-            # A change stream is not the table: the count is of CHANGES, which
-            # only the source's own write history predicts. What DuckDB can say
-            # independently is that the parts decode and are non-empty — a
-            # capture that wrote unreadable or zero rows fails here.
-            _stage(led, cell, tag, "oracle", duck > 0,
-                   f"duckdb={duck} changes decoded by an independent reader")
+            # A change stream is not the table: the count is of CHANGES. But the
+            # change set here is the SHARED, DETERMINISTIC cdc.changes() — cdc.py's
+            # e2e proves it is exactly CDC_EXPECT_EVENTS across every engine. So the
+            # floor is at-least-once: fewer than that means capture DROPPED a change
+            # (the old `duck > 0` passed with 4 of 5 lost). >= tolerates an
+            # at-least-once duplicate; < is a real loss.
+            want = cdc.CDC_EXPECT_EVENTS
+            # Per-column null profile too (mirrors the batch branch + cdc.py): a decode
+            # regression can null a WHOLE captured typed column (amount/meta) while the
+            # change COUNT holds — and local/gcs CDC cells were guarded NOWHERE (cdc.py
+            # only null-profiles s3). Local reads on-disk; cloud reads the copy _readback
+            # already pulled to work/pull_<store>.
+            prof = dest_dir if cell.store == "local" else (work / f"pull_{cell.store}")
+            nn, _nc = scenarios.duckdb_allnull_columns(f"{prof}/**/*.parquet")
+            n_null = max(0, nn)
+            _stage(led, cell, tag, "oracle", duck >= want and n_null == 0,
+                   f"duckdb={duck} >= {want} deterministic changes (at-least-once floor)"
+                   + (f" · ALLNULL {n_null} cols" if n_null else ""))
 
     # ── validate ─────────────────────────────────────────────────────────────
     p = rivet("validate", "-c", str(cfg), *cell.flags.get("validate", []),
@@ -1016,7 +1053,15 @@ def _load_leg(led: Ledger, cell: Cell, tag: str, work: Path, env: dict, url: str
     # — so all four engines' `users` land on ONE table. rivet caught this itself
     # and refused ("last loaded from `postgres:users`"), which is the guard doing
     # its job; nine cells failed on a collision the matrix created.
-    dset = os.environ.get("BQ_ORACLE_DATASET", "rivet_blessed") + "_" + cell.engine
+    # PER CELL, not just per engine. rivet load derives the warehouse table from
+    # `table:`, so every cell's `users` lands on ONE table; under the PARALLEL matrix
+    # concurrent cells then drop the table each other is querying (RED-proven: "Not
+    # found: rivet_blessed_mssql.users"). A per-cell dataset gives each its own
+    # `{dset}.users`. Only ~6 slugs × N engines distinct names, reused every run (bq
+    # mk -f is idempotent), so this does not accumulate datasets.
+    _cell_slug = f"{cell.lifecycle}_{cell.store}_{cell.state}"
+    dset = (os.environ.get("BQ_ORACLE_DATASET", "rivet_blessed")
+            + f"_{cell.engine}_{_cell_slug}")
     if cell.store != "gcs" or cell.pipeline != "batch":
         led.skipped(cell.engine, tag, "flow:load", cell.store,
                     f"{cell.engine} {cell.label} · load — the warehouse leg runs on the "
@@ -1033,7 +1078,7 @@ def _load_leg(led: Ledger, cell: Cell, tag: str, work: Path, env: dict, url: str
     tbl = cell.table.split(".")[-1]
     # Version-scoped for the same reason the readback prefix is: the gate runs
     # this once per gridded version and `cell.engine` does not distinguish them.
-    pfx = f"flow/{cell.engine}{tag}/{cell.pipeline}/{tbl}"
+    pfx = f"flow/{cell.engine}{tag}/{cell.pipeline}/{_cell_slug}/{tbl}"
     lcfg = work / "load.yaml"
     tls = "\n  tls: {accept_invalid_certs: true}" if cell.engine == "mssql" else ""
     lcfg.write_text(
@@ -1057,8 +1102,12 @@ def _load_leg(led: Ledger, cell: Cell, tag: str, work: Path, env: dict, url: str
         return
     # Unique per cell: the id is what the ledger check scopes on, and a shared
     # one would let one cell's rows satisfy another's assertion.
+    # + PID: work_dir().name is STABLE across gate invocations when RIVET_ORACLE_WORK is
+    # set, so without a per-invocation token the load_id repeats and _load_rows' `LIKE
+    # load_id%` count on the shared, never-reset Postgres ledger passes on a PRIOR run's
+    # rows. rivet records THIS load under this id (--run-id), so the scoping isolates it.
     load_id = (
-        f"flow-{cell.engine}-{cell.lifecycle}-{cell.state}-{scenarios.work_dir().name}"
+        f"flow-{cell.engine}-{cell.lifecycle}-{cell.state}-{scenarios.work_dir().name}-{os.getpid()}"
     )
     p = rivet("load", "-c", str(lcfg), "--rivet-bin", str(rivet_bin()),
               "--run-id", load_id, env=env, timeout=scenarios.NO_TIMEOUT)
@@ -1125,21 +1174,37 @@ def _load_rows(cell: Cell, work: Path, state_url: str, load_id: str,
 VERDICTS = "blessed-flow-verdicts.json"
 
 
-def _verdict_path() -> Path:
-    return Path(os.environ.get("RIVET_FLOW_VERDICTS", scenarios.work_dir() / VERDICTS))
+def _verdict_path(engine: str | None = None) -> Path:
+    base = Path(os.environ.get("RIVET_FLOW_VERDICTS", scenarios.work_dir() / VERDICTS))
+    # PER ENGINE. engine_loop runs the four engines' sc_blessed_flow concurrently, and
+    # each read-modify-overwrites this file under its OWN per-engine lock — so a shared
+    # path means the last engine to write CLOBBERS the others' resume anchors (a crashed
+    # matrix could then re-run only one engine's cells). A file per engine keeps each
+    # engine's incremental verdicts independent; failed_cells() unions them back.
+    if engine:
+        return base.with_name(f"{base.stem}.{engine}{base.suffix}")
+    return base
 
 
 def failed_cells(path: Path | None = None) -> set[str]:
     """The cell keys a previous run failed, for `only=`.
 
     The matrix is ~15 minutes; re-running all 76 cells to re-check four is how a
-    feedback loop gets long enough that people stop closing it.
+    feedback loop gets long enough that people stop closing it. Unions the per-engine
+    verdict files (see _verdict_path) plus any legacy shared file.
     """
-    p = path or _verdict_path()
-    try:
-        return {k for k, v in json.loads(p.read_text()).items() if v == "fail"}
-    except (OSError, json.JSONDecodeError):
-        return set()
+    if path is not None:
+        paths = [path]
+    else:
+        base = _verdict_path()
+        paths = [base, *sorted(base.parent.glob(f"{base.stem}.*{base.suffix}"))]
+    out: set[str] = set()
+    for p in paths:
+        try:
+            out |= {k for k, v in json.loads(p.read_text()).items() if v == "fail"}
+        except (OSError, json.JSONDecodeError):
+            continue
+    return out
 
 
 def sc_blessed_flow(led: Ledger, engine: str, tag: str, url: str,
@@ -1167,13 +1232,17 @@ def sc_blessed_flow(led: Ledger, engine: str, tag: str, url: str,
            f"{len(cells) - len(runnable)} na")
 
     verdicts: dict[str, str] = {}
-    vp = _verdict_path()
+    vp = _verdict_path(engine)  # per-engine: concurrent engines must not clobber
     try:
         verdicts = json.loads(vp.read_text())
     except (OSError, json.JSONDecodeError):
         verdicts = {}
 
     cdc_url = cdc_url or os.environ.get(f"RIVET_CDC_{engine.upper()}_URL", "")
+    # Skips are decided SEQUENTIALLY (no rivet, just a ledger row, kept in
+    # declaration order); only the cells that actually run a chain go through the
+    # pool, so no-op work never occupies a slot.
+    tasks: list[tuple[Cell, str, str]] = []
     for cell in cells:
         key = f"{engine}/{cell.pipeline}/{cell.lifecycle}/{cell.store}/{cell.state}"
         why = cell.na_reason()
@@ -1199,17 +1268,55 @@ def sc_blessed_flow(led: Ledger, engine: str, tag: str, url: str,
             led.skipped(cell.engine, tag, "flow:chain", cell.store,
                         f"{cell.engine} {cell.label} — {cell.store} store not up")
             continue
-        before = sum(1 for c in led.cells if c.status.value == "FAIL")
-        run_cell(led, cell, u, state_url, tag)
-        after = sum(1 for c in led.cells if c.status.value == "FAIL")
-        verdicts[key] = "fail" if after > before else "pass"
-        # Written after EVERY cell, not at the end: a matrix killed at minute ten
-        # would otherwise leave nothing to resume from, which is the same defect
-        # the CDC checkpoint exists to prevent one layer down.
+        tasks.append((cell, key, u))
+
+    if not tasks:
+        return
+
+    # Cells are independent (own work-dir + own destination prefix), so run them
+    # concurrently. Each records into its OWN buffered child, so (a) its rows/spans
+    # stay contiguous instead of interleaving with a sibling's, and (b) its pass/fail
+    # is that child's alone — thread-safe, unlike counting FAILs on the shared ledger.
+    # cell_gate() caps concurrency ACROSS engines (which also run in parallel). Flush +
+    # verdict write happen under a lock as each cell completes, so a matrix killed
+    # mid-run still leaves a resumable verdicts file — the property the per-cell write
+    # has always guarded, preserved under parallelism.
+    lock = threading.Lock()
+    # cdc cells DESTRUCTIVELY set up the ONE shared source probe per engine
+    # (drop/create/enable orc_cdc_probe), so they cannot run concurrently WITH EACH
+    # OTHER on this engine — RED-proven: 12 "orc_cdc_probe does not exist" collisions.
+    # Each engine has its own lock (sc_blessed_flow is per-engine), so cdc still
+    # overlaps ACROSS the 4 engines; batch cells never take it.
+    cdc_lock = threading.Lock()
+
+    def run_one(task: tuple[Cell, str, str]) -> None:
+        cell, key, u = task
+        child = led.buffered_child()
+        # Take the per-engine cdc lock BEFORE the global slot, so a queued cdc cell
+        # does not hold a cell_gate() permit while it waits (that would starve batch
+        # cells). Non-cdc cells use a no-op context and never serialise.
+        serialize = cdc_lock if cell.pipeline == "cdc" else nullcontext()
         try:
-            vp.write_text(json.dumps(verdicts, indent=1, sort_keys=True))
-        except OSError:
-            pass
+            with serialize, cell_gate():
+                with child.span(
+                    f"cell {engine} flow {cell.pipeline}/{cell.lifecycle}/{cell.store}/{cell.state}"
+                ):
+                    run_cell(child, cell, u, state_url, tag)
+        except Exception as e:  # a raising cell must not abort the whole matrix
+            child.failed(cell.engine, tag, f"flow:{cell.pipeline}/{cell.lifecycle}",
+                         cell.store, f"{cell.engine} {cell.label} — cell raised: {e}", "raised")
+        failed = any(c.status.value == "FAIL" for c in child.cells)
+        with lock:
+            child.flush_into(led)
+            verdicts[key] = "fail" if failed else "pass"
+            try:
+                vp.write_text(json.dumps(verdicts, indent=1, sort_keys=True))
+            except OSError:
+                pass
+
+    workers = min(len(tasks), cell_parallel())
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        list(ex.map(run_one, tasks))
 
 
 def flag_coverage(cells: list[Cell]) -> dict[str, set[str]]:

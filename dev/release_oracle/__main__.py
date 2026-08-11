@@ -136,9 +136,30 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     ap.add_argument("--no-cloud", action="store_true", help="local stage only (skip BigQuery)")
     ap.add_argument("--keep", action="store_true", help="leave engine containers up (debug)")
+    ap.add_argument(
+        "--cell-parallel", type=int, default=8,
+        help="global cap on concurrent MATRIX CELLS (blessed_flow/blessed_path) across "
+             "ALL engines. The matrix is I/O-bound (~62%% CPU idle at 4-way), so running "
+             "its independent cells concurrently fills the idle cores; this bounds the "
+             "total so the shared state DB / source containers are not stampeded.")
+    ap.add_argument(
+        "--engine-parallel", type=int, default=3,
+        help="how many engines to run CONCURRENTLY in the engine loop (default 3). Each engine "
+             "owns its own containers/ports, and the scenarios race on the SHARED state backend "
+             "— which doubles as a real concurrent-writer test. The dominant serial cost is CDC "
+             "capture-job waits (sleep-for-the-agent), which overlap under parallelism, so the "
+             "engine-loop wall drops from sum(engines) toward max(engine). Set 1 for the old "
+             "serial behaviour, or lower if Docker memory is tight (MSSQL is the ~1.6 GiB hog).")
     ap.add_argument("--no-clean", action="store_true",
                     help="skip the clean rebuild (iteration only — a release must be gated on a "
                          "tree built from nothing)")
+    ap.add_argument("--fast-clean", action="store_true",
+                    help="rebuild removing ONLY target/package (the documented `cargo package` "
+                         "fingerprint poison), not the whole target/ — keeps the binary=HEAD "
+                         "guarantee via cargo's own honest fingerprints while skipping the full "
+                         "dependency recompile. NOT a cache: no external keying heuristic can "
+                         "return a stale artifact. The tag verdict should still use the full "
+                         "clean (default); this is for fast pre-tag hunt passes.")
     ap.add_argument("--state-url", default="",
                     help="state backend for EVERY cell (default: SQLite beside each config). "
                          "A gate pass grades ONE backend; run it twice to grade both.")
@@ -153,7 +174,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return ns
 
 
-def clean_tree_and_build(led: Ledger) -> bool:
+def clean_tree_and_build(led: Ledger, *, fast: bool = False) -> bool:
     """Step ZERO: gate a binary built from nothing.
 
     A release must be graded on a tree with no history in it. `cargo package`
@@ -168,13 +189,26 @@ def clean_tree_and_build(led: Ledger) -> bool:
     So the gate starts by deleting the target directory and its own scratch, then
     builds `--release` itself. It costs one full compile; it buys the guarantee
     that the binary every cell below exercises is the code in the tree.
+
+    `fast=True` removes ONLY `target/package` — the exact directory the poison
+    lives in — instead of the whole `target/`. Cargo's own fingerprints are honest
+    once that snapshot is gone (every freshness-lie this repo has hit was
+    package-related), so the binary=HEAD guarantee holds while the dependency
+    recompile is skipped. This is NOT a compilation cache: there is no external
+    hash-keying heuristic (sccache's build-script / env / include! edge cases) that
+    can hand back a stale object — it is cargo's normal, sound incremental build
+    with the one known liar deleted. The full clean stays the default for the tag
+    verdict; `fast` is for the fast pre-tag hunt passes.
     """
     led.phase("Clean tree — the gate builds the binary it grades")
     for stale in ("/tmp/rivet_conc", "/tmp/rivet_iso", "/tmp/rivet_sweep", "/tmp/rivet_cdc_sweep"):
         shutil.rmtree(stale, ignore_errors=True)
     for lock in Path("/tmp").glob(".rivet_cdc_sweep*.lock"):
         lock.unlink(missing_ok=True)
-    if not run(["cargo", "clean"], cwd=ROOT, timeout=600).ok:
+    if fast:
+        # Delete ONLY the poison directory; cargo's honest fingerprints do the rest.
+        shutil.rmtree(ROOT / "target" / "package", ignore_errors=True)
+    elif not run(["cargo", "clean"], cwd=ROOT, timeout=600).ok:
         led.failed("-", "-", "clean_tree", "-",
                    "clean tree: `cargo clean` failed — the gate cannot vouch for the binary it "
                    "is about to grade")
@@ -187,9 +221,11 @@ def clean_tree_and_build(led: Ledger) -> bool:
             f"anything: {(build.err or build.out)[-300:]}",
         )
         return False
+    how = ("target/package removed (fast: cargo fingerprints trusted, binary=HEAD)"
+           if fast else "target/ removed and the release binary rebuilt from nothing")
     led.passed(
         "-", "-", "clean_tree", "-",
-        f"clean tree: target/ removed and the release binary rebuilt from nothing ({rivet_bin()})",
+        f"clean tree: {how} ({rivet_bin()})",
     )
     return True
 
@@ -212,6 +248,7 @@ def preflight(led: Ledger, *, bless_gifs: bool = False) -> None:
     gifs.verify_gif_currency(led, bless=bless_gifs)
     scenarios.verify_replica_read(led)
     scenarios.verify_pool_e2e(led)
+    scenarios.verify_pool_split(led)
     cdc.verify_cdc_e2e(led)
     regression.verify_release_regression(led)
     regression.verify_scale_memory(led)
@@ -388,57 +425,96 @@ def seed_engine(engine: str, tag: str, url: str) -> str:
     return "; ".join(hits) or f"exit {p.returncode}"
 
 
+def _run_one_engine(led: Ledger, ns: argparse.Namespace, engine: str) -> None:
+    """One engine's whole leg: every gridded version brought up, seeded, and run
+    through the scenarios, then torn down. Takes `led` so a parallel caller can
+    hand it a BUFFERED sub-ledger (its output is flushed as one block afterwards)."""
+    version_lines = [
+        l for l in matrix_cfg("versions", engine).splitlines() if len(l.split()) >= 3
+    ]
+    # --latest-only: keep just the last version of the family (the newest,
+    # matrix.yaml lists them ascending). Cuts the dev-loop wall roughly in
+    # proportion to the version count (postgres 4→1, mongo 5→1) while every
+    # scenario × store × state cell still runs once.
+    if ns.latest_only and version_lines:
+        skipped = len(version_lines) - 1
+        version_lines = version_lines[-1:]
+        if skipped:
+            led.add(engine, "-", "older-versions", "-", Status.SKIP,
+                    f"--latest-only: {skipped} older {engine} version(s) not run")
+    for line in version_lines:
+        parts = line.split()
+        tag, image, port = parts[0], parts[1], int(parts[2])
+        led.phase(f"{engine} {tag} ({image})")
+        with led.span(f"{engine}: bring-up"):
+            url = bring_up(led, engine, tag, image, port)
+        if not url:
+            led.add(engine, tag, "all", "-", Status.SKIP, "bring-up failed")
+            continue
+        # The seed is idempotent (DROP TABLE IF EXISTS …), so a transient
+        # failure is retried: a fresh container under load can drop the seed
+        # connection mid-stream, and crying wolf on that is worse than a retry.
+        err = ""
+        with led.span(f"{engine}: seed"):
+          for attempt in range(3):
+            err = seed_engine(engine, tag, url)
+            if not err:
+                break
+            # Back off between attempts. Without this the three retries fire
+            # back-to-back and all land inside the SAME startup window, so a
+            # race the retry exists to absorb is retried three times in the
+            # few hundred ms during which it cannot possibly succeed — which
+            # is how a transient became a FAIL.
+            time.sleep(2.0 * (attempt + 1))
+        if err:
+            led.failed(engine, tag, "seed", "-", f"{engine}:{tag} seed had errors", err)
+            continue
+        led.ok("seeded")
+        scenarios.run_scenarios(led, engine, tag, url)
+        if not ns.keep:
+            docker("rm", "-fv", engine_container(engine, tag))
+
+
 def engine_loop(led: Ledger, ns: argparse.Namespace) -> None:
     wanted = [e for e in ns.engines.split(",") if e] if ns.engines else None
-    for engine in matrix_cfg("engines").split():
-        if wanted and engine not in wanted:
-            continue
-        version_lines = [
-            l for l in matrix_cfg("versions", engine).splitlines() if len(l.split()) >= 3
-        ]
-        # --latest-only: keep just the last version of the family (the newest,
-        # matrix.yaml lists them ascending). Cuts the dev-loop wall roughly in
-        # proportion to the version count (postgres 4→1, mongo 5→1) while every
-        # scenario × store × state cell still runs once.
-        if ns.latest_only and version_lines:
-            skipped = len(version_lines) - 1
-            version_lines = version_lines[-1:]
-            if skipped:
-                led.add(engine, "-", "older-versions", "-", Status.SKIP,
-                        f"--latest-only: {skipped} older {engine} version(s) not run")
-        for line in version_lines:
-            parts = line.split()
-            tag, image, port = parts[0], parts[1], int(parts[2])
-            led.phase(f"{engine} {tag} ({image})")
-            url = bring_up(led, engine, tag, image, port)
-            if not url:
-                led.add(engine, tag, "all", "-", Status.SKIP, "bring-up failed")
-                continue
-            # The seed is idempotent (DROP TABLE IF EXISTS …), so a transient
-            # failure is retried: a fresh container under load can drop the seed
-            # connection mid-stream, and crying wolf on that is worse than a retry.
-            err = ""
-            for attempt in range(3):
-                err = seed_engine(engine, tag, url)
-                if not err:
-                    break
-                # Back off between attempts. Without this the three retries fire
-                # back-to-back and all land inside the SAME startup window, so a
-                # race the retry exists to absorb is retried three times in the
-                # few hundred ms during which it cannot possibly succeed — which
-                # is how a transient became a FAIL.
-                time.sleep(2.0 * (attempt + 1))
-            if err:
-                led.failed(engine, tag, "seed", "-", f"{engine}:{tag} seed had errors", err)
-                continue
-            led.ok("seeded")
-            scenarios.run_scenarios(led, engine, tag, url)
-            if not ns.keep:
-                docker("rm", "-fv", engine_container(engine, tag))
+    engines = [e for e in matrix_cfg("engines").split() if not wanted or e in wanted]
+    cap = max(1, ns.engine_parallel)
+
+    # Serial (unchanged behaviour) when asked or with nothing to overlap.
+    if cap == 1 or len(engines) <= 1:
+        for engine in engines:
+            _run_one_engine(led, ns, engine)
+        return
+
+    # Parallel: each engine owns its own containers/ports; the scenarios race on
+    # the shared state backend (a real concurrent-writer test). The big serial
+    # cost — CDC capture-job waits — overlaps, so the wall drops toward the
+    # slowest single engine. Output would interleave, so each engine runs into a
+    # BUFFERED sub-ledger and its block is flushed IN ENGINE ORDER after the join.
+    workers = min(cap, len(engines))
+    led.phase(
+        f"Engine matrix — {len(engines)} engines, up to {workers} concurrent "
+        f"(wall ≈ slowest engine; scenarios race on the shared state backend)"
+    )
+    subs = {e: led.buffered_child() for e in engines}
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _run(e: str) -> None:
+        # The per-engine total wall-clock — the "which engine is the long pole"
+        # number the opaque matrix phase can't give under parallelism.
+        with subs[e].span(f"{e}: engine-total"):
+            _run_one_engine(subs[e], ns, e)
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        list(ex.map(_run, engines))
+    for engine in engines:  # deterministic order, not completion order
+        subs[engine].flush_into(led)
 
 
 def main(argv: list[str] | None = None) -> int:
     ns = parse_args(argv)
+    from .core import set_cell_parallel
+    set_cell_parallel(ns.cell_parallel)
 
     if not rivet_bin().is_file() or not os.access(rivet_bin(), os.X_OK):
         print(f"rivet binary not found at {rivet_bin()} (build --release or set RIVET_BIN)", file=sys.stderr)
@@ -490,7 +566,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  state backend under test: {backend}")
         print("  a pass grades ONE backend; --state-url runs the same cells against the other")
 
-        if not ns.no_clean and not clean_tree_and_build(led):
+        if not ns.no_clean and not clean_tree_and_build(led, fast=ns.fast_clean):
             return 1
         start_stores(led)
         preflight(led, bless_gifs=ns.bless_gifs)
@@ -504,7 +580,7 @@ def main(argv: list[str] | None = None) -> int:
             # BQ stage's mysql leg still hit the initdb race and recorded
             # `SKIP seed` where the previous run had a PASS. One definition now.
             bigquery.run_bigquery_golden(led, bless=ns.bless_bigquery_golden,
-                                         keep=ns.keep,
+                                         keep=ns.keep, parallel=ns.engine_parallel,
                                          bring_up=bring_up, seed_engine=seed_engine)
         return led.report()
     finally:
