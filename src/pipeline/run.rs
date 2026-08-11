@@ -895,9 +895,33 @@ pub(crate) fn run_pool(
                     ),
                 }
             }
-            None => log::info!(
-                "apply --pool --split: no export dominates the pool floor — nothing to split."
-            ),
+            None => {
+                // advise_split returns None for a heavy dominator too, not only a balanced set.
+                // The most actionable case is a giant that DOMINATES the floor but is HEAVY (not
+                // parallel_safe): its range sub-units inherit the heavy flag and still serialize
+                // under the C3 floor, so a split cannot lower the wall — the fix is to mark it
+                // parallel_safe (independent rows), not to add a chunk key. Say so at WARN
+                // (visible), instead of the misattributed "nothing dominates" at INFO. A
+                // genuinely balanced set stays informational.
+                let total: f64 = items.iter().map(|i| i.predicted_secs).sum();
+                match items
+                    .iter()
+                    .max_by(|a, b| a.predicted_secs.total_cmp(&b.predicted_secs))
+                    .filter(|l| l.predicted_secs > total / (m.max(1) as f64) && !l.parallel_safe)
+                {
+                    Some(l) => log::warn!(
+                        "apply --pool --split: '{}' dominates the pool floor but is HEAVY (not \
+                         parallel_safe) — its split units would inherit the heavy flag and still \
+                         serialize (the C3 floor), so splitting cannot lower the wall. Mark it \
+                         `parallel_safe: true` if its rows are independent; running it whole.",
+                        l.name
+                    ),
+                    None => log::info!(
+                        "apply --pool --split: no export dominates the pool floor — nothing to \
+                         split."
+                    ),
+                }
+            }
         }
     } else if let Some((giant, n, broken)) = &advise {
         let giant_secs = items
