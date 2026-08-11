@@ -302,21 +302,6 @@ fn partition_ranges(
 /// parts from `file_log`) and re-runs the rest from their `lo` — the run_id-based
 /// part names make the re-run OVERWRITE the crashed range's partial parts rather
 /// than accumulate duplicates. Without `chunk_checkpoint`, a fresh full pass.
-/// True if a resumed split unit's PERSISTED keyset ranges cover a different OUTER window than
-/// the plan's CURRENT split window — the reconstruct coarsened the window after an adjacent
-/// crash, so resuming the persisted (narrower) ranges would silently drop the widened region.
-/// `None` split window (a non-split export) is never stale — the normal resume path applies.
-/// Pure + total for the mutation gate: the runner decides "resume vs run-fresh" on this alone.
-pub(crate) fn keyset_checkpoint_window_stale(
-    persisted_first_lo: Option<&str>,
-    persisted_last_hi: Option<&str>,
-    split_window: Option<&crate::manifest::SplitWindow>,
-) -> bool {
-    split_window.is_some_and(|sw| {
-        persisted_first_lo != sw.lo.as_deref() || persisted_last_hi != sw.hi.as_deref()
-    })
-}
-
 fn run_keyset_parallel(
     src: &mut dyn Source,
     plan: &ResolvedRunPlan,
@@ -384,41 +369,10 @@ fn run_keyset_parallel(
     // ranges: (range_index, lo_exclusive, hi_inclusive, already_done)
     let ranges: Vec<(usize, Option<String>, Option<String>, bool)> = match (&resume_run_id, state) {
         (Some(rid), Some(st)) => {
+            summary.run_id = rid.clone();
+            summary.resumed = true;
             let rows = st.load_keyset_ranges(&plan.export_name, rid)?;
-            // Window-fingerprint guard (post-0.24.3 review HIGH #2): a reconstruct after an
-            // adjacent crash can COARSEN this unit's split window — a trailing double-crash
-            // widens the tail from (b, b'] to (b, None] while KEEPING the unit name. The
-            // persisted ranges then span only the OLD narrower window, so resuming them
-            // verbatim silently DROPS the coarsened region (the widened tail's fresh top).
-            // If the persisted outer window != the plan's CURRENT split window, the checkpoint
-            // is stale: run FRESH over the current window under a NEW run_id — NOT reusing rid
-            // (that would rehydrate the old narrow parts and re-strand the tail). The pre-crash
-            // orphan parts are unmanifested and gc'd. chunked bails loud on its plan-fingerprint;
-            // keyset had no such guard until now.
-            let stale = keyset_checkpoint_window_stale(
-                rows.first().and_then(|r| r.lo.as_deref()),
-                rows.last().and_then(|r| r.hi.as_deref()),
-                plan.split_window.as_ref(),
-            );
-            if stale {
-                log::warn!(
-                    "export '{}': split window changed since its per-unit checkpoint \
-                     (persisted ({:?},{:?}] != current ({:?},{:?}]) — an adjacent crash \
-                     coarsened it; discarding the stale checkpoint and running FRESH over the \
-                     current window so the widened region is not silently dropped",
-                    plan.export_name,
-                    rows.first().and_then(|r| r.lo.clone()),
-                    rows.last().and_then(|r| r.hi.clone()),
-                    plan.split_window.as_ref().and_then(|w| w.lo.clone()),
-                    plan.split_window.as_ref().and_then(|w| w.hi.clone()),
-                );
-                let fresh = sample_parallel_ranges(src, plan, &key, parallel, floor_r, ceil_r)?;
-                st.persist_keyset_ranges(&plan.export_name, &summary.run_id, &lo_hi_pairs(&fresh))?;
-                st.set_resume_run_id(&plan.export_name, &summary.run_id)?;
-                fresh
-            } else if rows.is_empty() {
-                summary.run_id = rid.clone();
-                summary.resumed = true;
+            if rows.is_empty() {
                 // Anchor set but no persisted ranges (a crash between set_resume_
                 // run_id and persist_keyset_ranges — nothing committed): re-sample
                 // + persist under this run_id and start over. No skip.
@@ -426,8 +380,6 @@ fn run_keyset_parallel(
                 st.persist_keyset_ranges(&plan.export_name, rid, &lo_hi_pairs(&fresh))?;
                 fresh
             } else {
-                summary.run_id = rid.clone();
-                summary.resumed = true;
                 rows.into_iter()
                     .map(|r| (r.range_index as usize, r.lo, r.hi, r.done))
                     .collect()
@@ -1238,45 +1190,6 @@ pub(crate) fn run_keyset(
 mod tests {
     use super::*;
     use crate::config::SourceType;
-
-    // ── keyset_checkpoint_window_stale: coarsened split window ⇒ run fresh ─────
-    #[test]
-    fn keyset_checkpoint_window_stale_detects_a_trailing_coarsening() {
-        use crate::manifest::SplitWindow;
-        let sw = |lo: Option<&str>, hi: Option<&str>| SplitWindow {
-            key_column: "id".into(),
-            lo: lo.map(String::from),
-            hi: hi.map(String::from),
-        };
-        // Trailing double-crash: original tail unit was (b2, b3] but the reconstruct WIDENED it
-        // to (b2, None]. Persisted ranges still span (b2, b3] → last_hi=b3 != current hi=None →
-        // STALE. Resuming the persisted ranges would drop (b3, None] — the HIGH #2 loss.
-        assert!(
-            keyset_checkpoint_window_stale(Some("b2"), Some("b3"), Some(&sw(Some("b2"), None))),
-            "a widened (b2,None] unit resuming (b2,b3] ranges must be flagged stale"
-        );
-        // Interior coarsening (lo moved): persisted (b1,b2] but current (b0,b2] → first_lo mismatch.
-        assert!(keyset_checkpoint_window_stale(
-            Some("b1"),
-            Some("b2"),
-            Some(&sw(Some("b0"), Some("b2")))
-        ));
-        // Exact match (a clean single-crash resume of the SAME window) → NOT stale, resume normally.
-        assert!(!keyset_checkpoint_window_stale(
-            Some("b2"),
-            Some("b3"),
-            Some(&sw(Some("b2"), Some("b3")))
-        ));
-        // Bottom unit, exact match (both None ends) → not stale.
-        assert!(!keyset_checkpoint_window_stale(
-            None,
-            Some("b0"),
-            Some(&sw(None, Some("b0")))
-        ));
-        // A NON-split export (no split_window) is never stale — the guard must not touch the
-        // plain incremental/keyset resume path.
-        assert!(!keyset_checkpoint_window_stale(Some("x"), Some("y"), None));
-    }
 
     // ── highest_range_max: cursor_high = the top populated range's max ────────
     #[test]

@@ -2304,19 +2304,15 @@ fn stand_pool_split_gappy_key_mssql() {
 // adjacent_crash_*`; the RANGE stand tests above (`stand_pool_split_resume_grows_*`,
 // `stand_pool_split_gappy_key_*`) are the live finding-2 guards that DO bite the mutant.
 //
-// POST-0.24.3 review HIGH #2 (trailing-coarsening silent loss): a TRAILING double-crash
-// (the top two units hard-crash with NO manifest while the lower units finalize Success)
-// lowers `max_pos` so the reconstruct WIDENS the tail unit from (b, b'] to (b, None] while
-// keeping its name — but the tail's `filled` set is empty, so reconstruct's fresh-marking
-// never fires and the tail keeps `chunk_checkpoint=true`. The keyset runner then resumed the
-// STALE narrow persisted ranges and dropped (b', None]. The fix is a RUNNER-side window-
-// fingerprint guard (`keyset::keyset_checkpoint_window_stale`): on resume it compares the
-// persisted ranges' outer window to the plan's CURRENT split window and runs FRESH on any
-// mismatch (covers trailing AND interior/leading uniformly). That exact two-tail-HARD-crash
-// (lower units Success, top two SIGKILLed, no window manifest) can't be staged deterministically
-// here for the same reason documented above (the panic hook kills the whole process together),
-// so the guard is RED-proven offline by `keyset_checkpoint_window_stale_detects_a_trailing_
-// coarsening` — the decision the runner makes at the resume seam.
+// A TRAILING adjacent crash needs NO extra guard: it lowers `max_pos`, so the reconstruct's
+// tail unit becomes an OPEN `(b, None]` window baked into `base_query` as `WHERE key > b` (no
+// upper bound). The crashed unit's PERSISTED ranges record `ceil = None` for their last range
+// (a split unit is non-incremental → floor/ceil are None; the window lives in `base_query`, not
+// the range endpoints), so on resume that last range re-runs `WHERE key > last_bound` under the
+// WIDENED base_query and naturally covers everything up to the current max — the widened tail is
+// complete, not dropped. (A post-0.24.3 bughunt finding claimed this dropped `(b', None]` by
+// assuming the persisted last `hi = b'`; it is `None`, and the widened base_query covers the top
+// — verified by reading `partition_ranges` + the `(None, None)` floor/ceil for split units.)
 
 #[test]
 #[ignore = "live: requires docker compose up -d postgres"]
