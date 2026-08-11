@@ -337,19 +337,38 @@ fn is_superseded(m: &RunManifest, keyed: &[(String, RunManifest)]) -> bool {
 /// on mixed RFC3339 precision (`…00.5Z` sorts before `…00Z`) — and falls back to
 /// lexical only if a timestamp fails to parse, so a malformed manifest can't panic.
 pub fn latest_full(keyed: Vec<(String, RunManifest)>) -> Vec<(String, RunManifest)> {
-    keyed
-        .into_iter()
-        .max_by(|a, b| {
-            match (
-                chrono::DateTime::parse_from_rfc3339(&a.1.finished_at).ok(),
-                chrono::DateTime::parse_from_rfc3339(&b.1.finished_at).ok(),
-            ) {
-                (Some(x), Some(y)) => x.cmp(&y),
-                _ => a.1.finished_at.cmp(&b.1.finished_at),
-            }
-        })
-        .into_iter()
-        .collect()
+    // Group by export_name, then take the LATEST manifest per group. A `--pool --split`
+    // snapshot is N units `{family}#0..#N-1`, each its OWN run_id/manifest that finishes at
+    // a slightly different instant; the old `max_by` over the WHOLE set picked exactly ONE
+    // manifest — silently dropping the other N-1 units on a Full (replace) load. Grouping by
+    // export_name loads each unit's latest run. A non-split full export keeps ONE export_name
+    // across repeated runs → a single group → the single latest snapshot, unchanged replace
+    // semantics. BTreeMap so the selection order is deterministic (by unit name).
+    let mut latest: std::collections::BTreeMap<String, (String, RunManifest)> =
+        std::collections::BTreeMap::new();
+    for (key, m) in keyed {
+        let newer = match latest.get(&m.export_name) {
+            None => true,
+            Some((_, prev)) => finished_after(&m.finished_at, &prev.finished_at),
+        };
+        if newer {
+            latest.insert(m.export_name.clone(), (key, m));
+        }
+    }
+    latest.into_values().collect()
+}
+
+/// True if `a`'s finished-at instant is strictly after `b`'s (RFC3339; falls back to a
+/// lexical compare only if either fails to parse — the same ordering `latest_full` used
+/// before it grouped by unit).
+fn finished_after(a: &str, b: &str) -> bool {
+    match (
+        chrono::DateTime::parse_from_rfc3339(a).ok(),
+        chrono::DateTime::parse_from_rfc3339(b).ok(),
+    ) {
+        (Some(x), Some(y)) => x > y,
+        _ => a > b,
+    }
 }
 
 /// Which run manifests to load for `mode`, given the ledger's already-`loaded`
@@ -1497,6 +1516,65 @@ mod tests {
         let sel = latest_full(keyed);
         assert_eq!(sel.len(), 1, "exactly one snapshot, never all");
         assert_eq!(sel[0].1.run_id, "r3", "the newest by finished_at");
+    }
+
+    #[test]
+    fn latest_full_over_a_split_family_selects_every_unit_not_just_the_last() {
+        // A `--pool --split` snapshot: 3 units {family}#0..#2, each its own run_id and a
+        // slightly different finished_at. Full load must select ALL THREE (the whole
+        // snapshot), not just whichever unit finished last — the old max_by-over-all
+        // dropped 2 of 3 units silently.
+        let unit = |name: &str, run: &str, at: &str| {
+            let mut m = manifest(run, 100, None);
+            m.export_name = name.into();
+            m.export_family = "orders".into();
+            m.finished_at = at.into();
+            (format!("orders/manifest-{run}.json"), m)
+        };
+        let keyed = vec![
+            unit("orders#0", "r0", "2026-01-01T00:00:01Z"),
+            unit("orders#1", "r1", "2026-01-01T00:00:02Z"),
+            unit("orders#2", "r2", "2026-01-01T00:00:03Z"),
+        ];
+        let mut sel = latest_full(keyed);
+        sel.sort_by(|a, b| a.1.export_name.cmp(&b.1.export_name));
+        let names: Vec<&str> = sel.iter().map(|(_, m)| m.export_name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["orders#0", "orders#1", "orders#2"],
+            "a Full load over a split prefix must select EVERY unit — one per {{family}}#i — \
+             not just the unit that finished last"
+        );
+    }
+
+    #[test]
+    fn latest_full_over_a_split_family_takes_the_newest_run_per_unit() {
+        // Repeated Full runs into a split prefix: each unit has TWO runs. Per unit, only
+        // the newest is selected (replace semantics), and all units are present.
+        let unit = |name: &str, run: &str, at: &str| {
+            let mut m = manifest(run, 100, None);
+            m.export_name = name.into();
+            m.export_family = "orders".into();
+            m.finished_at = at.into();
+            (format!("orders/manifest-{run}.json"), m)
+        };
+        let keyed = vec![
+            unit("orders#0", "r0a", "2026-01-01T00:00:00Z"),
+            unit("orders#0", "r0b", "2026-01-02T00:00:00Z"), // newer #0
+            unit("orders#1", "r1a", "2026-01-01T00:00:00Z"),
+            unit("orders#1", "r1b", "2026-01-02T00:00:00Z"), // newer #1
+        ];
+        let mut sel = latest_full(keyed);
+        sel.sort_by(|a, b| a.1.export_name.cmp(&b.1.export_name));
+        let picked: Vec<(&str, &str)> = sel
+            .iter()
+            .map(|(_, m)| (m.export_name.as_str(), m.run_id.as_str()))
+            .collect();
+        assert_eq!(
+            picked,
+            vec![("orders#0", "r0b"), ("orders#1", "r1b")],
+            "each unit contributes its NEWEST run; no unit is dropped and no stale run loaded"
+        );
     }
 
     #[test]
