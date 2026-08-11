@@ -483,77 +483,20 @@ fn run_keyset_parallel(
     // predicate can't be stranded by a failing worker.
     let semaphore = crate::resource::Semaphore::new(parallel.max(1));
     let finished = std::sync::atomic::AtomicUsize::new(0);
-    let governor_floor = plan
-        .tuning
-        .min_parallel
-        .unwrap_or(1)
-        .clamp(1, parallel.max(1));
-    let governor_on = plan.tuning.adaptive && parallel > 1;
-    let governor_monitor: Option<Box<dyn Source>> = if governor_on {
-        match source::create_source(&plan.source) {
-            Ok(s) => {
-                log::info!(
-                    "export '{}': adaptive concurrency governor active on keyset (parallel {}..{})",
-                    plan.export_name,
-                    governor_floor,
-                    parallel
-                );
-                Some(s)
-            }
-            Err(e) => {
-                log::warn!(
-                    "export '{}': keyset governor monitoring connection failed; parallelism stays static at {}: {:#}",
-                    plan.export_name,
-                    parallel,
-                    e
-                );
-                None
-            }
-        }
-    } else {
-        None
-    };
-    let governor_log: Mutex<Vec<(usize, usize, String)>> = Mutex::new(Vec::new());
+    // OPT-2 adaptive concurrency governor — the SHARED seam (identical wiring in the chunked
+    // runner; #152). arm → spawn_into (in the scope) → drain_into (post-scope, before any bail).
+    let governor = crate::pipeline::governor::GovernorHarness::arm(plan, parallel);
 
     std::thread::scope(|scope| {
-        // Governor thread — mirrors chunked/exec.rs: samples source pressure on
-        // its own monitoring connection and resizes the permit semaphore within
-        // [floor, parallel], self-terminating once every worker has finished.
-        if let Some(mut monitor) = governor_monitor {
-            let semaphore = &semaphore;
-            let finished = &finished;
-            let governor_log = &governor_log;
-            let total = pending.len();
-            let ceiling = parallel;
-            let floor = governor_floor;
-            let export_name = plan.export_name.as_str();
-            scope.spawn(move || {
-                let mut gov = crate::tuning::Governor::new(ceiling, floor, ceiling);
-                gov.run(
-                    &mut monitor,
-                    || finished.load(Ordering::Relaxed) >= total,
-                    |from, to| {
-                        semaphore.resize(to);
-                        let reason = if to < from {
-                            "source pressure rising: backed off"
-                        } else {
-                            "source pressure eased: recovered"
-                        };
-                        log::info!(
-                            "export '{}': keyset governor parallelism {} → {} ({})",
-                            export_name,
-                            from,
-                            to,
-                            reason
-                        );
-                        governor_log
-                            .lock()
-                            .unwrap()
-                            .push((from, to, reason.to_string()));
-                    },
-                );
-            });
-        }
+        // Governor thread (shared seam): resizes the permit semaphore within [floor, ceiling],
+        // self-terminating once every worker has FINISHED (success OR failure).
+        governor.spawn_into(
+            scope,
+            &semaphore,
+            &finished,
+            pending.len(),
+            &plan.export_name,
+        );
 
         for (ridx, lo, hi) in pending.iter().cloned() {
             let dest = std::sync::Arc::clone(&dest);
@@ -817,16 +760,11 @@ fn run_keyset_parallel(
     }
     summary.total_rows += rows.into_inner();
 
-    // #152 (roast 2026-08-10): drain the governor's decisions into the journal
-    // BEFORE the error bail — the failure path is EXACTLY where the back-off
-    // forensics matter (was the source under pressure when it failed?). Draining
-    // after the bail lost every ParallelismAdjusted event on a failed run, unlike
-    // chunked/exec.rs which drains before its error check.
-    for (from, to, reason) in governor_log.into_inner().unwrap() {
-        summary
-            .journal
-            .record(crate::journal::RunEvent::ParallelismAdjusted { from, to, reason });
-    }
+    // #152: drain the governor's decisions into the journal BEFORE the error bail — the failure
+    // path is EXACTLY where the back-off forensics matter (was the source under pressure when it
+    // failed?). The shared drain_into (which poison-recovers, unlike the old into_inner().unwrap()
+    // here) makes this identical to the chunked runner — the drift the copy re-introduced twice.
+    governor.drain_into(summary);
 
     if !errs.is_empty() {
         anyhow::bail!(

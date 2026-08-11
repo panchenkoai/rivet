@@ -17,6 +17,7 @@ mod cli;
 pub(crate) mod commit;
 mod finalize;
 pub(crate) mod frame;
+mod governor;
 pub(crate) mod ipc;
 mod job;
 mod keyset;
