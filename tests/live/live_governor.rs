@@ -450,7 +450,10 @@ exports:
         "governed keyset run must complete; stderr:\n{stderr}"
     );
     assert!(
-        stderr.contains("adaptive concurrency governor active on keyset"),
+        // The chunked and keyset runners now share one GovernorHarness seam, so both log the
+        // SAME arm message (the old "on keyset" suffix is gone); this being a keyset run, its
+        // presence proves the governor armed on the keyset path.
+        stderr.contains("adaptive concurrency governor active"),
         "the KEYSET governor must arm for adaptive + parallel>1; stderr:\n{stderr}"
     );
     assert!(

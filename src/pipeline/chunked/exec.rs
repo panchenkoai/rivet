@@ -15,7 +15,6 @@ use crate::journal::RunEvent;
 use crate::plan::ResolvedRunPlan;
 use crate::source::{self, Source};
 use crate::state::StateStore;
-use crate::tuning::Governor;
 use crate::{destination, format, resource};
 
 pub(crate) fn run_chunked_sequential(
@@ -265,47 +264,9 @@ pub(crate) fn run_chunked_parallel(
     let pb = ChunkProgress::new(&plan.export_name, total_chunks);
     let pb_handle = pb.handle();
 
-    // OPT-2 adaptive concurrency governor. Armed only when the user opted into
-    // adaptation (`tuning.adaptive`) and there is real parallelism to govern
-    // (`parallel > 1`). Floor defaults to 1; ceiling is the configured
-    // `parallel`. A failed monitoring connection degrades gracefully to static
-    // parallelism rather than failing the export.
-    // `parallel` can be 0 when there are no chunks; `.max(1)` keeps `clamp`'s
-    // bounds valid (the governor is off in that case anyway).
-    let governor_floor = plan
-        .tuning
-        .min_parallel
-        .unwrap_or(1)
-        .clamp(1, parallel.max(1));
-    let governor_on = plan.tuning.adaptive && parallel > 1;
-    let governor_monitor: Option<Box<dyn Source>> = if governor_on {
-        match source::create_source(&plan.source) {
-            Ok(s) => {
-                log::info!(
-                    "export '{}': adaptive concurrency governor active (parallel {}..{})",
-                    plan.export_name,
-                    governor_floor,
-                    parallel
-                );
-                Some(s)
-            }
-            Err(e) => {
-                log::warn!(
-                    "export '{}': governor monitoring connection failed; parallelism stays static at {}: {:#}",
-                    plan.export_name,
-                    parallel,
-                    e
-                );
-                None
-            }
-        }
-    } else {
-        None
-    };
-    // Governor decisions buffered here (the journal is not thread-shared) and
-    // drained into `summary.journal` after the scope joins.
-    let governor_log: std::sync::Mutex<Vec<(usize, usize, String)>> =
-        std::sync::Mutex::new(Vec::new());
+    // OPT-2 adaptive concurrency governor — armed, spawned, and drained through the shared
+    // GovernorHarness (identical wiring in the keyset runner; #152).
+    let governor = crate::pipeline::governor::GovernorHarness::arm(plan, parallel);
 
     // One destination (GCS/S3) instance for the whole export: `create_destination` wires a
     // dedicated Tokio runtime; creating one per chunk caused runtime shutdown races under load
@@ -319,54 +280,10 @@ pub(crate) fn run_chunked_parallel(
     );
 
     std::thread::scope(|s| {
-        // Governor thread: samples source pressure on its own monitoring
-        // connection and resizes the semaphore within [floor, parallel]. It
-        // self-terminates once every chunk worker has finished (success OR
-        // failure) — keyed on `finished`, not `completed`, so a failing chunk
-        // can't strand it and deadlock the scope. Holds parallelism flat
-        // whenever the engine can't sample (`sample_pressure` → None).
-        if let Some(mut monitor) = governor_monitor {
-            let semaphore = &semaphore;
-            let finished = &finished;
-            let governor_log = &governor_log;
-            let total = total_chunks;
-            let ceiling = parallel;
-            let floor = governor_floor;
-            let export_name = plan.export_name.as_str();
-            s.spawn(move || {
-                // The decision loop lives in [`tuning::Governor`]; the
-                // callback below is the only runner-specific binding
-                // (resize the kernel-park semaphore, log the transition,
-                // append it to the off-thread decision log so the parent
-                // can drain it into the run journal post-scope).
-                //
-                // `RIVET_GOVERNOR_INTERVAL_MS` is read inside
-                // [`Governor::new`]; the poll interval is clamped to the
-                // sample interval so a tiny override (deterministic live
-                // tests) actually polls that fast.
-                let mut gov = Governor::new(ceiling, floor, ceiling);
-                gov.run(
-                    &mut monitor,
-                    || finished.load(Ordering::Relaxed) >= total,
-                    |from, to| {
-                        semaphore.resize(to);
-                        let reason = if to < from {
-                            "source pressure rising: backed off"
-                        } else {
-                            "source pressure eased: recovered"
-                        };
-                        log::info!(
-                            "export '{}': governor parallelism {} → {} ({})",
-                            export_name,
-                            from,
-                            to,
-                            reason
-                        );
-                        poison::lock_recover(governor_log).push((from, to, reason.to_string()));
-                    },
-                );
-            });
-        }
+        // Governor thread (shared seam): samples source pressure on its own monitoring connection
+        // and resizes the semaphore within [floor, ceiling], self-terminating once every chunk
+        // worker has FINISHED (success OR failure) so a failing chunk can't strand it.
+        governor.spawn_into(s, &semaphore, &finished, total_chunks, &plan.export_name);
 
         for (i, (start, end)) in chunks.iter().enumerate() {
             // Block (kernel-park) until a worker slot frees up.
@@ -509,12 +426,9 @@ pub(crate) fn run_chunked_parallel(
     super::super::commit::accumulate_run_rows(summary, agg_rows.load(Ordering::Relaxed));
     pb.finish(summary.total_rows);
 
-    // Drain governor decisions (recorded off-thread) into the run journal.
-    for (from, to, reason) in poison::into_recover(governor_log) {
-        summary
-            .journal
-            .record(RunEvent::ParallelismAdjusted { from, to, reason });
-    }
+    // Drain governor decisions (recorded off-thread) into the run journal — BEFORE any error
+    // check, so a failed run still journals its ParallelismAdjusted events.
+    governor.drain_into(summary);
     if plan.validate {
         summary.validated = Some(true);
     }
