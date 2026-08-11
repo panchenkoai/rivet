@@ -72,8 +72,17 @@ pub(crate) fn splittable_key(export: &ExportConfig) -> Option<String> {
     if export.cursor_column.is_some() {
         return None; // incremental: a single per-export cursor, not per-range
     }
+    if export.keyset_incremental {
+        // Append-only incremental-by-key: on a clean re-run each unit would continue
+        // from ITS OWN window's high-water mark, but the partition is re-derived every
+        // run — so the per-unit water marks and the fresh windows disagree and rows are
+        // silently dropped/duplicated across runs. This is the "incremental split needs
+        // a per-range cursor" case scope v1 refuses; keep the export WHOLE (its own
+        // keyset_incremental high-water is correct only unsplit).
+        return None;
+    }
     if let Some(key) = &export.chunk_by_key {
-        return Some(key.clone()); // keyset — resumable in any mode
+        return Some(key.clone()); // keyset (non-incremental) — resumable in any mode
     }
     if export.mode == ExportMode::Chunked
         && let Some(col) = &export.chunk_column
@@ -438,6 +447,18 @@ mod tests {
         let mut nokey = sample_export("n");
         nokey.mode = ExportMode::Chunked;
         assert!(splittable_key(&nokey).is_none());
+
+        // append-only incremental-by-key (keyset_incremental) → NOT splittable: a split
+        // re-derives the partition every run, so per-unit high-water marks and fresh
+        // windows disagree and rows are silently dropped/duplicated across re-runs. Scope
+        // v1 refuses an incremental split; the unsplit keyset_incremental is correct.
+        let mut ks_incr = chunked.clone();
+        ks_incr.keyset_incremental = true;
+        assert!(
+            splittable_key(&ks_incr).is_none(),
+            "an append-only keyset_incremental export must not split — the per-unit \
+             high-water mark disagrees with a re-derived partition (silent drop/dup)"
+        );
     }
 
     // Build a minimal SUCCESS unit manifest carrying a split window, and write it as a
