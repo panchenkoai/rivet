@@ -207,20 +207,25 @@ pub(crate) fn probe_and_synthesize(
 /// points at the ONE shared prefix. Best-effort: any listing/read/parse failure
 /// yields an empty set (the unit is treated as incomplete and re-run — safe,
 /// never a skip that could drop data). Read-only.
-pub(crate) fn completed_units_in_prefix(
+/// Read every run-unique unit manifest under the split prefix — the shared listing
+/// scaffolding both [`completed_units_in_prefix`] and [`reconstruct_units_from_prefix`]
+/// need (expand the destination for today's family, list the prefix, parse each
+/// `manifest-<run_id>.json`). A dest/list/read/parse failure yields an empty vec; both
+/// callers read "nothing found" as "no prior split". Read-only.
+fn read_unit_manifests(
     dest_config: &crate::config::DestinationConfig,
     family: &str,
-) -> std::collections::BTreeSet<String> {
-    use crate::manifest::{ManifestStatus, RunManifest, is_run_unique_manifest_name};
-    let mut done = std::collections::BTreeSet::new();
+) -> Vec<crate::manifest::RunManifest> {
+    use crate::manifest::{RunManifest, is_run_unique_manifest_name};
     let ctx = crate::destination::placeholder::PlaceholderContext::for_today(family);
     let expanded = crate::destination::placeholder::expand_destination(dest_config.clone(), &ctx);
     let Ok(dest) = crate::destination::create_destination(&expanded) else {
-        return done;
+        return Vec::new();
     };
     let Ok(listing) = dest.list_prefix("") else {
-        return done;
+        return Vec::new();
     };
+    let mut out = Vec::new();
     for meta in listing {
         let base = meta.key.rsplit('/').next().unwrap_or("");
         if !is_run_unique_manifest_name(base) {
@@ -228,12 +233,23 @@ pub(crate) fn completed_units_in_prefix(
         }
         if let Ok(bytes) = dest.read(&meta.key)
             && let Ok(m) = serde_json::from_slice::<RunManifest>(&bytes)
-            && matches!(m.status, ManifestStatus::Success)
         {
-            done.insert(m.export_name);
+            out.push(m);
         }
     }
-    done
+    out
+}
+
+pub(crate) fn completed_units_in_prefix(
+    dest_config: &crate::config::DestinationConfig,
+    family: &str,
+) -> std::collections::BTreeSet<String> {
+    use crate::manifest::ManifestStatus;
+    read_unit_manifests(dest_config, family)
+        .into_iter()
+        .filter(|m| matches!(m.status, ManifestStatus::Success))
+        .map(|m| m.export_name)
+        .collect()
 }
 
 /// Reconstruct the split into the EXACT partition a PRIOR run used, from the windows its
@@ -256,29 +272,13 @@ pub(crate) fn reconstruct_units_from_prefix(
     family: &str,
     giant: &ExportConfig,
 ) -> Option<Vec<ExportConfig>> {
-    use crate::manifest::{RunManifest, is_run_unique_manifest_name};
-    let ctx = crate::destination::placeholder::PlaceholderContext::for_today(family);
-    let expanded = crate::destination::placeholder::expand_destination(dest_config.clone(), &ctx);
-    let dest = crate::destination::create_destination(&expanded).ok()?;
-    let listing = dest.list_prefix("").ok()?;
-
     let prefix = format!("{}#", giant.name); // this giant's unit names: "{giant}#<ordinal>"
     let mut key: Option<String> = None;
     // boundary position -> value. Position i is the boundary between unit#i and unit#(i+1),
     // i.e. unit#i.hi and unit#(i+1).lo — collected from BOTH so a single crashed unit's
     // boundaries survive via its neighbours.
     let mut bmap: std::collections::BTreeMap<usize, String> = std::collections::BTreeMap::new();
-    for meta in listing {
-        let base = meta.key.rsplit('/').next().unwrap_or("");
-        if !is_run_unique_manifest_name(base) {
-            continue;
-        }
-        let Ok(bytes) = dest.read(&meta.key) else {
-            continue;
-        };
-        let Ok(m) = serde_json::from_slice::<RunManifest>(&bytes) else {
-            continue;
-        };
+    for m in read_unit_manifests(dest_config, family) {
         let (Some(w), Some(ord)) = (
             m.split_window.as_ref(),
             m.export_name
@@ -336,10 +336,12 @@ pub(crate) fn reconstruct_units_from_prefix(
             None => slot.clone_from(&next),
         }
     }
+    // After both fill passes every slot is Some: `max_pos` came from a real bmap key, so
+    // at least one slot is Some; forward-fill covers every slot after the first Some and
+    // back-fill every slot before it. So `flatten()` yields exactly `max_pos + 1` — the
+    // invariant is documented, not a live branch (the fill makes a partial set impossible).
     let boundaries: Vec<String> = boundaries.into_iter().flatten().collect();
-    if boundaries.len() != max_pos + 1 {
-        return None; // impossible given >=1 recovered boundary; never emit a partial set
-    }
+    debug_assert_eq!(boundaries.len(), max_pos + 1);
     Some(synthesize(giant, &key, &boundaries))
 }
 
@@ -515,21 +517,10 @@ mod tests {
         let units = reconstruct_units_from_prefix(&giant.destination, "daily", &giant)
             .expect("reconstruct must recover the partition from the persisted windows");
 
-        let wins: Vec<(Option<String>, Option<String>)> = units
-            .iter()
-            .map(|u| {
-                let s = u
-                    .split
-                    .as_ref()
-                    .expect("reconstructed unit carries a split window");
-                (s.lo.clone(), s.hi.clone())
-            })
-            .collect();
-
         // The EXACT original partition, gap-free and overlap-free — NOT a re-sample of the
         // grown source. Unit #2's (500, 750] is present despite #2 leaving no manifest.
         assert_eq!(
-            wins,
+            wins_of(&units),
             vec![
                 (None, Some("250".into())),
                 (Some("250".into()), Some("500".into())),
