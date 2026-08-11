@@ -250,7 +250,21 @@ pub fn gc_orphans(
             // spares the run's unmanifested in-flight parts below.
             ManifestStatus::Running => {}
             ManifestStatus::Failed | ManifestStatus::Interrupted => {
-                terminal.extend(resolve_parts(key, m))
+                // A Failed/Interrupted run's parts are USUALLY dead crash debris — but NOT
+                // always. A chunk-checkpoint resume ADOPTS the crashed run's run_id and
+                // REUSES its already-committed parts (rehydrate_manifest_parts_from_file_log
+                // references them into the resumed run's manifest rather than re-exporting),
+                // so while a LIVE run of the SAME export is in flight — a newer, non-superseded
+                // `Running` marker — those "terminal" parts may be getting adopted. Deleting
+                // them mid-resume loses the completed chunks and the resume finalizes Success
+                // referencing parts that are gone (post-0.24.3 review HIGH). Spare exactly those
+                // (KEEP); everything else stays terminal debris, deletable even while an
+                // UNRELATED export's run is active (no over-defer of genuine crash leftovers).
+                if superseded_by_active_running(m, keyed) {
+                    keep.extend(resolve_parts(key, m));
+                } else {
+                    terminal.extend(resolve_parts(key, m));
+                }
             }
         }
     }
@@ -304,6 +318,23 @@ pub fn has_active_running_manifest(keyed: &[(String, RunManifest)]) -> bool {
     keyed
         .iter()
         .any(|(_, m)| m.status == ManifestStatus::Running && !is_superseded(m, keyed))
+}
+
+/// True if `m` (a Failed/Interrupted manifest) is superseded by a LIVE run of the SAME
+/// export — a non-superseded `Running` marker with a newer `started_at`. That live run is a
+/// chunk-checkpoint resume which ADOPTS the crashed run's run_id and REUSES its committed
+/// parts, so those parts are being adopted, NOT dead debris — gc must SPARE them until the
+/// resume finalizes. Same clock-free family/supersession seam as [`is_superseded`]. When no
+/// same-export run is live, the parts stay terminal (deleted even while an unrelated run is
+/// active), so genuine crash debris is never over-deferred.
+fn superseded_by_active_running(m: &RunManifest, keyed: &[(String, RunManifest)]) -> bool {
+    keyed.iter().any(|(_, o)| {
+        o.status == ManifestStatus::Running
+            && crate::manifest::identity_family(o, keyed)
+                == crate::manifest::identity_family(m, keyed)
+            && o.started_at > m.started_at
+            && !is_superseded(o, keyed)
+    })
 }
 
 /// A `running` manifest is SUPERSEDED when a NEWER run of the SAME export exists
@@ -1453,6 +1484,36 @@ mod tests {
         let mut kv = keyed("base/manifest-f.json", "f", "f-000.parquet");
         kv.1.status = ManifestStatus::Failed;
         assert_eq!(gc_orphans(&store, "gs://b/base", &[kv], true).unwrap().0, 1);
+    }
+
+    #[test]
+    fn gc_orphans_spares_a_terminal_runs_parts_that_an_active_resume_is_reusing() {
+        // Post-0.24.3 review HIGH: a chunk-checkpoint resume ADOPTS a crashed run's run_id
+        // and REUSES its already-committed parts (rehydrate_manifest_parts_from_file_log),
+        // so a Failed manifest's parts are NOT dead debris while a LIVE run of the SAME export
+        // is in flight (a newer, non-superseded Running marker). Deleting them mid-resume loses
+        // the completed chunks. gc must SPARE them. RED against the pre-fix unconditional
+        // terminal delete (which returned removed=1 even with the live resume present).
+        let (store, _g) = fs_store(&[("base/chunk0.parquet", b"x".to_vec())]);
+        // r0: the crashed run, Failed, referencing the completed chunk (both default export "orders").
+        let mut failed = keyed("base/manifest-r0.json", "r0", "chunk0.parquet");
+        failed.1.status = ManifestStatus::Failed;
+        failed.1.started_at = "2026-01-01T00:00:00Z".into();
+        // r1: the live resume of the SAME export — a newer Running marker adopting r0's parts.
+        let live = running("r1", "2026-01-02T00:00:00Z");
+        let (removed, _) = gc_orphans(&store, "gs://b/base", &[failed, live], true).unwrap();
+        assert_eq!(
+            removed, 0,
+            "a terminal run's parts that an active same-export resume is reusing must be spared"
+        );
+        assert!(
+            store
+                .list_files("base")
+                .unwrap()
+                .iter()
+                .any(|k| k.ends_with("chunk0.parquet")),
+            "the reused chunk part must survive gc while the resume is live"
+        );
     }
 
     #[test]

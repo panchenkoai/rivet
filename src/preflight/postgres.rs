@@ -53,11 +53,27 @@ fn diagnose_pg(
     let base_query = resolve_preflight_base_query(export);
     let base_query = base_query.as_str();
 
-    // chunk_column (range) OR chunk_by_key (keyset) OR cursor_column
-    // (incremental) — the column the run actually reads on. Omitting
-    // chunk_by_key leaves keyset tables with range_col = None, which the index
-    // override below reads as "no index" and reports a false UNSAFE.
-    let range_col = preflight_range_col(export);
+    // The planner auto-resolves an UNSET chunked chunk_column to the single-integer PK
+    // (build_plan). Resolve it here too so range_col / the strategy label / the index probe
+    // target that SAME column — else every such export reports a false UNSAFE + `chunked(?,…)`
+    // + "create an index on chunk_column" on an already-PK-indexed table (post-0.24.3 MED).
+    let auto_pk: Option<String> = if export.mode == ExportMode::Chunked
+        && export.chunk_column.is_none()
+        && export.chunk_by_key.is_none()
+    {
+        export
+            .table
+            .as_deref()
+            .or_else(|| table_from_simple_query(base_query))
+            .and_then(|t| single_int_pk_pg(client, t))
+    } else {
+        None
+    };
+
+    // chunk_column (range) OR chunk_by_key (keyset) OR cursor_column (incremental) OR the
+    // auto-resolved PK above — the column the run actually reads on. Omitting any of these
+    // leaves range_col = None, which the index override below reads as "no index" → false UNSAFE.
+    let range_col = preflight_range_col_resolved(export, auto_pk.as_deref());
 
     let effective_query = if let Some(order) = incremental_key_expr(export, SourceType::Postgres) {
         format!(
@@ -134,7 +150,7 @@ fn diagnose_pg(
         plan_uses_index
     };
 
-    let strategy = derive_strategy(export);
+    let strategy = derive_strategy_resolved(export, auto_pk.as_deref());
     let verdict = compute_verdict(
         row_estimate,
         uses_index,
@@ -431,6 +447,34 @@ pub(crate) fn column_has_btree_pg(
             None
         }
     }
+}
+
+/// The single-integer primary key `build_plan` auto-resolves an unset chunked `chunk_column`
+/// to — so the diagnostic probes the SAME column the run will range on, not a `?` placeholder
+/// (post-0.24.3 review MED, the sibling of the chunk_by_key false-alarm). Mirrors the
+/// `single_int_pk` introspection in `source::postgres::mod`: exactly one PK column, integer
+/// family (`int2`/`int4`/`int8`). `None` on a composite / non-int / absent PK or a probe error.
+pub(crate) fn single_int_pk_pg(
+    client: &mut postgres::Client,
+    qualified_table: &str,
+) -> Option<String> {
+    let (schema, table) = match qualified_table.split_once('.') {
+        Some((s, t)) => (s, t),
+        None => ("public", qualified_table),
+    };
+    let sql = "SELECT a.attname::text, t.typname::text \
+               FROM pg_index i \
+               JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) \
+               JOIN pg_type t ON t.oid = a.atttypid \
+               WHERE i.indrelid = (($1::text || '.' || $2::text)::regclass) \
+                 AND i.indisprimary";
+    let rows = client.query(sql, &[&schema, &table]).ok()?;
+    if rows.len() != 1 {
+        return None; // composite or absent PK → the planner does not auto-resolve
+    }
+    let col: String = rows[0].get(0);
+    let pg_type: String = rows[0].get(1);
+    matches!(pg_type.as_str(), "int2" | "int4" | "int8").then_some(col)
 }
 
 fn analyze_plan_pg(client: &mut postgres::Client, query: &str) -> (Option<String>, bool) {

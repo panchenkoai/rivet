@@ -77,12 +77,26 @@ fn diagnose_mysql(
 
     let base_query = resolve_preflight_base_query(export);
     let base_query = base_query.as_str();
-    // The column the run actually reads on: chunk_column for range chunking,
-    // chunk_by_key for keyset (seek) — a keyset table has neither chunk_column
-    // nor cursor_column, so without chunk_by_key here range_col is None and every
-    // downstream probe (min/max, the index override) silently degrades keyset to
-    // a false unindexed full-scan verdict. cursor_column last for incremental.
-    let range_col = preflight_range_col(export);
+    // build_plan auto-resolves an UNSET chunked chunk_column to the single-integer PK; resolve
+    // it here too so range_col / the strategy label / the index probe target the SAME column,
+    // else the export reports a false UNSAFE + chunked(?,…) on a PK-indexed table (post-0.24.3 MED).
+    let auto_pk: Option<String> = if export.mode == ExportMode::Chunked
+        && export.chunk_column.is_none()
+        && export.chunk_by_key.is_none()
+    {
+        export
+            .table
+            .as_deref()
+            .or_else(|| super::postgres::table_from_simple_query(base_query))
+            .and_then(|t| single_int_pk_mysql(conn, t))
+    } else {
+        None
+    };
+    // The column the run actually reads on: chunk_column for range chunking, chunk_by_key for
+    // keyset (seek), cursor_column for incremental, or the auto-resolved PK above — a keyset
+    // table has neither chunk_column nor cursor_column, so without any of these range_col is
+    // None and every downstream probe silently degrades to a false unindexed full-scan verdict.
+    let range_col = preflight_range_col_resolved(export, auto_pk.as_deref());
     let effective_query = if let Some(order) = incremental_key_expr(export, SourceType::Mysql) {
         format!(
             "SELECT * FROM ({}) AS _rivet ORDER BY {}",
@@ -191,7 +205,7 @@ fn diagnose_mysql(
         plan_uses_index
     };
 
-    let strategy = derive_strategy(export);
+    let strategy = derive_strategy_resolved(export, auto_pk.as_deref());
     let verdict = compute_verdict(
         row_estimate,
         uses_index,
@@ -265,6 +279,58 @@ fn mysql_row_get_string(row: &mysql::Row, col: &str) -> Option<String> {
 /// catalog probe ran cleanly and found none, `None` when the probe
 /// itself failed. Callers fall back to the EXPLAIN-based heuristic on
 /// `None`.
+/// The single-integer PK `build_plan` auto-resolves an UNSET chunked `chunk_column` to — so
+/// the diagnostic ranges/probes on the SAME column the run will, not a `?` placeholder
+/// (post-0.24.3 review MED). FAITHFUL mirror of the `single_int_pk` probe in
+/// `source::mysql::introspect_mysql_table_for_chunking` — keep the int-type set in sync
+/// (tinyint/smallint/mediumint/int/bigint). `None` on composite / non-int / absent PK or a
+/// probe error (the planner then does NOT auto-resolve either).
+fn single_int_pk_mysql(conn: &mut mysql::PooledConn, qualified_table: &str) -> Option<String> {
+    use mysql::prelude::Queryable;
+    let (schema, table) = match qualified_table.split_once('.') {
+        Some((s, t)) => (s.to_string(), t.to_string()),
+        None => {
+            let db: Option<String> = conn.query_first("SELECT DATABASE()").ok().flatten();
+            (db.unwrap_or_default(), qualified_table.to_string())
+        }
+    };
+    let pk_first: Option<(String,)> = conn
+        .exec_first(
+            "SELECT COLUMN_NAME FROM information_schema.STATISTICS \
+             WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND INDEX_NAME = 'PRIMARY' AND SEQ_IN_INDEX = 1",
+            (&schema, &table),
+        )
+        .ok()
+        .flatten();
+    let (col,) = pk_first?;
+    let composite: Option<(String,)> = conn
+        .exec_first(
+            "SELECT COLUMN_NAME FROM information_schema.STATISTICS \
+             WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND INDEX_NAME = 'PRIMARY' AND SEQ_IN_INDEX = 2 \
+             LIMIT 1",
+            (&schema, &table),
+        )
+        .ok()
+        .flatten();
+    if composite.is_some() {
+        return None; // composite PK → the planner does not auto-resolve
+    }
+    let ty: Option<(String,)> = conn
+        .exec_first(
+            "SELECT DATA_TYPE FROM information_schema.COLUMNS \
+             WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND COLUMN_NAME = ?",
+            (&schema, &table, &col),
+        )
+        .ok()
+        .flatten();
+    let ty = ty.map(|(t,)| t.to_ascii_lowercase())?;
+    matches!(
+        ty.as_str(),
+        "tinyint" | "smallint" | "mediumint" | "int" | "bigint"
+    )
+    .then_some(col)
+}
+
 pub(crate) fn column_has_index_mysql(
     conn: &mut mysql::PooledConn,
     qualified_table: &str,

@@ -3,6 +3,15 @@ use crate::config::{ExportConfig, ExportMode};
 
 /// B1: Human-readable strategy name derived from mode + config.
 pub(crate) fn derive_strategy(export: &ExportConfig) -> String {
+    derive_strategy_resolved(export, None)
+}
+
+/// As [`derive_strategy`] but told the engine-introspected single-int PK the planner would
+/// auto-resolve an unset chunked `chunk_column` to (`build_plan`) — so the label reads
+/// `chunked(id, …)`, not `chunked(?, …)`, on a table whose PK the run actually ranges on.
+/// Post-0.24.3 review MED: the `?` placeholder + a false UNSAFE were the diagnostic-bypass
+/// tell (the sibling of the chunk_by_key false-alarm).
+pub(crate) fn derive_strategy_resolved(export: &ExportConfig, auto_pk: Option<&str>) -> String {
     // `chunk_by_key` pins keyset (seek) pagination regardless of the nominal
     // mode: page by ROWS on a unique index, not by key-span windows. The planner
     // (plan::build) turns it into ExtractionStrategy::Keyset, so the diagnostic
@@ -30,7 +39,11 @@ pub(crate) fn derive_strategy(export: &ExportConfig) -> String {
             format!("incremental({})", col)
         }
         ExportMode::Chunked => {
-            let col = export.chunk_column.as_deref().unwrap_or("?");
+            let col = export
+                .chunk_column
+                .as_deref()
+                .or(auto_resolved_chunk_pk(export, auto_pk))
+                .unwrap_or("?");
             if let Some(days) = export.chunk_by_days {
                 if export.parallel > 1 {
                     format!(
@@ -73,6 +86,36 @@ pub(crate) fn preflight_range_col(export: &ExportConfig) -> Option<&str> {
         .or(export.chunk_by_key.as_deref())
         .or(export.cursor_column.as_deref())
         .or(export.time_column.as_deref())
+}
+
+/// [`preflight_range_col`] plus the planner's AUTO-RESOLUTION: when a chunked export leaves
+/// both `chunk_column` and `chunk_by_key` unset, `build_plan` range-chunks on the single-integer
+/// PK (`introspection.single_int_pk`). A diagnostic that omits it probes the wrong/absent column
+/// and reports a false UNSAFE + "create an index on chunk_column" on an already-PK-indexed table
+/// (post-0.24.3 review MED, the sibling of the chunk_by_key false-alarm). `auto_pk` is the engine-
+/// introspected single-int PK, threaded from each engine's diagnose (where the connection lives).
+pub(crate) fn preflight_range_col_resolved<'a>(
+    export: &'a ExportConfig,
+    auto_pk: Option<&'a str>,
+) -> Option<&'a str> {
+    preflight_range_col(export).or(auto_resolved_chunk_pk(export, auto_pk))
+}
+
+/// The single-int PK a chunked export auto-resolves to — `Some(auto_pk)` ONLY when the planner
+/// would actually use it (mode Chunked, no explicit `chunk_column`/`chunk_by_key`). Shared by
+/// the range-col resolution AND the strategy label so both tell the same truth.
+fn auto_resolved_chunk_pk<'a>(
+    export: &'a ExportConfig,
+    auto_pk: Option<&'a str>,
+) -> Option<&'a str> {
+    if export.mode == ExportMode::Chunked
+        && export.chunk_column.is_none()
+        && export.chunk_by_key.is_none()
+    {
+        auto_pk
+    } else {
+        None
+    }
 }
 
 /// Does this strategy read on an indexed key the catalog probe should confirm?
@@ -877,6 +920,41 @@ mod tests {
             "name: test\nformat: parquet\ndestination:\n  type: local\n  path: /tmp\n{extra_yaml}"
         );
         serde_yaml_ng::from_str(&yaml).expect("parse ExportConfig")
+    }
+
+    // ── auto-resolved chunk PK: preflight must model the planner's fallback ───
+    #[test]
+    fn resolved_range_col_and_strategy_model_the_auto_chunk_pk() {
+        // build_plan auto-resolves an UNSET chunked chunk_column to the single-integer PK; the
+        // preflight resolution + strategy label must model that SAME choice, else a perfectly
+        // PK-indexed chunked export gets a `?` label + false UNSAFE + "create an index on
+        // chunk_column" (post-0.24.3 review MED). RED against the pre-fix helpers that ignored it.
+        let e = cfg("mode: chunked\ntable: orders\n"); // no chunk_column / chunk_by_key
+        // Offline (engine gave no PK) there is nothing to resolve to — same as before.
+        assert_eq!(preflight_range_col(&e), None);
+        assert_eq!(
+            derive_strategy(&e),
+            format!("chunked(?, size={})", e.chunk_size)
+        );
+        // WITH the engine-introspected single-int PK threaded in, both resolve to it:
+        assert_eq!(preflight_range_col_resolved(&e, Some("id")), Some("id"));
+        assert_eq!(
+            derive_strategy_resolved(&e, Some("id")),
+            format!("chunked(id, size={})", e.chunk_size)
+        );
+        // An EXPLICIT chunk_column is never overridden by the auto_pk hint.
+        let e2 = cfg("mode: chunked\ntable: orders\nchunk_column: created_at\n");
+        assert_eq!(
+            preflight_range_col_resolved(&e2, Some("id")),
+            Some("created_at")
+        );
+        // The auto-resolve fires ONLY for chunked-with-no-explicit-key: an incremental export
+        // must NOT absorb the PK hint (its cursor_column is the real read key).
+        let e3 = cfg("mode: incremental\ncursor_column: updated_at\n");
+        assert_eq!(
+            preflight_range_col_resolved(&e3, Some("id")),
+            Some("updated_at")
+        );
     }
 
     // ── derive_strategy ─────────────────────────────────────────────────────
