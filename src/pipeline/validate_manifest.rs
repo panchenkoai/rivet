@@ -591,11 +591,12 @@ fn read_sibling_manifests(dest: &dyn Destination, listing: &[ObjectMeta]) -> Vec
     out
 }
 
-/// The set of destination keys claimed by a SAME-FAMILY sibling run-unique
-/// manifest copy (#167 merge-back). A part is claimed only when a sibling of the
-/// SAME `export_family` declared it `Committed`, so a foreign export's parts under
-/// a mistakenly-shared prefix are still surfaced as untracked. Pure — the I/O
-/// (reading the copies) is [`read_sibling_manifests`]'s job.
+/// The set of destination keys claimed by a SAME-FAMILY sibling run-unique manifest copy
+/// (#167 merge-back). A part is claimed only when a sibling of the SAME `export_family`
+/// declared it `Committed`, so a foreign export's parts under a mistakenly-shared prefix are
+/// still surfaced as untracked. Covers BOTH split units AND a plain export's superseded
+/// historical / CDC-soak copies, so neither reads as surplus. Pure — the I/O (reading the
+/// copies) is [`read_sibling_manifests`]'s job.
 fn sibling_claimed_part_keys(
     siblings: &[RunManifest],
     canonical_family: &str,
@@ -603,9 +604,8 @@ fn sibling_claimed_part_keys(
 ) -> std::collections::BTreeSet<String> {
     let mut out = std::collections::BTreeSet::new();
     if canonical_family.is_empty() {
-        // A legacy manifest with no family: never claim across copies — keep the
-        // pre-#167 behaviour (a legacy prefix is single-run, so there is nothing
-        // to claim, and folding by empty family could hide cross-contamination).
+        // A legacy manifest with no family: never claim across copies (a legacy prefix is
+        // single-run, and folding by empty family could hide cross-contamination).
         return out;
     }
     for m in siblings {
@@ -619,6 +619,37 @@ fn sibling_claimed_part_keys(
         }
     }
     out
+}
+
+/// A working manifest whose `parts` are the UNION of `canonical`'s parts and every
+/// SAME-FAMILY **split-unit** sibling copy's `Committed` parts, deduped by declared path. The
+/// reconcile target for a `--pool --split` prefix: presence/size/md5 then cover EVERY unit,
+/// not just the last writer whose parts the canonical `manifest.json` happens to list.
+///
+/// A sibling is folded ONLY when it carries a `split_window` — the precise mark of a
+/// co-current split UNIT (finding 2). A plain export's family is its own name, so its
+/// HISTORICAL repeated-run copies share the family too, but they are SUPERSEDED snapshots
+/// (no `split_window`); folding them would presence-check a legitimately cleaned old part and
+/// false-fail. The canonical's own copy is among the siblings, so seeding `seen` with the
+/// canonical's parts keeps it from being added twice. Only `parts` differ from `canonical`.
+fn merge_split_unit_parts(canonical: &RunManifest, siblings: &[RunManifest]) -> RunManifest {
+    let mut merged = canonical.clone();
+    let mut seen: std::collections::BTreeSet<String> =
+        merged.parts.iter().map(|p| p.path.clone()).collect();
+    for m in siblings {
+        if m.export_family != canonical.export_family {
+            continue; // never fold a FOREIGN family's parts into the check
+        }
+        if m.split_window.is_none() {
+            continue; // only co-current SPLIT units — not superseded plain repeated-run copies
+        }
+        for p in &m.parts {
+            if p.status == PartStatus::Committed && seen.insert(p.path.clone()) {
+                merged.parts.push(p.clone());
+            }
+        }
+    }
+    merged
 }
 
 pub fn verify_at_destination(
@@ -740,20 +771,27 @@ pub fn verify_at_destination(
     let reconciliation = if depth.runs_part_reconcile() {
         match dest.list_prefix(manifest_dir) {
             Ok(listing) => {
-                let mut rec = reconcile_manifest_against_listing(&manifest, &listing, manifest_dir);
-                // #167: a `--pool --split` prefix holds N run-unique manifest
-                // copies of ONE family, each declaring a DISJOINT set of parts.
-                // The canonical `manifest.json` lists only the LAST writer's
-                // parts, so every sibling unit's parts would read as untracked
-                // surplus — noise that also MASKS a genuine orphan. Claim any
-                // listed part a SAME-FAMILY sibling copy declared committed, so
-                // only truly foreign objects stay untracked. (Also cleans up the
-                // repeated-run / CDC-soak case, where the historical runs' parts
-                // are likewise declared by their own copies.) Safe by
-                // construction: this only NARROWS untracked — it can never add a
-                // failure — and a foreign family's parts are never claimed.
+                // #167: a `--pool --split` prefix holds N run-unique manifest copies of ONE
+                // family, each declaring a DISJOINT set of parts. The canonical `manifest.json`
+                // lists only the LAST writer's parts, so reconciling the canonical alone
+                // presence/size/md5-checked ONLY the last unit — a missing/corrupt part of any
+                // OTHER split unit was invisible (no PartMissing: not in the canonical list; no
+                // UntrackedObject: not on disk), and the trust oracle silently PASSED an
+                // incomplete split (adjacent-bughunt finding, HIGH). Fold every SAME-FAMILY
+                // SPLIT-UNIT sibling's parts into the reconcile target so each unit is checked.
+                let siblings = if manifest.export_family.is_empty() {
+                    Vec::new()
+                } else {
+                    read_sibling_manifests(dest, &listing)
+                };
+                let target = merge_split_unit_parts(&manifest, &siblings);
+                let mut rec = reconcile_manifest_against_listing(&target, &listing, manifest_dir);
+                // Same-family sibling parts — the folded split units AND a plain export's
+                // SUPERSEDED historical / CDC-soak copies (no split_window, so NOT folded
+                // above) — are declared by their own copies elsewhere in the prefix, so they
+                // must not read as untracked surplus (noise that also MASKS a real orphan). A
+                // foreign family's parts are never claimed, so cross-contamination still shows.
                 if !rec.untracked.is_empty() && !manifest.export_family.is_empty() {
-                    let siblings = read_sibling_manifests(dest, &listing);
                     let claimed =
                         sibling_claimed_part_keys(&siblings, &manifest.export_family, manifest_dir);
                     rec.untracked.retain(|o| !claimed.contains(&o.key));
@@ -1005,11 +1043,94 @@ mod tests {
         }
     }
 
-    // ── #167 sibling-copy claim (manifest coherence under a shared prefix) ──
+    // ── #167 merge-back: reconcile the UNION of same-family split-unit parts ──
 
-    /// A same-family sibling copy's committed parts are claimed; a FOREIGN
-    /// family's are not. RED against claiming across families (which would hide a
-    /// cross-contamination the shared-prefix guard exists to surface).
+    fn split_win() -> crate::manifest::SplitWindow {
+        crate::manifest::SplitWindow {
+            key_column: "id".into(),
+            lo: None,
+            hi: Some("1000".into()),
+        }
+    }
+
+    /// merge_split_unit_parts folds every SAME-FAMILY SPLIT-UNIT sibling's committed parts
+    /// (those carrying a split_window) into the reconcile target, and EXCLUDES both a FOREIGN
+    /// family's parts and a SAME-FAMILY non-split (plain, superseded) copy's parts — so a
+    /// `--pool --split` snapshot is checked across ALL units without false-checking a plain
+    /// export's historical run or a foreign export sharing the prefix.
+    #[test]
+    fn merge_split_unit_parts_folds_split_siblings_only() {
+        let unit = |name: &str, path: &str, fam: &str, split: bool| {
+            let mut m = build_manifest(vec![part(0, 10, 100, "fp")], ManifestStatus::Success);
+            m.export_family = fam.into();
+            m.export_name = name.into();
+            m.parts[0].path = path.into();
+            m.split_window = if split { Some(split_win()) } else { None };
+            m
+        };
+        let canonical = unit("daily#3", "daily#3_p.parquet", "daily", true); // last split writer
+        let siblings = vec![
+            unit("daily#0", "daily#0_p.parquet", "daily", true),
+            unit("daily#1", "daily#1_p.parquet", "daily", true),
+            unit("daily#3", "daily#3_p.parquet", "daily", true), // canonical's OWN copy
+            unit("daily", "daily_old.parquet", "daily", false),  // SAME family, PLAIN (superseded)
+            unit("other#0", "other_p.parquet", "other", true),   // FOREIGN family
+        ];
+        let merged = merge_split_unit_parts(&canonical, &siblings);
+        let paths: std::collections::BTreeSet<&str> =
+            merged.parts.iter().map(|p| p.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            [
+                "daily#0_p.parquet",
+                "daily#1_p.parquet",
+                "daily#3_p.parquet"
+            ]
+            .into_iter()
+            .collect(),
+            "fold same-family SPLIT units only — never a foreign family, never a same-family \
+             plain/superseded copy: {paths:?}"
+        );
+        assert_eq!(
+            merged
+                .parts
+                .iter()
+                .filter(|p| p.path == "daily#3_p.parquet")
+                .count(),
+            1,
+            "the canonical's own sibling copy must not double its part"
+        );
+    }
+
+    /// A non-committed (quarantined) split-unit sibling part is NOT merged — only durable
+    /// committed parts belong to the dataset the reconcile checks for presence.
+    #[test]
+    fn merge_split_unit_parts_skips_non_committed_siblings() {
+        let mut canonical = build_manifest(vec![part(0, 10, 100, "fp")], ManifestStatus::Success);
+        canonical.export_family = "daily".into();
+        canonical.export_name = "daily#0".into();
+        canonical.parts[0].path = "daily#0_p.parquet".into();
+        canonical.split_window = Some(split_win());
+
+        let mut sib = build_manifest(vec![part(0, 10, 100, "fp")], ManifestStatus::Success);
+        sib.export_family = "daily".into();
+        sib.export_name = "daily#1".into();
+        sib.parts[0].path = "daily#1_q.parquet".into();
+        sib.parts[0].status = PartStatus::Quarantined;
+        sib.split_window = Some(split_win());
+
+        let merged = merge_split_unit_parts(&canonical, &[sib]);
+        let paths: Vec<&str> = merged.parts.iter().map(|p| p.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["daily#0_p.parquet"],
+            "a quarantined split-unit part must not be folded into the reconcile target"
+        );
+    }
+
+    /// sibling_claimed_part_keys claims a SAME-FAMILY sibling's committed parts (so a split
+    /// unit AND a plain export's superseded historical copy are both kept out of untracked),
+    /// but never a FOREIGN family's (cross-contamination must still surface as untracked).
     #[test]
     fn sibling_claimed_part_keys_claims_same_family_only() {
         let unit = |name: &str, path: &str, fam: &str| {
@@ -1021,22 +1142,22 @@ mod tests {
         };
         let siblings = vec![
             unit("daily#0", "daily#0_p.parquet", "daily"),
-            unit("daily#1", "daily#1_p.parquet", "daily"),
+            unit("daily", "daily_old.parquet", "daily"), // plain superseded copy, same family
             unit("other", "other_p.parquet", "other"),
         ];
         let claimed = sibling_claimed_part_keys(&siblings, "daily", "");
         assert!(
-            claimed.contains("daily#0_p.parquet") && claimed.contains("daily#1_p.parquet"),
-            "same-family split units' parts must be claimed: {claimed:?}"
+            claimed.contains("daily#0_p.parquet") && claimed.contains("daily_old.parquet"),
+            "same-family parts (split unit AND plain historical) must be claimed: {claimed:?}"
         );
         assert!(
             !claimed.contains("other_p.parquet"),
-            "a FOREIGN family's part must NOT be claimed — cross-contamination must still surface"
+            "a FOREIGN family's part must NOT be claimed — cross-contamination must surface"
         );
     }
 
-    /// A legacy canonical (empty family) claims nothing — pre-#167 behaviour, so
-    /// the widening never applies where a family cannot disambiguate.
+    /// A legacy canonical (empty family) claims nothing — the widening never applies where a
+    /// family cannot disambiguate.
     #[test]
     fn sibling_claimed_part_keys_empty_family_claims_nothing() {
         let mut m = build_manifest(vec![part(0, 10, 100, "fp")], ManifestStatus::Success);
@@ -1048,8 +1169,8 @@ mod tests {
         );
     }
 
-    /// A non-committed (quarantined) sibling part is NOT claimed — only durable
-    /// committed parts belong to the dataset.
+    /// A non-committed (quarantined) sibling part is NOT claimed — only durable committed
+    /// parts belong to the dataset.
     #[test]
     fn sibling_claimed_part_keys_skips_non_committed() {
         let mut m = build_manifest(vec![part(0, 10, 100, "fp")], ManifestStatus::Success);
@@ -1059,6 +1180,77 @@ mod tests {
         assert!(
             sibling_claimed_part_keys(&[m], "daily", "").is_empty(),
             "a quarantined part must not be claimed as a tracked dataset part"
+        );
+    }
+
+    /// End-to-end: a `--pool --split` prefix where a NON-last unit's part is missing must
+    /// FAIL validation. Before the merge-back fix, verify reconciled only the canonical
+    /// (last writer's) parts, so a lost part of any other unit was invisible — no PartMissing
+    /// (not in the canonical list) and no UntrackedObject (not on disk) — and the trust
+    /// oracle silently PASSED an incomplete split (adjacent-bughunt finding, HIGH).
+    #[test]
+    fn verify_over_a_split_prefix_catches_a_missing_non_last_unit_part() {
+        use crate::manifest::run_unique_manifest_name;
+        let dir = tempfile::tempdir().unwrap();
+
+        // Two split units of family "orders": #0 (run r0) and #1 (run r1 = LAST → canonical).
+        let mut u0 = build_manifest(
+            vec![part(0, 10, 4, "xxh3:0000000000000000")],
+            ManifestStatus::Success,
+        );
+        u0.export_family = "orders".into();
+        u0.export_name = "orders#0".into();
+        u0.run_id = "r0".into();
+        u0.parts[0].path = "orders#0-part.parquet".into();
+        u0.split_window = Some(crate::manifest::SplitWindow {
+            key_column: "id".into(),
+            lo: None,
+            hi: Some("1000".into()),
+        });
+
+        let mut u1 = build_manifest(
+            vec![part(1, 20, 5, "xxh3:1111111111111111")],
+            ManifestStatus::Success,
+        );
+        u1.export_family = "orders".into();
+        u1.export_name = "orders#1".into();
+        u1.run_id = "r1".into();
+        u1.parts[0].path = "orders#1-part.parquet".into();
+        u1.split_window = Some(crate::manifest::SplitWindow {
+            key_column: "id".into(),
+            lo: Some("1000".into()),
+            hi: None,
+        });
+
+        // Both units' run-unique copies on disk; canonical manifest.json = u1 (last writer).
+        std::fs::write(
+            dir.path().join(run_unique_manifest_name("r0")),
+            serde_json::to_vec(&u0).unwrap(),
+        )
+        .unwrap();
+        let u1_body = serde_json::to_vec(&u1).unwrap();
+        std::fs::write(dir.path().join(run_unique_manifest_name("r1")), &u1_body).unwrap();
+        std::fs::write(dir.path().join(MANIFEST_FILENAME), &u1_body).unwrap();
+        std::fs::write(
+            dir.path().join(SUCCESS_FILENAME),
+            success_marker_body(&u1_body),
+        )
+        .unwrap();
+        // u1's part present (5 bytes = its declared size); u0's part DELIBERATELY MISSING.
+        std::fs::write(dir.path().join("orders#1-part.parquet"), b"BBBBB").unwrap();
+
+        let dest = local_dest(dir.path());
+        let v = verify_at_destination(&dest, "", ValidateDepth::Full).unwrap();
+        assert!(
+            !v.passed,
+            "a missing part of a NON-last split unit must fail validation, not pass silently"
+        );
+        assert!(
+            v.failures
+                .iter()
+                .any(|f| matches!(f, Failure::PartMissing { .. })),
+            "expected a PartMissing for the dropped orders#0 part; got {:?}",
+            v.failures
         );
     }
 
