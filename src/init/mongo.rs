@@ -7,8 +7,8 @@
 //! estimate. The scaffold then emits a `type: mongo` source + one
 //! `table: <collection>` / `mode: full` export per collection.
 //!
-//! The async→sync bridge is the shared [`MongoSession`]; init connects
-//! ungated (dev convenience, like the SQL init helpers).
+//! The async→sync bridge is the shared [`MongoSession`]; init connects GATED
+//! (refuses remote plaintext), matching the PG/MySQL init helpers.
 
 use mongodb::bson::Document;
 
@@ -16,8 +16,8 @@ use super::TableInfo;
 use crate::error::Result;
 use crate::source::mongo::MongoSession;
 
-/// Connect once (ungated) so one session serves the whole `list_tables` +
-/// per-collection `introspect` scan.
+/// Connect once (GATED — refuses remote plaintext) so one session serves the
+/// whole `list_tables` + per-collection `introspect` scan.
 pub(super) fn connect(url: &str, tls: Option<&crate::config::TlsConfig>) -> Result<MongoSession> {
     // gate=true, matching PG init (connect_client) and MySQL init (connect_pool),
     // both of which refuse remote plaintext. The old `false` + "like the SQL

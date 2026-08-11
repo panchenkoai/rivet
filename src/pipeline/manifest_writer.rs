@@ -312,6 +312,10 @@ pub fn record_run_schema_fingerprint(
 /// Used by parallel-chunked aggregation, where workers compute fingerprints
 /// inside their thread (the local tmp file is dropped at thread exit) and
 /// the parent iterates over the shared `file_records` collection.
+/// Returns `true` iff the part was DEDUPED in place (a re-read overwrote a rehydrated part of the
+/// same path) — the caller must then NOT double-count the run aggregates for it; `false` on a
+/// normal first-time push.
+#[must_use]
 pub fn record_committed_part_with_fingerprint(
     summary: &mut RunSummary,
     relative_path: String,
@@ -319,7 +323,7 @@ pub fn record_committed_part_with_fingerprint(
     size_bytes: u64,
     content_fingerprint: String,
     content_md5: String,
-) {
+) -> bool {
     // ADR-0012 M4: part_id must be unique within the manifest.  Before the
     // M8 resume-hydration work, `summary.manifest_parts.len() + 1` was a
     // safe ordinal because the list was always built from scratch this run.
@@ -328,6 +332,25 @@ pub fn record_committed_part_with_fingerprint(
     // write at len()=4 would get part_id=5 — duplicate).  Take max+1 of
     // existing part_ids instead.  Empty list → 1, matching the historical
     // first-part value.
+    // Dedup by PATH: a resume that re-reads a page whose REHYDRATED part shares this run's stable
+    // part name (keyset seek_tag / a chunked stable name) OVERWRITES the file on disk — the
+    // manifest must then carry ONE entry, not both, or finalize double-counts the page's rows (the
+    // after_manifest_update dup — measured 300/1000 on a live keyset resume, convergence round-1
+    // HIGH). Two parts sharing a path is never valid (each is a distinct file), so the re-read is
+    // authoritative: keep the existing part_id, refresh the payload in place. A first-time write
+    // (the common case) never collides and falls through to the push below unchanged.
+    if let Some(existing) = summary
+        .manifest_parts
+        .iter_mut()
+        .find(|p| p.path == relative_path)
+    {
+        existing.rows = rows;
+        existing.size_bytes = size_bytes;
+        existing.content_fingerprint = content_fingerprint;
+        existing.content_md5 = content_md5;
+        existing.status = PartStatus::Committed;
+        return true; // deduped in place — the caller must NOT double-count the aggregates
+    }
     let part_id = summary
         .manifest_parts
         .iter()
@@ -344,6 +367,7 @@ pub fn record_committed_part_with_fingerprint(
         content_md5,
         status: PartStatus::Committed,
     });
+    false
 }
 
 /// Outcome of a manifest-write attempt.
@@ -802,7 +826,7 @@ mod tests {
                 status: PartStatus::Committed,
             });
         }
-        record_committed_part_with_fingerprint(
+        let _ = record_committed_part_with_fingerprint(
             &mut s,
             "part-next.parquet".into(),
             1,

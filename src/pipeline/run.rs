@@ -878,6 +878,17 @@ pub(crate) fn run_pool(
                         let realized = units.len();
                         split_info = Some((base.destination.clone(), base.family()));
                         effective.retain(|e| &e.name != giant);
+                        // A synthesized unit is named `{giant}#i`; if a user export already carries
+                        // that exact name, the `by_name` HashMap below collapses the two and
+                        // silently DROPS the pre-existing export's whole table (convergence round-2
+                        // LOW — `#` is not reserved in export-name validation). Refuse loudly.
+                        if let Some(clash) = first_name_collision(&units, &effective) {
+                            anyhow::bail!(
+                                "apply --pool --split: the synthesized split unit '{clash}' collides \
+                                 with an existing export of the same name. Rename that export — a \
+                                 name of the form '{giant}#<n>' is reserved for split unit names."
+                            );
+                        }
                         effective.extend(units);
                         items = build_items(&effective);
                         log::warn!(
@@ -1224,9 +1235,37 @@ fn is_parallel_safe(export: &ExportConfig) -> bool {
     export.parallel_safe.unwrap_or(false)
 }
 
+/// The first synthesized split-unit name (`{giant}#i`) that collides with an EXISTING export's
+/// name. `--pool --split` splices the units into the export set, and the downstream `by_name`
+/// HashMap collapses same-named entries — so a user export literally named `{giant}#0` would be
+/// silently dropped (its whole table lost). `Some(name)` here → the caller refuses loudly.
+fn first_name_collision<'a>(
+    units: &'a [ExportConfig],
+    existing: &[ExportConfig],
+) -> Option<&'a str> {
+    units
+        .iter()
+        .find(|u| existing.iter().any(|e| e.name == u.name))
+        .map(|u| u.name.as_str())
+}
+
 #[cfg(test)]
 mod wave_grouping_tests {
-    use super::{group_exports_by_wave, is_parallel_safe, next_eligible};
+    use super::{first_name_collision, group_exports_by_wave, is_parallel_safe, next_eligible};
+
+    #[test]
+    fn a_synthesized_split_unit_colliding_with_an_existing_export_is_detected() {
+        // Convergence round-2 LOW: a user export named exactly `orders#0` coexisting with the
+        // split of `orders` would be collapsed by the pool's by_name map and silently dropped.
+        // The guard must catch the collision so the caller can refuse. RED against no-guard.
+        use crate::config::sample_export;
+        let units = vec![sample_export("orders#0"), sample_export("orders#1")];
+        let existing = vec![sample_export("users"), sample_export("orders#0")]; // pre-existing table
+        assert_eq!(first_name_collision(&units, &existing), Some("orders#0"));
+        // No collision when names are disjoint.
+        let clean = vec![sample_export("users"), sample_export("events")];
+        assert_eq!(first_name_collision(&units, &clean), None);
+    }
 
     /// The pool's pick rule (#166), both directions — RED against `||`→`&&`
     /// (which would starve every heavy export the moment slots are free) and

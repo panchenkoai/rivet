@@ -199,9 +199,14 @@ impl TxnFramer {
         }
     }
 
-    /// Mongo's model: each change-stream event IS its own commit, so every
-    /// event is a boundary. A NAMED decision, not a divergence (#158). `position`
-    /// is already per-event here, so this only sets the flag.
+    /// Mark a stand-alone event as its own commit boundary (#158 — a NAMED decision, not a
+    /// divergence). Correct where each event's write is a distinct commit (Mongo single-document
+    /// writes). A Mongo MULTI-document transaction shares one commit across N events; each is still
+    /// marked committed here (so a large one can roll the sink mid-transaction) — safe ONLY because
+    /// Mongo's per-event, consume-free resume token re-reads a mid-transaction tail rather than
+    /// skipping it (see `mongo/cdc.rs`). Engines whose resume position skips (PG slot / MSSQL
+    /// from-LSN) must frame the TRUE boundary instead. `position` is already per-event, so this
+    /// only sets the flag.
     pub(crate) fn single_event_commit(event: &mut ChangeEvent) {
         event.committed = true;
     }

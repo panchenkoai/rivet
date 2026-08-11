@@ -2303,6 +2303,16 @@ fn stand_pool_split_gappy_key_mssql() {
 // RED-proven by the unit tests `reconstruct_{covers_a_leading,fills_an_interior}_
 // adjacent_crash_*`; the RANGE stand tests above (`stand_pool_split_resume_grows_*`,
 // `stand_pool_split_gappy_key_*`) are the live finding-2 guards that DO bite the mutant.
+//
+// A TRAILING adjacent crash needs NO extra guard: it lowers `max_pos`, so the reconstruct's
+// tail unit becomes an OPEN `(b, None]` window baked into `base_query` as `WHERE key > b` (no
+// upper bound). The crashed unit's PERSISTED ranges record `ceil = None` for their last range
+// (a split unit is non-incremental → floor/ceil are None; the window lives in `base_query`, not
+// the range endpoints), so on resume that last range re-runs `WHERE key > last_bound` under the
+// WIDENED base_query and naturally covers everything up to the current max — the widened tail is
+// complete, not dropped. (A post-0.24.3 bughunt finding claimed this dropped `(b', None]` by
+// assuming the persisted last `hi = b'`; it is `None`, and the widened base_query covers the top
+// — verified by reading `partition_ranges` + the `(None, None)` floor/ceil for split units.)
 
 #[test]
 #[ignore = "live: requires docker compose up -d postgres"]

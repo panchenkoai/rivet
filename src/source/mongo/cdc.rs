@@ -437,9 +437,13 @@ fn to_change_event(
         seq: 0, // stamped by TxnSeq as the stream is consumed
         poison: None,
     };
-    // #158: Mongo's model — each change-stream event IS its own commit (post-
-    // commit oplog), so every event is a boundary. A NAMED decision via the
-    // shared framer, not an inline `committed: true` that reads as a divergence.
+    // #158: Mongo's model — a SINGLE-document write's change event IS its own commit (post-commit
+    // oplog), so it is a boundary. A MULTI-document transaction (one lsid/txnNumber) shares one
+    // commit across N events, so marking each `committed` can roll the sink MID-transaction — but
+    // Mongo's resume token is PER-EVENT and consume-free, so a crash between the mid-txn checkpoint
+    // and the tail RE-READS the remaining events (at-least-once, dedup absorbs it), never SKIPS them
+    // like the PG slot / MSSQL from-LSN would (which is why those engines frame the true boundary).
+    // A NAMED decision via the shared framer, not an inline `committed: true` that reads as a divergence.
     crate::source::cdc::TxnFramer::single_event_commit(&mut ev);
     Ok(ev)
 }

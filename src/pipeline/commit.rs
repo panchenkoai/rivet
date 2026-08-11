@@ -158,9 +158,19 @@ pub(crate) struct PartRecord {
 ///   `RunEvent::KeysetPageWritten` later without touching the runners —
 ///   only the match arm in [`record_part`] would change.
 pub(crate) enum PartKind {
-    File { part_index: usize },
-    Chunk { chunk_index: i64 },
-    Page { page_index: i64 },
+    File {
+        part_index: usize,
+    },
+    Chunk {
+        chunk_index: i64,
+    },
+    Page {
+        page_index: i64,
+        /// The page's high-water key — written into the SAME file_log row as the part, so a
+        /// crash-recovery resume reconciles the cursor from committed parts and never re-reads a
+        /// committed page (v25 cursor-atomic keyset checkpoint). `None` on a non-keyset page.
+        cursor_high: Option<String>,
+    },
 }
 
 /// Seam 1 — ADR-0001 I1 + the destination-write boundary. Writes the
@@ -279,22 +289,26 @@ pub(crate) fn part_indexed_name(base: &str, idx: usize, count: usize) -> String 
 /// Seam 2 — the single home for the post-write ordering that used to drift
 /// across runners: the I2 fault window, the byte/file counters, the manifest
 /// part (I2/M1), the journal event, and the warn-on-fail file-log write (I7).
+/// Returns `true` iff the part was DEDUPED (a re-read overwrote a rehydrated part of the same
+/// path); the caller (the keyset page loop) then skips the per-page `total_rows` bump because
+/// rehydration already counted that page.
 pub(crate) fn record_part(
     plan: &ResolvedRunPlan,
     summary: &mut RunSummary,
     state: Option<&StateStore>,
     part: &PartRecord,
     kind: PartKind,
-) {
+) -> bool {
     // ADR-0001 I2→I3 crash window: file at destination, manifest not yet updated.
     crate::test_hook::maybe_panic_at("after_file_write");
 
-    summary.bytes_written += part.bytes;
-    summary.files_produced += 1;
-    summary.files_committed += 1;
-
-    // ADR-0012 M1: record the committed part for the finalizer's RunManifest.
-    manifest_writer::record_committed_part_with_fingerprint(
+    // ADR-0012 M1: record the committed part for the finalizer's RunManifest. Returns whether it
+    // DEDUPED (a re-read overwrote a rehydrated part of the same path — the keyset after-manifest
+    // resume window). Aggregates are bumped only on a genuine NEW part, so a deduped re-read does
+    // not inflate files_committed / bytes_written past manifest_parts.len() (which would trip the
+    // run-integrity invariant). total_rows is a per-page loop counter; the keyset runner reconciles
+    // it to the manifest sum after the loop.
+    let deduped = manifest_writer::record_committed_part_with_fingerprint(
         summary,
         part.file_name.clone(),
         part.rows,
@@ -302,16 +316,21 @@ pub(crate) fn record_part(
         part.fingerprint.clone(),
         part.md5.clone(),
     );
+    if !deduped {
+        summary.bytes_written += part.bytes;
+        summary.files_produced += 1;
+        summary.files_committed += 1;
+    }
 
-    match kind {
+    match &kind {
         PartKind::File { part_index } => summary.journal.record(RunEvent::FileWritten {
             file_name: part.file_name.clone(),
             rows: part.rows,
             bytes: part.bytes,
-            part_index,
+            part_index: *part_index,
         }),
         PartKind::Chunk { chunk_index } => summary.journal.record(RunEvent::ChunkCompleted {
-            chunk_index,
+            chunk_index: *chunk_index,
             rows: part.rows,
             file_name: Some(part.file_name.clone()),
         }),
@@ -319,12 +338,20 @@ pub(crate) fn record_part(
         // backward compatibility. See [`PartKind::Page`] for the rationale
         // and the upgrade path if/when downstream observability needs to
         // distinguish keyset pages from chunked windows.
-        PartKind::Page { page_index } => summary.journal.record(RunEvent::ChunkCompleted {
-            chunk_index: page_index,
+        PartKind::Page { page_index, .. } => summary.journal.record(RunEvent::ChunkCompleted {
+            chunk_index: *page_index,
             rows: part.rows,
             file_name: Some(part.file_name.clone()),
         }),
     }
+
+    // v25: the page's high-water key rides in the SAME file_log row as its part, so a resume
+    // reconciles the cursor from committed parts (see keyset::run_keyset resume) and never
+    // re-reads a committed page. `None` for every non-keyset part.
+    let cursor_high: Option<&str> = match &kind {
+        PartKind::Page { cursor_high, .. } => cursor_high.as_deref(),
+        _ => None,
+    };
 
     // ADR-0001 I7: file-log (manifest) write failure is non-fatal — the file is
     // already durable at the destination; log and continue.
@@ -338,6 +365,7 @@ pub(crate) fn record_part(
             format: plan.format.label(),
             compression: Some(plan.compression.label()),
             mode: plan.strategy.mode_label(),
+            cursor_high,
         })
     {
         log::warn!(
@@ -350,6 +378,7 @@ pub(crate) fn record_part(
 
     // ADR-0001 I3 crash window: manifest recorded, cursor not yet advanced.
     crate::test_hook::maybe_panic_at("after_manifest_update");
+    deduped
 }
 
 #[cfg(test)]

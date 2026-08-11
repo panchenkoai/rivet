@@ -447,6 +447,7 @@ mod tests {
             bytes: 100,
             format: "parquet",
             compression: None,
+            cursor_high: None,
         })
         .expect("seed a durable part");
 

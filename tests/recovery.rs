@@ -55,6 +55,7 @@ fn record_file(state: &StateStore, run_id: &str, export: &str, file: &str, rows:
             bytes: rows * 100,
             format: "parquet",
             compression: Some("zstd"),
+            cursor_high: None,
         })
         .unwrap();
 }

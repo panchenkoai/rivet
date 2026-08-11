@@ -250,7 +250,21 @@ pub fn gc_orphans(
             // spares the run's unmanifested in-flight parts below.
             ManifestStatus::Running => {}
             ManifestStatus::Failed | ManifestStatus::Interrupted => {
-                terminal.extend(resolve_parts(key, m))
+                // A Failed/Interrupted run's parts are USUALLY dead crash debris — but NOT
+                // always. A chunk-checkpoint resume ADOPTS the crashed run's run_id and
+                // REUSES its already-committed parts (rehydrate_manifest_parts_from_file_log
+                // references them into the resumed run's manifest rather than re-exporting),
+                // so while a LIVE run of the SAME export is in flight — a newer, non-superseded
+                // `Running` marker — those "terminal" parts may be getting adopted. Deleting
+                // them mid-resume loses the completed chunks and the resume finalizes Success
+                // referencing parts that are gone (post-0.24.3 review HIGH). Spare exactly those
+                // (KEEP); everything else stays terminal debris, deletable even while an
+                // UNRELATED export's run is active (no over-defer of genuine crash leftovers).
+                if superseded_by_active_running(m, keyed) {
+                    keep.extend(resolve_parts(key, m));
+                } else {
+                    terminal.extend(resolve_parts(key, m));
+                }
             }
         }
     }
@@ -306,6 +320,23 @@ pub fn has_active_running_manifest(keyed: &[(String, RunManifest)]) -> bool {
         .any(|(_, m)| m.status == ManifestStatus::Running && !is_superseded(m, keyed))
 }
 
+/// True if `m` (a Failed/Interrupted manifest) is superseded by a LIVE run of the SAME
+/// export — a non-superseded `Running` marker with a newer `started_at`. That live run is a
+/// chunk-checkpoint resume which ADOPTS the crashed run's run_id and REUSES its committed
+/// parts, so those parts are being adopted, NOT dead debris — gc must SPARE them until the
+/// resume finalizes. Same clock-free family/supersession seam as [`is_superseded`]. When no
+/// same-export run is live, the parts stay terminal (deleted even while an unrelated run is
+/// active), so genuine crash debris is never over-deferred.
+fn superseded_by_active_running(m: &RunManifest, keyed: &[(String, RunManifest)]) -> bool {
+    keyed.iter().any(|(_, o)| {
+        o.status == ManifestStatus::Running
+            && crate::manifest::identity_family(o, keyed)
+                == crate::manifest::identity_family(m, keyed)
+            && o.started_at > m.started_at
+            && !is_superseded(o, keyed)
+    })
+}
+
 /// A `running` manifest is SUPERSEDED when a NEWER run of the SAME export exists
 /// (a higher `started_at`) — it crashed and its successor already re-ran, so it
 /// no longer protects anything. The ONE clock-free staleness predicate, shared by
@@ -318,10 +349,40 @@ fn is_superseded(m: &RunManifest, keyed: &[(String, RunManifest)]) -> bool {
     // `name:` ≠ `table:` a name-only compare never matched — a crashed marker
     // stayed "active" forever and gc over-deferred cleanup permanently. Same
     // recorded-identity seam as `ensure_single_export`.
+    //
+    // BUT a `--pool --split` fans ONE family into N units (`{family}#0..#N-1`) that run
+    // CONCURRENTLY under that shared family. A later-STARTED sibling that finishes first must
+    // NOT make an earlier, still-live sibling look superseded — that would let a cross-host
+    // gc_orphans (whose only liveness signal is `has_active_running_manifest`) delete the live
+    // sibling's in-flight parts (post-0.24.3 convergence HIGH). A crash SUCCESSOR of a unit
+    // shares its export_NAME (`orders#0` re-run), so it still supersedes correctly; only a
+    // DIFFERENT sibling (`orders#1` vs `orders#0`) is excluded.
     keyed.iter().any(|(_, o)| {
         crate::manifest::identity_family(o, keyed) == crate::manifest::identity_family(m, keyed)
             && o.started_at > m.started_at
+            && !are_split_siblings(o, m)
     })
+}
+
+/// True if `a` and `b` are DIFFERENT split units of the same family (`{family}#i` vs
+/// `{family}#j`, i≠j) — concurrent siblings, not a crash + successor. Keyed off the export
+/// NAME pattern because a split unit's running marker carries `split_window: None` (it is
+/// overwritten by the terminal), so the name is the only sibling discriminator on a marker.
+fn are_split_siblings(a: &RunManifest, b: &RunManifest) -> bool {
+    fn unit_index(m: &RunManifest) -> Option<&str> {
+        // "orders#0" with family "orders" → Some("0"); a non-split name → None.
+        if m.export_family.is_empty() {
+            return None;
+        }
+        m.export_name
+            .strip_prefix(m.export_family.as_str())
+            .and_then(|s| s.strip_prefix('#'))
+            .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()))
+    }
+    a.export_family == b.export_family
+        && a.export_name != b.export_name
+        && unit_index(a).is_some()
+        && unit_index(b).is_some()
 }
 
 /// Full/chunked loads care only about the LATEST snapshot: from `keyed` (all run
@@ -413,6 +474,38 @@ fn ensure_single_split_generation(selected: &[(String, RunManifest)]) -> Result<
             } else {
                 String::new()
             }
+        );
+    }
+    // bottoms==1, tops==1, plain==0 is NECESSARY but NOT sufficient. When two generations
+    // split into the SAME unit COUNT but at DIFFERENT boundaries and an INTERIOR unit is
+    // substituted from the older generation (its newer sibling crashed, so latest_full falls
+    // back to the stale Success), the selection still has exactly one bottom + one top — yet
+    // the windows no longer tile: a GAP loses rows and an OVERLAP duplicates them, and the
+    // count gate can't see it (expected_rows inflates with the parts). Post-0.24.3 review HIGH.
+    //
+    // A coherent split tiles the key space: every INTERIOR boundary appears once as some
+    // unit's `hi` and once as the NEXT unit's `lo`. So the multiset of non-None `lo` bounds
+    // must equal the multiset of non-None `hi` bounds. Compare them sorted — order-free, no
+    // numeric parse of opaque key text (a gap leaves a `hi` with no matching `lo`; an overlap
+    // leaves a `lo` with no matching `hi`).
+    let mut los: Vec<&String> = split
+        .iter()
+        .filter_map(|m| m.split_window.as_ref().unwrap().lo.as_ref())
+        .collect();
+    let mut his: Vec<&String> = split
+        .iter()
+        .filter_map(|m| m.split_window.as_ref().unwrap().hi.as_ref())
+        .collect();
+    los.sort();
+    his.sort();
+    if los != his {
+        anyhow::bail!(
+            "Full load over a --pool --split prefix selected an INCOHERENT set of split windows \
+             — the interior boundaries do not tile the key space, so a later run re-sampled to \
+             different boundaries and an older unit was substituted for a crashed one. Their \
+             union LOSES the gap rows and DUPLICATES the overlap rows (the count gate can't see \
+             it). Interior lower bounds {los:?} != upper bounds {his:?}. Load into a FRESH \
+             destination prefix (or clear the stale generation) and re-run."
         );
     }
     Ok(())
@@ -1424,6 +1517,36 @@ mod tests {
     }
 
     #[test]
+    fn gc_orphans_spares_a_terminal_runs_parts_that_an_active_resume_is_reusing() {
+        // Post-0.24.3 review HIGH: a chunk-checkpoint resume ADOPTS a crashed run's run_id
+        // and REUSES its already-committed parts (rehydrate_manifest_parts_from_file_log),
+        // so a Failed manifest's parts are NOT dead debris while a LIVE run of the SAME export
+        // is in flight (a newer, non-superseded Running marker). Deleting them mid-resume loses
+        // the completed chunks. gc must SPARE them. RED against the pre-fix unconditional
+        // terminal delete (which returned removed=1 even with the live resume present).
+        let (store, _g) = fs_store(&[("base/chunk0.parquet", b"x".to_vec())]);
+        // r0: the crashed run, Failed, referencing the completed chunk (both default export "orders").
+        let mut failed = keyed("base/manifest-r0.json", "r0", "chunk0.parquet");
+        failed.1.status = ManifestStatus::Failed;
+        failed.1.started_at = "2026-01-01T00:00:00Z".into();
+        // r1: the live resume of the SAME export — a newer Running marker adopting r0's parts.
+        let live = running("r1", "2026-01-02T00:00:00Z");
+        let (removed, _) = gc_orphans(&store, "gs://b/base", &[failed, live], true).unwrap();
+        assert_eq!(
+            removed, 0,
+            "a terminal run's parts that an active same-export resume is reusing must be spared"
+        );
+        assert!(
+            store
+                .list_files("base")
+                .unwrap()
+                .iter()
+                .any(|k| k.ends_with("chunk0.parquet")),
+            "the reused chunk part must survive gc while the resume is live"
+        );
+    }
+
+    #[test]
     fn gc_orphans_spares_an_unmanifested_part_while_a_run_is_active() {
         // The concurrent-extract guard. A part with NO manifest, while a run is
         // ACTIVE on this prefix (the run-status ledger says so), is probably that
@@ -1482,6 +1605,44 @@ mod tests {
             "r1",
             "2026-01-01T00:00:00Z"
         )]));
+    }
+
+    #[test]
+    fn a_later_started_split_sibling_finishing_first_does_not_mask_a_live_sibling() {
+        // Post-0.24.3 convergence HIGH: `--pool --split` fans `orders` into siblings that run
+        // CONCURRENTLY under the shared family "orders". orders#2 started LAST (T2) but its window
+        // is smallest so it finishes FIRST (Success); orders#0/#1 are still Running with in-flight
+        // parts. is_superseded keyed on (family, started_at) alone would mark #0/#1 superseded by
+        // #2 → has_active_running_manifest=false → a cross-host gc_orphans deletes #0/#1's live
+        // parts. The sibling exclusion must keep the two live markers ACTIVE. RED against the
+        // pre-fix predicate (which returned false here).
+        let unit = |name: &str, status, started: &str| {
+            let mut m = manifest(name, 0, None);
+            m.export_name = name.into();
+            m.export_family = "orders".into();
+            m.status = status;
+            m.started_at = started.into();
+            m.finished_at = String::new();
+            m.parts.clear();
+            (format!("base/manifest-{name}.json"), m)
+        };
+        let keyed = vec![
+            unit("orders#0", ManifestStatus::Running, "2026-01-01T00:00:00Z"),
+            unit("orders#1", ManifestStatus::Running, "2026-01-01T00:00:01Z"),
+            unit("orders#2", ManifestStatus::Success, "2026-01-01T00:00:02Z"),
+        ];
+        assert!(
+            has_active_running_manifest(&keyed),
+            "two still-Running split siblings must count as active even when a later-started \
+             sibling has already finished — else a cross-host gc deletes their in-flight parts"
+        );
+        // A crash SUCCESSOR (same export_name, newer start) MUST still supersede the crashed marker.
+        let crashed = unit("orders#0", ManifestStatus::Running, "2026-01-01T00:00:00Z");
+        let successor = unit("orders#0", ManifestStatus::Running, "2026-01-02T00:00:00Z");
+        assert!(
+            is_superseded(&crashed.1, &[crashed.clone(), successor]),
+            "a re-run of the SAME unit (orders#0) must still supersede its crashed marker"
+        );
     }
 
     #[test]
@@ -1664,6 +1825,60 @@ mod tests {
             err.to_string().contains("more than one split generation")
                 || err.to_string().contains("DUPLICATE"),
             "error must name the multi-generation duplication hazard: {err}"
+        );
+    }
+
+    #[test]
+    fn select_runs_full_refuses_an_equal_count_split_generation_with_an_interior_hole() {
+        // The subtler mixed-generation case the bottom/top COUNT guard misses (post-0.24.3
+        // review HIGH). Gen A and gen B both split into 4, so there is exactly ONE bottom
+        // (lo=None) and ONE top (hi=None) — bottoms==1/tops==1/plain==0 all pass. But gen B
+        // re-sampled to DIFFERENT boundaries (200/400/600 vs A's 250/500/750) and its interior
+        // unit #2 crashed, so latest_full substitutes STALE gen A #2 (window (500,750]). The
+        // four selected windows no longer tile: (400,500] is in NO unit (LOST) and (600,750] is
+        // in BOTH A#2 and B#3 (DUPLICATED). Every count/sum still passes. Must REFUSE.
+        let unit = |name: &str, run: &str, lo: Option<&str>, hi: Option<&str>, at: &str| {
+            let mut m = manifest(run, 100, None);
+            m.export_name = name.into();
+            m.export_family = "orders".into();
+            m.finished_at = at.into();
+            m.split_window = Some(crate::manifest::SplitWindow {
+                key_column: "id".into(),
+                lo: lo.map(String::from),
+                hi: hi.map(String::from),
+            });
+            (format!("orders/manifest-{run}.json"), m)
+        };
+        let keyed = vec![
+            unit("orders#0", "b0", None, Some("200"), "2026-01-02T00:00:00Z"),
+            unit(
+                "orders#1",
+                "b1",
+                Some("200"),
+                Some("400"),
+                "2026-01-02T00:00:01Z",
+            ),
+            // gen B #2 crashed → stale gen A #2 (500,750] substituted (older finished_at):
+            unit(
+                "orders#2",
+                "a2",
+                Some("500"),
+                Some("750"),
+                "2026-01-01T00:00:00Z",
+            ),
+            unit("orders#3", "b3", Some("600"), None, "2026-01-02T00:00:03Z"),
+        ];
+        let err = select_runs(
+            keyed,
+            &std::collections::HashSet::new(),
+            crate::load::plan::LoadMode::Full,
+        )
+        .expect_err(
+            "an equal-count split generation with a gap+overlap must be refused, not loaded",
+        );
+        assert!(
+            err.to_string().contains("tile") || err.to_string().contains("INCOHERENT"),
+            "error must name the non-tiling (gap+overlap) hazard: {err}"
         );
     }
 

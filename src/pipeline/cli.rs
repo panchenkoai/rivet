@@ -1068,6 +1068,7 @@ exports:
                 bytes: 4096,
                 format: "parquet",
                 compression: Some("zstd"),
+                cursor_high: None,
             })
             .unwrap();
         drop(state);
@@ -1224,6 +1225,7 @@ exports:
                     bytes: 100,
                     format: "parquet",
                     compression: None,
+                    cursor_high: None,
                 })
                 .unwrap();
         };
