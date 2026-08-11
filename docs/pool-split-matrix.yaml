@@ -56,3 +56,58 @@ scenarios:
     mysql:    { test: stand_pool_split_keyset_recovers_a_crash_mysql }
     mssql:    { test: stand_pool_split_keyset_recovers_a_crash_mssql }
     mongo:    { na: "no inline SQL range literal (inline_literal is unreachable for Mongo) — source_type_supports_split leaves a Mongo giant WHOLE; it fans out via its own keyset/parallel path, never a range split" }
+
+  # ── Engine-AGNOSTIC split merge-back / reconstruct guarantees (post-0.24.3 review) ──
+  # These operate on the run-unique manifest copies, not per-engine SQL, so every engine cell is
+  # `na` (proven ONCE by the RED-proven test named in `what` — the na-shared-seam convention, like
+  # runner-coverage-matrix). Added so pool-split-matrix is the full regression ledger for the split
+  # bugs this session found: each class here had a silent data bug (loss/dup) and now a guard test.
+
+  - id: reconstruct_survives_adjacent_crashes
+    what: "TWO adjacent units hard-crash (no manifest): reconstruct must rebuild the FULL partition, never truncate. RED: reconstruct_covers_a_leading_adjacent_crash_instead_of_re_sampling (leading gap → NOT None→re-sample→silent LOSS) + reconstruct_fills_an_interior_adjacent_crash_without_overlapping_a_survivor (interior gap → NOT a coarse open-ended unit that re-covers a survivor → silent DUP)."
+    postgres: { na: "engine-agnostic — the split fold/selection/reconstruct operates on the run-unique manifests, not per-engine SQL; proven once by the test in `what`" }
+    mysql:    { na: "engine-agnostic — the split fold/selection/reconstruct operates on the run-unique manifests, not per-engine SQL; proven once by the test in `what`" }
+    mssql:    { na: "engine-agnostic — the split fold/selection/reconstruct operates on the run-unique manifests, not per-engine SQL; proven once by the test in `what`" }
+    mongo:    { na: "engine-agnostic — the split fold/selection/reconstruct operates on the run-unique manifests, not per-engine SQL; proven once by the test in `what`" }
+
+  - id: fill_synthesized_unit_runs_fresh_not_stale_checkpoint
+    what: "A unit whose window was SYNTHESIZED by the adjacent-crash fill must run FRESH, never resume its stale per-unit checkpoint against the changed window (keyset would silently dup/lose; chunked would loudly bail). RED: reconstruct_fills_an_interior_adjacent_crash_* asserts chunk_checkpoint=[true,false,false,true] + reconstruct_keeps_checkpoint_for_an_exactly_recovered_single_crash (single-crash exact recovery still resumes)."
+    postgres: { na: "engine-agnostic — the split fold/selection/reconstruct operates on the run-unique manifests, not per-engine SQL; proven once by the test in `what`" }
+    mysql:    { na: "engine-agnostic — the split fold/selection/reconstruct operates on the run-unique manifests, not per-engine SQL; proven once by the test in `what`" }
+    mssql:    { na: "engine-agnostic — the split fold/selection/reconstruct operates on the run-unique manifests, not per-engine SQL; proven once by the test in `what`" }
+    mongo:    { na: "engine-agnostic — the split fold/selection/reconstruct operates on the run-unique manifests, not per-engine SQL; proven once by the test in `what`" }
+
+  - id: validate_presence_covers_every_split_unit
+    what: "rivet validate must presence/size-check EVERY split unit's parts, not just the canonical (last-writer) manifest — else a missing part of a non-last unit is invisible (silent loss, trust-oracle passes). RED: verify_over_a_split_prefix_catches_a_missing_non_last_unit_part (merge_split_unit_parts folds same-family split-window siblings)."
+    postgres: { na: "engine-agnostic — the split fold/selection/reconstruct operates on the run-unique manifests, not per-engine SQL; proven once by the test in `what`" }
+    mysql:    { na: "engine-agnostic — the split fold/selection/reconstruct operates on the run-unique manifests, not per-engine SQL; proven once by the test in `what`" }
+    mssql:    { na: "engine-agnostic — the split fold/selection/reconstruct operates on the run-unique manifests, not per-engine SQL; proven once by the test in `what`" }
+    mongo:    { na: "engine-agnostic — the split fold/selection/reconstruct operates on the run-unique manifests, not per-engine SQL; proven once by the test in `what`" }
+
+  - id: validate_value_checksum_covers_every_split_unit
+    what: "Form-B value-checksum + per-part row-count re-read must cover EVERY split unit, not just the canonical — else a value corruption / row mis-count in a non-last unit silently PASSES. RED: split_unit_manifests_folds_every_same_family_split_sibling (value_checksum.rs folds split-window siblings, excludes foreign/plain)."
+    postgres: { na: "engine-agnostic — the split fold/selection/reconstruct operates on the run-unique manifests, not per-engine SQL; proven once by the test in `what`" }
+    mysql:    { na: "engine-agnostic — the split fold/selection/reconstruct operates on the run-unique manifests, not per-engine SQL; proven once by the test in `what`" }
+    mssql:    { na: "engine-agnostic — the split fold/selection/reconstruct operates on the run-unique manifests, not per-engine SQL; proven once by the test in `what`" }
+    mongo:    { na: "engine-agnostic — the split fold/selection/reconstruct operates on the run-unique manifests, not per-engine SQL; proven once by the test in `what`" }
+
+  - id: load_full_selects_every_split_unit
+    what: "rivet load in Full (replace) mode must select ALL units of the split snapshot, not the single latest manifest — else N-1 units are silently dropped. RED: latest_full_over_a_split_family_selects_every_unit_not_just_the_last + latest_full_over_a_split_family_takes_the_newest_run_per_unit (group by export_name, latest per group)."
+    postgres: { na: "engine-agnostic — the split fold/selection/reconstruct operates on the run-unique manifests, not per-engine SQL; proven once by the test in `what`" }
+    mysql:    { na: "engine-agnostic — the split fold/selection/reconstruct operates on the run-unique manifests, not per-engine SQL; proven once by the test in `what`" }
+    mssql:    { na: "engine-agnostic — the split fold/selection/reconstruct operates on the run-unique manifests, not per-engine SQL; proven once by the test in `what`" }
+    mongo:    { na: "engine-agnostic — the split fold/selection/reconstruct operates on the run-unique manifests, not per-engine SQL; proven once by the test in `what`" }
+
+  - id: load_full_refuses_a_mixed_generation_prefix
+    what: "A Full load whose selection mixes TWO split generations (a reused prefix, a changed unit count, an unsplit↔split toggle) would DUPLICATE rows and the count gate can't catch it; with no generation id, select_runs REFUSES loudly rather than silently dup. RED: select_runs_full_refuses_a_mixed_generation_split_prefix (+ _accepts_one_coherent_split_generation)."
+    postgres: { na: "engine-agnostic — the split fold/selection/reconstruct operates on the run-unique manifests, not per-engine SQL; proven once by the test in `what`" }
+    mysql:    { na: "engine-agnostic — the split fold/selection/reconstruct operates on the run-unique manifests, not per-engine SQL; proven once by the test in `what`" }
+    mssql:    { na: "engine-agnostic — the split fold/selection/reconstruct operates on the run-unique manifests, not per-engine SQL; proven once by the test in `what`" }
+    mongo:    { na: "engine-agnostic — the split fold/selection/reconstruct operates on the run-unique manifests, not per-engine SQL; proven once by the test in `what`" }
+
+  - id: split_refuses_an_unsplittable_export_loudly
+    what: "Split must REFUSE what it cannot do correctly — incremental (cursor_column), keyset_incremental (append-only), CDC (a stream), Mongo (no inline range literal) — on the FRESH path AND on resume (reconstruct must not resurrect a now-unsplittable split). RED: incremental_and_cdc_exports_are_not_splittable + reconstruct_refuses_to_resurrect_a_now_unsplittable_export_on_resume + mongo_source_is_not_range_split_capable."
+    postgres: { na: "engine-agnostic — the split fold/selection/reconstruct operates on the run-unique manifests, not per-engine SQL; proven once by the test in `what`" }
+    mysql:    { na: "engine-agnostic — the split fold/selection/reconstruct operates on the run-unique manifests, not per-engine SQL; proven once by the test in `what`" }
+    mssql:    { na: "engine-agnostic — the split fold/selection/reconstruct operates on the run-unique manifests, not per-engine SQL; proven once by the test in `what`" }
+    mongo:    { na: "engine-agnostic — the split fold/selection/reconstruct operates on the run-unique manifests, not per-engine SQL; proven once by the test in `what`" }
