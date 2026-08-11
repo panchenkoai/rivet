@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 0.24.4 — 2026-08-11
+
+Silent-loss hardening of the `apply --pool --split` GA (#167), driven to convergence:
+a multi-agent bughunt found the defects, an adversarial review caught an incomplete fix,
+and two consecutive fresh rounds then came up empty. Every "Fixed" defect below reported
+a successful run while the data was gapped, duplicated, or about to be deleted — and none
+changes a config or an output format.
+
 ### Added
 
 - **Extension seam (ADR-0026): `rivet::google_auth`** —
@@ -15,6 +23,50 @@
   `client_id`/`client_secret` back in some failure modes), kept the secrets
   un-zeroed, and invented a lifetime when `expires_in` was absent. Additive:
   nothing existing changed shape.
+
+### Fixed — the run said success and the data disagreed
+
+- **A keyset `chunk_checkpoint` crash-resume duplicated a page** (measured live: 1300 rows
+  declared for a 1000-row table). A crash in the `after_manifest_update` window — the part's
+  `file_log` row written but the cursor not yet advanced — left the resume re-reading an
+  already-committed page while its rehydrated copy was also declared. The root fix is a new
+  **cursor-atomic checkpoint** (state schema **v25**): each keyset page stamps its high-water
+  key into the `file_log` row of its last part, so a crash-recovery resume reconciles the
+  cursor from the committed parts and NEVER re-reads a committed page. Loss-safe by
+  construction (a mid-page crash falls back to a recoverable dup, never a loss). NOT
+  split-only — any keyset export with `chunk_checkpoint` was affected; `--split` forced it on.
+- **A `--pool --split` Full load could gap AND duplicate rows** across two split generations
+  of equal size. The coherence guard only counted bottom/top/plain units; two generations at
+  the same unit count but different boundaries, with an interior unit substituted from the
+  older generation, passed it while the windows no longer tiled. Now a tiling check (the
+  multiset of non-None lower bounds must equal the multiset of upper bounds) refuses it.
+- **Split siblings superseded each other's `running` markers**, so a later-started sibling
+  finishing first made an earlier, still-live sibling look inactive — and a cross-host
+  `rivet load --gc-orphans` then deleted the live sibling's in-flight parts. Concurrent
+  split siblings are now excluded from supersession; a crash successor (same unit name)
+  still supersedes correctly.
+- **A trailing split crash dropped the widened tail** on the parallel-keyset runner: a
+  reconstruct after the top units hard-crashed widened the tail unit's window but resumed its
+  stale, narrower ranges. The open tail now runs fresh when its ordinal left no manifest.
+- **`gc_orphans` deleted parts a chunk-checkpoint resume was reusing** — a Failed run's parts
+  are adopted (not re-exported) by the resume, so they are now spared while a live run of the
+  same export may be adopting them.
+
+### Fixed — the diagnostic cried wolf
+
+- **`rivet check` reported a false UNSAFE** on a `mode: chunked` + `table:` export whose
+  chunk column the planner auto-resolves to the single-integer PK: preflight ignored that
+  resolution, probed nothing, and told the operator to "create an index" on an already-indexed
+  PK. All three engine diagnostics now resolve the same PK the planner would.
+
+### Internal
+
+- Refuse a synthesized split-unit name that collides with an existing export (would otherwise
+  silently drop that export's table); doc-honesty corrections (Mongo init gate, CDC
+  `single_event_commit` contract, the split resume "overwrite in place" claim); a dead mask
+  clause removed. Every fix ships a RED-proven regression test; the split guards are registered
+  in `docs/pool-split-matrix.yaml`. `--pool` was clean throughout; `apply --pool --split`
+  (#167) is now converged.
 
 ## 0.24.3 — 2026-08-07
 
