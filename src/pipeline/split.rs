@@ -31,7 +31,6 @@ use crate::error::Result;
 /// probed min still lands) and the last NO ceil (`hi = None`, so a key above the
 /// probed max still lands) — defer-nothing, drop-nothing, the same convention
 /// `keyset::partition_ranges` uses. Pure.
-#[allow(dead_code)]
 fn windows(bounds: &[String]) -> Vec<(Option<String>, Option<String>)> {
     let mut out = Vec::with_capacity(bounds.len() + 1);
     let mut prev: Option<String> = None;
@@ -41,6 +40,15 @@ fn windows(bounds: &[String]) -> Vec<(Option<String>, Option<String>)> {
     }
     out.push((prev, None));
     out
+}
+
+/// Whether a source can be RANGE-SPLIT into `WHERE key > lo AND key <= hi` sub-exports.
+/// MongoDB cannot: it has no inline SQL range literal ([`crate::source::query::inline_literal`]
+/// is `unreachable!()` for it — a key window is expressed through the driver, not a textual
+/// predicate), so a split unit would PANIC at plan build. `--pool --split` therefore leaves a
+/// Mongo giant WHOLE (its own keyset/parallel path fans out differently) rather than crash.
+pub(crate) fn source_type_supports_split(st: SourceType) -> bool {
+    !matches!(st, SourceType::Mongo)
 }
 
 /// Whether an export may be split into range sub-exports, and on which key. A
@@ -56,15 +64,6 @@ fn windows(bounds: &[String]) -> Vec<(Option<String>, Option<String>)> {
 /// A plain `mode: full` export (chunk_column ignored) is NOT split — it has no
 /// per-unit checkpoint, so a crashed unit could not resume without duplicating.
 /// Returns the key column, or `None` (leave the export whole).
-/// Whether a source can be RANGE-SPLIT into `WHERE key > lo AND key <= hi` sub-exports.
-/// MongoDB cannot: it has no inline SQL range literal ([`crate::source::query::inline_literal`]
-/// is `unreachable!()` for it — a key window is expressed through the driver, not a textual
-/// predicate), so a split unit would PANIC at plan build. `--pool --split` therefore leaves a
-/// Mongo giant WHOLE (its own keyset/parallel path fans out differently) rather than crash.
-pub(crate) fn source_type_supports_split(st: SourceType) -> bool {
-    !matches!(st, SourceType::Mongo)
-}
-
 pub(crate) fn splittable_key(export: &ExportConfig) -> Option<String> {
     if export.mode == ExportMode::Cdc {
         return None; // a stream, not a range scan
