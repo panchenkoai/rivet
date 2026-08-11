@@ -72,8 +72,17 @@ pub(crate) fn splittable_key(export: &ExportConfig) -> Option<String> {
     if export.cursor_column.is_some() {
         return None; // incremental: a single per-export cursor, not per-range
     }
+    if export.keyset_incremental {
+        // Append-only incremental-by-key: on a clean re-run each unit would continue
+        // from ITS OWN window's high-water mark, but the partition is re-derived every
+        // run — so the per-unit water marks and the fresh windows disagree and rows are
+        // silently dropped/duplicated across runs. This is the "incremental split needs
+        // a per-range cursor" case scope v1 refuses; keep the export WHOLE (its own
+        // keyset_incremental high-water is correct only unsplit).
+        return None;
+    }
     if let Some(key) = &export.chunk_by_key {
-        return Some(key.clone()); // keyset — resumable in any mode
+        return Some(key.clone()); // keyset (non-incremental) — resumable in any mode
     }
     if export.mode == ExportMode::Chunked
         && let Some(col) = &export.chunk_column
@@ -272,6 +281,13 @@ pub(crate) fn reconstruct_units_from_prefix(
     family: &str,
     giant: &ExportConfig,
 ) -> Option<Vec<ExportConfig>> {
+    // A resume must not RESURRECT a split the fresh path would now refuse. `probe_and_synthesize`
+    // gates new splits through `splittable_key` (e.g. it refuses `keyset_incremental`), but
+    // reconstruct rebuilds from on-disk unit manifests and would bypass that gate — so a config
+    // that turned unsafe-to-split since the prior run (a flipped `keyset_incremental`, an added
+    // `cursor_column`) would resume its old split and silently drop/duplicate. Honour the same
+    // gate here: not splittable → leave the giant whole (probe agrees, so no split runs).
+    splittable_key(giant)?;
     let prefix = format!("{}#", giant.name); // this giant's unit names: "{giant}#<ordinal>"
     let mut key: Option<String> = None;
     // boundary position -> value. Position i is the boundary between unit#i and unit#(i+1),
@@ -438,6 +454,18 @@ mod tests {
         let mut nokey = sample_export("n");
         nokey.mode = ExportMode::Chunked;
         assert!(splittable_key(&nokey).is_none());
+
+        // append-only incremental-by-key (keyset_incremental) → NOT splittable: a split
+        // re-derives the partition every run, so per-unit high-water marks and fresh
+        // windows disagree and rows are silently dropped/duplicated across re-runs. Scope
+        // v1 refuses an incremental split; the unsplit keyset_incremental is correct.
+        let mut ks_incr = chunked.clone();
+        ks_incr.keyset_incremental = true;
+        assert!(
+            splittable_key(&ks_incr).is_none(),
+            "an append-only keyset_incremental export must not split — the per-unit \
+             high-water mark disagrees with a re-derived partition (silent drop/dup)"
+        );
     }
 
     // Build a minimal SUCCESS unit manifest carrying a split window, and write it as a
@@ -547,6 +575,29 @@ mod tests {
                 (s.lo.clone(), s.hi.clone())
             })
             .collect()
+    }
+
+    #[test]
+    fn reconstruct_refuses_to_resurrect_a_now_unsplittable_export_on_resume() {
+        // A prior run split this export and left unit manifests; the config has since flipped
+        // `keyset_incremental: true` (append-only), which `splittable_key` now refuses. Resume
+        // must NOT rebuild the old split from the on-disk manifests (that would bypass the
+        // fresh-path guard and drop/duplicate) — reconstruct returns None, so the giant runs
+        // whole (probe_and_synthesize also returns None for it).
+        let dir = tempfile::tempdir().unwrap();
+        let mut giant = sample_export("daily");
+        giant.mode = ExportMode::Chunked;
+        giant.chunk_by_key = Some("id".into());
+        giant.destination.path = Some(dir.path().to_string_lossy().into_owned());
+        // On-disk split units from the prior (splittable) run.
+        write_unit_manifest(dir.path(), "daily#0", "r0", None, Some("500"));
+        write_unit_manifest(dir.path(), "daily#1", "r1", Some("500"), None);
+        // The config is now keyset_incremental → not splittable.
+        giant.keyset_incremental = true;
+        assert!(
+            reconstruct_units_from_prefix(&giant.destination, "daily", &giant).is_none(),
+            "a resume must not resurrect a split for a config that is no longer splittable"
+        );
     }
 
     #[test]

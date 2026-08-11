@@ -1150,7 +1150,7 @@ fn prepare_load(
         Some(s) => s.loaded_source_run_ids(target_fqtn).unwrap_or_default(),
         None => std::collections::HashSet::new(),
     };
-    let new = load::reconcile::select_runs(keyed, &loaded, plan.mode);
+    let new = load::reconcile::select_runs(keyed, &loaded, plan.mode)?;
     if new.is_empty() {
         return Ok(None);
     }
