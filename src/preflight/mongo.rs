@@ -79,6 +79,10 @@ fn diagnose_mongo(
         suggestion: None,
         chunk_min: None,
         chunk_max: None,
-        db_max_connections: None,
+        // Store the fetched headroom (not None) so the #149/#202 measured overlay's
+        // re-run of collect_warnings gets Mongo's real connection limit and runs the
+        // check_connection_limit check, instead of the "could not fetch" skip note —
+        // parity with pg/mysql/mssql. Mongo is full-only, so the overlay always runs.
+        db_max_connections,
     })
 }
