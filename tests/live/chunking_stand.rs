@@ -2303,6 +2303,20 @@ fn stand_pool_split_gappy_key_mssql() {
 // RED-proven by the unit tests `reconstruct_{covers_a_leading,fills_an_interior}_
 // adjacent_crash_*`; the RANGE stand tests above (`stand_pool_split_resume_grows_*`,
 // `stand_pool_split_gappy_key_*`) are the live finding-2 guards that DO bite the mutant.
+//
+// POST-0.24.3 review HIGH #2 (trailing-coarsening silent loss): a TRAILING double-crash
+// (the top two units hard-crash with NO manifest while the lower units finalize Success)
+// lowers `max_pos` so the reconstruct WIDENS the tail unit from (b, b'] to (b, None] while
+// keeping its name — but the tail's `filled` set is empty, so reconstruct's fresh-marking
+// never fires and the tail keeps `chunk_checkpoint=true`. The keyset runner then resumed the
+// STALE narrow persisted ranges and dropped (b', None]. The fix is a RUNNER-side window-
+// fingerprint guard (`keyset::keyset_checkpoint_window_stale`): on resume it compares the
+// persisted ranges' outer window to the plan's CURRENT split window and runs FRESH on any
+// mismatch (covers trailing AND interior/leading uniformly). That exact two-tail-HARD-crash
+// (lower units Success, top two SIGKILLed, no window manifest) can't be staged deterministically
+// here for the same reason documented above (the panic hook kills the whole process together),
+// so the guard is RED-proven offline by `keyset_checkpoint_window_stale_detects_a_trailing_
+// coarsening` — the decision the runner makes at the resume seam.
 
 #[test]
 #[ignore = "live: requires docker compose up -d postgres"]

@@ -415,6 +415,38 @@ fn ensure_single_split_generation(selected: &[(String, RunManifest)]) -> Result<
             }
         );
     }
+    // bottoms==1, tops==1, plain==0 is NECESSARY but NOT sufficient. When two generations
+    // split into the SAME unit COUNT but at DIFFERENT boundaries and an INTERIOR unit is
+    // substituted from the older generation (its newer sibling crashed, so latest_full falls
+    // back to the stale Success), the selection still has exactly one bottom + one top — yet
+    // the windows no longer tile: a GAP loses rows and an OVERLAP duplicates them, and the
+    // count gate can't see it (expected_rows inflates with the parts). Post-0.24.3 review HIGH.
+    //
+    // A coherent split tiles the key space: every INTERIOR boundary appears once as some
+    // unit's `hi` and once as the NEXT unit's `lo`. So the multiset of non-None `lo` bounds
+    // must equal the multiset of non-None `hi` bounds. Compare them sorted — order-free, no
+    // numeric parse of opaque key text (a gap leaves a `hi` with no matching `lo`; an overlap
+    // leaves a `lo` with no matching `hi`).
+    let mut los: Vec<&String> = split
+        .iter()
+        .filter_map(|m| m.split_window.as_ref().unwrap().lo.as_ref())
+        .collect();
+    let mut his: Vec<&String> = split
+        .iter()
+        .filter_map(|m| m.split_window.as_ref().unwrap().hi.as_ref())
+        .collect();
+    los.sort();
+    his.sort();
+    if los != his {
+        anyhow::bail!(
+            "Full load over a --pool --split prefix selected an INCOHERENT set of split windows \
+             — the interior boundaries do not tile the key space, so a later run re-sampled to \
+             different boundaries and an older unit was substituted for a crashed one. Their \
+             union LOSES the gap rows and DUPLICATES the overlap rows (the count gate can't see \
+             it). Interior lower bounds {los:?} != upper bounds {his:?}. Load into a FRESH \
+             destination prefix (or clear the stale generation) and re-run."
+        );
+    }
     Ok(())
 }
 
@@ -1664,6 +1696,60 @@ mod tests {
             err.to_string().contains("more than one split generation")
                 || err.to_string().contains("DUPLICATE"),
             "error must name the multi-generation duplication hazard: {err}"
+        );
+    }
+
+    #[test]
+    fn select_runs_full_refuses_an_equal_count_split_generation_with_an_interior_hole() {
+        // The subtler mixed-generation case the bottom/top COUNT guard misses (post-0.24.3
+        // review HIGH). Gen A and gen B both split into 4, so there is exactly ONE bottom
+        // (lo=None) and ONE top (hi=None) — bottoms==1/tops==1/plain==0 all pass. But gen B
+        // re-sampled to DIFFERENT boundaries (200/400/600 vs A's 250/500/750) and its interior
+        // unit #2 crashed, so latest_full substitutes STALE gen A #2 (window (500,750]). The
+        // four selected windows no longer tile: (400,500] is in NO unit (LOST) and (600,750] is
+        // in BOTH A#2 and B#3 (DUPLICATED). Every count/sum still passes. Must REFUSE.
+        let unit = |name: &str, run: &str, lo: Option<&str>, hi: Option<&str>, at: &str| {
+            let mut m = manifest(run, 100, None);
+            m.export_name = name.into();
+            m.export_family = "orders".into();
+            m.finished_at = at.into();
+            m.split_window = Some(crate::manifest::SplitWindow {
+                key_column: "id".into(),
+                lo: lo.map(String::from),
+                hi: hi.map(String::from),
+            });
+            (format!("orders/manifest-{run}.json"), m)
+        };
+        let keyed = vec![
+            unit("orders#0", "b0", None, Some("200"), "2026-01-02T00:00:00Z"),
+            unit(
+                "orders#1",
+                "b1",
+                Some("200"),
+                Some("400"),
+                "2026-01-02T00:00:01Z",
+            ),
+            // gen B #2 crashed → stale gen A #2 (500,750] substituted (older finished_at):
+            unit(
+                "orders#2",
+                "a2",
+                Some("500"),
+                Some("750"),
+                "2026-01-01T00:00:00Z",
+            ),
+            unit("orders#3", "b3", Some("600"), None, "2026-01-02T00:00:03Z"),
+        ];
+        let err = select_runs(
+            keyed,
+            &std::collections::HashSet::new(),
+            crate::load::plan::LoadMode::Full,
+        )
+        .expect_err(
+            "an equal-count split generation with a gap+overlap must be refused, not loaded",
+        );
+        assert!(
+            err.to_string().contains("tile") || err.to_string().contains("INCOHERENT"),
+            "error must name the non-tiling (gap+overlap) hazard: {err}"
         );
     }
 
