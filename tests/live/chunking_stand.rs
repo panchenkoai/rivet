@@ -176,13 +176,38 @@ fn run_pool_split_resume(
     original_ids: &std::collections::BTreeSet<i64>,
     grow: Option<(i64, i64)>,
 ) {
+    // Default arm: RANGE chunking (`chunk_column`), crashed mid-chunk via the chunked
+    // runner's `chunk_export` error hook.
+    run_pool_split_resume_with(
+        eng,
+        table,
+        original_ids,
+        grow,
+        "chunk_column: id",
+        ("RIVET_TEST_ERROR_AT", "chunk_export:1"),
+    );
+}
+
+/// As [`run_pool_split_resume`] but with the key STRATEGY line and the mid-run crash
+/// hook parameterised, so the identical split→crash→(grow)→resume proof runs over BOTH
+/// range chunking (`chunk_column` + `chunk_export` error) AND keyset (`chunk_by_key` +
+/// the `after_keyset_page` PANIC — the keyset runner has no `chunk_export` hook, and a
+/// panic is the hard-crash-with-no-manifest shape the reconstruct fill must survive).
+fn run_pool_split_resume_with(
+    eng: Eng,
+    table: &str,
+    original_ids: &std::collections::BTreeSet<i64>,
+    grow: Option<(i64, i64)>,
+    key_line: &str,
+    crash: (&str, &str),
+) {
     let n = original_ids.len() as i64;
-    let chunk = (n / 4).max(1); // 2 units of n/2 → 2 chunks each → chunk_export:1 fires
+    let chunk = (n / 4).max(1); // 2 units of n/2 → 2 chunks/pages each → the hook fires
     let sibling_q = format!("SELECT id FROM {} WHERE id <= 100", eng.qualified(table));
     let rig = eng
         .rig(table)
         .mode("chunked")
-        .export_line("chunk_column: id")
+        .export_line(key_line)
         .export_line(&format!("chunk_size: {chunk}"))
         .export_line("parallel_safe: true")
         .also_export("split_sibling", &sibling_q)
@@ -204,7 +229,7 @@ fn run_pool_split_resume(
     // Run 1: split + crash a unit mid-way.
     let crashed = run_rivet_env(
         &["apply", cfg.to_str().unwrap(), "--pool", "2", "--split"],
-        &[("RIVET_TEST_ERROR_AT", "chunk_export:1")],
+        &[crash],
     );
     assert!(
         !crashed.status.success(),
@@ -2256,4 +2281,70 @@ fn stand_pool_split_gappy_key_mssql() {
     Eng::Ms.require();
     let (table, _g, ids) = seed_gappy_split(Eng::Ms, 150_000);
     run_pool_split_resume(Eng::Ms, &table, &ids, Some((450_001, 525_000)));
+}
+
+// ─── Split+pool crash-resume on a KEYSET key (chunk_by_key), across engines ─────
+//
+// The runner-bypass check the review demanded: `chunk_by_key` (keyset) IS splittable
+// (splittable_key returns Some for it — only CDC and cursor_column/incremental are
+// refused), and the split window is applied at the SHARED build_plan seam
+// (wrap_key_range), so it composes with the keyset runner exactly as with range
+// chunking. These prove keyset pool-split works END-TO-END across a crash (split →
+// crash → grow → resume → every original id declared), per engine via the Rig + DuckDB
+// manifest oracle.
+//
+// SCOPE (honest): these do NOT isolate the finding-2 reconstruct mutant. The single
+// keyset runner has only PANIC hooks (`after_keyset_page`), no returning-error hook
+// like the chunked runner's `chunk_export`; a panic kills the whole pool process with
+// both giant units mid-page, so NO completed giant unit survives to misalign against a
+// re-sample — with reconstruct disabled the resume simply re-runs both fresh and still
+// completes (verified: the mutant stays GREEN here). The finding-2 reconstruct
+// guarantee is RUNNER-AGNOSTIC (it operates on the manifests, not the runner) and is
+// RED-proven by the unit tests `reconstruct_{covers_a_leading,fills_an_interior}_
+// adjacent_crash_*`; the RANGE stand tests above (`stand_pool_split_resume_grows_*`,
+// `stand_pool_split_gappy_key_*`) are the live finding-2 guards that DO bite the mutant.
+
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn stand_pool_split_keyset_recovers_a_crash_postgres() {
+    Eng::Pg.require();
+    let (table, _g) = seed_dense(Eng::Pg, 300_000);
+    run_pool_split_resume_with(
+        Eng::Pg,
+        &table,
+        &dense_ids(300_000),
+        Some((300_001, 450_000)),
+        "chunk_by_key: id",
+        ("RIVET_TEST_PANIC_AT", "after_keyset_page:1"),
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mysql"]
+fn stand_pool_split_keyset_recovers_a_crash_mysql() {
+    Eng::My.require();
+    let (table, _g) = seed_dense(Eng::My, 300_000);
+    run_pool_split_resume_with(
+        Eng::My,
+        &table,
+        &dense_ids(300_000),
+        Some((300_001, 450_000)),
+        "chunk_by_key: id",
+        ("RIVET_TEST_PANIC_AT", "after_keyset_page:1"),
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mssql"]
+fn stand_pool_split_keyset_recovers_a_crash_mssql() {
+    Eng::Ms.require();
+    let (table, _g) = seed_dense(Eng::Ms, 300_000);
+    run_pool_split_resume_with(
+        Eng::Ms,
+        &table,
+        &dense_ids(300_000),
+        Some((300_001, 450_000)),
+        "chunk_by_key: id",
+        ("RIVET_TEST_PANIC_AT", "after_keyset_page:1"),
+    );
 }
