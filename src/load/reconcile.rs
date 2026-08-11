@@ -349,10 +349,40 @@ fn is_superseded(m: &RunManifest, keyed: &[(String, RunManifest)]) -> bool {
     // `name:` ≠ `table:` a name-only compare never matched — a crashed marker
     // stayed "active" forever and gc over-deferred cleanup permanently. Same
     // recorded-identity seam as `ensure_single_export`.
+    //
+    // BUT a `--pool --split` fans ONE family into N units (`{family}#0..#N-1`) that run
+    // CONCURRENTLY under that shared family. A later-STARTED sibling that finishes first must
+    // NOT make an earlier, still-live sibling look superseded — that would let a cross-host
+    // gc_orphans (whose only liveness signal is `has_active_running_manifest`) delete the live
+    // sibling's in-flight parts (post-0.24.3 convergence HIGH). A crash SUCCESSOR of a unit
+    // shares its export_NAME (`orders#0` re-run), so it still supersedes correctly; only a
+    // DIFFERENT sibling (`orders#1` vs `orders#0`) is excluded.
     keyed.iter().any(|(_, o)| {
         crate::manifest::identity_family(o, keyed) == crate::manifest::identity_family(m, keyed)
             && o.started_at > m.started_at
+            && !are_split_siblings(o, m)
     })
+}
+
+/// True if `a` and `b` are DIFFERENT split units of the same family (`{family}#i` vs
+/// `{family}#j`, i≠j) — concurrent siblings, not a crash + successor. Keyed off the export
+/// NAME pattern because a split unit's running marker carries `split_window: None` (it is
+/// overwritten by the terminal), so the name is the only sibling discriminator on a marker.
+fn are_split_siblings(a: &RunManifest, b: &RunManifest) -> bool {
+    fn unit_index(m: &RunManifest) -> Option<&str> {
+        // "orders#0" with family "orders" → Some("0"); a non-split name → None.
+        if m.export_family.is_empty() {
+            return None;
+        }
+        m.export_name
+            .strip_prefix(m.export_family.as_str())
+            .and_then(|s| s.strip_prefix('#'))
+            .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()))
+    }
+    a.export_family == b.export_family
+        && a.export_name != b.export_name
+        && unit_index(a).is_some()
+        && unit_index(b).is_some()
 }
 
 /// Full/chunked loads care only about the LATEST snapshot: from `keyed` (all run
@@ -1575,6 +1605,44 @@ mod tests {
             "r1",
             "2026-01-01T00:00:00Z"
         )]));
+    }
+
+    #[test]
+    fn a_later_started_split_sibling_finishing_first_does_not_mask_a_live_sibling() {
+        // Post-0.24.3 convergence HIGH: `--pool --split` fans `orders` into siblings that run
+        // CONCURRENTLY under the shared family "orders". orders#2 started LAST (T2) but its window
+        // is smallest so it finishes FIRST (Success); orders#0/#1 are still Running with in-flight
+        // parts. is_superseded keyed on (family, started_at) alone would mark #0/#1 superseded by
+        // #2 → has_active_running_manifest=false → a cross-host gc_orphans deletes #0/#1's live
+        // parts. The sibling exclusion must keep the two live markers ACTIVE. RED against the
+        // pre-fix predicate (which returned false here).
+        let unit = |name: &str, status, started: &str| {
+            let mut m = manifest(name, 0, None);
+            m.export_name = name.into();
+            m.export_family = "orders".into();
+            m.status = status;
+            m.started_at = started.into();
+            m.finished_at = String::new();
+            m.parts.clear();
+            (format!("base/manifest-{name}.json"), m)
+        };
+        let keyed = vec![
+            unit("orders#0", ManifestStatus::Running, "2026-01-01T00:00:00Z"),
+            unit("orders#1", ManifestStatus::Running, "2026-01-01T00:00:01Z"),
+            unit("orders#2", ManifestStatus::Success, "2026-01-01T00:00:02Z"),
+        ];
+        assert!(
+            has_active_running_manifest(&keyed),
+            "two still-Running split siblings must count as active even when a later-started \
+             sibling has already finished — else a cross-host gc deletes their in-flight parts"
+        );
+        // A crash SUCCESSOR (same export_name, newer start) MUST still supersede the crashed marker.
+        let crashed = unit("orders#0", ManifestStatus::Running, "2026-01-01T00:00:00Z");
+        let successor = unit("orders#0", ManifestStatus::Running, "2026-01-02T00:00:00Z");
+        assert!(
+            is_superseded(&crashed.1, &[crashed.clone(), successor]),
+            "a re-run of the SAME unit (orders#0) must still supersede its crashed marker"
+        );
     }
 
     #[test]
