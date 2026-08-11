@@ -366,6 +366,15 @@ pub(crate) fn apply_m8_resume_decisions(
             run_id,
             plan.export_name
         );
+        // A --split unit's canonical manifest.json is last-writer-wins → usually a SIBLING
+        // unit's (foreign run_id), so this branch is the norm for split resume, not a rare
+        // restore/collision. We still must NOT reset chunk_tasks off a foreign manifest — but
+        // we MUST rehydrate THIS run's OWN committed parts from file_log (run_id-scoped, so
+        // the foreign manifest is irrelevant to it), exactly as the no-manifest branch does.
+        // Without this, a resuming unit's pre-crash completed-chunk parts sit on disk but are
+        // dropped from the finalize manifest — silent, manifest-authoritative row loss that
+        // `rivet load` inherits (RED-proven: 225000/300000 declared after a crash+resume).
+        rehydrate_manifest_parts_from_file_log(state, run_id, summary)?;
         return Ok(M8Stats::default());
     }
 
