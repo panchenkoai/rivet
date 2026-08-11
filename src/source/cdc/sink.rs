@@ -204,6 +204,7 @@ impl TableSink<'_> {
                 format: format.label(),
                 compression: Some(part_compression(format).label()),
                 mode: "cdc",
+                cursor_high: None, // CDC sink has no keyset page cursor
             })
         {
             log::warn!(

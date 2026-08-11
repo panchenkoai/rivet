@@ -158,9 +158,19 @@ pub(crate) struct PartRecord {
 ///   `RunEvent::KeysetPageWritten` later without touching the runners —
 ///   only the match arm in [`record_part`] would change.
 pub(crate) enum PartKind {
-    File { part_index: usize },
-    Chunk { chunk_index: i64 },
-    Page { page_index: i64 },
+    File {
+        part_index: usize,
+    },
+    Chunk {
+        chunk_index: i64,
+    },
+    Page {
+        page_index: i64,
+        /// The page's high-water key — written into the SAME file_log row as the part, so a
+        /// crash-recovery resume reconciles the cursor from committed parts and never re-reads a
+        /// committed page (v25 cursor-atomic keyset checkpoint). `None` on a non-keyset page.
+        cursor_high: Option<String>,
+    },
 }
 
 /// Seam 1 — ADR-0001 I1 + the destination-write boundary. Writes the
@@ -312,15 +322,15 @@ pub(crate) fn record_part(
         summary.files_committed += 1;
     }
 
-    match kind {
+    match &kind {
         PartKind::File { part_index } => summary.journal.record(RunEvent::FileWritten {
             file_name: part.file_name.clone(),
             rows: part.rows,
             bytes: part.bytes,
-            part_index,
+            part_index: *part_index,
         }),
         PartKind::Chunk { chunk_index } => summary.journal.record(RunEvent::ChunkCompleted {
-            chunk_index,
+            chunk_index: *chunk_index,
             rows: part.rows,
             file_name: Some(part.file_name.clone()),
         }),
@@ -328,12 +338,20 @@ pub(crate) fn record_part(
         // backward compatibility. See [`PartKind::Page`] for the rationale
         // and the upgrade path if/when downstream observability needs to
         // distinguish keyset pages from chunked windows.
-        PartKind::Page { page_index } => summary.journal.record(RunEvent::ChunkCompleted {
-            chunk_index: page_index,
+        PartKind::Page { page_index, .. } => summary.journal.record(RunEvent::ChunkCompleted {
+            chunk_index: *page_index,
             rows: part.rows,
             file_name: Some(part.file_name.clone()),
         }),
     }
+
+    // v25: the page's high-water key rides in the SAME file_log row as its part, so a resume
+    // reconciles the cursor from committed parts (see keyset::run_keyset resume) and never
+    // re-reads a committed page. `None` for every non-keyset part.
+    let cursor_high: Option<&str> = match &kind {
+        PartKind::Page { cursor_high, .. } => cursor_high.as_deref(),
+        _ => None,
+    };
 
     // ADR-0001 I7: file-log (manifest) write failure is non-fatal — the file is
     // already durable at the destination; log and continue.
@@ -347,6 +365,7 @@ pub(crate) fn record_part(
             format: plan.format.label(),
             compression: Some(plan.compression.label()),
             mode: plan.strategy.mode_label(),
+            cursor_high,
         })
     {
         log::warn!(

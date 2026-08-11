@@ -425,6 +425,7 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                                                     format: fmt_label_w,
                                                     compression: Some(comp_label_w),
                                                     mode: mode_label_w,
+                                                    cursor_high: None, // chunked runner, not keyset pages
                                                 },
                                             ) {
                                                 log::warn!(

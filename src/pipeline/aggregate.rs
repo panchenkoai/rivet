@@ -434,6 +434,7 @@ mod tests {
                     bytes: 1000,
                     format: "parquet",
                     compression: None,
+                    cursor_high: None,
                 })
                 .unwrap();
         }
@@ -447,6 +448,7 @@ mod tests {
                 format: "parquet",
                 compression: None,
                 mode: "chunked",
+                cursor_high: None,
             })
             .unwrap();
 

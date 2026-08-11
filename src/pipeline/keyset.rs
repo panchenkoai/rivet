@@ -774,6 +774,10 @@ fn run_keyset_parallel(
             rec,
             super::commit::PartKind::Page {
                 page_index: idx as i64,
+                // The PARALLEL keyset runner resumes via per-range done flags + stable run_id part
+                // names (immune to the sequential cursor window), so it does not use the v25
+                // cursor-atomic reconcile — None.
+                cursor_high: None,
             },
         );
     }
@@ -989,6 +993,19 @@ pub(crate) fn run_keyset(
             Some(rid) => {
                 summary.run_id = rid.clone();
                 super::chunked::rehydrate_manifest_parts_from_file_log(st, rid, summary)?;
+                // v25 cursor-atomic reconcile: the export_state cursor can LAG the committed parts
+                // — a crash in the after_manifest_update window advanced file_log (with the page's
+                // cursor_high) but NOT the export_state cursor, so resuming from the latter
+                // re-reads an already-committed page and DUPLICATES it (measured 300/1000; and its
+                // multi-part-rotation variant). Each committed part carries its page high-water key
+                // in the SAME file_log row, so resume from the LAST committed cursor_high instead —
+                // the loop then never re-reads a committed page. It is >= the persisted cursor by
+                // construction (written before/with the cursor advance), so this only ever moves
+                // `last` FORWARD, never skipping uncommitted rows.
+                if let Some(hw) = st.last_committed_cursor_high(rid)? {
+                    last = Some(hw);
+                    summary.cursor_low = last.clone();
+                }
             }
             None => {
                 // FRESH run. For crash-recovery-only (non-incremental) keyset, null
@@ -1091,16 +1108,25 @@ pub(crate) fn run_keyset(
         if plan.validate {
             summary.validated = Some(true);
         }
-        // Record the parts FIRST, tracking whether EVERY part deduped (a re-read overwriting a
-        // rehydrated page in the after_manifest_update resume window). rehydration already counted
-        // that page's rows into total_rows, so a fully-deduped re-read must NOT add them again —
-        // else total_rows diverges from sum(manifest_parts) and trips the coherence invariant. A
-        // page with any genuinely-new part is counted as usual. (A page split into a DIFFERENT
-        // part shape on re-read — max_file_size / auto_shrink — only partially dedups; that
-        // multi-part-rotation dup is a known keyset-checkpoint gap tracked for the cursor-atomic
-        // checkpoint fix, not addressed here.)
+        // Record the parts FIRST, tracking whether EVERY part deduped. With v25 the cursor
+        // reconcile (above) means a committed page is never re-read, so a dedup normally fires only
+        // in the mid-page-crash fallback (below); the counter must still not double-count a deduped
+        // re-read (rehydration already counted that page), or total_rows diverges from
+        // sum(manifest_parts) and trips the coherence invariant — so total_rows is added only when
+        // a page has a genuinely-new part.
         let mut any_new_part = page.parts.is_empty();
-        for rec in &page.parts {
+        let n_parts = page.parts.len();
+        for (pi, rec) in page.parts.iter().enumerate() {
+            // v25: stamp the page's high-water key ONLY on the LAST part's file_log row — the
+            // point at which the WHOLE page is committed. On resume, `last` reconciles to the max
+            // committed `cursor_high`, so a page that fully committed is skipped (never re-read →
+            // no dup, the measured single-part fix). A crash MID-page (only earlier parts written,
+            // last part absent → no cursor_high for this page) does NOT advance the reconcile, so
+            // the page re-reads and its already-committed parts are handled by the run-id part
+            // naming — a recoverable dup, never LOSS. Stamping every part with the page's eventual
+            // high-water would falsely mark a mid-page crash "done" and DROP its uncommitted parts
+            // (there is no per-part key to reconcile against — KeysetPage carries only next_cursor).
+            let is_last = pi + 1 == n_parts;
             let deduped = super::commit::record_part(
                 plan,
                 summary,
@@ -1108,6 +1134,11 @@ pub(crate) fn run_keyset(
                 rec,
                 super::commit::PartKind::Page {
                     page_index: pages as i64,
+                    cursor_high: if is_last {
+                        page.next_cursor.clone()
+                    } else {
+                        None
+                    },
                 },
             );
             any_new_part |= !deduped;

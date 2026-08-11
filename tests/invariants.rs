@@ -317,6 +317,7 @@ fn i2_manifest_absent_before_record_file_is_called() {
             bytes: 4096,
             format: "parquet",
             compression: Some("zstd"),
+            cursor_high: None,
         })
         .unwrap();
 
@@ -340,6 +341,7 @@ fn i2_distinct_files_produce_distinct_manifest_entries() {
             bytes: 2048,
             format: "parquet",
             compression: None,
+            cursor_high: None,
         })
         .unwrap();
     state
@@ -351,6 +353,7 @@ fn i2_distinct_files_produce_distinct_manifest_entries() {
             bytes: 2048,
             format: "parquet",
             compression: None,
+            cursor_high: None,
         })
         .unwrap();
 
@@ -391,6 +394,7 @@ fn i7_prior_manifest_entries_survive_subsequent_record_file_calls() {
             bytes: 4096,
             format: "parquet",
             compression: None,
+            cursor_high: None,
         })
         .unwrap();
 
@@ -405,6 +409,7 @@ fn i7_prior_manifest_entries_survive_subsequent_record_file_calls() {
         bytes: 8192,
         format: "parquet",
         compression: None,
+        cursor_high: None,
     });
 
     // The first manifest entry must still be present — SQLite row-level durability

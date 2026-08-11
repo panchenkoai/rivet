@@ -769,6 +769,7 @@ mod tests {
                 bytes: 4096,
                 format: "parquet",
                 compression: None,
+                cursor_high: None,
             })
             .unwrap();
         state
@@ -780,6 +781,7 @@ mod tests {
                 bytes: 2048,
                 format: "parquet",
                 compression: None,
+                cursor_high: None,
             })
             .unwrap();
         let mut summary =
@@ -853,6 +855,7 @@ mod tests {
                 bytes: 4096,
                 format: "parquet",
                 compression: None,
+                cursor_high: None,
             })
             .unwrap();
         state
@@ -864,6 +867,7 @@ mod tests {
                 bytes: 2048,
                 format: "parquet",
                 compression: None,
+                cursor_high: None,
             })
             .unwrap();
         let mut summary =
@@ -968,6 +972,7 @@ mod tests {
                     bytes: 4096,
                     format: "parquet",
                     compression: None,
+                    cursor_high: None,
                 })
                 .unwrap();
         }
@@ -1027,6 +1032,7 @@ mod tests {
                     bytes: 4096,
                     format: "parquet",
                     compression: None,
+                    cursor_high: None,
                 })
                 .unwrap();
         }
@@ -1096,6 +1102,7 @@ mod tests {
                 bytes: 4096,
                 format: "parquet",
                 compression: None,
+                cursor_high: None,
             })
             .unwrap();
         // …and its part IS on record, which is exactly the trap: written, logged,
@@ -1109,6 +1116,7 @@ mod tests {
                 bytes: 4096,
                 format: "parquet",
                 compression: None,
+                cursor_high: None,
             })
             .unwrap();
 
@@ -1371,6 +1379,7 @@ mod tests {
                     bytes: if idx == 0 { 5 } else { 7 },
                     format: "parquet",
                     compression: Some("zstd"),
+                    cursor_high: None,
                 })
                 .unwrap();
         }
@@ -1435,6 +1444,7 @@ mod tests {
                 bytes: 5,
                 format: "parquet",
                 compression: Some("zstd"),
+                cursor_high: None,
             })
             .unwrap();
         state
@@ -1446,6 +1456,7 @@ mod tests {
                 bytes: 7,
                 format: "parquet",
                 compression: Some("zstd"),
+                cursor_high: None,
             })
             .unwrap();
 

@@ -459,6 +459,12 @@ const MIGRATIONS: &[(i64, &str)] = &[
         ALTER TABLE strategy_snapshot ADD COLUMN probe_k INTEGER;
         ALTER TABLE strategy_snapshot ADD COLUMN probe_w INTEGER;",
     ),
+    // v25: cursor-atomic keyset checkpoint. The page's high-water key, written in the SAME
+    // file_log row as its part(s), so a crash-recovery resume reconciles the cursor from the
+    // COMMITTED parts and never re-reads a committed page — closing the after_manifest_update
+    // dup and its multi-part-rotation variant at the root (a re-read that never happens can't
+    // duplicate). Nullable: only the sequential keyset checkpoint path writes it.
+    (25, "ALTER TABLE file_log ADD COLUMN cursor_high TEXT;"),
 ];
 
 /// PostgreSQL-compatible DDL.  Column types differ from SQLite (BIGSERIAL,
@@ -833,6 +839,11 @@ const PG_MIGRATIONS: &[(i64, &str)] = &[
         ALTER TABLE strategy_snapshot ADD COLUMN IF NOT EXISTS estimate_method TEXT;
         ALTER TABLE strategy_snapshot ADD COLUMN IF NOT EXISTS probe_k BIGINT;
         ALTER TABLE strategy_snapshot ADD COLUMN IF NOT EXISTS probe_w BIGINT;",
+    ),
+    // v25: cursor-atomic keyset checkpoint — see the SQLite ladder. IDEMPOTENT (`IF NOT EXISTS`).
+    (
+        25,
+        "ALTER TABLE file_log ADD COLUMN IF NOT EXISTS cursor_high TEXT;",
     ),
 ];
 
