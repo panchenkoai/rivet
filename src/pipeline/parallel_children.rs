@@ -384,9 +384,10 @@ pub(super) fn run_exports_as_child_processes(
 /// directly unit-tested with exact expected strings.
 pub(super) fn error_class(msg: &str) -> String {
     let mask_token = |tok: &str| -> String {
-        let has_digit = tok.chars().any(|c| c.is_ascii_digit());
-        let has_alpha = tok.chars().any(|c| c.is_ascii_alphabetic());
-        if has_digit && (has_alpha || tok.chars().all(|c| c.is_ascii_digit())) {
+        // Each token is a run of `is_ascii_alphanumeric()` chars, so every char is a digit or an
+        // ASCII letter; `has_alpha || all-digits` is therefore always true and the mask condition
+        // reduces to just `has_digit` (mask any token that carries a digit — an id/hash/token).
+        if tok.chars().any(|c| c.is_ascii_digit()) {
             "#".to_string()
         } else {
             tok.to_string()
