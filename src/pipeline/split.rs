@@ -281,6 +281,13 @@ pub(crate) fn reconstruct_units_from_prefix(
     family: &str,
     giant: &ExportConfig,
 ) -> Option<Vec<ExportConfig>> {
+    // A resume must not RESURRECT a split the fresh path would now refuse. `probe_and_synthesize`
+    // gates new splits through `splittable_key` (e.g. it refuses `keyset_incremental`), but
+    // reconstruct rebuilds from on-disk unit manifests and would bypass that gate — so a config
+    // that turned unsafe-to-split since the prior run (a flipped `keyset_incremental`, an added
+    // `cursor_column`) would resume its old split and silently drop/duplicate. Honour the same
+    // gate here: not splittable → leave the giant whole (probe agrees, so no split runs).
+    splittable_key(giant)?;
     let prefix = format!("{}#", giant.name); // this giant's unit names: "{giant}#<ordinal>"
     let mut key: Option<String> = None;
     // boundary position -> value. Position i is the boundary between unit#i and unit#(i+1),
@@ -568,6 +575,29 @@ mod tests {
                 (s.lo.clone(), s.hi.clone())
             })
             .collect()
+    }
+
+    #[test]
+    fn reconstruct_refuses_to_resurrect_a_now_unsplittable_export_on_resume() {
+        // A prior run split this export and left unit manifests; the config has since flipped
+        // `keyset_incremental: true` (append-only), which `splittable_key` now refuses. Resume
+        // must NOT rebuild the old split from the on-disk manifests (that would bypass the
+        // fresh-path guard and drop/duplicate) — reconstruct returns None, so the giant runs
+        // whole (probe_and_synthesize also returns None for it).
+        let dir = tempfile::tempdir().unwrap();
+        let mut giant = sample_export("daily");
+        giant.mode = ExportMode::Chunked;
+        giant.chunk_by_key = Some("id".into());
+        giant.destination.path = Some(dir.path().to_string_lossy().into_owned());
+        // On-disk split units from the prior (splittable) run.
+        write_unit_manifest(dir.path(), "daily#0", "r0", None, Some("500"));
+        write_unit_manifest(dir.path(), "daily#1", "r1", Some("500"), None);
+        // The config is now keyset_incremental → not splittable.
+        giant.keyset_incremental = true;
+        assert!(
+            reconstruct_units_from_prefix(&giant.destination, "daily", &giant).is_none(),
+            "a resume must not resurrect a split for a config that is no longer splittable"
+        );
     }
 
     #[test]

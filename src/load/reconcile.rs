@@ -371,6 +371,53 @@ fn finished_after(a: &str, b: &str) -> bool {
     }
 }
 
+/// A Full selection must be ONE coherent split generation (or a single plain snapshot). A
+/// `--pool --split` prefix accumulates a manifest copy per unit per run (different run_ids →
+/// different part names → nothing overwrites), and there is no generation id, so if a later run
+/// split into a DIFFERENT unit count — or the export toggled unsplit↔split — [`latest_full`]'s
+/// group-by-unit selection would mix TWO generations: their windows overlap and a Full (replace)
+/// load would DUPLICATE rows (the count gate can't catch it — `expected_rows` inflates with the
+/// parts). Every coherent split generation has EXACTLY one bottom unit (`lo == None`) and one
+/// top (`hi == None`) and no plain/split mix; violate that and we cannot tell which parts form
+/// the current snapshot, so REFUSE loudly rather than silently duplicate. (Proper fix: stamp a
+/// split-generation id on the units — tracked follow-up.)
+fn ensure_single_split_generation(selected: &[(String, RunManifest)]) -> Result<()> {
+    let split: Vec<&RunManifest> = selected
+        .iter()
+        .map(|(_, m)| m)
+        .filter(|m| m.split_window.is_some())
+        .collect();
+    if split.is_empty() {
+        return Ok(()); // a plain single-snapshot selection is always coherent
+    }
+    let plain = selected.len() - split.len();
+    let bottoms = split
+        .iter()
+        .filter(|m| m.split_window.as_ref().unwrap().lo.is_none())
+        .count();
+    let tops = split
+        .iter()
+        .filter(|m| m.split_window.as_ref().unwrap().hi.is_none())
+        .count();
+    if plain > 0 || bottoms > 1 || tops > 1 {
+        anyhow::bail!(
+            "Full load over a --pool --split prefix selected parts from MORE THAN ONE split \
+             generation ({} split units incl. {bottoms} bottom + {tops} top window(s){}); \
+             loading their union would DUPLICATE rows. The prefix holds a prior split run's \
+             leftover parts (a later run split into a different unit count, or the export \
+             toggled split↔unsplit). Load into a FRESH destination prefix (or clear the stale \
+             generation) and re-run.",
+            split.len(),
+            if plain > 0 {
+                format!(", plus {plain} non-split snapshot(s)")
+            } else {
+                String::new()
+            }
+        );
+    }
+    Ok(())
+}
+
 /// Which run manifests to load for `mode`, given the ledger's already-`loaded`
 /// run_ids. The single mode→selection decision, pure and testable so the load's
 /// central invariant isn't buried in dispatch I/O:
@@ -384,7 +431,7 @@ pub fn select_runs(
     keyed: Vec<(String, RunManifest)>,
     loaded: &std::collections::HashSet<String>,
     mode: crate::load::plan::LoadMode,
-) -> Vec<(String, RunManifest)> {
+) -> Result<Vec<(String, RunManifest)>> {
     // Only a `Success` run is loadable, so drop every other status BEFORE
     // selection. `Running` is a live run's in-flight marker (no committed
     // parts); `Failed`/`Interrupted` is an ABORTED run whose parts are partial —
@@ -409,11 +456,15 @@ pub fn select_runs(
         .filter(|(_, m)| m.status == ManifestStatus::Success)
         .collect();
     match mode {
-        crate::load::plan::LoadMode::Full => latest_full(keyed),
-        _ => keyed
+        crate::load::plan::LoadMode::Full => {
+            let sel = latest_full(keyed);
+            ensure_single_split_generation(&sel)?;
+            Ok(sel)
+        }
+        _ => Ok(keyed
             .into_iter()
             .filter(|(_, m)| !loaded.contains(&m.run_id))
-            .collect(),
+            .collect()),
     }
 }
 
@@ -1105,7 +1156,8 @@ mod tests {
             vec![keyed(failed), keyed(ok8), keyed(ok9)],
             &std::collections::HashSet::new(),
             crate::load::plan::LoadMode::Cdc,
-        );
+        )
+        .unwrap();
         let ids: Vec<&str> = sel.iter().map(|(_, m)| m.run_id.as_str()).collect();
         assert_eq!(
             ids,
@@ -1467,7 +1519,8 @@ mod tests {
             vec![run_marker, ok],
             &std::collections::HashSet::new(),
             crate::load::plan::LoadMode::Incremental,
-        );
+        )
+        .unwrap();
         assert_eq!(sel.len(), 1, "only the Success run is selected");
         assert_eq!(sel[0].1.run_id, "r_ok");
         assert!(sel.iter().all(|(_, m)| m.status != ManifestStatus::Running));
@@ -1578,6 +1631,75 @@ mod tests {
     }
 
     #[test]
+    fn select_runs_full_refuses_a_mixed_generation_split_prefix() {
+        // Two split generations accumulated under one prefix: gen A split into 3
+        // (orders#0..#2), a later clean run gen B into 2 (orders#0..#1). Nothing deletes gen
+        // A's copies, so latest_full's group-by-name picks B#0, B#1, and STALE A#2 — TWO top
+        // (hi=None) units → overlapping coverage → a Full (replace) load would DUPLICATE the
+        // (700, ∞) rows. select_runs must REFUSE, not silently duplicate.
+        let unit = |name: &str, run: &str, lo: Option<&str>, hi: Option<&str>, at: &str| {
+            let mut m = manifest(run, 100, None);
+            m.export_name = name.into();
+            m.export_family = "orders".into();
+            m.finished_at = at.into();
+            m.split_window = Some(crate::manifest::SplitWindow {
+                key_column: "id".into(),
+                lo: lo.map(String::from),
+                hi: hi.map(String::from),
+            });
+            (format!("orders/manifest-{run}.json"), m)
+        };
+        let keyed = vec![
+            unit("orders#0", "b0", None, Some("500"), "2026-01-02T00:00:00Z"),
+            unit("orders#1", "b1", Some("500"), None, "2026-01-02T00:00:01Z"),
+            unit("orders#2", "a2", Some("700"), None, "2026-01-01T00:00:00Z"), // stale gen A top
+        ];
+        let err = select_runs(
+            keyed,
+            &std::collections::HashSet::new(),
+            crate::load::plan::LoadMode::Full,
+        )
+        .expect_err("a mixed-generation split prefix must be refused, not silently loaded");
+        assert!(
+            err.to_string().contains("more than one split generation")
+                || err.to_string().contains("DUPLICATE"),
+            "error must name the multi-generation duplication hazard: {err}"
+        );
+    }
+
+    #[test]
+    fn select_runs_full_accepts_one_coherent_split_generation() {
+        // A single clean split generation (one bottom lo=None, one top hi=None) loads all its
+        // units — the headline fix — without tripping the guard.
+        let unit = |name: &str, run: &str, lo: Option<&str>, hi: Option<&str>| {
+            let mut m = manifest(run, 100, None);
+            m.export_name = name.into();
+            m.export_family = "orders".into();
+            m.split_window = Some(crate::manifest::SplitWindow {
+                key_column: "id".into(),
+                lo: lo.map(String::from),
+                hi: hi.map(String::from),
+            });
+            (format!("orders/manifest-{run}.json"), m)
+        };
+        let keyed = vec![
+            unit("orders#0", "r0", None, Some("500")),
+            unit("orders#1", "r1", Some("500"), None),
+        ];
+        let sel = select_runs(
+            keyed,
+            &std::collections::HashSet::new(),
+            crate::load::plan::LoadMode::Full,
+        )
+        .unwrap();
+        assert_eq!(
+            sel.len(),
+            2,
+            "both units of one coherent generation must load"
+        );
+    }
+
+    #[test]
     fn latest_full_re_materializes_even_when_the_latest_is_already_loaded() {
         // Full is NOT ledger-skipped: a re-load re-OVERWRITEs from the latest
         // snapshot, self-healing a drifted target and staying resilient to hidden
@@ -1626,12 +1748,12 @@ mod tests {
         ];
         // Stateful, r2 already loaded → still selects r2 (re-materialize/self-heal).
         let loaded = HashSet::from(["r2".to_string()]);
-        let sel = select_runs(keyed.clone(), &loaded, LoadMode::Full);
+        let sel = select_runs(keyed.clone(), &loaded, LoadMode::Full).unwrap();
         assert_eq!(sel.len(), 1);
         assert_eq!(sel[0].1.run_id, "r2", "Full picks latest, loaded or not");
         // STATELESS (empty loaded) → the latest, NEVER a blanket load of both
         // snapshots (the duplicate-rows bug this fix closes).
-        let sel = select_runs(keyed, &HashSet::new(), LoadMode::Full);
+        let sel = select_runs(keyed, &HashSet::new(), LoadMode::Full).unwrap();
         assert_eq!(sel.len(), 1, "stateless Full is not a blanket load");
         assert_eq!(sel[0].1.run_id, "r2");
     }
@@ -1646,12 +1768,14 @@ mod tests {
         ];
         let loaded = HashSet::from(["r1".to_string()]);
         for mode in [LoadMode::Incremental, LoadMode::Cdc] {
-            let sel = select_runs(keyed.clone(), &loaded, mode);
+            let sel = select_runs(keyed.clone(), &loaded, mode).unwrap();
             assert_eq!(sel.len(), 1, "{mode:?}: only the unloaded run");
             assert_eq!(sel[0].1.run_id, "r2");
             // Stateless → empty loaded → load all (at-least-once, dedup absorbs).
             assert_eq!(
-                select_runs(keyed.clone(), &HashSet::new(), mode).len(),
+                select_runs(keyed.clone(), &HashSet::new(), mode)
+                    .unwrap()
+                    .len(),
                 2,
                 "{mode:?}: stateless loads every run"
             );
