@@ -383,6 +383,7 @@ fn pool_split_shared_seam_scenarios_name_existing_regression_tests() {
         "latest_full_over_a_split_family_selects_every_unit_not_just_the_last",
         "latest_full_over_a_split_family_takes_the_newest_run_per_unit",
         "select_runs_full_refuses_a_mixed_generation_split_prefix",
+        "select_runs_full_refuses_an_equal_count_split_generation_with_an_interior_hole",
         "incremental_and_cdc_exports_are_not_splittable",
         "reconstruct_refuses_to_resurrect_a_now_unsplittable_export_on_resume",
         "mongo_source_is_not_range_split_capable",

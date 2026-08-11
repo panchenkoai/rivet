@@ -57,10 +57,7 @@ fn diagnose_pg(
     // (build_plan). Resolve it here too so range_col / the strategy label / the index probe
     // target that SAME column — else every such export reports a false UNSAFE + `chunked(?,…)`
     // + "create an index on chunk_column" on an already-PK-indexed table (post-0.24.3 MED).
-    let auto_pk: Option<String> = if export.mode == ExportMode::Chunked
-        && export.chunk_column.is_none()
-        && export.chunk_by_key.is_none()
-    {
+    let auto_pk: Option<String> = if should_auto_resolve_chunk_pk(export) {
         export
             .table
             .as_deref()

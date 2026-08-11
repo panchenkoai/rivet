@@ -80,10 +80,7 @@ fn diagnose_mysql(
     // build_plan auto-resolves an UNSET chunked chunk_column to the single-integer PK; resolve
     // it here too so range_col / the strategy label / the index probe target the SAME column,
     // else the export reports a false UNSAFE + chunked(?,…) on a PK-indexed table (post-0.24.3 MED).
-    let auto_pk: Option<String> = if export.mode == ExportMode::Chunked
-        && export.chunk_column.is_none()
-        && export.chunk_by_key.is_none()
-    {
+    let auto_pk: Option<String> = if should_auto_resolve_chunk_pk(export) {
         export
             .table
             .as_deref()

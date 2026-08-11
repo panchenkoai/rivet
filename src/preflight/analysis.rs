@@ -102,20 +102,28 @@ pub(crate) fn preflight_range_col_resolved<'a>(
 }
 
 /// The single-int PK a chunked export auto-resolves to — `Some(auto_pk)` ONLY when the planner
-/// would actually use it (mode Chunked, no explicit `chunk_column`/`chunk_by_key`). Shared by
-/// the range-col resolution AND the strategy label so both tell the same truth.
+/// would actually use it. Shared by the range-col resolution AND the strategy label so both tell
+/// the same truth.
 fn auto_resolved_chunk_pk<'a>(
     export: &'a ExportConfig,
     auto_pk: Option<&'a str>,
 ) -> Option<&'a str> {
-    if export.mode == ExportMode::Chunked
-        && export.chunk_column.is_none()
-        && export.chunk_by_key.is_none()
-    {
+    if should_auto_resolve_chunk_pk(export) {
         auto_pk
     } else {
         None
     }
+}
+
+/// Does `build_plan` auto-resolve this export's chunk column to the single-integer PK? True iff
+/// mode is Chunked with NEITHER an explicit `chunk_column` NOR `chunk_by_key`. The ONE predicate
+/// every diagnose site (pg/mysql/mssql) and the analysis resolution share, so a future change to
+/// the planner's auto-resolution trigger (build_plan) is mirrored in ONE place — four inlined
+/// copies would silently diverge and reintroduce the false-UNSAFE this fixes.
+pub(crate) fn should_auto_resolve_chunk_pk(export: &ExportConfig) -> bool {
+    export.mode == ExportMode::Chunked
+        && export.chunk_column.is_none()
+        && export.chunk_by_key.is_none()
 }
 
 /// Does this strategy read on an indexed key the catalog probe should confirm?
