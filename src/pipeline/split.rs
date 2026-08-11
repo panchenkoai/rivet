@@ -335,6 +335,14 @@ pub(crate) fn reconstruct_units_from_prefix(
     // open `(b, None]` that absorbs the crashed tail — no completed unit sits above it,
     // so that coarsening is genuinely loss- AND dup-free.)
     let &max_pos = bmap.keys().next_back()?; // no interior boundaries → None (first run)
+    // Boundary positions NO surviving unit could supply — the adjacent-crash holes the fill
+    // synthesizes. A unit whose window TOUCHES a filled position has a window that DIFFERS from
+    // the one its own pre-crash per-unit checkpoint was taken over; resuming that stale
+    // checkpoint against the changed window silently DUPLICATES or LOSES rows (chunked bailed
+    // loud on the plan-fingerprint mismatch, keyset had no guard at all — post-0.24.3 review
+    // HIGH). Such units must run FRESH; recorded here, enforced after `synthesize` below.
+    let filled: std::collections::HashSet<usize> =
+        (0..=max_pos).filter(|i| !bmap.contains_key(i)).collect();
     let mut boundaries: Vec<Option<String>> =
         (0..=max_pos).map(|i| bmap.get(&i).cloned()).collect();
     let mut last: Option<String> = None;
@@ -357,7 +365,21 @@ pub(crate) fn reconstruct_units_from_prefix(
     // invariant is documented, not a live branch (the fill makes a partial set impossible).
     let boundaries: Vec<String> = boundaries.into_iter().flatten().collect();
     debug_assert_eq!(boundaries.len(), max_pos + 1);
-    Some(synthesize(giant, &key, &boundaries))
+
+    let mut units = synthesize(giant, &key, &boundaries);
+    // Unit i's window is `(boundaries[i-1], boundaries[i]]` (open at the ends). If EITHER of its
+    // two boundary positions was FILLED, the window is synthetic — its stale per-unit checkpoint
+    // no longer matches, so force a FRESH run (chunk_checkpoint off → the keyset/chunked resume
+    // path reads no checkpoint and re-runs the whole window; the pre-crash orphan parts are
+    // unmanifested and gc'd, so no duplicate/loss and no loud bail). A unit both of whose
+    // boundaries are REAL (a single-crash exact recovery, or a completed unit that will be
+    // skipped anyway) keeps crash-recovery and resumes normally.
+    for (i, unit) in units.iter_mut().enumerate() {
+        if (i > 0 && filled.contains(&(i - 1))) || filled.contains(&i) {
+            unit.chunk_checkpoint = false;
+        }
+    }
+    Some(units)
 }
 
 #[cfg(test)]
@@ -674,6 +696,41 @@ mod tests {
         assert!(
             !overlaps_survivor,
             "no re-run unit may be open-ended below the surviving #3 boundary (would dup)"
+        );
+
+        // HIGH (post-0.24.3 review): a unit whose window was SYNTHESIZED by the fill must run
+        // FRESH (chunk_checkpoint off), never resume its stale pre-crash checkpoint against the
+        // changed window (keyset would silently dup/lose; chunked would loudly bail). #1 (empty,
+        // touches the filled boundary 1) and #2 (merged, also touches it) → fresh; #0 and #3
+        // (both boundaries real) keep crash-recovery.
+        let ck: Vec<bool> = units.iter().map(|u| u.chunk_checkpoint).collect();
+        assert_eq!(
+            ck,
+            vec![true, false, false, true],
+            "fill-synthesized units (#1, #2) must run fresh; exact units (#0, #3) keep checkpoint"
+        );
+    }
+
+    #[test]
+    fn reconstruct_keeps_checkpoint_for_an_exactly_recovered_single_crash() {
+        // A SINGLE crash (#2), both neighbours present → every boundary is real, no fill → the
+        // crashed unit's window is EXACTLY its original, so its checkpoint is valid and it must
+        // resume normally (chunk_checkpoint stays on for every unit).
+        let dir = tempfile::tempdir().unwrap();
+        let mut giant = sample_export("daily");
+        giant.mode = ExportMode::Chunked;
+        giant.chunk_by_key = Some("id".into());
+        giant.destination.path = Some(dir.path().to_string_lossy().into_owned());
+        write_unit_manifest(dir.path(), "daily#0", "r0", None, Some("250"));
+        write_unit_manifest(dir.path(), "daily#1", "r1", Some("250"), Some("500"));
+        // #2 crashed (no manifest) — recovered exactly from #1.hi (500) and #3.lo (750).
+        write_unit_manifest(dir.path(), "daily#3", "r3", Some("750"), None);
+
+        let units = reconstruct_units_from_prefix(&giant.destination, "daily", &giant)
+            .expect("reconstruct");
+        assert!(
+            units.iter().all(|u| u.chunk_checkpoint),
+            "an exactly-recovered single-crash resume must keep crash-recovery on every unit"
         );
     }
 
