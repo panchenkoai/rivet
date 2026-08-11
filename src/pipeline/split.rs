@@ -115,13 +115,18 @@ pub(crate) fn synthesize(
         .map(|(i, (lo, hi))| {
             let mut e = base.clone();
             e.name = format!("{}#{i}", base.name);
-            // Crash-recovery ON so `--pool --split --resume` resumes a crashed unit
-            // from its own checkpoint (#167 per-unit resume): the runner reuses the
-            // in-progress run_id, so the partial parts are OVERWRITTEN in place
-            // (cloud-safe — no delete needed) rather than duplicated. Completed
-            // units are skipped by the pool; never-started units run fresh. This is
-            // crash-recovery only (never the append-only keyset_incremental), so a
-            // clean re-run still does a full pass over the window.
+            // Crash-recovery ON so `--pool --split --resume` resumes a crashed unit from its
+            // own checkpoint (#167 per-unit resume): the runner reuses the in-progress run_id
+            // for MANIFEST IDENTITY and REHYDRATES the file_log-committed parts into this run's
+            // manifest (rehydrate_manifest_parts_from_file_log) — it does NOT overwrite them in
+            // place (part names carry a per-invocation wall-clock stamp / random nonce, not the
+            // run_id, so a resume writes DIFFERENTLY-named parts). A part written but not yet
+            // file_log-committed before the crash is therefore neither rehydrated nor overwritten
+            // — it lingers as an unmanifested cloud orphan that `gc_orphans` reclaims (a delete
+            // IS eventually needed on cloud). No dup/loss: the loader is manifest-authoritative,
+            // so the orphan is ignored and the resume re-reads that page. Completed units are
+            // skipped by the pool; never-started units run fresh. Crash-recovery only (never the
+            // append-only keyset_incremental), so a clean re-run does a full pass over the window.
             e.chunk_checkpoint = true;
             e.split = Some(SplitSynth {
                 parent: parent.clone(),
@@ -248,6 +253,16 @@ fn read_unit_manifests(
     out
 }
 
+/// The Success unit names under the split prefix — the per-unit resume skip set. KNOWN LIMIT
+/// (post-0.24.3 review, PLAUSIBLE-HIGH): this is GENERATION-BLIND — it collects Success across
+/// EVERY manifest copy in the prefix, so if an OLDER split generation (a prior full run into a
+/// fixed, non-{run_id} prefix) completed the same ordinal, its Success masks a CURRENT-generation
+/// unit that crashed, and the skip drops it. The silent-loss chain requires a full split export
+/// run REPEATEDLY into one accumulating prefix — an atypical pattern — AND is caught at LOAD by
+/// the tiling backstop `ensure_single_split_generation` (a mixed-generation selection whose
+/// windows do not tile is REFUSED loudly, not silently gapped/duplicated). The precise run-side
+/// fix is generation-scoping (a generation id on `SplitWindow`, or matching the reconstructed
+/// window per ordinal before skipping) — tracked; the load guard makes the interim non-silent.
 pub(crate) fn completed_units_in_prefix(
     dest_config: &crate::config::DestinationConfig,
     family: &str,
