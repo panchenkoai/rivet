@@ -1088,12 +1088,20 @@ pub(crate) fn run_keyset(
         if checksum_key_column.is_none() {
             checksum_key_column = page.checksum_key_column.clone();
         }
-        summary.total_rows += page.rows as i64;
         if plan.validate {
             summary.validated = Some(true);
         }
+        // Record the parts FIRST, tracking whether EVERY part deduped (a re-read overwriting a
+        // rehydrated page in the after_manifest_update resume window). rehydration already counted
+        // that page's rows into total_rows, so a fully-deduped re-read must NOT add them again —
+        // else total_rows diverges from sum(manifest_parts) and trips the coherence invariant. A
+        // page with any genuinely-new part is counted as usual. (A page split into a DIFFERENT
+        // part shape on re-read — max_file_size / auto_shrink — only partially dedups; that
+        // multi-part-rotation dup is a known keyset-checkpoint gap tracked for the cursor-atomic
+        // checkpoint fix, not addressed here.)
+        let mut any_new_part = page.parts.is_empty();
         for rec in &page.parts {
-            super::commit::record_part(
+            let deduped = super::commit::record_part(
                 plan,
                 summary,
                 state,
@@ -1102,6 +1110,10 @@ pub(crate) fn run_keyset(
                     page_index: pages as i64,
                 },
             );
+            any_new_part |= !deduped;
+        }
+        if any_new_part {
+            summary.total_rows += page.rows as i64;
         }
         // Persist the high-water mark AFTER the parts are durably committed, so a
         // resume continues from committed data (peek→flush→ack). The crash window

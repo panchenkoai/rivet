@@ -279,22 +279,26 @@ pub(crate) fn part_indexed_name(base: &str, idx: usize, count: usize) -> String 
 /// Seam 2 — the single home for the post-write ordering that used to drift
 /// across runners: the I2 fault window, the byte/file counters, the manifest
 /// part (I2/M1), the journal event, and the warn-on-fail file-log write (I7).
+/// Returns `true` iff the part was DEDUPED (a re-read overwrote a rehydrated part of the same
+/// path); the caller (the keyset page loop) then skips the per-page `total_rows` bump because
+/// rehydration already counted that page.
 pub(crate) fn record_part(
     plan: &ResolvedRunPlan,
     summary: &mut RunSummary,
     state: Option<&StateStore>,
     part: &PartRecord,
     kind: PartKind,
-) {
+) -> bool {
     // ADR-0001 I2→I3 crash window: file at destination, manifest not yet updated.
     crate::test_hook::maybe_panic_at("after_file_write");
 
-    summary.bytes_written += part.bytes;
-    summary.files_produced += 1;
-    summary.files_committed += 1;
-
-    // ADR-0012 M1: record the committed part for the finalizer's RunManifest.
-    manifest_writer::record_committed_part_with_fingerprint(
+    // ADR-0012 M1: record the committed part for the finalizer's RunManifest. Returns whether it
+    // DEDUPED (a re-read overwrote a rehydrated part of the same path — the keyset after-manifest
+    // resume window). Aggregates are bumped only on a genuine NEW part, so a deduped re-read does
+    // not inflate files_committed / bytes_written past manifest_parts.len() (which would trip the
+    // run-integrity invariant). total_rows is a per-page loop counter; the keyset runner reconciles
+    // it to the manifest sum after the loop.
+    let deduped = manifest_writer::record_committed_part_with_fingerprint(
         summary,
         part.file_name.clone(),
         part.rows,
@@ -302,6 +306,11 @@ pub(crate) fn record_part(
         part.fingerprint.clone(),
         part.md5.clone(),
     );
+    if !deduped {
+        summary.bytes_written += part.bytes;
+        summary.files_produced += 1;
+        summary.files_committed += 1;
+    }
 
     match kind {
         PartKind::File { part_index } => summary.journal.record(RunEvent::FileWritten {
@@ -350,6 +359,7 @@ pub(crate) fn record_part(
 
     // ADR-0001 I3 crash window: manifest recorded, cursor not yet advanced.
     crate::test_hook::maybe_panic_at("after_manifest_update");
+    deduped
 }
 
 #[cfg(test)]
