@@ -294,7 +294,7 @@ an env var and use Path A.
 
 ---
 
-## S3-compatible storage (MinIO, R2, etc.)
+## S3-compatible storage (MinIO)
 
 Same as AWS Path A above + an explicit `endpoint:` URL.  Static keys
 only — STS / temporary credentials are an AWS-specific concept.
@@ -309,23 +309,14 @@ destination:
   secret_key_env: MINIO_SECRET_KEY
 ```
 
-Cloudflare R2, Wasabi, Backblaze B2 etc. use the same static-key shape,
-with one addition: their endpoints are **non-loopback**, so the config must
-also set `allow_anonymous: true` — otherwise the endpoint is rejected at
-config load (a committed custom endpoint redirects every upload, so Rivet
-requires the explicit opt-in). For S3 the flag only waives that endpoint
-guard; requests are still signed with the configured static keys.
-
-```yaml
-destination:
-  type: s3
-  bucket: my-r2-bucket
-  endpoint: "https://ACCOUNT_ID.r2.cloudflarestorage.com"
-  region: auto
-  allow_anonymous: true      # required for a non-loopback custom endpoint
-  access_key_env: R2_ACCESS_KEY
-  secret_key_env: R2_SECRET_KEY
-```
+Cloudflare R2, Wasabi, Backblaze B2 etc. are **not supported**: they require
+a non-loopback `endpoint:`, which Rivet rejects at config load (a committed
+custom endpoint redirects every upload — an exfiltration guard). Only the
+loopback MinIO shape above is a validated custom-endpoint path. Rivet has
+never been tested against R2 / Wasabi / B2; `allow_anonymous: true`
+technically waives the endpoint guard (static keys still sign), but the flag
+targets anonymous emulators and the combination is unvalidated — use it at
+your own risk, and verify the upload end-to-end if you do.
 
 ---
 

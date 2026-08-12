@@ -66,10 +66,10 @@ at the output directory.
 
 `region:` is optional when the SDK can derive one from the profile or env
 vars; required otherwise.  `endpoint:` overrides the resolved S3 endpoint.
-A loopback endpoint (MinIO) works as-is; any non-loopback endpoint (AWS
-GovCloud, Cloudflare R2, custom domains) is rejected at config load unless
-the export also sets `allow_anonymous: true` — for S3 the flag only waives
-that endpoint guard, requests are still signed with the configured keys
+Only a loopback endpoint (MinIO) is a supported custom-endpoint path; any
+non-loopback endpoint (AWS GovCloud, Cloudflare R2, Wasabi, custom domains)
+is rejected at config load as an exfiltration guard, and those services are
+untested / not supported as Rivet destinations
 (see [cloud-auth.md](cloud-auth.md), "S3-compatible storage").
 
 ### Google Cloud Storage
