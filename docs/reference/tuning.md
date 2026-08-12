@@ -242,8 +242,8 @@ exports:
 | Engine | Pressure proxy | Read via |
 |--------|----------------|----------|
 | PostgreSQL | `pg_stat_bgwriter.checkpoints_req` | `SELECT checkpoints_req FROM pg_stat_bgwriter` (preceded by `pg_stat_clear_snapshot()`) |
-| MySQL | global `Innodb_log_waits` | `SHOW GLOBAL STATUS LIKE 'Innodb_log_waits'` |
-| SQL Server | `Log Flush Waits/sec` (cumulative `cntr_value`) | `SELECT cntr_value FROM sys.dm_os_performance_counters WHERE counter_name LIKE 'Log Flush Wait%' AND instance_name = <database>` |
+| MySQL | `Created_tmp_disk_tables` + `Innodb_buffer_pool_wait_free` (summed; read-spill pressure) | `SHOW GLOBAL STATUS WHERE Variable_name IN ('Created_tmp_disk_tables', 'Innodb_buffer_pool_wait_free')` |
+| SQL Server | `Workfiles Created/sec` + `Worktables Created/sec` (summed cumulative `cntr_value`; tempdb spill pressure, instance-level) | `SELECT SUM(cntr_value) FROM sys.dm_os_performance_counters WHERE counter_name IN ('Workfiles Created/sec', 'Worktables Created/sec')` |
 
 It is the **same proxy** the adaptive batch loop uses — enabling the governor adds no new query beyond what `adaptive: true` already runs.
 
@@ -294,7 +294,7 @@ each chunk on its own worker and are not intra-chunk pipelined.
 
 1. **Reduce `batch_size`** -- the single most effective knob
 2. **Use `safe` profile** for wide tables on production databases
-3. **Enable jemalloc** -- build with `--features jemalloc` for 20-40% lower RSS
+3. **jemalloc is the default allocator** -- ordinary builds (`cargo build`, `cargo install rivet-cli`) already include it (a default cargo feature), so its 20-40% RSS reduction is in effect out of the box; only a `--no-default-features` build loses it
 4. **Set `memory_threshold_mb`** -- Rivet pauses fetching when RSS exceeds this
 
 ## Examples
@@ -361,7 +361,7 @@ smaller `batch_size` directly.
 
 ### How `memory_threshold_mb` works
 
-When `tuning.memory_threshold_mb` is set, Rivet samples RSS after each batch (via `mach_task_basic_info` on macOS, `/proc/self/statm` on Linux). If RSS exceeds the threshold, fetching pauses until RSS drops below 80 % of the limit. This prevents OOM on tables with highly variable row widths.
+When `tuning.memory_threshold_mb` is set, the **chunked runners** sample RSS at each chunk boundary (via `mach_task_basic_info` on macOS, `/proc/self/statm` on Linux). If RSS exceeds the threshold, the next chunk is held back (re-polling every few seconds) until RSS falls back to or below the threshold — there is no hysteresis band, and no per-batch check. Full, incremental, keyset, and mongo-parallel exports never pause on this knob; there RSS is only recorded for the peak-RSS metric. For a memory ceiling on those paths use `batch_size_memory_mb` / `max_batch_memory_mb` instead.
 
 ```yaml
 source:
@@ -369,7 +369,7 @@ source:
     memory_threshold_mb: 1024   # pause fetching above 1 GB RSS
 ```
 
-The guard adds ~1–2 ms of overhead per batch from the RSS syscall. It is enabled by default on `balanced` (4096 MB) and `safe` (2048 MB) profiles; set `memory_threshold_mb: 0` to disable it.
+The RSS syscall costs ~1–2 ms, paid once per chunk. The guard is enabled by default on `balanced` (4096 MB) and `safe` (2048 MB) profiles; set `memory_threshold_mb: 0` to disable it.
 
 ### Parallelism and source capacity
 

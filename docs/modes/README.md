@@ -28,7 +28,7 @@ Notes worth knowing before you run:
 
 - **`incremental` first run = full export.** With no cursor yet, every matching
   row is exported, so the first run behaves like `full` — size `batch_size`
-  accordingly ([incremental.md](incremental.md#first-run)).
+  accordingly ([incremental.md](incremental.md#batch-size-and-tuning)).
 - **`chunked` clean re-runs are NOT idempotent.** A crash + `--resume` is
   at-least-once: a re-run chunk can be written twice (byte-identical), so
   de-duplicate downstream if you re-run ([chunked.md](chunked.md#clean-re-runs-are-not-idempotent)).

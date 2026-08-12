@@ -36,11 +36,11 @@ dev — the URL is otherwise visible in `ps` / shell history.
 | `--checkpoint PATH` | persist/resume the log position. Omit to tail from the current position without checkpointing. On the **first** checkpointed MySQL run the open position is persisted immediately (the client-side analogue of PostgreSQL's slot pinning at creation), so an idle first run still anchors the resume position — without it, changes landing between two idle scheduler cycles would be skipped. |
 | `--table NAME` | only emit this table (repeatable for NDJSON; **exactly one** required for `--output`, whose schema is resolved from the source). |
 | `--output DIR` | write typed Parquet/CSV files instead of NDJSON. |
-| `--max-events N` | stop after N changes (otherwise stream until interrupted; the per-event checkpoint makes an interrupted run resumable). |
+| `--max-events N` | stop after N changes; without it the default bounded run drains to the log end as of open and exits (stream until interrupted only with `--stream`). The per-event checkpoint makes an interrupted run resumable. |
 | `--rollover N` | rows per output part file (default `100000`); also rolls at a transaction boundary, never splitting one. **This is the file-size ⇄ memory dial**: larger ⇒ fewer, bigger files but more drain memory (the PostgreSQL peek reads a part's worth per batch, so drain RSS is O(rollover) — ≈`28 MB + 1.3 KB × rollover`). Raise it to cut file count on a big host; lower it to cap memory on a small extractor. (Config: `cdc.rollover`.) |
 | `--slot NAME` | PostgreSQL logical slot (default `rivet_slot`; created if absent). |
 | `--capture-instance NAME` | SQL Server CDC capture instance (e.g. `dbo_orders`) — required for `sqlserver://`. |
-| `--stream` | **Opt out of the default bounded run and stream continuously** (a long-lived daemon). By default `rivet cdc` catches up to the source's log end **as of the moment the run opened**, then **exits** instead of streaming — this is the scheduler-friendly model, so no flag is needed for it. Every engine pins that boundary at open (PostgreSQL: `pg_current_wal_lsn()`; MySQL: the binlog coordinates, plus `BINLOG_DUMP_NON_BLOCK` as the catch-up backstop; SQL Server: `fn_cdc_get_max_lsn()`; MongoDB: the cluster `operationTime`), so a hot table whose writers outpace the drain cannot keep the run alive chasing a moving log end — the run's work is O(backlog at open), and everything committed after the boundary is picked up by the next run from the checkpoint. With `--max-events N`, the bounded run stops at the smaller of "N events" or the boundary — so it never blocks waiting for the N-th event. Passing `--stream` disables the boundary and tails the log until interrupted (and logs a warning that it is a daemon). On a PostgreSQL **standby** (PG 16+ logical decoding) the ceiling query (`pg_current_wal_lsn()`) is unavailable during recovery, so the default bounded run fails loudly at open — pass `--stream`, or point the source at the primary. |
+| `--stream` | **Opt out of the default bounded run and stream continuously** (a long-lived daemon). By default `rivet cdc` catches up to the source's log end **as of the moment the run opened**, then **exits** instead of streaming — this is the scheduler-friendly model, so no flag is needed for it. Every engine pins that boundary at open (PostgreSQL: `pg_current_wal_lsn()`; MySQL: the binlog coordinates, plus `BINLOG_DUMP_NON_BLOCK` as the catch-up backstop; SQL Server: `fn_cdc_get_max_lsn()`; MongoDB: the cluster `operationTime`), so a hot table whose writers outpace the drain cannot keep the run alive chasing a moving log end — the run's work is O(backlog at open), and everything committed after the boundary is picked up by the next run from the checkpoint. With `--max-events N`, the bounded run stops at the smaller of "N events" or the boundary — so it never blocks waiting for the N-th event. Passing `--stream` removes the open-time boundary, but what that means is engine-specific: only MySQL genuinely stays up (the binlog dump blocks on an idle source); MongoDB tails the change stream while writes continue but exits on an idle poll; PostgreSQL and SQL Server are poll adapters that still exit on catch-up — one unbounded pass, not a daemon. On everything but MySQL a continuous pipeline needs an external supervisor re-running the command (or just the default bounded model on a schedule). On a PostgreSQL **standby** (PG 16+ logical decoding) the ceiling query (`pg_current_wal_lsn()`) is unavailable during recovery, so the default bounded run fails loudly at open — pass `--stream`, or point the source at the primary. |
 
 The engine is chosen from the URL scheme (`mysql://` / `postgresql://` /
 `sqlserver://` / `mongodb://`) by `create_change_stream`, the CDC sibling of the batch
@@ -79,7 +79,7 @@ exports:
 
 ```bash
 rivet run --config cdc.yaml      # captures, writes typed Parquet, records the run
-rivet metrics                    # the CDC run appears with mode=cdc, like a batch
+rivet metrics -c cdc.yaml        # the CDC run appears with mode=cdc, like a batch
 ```
 
 A `mode: cdc` export reuses the export's `table`, `destination`, and `format`; the
@@ -635,9 +635,12 @@ engines. What remains:
   drain their backlog and stop). The supported continuous model is a scheduler
   running the default bounded `rivet cdc` (or `rivet run` with
   `cdc.until_current: true`, now the default) on an interval, each run resuming from
-  the checkpoint. For a genuinely long-lived daemon that tails the log until
-  interrupted, pass `--stream` (config: `cdc.until_current: false`) — it logs a
-  warning, since the bounded run is the intended model.
+  the checkpoint. For an unbounded run, pass `--stream` (config:
+  `cdc.until_current: false`) — it logs an engine-specific warning, because only
+  MySQL genuinely stays up as a daemon (the binlog dump blocks); PostgreSQL and
+  SQL Server still exit on catch-up (one unbounded pass — run it under a
+  supervisor that restarts it), and MongoDB exits on an idle poll. The bounded
+  run remains the intended model.
 - **Schema drift:** the sink schema is frozen at the first flush — a column added
   mid-run is not picked up until the next run re-resolves the table.
 - **No lag metric:** the run records rows / files / bytes / duration / status, but

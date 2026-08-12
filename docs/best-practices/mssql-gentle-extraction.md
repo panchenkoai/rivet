@@ -23,7 +23,7 @@ exports:
     parallel: 1               # sequential = gentlest to the source
     chunk_checkpoint: true    # resumable
 source:
-  environment: production     # governor throttles concurrency on source write pressure
+  environment: production     # Balanced profile: gentler batch/throttle/retry defaults
 ```
 
 The one rule that matters: **on SQL Server, set `chunk_size` (rows) explicitly;
@@ -44,10 +44,16 @@ rivet export is a quiet tenant:
 | Peak lock count | **3–4** | shared locks released as each chunk scans (READ COMMITTED) |
 
 The lever: **`environment: production`** (or `replica`). It selects the
-*Balanced* tuning profile, which turns on the OPT-2 back-pressure governor — it
-samples the source's `Log Flush Waits` counter and **sheds a concurrent worker
-when the counter rises**, so a busy source slows rivet down instead of the other
-way round. `environment: local` (the default for dev) does **not** throttle.
+*Balanced* tuning profile — gentler batch/throttle/retry defaults.
+`environment: local` (the default for dev) does **not** throttle.
+
+The OPT-2 back-pressure governor is a separate, explicit opt-in: it arms only
+when you set **`tuning.adaptive: true` and `parallel > 1`** (with `parallel: 1`
+there is no worker to shed). When armed, on SQL Server it samples the
+tempdb-spill counters `Workfiles Created/sec` + `Worktables Created/sec`
+(read-spill pressure — `Log Flush Waits` is write pressure and barely moves
+during a read-only export) and **sheds a concurrent worker when the counter
+rises**, so a busy source slows rivet down instead of the other way round.
 
 > **Caveat — isolation.** rivet reads under SQL Server's default READ COMMITTED.
 > It does not downgrade to `NOLOCK` / snapshot isolation, so on a table under

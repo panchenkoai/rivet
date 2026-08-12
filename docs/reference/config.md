@@ -119,8 +119,10 @@ Each entry in the `exports` list defines one export job.
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `name` | string | **yes** | — | Unique identifier for this export |
-| `query` | string | one of query/query_file | — | SQL SELECT query |
+| `query` | string | one of query/query_file/table/tables | — | Inline SQL SELECT query |
 | `query_file` | string | | — | Path to `.sql` file (relative to config dir) |
+| `table` | string | | — | Whole-table shortcut (`name` or `schema.table`) — enables PK auto-chunking; required for `chunk_by_key` / `chunk_size_memory_mb` |
+| `tables` | list | | — | List of tables (multi-table export) |
 | `mode` | `full` \| `incremental` \| `chunked` \| `time_window` \| `cdc` | no | `full` | Export mode. `cdc` = log-based change data capture ([cdc.md](cdc.md)). MongoDB supports `full` + `cdc` only (a document store has no chunked/incremental/time_window). |
 | `format` | `parquet` \| `csv` | **yes** | — | Output format |
 | `compression` | `zstd` \| `snappy` \| `gzip` \| `lz4` \| `none` | no | `zstd` | Compression codec (low-level; prefer `compression_profile`) |
@@ -247,7 +249,7 @@ Controls what Rivet does when it detects a structural change in the output schem
 |---|---|
 | `warn` | **(default)** Log a warning, store the new schema fingerprint, and continue the run. |
 | `continue` | Silently accept — store the new schema, no log output. |
-| `fail` | Abort the run with exit code 1. The schema store is **not** updated, so the next run will detect the same change again. |
+| `fail` | Abort the run with exit code 4 (the schema-drift exit class). The schema store is **not** updated, so the next run will detect the same change again. |
 
 `fail` is useful in CI pipelines where schema changes must be reviewed before the new shape is exported downstream.
 
@@ -257,7 +259,7 @@ exports:
     on_schema_drift: fail
 ```
 
-When `fail` triggers, the output file has already been written to the destination (schema check happens post-extraction), but no cursor advance or manifest commit occurs. Re-run after confirming the schema change is intentional, or switch to `warn` to accept it.
+When `fail` triggers, behavior depends on the runner: in single, keyset, and parallel-Mongo modes the schema check runs post-extraction, so the output file has already been written to the destination (but no cursor advance or manifest commit occurs). In chunked mode the check runs pre-chunk from a scan-free type probe, so the run aborts before any chunk is written. Re-run after confirming the schema change is intentional, or switch to `warn` to accept it.
 
 ---
 
@@ -393,7 +395,7 @@ sub-folders by a date column. See [partitioning.md](../partitioning.md).
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `exported_at` | boolean | `false` | Add `_rivet_exported_at` column (Timestamp UTC; one value per batch) |
-| `row_hash` | boolean | `false` | Add `_rivet_row_hash` column — lower 64 bits of `xxHash3-128` over the row, written as `Int64` for fast `PARTITION BY` / `JOIN`. Deterministic across runs; distinguishes NULL from empty string. |
+| `row_hash` | boolean or list of column names | `false` | Add `_rivet_row_hash` column — lower 64 bits of `xxHash3-128`, written as `Int64` for fast `PARTITION BY` / `JOIN`. `true` hashes every column; a list (`row_hash: [id, status, updated_at]`) hashes exactly those columns in that order and records the covered set in the run manifest. Deterministic across runs; distinguishes NULL from empty string. |
 
 ---
 
@@ -447,6 +449,7 @@ The `path` (local) and `prefix` (S3 / GCS) fields support template placeholders,
 | `{date}` | UTC date as `YYYY-MM-DD` |
 | `{export}` | Export name from config |
 | `{table}` | Alias for `{export}` |
+| `{run_id}` | The run's unique id, substituted when the resolving command carries one (`run` / `apply`; `validate --run-id` re-targets it). If no run id is available the token is left verbatim so the destination open fails fast rather than aliasing to an unintended prefix. |
 
 ```yaml
 destination:

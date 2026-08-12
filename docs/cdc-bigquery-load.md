@@ -89,17 +89,18 @@ The whole point of the loader's job labels (`managed_by:rivet` /
 So the CDC steps use distinct ops:
 
 - `rivet_op:load` — the free `LOAD DATA` of the change log (`bytes_billed = 0`);
-- `rivet_op:merge` — a batch `MERGE` (billed), if you materialize with option 2;
-- `rivet_op:compact` — a daily compaction `CREATE OR REPLACE` (billed), if you
-  compact the view.
+- `rivet_op:create` / `rivet_op:alter` — the changes-table DDL;
+- `rivet_op:view` — the free `CREATE OR REPLACE VIEW` dedup step.
 
-Then the cost-attribution query (`GROUP BY rivet_op`) shows the merge/compaction
-cost on its **own line**, separate from the free load — you can price exactly
-what the dedup step costs per table:
+rivet performs no `MERGE` or compaction step. If you materialize with option 2
+or add a daily compaction, run and label those jobs yourself (e.g. your own
+`rivet_op:merge` / `rivet_op:compact` labels) so they appear on the
+cost-attribution query (`GROUP BY rivet_op`) on their **own line**, separate
+from the free load — you can price exactly what the dedup step costs per table:
 
 ```sql
 SELECT
-  (SELECT value FROM UNNEST(labels) WHERE key='rivet_op')    AS op,      -- load | merge | compact
+  (SELECT value FROM UNNEST(labels) WHERE key='rivet_op')    AS op,      -- load | create | alter | view
   (SELECT value FROM UNNEST(labels) WHERE key='rivet_table') AS tbl,
   COUNT(*) AS jobs, SUM(total_bytes_billed) AS bytes_billed
 FROM `region-us`.INFORMATION_SCHEMA.JOBS
@@ -108,7 +109,8 @@ GROUP BY op, tbl ORDER BY bytes_billed DESC;
 ```
 
 The loader's labeling is already op-parameterized (`run_sql(sql, op, table)`),
-so the `merge`/`compact` step just passes its op — no new mechanism needed.
+and every rivet-driven step (`load` / `create` / `alter` / `view`) passes its
+own op — only jobs you run yourself need labels of your own.
 
 ## The one command: `rivet load`
 
@@ -140,9 +142,12 @@ Both steps are free. The count gate (summed manifest rows == warehouse
 `--cdc` flag** — the mode comes from the export's `mode: cdc`; one config drives
 both `rivet run` (extract) and `rivet load`.
 
-Live-verified end to end: this flow builds precisely the dedup view shown above
-(on MySQL the `__pos` parse is `JSON_VALUE(__pos,'$.file')` +
-`CAST(…'$.pos' AS INT64)`), and a deleted PK survives as `__is_deleted = true`
+Live-verified end to end: this flow builds the dedup view shown above, with two
+refinements over the sketch — on MySQL the binlog file is parsed numerically
+(`CAST(REGEXP_EXTRACT(JSON_VALUE(__pos,'$.file'), r'[0-9]+$') AS INT64)` then
+`CAST(JSON_VALUE(__pos,'$.pos') AS INT64)`), and the delete flag is
+`COALESCE(__op = 'delete', FALSE) AS __is_deleted` so snapshot-backfill rows
+(NULL `__op`) stay live — and a deleted PK survives as `__is_deleted = true`
 rather than vanishing. See the matrix cells `cdc_backfill_snapshot_{mysql,pg,mongo}`
 and the Snowflake parity `mongo_cdc_delete_flag_snowflake`.
 

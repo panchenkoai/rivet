@@ -7,7 +7,7 @@ Rivet has two benchmark layers:
 | Layer | Tool | Purpose |
 |-------|------|---------|
 | **Micro-benchmarks** | Criterion (`benches/`) | Hot-path throughput, compilation check, per-function regression gate |
-| **Cross-tool / cross-engine E2E** | `dev/bench/smoke.py` + `docs/bench/matrix.yaml` | rivet vs 7 other tools on Postgres / MySQL / SQL Server / MongoDB — throughput, peak RSS, source-harm, type fidelity |
+| **Cross-tool / cross-engine E2E** | `dev/bench/smoke.py` + `docs/bench/matrix.yaml` | rivet vs 6 other tools on Postgres / MySQL / SQL Server / MongoDB — throughput, peak RSS, source-harm, type fidelity |
 
 ---
 
@@ -67,9 +67,9 @@ cargo bench --bench hot_paths -- --baseline main
 
 | Binary | Group | What it measures |
 |--------|-------|-----------------|
-| `hot_paths` | `arrow_cast` | Arrow type-cast throughput for each SQL type |
-| `hot_paths` | `parquet_write` | Parquet writer throughput for narrow / wide batches |
-| `hot_paths` | `quality_hash` | Quality uniqueness tracking throughput |
+| `hot_paths` | `parquet_write_batch` | Parquet writer throughput for narrow / wide batches |
+| `hot_paths` | `quality_uniqueness` | Quality uniqueness tracking throughput |
+| `hot_paths` | `csv_write_batch`, `hash_column`, `column_scan`, `shape_tracking`, `mysql_parse_time`, `mysql_int_bytes`, `mysql_utf8_text_append`, `csv_binary_hex`, `csv_timestamp` | Remaining hot-path groups (CSV writer, hashing, column scan, shape tracking, MySQL decode paths) |
 | `resource_aware` | `auto_shrink` | Split overhead at different cap levels |
 | `resource_aware` | `compression_profiles` | Per-codec wall time for a 10,000-row batch |
 | `resource_aware` | `row_group_computation` | Row group target computation for narrow / wide schemas |
@@ -105,7 +105,7 @@ E2E runs on shared CI (or a busy laptop) can show ±10–20% variance in wall ti
 |---------|-------------|
 | RSS much higher than expected | Filesystem cache not warm; first run always higher |
 | Wall time much higher than expected | Postgres query planner chose a sequential scan; check indexes on bench tables |
-| `Files > 1` unexpectedly | File splitting triggered; check `max_split_size_mb` in the config |
+| `Files > 1` unexpectedly | File splitting triggered; check `max_file_size` (export-level size string, e.g. "512MB") in the config |
 | `Size(MB)` unexpectedly large | Wrong compression profile in the config template |
 
 ### Relating E2E numbers to `rivet plan` output

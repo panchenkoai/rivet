@@ -26,7 +26,7 @@ three artefacts at the resolved prefix on a clean run:
 
 | File | Purpose |
 |---|---|
-| `<export>_<timestamp>[_partN].<fmt>` | Data parts, run-unique (millisecond-stamped, plus `_chunkN` / `_keysetN` on the multi-part runners). `<fmt>` is `parquet` or `csv`. |
+| `<export>_<timestamp>[_partN].<fmt>` | Data parts, run-unique, named per runner: single runs use `<export>_<ms-timestamp>[_partN].<fmt>` (millisecond stamp); chunked runs use `<export>_<timestamp>_chunk<N>_<16-hex-nonce>.<fmt>` (second-granularity stamp; uniqueness comes from the random nonce); keyset runs use `<export>_<run_id>_pk_w<worker>_<page>.<fmt>` (the run_id embeds a millisecond stamp). `<fmt>` is `parquet` or `csv`. |
 | `manifest.json` | ADR-0012 trust contract: every committed part is listed with `size_bytes` and `content_fingerprint`. Schema fingerprint and run identity travel here. |
 | `_SUCCESS` | Single line `xxh3:<16-hex>` over the exact bytes of `manifest.json`. Presence implies M5 (every listed part exists at recorded size). |
 
@@ -65,8 +65,12 @@ at the output directory.
 | Default chain | *(none of the above set)* | Env, profile, container, EC2/EKS — same precedence as the AWS SDK. |
 
 `region:` is optional when the SDK can derive one from the profile or env
-vars; required otherwise.  `endpoint:` overrides the resolved S3 endpoint
-(MinIO, AWS GovCloud, custom domains).
+vars; required otherwise.  `endpoint:` overrides the resolved S3 endpoint.
+A loopback endpoint (MinIO) works as-is; any non-loopback endpoint (AWS
+GovCloud, Cloudflare R2, custom domains) is rejected at config load unless
+the export also sets `allow_anonymous: true` — for S3 the flag only waives
+that endpoint guard, requests are still signed with the configured keys
+(see [cloud-auth.md](cloud-auth.md), "S3-compatible storage").
 
 ### Google Cloud Storage
 

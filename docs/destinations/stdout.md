@@ -52,7 +52,7 @@ rivet run --config export.yaml | csvjson | jq '.[] | select(.status == "active")
 ## Notes
 
 - Only **one export** can use `type: stdout` per config file (multiple exports would intermix output)
-- Compression is supported (`zstd`, `gzip`) but makes the output binary — use `compression: none` for human-readable output
+- CSV output supports only `compression: none` — `zstd`/`gzip` on a CSV export is rejected at config load. For compressed (binary) stdout output use `format: parquet`; keep `format: csv` for human-readable output
 - Rivet streams to stdout without buffering the full result
 - Progress bars and log messages go to stderr, so they don't interfere with piped data
 - `--validate` and `--reconcile` flags work normally — results are printed to stderr
@@ -66,5 +66,7 @@ rivet doctor --config preview.yaml
 Output:
 
 ```
-[OK] Destination 'stdout' — writable
+[OK]  Destination Stdout (streaming; no preflight needed)
 ```
+
+(stdout is a streaming sink — doctor records the check but performs no write probe)

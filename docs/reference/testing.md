@@ -198,10 +198,13 @@ hard rules over the live CDC suite's SOURCES:
 
 ## Mutation testing (nightly)
 
-`mutants-cdc` in `nightly-live.yml` runs `cargo-mutants` over the CDC value /
-sink / parser / checksum / decimal modules against the offline suite. A
-surviving mutant is a named test blind spot — the meta-gate that finds holes
-in the gates above.
+`mutants-nightly` in `nightly-live.yml` runs `cargo-mutants` on a rotating
+tier group per night (day-of-year modulo the group count: ledger/pipeline,
+CDC/value/integrity, planning/formats/gates, ...) against the offline suite,
+and passes/fails on the diff against `docs/mutants-baseline.txt` — a NEW
+missed mutant fails the job; known misses live in the baseline and only ever
+shrink. A surviving mutant is a named test blind spot — the meta-gate that
+finds holes in the gates above.
 
 ## Config-key composition gate (per PR)
 

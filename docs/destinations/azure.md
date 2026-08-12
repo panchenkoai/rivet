@@ -23,8 +23,13 @@ inside Rivet so it's wiped from heap on drop.
 
 Rivet auto-derives the endpoint from `account_name` as
 `https://<account_name>.blob.core.windows.net`.  Set `endpoint:`
-explicitly for Azurite, sovereign clouds (US-Gov, China-Mooncake), or a
-custom DNS in front of the storage account.
+explicitly only for a loopback emulator (Azurite, e.g.
+`http://127.0.0.1:10000/devstoreaccount1`) or, with
+`allow_anonymous: true`, an anonymous emulator.  Rivet rejects any
+non-loopback custom endpoint at config load as an exfiltration guard,
+and `allow_anonymous` cannot be combined with credentials — so
+authenticated sovereign-cloud (US-Gov, China-Mooncake) or custom-DNS
+endpoints are not currently supported.
 
 ## Credentials
 
@@ -169,10 +174,12 @@ access scoped to one container and time window.
 Files are uploaded as:
 
 ```
-az://{container}/{prefix}{export_name}_{YYYYMMDD}_{HHMMSS}.{format}
+az://{container}/{prefix}{export_name}_{YYYYMMDD}_{HHMMSS}_{mmm}.{format}
 ```
 
-Example: `az://my-container/exports/orders_20260521_181423.parquet`.
+The timestamp carries millisecond precision; multi-part exports append `_part{N}`.
+
+Example: `az://my-container/exports/orders_20260521_181423_042.parquet`.
 
 The `az://` scheme is the HDFS / azcopy convention.  Rivet writes the
 same string into the manifest's `destination.uri` field so downstream

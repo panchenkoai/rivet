@@ -12,7 +12,7 @@ Rivet operates with two independent memory boundaries:
 
 | Boundary | Config key | What it measures | When it fires |
 |---|---|---|---|
-| Process RSS guard | `tuning.memory_threshold_mb` | OS-reported resident set size | After each batch, if RSS ≥ threshold → pause fetching |
+| Process RSS guard | `tuning.memory_threshold_mb` | OS-reported resident set size | Chunked exports only: before starting each chunk, if RSS ≥ threshold → pause until it drops. Other modes (full, incremental, keyset, mongo-parallel) do not pause on this setting; they only record peak RSS — use `max_batch_memory_mb` for a per-batch bound in any mode |
 | Batch footprint cap | `tuning.max_batch_memory_mb` | Arrow in-memory buffer size | Before writing, if batch bytes > cap → apply policy |
 
 They are complementary, not redundant:

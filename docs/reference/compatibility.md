@@ -49,8 +49,12 @@ local `docker-compose.yaml` top-level `postgres` / `mysql` / `mssql` / `mongo` s
 > (RUSTSEC-2026-0098/0099) and a CRL-parse panic (RUSTSEC-2026-0104). Rather than
 > wait for an upstream `tiberius` bump, the driver now uses its `vendored-openssl`
 > TLS backend (OpenSSL, statically linked on every platform), so those advisories
-> are **out of the dependency tree entirely — not suppressed**. This also unifies
-> the TLS stack with the PG/MySQL drivers. Strict validation (`tls.mode:
+> are **out of the dependency tree entirely — not suppressed**. On Linux this
+> also unifies the TLS stack with the PG/MySQL drivers (all three link OpenSSL).
+> On macOS the stacks differ: PG/MySQL use `native-tls`, which resolves to the
+> system SecureTransport framework, while the MSSQL driver statically links
+> OpenSSL (SecureTransport cannot complete SQL Server's TDS-wrapped TLS
+> handshake). Strict validation (`tls.mode:
 > verify-ca | verify-full`) is enforced by OpenSSL and **rejects** a certificate
 > that does not chain to the trusted CA — verified live on macOS and Linux
 > against a private-CA-configured SQL Server (correct CA connects; wrong CA is

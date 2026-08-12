@@ -66,8 +66,8 @@ rivet init --source 'mysql://user:pass@localhost:3306/' --schema rivet -o rivet_
 | Condition | Suggested mode |
 |-----------|----------------|
 | Estimated rows ≤ 100k | `full` |
-| Rows > 100k and integer PK (or first integer column) | `chunked` with `chunk_column` / `chunk_size`, **`chunk_checkpoint: true` by default**, and sometimes `parallel` |
-| Rows > 100k, no suitable integer chunk key, but a timestamp column | `incremental` with `cursor_column` (`updated_at` / `created_at` preferred) |
+| Rows > 100k and an integer chunk column **or** a keyset-usable single-column PK (integer / uuid / string / timestamp / date — not decimal) | `chunked` — range chunking with `chunk_column` / `chunk_size` on the integer column, or keyset via `chunk_by_key` for a non-integer PK; **`chunk_checkpoint: true` by default**, and sometimes `parallel` |
+| Rows > 100k, no integer chunk column **and** no keyset-usable single PK, but a timestamp column | `incremental` with `cursor_column` (`updated_at` / `created_at` preferred) |
 
 The table above applies to the SQL engines (PostgreSQL / MySQL / SQL Server).
 **MongoDB** is schemaless — `rivet init` introspects no columns, primary keys,
@@ -127,7 +127,7 @@ If the column is declared as plain `NUMERIC` (no precision / scale in the DDL), 
 | `--source-env` | one-of `--source*` | Name of an env var holding the URL (e.g. `DATABASE_URL`). URL never hits the command line. **Recommended.** |
 | `--source-file` | one-of `--source*` | Path to a file containing just the URL on one line. Credentials stay on disk. |
 | `--table` | no | Single table; omit for schema-wide / database-wide scaffold |
-| `--schema` | no | **PostgreSQL:** schema to scan (default `public`). **SQL Server:** schema (default `dbo`). **MySQL:** database name if missing from URL or to override URL database |
+| `--schema` | no | **PostgreSQL:** schema to scan (default `public`). **SQL Server:** schema (default `dbo`). **MySQL:** database name when the URL omits one (a `--schema` naming a *different* database than the URL's is refused — put the database in the URL instead) |
 | `-o` / `--output` | no | Write output to file; default is stdout |
 | `--discover` | no | Emit a **JSON discovery artifact** (Epic B) instead of a YAML scaffold — see below |
 | `--mode` | no | Override the suggested mode for every scaffolded export. **`--mode cdc`** scaffolds a change-data-capture config (`mode: cdc` + an engine-specific `cdc:` block) instead of a batch query — see [cdc.md](cdc.md). Other values (`full` / `incremental` / `chunked` / `time_window`) just override the auto-suggested mode |

@@ -62,10 +62,12 @@ The simplest predefined role: **Storage Object Admin** (`roles/storage.objectAdm
 Files are uploaded as:
 
 ```
-gs://{bucket}/{prefix}{export_name}_{YYYYMMDD}_{HHMMSS}.{format}
+gs://{bucket}/{prefix}{export_name}_{YYYYMMDD}_{HHMMSS}_{mmm}.{format}
 ```
 
-Example: `gs://my-gcs-bucket/exports/orders_20260406_120000.parquet`
+The timestamp carries millisecond precision; multi-part exports append `_part{N}`.
+
+Example: `gs://my-gcs-bucket/exports/orders_20260406_120000_123.parquet`
 
 ## Streaming upload
 
@@ -121,8 +123,11 @@ Source: [docs/gifs/doctor-gcs.tape](../gifs/doctor-gcs.tape).
 Plain-text equivalent output:
 
 ```
-[OK] Destination 'gs://my-gcs-bucket/exports/' — bucket accessible, write test passed
+[OK]  Destination GCS(my-gcs-bucket)
 ```
+
+Doctor labels the destination as `GCS(<bucket>)`; passing checks print no
+detail suffix.
 
 ## Troubleshooting
 

@@ -146,7 +146,7 @@ destination:
   prefix: exports/
 ```
 
-No `credentials_file:` needed.  See `gcs_auth::try_authorized_user_token`
+No `credentials_file:` needed.  See `gcs_auth::try_authorized_user_loader`
 in `src/destination/gcs_auth.rs` for the detection.
 
 ### Path B — Service account JSON
@@ -227,8 +227,11 @@ or GCS bucket name).
 
 Rivet auto-derives the endpoint from `account_name` as
 `https://<account_name>.blob.core.windows.net` — operators only need to
-set `endpoint:` for Azurite, sovereign clouds (US-Gov, China-Mooncake),
-or a custom DNS in front of the storage account.
+set `endpoint:` for Azurite (loopback, with `allow_anonymous: true`).
+Sovereign clouds (US-Gov, China-Mooncake) and custom DNS fronts are not
+currently reachable: a non-loopback Azure endpoint with credentials is
+rejected at config load, and `allow_anonymous: true` cannot be combined
+with credentials.
 
 ### Path B — Azurite emulator / public-read containers
 
@@ -306,8 +309,23 @@ destination:
   secret_key_env: MINIO_SECRET_KEY
 ```
 
-Cloudflare R2, Wasabi, Backblaze B2 etc. follow the same shape — the
-S3-compatible API gives them all the same authentication path.
+Cloudflare R2, Wasabi, Backblaze B2 etc. use the same static-key shape,
+with one addition: their endpoints are **non-loopback**, so the config must
+also set `allow_anonymous: true` — otherwise the endpoint is rejected at
+config load (a committed custom endpoint redirects every upload, so Rivet
+requires the explicit opt-in). For S3 the flag only waives that endpoint
+guard; requests are still signed with the configured static keys.
+
+```yaml
+destination:
+  type: s3
+  bucket: my-r2-bucket
+  endpoint: "https://ACCOUNT_ID.r2.cloudflarestorage.com"
+  region: auto
+  allow_anonymous: true      # required for a non-loopback custom endpoint
+  access_key_env: R2_ACCESS_KEY
+  secret_key_env: R2_SECRET_KEY
+```
 
 ---
 
