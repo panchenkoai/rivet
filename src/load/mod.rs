@@ -4,10 +4,12 @@
 //! OSS decides *what* a column becomes in the warehouse (`TargetColumnSpec` via
 //! `ExportTarget::resolve_table`). A [`TargetLoader`] **adapter** runs the
 //! warehouse-specific load ([`bigquery`] — free `LOAD DATA`; [`snowflake`] —
-//! `COPY` off a GCS external stage). The **driver** ([`run_load`] /
-//! [`run_load_cdc`]) owns the invariant orchestration — spec validation, the
-//! count-integrity gate, the dedup-view wiring, and cleanup ordering — so those
-//! invariants are exercised once through a fake adapter, not per warehouse.
+//! `COPY` off a GCS external stage; [`clickhouse`] — HTTP `INSERT … FORMAT
+//! Parquet`, downloading the staged objects through [`GcsStore`]). The
+//! **driver** ([`run_load`] / [`run_load_cdc`]) owns the invariant
+//! orchestration — spec validation, the count-integrity gate, the dedup-view
+//! wiring, and cleanup ordering — so those invariants are exercised once through
+//! a fake adapter, not per warehouse.
 
 use crate::destination::gcs::GcsStore;
 use crate::types::target::{TargetColumnSpec, TargetStatus};
@@ -15,11 +17,13 @@ use anyhow::{Context, Result, bail};
 
 mod bigquery;
 pub mod cdc;
+mod clickhouse;
 pub mod plan;
 pub mod reconcile;
 mod snowflake;
 
 pub use bigquery::BigQueryLoader;
+pub use clickhouse::ClickhouseLoader;
 pub use snowflake::SnowflakeLoader;
 
 /// Outcome of a successful batch load.
@@ -467,7 +471,18 @@ pub fn open_store(dest: &crate::config::DestinationConfig) -> Result<GcsStore> {
 /// concrete [`TargetLoader`] adapter — wiring partition / cluster / connection /
 /// run-id from the config. The count gate and cleanup are the driver's, so the
 /// adapter carries no `expected_rows`.
-pub fn build_loader(plan: &plan::LoadPlan, run_id: &str) -> Box<dyn TargetLoader> {
+///
+/// The load layer's [`GcsStore`] is injected: the ClickHouse adapter downloads
+/// the staged Parquet through it (there is no external-stage path for CH), and
+/// every adapter's driver-side cleanup deletes through it. Taking it as an
+/// argument (rather than each adapter building one from a config) is what lets
+/// an fs-backed store exercise the whole load offline.
+#[allow(private_interfaces)]
+pub fn build_loader(
+    plan: &plan::LoadPlan,
+    run_id: &str,
+    store: &GcsStore,
+) -> Box<dyn TargetLoader> {
     use plan::LoadTarget;
     let load = &plan.load;
     match &load.target {
@@ -496,6 +511,22 @@ pub fn build_loader(plan: &plan::LoadPlan, run_id: &str) -> Box<dyn TargetLoader
             l.gcs_url = plan.gcs_prefix.replacen("gs://", "gcs://", 1);
             // The `snow` CLI does not expand `~`; pass an absolute key path.
             l.private_key_path = std::env::var("RIVET_SNOWFLAKE_KEY").ok();
+            Box::new(l)
+        }
+        LoadTarget::Clickhouse {
+            url,
+            database,
+            user,
+            password_env,
+        } => {
+            let mut l = ClickhouseLoader::new(
+                url.clone(),
+                database.clone(),
+                user.clone(),
+                password_env.clone(),
+                store.clone(),
+            );
+            l.cluster_by = load.cluster_by.clone();
             Box::new(l)
         }
     }

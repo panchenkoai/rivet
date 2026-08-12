@@ -52,15 +52,17 @@ pub enum SourceEngine {
 pub enum Warehouse {
     BigQuery,
     Snowflake,
+    ClickHouse,
 }
 
 impl Warehouse {
-    /// The `SELECT *`-minus-columns keyword: BigQuery spells it `EXCEPT`,
-    /// Snowflake `EXCLUDE`.
+    /// The `SELECT *`-minus-columns keyword: BigQuery and ClickHouse spell it
+    /// `EXCEPT`, Snowflake `EXCLUDE`.
     fn except_keyword(self) -> &'static str {
         match self {
             Warehouse::BigQuery => "EXCEPT",
             Warehouse::Snowflake => "EXCLUDE",
+            Warehouse::ClickHouse => "EXCEPT",
         }
     }
 
@@ -68,23 +70,30 @@ impl Warehouse {
     /// warehouse. BigQuery back-ticks the whole path; Snowflake leaves it bare
     /// (matching the unquoted identifiers the Snowflake loader creates, so a
     /// lowercase name resolves to the same upper-cased object) — a back-tick
-    /// there is a syntax error.
-    fn quote_fqtn(self, fqtn: &str) -> String {
+    /// there is a syntax error. ClickHouse back-ticks **each dot-separated
+    /// segment** — a single `` `db.table` `` would parse as ONE identifier
+    /// named `db.table`, not a qualified name.
+    pub(crate) fn quote_fqtn(self, fqtn: &str) -> String {
         match self {
             Warehouse::BigQuery => format!("`{fqtn}`"),
             Warehouse::Snowflake => fqtn.to_string(),
+            Warehouse::ClickHouse => fqtn
+                .split('.')
+                .map(|p| format!("`{p}`"))
+                .collect::<Vec<_>>()
+                .join("."),
         }
     }
 
     /// Quote a single column identifier for the view's `PARTITION BY`/`ORDER BY`.
-    /// BigQuery back-ticks (case-preserving, so a reserved-word column like
-    /// `order`/`end` is safe). Snowflake is left BARE — the loader creates its
-    /// columns unquoted (upper-cased), and a case-sensitive `"col"` there would
-    /// miss them; a reserved-word column already fails at the Snowflake `__changes`
-    /// DDL, a narrower pre-existing limitation.
-    fn quote_ident(self, col: &str) -> String {
+    /// BigQuery and ClickHouse back-tick (case-preserving, so a reserved-word
+    /// column like `order`/`end` is safe). Snowflake is left BARE — the loader
+    /// creates its columns unquoted (upper-cased), and a case-sensitive `"col"`
+    /// there would miss them; a reserved-word column already fails at the
+    /// Snowflake `__changes` DDL, a narrower pre-existing limitation.
+    pub(crate) fn quote_ident(self, col: &str) -> String {
         match self {
-            Warehouse::BigQuery => format!("`{col}`"),
+            Warehouse::BigQuery | Warehouse::ClickHouse => format!("`{col}`"),
             Warehouse::Snowflake => col.to_string(),
         }
     }
@@ -132,6 +141,34 @@ impl SourceEngine {
             (Warehouse::Snowflake, SourceEngine::Mongo) => {
                 vec!["PARSE_JSON(__pos):_data::string".into()]
             }
+            // ── ClickHouse: JSONExtract* — the JSON functions a String-typed
+            // `__pos` exposes (CH has no JSON_VALUE / PARSE_JSON dialect).
+            // MySQL `pos` is numeric → JSONExtractInt keeps a numeric sort;
+            // Postgres `lsn` hex halves pad to fixed width so lexical == numeric.
+            //
+            // `__pos` is `Nullable(String)` (snapshot backfill rows carry NULL),
+            // so `splitByChar('/', …)` would type as an Array of a NULLABLE —
+            // which MergeTree 24.8 rejects in an ORDER BY ("Array cannot be
+            // inside Nullable", caught live). `ifNull(__pos, '')` makes the
+            // parse chain non-nullable (the `__pos IS NOT NULL DESC` rank guard
+            // already sorts NULL-__pos rows LAST, so their parse value never
+            // decides an ordering).
+            (Warehouse::ClickHouse, SourceEngine::MySql) => vec![
+                "JSONExtractString(__pos, 'file')".into(),
+                "JSONExtractInt(__pos, 'pos')".into(),
+            ],
+            (Warehouse::ClickHouse, SourceEngine::Postgres) => vec![
+                "leftPad(splitByChar('/', JSONExtractString(ifNull(__pos, ''), 'lsn'))[1], 8, '0')"
+                    .into(),
+                "leftPad(splitByChar('/', JSONExtractString(ifNull(__pos, ''), 'lsn'))[2], 8, '0')"
+                    .into(),
+            ],
+            (Warehouse::ClickHouse, SourceEngine::SqlServer) => {
+                vec!["JSONExtractString(__pos, 'lsn')".into()]
+            }
+            (Warehouse::ClickHouse, SourceEngine::Mongo) => {
+                vec!["JSONExtractString(__pos, '_data')".into()]
+            }
         };
         // `__seq` is always the final, least-significant tiebreak: it orders
         // changes that share a commit position (same transaction).
@@ -157,6 +194,7 @@ pub fn meta_column_specs(warehouse: Warehouse) -> Vec<TargetColumnSpec> {
     let (str_ty, int_ty) = match warehouse {
         Warehouse::BigQuery => ("STRING", "INT64"),
         Warehouse::Snowflake => ("VARCHAR", "INTEGER"),
+        Warehouse::ClickHouse => ("String", "Int64"),
     };
     ["__op", "__pos"]
         .into_iter()
@@ -314,7 +352,11 @@ pub fn inc_dedup_view_sql(
 mod tests {
     use super::*;
 
-    const WAREHOUSES: [Warehouse; 2] = [Warehouse::BigQuery, Warehouse::Snowflake];
+    const WAREHOUSES: [Warehouse; 3] = [
+        Warehouse::BigQuery,
+        Warehouse::Snowflake,
+        Warehouse::ClickHouse,
+    ];
     const ENGINES: [SourceEngine; 4] = [
         SourceEngine::MySql,
         SourceEngine::Postgres,
@@ -532,7 +574,7 @@ mod tests {
                 "{wh:?}: no CDC delete logic: {sql}"
             );
             let kw = match wh {
-                Warehouse::BigQuery => "EXCEPT",
+                Warehouse::BigQuery | Warehouse::ClickHouse => "EXCEPT",
                 Warehouse::Snowflake => "EXCLUDE",
             };
             assert!(
@@ -618,5 +660,70 @@ mod tests {
         let sf = meta_column_specs(Warehouse::Snowflake);
         assert_eq!(sf[1].target_type, "VARCHAR");
         assert_eq!(sf[2].target_type, "INTEGER");
+        let ch = meta_column_specs(Warehouse::ClickHouse);
+        assert_eq!(ch[1].target_type, "String");
+        assert_eq!(ch[2].target_type, "Int64");
+    }
+
+    #[test]
+    fn clickhouse_uses_json_extract_except_and_per_segment_backticks() {
+        let sql = dedup_view_sql(
+            Warehouse::ClickHouse,
+            "db.orders",
+            "db.orders__changes",
+            &["id"],
+            SourceEngine::MySql,
+        );
+        // ClickHouse JSON functions, not JSON_VALUE/PARSE_JSON.
+        assert!(sql.contains("JSONExtractString(__pos, 'file') DESC"));
+        assert!(sql.contains("JSONExtractInt(__pos, 'pos') DESC"));
+        // Same EXCEPT keyword as BigQuery.
+        assert!(sql.contains("EXCEPT (__op, __pos, __seq, __rn)"));
+        // Each dot-separated segment is back-ticked separately — a single
+        // `` `db.orders` `` would parse as one identifier named `db.orders`.
+        assert!(sql.contains("VIEW `db`.`orders` AS"));
+        assert!(sql.contains("FROM `db`.`orders__changes`"));
+        // NULL __pos ranked below real changes (guarded first), like the others.
+        assert!(sql.contains("__pos IS NOT NULL DESC, JSONExtractString"));
+    }
+
+    #[test]
+    fn clickhouse_postgres_lsn_zero_pads_with_left_pad() {
+        let sql = dedup_view_sql(
+            Warehouse::ClickHouse,
+            "db.orders",
+            "db.orders__changes",
+            &["id"],
+            SourceEngine::Postgres,
+        );
+        // The NULLable `__pos` is coerced with ifNull so `splitByChar` does not
+        // type as a NULLable Array (MergeTree 24.8 rejects that in ORDER BY).
+        assert!(sql.contains(
+            "leftPad(splitByChar('/', JSONExtractString(ifNull(__pos, ''), 'lsn'))[1], 8, '0')"
+        ));
+        assert!(sql.contains(
+            "leftPad(splitByChar('/', JSONExtractString(ifNull(__pos, ''), 'lsn'))[2], 8, '0')"
+        ));
+        assert!(
+            !sql.contains("splitByChar('/', JSONExtractString(__pos"),
+            "the parse must not split a NULLable __pos (nullable-Array ORDER BY): {sql}"
+        );
+    }
+
+    #[test]
+    fn clickhouse_dedup_view_quotes_identifiers() {
+        let sql = dedup_view_sql(
+            Warehouse::ClickHouse,
+            "v",
+            "c",
+            &["order"],
+            SourceEngine::MySql,
+        );
+        assert!(sql.contains("PARTITION BY `order`"), "{sql}");
+        let inc = inc_dedup_view_sql(Warehouse::ClickHouse, "v", "c", &["id"], "end");
+        assert!(
+            inc.contains("ORDER BY `end` IS NOT NULL DESC, `end` DESC"),
+            "{inc}"
+        );
     }
 }
