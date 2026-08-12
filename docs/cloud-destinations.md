@@ -17,6 +17,13 @@ For the per-backend deep dive, read the dedicated pages:
 For the *credential* matrix (env vars, profile files, identity providers),
 see [docs/cloud-auth.md](cloud-auth.md).
 
+**The supported destination set is exactly:** AWS S3, Google Cloud Storage,
+Azure Blob Storage, the local filesystem, stdout — plus their loopback dev
+emulators (MinIO for S3, fake-gcs-server for GCS, Azurite for Azure), which
+CI exercises. Other S3-compatible services (Cloudflare R2, Wasabi, Backblaze
+B2), sovereign clouds, and custom-DNS endpoints are untested and not
+supported; the config-load endpoint guard rejects them by design.
+
 ---
 
 ## Common output contract
