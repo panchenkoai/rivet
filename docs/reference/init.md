@@ -12,7 +12,7 @@ Generated configs use `url_env: DATABASE_URL` so secrets are not embedded in the
 
 ![rivet init generating a YAML for a single table](../gifs/init-scaffold.gif)
 
-Provide `--table` (optionally `schema.table` on PostgreSQL).
+Provide `--table` (optionally schema-qualified: `public.orders` on PostgreSQL, `dbo.orders` on SQL Server).
 
 ```bash
 export DATABASE_URL='postgresql://user:pass@localhost:5432/mydb'
@@ -66,7 +66,7 @@ rivet init --source 'mysql://user:pass@localhost:3306/' --schema rivet -o rivet_
 | Condition | Suggested mode |
 |-----------|----------------|
 | Estimated rows ≤ 100k | `full` |
-| Rows > 100k and an integer chunk column **or** a keyset-usable single-column PK (integer / uuid / string / timestamp / date — not decimal) | `chunked` — range chunking with `chunk_column` / `chunk_size` on the integer column, or keyset via `chunk_by_key` for a non-integer PK; **`chunk_checkpoint: true` by default**, and sometimes `parallel` |
+| Rows > 100k and an integer chunk column **or** a keyset-usable single-column PK (integer / float / uuid / string / timestamp / date — not decimal/numeric) | `chunked` — range chunking with `chunk_column` / `chunk_size` on the integer column, or keyset via `chunk_by_key` for a non-integer PK; **`chunk_checkpoint: true` by default**, and sometimes `parallel` |
 | Rows > 100k, no integer chunk column **and** no keyset-usable single PK, but a timestamp column | `incremental` with `cursor_column` (`updated_at` / `created_at` preferred) |
 
 The table above applies to the SQL engines (PostgreSQL / MySQL / SQL Server).
@@ -114,7 +114,7 @@ If the column is declared as plain `NUMERIC` (no precision / scale in the DDL), 
 
 ```yaml
     columns:
-      price: decimal(38,18)  # REVIEW: DDL has no numeric(p,s); edit when you know the real decimal(p,s); …
+      price: decimal(38,18)  # REVIEW: DDL has no numeric(p,s); edit to the real decimal(p,s) or change the column type — values outside this bound may truncate or fail export.
 ```
 
 ---

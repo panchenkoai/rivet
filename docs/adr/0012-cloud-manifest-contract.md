@@ -33,12 +33,15 @@ For every export run targeting a cloud or local-file destination, Rivet writes:
   part-000002.<format>
   ...
   manifest.json
+  manifest-<run_id>.json       # immutable per-run copy of the manifest
   _SUCCESS                     # only if the run completed cleanly
 ```
 
 `<export_layout>` is the destination-config-provided layout, typically `<schema>.<table>/` and optionally namespaced by `run_id`. Layout policy is destination-config concern, not part of this ADR.
 
 `manifest.json` is the authoritative record of the run for this export. Its schema is versioned (see "Versioning") and stable across patch releases.
+
+Every manifest write also leaves an immutable run-unique copy `manifest-<sanitized-run_id>.json` beside the canonical last-writer-wins `manifest.json` (`src/manifest.rs::run_unique_manifest_name`), so repeated runs into one prefix do not clobber prior runs' records. The copies are Rivet-internal sidecars: resume, validate, and reconcile keep reading the canonical name, and the untracked-object scans exempt any `manifest-*.json` name (`is_run_unique_manifest_name`).
 
 `_SUCCESS` is a zero-byte marker. Its only meaning is "the manifest at this prefix represents a fully-committed run". Its existence implies the manifest exists, and every part the manifest references also exists at the recorded byte length.
 
@@ -86,6 +89,8 @@ Rationale: partially-written manifests must be impossible to observe. Object sto
 
 Resume across multiple interruptions does not produce multiple manifests for the same run — the latest write supersedes.
 
+[Update: each manifest write now also leaves an immutable run-unique copy `manifest-<run_id>.json` (see Artifacts), so one `run_id` yields the canonical `manifest.json` plus one sidecar copy at the prefix. The canonical manifest is still never amended in place — the copy exists so repeated runs into one prefix keep every run's record.]
+
 ### M5 — SUCCESS Implies Verifiability
 
 > If `_SUCCESS` exists, then for every part listed in the manifest, the part is present at the destination at the recorded byte length.
@@ -98,8 +103,7 @@ This is the contract `--validate` checks on the metadata-only path: it lists the
 
 > Runs that completed before 0.7.0 (no manifest at the destination prefix) are not migrated. Operations on legacy prefixes succeed with reduced guarantees and **must** emit an explicit `legacy_run: true` label in operator-facing output.
 
-Per the project decision documented in
-[project-roadmap-0-7-0-legacy-runs](https://github.com/panchenkoai/rivet/blob/main/.claude/projects/-Users-andriipanchenko-rivet/memory/project_roadmap_0_7_0_legacy_runs.md):
+Per the project decision taken at 0.7.0 planning (pre-0.7.0 runs keep the old behavior; the manifest applies only to new runs; every reduced check is explicitly labeled `legacy_run`, never silent):
 
 - `--resume` on a legacy prefix uses the pre-0.7.0 file-log-based logic; no manifest-aware skip.
 - `--validate` on a legacy prefix falls back to local-file row-count checks; manifest/M5 checks are skipped and reported as such.
@@ -133,6 +137,8 @@ Decision matrix per part name:
 | no  | no  | —   | —   | new — write |
 
 `_SUCCESS` present + no `--force` → refuse to start (operator must opt in to overwrite a successful run).
+
+The "no manifest entry / object present" row does not apply to the run-unique manifest copies (`manifest-*.json`, see Artifacts): both the reconcile and validate untracked-object scans exempt them via `is_run_unique_manifest_name`, so prior runs' sidecar copies are never quarantined as untracked artifacts.
 
 ### M9 — Untracked / Corrupt Parts Are Quarantined Best-Effort, Never Deleted
 
@@ -227,10 +233,10 @@ These items were open in the first draft of this ADR; they are now decided.
 | Invariant | Status (2026-05-21) | Test |
 |---|---|---|
 | M1 | ✅ writer side covered | manifest writer commits parts before manifest (`pipeline::manifest_writer`); kill-mid-write integration test deferred to Phase C-γ |
-| M2 | ✅ writer side covered | `_SUCCESS` written iff status==Success; body = `xxh3(manifest.json bytes)`; covered by `success_marker_*` tests + `tests/trust_artifacts_integration.rs` §4 |
+| M2 | ✅ writer side covered | `_SUCCESS` written iff status==Success; body = `xxh3(manifest.json bytes)`; covered by `success_marker_*` tests + `tests/offline/trust_artifacts_integration.rs` §4 (compiled into the offline suite via `tests/offline_suite.rs`) |
 | M3 | ✅ write side + no-download content verify | per-part `content_fingerprint` (xxh3) and `content_md5` recorded at write in one pass; `--validate` confirms content by comparing `content_md5` to the store's listing checksum (no download); resume still trusts size for skip decisions (quarantine on size drift) — covered by `pipeline::resume_decisions::tests` and `pipeline::manifest_reconcile::tests` |
-| M4 | ✅ | `tests/trust_artifacts_integration.rs §6 — writing_manifest_twice_replaces_the_previous_artifact` |
-| M5 | ✅ | `pipeline::validate_manifest` + `tests/trust_artifacts_integration.rs` §22 (manifest read, part presence, size match) |
+| M4 | ✅ | `tests/offline/trust_artifacts_integration.rs §6 — writing_manifest_twice_replaces_the_previous_artifact` |
+| M5 | ✅ | `pipeline::validate_manifest` + `tests/offline/trust_artifacts_integration.rs` §22 (manifest read, part presence, size match) |
 | M6 | ✅ | `legacy_run: true` label surfaced by `verify_at_destination` when no manifest present; covered in `validate_manifest` unit + integration tests |
 | M7 | ✅ writer relies on `Destination::write` atomicity | local: `fs::copy`; S3/GCS: single PUT (opendal); covered by destination capability tests |
 | M8 | ✅ gate + matrix + chunked-resume executor wired | `--resume` against `_SUCCESS` refuses without `--force` (covered §26); pure matrix tested per row in `pipeline::resume_decisions::tests` and end-to-end against real Destination listing in §27; executor `apply_m8_resume_decisions` runs as the resume preamble in both chunked runners (`pipeline/chunked/resume_m8.rs`, called from `sequential_checkpoint` + `parallel_checkpoint`) |

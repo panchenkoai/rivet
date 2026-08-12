@@ -45,7 +45,8 @@ baselines are comparable.
 `warn` / `continue` store-or-update the baseline. The logic lives in
 `pipeline::schema_drift` as one deep core (`check_and_persist`: detect → policy
 → store) behind two thin **column-source adapters** — `check_from_sink_schema`
-(single, post-write, sink schema) and `check_from_type_mappings` (chunked,
+(post-write, sink schema: used by the single, keyset, and parallel-Mongo
+runners) and `check_from_type_mappings` (chunked,
 pre-chunk, `type_mappings` schema). The four chunked Detect arms reach the
 chunked adapter through one shared preamble, `prepare_chunk_plan` (compute chunk
 ranges → run the pre-chunk drift check), rather than re-implementing

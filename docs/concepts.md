@@ -13,7 +13,7 @@ If you want the binding execution semantics (what's at-least-once, what survives
 | Term | What it is | Where it lives | How to see it |
 |---|---|---|---|
 | **Export** | A named entry in `rivet.yaml` — a query + cursor / chunk strategy + destination triple. One config file can have many exports. | `exports[]:` array in the YAML. | `rivet check` lists them; `rivet plan` resolves them; `rivet run` extracts them. |
-| **Run** | One invocation of `rivet run`. Produces zero or more files per export. Has a unique `run_id`. A single run can extract one or many exports. | The state DB (`run_journal`, `export_metrics`) + the on-disk `journal` file. | `rivet metrics --last N` · `rivet journal --export NAME`. |
+| **Run** | One invocation of `rivet run`. Produces zero or more files per export. Has a unique `run_id`. A single run can extract one or many exports. | The state DB (`run_journal`, `export_metrics`) + the per-run report artifacts `.rivet/runs/<run_id>/summary.{json,md}`. | `rivet metrics --last N` · `rivet journal --export NAME`. |
 
 The same export can be extracted by many runs over time. Each run gets its own `run_id`; the export's *cumulative* state (cursor, chunks done, files written) accretes across runs.
 

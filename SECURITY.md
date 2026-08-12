@@ -18,7 +18,7 @@ When you run Rivet, the process has access to:
 - **State backend file** — `.rivet_state.db` (SQLite) in the working directory unless overridden.
 - **Local files** written by the export: temp files during extraction, final output files, journal/metrics records.
 
-Rivet does **not** execute DDL, `INSERT`, `UPDATE`, or `DELETE` against the source. It issues `SELECT` and (for cursors) `DECLARE CURSOR` / `FETCH` only.
+In batch mode Rivet does **not** execute DDL, `INSERT`, `UPDATE`, or `DELETE` against the source. It issues `SELECT`, (for cursors) `DECLARE CURSOR` / `FETCH`, transaction-scoped `SET LOCAL` session tuning, and (during preflight) `EXPLAIN`. In CDC mode Rivet additionally creates — and on teardown drops — a persistent logical replication slot on PostgreSQL (`pg_create_logical_replication_slot`), which requires the `REPLICATION` privilege and pins WAL retention until acknowledged; MySQL CDC requires `REPLICATION SLAVE` / `REPLICATION CLIENT` grants, and SQL Server CDC reads the change tables.
 
 ---
 
@@ -30,11 +30,10 @@ The following files may contain sensitive information even when credentials are 
 |---|---|
 | `rivet.yaml` | Source URL, query bodies, destination credentials (if inlined) |
 | `plan.json` | Table names, query SQL, chunk bounds, row estimates |
-| `.rivet_state.db` | Cursor values, manifest of exported files, run metrics, and **failed-run error text** (see the note below) |
-| `*.jsonl` journal | Per-run event timeline; includes export names, run IDs, chunk boundaries, and error text |
+| `.rivet_state.db` | Cursor values, manifest of exported files, run metrics, the per-run event timeline (`run_journal` table, read via `rivet journal` — export names, run IDs, chunk boundaries, error text), and **failed-run error text** (see the note below) |
 | Run summary (`summary.json` / `summary.md`) | Per-export status, counts, and error text on failure |
 | Parquet / CSV outputs | The actual exported data |
-| Log output (stdout / `--log-format json`) | Query SQL (truncated), table names, row counts; redacted URLs |
+| Log output (stdout via `RUST_LOG`; machine-readable surfaces are `--json` for the run summary and `--json-errors` for errors) | Query SQL (truncated), table names, row counts; redacted URLs |
 
 > **Redaction covers credentials only.** Rivet redacts connection-URL passwords
 > everywhere error text is persisted or emitted. It does **not** scrub source
@@ -55,7 +54,6 @@ If you use a Rivet config inside a git repository, exclude generated and state a
 *.rivet.local.yaml
 *.rivet.secrets.yaml
 plan.json
-*.journal.jsonl
 output/
 ```
 
@@ -77,15 +75,17 @@ source:
     mode: verify-full
     ca_file: /etc/ssl/certs/rds-ca-2019-root.pem
 
-destinations:
+exports:
   - name: warehouse
-    type: s3
-    bucket: my-exports
-    access_key_env: AWS_ACCESS_KEY_ID
-    secret_key_env: AWS_SECRET_ACCESS_KEY
+    query: SELECT * FROM orders
+    destination:
+      type: s3
+      bucket: my-exports
+      access_key_env: AWS_ACCESS_KEY_ID
+      secret_key_env: AWS_SECRET_ACCESS_KEY
 ```
 
-Inline `password:` / `url:` / `access_key:` fields are accepted but **not recommended** for any file that ships outside the operator's machine.
+Inline `password:` / `url:` fields on the source are accepted but **not recommended** for any file that ships outside the operator's machine. Destination credentials have no inline form at all — only the env indirection (`access_key_env`, `secret_key_env`, `account_key_env`, `sas_token_env`) is accepted.
 
 ### Redaction in errors and artifacts
 
@@ -116,9 +116,9 @@ Credential redaction is split across two layers (v0.7.2 P0.3):
 
 Pinned in tests:
 
-- [`tests/config_secrets.rs`](tests/config_secrets.rs) — config-parse
+- [`tests/offline/config_secrets.rs`](tests/offline/config_secrets.rs) — config-parse
   errors never echo plaintext.
-- [`tests/redaction_invariant.rs`](tests/redaction_invariant.rs) —
+- [`tests/offline/redaction_invariant.rs`](tests/offline/redaction_invariant.rs) —
   string-redactor unit + integration suite; pins the URL-rewrite
   rule and proves the redactor is wired into every error → artifact
   path enumerated above.
@@ -145,14 +145,14 @@ treat it as a security bug (see Reporting below).
   and Azure account keys are pulled from env vars at runtime and never
   flow through our string formatters.  If a leak vector is discovered,
   add a pattern to `src/redact.rs`, pin it in
-  `tests/redaction_invariant.rs`, and ship a patch release.
+  `tests/offline/redaction_invariant.rs`, and ship a patch release.
 
 ---
 
 ## Network security
 
 - **PostgreSQL TLS** — Rivet supports `disable | require | verify-ca | verify-full` via the `tls` block on the source. `verify-full` is recommended for any non-local target. See [docs/reference/config.md](docs/reference/config.md#tls).
-- **MySQL TLS** — supported through the underlying `mysql` crate; configure via the connection URL (`?ssl-mode=REQUIRED`).
+- **MySQL TLS** — configured via the same `tls` block as PostgreSQL (`source.tls: { mode: verify-full, ca_file: ... }`). Rivet refuses to connect to any remote (non-loopback) MySQL host without a `tls:` block unless `mode: disable` is set explicitly.
 - **Object storage** — S3 and GCS endpoints use HTTPS by default. The CI/dev fixtures use plain HTTP against `minio` and `fake-gcs` containers; do not point a production config at those URLs.
 
 For production exports against shared / managed databases:
@@ -212,7 +212,7 @@ We aim to acknowledge reports within **7 days** and to ship a fix or mitigation 
 
 ### Supported versions
 
-Only the latest minor release line (currently `0.5.x`) receives security fixes. Older lines may be patched on a best-effort basis when the fix is trivial to backport.
+Only the latest minor release line (currently `0.24.x`) receives security fixes. Older lines may be patched on a best-effort basis when the fix is trivial to backport.
 
 ---
 

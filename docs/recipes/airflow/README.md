@@ -37,10 +37,11 @@ docker compose -f docker-compose.2.10.yaml up --build      # Airflow 2.10.5
 ```
 
 First boot builds the image and migrates the metadata DB (~2-3 min). Then open
-<http://localhost:8080> (login **`airflow`** / **`airflow`**). There are three DAGs
-— **`rivet_waves_postgres`**, **`rivet_waves_mysql`**, **`rivet_waves_mssql`** —
-one per source (a MongoDB config would add a fourth, `rivet_waves_mongo`, from the
-same factory). Un-pause and trigger one, and open **Graph**:
+<http://localhost:8080> (login **`airflow`** / **`airflow`**). There are seven DAGs
+— **`rivet_waves_postgres`**, **`rivet_waves_mysql`**, **`rivet_waves_mssql`**
+(local Parquet), the same three with an `_s3` suffix (shared MinIO bucket), and
+**`rivet_waves_postgres_gcs`** — all from the same factory (a MongoDB config would
+add an eighth, `rivet_waves_mongo`). Un-pause and trigger one, and open **Graph**:
 
 ```
 plan ──> wave_2 ──────────> wave_3 ───────────────> wave_4
@@ -123,15 +124,21 @@ Set an env var on the workers (or in the compose `environment:`):
 
 ## Many sources → one bucket
 
-For a shared S3 / GCS data lake, point each source's config at the **same bucket
-with a per-source prefix** so same-named tables across engines never collide:
+For a shared S3 / GCS data lake, point each export's `destination:` block —
+nested inside every `exports[]` entry, as in the checked-in
+`dags/postgres.s3.yaml`; there is no top-level `destination` in rivet configs —
+at the **same bucket with a per-source prefix** so same-named tables across
+engines never collide:
 
 ```yaml
 # postgres.s3.yaml
-destination:
-  type: s3
-  bucket: my-data-lake                 # ← one bucket for every source
-  prefix: rivet/postgres/{export}/     # ← namespaced by source; {export} = table
+exports:
+  - name: bench_hc
+    # ...
+    destination:
+      type: s3
+      bucket: my-data-lake                 # ← one bucket for every source
+      prefix: rivet/postgres/{export}/     # ← namespaced by source; {export} = table
 # mysql.s3.yaml  → prefix: rivet/mysql/{export}/
 # mssql.s3.yaml  → prefix: rivet/mssql/{export}/
 ```

@@ -30,7 +30,7 @@ The most-used options, grouped by section, with the *why* and examples.
 | `url_env` | string | | — | Env var name containing the URL |
 | `url_file` | string | | — | Path to file containing the URL |
 | `host` | string | for structured | — | Database hostname |
-| `port` | integer | no | `5432` (PG) / `3306` (MySQL) / `1433` (MSSQL) | Database port |
+| `port` | integer | no | `5432` (PG) / `3306` (MySQL) / `1433` (MSSQL) / `27017` (MongoDB) | Database port |
 | `user` | string | for structured | — | Database user |
 | `password` | string | no | — | **Not recommended** — plaintext; see [Credentials & plan artifacts](#credentials--plan-artifacts) below |
 | `password_env` | string | no | — | Env var name containing the password (recommended) |
@@ -122,7 +122,7 @@ Each entry in the `exports` list defines one export job.
 | `query` | string | one of query/query_file/table/tables | — | Inline SQL SELECT query |
 | `query_file` | string | | — | Path to `.sql` file (relative to config dir) |
 | `table` | string | | — | Whole-table shortcut (`name` or `schema.table`) — enables PK auto-chunking; required for `chunk_by_key` / `chunk_size_memory_mb` |
-| `tables` | list | | — | List of tables (multi-table export) |
+| `tables` | list | | — | CDC only (`mode: cdc`): capture several tables through one change stream (one slot/binlog connection); rejected at config load for batch exports (batch is one query/table per export). Mutually exclusive with `table:`; not supported for SQL Server |
 | `mode` | `full` \| `incremental` \| `chunked` \| `time_window` \| `cdc` | no | `full` | Export mode. `cdc` = log-based change data capture ([cdc.md](cdc.md)). MongoDB supports `full` + `cdc` only (a document store has no chunked/incremental/time_window). |
 | `format` | `parquet` \| `csv` | **yes** | — | Output format |
 | `compression` | `zstd` \| `snappy` \| `gzip` \| `lz4` \| `none` | no | `zstd` | Compression codec (low-level; prefer `compression_profile`) |
@@ -360,7 +360,7 @@ Rivet exports the WKT text as a `Utf8` (string) column. Downstream tools (DuckDB
 | `chunk_column` | string | yes* | — | Numeric or date/timestamp column to partition by. *Required unless `chunk_by_key` is set (mutually exclusive). |
 | `chunk_by_key` | string | yes* | — | Single index-backed UNIQUE NOT NULL column for **keyset (seek)** pagination — the source-safe shape for tables with no single-integer PK (UUID / string / composite). Requires the `table:` shortcut; mutually exclusive with `chunk_column`. See [chunked modes](../modes/chunked.md) and [ADR-0020](../adr/0020-pg-uuid-pk-chunking-asymmetry.md). |
 | `chunk_size` | integer | no | `100000` | Rows per chunk (numeric mode), or page size for keyset. Ignored when `chunk_count` is set. |
-| `chunk_size_memory_mb` | integer | no | — | Target memory budget per chunk in MB; `chunk_size` is derived from a `pg_class` row-size estimate (`pg_relation_size / reltuples`), clamped to `[10000, 5000000]` rows. **PostgreSQL only**, requires the `table:` shortcut, mutually exclusive with an explicit non-default `chunk_size:`. |
+| `chunk_size_memory_mb` | integer | no | — | Target memory budget per chunk in MB; `chunk_size` is derived from a per-engine row-size estimate, clamped to `[10000, 5000000]` rows. Works on **PostgreSQL, MySQL and SQL Server** (PG: `pg_relation_size / reltuples`; MySQL: `information_schema` `AVG_ROW_LENGTH` with InnoDB overflow correction; SQL Server: no estimate, falls back to 512 B/row with a warning). Requires the `table:` shortcut, mutually exclusive with an explicit non-default `chunk_size:`. |
 | `chunk_count` | integer | no | — | Divide the column range into exactly this many equal chunks. `chunk_size` is computed dynamically from `min`/`max`. Must be ≥ 1. Mutually exclusive with `chunk_dense` and `chunk_by_days`. |
 | `chunk_by_days` | integer | no | — | Enable date chunking: window size in days. Mutually exclusive with `chunk_dense` and `chunk_count`. |
 | `parallel` | integer | no | `1` | Concurrent chunk workers |
@@ -394,7 +394,7 @@ sub-folders by a date column. See [partitioning.md](../partitioning.md).
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `exported_at` | boolean | `false` | Add `_rivet_exported_at` column (Timestamp UTC; one value per batch) |
+| `exported_at` | boolean | `false` | Add `_rivet_exported_at` column (Timestamp UTC; one value captured at sink construction and shared by every batch/row that sink writes — effectively one value per export run in single mode, per chunk worker in multi-part modes) |
 | `row_hash` | boolean or list of column names | `false` | Add `_rivet_row_hash` column — lower 64 bits of `xxHash3-128`, written as `Int64` for fast `PARTITION BY` / `JOIN`. `true` hashes every column; a list (`row_hash: [id, status, updated_at]`) hashes exactly those columns in that order and records the covered set in the run manifest. Deterministic across runs; distinguishes NULL from empty string. |
 
 ---

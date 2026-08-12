@@ -53,7 +53,7 @@ S3 single `PutObject` ETag), which the commit path compares to the locally
 computed MD5 for a fail-fast, no-download transit-integrity check. `None` for
 backends/paths that report none (local FS, streamed multipart).
 
-- **`Atomic`**: a successful `write()` means the full file is present at the destination. A failure may leave a partial artifact (`partial_write_risk = true`); the caller must clean it up before retrying.
+- **`Atomic`**: a successful `write()` means the full file is present at the destination. The only Atomic backend (`LocalDestination`) stages into a temp file and commits via atomic same-filesystem rename, so a failure leaves nothing at the final path (`partial_write_risk = false`, `retry_safe = true`); an Atomic backend that could leave a partial artifact would declare `partial_write_risk = true`, in which case the caller would need to clean up before retrying.
 - **`FinalizeOnClose`**: The object is committed only when the internal writer handle is closed. A mid-upload failure leaves nothing at the destination — the object is never partially visible to readers. `retry_safe = true` because a failed upload can be retried from scratch with no cleanup needed.
 - **`Streaming`**: Data is written to an unbuffered output with no atomic commit boundary. Partial output may be observable before `write()` returns. Retrying after failure produces duplicate or corrupt output. There is no safe commit moment.
 
@@ -67,12 +67,7 @@ ADR-0001 requires that state writes (manifest, cursor, schema) happen only after
 - **I3 (Write Before Cursor)**: `st.update()` is called after the file-writing loop. For `Atomic` and `FinalizeOnClose` backends, all files are committed before the cursor advances.
 - **I4 (Metric After Verdict)**: Unchanged — metrics are recorded at the terminal state of the run.
 
-The comment added to `pipeline/single.rs:run_single_export` immediately before the `record_file` call makes this ordering explicit in the source:
-
-```rust
-// ADR-0001 I2–I4 / ADR-0004: state writes happen only after destination.write()
-// returns Ok(()), which for all current backends is the commit boundary.
-```
+The ordering is made explicit in the source at the shared commit seam: `pipeline/commit.rs::{write_part_file, record_part}` (which every runner, including `pipeline/single.rs:run_single_export` at its `record_part` call, goes through) documents that state writes happen only after `destination.write()` returns Ok.
 
 ---
 
@@ -84,13 +79,13 @@ The comment added to `pipeline/single.rs:run_single_export` immediately before t
 export 'orders': destination commit_protocol=Atomic idempotent=true retry_safe=true partial_risk=false
 ```
 
-When a destination that is not retry-safe (`retry_safe = false`) is used on a run that performed one or more retries, a `WARN` is emitted:
+When a destination that is not retry-safe (`retry_safe = false`) is configured with automatic retries (`max_retries > 0`), a `WARN` is emitted once per export at capability-logging time, before any retry occurs:
 
 ```
-export 'orders': destination is not retry-safe (2 retries used); partial artifacts may exist at destination — manual cleanup may be needed
+export 'orders': stdout destination is not retry-safe (max_retries=2); partial artifacts may exist at destination on failure — manual cleanup may be needed
 ```
 
-This surfaces retry-safety mismatches (e.g. local filesystem + automatic retries) without blocking the run.
+This surfaces retry-safety mismatches without blocking the run. With current backends this can fire only for stdout (`Streaming`); local, S3, GCS and Azure all declare `retry_safe: true`.
 
 ---
 

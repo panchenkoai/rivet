@@ -16,7 +16,7 @@ shipped keyset (seek) pagination for exactly this case
 single-column, NOT NULL, UNIQUE key regardless of underlying type.
 
 A live-test sweep added in this session
-(`tests/live_keyset.rs::keyset_pg_uuid_pk_via_explicit_chunk_by_key_roundtrips_full_set`
+(`tests/live/live_keyset.rs::keyset_pg_uuid_pk_via_explicit_chunk_by_key_roundtrips_full_set`
 and friends) surfaced **two distinct layers** of why PG UUID-PK
 chunking was not working end-to-end:
 
@@ -173,14 +173,15 @@ holds:
 
 - `src/pipeline/sink/cursor.rs::extract_last_cursor_value` —
   the `FixedSizeBinary(16)` arm + the two new unit tests.
-- `src/pipeline/keyset.rs:146` — error message with the updated
+- `src/pipeline/keyset.rs:1195-1198` — error message with the updated
   supported-types list (adds `uuid`).
-- `src/plan/build.rs::resolve_chunked_strategy` lines 364-394 —
+- `src/plan/build.rs::chunked_strategy_from_introspection` lines
+  ~705-733 (the split-out decision half of `resolve_chunked_strategy`) —
   the `if SourceType::Mysql` guard that constrains layer 1.
 - `src/source/query.rs::cursor_rhs` — the `E'…'` literal-with-cast
   pattern that makes the PG keyset-WHERE path UUID-aware without
   separate cast logic.
-- `tests/live_keyset.rs` — four live tests covering the four paths in
+- `tests/live/live_keyset.rs` — four live tests covering the four paths in
   the operator-UX table above:
   - `keyset_varchar_pk_roundtrips_full_keyset_across_pages` (MySQL)
   - `keyset_mysql_uuid_pk_roundtrips_full_keyset_across_pages`

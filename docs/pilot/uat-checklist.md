@@ -49,7 +49,7 @@ For the full internal acceptance test plan with detailed suites and smoke-test s
 
 - [ ] `rivet plan -c rivet.yaml -o plan.json` succeeds
 - [ ] `rivet apply plan.json` runs and matches the plan artifact
-- [ ] Re-running `rivet apply` with an unchanged plan succeeds; altered config is rejected
+- [ ] Re-running `rivet apply` with an unchanged plan succeeds; a tampered or hand-edited plan artifact is rejected (PA10 integrity check). Note: apply never re-reads the config file — altering rivet.yaml does not affect applying an existing plan; config-fingerprint drift is only logged as advisory
 
 ## Observability
 

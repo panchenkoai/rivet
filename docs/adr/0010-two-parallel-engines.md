@@ -35,7 +35,7 @@ Unifying these into one engine would mean either:
 - Pushing chunked exports into subprocesses → much higher overhead per chunk (cold connection, runtime spin-up, IPC for every progress event), losing the in-process semaphore and shared destination.
 - Pushing multi-export concurrency into threads → losing per-export crash isolation and OpenDAL-runtime separation.
 
-Neither trade is worth the refactor at v0.5.x scale, especially given that both engines now share `resource::Semaphore` (kernel-parking, no busy-wait) and `RetryClass` (typed error classification).
+Neither trade is worth the refactor at v0.5.x scale. [Update: the sharing claim below held only for the in-process engine — it uses `resource::Semaphore` (kernel-parking, no busy-wait) and `RetryClass` (typed error classification); the subprocess fan-out engine uses neither, classifying child failures from exit codes over the IPC seam.]
 
 ---
 
@@ -68,7 +68,7 @@ This ADR is not "we'll never unify". It is "we accept the duplication for now, a
 
 2. **One engine via threads only.** Rejected: a panic in one of N exports running multiple plans simultaneously would crash the whole `rivet` process. The operator currently relies on the child-isolation property for long multi-export runs.
 
-3. **Async/tokio for both.** Rejected: rivet has no internal async surface today; `tokio` is in `Cargo.toml` only for `reqwest`/`opendal` transitively. Migrating Source to async I/O is a strictly larger refactor than this ADR is willing to scope. Decision deferred until the Source trait redesign in [ADR-0011](0011-source-trait-send-not-sync.md) lands.
+3. **Async/tokio for both.** Rejected: rivet keeps its execution model sync. [Update: `tokio` has since become a direct dependency (rt-multi-thread/net/time) — the MongoDB and MSSQL drivers are async internally, bridged to the sync `Source` trait via a per-source runtime + `block_on` (ADR-0011); the pipeline itself remains sync.] Migrating Source to async I/O is a strictly larger refactor than this ADR is willing to scope. Decision deferred until the Source trait redesign in [ADR-0011](0011-source-trait-send-not-sync.md) lands.
 
 ---
 

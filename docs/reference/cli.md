@@ -100,14 +100,12 @@ single aggregated `Run summary` block prints once for the whole run.
 ![Parallel cards UI](../gifs/parallel-cards.gif)
 
 ```text
-── orders ──────────────────────────────────────────────
-  run_id:    orders_20260427T120000.069
-  status:    running
-  mode:      chunked
-  tuning:    profile=balanced (default)
-  batch_size: 1,000
-  [====================>--------------] 11/20 chunks | 1.1M rows | 00:02:06 | ETA 66s
+▸ orders            chunked   11/20 chunks   1.1M rows   2m 6.0s  ETA 66.0s
 ```
+
+One card line per export (`▸` running, `✓` finished), redrawn in place; the
+children's verbose per-export output goes to a timestamped log file beside the
+config.
 
 Children emit structured NDJSON events (`Started`, `ProgressInit`,
 `Progress`, `Finished`) on stdout via the `RIVET_IPC_EVENTS=1` env var; the
@@ -349,7 +347,7 @@ By default `validate` resolves the destination prefix the same way `run` does (`
 | `--depth` | | `light`\|`sample`\|`full` | Verification depth: `light` (manifest + `_SUCCESS`), `sample` (+ part reconcile + untracked surplus), `full` (+ value-checksum re-read of every part; **default**) |
 | `--output` | `-o` | PATH | Write the JSON report to this file (only with `--format json`) |
 | `--date` | | YYYY-MM-DD | Resolve `{date}` to this date instead of today (UTC) |
-| `--run-id` | | string | Point at a prior run's prefix by run id |
+| `--run-id` | | string | Substitute `{run_id}` in the destination prefix template (composes with `--date`). No run lookup is performed — if the template has no `{run_id}` placeholder this has no effect; use `--prefix` for an arbitrary path |
 | `--prefix` | | string | Point at an explicit destination prefix |
 
 Exits non-zero when the manifest references a part that is missing or whose size does not match. A legacy prefix (no manifest) falls back to the M6 reduced-guarantee path and is labelled `legacy_run: true`.
@@ -361,7 +359,7 @@ Exits non-zero when the manifest references a part that is missing or whose size
 rivet validate -c my_export.yaml
 
 # Verify a prior run by id, JSON report to a file
-rivet validate -c my_export.yaml --run-id orders_20260521T120000 -o verdict.json
+rivet validate -c my_export.yaml --run-id orders_20260521T120000 --format json -o verdict.json   # -o is ignored unless --format json is set
 ```
 
 ## `rivet reconcile`
@@ -412,7 +410,7 @@ rivet reconcile -c my_export.yaml -e orders
 rivet reconcile -c my_export.yaml -e orders --format json -o reconcile.json
 ```
 
-Reports are **advisory** — same policy as prioritization (ADR-0006) and plan artifacts (ADR-0005). They surface what needs repair; they do not re-export on their own.
+Reports never re-export on their own — they surface what needs repair. They are not merely advisory though: a detected mismatch exits non-zero with the data-integrity class (exit 3), so CI can gate on it.
 
 ### Verification strategy tradeoffs
 
@@ -529,7 +527,7 @@ Fidelity levels:
 | `compatible` | Structurally compatible; minor representation difference |
 | `logical_string` | Serialized to STRING/text (no native Arrow type) |
 | `lossy` | Precision or range reduction |
-| `unsupported` | No mapping available; column is skipped |
+| `unsupported` | No safe mapping exists; the export fails with `N column(s) have no safe Rivet mapping — add column overrides in rivet.yaml`, and `rivet check --strict` exits non-zero |
 
 Output includes: table existence, estimated row count, index analysis, tuning recommendation.
 
@@ -565,7 +563,7 @@ rivet doctor: verifying auth for config 'my_export.yaml'
 All checks passed.
 ```
 
-When `tls:` is omitted from `source:`, an extra line appears before the source check: `[WARN] source: TLS is not enforced — credentials and result rows cross the network in plaintext.` Silence it by adding `tls: { mode: disable }` (local dev only) or fix it for prod with `tls: { mode: verify-full }` — see [reference/config.md § TLS](config.md#tls).
+When `tls:` is omitted from `source:` and the host is **loopback**, nothing is printed (local dev is exempt). On a **remote** host the `[WARN] source: TLS is not enforced…` line appears and the source check **fails** (`TLS required — refusing to connect to a remote (non-loopback) host without TLS`): fix it with `tls: { mode: verify-full }`, or explicitly opt into remote plaintext with `tls: { mode: disable }` on an already-trusted network path — see [reference/config.md § TLS](config.md#tls).
 
 ---
 
@@ -585,7 +583,7 @@ Exactly one of `--source`, `--source-env`, `--source-file` must be provided (enf
 | `--source` | | string | Connection URL: `postgresql://` \| `mysql://` \| `sqlserver://` \| `mongodb://`. **Visible in shell history / `ps`** — avoid in production |
 | `--source-env` | | env var name | Name of an env var that holds the URL (e.g. `DATABASE_URL`). URL never hits the command line. **Recommended.** |
 | `--source-file` | | path | Path to a file containing just the URL on one line. Credentials stay on disk |
-| `--table` | | string | Single table; optional `schema.table` on PostgreSQL. Omit to scaffold **all** tables/views in a Postgres schema or MySQL database |
+| `--table` | | string | Single table; optionally schema-qualified (`public.orders` on PostgreSQL, `dbo.orders` on SQL Server). Omit to scaffold **all** tables/views in a Postgres/SQL Server schema or MySQL database |
 | `--schema` | | string | **PostgreSQL:** schema to list (default `public`). **MySQL:** database name when the URL omits one; a `--schema` naming a *different* database than the URL's is refused — put the database in the URL instead |
 | `--output` | `-o` | string | Write output to file (default: print to stdout) |
 | `--discover` | | bool | Emit a machine-readable JSON discovery artifact instead of YAML — includes ranked cursor/chunk candidates, row estimates, on-disk sizes, and coalesce-fallback hints |
@@ -666,7 +664,8 @@ rivet journal -c my_export.yaml -e orders --run-id orders_20260513T120000.123
 Each run is shown as a block:
 
 ```
-✓ orders_20260513T120000.123  succeeded  12.3s
+✓ orders  success  12.3s
+  run_id: orders_20260513T120000.123
   files: 3  rows: 150,000  bytes: 4.2 MB
 ```
 

@@ -15,7 +15,8 @@ CDC has two drivers over the `ChangeStream` seam:
 - `source::cdc::sink::run_to_files()` — the typed-file driver for `rivet cdc
   --output` and every `mode: cdc` run: buffers, rolls a part at a
   commit-boundary + threshold, and runs the durable sequence
-  flush → checkpoint → **ack** (`PartCommitter`), then writes a `RunManifest`.
+  flush → checkpoint → **ack** (`roll_all`, with per-table `TableSink` state,
+  in `src/source/cdc/sink.rs`), then writes a `RunManifest`.
 
 Each architecture pass over CDC flags these two as a duplication and proposes a
 single `drive(stream, sink)` loop with a `ChangeSink` trait (an `NdjsonSink` and a
@@ -43,7 +44,7 @@ path and the `mode: cdc` run call. Only the NDJSON driver remains its own loop.
   slot. So the durability logic is *correctly file-only*, not duplicated.
 
 - **The two loop bodies share almost nothing.** NDJSON: `to_json` + `println` +
-  checkpoint-on-commit. File: buffer + byte/row rollover policy + `PartCommitter`
+  checkpoint-on-commit. File: buffer + byte/row rollover policy + `roll_all`
   (flush → checkpoint → ack) + manifest. The only common code is the ~5-line outer
   skeleton (`while next_change { table-filter; <body>; max_events }`).
 

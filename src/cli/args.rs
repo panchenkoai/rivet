@@ -129,14 +129,18 @@ pub enum Commands {
         /// source's and any other replica).
         #[arg(long, default_value_t = 4271)]
         server_id: u32,
-        /// Persist/resume the binlog position to this file. Omit to tail from the
-        /// current position without checkpointing.
+        /// Persist/resume the engine's log position to this file (MySQL binlog
+        /// coordinates / PostgreSQL slot-resume marker / SQL Server from-LSN /
+        /// MongoDB resume token). Omit to tail from the current position without
+        /// checkpointing.
         #[arg(long, value_name = "PATH")]
         checkpoint: Option<String>,
         /// Only emit changes for this table (repeatable; default: all tables).
         #[arg(long, value_name = "TABLE")]
         table: Vec<String>,
-        /// Stop after N change events (default: stream until interrupted).
+        /// Stop after N change events. Without it the default bounded run drains
+        /// to the log end as of open and exits; streaming until interrupted needs
+        /// `--stream`.
         #[arg(long, value_name = "N")]
         max_events: Option<usize>,
         /// Write typed Parquet/CSV files to this directory (the upsert/after-image
@@ -301,7 +305,11 @@ pub enum Commands {
         /// finished tables. Independent tables are never re-exported.
         #[arg(long)]
         resume: bool,
-        /// Skip staleness check (allow plans older than 24 h)
+        /// Override whichever safety gate refuses the run: in JSON-artifact
+        /// mode the plan staleness check (> 24 h) and the incremental
+        /// cursor-drift check (each bypass is recorded in the run's
+        /// `apply_context`); in YAML config mode, with `--resume`, the refusal
+        /// to resume into a prefix whose `_SUCCESS` marker is already present
         #[arg(long)]
         force: bool,
         /// Run the whole config as ONE bounded work-stealing pool of N export

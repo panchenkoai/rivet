@@ -113,7 +113,7 @@ docker compose up -d postgres mysql minio fake-gcs
 docker compose --profile legacy up -d \
     postgres-12 postgres-13 postgres-14 postgres-15 mysql-57
 
-cargo build --release --bin rivet --bin seed
+cargo build --release --bin rivet --bin seed --features dev-seed
 ```
 
 Ports assigned (none conflict with the primary services):

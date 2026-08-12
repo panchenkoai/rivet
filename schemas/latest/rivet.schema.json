@@ -294,7 +294,7 @@
           ]
         },
         "adaptive": {
-          "description": "Enable real-time batch size adaptation based on DB pressure metrics.\nPostgres: samples `pg_stat_bgwriter`. MySQL: samples `Innodb_log_waits`.\nAlso arms the OPT-2 concurrency governor when `parallel > 1`.",
+          "description": "Enable real-time batch size adaptation based on DB pressure metrics.\nPostgres: samples `pg_stat_bgwriter` checkpoint pressure. MySQL: samples\n`Created_tmp_disk_tables` + `Innodb_buffer_pool_wait_free` (read-spill\npressure). SQL Server: `Workfiles Created/sec` + `Worktables Created/sec`\n(tempdb spills). Also arms the OPT-2 concurrency governor when\n`parallel > 1`.",
           "type": [
             "boolean",
             "null"
@@ -423,7 +423,7 @@
           "default": true
         },
         "page_size": {
-          "description": "When set, read the collection with **keyset (seek) pagination** on `_id`\ninstead of one long-held cursor: each page is a bounded\n`find({_id: {$gt: last}}).sort({_id: 1}).limit(page_size)` — an indexed\nrange scan that becomes one output part file. Bounds longest-query time\n(no 35-minute cursor to hit a timeout / snapshot window) and is the base\nfor parallel `_id`-range reads. Requires an **ObjectId** `_id` (the\ndefault); a non-ObjectId key errors with a clear message. Unset ⇒ the\nsingle-cursor full scan.",
+          "description": "When set, read the collection with **keyset (seek) pagination** on `_id`\ninstead of one long-held cursor: each page is a bounded\n`find({_id: {$gt: last}}).sort({_id: 1}).limit(page_size)` — an indexed\nrange scan that becomes one output part file. Bounds longest-query time\n(no 35-minute cursor to hit a timeout / snapshot window) and is the base\nfor parallel `_id`-range reads. Works with any **uniform** `_id` type\n(ObjectId — the default — integer, string, date, …); a collection mixing\n`_id` type brackets errors with a clear message pointing at the full\nordered scan (Mongo's `$gt` compares only within a type bracket, so a\nmixed key would silently drop every bracket but one). Unset ⇒ the\nsingle-cursor full scan.",
           "type": [
             "integer",
             "null"
@@ -559,7 +559,7 @@
           "default": 100000
         },
         "chunk_size_memory_mb": {
-          "description": "Target memory budget per chunk in MB. When set, `chunk_size` is derived\nfrom this budget at plan-build time using a `pg_class` row-size estimate\n(`pg_relation_size / reltuples`), clamped to `[10_000, 5_000_000]` rows.\n\nMutually exclusive with an explicit non-default `chunk_size:`. Only\napplies to `mode: chunked` on a Postgres source using the `table:`\nshortcut (the row-size probe needs a known relation).\n\n```yaml\nexports:\n  - name: page_views\n    table: public.page_views\n    mode: chunked\n    chunk_size_memory_mb: 256\n```",
+          "description": "Target memory budget per chunk in MB. When set, `chunk_size` is derived\nfrom this budget at plan-build time using the engine's row-size estimate\n(PostgreSQL `pg_relation_size / reltuples`; MySQL `information_schema`\naverage row length; a defensive 512 B/row default when no estimate\nexists, e.g. SQL Server), clamped to `[10_000, 5_000_000]` rows.\n\nMutually exclusive with an explicit non-default `chunk_size:`. Requires\n`mode: chunked` and the `table:` shortcut (the row-size probe needs a\nknown relation); any SQL engine works.\n\n```yaml\nexports:\n  - name: page_views\n    table: public.page_views\n    mode: chunked\n    chunk_size_memory_mb: 256\n```",
           "type": [
             "integer",
             "null"
@@ -679,7 +679,7 @@
           "$ref": "#/$defs/DestinationConfig"
         },
         "verify": {
-          "description": "Integrity depth required of `--validate` for this export's parts.\n`size` (default) accepts size-only verification; `content` requires every\npart's content MD5 to be checked against the store's listing (no\ndownload) and **fails** validation for any part that could only be\nsize-verified — e.g. a part too large to upload as a single PUT (raise\n`max_file_size` down so it fits), or a backend that exposes no checksum.",
+          "description": "Integrity depth required of `--validate` for this export's parts.\n`size` (default) accepts size-only verification; `content` requires every\npart's content MD5 to be checked against the store's listing (no\ndownload) and **fails** validation for any part that could only be\nsize-verified — e.g. a part too large to upload as a single PUT (lower\n`max_file_size` so it fits), or a backend that exposes no checksum.",
           "$ref": "#/$defs/VerifyMode",
           "default": "size"
         },
@@ -846,7 +846,7 @@
           ]
         },
         "until_current": {
-          "description": "Catch up to the source's current end and exit (a bounded run), instead of\nstreaming indefinitely — ideal for a scheduler. For MySQL this is a\nnon-blocking binlog dump; PostgreSQL / SQL Server already drain-and-exit.\n**Defaults to `true`** (bounded): the OSS model is scheduler-driven, and\nomitting this must NOT silently start a never-terminating stream. Set it to\n`false` to opt into continuous streaming explicitly.",
+          "description": "Catch up to the source's current end and exit (a bounded run), instead of\nstreaming indefinitely — ideal for a scheduler. For MySQL this is a\nnon-blocking binlog dump; PostgreSQL / SQL Server already drain-and-exit.\n**Defaults to `true`** (bounded): the OSS model is scheduler-driven, and\nomitting this must NOT silently start a never-terminating stream. Setting\n`false` opts into the continuous model, which is engine-specific: a true\ndaemon only on MySQL (blocking binlog dump); MongoDB tails while writes\ncontinue and exits on an idle poll; PostgreSQL / SQL Server still exit on\ncatch-up — one unbounded pass, run it under a supervisor.",
           "type": "boolean",
           "default": true
         },

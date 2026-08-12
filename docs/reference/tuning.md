@@ -2,7 +2,7 @@
 
 Tuning controls how Rivet queries the source database: batch sizes, timeouts, throttling, and retries.
 
-> **MongoDB sources** don't use the SQL tuning on this page — a document store has no chunked mode, `batch_size`, or `chunk_size`. Mongo's tuning levers are the driver connection pool and `parallel: N` `_id`-range fan-out; see [MongoDB → Connection pool & parallel tuning](mongodb.md#connection-pool).
+> **MongoDB sources** don't use the SQL tuning on this page — a document store has no chunked mode or `chunk_size`, though `tuning.batch_size` (per-batch row cap) and `max_batch_memory_mb` (per-batch byte cap) ARE honored. Mongo's tuning levers are the driver connection pool and `parallel: N` `_id`-range fan-out; see [MongoDB → Connection pool & parallel tuning](mongodb.md#connection-pool).
 
 ## Where to place tuning
 
@@ -232,9 +232,12 @@ source:
 
 exports:
   - name: orders
+    table: public.orders
     mode: chunked
     chunk_column: id
     parallel: 8           # ceiling — governor varies the live count in [2, 8]
+    format: parquet
+    destination: { type: local, path: ./out }
 ```
 
 **How it decides.** A dedicated monitoring connection polls a source write-pressure counter every ~1.5 s and compares it to the previous reading. A *rising* counter means pressure is climbing, so the governor sheds one worker; a flat/falling counter lets it recover one. The counter is:

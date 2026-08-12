@@ -57,8 +57,10 @@ Migrate when ANY of these fires:
 Migration shape: a second `ChangeStream` impl (`PgOutputStream`) behind the
 same trait + the same commit/ack seam; `test_decoding` stays as the fallback
 until the live matrix + non-UTC + hostile suites pass against both, then
-becomes the compatibility path for one release before removal. The
-`AnchorModel::ServerSide` contract is unchanged (the slot is still the anchor).
+becomes the compatibility path for one release before removal. The per-engine
+anchor-model contract is unchanged — PG still pins server-side at slot creation
+(the slot is still the anchor); the contract is documented in the
+`ensure_anchor` doc comment (`src/source/cdc/mod.rs`).
 
 ## Consequences
 
