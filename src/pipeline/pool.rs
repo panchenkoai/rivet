@@ -17,9 +17,18 @@
 //! scheduler. So `pool_order` is pure LPT (duration desc); tiers are NOT
 //! honored in pool mode, by design.
 //!
-//! This module is the PURE core — ordering + the makespan model `plan` prints.
-//! The runtime bounded pool that consumes `pool_order` at apply time lives in
-//! the runner; keeping the math here makes it property-testable offline.
+//! This module owns THE PoolItem concept end to end: what it is, how its
+//! duration is PREDICTED, and how items are ordered. The prediction half was
+//! deepened here after the two former adapters drifted (walk find,
+//! 2026-08-13): `rivet plan`'s preview excluded history-less exports and
+//! hardcoded `parallel_safe: true`, while `apply --pool` scheduled the same
+//! exports at placeholder floors with the real flags — two different
+//! makespans for one config, from one type. [`predict_items`] is now the
+//! ONLY constructor either command uses.
+//!
+//! The scheduling math stays pure; the predictor's single impurity is the
+//! state-store read, kept behind [`predict_secs`] so the classification and
+//! seeding logic remain unit-testable with an in-memory store.
 
 /// One export the pool schedules, by its predicted duration.
 #[derive(Debug, Clone)]
@@ -35,6 +44,95 @@ pub(crate) struct PoolItem {
     /// reach (#166/#167 C3, roast 2026-08-09). Default `true` keeps the pure
     /// tests that don't care about the constraint unchanged.
     pub parallel_safe: bool,
+}
+
+/// Where a [`PoolItem`]'s predicted duration came from — the honesty axis of
+/// the makespan print ("N measured, M estimated"), and the LOWER-BOUND note
+/// when placeholders are in play.
+#[derive(Debug, Clone)]
+pub(crate) enum PredictedFrom {
+    /// A prior SUCCESSFUL run's wall time — the only true measurement.
+    Measured(f64),
+    /// No success on record, but a failed/interrupted attempt ran this long —
+    /// a floor on the real duration (the attempt died early).
+    FailedAttemptFloor(f64),
+    /// A synthesized split unit inheriting `giant_predicted / N` — measured by
+    /// proxy, so LPT ranks the slices where the giant stood (front of the
+    /// queue), never at the placeholder tail (bughunt 2026-08-13).
+    SeededSplit(f64),
+    /// No history at all: the placeholder. Deliberately small so unknown
+    /// exports never displace measured heavies in LPT order; the print
+    /// flags how many predictions rest on it.
+    Placeholder(f64),
+}
+
+/// Placeholder duration for an export with no run history at all.
+pub(crate) const POOL_PLACEHOLDER_SECS: f64 = 5.0;
+
+impl PredictedFrom {
+    pub(crate) fn secs(&self) -> f64 {
+        match self {
+            PredictedFrom::Measured(s)
+            | PredictedFrom::FailedAttemptFloor(s)
+            | PredictedFrom::SeededSplit(s)
+            | PredictedFrom::Placeholder(s) => *s,
+        }
+    }
+}
+
+/// Predict one export's duration from the state store: last SUCCESS, else the
+/// longest terminal attempt (floored at the placeholder), else the placeholder.
+/// Direct success query — a fixed recent window went blind after N consecutive
+/// failures, misclassifying a measured export exactly during its degraded
+/// period (bughunt 2026-08-13).
+pub(crate) fn predict_secs(state: &crate::state::StateStore, name: &str) -> PredictedFrom {
+    let last_success = state
+        .get_last_success_metric(name)
+        .ok()
+        .flatten()
+        .map(|m| (m.duration_ms as f64 / 1000.0).max(0.001));
+    if let Some(s) = last_success {
+        return PredictedFrom::Measured(s);
+    }
+    let last_attempt = state
+        .get_metrics(Some(name), 25)
+        .ok()
+        .into_iter()
+        .flatten()
+        .map(|m| (m.duration_ms as f64 / 1000.0).max(0.001))
+        .reduce(f64::max);
+    match last_attempt {
+        Some(s) => PredictedFrom::FailedAttemptFloor(s.max(POOL_PLACEHOLDER_SECS)),
+        None => PredictedFrom::Placeholder(POOL_PLACEHOLDER_SECS),
+    }
+}
+
+/// THE PoolItem constructor — both `rivet plan`'s preview and `apply --pool`'s
+/// schedule go through here, so the two commands cannot print different
+/// makespans for one config again. `split_seeds` carries `{giant}#N` units'
+/// inherited durations (empty everywhere except the realized-split path).
+pub(crate) fn predict_items<'a>(
+    state: &crate::state::StateStore,
+    exports: impl IntoIterator<Item = (&'a str, bool)>,
+    split_seeds: &std::collections::HashMap<String, f64>,
+) -> Vec<(PoolItem, PredictedFrom)> {
+    exports
+        .into_iter()
+        .map(|(name, parallel_safe)| {
+            let from = match split_seeds.get(name) {
+                Some(secs) => PredictedFrom::SeededSplit(*secs),
+                None => predict_secs(state, name),
+            };
+            (
+                PoolItem {
+                    name: name.to_string(),
+                    predicted_secs: from.secs(),
+                    parallel_safe,
+                },
+                from,
+            )
+        })
+        .collect()
 }
 
 /// LPT order: longest predicted duration first, ties broken by name so the
@@ -420,5 +518,104 @@ mod tests {
             // A single worker's makespan IS the total (no concurrency).
             if m == 1 { prop_assert!((mk - total).abs() < 1e-6); }
         });
+    }
+}
+
+#[cfg(test)]
+mod prediction_tests {
+    use super::{POOL_PLACEHOLDER_SECS, PredictedFrom, predict_items, predict_secs};
+    use crate::state::{MetricRow, StateStore};
+
+    fn store_with(rows: &[(&str, &str, i64, &str)]) -> StateStore {
+        let s = StateStore::open_in_memory().expect("in-memory store");
+        for (export, run_id, duration_ms, status) in rows {
+            s.record_metric_full(&MetricRow {
+                export_name: (*export).into(),
+                run_id: (*run_id).into(),
+                duration_ms: *duration_ms,
+                status: (*status).into(),
+                ..Default::default()
+            })
+            .expect("record metric");
+        }
+        s
+    }
+
+    /// Field find (2026-08-13, --pool 5): an export with FAILED history but no
+    /// success was scheduled at the flat 5 s placeholder, so a giant that had
+    /// already demonstrated an hours-long attempt was predicted as noise and
+    /// the printed makespan promised minutes for an hours-long run. A failed
+    /// attempt's duration is a floor on the real one — use it.
+    #[test]
+    fn unmeasured_export_with_failed_history_predicts_at_least_that_attempt() {
+        let s = store_with(&[("big", "r1", 3_600_000, "failed")]);
+        match predict_secs(&s, "big") {
+            PredictedFrom::FailedAttemptFloor(secs) => {
+                assert!(
+                    (secs - 3600.0).abs() < 1.0,
+                    "the failed attempt's hour must survive as the floor, got {secs}"
+                );
+            }
+            _ => panic!("failed-only history must be a FailedAttemptFloor, not a placeholder"),
+        }
+    }
+
+    #[test]
+    fn measured_success_beats_failed_attempts_and_no_history_is_a_placeholder() {
+        // A success among failures → measured, at the SUCCESS duration — even
+        // when dozens of failures sit between it and now (direct success
+        // query, not a fixed recent window).
+        let mut rows: Vec<(&str, String, i64, &str)> = vec![("t", "r0".into(), 120_000, "success")];
+        for i in 1..=30 {
+            rows.push(("t", format!("r{i}"), 3_600_000, "failed"));
+        }
+        let owned: Vec<(&str, &str, i64, &str)> = rows
+            .iter()
+            .map(|(e, r, d, s)| (*e, r.as_str(), *d, *s))
+            .collect();
+        let s = store_with(&owned);
+        match predict_secs(&s, "t") {
+            PredictedFrom::Measured(secs) => assert!((secs - 120.0).abs() < 1.0, "got {secs}"),
+            _ => panic!("a successful run must classify as Measured even past 25 failures"),
+        }
+        // No history at all → the placeholder, honestly labeled as such.
+        let empty = store_with(&[]);
+        match predict_secs(&empty, "unknown") {
+            PredictedFrom::Placeholder(secs) => assert_eq!(secs, POOL_PLACEHOLDER_SECS),
+            _ => panic!("no history must classify as Placeholder"),
+        }
+        // A sub-placeholder failed attempt is floored at the placeholder.
+        let quick = store_with(&[("q", "r1", 1_000, "failed")]);
+        assert!(predict_secs(&quick, "q").secs() >= POOL_PLACEHOLDER_SECS);
+    }
+
+    /// The drift this module closed (walk find, 2026-08-13): plan's preview
+    /// and apply's schedule must be the same numbers. Both now call
+    /// predict_items — this pins the constructor's remaining decisions: split
+    /// seeds win over history, parallel_safe passes through verbatim, and
+    /// every export is INCLUDED (the old preview silently excluded
+    /// history-less exports, so its makespan covered less work than the wave
+    /// plan printed beside it).
+    #[test]
+    fn predict_items_seeds_split_units_and_includes_history_less_exports() {
+        let s = store_with(&[("giant", "r1", 900_000, "success")]);
+        let seeds = std::collections::HashMap::from([("giant#0".to_string(), 450.0)]);
+        let out = predict_items(&s, [("giant#0", false), ("fresh", true)], &seeds);
+        assert_eq!(
+            out.len(),
+            2,
+            "history-less exports are included, not dropped"
+        );
+        let (unit, from) = &out[0];
+        assert!(matches!(from, PredictedFrom::SeededSplit(_)));
+        assert_eq!(
+            unit.predicted_secs, 450.0,
+            "seed wins over any history lookup"
+        );
+        assert!(!unit.parallel_safe, "parallel_safe passes through verbatim");
+        let (fresh, from) = &out[1];
+        assert!(matches!(from, PredictedFrom::Placeholder(_)));
+        assert_eq!(fresh.predicted_secs, POOL_PLACEHOLDER_SECS);
+        assert!(fresh.parallel_safe);
     }
 }

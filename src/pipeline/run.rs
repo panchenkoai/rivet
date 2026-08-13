@@ -749,69 +749,6 @@ pub(crate) fn run_waves(
     Ok(())
 }
 
-/// Last successful run's duration for `name`, in seconds — the pool's
-/// predictor (the same source the wave packer reads). `None` = no history.
-fn last_success_secs(state: &StateStore, name: &str) -> Option<f64> {
-    // Direct success query — a fixed recent window went blind after 25
-    // consecutive failed attempts, misclassifying a measured export as
-    // unmeasured exactly during its degraded period (bughunt 2026-08-13).
-    state
-        .get_last_success_metric(name)
-        .ok()?
-        .map(|m| (m.duration_ms as f64 / 1000.0).max(0.001))
-}
-
-/// Longest recorded duration across `name`'s recent runs of ANY terminal
-/// status — the fallback predictor when no run ever SUCCEEDED. A failed or
-/// interrupted attempt died early, so this is a LOWER bound on the real
-/// duration; it is still far more honest than the flat placeholder (field
-/// find, 2026-08-13 pool dogfood: a nine-figure-row export with no success
-/// history was scheduled as 5 s, and the printed makespan promised minutes
-/// for a run that takes hours).
-fn last_attempt_secs(state: &StateStore, name: &str) -> Option<f64> {
-    state
-        .get_metrics(Some(name), 25)
-        .ok()?
-        .into_iter()
-        .map(|m| (m.duration_ms as f64 / 1000.0).max(0.001))
-        .reduce(f64::max)
-}
-
-/// A pool item's predicted duration plus which signal produced it, so the
-/// makespan print can say how much of the prediction is guesswork.
-enum PredictedFrom {
-    Measured(f64),
-    FailedAttemptFloor(f64),
-    Placeholder(f64),
-}
-
-impl PredictedFrom {
-    fn secs(&self) -> f64 {
-        match self {
-            PredictedFrom::Measured(s)
-            | PredictedFrom::FailedAttemptFloor(s)
-            | PredictedFrom::Placeholder(s) => *s,
-        }
-    }
-}
-
-/// Placeholder for an export with no run history at all. Deliberately small so
-/// unknown exports never displace measured heavies in LPT order; the makespan
-/// print flags how many predictions rest on it.
-const POOL_PLACEHOLDER_SECS: f64 = 5.0;
-
-fn predicted_from(state: &StateStore, name: &str) -> PredictedFrom {
-    if let Some(s) = last_success_secs(state, name) {
-        return PredictedFrom::Measured(s);
-    }
-    match last_attempt_secs(state, name) {
-        // A crashed/failed attempt's duration is a floor on the real one —
-        // taking `max` with the placeholder keeps sub-5s failures at 5 s.
-        Some(s) => PredictedFrom::FailedAttemptFloor(s.max(POOL_PLACEHOLDER_SECS)),
-        None => PredictedFrom::Placeholder(POOL_PLACEHOLDER_SECS),
-    }
-}
-
 /// The pool's pick rule, pure for the mutation gate (#166): the first queued
 /// export a freeing slot may start. A `parallel_safe` export is always
 /// eligible; a non-safe (heavy) one only when NO other heavy export is
@@ -900,13 +837,14 @@ pub(crate) fn run_pool(
     }
 
     let build_items = |exps: &[ExportConfig]| -> Vec<super::pool::PoolItem> {
-        exps.iter()
-            .map(|e| super::pool::PoolItem {
-                name: e.name.clone(),
-                predicted_secs: predicted_from(&state, &e.name).secs(),
-                parallel_safe: is_parallel_safe(e),
-            })
-            .collect()
+        super::pool::predict_items(
+            &state,
+            exps.iter().map(|e| (e.name.as_str(), is_parallel_safe(e))),
+            &std::collections::HashMap::new(),
+        )
+        .into_iter()
+        .map(|(i, _)| i)
+        .collect()
     };
     let mut items = build_items(&effective);
 
@@ -1105,33 +1043,28 @@ pub(crate) fn run_pool(
     // measured/estimated accounting below — a second predicted_from sweep
     // would re-query the state store per export and could describe a
     // different schedule than the one that runs (walk find, 2026-08-13).
-    let classified: Vec<PredictedFrom> = effective
-        .iter()
-        .map(|e| match split_unit_secs.get(&e.name) {
-            // A split unit inherits the giant's measured/estimated share —
-            // measured-by-proxy, so LPT ranks it like the giant it slices.
-            Some(secs) => PredictedFrom::Measured(*secs),
-            None => predicted_from(&state, &e.name),
-        })
-        .collect();
-    items = effective
-        .iter()
-        .zip(&classified)
-        .map(|(e, p)| super::pool::PoolItem {
-            name: e.name.clone(),
-            predicted_secs: p.secs(),
-            parallel_safe: is_parallel_safe(e),
-        })
-        .collect();
+    let predicted = super::pool::predict_items(
+        &state,
+        effective
+            .iter()
+            .map(|e| (e.name.as_str(), is_parallel_safe(e))),
+        &split_unit_secs,
+    );
+    let classified: Vec<super::pool::PredictedFrom> =
+        predicted.iter().map(|(_, f)| f.clone()).collect();
+    items = predicted.into_iter().map(|(i, _)| i).collect();
     let order = super::pool::pool_order(&items);
     let predicted_secs = super::pool::predicted_makespan_secs(&items, m);
     let floor_secs = super::pool::makespan_floor_secs(&items, m);
     let (mut measured_n, mut attempt_n, mut placeholder_n) = (0usize, 0usize, 0usize);
     for p in &classified {
         match p {
-            PredictedFrom::Measured(_) => measured_n += 1,
-            PredictedFrom::FailedAttemptFloor(_) => attempt_n += 1,
-            PredictedFrom::Placeholder(_) => placeholder_n += 1,
+            // A seeded split unit inherits the giant's (usually measured)
+            // share — measured by proxy for the accounting too.
+            super::pool::PredictedFrom::Measured(_)
+            | super::pool::PredictedFrom::SeededSplit(_) => measured_n += 1,
+            super::pool::PredictedFrom::FailedAttemptFloor(_) => attempt_n += 1,
+            super::pool::PredictedFrom::Placeholder(_) => placeholder_n += 1,
         }
     }
     println!(
@@ -1155,7 +1088,7 @@ pub(crate) fn run_pool(
             attempt_n + placeholder_n,
             attempt_n,
             placeholder_n,
-            POOL_PLACEHOLDER_SECS as i64,
+            super::pool::POOL_PLACEHOLDER_SECS as i64,
         );
     }
 
@@ -1453,69 +1386,6 @@ fn first_name_collision<'a>(
         .iter()
         .find(|u| existing.iter().any(|e| e.name == u.name))
         .map(|u| u.name.as_str())
-}
-
-#[cfg(test)]
-mod pool_prediction_tests {
-    use super::{POOL_PLACEHOLDER_SECS, PredictedFrom, predicted_from};
-    use crate::state::{MetricRow, StateStore};
-
-    fn store_with(rows: &[(&str, &str, i64, &str)]) -> StateStore {
-        let s = StateStore::open_in_memory().expect("in-memory store");
-        for (export, run_id, duration_ms, status) in rows {
-            s.record_metric_full(&MetricRow {
-                export_name: (*export).into(),
-                run_id: (*run_id).into(),
-                duration_ms: *duration_ms,
-                status: (*status).into(),
-                ..Default::default()
-            })
-            .expect("record metric");
-        }
-        s
-    }
-
-    /// Field find (2026-08-13 pool dogfood): an export with FAILED history but
-    /// no success was scheduled at the flat 5 s placeholder, so a giant that
-    /// had already demonstrated an hours-long attempt was predicted as noise
-    /// and the printed makespan promised minutes for an hours-long run. A
-    /// failed attempt's duration is a floor on the real one — use it.
-    #[test]
-    fn unmeasured_export_with_failed_history_predicts_at_least_that_attempt() {
-        let s = store_with(&[("big", "r1", 3_600_000, "failed")]);
-        match predicted_from(&s, "big") {
-            PredictedFrom::FailedAttemptFloor(secs) => {
-                assert!(
-                    (secs - 3600.0).abs() < 1.0,
-                    "the failed attempt's hour must survive as the floor, got {secs}"
-                );
-            }
-            _ => panic!("failed-only history must be a FailedAttemptFloor, not a placeholder"),
-        }
-    }
-
-    #[test]
-    fn measured_success_beats_failed_attempts_and_no_history_is_a_placeholder() {
-        // A success among failures → measured, at the SUCCESS duration.
-        let s = store_with(&[
-            ("t", "r1", 3_600_000, "failed"),
-            ("t", "r2", 120_000, "success"),
-        ]);
-        match predicted_from(&s, "t") {
-            PredictedFrom::Measured(secs) => assert!((secs - 120.0).abs() < 1.0, "got {secs}"),
-            _ => panic!("a successful run must classify as Measured"),
-        }
-        // No history at all → the placeholder, honestly labeled as such.
-        let empty = store_with(&[]);
-        match predicted_from(&empty, "unknown") {
-            PredictedFrom::Placeholder(secs) => assert_eq!(secs, POOL_PLACEHOLDER_SECS),
-            _ => panic!("no history must classify as Placeholder"),
-        }
-        // A sub-placeholder failed attempt is floored at the placeholder, so a
-        // 1 s crash does not schedule BELOW the unknown baseline.
-        let quick = store_with(&[("q", "r1", 1_000, "failed")]);
-        assert!(predicted_from(&quick, "q").secs() >= POOL_PLACEHOLDER_SECS);
-    }
 }
 
 #[cfg(test)]
