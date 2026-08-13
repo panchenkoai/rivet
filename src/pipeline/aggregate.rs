@@ -184,6 +184,17 @@ pub(super) fn print(agg: &RunAggregate) {
         "  duration:    {} (wall clock)",
         format_duration(agg.duration_ms)
     );
+    // Transient destination retries the RetryLayer absorbed (each recovered;
+    // an exhausted budget errors loudly elsewhere). Per-attempt lines log at
+    // DEBUG after the first, so this aggregate is where the "destination was
+    // flaky" signal lives — a nonzero count on a green run is early warning
+    // of throttling/network degradation, not a data problem.
+    let dest_retries = crate::destination::transient_retries_total();
+    if dest_retries > 0 {
+        eprintln!(
+            "  dest retries: {dest_retries} transient (all recovered; RUST_LOG=debug for detail)"
+        );
+    }
     if agg.duration_ms > 0 && agg.total_rows > 0 {
         let rps = agg.total_rows as f64 * 1000.0 / agg.duration_ms as f64;
         eprintln!("  throughput:  {} rows/s", format_rate(rps));

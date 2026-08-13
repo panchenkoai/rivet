@@ -63,7 +63,8 @@ impl GcsStore {
                 .with_max_times(3)
                 .with_min_delay(std::time::Duration::from_millis(200))
                 .with_max_delay(std::time::Duration::from_secs(10))
-                .with_jitter(),
+                .with_jitter()
+                .with_notify(super::cloud::RivetRetryNotify),
         );
         let op = opendal::blocking::Operator::new(async_op)?;
         Ok(Self {
