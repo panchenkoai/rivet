@@ -85,7 +85,7 @@ exports:
       secret_key_env: AWS_SECRET_ACCESS_KEY
 ```
 
-Inline `password:` / `url:` fields on the source are accepted but **not recommended** for any file that ships outside the operator's machine. Destination credentials have no inline form at all — only the env indirection (`access_key_env`, `secret_key_env`, `account_key_env`, `sas_token_env`) is accepted.
+Inline `password:` / `url:` fields on the source are accepted but **not recommended** for any file that ships outside the operator's machine. Destination credentials have no inline form at all — the only accepted forms are the env indirection (`access_key_env`, `secret_key_env`, `session_token_env`, `account_key_env`, `sas_token_env`) and two out-of-band indirections that keep the secret outside the config entirely: `credentials_file` (path to a GCS service-account JSON) and `aws_profile` (a named profile resolved from the shared AWS config/credentials chain).
 
 ### Redaction in errors and artifacts
 

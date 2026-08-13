@@ -227,7 +227,11 @@ or GCS bucket name).
 
 Rivet auto-derives the endpoint from `account_name` as
 `https://<account_name>.blob.core.windows.net` — operators only need to
-set `endpoint:` for Azurite (loopback, with `allow_anonymous: true`).
+set `endpoint:` for a loopback emulator (Azurite).  Both loopback shapes
+are accepted: with credentials (`account_name: devstoreaccount1` +
+`account_key_env` holding the well-known dev key — the shape the live
+Azurite test in CI uses), or with `allow_anonymous: true` and no
+credentials at all (Path B below).
 Sovereign clouds (US-Gov, China-Mooncake) and custom DNS fronts are not
 currently reachable: a non-loopback Azure endpoint with credentials is
 rejected at config load, and `allow_anonymous: true` cannot be combined

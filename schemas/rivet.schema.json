@@ -294,7 +294,7 @@
           ]
         },
         "adaptive": {
-          "description": "Enable real-time batch size adaptation based on DB pressure metrics.\nPostgres: samples `pg_stat_bgwriter` checkpoint pressure. MySQL: samples\n`Created_tmp_disk_tables` + `Innodb_buffer_pool_wait_free` (read-spill\npressure). SQL Server: `Workfiles Created/sec` + `Worktables Created/sec`\n(tempdb spills). Also arms the OPT-2 concurrency governor when\n`parallel > 1`.",
+          "description": "Enable real-time batch size adaptation based on DB pressure metrics.\nThe batch loop samples: Postgres `pg_stat_bgwriter` checkpoint pressure;\nMySQL `Created_tmp_disk_tables` + `Innodb_buffer_pool_wait_free`\n(read-spill pressure). SQL Server takes no batch sample, so its batch\nsize is set by the memory cap alone and never adapts. Also arms the OPT-2\nconcurrency governor when `parallel > 1`; the governor samples the same\ncounters on its own monitoring connection, and on SQL Server samples\n`Workfiles Created/sec` + `Worktables Created/sec` (tempdb spills).",
           "type": [
             "boolean",
             "null"

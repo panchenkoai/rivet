@@ -131,8 +131,12 @@ pub enum Commands {
         server_id: u32,
         /// Persist/resume the engine's log position to this file (MySQL binlog
         /// coordinates / PostgreSQL slot-resume marker / SQL Server from-LSN /
-        /// MongoDB resume token). Omit to tail from the current position without
-        /// checkpointing.
+        /// MongoDB resume token). If omitted, each engine falls back to its own
+        /// anchor: MySQL and MongoDB start at the source's CURRENT position (nothing
+        /// written before now is captured), PostgreSQL resumes from the slot itself
+        /// (server-side — a slot created here pins at the current WAL position), and
+        /// SQL Server starts at the capture instance's `fn_cdc_get_min_lsn` (it
+        /// over-reads the retained backlog rather than skipping).
         #[arg(long, value_name = "PATH")]
         checkpoint: Option<String>,
         /// Only emit changes for this table (repeatable; default: all tables).
@@ -164,8 +168,12 @@ pub enum Commands {
         #[arg(long, value_name = "INSTANCE")]
         capture_instance: Option<String>,
         /// Stream continuously instead of the DEFAULT bounded "read to the log end
-        /// and exit" drain. Continuous streaming is a long-lived daemon; omit this
-        /// for the scheduler-friendly bounded run (the default). For MySQL the
+        /// and exit" drain. What "continuously" means is per engine: MySQL (a
+        /// blocking binlog dump) and MongoDB (a change stream that blocks awaiting
+        /// events) stay up until stopped; PostgreSQL and SQL Server are poll
+        /// adapters that STILL EXIT ON CATCH-UP — there this is one unbounded pass,
+        /// not a daemon, so run it under a supervisor that restarts it. Omit it for
+        /// the scheduler-friendly bounded run (the default). For MySQL the
         /// bounded run is a non-blocking binlog dump; PostgreSQL / SQL Server drain
         /// their backlog and exit.
         #[arg(long)]

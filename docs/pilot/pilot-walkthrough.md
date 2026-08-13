@@ -24,7 +24,8 @@ The repo ships a `docker-compose.yaml` with both engines pre-seeded by [`dev/pos
 
 ```bash
 docker compose up -d postgres mysql
-cargo run --features dev-seed --bin seed -- --target both   # fills orders, events, orders_coalesce, orders_sparse
+cargo run --features dev-seed --bin seed -- --target both   # postgres + mysql: fills users, orders, events, page_views, content_items, orders_coalesce
+# orders_sparse is created and truncated but left EMPTY — add --sparse-chunk-demo to fill it
 export DATABASE_URL='postgresql://rivet:rivet@localhost:5432/rivet'
 ```
 

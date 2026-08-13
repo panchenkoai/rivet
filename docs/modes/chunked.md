@@ -32,7 +32,7 @@ Four ways to slice the table. They differ in how chunk boundaries are computed; 
 |---|---|
 | `parallel: N` | Up to `N` chunks execute concurrently (separate DB connections). Default `1`. `rivet init` scaffolds a row-scaled value (≤500 K → 1, <5 M → 2, ≥5 M → 4) |
 | `chunk_checkpoint: true` | Per-chunk row in state DB → `rivet run --resume` skips completed chunks after a crash |
-| `chunk_max_attempts: 3` | Total attempt budget per chunk (first attempt + retries): `3` means each failed chunk is retried up to 2 times before the run bails. Defaults to `tuning.max_retries + 1` |
+| `chunk_max_attempts: 3` | **Requires `chunk_checkpoint: true`.** Total attempt budget per chunk (first attempt + retries): `3` means each failed chunk is retried up to 2 times before the run bails. The budget is stored on the checkpoint run and enforced when a chunk task is claimed, so without `chunk_checkpoint` it has no effect — the non-checkpointed runners have no per-chunk retry and a failed chunk fails the run. Defaults to `tuning.max_retries + 1` |
 
 > **Picking `parallel`.** Extraction is I/O-bound, so the win comes from
 > overlapping FETCH round-trips, not from CPU. Measured on a 10-core host,

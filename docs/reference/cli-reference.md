@@ -141,7 +141,7 @@ The engine is chosen from the URL scheme: `mysql://` (binlog), `postgresql://` (
 * `--server-id <SERVER_ID>` — Replica server-id for the binlog connection (must be distinct from the source's and any other replica)
 
   Default value: `4271`
-* `--checkpoint <PATH>` — Persist/resume the engine's log position to this file (MySQL binlog coordinates / PostgreSQL slot-resume marker / SQL Server from-LSN / MongoDB resume token). Omit to tail from the current position without checkpointing
+* `--checkpoint <PATH>` — Persist/resume the engine's log position to this file (MySQL binlog coordinates / PostgreSQL slot-resume marker / SQL Server from-LSN / MongoDB resume token). If omitted, each engine falls back to its own anchor: MySQL and MongoDB start at the source's CURRENT position (nothing written before now is captured), PostgreSQL resumes from the slot itself (server-side — a slot created here pins at the current WAL position), and SQL Server starts at the capture instance's `fn_cdc_get_min_lsn` (it over-reads the retained backlog rather than skipping)
 * `--table <TABLE>` — Only emit changes for this table (repeatable; default: all tables)
 * `--max-events <N>` — Stop after N change events. Without it the default bounded run drains to the log end as of open and exits; streaming until interrupted needs `--stream`
 * `--output <DIR>` — Write typed Parquet/CSV files to this directory (the upsert/after-image shape) instead of NDJSON to stdout. Requires exactly one `--table` — its schema is resolved from the source
@@ -155,7 +155,7 @@ The engine is chosen from the URL scheme: `mysql://` (binlog), `postgresql://` (
 
   Default value: `rivet_slot`
 * `--capture-instance <INSTANCE>` — SQL Server CDC capture instance, e.g. `dbo_orders` — required for `sqlserver://` sources
-* `--stream` — Stream continuously instead of the DEFAULT bounded "read to the log end and exit" drain. Continuous streaming is a long-lived daemon; omit this for the scheduler-friendly bounded run (the default). For MySQL the bounded run is a non-blocking binlog dump; PostgreSQL / SQL Server drain their backlog and exit
+* `--stream` — Stream continuously instead of the DEFAULT bounded "read to the log end and exit" drain. What "continuously" means is per engine: MySQL (a blocking binlog dump) and MongoDB (a change stream that blocks awaiting events) stay up until stopped; PostgreSQL and SQL Server are poll adapters that STILL EXIT ON CATCH-UP — there this is one unbounded pass, not a daemon, so run it under a supervisor that restarts it. Omit it for the scheduler-friendly bounded run (the default). For MySQL the bounded run is a non-blocking binlog dump; PostgreSQL / SQL Server drain their backlog and exit
 
 
 

@@ -75,7 +75,9 @@ at the output directory.
 vars; required otherwise.  `endpoint:` overrides the resolved S3 endpoint.
 Only a loopback endpoint (MinIO) is a supported custom-endpoint path; any
 non-loopback endpoint (AWS GovCloud, Cloudflare R2, Wasabi, custom domains)
-is rejected at config load as an exfiltration guard, and those services are
+is rejected at config load as an exfiltration guard.  The one waiver is
+`allow_anonymous: true` — the anonymous-emulator escape, which sends no
+credentials at all; it is not an auth path for those services, which remain
 untested / not supported as Rivet destinations
 (see [cloud-auth.md](cloud-auth.md), "S3-compatible storage").
 
@@ -102,8 +104,12 @@ untested / not supported as Rivet destinations
 `account_key_env` and `sas_token_env` are **mutually exclusive** — picking
 both is refused at config-load time with a message that names both
 fields.  `account_name` is the prefix in
-`<account>.blob.core.windows.net`; an explicit `endpoint:` (Azurite,
-sovereign clouds) takes precedence over the derived URL.
+`<account>.blob.core.windows.net`; an explicit `endpoint:` takes
+precedence over the derived URL, but only a **loopback** emulator
+endpoint (Azurite) is accepted alongside credentials — a non-loopback
+endpoint is rejected at config load unless `allow_anonymous: true`, which
+itself cannot be combined with credentials, so sovereign clouds are not
+reachable.
 
 The Azure SAS-token body may be pasted with or without the leading `?`
 — Rivet trims it transparently so `sv=…&sig=…` and `?sv=…&sig=…` are
