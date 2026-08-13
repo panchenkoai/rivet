@@ -128,6 +128,9 @@ exports:
 #[ignore = "live: requires docker compose up -d postgres"]
 fn governor_backs_off_under_concurrent_write_pressure() {
     require_alive(LiveService::Postgres);
+    // Serialize PG write-pressure tests against the shared server: one
+    // test's CHECKPOINT spam is another's false foreign pressure (drives CHECKPOINT spam).
+    let _pg_pressure = pg_pressure_guard();
 
     // Wide payload + small batches + a deliberately large per-batch throttle
     // make the run last a hardware-independent ~2 s+ (the throttle is a fixed
@@ -357,6 +360,9 @@ exports:
 #[ignore = "live: requires docker compose up -d postgres"]
 fn keyset_governor_backs_off_under_concurrent_write_pressure() {
     require_alive(LiveService::Postgres);
+    // Serialize PG write-pressure tests against the shared server: one
+    // test's CHECKPOINT spam is another's false foreign pressure (drives CHECKPOINT spam).
+    let _pg_pressure = pg_pressure_guard();
 
     const ROWS: i64 = 20_000;
     let table = seed_pg_wide_table(ROWS, 1024);
@@ -742,6 +748,9 @@ fn mysql_adaptive_never_loses_to_its_own_baseline_on_an_idle_source() {
 #[ignore = "live: requires docker-compose postgres"]
 fn pg_adaptive_never_loses_to_its_own_baseline_on_an_idle_source() {
     require_alive(LiveService::Postgres);
+    // Serialize PG write-pressure tests against the shared server: one
+    // test's CHECKPOINT spam is another's false foreign pressure (asserts an idle server).
+    let _pg_pressure = pg_pressure_guard();
     const ROWS: i64 = 40_000;
     let table = seed_pg_wide_table(ROWS, 512);
     let run = |adaptive: bool| -> (f64, String) {

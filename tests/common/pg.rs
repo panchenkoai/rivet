@@ -127,3 +127,33 @@ impl Drop for Slot {
         }
     }
 }
+
+/// RAII cross-process lock serializing tests that either DRIVE PostgreSQL
+/// write pressure (`CHECKPOINT` spam, contended writers) or ASSERT its
+/// absence (the adaptive canary's no-shed gate) against the shared server.
+/// Same advisory `flock(2)` shape as `toxiproxy_guard` / `mysql_globals_guard`
+/// — without it the backs-off tests' checkpoint spam overlaps the canary's
+/// window and sheds a governor the canary asserts idle (seen live, 2026-08-13).
+pub struct PgPressureGuard {
+    _file: std::fs::File,
+}
+
+pub fn pg_pressure_guard() -> PgPressureGuard {
+    use std::os::unix::io::AsRawFd;
+    let path = std::env::temp_dir().join("rivet_qa_pg_pressure.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+        .unwrap_or_else(|e| panic!("open pg pressure lock {}: {e}", path.display()));
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    if rc != 0 {
+        panic!(
+            "flock(LOCK_EX) on {} failed: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        );
+    }
+    PgPressureGuard { _file: file }
+}
