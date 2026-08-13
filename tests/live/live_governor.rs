@@ -673,3 +673,121 @@ exports:
     );
     drop(prior);
 }
+
+/// The CLASS guard behind the 2026-08-13 field regression: on an IDLE source
+/// every adaptive feedback loop (governor, batch shrink, and whatever joins
+/// them later) has nothing legitimate to react to — so `adaptive: true` must
+/// cost approximately nothing versus `adaptive: false` on the same fixture.
+/// The governor bug this distills (self-exhaust spiral to `min_parallel: 1`)
+/// made the adaptive side 2.4× slower; any future controller that feeds on a
+/// signal its own workload moves will fail this same ratio gate, whatever its
+/// mechanism. Limits stated honestly: the stand cannot express slowdowns that
+/// need multi-GB tables vs a small buffer pool, so this canary catches
+/// signal-driven spirals expressible at stand scale, and the run-over-run
+/// throughput report (`aggregate::warn_throughput_regressions`) is the
+/// production-scale net behind it.
+#[test]
+#[ignore = "live: requires docker-compose mysql"]
+fn mysql_adaptive_never_loses_to_its_own_baseline_on_an_idle_source() {
+    use mysql::prelude::Queryable;
+    require_alive(LiveService::Mysql);
+
+    const ROWS: i64 = 60_000;
+    let name = unique_name("rivet_qa_ab_canary");
+    let mut c = mysql_connect();
+    c.query_drop(format!(
+        "CREATE TABLE {name} (id BIGINT PRIMARY KEY, payload TEXT NOT NULL) ENGINE=InnoDB"
+    ))
+    .expect("create table");
+    for start in (1..=ROWS).step_by(2000) {
+        let values: Vec<String> = (start..start + 2000)
+            .map(|i| format!("({i}, REPEAT('x', 512))"))
+            .collect();
+        c.query_drop(format!(
+            "INSERT INTO {name} (id, payload) VALUES {}",
+            values.join(",")
+        ))
+        .expect("seed batch");
+    }
+    let table = MysqlTable::adopt(name.clone());
+
+    // Keyset-parallel with ≥10 batches per page, so BOTH feedback loops run
+    // at their real cadence (the governor per wall-interval, the batch
+    // controller per ADAPTIVE_SAMPLE_INTERVAL batches).
+    let run = |adaptive: bool| -> (f64, String) {
+        let out_dir = tempfile::tempdir().unwrap();
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let yaml = format!(
+            r#"
+source:
+  type: mysql
+  url: "{MYSQL_URL}"
+  tuning:
+    adaptive: {adaptive}
+    min_parallel: 1
+    batch_size: 500
+exports:
+  - name: {name}
+    table: {name}
+    mode: chunked
+    chunk_by_key: id
+    chunk_size: 10000
+    parallel: 4
+    format: parquet
+    destination:
+      type: local
+      path: {out}
+"#,
+            name = table.name(),
+            out = out_dir.path().display(),
+        );
+        let cfg = write_config(&cfg_dir, &yaml);
+        let log_path = cfg_dir.path().join("rivet.stderr");
+        let log_file = std::fs::File::create(&log_path).unwrap();
+        let started = std::time::Instant::now();
+        let status = std::process::Command::new(RIVET_BIN)
+            .args([
+                "run",
+                "--config",
+                cfg.to_str().unwrap(),
+                "--export",
+                table.name(),
+            ])
+            .env("RUST_LOG", "info")
+            .env("RIVET_GOVERNOR_INTERVAL_MS", "200")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::from(log_file))
+            .status()
+            .expect("run rivet");
+        let wall = started.elapsed().as_secs_f64();
+        let stderr = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert!(
+            status.success(),
+            "adaptive={adaptive} run failed:\n{stderr}"
+        );
+        assert_eq!(
+            duckdb_total_parquet_rows(out_dir.path()),
+            ROWS as usize,
+            "adaptive={adaptive}: every row must round-trip"
+        );
+        (wall, stderr)
+    };
+
+    // Baseline first so its page cache warm-up, if anything, favors the
+    // adaptive side — a false PASS from ordering is not possible, only a
+    // false margin against the assertion.
+    let (wall_off, _) = run(false);
+    let (wall_on, stderr_on) = run(true);
+
+    assert!(
+        !stderr_on.contains("backed off"),
+        "idle source: the governor has nothing to shed for; stderr:\n{stderr_on}"
+    );
+    // Generous bound: 1.6× + 1s absolute slack absorbs stand noise while the
+    // failure mode it exists for (the field spiral) was 2.4×.
+    assert!(
+        wall_on <= wall_off * 1.6 + 1.0,
+        "adaptive: true must not lose to adaptive: false on an idle source \
+         (self-feedback suspected): on={wall_on:.2}s vs off={wall_off:.2}s"
+    );
+}

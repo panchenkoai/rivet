@@ -245,6 +245,7 @@ pub fn run(
                     "parallel-processes",
                 );
                 aggregate::print(&agg);
+                aggregate::warn_throughput_regressions(&state, &agg);
                 aggregate::persist(&state, &agg, summary_output);
                 if json_output {
                     print_json_summary(&agg);
@@ -433,7 +434,10 @@ pub fn run(
         // Open a fresh state handle for persisting the aggregate so we don't
         // assume which thread owned the per-export `StateStore` above.
         match StateStore::open(config_path) {
-            Ok(state) => aggregate::persist(&state, &agg, summary_output),
+            Ok(state) => {
+                aggregate::warn_throughput_regressions(&state, &agg);
+                aggregate::persist(&state, &agg, summary_output)
+            }
             Err(e) => log::warn!(
                 "aggregate: cannot open state DB to record run aggregate: {:#}",
                 e
@@ -698,6 +702,7 @@ pub(crate) fn run_waves(
             },
         );
         aggregate::print(&agg);
+        aggregate::warn_throughput_regressions(&state, &agg);
         aggregate::persist(&state, &agg, None);
     }
     // Captured child stderr (verbose per-export cards, parallel path only) goes
@@ -1300,6 +1305,7 @@ pub(crate) fn run_pool(
             .collect();
         let agg = aggregate::build(entries, started_at, finished_at, Some(config_path), "pool");
         aggregate::print(&agg);
+        aggregate::warn_throughput_regressions(&state, &agg);
         aggregate::persist(&state, &agg, None);
     }
     if !failures.is_empty() {
