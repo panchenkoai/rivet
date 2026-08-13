@@ -385,8 +385,16 @@ pub(super) fn run_diagnosis(summary: &RunSummary, harm_deltas: &[(String, i64)])
         .map(|(_, v)| *v)
         .sum();
     if spills >= 100 {
+        // The remedy must not suggest what the export ALREADY runs (a keyset
+        // export told to "try chunk_by_key" reads as a broken diagnostic and
+        // hides the real lever): on chunked/keyset the paging is already on,
+        // so the remaining levers are the page/batch sizes.
+        let remedy = match summary.mode.as_str() {
+            "chunked" | "keyset" => "lower `chunk_size` (smaller pages) or `tuning.batch_size`",
+            _ => "try `mode: chunked`/`chunk_by_key` or a smaller `tuning.batch_size`",
+        };
         flags.push(format!(
-            "{spills} tmp-disk spills — the source spilled to disk; try `mode: chunked`/`chunk_by_key` or a smaller `tuning.batch_size`"
+            "{spills} tmp-disk spills — the source spilled to disk; {remedy}"
         ));
     }
     if flags.is_empty() {
@@ -1526,6 +1534,43 @@ mod tests {
         assert!(line.contains("2782 tmp-disk spills"), "got: {line}");
         // A negligible spill is noise, not a diagnosis on its own.
         assert!(run_diagnosis(&base(), &[("Created_tmp_disk_tables".into(), 5)]).is_none());
+    }
+
+    #[test]
+    fn run_diagnosis_spill_remedy_never_suggests_the_strategy_already_running() {
+        // Field find (2026-08-13 pool dogfood): a keyset export with source
+        // tmp-disk spills was told to "try `mode: chunked`/`chunk_by_key`" —
+        // the strategy it was ALREADY running. The remedy must be picked from
+        // the summary's mode: paged modes get the page/batch levers, only the
+        // unpaged modes are told to switch strategy.
+        let with_mode = |mode: &str| RunSummary {
+            export_name: "items".into(),
+            total_rows: 1000,
+            peak_rss_mb: 50,
+            duration_ms: 2000,
+            status: "success".into(),
+            mode: mode.into(),
+            ..Default::default()
+        };
+        let spills = [("Created_tmp_disk_tables".to_string(), 240_i64)];
+        for paged in ["keyset", "chunked"] {
+            let line = run_diagnosis(&with_mode(paged), &spills).expect("spills must diagnose");
+            assert!(
+                !line.contains("mode: chunked") && !line.contains("chunk_by_key"),
+                "{paged} export must not be told to switch to a paging it already runs: {line}"
+            );
+            assert!(
+                line.contains("chunk_size") && line.contains("batch_size"),
+                "{paged} remedy must name the page/batch levers: {line}"
+            );
+        }
+        for unpaged in ["full", "incremental", "timewindow"] {
+            let line = run_diagnosis(&with_mode(unpaged), &spills).expect("spills must diagnose");
+            assert!(
+                line.contains("chunk_by_key"),
+                "{unpaged} remedy should offer the paging escape: {line}"
+            );
+        }
     }
 
     #[test]

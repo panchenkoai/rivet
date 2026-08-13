@@ -734,6 +734,59 @@ fn last_success_secs(state: &StateStore, name: &str) -> Option<f64> {
         .map(|m| (m.duration_ms as f64 / 1000.0).max(0.001))
 }
 
+/// Longest recorded duration across `name`'s recent runs of ANY terminal
+/// status — the fallback predictor when no run ever SUCCEEDED. A failed or
+/// interrupted attempt died early, so this is a LOWER bound on the real
+/// duration; it is still far more honest than the flat placeholder (field
+/// find, 2026-08-13 pool dogfood: a nine-figure-row export with no success
+/// history was scheduled as 5 s, and the printed makespan promised minutes
+/// for a run that takes hours).
+fn last_attempt_secs(state: &StateStore, name: &str) -> Option<f64> {
+    state
+        .get_metrics(Some(name), 25)
+        .ok()?
+        .into_iter()
+        .map(|m| (m.duration_ms as f64 / 1000.0).max(0.001))
+        .fold(None, |acc: Option<f64>, s| {
+            Some(acc.map_or(s, |a| a.max(s)))
+        })
+}
+
+/// A pool item's predicted duration plus which signal produced it, so the
+/// makespan print can say how much of the prediction is guesswork.
+enum PredictedFrom {
+    Measured(f64),
+    FailedAttemptFloor(f64),
+    Placeholder(f64),
+}
+
+impl PredictedFrom {
+    fn secs(&self) -> f64 {
+        match self {
+            PredictedFrom::Measured(s)
+            | PredictedFrom::FailedAttemptFloor(s)
+            | PredictedFrom::Placeholder(s) => *s,
+        }
+    }
+}
+
+/// Placeholder for an export with no run history at all. Deliberately small so
+/// unknown exports never displace measured heavies in LPT order; the makespan
+/// print flags how many predictions rest on it.
+const POOL_PLACEHOLDER_SECS: f64 = 5.0;
+
+fn predicted_from(state: &StateStore, name: &str) -> PredictedFrom {
+    if let Some(s) = last_success_secs(state, name) {
+        return PredictedFrom::Measured(s);
+    }
+    match last_attempt_secs(state, name) {
+        // A crashed/failed attempt's duration is a floor on the real one —
+        // taking `max` with the placeholder keeps sub-5s failures at 5 s.
+        Some(s) => PredictedFrom::FailedAttemptFloor(s.max(POOL_PLACEHOLDER_SECS)),
+        None => PredictedFrom::Placeholder(POOL_PLACEHOLDER_SECS),
+    }
+}
+
 /// The pool's pick rule, pure for the mutation gate (#166): the first queued
 /// export a freeing slot may start. A `parallel_safe` export is always
 /// eligible; a non-safe (heavy) one only when NO other heavy export is
@@ -825,7 +878,7 @@ pub(crate) fn run_pool(
         exps.iter()
             .map(|e| super::pool::PoolItem {
                 name: e.name.clone(),
-                predicted_secs: last_success_secs(&state, &e.name).unwrap_or(5.0),
+                predicted_secs: predicted_from(&state, &e.name).secs(),
                 parallel_safe: is_parallel_safe(e),
             })
             .collect()
@@ -1003,10 +1056,14 @@ pub(crate) fn run_pool(
     let order = super::pool::pool_order(&items);
     let predicted_secs = super::pool::predicted_makespan_secs(&items, m);
     let floor_secs = super::pool::makespan_floor_secs(&items, m);
-    let measured_n = effective
-        .iter()
-        .filter(|e| last_success_secs(&state, &e.name).is_some())
-        .count();
+    let (mut measured_n, mut attempt_n, mut placeholder_n) = (0usize, 0usize, 0usize);
+    for e in &effective {
+        match predicted_from(&state, &e.name) {
+            PredictedFrom::Measured(_) => measured_n += 1,
+            PredictedFrom::FailedAttemptFloor(_) => attempt_n += 1,
+            PredictedFrom::Placeholder(_) => placeholder_n += 1,
+        }
+    }
     println!(
         "  Pool: {} export(s) × {} slot(s) — predicted makespan ~{:.1} min (floor {:.1}; {} measured, {} estimated)",
         effective.len(),
@@ -1014,8 +1071,23 @@ pub(crate) fn run_pool(
         predicted_secs / 60.0,
         floor_secs / 60.0,
         measured_n,
-        effective.len() - measured_n,
+        attempt_n + placeholder_n,
     );
+    // An unmeasured export is scheduled at a placeholder (or a failed
+    // attempt's floor) — the prediction cannot be better than its inputs, so
+    // say so up front instead of letting "~12 min" stand for a run that a
+    // single unmeasured giant can stretch to hours.
+    if attempt_n + placeholder_n > 0 {
+        println!(
+            "        prediction is a LOWER BOUND: {} export(s) have no successful run to \
+             measure from ({} scheduled at a failed attempt's duration, {} at a {}s \
+             placeholder) — it tightens as runs complete",
+            attempt_n + placeholder_n,
+            attempt_n,
+            placeholder_n,
+            POOL_PLACEHOLDER_SECS as i64,
+        );
+    }
 
     let pending: Vec<&ExportConfig> = effective.iter().collect();
     let by_name: std::collections::HashMap<&str, &ExportConfig> =
@@ -1247,6 +1319,69 @@ fn first_name_collision<'a>(
         .iter()
         .find(|u| existing.iter().any(|e| e.name == u.name))
         .map(|u| u.name.as_str())
+}
+
+#[cfg(test)]
+mod pool_prediction_tests {
+    use super::{POOL_PLACEHOLDER_SECS, PredictedFrom, predicted_from};
+    use crate::state::{MetricRow, StateStore};
+
+    fn store_with(rows: &[(&str, &str, i64, &str)]) -> StateStore {
+        let s = StateStore::open_in_memory().expect("in-memory store");
+        for (export, run_id, duration_ms, status) in rows {
+            s.record_metric_full(&MetricRow {
+                export_name: (*export).into(),
+                run_id: (*run_id).into(),
+                duration_ms: *duration_ms,
+                status: (*status).into(),
+                ..Default::default()
+            })
+            .expect("record metric");
+        }
+        s
+    }
+
+    /// Field find (2026-08-13 pool dogfood): an export with FAILED history but
+    /// no success was scheduled at the flat 5 s placeholder, so a giant that
+    /// had already demonstrated an hours-long attempt was predicted as noise
+    /// and the printed makespan promised minutes for an hours-long run. A
+    /// failed attempt's duration is a floor on the real one — use it.
+    #[test]
+    fn unmeasured_export_with_failed_history_predicts_at_least_that_attempt() {
+        let s = store_with(&[("big", "r1", 3_600_000, "failed")]);
+        match predicted_from(&s, "big") {
+            PredictedFrom::FailedAttemptFloor(secs) => {
+                assert!(
+                    (secs - 3600.0).abs() < 1.0,
+                    "the failed attempt's hour must survive as the floor, got {secs}"
+                );
+            }
+            _ => panic!("failed-only history must be a FailedAttemptFloor, not a placeholder"),
+        }
+    }
+
+    #[test]
+    fn measured_success_beats_failed_attempts_and_no_history_is_a_placeholder() {
+        // A success among failures → measured, at the SUCCESS duration.
+        let s = store_with(&[
+            ("t", "r1", 3_600_000, "failed"),
+            ("t", "r2", 120_000, "success"),
+        ]);
+        match predicted_from(&s, "t") {
+            PredictedFrom::Measured(secs) => assert!((secs - 120.0).abs() < 1.0, "got {secs}"),
+            _ => panic!("a successful run must classify as Measured"),
+        }
+        // No history at all → the placeholder, honestly labeled as such.
+        let empty = store_with(&[]);
+        match predicted_from(&empty, "unknown") {
+            PredictedFrom::Placeholder(secs) => assert_eq!(secs, POOL_PLACEHOLDER_SECS),
+            _ => panic!("no history must classify as Placeholder"),
+        }
+        // A sub-placeholder failed attempt is floored at the placeholder, so a
+        // 1 s crash does not schedule BELOW the unknown baseline.
+        let quick = store_with(&[("q", "r1", 1_000, "failed")]);
+        assert!(predicted_from(&quick, "q").secs() >= POOL_PLACEHOLDER_SECS);
+    }
 }
 
 #[cfg(test)]
