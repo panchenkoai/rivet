@@ -368,7 +368,11 @@ fn harm_deltas(before: &[(String, i64)], after: &[(String, i64)]) -> Vec<(String
 /// card. Emitted at WARN so it is visible at the default log level (INFO is not).
 /// Pure so the wording is unit-tested without a run. PG temp-byte spills are warned
 /// separately (`pg_temp_bytes_delta`), so they are not duplicated here.
-pub(super) fn run_diagnosis(summary: &RunSummary, harm_deltas: &[(String, i64)]) -> Option<String> {
+pub(super) fn run_diagnosis(
+    summary: &RunSummary,
+    harm_deltas: &[(String, i64)],
+    concurrent_siblings: bool,
+) -> Option<String> {
     let mut flags: Vec<String> = Vec::new();
     if summary.reconnects > 0 {
         flags.push(format!(
@@ -393,15 +397,30 @@ pub(super) fn run_diagnosis(summary: &RunSummary, harm_deltas: &[(String, i64)])
             "chunked" | "keyset" => "lower `chunk_size` (smaller pages) or `tuning.batch_size`",
             _ => "try `mode: chunked`/`chunk_by_key` or a smaller `tuning.batch_size`",
         };
-        flags.push(format!(
-            "{spills} tmp-disk spills — the source spilled to disk; {remedy}"
-        ));
+        // The spill counters come from `SHOW GLOBAL STATUS` — SERVER-wide, not
+        // per-connection. Solo they are a fair attribution (rivet is the only
+        // query stream it knows of); with concurrent sibling exports in this
+        // process (--pool / --parallel-exports) the window overlaps every
+        // sibling's work, so blaming THIS export would be a measurement lie
+        // (field find, 2026-08-13: a pool run attributed a 5-slot window's
+        // spills to the one export whose card they printed beside).
+        if concurrent_siblings {
+            flags.push(format!(
+                "{spills} tmp-disk spills on the SERVER during this export's window \
+                 (server-global counter; concurrent exports and other clients \
+                 contribute) — if the source is spilling on this export, {remedy}"
+            ));
+        } else {
+            flags.push(format!(
+                "{spills} tmp-disk spills — the source spilled to disk; {remedy}"
+            ));
+        }
     }
     if flags.is_empty() {
         return None;
     }
     Some(format!(
-        "export '{}': DIAGNOSIS — {} rows @ {} MB in {} ms [{}] · retries={} · {}",
+        "export '{}': DIAGNOSIS — {} rows · peak RSS {} MB · {} ms [{}] · retries={} · {}",
         summary.export_name,
         summary.total_rows,
         summary.peak_rss_mb,
@@ -1010,7 +1029,11 @@ pub(super) fn run_export_job(
     // Emitted AFTER the success/failed resolution above so the line reports the
     // real terminal status, not the transient "running" it was built with (#18
     // bughunt: it ran before the status was resolved, so it always said running).
-    if let Some(line) = run_diagnosis(&summary, &harm_delta_vec) {
+    if let Some(line) = run_diagnosis(
+        &summary,
+        &harm_delta_vec,
+        super::run::multi_export_concurrent(),
+    ) {
         log::warn!("{line}");
     }
 
@@ -1504,12 +1527,12 @@ mod tests {
             ..Default::default()
         };
         // A clean run has nothing to diagnose — its stats are in the run card.
-        assert!(run_diagnosis(&base(), &[]).is_none());
+        assert!(run_diagnosis(&base(), &[], false).is_none());
         // Reconnects survived (the flaky-link signal) → flagged, with the count.
         let mut s = base();
         s.reconnects = 2;
         s.retries = 3;
-        let line = run_diagnosis(&s, &[]).expect("reconnects must diagnose");
+        let line = run_diagnosis(&s, &[], false).expect("reconnects must diagnose");
         assert!(line.contains("2 reconnect"), "got: {line}");
         assert!(line.contains("retries=3"), "got: {line}");
         // #18 bughunt: the line interpolates the run STATUS — the caller must emit
@@ -1523,17 +1546,17 @@ mod tests {
         let mut s = base();
         s.resumed = true;
         assert!(
-            run_diagnosis(&s, &[])
+            run_diagnosis(&s, &[], false)
                 .unwrap()
                 .contains("resumed a prior CRASHED")
         );
         // A source tmp-disk spill (recorded in export_harm but never LOGGED before)
         // → flagged with the escape hatch.
-        let line = run_diagnosis(&base(), &[("Created_tmp_disk_tables".into(), 2782)])
+        let line = run_diagnosis(&base(), &[("Created_tmp_disk_tables".into(), 2782)], false)
             .expect("spills must diagnose");
         assert!(line.contains("2782 tmp-disk spills"), "got: {line}");
         // A negligible spill is noise, not a diagnosis on its own.
-        assert!(run_diagnosis(&base(), &[("Created_tmp_disk_tables".into(), 5)]).is_none());
+        assert!(run_diagnosis(&base(), &[("Created_tmp_disk_tables".into(), 5)], false).is_none());
     }
 
     #[test]
@@ -1554,7 +1577,8 @@ mod tests {
         };
         let spills = [("Created_tmp_disk_tables".to_string(), 240_i64)];
         for paged in ["keyset", "chunked"] {
-            let line = run_diagnosis(&with_mode(paged), &spills).expect("spills must diagnose");
+            let line =
+                run_diagnosis(&with_mode(paged), &spills, false).expect("spills must diagnose");
             assert!(
                 !line.contains("mode: chunked") && !line.contains("chunk_by_key"),
                 "{paged} export must not be told to switch to a paging it already runs: {line}"
@@ -1565,12 +1589,45 @@ mod tests {
             );
         }
         for unpaged in ["full", "incremental", "timewindow"] {
-            let line = run_diagnosis(&with_mode(unpaged), &spills).expect("spills must diagnose");
+            let line =
+                run_diagnosis(&with_mode(unpaged), &spills, false).expect("spills must diagnose");
             assert!(
                 line.contains("chunk_by_key"),
                 "{unpaged} remedy should offer the paging escape: {line}"
             );
         }
+    }
+
+    /// Field find (2026-08-13, --pool 5): the spill counter is `SHOW GLOBAL
+    /// STATUS` — server-wide — and a pool window overlaps every concurrent
+    /// sibling's work. Solo runs keep the confident attribution; concurrent
+    /// runs must say the counter is server-global instead of blaming the one
+    /// export the line prints beside.
+    #[test]
+    fn run_diagnosis_spill_attribution_hedges_under_concurrent_siblings() {
+        let s = || RunSummary {
+            export_name: "items".into(),
+            total_rows: 1000,
+            duration_ms: 2000,
+            status: "success".into(),
+            mode: "keyset".into(),
+            ..Default::default()
+        };
+        let spills = [("Created_tmp_disk_tables".to_string(), 240_i64)];
+        let solo = run_diagnosis(&s(), &spills, false).expect("spills must diagnose");
+        assert!(
+            solo.contains("the source spilled to disk"),
+            "solo attribution stays direct: {solo}"
+        );
+        let pooled = run_diagnosis(&s(), &spills, true).expect("spills must diagnose");
+        assert!(
+            pooled.contains("server-global counter"),
+            "concurrent attribution must name the counter scope: {pooled}"
+        );
+        assert!(
+            !pooled.contains("— the source spilled to disk;"),
+            "concurrent line must not carry the solo blame phrasing: {pooled}"
+        );
     }
 
     #[test]

@@ -1111,6 +1111,14 @@ pub(crate) fn run_pool(
         .max()
         .unwrap_or(0);
     let prev_multi = MULTI_EXPORT_MODE.swap(false, AtomicOrdering::Relaxed);
+    // The pool runs up to `m` exports on concurrent in-process threads:
+    // declare that, so (a) per-export indicatif chunk bars stay suppressed
+    // (concurrent threads corrupt each other's terminal writes — same reason
+    // as `--parallel-exports`) and (b) `run_diagnosis` knows the server-global
+    // harm counters overlapped sibling exports' windows and hedges its
+    // attribution instead of blaming the one export it prints beside
+    // (field find, 2026-08-13).
+    let prev_concurrent = MULTI_EXPORT_CONCURRENT.swap(true, AtomicOrdering::Relaxed);
     let (tx, rx) = std::sync::mpsc::channel::<parent_ui::UiMessage>();
     ipc::install_in_process_tx(tx);
     let n_cards = pending.len();
@@ -1205,6 +1213,7 @@ pub(crate) fn run_pool(
         let _ = h.join();
     }
     MULTI_EXPORT_MODE.store(prev_multi, AtomicOrdering::Relaxed);
+    MULTI_EXPORT_CONCURRENT.store(prev_concurrent, AtomicOrdering::Relaxed);
 
     let finished_at = chrono::Utc::now();
     let actual_secs = (finished_at - started_at).num_milliseconds() as f64 / 1000.0;
