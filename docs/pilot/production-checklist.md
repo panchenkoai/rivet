@@ -9,7 +9,7 @@ Complete this checklist before running Rivet against a production database.
 - [ ] **Read-only user**: create a dedicated database user with `SELECT`-only privileges
 - [ ] **Credential management**: use `url_env` or `password_env` — never hardcode passwords in YAML
 - [ ] **Read replica**: if available, point Rivet at the replica to avoid load on the primary
-- [ ] **Connection limits**: confirm the database connection pool has room for Rivet's connections (1 per export, +1 for chunked parallel workers)
+- [ ] **Connection limits**: confirm the database connection pool has room for Rivet's connections — 1 per export, but chunked exports with `parallel: N` open N concurrent backend connections (one per worker; see the **Connection budget** note below and [ADR-0011](../adr/0011-source-trait-send-not-sync.md))
 - [ ] **Connection pooler / proxy awareness**: if traffic is routed through pgBouncer, Odyssey, ProxySQL, MaxScale, or HAProxy, read the **Connection poolers and proxies** section below before the first run
 
 ## Connectivity
@@ -134,4 +134,4 @@ The full coverage table is in [docs/reliability-matrix.md § Pool and load press
 | 10,000 | 200-500 MB | 500 MB - 3 GB |
 | 50,000 | 500 MB - 2 GB | 2-10 GB |
 
-For memory-constrained environments, use `profile: safe` and consider building with `--features jemalloc`.
+For memory-constrained environments, use `profile: safe`. (jemalloc is already the default allocator in standard builds — no build flag needed; it is only absent if you built with `--no-default-features`.)

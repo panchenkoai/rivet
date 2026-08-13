@@ -146,7 +146,7 @@ destination:
   prefix: exports/
 ```
 
-No `credentials_file:` needed.  See `gcs_auth::try_authorized_user_token`
+No `credentials_file:` needed.  See `gcs_auth::try_authorized_user_loader`
 in `src/destination/gcs_auth.rs` for the detection.
 
 ### Path B — Service account JSON
@@ -227,8 +227,15 @@ or GCS bucket name).
 
 Rivet auto-derives the endpoint from `account_name` as
 `https://<account_name>.blob.core.windows.net` — operators only need to
-set `endpoint:` for Azurite, sovereign clouds (US-Gov, China-Mooncake),
-or a custom DNS in front of the storage account.
+set `endpoint:` for a loopback emulator (Azurite).  Both loopback shapes
+are accepted: with credentials (`account_name: devstoreaccount1` +
+`account_key_env` holding the well-known dev key — the shape the live
+Azurite test in CI uses), or with `allow_anonymous: true` and no
+credentials at all (Path B below).
+Sovereign clouds (US-Gov, China-Mooncake) and custom DNS fronts are not
+currently reachable: a non-loopback Azure endpoint with credentials is
+rejected at config load, and `allow_anonymous: true` cannot be combined
+with credentials.
 
 ### Path B — Azurite emulator / public-read containers
 
@@ -291,7 +298,7 @@ an env var and use Path A.
 
 ---
 
-## S3-compatible storage (MinIO, R2, etc.)
+## S3-compatible storage (MinIO)
 
 Same as AWS Path A above + an explicit `endpoint:` URL.  Static keys
 only — STS / temporary credentials are an AWS-specific concept.
@@ -306,8 +313,14 @@ destination:
   secret_key_env: MINIO_SECRET_KEY
 ```
 
-Cloudflare R2, Wasabi, Backblaze B2 etc. follow the same shape — the
-S3-compatible API gives them all the same authentication path.
+Cloudflare R2, Wasabi, Backblaze B2 etc. are **not supported**: they require
+a non-loopback `endpoint:`, which Rivet rejects at config load (a committed
+custom endpoint redirects every upload — an exfiltration guard). Only the
+loopback MinIO shape above is a validated custom-endpoint path. Rivet has
+never been tested against R2 / Wasabi / B2; `allow_anonymous: true`
+technically waives the endpoint guard (static keys still sign), but the flag
+targets anonymous emulators and the combination is unvalidated — use it at
+your own risk, and verify the upload end-to-end if you do.
 
 ---
 

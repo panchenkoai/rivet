@@ -51,10 +51,14 @@ output format, or destination means implementing exactly one of them.
 // used to live as 5 positional args on Source::export into a named struct.
 pub struct ExportRequest<'a> {
     pub query: &'a str,
+    pub catalog_hint_query: Option<&'a str>,  // unwrapped base query for catalog-dependent type hints
     pub incremental: Option<&'a IncrementalCursorPlan>,
     pub cursor: Option<&'a CursorState>,
     pub tuning: &'a SourceTuning,
     pub column_overrides: &'a ColumnOverrides,
+    pub page_limit: Option<usize>,            // keyset (seek) page size
+    pub base_relation: Option<&'a str>,       // ADR-0027 read-relation seam
+    pub upper_bound: Option<&'a str>,         // parallel-keyset inclusive range cap
 }
 
 // Source pushes data through a sink callback. `Send` not `Sync`
@@ -97,10 +101,10 @@ Implementations:
 
 | Trait | Concrete types |
 |-------|----------------|
-| `Source` | `PostgresSource` (DECLARE CURSOR + FETCH N), `MysqlSource` (`query_iter`), `MssqlSource` (tiberius; `OFFSET … FETCH NEXT`), `MongoSource` (JSON-blob: `_id` + `document`) |
+| `Source` | `PostgresSource` (DECLARE CURSOR + FETCH N), `MysqlSource` (`exec_iter`, binary protocol), `MssqlSource` (tiberius; `OFFSET … FETCH NEXT`), `MongoSource` (JSON-blob: `_id` + `document`) |
 | `Format` | `CsvFormat`, `ParquetFormat` |
-| `FormatWriter` | `CsvWriter` (`csv::Writer`), `ParquetArrowWriter` |
-| `Destination` | `LocalDest`, `S3Dest` (OpenDAL), `GcsDest` (OpenDAL), `AzureDest` (OpenDAL), `StdoutDest` |
+| `FormatWriter` | `CsvFormatWriter` (hand-rolled escaping over `Box<dyn Write>`), `ParquetFormatWriter` (arrow `ArrowWriter`) |
+| `Destination` | `LocalDestination`, `StdoutDestination`, `CloudDestination<B: CloudBackend>` (OpenDAL) with backends `S3Backend`, `GcsBackend`, `AzureBackend` |
 
 ---
 
@@ -218,7 +222,7 @@ both direct and proxied backends; the warning is about *behavioural*
 side-effects (timeouts, locks, NOTIFY) that the cleanup cannot recover.
 
 Coverage: 18 unit tests on `classify_mysql_proxy` exhaustively cover
-the signal precedence; `tests/live_pool_safety.rs` runs the full
+the signal precedence; `tests/live/live_pool_safety.rs` runs the full
 session-leak suite against pgBouncer (transaction mode, pool_size=1)
 and ProxySQL (transaction-persistent pool) under the `pool`
 docker-compose profile. See [docs/reliability-matrix.md § Pool and load
@@ -252,7 +256,8 @@ src/
     dispatch.rs             match Commands → pipeline / init / preflight entry points
 
   config/                 YAML parsing, validation, env/file resolution
-    mod.rs, models.rs, resolve.rs, cursor.rs, tests.rs
+    mod.rs, source.rs, export.rs, destination.rs, format.rs, schema.rs,
+    lints.rs, notifications.rs, resolve.rs, cursor.rs, tests/
 
   tuning/                 Tuning profiles + memory model (split from a single 678-line file)
     mod.rs                  Re-exports the externally-used names
@@ -266,7 +271,7 @@ src/
     batch_controller.rs     Shared batch-loop driver (fetch → sink → throttle) across engines
     postgres/               DECLARE CURSOR + FETCH N; PgTxnGuard (RAII); detect_pg_transaction_pooler
       mod.rs, arrow_convert.rs, from_parse.rs, cdc.rs (PgChangeStream — logical slot)
-    mysql/                  query_iter; MysqlProxyKind (Direct/ProxySql/MaxScale/Multiplexed)
+    mysql/                  exec_iter (binary protocol); MysqlProxyKind (Direct/ProxySql/MaxScale/Multiplexed)
       mod.rs, arrow_convert.rs, proxy.rs (classify_mysql_proxy), cdc.rs (MysqlChangeStream — binlog)
     mssql/                  tiberius OFFSET/FETCH + keyset; MssqlProxyKind (Direct/Multiplexed/AzureGateway)
       mod.rs, arrow_convert.rs, proxy.rs (classify_mssql_proxy), cdc.rs (MssqlChangeStream — change tables)
@@ -296,8 +301,9 @@ src/
     aggregate.rs              Multi-export run aggregate (--parallel-exports, --json output)
     parallel_children.rs      --parallel-export-processes orchestrator (subprocess fan-out)
     parent_ui.rs              Multi-progress UI for parallel runs
-    child.rs                  Child-process entry point + IPC framing (paired with ipc.rs)
-    ipc.rs                    Parent ↔ child JSON line protocol
+    ipc.rs                    Parent ↔ child JSON line protocol (the child side is a plain
+                                `rivet run` subprocess gated on RIVET_IPC_EVENTS=1; it emits
+                                ChildEvent JSON lines on stdout, read in parallel_children.rs)
     progress.rs               Indicatif progress bars (ChunkProgress, single-export progress)
     validate.rs               --validate output verification (row count, schema)
     sink/                     ExportSink (writer + temp file lifecycle); cursor.rs sink-cursor helper
@@ -318,7 +324,7 @@ src/
     rivet_type.rs           RivetType enum (Bool, Int*, Float*, Decimal, Date, Time, Timestamp,
                               String, Text, Binary, Json, Uuid, Enum, Interval, List{inner}, Unsupported)
     mapping.rs              TypeMapping struct: source_native_type → RivetType → Arrow DataType + fidelity
-    fidelity.rs             TypeFidelity (Lossless / WidenedPrecision / WidenedRange / Lossy / Unsupported)
+    fidelity.rs             TypeFidelity (Exact / Compatible / LogicalString / Lossy / Unsupported)
     policy.rs               TypePolicy (Fail/Warn/Allow per fidelity); PolicyViolation; `--strict` gate
     target.rs               ExportTarget (DuckDB / BigQuery / Snowflake / ClickHouse); TargetCompat (Ok/Warn/Fail); per-target type mapping
     decimal.rs              NUMERIC / DECIMAL precision+scale resolution
@@ -331,7 +337,9 @@ src/
     type_report.rs          `rivet check --type-report`: collects TypeMappings, applies TypePolicy,
                               checks ExportTarget compat, renders table or NDJSON
 
-  state/                  SQLite-backed state store (schema v4+)
+  state/                  Backend-pluggable state store (schema v4+): SQLite by default
+                            (.rivet_state.db beside the config); PostgreSQL when RIVET_STATE_URL
+                            is set (StateConn::Sqlite | Postgres), for stateless/replicated deployments
     mod.rs                  StateStore facade; transaction management
     cursor.rs               export_state.last_cursor_value (incremental cursor persistence)
     file_log.rs             file_log (per-export file ledger; renamed from file_manifest in v8)
@@ -348,7 +356,8 @@ src/
 
   bin/
     rivet-mcp.rs            Dedicated MCP stdio binary (Claude Desktop / Claude Code integration)
-    seed.rs                 Test data generator (dev fixture)
+    seed/                   Test data generator (dev fixture): main.rs, args.rs, insert.rs,
+                              fast.rs, copy_pg.rs, mssql.rs
 
 tests/                    Offline (cargo test) + live (cargo test -- --ignored)
 dev/                      docker-compose fixtures, seed SQL, e2e harness

@@ -96,7 +96,7 @@ Documented in [type-mapping.md](../type-mapping.md). Summary:
 | `timestamptz` | `Timestamp` + UTC | `Timestamp(µs, UTC)` | `fidelity=exact` |
 | PG `enum` | `Enum` | `Utf8` | `logical_type=enum` |
 
-CSV omits list columns today; metadata is Parquet-only.
+CSV rejects list (and other non-serializable) columns loudly at writer creation, naming the column — the export fails with `CSV cannot serialize column …` rather than omitting the column (and `rivet check --type-report` surfaces the same violation); metadata is Parquet-only.
 
 ---
 
@@ -137,21 +137,21 @@ Resolver **must** consider `rivet.logical_type` when physical type is `Utf8` / `
 
 | RivetType | DuckDB native | DuckDB autoload | BigQuery native | BQ autoload | Snowflake native | ClickHouse native |
 |-----------|---------------|-----------------|-----------------|-------------|------------------|-------------------|
-| `Json` | `JSON` | `VARCHAR` | `JSON` | `STRING` | `VARIANT` | `JSON`† |
+| `Json` | `JSON` | `JSON` | `JSON` | `BYTES` ⚠ | `VARIANT` | `JSON`† |
 | `Uuid` | `UUID` | `UUID` | `STRING` | `BYTES` ⚠ | `TEXT` | `UUID` |
 | `Enum` | `VARCHAR` | `VARCHAR` | `STRING` | `STRING` | `STRING` | `String` |
-| `Decimal(p,s)` | `DECIMAL(p,s)` | `DECIMAL(p,s)` | `NUMERIC`/`BIGNUMERIC`‡ | same | `NUMBER(p,s)` | `Decimal(p,s)` |
-| `UInt64` | `UBIGINT` | `UBIGINT`/`HUGEINT` | `INT64` ⚠ | `INT64` | `NUMBER` | `UInt64` |
+| `Decimal(p,s)` | `DECIMAL(p,s)`‡ | `DECIMAL(p,s)`‡ | `NUMERIC`/`BIGNUMERIC`‡ | same | `NUMBER(p,s)`‡ | `Decimal(p,s)` |
+| `UInt64` | `UBIGINT` | `UBIGINT` | `NUMERIC` | `INT64` ⚠ | `NUMBER` | `UInt64` |
 | `Timestamp` + TZ | `TIMESTAMPTZ` | `TIMESTAMPTZ` | `TIMESTAMP` | `TIMESTAMP` | `TIMESTAMP_TZ` | `DateTime64` |
-| `Timestamp` naive | `TIMESTAMP` | `TIMESTAMP` | `DATETIME` | `DATETIME` | `TIMESTAMP_NTZ` | `DateTime64` |
-| `Interval` | `INTERVAL` / `VARCHAR` § | `VARCHAR` | `INTERVAL` ⚠ | `STRING` | `INTERVAL` | `String` |
+| `Timestamp` naive | `TIMESTAMP` | `TIMESTAMP` | `DATETIME` | `TIMESTAMP` ⚠ | `TIMESTAMP_NTZ` | `DateTime64` |
+| `Interval` | `INTERVAL` § | `INTERVAL` § | `STRING` | `STRING` | `TEXT` | `String` |
 | `List { … }` | `LIST(T)` | `LIST(T)` | `ARRAY<…>` | `REPEATED …` | `ARRAY` | `Array(T)` |
 | `Binary` | `BLOB` | `BLOB` | `BYTES` | `BYTES` | `BINARY` | `String`/binary |
 
 † ClickHouse: use `JSON` when querying inside fields; opaque blob → `String` ([JSON type](https://clickhouse.com/docs/sql-reference/data-types/json)).  
-‡ BigQuery precision/scale limits enforced in existing `bq_decimal_compat`.  
-⚠ Warn on overflow or limited arithmetic (existing BQ `UINT64` / `INTERVAL` warnings).  
-§ PG `interval` exported as ISO `Utf8` today → materialize as `VARCHAR` or parse to `INTERVAL` per policy.
+‡ Per-warehouse decimal ceilings: DuckDB and Snowflake cap at precision ≤ 38 — past 38, DuckDB autoloads as `DOUBLE` (lossy past 2^53, no recovering cast — narrow the source precision) and Snowflake FAILS the column (`NUMBER` above precision 38 is not a valid type). BigQuery instead escalates `NUMERIC` (≤ (29,9)) → `BIGNUMERIC` (≤ (76,38)), failing only past (76,38) (`bigquery::decimal` in `src/types/target.rs`, covered by the `bq_decimal_*` tests).  
+⚠ Autoload diverges from native, `cast_sql` only where lossless: BQ `Json` autoloads as `BYTES` — recover native JSON with `PARSE_JSON(SAFE_CONVERT_BYTES_TO_STRING(col))`; BQ `Uuid` as 16-byte `BYTES` — `TO_HEX(col)`; BQ `UInt64` autoloads as `INT64`, which overflows past `i64::MAX` unrecoverably (`cast_sql` `None`) — map the column to `decimal(20,0)` via a source override; BQ naive `Timestamp` autoloads as `TIMESTAMP` (an instant — BigQuery ignores Parquet `isAdjustedToUTC=false`) — recover the wall-clock with `DATETIME(col)` after load.  
+§ The resolver reports DuckDB `INTERVAL`/`INTERVAL` ok, but `mapping.rs` still exports PG `interval` as ISO `Utf8` — the DuckDB autoload claim itself warrants a code-side check.
 
 ### Example L5 — DuckDB view over Rivet Parquet
 
@@ -181,7 +181,7 @@ uid STRING
 
 - `rivet check --type-report --target duckdb` (and other targets as implemented).
 - Columns: existing source/Rivet/Arrow/fidelity + **target native**, **autoload**, **status**, **note**.
-- DuckDB: warn only when `native != autoload` and cast is recommended (JSON, UUID).
+- DuckDB: warn only when `native != autoload` and cast is recommended (JSON, UUID). [Update: DuckDB now autoloads JSON and UUID natively — rivet writes the Parquet JSON logical type via the Arrow Json extension — so the only DuckDB divergence left is `decimal(p>38)` → `DOUBLE`.]
 
 ### Phase B — load plan artifact (optional)
 

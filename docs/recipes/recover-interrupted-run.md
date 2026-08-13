@@ -109,7 +109,10 @@ What `repair --execute` does and does not:
 - Re-runs only the flagged chunk ranges via `ChunkSource::Precomputed`
   — same SQL shape as extraction and reconcile (RR3).
 - Writes **new** files alongside originals with the
-  `<export>_<ts>_chunk<idx>.<ext>` naming scheme (RR5).
+  `<export>_<ts>_chunk<idx>_<nonce>.<ext>` naming scheme (RR5), where
+  `<nonce>` is a random 16-hex-digit suffix — the nonce, not the
+  timestamp, is what guarantees a repair re-export never overwrites
+  the original part.
 - Does **not** delete or overwrite prior files.  Downstream
   deduplication or a versioned output prefix is the operator's job.
 - Leaves `last_committed_*` untouched (RR4).  `last_verified_*`

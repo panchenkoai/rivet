@@ -67,7 +67,7 @@ If these stores are updated in the wrong order — or if failures leave them in 
 
 **Rationale**: A metric recorded before all artifacts are committed will show a misleading status. The status field in `export_metrics` always reflects the terminal state of the run.
 
-**Current implementation**: `state.record_metric(...)` is called near the end of `pipeline/job.rs:run_export_job` (and `run_export_job_with_chunk_source` for apply), after the quality gate has resolved the result and the status field is set to `"success"` or `"failed"`.
+**Current implementation**: `state.record_metric_full(...)` is called near the end of `pipeline/job.rs:run_export_job` (and `run_export_job_with_chunk_source` for apply), after the quality gate has resolved the result and the status field is set to `"success"` or `"failed"`.
 
 ---
 
@@ -162,4 +162,4 @@ labels it accordingly.  A failure at step 2 leaves
 
 ## Test Coverage
 
-Each invariant is covered by at least one automated test. `tests/invariants.rs` covers I1–I7 structural contracts. `tests/journal_invariants.rs` covers the `RunJournal` event-ordering contracts (plan snapshot recorded first, `RunCompleted` recorded last, chunk lifecycle ordering). `tests/recovery.rs` covers chunk checkpoint resume semantics (I5/I6). I8 (finalize order) is exercised by `tests/trust_artifacts_integration.rs` §14: the run report's `validation.manifest` sub-object is populated only when the verification step ran between the manifest write and the report write — the order test passes by virtue of the verdict appearing in the JSON. All test suites are run as semantic release gates in CI before any binary is produced.
+Each invariant is covered by at least one automated test. `tests/invariants.rs` covers I1–I7 structural contracts. `tests/journal_invariants.rs` covers the `RunJournal` event-ordering contracts (plan snapshot recorded first, `RunCompleted` recorded last, chunk lifecycle ordering). `tests/recovery.rs` covers chunk checkpoint resume semantics (I5/I6). I8 (finalize order) is exercised by `tests/offline/trust_artifacts_integration.rs` §23 (ValidationOutcome wire contract): the run report's `validation.manifest` sub-object is populated only when the verification step ran between the manifest write and the report write — the order test passes by virtue of the verdict appearing in the JSON. All test suites are run as semantic release gates in CI before any binary is produced.

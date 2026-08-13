@@ -81,7 +81,7 @@ PR CI defines branch protection — the named gates (`fmt`, `clippy`, `test`, `t
 | Local filesystem | ✅ | ✅ | ✅ | Default for unit + e2e |
 | S3 (MinIO container) | ✅ | ✅ | partial | `live_destination_parity` |
 | GCS (fake-gcs container) | ✅ | ✅ | partial | `live_destination_parity` |
-| Azure Blob Storage | — | — | ✅ | Added 0.7.1; live-verified against a real Azure account on 2026-05-21.  SAS token auth added 0.7.2 (unit-tested; no Azurite container in CI yet). |
+| Azure Blob Storage | ✅ | ✅ | ✅ | Added 0.7.1; live-verified against a real Azure account on 2026-05-21.  SAS token auth added 0.7.2. CI runs the `live_azure_multipart` suite against an Azurite emulator (PR CI + nightly); real-account endpoints remain manual smoke. |
 | stdout | ✅ | ✅ | — | Constrained — rejects chunked + max_file_size |
 
 Per-backend commit contracts: [ADR-0004](adr/0004-destination-write-contracts.md). Production credentials for real S3 / GCS / Azure endpoints are not exercised in CI.

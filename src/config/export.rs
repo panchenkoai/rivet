@@ -147,12 +147,14 @@ pub struct ExportConfig {
     #[serde(default = "default_chunk_size")]
     pub chunk_size: usize,
     /// Target memory budget per chunk in MB. When set, `chunk_size` is derived
-    /// from this budget at plan-build time using a `pg_class` row-size estimate
-    /// (`pg_relation_size / reltuples`), clamped to `[10_000, 5_000_000]` rows.
+    /// from this budget at plan-build time using the engine's row-size estimate
+    /// (PostgreSQL `pg_relation_size / reltuples`; MySQL `information_schema`
+    /// average row length; a defensive 512 B/row default when no estimate
+    /// exists, e.g. SQL Server), clamped to `[10_000, 5_000_000]` rows.
     ///
-    /// Mutually exclusive with an explicit non-default `chunk_size:`. Only
-    /// applies to `mode: chunked` on a Postgres source using the `table:`
-    /// shortcut (the row-size probe needs a known relation).
+    /// Mutually exclusive with an explicit non-default `chunk_size:`. Requires
+    /// `mode: chunked` and the `table:` shortcut (the row-size probe needs a
+    /// known relation); any SQL engine works.
     ///
     /// ```yaml
     /// exports:
@@ -261,8 +263,8 @@ pub struct ExportConfig {
     /// `size` (default) accepts size-only verification; `content` requires every
     /// part's content MD5 to be checked against the store's listing (no
     /// download) and **fails** validation for any part that could only be
-    /// size-verified — e.g. a part too large to upload as a single PUT (raise
-    /// `max_file_size` down so it fits), or a backend that exposes no checksum.
+    /// size-verified — e.g. a part too large to upload as a single PUT (lower
+    /// `max_file_size` so it fits), or a backend that exposes no checksum.
     #[serde(default)]
     pub verify: VerifyMode,
     #[serde(default)]
@@ -768,8 +770,12 @@ pub struct CdcExportConfig {
     /// streaming indefinitely — ideal for a scheduler. For MySQL this is a
     /// non-blocking binlog dump; PostgreSQL / SQL Server already drain-and-exit.
     /// **Defaults to `true`** (bounded): the OSS model is scheduler-driven, and
-    /// omitting this must NOT silently start a never-terminating stream. Set it to
-    /// `false` to opt into continuous streaming explicitly.
+    /// omitting this must NOT silently start a never-terminating stream. Setting
+    /// `false` opts into the continuous model, which is engine-specific: a true
+    /// daemon on MySQL (blocking binlog dump) and MongoDB (the change stream
+    /// blocks awaiting events; ends only if the stream is invalidated/closed);
+    /// PostgreSQL / SQL Server still exit on catch-up — one unbounded pass, run
+    /// it under a supervisor.
     #[serde(default = "default_true")]
     pub until_current: bool,
     /// Stop at the first COMMIT BOUNDARY once N change events have been

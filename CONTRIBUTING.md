@@ -25,8 +25,11 @@ git config core.hooksPath .githooks
 
 With the hooks enabled:
 
-- **`pre-commit`** runs the exact CI fmt + clippy commands on every commit
-  (fast feedback) — bypass with `git commit --no-verify`.
+- **`pre-commit`** mirrors the CI fmt + clippy + audit gates and keeps
+  code-derived docs in sync: it runs cargo fmt/clippy, builds the rivet binary,
+  regenerates the JSON schema + reference docs and stages them into your commit
+  (`git add -u schemas docs`), and runs cargo audit when installed — bypass with
+  `git commit --no-verify`.
 - **`pre-push`** runs the offline test suite (`cargo test --tests` — lib +
   integration, benches excluded) before the push leaves your machine — bypass
   with `git push --no-verify`.
@@ -63,7 +66,7 @@ All **user-facing documentation** must be in **English**, including:
 
 - Markdown in the repository (`README.md`, `CHANGELOG.md`, this file, and any future docs)
 - Comments in `dev/*.sh` and other scripts meant for operators or contributors
-- `clap` help strings and `about` text in `src/main.rs`, `src/bin/seed.rs`, and related binaries
+- `clap` help strings and `about` text in `src/main.rs`, `src/bin/seed/` (the seed binary), and related binaries
 - Inline comments in example YAML configs when they explain behavior to humans
 
 Rust API docs (`///` on public items) should also be English when added.
@@ -83,15 +86,15 @@ The codebase is organized into focused modules:
 | Module | Purpose |
 |--------|---------|
 | `config/` | YAML parsing, validation, variable resolution |
-| `source/` | Database connectors (Postgres, MySQL), TLS, query shaping |
+| `source/` | Database connectors (PostgreSQL, MySQL, SQL Server, MongoDB), CDC adapters, TLS, query shaping |
 | `pipeline/` | Export orchestration, retry, chunking, validation, plan/apply, reconcile, repair |
 | `plan/` | Plan artifacts, source-aware prioritization, reconcile / repair contracts |
 | `format/` | Parquet and CSV writers |
-| `destination/` | Local, S3, GCS, stdout |
-| `state/` | SQLite state store with versioned migrations (cursor, manifest, metrics, checkpoint, progression) |
+| `destination/` | Local, S3, GCS, Azure Blob, stdout |
+| `state/` | Backend-pluggable state store (SQLite default, PostgreSQL via RIVET_STATE_URL) with versioned migrations (cursor, manifest, metrics, checkpoint, progression) |
 | `preflight/` | Health checks, EXPLAIN analysis, recommendations, doctor |
 | `init/` | `rivet init` scaffolding + discovery artifact |
-| `tuning.rs` | Tuning profiles (fast / balanced / safe), memory-adaptive batch sizing |
+| `tuning/` | Tuning profiles (fast / balanced / safe), memory-adaptive batch sizing |
 | `quality.rs` | Data quality checks (row count, nulls, uniqueness) |
 | `enrich.rs` | Meta columns (_rivet_exported_at, _rivet_row_hash via xxh3_128) |
 | `notify.rs` | Slack notifications |

@@ -42,7 +42,7 @@
 # Destinations
 
 - [Local files](destinations/local.md)
-- [Amazon S3 / MinIO / R2](destinations/s3.md)
+- [Amazon S3 / MinIO](destinations/s3.md)
 - [Google Cloud Storage](destinations/gcs.md)
 - [Azure Blob Storage](destinations/azure.md)
 - [stdout](destinations/stdout.md)

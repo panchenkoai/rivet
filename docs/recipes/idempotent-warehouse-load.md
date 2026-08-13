@@ -3,7 +3,13 @@
 Rivet provides **at-least-once file delivery** to its destination.  After
 a clean run, the destination prefix carries:
 
-- one or more data parts (`part-NNNNNN.parquet` or `part-NNNNNN.csv`),
+- one or more data parts — names are **per-runner** (single/incremental
+  `{export}_{YYYYMMDD_HHMMSS_mmm}.parquet` for a single-part run, with a
+  `_part0`..`_partN-1` suffix on **every** part when the run rotates into
+  multiple parts; chunked
+  `{export}_{ts}_chunk{idx}_{nonce}.parquet`; keyset
+  `{export}_{run-tag}_keyset_{seek-tag}.parquet`, …) — always take them from
+  the manifest, never pattern-match them,
 - a `manifest.json` listing every committed part with `size_bytes` and
   `content_fingerprint` (xxh3 over the part bytes),
 - a `_SUCCESS` marker whose body fingerprints the exact `manifest.json`
@@ -65,15 +71,23 @@ Every committed part is recorded in `manifest.json`:
 
 ```json
 {
-  "schema_version": 1,
-  "run_id": "abc123…",
+  "manifest_version": 1,
+  "run_id": "orders_20260523T120000.123",
   "schema_fingerprint": "xxh3:…",
+  "row_count": 200000,
+  "part_count": 2,
   "parts": [
-    {"key": "part-000001.parquet", "size_bytes": 4_194_304, "content_fingerprint": "xxh3:…"},
-    {"key": "part-000002.parquet", "size_bytes": 4_198_400, "content_fingerprint": "xxh3:…"}
+    {"part_id": 0, "path": "orders_20260523_120000_123_part0.parquet", "rows": 100000,
+     "size_bytes": 4194304, "content_fingerprint": "xxh3:…", "content_md5": "…", "status": "committed"},
+    {"part_id": 1, "path": "orders_20260523_120000_123_part1.parquet", "rows": 100000,
+     "size_bytes": 4198400, "content_fingerprint": "xxh3:…", "content_md5": "…", "status": "committed"}
   ]
 }
 ```
+
+(Abridged — the real manifest also records `export_name`, `status`, timestamps,
+source/destination blocks, format/compression, and optional per-column
+checksums. Each part's object name is its `path` field.)
 
 `_SUCCESS` is a single line: `xxh3:<16-hex>` where the hex is the
 fingerprint of the exact `manifest.json` bytes.  See
@@ -133,7 +147,9 @@ on retry, skip any manifest already marked committed.
 LOAD DATA INTO project.dataset.orders_stage_<run_id>
 FROM FILES (
   format = 'PARQUET',
-  uris = ['gs://my-bucket/exports/2026-05-23/orders/part-*.parquet']
+  -- list the exact `parts[].path` values from manifest.json — never a glob
+  uris = ['gs://my-bucket/exports/2026-05-23/orders/orders_20260523_120000_123_part0.parquet',
+          'gs://my-bucket/exports/2026-05-23/orders/orders_20260523_120000_123_part1.parquet']
 );
 
 -- 2. Tag every staged row with the run identity.
@@ -191,8 +207,8 @@ prove which bytes were loaded.
 ```sql
 -- 1. COPY INTO a staging table, listing the exact files from manifest.json.
 COPY INTO @my_stage/orders/orders_stage_<run_id>
-FROM ('@my_stage/exports/2026-05-23/orders/part-000001.parquet',
-      '@my_stage/exports/2026-05-23/orders/part-000002.parquet',
+FROM ('@my_stage/exports/2026-05-23/orders/orders_20260523_120000_123_part0.parquet',
+      '@my_stage/exports/2026-05-23/orders/orders_20260523_120000_123_part1.parquet',
       ...)
 FILE_FORMAT = (TYPE = PARQUET);
 

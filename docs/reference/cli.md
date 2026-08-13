@@ -100,14 +100,12 @@ single aggregated `Run summary` block prints once for the whole run.
 ![Parallel cards UI](../gifs/parallel-cards.gif)
 
 ```text
-── orders ──────────────────────────────────────────────
-  run_id:    orders_20260427T120000.069
-  status:    running
-  mode:      chunked
-  tuning:    profile=balanced (default)
-  batch_size: 1,000
-  [====================>--------------] 11/20 chunks | 1.1M rows | 00:02:06 | ETA 66s
+▸ orders            chunked   11/20 chunks   1.1M rows  8.7K r/s   2m 06.0s  ETA 1m 43.1s
 ```
+
+One card line per export (`▸` running, `✓` finished), redrawn in place; the
+children's verbose per-export output goes to a timestamped log file beside the
+config.
 
 Children emit structured NDJSON events (`Started`, `ProgressInit`,
 `Progress`, `Finished`) on stdout via the `RIVET_IPC_EVENTS=1` env var; the
@@ -122,12 +120,13 @@ silent crash never leaves the run looking healthy.
 Stream log-based change data capture directly (without a config). The engine is
 chosen from the URL scheme — `mysql://` (binlog) / `postgresql://` (logical slot) /
 `sqlserver://` (change tables) / `mongodb://` (change stream). Emits NDJSON to
-stdout by default, or typed Parquet/CSV with `--output`; `--checkpoint` persists a
-resume position.
+stdout by default, or typed Parquet/CSV with `--output` (`--output` requires
+exactly one `--table` — the schema is resolved from the source); `--checkpoint`
+persists a resume position.
 
 ```bash
 rivet cdc --source-env DATABASE_URL --table orders                 # NDJSON to stdout
-rivet cdc --source-env DATABASE_URL --output ./cdc --format parquet --checkpoint ./o.ckpt
+rivet cdc --source-env DATABASE_URL --table orders --output ./cdc --format parquet --checkpoint ./o.ckpt
 ```
 
 The full reference — per-engine prerequisites, `--slot` / `--capture-instance` /
@@ -273,7 +272,7 @@ rivet apply <PLAN_FILE | CONFIG> [OPTIONS]
 | Argument/Flag | Type | Description |
 |---|---|---|
 | `PLAN_FILE` / `CONFIG` | string | Path to a plan JSON artifact, or a YAML config for wave-ordered execution **(required)** |
-| `--force` | bool | Skip staleness check (allow plans older than 24 h) — JSON-artifact mode only |
+| `--force` | bool | Overrides whichever safety gate refuses the run (ADR-0013). JSON-artifact mode: bypasses the staleness check (plans > 24 h) **and** the incremental cursor-drift check (both logged and recorded in the run's `apply_context`). YAML config mode: meaningful only with `--resume`, where it overrides the refusal to resume into a destination whose `_SUCCESS` marker is already present; without `--resume` it is a warned no-op |
 
 ### Staleness rules
 
@@ -306,7 +305,7 @@ rivet apply plan.json --force
 
 ### State location
 
-`rivet apply` opens `.rivet_state.db` from the directory containing the plan file. Place the plan file alongside the config file, or in the same directory, to ensure the correct state database is used.
+`rivet apply` opens `.rivet_state.db` next to the config file recorded inside the plan artifact (`artifact.config_path`), so apply shares the same state (cursors, manifests, schema history) as `rivet run`. It falls back to the plan file's own directory — with a warning — only when the recorded config directory no longer exists or the artifact was generated before 0.7.5. Plan files do not need to sit beside the config.
 
 ### Wave-ordered execution (YAML config)
 
@@ -348,7 +347,7 @@ By default `validate` resolves the destination prefix the same way `run` does (`
 | `--depth` | | `light`\|`sample`\|`full` | Verification depth: `light` (manifest + `_SUCCESS`), `sample` (+ part reconcile + untracked surplus), `full` (+ value-checksum re-read of every part; **default**) |
 | `--output` | `-o` | PATH | Write the JSON report to this file (only with `--format json`) |
 | `--date` | | YYYY-MM-DD | Resolve `{date}` to this date instead of today (UTC) |
-| `--run-id` | | string | Point at a prior run's prefix by run id |
+| `--run-id` | | string | Substitute `{run_id}` in the destination prefix template (composes with `--date`). No run lookup is performed — if the template has no `{run_id}` placeholder this has no effect; use `--prefix` for an arbitrary path |
 | `--prefix` | | string | Point at an explicit destination prefix |
 
 Exits non-zero when the manifest references a part that is missing or whose size does not match. A legacy prefix (no manifest) falls back to the M6 reduced-guarantee path and is labelled `legacy_run: true`.
@@ -360,7 +359,7 @@ Exits non-zero when the manifest references a part that is missing or whose size
 rivet validate -c my_export.yaml
 
 # Verify a prior run by id, JSON report to a file
-rivet validate -c my_export.yaml --run-id orders_20260521T120000 -o verdict.json
+rivet validate -c my_export.yaml --run-id orders_20260521T120000 --format json -o verdict.json   # -o is ignored unless --format json is set
 ```
 
 ## `rivet reconcile`
@@ -411,7 +410,7 @@ rivet reconcile -c my_export.yaml -e orders
 rivet reconcile -c my_export.yaml -e orders --format json -o reconcile.json
 ```
 
-Reports are **advisory** — same policy as prioritization (ADR-0006) and plan artifacts (ADR-0005). They surface what needs repair; they do not re-export on their own.
+Reports never re-export on their own — they surface what needs repair. They are not merely advisory though: a detected mismatch exits non-zero with the data-integrity class (exit 3), so CI can gate on it.
 
 ### Verification strategy tradeoffs
 
@@ -464,7 +463,7 @@ rivet repair -c my_export.yaml -e orders --report reconcile.json --execute
 ### What `--execute` does and does not do
 
 - Re-runs only the flagged chunk ranges via `ChunkSource::Precomputed` — same SQL shape as extraction and reconcile (RR3).
-- Writes **new** files alongside originals with `<export>_<ts>_chunk<idx>.<ext>` (RR5). Rivet does **not** delete or overwrite prior files. Downstream deduplication (or a versioned output prefix) is the operator's responsibility.
+- Writes **new** files alongside originals named `<export>_<ts>_chunk<idx>_<nonce>.<ext>`, where `<nonce>` is a random 16-hex-digit value (RR5) — the nonce, not the second-granularity timestamp, is what guarantees a repair landing in the same second as the original can never clobber it. Rivet does **not** delete or overwrite prior files. Downstream deduplication (or a versioned output prefix) is the operator's responsibility.
 - Leaves `last_committed_*` untouched (RR4) — repair is corrective, not commitment. `last_verified_*` re-advances only if a subsequent clean `rivet reconcile` runs.
 
 ---
@@ -528,7 +527,7 @@ Fidelity levels:
 | `compatible` | Structurally compatible; minor representation difference |
 | `logical_string` | Serialized to STRING/text (no native Arrow type) |
 | `lossy` | Precision or range reduction |
-| `unsupported` | No mapping available; column is skipped |
+| `unsupported` | No safe mapping exists; the export fails with `N column(s) have no safe Rivet mapping — add column overrides in rivet.yaml`, and `rivet check --strict` exits non-zero |
 
 Output includes: table existence, estimated row count, index analysis, tuning recommendation.
 
@@ -564,13 +563,13 @@ rivet doctor: verifying auth for config 'my_export.yaml'
 All checks passed.
 ```
 
-When `tls:` is omitted from `source:`, an extra line appears before the source check: `[WARN] source: TLS is not enforced — credentials and result rows cross the network in plaintext.` Silence it by adding `tls: { mode: disable }` (local dev only) or fix it for prod with `tls: { mode: verify-full }` — see [reference/config.md § TLS](config.md#tls).
+When `tls:` is omitted from `source:` and the host is **loopback**, nothing is printed (local dev is exempt). On a **remote** host the `[WARN] source: TLS is not enforced…` line appears and the source check **fails** (`TLS required — refusing to connect to a remote (non-loopback) host without TLS`): fix it with `tls: { mode: verify-full }`, or explicitly opt into remote plaintext with `tls: { mode: disable }` on an already-trusted network path — see [reference/config.md § TLS](config.md#tls).
 
 ---
 
 ## `rivet init`
 
-Generate a YAML config scaffold (or a machine-readable discovery artifact) by connecting to PostgreSQL or MySQL and introspecting tables (read-only). Does **not** run an export. YAML scaffolds include **`meta_columns`** (`exported_at` / `row_hash` **on** by default); scaffolds with heuristic **`mode: chunked`** also include **`chunk_checkpoint: true`** — see [init.md](init.md).
+Generate a YAML config scaffold (or a machine-readable discovery artifact) by connecting to PostgreSQL, MySQL, SQL Server, or MongoDB and introspecting tables/collections (read-only). Does **not** run an export. YAML scaffolds include **`meta_columns`** (`exported_at` / `row_hash` **on** by default); scaffolds with heuristic **`mode: chunked`** also include **`chunk_checkpoint: true`** — see [init.md](init.md).
 
 ```bash
 rivet init (--source <URL> | --source-env <ENV_VAR> | --source-file <PATH>)
@@ -584,8 +583,8 @@ Exactly one of `--source`, `--source-env`, `--source-file` must be provided (enf
 | `--source` | | string | Connection URL: `postgresql://` \| `mysql://` \| `sqlserver://` \| `mongodb://`. **Visible in shell history / `ps`** — avoid in production |
 | `--source-env` | | env var name | Name of an env var that holds the URL (e.g. `DATABASE_URL`). URL never hits the command line. **Recommended.** |
 | `--source-file` | | path | Path to a file containing just the URL on one line. Credentials stay on disk |
-| `--table` | | string | Single table; optional `schema.table` on PostgreSQL. Omit to scaffold **all** tables/views in a Postgres schema or MySQL database |
-| `--schema` | | string | **PostgreSQL:** schema to list (default `public`). **MySQL:** database name if not in the URL, or override URL database |
+| `--table` | | string | Single table; optionally schema-qualified (`public.orders` on PostgreSQL, `dbo.orders` on SQL Server). Omit to scaffold **all** tables/views in a Postgres/SQL Server schema or MySQL database |
+| `--schema` | | string | **PostgreSQL:** schema to list (default `public`). **MySQL:** database name when the URL omits one; a `--schema` naming a *different* database than the URL's is refused — put the database in the URL instead |
 | `--output` | `-o` | string | Write output to file (default: print to stdout) |
 | `--discover` | | bool | Emit a machine-readable JSON discovery artifact instead of YAML — includes ranked cursor/chunk candidates, row estimates, on-disk sizes, and coalesce-fallback hints |
 
@@ -665,8 +664,9 @@ rivet journal -c my_export.yaml -e orders --run-id orders_20260513T120000.123
 Each run is shown as a block:
 
 ```
-✓ orders_20260513T120000.123  succeeded  12.3s
-  files: 3  rows: 150,000  bytes: 4.2 MB
+✓ orders  success  12.3s
+  run_id: orders_20260513T120000.123
+  files:  3  rows: 150000  size: 4.2 MB
 ```
 
 `✓` = succeeded · `✗` = failed · `•` = partial / unknown.
@@ -773,6 +773,7 @@ rivet completions <SHELL>
 | Zsh | `rivet completions zsh > ~/.zfunc/_rivet` |
 | Fish | `rivet completions fish > ~/.config/fish/completions/rivet.fish` |
 | PowerShell | `rivet completions powershell > _rivet.ps1` |
+| Elvish | `rivet completions elvish > ~/.config/elvish/lib/rivet.elv` |
 
 ---
 
@@ -803,7 +804,7 @@ export RIVET_STATE_URL=postgresql://rivet:rivet@localhost:5433/rivet_state
 rivet run --config rivet.yaml
 ```
 
-Rivet creates all state tables automatically on first connect (migrations `v1`–`v7`, same schema version sequence as SQLite). No manual DDL required.
+Rivet creates all state tables automatically on first connect, running the full migration ladder up to the current schema version (the same schema-version sequence as SQLite). No manual DDL required.
 
 ### Docker Compose (local dev)
 
@@ -856,5 +857,7 @@ RUST_LOG=info rivet run -c my_export.yaml
 | Code | Meaning |
 |------|---------|
 | 0 | All exports succeeded |
-| 1 | One or more exports failed |
-| 2 | Config parsing / validation error |
+| 1 | Generic failure — config parsing/validation, usage, or an unclassified export error. Fix the input; retrying won't help |
+| 2 | Retryable transient failure (connection loss, timeout, throttling) — safe to retry. Clap argument-parse errors also exit 2 (distinguishable by the usage text and absence of an `Error:` line) |
+| 3 | Data-integrity failure (quality gate / reconcile / validate / duplicate-guard) — stop and investigate |
+| 4 | Schema drift (`on_schema_drift: fail` tripped) |
