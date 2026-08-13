@@ -240,7 +240,9 @@ pub fn run_plan_command(
         .iter()
         .map(|(name, _, safe)| (name.clone(), *safe))
         .collect();
-    print_pool_estimate(&artifacts, &safe_of, &state);
+    if pool_estimate_is_printable(&format) {
+        print_pool_estimate(&artifacts, &safe_of, &state);
+    }
 
     emit_artifacts(&artifacts, &format, multi_export, config_path)?;
 
@@ -586,6 +588,20 @@ fn compute_plan_data(
 /// work than the wave plan beside it); when any prediction rests on a
 /// placeholder or a failed attempt, the print says LOWER BOUND, mirroring
 /// `run_pool`'s accounting.
+/// May the pool advisory be printed for this output format?
+///
+/// `--format json` with no `--output` makes STDOUT the machine document: a
+/// human advisory printed beside it turns the stream into two documents, and
+/// `serde_json`/`jq` reject the whole thing. This used to be latent — the
+/// advisory required MEASURED durations, so a fresh config never reached it —
+/// until the predictor gained placeholder estimates and started printing for
+/// every multi-export plan (live-suite catch on this branch). The decision is
+/// a pure fn so it is unit-testable; the print itself writes to stdout and
+/// cannot be observed in-process.
+fn pool_estimate_is_printable(format: &PlanOutputFormat) -> bool {
+    !matches!(format, PlanOutputFormat::Json(None))
+}
+
 fn print_pool_estimate(
     artifacts: &[PlanArtifact],
     safe_of: &std::collections::HashMap<String, bool>,
@@ -1335,6 +1351,25 @@ mod tests {
             Some("json"),
             "extension must survive sanitization"
         );
+    }
+
+    /// The pool advisory must never share STDOUT with the machine document.
+    ///
+    /// `rivet plan --format json` (no `--output`) makes stdout ONE JSON
+    /// document; the advisory printed before it produced "expected value at
+    /// line 2 column 3" for every multi-export config once the predictor
+    /// started estimating from placeholders instead of requiring measured
+    /// history. RED against `!matches!(..)` -> `true` (the shipped state).
+    #[test]
+    fn the_pool_advisory_never_shares_stdout_with_the_json_document() {
+        use super::{PlanOutputFormat, pool_estimate_is_printable};
+        // stdout carries the document — nothing else may be written there.
+        assert!(!pool_estimate_is_printable(&PlanOutputFormat::Json(None)));
+        // A file target leaves stdout free for the human lines.
+        assert!(pool_estimate_is_printable(&PlanOutputFormat::Json(Some(
+            "plan.json".to_string()
+        ))));
+        assert!(pool_estimate_is_printable(&PlanOutputFormat::Pretty));
     }
 
     /// Field find (2026-08-13 pool dogfood): a chunked export on a NON-UNIQUE
