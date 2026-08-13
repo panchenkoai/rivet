@@ -248,10 +248,13 @@ exports:
 | MySQL | global `Innodb_log_waits` | `SHOW GLOBAL STATUS LIKE 'Innodb_log_waits'` |
 | SQL Server | `Log Flush Waits/sec` (summed cumulative `cntr_value`, instance-level) | `SELECT SUM(cntr_value) FROM sys.dm_os_performance_counters WHERE counter_name LIKE 'Log Flush Waits%'` |
 
-The governor's proxy is deliberately **NOT** the adaptive batch loop's. The
-batch loop listens to **own-extraction** pressure (spill/temp counters the
-export's own reads inflate — shrinking the batch genuinely shrinks the
-per-query spill). The governor asks a different question — *is someone ELSE
+The governor's proxy is deliberately **NOT** the adaptive batch loop's. On
+MySQL the batch loop listens to **own-extraction** pressure (spill/temp
+counters the export's own reads inflate — shrinking the batch genuinely
+shrinks the per-query spill); on PostgreSQL the batch loop shares
+`checkpoints_req` with the governor; SQL Server's batch loop currently has no
+pressure sampling (batch adaptation is inert there). The governor asks a
+different question — *is someone ELSE
 straining this server while I run?* — so it listens to **write/redo**
 counters a read-only export cannot move. Feeding it the batch loop's spill
 counters makes it read its own exhaust: a keyset export whose pages spill by

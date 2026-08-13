@@ -799,8 +799,12 @@ impl Source for MssqlSource {
         // — which is exactly what the governor needs: the export's own
         // tempdb worktable spills cannot talk it into shedding its own workers
         // (field find, 2026-08-13 — see `Source::sample_governor_pressure`).
-        // Instance-level sum, no bound parameter.
-        let sql = "SELECT SUM(cntr_value) FROM sys.dm_os_performance_counters                    WHERE counter_name LIKE 'Log Flush Waits%'";
+        // The Databases object exposes one row PER DATABASE plus a `_Total`
+        // row (verified live: _Total == the sum of the others), so a SUM over
+        // all rows double-counts — and a dropped database SHRINKS it, reading
+        // as "pressure eased". Read the `_Total` row directly.
+        let sql = "SELECT cntr_value FROM sys.dm_os_performance_counters \
+                   WHERE counter_name LIKE 'Log Flush Waits%' AND instance_name = '_Total'";
         rt.block_on(async {
             let row = client.query(sql, &[]).await.ok()?.into_row().await.ok()??;
             row.get::<i64, _>(0).map(|v| v.max(0) as u64)

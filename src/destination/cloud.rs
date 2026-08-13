@@ -45,6 +45,14 @@ pub fn transient_retries_total() -> u64 {
     TRANSIENT_RETRIES.load(Ordering::Relaxed)
 }
 
+/// Fold a CHILD process's retry total into this process's counter — the
+/// parent of `--parallel-export-processes` / wave-parallel children calls
+/// this from the Finished-event handler so the run summary's "dest retries"
+/// line covers the whole run, not just the parent's own probes.
+pub fn add_transient_retries(n: u64) {
+    TRANSIENT_RETRIES.fetch_add(n, Ordering::Relaxed);
+}
+
 /// Rivet's [`opendal::layers::RetryInterceptor`]: keep the truth, drop the
 /// spam. The FIRST transient retry in the process logs at WARN with the
 /// error kind (so an operator sees what the destination is doing), every

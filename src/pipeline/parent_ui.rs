@@ -393,7 +393,12 @@ impl Renderer {
                 duration_ms,
                 peak_rss_mb,
                 error_message,
+                dest_retries,
             } => {
+                // A child's RetryLayer counter is process-local; folding it in
+                // here is what makes the parent's "dest retries" summary line
+                // true in the child-process modes (bughunt 2026-08-13).
+                crate::destination::add_transient_retries(dest_retries);
                 if let Some(card) = self.cards.get_mut(&export_name) {
                     card.finalize(
                         &status,
