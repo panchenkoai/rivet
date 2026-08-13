@@ -324,6 +324,47 @@ fn pg_temp_bytes_snapshot(plan: &ResolvedRunPlan) -> Option<i64> {
     crate::source::postgres::sample_temp_bytes(&url, plan.source.tls.as_ref())
 }
 
+/// Volume above which a `temp_bytes` delta is worth a WARN (100 MB).
+const PG_TEMP_BYTES_WARN_MIN: i64 = 100 * 1024 * 1024;
+
+/// The per-export PG temp-spill warning, pure so its wording is unit-tested.
+///
+/// `pg_stat_database.temp_bytes` is DATABASE-wide, exactly like the tmp-disk
+/// counter `run_diagnosis` flags: with concurrent sibling exports (--pool,
+/// --parallel-exports, --parallel-export-processes, apply --parallel) the
+/// window overlaps every sibling's work, so attributing the whole delta to THIS
+/// export is a measurement lie. The warning stays LOUD either way — it IS real
+/// source pressure — but under concurrency it says the attribution is unknown
+/// instead of naming one export as the cause (the same hedge the spill flag
+/// carries; leaving it off this sibling was the last unhedged copy).
+///
+/// `None` below [`PG_TEMP_BYTES_WARN_MIN`] — a small spill is noise.
+fn pg_temp_bytes_warning(
+    export_name: &str,
+    delta: i64,
+    concurrent_siblings: bool,
+) -> Option<String> {
+    if delta <= PG_TEMP_BYTES_WARN_MIN {
+        return None;
+    }
+    let mb = delta as f64 / (1024.0 * 1024.0);
+    let remedy = "Consider lowering `tuning.batch_size` or setting \
+                  `tuning.batch_size_memory_mb` below PG's `work_mem`.";
+    Some(if concurrent_siblings {
+        format!(
+            "export '{export_name}': PG temp_bytes spill +{mb:.1} MB during this export's \
+             window — real source pressure, but `pg_stat_database.temp_bytes` is \
+             database-wide and concurrent sibling exports share the window, so per-export \
+             attribution is unknown. If it tracks this export: {remedy}"
+        )
+    } else {
+        format!(
+            "export '{export_name}': PG temp_bytes spill +{mb:.1} MB during run — \
+             cursor / sort overflow. {remedy}"
+        )
+    })
+}
+
 /// Snapshot the broader source-harm counters for the run's source engine, as
 /// `(metric, cumulative_value)` pairs, dispatched by source type to the
 /// per-engine probe. `None` for any connect/query failure or a source whose
@@ -369,6 +410,57 @@ pub(super) fn harm_deltas(before: &[(String, i64)], after: &[(String, i64)]) -> 
 /// cannot drift (the pool copy used to inline its own `100`).
 pub(super) const SPILL_FLAG_MIN: i64 = 100;
 
+/// What a [`spill_total`] fold counted, so the message can name it truthfully.
+pub(super) struct Spill {
+    /// Summed delta across every spill counter the engine reported.
+    pub total: i64,
+    /// The NOUN for what `total` counts — the units differ in MEANING between
+    /// engines (MySQL counts tmp-disk TABLES, PostgreSQL counts temp FILES), so
+    /// the caller interpolates this rather than hard-coding one engine's word.
+    pub unit: &'static str,
+}
+
+/// Sum the source-harm deltas that mean "the source had to spill to disk",
+/// across EVERY engine that has such a counter — one fold, shared by the
+/// per-export DIAGNOSIS (`run_diagnosis`) and the run-level verdict
+/// (`run::run_harm_verdict`) for the same reason [`SPILL_FLAG_MIN`] is shared:
+/// two copies of the filter drift, and the first drift already happened —
+/// both sites matched `tmp_disk` only, so PostgreSQL's `pg_temp_files` (the
+/// direct spill analogue, `src/source/postgres/mod.rs::harm_counters`) tripped
+/// NEITHER rule and the spill signal was silently absent on PG.
+///
+/// Engines without a spill counter stay silent, and that is correct, not a gap:
+/// MSSQL reports `mssql_lock_waits`/`mssql_lock_wait_ms` (contention, not
+/// spill) and Mongo reports scan/cache counters.
+///
+/// PG's `temp_bytes` VOLUME is warned separately per export
+/// (`pg_temp_bytes_warning`); `pg_temp_files` is the file COUNT, a different
+/// counter, so flagging it here is not a duplicate of that warning.
+pub(super) fn spill_total(deltas: &[(String, i64)]) -> Spill {
+    let sum = |needle: &str| -> i64 {
+        deltas
+            .iter()
+            .filter(|(k, _)| k.contains(needle))
+            .map(|(_, v)| *v)
+            .sum()
+    };
+    // MySQL: `Created_tmp_disk_tables` (raw, or `mysql_`-prefixed by the probe).
+    let tmp_disk = sum("tmp_disk");
+    // PostgreSQL: `pg_temp_files`.
+    let temp_files = sum("temp_files");
+    let unit = match (tmp_disk > 0, temp_files > 0) {
+        // One source engine per run, so the mixed arm is defensive only; it must
+        // still not claim either engine's unit for the other's count.
+        (true, true) => "disk spills (tmp-disk tables + temp files)",
+        (false, true) => "temp-file spills",
+        _ => "tmp-disk spills",
+    };
+    Spill {
+        total: tmp_disk + temp_files,
+        unit,
+    }
+}
+
 pub(super) fn run_diagnosis(
     summary: &RunSummary,
     harm_deltas: &[(String, i64)],
@@ -384,11 +476,10 @@ pub(super) fn run_diagnosis(
     if summary.resumed {
         flags.push("resumed a prior CRASHED run".to_string());
     }
-    let spills: i64 = harm_deltas
-        .iter()
-        .filter(|(k, _)| k.contains("tmp_disk"))
-        .map(|(_, v)| *v)
-        .sum();
+    let Spill {
+        total: spills,
+        unit: spill_unit,
+    } = spill_total(harm_deltas);
     if spills >= SPILL_FLAG_MIN {
         // The remedy must not suggest what the export ALREADY runs (a keyset
         // export told to "try chunk_by_key" reads as a broken diagnostic and
@@ -398,24 +489,27 @@ pub(super) fn run_diagnosis(
             "chunked" | "keyset" => "lower `chunk_size` (smaller pages) or `tuning.batch_size`",
             _ => "try `mode: chunked`/`chunk_by_key` or a smaller `tuning.batch_size`",
         };
-        // The spill counters come from `SHOW GLOBAL STATUS` — SERVER-wide, not
-        // per-connection. Solo they are a fair attribution (rivet is the only
-        // query stream it knows of); with concurrent sibling exports in this
-        // process (--pool / --parallel-exports) the window overlaps every
-        // sibling's work, so blaming THIS export would be a measurement lie
-        // (field find, 2026-08-13: a pool run attributed a 5-slot window's
-        // spills to the one export whose card they printed beside).
+        // The spill counters come from `SHOW GLOBAL STATUS` / `pg_stat_database`
+        // — SERVER-wide, not per-connection. Solo they are a fair attribution
+        // (rivet is the only query stream it knows of); with concurrent sibling
+        // exports (--pool / --parallel-exports / --parallel-export-processes)
+        // the window overlaps every sibling's work, so blaming THIS export would
+        // be a measurement lie (field find, 2026-08-13: a pool run attributed a
+        // 5-slot window's spills to the one export whose card they printed
+        // beside). The run-level line this points at is emitted by every
+        // concurrent-sibling parent via `run::RunHarmBracket`, so the pointer is
+        // true on the pool AND the parallel paths, not just the pool.
         if concurrent_siblings {
             flags.push(format!(
-                "{spills} tmp-disk spills server-wide during this export's window — real \
+                "{spills} {spill_unit} server-wide during this export's window — real \
                  source pressure, but the counter is server-global and concurrent \
                  sibling exports share the window, so per-export attribution is \
-                 unknown (the run-level harm line carries the pool-window total); \
+                 unknown (the run-level harm line carries the whole-window total); \
                  if it tracks this export, {remedy}"
             ));
         } else {
             flags.push(format!(
-                "{spills} tmp-disk spills — the source spilled to disk; {remedy}"
+                "{spills} {spill_unit} — the source spilled to disk; {remedy}"
             ));
         }
     }
@@ -984,14 +1078,12 @@ pub(super) fn run_export_job(
     {
         let delta = (after - before).max(0);
         summary.pg_temp_bytes_delta = Some(delta);
-        if delta > 100 * 1024 * 1024 {
-            log::warn!(
-                "export '{}': PG temp_bytes spill +{:.1} MB during run — cursor / sort overflow. \
-                 Consider lowering `tuning.batch_size` or setting `tuning.batch_size_memory_mb` \
-                 below PG's `work_mem`.",
-                plan.export_name,
-                delta as f64 / (1024.0 * 1024.0),
-            );
+        if let Some(line) = pg_temp_bytes_warning(
+            &plan.export_name,
+            delta,
+            super::run::multi_export_concurrent(),
+        ) {
+            log::warn!("{line}");
         }
     }
 
@@ -1632,6 +1724,124 @@ mod tests {
             !pooled.contains("— the source spilled to disk;"),
             "concurrent line must not carry the solo blame phrasing: {pooled}"
         );
+    }
+
+    /// The spill fold must cover EVERY engine that has a spill counter, and
+    /// name what it counted. The shipped filter matched `tmp_disk` only —
+    /// MySQL's counter — so PostgreSQL's `pg_temp_files` (the direct spill
+    /// analogue in `postgres::harm_counters`) summed to zero and the spill
+    /// signal was silently absent on PG, on BOTH the per-export and the
+    /// run-level surface. Engines with no spill counter (MSSQL lock waits,
+    /// Mongo scan counters) must stay at zero — that silence is correct.
+    /// Fixtures are ≥2 counters per engine because this is a FOLD: one element
+    /// makes any sum look right.
+    /// RED against restoring the `tmp_disk`-only filter (the PG case reads 0)
+    /// and against a fold that hard-codes MySQL's noun for a temp_files count.
+    #[test]
+    fn spill_total_counts_every_engines_spill_counter_and_names_the_unit() {
+        // MySQL — raw `SHOW GLOBAL STATUS` key and the `mysql_`-prefixed form.
+        let mysql = [
+            ("Created_tmp_disk_tables".to_string(), 40_i64),
+            ("mysql_created_tmp_disk_tables".to_string(), 60_i64),
+        ];
+        let s = spill_total(&mysql);
+        assert_eq!(s.total, 100, "both tmp-disk keys must fold in");
+        assert_eq!(s.unit, "tmp-disk spills");
+
+        // PostgreSQL — the whole harm set, only `pg_temp_files` is a spill.
+        let pg = [
+            ("pg_blks_read".to_string(), 900_000_i64),
+            ("pg_blks_hit".to_string(), 5_000_000_i64),
+            ("pg_tup_returned".to_string(), 9_000_000_i64),
+            ("pg_tup_fetched".to_string(), 800_000_i64),
+            ("pg_temp_files".to_string(), 137_i64),
+            ("pg_deadlocks".to_string(), 3_i64),
+        ];
+        let s = spill_total(&pg);
+        assert_eq!(s.total, 137, "PG's temp_files IS the spill counter");
+        assert_eq!(
+            s.unit, "temp-file spills",
+            "PG counts FILES — printing MySQL's tmp-disk-table noun for it would \
+             misdescribe what was measured"
+        );
+
+        // MSSQL and Mongo have no spill counter: silence, not a gap.
+        let mssql = [
+            ("mssql_lock_waits".to_string(), 4_000_i64),
+            ("mssql_lock_wait_ms".to_string(), 900_000_i64),
+        ];
+        assert_eq!(spill_total(&mssql).total, 0);
+        let mongo = [
+            ("mongo_docs_scanned".to_string(), 10_000_000_i64),
+            ("mongo_wt_cache_bytes_read".to_string(), 1_048_576_i64),
+        ];
+        assert_eq!(spill_total(&mongo).total, 0);
+    }
+
+    /// The per-export DIAGNOSIS is the first surface that must see the PG
+    /// spill: with the `tmp_disk`-only filter a PG run could spill thousands of
+    /// temp files and the line never appeared. RED against that filter
+    /// (`expect` fails: no line at all).
+    #[test]
+    fn run_diagnosis_flags_a_postgres_temp_file_spill_in_its_own_words() {
+        let s = RunSummary {
+            export_name: "events".into(),
+            total_rows: 1000,
+            duration_ms: 2000,
+            status: "success".into(),
+            mode: "chunked".into(),
+            ..Default::default()
+        };
+        let pg = [
+            ("pg_temp_files".to_string(), 150_i64),
+            ("pg_tup_returned".to_string(), 9_000_000_i64),
+        ];
+        let line = run_diagnosis(&s, &pg, false).expect("a PG temp-file spill must diagnose");
+        assert!(
+            line.contains("150 temp-file spills"),
+            "PG spill must be counted and named as temp FILES: {line}"
+        );
+        assert!(
+            !line.contains("tmp-disk"),
+            "must not print MySQL's unit for a PG temp_files count: {line}"
+        );
+        // Below the shared threshold it stays quiet, same as MySQL's counter.
+        let quiet = [("pg_temp_files".to_string(), 99_i64)];
+        assert!(run_diagnosis(&s, &quiet, false).is_none());
+    }
+
+    /// `pg_stat_database.temp_bytes` is DATABASE-wide, so under any
+    /// concurrent-sibling mode the whole delta cannot be blamed on the one
+    /// export whose name the line carries — the same measurement lie the
+    /// tmp-disk flag was fixed for, left on its PG sibling. The warning must
+    /// stay LOUD (it is real source pressure) and hedge the attribution.
+    /// RED against the unhedged single-format warning (the concurrent line
+    /// then still says "during run" and never says the scope is database-wide).
+    #[test]
+    fn pg_temp_bytes_warning_hedges_attribution_under_concurrent_siblings() {
+        let big = 250 * 1024 * 1024;
+        let solo = pg_temp_bytes_warning("orders", big, false).expect("250 MB must warn");
+        assert!(
+            solo.contains("during run") && solo.contains("+250.0 MB"),
+            "solo wording keeps the direct attribution: {solo}"
+        );
+        let concurrent = pg_temp_bytes_warning("orders", big, true).expect("250 MB must warn");
+        assert!(
+            concurrent.contains("+250.0 MB"),
+            "the hedge must stay LOUD about the volume: {concurrent}"
+        );
+        assert!(
+            concurrent.contains("database-wide") && concurrent.contains("attribution is unknown"),
+            "concurrent wording must name the counter scope and refuse to blame one \
+             export: {concurrent}"
+        );
+        assert!(
+            !concurrent.contains("during run —"),
+            "concurrent line must not carry the solo phrasing: {concurrent}"
+        );
+        // Threshold is exclusive at 100 MB in both modes — a small spill is noise.
+        assert!(pg_temp_bytes_warning("orders", 100 * 1024 * 1024, false).is_none());
+        assert!(pg_temp_bytes_warning("orders", 100 * 1024 * 1024, true).is_none());
     }
 
     #[test]

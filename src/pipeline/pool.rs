@@ -546,14 +546,28 @@ mod prediction_tests {
     /// already demonstrated an hours-long attempt was predicted as noise and
     /// the printed makespan promised minutes for an hours-long run. A failed
     /// attempt's duration is a floor on the real one — use it.
+    ///
+    /// The fixture carries THREE attempts with DIFFERENT durations, and the
+    /// longest is neither the first nor the last row: `predict_secs` folds the
+    /// history with `reduce(f64::max)`, and over a one-row history (this test's
+    /// original fixture) max, min, first and last are the same number — every
+    /// fold mutant survives. With the longest attempt in the middle, only a
+    /// genuine max passes (RED against `f64::max` → `f64::min`: got 300 s where
+    /// 3600 s was required; RED against a first/last pick: 1800 s / 600 s).
     #[test]
-    fn unmeasured_export_with_failed_history_predicts_at_least_that_attempt() {
-        let s = store_with(&[("big", "r1", 3_600_000, "failed")]);
+    fn unmeasured_export_with_failed_history_predicts_the_longest_attempt() {
+        let s = store_with(&[
+            ("big", "r1", 1_800_000, "failed"),    // 30 min
+            ("big", "r2", 3_600_000, "failed"),    // 60 min — the floor
+            ("big", "r3", 600_000, "interrupted"), // 10 min, most recent
+            ("big", "r4", 300_000, "failed"),      // 5 min, the minimum
+        ]);
         match predict_secs(&s, "big") {
             PredictedFrom::FailedAttemptFloor(secs) => {
                 assert!(
                     (secs - 3600.0).abs() < 1.0,
-                    "the failed attempt's hour must survive as the floor, got {secs}"
+                    "the LONGEST attempt's hour must survive as the floor (not the \
+                     shortest, first or most recent attempt), got {secs}"
                 );
             }
             _ => panic!("failed-only history must be a FailedAttemptFloor, not a placeholder"),
