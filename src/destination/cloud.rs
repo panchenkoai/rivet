@@ -33,16 +33,35 @@ use opendal::layers::RetryLayer;
 use crate::config::DestinationConfig;
 use crate::error::Result;
 
-/// Process-wide count of transient destination-side retries the
-/// [`RetryLayer`] absorbed (each one recovered — a retry that exhausts the
-/// budget surfaces as a hard error through rivet's own path). Read by the
-/// run summary so the "destination was flaky today" signal survives even
-/// though the per-attempt log lines are demoted to DEBUG after the first.
+/// Process-wide count of transient destination-side retry ATTEMPTS the
+/// [`RetryLayer`] scheduled. Read by the run summary so the "destination was
+/// flaky today" signal survives even though the per-attempt log lines are
+/// demoted to DEBUG after the first.
+///
+/// **It counts attempts, not recoveries** — see [`transient_retries_summary`]
+/// for why the interceptor cannot know which retries then succeeded.
 pub(crate) static TRANSIENT_RETRIES: AtomicU64 = AtomicU64::new(0);
 
-/// Total transient destination retries absorbed so far in this process.
+/// Total transient destination retry attempts made so far in this process.
 pub fn transient_retries_total() -> u64 {
     TRANSIENT_RETRIES.load(Ordering::Relaxed)
+}
+
+/// The run-summary value for `n` transient destination retries — `None` when
+/// there were none (the caller omits the row entirely).
+///
+/// **Says "attempts", never "all recovered".** opendal's
+/// [`opendal::layers::RetryInterceptor`] contract fires the interceptor
+/// "just before the retry sleep" with only `(err, dur)` and no return
+/// channel, and backon notifies only on the way INTO another attempt (a
+/// budget-exhausting failure returns without a final notify) — so the
+/// interceptor never learns whether the attempt it announced then succeeded.
+/// The last counted retry may be exactly the one whose attempt failed the
+/// run. The old wording ("N transient (all recovered)") therefore made its
+/// strongest claim on precisely the run where it was false: one that died on
+/// a destination error.
+pub fn transient_retries_summary(n: u64) -> Option<String> {
+    (n > 0).then(|| format!("{n} transient retry attempts (RUST_LOG=debug for detail)"))
 }
 
 /// Fold a CHILD process's retry total into this process's counter — the
@@ -57,7 +76,9 @@ pub fn add_transient_retries(n: u64) {
 /// spam. The FIRST transient retry in the process logs at WARN with the
 /// error kind (so an operator sees what the destination is doing), every
 /// subsequent one logs at DEBUG, and all of them are counted for the run
-/// summary. Replacing opendal's default per-attempt WARN — which on a busy
+/// summary. The count is of retry ATTEMPTS — this hook runs before the
+/// retry sleep and is never told the outcome, so it cannot claim recovery
+/// (see [`transient_retries_summary`]). Replacing opendal's default per-attempt WARN — which on a busy
 /// parallel upload was every other log line (field find, 2026-08-13) —
 /// with a log-filter mute would have hidden the degradation signal
 /// entirely; this aggregates it instead.
@@ -481,5 +502,44 @@ mod tests {
             transient_retries_total() >= before + 2,
             "both retries must be counted"
         );
+    }
+
+    /// The summary line must state what was MEASURED — retry ATTEMPTS — and
+    /// must never claim the retries recovered.
+    ///
+    /// [`RivetRetryNotify::intercept`] counts on the way INTO a retry (opendal's
+    /// contract: fired "just before the retry sleep", inputs `(err, dur)`, no
+    /// return channel; backon skips the notify entirely once the budget is
+    /// exhausted), so the interceptor never learns whether the attempt it
+    /// announced then succeeded — the last counted attempt can be the one that
+    /// failed the run. RED against the pre-fix wording
+    /// `"{n} transient (all recovered; RUST_LOG=debug for detail)"`, which made
+    /// its strongest claim exactly on a run that died on a destination error.
+    #[test]
+    fn transient_retries_line_reports_attempts_and_never_claims_recovery() {
+        use super::transient_retries_summary;
+        assert_eq!(
+            transient_retries_summary(0),
+            None,
+            "no row at all when the destination never retried"
+        );
+        // Two counts, not one: the line embeds the number, so a single sample
+        // cannot tell a formatted count from a hard-coded one.
+        for n in [1u64, 7] {
+            let line = transient_retries_summary(n).expect("a row once retries > 0");
+            assert!(
+                line.contains(&format!("{n} transient retry attempts")),
+                "line must report the attempt COUNT: {line:?}"
+            );
+            assert!(
+                !line.to_ascii_lowercase().contains("recover"),
+                "line must not claim recovery — the interceptor cannot observe \
+                 the outcome of the attempt it counted: {line:?}"
+            );
+            assert!(
+                line.contains("RUST_LOG=debug"),
+                "line must still point at the per-attempt detail: {line:?}"
+            );
+        }
     }
 }

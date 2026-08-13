@@ -224,6 +224,11 @@ pub fn run(
             ));
         }
 
+        // Every child sets ENV_CONCURRENT_SIBLINGS, so every child's per-export
+        // DIAGNOSIS hedges and points at "the run-level harm line" — which only
+        // the PARENT can emit (each child sees one export's window). Same
+        // bracket the pool uses, so the pointer is not a dangling reference.
+        let run_harm = RunHarmBracket::open(&config.source);
         let (result, child_failures, stderr_dump) =
             parallel_children::run_exports_as_child_processes(
                 config_path,
@@ -235,7 +240,14 @@ pub fn run(
                 params,
                 name_floor,
             );
+        // Stamp the window BEFORE closing the bracket: the close opens a source
+        // connection and queries the counters, so stamping after it folds the
+        // instrumentation's own round-trip into the aggregate's duration and
+        // throughput (same ordering the pool now keeps).
         let finished_at = chrono::Utc::now();
+        run_harm.close_and_warn(HarmWindow::Parallel {
+            exports: exports.len(),
+        });
         // Best-effort aggregate: open the state DB read-only-ish and reconstruct
         // entries from the per-child `record_metric` rows.  Failure to open the
         // DB here only suppresses the aggregate, not the run itself.
@@ -297,6 +309,10 @@ pub fn run(
     // `error::classify_exit`, giving the right process exit code without grepping
     // the message.
     let mut failures: Vec<anyhow::Error> = Vec::new();
+    // Set by the concurrent path that closes a run-harm bracket: the export
+    // window ends when the exports do, not when the counter probe returns.
+    // `None` on the sequential path, which opens no bracket.
+    let mut window_end: Option<chrono::DateTime<chrono::Utc>> = None;
 
     if run_parallel {
         log::info!(
@@ -326,6 +342,10 @@ pub fn run(
             .spawn(move || parent_ui::run_ui(rx, name_floor, n_cards))
             .ok();
 
+        // In-process concurrency sets MULTI_EXPORT_CONCURRENT, so every export's
+        // DIAGNOSIS hedges and points at the run-level harm line — emit it here
+        // (same bracket as the pool and the process-parallel parent).
+        let run_harm = RunHarmBracket::open(&config.source);
         let collected: std::sync::Mutex<Vec<(Result<()>, RunSummary)>> =
             std::sync::Mutex::new(Vec::with_capacity(exports.len()));
         std::thread::scope(|s| {
@@ -364,6 +384,12 @@ pub fn run(
         if let Some(t) = ui_thread {
             let _ = t.join();
         }
+        // Stamp the window BEFORE the bracket close queries the source, so the
+        // aggregate's duration excludes the instrumentation round-trip.
+        window_end = Some(chrono::Utc::now());
+        run_harm.close_and_warn(HarmWindow::Parallel {
+            exports: exports.len(),
+        });
 
         for (res, summary) in collected.into_inner().unwrap() {
             if let Err(e) = res {
@@ -408,7 +434,7 @@ pub fn run(
         }
     }
 
-    let finished_at = chrono::Utc::now();
+    let finished_at = window_end.unwrap_or_else(chrono::Utc::now);
     // Skip the aggregate for single-export runs.  Two cases this catches:
     //   1) `rivet run --export X` (manual one-off): the per-export block
     //      already says everything, an aggregate of one row is just noise.
@@ -589,6 +615,12 @@ pub(crate) fn run_waves(
     let mut child_failures: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
     let mut combined_stderr = String::new();
+    // `apply --parallel` re-execs children with ENV_CONCURRENT_SIBLINGS, so each
+    // child's per-export DIAGNOSIS hedges and points at "the run-level harm
+    // line". Only this parent spans the whole concurrent window, so it owns the
+    // bracket — one per RUN, not per wave/batch, since the counters are
+    // server-global and the operator's lever (concurrency) is run-wide.
+    let run_harm = parallel.then(|| RunHarmBracket::open(&config.source));
 
     for (wave, exports) in &by_wave {
         let label = if *wave == u32::MAX {
@@ -701,7 +733,15 @@ pub(crate) fn run_waves(
         }
     }
 
+    // Stamp the window BEFORE the bracket close queries the source, so the
+    // aggregate's duration excludes the instrumentation round-trip.
     let finished_at = chrono::Utc::now();
+    if let Some(bracket) = run_harm {
+        bracket.close_and_warn(HarmWindow::Parallel {
+            exports: all_exports.len(),
+        });
+    }
+
     if total > 1 {
         let entries = if parallel {
             aggregate::collect_child_entries(&state, &all_exports, started_at, &child_failures)
@@ -749,26 +789,92 @@ pub(crate) fn run_waves(
     Ok(())
 }
 
-/// The pool-window harm verdict, pure so the threshold and wording are
+/// How the run shaped its concurrency, for the run-level harm line's frame —
+/// the operator needs to know WHICH window the total covers before they can act
+/// on it (shed slots vs shed export concurrency).
+#[derive(Clone, Copy)]
+pub(crate) enum HarmWindow {
+    /// `--pool m`: `exports` exports drained through `slots` slots.
+    Pool { exports: usize, slots: usize },
+    /// `--parallel-exports` / `--parallel-export-processes` / `apply --parallel`:
+    /// `exports` exports concurrent with no slot cap.
+    Parallel { exports: usize },
+}
+
+/// The run-window harm verdict, pure so the threshold and wording are
 /// unit-tested (its per-export sibling in `job::run_diagnosis` always was;
 /// this copy had zero cover behind a live-only seam — walk find, 2026-08-13).
-/// Shares [`job::SPILL_FLAG_MIN`] with that sibling so the two rules cannot
-/// drift.
-fn pool_harm_verdict(deltas: &[(String, i64)], exports: usize, slots: usize) -> Option<String> {
-    let spills: i64 = deltas
-        .iter()
-        .filter(|(k, _)| k.contains("tmp_disk"))
-        .map(|(_, v)| *v)
-        .sum();
+/// Shares [`job::SPILL_FLAG_MIN`] AND the [`job::spill_total`] fold with that
+/// sibling so the two rules cannot drift — they already had, on the fold: both
+/// matched `tmp_disk` only, so PG's `pg_temp_files` tripped neither.
+fn run_harm_verdict(deltas: &[(String, i64)], window: HarmWindow) -> Option<String> {
+    let job::Spill {
+        total: spills,
+        unit,
+    } = job::spill_total(deltas);
     if spills < job::SPILL_FLAG_MIN {
         return None;
     }
+    let (scope, frame, lever) = match window {
+        HarmWindow::Pool { exports, slots } => (
+            "pool run",
+            format!("the pool window ({exports} exports, {slots} slots)"),
+            "`--pool` slots",
+        ),
+        HarmWindow::Parallel { exports } => (
+            "parallel run",
+            format!("the run window ({exports} concurrent exports)"),
+            "the export concurrency (`--pool N` bounds it)",
+        ),
+    };
     Some(format!(
-        "pool run: source harm — {spills} tmp-disk spills server-wide across the pool \
-         window ({exports} exports, {slots} slots): the source spilled to disk while rivet \
-         ran. Lower `--pool` slots, `chunk_size` pages, or `tuning.batch_size` to shed \
-         pressure (foreign clients can contribute, but rivet's window is the frame)."
+        "{scope}: source harm — {spills} {unit} server-wide across {frame}: the source \
+         spilled to disk while rivet ran. Lower {lever}, `chunk_size` pages, or \
+         `tuning.batch_size` to shed pressure (foreign clients can contribute, but \
+         rivet's window is the frame)."
     ))
+}
+
+/// The run-level source-harm bracket: one `before` snapshot, one `after`
+/// snapshot, one WARN verdict — shared by EVERY parent that runs exports
+/// concurrently (the pool, `--parallel-exports`, `--parallel-export-processes`,
+/// `apply --parallel`).
+///
+/// It is shared because the per-export DIAGNOSIS hedge POINTS at this line
+/// ("the run-level harm line carries the whole-window total"): the hedge fires
+/// wherever [`multi_export_concurrent`] is true, which since the
+/// `ENV_CONCURRENT_SIBLINGS` marker includes the process-parallel and
+/// `apply --parallel` children — paths that emitted no such line, so the
+/// pointer dangled at a line the operator could never find. One bracket type
+/// used by every parent keeps the pointer TRUE by construction rather than by
+/// four copies staying in sync.
+///
+/// Best-effort throughout, like the per-export snapshots: a failed probe yields
+/// no line, never an error.
+pub(crate) struct RunHarmBracket<'a> {
+    source: &'a crate::config::SourceConfig,
+    before: Option<Vec<(String, i64)>>,
+}
+
+impl<'a> RunHarmBracket<'a> {
+    /// Take the `before` snapshot. Call immediately before the concurrent work.
+    fn open(source: &'a crate::config::SourceConfig) -> Self {
+        Self {
+            source,
+            before: job::harm_snapshot(source),
+        }
+    }
+
+    /// Take the `after` snapshot and WARN the verdict if the window crossed the
+    /// shared threshold. WARN (not info) so it is visible at the default log
+    /// level — an invisible "your source is spilling" line is no line at all.
+    fn close_and_warn(self, window: HarmWindow) {
+        if let (Some(before), Some(after)) = (&self.before, job::harm_snapshot(self.source))
+            && let Some(line) = run_harm_verdict(&job::harm_deltas(before, &after), window)
+        {
+            log::warn!("{line}");
+        }
+    }
 }
 
 /// The pool's pick rule, pure for the mutation gate (#166): the first queued
@@ -1187,7 +1293,7 @@ pub(crate) fn run_pool(
     // the dominant load in it, so `after - before` here is "what this run did
     // to the source" (modulo foreign clients). Best-effort, like the
     // per-export snapshots.
-    let run_harm_before = job::harm_snapshot(&config.source);
+    let run_harm = RunHarmBracket::open(&config.source);
     let collected: std::sync::Mutex<Vec<(Result<()>, RunSummary)>> =
         std::sync::Mutex::new(Vec::with_capacity(pending.len()));
     std::thread::scope(|s| {
@@ -1268,21 +1374,27 @@ pub(crate) fn run_pool(
             });
         }
     });
+    // The measured makespan must close at the END OF THE WORK, not at the end
+    // of the instrumentation that grades it. Closing the harm bracket below
+    // OPENS a source connection and queries the server's counters; stamping
+    // `finished_at` after it folded that round-trip into the number printed as
+    // "actual makespan X vs predicted Y" and into the aggregate's window — the
+    // model would grade itself against its own measurement cost (bughunt
+    // 2026-08-13). Taken here, right after the export loop drains.
+    let finished_at = chrono::Utc::now();
     ipc::clear_in_process_tx();
     if let Some(h) = ui_thread {
         let _ = h.join();
     }
     // The run-level harm verdict the per-export DIAGNOSIS lines point at:
     // spills during the pool window are REAL harm to the source (disk-spilling
-    // tmp tables) whoever triggered them — WARN so it is visible at the
-    // default log level, with the levers that shrink the pressure.
-    if let (Some(before), Some(after)) = (&run_harm_before, job::harm_snapshot(&config.source))
-        && let Some(line) = pool_harm_verdict(&job::harm_deltas(before, &after), effective.len(), m)
-    {
-        log::warn!("{line}");
-    }
+    // tmp tables, PG temp files) whoever triggered them — WARN so it is visible
+    // at the default log level, with the levers that shrink the pressure.
+    run_harm.close_and_warn(HarmWindow::Pool {
+        exports: effective.len(),
+        slots: m,
+    });
 
-    let finished_at = chrono::Utc::now();
     let actual_secs = (finished_at - started_at).num_milliseconds() as f64 / 1000.0;
     println!(
         "  Pool: actual makespan {:.1} min vs predicted {:.1} min ({:+.0}%) — the model grades itself every run",
@@ -1400,7 +1512,14 @@ fn first_name_collision<'a>(
 
 #[cfg(test)]
 mod pool_harm_tests {
-    use super::pool_harm_verdict;
+    use super::{HarmWindow, run_harm_verdict};
+
+    fn pool() -> HarmWindow {
+        HarmWindow::Pool {
+            exports: 154,
+            slots: 5,
+        }
+    }
 
     /// The pool-window verdict was the untested twin of run_diagnosis's spill
     /// flag (same threshold, same filter, zero cover). Pinned here: fires at
@@ -1409,13 +1528,135 @@ mod pool_harm_tests {
     #[test]
     fn pool_harm_verdict_fires_at_threshold_on_tmp_disk_only() {
         let at = vec![("mysql_created_tmp_disk_tables".to_string(), 100_i64)];
-        let line = pool_harm_verdict(&at, 154, 5).expect("threshold reached");
+        let line = run_harm_verdict(&at, pool()).expect("threshold reached");
         assert!(line.contains("100 tmp-disk spills") && line.contains("154 exports"));
         let below = vec![("mysql_created_tmp_disk_tables".to_string(), 99_i64)];
-        assert!(pool_harm_verdict(&below, 154, 5).is_none());
+        assert!(run_harm_verdict(&below, pool()).is_none());
         // Non-spill counters never trip it, however large.
         let other = vec![("mysql_innodb_rows_read".to_string(), 1_000_000_i64)];
-        assert!(pool_harm_verdict(&other, 154, 5).is_none());
+        assert!(run_harm_verdict(&other, pool()).is_none());
+    }
+
+    /// The run-level verdict must see EVERY engine's spill counter, not just
+    /// MySQL's. Both this fold and `run_diagnosis`'s used to match `tmp_disk`
+    /// only, so on PostgreSQL — whose harm set carries `pg_temp_files`, the
+    /// direct spill analogue — the run-level line was silently never emitted.
+    /// The other PG harm counters (scan/cache/deadlock) must stay silent, and
+    /// the wording must name what was COUNTED: temp FILES, not tmp-disk tables.
+    /// RED against restoring the `tmp_disk`-only filter (`is_none()` on the PG
+    /// case) or against reusing MySQL's noun for it.
+    #[test]
+    fn run_harm_verdict_sees_postgres_temp_files_with_its_own_unit() {
+        // >= 2 counters so the fold is a real fold, not a passthrough.
+        let pg = vec![
+            ("pg_temp_files".to_string(), 60_i64),
+            ("pg_temp_files_replica".to_string(), 60_i64),
+        ];
+        let line = run_harm_verdict(&pg, pool()).expect("120 temp files must reach the threshold");
+        assert!(
+            line.contains("120 temp-file spills"),
+            "PG's count must be summed and named as temp FILES: {line}"
+        );
+        assert!(
+            !line.contains("tmp-disk"),
+            "must not print MySQL's unit for a temp_files count: {line}"
+        );
+        // PG's non-spill counters never trip it, however large.
+        let noise = vec![
+            ("pg_tup_returned".to_string(), 9_000_000_i64),
+            ("pg_blks_read".to_string(), 5_000_000_i64),
+            ("pg_deadlocks".to_string(), 7_i64),
+        ];
+        assert!(run_harm_verdict(&noise, pool()).is_none());
+    }
+
+    /// The line the per-export DIAGNOSIS hedge points at is now emitted by the
+    /// PARALLEL parents too, so its frame must describe THAT window (concurrent
+    /// exports, no slot cap) and name a lever that path actually has — printing
+    /// "pool window / lower --pool slots" to a `--parallel-export-processes` run
+    /// is the same dangling pointer one layer down. RED against collapsing the
+    /// two windows into one wording.
+    #[test]
+    fn run_harm_verdict_frames_the_parallel_window_in_its_own_terms() {
+        let spills = vec![("mysql_created_tmp_disk_tables".to_string(), 300_i64)];
+        let par =
+            run_harm_verdict(&spills, HarmWindow::Parallel { exports: 12 }).expect("300 >= 100");
+        assert!(
+            par.contains("12 concurrent exports") && !par.contains("slots"),
+            "parallel frame must not claim pool slots: {par}"
+        );
+        assert!(
+            par.contains("export concurrency"),
+            "parallel lever must be the concurrency, not `--pool` slots alone: {par}"
+        );
+        let pooled = run_harm_verdict(&spills, pool()).expect("300 >= 100");
+        assert!(
+            pooled.contains("5 slots") && pooled.contains("`--pool` slots"),
+            "pool frame keeps its slot lever: {pooled}"
+        );
+    }
+
+    /// The per-export DIAGNOSIS hedge points at "the run-level harm line", and
+    /// that line exists only where a parent BRACKETS the window. Before this
+    /// fix only `run_pool` did, while the hedge fires on every concurrent path
+    /// (the `ENV_CONCURRENT_SIBLINGS` marker covers the process-parallel and
+    /// `apply --parallel` children) — an operator-facing pointer at a line that
+    /// was never printed.
+    ///
+    /// HONESTY: this pins the WIRING, not the emission. The emission needs a
+    /// live source (both snapshots come from a real server), so no unit test can
+    /// observe the log line; the live proof is a concurrent run against a
+    /// spilling source. What this DOES catch, and goes RED on, is a parent
+    /// losing its bracket — deleting any one `close_and_warn` call site fails
+    /// it, which is exactly how the pointer dangled in the first place.
+    #[test]
+    fn every_concurrent_export_parent_brackets_the_run_harm_window() {
+        let whole = include_str!("run.rs");
+        // Analyse the PRODUCT half only — the test modules below would otherwise
+        // satisfy the last slice's check with this test's own text.
+        let src = &whole[..whole
+            .find("\n#[cfg(test)]")
+            .expect("run.rs has test modules")];
+        // Spelled in pieces so this needle does not match the assertion that
+        // uses it (the same self-match that made the first draft read 6 of 4).
+        let open = concat!("RunHarmBracket::", "open(&config.source)");
+        let close = concat!("close_and", "_warn(HarmWindow::");
+        // Slice each concurrent parent's body by its signature anchor; the last
+        // one runs to the end of the product half.
+        let anchors = [
+            ("run", "\npub fn run("),
+            ("run_waves", "\npub(crate) fn run_waves("),
+            ("run_pool", "\npub(crate) fn run_pool("),
+        ];
+        let mut starts: Vec<(&str, usize)> = anchors
+            .iter()
+            .map(|(name, sig)| {
+                (
+                    *name,
+                    src.find(sig)
+                        .unwrap_or_else(|| panic!("{name}'s signature moved — update the anchor")),
+                )
+            })
+            .collect();
+        starts.sort_by_key(|(_, at)| *at);
+        for (i, (name, at)) in starts.iter().enumerate() {
+            let end = starts.get(i + 1).map(|(_, n)| *n).unwrap_or(src.len());
+            let body = &src[*at..end];
+            assert!(
+                body.contains(open) && body.contains(close),
+                "{name} runs exports concurrently, so it must bracket the run-level \
+                 harm window — the per-export DIAGNOSIS hedge points at the line it emits"
+            );
+        }
+        // `run` brackets BOTH of its concurrent paths (child processes AND
+        // in-process threads); a single site would leave one path pointing at a
+        // line it never prints. Fold ≥ 2 by construction, so count the sites.
+        assert_eq!(
+            src.matches(open).count(),
+            4,
+            "expected one bracket per concurrent path: run/processes, run/threads, \
+             run_waves/parallel, run_pool"
+        );
     }
 }
 

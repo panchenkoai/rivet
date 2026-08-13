@@ -178,6 +178,15 @@ pub struct RunSummary {
     /// indicates cursor / sort spill to `pgsql_tmp/` — the safe action is to
     /// shrink `tuning.batch_size` or set `tuning.batch_size_memory_mb` below
     /// PG's `work_mem`.
+    ///
+    /// SCOPE: the counter is DATABASE-wide, so this is a WINDOW delta, not a
+    /// per-export measurement. Solo it is a fair attribution (rivet is the only
+    /// query stream it knows of); under any concurrent-sibling mode (--pool,
+    /// --parallel-exports, --parallel-export-processes, apply --parallel) every
+    /// concurrent export records the SAME shared window, so the values must not
+    /// be summed across exports nor read as "this export spilled N". The field
+    /// is kept — a window delta is still the only spill-volume signal there is —
+    /// and its warning hedges accordingly (`job::pg_temp_bytes_warning`).
     pub pg_temp_bytes_delta: Option<i64>,
     /// Human-readable parenthetical attached to `status: skipped` so the
     /// operator knows *why* there was nothing to export this run (e.g.
@@ -565,6 +574,7 @@ impl RunSummary {
         rows.extend(self.pg_temp_spill_row());
         rows.extend(self.compression_row());
         rows.extend(self.retries_row());
+        rows.extend(dest_retries_row());
         rows.extend(self.outcome_rows());
         rows.extend(self.error_row());
         format_block(&self.export_name, &rows)
@@ -956,6 +966,25 @@ fn time_window_skip_line(mode: &str, skip_reason: Option<&str>) -> Option<String
     Some("rolling time window matched no rows — check `time_column`/`days_window`".to_string())
 }
 
+/// The summary block's `dest retries:` row — transient destination-side retry
+/// attempts the OpenDAL `RetryLayer` scheduled this process, or `None` when
+/// there were none.
+///
+/// Reads the process-wide counter rather than a `RunSummary` field, mirroring
+/// what [`RunSummary::print`] already does when it forwards `dest_retries` on
+/// the child `Finished` event.
+///
+/// It exists because the aggregate block is NOT printed for a single-export
+/// run (`run.rs`: `if exports.len() > 1`), and a `--parallel-export-processes`
+/// child is exactly that shape. Demoting the per-attempt WARNs to DEBUG
+/// without this row left `rivet run -c cfg.yaml` (one export, cloud
+/// destination) printing NOTHING about a flaky destination at any level above
+/// debug — the signal was demoted and never re-surfaced.
+fn dest_retries_row() -> Option<Row> {
+    crate::destination::transient_retries_summary(crate::destination::transient_retries_total())
+        .map(|v| ("dest retries", v))
+}
+
 fn summarize_parallel_chunk_errors(raw: &str) -> Option<String> {
     let header_pos = raw.find("parallel checkpoint worker errors:")?;
     let prefix = raw[..header_pos].trim_end_matches(": ").trim_end();
@@ -1230,6 +1259,62 @@ mod tests {
         assert!(line.contains("1m 08.4s"), "duration present: {:?}", line);
         assert!(line.contains("RSS 884 MB"), "rss present: {:?}", line);
         assert!(!line.contains('\n'), "single line: {:?}", line);
+    }
+
+    /// A single-export run must SEE the destination-retry signal.
+    ///
+    /// `aggregate::print` — the only other place the count is reported — runs
+    /// only for `exports.len() > 1` (`run.rs`), and a
+    /// `--parallel-export-processes` child is always a one-export run. With the
+    /// per-attempt WARNs demoted to DEBUG, `rivet run -c cfg.yaml` over a flaky
+    /// cloud destination printed nothing above debug until this row existed.
+    ///
+    /// Producer chain, both halves proven rather than hand-built: the real
+    /// increment site (`RivetRetryNotify::intercept`) feeds this same
+    /// process-wide counter — asserted in
+    /// `destination::cloud::tests::retry_interceptor_counts_every_absorbed_retry`
+    /// (the interceptor is `pub(crate)` to `destination`, so it cannot be
+    /// called from here) — and this test drives the counter through the other
+    /// production writer, `add_transient_retries` (what the parent calls for
+    /// each child's `Finished` event, `parent_ui.rs`), then reads the row out
+    /// of the real `render()`.
+    ///
+    /// Delta-based, not absolute: the counter is process-wide and other tests
+    /// in this binary may bump it concurrently. The "no row when zero" half
+    /// cannot be asserted here for the same reason — it is covered by
+    /// `transient_retries_summary(0) == None` in the cloud module.
+    #[test]
+    fn single_export_summary_card_surfaces_destination_retries() {
+        let before = crate::destination::transient_retries_total();
+        // Two retries, not one: the row folds a counter, so a single element
+        // would not distinguish the total from "some retry happened".
+        crate::destination::add_transient_retries(2);
+
+        let s = RunSummary::stub_for_testing("run-dest-retries", "orders");
+        let block = s.render();
+
+        let line = block
+            .lines()
+            .find(|l| l.trim_start().starts_with("dest retries:"))
+            .unwrap_or_else(|| {
+                panic!("single-export summary card must carry a dest-retries row:\n{block}")
+            });
+        let value = line.split("dest retries:").nth(1).unwrap().trim();
+        let n: u64 = value
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap_or_else(|e| panic!("row must lead with the count, got {value:?}: {e}"));
+        assert!(
+            n >= before + 2,
+            "row must report the accumulated total (>= {} after two more), got {n}: {line:?}",
+            before + 2
+        );
+        assert!(
+            value.contains("transient retry attempts"),
+            "row must say ATTEMPTS, not claim recovery: {line:?}"
+        );
     }
 
     #[test]
