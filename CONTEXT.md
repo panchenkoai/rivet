@@ -160,3 +160,16 @@ as three differently-aliased bools (`bound_at_open`, `non_block`,
 `until_current`). The termination contract lives on this enum's doc
 (`src/source/cdc/mod.rs`). _Avoid_: bounded flag, non-block mode, until-current
 mode (as a type name — `until_current` remains the user-facing config key).
+
+## Pool predictor
+
+The single constructor of a `PoolItem`'s predicted duration
+(`pipeline::pool::predict_items`): last measured SUCCESS, else the longest
+terminal attempt as a floor, else the 5 s placeholder; split units inherit
+`giant_predicted / N` via seed. BOTH consumers — `rivet plan`'s pool preview
+and `apply --pool`'s schedule — go through it, so the preview and the schedule
+are one number by construction (before 2026-08-13 they drifted: plan excluded
+history-less exports and assumed everything `parallel_safe`). The provenance
+enum (`PredictedFrom`) is the honesty axis: "N measured, M estimated" and the
+LOWER BOUND note derive from it. _Avoid_: duration estimate (ambiguous with
+row estimates), history lookup.

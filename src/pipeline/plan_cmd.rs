@@ -231,7 +231,16 @@ pub fn run_plan_command(
     // pool would achieve from measured durations, so the operator can weigh it
     // against the wave count. Printed only when we have real durations for more
     // than one export (a single export has nothing to schedule).
-    print_pool_estimate(&artifacts, &state);
+    // The same parallel_safe the annotations write is what the pool print
+    // must model — the old preview hardcoded `true` "because no config is in
+    // scope", while the flags were computed twenty lines up (walk find,
+    // 2026-08-13): heavies then predicted M-way parallelism apply-time
+    // serialization can never reach.
+    let safe_of: std::collections::HashMap<String, bool> = recs
+        .iter()
+        .map(|(name, _, safe)| (name.clone(), *safe))
+        .collect();
+    print_pool_estimate(&artifacts, &safe_of, &state);
 
     emit_artifacts(&artifacts, &format, multi_export, config_path)?;
 
@@ -545,77 +554,42 @@ fn compute_plan_data(
     }
 }
 
-/// Print the pool scheduler's predicted makespan (#166) beside the wave plan.
-/// Reads each export's last successful duration from the state store; skips
-/// silently when fewer than two exports have history (nothing to schedule).
-/// Pure core of `print_pool_estimate`: given each export's run history
-/// (`(status, duration_ms)` rows, newest first), keep the most-recent
-/// **successful** run of each and convert it to a `PoolItem`. Returns `None`
-/// when fewer than two exports have a success on record — nothing to schedule,
-/// so the estimate is skipped.
-///
-/// Extracted so the mutation gate can bite the three decisions the display
-/// glue used to hide: the `status == "success"` filter, the ms→s divide, and
-/// the `< 2` skip. RED-proven by `pool_items_from_history_*`.
-fn pool_items_from_history(
-    per_export: &[(String, Vec<(String, i64)>)],
-) -> Option<Vec<super::pool::PoolItem>> {
-    let items: Vec<super::pool::PoolItem> = per_export
-        .iter()
-        .filter_map(|(name, history)| {
-            let dur_ms = history
-                .iter()
-                .find(|(status, _)| status == "success")
-                .map(|(_, ms)| *ms)?;
-            Some(super::pool::PoolItem {
-                name: name.clone(),
-                predicted_secs: (dur_ms as f64 / 1000.0).max(0.001),
-                // This history-only preview has no config in scope, so it cannot
-                // read parallel_safe; assume safe (optimistic). The authoritative
-                // heavy-serialization-aware prediction is run_pool's at apply time
-                // (#166/#167 C3), where the real flag is known.
-                parallel_safe: true,
-            })
-        })
-        .collect();
-    if items.len() < 2 {
-        return None;
+/// Print the pool scheduler's predicted makespan (#166) beside the wave plan,
+/// from the SAME predictor `apply --pool` schedules with
+/// ([`super::pool::predict_items`]) — the preview and the schedule are one
+/// number by construction. History-less exports are included at the
+/// placeholder (the old preview excluded them, so its makespan covered less
+/// work than the wave plan beside it); when any prediction rests on a
+/// placeholder or a failed attempt, the print says LOWER BOUND, mirroring
+/// `run_pool`'s accounting.
+fn print_pool_estimate(
+    artifacts: &[PlanArtifact],
+    safe_of: &std::collections::HashMap<String, bool>,
+    state: &StateStore,
+) {
+    if artifacts.len() < 2 {
+        return; // a single export has nothing to schedule
     }
-    Some(items)
-}
-
-fn print_pool_estimate(artifacts: &[PlanArtifact], state: &StateStore) {
-    let per_export: Vec<(String, Vec<(String, i64)>)> = artifacts
+    let predicted = super::pool::predict_items(
+        state,
+        artifacts.iter().map(|a| {
+            (
+                a.export_name.as_str(),
+                safe_of.get(&a.export_name).copied().unwrap_or(false),
+            )
+        }),
+        &std::collections::HashMap::new(),
+    );
+    let items: Vec<super::pool::PoolItem> = predicted.iter().map(|(i, _)| i.clone()).collect();
+    let measured = predicted
         .iter()
-        .map(|a| {
-            let history = state
-                .get_metrics(Some(&a.export_name), 20)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|m| (m.status, m.duration_ms))
-                .collect();
-            (a.export_name.clone(), history)
-        })
-        .collect();
-    let Some(items) = pool_items_from_history(&per_export) else {
-        return;
-    };
+        .filter(|(_, f)| matches!(f, super::pool::PredictedFrom::Measured(_)))
+        .count();
+    let estimated = predicted.len() - measured;
     let total: f64 = items.iter().map(|i| i.predicted_secs).sum();
-    // Honesty: the estimate covers only exports with run history — a config with
-    // newly-added tables schedules more work than this, so an operator comparing
-    // the pool number against the (all-inclusive) wave plan must see the gap
-    // (roast 2026-08-09).
-    let excluded = per_export.len().saturating_sub(items.len());
-    let excluded_note = if excluded > 0 {
-        format!("; {excluded} without history excluded — real makespan is higher")
-    } else {
-        String::new()
-    };
     println!(
-        "\n  Pool scheduler (measured, {} of {} export(s) with history{}):",
-        items.len(),
-        per_export.len(),
-        excluded_note
+        "\n  Pool scheduler ({measured} measured, {estimated} estimated of {} export(s)):",
+        predicted.len(),
     );
     println!("    sequential: {:.0} min", total / 60.0);
     for m in [2usize, 4, 6] {
@@ -627,8 +601,15 @@ fn print_pool_estimate(artifacts: &[PlanArtifact], state: &StateStore) {
             floor / 60.0
         );
     }
+    if estimated > 0 {
+        println!(
+            "    prediction is a LOWER BOUND: {estimated} export(s) have no successful run to \
+             measure from — it tightens as runs complete"
+        );
+    }
     println!(
-        "    (a bounded work-stealing pool; --annotate-waves packs the wave          alternative — see #166)"
+        "    (a bounded work-stealing pool; --annotate-waves packs the wave \
+         alternative — see #166)"
     );
 }
 
@@ -957,8 +938,8 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        ExportFields, apply_field_annotations, fields_to_write, pool_items_from_history,
-        refuse_annotate_scoped_to_export, repack_from_history,
+        ExportFields, apply_field_annotations, fields_to_write, refuse_annotate_scoped_to_export,
+        repack_from_history,
     };
 
     /// The refuse-guard fires ONLY when BOTH `--annotate-waves` and `--export`
@@ -1146,50 +1127,12 @@ mod tests {
         );
     }
 
-    /// The pool estimate reads history through `pool_items_from_history`; these
-    /// pin the three decisions the mutation gate flagged as unguarded display
-    /// glue: the `status == "success"` filter, the ms→s divide, and the `< 2`
-    /// skip. Each assertion goes RED against the mutant named beside it.
-    #[test]
-    fn pool_items_from_history_keeps_only_the_latest_success_and_converts_ms() {
-        // Two exports, each newest-first history. "big" has a failed newer run
-        // ahead of its success — the `== "success"` filter (mutant `!=`) must
-        // skip the failure and take the success.
-        let per_export = vec![
-            (
-                "big".to_string(),
-                vec![
-                    ("failed".to_string(), 999_000),
-                    ("success".to_string(), 120_000),
-                ],
-            ),
-            ("small".to_string(), vec![("success".to_string(), 30_000)]),
-        ];
-        let items = pool_items_from_history(&per_export).expect("two successes → Some");
-        assert_eq!(items.len(), 2);
-        let big = items.iter().find(|i| i.name == "big").unwrap();
-        // 120_000 ms / 1000 = 120 s — kills `/`→`*`/`%` (443) and the `!=`
-        // filter (would have taken the 999_000 failure → 999.0).
-        assert_eq!(big.predicted_secs, 120.0);
-        let small = items.iter().find(|i| i.name == "small").unwrap();
-        assert_eq!(small.predicted_secs, 30.0);
-    }
-
-    #[test]
-    fn pool_items_from_history_skips_when_fewer_than_two_have_history() {
-        // One export with a success, one with only a failure → a single item.
-        // The `< 2` skip (mutants `==`/`>`/`<=`) must return None: with `>` or
-        // `<=` a one-item schedule would print, and `==` would skip the valid
-        // two-item case above.
-        let one = vec![
-            ("only".to_string(), vec![("success".to_string(), 10_000)]),
-            ("nope".to_string(), vec![("failed".to_string(), 5_000)]),
-        ];
-        assert!(pool_items_from_history(&one).is_none());
-        // Zero items → None as well.
-        assert!(pool_items_from_history(&[]).is_none());
-    }
-
+    /// The plan preview and apply --pool now share ONE predictor
+    /// ([`crate::pipeline::pool::predict_items`]) — its decisions (success
+    /// filter, ms→s, placeholder inclusion) are pinned in pool.rs beside the
+    /// implementation. What remains plan-side is only the wiring pinned by
+    /// `print_pool_estimate`'s callsite (real `parallel_safe` map + the
+    /// artifacts iterator), which the drift this closed lived in.
     /// The additive contract (#150): plan fills BLANKS; a value the operator
     /// set is untouched unless `--annotate-waves` says overwrite. Per FIELD —
     /// a hand-set `wave:` with no `parallel_safe:` gets only the missing half.
