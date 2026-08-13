@@ -796,7 +796,12 @@ impl super::Source for PostgresSource {
     /// Governor pressure proxy: `pg_stat_bgwriter.checkpoints_req` — the same
     /// monotonic counter the adaptive batch loop samples. Rising between samples
     /// means the source is checkpointing harder under write pressure.
-    fn sample_pressure(&mut self) -> Option<u64> {
+    fn sample_governor_pressure(&mut self) -> Option<u64> {
+        // `checkpoints_req` is WRITE-driven (WAL volume forcing checkpoints):
+        // a read-only export cannot move it, so the governor may share it
+        // with PG's batch loop (which samples it engine-internally) — unlike
+        // MySQL/MSSQL, whose batch loops listen to spill counters the
+        // export's own reads inflate.
         pg_sample_checkpoints_req(&mut self.client).map(|v| v.max(0) as u64)
     }
 

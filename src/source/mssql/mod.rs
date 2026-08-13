@@ -792,19 +792,15 @@ impl Source for MssqlSource {
         })
     }
 
-    fn sample_pressure(&mut self) -> Option<u64> {
+    fn sample_governor_pressure(&mut self) -> Option<u64> {
         let Self { rt, client, .. } = self;
-        // Extraction-pressure proxy (Epic 18 C2): cumulative `Workfiles Created`
-        // + `Worktables Created` (SQLServer:Access Methods). A workfile /
-        // worktable is created when a sort or hash spills to tempdb — the SQL
-        // Server analogue of PG `temp_bytes` / MySQL `Created_tmp_disk_tables`.
-        // The `cntr_value` of these `*/sec`-named perfmon counters is the raw
-        // cumulative count, so their sum is monotonic — exactly what the governor
-        // compares deltas of. Replaces `Log Flush Waits`, which is redo-**write**
-        // pressure and barely moves during a read-only export. Instance-level
-        // (no per-database `instance_name`), so no parameter is bound.
-        let sql = "SELECT SUM(cntr_value) FROM sys.dm_os_performance_counters \
-                   WHERE counter_name IN ('Workfiles Created/sec', 'Worktables Created/sec')";
+        // FOREIGN-pressure proxy for the governor: cumulative `Log Flush
+        // Waits/sec` (redo-WRITE pressure). A read-only export barely moves it
+        // — which is exactly what the governor needs: the export's own
+        // tempdb worktable spills cannot talk it into shedding its own workers
+        // (field find, 2026-08-13 — see `Source::sample_governor_pressure`).
+        // Instance-level sum, no bound parameter.
+        let sql = "SELECT SUM(cntr_value) FROM sys.dm_os_performance_counters                    WHERE counter_name LIKE 'Log Flush Waits%'";
         rt.block_on(async {
             let row = client.query(sql, &[]).await.ok()?.into_row().await.ok()??;
             row.get::<i64, _>(0).map(|v| v.max(0) as u64)

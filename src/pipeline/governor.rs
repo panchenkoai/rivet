@@ -113,9 +113,19 @@ impl GovernorHarness {
                     } else {
                         "source pressure eased: recovered"
                     };
-                    log::info!(
-                        "export '{export_name}': governor parallelism {from} → {to} ({reason})"
-                    );
+                    // A shed is a deliberate slowdown of the run — the operator
+                    // must SEE it at the default log level (an info-level "this
+                    // will be slower" is functionally silent; a field pool run
+                    // lost 1h48m to invisible sheds). Recovery stays info.
+                    if to < from {
+                        log::warn!(
+                            "export '{export_name}': governor parallelism {from} → {to} ({reason})                              — raise `min_parallel` to floor it, or set `adaptive: false` to disarm"
+                        );
+                    } else {
+                        log::info!(
+                            "export '{export_name}': governor parallelism {from} → {to} ({reason})"
+                        );
+                    }
                     recover(log).push((from, to, reason.to_string()));
                 },
             );

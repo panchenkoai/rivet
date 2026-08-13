@@ -239,13 +239,22 @@ exports:
 
 **How it decides.** A dedicated monitoring connection polls a source write-pressure counter every ~1.5 s and compares it to the previous reading. A *rising* counter means pressure is climbing, so the governor sheds one worker; a flat/falling counter lets it recover one. The counter is:
 
-| Engine | Pressure proxy | Read via |
-|--------|----------------|----------|
+| Engine | Governor pressure proxy | Read via |
+|--------|-------------------------|----------|
 | PostgreSQL | `pg_stat_bgwriter.checkpoints_req` | `SELECT checkpoints_req FROM pg_stat_bgwriter` (preceded by `pg_stat_clear_snapshot()`) |
 | MySQL | global `Innodb_log_waits` | `SHOW GLOBAL STATUS LIKE 'Innodb_log_waits'` |
-| SQL Server | `Log Flush Waits/sec` (cumulative `cntr_value`) | `SELECT cntr_value FROM sys.dm_os_performance_counters WHERE counter_name LIKE 'Log Flush Wait%' AND instance_name = <database>` |
+| SQL Server | `Log Flush Waits/sec` (summed cumulative `cntr_value`, instance-level) | `SELECT SUM(cntr_value) FROM sys.dm_os_performance_counters WHERE counter_name LIKE 'Log Flush Waits%'` |
 
-It is the **same proxy** the adaptive batch loop uses — enabling the governor adds no new query beyond what `adaptive: true` already runs.
+The governor's proxy is deliberately **NOT** the adaptive batch loop's. The
+batch loop listens to **own-extraction** pressure (spill/temp counters the
+export's own reads inflate — shrinking the batch genuinely shrinks the
+per-query spill). The governor asks a different question — *is someone ELSE
+straining this server while I run?* — so it listens to **write/redo**
+counters a read-only export cannot move. Feeding it the batch loop's spill
+counters makes it read its own exhaust: a keyset export whose pages spill by
+design would shed workers 4→3→2→1 and never recover (the counter keeps
+rising as long as its own pages run) — measured on a production pool run as
+every keyset export slowing 2–2.7×.
 
 ### Required privileges (read-only is enough)
 

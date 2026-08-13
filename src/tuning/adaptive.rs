@@ -144,7 +144,12 @@ pub trait PressureSource: Send {
 
 impl PressureSource for Box<dyn crate::source::Source> {
     fn sample_pressure(&mut self) -> Option<u64> {
-        crate::source::Source::sample_pressure(self.as_mut())
+        // The governor's signal is the FOREIGN-pressure counter, not the batch
+        // loop's own-extraction counter: a keyset export's own pages inflate
+        // the spill counters by design, and a governor listening to them sheds
+        // its own workers to the floor and never recovers (field find,
+        // 2026-08-13 — see `Source::sample_governor_pressure`).
+        crate::source::Source::sample_governor_pressure(self.as_mut())
     }
 }
 
