@@ -645,7 +645,8 @@ engines. What remains:
   running the default bounded `rivet cdc` (or `rivet run` with
   `cdc.until_current: true`, now the default) on an interval, each run resuming from
   the checkpoint. For an unbounded run, pass `--stream` (config:
-  `cdc.until_current: false`) — it logs an engine-specific warning, because only
+  `cdc.until_current: false`; the config-driven `rivet run` path logs an
+  engine-specific warning), because only
   MySQL genuinely stays up as a daemon (the binlog dump blocks); PostgreSQL and
   SQL Server still exit on catch-up (one unbounded pass — run it under a
   supervisor that restarts it), and MongoDB exits on an idle poll. The bounded

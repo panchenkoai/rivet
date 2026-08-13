@@ -65,7 +65,7 @@ Files are uploaded as:
 gs://{bucket}/{prefix}{export_name}_{YYYYMMDD}_{HHMMSS}_{mmm}.{format}
 ```
 
-The timestamp carries millisecond precision; multi-part exports append `_part{N}`.
+This is the single (non-chunked, non-keyset) runner's naming: the timestamp carries millisecond precision, and its size-split parts append `_part{N}`. Chunked and keyset runs use their own run-unique part names — see the per-runner naming table in [docs/cloud-destinations.md](../cloud-destinations.md).
 
 Example: `gs://my-gcs-bucket/exports/orders_20260406_120000_123.parquet`
 

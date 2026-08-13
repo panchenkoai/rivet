@@ -4,8 +4,10 @@ Rivet provides **at-least-once file delivery** to its destination.  After
 a clean run, the destination prefix carries:
 
 - one or more data parts — names are **per-runner** (single/incremental
-  `{export}_{YYYYMMDD_HHMMSS_mmm}[_partN].parquet`, chunked
-  `{export}_{ts}_chunk{idx}_{nonce}.parquet`, keyset
+  `{export}_{YYYYMMDD_HHMMSS_mmm}.parquet` for a single-part run, with a
+  `_part0`..`_partN-1` suffix on **every** part when the run rotates into
+  multiple parts; chunked
+  `{export}_{ts}_chunk{idx}_{nonce}.parquet`; keyset
   `{export}_{run-tag}_keyset_{seek-tag}.parquet`, …) — always take them from
   the manifest, never pattern-match them,
 - a `manifest.json` listing every committed part with `size_bytes` and
@@ -75,7 +77,7 @@ Every committed part is recorded in `manifest.json`:
   "row_count": 200000,
   "part_count": 2,
   "parts": [
-    {"part_id": 0, "path": "orders_20260523_120000_123.parquet", "rows": 100000,
+    {"part_id": 0, "path": "orders_20260523_120000_123_part0.parquet", "rows": 100000,
      "size_bytes": 4194304, "content_fingerprint": "xxh3:…", "content_md5": "…", "status": "committed"},
     {"part_id": 1, "path": "orders_20260523_120000_123_part1.parquet", "rows": 100000,
      "size_bytes": 4198400, "content_fingerprint": "xxh3:…", "content_md5": "…", "status": "committed"}
@@ -146,7 +148,7 @@ LOAD DATA INTO project.dataset.orders_stage_<run_id>
 FROM FILES (
   format = 'PARQUET',
   -- list the exact `parts[].path` values from manifest.json — never a glob
-  uris = ['gs://my-bucket/exports/2026-05-23/orders/orders_20260523_120000_123.parquet',
+  uris = ['gs://my-bucket/exports/2026-05-23/orders/orders_20260523_120000_123_part0.parquet',
           'gs://my-bucket/exports/2026-05-23/orders/orders_20260523_120000_123_part1.parquet']
 );
 
@@ -205,7 +207,7 @@ prove which bytes were loaded.
 ```sql
 -- 1. COPY INTO a staging table, listing the exact files from manifest.json.
 COPY INTO @my_stage/orders/orders_stage_<run_id>
-FROM ('@my_stage/exports/2026-05-23/orders/orders_20260523_120000_123.parquet',
+FROM ('@my_stage/exports/2026-05-23/orders/orders_20260523_120000_123_part0.parquet',
       '@my_stage/exports/2026-05-23/orders/orders_20260523_120000_123_part1.parquet',
       ...)
 FILE_FORMAT = (TYPE = PARQUET);

@@ -165,7 +165,8 @@ standalone**, without introducing new trust nouns.  Two examples:
   `chunk_checkpoint: true` (re-runs per-chunk `COUNT(*)` against stored chunk
   counts). For snapshot/incremental/keyset it bails and directs the operator
   to `rivet run --reconcile`, the whole-export COUNT(*)-vs-exported-rows
-  audit (`src/pipeline/reconcile_cmd.rs`). It is a sibling partition-level
+  audit (`reconcile_source_count` in `src/pipeline/job.rs`). The subcommand
+  itself (`src/pipeline/reconcile_cmd.rs`) is a sibling partition-level
   check, not a standalone driver of the `--reconcile` flag semantics.
 - `rivet validate [--export <name>]` — added 2026-05-21; standalone driver
   for the M5/M6 semantics that `rivet run --validate` performs at end-of-run.

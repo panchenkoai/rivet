@@ -33,7 +33,7 @@ three artefacts at the resolved prefix on a clean run:
 
 | File | Purpose |
 |---|---|
-| `<export>_<timestamp>[_partN].<fmt>` | Data parts, run-unique, named per runner: single runs use `<export>_<ms-timestamp>[_partN].<fmt>` (millisecond stamp); chunked runs use `<export>_<timestamp>_chunk<N>_<16-hex-nonce>.<fmt>` (second-granularity stamp; uniqueness comes from the random nonce); keyset runs use `<export>_<run_id>_pk_w<worker>_<page>.<fmt>` (the run_id embeds a millisecond stamp). `<fmt>` is `parquet` or `csv`. |
+| `<export>_<timestamp>[_partN].<fmt>` | Data parts, run-unique, named per runner: single runs use `<export>_<ms-timestamp>[_partN].<fmt>` (millisecond stamp); chunked runs use `<export>_<timestamp>_chunk<N>_<16-hex-nonce>.<fmt>` (second-granularity stamp; uniqueness comes from the random nonce); single-worker keyset runs use `<export>_<run_id>_keyset_<seek-tag>.<fmt>` (named by the seek cursor, so a crash re-read from the same seek overwrites its part idempotently; the run_id embeds a millisecond stamp); parallel keyset runs (`parallel > 1`) use `<export>_<run_id>_pk_w<worker>_<page>.<fmt>` (same run_id stamp); parallel Mongo runs use `<export>_<ms-timestamp>_w<worker>_keyset<page>.<fmt>` (run-unique via the shared millisecond stamp). `<fmt>` is `parquet` or `csv`. |
 | `manifest.json` | ADR-0012 trust contract: every committed part is listed with `size_bytes` and `content_fingerprint`. Schema fingerprint and run identity travel here. |
 | `_SUCCESS` | Single line `xxh3:<16-hex>` over the exact bytes of `manifest.json`. Presence implies M5 (every listed part exists at recorded size). |
 

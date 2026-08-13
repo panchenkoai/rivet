@@ -449,7 +449,7 @@ The `path` (local) and `prefix` (S3 / GCS) fields support template placeholders,
 | `{date}` | UTC date as `YYYY-MM-DD` |
 | `{export}` | Export name from config |
 | `{table}` | Alias for `{export}` |
-| `{run_id}` | The run's unique id, substituted when the resolving command carries one (`run` / `apply`; `validate --run-id` re-targets it). If no run id is available the token is left verbatim so the destination open fails fast rather than aliasing to an unintended prefix. |
+| `{run_id}` | The run's unique id — substituted only by `rivet validate --run-id`, which re-targets validation at that run's prefix. `run` and `apply` resolve destinations without a run id, so the token is always left verbatim there and the destination open fails fast rather than aliasing to an unintended prefix (and `rivet load` refuses a `{run_id}` prefix outright — it cannot know which run's output to load). |
 
 ```yaml
 destination:

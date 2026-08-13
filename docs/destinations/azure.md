@@ -26,7 +26,8 @@ Rivet auto-derives the endpoint from `account_name` as
 explicitly only for a loopback emulator (Azurite, e.g.
 `http://127.0.0.1:10000/devstoreaccount1`) or, with
 `allow_anonymous: true`, an anonymous emulator.  Rivet rejects any
-non-loopback custom endpoint at config load as an exfiltration guard,
+non-loopback custom endpoint at config load as an exfiltration guard
+unless `allow_anonymous: true` is set (the anonymous-emulator escape),
 and `allow_anonymous` cannot be combined with credentials — so
 authenticated sovereign-cloud (US-Gov, China-Mooncake) or custom-DNS
 endpoints are not currently supported.
@@ -177,7 +178,11 @@ Files are uploaded as:
 az://{container}/{prefix}{export_name}_{YYYYMMDD}_{HHMMSS}_{mmm}.{format}
 ```
 
-The timestamp carries millisecond precision; multi-part exports append `_part{N}`.
+This is the single (non-chunked, non-keyset) runner's naming: the
+timestamp carries millisecond precision, and its size-split parts append
+`_part{N}`.  Chunked and keyset runs use their own run-unique part names
+— see the per-runner naming table in
+[docs/cloud-destinations.md](../cloud-destinations.md).
 
 Example: `az://my-container/exports/orders_20260521_181423_042.parquet`.
 

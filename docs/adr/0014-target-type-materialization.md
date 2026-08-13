@@ -141,16 +141,16 @@ Resolver **must** consider `rivet.logical_type` when physical type is `Utf8` / `
 | `Uuid` | `UUID` | `UUID` | `STRING` | `BYTES` ⚠ | `TEXT` | `UUID` |
 | `Enum` | `VARCHAR` | `VARCHAR` | `STRING` | `STRING` | `STRING` | `String` |
 | `Decimal(p,s)` | `DECIMAL(p,s)`‡ | `DECIMAL(p,s)`‡ | `NUMERIC`/`BIGNUMERIC`‡ | same | `NUMBER(p,s)`‡ | `Decimal(p,s)` |
-| `UInt64` | `UBIGINT` | `UBIGINT`/`HUGEINT` | `NUMERIC` | `INT64` ⚠ | `NUMBER` | `UInt64` |
+| `UInt64` | `UBIGINT` | `UBIGINT` | `NUMERIC` | `INT64` ⚠ | `NUMBER` | `UInt64` |
 | `Timestamp` + TZ | `TIMESTAMPTZ` | `TIMESTAMPTZ` | `TIMESTAMP` | `TIMESTAMP` | `TIMESTAMP_TZ` | `DateTime64` |
-| `Timestamp` naive | `TIMESTAMP` | `TIMESTAMP` | `DATETIME` | `DATETIME` | `TIMESTAMP_NTZ` | `DateTime64` |
+| `Timestamp` naive | `TIMESTAMP` | `TIMESTAMP` | `DATETIME` | `TIMESTAMP` ⚠ | `TIMESTAMP_NTZ` | `DateTime64` |
 | `Interval` | `INTERVAL` § | `INTERVAL` § | `STRING` | `STRING` | `TEXT` | `String` |
 | `List { … }` | `LIST(T)` | `LIST(T)` | `ARRAY<…>` | `REPEATED …` | `ARRAY` | `Array(T)` |
 | `Binary` | `BLOB` | `BLOB` | `BYTES` | `BYTES` | `BINARY` | `String`/binary |
 
 † ClickHouse: use `JSON` when querying inside fields; opaque blob → `String` ([JSON type](https://clickhouse.com/docs/sql-reference/data-types/json)).  
-‡ Precision ≤ 38 only: BigQuery limits enforced in existing `bq_decimal_compat`; past 38, DuckDB autoloads as `DOUBLE` (lossy past 2^53, no recovering cast — narrow the source precision) and Snowflake FAILS the column (`NUMBER` above precision 38 is not a valid type).  
-⚠ Autoload diverges from native, `cast_sql` only where lossless: BQ `Json` autoloads as `BYTES` — recover native JSON with `PARSE_JSON(SAFE_CONVERT_BYTES_TO_STRING(col))`; BQ `Uuid` as 16-byte `BYTES` — `TO_HEX(col)`; BQ `UInt64` autoloads as `INT64`, which overflows past `i64::MAX` unrecoverably (`cast_sql` `None`) — map the column to `decimal(20,0)` via a source override.  
+‡ Precision ≤ 38 only: BigQuery limits enforced by the resolver's BigQuery decimal arm (`bigquery::decimal` in `src/types/target.rs`, covered by the `bq_decimal_*` tests); past 38, DuckDB autoloads as `DOUBLE` (lossy past 2^53, no recovering cast — narrow the source precision) and Snowflake FAILS the column (`NUMBER` above precision 38 is not a valid type).  
+⚠ Autoload diverges from native, `cast_sql` only where lossless: BQ `Json` autoloads as `BYTES` — recover native JSON with `PARSE_JSON(SAFE_CONVERT_BYTES_TO_STRING(col))`; BQ `Uuid` as 16-byte `BYTES` — `TO_HEX(col)`; BQ `UInt64` autoloads as `INT64`, which overflows past `i64::MAX` unrecoverably (`cast_sql` `None`) — map the column to `decimal(20,0)` via a source override; BQ naive `Timestamp` autoloads as `TIMESTAMP` (an instant — BigQuery ignores Parquet `isAdjustedToUTC=false`) — recover the wall-clock with `DATETIME(col)` after load.  
 § The resolver reports DuckDB `INTERVAL`/`INTERVAL` ok, but `mapping.rs` still exports PG `interval` as ISO `Utf8` — the DuckDB autoload claim itself warrants a code-side check.
 
 ### Example L5 — DuckDB view over Rivet Parquet

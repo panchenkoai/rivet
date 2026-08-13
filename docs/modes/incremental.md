@@ -57,7 +57,7 @@ rivet state reset --config orders.yaml --export orders_incremental
 
 1. First run: no cursor exists, so all rows matching the query are exported
 2. Rivet records the maximum value of `cursor_column` as the cursor
-3. Subsequent runs: Rivet wraps your query in a subquery, adds `WHERE updated_at > <last cursor>`, and orders by the cursor column (the cursor is an inlined literal on Postgres/SQL Server, a bind parameter on MySQL)
+3. Subsequent runs: Rivet wraps your query in a subquery, adds `WHERE updated_at > <last cursor>`, and orders by the cursor column (the cursor is an inlined literal on Postgres/SQL Server — Postgres uses the escaped `E'…'` form — and a bind parameter on MySQL)
 4. Only new/updated rows are exported; cursor advances after successful write
 
 ```
@@ -67,7 +67,7 @@ Run 1 (no cursor):  SELECT * FROM (SELECT ... FROM orders) AS _rivet ORDER BY "u
                       on the cursor column matters)
 
 Run 2 (with cursor): SELECT * FROM (SELECT ... FROM orders) AS _rivet
-                       WHERE "updated_at" > '2026-04-05 23:59:59' ORDER BY "updated_at"
+                       WHERE "updated_at" > E'2026-04-05 23:59:59' ORDER BY "updated_at"
                       → 47 rows (only changes since last run)
 ```
 

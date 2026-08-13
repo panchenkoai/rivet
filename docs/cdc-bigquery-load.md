@@ -89,6 +89,9 @@ The whole point of the loader's job labels (`managed_by:rivet` /
 So the CDC steps use distinct ops:
 
 - `rivet_op:load` — the free `LOAD DATA` of the change log (`bytes_billed = 0`);
+- `rivet_op:count` — the free `SELECT COUNT(*)` row-count gate (a 0-bytes-billed
+  metadata read), run before and after the load so the delta can be checked
+  against the manifest total;
 - `rivet_op:create` / `rivet_op:alter` — the changes-table DDL;
 - `rivet_op:view` — the free `CREATE OR REPLACE VIEW` dedup step.
 
@@ -100,7 +103,7 @@ from the free load — you can price exactly what the dedup step costs per table
 
 ```sql
 SELECT
-  (SELECT value FROM UNNEST(labels) WHERE key='rivet_op')    AS op,      -- load | create | alter | view
+  (SELECT value FROM UNNEST(labels) WHERE key='rivet_op')    AS op,      -- load | count | create | alter | view
   (SELECT value FROM UNNEST(labels) WHERE key='rivet_table') AS tbl,
   COUNT(*) AS jobs, SUM(total_bytes_billed) AS bytes_billed
 FROM `region-us`.INFORMATION_SCHEMA.JOBS
@@ -109,8 +112,8 @@ GROUP BY op, tbl ORDER BY bytes_billed DESC;
 ```
 
 The loader's labeling is already op-parameterized (`run_sql(sql, op, table)`),
-and every rivet-driven step (`load` / `create` / `alter` / `view`) passes its
-own op — only jobs you run yourself need labels of your own.
+and every rivet-driven step (`load` / `count` / `create` / `alter` / `view`)
+passes its own op — only jobs you run yourself need labels of your own.
 
 ## The one command: `rivet load`
 
