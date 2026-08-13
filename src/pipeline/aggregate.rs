@@ -157,6 +157,91 @@ pub(super) fn build(
     }
 }
 
+/// One export's run-over-run throughput comparison input: current and
+/// previous-success `(rows, duration_ms)`.
+pub(super) struct ThroughputPair {
+    pub export_name: String,
+    pub cur_rows: i64,
+    pub cur_ms: i64,
+    pub prev_rows: i64,
+    pub prev_ms: i64,
+}
+
+/// Floor below which a run is too small/short for a throughput comparison to
+/// mean anything (startup overhead dominates; noise reads as regression).
+const REGRESSION_MIN_ROWS: i64 = 10_000;
+const REGRESSION_MIN_MS: i64 = 5_000;
+/// A run counts as regressed when its rows/s drop to ≤ 2/3 of the previous
+/// success (≥1.5× slower per row).
+const REGRESSION_RATIO: f64 = 1.5;
+
+/// Pure run-over-run self-check: compare each export's throughput (rows/s)
+/// against its previous SUCCESS and name the material regressions.
+///
+/// This is the run proving itself: the 2026-08-13 field regression (a
+/// governor reading its own exhaust ran every keyset export 2–2.7× slower,
+/// +1h48m) was invisible in the moment — counts matched, statuses were green,
+/// and only a hand-written SQL join over two state DBs surfaced it days
+/// later. Rows/s (not wall time) so organic data growth does not read as a
+/// slowdown; tiny/short runs are skipped as noise.
+pub(super) fn throughput_regressions(pairs: &[ThroughputPair]) -> Vec<String> {
+    let mut out = Vec::new();
+    for p in pairs {
+        if p.cur_rows < REGRESSION_MIN_ROWS
+            || p.prev_rows < REGRESSION_MIN_ROWS
+            || p.prev_ms < REGRESSION_MIN_MS
+            || p.cur_ms <= 0
+        {
+            continue;
+        }
+        let cur_tp = p.cur_rows as f64 * 1000.0 / p.cur_ms as f64;
+        let prev_tp = p.prev_rows as f64 * 1000.0 / p.prev_ms as f64;
+        if prev_tp > 0.0 && prev_tp / cur_tp >= REGRESSION_RATIO {
+            out.push(format!(
+                "export '{}': throughput {} → {} rows/s ({:.1}× slower than its last success) — \
+                 check governor sheds / adaptive batch shrinks / source load",
+                p.export_name,
+                format_rate(prev_tp),
+                format_rate(cur_tp),
+                prev_tp / cur_tp,
+            ));
+        }
+    }
+    out
+}
+
+/// Read each successful export's previous success from the state DB and WARN
+/// about material throughput regressions. Best-effort: a state read failing
+/// never affects the run. Called beside [`print`] at every aggregate site so
+/// EVERY run self-reports degradation at the default log level — the answer
+/// to "prove the next run is not strangling itself" is that the run says so.
+pub(super) fn warn_throughput_regressions(state: &StateStore, agg: &RunAggregate) {
+    let mut pairs = Vec::new();
+    for e in agg.per_export.iter().filter(|e| e.status == "success") {
+        let Ok(metrics) = state.get_metrics(Some(&e.export_name), 10) else {
+            continue;
+        };
+        // Newest-first; skip THIS run's own row (matched by run_id), then take
+        // the first prior success as the baseline.
+        let prev = metrics
+            .iter()
+            .filter(|m| m.status == "success")
+            .find(|m| m.run_id.as_deref() != Some(e.run_id.as_str()));
+        if let Some(prev) = prev {
+            pairs.push(ThroughputPair {
+                export_name: e.export_name.clone(),
+                cur_rows: e.rows,
+                cur_ms: e.duration_ms,
+                prev_rows: prev.total_rows,
+                prev_ms: prev.duration_ms,
+            });
+        }
+    }
+    for line in throughput_regressions(&pairs) {
+        log::warn!("{line}");
+    }
+}
+
 /// Pretty-print the aggregate after all per-export blocks.
 pub(super) fn print(agg: &RunAggregate) {
     eprintln!();
@@ -589,6 +674,48 @@ mod tests {
         assert_eq!(format_duration(1500), "1.5s");
         assert_eq!(format_duration(65_000), "1m 5s");
         assert_eq!(format_duration(3_725_000), "1h 2m 5s");
+    }
+
+    /// The run-over-run self-check that answers "prove the next run is not
+    /// strangling itself": a material rows/s drop vs the last success must be
+    /// named, organic growth and noise must not. RED-proven against a mutant
+    /// inverting the ratio comparison.
+    #[test]
+    fn throughput_regressions_flag_real_slowdowns_only() {
+        let pair = |name: &str, cur_rows, cur_ms, prev_rows, prev_ms| ThroughputPair {
+            export_name: name.into(),
+            cur_rows,
+            cur_ms,
+            prev_rows,
+            prev_ms,
+        };
+        // 2.4× slower per row (the field regression's shape) → flagged.
+        let out = throughput_regressions(&[pair("big", 1_000_000, 24_000, 1_000_000, 10_000)]);
+        assert_eq!(out.len(), 1, "a 2.4× slowdown must be flagged: {out:?}");
+        assert!(
+            out[0].contains("big") && out[0].contains("slower"),
+            "{out:?}"
+        );
+        // 1.2× — within noise/growth → silent.
+        assert!(
+            throughput_regressions(&[pair("ok", 1_000_000, 12_000, 1_000_000, 10_000)]).is_empty()
+        );
+        // Faster run → silent.
+        assert!(
+            throughput_regressions(&[pair("fast", 1_000_000, 8_000, 1_000_000, 10_000)]).is_empty()
+        );
+        // Rows GREW 3× while wall grew 3× — throughput flat → silent (wall-time
+        // comparison would have false-flagged this; rows/s is the honest unit).
+        assert!(
+            throughput_regressions(&[pair("grew", 3_000_000, 30_000, 1_000_000, 10_000)])
+                .is_empty()
+        );
+        // Tiny/short runs are noise → silent even at 10× slower.
+        assert!(throughput_regressions(&[pair("tiny", 500, 5_000, 500, 500)]).is_empty());
+        assert!(
+            throughput_regressions(&[pair("short", 20_000, 4_000, 20_000, 400)]).is_empty(),
+            "prev under the min-duration floor must not baseline"
+        );
     }
 
     #[test]
