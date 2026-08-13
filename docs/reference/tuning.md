@@ -364,7 +364,7 @@ smaller `batch_size` directly.
 
 ### How `memory_threshold_mb` works
 
-When `tuning.memory_threshold_mb` is set, the **chunked runners** sample RSS at each chunk boundary (via `mach_task_basic_info` on macOS, `/proc/self/statm` on Linux). If RSS exceeds the threshold, the next chunk is held back (re-polling every few seconds) until RSS falls back to or below the threshold — there is no hysteresis band, and no per-batch check. Full, incremental, keyset, and mongo-parallel exports never pause on this knob; there RSS is only recorded for the peak-RSS metric. For a memory ceiling on those paths use `batch_size_memory_mb` / `max_batch_memory_mb` instead.
+When `tuning.memory_threshold_mb` is set, the **chunked runners** sample RSS at each chunk boundary (via `mach_task_basic_info` on macOS, `/proc/self/statm` on Linux). What happens above the threshold depends on the path: the **parallel chunked** runner (without checkpointing) holds the next chunk back, re-polling every 2 s until RSS falls back below the threshold; the **sequential** and **checkpointed** chunked paths pause once for a fixed 2–5 s and then proceed with the next chunk even if RSS is still above the threshold. There is no hysteresis band, and no per-batch check. Full, incremental, keyset, and mongo-parallel exports never pause on this knob; there RSS is only recorded for the peak-RSS metric. For a memory ceiling on those paths use `batch_size_memory_mb` / `max_batch_memory_mb` instead.
 
 ```yaml
 source:

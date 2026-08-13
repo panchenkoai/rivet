@@ -394,7 +394,7 @@ sub-folders by a date column. See [partitioning.md](../partitioning.md).
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `exported_at` | boolean | `false` | Add `_rivet_exported_at` column (Timestamp UTC; one value captured at sink construction and shared by every batch/row that sink writes — effectively one value per export run in single mode, per chunk worker in multi-part modes) |
+| `exported_at` | boolean | `false` | Add `_rivet_exported_at` column (Timestamp UTC; one value captured at sink construction and shared by every batch/row that sink writes — effectively one value per export run in single mode, per chunk (or keyset page) in multi-part modes) |
 | `row_hash` | boolean or list of column names | `false` | Add `_rivet_row_hash` column — lower 64 bits of `xxHash3-128`, written as `Int64` for fast `PARTITION BY` / `JOIN`. `true` hashes every column; a list (`row_hash: [id, status, updated_at]`) hashes exactly those columns in that order and records the covered set in the run manifest. Deterministic across runs; distinguishes NULL from empty string. |
 
 ---

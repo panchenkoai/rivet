@@ -44,7 +44,7 @@ Four ways to slice the table. They differ in how chunk boundaries are computed; 
 > heuristic is a good starting point; tune from there if memory or source
 > connection count is constrained.
 
-**Each integer-range chunk runs:** `SELECT * FROM (<base_query>) AS _rivet WHERE <chunk_column> BETWEEN <lo> AND <hi>` — inclusive bounds (hi = lo + chunk_size - 1) inlined as literals, not bind parameters. The date variant (`chunk_by_days`) uses half-open `WHERE col >= '<start>' AND col < '<end>'`; dense uses `ROW_NUMBER()` (documented further down).
+**Each integer-range chunk runs:** `SELECT * FROM (<base_query>) AS _rivet WHERE <chunk_column> BETWEEN <lo> AND <hi>` — inclusive bounds (hi = lo + chunk_size - 1) inlined as literals, not bind parameters. The subquery wrap applies to `query:` exports; a `table:` shortcut renders the unwrapped `SELECT * FROM <table> WHERE <chunk_column> BETWEEN <lo> AND <hi>`. The date variant (`chunk_by_days`) uses half-open `WHERE col >= '<start>' AND col < '<end>'`; dense uses `ROW_NUMBER()` (documented further down).
 
 ## Minimal config
 
@@ -283,7 +283,7 @@ exports:
       path: ./output
 ```
 
-Output files: one per page, named `{export}_{run_id}_keyset_{tag}.parquet` where run_id is `{export}_YYYYMMDDTHHMMSSmmm` (sanitized) and the tag is `start` for the first page, then a 16-hex hash of that page's seek cursor — e.g. `events_events_20260529T120000123_keyset_start.parquet`. The run_id/seek-based name makes a crash-resume overwrite its own page idempotently.
+Output files: one per page, named `{export}_{run_id}_keyset_{tag}.parquet` where run_id is `{export}_YYYYMMDDTHHMMSS.mmm` (filename sanitization maps the `.` to `_`) and the tag is `start` for the first page, then a 16-hex hash of that page's seek cursor — e.g. `events_events_20260529T120000_123_keyset_start.parquet`. The run_id/seek-based name makes a crash-resume overwrite its own page idempotently.
 
 **Auto-resolution (MySQL).** With the `table:` shortcut and **no** `chunk_by_key`,
 if the table has no single-integer PK but *does* have a usable single-column

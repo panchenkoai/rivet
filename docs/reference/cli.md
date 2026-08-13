@@ -666,7 +666,7 @@ Each run is shown as a block:
 ```
 ✓ orders  success  12.3s
   run_id: orders_20260513T120000.123
-  files: 3  rows: 150,000  bytes: 4.2 MB
+  files:  3  rows: 150000  size: 4.2 MB
 ```
 
 `✓` = succeeded · `✗` = failed · `•` = partial / unknown.

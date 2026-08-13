@@ -55,7 +55,7 @@ What each setting does:
 | `profile: safe` | `batch_size: 2000`, `throttle_ms: 500`, `memory_threshold_mb: 2048` |
 | `max_batch_memory_mb: 64` | Caps each Arrow batch at 64 MB; overrides the profile default |
 | `on_batch_memory_exceeded: auto_shrink` | Splits oversized batches instead of failing |
-| `memory_threshold_mb: 512` | On chunked exports, holds the next chunk while process RSS exceeds 512 MB (other modes only record peak RSS) |
+| `memory_threshold_mb: 512` | On chunked exports, pauses before the next chunk when process RSS exceeds 512 MB — the parallel chunked runner waits until RSS drops; sequential/checkpointed paths pause a fixed 2–5 s once and proceed (other modes only record peak RSS) |
 | `target_row_group_mb: 32` | Writes smaller Parquet row groups — reduces Parquet writer peak RSS |
 
 On a wide-text table (200K rows, avg 3 KB/row, 12 columns), this combination measured **154 MB peak RSS** — compared to 878 MB without the cap. Actual RSS on your table will depend on row width and column count; use `rivet metrics` to validate after the first run.

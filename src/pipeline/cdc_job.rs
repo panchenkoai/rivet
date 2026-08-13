@@ -494,7 +494,8 @@ fn run_cdc_inner(
         let shape = match config.source.source_type {
             crate::config::SourceType::Mysql => "blocks on the binlog and stays up until stopped",
             crate::config::SourceType::Mongo => {
-                "tails the change stream while writes continue, and exits on an idle poll"
+                "blocks on the change stream awaiting events and stays up until stopped \
+                 (it ends only if the stream is invalidated or closed)"
             }
             _ => {
                 concat!(

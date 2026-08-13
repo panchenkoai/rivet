@@ -72,7 +72,7 @@ Every committed part is recorded in `manifest.json`:
 ```json
 {
   "manifest_version": 1,
-  "run_id": "orders_20260523T120000123",
+  "run_id": "orders_20260523T120000.123",
   "schema_fingerprint": "xxh3:…",
   "row_count": 200000,
   "part_count": 2,

@@ -772,9 +772,10 @@ pub struct CdcExportConfig {
     /// **Defaults to `true`** (bounded): the OSS model is scheduler-driven, and
     /// omitting this must NOT silently start a never-terminating stream. Setting
     /// `false` opts into the continuous model, which is engine-specific: a true
-    /// daemon only on MySQL (blocking binlog dump); MongoDB tails while writes
-    /// continue and exits on an idle poll; PostgreSQL / SQL Server still exit on
-    /// catch-up — one unbounded pass, run it under a supervisor.
+    /// daemon on MySQL (blocking binlog dump) and MongoDB (the change stream
+    /// blocks awaiting events; ends only if the stream is invalidated/closed);
+    /// PostgreSQL / SQL Server still exit on catch-up — one unbounded pass, run
+    /// it under a supervisor.
     #[serde(default = "default_true")]
     pub until_current: bool,
     /// Stop at the first COMMIT BOUNDARY once N change events have been

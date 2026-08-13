@@ -18,7 +18,7 @@ When you run Rivet, the process has access to:
 - **State backend file** — `.rivet_state.db` (SQLite) in the working directory unless overridden.
 - **Local files** written by the export: temp files during extraction, final output files, journal/metrics records.
 
-In batch mode Rivet does **not** execute DDL, `INSERT`, `UPDATE`, or `DELETE` against the source. It issues `SELECT`, (for cursors) `DECLARE CURSOR` / `FETCH`, transaction-scoped `SET LOCAL` session tuning, and (during preflight) `EXPLAIN`. In CDC mode Rivet additionally creates a persistent logical replication slot on PostgreSQL (`pg_create_logical_replication_slot`), which requires the `REPLICATION` privilege and pins WAL retention until acknowledged — Rivet never drops the slot itself; when a capture is retired, the operator must drop it manually (`rivet doctor` surfaces a `pg_drop_replication_slot` hint for stale slots). MySQL CDC requires `REPLICATION SLAVE` / `REPLICATION CLIENT` grants, and SQL Server CDC reads the change tables.
+In batch mode Rivet does **not** execute DDL, `INSERT`, `UPDATE`, or `DELETE` against the source. It issues `SELECT`, (for cursors) `DECLARE CURSOR` / `FETCH`, session tuning (transaction-scoped `SET LOCAL` on PostgreSQL; session-scoped `SET SESSION` on MySQL — `time_zone`, `sql_mode`, `max_execution_time`, reset before the connection returns to the pool), and (during preflight) `EXPLAIN`. In CDC mode Rivet additionally creates a persistent logical replication slot on PostgreSQL (`pg_create_logical_replication_slot`), which requires the `REPLICATION` privilege and pins WAL retention until acknowledged — Rivet never drops the slot itself; when a capture is retired, the operator must drop it manually (`rivet doctor` surfaces a `pg_drop_replication_slot` hint for stale slots). MySQL CDC requires `REPLICATION SLAVE` / `REPLICATION CLIENT` grants, and SQL Server CDC reads the change tables.
 
 ---
 
@@ -28,7 +28,7 @@ The following files may contain sensitive information even when credentials are 
 
 | Artifact | Sensitive content |
 |---|---|
-| `rivet.yaml` | Source URL, query bodies, destination credentials (if inlined) |
+| `rivet.yaml` | Source URL, query bodies, source credentials (if inlined — destination credentials have no inline form; see below) |
 | `plan.json` | Table names, query SQL, chunk bounds, row estimates |
 | `.rivet_state.db` | Cursor values, manifest of exported files, run metrics, the per-run event timeline (`run_journal` table, read via `rivet journal` — export names, run IDs, chunk boundaries, error text), and **failed-run error text** (see the note below) |
 | Run summary (`summary.json` / `summary.md`) | Per-export status, counts, and error text on failure |

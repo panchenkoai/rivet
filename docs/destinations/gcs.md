@@ -114,7 +114,7 @@ rivet doctor --config export.yaml
 The GIF above shows the end-to-end flow with **Application Default Credentials** (no `credentials_file:` in the config, no `GOOGLE_APPLICATION_CREDENTIALS` env var — Rivet reads `~/.config/gcloud/application_default_credentials.json` directly):
 
 1. `cat gcs.yaml` — production-shaped YAML (just `type: gcs`, `bucket:`, `prefix:`).
-2. `rivet doctor` writes a small `.rivet_doctor_probe` object to verify write access, then reports `[OK] Destination GCS(<bucket>) — All checks passed`.
+2. `rivet doctor` writes a small `.rivet_doctor_probe` object to verify write access, then reports `[OK]  Destination GCS(<bucket>)` followed by a final `All checks passed.` line.
 3. `rivet run --validate` exports 100 rows and uploads the Parquet file.
 4. `gcloud storage ls` confirms the probe file **and** the export both landed in the bucket.
 

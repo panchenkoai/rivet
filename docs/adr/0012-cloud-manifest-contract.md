@@ -43,7 +43,7 @@ For every export run targeting a cloud or local-file destination, Rivet writes:
 
 Every manifest write also leaves an immutable run-unique copy `manifest-<sanitized-run_id>.json` beside the canonical last-writer-wins `manifest.json` (`src/manifest.rs::run_unique_manifest_name`), so repeated runs into one prefix do not clobber prior runs' records. The copies are Rivet-internal sidecars: resume, validate, and reconcile keep reading the canonical name, and the untracked-object scans exempt any `manifest-*.json` name (`is_run_unique_manifest_name`).
 
-`_SUCCESS` is a zero-byte marker. Its only meaning is "the manifest at this prefix represents a fully-committed run". Its existence implies the manifest exists, and every part the manifest references also exists at the recorded byte length.
+`_SUCCESS` is a single-line marker carrying the manifest fingerprint (`xxh3:<16-hex>`, `src/manifest.rs::success_marker_body`; see M2). Its only meaning is "the manifest at this prefix represents a fully-committed run". Its existence implies the manifest exists, and every part the manifest references also exists at the recorded byte length.
 
 ---
 

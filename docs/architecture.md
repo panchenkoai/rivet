@@ -101,7 +101,7 @@ Implementations:
 
 | Trait | Concrete types |
 |-------|----------------|
-| `Source` | `PostgresSource` (DECLARE CURSOR + FETCH N), `MysqlSource` (`query_iter`), `MssqlSource` (tiberius; `OFFSET … FETCH NEXT`), `MongoSource` (JSON-blob: `_id` + `document`) |
+| `Source` | `PostgresSource` (DECLARE CURSOR + FETCH N), `MysqlSource` (`exec_iter`, binary protocol), `MssqlSource` (tiberius; `OFFSET … FETCH NEXT`), `MongoSource` (JSON-blob: `_id` + `document`) |
 | `Format` | `CsvFormat`, `ParquetFormat` |
 | `FormatWriter` | `CsvFormatWriter` (hand-rolled escaping over `Box<dyn Write>`), `ParquetFormatWriter` (arrow `ArrowWriter`) |
 | `Destination` | `LocalDestination`, `StdoutDestination`, `CloudDestination<B: CloudBackend>` (OpenDAL) with backends `S3Backend`, `GcsBackend`, `AzureBackend` |
@@ -271,7 +271,7 @@ src/
     batch_controller.rs     Shared batch-loop driver (fetch → sink → throttle) across engines
     postgres/               DECLARE CURSOR + FETCH N; PgTxnGuard (RAII); detect_pg_transaction_pooler
       mod.rs, arrow_convert.rs, from_parse.rs, cdc.rs (PgChangeStream — logical slot)
-    mysql/                  query_iter; MysqlProxyKind (Direct/ProxySql/MaxScale/Multiplexed)
+    mysql/                  exec_iter (binary protocol); MysqlProxyKind (Direct/ProxySql/MaxScale/Multiplexed)
       mod.rs, arrow_convert.rs, proxy.rs (classify_mysql_proxy), cdc.rs (MysqlChangeStream — binlog)
     mssql/                  tiberius OFFSET/FETCH + keyset; MssqlProxyKind (Direct/Multiplexed/AzureGateway)
       mod.rs, arrow_convert.rs, proxy.rs (classify_mssql_proxy), cdc.rs (MssqlChangeStream — change tables)
