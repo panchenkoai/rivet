@@ -139,11 +139,15 @@ pub trait PressureSource: Send {
     /// Return the source's current pressure reading, or `None` when the
     /// source cannot sample this tick (the governor then holds parallelism
     /// flat — see [`GovernorState::observe`]).
-    fn sample_pressure(&mut self) -> Option<u64>;
+    /// One reading of the governor's foreign-pressure signal. (Named `sample`,
+    /// not `sample_pressure`: the latter was the retired Source-trait method
+    /// whose name colliding here sent greps to the wrong concept — walk find,
+    /// 2026-08-13.)
+    fn sample(&mut self) -> Option<u64>;
 }
 
 impl PressureSource for Box<dyn crate::source::Source> {
-    fn sample_pressure(&mut self) -> Option<u64> {
+    fn sample(&mut self) -> Option<u64> {
         // The governor's signal is the FOREIGN-pressure counter, not the batch
         // loop's own-extraction counter: a keyset export's own pages inflate
         // the spill counters by design, and a governor listening to them sheds
@@ -236,7 +240,7 @@ impl Governor {
                 continue;
             }
             last_sample = Instant::now();
-            if let Some((from, to)) = self.tick(source.sample_pressure()) {
+            if let Some((from, to)) = self.tick(source.sample()) {
                 on_decision(from, to);
             }
         }
@@ -445,7 +449,7 @@ mod tests {
     }
 
     impl PressureSource for VecSource {
-        fn sample_pressure(&mut self) -> Option<u64> {
+        fn sample(&mut self) -> Option<u64> {
             self.sample_count
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.samples.pop_front().unwrap_or(None)
