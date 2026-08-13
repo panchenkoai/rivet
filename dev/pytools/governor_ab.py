@@ -28,9 +28,25 @@ import time
 from pathlib import Path
 
 TABLE = "gov_stand_ab"
-ROWS = 60_000
 MYSQL_CONTAINER = "rivet-mysql-1"
 MYSQL_URL = "mysql://rivet:rivet@127.0.0.1:3306/rivet"
+
+# Two scenario profiles over the same self-spilling fixture:
+#
+# * quick — a smoke gate: seconds per leg, governor at a 200 ms interval; the
+#   discriminator is the SHED COUNT (the wall damage has no time to
+#   accumulate on a 4 s run).
+# * field — models the 2026-08-13 production regression's SIGNAL SHAPE: the
+#   governor only ever sees a counter, so a faithful model is "the counter it
+#   listened to rises at the field's cadence, from the export's OWN work, on
+#   a source with no foreign load, for a run long enough that shedding costs
+#   real wall time". Multi-minute legs at the DEFAULT 1500 ms governor
+#   interval reproduce not just the sheds but the field's wall-clock damage
+#   (~2.4x on the buggy binary), so the A/B ratio becomes the verdict.
+PROFILES = {
+    "quick": dict(rows=60_000, payload=1024, chunk_size=3_000, batch=250, interval_ms=200),
+    "field": dict(rows=600_000, payload=1024, chunk_size=20_000, batch=1_000, interval_ms=1_500),
+}
 
 
 def mysql_root(sql: str) -> str:
@@ -44,14 +60,14 @@ def mysql_root(sql: str) -> str:
     return out.stdout.strip()
 
 
-def seed() -> None:
-    print(f"== seeding {TABLE} ({ROWS} rows, wide payload)")
+def seed(rows: int, payload: int) -> None:
+    print(f"== seeding {TABLE} ({rows} rows, payload {payload}B)")
     mysql_root(f"DROP TABLE IF EXISTS {TABLE}; CREATE TABLE {TABLE} (id BIGINT PRIMARY KEY, payload TEXT NOT NULL) ENGINE=InnoDB;")
     step = 5_000
-    for start in range(1, ROWS, step):
+    for start in range(1, rows, step):
         mysql_root(
             f"SET SESSION cte_max_recursion_depth={step + 1000}; "
-            f"INSERT INTO {TABLE} SELECT seq, REPEAT('x',1024) FROM "
+            f"INSERT INTO {TABLE} SELECT seq, REPEAT('x',{payload}) FROM "
             f"(WITH RECURSIVE s(seq) AS (SELECT {start} UNION ALL SELECT seq+1 FROM s WHERE seq < {start + step - 1}) "
             f"SELECT seq FROM s) t;"
         )
@@ -84,7 +100,7 @@ class TmpTableGlobals:
         )
 
 
-def run_once(binary: Path, adaptive: bool, workdir: Path) -> tuple[float, int]:
+def run_once(binary: Path, adaptive: bool, workdir: Path, p: dict) -> tuple[float, int]:
     """One export run; returns (wall_seconds, shed_count)."""
     workdir.mkdir(parents=True)
     cfg = workdir / "cfg.yaml"
@@ -96,13 +112,13 @@ source:
   tuning:
     adaptive: {str(adaptive).lower()}
     min_parallel: 1
-    batch_size: 250
+    batch_size: {p['batch']}
 exports:
   - name: {TABLE}
     query: "SELECT DISTINCT id, payload FROM {TABLE}"
     mode: chunked
     chunk_column: id
-    chunk_size: 3000
+    chunk_size: {p['chunk_size']}
     parallel: 4
     format: parquet
     destination: {{ type: local, path: {workdir / 'out'} }}
@@ -113,7 +129,11 @@ exports:
         [str(binary), "run", "-c", str(cfg)],
         capture_output=True,
         text=True,
-        env={"RUST_LOG": "info", "RIVET_GOVERNOR_INTERVAL_MS": "200", "PATH": "/usr/bin:/bin"},
+        env={
+            "RUST_LOG": "info",
+            "RIVET_GOVERNOR_INTERVAL_MS": str(p["interval_ms"]),
+            "PATH": "/usr/bin:/bin",
+        },
     )
     wall = time.monotonic() - t0
     if proc.returncode != 0:
@@ -122,11 +142,11 @@ exports:
     return wall, sheds
 
 
-def verdict(binary: Path, label: str, tmp: Path) -> bool:
+def verdict(binary: Path, label: str, tmp: Path, p: dict) -> bool:
     version = subprocess.run([str(binary), "--version"], capture_output=True, text=True).stdout.strip()
     print(f"== {label}: {version} ({binary})")
-    wall_off, _ = run_once(binary, False, tmp / f"{label}_off")
-    wall_on, sheds = run_once(binary, True, tmp / f"{label}_on")
+    wall_off, _ = run_once(binary, False, tmp / f"{label}_off", p)
+    wall_on, sheds = run_once(binary, True, tmp / f"{label}_on", p)
     ratio = wall_on / wall_off
     ok = sheds == 0 and wall_on <= wall_off * 1.6 + 1.0
     verdict_s = "PASS" if ok else "FAIL (self-throttle)"
@@ -138,13 +158,21 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--rivet-a", required=True, type=Path, help="baseline rivet binary (e.g. the released one)")
     ap.add_argument("--rivet-b", required=True, type=Path, help="candidate rivet binary (e.g. target/release/rivet)")
+    ap.add_argument(
+        "--profile",
+        choices=sorted(PROFILES),
+        default="quick",
+        help="quick = seconds-per-leg shed gate; field = multi-minute legs at the default "
+        "1500ms governor interval, reproducing the 2026-08-13 wall-clock damage",
+    )
     args = ap.parse_args()
+    p = PROFILES[args.profile]
 
-    seed()
-    print("== forcing tmp-table spills (globals flipped; restored on exit)")
+    seed(p["rows"], p["payload"])
+    print(f"== forcing tmp-table spills (globals flipped; restored on exit) — profile '{args.profile}'")
     with TmpTableGlobals(), tempfile.TemporaryDirectory(prefix="rivet-gov-ab-") as tmp:
-        a_ok = verdict(args.rivet_a.expanduser(), "A", Path(tmp))
-        b_ok = verdict(args.rivet_b.expanduser(), "B", Path(tmp))
+        a_ok = verdict(args.rivet_a.expanduser(), "A", Path(tmp), p)
+        b_ok = verdict(args.rivet_b.expanduser(), "B", Path(tmp), p)
     # The stand's exit code grades the CANDIDATE (B) only — A is often the
     # known-bad baseline whose FAIL is the demonstration, not a problem.
     return 0 if b_ok else 1
