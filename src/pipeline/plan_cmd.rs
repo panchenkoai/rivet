@@ -434,13 +434,12 @@ fn build_plan_artifact(
     Ok((artifact, inputs, recommendation))
 }
 
-/// Compute the `ComputedPlanData` portion of the artifact.
-///
-/// For `Chunked` exports this opens a source connection and calls
-/// `detect_and_generate_chunks` to pre-compute chunk boundaries.  No rows are
-/// exported — we only run the `SELECT min(col) / max(col)` boundary queries.
-///
-/// For `Incremental` exports we read the last cursor value from `StateStore`.
+/// Below this span the catalog is not allowed to override it: the F4
+/// fresh-ANALYZE case is a SMALL table whose garbage `reltuples` (1130 on a
+/// 30-row table) would otherwise win over an exact tiny span. A genuinely
+/// non-unique chunk key on a table worth chunking has a span far above this.
+const CATALOG_OVERRIDE_MIN_SPAN: i64 = 10_000;
+
 /// The row estimate a chunked plan reports, from the two available signals.
 ///
 /// * A MEASURED whole-table actual (a prior run's row count) always wins —
@@ -464,11 +463,22 @@ fn chunked_row_estimate(
         return catalog.or(key_span);
     }
     match (key_span, catalog) {
-        (Some(span), Some(cat)) => Some(span.max(cat)),
+        (Some(span), Some(cat)) if span >= CATALOG_OVERRIDE_MIN_SPAN => Some(span.max(cat)),
+        // Tiny span: keep the exact span — a larger catalog here is the
+        // fresh-ANALYZE garbage shape, not evidence of a non-unique key
+        // (bughunt 2026-08-13 push-back on the max() rule).
+        (Some(span), Some(_)) => Some(span),
         (a, b) => a.or(b),
     }
 }
 
+/// Compute the `ComputedPlanData` portion of the artifact.
+///
+/// For `Chunked` exports this opens a source connection and calls
+/// `detect_and_generate_chunks` to pre-compute chunk boundaries.  No rows are
+/// exported — we only run the `SELECT min(col) / max(col)` boundary queries.
+///
+/// For `Incremental` exports we read the last cursor value from `StateStore`.
 fn compute_plan_data(
     plan: &crate::plan::ResolvedRunPlan,
     row_estimate: Option<i64>,
@@ -1384,6 +1394,10 @@ mod tests {
             chunked_row_estimate(Some(342_000_000), Some(520_000), true),
             Some(520_000),
         );
+        // F4 fresh-ANALYZE shape: tiny exact span, garbage catalog above it —
+        // the span must survive (the catalog override is gated on a span big
+        // enough to be worth chunking).
+        assert_eq!(chunked_row_estimate(Some(30), Some(1130), false), Some(30));
         // Missing signals degrade to whichever side exists.
         assert_eq!(chunked_row_estimate(Some(42), None, false), Some(42));
         assert_eq!(chunked_row_estimate(None, Some(42), false), Some(42));

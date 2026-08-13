@@ -148,6 +148,16 @@ pub(super) fn run_exports_as_child_processes(
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .env(ENV_IPC_EVENTS, "1");
+        // Declare sibling concurrency to the child: it runs single-export in
+        // its own process, so MULTI_EXPORT_CONCURRENT reads false there and
+        // run_diagnosis would print the confident solo harm attribution while
+        // N sibling children share the same server-global counter window —
+        // the runner-bypass shape of the pool hedge fix (bughunt 2026-08-13).
+        // Only when this batch actually has siblings: a lone child (a heavy
+        // wave batch of one) keeps the truthful solo attribution.
+        if exports.len() > 1 {
+            cmd.env(super::run::ENV_CONCURRENT_SIBLINGS, "1");
+        }
         log::debug!("spawning child for export '{}': {:?}", export.name, cmd);
         match cmd.spawn() {
             Ok(mut child) => {

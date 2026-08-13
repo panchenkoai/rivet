@@ -209,9 +209,10 @@ which the unit tests cannot exercise.
 The extraction preserved a coupling this ADR did not name: the governor
 sampled `Source::sample_pressure` — the SAME counter the adaptive batch loop
 uses. When that counter was later re-pointed at own-read spill proxies
-(MySQL `Created_tmp_disk_tables`, MSSQL `Workfiles/Worktables Created`) for
-the batch loop's benefit, the governor silently inherited a signal its own
-workload inflates. On keyset exports (pages spill by design) it read its own
+(MySQL `Created_tmp_disk_tables` for the batch loop's benefit; MSSQL
+`Workfiles/Worktables Created`, which — correction — only the governor ever
+consumed: MSSQL's batch loop has no pressure sampling), the governor
+silently inherited a signal its own workload inflates. On keyset exports (pages spill by design) it read its own
 exhaust as "pressure rising", shed to the floor, and never recovered —
 measured in a production pool run as 2–2.7× per-export slowdowns, +1h48m
 makespan, on a source with no foreign load. The fix separates the signals:

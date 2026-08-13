@@ -278,15 +278,41 @@ fn parse_work_mem(raw: &str) -> Option<i64> {
     (bytes > 0).then_some(bytes)
 }
 
-/// Sample `checkpoints_req` from `pg_stat_bgwriter`.
+/// Sample requested-checkpoint pressure, version-portably.
 ///
 /// PostgreSQL caches the statistics snapshot at the start of each transaction.
 /// We call `pg_stat_clear_snapshot()` first to discard that cache so every
 /// adaptive sample sees fresh counters rather than the frozen value from BEGIN.
+///
+/// PG 17 moved the counter: `pg_stat_bgwriter.checkpoints_req` was removed and
+/// lives on as `pg_stat_checkpointer.num_requested` (bughunt 2026-08-13,
+/// proven on postgres:18). The old query on PG17+ is not merely a `None` —
+/// the batch loop samples INSIDE the export's cursor transaction, and any
+/// ERROR aborts that transaction, killing the next FETCH: every
+/// `adaptive: true` PG17+ export hard-failed. A probe-then-query pair avoids
+/// ever ERRORing on either vintage (a one-statement CASE still plans the dead
+/// branch and errors — proven on postgres:18).
 fn pg_sample_checkpoints_req(client: &mut Client) -> Option<i64> {
     let _ = client.execute("SELECT pg_stat_clear_snapshot()", &[]);
+    // Two steps, because PG plans a whole statement up front: a CASE whose
+    // dead branch references the missing column still ERRORs (proven on
+    // postgres:18), and an ERROR inside the export's cursor transaction
+    // aborts it. The existence probe can never error; only the matching
+    // query is then sent.
+    let has_checkpointer = client
+        .query_one(
+            "SELECT to_regclass('pg_catalog.pg_stat_checkpointer') IS NOT NULL",
+            &[],
+        )
+        .ok()
+        .and_then(|r| r.try_get::<_, bool>(0).ok())?;
+    let sql = if has_checkpointer {
+        "SELECT num_requested FROM pg_stat_checkpointer"
+    } else {
+        "SELECT checkpoints_req FROM pg_stat_bgwriter"
+    };
     client
-        .query_one("SELECT checkpoints_req FROM pg_stat_bgwriter", &[])
+        .query_one(sql, &[])
         .ok()
         .and_then(|r| r.try_get::<_, i64>(0).ok())
 }

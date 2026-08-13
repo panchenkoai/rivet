@@ -215,27 +215,24 @@ pub(super) fn throughput_regressions(pairs: &[ThroughputPair]) -> Vec<String> {
 /// never affects the run. Called beside [`print`] at every aggregate site so
 /// EVERY run self-reports degradation at the default log level — the answer
 /// to "prove the next run is not strangling itself" is that the run says so.
-pub(super) fn warn_throughput_regressions(state: &StateStore, agg: &RunAggregate) {
+pub(super) fn warn_throughput_regressions(state: &StateStore, entries: &[RunAggregateEntry]) {
     let mut pairs = Vec::new();
-    for e in agg.per_export.iter().filter(|e| e.status == "success") {
-        let Ok(metrics) = state.get_metrics(Some(&e.export_name), 10) else {
+    for e in entries.iter().filter(|e| e.status == "success") {
+        // Direct success query, excluding this run's own row — a fixed
+        // recent-window scan went blind after ~9 consecutive failures,
+        // exactly during the degraded period the baseline exists for
+        // (bughunt 2026-08-13).
+        let Ok(Some(prev)) = state.get_last_success_metric_excluding(&e.export_name, &e.run_id)
+        else {
             continue;
         };
-        // Newest-first; skip THIS run's own row (matched by run_id), then take
-        // the first prior success as the baseline.
-        let prev = metrics
-            .iter()
-            .filter(|m| m.status == "success")
-            .find(|m| m.run_id.as_deref() != Some(e.run_id.as_str()));
-        if let Some(prev) = prev {
-            pairs.push(ThroughputPair {
-                export_name: e.export_name.clone(),
-                cur_rows: e.rows,
-                cur_ms: e.duration_ms,
-                prev_rows: prev.total_rows,
-                prev_ms: prev.duration_ms,
-            });
-        }
+        pairs.push(ThroughputPair {
+            export_name: e.export_name.clone(),
+            cur_rows: e.rows,
+            cur_ms: e.duration_ms,
+            prev_rows: prev.total_rows,
+            prev_ms: prev.duration_ms,
+        });
     }
     for line in throughput_regressions(&pairs) {
         log::warn!("{line}");

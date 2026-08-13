@@ -103,6 +103,21 @@ impl GovernorHarness {
             // off-thread log for the post-scope drain. `RIVET_GOVERNOR_INTERVAL_MS` is read inside
             // `Governor::new`.
             let mut gov = Governor::new(ceiling, floor, ceiling);
+            // An armed governor whose sampler yields nothing never acts — and
+            // never says so. One probe up front turns that silence into a
+            // line: runtime sampling failures (permissions, dropped monitor
+            // connection) otherwise leave the operator believing back-off
+            // protection is active when parallelism is in fact static
+            // (bughunt 2026-08-13). The probe result is not fed to the
+            // decision state, so the baseline still comes from the loop's own
+            // first sample.
+            if crate::source::Source::sample_governor_pressure(monitor.as_mut()).is_none() {
+                log::warn!(
+                    "export '{export_name}': governor armed, but the source provides no \
+                     pressure signal (engine without a foreign-pressure counter, or the \
+                     monitor connection cannot sample) — parallelism stays at {ceiling}"
+                );
+            }
             gov.run(
                 &mut monitor,
                 || finished.load(Ordering::Relaxed) >= total,
@@ -119,7 +134,7 @@ impl GovernorHarness {
                     // lost 1h48m to invisible sheds). Recovery stays info.
                     if to < from {
                         log::warn!(
-                            "export '{export_name}': governor parallelism {from} → {to} ({reason})                              — raise `min_parallel` to floor it, or set `adaptive: false` to disarm"
+                            "export '{export_name}': governor parallelism {from} → {to} ({reason}) — raise `min_parallel` to floor it, or set `adaptive: false` to disarm"
                         );
                     } else {
                         log::info!(

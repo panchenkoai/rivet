@@ -345,10 +345,12 @@ pub trait Source: Send {
     /// Flush Waits/sec`).
     ///
     /// This is the governor's ONLY signal, and it is deliberately NOT the
-    /// adaptive batch loop's: the batch loops sample their own-extraction
-    /// spill counters engine-internally (`mysql_sample_extraction_pressure`,
-    /// `pg_sample_checkpoints_req` at the batch sites), where shrinking the
-    /// batch genuinely shrinks the per-query spill. Feeding the governor
+    /// adaptive batch loop's. The batch loops sample engine-internally:
+    /// MySQL its own-extraction spill sum (`mysql_sample_extraction_pressure`
+    /// — shrinking the batch genuinely shrinks the per-query spill), PG the
+    /// same `checkpoints_req` both loops share (write-driven, own reads
+    /// can't move it), MSSQL nothing (its batch adaptation is inert).
+    /// Feeding the governor
     /// those same spill counters made it read its own exhaust (field find,
     /// 2026-08-13): a keyset export whose pages spill by design saw a
     /// permanently-rising counter on an idle server, shed workers 4→3→2→1,

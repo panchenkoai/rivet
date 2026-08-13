@@ -494,6 +494,11 @@ exports:
 fn mysql_governor_ignores_the_exports_own_spill_exhaust() {
     use mysql::prelude::Queryable;
     require_alive(LiveService::Mysql);
+    // Serialize against other MySQL tests: this test flips server-wide
+    // tmp-table globals, which would slow unrelated tests' queries — and a
+    // concurrently-finishing sibling instance restoring the globals mid-run
+    // could deflate this test's spill delta below its activation guard.
+    let _globals_lock = mysql_globals_guard();
 
     const ROWS: i64 = 20_000;
     // Wide payload so the DISTINCT materialization overflows tmp_table_size.
@@ -691,6 +696,10 @@ exports:
 fn mysql_adaptive_never_loses_to_its_own_baseline_on_an_idle_source() {
     use mysql::prelude::Queryable;
     require_alive(LiveService::Mysql);
+    // The A/B wall-clock ratio is only meaningful without a heavy sibling
+    // starting between the two runs — take the same cross-process lock the
+    // globals-flipping test holds (bughunt 2026-08-13).
+    let _globals_lock = mysql_globals_guard();
 
     const ROWS: i64 = 60_000;
     let name = unique_name("rivet_qa_ab_canary");

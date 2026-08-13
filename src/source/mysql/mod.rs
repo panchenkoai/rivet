@@ -800,11 +800,11 @@ impl super::Source for MysqlSource {
         Ok(mappings)
     }
 
-    /// Governor pressure proxy (Epic 18 C1): the same monotonic
-    /// extraction-pressure sum the adaptive batch loop samples
-    /// (`Created_tmp_disk_tables` + `Innodb_buffer_pool_wait_free`). Rising
-    /// between samples means the extraction is spilling a temp table to disk or
-    /// stalling on buffer-pool memory — the MySQL analogue of PG `temp_bytes`.
+    /// Governor FOREIGN-pressure proxy: `Innodb_log_waits` (redo-write
+    /// pressure a read-only export cannot move) — deliberately NOT the batch
+    /// loop's extraction-pressure sum, which the export's own pages inflate
+    /// (see [`mysql_sample_foreign_pressure`] and
+    /// `Source::sample_governor_pressure`).
     fn sample_governor_pressure(&mut self) -> Option<u64> {
         mysql_sample_foreign_pressure(&self.pool)
     }

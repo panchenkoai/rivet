@@ -63,9 +63,15 @@ pub(crate) fn multi_export_mode() -> bool {
     MULTI_EXPORT_MODE.load(AtomicOrdering::Relaxed)
 }
 
-#[allow(dead_code)] // kept for future renderers; flag is still set in `run` below.
+/// Env marker a parent sets on re-exec'd children (--parallel-export-processes,
+/// apply's wave-parallel batches) so a single-export child still knows sibling
+/// processes share its server-counter windows. In-process concurrency uses the
+/// atomic; the env covers the process boundary the atomic cannot cross.
+pub(crate) const ENV_CONCURRENT_SIBLINGS: &str = "RIVET_CONCURRENT_SIBLINGS";
+
 pub(crate) fn multi_export_concurrent() -> bool {
     MULTI_EXPORT_CONCURRENT.load(AtomicOrdering::Relaxed)
+        || std::env::var_os(ENV_CONCURRENT_SIBLINGS).is_some()
 }
 
 fn print_json_summary(agg: &crate::state::RunAggregate) {
@@ -245,7 +251,7 @@ pub fn run(
                     "parallel-processes",
                 );
                 aggregate::print(&agg);
-                aggregate::warn_throughput_regressions(&state, &agg);
+                aggregate::warn_throughput_regressions(&state, &agg.per_export);
                 aggregate::persist(&state, &agg, summary_output);
                 if json_output {
                     print_json_summary(&agg);
@@ -435,7 +441,7 @@ pub fn run(
         // assume which thread owned the per-export `StateStore` above.
         match StateStore::open(config_path) {
             Ok(state) => {
-                aggregate::warn_throughput_regressions(&state, &agg);
+                aggregate::warn_throughput_regressions(&state, &agg.per_export);
                 aggregate::persist(&state, &agg, summary_output)
             }
             Err(e) => log::warn!(
@@ -446,7 +452,22 @@ pub fn run(
         if json_output {
             print_json_summary(&agg);
         }
-    } else if summary_output.is_some() || json_output {
+    } else {
+        // Single-export run: the aggregate block is noise, but the
+        // run-over-run self-check must still fire — "EVERY run self-reports
+        // degradation" was false on exactly the `rivet run --export X` shape
+        // (bughunt 2026-08-13). Children of --parallel-export-processes also
+        // pass here; their baseline query excludes their own fresh row, so
+        // the report stays correct there too.
+        if let Ok(state) = StateStore::open(config_path) {
+            let entries: Vec<_> = summaries
+                .iter()
+                .map(aggregate::entry_from_summary)
+                .collect();
+            aggregate::warn_throughput_regressions(&state, &entries);
+        }
+    }
+    if exports.len() == 1 && (summary_output.is_some() || json_output) {
         // One export, but the user asked for a summary file and/or JSON stdout —
         // honour both without polluting the DB or stderr.
         let entries: Vec<_> = summaries
@@ -702,7 +723,7 @@ pub(crate) fn run_waves(
             },
         );
         aggregate::print(&agg);
-        aggregate::warn_throughput_regressions(&state, &agg);
+        aggregate::warn_throughput_regressions(&state, &agg.per_export);
         aggregate::persist(&state, &agg, None);
     }
     // Captured child stderr (verbose per-export cards, parallel path only) goes
@@ -731,11 +752,12 @@ pub(crate) fn run_waves(
 /// Last successful run's duration for `name`, in seconds — the pool's
 /// predictor (the same source the wave packer reads). `None` = no history.
 fn last_success_secs(state: &StateStore, name: &str) -> Option<f64> {
+    // Direct success query — a fixed recent window went blind after 25
+    // consecutive failed attempts, misclassifying a measured export as
+    // unmeasured exactly during its degraded period (bughunt 2026-08-13).
     state
-        .get_metrics(Some(name), 25)
+        .get_last_success_metric(name)
         .ok()?
-        .into_iter()
-        .find(|m| m.status == "success")
         .map(|m| (m.duration_ms as f64 / 1000.0).max(0.001))
 }
 
@@ -752,9 +774,7 @@ fn last_attempt_secs(state: &StateStore, name: &str) -> Option<f64> {
         .ok()?
         .into_iter()
         .map(|m| (m.duration_ms as f64 / 1000.0).max(0.001))
-        .fold(None, |acc: Option<f64>, s| {
-            Some(acc.map_or(s, |a| a.max(s)))
-        })
+        .reduce(f64::max)
 }
 
 /// A pool item's predicted duration plus which signal produced it, so the
@@ -903,6 +923,15 @@ pub(crate) fn run_pool(
     // #167 per-unit resume: (destination, family) of the giant that was split, so
     // the post-split skip can read which of its units already completed.
     let mut split_info: Option<(crate::config::DestinationConfig, String)> = None;
+    // #167 + bughunt 2026-08-13: a synthesized `{giant}#N` unit has no metrics
+    // history, so predicted_from would give it the 5 s placeholder and LPT
+    // would schedule the giant's slices LAST — smalls first, nothing
+    // backfilling behind the units, defeating the split's makespan purpose.
+    // Each unit inherits giant_predicted / realized (the same arithmetic
+    // pool::split_dominating models), recorded here and consulted by the
+    // final classification sweep.
+    let mut split_unit_secs: std::collections::HashMap<String, f64> =
+        std::collections::HashMap::new();
     let advise = super::pool::advise_split(&items, m, 3.0, m.max(2));
     if split {
         match &advise {
@@ -934,6 +963,19 @@ pub(crate) fn run_pool(
                 match units_opt {
                     Some(units) => {
                         let realized = units.len();
+                        // Seed each unit with its share of the giant's
+                        // prediction so LPT places the slices where the giant
+                        // stood (front of the queue), not at the 5 s
+                        // placeholder tail.
+                        let giant_secs = items
+                            .iter()
+                            .find(|i| &i.name == giant)
+                            .map(|i| i.predicted_secs)
+                            .unwrap_or(0.0);
+                        for u in &units {
+                            split_unit_secs
+                                .insert(u.name.clone(), giant_secs / realized.max(1) as f64);
+                        }
                         split_info = Some((base.destination.clone(), base.family()));
                         effective.retain(|e| &e.name != giant);
                         // A synthesized unit is named `{giant}#i`; if a user export already carries
@@ -948,7 +990,8 @@ pub(crate) fn run_pool(
                             );
                         }
                         effective.extend(units);
-                        items = build_items(&effective);
+                        // `items` is rebuilt by the single post-split
+                        // classification sweep below.
                         log::warn!(
                             "apply --pool --split: split '{giant}' into {realized} range \
                              sub-export(s) over its key — predicted wall ~{:.1} min (was the \
@@ -1052,18 +1095,40 @@ pub(crate) fn run_pool(
             log::warn!("apply --pool: nothing to run (no exports, or all complete)");
             return Ok(());
         }
-        items = build_items(&effective);
     }
 
     // LPT order + the makespan the model PREDICTS (POST-split) — printed up front
     // and graded against the actual wall at the end, so every run improves trust
     // in (or honestly indicts) the model.
+    //
+    // ONE classification sweep feeds BOTH the schedule (items) and the
+    // measured/estimated accounting below — a second predicted_from sweep
+    // would re-query the state store per export and could describe a
+    // different schedule than the one that runs (walk find, 2026-08-13).
+    let classified: Vec<PredictedFrom> = effective
+        .iter()
+        .map(|e| match split_unit_secs.get(&e.name) {
+            // A split unit inherits the giant's measured/estimated share —
+            // measured-by-proxy, so LPT ranks it like the giant it slices.
+            Some(secs) => PredictedFrom::Measured(*secs),
+            None => predicted_from(&state, &e.name),
+        })
+        .collect();
+    items = effective
+        .iter()
+        .zip(&classified)
+        .map(|(e, p)| super::pool::PoolItem {
+            name: e.name.clone(),
+            predicted_secs: p.secs(),
+            parallel_safe: is_parallel_safe(e),
+        })
+        .collect();
     let order = super::pool::pool_order(&items);
     let predicted_secs = super::pool::predicted_makespan_secs(&items, m);
     let floor_secs = super::pool::makespan_floor_secs(&items, m);
     let (mut measured_n, mut attempt_n, mut placeholder_n) = (0usize, 0usize, 0usize);
-    for e in &effective {
-        match predicted_from(&state, &e.name) {
+    for p in &classified {
+        match p {
             PredictedFrom::Measured(_) => measured_n += 1,
             PredictedFrom::FailedAttemptFloor(_) => attempt_n += 1,
             PredictedFrom::Placeholder(_) => placeholder_n += 1,
@@ -1122,8 +1187,35 @@ pub(crate) fn run_pool(
     // as `--parallel-exports`) and (b) `run_diagnosis` knows the server-global
     // harm counters overlapped sibling exports' windows and hedges its
     // attribution instead of blaming the one export it prints beside
-    // (field find, 2026-08-13).
-    let prev_concurrent = MULTI_EXPORT_CONCURRENT.swap(true, AtomicOrdering::Relaxed);
+    // (field find, 2026-08-13). Restored via a Drop guard — the `run()` path's
+    // discipline — so a panic escaping `thread::scope` cannot leak
+    // CONCURRENT=true into the rest of the process.
+    // Only claim concurrency when the pool can actually overlap work — a
+    // `--pool 1` (or a single pending export) runs strictly serially, and the
+    // hedge text run_diagnosis emits for concurrent siblings would be a false
+    // claim there (bughunt 2026-08-13).
+    let really_concurrent = m.min(pending.len()) > 1;
+    let prev_concurrent = MULTI_EXPORT_CONCURRENT.swap(really_concurrent, AtomicOrdering::Relaxed);
+    struct ResetPoolStatics(bool, bool);
+    impl Drop for ResetPoolStatics {
+        fn drop(&mut self) {
+            MULTI_EXPORT_MODE.store(self.0, AtomicOrdering::Relaxed);
+            MULTI_EXPORT_CONCURRENT.store(self.1, AtomicOrdering::Relaxed);
+        }
+    }
+    let _reset_pool_statics = ResetPoolStatics(prev_multi, prev_concurrent);
+    // The ipc sender gets the same panic-safety: a worker panic re-raised by
+    // `thread::scope` would otherwise skip the straight-line clear below and
+    // leak a stale global Sender for the rest of the process (bughunt
+    // 2026-08-13). clear is idempotent, so the guard + the normal-path clear
+    // coexist harmlessly.
+    struct ClearIpcTx;
+    impl Drop for ClearIpcTx {
+        fn drop(&mut self) {
+            ipc::clear_in_process_tx();
+        }
+    }
+    let _clear_ipc = ClearIpcTx;
     let (tx, rx) = std::sync::mpsc::channel::<parent_ui::UiMessage>();
     ipc::install_in_process_tx(tx);
     let n_cards = pending.len();
@@ -1225,9 +1317,6 @@ pub(crate) fn run_pool(
     if let Some(h) = ui_thread {
         let _ = h.join();
     }
-    MULTI_EXPORT_MODE.store(prev_multi, AtomicOrdering::Relaxed);
-    MULTI_EXPORT_CONCURRENT.store(prev_concurrent, AtomicOrdering::Relaxed);
-
     // The run-level harm verdict the per-export DIAGNOSIS lines point at:
     // spills during the pool window are REAL harm to the source (disk-spilling
     // tmp tables) whoever triggered them — WARN so it is visible at the
@@ -1305,7 +1394,7 @@ pub(crate) fn run_pool(
             .collect();
         let agg = aggregate::build(entries, started_at, finished_at, Some(config_path), "pool");
         aggregate::print(&agg);
-        aggregate::warn_throughput_regressions(&state, &agg);
+        aggregate::warn_throughput_regressions(&state, &agg.per_export);
         aggregate::persist(&state, &agg, None);
     }
     if !failures.is_empty() {
