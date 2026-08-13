@@ -80,6 +80,24 @@ fn lean_pool_opts() -> PoolOpts {
 /// then (and `Created_tmp_disk_tables` adds it on 5.7 / MariaDB). This replaces
 /// the old `Innodb_log_waits`, which is redo-**write** pressure and barely moves
 /// during a read-only export.
+/// Sample the FOREIGN-pressure proxy for the concurrency governor:
+/// `Innodb_log_waits` — redo-log-buffer waits, pure WRITE pressure. A
+/// read-only export barely moves it (the exact reason it was REPLACED as the
+/// batch loop's own-extraction proxy above), which is precisely what the
+/// governor needs: it rises only when someone ELSE is writing hard, so the
+/// export's own keyset pages cannot talk the governor into shedding its own
+/// workers (field find, 2026-08-13 — see `Source::sample_governor_pressure`).
+fn mysql_sample_foreign_pressure(pool: &Pool) -> Option<u64> {
+    let mut conn = pool.get_conn().ok()?;
+    let rows: Vec<(String, u64)> = conn
+        .query("SHOW GLOBAL STATUS LIKE 'Innodb_log_waits'")
+        .ok()?;
+    if rows.is_empty() {
+        return None;
+    }
+    Some(rows.iter().map(|(_, v)| *v).sum())
+}
+
 fn mysql_sample_extraction_pressure(pool: &Pool) -> Option<u64> {
     let mut conn = pool.get_conn().ok()?;
     let rows: Vec<(String, u64)> = conn
@@ -95,7 +113,7 @@ fn mysql_sample_extraction_pressure(pool: &Pool) -> Option<u64> {
 }
 
 /// Snapshot the broader source-harm counters from `SHOW GLOBAL STATUS` — a
-/// superset of the governor's [`mysql_sample_extraction_pressure`]. Returns
+/// superset of the batch loop's [`mysql_sample_extraction_pressure`]. Returns
 /// `(metric, cumulative_value)` pairs the pipeline deltas around the export and
 /// stores in `export_harm`. `SHOW GLOBAL STATUS` needs **no special privilege**.
 /// These are global counters, so concurrent load inflates the delta (accurate on
@@ -787,8 +805,8 @@ impl super::Source for MysqlSource {
     /// (`Created_tmp_disk_tables` + `Innodb_buffer_pool_wait_free`). Rising
     /// between samples means the extraction is spilling a temp table to disk or
     /// stalling on buffer-pool memory — the MySQL analogue of PG `temp_bytes`.
-    fn sample_pressure(&mut self) -> Option<u64> {
-        mysql_sample_extraction_pressure(&self.pool)
+    fn sample_governor_pressure(&mut self) -> Option<u64> {
+        mysql_sample_foreign_pressure(&self.pool)
     }
 
     fn server_context(&mut self) -> Option<String> {

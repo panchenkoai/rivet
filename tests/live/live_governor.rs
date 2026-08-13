@@ -466,3 +466,210 @@ exports:
         "every row must round-trip through the governed keyset run"
     );
 }
+
+/// Field regression (2026-08-13, production pool run): the governor used to
+/// sample the SAME counter as the adaptive batch loop — on MySQL the
+/// own-read spill proxy (`Created_tmp_disk_tables` + buffer-pool waits). An
+/// export whose own queries spill tmp tables to disk therefore fed the
+/// governor a permanently-rising signal on an otherwise idle server: it shed
+/// workers 4→3→2→1 ("source pressure rising") and never recovered, since its
+/// own pages kept the counter climbing. Measured in the field as every
+/// keyset export running 2–2.7× slower (+1h48m makespan) with zero foreign
+/// load. The governor now listens to `Innodb_log_waits` (redo-WRITE pressure
+/// a read-only export cannot move — `Source::sample_governor_pressure`).
+///
+/// Fixture: a chunked MySQL export over a `DISTINCT` derived query — DISTINCT
+/// blocks derived-merge, so every chunk materializes the whole ~40 MB derived
+/// table, overflowing the default 16 MB `tmp_table_size` to disk: the run
+/// PROVABLY inflates the spill counter by itself (asserted below, so the
+/// fixture cannot go inert). The mechanism is runner-agnostic — chunked and
+/// keyset share one GovernorHarness — chunked is used because a `DISTINCT`
+/// spiller is legal there without introspection.
+///
+/// RED against the old shared-signal bridge: re-point
+/// `impl PressureSource for Box<dyn Source>` back at `sample_pressure` and
+/// this fails on the `backed off` assertion.
+#[test]
+#[ignore = "live: requires docker-compose mysql"]
+fn mysql_governor_ignores_the_exports_own_spill_exhaust() {
+    use mysql::prelude::Queryable;
+    require_alive(LiveService::Mysql);
+
+    const ROWS: i64 = 20_000;
+    // Wide payload so the DISTINCT materialization overflows tmp_table_size.
+    let name = unique_name("rivet_qa_gov_spill");
+    let mut c = mysql_connect();
+    c.query_drop(format!(
+        "CREATE TABLE {name} (id BIGINT PRIMARY KEY, payload TEXT NOT NULL) ENGINE=InnoDB"
+    ))
+    .expect("create table");
+    for start in (1..=ROWS).step_by(1000) {
+        let values: Vec<String> = (start..start + 1000)
+            .map(|i| format!("({i}, REPEAT('x', 2048))"))
+            .collect();
+        c.query_drop(format!(
+            "INSERT INTO {name} (id, payload) VALUES {}",
+            values.join(",")
+        ))
+        .expect("seed batch");
+    }
+    let table = MysqlTable::adopt(name.clone());
+
+    // MySQL 8's TempTable engine keeps implicit tmp tables in a shared 1 GB
+    // RAM pool (`temptable_max_ram`), so a 40 MB DISTINCT materialization
+    // never reaches disk and the spill counter stays flat — the fixture goes
+    // inert (the activation guard below caught exactly that on first run).
+    // Force the legacy MEMORY engine with a tiny size ceiling for the test's
+    // duration so every chunk's materialization provably spills; the guard
+    // restores the prior globals on every exit path (same flip-and-reset
+    // pattern as the session-state timezone tests).
+    struct TmpTableGlobals {
+        engine: String,
+        tmp_size: u64,
+        heap_size: u64,
+    }
+    // Globals need SYSTEM_VARIABLES_ADMIN — the app user deliberately lacks
+    // it, so the flip runs as root (compose: MYSQL_ROOT_PASSWORD=rivet).
+    const MYSQL_ROOT_URL: &str = "mysql://root:rivet@127.0.0.1:3306/rivet";
+    impl Drop for TmpTableGlobals {
+        fn drop(&mut self) {
+            if let Ok(pool) = mysql::Pool::new(MYSQL_ROOT_URL)
+                && let Ok(mut c) = pool.get_conn()
+            {
+                let _ = c.query_drop(format!(
+                    "SET GLOBAL internal_tmp_mem_storage_engine = {}",
+                    self.engine
+                ));
+                let _ = c.query_drop(format!("SET GLOBAL tmp_table_size = {}", self.tmp_size));
+                let _ = c.query_drop(format!(
+                    "SET GLOBAL max_heap_table_size = {}",
+                    self.heap_size
+                ));
+            }
+        }
+    }
+    let prior = {
+        let mut c = mysql::Pool::new(MYSQL_ROOT_URL)
+            .expect("root pool")
+            .get_conn()
+            .expect("root conn");
+        let get = |c: &mut mysql::PooledConn, var: &str| -> String {
+            let rows: Vec<(String, String)> = c
+                .query(format!("SHOW GLOBAL VARIABLES LIKE '{var}'"))
+                .expect("read global");
+            rows.first().map(|(_, v)| v.clone()).unwrap_or_default()
+        };
+        let engine = get(&mut c, "internal_tmp_mem_storage_engine");
+        let tmp_size: u64 = get(&mut c, "tmp_table_size").parse().unwrap_or(16777216);
+        let heap_size: u64 = get(&mut c, "max_heap_table_size")
+            .parse()
+            .unwrap_or(16777216);
+        c.query_drop("SET GLOBAL internal_tmp_mem_storage_engine = MEMORY")
+            .expect("force MEMORY tmp engine");
+        c.query_drop("SET GLOBAL tmp_table_size = 16384")
+            .expect("shrink tmp_table_size");
+        c.query_drop("SET GLOBAL max_heap_table_size = 16384")
+            .expect("shrink max_heap_table_size");
+        TmpTableGlobals {
+            engine,
+            tmp_size,
+            heap_size,
+        }
+    };
+
+    let spills = |c: &mut mysql::PooledConn| -> u64 {
+        let rows: Vec<(String, u64)> = c
+            .query("SHOW GLOBAL STATUS LIKE 'Created_tmp_disk_tables'")
+            .expect("sample spills");
+        rows.first().map(|(_, v)| *v).unwrap_or(0)
+    };
+    let spills_before = spills(&mut c);
+
+    let out_dir = tempfile::tempdir().unwrap();
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let yaml = format!(
+        r#"
+source:
+  type: mysql
+  url: "{MYSQL_URL}"
+  tuning:
+    adaptive: true
+    min_parallel: 1
+    batch_size: 250
+exports:
+  - name: {name}
+    query: "SELECT DISTINCT id, payload FROM {name}"
+    mode: chunked
+    chunk_column: id
+    chunk_size: 1000
+    parallel: 4
+    format: parquet
+    destination:
+      type: local
+      path: {out}
+"#,
+        name = table.name(),
+        out = out_dir.path().display(),
+    );
+    let cfg = write_config(&cfg_dir, &yaml);
+
+    let log_path = cfg_dir.path().join("rivet.stderr");
+    let log_file = std::fs::File::create(&log_path).unwrap();
+    let mut child = std::process::Command::new(RIVET_BIN)
+        .args([
+            "run",
+            "--config",
+            cfg.to_str().unwrap(),
+            "--export",
+            table.name(),
+        ])
+        .env("RUST_LOG", "info")
+        .env("RIVET_GOVERNOR_INTERVAL_MS", "200")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::from(log_file))
+        .spawn()
+        .expect("spawn rivet run");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(180);
+    let status = loop {
+        match child.try_wait().expect("try_wait") {
+            Some(s) => break s,
+            None if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                panic!("self-spilling governed run did not finish within 180s");
+            }
+            None => std::thread::sleep(Duration::from_millis(100)),
+        }
+    };
+
+    let stderr = std::fs::read_to_string(&log_path).unwrap_or_default();
+    assert!(status.success(), "run must complete; stderr:\n{stderr}");
+    assert!(
+        stderr.contains("adaptive concurrency governor active"),
+        "governor must arm (adaptive + parallel>1); stderr:\n{stderr}"
+    );
+    // Activation-threshold guard: the fixture must really have spilled — a
+    // fixture that stops spilling (bigger tmp_table_size, narrower payload)
+    // would make the no-shed assertion below vacuous. ≥10 ties the delta to
+    // this run's ~20 chunk materializations, not to concurrent test noise on
+    // the shared server.
+    let spill_delta = spills(&mut c).saturating_sub(spills_before);
+    assert!(
+        spill_delta >= 10,
+        "fixture went inert: expected the run's own chunks to spill tmp tables \
+         (Created_tmp_disk_tables delta ≥ 10), got {spill_delta}"
+    );
+    // The point: with the export's OWN spills proven present and no foreign
+    // write load, the governor must hold parallelism flat — its signal is now
+    // `Innodb_log_waits`, which its own read-only pages cannot move.
+    assert!(
+        !stderr.contains("backed off"),
+        "governor shed workers on the export's OWN spill exhaust; stderr:\n{stderr}"
+    );
+    assert_eq!(
+        duckdb_total_parquet_rows(out_dir.path()),
+        ROWS as usize,
+        "every row must round-trip"
+    );
+    drop(prior);
+}
