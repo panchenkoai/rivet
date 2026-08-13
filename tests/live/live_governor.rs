@@ -128,9 +128,9 @@ exports:
 #[ignore = "live: requires docker compose up -d postgres"]
 fn governor_backs_off_under_concurrent_write_pressure() {
     require_alive(LiveService::Postgres);
-    // Serialize PG write-pressure tests against the shared server: one
-    // test's CHECKPOINT spam is another's false foreign pressure (drives CHECKPOINT spam).
-    let _pg_pressure = pg_pressure_guard();
+    // Quiet window: this test's CHECKPOINT spam is a sibling's false foreign
+    // pressure, and its own rivet runs are a sibling canary's CPU noise.
+    let _quiet = quiet_window_guard();
 
     // Wide payload + small batches + a deliberately large per-batch throttle
     // make the run last a hardware-independent ~2 s+ (the throttle is a fixed
@@ -360,9 +360,9 @@ exports:
 #[ignore = "live: requires docker compose up -d postgres"]
 fn keyset_governor_backs_off_under_concurrent_write_pressure() {
     require_alive(LiveService::Postgres);
-    // Serialize PG write-pressure tests against the shared server: one
-    // test's CHECKPOINT spam is another's false foreign pressure (drives CHECKPOINT spam).
-    let _pg_pressure = pg_pressure_guard();
+    // Quiet window: this test's CHECKPOINT spam is a sibling's false foreign
+    // pressure, and its own rivet runs are a sibling canary's CPU noise.
+    let _quiet = quiet_window_guard();
 
     const ROWS: i64 = 20_000;
     let table = seed_pg_wide_table(ROWS, 1024);
@@ -500,10 +500,10 @@ exports:
 fn mysql_governor_ignores_the_exports_own_spill_exhaust() {
     use mysql::prelude::Queryable;
     require_alive(LiveService::Mysql);
-    // Serialize against other MySQL tests: this test flips server-wide
-    // tmp-table globals, which would slow unrelated tests' queries — and a
-    // concurrently-finishing sibling instance restoring the globals mid-run
-    // could deflate this test's spill delta below its activation guard.
+    // Quiet window FIRST, then the mysql-globals lock (this test flips
+    // server-wide tmp-table globals; a sibling restoring them mid-run could
+    // deflate the spill delta below the activation guard).
+    let _quiet = quiet_window_guard();
     let _globals_lock = mysql_globals_guard();
 
     const ROWS: i64 = 20_000;
@@ -662,9 +662,9 @@ fn mysql_governor_ignores_the_exports_own_spill_exhaust() {
 fn mysql_adaptive_never_loses_to_its_own_baseline_on_an_idle_source() {
     use mysql::prelude::Queryable;
     require_alive(LiveService::Mysql);
-    // The A/B wall-clock ratio is only meaningful without a heavy sibling
-    // starting between the two runs — take the same cross-process lock the
-    // globals-flipping test holds (bughunt 2026-08-13).
+    // Quiet window FIRST (cross-engine CPU/pressure exclusion), then the
+    // narrower mysql-globals lock — consistent order, no deadlock.
+    let _quiet = quiet_window_guard();
     let _globals_lock = mysql_globals_guard();
 
     const ROWS: i64 = 60_000;
@@ -748,9 +748,8 @@ fn mysql_adaptive_never_loses_to_its_own_baseline_on_an_idle_source() {
 #[ignore = "live: requires docker-compose postgres"]
 fn pg_adaptive_never_loses_to_its_own_baseline_on_an_idle_source() {
     require_alive(LiveService::Postgres);
-    // Serialize PG write-pressure tests against the shared server: one
-    // test's CHECKPOINT spam is another's false foreign pressure (asserts an idle server).
-    let _pg_pressure = pg_pressure_guard();
+    // Quiet window: the no-shed and ratio gates need no sibling pressure/CPU.
+    let _quiet = quiet_window_guard();
     const ROWS: i64 = 40_000;
     let table = seed_pg_wide_table(ROWS, 512);
     let run = |adaptive: bool| -> (f64, String) {
@@ -804,6 +803,8 @@ fn pg_adaptive_never_loses_to_its_own_baseline_on_an_idle_source() {
 #[ignore = "live: requires docker-compose mssql"]
 fn mssql_adaptive_never_loses_to_its_own_baseline_on_an_idle_source() {
     require_alive(LiveService::Mssql);
+    // Quiet window: the no-shed and ratio gates need no sibling pressure/CPU.
+    let _quiet = quiet_window_guard();
     const ROWS: i64 = 40_000;
     let table = seed_mssql_numeric_table(ROWS);
     let run = |adaptive: bool| -> (f64, String) {

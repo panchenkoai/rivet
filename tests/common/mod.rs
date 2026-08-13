@@ -91,3 +91,36 @@ pub fn unique_name(prefix: &str) -> String {
     let pid = std::process::id();
     format!("{prefix}_{pid}_{c}")
 }
+
+/// RAII cross-process lock for the suite's QUIET WINDOW: taken by every test
+/// that measures a wall-clock ratio (the adaptive canaries) or generates
+/// deliberate source pressure (the governor backs-off drivers). Cargo runs
+/// integration binaries and threads in parallel; a heavy sibling starting
+/// mid-A/B skews a timing bound, and one test's CHECKPOINT spam is another's
+/// false foreign pressure — engine-specific locks cannot cover cross-engine
+/// CPU noise (a PG driver flaked the MSSQL canary, 2026-08-13). Same
+/// advisory `flock(2)` shape as `toxiproxy_guard`; take it FIRST, before any
+/// narrower guard (consistent order, no deadlock).
+pub struct QuietWindowGuard {
+    _file: std::fs::File,
+}
+
+pub fn quiet_window_guard() -> QuietWindowGuard {
+    use std::os::unix::io::AsRawFd;
+    let path = std::env::temp_dir().join("rivet_qa_quiet_window.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+        .unwrap_or_else(|e| panic!("open quiet-window lock {}: {e}", path.display()));
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    if rc != 0 {
+        panic!(
+            "flock(LOCK_EX) on {} failed: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        );
+    }
+    QuietWindowGuard { _file: file }
+}
