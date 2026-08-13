@@ -1128,6 +1128,14 @@ pub(crate) fn run_pool(
         .ok();
 
     let started_at = chrono::Utc::now();
+    // Run-level source-harm bracket: the per-export deltas overlap in time
+    // under pool concurrency (each reads the same server-global counters over
+    // its own window), so summing them double-counts and blaming one export
+    // mis-attributes. The POOL window is the honest scope: rivet's slots are
+    // the dominant load in it, so `after - before` here is "what this run did
+    // to the source" (modulo foreign clients). Best-effort, like the
+    // per-export snapshots.
+    let run_harm_before = job::harm_snapshot(&config.source);
     let collected: std::sync::Mutex<Vec<(Result<()>, RunSummary)>> =
         std::sync::Mutex::new(Vec::with_capacity(pending.len()));
     std::thread::scope(|s| {
@@ -1214,6 +1222,28 @@ pub(crate) fn run_pool(
     }
     MULTI_EXPORT_MODE.store(prev_multi, AtomicOrdering::Relaxed);
     MULTI_EXPORT_CONCURRENT.store(prev_concurrent, AtomicOrdering::Relaxed);
+
+    // The run-level harm verdict the per-export DIAGNOSIS lines point at:
+    // spills during the pool window are REAL harm to the source (disk-spilling
+    // tmp tables) whoever triggered them — WARN so it is visible at the
+    // default log level, with the levers that shrink the pressure.
+    if let (Some(before), Some(after)) = (&run_harm_before, job::harm_snapshot(&config.source)) {
+        let spills: i64 = job::harm_deltas(before, &after)
+            .iter()
+            .filter(|(k, _)| k.contains("tmp_disk"))
+            .map(|(_, v)| *v)
+            .sum();
+        if spills >= 100 {
+            log::warn!(
+                "pool run: source harm — {spills} tmp-disk spills server-wide across the pool \
+                 window ({} exports, {} slots): the source spilled to disk while rivet ran. \
+                 Lower `--pool` slots, `chunk_size` pages, or `tuning.batch_size` to shed \
+                 pressure (foreign clients can contribute, but rivet's window is the frame).",
+                effective.len(),
+                m,
+            );
+        }
+    }
 
     let finished_at = chrono::Utc::now();
     let actual_secs = (finished_at - started_at).num_milliseconds() as f64 / 1000.0;

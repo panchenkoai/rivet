@@ -330,10 +330,10 @@ fn pg_temp_bytes_snapshot(plan: &ResolvedRunPlan) -> Option<i64> {
 /// probe is unavailable (e.g. MSSQL without `VIEW SERVER STATE`) — harm metrics
 /// are observability, never a gate, so a missing snapshot just yields no
 /// `export_harm` rows.
-fn harm_snapshot(plan: &ResolvedRunPlan) -> Option<Vec<(String, i64)>> {
-    let url = plan.source.resolve_url().ok()?;
-    let tls = plan.source.tls.as_ref();
-    match plan.source.source_type {
+pub(super) fn harm_snapshot(source: &crate::config::SourceConfig) -> Option<Vec<(String, i64)>> {
+    let url = source.resolve_url().ok()?;
+    let tls = source.tls.as_ref();
+    match source.source_type {
         crate::config::SourceType::Postgres => {
             crate::source::postgres::sample_harm_counters(&url, tls)
         }
@@ -347,7 +347,7 @@ fn harm_snapshot(plan: &ResolvedRunPlan) -> Option<Vec<(String, i64)>> {
 /// both snapshots, matched by name. Floored because these are monotonic
 /// cumulative counters within a run; a negative would only arise from a counter
 /// reset (server restart mid-run) and is not meaningful harm.
-fn harm_deltas(before: &[(String, i64)], after: &[(String, i64)]) -> Vec<(String, i64)> {
+pub(super) fn harm_deltas(before: &[(String, i64)], after: &[(String, i64)]) -> Vec<(String, i64)> {
     let bmap: std::collections::HashMap<&str, i64> =
         before.iter().map(|(k, v)| (k.as_str(), *v)).collect();
     after
@@ -406,9 +406,11 @@ pub(super) fn run_diagnosis(
         // spills to the one export whose card they printed beside).
         if concurrent_siblings {
             flags.push(format!(
-                "{spills} tmp-disk spills on the SERVER during this export's window \
-                 (server-global counter; concurrent exports and other clients \
-                 contribute) — if the source is spilling on this export, {remedy}"
+                "{spills} tmp-disk spills server-wide during this export's window — real \
+                 source pressure, but the counter is server-global and concurrent \
+                 sibling exports share the window, so per-export attribution is \
+                 unknown (the run-level harm line carries the pool-window total); \
+                 if it tracks this export, {remedy}"
             ));
         } else {
             flags.push(format!(
@@ -927,7 +929,7 @@ pub(super) fn run_export_job(
     // Tier 2: broader source-harm counters (locks, rows read, buffer misses,
     // temp files) bracketed around the same run window; the per-counter delta is
     // stored in export_harm. Best-effort — see `harm_snapshot`.
-    let harm_before = harm_snapshot(&plan);
+    let harm_before = harm_snapshot(&plan.source);
 
     // Record plan diagnostics that were already logged above.
     for d in &diags {
@@ -996,7 +998,7 @@ pub(super) fn run_export_job(
     // (e.g. missing VIEW SERVER STATE on MSSQL) leaves no rows — never fatal.
     let mut harm_delta_vec: Vec<(String, i64)> = Vec::new();
     if let Some(before) = &harm_before
-        && let Some(after) = harm_snapshot(&plan)
+        && let Some(after) = harm_snapshot(&plan.source)
     {
         harm_delta_vec = harm_deltas(before, &after);
         if let Err(e) = state.record_harm(&summary.run_id, &summary.export_name, &harm_delta_vec) {
@@ -1621,8 +1623,9 @@ mod tests {
         );
         let pooled = run_diagnosis(&s(), &spills, true).expect("spills must diagnose");
         assert!(
-            pooled.contains("server-global counter"),
-            "concurrent attribution must name the counter scope: {pooled}"
+            pooled.contains("server-global") && pooled.contains("run-level harm"),
+            "concurrent attribution must name the counter scope and point at the \
+             run-level total: {pooled}"
         );
         assert!(
             !pooled.contains("— the source spilled to disk;"),
