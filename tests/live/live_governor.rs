@@ -590,65 +590,25 @@ fn mysql_governor_ignores_the_exports_own_spill_exhaust() {
     };
     let spills_before = spills(&mut c);
 
-    let out_dir = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        r#"
-source:
-  type: mysql
-  url: "{MYSQL_URL}"
-  tuning:
-    adaptive: true
-    min_parallel: 1
-    batch_size: 250
-exports:
-  - name: {name}
-    query: "SELECT DISTINCT id, payload FROM {name}"
-    mode: chunked
-    chunk_column: id
-    chunk_size: 1000
-    parallel: 4
-    format: parquet
-    destination:
-      type: local
-      path: {out}
-"#,
-        name = table.name(),
-        out = out_dir.path().display(),
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
-
-    let log_path = cfg_dir.path().join("rivet.stderr");
-    let log_file = std::fs::File::create(&log_path).unwrap();
-    let mut child = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            table.name(),
-        ])
-        .env("RUST_LOG", "info")
-        .env("RIVET_GOVERNOR_INTERVAL_MS", "200")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::from(log_file))
-        .spawn()
-        .expect("spawn rivet run");
-
-    let deadline = std::time::Instant::now() + Duration::from_secs(180);
-    let status = loop {
-        match child.try_wait().expect("try_wait") {
-            Some(s) => break s,
-            None if std::time::Instant::now() >= deadline => {
-                let _ = child.kill();
-                panic!("self-spilling governed run did not finish within 180s");
-            }
-            None => std::thread::sleep(Duration::from_millis(100)),
-        }
-    };
-
-    let stderr = std::fs::read_to_string(&log_path).unwrap_or_default();
-    assert!(status.success(), "run must complete; stderr:\n{stderr}");
+    // Canonical Rig config + runner — no bespoke YAML/Command (the harness
+    // rule this file predates; new tests go through the rig).
+    let rig = Rig::mysql_batch(table.name())
+        .query(&format!(
+            "SELECT DISTINCT id, payload FROM {}",
+            table.name()
+        ))
+        .mode("chunked")
+        .source_line("tuning:")
+        .source_line("  adaptive: true")
+        .source_line("  min_parallel: 1")
+        .source_line("  batch_size: 250")
+        .export_line("chunk_column: id")
+        .export_line("chunk_size: 1000")
+        .export_line("parallel: 4");
+    let out = rig.run_with_envs(&[("RUST_LOG", "info"), ("RIVET_GOVERNOR_INTERVAL_MS", "200")]);
+    let out_dir = rig.out_dir();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(out.status.success(), "run must complete; stderr:\n{stderr}");
     assert!(
         stderr.contains("adaptive concurrency governor active"),
         "governor must arm (adaptive + parallel>1); stderr:\n{stderr}"
@@ -672,7 +632,7 @@ exports:
         "governor shed workers on the export's OWN spill exhaust; stderr:\n{stderr}"
     );
     assert_eq!(
-        duckdb_total_parquet_rows(out_dir.path()),
+        duckdb_total_parquet_rows(&out_dir),
         ROWS as usize,
         "every row must round-trip"
     );
@@ -723,59 +683,27 @@ fn mysql_adaptive_never_loses_to_its_own_baseline_on_an_idle_source() {
     // Keyset-parallel with ≥10 batches per page, so BOTH feedback loops run
     // at their real cadence (the governor per wall-interval, the batch
     // controller per ADAPTIVE_SAMPLE_INTERVAL batches).
+    // Canonical Rig config + runner per leg — no bespoke YAML/Command.
     let run = |adaptive: bool| -> (f64, String) {
-        let out_dir = tempfile::tempdir().unwrap();
-        let cfg_dir = tempfile::tempdir().unwrap();
-        let yaml = format!(
-            r#"
-source:
-  type: mysql
-  url: "{MYSQL_URL}"
-  tuning:
-    adaptive: {adaptive}
-    min_parallel: 1
-    batch_size: 500
-exports:
-  - name: {name}
-    table: {name}
-    mode: chunked
-    chunk_by_key: id
-    chunk_size: 10000
-    parallel: 4
-    format: parquet
-    destination:
-      type: local
-      path: {out}
-"#,
-            name = table.name(),
-            out = out_dir.path().display(),
-        );
-        let cfg = write_config(&cfg_dir, &yaml);
-        let log_path = cfg_dir.path().join("rivet.stderr");
-        let log_file = std::fs::File::create(&log_path).unwrap();
+        let rig = Rig::mysql_batch(table.name())
+            .mode("chunked")
+            .source_line("tuning:")
+            .source_line(&format!("  adaptive: {adaptive}"))
+            .source_line("  min_parallel: 1")
+            .source_line("  batch_size: 500")
+            .export_line("chunk_by_key: id")
+            .export_line("chunk_size: 10000")
+            .export_line("parallel: 4");
         let started = std::time::Instant::now();
-        let status = std::process::Command::new(RIVET_BIN)
-            .args([
-                "run",
-                "--config",
-                cfg.to_str().unwrap(),
-                "--export",
-                table.name(),
-            ])
-            .env("RUST_LOG", "info")
-            .env("RIVET_GOVERNOR_INTERVAL_MS", "200")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::from(log_file))
-            .status()
-            .expect("run rivet");
+        let out = rig.run_with_envs(&[("RUST_LOG", "info"), ("RIVET_GOVERNOR_INTERVAL_MS", "200")]);
         let wall = started.elapsed().as_secs_f64();
-        let stderr = std::fs::read_to_string(&log_path).unwrap_or_default();
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
         assert!(
-            status.success(),
+            out.status.success(),
             "adaptive={adaptive} run failed:\n{stderr}"
         );
         assert_eq!(
-            duckdb_total_parquet_rows(out_dir.path()),
+            duckdb_total_parquet_rows(&rig.out_dir()),
             ROWS as usize,
             "adaptive={adaptive}: every row must round-trip"
         );

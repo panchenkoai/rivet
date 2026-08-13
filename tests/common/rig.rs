@@ -159,6 +159,14 @@ impl Rig {
 
     /// Point the source at a different URL (a toxiproxy front, a scout
     /// container) while keeping the engine's config shape.
+    /// Append a raw line under `source:` (2-space indented by render) — e.g.
+    /// `tuning:` blocks for governor/adaptive tests. The same mechanism
+    /// `mssql_batch` uses internally for its TLS opt-in.
+    pub fn source_line(mut self, line: &str) -> Self {
+        self.source_lines.push(line.to_string());
+        self
+    }
+
     pub fn source_url(mut self, url: &str) -> Self {
         self.source_url = url.to_string();
         self
