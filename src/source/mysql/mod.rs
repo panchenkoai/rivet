@@ -65,28 +65,14 @@ fn lean_pool_opts() -> PoolOpts {
         .with_constraints(PoolConstraints::new(1, 100).expect("valid pool constraints"))
 }
 
-/// Sample an **extraction-pressure** proxy (Epic 18 C1) — the MySQL analogue of
-/// PG's `temp_bytes`. Sums two monotonic global counters:
-///
-/// - `Created_tmp_disk_tables` — a query spilled an internal temp table to disk
-///   (a `GROUP BY` / `DISTINCT` / `ORDER BY` that exceeded `tmp_table_size`).
-/// - `Innodb_buffer_pool_wait_free` — InnoDB had to wait for a free buffer-pool
-///   page, i.e. the read is evicting pages under memory pressure.
-///
-/// Either moving means "my extraction is stressing the source"; their sum is
-/// monotonic, so the governor's `cur > prev` comparison works unchanged. The
-/// sum is robust to MySQL 8.0's `TempTable` engine, where a spill may not bump
-/// `Created_tmp_disk_tables` — `Innodb_buffer_pool_wait_free` carries the signal
-/// then (and `Created_tmp_disk_tables` adds it on 5.7 / MariaDB). This replaces
-/// the old `Innodb_log_waits`, which is redo-**write** pressure and barely moves
-/// during a read-only export.
 /// Sample the FOREIGN-pressure proxy for the concurrency governor:
 /// `Innodb_log_waits` — redo-log-buffer waits, pure WRITE pressure. A
-/// read-only export barely moves it (the exact reason it was REPLACED as the
-/// batch loop's own-extraction proxy above), which is precisely what the
-/// governor needs: it rises only when someone ELSE is writing hard, so the
-/// export's own keyset pages cannot talk the governor into shedding its own
-/// workers (field find, 2026-08-13 — see `Source::sample_governor_pressure`).
+/// read-only export barely moves it (the exact reason it is unfit as the batch
+/// loop's own-extraction proxy — see [`mysql_sample_extraction_pressure`]),
+/// which is precisely what the governor needs: it rises only when someone ELSE
+/// is writing hard, so the export's own keyset pages cannot talk the governor
+/// into shedding its own workers (field find, 2026-08-13 — see
+/// `Source::sample_governor_pressure`).
 fn mysql_sample_foreign_pressure(pool: &Pool) -> Option<u64> {
     let mut conn = pool.get_conn().ok()?;
     let rows: Vec<(String, u64)> = conn
@@ -98,6 +84,25 @@ fn mysql_sample_foreign_pressure(pool: &Pool) -> Option<u64> {
     Some(rows.iter().map(|(_, v)| *v).sum())
 }
 
+/// Sample an **extraction-pressure** proxy (Epic 18 C1) — the MySQL analogue of
+/// PG's `temp_bytes`, for the ADAPTIVE BATCH loop only (never the governor).
+/// Sums two monotonic global counters:
+///
+/// - `Created_tmp_disk_tables` — a query spilled an internal temp table to disk
+///   (a `GROUP BY` / `DISTINCT` / `ORDER BY` that exceeded `tmp_table_size`).
+/// - `Innodb_buffer_pool_wait_free` — InnoDB had to wait for a free buffer-pool
+///   page, i.e. the read is evicting pages under memory pressure.
+///
+/// Either moving means "MY extraction is stressing the source"; their sum is
+/// monotonic, so a `cur > prev` comparison works unchanged. The sum is robust
+/// to MySQL 8.0's `TempTable` engine, where a spill may not bump
+/// `Created_tmp_disk_tables` — `Innodb_buffer_pool_wait_free` carries the
+/// signal then (and `Created_tmp_disk_tables` adds it on 5.7 / MariaDB).
+///
+/// Because the export's OWN reads move it, this counter must never reach the
+/// concurrency governor: feeding it there is the 2026-08-13 field regression
+/// (self-exhaust spiral 4→3→2→1). The governor samples
+/// [`mysql_sample_foreign_pressure`] instead.
 fn mysql_sample_extraction_pressure(pool: &Pool) -> Option<u64> {
     let mut conn = pool.get_conn().ok()?;
     let rows: Vec<(String, u64)> = conn
@@ -112,14 +117,6 @@ fn mysql_sample_extraction_pressure(pool: &Pool) -> Option<u64> {
     Some(rows.iter().map(|(_, v)| *v).sum())
 }
 
-/// Snapshot the broader source-harm counters from `SHOW GLOBAL STATUS` — a
-/// superset of the batch loop's [`mysql_sample_extraction_pressure`]. Returns
-/// `(metric, cumulative_value)` pairs the pipeline deltas around the export and
-/// stores in `export_harm`. `SHOW GLOBAL STATUS` needs **no special privilege**.
-/// These are global counters, so concurrent load inflates the delta (accurate on
-/// a quiet pilot box). `Innodb_rows_read` is the read-amplification signal the
-/// 0.12 harm A/B keyed on. `None` on connect/query failure — never blocks the
-/// export.
 impl MysqlSource {
     /// Build a source from an existing pool: the single place that detects the
     /// proxy kind, warns once, and wraps the pool. The `connect*` entry points
@@ -786,6 +783,14 @@ impl super::Source for MysqlSource {
         mysql_sample_foreign_pressure(&self.pool)
     }
 
+    /// Snapshot the broader source-harm counters from `SHOW GLOBAL STATUS` — a
+    /// superset of the batch loop's [`mysql_sample_extraction_pressure`].
+    /// Returns `(metric, cumulative_value)` pairs the pipeline deltas around
+    /// the export and stores in `export_harm`. `SHOW GLOBAL STATUS` needs **no
+    /// special privilege**. These are global counters, so concurrent load
+    /// inflates the delta (accurate on a quiet pilot box). `Innodb_rows_read`
+    /// is the read-amplification signal the 0.12 harm A/B keyed on. `None` on
+    /// connect/query failure — never blocks the export.
     fn harm_counters(&mut self) -> Option<Vec<(String, i64)>> {
         let pool = &self.pool;
         let mut conn = pool.get_conn().ok()?;

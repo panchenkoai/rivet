@@ -292,6 +292,18 @@ fn column_widths(cards: &HashMap<String, CardState>, name_floor: usize) -> (usiz
 /// addressed by export name; `order` is the insertion order in which we
 /// observed each `Started` event so the card layout is deterministic across
 /// runs even when the underlying `HashMap` iterates in a different order.
+///
+/// **The renderer never mutates process-global state.** It is fed by TWO
+/// transports — the cross-process child-stdout reader
+/// ([`super::parallel_children::adopt_child_event`], where a counter carried
+/// on an event is genuinely FOREIGN) and the in-process `mpsc` channel
+/// ([`super::ipc::emit_event`], installed for `--parallel-exports`, `--pool`
+/// AND the plain sequential path, where the very same process both wrote and
+/// reads the counter). A fold placed here therefore runs on both, and on the
+/// in-process transport it adds a counter to itself: one export with 3 real
+/// retries reported 6, and N exports doubled per export (2^N). Folding
+/// belongs at the process boundary, which is the only place provenance is
+/// knowable — see `adopt_child_event` (bughunt 2026-08-14, finding #4).
 struct Renderer {
     cards: HashMap<String, CardState>,
     order: Vec<String>,
@@ -393,12 +405,12 @@ impl Renderer {
                 duration_ms,
                 peak_rss_mb,
                 error_message,
-                dest_retries,
+                // NOT folded here — see the note above `Renderer` and
+                // `parallel_children::adopt_child_event`. The renderer is
+                // shared by an in-process transport, where this number IS
+                // this process's own counter.
+                dest_retries: _,
             } => {
-                // A child's RetryLayer counter is process-local; folding it in
-                // here is what makes the parent's "dest retries" summary line
-                // true in the child-process modes (bughunt 2026-08-13).
-                crate::destination::add_transient_retries(dest_retries);
                 if let Some(card) = self.cards.get_mut(&export_name) {
                     card.finalize(
                         &status,
@@ -704,9 +716,92 @@ fn fmt_duration_ms(ms: i64) -> String {
     }
 }
 
+/// Serialises the tests that assert on the process-wide
+/// `destination::TRANSIENT_RETRIES` counter by DELTA. The counter is global
+/// and the lib test binary runs its tests on threads, so two such tests
+/// overlapping would let one's bump satisfy the other's assertion — which is
+/// exactly how a mutant survives. Lives here (rather than beside the counter)
+/// because the invariant it protects is this module's: only a foreign counter
+/// is folded. `destination::cloud`'s own interceptor test still adds 2 outside
+/// this lock, so the assertions stay delta-based with room for that.
+#[cfg(test)]
+pub(super) fn retry_counter_test_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    &LOCK
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The renderer must NOT fold a retry counter that arrived over the
+    /// IN-PROCESS channel — that counter is this process's own.
+    ///
+    /// Drives the real path end to end: install the in-process tx exactly as
+    /// `run.rs` does for `--parallel-exports` / `--pool` / the plain
+    /// sequential run, bump the process counter, call the production
+    /// `RunSummary::print()` (which takes its `ipc::capturing_events()`
+    /// branch and emits `Finished { dest_retries: transient_retries_total() }`),
+    /// then drain the channel through the real `Renderer::process_message`.
+    /// The pre-existing guard
+    /// (`summary::tests::single_export_summary_card_surfaces_destination_retries`)
+    /// calls `add_transient_retries` directly on a stub, so it never touches
+    /// print → emit_event → Renderer and could not see this feedback loop.
+    ///
+    /// TWO exports, not one: the defect is a fold, and a single event would
+    /// only show a doubling, not the per-export compounding (2^N) that made
+    /// the 154-export field pool report garbage.
+    ///
+    /// Mutant: restore `add_transient_retries(dest_retries)` in
+    /// `Renderer::handle_event`'s `Finished` arm → RED, measured
+    /// `grew by 2000000` (two events, each carrying the whole process total).
+    #[test]
+    fn in_process_finished_event_must_not_refold_this_processs_own_retry_counter() {
+        let _serial = super::retry_counter_test_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+
+        // Large enough that the mutant's growth (>= this, twice over) can
+        // never be confused with the handful of counts a concurrent
+        // `destination::cloud` interceptor test adds.
+        const SEED: u64 = 1_000_000;
+        crate::destination::add_transient_retries(SEED);
+
+        let (tx, rx) = std::sync::mpsc::channel::<UiMessage>();
+        super::super::ipc::install_in_process_tx(tx);
+        for name in ["orders", "events"] {
+            let s = crate::pipeline::summary::RunSummary::stub_for_testing("run-refold", name);
+            s.print();
+        }
+        // Drop the global sender so the drain below terminates.
+        super::super::ipc::clear_in_process_tx();
+
+        let before_drain = crate::destination::transient_retries_total();
+        let mut renderer = Renderer::new(80, 8);
+        let mut finished = 0usize;
+        while let Ok(msg) = rx.recv() {
+            if let UiMessage::Event(ChildEvent::Finished { dest_retries, .. }) = &msg {
+                // Fixture is not inert: print() really did emit, and the
+                // event really does carry this process's whole counter —
+                // the value the mutant would re-add.
+                assert!(
+                    *dest_retries >= SEED,
+                    "in-process Finished must carry the process total, got {dest_retries}"
+                );
+                finished += 1;
+            }
+            renderer.process_message(msg);
+        }
+        assert_eq!(finished, 2, "both exports must have emitted a Finished");
+
+        let grew_by = crate::destination::transient_retries_total() - before_drain;
+        assert!(
+            grew_by < 1_000,
+            "rendering the process's OWN events must not fold their counter back \
+             into it (grew by {grew_by}; the mutant folds >= {} per event)",
+            SEED
+        );
+    }
 
     fn fresh_card(name: &str, mode: &str) -> CardState {
         CardState {

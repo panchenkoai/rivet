@@ -181,18 +181,6 @@ pub(crate) fn sample_temp_bytes(url: &str, tls: Option<&TlsConfig>) -> Option<i6
         .and_then(|r| r.try_get::<_, i64>(0).ok())
 }
 
-/// Snapshot the broader source-harm counters from `pg_stat_database` for the
-/// current database — a superset of [`sample_temp_bytes`] (which the run summary
-/// tracks on its own). Returns `(metric, cumulative_value)` pairs; the pipeline
-/// captures these before and after the export and stores the per-metric delta in
-/// `export_harm`.
-///
-/// All counters live in `pg_stat_database` and are readable by **any** role — no
-/// `pg_monitor` membership or superuser needed (unlike `pg_stat_activity`'s view
-/// of other sessions). These are cluster-level cumulative counters, so concurrent
-/// activity inflates the delta; on a single-tenant pilot box it is the run's own
-/// footprint. `None` on connect/query failure — informational, never blocks the
-/// export.
 /// Probe `SHOW work_mem` and return the value in bytes.
 ///
 /// PostgreSQL spills FETCH-cursor output to `pgsql_tmp/` once the in-flight
@@ -785,9 +773,16 @@ impl super::Source for PostgresSource {
         Ok(mappings)
     }
 
-    /// Governor pressure proxy: `pg_stat_bgwriter.checkpoints_req` — the same
-    /// monotonic counter the adaptive batch loop samples. Rising between samples
-    /// means the source is checkpointing harder under write pressure.
+    /// Snapshot the source-harm counters from `pg_stat_database` for the current
+    /// database. Returns `(metric, cumulative_value)` pairs; the pipeline captures
+    /// these before and after the export and stores the per-metric delta in
+    /// `export_harm`.
+    ///
+    /// Every counter here is readable by **any** role — no `pg_monitor` membership
+    /// or superuser needed (unlike `pg_stat_activity`'s view of other sessions).
+    /// They are CLUSTER-level cumulative counters, so concurrent activity inflates
+    /// the delta; on a single-tenant box it is the run's own footprint. `None` on
+    /// connect/query failure — observability, never a gate.
     fn harm_counters(&mut self) -> Option<Vec<(String, i64)>> {
         let client = &mut self.client;
         // `tup_returned` (rows the engine had to scan) is the read-amplification
@@ -819,6 +814,11 @@ impl super::Source for PostgresSource {
         Some(out)
     }
 
+    /// Governor pressure proxy: `checkpoints_req` — WAL volume forcing
+    /// checkpoints. Rising between samples means the source is checkpointing
+    /// harder under WRITE pressure, which a read-only export cannot cause; that
+    /// is why the governor may share this counter with the batch loop while the
+    /// other engines need a separate one.
     fn sample_governor_pressure(&mut self) -> Option<u64> {
         // `checkpoints_req` is WRITE-driven (WAL volume forcing checkpoints):
         // a read-only export cannot move it, so the governor may share it

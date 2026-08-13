@@ -1276,8 +1276,16 @@ mod tests {
     /// (the interceptor is `pub(crate)` to `destination`, so it cannot be
     /// called from here) — and this test drives the counter through the other
     /// production writer, `add_transient_retries` (what the parent calls for
-    /// each child's `Finished` event, `parent_ui.rs`), then reads the row out
-    /// of the real `render()`.
+    /// each CHILD PROCESS's `Finished` event, in
+    /// `parallel_children::adopt_child_event`), then reads the row out of the
+    /// real `render()`.
+    ///
+    /// Scope, so the next reader does not mistake this for more than it is:
+    /// it pins the ROW, not the wiring. It cannot see how the counter got its
+    /// value, which is why it stayed green while every in-process run folded
+    /// the counter into itself (finding #4) — that seam is pinned by
+    /// `parent_ui::tests::in_process_finished_event_must_not_refold_this_processs_own_retry_counter`,
+    /// which drives print → emit_event → Renderer for real.
     ///
     /// Delta-based, not absolute: the counter is process-wide and other tests
     /// in this binary may bump it concurrently. The "no row when zero" half

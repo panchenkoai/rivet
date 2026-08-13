@@ -263,7 +263,7 @@ pub fn run(
                     "parallel-processes",
                 );
                 aggregate::print(&agg);
-                aggregate::warn_throughput_regressions(&state, &agg.per_export);
+                aggregate::warn_throughput_regressions(&state, &agg.per_export, &agg.parallel_mode);
                 aggregate::persist(&state, &agg, summary_output);
                 if json_output {
                     print_json_summary(&agg);
@@ -467,7 +467,7 @@ pub fn run(
         // assume which thread owned the per-export `StateStore` above.
         match StateStore::open(config_path) {
             Ok(state) => {
-                aggregate::warn_throughput_regressions(&state, &agg.per_export);
+                aggregate::warn_throughput_regressions(&state, &agg.per_export, &agg.parallel_mode);
                 aggregate::persist(&state, &agg, summary_output)
             }
             Err(e) => log::warn!(
@@ -490,7 +490,16 @@ pub fn run(
                 .iter()
                 .map(aggregate::entry_from_summary)
                 .collect();
-            aggregate::warn_throughput_regressions(&state, &entries);
+            // A lone export has no aggregate, so name the mode here: a
+            // re-exec'd child of --parallel-export-processes / a wave batch
+            // runs single-export in its own process while N siblings share the
+            // source, and ENV_CONCURRENT_SIBLINGS is exactly that declaration.
+            let mode = if multi_export_concurrent() {
+                "concurrent-siblings"
+            } else {
+                "sequential"
+            };
+            aggregate::warn_throughput_regressions(&state, &entries, mode);
         }
     }
     if exports.len() == 1 && (summary_output.is_some() || json_output) {
@@ -763,7 +772,7 @@ pub(crate) fn run_waves(
             },
         );
         aggregate::print(&agg);
-        aggregate::warn_throughput_regressions(&state, &agg.per_export);
+        aggregate::warn_throughput_regressions(&state, &agg.per_export, &agg.parallel_mode);
         aggregate::persist(&state, &agg, None);
     }
     // Captured child stderr (verbose per-export cards, parallel path only) goes
@@ -964,17 +973,21 @@ pub(crate) fn run_pool(
         return Ok(());
     }
 
-    let build_items = |exps: &[ExportConfig]| -> Vec<super::pool::PoolItem> {
+    // The pre-split sweep keeps the (item, classification) PAIRS, not just the
+    // items: a split unit inherits the giant's PROVENANCE as well as its
+    // seconds (see `pool::split_unit_from`). Dropping the classification here
+    // is what let `--split` re-label a giant that has never succeeded as
+    // "measured" and delete the LOWER BOUND hedge (bughunt 2026-08-14).
+    let predicted_pre: Vec<(super::pool::PoolItem, super::pool::PredictedFrom)> =
         super::pool::predict_items(
             &state,
-            exps.iter().map(|e| (e.name.as_str(), is_parallel_safe(e))),
+            effective
+                .iter()
+                .map(|e| (e.name.as_str(), is_parallel_safe(e))),
             &std::collections::HashMap::new(),
-        )
-        .into_iter()
-        .map(|(i, _)| i)
-        .collect()
-    };
-    let mut items = build_items(&effective);
+        );
+    let mut items: Vec<super::pool::PoolItem> =
+        predicted_pre.iter().map(|(i, _)| i.clone()).collect();
 
     // #167: a single dominating export IS the pool floor — extra slots buy
     // nothing past it until the giant is itself divisible. The pure planner
@@ -994,9 +1007,9 @@ pub(crate) fn run_pool(
     // would schedule the giant's slices LAST — smalls first, nothing
     // backfilling behind the units, defeating the split's makespan purpose.
     // Each unit inherits giant_predicted / realized (the same arithmetic
-    // pool::split_dominating models), recorded here and consulted by the
-    // final classification sweep.
-    let mut split_unit_secs: std::collections::HashMap<String, f64> =
+    // pool::split_dominating models) AND the giant's classification, recorded
+    // here and consulted by the final classification sweep.
+    let mut split_seeds: std::collections::HashMap<String, super::pool::PredictedFrom> =
         std::collections::HashMap::new();
     let advise = super::pool::advise_split(&items, m, 3.0, m.max(2));
     if split {
@@ -1032,15 +1045,22 @@ pub(crate) fn run_pool(
                         // Seed each unit with its share of the giant's
                         // prediction so LPT places the slices where the giant
                         // stood (front of the queue), not at the 5 s
-                        // placeholder tail.
-                        let giant_secs = items
+                        // placeholder tail — and with the giant's CLASSIFICATION,
+                        // so a giant that has never succeeded does not turn into
+                        // N "measured" units and silently delete the LOWER BOUND
+                        // hedge below (bughunt 2026-08-14).
+                        let (giant_secs, giant_from) = predicted_pre
                             .iter()
-                            .find(|i| &i.name == giant)
-                            .map(|i| i.predicted_secs)
-                            .unwrap_or(0.0);
+                            .find(|(i, _)| &i.name == giant)
+                            .map(|(i, f)| (i.predicted_secs, Some(f.clone())))
+                            .unwrap_or((0.0, None));
+                        let share = giant_secs / realized.max(1) as f64;
+                        let unit_from = match &giant_from {
+                            Some(f) => super::pool::split_unit_from(f, share),
+                            None => super::pool::PredictedFrom::SeededSplit(share),
+                        };
                         for u in &units {
-                            split_unit_secs
-                                .insert(u.name.clone(), giant_secs / realized.max(1) as f64);
+                            split_seeds.insert(u.name.clone(), unit_from.clone());
                         }
                         split_info = Some((base.destination.clone(), base.family()));
                         effective.retain(|e| &e.name != giant);
@@ -1058,11 +1078,23 @@ pub(crate) fn run_pool(
                         effective.extend(units);
                         // `items` is rebuilt by the single post-split
                         // classification sweep below.
+                        // The wall is only as good as the giant's prediction:
+                        // an unmeasured giant makes it a LOWER BOUND, and this
+                        // line is the one an operator reads while the run
+                        // starts (the accounting print below repeats it).
+                        let wall_hedge = match &unit_from {
+                            super::pool::PredictedFrom::SeededSplit(_) => "",
+                            _ => {
+                                " This wall is a LOWER BOUND: the giant has no successful run to \
+                                  measure from, so each unit is seeded from a failed attempt / \
+                                  placeholder."
+                            }
+                        };
                         log::warn!(
                             "apply --pool --split: split '{giant}' into {realized} range \
                              sub-export(s) over its key — predicted wall ~{:.1} min (was the \
                              single-export floor). The units share one prefix and fold to family \
-                             '{giant}', so the load view reads them as one table.",
+                             '{giant}', so the load view reads them as one table.{wall_hedge}",
                             broken / 60.0,
                         );
                     }
@@ -1176,7 +1208,7 @@ pub(crate) fn run_pool(
         effective
             .iter()
             .map(|e| (e.name.as_str(), is_parallel_safe(e))),
-        &split_unit_secs,
+        &split_seeds,
     );
     let classified: Vec<super::pool::PredictedFrom> =
         predicted.iter().map(|(_, f)| f.clone()).collect();
@@ -1184,17 +1216,7 @@ pub(crate) fn run_pool(
     let order = super::pool::pool_order(&items);
     let predicted_secs = super::pool::predicted_makespan_secs(&items, m);
     let floor_secs = super::pool::makespan_floor_secs(&items, m);
-    let (mut measured_n, mut attempt_n, mut placeholder_n) = (0usize, 0usize, 0usize);
-    for p in &classified {
-        match p {
-            // A seeded split unit inherits the giant's (usually measured)
-            // share — measured by proxy for the accounting too.
-            super::pool::PredictedFrom::Measured(_)
-            | super::pool::PredictedFrom::SeededSplit(_) => measured_n += 1,
-            super::pool::PredictedFrom::FailedAttemptFloor(_) => attempt_n += 1,
-            super::pool::PredictedFrom::Placeholder(_) => placeholder_n += 1,
-        }
-    }
+    let (measured_n, attempt_n, placeholder_n) = super::pool::classification_counts(&classified);
     println!(
         "  Pool: {} export(s) × {} slot(s) — predicted makespan ~{:.1} min (floor {:.1}; {} measured, {} estimated)",
         effective.len(),
@@ -1449,7 +1471,7 @@ pub(crate) fn run_pool(
             .collect();
         let agg = aggregate::build(entries, started_at, finished_at, Some(config_path), "pool");
         aggregate::print(&agg);
-        aggregate::warn_throughput_regressions(&state, &agg.per_export);
+        aggregate::warn_throughput_regressions(&state, &agg.per_export, &agg.parallel_mode);
         aggregate::persist(&state, &agg, None);
     }
     if !failures.is_empty() {

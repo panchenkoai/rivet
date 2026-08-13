@@ -158,22 +158,89 @@ pub(super) fn build(
 }
 
 /// One export's run-over-run throughput comparison input: current and
-/// previous-success `(rows, duration_ms)`.
+/// previous-success `(rows, duration_ms)`, plus the export MODE each side ran
+/// in (`full` / `incremental` / …) — a mode switch changes what the work IS,
+/// so the two rows are not two measurements of one thing.
 pub(super) struct ThroughputPair {
     pub export_name: String,
     pub cur_rows: i64,
     pub cur_ms: i64,
     pub prev_rows: i64,
     pub prev_ms: i64,
+    pub cur_mode: String,
+    /// `None` when the baseline row predates the `mode` column — unknown mode
+    /// is not evidence of a change, so it does not block the comparison.
+    pub prev_mode: Option<String>,
 }
 
 /// Floor below which a run is too small/short for a throughput comparison to
 /// mean anything (startup overhead dominates; noise reads as regression).
+/// Applied to BOTH sides: the fixed per-run cost (connect, schema detect,
+/// boundary probe, destination init, manifest/validate) is charged to the
+/// CURRENT run too, so a short current run understates its own rows/s.
 const REGRESSION_MIN_ROWS: i64 = 10_000;
 const REGRESSION_MIN_MS: i64 = 5_000;
 /// A run counts as regressed when its rows/s drop to ≤ 2/3 of the previous
 /// success (≥1.5× slower per row).
 const REGRESSION_RATIO: f64 = 1.5;
+/// The two runs must have moved comparable amounts of data: past this factor
+/// the fixed per-run cost is amortized over wildly different row counts and the
+/// ratio measures SHAPE, not speed (a weekend backfill vs a daily delta).
+const REGRESSION_MAX_SCALE: i64 = 2;
+
+/// Why two runs of one export are NOT comparable on rows/s.
+///
+/// Made explicit (and named) because the skip condition is the load-bearing
+/// half of this check: a false "5.0× slower — check governor sheds" on 154
+/// healthy exports drowns the one real regression, the same
+/// diagnostic-bypass harm a false UNSAFE does in preflight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Incomparable {
+    /// Either side moved too few rows for rows/s to mean anything.
+    TooFewRows,
+    /// Either side ran too briefly — fixed per-run cost dominates.
+    TooShort,
+    /// The two runs moved very different amounts of data.
+    ScaleMismatch,
+    /// The export ran in a different mode (a `full` backfill vs an
+    /// `incremental` delta reads as a regression while both are healthy).
+    ModeChanged,
+}
+
+/// The comparability rule, pure and total: `None` means the pair may be
+/// compared, `Some(reason)` names the refusal.
+pub(super) fn incomparable(p: &ThroughputPair) -> Option<Incomparable> {
+    if p.cur_rows < REGRESSION_MIN_ROWS || p.prev_rows < REGRESSION_MIN_ROWS {
+        return Some(Incomparable::TooFewRows);
+    }
+    if p.cur_ms < REGRESSION_MIN_MS || p.prev_ms < REGRESSION_MIN_MS {
+        return Some(Incomparable::TooShort);
+    }
+    let scale = REGRESSION_MAX_SCALE;
+    if p.cur_rows.saturating_mul(scale) < p.prev_rows
+        || p.prev_rows.saturating_mul(scale) < p.cur_rows
+    {
+        return Some(Incomparable::ScaleMismatch);
+    }
+    if let Some(prev_mode) = &p.prev_mode
+        && !prev_mode.is_empty()
+        && !p.cur_mode.is_empty()
+        && prev_mode != &p.cur_mode
+    {
+        return Some(Incomparable::ModeChanged);
+    }
+    None
+}
+
+/// Does this run's concurrency mode make a per-export rows/s DROP expected?
+///
+/// Exports sharing one source/network/CPU legitimately each run slower while
+/// the run's makespan improves — the very trade `--pool` is for. Unknown modes
+/// are treated as concurrent: hedged text on a serial run is harmless, a
+/// confident "check governor sheds" on a pool run is a false accusation.
+fn mode_shares_the_source(run_mode: &str) -> bool {
+    !matches!(run_mode, "sequential" | "wave-sequential" | "single")
+}
 
 /// Pure run-over-run self-check: compare each export's throughput (rows/s)
 /// against its previous SUCCESS and name the material regressions.
@@ -183,23 +250,41 @@ const REGRESSION_RATIO: f64 = 1.5;
 /// +1h48m) was invisible in the moment — counts matched, statuses were green,
 /// and only a hand-written SQL join over two state DBs surfaced it days
 /// later. Rows/s (not wall time) so organic data growth does not read as a
-/// slowdown; tiny/short runs are skipped as noise.
-pub(super) fn throughput_regressions(pairs: &[ThroughputPair]) -> Vec<String> {
+/// slowdown; pairs of incomparable SHAPE are refused by [`incomparable`].
+///
+/// `run_mode` is the current run's concurrency mode (`sequential`, `pool`,
+/// `parallel-threads`, …). It never suppresses the line — the field regression
+/// happened on a concurrent run, so suppressing there would delete the signal
+/// where it is needed most — but on a source-sharing mode the text says so
+/// instead of blaming a shed the operator's own `--pool` explains. The
+/// BASELINE run's mode is not recorded on `export_metrics`, so this scopes the
+/// attribution, not the comparison.
+pub(super) fn throughput_regressions(pairs: &[ThroughputPair], run_mode: &str) -> Vec<String> {
     let mut out = Vec::new();
     for p in pairs {
-        if p.cur_rows < REGRESSION_MIN_ROWS
-            || p.prev_rows < REGRESSION_MIN_ROWS
-            || p.prev_ms < REGRESSION_MIN_MS
-            || p.cur_ms <= 0
-        {
+        if let Some(reason) = incomparable(p) {
+            log::debug!(
+                "throughput self-check: skipping '{}' — {:?}",
+                p.export_name,
+                reason
+            );
             continue;
         }
         let cur_tp = p.cur_rows as f64 * 1000.0 / p.cur_ms as f64;
         let prev_tp = p.prev_rows as f64 * 1000.0 / p.prev_ms as f64;
         if prev_tp > 0.0 && prev_tp / cur_tp >= REGRESSION_RATIO {
+            let tail = if mode_shares_the_source(run_mode) {
+                format!(
+                    "this run ran {run_mode}, where exports share the source and per-export \
+                     rows/s falls BY DESIGN — compare the run's makespan before blaming a \
+                     governor shed / adaptive batch shrink / source load"
+                )
+            } else {
+                "check governor sheds / adaptive batch shrinks / source load".to_string()
+            };
             out.push(format!(
                 "export '{}': throughput {} → {} rows/s ({:.1}× slower than its last success) — \
-                 check governor sheds / adaptive batch shrinks / source load",
+                 {tail}",
                 p.export_name,
                 format_rate(prev_tp),
                 format_rate(cur_tp),
@@ -215,7 +300,16 @@ pub(super) fn throughput_regressions(pairs: &[ThroughputPair]) -> Vec<String> {
 /// never affects the run. Called beside [`print`] at every aggregate site so
 /// EVERY run self-reports degradation at the default log level — the answer
 /// to "prove the next run is not strangling itself" is that the run says so.
-pub(super) fn warn_throughput_regressions(state: &StateStore, entries: &[RunAggregateEntry]) {
+///
+/// `run_mode` is the same string [`build`] records on the aggregate — passed
+/// here so the warning can say which concurrency the run used (see
+/// [`throughput_regressions`]); the single-export path has no aggregate and
+/// passes `sequential` / `concurrent-siblings` for itself.
+pub(super) fn warn_throughput_regressions(
+    state: &StateStore,
+    entries: &[RunAggregateEntry],
+    run_mode: &str,
+) {
     let mut pairs = Vec::new();
     for e in entries.iter().filter(|e| e.status == "success") {
         // Direct success query, excluding this run's own row — a fixed
@@ -232,9 +326,11 @@ pub(super) fn warn_throughput_regressions(state: &StateStore, entries: &[RunAggr
             cur_ms: e.duration_ms,
             prev_rows: prev.total_rows,
             prev_ms: prev.duration_ms,
+            cur_mode: e.mode.clone(),
+            prev_mode: prev.mode.clone(),
         });
     }
-    for line in throughput_regressions(&pairs) {
+    for line in throughput_regressions(&pairs, run_mode) {
         log::warn!("{line}");
     }
 }
@@ -584,6 +680,26 @@ mod tests {
     use super::*;
     use chrono::Duration;
 
+    /// A comparable pair by default — same export mode both sides, so each
+    /// test names only the dimension it is about.
+    fn pair(
+        name: &str,
+        cur_rows: i64,
+        cur_ms: i64,
+        prev_rows: i64,
+        prev_ms: i64,
+    ) -> ThroughputPair {
+        ThroughputPair {
+            export_name: name.into(),
+            cur_rows,
+            cur_ms,
+            prev_rows,
+            prev_ms,
+            cur_mode: "full".into(),
+            prev_mode: Some("full".into()),
+        }
+    }
+
     fn entry(name: &str, status: &str, rows: i64, files: i64, bytes: u64) -> RunAggregateEntry {
         RunAggregateEntry {
             bytes_read: 0,
@@ -680,15 +796,11 @@ mod tests {
     /// inverting the ratio comparison.
     #[test]
     fn throughput_regressions_flag_real_slowdowns_only() {
-        let pair = |name: &str, cur_rows, cur_ms, prev_rows, prev_ms| ThroughputPair {
-            export_name: name.into(),
-            cur_rows,
-            cur_ms,
-            prev_rows,
-            prev_ms,
-        };
         // 2.4× slower per row (the field regression's shape) → flagged.
-        let out = throughput_regressions(&[pair("big", 1_000_000, 24_000, 1_000_000, 10_000)]);
+        let out = throughput_regressions(
+            &[pair("big", 1_000_000, 24_000, 1_000_000, 10_000)],
+            "sequential",
+        );
         assert_eq!(out.len(), 1, "a 2.4× slowdown must be flagged: {out:?}");
         assert!(
             out[0].contains("big") && out[0].contains("slower"),
@@ -696,24 +808,126 @@ mod tests {
         );
         // 1.2× — within noise/growth → silent.
         assert!(
-            throughput_regressions(&[pair("ok", 1_000_000, 12_000, 1_000_000, 10_000)]).is_empty()
+            throughput_regressions(
+                &[pair("ok", 1_000_000, 12_000, 1_000_000, 10_000)],
+                "sequential"
+            )
+            .is_empty()
         );
         // Faster run → silent.
         assert!(
-            throughput_regressions(&[pair("fast", 1_000_000, 8_000, 1_000_000, 10_000)]).is_empty()
+            throughput_regressions(
+                &[pair("fast", 1_000_000, 8_000, 1_000_000, 10_000)],
+                "sequential"
+            )
+            .is_empty()
         );
-        // Rows GREW 3× while wall grew 3× — throughput flat → silent (wall-time
-        // comparison would have false-flagged this; rows/s is the honest unit).
+        // Rows GREW 1.8× while wall grew 1.8× — throughput flat → silent
+        // (wall-time comparison would have false-flagged this; rows/s is the
+        // honest unit). Kept inside the comparability band on purpose, so it
+        // still exercises the RATIO rather than being short-circuited by the
+        // scale rule below.
         assert!(
-            throughput_regressions(&[pair("grew", 3_000_000, 30_000, 1_000_000, 10_000)])
-                .is_empty()
+            throughput_regressions(
+                &[pair("grew", 1_800_000, 18_000, 1_000_000, 10_000)],
+                "sequential"
+            )
+            .is_empty()
         );
         // Tiny/short runs are noise → silent even at 10× slower.
-        assert!(throughput_regressions(&[pair("tiny", 500, 5_000, 500, 500)]).is_empty());
         assert!(
-            throughput_regressions(&[pair("short", 20_000, 4_000, 20_000, 400)]).is_empty(),
+            throughput_regressions(&[pair("tiny", 500, 5_000, 500, 500)], "sequential").is_empty()
+        );
+        assert!(
+            throughput_regressions(&[pair("short", 20_000, 4_000, 20_000, 400)], "sequential")
+                .is_empty(),
             "prev under the min-duration floor must not baseline"
         );
+    }
+
+    /// The comparability rule is the load-bearing half of the self-check: a
+    /// confident "5.0× slower — check governor sheds" on a healthy run is the
+    /// diagnostic-bypass harm (154 false alarms drown the one real one). Each
+    /// case below is a pair the check must REFUSE to compare, and each was a
+    /// false WARN before this rule existed.
+    ///
+    /// RED-proven, one mutant per rule, each reverting to the pre-fix code
+    /// (`left` is the mutant's verdict, `right` the required one):
+    ///
+    ///  * `p.cur_ms < REGRESSION_MIN_MS` → `p.cur_ms <= 0` — the floor applied
+    ///    to the PREVIOUS side only: `left: None, right: Some(TooShort)`.
+    ///  * drop the `ScaleMismatch` arm: `left: None, right: Some(ScaleMismatch)`.
+    ///  * drop the `ModeChanged` arm: `left: None, right: Some(ModeChanged)`.
+    ///
+    /// The fixture carries FOUR pairs, one of them a genuine regression, so a
+    /// mutant that refuses everything (`incomparable` → always `Some`) is also
+    /// RED — the filter must SELECT, not merely return empty.
+    #[test]
+    fn throughput_regressions_refuse_pairs_of_incomparable_shape() {
+        // (a) The weekend backfill baselining a daily delta: both sides clear
+        // every noise floor, the ratio is 5.0×, and nothing is wrong.
+        let backfill = pair("orders", 40_000, 6_000, 2_000_000, 60_000);
+        assert_eq!(incomparable(&backfill), Some(Incomparable::ScaleMismatch));
+        // (b) A 4 s current run: fixed per-run cost (connect, schema detect,
+        // boundary probe, manifest/validate) is most of its wall, so its
+        // rows/s understates itself — the same reason `prev_ms` has a floor.
+        let short_cur = pair("short-cur", 40_000, 4_000, 80_000, 5_000);
+        assert_eq!(incomparable(&short_cur), Some(Incomparable::TooShort));
+        // (c) A mode switch changes what the work IS.
+        let mut mode_flip = pair("switched", 100_000, 40_000, 100_000, 10_000);
+        mode_flip.cur_mode = "incremental".into();
+        mode_flip.prev_mode = Some("full".into());
+        assert_eq!(incomparable(&mode_flip), Some(Incomparable::ModeChanged));
+        // (d) …and one genuine regression, same shape both runs.
+        let real = pair("real", 1_000_000, 24_000, 1_000_000, 10_000);
+        assert_eq!(incomparable(&real), None);
+
+        let out = throughput_regressions(&[backfill, short_cur, mode_flip, real], "sequential");
+        assert_eq!(
+            out.len(),
+            1,
+            "only the comparable pair may be reported: {out:?}"
+        );
+        assert!(out[0].contains("real"), "{out:?}");
+    }
+
+    /// A concurrency mode is not a regression: under `--pool` every export
+    /// shares the source, so per-export rows/s falls while the makespan
+    /// improves — the run must not blame the governor for the operator's own
+    /// `--pool`. The line still PRINTS (the field regression happened on a
+    /// concurrent run; suppressing there deletes the signal where it is needed
+    /// most) but says which mode it ran.
+    ///
+    /// RED-proven against `mode_shares_the_source` → `false` for every mode
+    /// (the pre-fix behaviour: one text for all modes): the `contains("pool")`
+    /// assert fails.
+    #[test]
+    fn throughput_regression_text_names_a_source_sharing_mode() {
+        let p = || pair("orders", 1_000_000, 24_000, 1_000_000, 10_000);
+        let pooled = throughput_regressions(&[p()], "pool");
+        assert_eq!(pooled.len(), 1, "the line must still print under a pool");
+        assert!(
+            pooled[0].contains("pool") && pooled[0].contains("makespan"),
+            "a source-sharing run must name its mode instead of blaming a shed: {pooled:?}"
+        );
+        let serial = throughput_regressions(&[p()], "sequential");
+        assert!(
+            serial[0].contains("check governor sheds"),
+            "a serial run keeps the direct attribution: {serial:?}"
+        );
+        // Every mode the aggregate records, classified.
+        for m in [
+            "parallel-threads",
+            "parallel-processes",
+            "wave-parallel-processes",
+            "pool",
+            "concurrent-siblings",
+        ] {
+            assert!(mode_shares_the_source(m), "{m} shares the source");
+        }
+        for m in ["sequential", "wave-sequential", "single"] {
+            assert!(!mode_shares_the_source(m), "{m} is serial");
+        }
     }
 
     #[test]

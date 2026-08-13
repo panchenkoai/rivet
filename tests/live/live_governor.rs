@@ -33,6 +33,37 @@ use std::time::Duration;
 
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
+/// Prove the governor was ARMED and AWAKE on this leg before any `backed off`
+/// assertion is allowed to mean anything.
+///
+/// `!stderr.contains("backed off")` is equally true of a healthy idle governor
+/// and of one that is structurally deaf — its sampler returning `None` freezes
+/// parallelism at the ceiling forever (`GovernorState::observe` returns `None`
+/// on a `None` sample), which is exactly the state a renamed counter produces
+/// (PG 17 moved `checkpoints_req` to `pg_stat_checkpointer.num_requested`; a
+/// login losing `VIEW SERVER STATE` does it on MSSQL; a missing
+/// `Innodb_log_waits` does it on MySQL). The product emits a distinct line per
+/// state (`src/pipeline/governor.rs`), so the canaries assert on all three
+/// rather than on the shed count alone (bughunt 2026-08-13, finding "all four
+/// canaries pass identically when the governor is DEAF").
+fn assert_governor_awake(stderr: &str, engine: &str) {
+    assert!(
+        stderr.contains("adaptive concurrency governor active"),
+        "{engine}: the governor must ARM (adaptive + parallel>1) — without it the \
+         no-shed assertion grades nothing; stderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("governor monitoring connection failed"),
+        "{engine}: the governor could not open its monitoring connection, so \
+         parallelism stayed static and no-shed is vacuous; stderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("provides no pressure signal"),
+        "{engine}: the governor armed but is DEAF — its sampler yields nothing, so \
+         parallelism is frozen at the ceiling and no-shed is vacuous; stderr:\n{stderr}"
+    );
+}
+
 fn duckdb_total_parquet_rows(dir: &std::path::Path) -> usize {
     let mut n = 0;
     for path in files_with_extension(dir, "parquet") {
@@ -588,21 +619,62 @@ fn mysql_governor_ignores_the_exports_own_spill_exhaust() {
         }
     };
 
-    let spills = |c: &mut mysql::PooledConn| -> u64 {
+    // Activation-threshold probe, measured on a SESSION-scoped counter.
+    //
+    // The guard's job is "this fixture still spills" — otherwise the no-shed
+    // assertion below is vacuous. The first version read GLOBAL
+    // `Created_tmp_disk_tables` around the run, which cannot do that job on
+    // this stand: the tmp-table globals were just shrunk SERVER-WIDE and only
+    // the two tests that take `mysql_globals_guard` are excluded, so every
+    // other concurrent MySQL live test now spills at a 16 KB threshold into
+    // the same counter — an inert fixture stays "proven" by sibling noise
+    // (bughunt 2026-08-13).
+    //
+    // `SHOW SESSION STATUS` is per-connection, so it is noise-immune by
+    // construction. The probe replays the EXACT SQL rivet's chunked runner
+    // emits for a curated query (`build_chunk_query_sql`:
+    // `SELECT * FROM (<query>) AS _rivet WHERE <col> BETWEEN a AND b`) on a
+    // connection opened AFTER the flip (session tmp-table limits are copied
+    // from the globals at connect). Two windows, not one: the property under
+    // test is "EVERY chunk materializes", which one window cannot express —
+    // and the counter accumulates, so a single probe cannot tell +1-once from
+    // +1-per-chunk. Measured on the dev stand: +1 per window with the flip,
+    // +0 without it (so the probe genuinely goes RED on an inert fixture),
+    // and `SHOW SESSION STATUS` itself contributes 0.
+    //
+    // The probe's SQL is DERIVED from the same `base_query` the rig exports, so
+    // a future edit to the fixture query cannot leave the probe validating a
+    // query the run no longer issues.
+    let base_query = format!("SELECT DISTINCT id, payload FROM {}", table.name());
+    let session_spills = |c: &mut mysql::PooledConn| -> u64 {
         let rows: Vec<(String, u64)> = c
-            .query("SHOW GLOBAL STATUS LIKE 'Created_tmp_disk_tables'")
-            .expect("sample spills");
+            .query("SHOW SESSION STATUS LIKE 'Created_tmp_disk_tables'")
+            .expect("sample session spills");
         rows.first().map(|(_, v)| *v).unwrap_or(0)
     };
-    let spills_before = spills(&mut c);
+    let mut probe = mysql_connect();
+    let probe_before = session_spills(&mut probe);
+    for (lo, hi) in [(1, 1000), (1001, 2000)] {
+        let n: Option<u64> = probe
+            .query_first(format!(
+                "SELECT count(*) FROM (SELECT * FROM ({base_query}) AS _rivet \
+                 WHERE id BETWEEN {lo} AND {hi}) probe"
+            ))
+            .expect("probe chunk query");
+        assert_eq!(n, Some(1000), "probe window {lo}..{hi} must read its rows");
+    }
+    let probe_delta = session_spills(&mut probe).saturating_sub(probe_before);
+    assert!(
+        probe_delta >= 2,
+        "fixture went inert: each chunk-shaped query must spill its DISTINCT \
+         materialization to disk (session Created_tmp_disk_tables delta ≥ 2 over two \
+         windows), got {probe_delta} — the no-shed assertion below would grade nothing"
+    );
 
     // Canonical Rig config + runner — no bespoke YAML/Command (the harness
     // rule this file predates; new tests go through the rig).
     let rig = Rig::mysql_batch(table.name())
-        .query(&format!(
-            "SELECT DISTINCT id, payload FROM {}",
-            table.name()
-        ))
+        .query(&base_query)
         .mode("chunked")
         .source_line("tuning:")
         .source_line("  adaptive: true")
@@ -615,21 +687,7 @@ fn mysql_governor_ignores_the_exports_own_spill_exhaust() {
     let out_dir = rig.out_dir();
     let stderr = String::from_utf8_lossy(&out.stderr).to_string();
     assert!(out.status.success(), "run must complete; stderr:\n{stderr}");
-    assert!(
-        stderr.contains("adaptive concurrency governor active"),
-        "governor must arm (adaptive + parallel>1); stderr:\n{stderr}"
-    );
-    // Activation-threshold guard: the fixture must really have spilled — a
-    // fixture that stops spilling (bigger tmp_table_size, narrower payload)
-    // would make the no-shed assertion below vacuous. ≥10 ties the delta to
-    // this run's ~20 chunk materializations, not to concurrent test noise on
-    // the shared server.
-    let spill_delta = spills(&mut c).saturating_sub(spills_before);
-    assert!(
-        spill_delta >= 10,
-        "fixture went inert: expected the run's own chunks to spill tmp tables \
-         (Created_tmp_disk_tables delta ≥ 10), got {spill_delta}"
-    );
+    assert_governor_awake(&stderr, "mysql");
     // The point: with the export's OWN spills proven present and no foreign
     // write load, the governor must hold parallelism flat — its signal is now
     // `Innodb_log_waits`, which its own read-only pages cannot move.
@@ -645,18 +703,36 @@ fn mysql_governor_ignores_the_exports_own_spill_exhaust() {
     drop(prior);
 }
 
-/// The CLASS guard behind the 2026-08-13 field regression: on an IDLE source
-/// every adaptive feedback loop (governor, batch shrink, and whatever joins
-/// them later) has nothing legitimate to react to — so `adaptive: true` must
-/// cost approximately nothing versus `adaptive: false` on the same fixture.
-/// The governor bug this distills (self-exhaust spiral to `min_parallel: 1`)
-/// made the adaptive side 2.4× slower; any future controller that feeds on a
-/// signal its own workload moves will fail this same ratio gate, whatever its
-/// mechanism. Limits stated honestly: the stand cannot express slowdowns that
-/// need multi-GB tables vs a small buffer pool, so this canary catches
-/// signal-driven spirals expressible at stand scale, and the run-over-run
-/// throughput report (`aggregate::warn_throughput_regressions`) is the
-/// production-scale net behind it.
+/// The COST half of the class guard behind the 2026-08-13 field regression: on
+/// an IDLE source every adaptive feedback loop (governor, batch shrink, and
+/// whatever joins them later) has nothing legitimate to react to — so
+/// `adaptive: true` must arm, stay awake, shed nothing, and cost approximately
+/// nothing versus `adaptive: false` on the same fixture.
+///
+/// WHAT THIS TEST CANNOT DO, stated plainly: it is NOT red against the field
+/// regression itself. Its fixture is a plain keyset export read through the
+/// primary key — no DISTINCT/GROUP BY/filesort, so it creates no implicit temp
+/// table, and 60 000 × 512 B never exhausts the buffer pool. The pre-fix
+/// governor (pointed at MySQL's own-extraction sum
+/// `Created_tmp_disk_tables + Innodb_buffer_pool_wait_free`) therefore samples
+/// a FLAT counter here, and `GovernorState::observe` sheds only on
+/// `cur > prev` — so the buggy build passes every assertion below. Verified by
+/// reasoning about the fixture, not assumed: an earlier version of this doc
+/// claimed "any future controller that feeds on a signal its own workload
+/// moves will fail this same ratio gate", which this fixture cannot deliver
+/// (bughunt 2026-08-13).
+///
+/// The RED proof against the coupled-signal regression lives in
+/// `mysql_governor_ignores_the_exports_own_spill_exhaust`, whose fixture
+/// provably crosses the activation threshold (a session-scoped probe asserts
+/// the spill). What THIS test pins, and what would go red here, is the cost
+/// side that the spill test does not measure: a governor that arms, is awake,
+/// and still makes an idle-source run materially slower than its own
+/// non-adaptive baseline — the shape (2.4× in the field) of any
+/// self-feedback spiral large enough to show at stand scale. Limits: the stand
+/// cannot express slowdowns that need multi-GB tables vs a small buffer pool;
+/// the run-over-run throughput report
+/// (`aggregate::warn_throughput_regressions`) is the production-scale net.
 #[test]
 #[ignore = "live: requires docker-compose mysql"]
 fn mysql_adaptive_never_loses_to_its_own_baseline_on_an_idle_source() {
@@ -722,6 +798,7 @@ fn mysql_adaptive_never_loses_to_its_own_baseline_on_an_idle_source() {
     let (wall_off, _) = run(false);
     let (wall_on, stderr_on) = run(true);
 
+    assert_governor_awake(&stderr_on, "mysql");
     assert!(
         !stderr_on.contains("backed off"),
         "idle source: the governor has nothing to shed for; stderr:\n{stderr_on}"
@@ -779,10 +856,7 @@ fn pg_adaptive_never_loses_to_its_own_baseline_on_an_idle_source() {
     };
     let (wall_off, _) = run(false);
     let (wall_on, stderr_on) = run(true);
-    assert!(
-        stderr_on.contains("adaptive concurrency governor active"),
-        "governor must arm; stderr:\n{stderr_on}"
-    );
+    assert_governor_awake(&stderr_on, "postgres");
     assert!(
         !stderr_on.contains("backed off"),
         "idle source: the PG governor has nothing to shed for; stderr:\n{stderr_on}"
@@ -834,10 +908,7 @@ fn mssql_adaptive_never_loses_to_its_own_baseline_on_an_idle_source() {
     };
     let (wall_off, _) = run(false);
     let (wall_on, stderr_on) = run(true);
-    assert!(
-        stderr_on.contains("adaptive concurrency governor active"),
-        "governor must arm; stderr:\n{stderr_on}"
-    );
+    assert_governor_awake(&stderr_on, "mssql");
     assert!(
         !stderr_on.contains("backed off"),
         "idle source: the MSSQL governor has nothing to shed for; stderr:\n{stderr_on}"

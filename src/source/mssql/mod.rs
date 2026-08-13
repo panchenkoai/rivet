@@ -975,8 +975,6 @@ pub(crate) struct MssqlCdcProbe {
     pub agent_running: Option<bool>,
 }
 
-/// Connect and snapshot MSSQL harm counters; see [`MssqlSource::harm_counters`].
-/// `None` on connect failure or a missing `VIEW SERVER STATE` grant.
 /// Connect and check whether the login has `VIEW SERVER STATE` — used by
 /// `rivet doctor` to *advise* (never block) that source-harm metrics will be
 /// skipped without it. `None` on connect failure, in which case doctor stays

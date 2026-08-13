@@ -236,10 +236,10 @@ pub fn run_plan_command(
     // scope", while the flags were computed twenty lines up (walk find,
     // 2026-08-13): heavies then predicted M-way parallelism apply-time
     // serialization can never reach.
-    let safe_of: std::collections::HashMap<String, bool> = recs
-        .iter()
-        .map(|(name, _, safe)| (name.clone(), *safe))
-        .collect();
+    // …and the RECOMMENDATION is not what apply reads: `fields_to_write`
+    // deliberately preserves a hand-set `parallel_safe:`, so the preview must
+    // model the value now ON DISK (bughunt 2026-08-14).
+    let safe_of = effective_parallel_safe(&recs, &config, &fields, &written);
     if pool_estimate_is_printable(&format) {
         print_pool_estimate(&artifacts, &safe_of, &state);
     }
@@ -876,6 +876,52 @@ fn fields_to_write(
     (fields, preserved)
 }
 
+/// What `apply --pool` will read for `parallel_safe` on each export AFTER this
+/// plan run finished writing — the value the preview must model.
+///
+/// The recommendation is NOT that value. `fields_to_write` preserves a hand-set
+/// `parallel_safe:` (the operator's decision, #150 config-clobber class), so a
+/// config that says `true` on an export the cost model rates High keeps `true`
+/// on disk while `recs` says `false`. Sourcing the preview from `recs` made the
+/// preview apply the C3 heavy-serialization floor to an export apply runs
+/// M-way (preview 90 min, real 30) — and inverted, advertised parallelism apply
+/// serializes, the exact defect the C3 model fixed on the apply side
+/// (bughunt 2026-08-14). Three inputs, one rule per export:
+///
+///  * this run WROTE `parallel_safe` for it (blank field, or `--annotate-waves`
+///    overwriting, AND a `- name:` line actually matched) → the recommendation
+///    is now on disk;
+///  * otherwise the config's own value survives;
+///  * otherwise the field is absent from the file and `apply` reads
+///    `unwrap_or(false)` — including the case where the write was attempted but
+///    matched no `- name:` line (the `unmatched` warning above).
+fn effective_parallel_safe(
+    recs: &[(String, u32, bool)],
+    config: &Config,
+    fields: &ExportFields,
+    written: &std::collections::HashSet<String>,
+) -> HashMap<String, bool> {
+    recs.iter()
+        .map(|(name, _, rec_safe)| {
+            let wrote_safe = written.contains(name)
+                && fields
+                    .get(name)
+                    .is_some_and(|items| items.iter().any(|(k, _)| *k == "parallel_safe"));
+            let effective = if wrote_safe {
+                *rec_safe
+            } else {
+                config
+                    .exports
+                    .iter()
+                    .find(|e| &e.name == name)
+                    .and_then(|e| e.parallel_safe)
+                    .unwrap_or(false)
+            };
+            (name.clone(), effective)
+        })
+        .collect()
+}
+
 fn write_plan_fields_to_config(
     config_path: &str,
     fields: &ExportFields,
@@ -978,8 +1024,8 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        ExportFields, apply_field_annotations, fields_to_write, refuse_annotate_scoped_to_export,
-        repack_from_history,
+        ExportFields, apply_field_annotations, effective_parallel_safe, fields_to_write,
+        refuse_annotate_scoped_to_export, repack_from_history,
     };
 
     /// The refuse-guard fires ONLY when BOTH `--annotate-waves` and `--export`
@@ -1245,6 +1291,88 @@ mod tests {
                 .map(|(k, _)| *k)
                 .collect::<Vec<_>>(),
             vec!["wave", "parallel_safe"]
+        );
+    }
+
+    /// The preview and the schedule must be ONE number: `plan`'s pool print
+    /// models the `parallel_safe` that is on DISK after the annotations were
+    /// written, not the recommendation — because `fields_to_write` deliberately
+    /// preserves a hand-set flag (the test directly above pins that
+    /// preservation, and that is exactly the state where the two disagreed).
+    ///
+    /// Fixture carries THREE exports, one per branch of the rule, because the
+    /// subject is a per-export fold: a hand-set flag that must WIN over the
+    /// rec, a blank one whose write LANDED (rec wins), and a blank one whose
+    /// write matched no `- name:` line (nothing on disk → `apply` reads
+    /// `unwrap_or(false)`).
+    ///
+    /// RED-proven against the pre-fix source — `recs.iter().map(|(n, _, s)| (n,
+    /// *s))` — which reports `hand_tuned = true` and `unmatched = true` where
+    /// apply reads `false` / `false`.
+    #[test]
+    fn pool_preview_models_the_parallel_safe_apply_will_read_not_the_recommendation() {
+        let source = crate::config::SourceConfig {
+            source_type: crate::config::SourceType::Postgres,
+            url: Some("postgresql://localhost/test".into()),
+            url_env: None,
+            url_file: None,
+            host: None,
+            port: None,
+            user: None,
+            password: None,
+            password_env: None,
+            database: None,
+            environment: None,
+            tuning: None,
+            tls: None,
+            mongo: None,
+        };
+        let mut cfg = crate::config::Config {
+            source,
+            exports: vec![
+                crate::config::sample_export("hand_tuned"),
+                crate::config::sample_export("blank"),
+                crate::config::sample_export("unmatched"),
+            ],
+            notifications: None,
+            parallel_exports: false,
+            parallel_export_processes: false,
+            load: None,
+        };
+        // The operator's decision: independent rows, run me concurrently.
+        cfg.exports[0].wave = Some(7);
+        cfg.exports[0].parallel_safe = Some(false);
+        // The recommendation disagrees with the config on every export.
+        let recs = vec![
+            ("hand_tuned".to_string(), 2, true),
+            ("blank".to_string(), 2, true),
+            ("unmatched".to_string(), 2, true),
+        ];
+        let (fields, _preserved) = fields_to_write(&recs, &cfg, false);
+        assert!(
+            fields.contains_key("unmatched"),
+            "the fixture must ATTEMPT the write it then fails to match"
+        );
+        // `write_plan_fields_to_config` returns only the names whose `- name:`
+        // line matched; a templated/oddly-quoted name writes nothing.
+        let written: std::collections::HashSet<String> =
+            ["blank".to_string()].into_iter().collect();
+
+        let safe = effective_parallel_safe(&recs, &cfg, &fields, &written);
+        assert_eq!(
+            safe.get("hand_tuned"),
+            Some(&false),
+            "a hand-set flag is what apply reads — the rec was never written"
+        );
+        assert_eq!(
+            safe.get("blank"),
+            Some(&true),
+            "a blank field the plan just filled reads back as the rec"
+        );
+        assert_eq!(
+            safe.get("unmatched"),
+            Some(&false),
+            "nothing landed on disk, so apply's `unwrap_or(false)` is the truth"
         );
     }
 

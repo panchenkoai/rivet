@@ -842,7 +842,7 @@ fn nested_i64(doc: &Document, path: &[&str]) -> Option<i64> {
 /// Pull the source-harm counters out of a `serverStatus` response. Only
 /// **cumulative monotonic** counters are emitted (never gauges), because the
 /// pipeline stores the before→after *delta* — the same contract as the SQL
-/// engines' `sample_harm_counters`.
+/// engines' `Source::harm_counters` impls.
 fn harm_from_server_status(status: &Document) -> Vec<(String, i64)> {
     // (metric label, serverStatus path). Chosen as the Mongo analogues of the
     // PG harm set: docs/keys *scanned* are the read-amplification signal
@@ -873,7 +873,7 @@ fn harm_from_server_status(status: &Document) -> Vec<(String, i64)> {
 }
 
 /// Snapshot MongoDB's source-harm counters via `serverStatus` — the document-
-/// store analogue of the SQL engines' `sample_harm_counters`. Returns
+/// store analogue of the SQL engines' `harm_counters`. Returns
 /// `(metric, cumulative_value)` pairs; the pipeline captures these before and
 /// after the export and stores the per-metric delta in `export_harm`.
 ///
@@ -883,6 +883,9 @@ fn harm_from_server_status(status: &Document) -> Vec<(String, i64)> {
 /// `serverStatus` privilege) on authenticated deployments — `None` on any
 /// connect / permission / query failure, exactly like the SQL engines:
 /// harm metrics are observability, never a gate.
+///
+/// (Documents [`MongoSource::harm_counters`]; the estimate below is a
+/// separate probe.)
 /// Scan-free document-count estimate for one collection — the preflight
 /// `row_estimate` (the Mongo analogue of PG `reltuples` / MySQL `TABLE_ROWS`).
 /// `estimatedDocumentCount` reads collection metadata, never scans the

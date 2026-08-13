@@ -56,9 +56,11 @@ pub(crate) enum PredictedFrom {
     /// No success on record, but a failed/interrupted attempt ran this long —
     /// a floor on the real duration (the attempt died early).
     FailedAttemptFloor(f64),
-    /// A synthesized split unit inheriting `giant_predicted / N` — measured by
-    /// proxy, so LPT ranks the slices where the giant stood (front of the
-    /// queue), never at the placeholder tail (bughunt 2026-08-13).
+    /// A synthesized split unit inheriting `giant_predicted / N` from a giant
+    /// that was itself MEASURED — measured by proxy, so LPT ranks the slices
+    /// where the giant stood (front of the queue), never at the placeholder
+    /// tail (bughunt 2026-08-13). A unit of an UNMEASURED giant is NOT this:
+    /// see [`split_unit_from`].
     SeededSplit(f64),
     /// No history at all: the placeholder. Deliberately small so unknown
     /// exports never displace measured heavies in LPT order; the print
@@ -107,20 +109,60 @@ pub(crate) fn predict_secs(state: &crate::state::StateStore, name: &str) -> Pred
     }
 }
 
+/// A split unit's provenance INHERITS the giant's — the unit is the same
+/// knowledge about the same table, cut into N.
+///
+/// `--split` is reached for precisely when a giant is huge and painful, which
+/// is also when it has been TIMING OUT — i.e. exactly the export with no
+/// successful run to measure. Classifying every unit `SeededSplit` (== measured
+/// by proxy in the accounting) made `--split` DELETE the LOWER BOUND hedge:
+/// the run printed "14 measured, 0 estimated" for a schedule resting entirely
+/// on an export that has never finished (bughunt 2026-08-14). Only a MEASURED
+/// giant yields measured-by-proxy units; a failed-attempt floor stays a floor
+/// and a placeholder stays a placeholder, so the hedge still prints.
+pub(crate) fn split_unit_from(giant: &PredictedFrom, share_secs: f64) -> PredictedFrom {
+    match giant {
+        PredictedFrom::Measured(_) | PredictedFrom::SeededSplit(_) => {
+            PredictedFrom::SeededSplit(share_secs)
+        }
+        PredictedFrom::FailedAttemptFloor(_) => PredictedFrom::FailedAttemptFloor(share_secs),
+        PredictedFrom::Placeholder(_) => PredictedFrom::Placeholder(share_secs),
+    }
+}
+
+/// Fold classifications into the `(measured, failed-attempt, placeholder)`
+/// accounting the makespan print grades itself with — and whose second and
+/// third members decide the LOWER BOUND hedge. Pure so the hedge's input is
+/// testable without a live pool run.
+pub(crate) fn classification_counts(fs: &[PredictedFrom]) -> (usize, usize, usize) {
+    let (mut measured, mut attempt, mut placeholder) = (0usize, 0usize, 0usize);
+    for f in fs {
+        match f {
+            // A seeded split unit inherits a MEASURED giant's share (see
+            // `split_unit_from`) — measured by proxy for the accounting too.
+            PredictedFrom::Measured(_) | PredictedFrom::SeededSplit(_) => measured += 1,
+            PredictedFrom::FailedAttemptFloor(_) => attempt += 1,
+            PredictedFrom::Placeholder(_) => placeholder += 1,
+        }
+    }
+    (measured, attempt, placeholder)
+}
+
 /// THE PoolItem constructor — both `rivet plan`'s preview and `apply --pool`'s
 /// schedule go through here, so the two commands cannot print different
 /// makespans for one config again. `split_seeds` carries `{giant}#N` units'
-/// inherited durations (empty everywhere except the realized-split path).
+/// inherited prediction — duration AND provenance, built by
+/// [`split_unit_from`] (empty everywhere except the realized-split path).
 pub(crate) fn predict_items<'a>(
     state: &crate::state::StateStore,
     exports: impl IntoIterator<Item = (&'a str, bool)>,
-    split_seeds: &std::collections::HashMap<String, f64>,
+    split_seeds: &std::collections::HashMap<String, PredictedFrom>,
 ) -> Vec<(PoolItem, PredictedFrom)> {
     exports
         .into_iter()
         .map(|(name, parallel_safe)| {
             let from = match split_seeds.get(name) {
-                Some(secs) => PredictedFrom::SeededSplit(*secs),
+                Some(seed) => seed.clone(),
                 None => predict_secs(state, name),
             };
             (
@@ -523,7 +565,10 @@ mod tests {
 
 #[cfg(test)]
 mod prediction_tests {
-    use super::{POOL_PLACEHOLDER_SECS, PredictedFrom, predict_items, predict_secs};
+    use super::{
+        POOL_PLACEHOLDER_SECS, PredictedFrom, classification_counts, predict_items, predict_secs,
+        split_unit_from,
+    };
     use crate::state::{MetricRow, StateStore};
 
     fn store_with(rows: &[(&str, &str, i64, &str)]) -> StateStore {
@@ -613,7 +658,10 @@ mod prediction_tests {
     #[test]
     fn predict_items_seeds_split_units_and_includes_history_less_exports() {
         let s = store_with(&[("giant", "r1", 900_000, "success")]);
-        let seeds = std::collections::HashMap::from([("giant#0".to_string(), 450.0)]);
+        let seeds = std::collections::HashMap::from([(
+            "giant#0".to_string(),
+            PredictedFrom::SeededSplit(450.0),
+        )]);
         let out = predict_items(&s, [("giant#0", false), ("fresh", true)], &seeds);
         assert_eq!(
             out.len(),
@@ -631,5 +679,79 @@ mod prediction_tests {
         assert!(matches!(from, PredictedFrom::Placeholder(_)));
         assert_eq!(fresh.predicted_secs, POOL_PLACEHOLDER_SECS);
         assert!(fresh.parallel_safe);
+    }
+
+    /// Splitting an UNMEASURED giant must not manufacture measurement.
+    ///
+    /// `--split` is reached for exactly when a giant keeps timing out — the
+    /// state holds only `failed`/`interrupted` rows. Seeding its units as
+    /// `SeededSplit` (which the accounting folds into `measured`) made
+    /// `apply --pool --split` print "14 measured, 0 estimated" and DROP the
+    /// LOWER BOUND line, for a schedule resting entirely on an export that has
+    /// never finished (bughunt 2026-08-14).
+    ///
+    /// This pins the two pure halves `run_pool` wires together — the seed's
+    /// provenance ([`split_unit_from`]) and the hedge's input
+    /// ([`classification_counts`]) — because the wiring itself needs a live
+    /// source and destination and cannot be unit-tested. The fixture splits
+    /// into FOUR units beside a measured small: a one-unit split cannot tell a
+    /// per-unit inheritance from a whole-set default, and without the measured
+    /// neighbour a mutant that classifies EVERYTHING as an attempt would also
+    /// pass.
+    #[test]
+    fn split_units_of_an_unmeasured_giant_keep_the_lower_bound_hedge() {
+        let s = store_with(&[
+            ("giant", "r1", 3_600_000, "failed"),
+            ("giant", "r2", 3_000_000, "interrupted"),
+            ("small", "r3", 60_000, "success"),
+        ]);
+        let giant_from = predict_secs(&s, "giant");
+        assert!(
+            matches!(giant_from, PredictedFrom::FailedAttemptFloor(_)),
+            "fixture: the giant must be unmeasured, got {giant_from:?}"
+        );
+        let share = giant_from.secs() / 4.0;
+        let seeds: std::collections::HashMap<String, PredictedFrom> = (0..4)
+            .map(|i| (format!("giant#{i}"), split_unit_from(&giant_from, share)))
+            .collect();
+        let names: Vec<String> = (0..4).map(|i| format!("giant#{i}")).collect();
+        let exports: Vec<(&str, bool)> = names
+            .iter()
+            .map(|n| (n.as_str(), true))
+            .chain(std::iter::once(("small", true)))
+            .collect();
+        let predicted = predict_items(&s, exports, &seeds);
+        let classified: Vec<PredictedFrom> = predicted.iter().map(|(_, f)| f.clone()).collect();
+        for (item, from) in &predicted {
+            if item.name.starts_with("giant#") {
+                assert!(
+                    matches!(from, PredictedFrom::FailedAttemptFloor(_)),
+                    "a unit of a never-succeeded giant is not measured: {from:?}"
+                );
+                assert_eq!(item.predicted_secs, share, "the unit still gets its share");
+            }
+        }
+        let (measured, attempt, placeholder) = classification_counts(&classified);
+        assert_eq!(
+            (measured, attempt, placeholder),
+            (1, 4, 0),
+            "only the small export is measured; the four units are attempt-floored"
+        );
+        assert!(
+            attempt + placeholder > 0,
+            "this sum is the LOWER BOUND hedge's condition in run_pool — \
+             a split must never zero it"
+        );
+        // …and a MEASURED giant's units stay measured-by-proxy, so the hedge
+        // does not start crying wolf on the case the seed was built for.
+        let measured_giant = PredictedFrom::Measured(1200.0);
+        assert!(matches!(
+            split_unit_from(&measured_giant, 300.0),
+            PredictedFrom::SeededSplit(s) if s == 300.0
+        ));
+        assert!(matches!(
+            split_unit_from(&PredictedFrom::Placeholder(POOL_PLACEHOLDER_SECS), 1.25),
+            PredictedFrom::Placeholder(_)
+        ));
     }
 }
