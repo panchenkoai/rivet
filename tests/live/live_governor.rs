@@ -728,3 +728,112 @@ fn mysql_adaptive_never_loses_to_its_own_baseline_on_an_idle_source() {
          (self-feedback suspected): on={wall_on:.2}s vs off={wall_off:.2}s"
     );
 }
+
+/// Per-engine completion of the adaptive canary: PostgreSQL and SQL Server's
+/// governor signals (`checkpoints_req`, `Log Flush Waits _Total`) are
+/// write-driven counters a read-only export cannot move — so on an idle
+/// source `adaptive: true` must shed nothing and cost ~nothing. That holds
+/// by construction TODAY; this pins it so a future signal swap (exactly how
+/// the MySQL regression shipped: the counter under the governor was
+/// re-pointed for another loop's benefit) goes RED here instead of in a
+/// field pool run. Lighter than the MySQL canary on purpose: no spill
+/// forcing needed — the pin is "no self-feedback", not "spills are ignored".
+#[test]
+#[ignore = "live: requires docker-compose postgres"]
+fn pg_adaptive_never_loses_to_its_own_baseline_on_an_idle_source() {
+    require_alive(LiveService::Postgres);
+    const ROWS: i64 = 40_000;
+    let table = seed_pg_wide_table(ROWS, 512);
+    let run = |adaptive: bool| -> (f64, String) {
+        let rig = Rig::pg_batch(table.name())
+            .mode("chunked")
+            .source_line("tuning:")
+            .source_line(&format!("  adaptive: {adaptive}"))
+            .source_line("  min_parallel: 1")
+            .source_line("  batch_size: 500")
+            .export_line("chunk_column: id")
+            .export_line("chunk_size: 5000")
+            .export_line("parallel: 4");
+        let started = std::time::Instant::now();
+        let out = rig.run_with_envs(&[("RUST_LOG", "info"), ("RIVET_GOVERNOR_INTERVAL_MS", "200")]);
+        let wall = started.elapsed().as_secs_f64();
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        assert!(
+            out.status.success(),
+            "adaptive={adaptive} run failed:\n{stderr}"
+        );
+        assert_eq!(
+            duckdb_total_parquet_rows(&rig.out_dir()),
+            ROWS as usize,
+            "adaptive={adaptive}: every row must round-trip"
+        );
+        (wall, stderr)
+    };
+    let (wall_off, _) = run(false);
+    let (wall_on, stderr_on) = run(true);
+    assert!(
+        stderr_on.contains("adaptive concurrency governor active"),
+        "governor must arm; stderr:\n{stderr_on}"
+    );
+    assert!(
+        !stderr_on.contains("backed off"),
+        "idle source: the PG governor has nothing to shed for; stderr:\n{stderr_on}"
+    );
+    assert!(
+        wall_on <= wall_off * 1.6 + 1.0,
+        "adaptive must not lose to its own baseline: on={wall_on:.2}s off={wall_off:.2}s"
+    );
+}
+
+/// SQL Server variant — the first end-to-end governor test on MSSQL at all:
+/// its shed side has never had a deterministic live driver (forcing real
+/// `Log Flush Waits` needs contended log flushes), so the arm + no-self-shed
+/// half is pinned here and the shed CONTRACT rides the shared
+/// GovernorState/harness proven on PG; the per-engine difference is only the
+/// counter SQL, verified empirically (`_Total` row semantics).
+#[test]
+#[ignore = "live: requires docker-compose mssql"]
+fn mssql_adaptive_never_loses_to_its_own_baseline_on_an_idle_source() {
+    require_alive(LiveService::Mssql);
+    const ROWS: i64 = 40_000;
+    let table = seed_mssql_numeric_table(ROWS);
+    let run = |adaptive: bool| -> (f64, String) {
+        let rig = Rig::mssql_batch(table.name())
+            .mode("chunked")
+            .source_line("tuning:")
+            .source_line(&format!("  adaptive: {adaptive}"))
+            .source_line("  min_parallel: 1")
+            .source_line("  batch_size: 500")
+            .export_line("chunk_column: id")
+            .export_line("chunk_size: 5000")
+            .export_line("parallel: 4");
+        let started = std::time::Instant::now();
+        let out = rig.run_with_envs(&[("RUST_LOG", "info"), ("RIVET_GOVERNOR_INTERVAL_MS", "200")]);
+        let wall = started.elapsed().as_secs_f64();
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        assert!(
+            out.status.success(),
+            "adaptive={adaptive} run failed:\n{stderr}"
+        );
+        assert_eq!(
+            duckdb_total_parquet_rows(&rig.out_dir()),
+            ROWS as usize,
+            "adaptive={adaptive}: every row must round-trip"
+        );
+        (wall, stderr)
+    };
+    let (wall_off, _) = run(false);
+    let (wall_on, stderr_on) = run(true);
+    assert!(
+        stderr_on.contains("adaptive concurrency governor active"),
+        "governor must arm; stderr:\n{stderr_on}"
+    );
+    assert!(
+        !stderr_on.contains("backed off"),
+        "idle source: the MSSQL governor has nothing to shed for; stderr:\n{stderr_on}"
+    );
+    assert!(
+        wall_on <= wall_off * 1.6 + 1.0,
+        "adaptive must not lose to its own baseline: on={wall_on:.2}s off={wall_off:.2}s"
+    );
+}
