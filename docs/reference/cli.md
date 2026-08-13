@@ -100,7 +100,7 @@ single aggregated `Run summary` block prints once for the whole run.
 ![Parallel cards UI](../gifs/parallel-cards.gif)
 
 ```text
-▸ orders            chunked   11/20 chunks   1.1M rows   2m 6.0s  ETA 66.0s
+▸ orders            chunked   11/20 chunks   1.1M rows  8.7K r/s   2m 06.0s  ETA 1m 43.1s
 ```
 
 One card line per export (`▸` running, `✓` finished), redrawn in place; the

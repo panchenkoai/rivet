@@ -97,7 +97,7 @@ The full basic workflow (`init` → `doctor` → `check` → `run` → `state`) 
 
 What each step does:
 
-- **`rivet doctor`** — connects to the source and writes a tiny probe object (`.rivet_doctor_probe`) to every destination prefix and removes it afterwards; fixes nothing, fails loudly on any auth / network issue.
+- **`rivet doctor`** — connects to the source and writes a tiny probe object (`.rivet_doctor_probe`) to every destination prefix — removed afterwards on local destinations, while on S3 / GCS / Azure it stays at the prefix (the destination seam has no delete) and is filtered out of manifest and validate listings; fixes nothing, fails loudly on any auth / network issue.
 - **`rivet check`** — runs `EXPLAIN` against your queries, estimates row counts, detects whether your cursor / chunk columns are indexed, and emits a verdict + concrete suggestion. Verdicts are `EFFICIENT` · `ACCEPTABLE` · `DEGRADED` · `UNSAFE`; on the SQL engines the last two carry a mode-aware `Suggestion:` line (MongoDB is full-scan-only, so its verdicts omit the mode suggestion).
 
   ![rivet check verdict block](gifs/check-verdict.gif)
