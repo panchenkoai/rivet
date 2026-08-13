@@ -76,7 +76,7 @@ Apply uses the cursor snapshot embedded in the plan artifact (ADR-0005 PA4). The
 
 ## Quoting and escaping
 
-Rivet quotes `cursor_column` and `cursor_fallback_column` using the source dialect (`"…"` for Postgres, `` `…` `` for MySQL). Cursor values are emitted as SQL string literals with `'` doubled (`O'Brien` → `'O''Brien'`). No additional escaping is required on your side.
+Rivet quotes `cursor_column` and `cursor_fallback_column` using the source dialect (`"…"` for Postgres, `` `…` `` for MySQL). On MySQL the cursor value is sent as a `?` bind parameter (never inlined into the SQL). On Postgres it is emitted as an `E'…'` string literal with `'` and `\` backslash-escaped (`O'Brien` → `E'O\'Brien'`). No additional escaping is required on your side.
 
 ## Caveats
 

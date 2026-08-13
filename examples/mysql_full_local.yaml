@@ -23,11 +23,11 @@ exports:
 
     skip_empty: true
 
-    # MySQL does not surface precision/scale for `DECIMAL` columns through
-    # the wire protocol, so Rivet refuses to map them by default. Declare
-    # the expected `decimal(p,s)` here to match the column definition in
-    # the source schema. (PostgreSQL exposes this metadata and does not
-    # need the override.) See docs/type-policies.md for details.
+    # Rivet derives DECIMAL precision/scale automatically from the MySQL
+    # wire column metadata (display width + decimals + signedness). A
+    # `columns:` override like this is optional — needed only if that
+    # derivation fails or you want to pin an explicit (p,s).
+    # See docs/type-mapping.md for details.
     columns:
       balance: decimal(12,2)
 

@@ -123,11 +123,16 @@ auth mode (see the per-backend pages under
 export AWS_ACCESS_KEY_ID=AKIA...
 export AWS_SECRET_ACCESS_KEY=wJa...
 export RIVET_SMOKE_S3_BUCKET=rivet-smoke-${USER}
-rivet doctor --config dev/cloud-smoke/s3.yaml
-rivet run    --config dev/cloud-smoke/s3.yaml
-rivet validate --config dev/cloud-smoke/s3.yaml
-rivet validate --config dev/cloud-smoke/s3.yaml --date "$(date -u +%Y-%m-%d)"
-rivet validate --config dev/cloud-smoke/s3.yaml --prefix "$(jq -r .resolved_prefix < .rivet/runs/*/summary.json | tail -1)"
+# Copy an example config to a scratch path and point it at the smoke bucket
+cp examples/pg_chunked_s3.yaml /tmp/smoke-s3.yaml
+# edit /tmp/smoke-s3.yaml: set `bucket:` to $RIVET_SMOKE_S3_BUCKET
+rivet doctor --config /tmp/smoke-s3.yaml
+rivet run    --config /tmp/smoke-s3.yaml
+rivet validate --config /tmp/smoke-s3.yaml
+rivet validate --config /tmp/smoke-s3.yaml --date "$(date -u +%Y-%m-%d)"
+# The resolved prefix comes from validate's own JSON report — the run
+# summary (.rivet/runs/<id>/summary.json) does not record it.
+rivet validate --config /tmp/smoke-s3.yaml --prefix "$(rivet validate --config /tmp/smoke-s3.yaml --format json | jq -r '.exports[0].resolved_prefix')"
 ```
 
 Equivalent recipes for GCS and Azure live under

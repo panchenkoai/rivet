@@ -52,7 +52,7 @@ harness needs it", not "public API".
 | `state` | `pub` | Integration tests verify state invariants (`StateStore`, `SchemaColumn`) |
 | `tuning` | `pub` | Governor / adaptive tuning tests link it (ADR-0019) |
 | `types` | `pub` | Type-roundtrip tests assert `RivetType` / fidelity mappings (ADR-0014) |
-| `mcp` | `pub` | In-crate MCP server surface (code-review-graph integration) |
+| `mcp` | `pub` | Rivet's read-only DB-introspection MCP server (`run_stdio`) — public so the `rivet-mcp` binary in `src/bin/rivet-mcp.rs` can link it |
 | `redact` | `pub` | Cross-cutting credential-redaction helper, asserted in tests |
 | `destination_for_tests` | `pub` | Thin test-only shim over the `pub(crate)` `destination` module |
 | `destination` | `pub(crate)` | Internal write backends — exercised via `destination_for_tests` |

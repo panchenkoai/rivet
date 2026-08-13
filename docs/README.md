@@ -60,7 +60,7 @@ Short terminal walkthroughs in [gifs/](gifs/):
 | Destination | Guide |
 |-------------|-------|
 | Local filesystem | [destinations/local.md](destinations/local.md) |
-| AWS S3 / MinIO / R2 | [destinations/s3.md](destinations/s3.md) |
+| AWS S3 / MinIO | [destinations/s3.md](destinations/s3.md) |
 | Google Cloud Storage | [destinations/gcs.md](destinations/gcs.md) |
 | Azure Blob Storage | [destinations/azure.md](destinations/azure.md) |
 | Stdout (pipe) | [destinations/stdout.md](destinations/stdout.md) |

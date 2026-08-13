@@ -62,10 +62,12 @@ The simplest predefined role: **Storage Object Admin** (`roles/storage.objectAdm
 Files are uploaded as:
 
 ```
-gs://{bucket}/{prefix}{export_name}_{YYYYMMDD}_{HHMMSS}.{format}
+gs://{bucket}/{prefix}{export_name}_{YYYYMMDD}_{HHMMSS}_{mmm}.{format}
 ```
 
-Example: `gs://my-gcs-bucket/exports/orders_20260406_120000.parquet`
+This is the single (non-chunked, non-keyset) runner's naming: the timestamp carries millisecond precision, and its size-split parts append `_part{N}`. Chunked and keyset runs use their own run-unique part names — see the per-runner naming table in [docs/cloud-destinations.md](../cloud-destinations.md).
+
+Example: `gs://my-gcs-bucket/exports/orders_20260406_120000_123.parquet`
 
 ## Streaming upload
 
@@ -112,7 +114,7 @@ rivet doctor --config export.yaml
 The GIF above shows the end-to-end flow with **Application Default Credentials** (no `credentials_file:` in the config, no `GOOGLE_APPLICATION_CREDENTIALS` env var — Rivet reads `~/.config/gcloud/application_default_credentials.json` directly):
 
 1. `cat gcs.yaml` — production-shaped YAML (just `type: gcs`, `bucket:`, `prefix:`).
-2. `rivet doctor` writes a small `.rivet_doctor_probe` object to verify write access, then reports `[OK] Destination GCS(<bucket>) — All checks passed`.
+2. `rivet doctor` writes a small `.rivet_doctor_probe` object to verify write access, then reports `[OK]  Destination GCS(<bucket>)` followed by a final `All checks passed.` line.
 3. `rivet run --validate` exports 100 rows and uploads the Parquet file.
 4. `gcloud storage ls` confirms the probe file **and** the export both landed in the bucket.
 
@@ -121,8 +123,11 @@ Source: [docs/gifs/doctor-gcs.tape](../gifs/doctor-gcs.tape).
 Plain-text equivalent output:
 
 ```
-[OK] Destination 'gs://my-gcs-bucket/exports/' — bucket accessible, write test passed
+[OK]  Destination GCS(my-gcs-bucket)
 ```
+
+Doctor labels the destination as `GCS(<bucket>)`; passing checks print no
+detail suffix.
 
 ## Troubleshooting
 

@@ -93,8 +93,11 @@ pub struct MongoConfig {
     /// `find({_id: {$gt: last}}).sort({_id: 1}).limit(page_size)` — an indexed
     /// range scan that becomes one output part file. Bounds longest-query time
     /// (no 35-minute cursor to hit a timeout / snapshot window) and is the base
-    /// for parallel `_id`-range reads. Requires an **ObjectId** `_id` (the
-    /// default); a non-ObjectId key errors with a clear message. Unset ⇒ the
+    /// for parallel `_id`-range reads. Works with any **uniform** `_id` type
+    /// (ObjectId — the default — integer, string, date, …); a collection mixing
+    /// `_id` type brackets errors with a clear message pointing at the full
+    /// ordered scan (Mongo's `$gt` compares only within a type bracket, so a
+    /// mixed key would silently drop every bracket but one). Unset ⇒ the
     /// single-cursor full scan.
     #[serde(default)]
     pub page_size: Option<usize>,

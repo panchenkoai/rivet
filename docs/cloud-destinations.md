@@ -17,6 +17,13 @@ For the per-backend deep dive, read the dedicated pages:
 For the *credential* matrix (env vars, profile files, identity providers),
 see [docs/cloud-auth.md](cloud-auth.md).
 
+**The supported destination set is exactly:** AWS S3, Google Cloud Storage,
+Azure Blob Storage, the local filesystem, stdout — plus their loopback dev
+emulators (MinIO for S3, fake-gcs-server for GCS, Azurite for Azure), which
+CI exercises. Other S3-compatible services (Cloudflare R2, Wasabi, Backblaze
+B2), sovereign clouds, and custom-DNS endpoints are untested and not
+supported; the config-load endpoint guard rejects them by design.
+
 ---
 
 ## Common output contract
@@ -26,7 +33,7 @@ three artefacts at the resolved prefix on a clean run:
 
 | File | Purpose |
 |---|---|
-| `<export>_<timestamp>[_partN].<fmt>` | Data parts, run-unique (millisecond-stamped, plus `_chunkN` / `_keysetN` on the multi-part runners). `<fmt>` is `parquet` or `csv`. |
+| `<export>_<timestamp>[_partN].<fmt>` | Data parts, run-unique, named per runner: single runs use `<export>_<ms-timestamp>[_partN].<fmt>` (millisecond stamp); chunked runs use `<export>_<timestamp>_chunk<N>_<16-hex-nonce>.<fmt>` (second-granularity stamp; uniqueness comes from the random nonce); single-worker keyset runs use `<export>_<run_id>_keyset_<seek-tag>.<fmt>` (named by the seek cursor, so a crash re-read from the same seek overwrites its part idempotently; the run_id embeds a millisecond stamp); parallel keyset runs (`parallel > 1`) use `<export>_<run_id>_pk_w<worker>_<page>.<fmt>` (same run_id stamp); parallel Mongo runs use `<export>_<ms-timestamp>_w<worker>_keyset<page>.<fmt>` (run-unique via the shared millisecond stamp). `<fmt>` is `parquet` or `csv`. |
 | `manifest.json` | ADR-0012 trust contract: every committed part is listed with `size_bytes` and `content_fingerprint`. Schema fingerprint and run identity travel here. |
 | `_SUCCESS` | Single line `xxh3:<16-hex>` over the exact bytes of `manifest.json`. Presence implies M5 (every listed part exists at recorded size). |
 
@@ -65,8 +72,14 @@ at the output directory.
 | Default chain | *(none of the above set)* | Env, profile, container, EC2/EKS — same precedence as the AWS SDK. |
 
 `region:` is optional when the SDK can derive one from the profile or env
-vars; required otherwise.  `endpoint:` overrides the resolved S3 endpoint
-(MinIO, AWS GovCloud, custom domains).
+vars; required otherwise.  `endpoint:` overrides the resolved S3 endpoint.
+Only a loopback endpoint (MinIO) is a supported custom-endpoint path; any
+non-loopback endpoint (AWS GovCloud, Cloudflare R2, Wasabi, custom domains)
+is rejected at config load as an exfiltration guard.  The one waiver is
+`allow_anonymous: true` — the anonymous-emulator escape, which sends no
+credentials at all; it is not an auth path for those services, which remain
+untested / not supported as Rivet destinations
+(see [cloud-auth.md](cloud-auth.md), "S3-compatible storage").
 
 ### Google Cloud Storage
 
@@ -91,8 +104,12 @@ vars; required otherwise.  `endpoint:` overrides the resolved S3 endpoint
 `account_key_env` and `sas_token_env` are **mutually exclusive** — picking
 both is refused at config-load time with a message that names both
 fields.  `account_name` is the prefix in
-`<account>.blob.core.windows.net`; an explicit `endpoint:` (Azurite,
-sovereign clouds) takes precedence over the derived URL.
+`<account>.blob.core.windows.net`; an explicit `endpoint:` takes
+precedence over the derived URL, but only a **loopback** emulator
+endpoint (Azurite) is accepted alongside credentials — a non-loopback
+endpoint is rejected at config load unless `allow_anonymous: true`, which
+itself cannot be combined with credentials, so sovereign clouds are not
+reachable.
 
 The Azure SAS-token body may be pasted with or without the leading `?`
 — Rivet trims it transparently so `sv=…&sig=…` and `?sv=…&sig=…` are

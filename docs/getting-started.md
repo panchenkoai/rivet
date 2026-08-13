@@ -14,7 +14,7 @@ rivet run -c rivet.yaml --validate
 
 That's the whole flow. The four steps below explain each command, expected output, and where to go from each. Read time: ~3 minutes.
 
-> **Already running it locally?** Jump to [§3 Preflight & run](#3-preflight--run). If you're evaluating it for production, finish this page first, then continue with [docs/pilot/](pilot/).
+> **Already running it locally?** Jump to [§3 Preflight & run](#3--preflight--run). If you're evaluating it for production, finish this page first, then continue with [docs/pilot/](pilot/).
 
 ---
 
@@ -61,7 +61,7 @@ rivet run -c rivet.yaml --validate
 ```
 
 That is the whole flow against a real (throwaway) database. Then jump to
-[§4 Inspect & iterate](#4-inspect--iterate), or read on to point Rivet at your
+[§4 Inspect & iterate](#4--inspect--iterate), or read on to point Rivet at your
 own database.
 
 ## 2 · Connect & scaffold a config
@@ -97,8 +97,8 @@ The full basic workflow (`init` → `doctor` → `check` → `run` → `state`) 
 
 What each step does:
 
-- **`rivet doctor`** — connects to the source and writes a 1-byte probe to every destination; fixes nothing, fails loudly on any auth / network issue.
-- **`rivet check`** — runs `EXPLAIN` against your queries, estimates row counts, detects whether your cursor / chunk columns are indexed, and emits a verdict + concrete suggestion. Verdicts are `EFFICIENT` · `ACCEPTABLE` · `DEGRADED` · `UNSAFE`; the last two always carry a mode-aware `Suggestion:` line.
+- **`rivet doctor`** — connects to the source and writes a tiny probe object (`.rivet_doctor_probe`) to every destination prefix — removed afterwards on local destinations, while on S3 / GCS / Azure it stays at the prefix (the destination seam has no delete) and is filtered out of manifest and validate listings; fixes nothing, fails loudly on any auth / network issue.
+- **`rivet check`** — runs `EXPLAIN` against your queries, estimates row counts, detects whether your cursor / chunk columns are indexed, and emits a verdict + concrete suggestion. Verdicts are `EFFICIENT` · `ACCEPTABLE` · `DEGRADED` · `UNSAFE`; on the SQL engines the last two carry a mode-aware `Suggestion:` line (MongoDB is full-scan-only, so its verdicts omit the mode suggestion).
 
   ![rivet check verdict block](gifs/check-verdict.gif)
 
@@ -110,11 +110,12 @@ Example summary card after a successful run:
 ── orders ──
   run_id:      orders_20260519T120000.123
   status:      success
-  tuning:      profile=balanced (default), batch_size=10,000
+  tuning:      profile=balanced (default), batch_size=10,000 (batch_size_memory_mb=32MiB → effective FETCH in logs)
   rows:        5,432
   files:       1
   output:      file://./output
-  bytes:       847 KB
+  bytes read:    1.2 MB
+  bytes written: 847.0 KB
   duration:    1.2s
   peak RSS:    15 MB (sampled during run)
   validated:   pass
@@ -180,7 +181,7 @@ rivet apply rivet.yaml          # a .yaml path → wave-ordered execution
 
 ### Parallel within a wave — only where it's safe
 
-Add `parallel_export_processes: true` (or pass `rivet apply --parallel-export-processes`) and, within each wave, the **cheap** exports — the ones `rivet plan` marked `parallel_safe: true` (cost class `Low`, under ~100K rows) — run concurrently as separate processes. A heavier export already chunk-parallelizes its own ranges *internally*, so it runs **alone** in its wave: two big tables at once would multiply the load on the source. Every child still self-throttles on source pressure + memory (the adaptive governor), so a whole wave at once stays bounded.
+Add `parallel_export_processes: true` (or pass `rivet apply --parallel-export-processes`) and, within each wave, the **cheap** exports — the ones `rivet plan` marked `parallel_safe: true` (cost class `Low`, under ~100K rows) — run concurrently as separate processes. A heavier export already chunk-parallelizes its own ranges *internally*, so it runs **alone** in its wave: two big tables at once would multiply the load on the source. The wave stays bounded because only the cheap `parallel_safe` exports run concurrently, and each child honors its own batch/memory caps (the adaptive back-pressure governor is a separate opt-in: `tuning.adaptive: true` with `parallel > 1`).
 
 ```yaml
 parallel_export_processes: true   # top-level: parallelize the cheap (parallel_safe) exports within each wave

@@ -20,9 +20,12 @@ exports:
     mode: chunked
 
     # chunk_column: numeric column for range-splitting (typically primary key).
-    # Rivet queries MIN/MAX then creates ranges of chunk_size rows.
+    # Rivet queries MIN/MAX then slices the KEY RANGE into windows of
+    # chunk_size key values ((max-min)/chunk_size windows). Rows per chunk
+    # equals chunk_size only when the key is dense; on a sparse/gappy key
+    # most windows hold far fewer rows (use chunk_dense: true or chunk_count: N).
     chunk_column: id
-    chunk_size: 100000              # rows per chunk (default: 100,000)
+    chunk_size: 100000              # key values per window (default: 100,000)
     parallel: 4                     # concurrent workers
 
     # Enable checkpoint to resume after crash (only incomplete chunks re-run)

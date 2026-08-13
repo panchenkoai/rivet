@@ -75,11 +75,14 @@ _Avoid_: loading, ingestion.
 
 **TargetLoader**:
 The warehouse **adapter** — one per loading `ExportTarget` (`BigQuery`,
-`Snowflake`). A deliberately *coarse*, warehouse-specific seam: `materialize`
-(overwrite a table from Parquet, returning the rows the load reported),
-`append_changelog` (append a CDC change log, returning rows appended),
-`create_dedup_view` (the current-state view), `cleanup` (delete the source
-prefix). Dialect and CLI (`bq` / `snow`) live *behind* it; every asymmetry —
+`Snowflake`). A deliberately *coarse*, warehouse-specific seam: `fqtn`
+(fully-qualify a table), `materialize` (overwrite a table from Parquet,
+returning the rows the load reported), `append_changelog` (append a CDC change
+log, returning rows appended), `warehouse` (the dialect handle so the driver
+builds the view SQL once), `create_view` (execute the driver-built
+current-state view SQL). Source-prefix cleanup is the driver's `maybe_cleanup`
+over a `GcsStore`, not an adapter method. Dialect and CLI (`bq` / `snow`) live
+*behind* it; every asymmetry —
 Snowflake's external stage, BigQuery's 4,000-partition batch split — stays inside
 the adapter.
 _Avoid_: loader class, connector, sink.
@@ -94,9 +97,10 @@ _Avoid_: loader, orchestrator, pipeline.
 **Load-integrity gate**:
 The driver's refusal to accept a load unless the rows the load *landed* equal the
 reconciled file rows (the manifests' summed `row_count`). The landed count is read
-straight back from the Rivet-owned target — Snowflake's `COPY` `rows_loaded`; a
-0-byte `COUNT(*)` metadata read on BigQuery (swappable for the load job's
-`outputRows` behind the adapter seam). The target is Rivet-owned, so no foreign
+straight back from the Rivet-owned target — a `SELECT COUNT(*)` on the freshly
+materialized table for Snowflake (swappable for the `COPY`'s `rows_loaded`
+metadata behind the adapter seam); a 0-byte `COUNT(*)` metadata read on BigQuery
+(swappable for the load job's `outputRows` behind the adapter seam). The target is Rivet-owned, so no foreign
 writer can diverge it and that count is authoritative without a second reconciling
 source. Cleanup runs only after the gate passes.
 _Avoid_: count check, verify query.

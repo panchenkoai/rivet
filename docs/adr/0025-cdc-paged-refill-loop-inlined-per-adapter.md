@@ -36,9 +36,10 @@ driver.**
 
 ## Consequences
 
-- A `ChangeStream` default method is wrong: MySQL implements `ChangeStream` but
-  blocks instead of paging, so a shared default `next_change` would be incorrect
-  for one of the three adapters (2-of-3, not 3-of-3).
+- A `ChangeStream` default method is wrong: MySQL (blocking binlog) and MongoDB
+  (tailable change stream) implement `ChangeStream` but do not page, so a shared
+  default `next_change` would be incorrect for two of the four adapters
+  (2-of-4, not 4-of-4). PG and MSSQL remain the only poll-paged pair.
 - A free-function / wrapper extraction fights the borrow checker. The loop must
   hold `&mut self.pending` **and** call `self.fill()` (also `&mut self`) — a
   borrow conflict. The only way through is an accessor trait

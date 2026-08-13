@@ -15,7 +15,7 @@ Both tiers run in CI (`.github/workflows/ci.yml`):
 - Offline suite runs in the `test` / `test-invariants` / `test-recovery` / `test-compatibility` jobs on every push and PR.
 - Live suite runs in two dedicated jobs:
   - **`test-type-golden`** — starts only Postgres + MySQL, runs `--test live_type_golden -- --ignored`. Named branch-protection gate for type-contract regressions.
-  - **`e2e`** — full stack (Postgres, MySQL, SQL Server, MinIO, fake-gcs, Azurite, Toxiproxy, plus DuckDB/ClickHouse targets and the `cdc` / `replica` / `pool` compose profiles); seeds databases, builds release binary, runs `python3 -m dev.pytools.e2e`, then runs all remaining `--ignored` tests **except the MongoDB suites** (`live_mongo*` / `live_cdc_mongo`), which run in the dedicated nightly `mongo-versions` matrix (4.4 → 8.0, `nightly-live.yml`).
+  - **`e2e`** — full stack (Postgres, MySQL, SQL Server, MinIO, fake-gcs, Azurite, Toxiproxy, plus DuckDB/ClickHouse targets and the `cdc` / `replica` / `pool` compose profiles); seeds databases, builds a **debug** binary (deliberately — the e2e layer checks correctness, not throughput; the release profile is exercised by the separate release-build job), runs `python3 -m dev.pytools.e2e`, then runs all remaining `--ignored` tests **except the MongoDB suites** (`live_mongo*` / `live_cdc_mongo`), which run in the dedicated nightly `mongo-versions` matrix (4.4 → 8.0, `nightly-live.yml`).
 
 ## Offline suite
 
@@ -100,7 +100,7 @@ Each test targets **both engines** where the contract applies:
 | Canonical UUID-ish text (`Utf8`) | native `UUID` | `VARCHAR(36)` with hyphenated lowercase literal |
 | INTERVAL → ISO 8601 `Utf8` | `INTERVAL '1 year 2 months 3 days'` → `"P1Y2M3D"`, `INTERVAL '-1 year'` → `"P-1Y"`, `INTERVAL '0'` → `"PT0S"` | — (no MySQL INTERVAL type) |
 
-CI runs these in the dedicated `test-type-golden` job (`cargo test --release --test live_type_golden -- --ignored`) as well as in the full `e2e` job. Local:
+CI runs these in the dedicated `test-type-golden` job (`cargo test --test live_type_golden -- --ignored`) as well as in the full `e2e` job. Local:
 
 ```bash
 docker compose up -d
@@ -198,10 +198,13 @@ hard rules over the live CDC suite's SOURCES:
 
 ## Mutation testing (nightly)
 
-`mutants-cdc` in `nightly-live.yml` runs `cargo-mutants` over the CDC value /
-sink / parser / checksum / decimal modules against the offline suite. A
-surviving mutant is a named test blind spot — the meta-gate that finds holes
-in the gates above.
+`mutants-nightly` in `nightly-live.yml` runs `cargo-mutants` on a rotating
+tier group per night (day-of-year modulo the group count: ledger/pipeline,
+CDC/value/integrity, planning/formats/gates, ...) against the offline suite,
+and passes/fails on the diff against `docs/mutants-baseline.txt` — a NEW
+missed mutant fails the job; known misses live in the baseline and only ever
+shrink. A surviving mutant is a named test blind spot — the meta-gate that
+finds holes in the gates above.
 
 ## Config-key composition gate (per PR)
 

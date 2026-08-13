@@ -11,7 +11,7 @@ How to run Rivet reliably on hosts with 1–4 GB of RAM — containers, small VM
 
 ## The problem with defaults
 
-Rivet's `balanced` profile fetches 10,000 rows per batch. For a narrow table (IDs, timestamps, small text) this is fine. For a wide table (TEXT/JSONB columns, average row ~3 KB), a larger batch size can push total RSS above 800 MB:
+Rivet's `balanced` profile sizes each batch from a 32 MB memory target using the schema's estimated row width (clamped 1,000–150,000 rows; the static 10,000 applies only when no schema is available). Narrow tables (IDs, timestamps, small text) fetch large batches, wide ones (TEXT/JSONB columns, average row ~3 KB) small — but a larger batch size can still push total RSS above 800 MB:
 
 | Config | `batch_size` | Peak RSS | Wall time | Output size |
 |--------|--------------|----------|-----------|-------------|
@@ -19,7 +19,7 @@ Rivet's `balanced` profile fetches 10,000 rows per batch. For a narrow table (ID
 | Safe baseline (`max_batch_memory_mb: 64`) | 2,000 (safe profile) | **154 MB** | 16.6 s | 71 MB (zstd-3) |
 | Tight (`batch_size: 500`, cap 32 MB) | 500 | **111 MB** | 16.3 s | 188 MB (snappy) |
 
-The safe baseline cuts RSS by **5.7×** with no wall-time regression. Default profiles do not know your table shape — low-memory environments need explicit caps.
+The safe baseline cuts RSS by **5.7×** with no wall-time regression. The default profile does adapt to table shape, but its 32 MB target and 150k-row ceiling may still exceed a tight host budget — low-memory environments need explicit caps (`max_batch_memory_mb`, or a fixed `batch_size`).
 
 ---
 
@@ -37,10 +37,15 @@ source:
     on_batch_memory_exceeded: auto_shrink
     memory_threshold_mb: 512
 
-parquet:
-  row_group_strategy: auto
-  target_row_group_mb: 32
-  max_row_group_mb: 64
+exports:
+  - name: my_table
+    query: "SELECT * FROM my_table"
+    format: parquet
+    destination: { type: local, path: ./out }
+    parquet:                       # per-export setting — lives inside the export entry
+      row_group_strategy: auto
+      target_row_group_mb: 32
+      max_row_group_mb: 64
 ```
 
 What each setting does:
@@ -50,7 +55,7 @@ What each setting does:
 | `profile: safe` | `batch_size: 2000`, `throttle_ms: 500`, `memory_threshold_mb: 2048` |
 | `max_batch_memory_mb: 64` | Caps each Arrow batch at 64 MB; overrides the profile default |
 | `on_batch_memory_exceeded: auto_shrink` | Splits oversized batches instead of failing |
-| `memory_threshold_mb: 512` | Pauses fetching when process RSS reaches 512 MB |
+| `memory_threshold_mb: 512` | On chunked exports, pauses before the next chunk when process RSS exceeds 512 MB — the parallel chunked runner waits until RSS drops; sequential/checkpointed paths pause a fixed 2–5 s once and proceed (other modes only record peak RSS) |
 | `target_row_group_mb: 32` | Writes smaller Parquet row groups — reduces Parquet writer peak RSS |
 
 On a wide-text table (200K rows, avg 3 KB/row, 12 columns), this combination measured **154 MB peak RSS** — compared to 878 MB without the cap. Actual RSS on your table will depend on row width and column count; use `rivet metrics` to validate after the first run.
@@ -69,12 +74,16 @@ source:
     memory_threshold_mb: 256
     throttle_ms: 1000
 
-parquet:
-  row_group_strategy: auto
-  target_row_group_mb: 16
-  max_row_group_mb: 32
-
-compression_profile: fast    # snappy: lower CPU overhead than zstd
+exports:
+  - name: my_table
+    query: "SELECT * FROM my_table"
+    format: parquet
+    destination: { type: local, path: ./out }
+    compression_profile: fast    # per-export; snappy: lower CPU overhead than zstd
+    parquet:                     # per-export setting — lives inside the export entry
+      row_group_strategy: auto
+      target_row_group_mb: 16
+      max_row_group_mb: 32
 ```
 
 On the wide-text benchmark table (200K rows, ~3 KB/row), this config measured **111 MB peak RSS** — well within a 512 MB host. Wall time was identical to the uncapped run.
