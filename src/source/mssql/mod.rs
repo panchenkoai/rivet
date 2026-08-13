@@ -792,6 +792,12 @@ impl Source for MssqlSource {
         })
     }
 
+    fn harm_counters(&mut self) -> Option<Vec<(String, i64)>> {
+        // Delegates to the inherent method (same name; inherent wins in
+        // method-call resolution, so this is a delegation, not recursion).
+        MssqlSource::harm_counters(self)
+    }
+
     fn sample_governor_pressure(&mut self) -> Option<u64> {
         let Self { rt, client, .. } = self;
         // FOREIGN-pressure proxy for the governor: cumulative `Log Flush
@@ -971,14 +977,6 @@ pub(crate) struct MssqlCdcProbe {
 
 /// Connect and snapshot MSSQL harm counters; see [`MssqlSource::harm_counters`].
 /// `None` on connect failure or a missing `VIEW SERVER STATE` grant.
-pub(crate) fn sample_harm_counters(
-    url: &str,
-    tls: Option<&TlsConfig>,
-) -> Option<Vec<(String, i64)>> {
-    let mut src = MssqlSource::connect_with_tls(url, tls).ok()?;
-    src.harm_counters()
-}
-
 /// Connect and check whether the login has `VIEW SERVER STATE` — used by
 /// `rivet doctor` to *advise* (never block) that source-harm metrics will be
 /// skipped without it. `None` on connect failure, in which case doctor stays

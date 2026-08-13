@@ -749,6 +749,28 @@ pub(crate) fn run_waves(
     Ok(())
 }
 
+/// The pool-window harm verdict, pure so the threshold and wording are
+/// unit-tested (its per-export sibling in `job::run_diagnosis` always was;
+/// this copy had zero cover behind a live-only seam — walk find, 2026-08-13).
+/// Shares [`job::SPILL_FLAG_MIN`] with that sibling so the two rules cannot
+/// drift.
+fn pool_harm_verdict(deltas: &[(String, i64)], exports: usize, slots: usize) -> Option<String> {
+    let spills: i64 = deltas
+        .iter()
+        .filter(|(k, _)| k.contains("tmp_disk"))
+        .map(|(_, v)| *v)
+        .sum();
+    if spills < job::SPILL_FLAG_MIN {
+        return None;
+    }
+    Some(format!(
+        "pool run: source harm — {spills} tmp-disk spills server-wide across the pool \
+         window ({exports} exports, {slots} slots): the source spilled to disk while rivet \
+         ran. Lower `--pool` slots, `chunk_size` pages, or `tuning.batch_size` to shed \
+         pressure (foreign clients can contribute, but rivet's window is the frame)."
+    ))
+}
+
 /// The pool's pick rule, pure for the mutation gate (#166): the first queued
 /// export a freeing slot may start. A `parallel_safe` export is always
 /// eligible; a non-safe (heavy) one only when NO other heavy export is
@@ -1254,22 +1276,10 @@ pub(crate) fn run_pool(
     // spills during the pool window are REAL harm to the source (disk-spilling
     // tmp tables) whoever triggered them — WARN so it is visible at the
     // default log level, with the levers that shrink the pressure.
-    if let (Some(before), Some(after)) = (&run_harm_before, job::harm_snapshot(&config.source)) {
-        let spills: i64 = job::harm_deltas(before, &after)
-            .iter()
-            .filter(|(k, _)| k.contains("tmp_disk"))
-            .map(|(_, v)| *v)
-            .sum();
-        if spills >= 100 {
-            log::warn!(
-                "pool run: source harm — {spills} tmp-disk spills server-wide across the pool \
-                 window ({} exports, {} slots): the source spilled to disk while rivet ran. \
-                 Lower `--pool` slots, `chunk_size` pages, or `tuning.batch_size` to shed \
-                 pressure (foreign clients can contribute, but rivet's window is the frame).",
-                effective.len(),
-                m,
-            );
-        }
+    if let (Some(before), Some(after)) = (&run_harm_before, job::harm_snapshot(&config.source))
+        && let Some(line) = pool_harm_verdict(&job::harm_deltas(before, &after), effective.len(), m)
+    {
+        log::warn!("{line}");
     }
 
     let finished_at = chrono::Utc::now();
@@ -1386,6 +1396,27 @@ fn first_name_collision<'a>(
         .iter()
         .find(|u| existing.iter().any(|e| e.name == u.name))
         .map(|u| u.name.as_str())
+}
+
+#[cfg(test)]
+mod pool_harm_tests {
+    use super::pool_harm_verdict;
+
+    /// The pool-window verdict was the untested twin of run_diagnosis's spill
+    /// flag (same threshold, same filter, zero cover). Pinned here: fires at
+    /// the shared threshold on tmp_disk counters only, silent below it.
+    /// RED against a `<`→`<=`/threshold mutant or a dropped filter.
+    #[test]
+    fn pool_harm_verdict_fires_at_threshold_on_tmp_disk_only() {
+        let at = vec![("mysql_created_tmp_disk_tables".to_string(), 100_i64)];
+        let line = pool_harm_verdict(&at, 154, 5).expect("threshold reached");
+        assert!(line.contains("100 tmp-disk spills") && line.contains("154 exports"));
+        let below = vec![("mysql_created_tmp_disk_tables".to_string(), 99_i64)];
+        assert!(pool_harm_verdict(&below, 154, 5).is_none());
+        // Non-spill counters never trip it, however large.
+        let other = vec![("mysql_innodb_rows_read".to_string(), 1_000_000_i64)];
+        assert!(pool_harm_verdict(&other, 154, 5).is_none());
+    }
 }
 
 #[cfg(test)]
