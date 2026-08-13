@@ -331,16 +331,12 @@ fn pg_temp_bytes_snapshot(plan: &ResolvedRunPlan) -> Option<i64> {
 /// are observability, never a gate, so a missing snapshot just yields no
 /// `export_harm` rows.
 pub(super) fn harm_snapshot(source: &crate::config::SourceConfig) -> Option<Vec<(String, i64)>> {
-    let url = source.resolve_url().ok()?;
-    let tls = source.tls.as_ref();
-    match source.source_type {
-        crate::config::SourceType::Postgres => {
-            crate::source::postgres::sample_harm_counters(&url, tls)
-        }
-        crate::config::SourceType::Mysql => crate::source::mysql::sample_harm_counters(&url, tls),
-        crate::config::SourceType::Mssql => crate::source::mssql::sample_harm_counters(&url, tls),
-        crate::config::SourceType::Mongo => crate::source::mongo::sample_harm_counters(&url, tls),
-    }
+    // One dispatch for "which engine": `create_source`. The former per-engine
+    // free-fn switch here duplicated it (walk find, 2026-08-13); the harm
+    // probe is now the trait's third telemetry axis
+    // (`Source::harm_counters`), so any caller with a Source instance — or a
+    // test with a fake — reaches it without a URL round-trip.
+    crate::source::create_source(source).ok()?.harm_counters()
 }
 
 /// Per-metric delta (`after - before`, floored at 0) for counters present in
@@ -368,6 +364,11 @@ pub(super) fn harm_deltas(before: &[(String, i64)], after: &[(String, i64)]) -> 
 /// card. Emitted at WARN so it is visible at the default log level (INFO is not).
 /// Pure so the wording is unit-tested without a run. PG temp-byte spills are warned
 /// separately (`pg_temp_bytes_delta`), so they are not duplicated here.
+/// Spill count below which a run is not worth flagging — shared by the
+/// per-export DIAGNOSIS and the pool-window harm verdict so the two rules
+/// cannot drift (the pool copy used to inline its own `100`).
+pub(super) const SPILL_FLAG_MIN: i64 = 100;
+
 pub(super) fn run_diagnosis(
     summary: &RunSummary,
     harm_deltas: &[(String, i64)],
@@ -388,7 +389,7 @@ pub(super) fn run_diagnosis(
         .filter(|(k, _)| k.contains("tmp_disk"))
         .map(|(_, v)| *v)
         .sum();
-    if spills >= 100 {
+    if spills >= SPILL_FLAG_MIN {
         // The remedy must not suggest what the export ALREADY runs (a keyset
         // export told to "try chunk_by_key" reads as a broken diagnostic and
         // hides the real lever): on chunked/keyset the paging is already on,

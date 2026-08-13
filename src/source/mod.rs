@@ -367,6 +367,17 @@ pub trait Source: Send {
         None
     }
 
+    /// The Tier-2 source-harm counter snapshot (locks, rows read, buffer
+    /// misses, temp spills) the pipeline deltas around a run window and
+    /// stores in `export_harm` — the third telemetry axis beside
+    /// [`Source::sample_governor_pressure`] (governor) and each engine's
+    /// internal batch-pressure sampling. `None` when the engine can't sample
+    /// (e.g. MSSQL without `VIEW SERVER STATE`) — harm metrics are
+    /// observability, never a gate. Default: `None`.
+    fn harm_counters(&mut self) -> Option<Vec<(String, i64)>> {
+        None
+    }
+
     /// A best-effort JSON snapshot of the source SERVER's forensic context —
     /// version + the limits/session settings that shape failures (the
     /// statement-timeout that surfaces as `ERROR 3024`, the sql_mode/timezone that
