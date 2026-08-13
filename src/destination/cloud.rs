@@ -23,7 +23,7 @@
 use std::marker::PhantomData;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::Duration;
 
 use opendal::Operator;
@@ -32,6 +32,46 @@ use opendal::layers::RetryLayer;
 
 use crate::config::DestinationConfig;
 use crate::error::Result;
+
+/// Process-wide count of transient destination-side retries the
+/// [`RetryLayer`] absorbed (each one recovered — a retry that exhausts the
+/// budget surfaces as a hard error through rivet's own path). Read by the
+/// run summary so the "destination was flaky today" signal survives even
+/// though the per-attempt log lines are demoted to DEBUG after the first.
+pub(crate) static TRANSIENT_RETRIES: AtomicU64 = AtomicU64::new(0);
+
+/// Total transient destination retries absorbed so far in this process.
+pub fn transient_retries_total() -> u64 {
+    TRANSIENT_RETRIES.load(Ordering::Relaxed)
+}
+
+/// Rivet's [`opendal::layers::RetryInterceptor`]: keep the truth, drop the
+/// spam. The FIRST transient retry in the process logs at WARN with the
+/// error kind (so an operator sees what the destination is doing), every
+/// subsequent one logs at DEBUG, and all of them are counted for the run
+/// summary. Replacing opendal's default per-attempt WARN — which on a busy
+/// parallel upload was every other log line (field find, 2026-08-13) —
+/// with a log-filter mute would have hidden the degradation signal
+/// entirely; this aggregates it instead.
+pub(crate) struct RivetRetryNotify;
+
+impl opendal::layers::RetryInterceptor for RivetRetryNotify {
+    fn intercept(&self, err: &opendal::Error, dur: Duration) {
+        let n = TRANSIENT_RETRIES.fetch_add(1, Ordering::Relaxed);
+        if n == 0 {
+            log::warn!(
+                "destination: transient error, retrying in {:.1}s (further retries log at \
+                 DEBUG; the run summary reports the total): {err}",
+                dur.as_secs_f64(),
+            );
+        } else {
+            log::debug!(
+                "destination: transient error, retrying in {:.1}s: {err}",
+                dur.as_secs_f64(),
+            );
+        }
+    }
+}
 
 /// Process-wide ceiling on RAM held in one-shot upload buffers.
 ///
@@ -174,7 +214,8 @@ impl<B: CloudBackend> CloudDestination<B> {
                 .with_max_times(max_times)
                 .with_min_delay(Duration::from_millis(200))
                 .with_max_delay(Duration::from_secs(10))
-                .with_jitter(),
+                .with_jitter()
+                .with_notify(RivetRetryNotify),
         );
         let op = blocking::Operator::new(async_op)?;
 
@@ -409,5 +450,28 @@ mod tests {
             "part bigger than budget streams"
         );
         assert_eq!(budget.load(Ordering::Relaxed), 64, "budget untouched");
+    }
+
+    /// The retry interceptor must COUNT every transient retry it absorbs —
+    /// the run summary reads this total, and it is the only place the
+    /// "destination was flaky" signal survives once the per-attempt lines
+    /// drop to DEBUG after the first. RED against an interceptor that logs
+    /// without counting (the field-find alternative of muting the log
+    /// target wholesale would have zeroed this signal entirely).
+    #[test]
+    fn retry_interceptor_counts_every_absorbed_retry() {
+        use super::{RivetRetryNotify, transient_retries_total};
+        use opendal::layers::RetryInterceptor as _;
+        use std::time::Duration;
+        let before = transient_retries_total();
+        let err = opendal::Error::new(opendal::ErrorKind::Unexpected, "transient blip");
+        RivetRetryNotify.intercept(&err, Duration::from_millis(200));
+        RivetRetryNotify.intercept(&err, Duration::from_millis(400));
+        // Delta, not absolute: the counter is process-wide and other tests may
+        // run concurrently in this process.
+        assert!(
+            transient_retries_total() >= before + 2,
+            "both retries must be counted"
+        );
     }
 }

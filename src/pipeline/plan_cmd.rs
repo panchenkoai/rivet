@@ -441,6 +441,34 @@ fn build_plan_artifact(
 /// exported — we only run the `SELECT min(col) / max(col)` boundary queries.
 ///
 /// For `Incremental` exports we read the last cursor value from `StateStore`.
+/// The row estimate a chunked plan reports, from the two available signals.
+///
+/// * A MEASURED whole-table actual (a prior run's row count) always wins —
+///   `#149`: on a sparse key the span is the ID range, not the row count
+///   (950M..1.29B over 520K rows → 342M, far worse than the measurement).
+/// * Otherwise take the LARGER of the key span and the catalog estimate.
+///   For an integer key `span ≥ distinct keys` always holds, so a catalog
+///   estimate LARGER than the span is direct evidence the chunk key is
+///   NON-UNIQUE (rows > distinct keys) and the span is only a lower bound —
+///   field find (2026-08-13 pool dogfood): a versioned table keyed by a
+///   non-unique ref column held ~2.5 rows per key, and the span under-reported
+///   ~831M catalog rows as ~333M, feeding the pool's makespan prediction.
+///   When the catalog is the smaller side (the sparse case, or F4's
+///   fresh-ANALYZE garbage) the span still wins, exactly as before.
+fn chunked_row_estimate(
+    key_span: Option<i64>,
+    catalog: Option<i64>,
+    measured: bool,
+) -> Option<i64> {
+    if measured {
+        return catalog.or(key_span);
+    }
+    match (key_span, catalog) {
+        (Some(span), Some(cat)) => Some(span.max(cat)),
+        (a, b) => a.or(b),
+    }
+}
+
 fn compute_plan_data(
     plan: &crate::plan::ResolvedRunPlan,
     row_estimate: Option<i64>,
@@ -480,13 +508,7 @@ fn compute_plan_data(
                 chunk_ranges,
                 chunk_count,
                 cursor_snapshot: None,
-                // A measured whole-table actual beats the key-span estimate;
-                // otherwise the span refines a stale catalog (fresh-ANALYZE PG).
-                row_estimate: if row_is_measured {
-                    row_estimate.or(chunked_estimate)
-                } else {
-                    chunked_estimate.or(row_estimate)
-                },
+                row_estimate: chunked_row_estimate(chunked_estimate, row_estimate, row_is_measured),
             })
         }
 
@@ -1336,5 +1358,35 @@ mod tests {
             Some("json"),
             "extension must survive sanitization"
         );
+    }
+
+    /// Field find (2026-08-13 pool dogfood): a chunked export on a NON-UNIQUE
+    /// key (a versioned table, ~2.5 rows per key value) has `catalog > span`,
+    /// and the old span-always-wins rule under-reported ~831M rows as the
+    /// ~333M key span — which then fed the pool's makespan prediction.
+    #[test]
+    fn chunked_row_estimate_prefers_catalog_when_key_is_provably_non_unique() {
+        use super::chunked_row_estimate;
+        // catalog > span ⇒ rows > distinct keys ⇒ the span is only a floor.
+        assert_eq!(
+            chunked_row_estimate(Some(333_000_000), Some(831_000_000), false),
+            Some(831_000_000),
+        );
+        // Sparse key (#149 shape): span dwarfs the catalog — span still wins,
+        // exactly the pre-existing behavior (over-estimating is the safe
+        // direction for scheduling; the catalog is not trusted to shrink it).
+        assert_eq!(
+            chunked_row_estimate(Some(342_000_000), Some(520_000), false),
+            Some(342_000_000),
+        );
+        // A measured whole-table actual beats the span in either direction.
+        assert_eq!(
+            chunked_row_estimate(Some(342_000_000), Some(520_000), true),
+            Some(520_000),
+        );
+        // Missing signals degrade to whichever side exists.
+        assert_eq!(chunked_row_estimate(Some(42), None, false), Some(42));
+        assert_eq!(chunked_row_estimate(None, Some(42), false), Some(42));
+        assert_eq!(chunked_row_estimate(None, None, false), None);
     }
 }
