@@ -1220,3 +1220,126 @@ exports:
         "every exported row must round-trip while the governor is shedding"
     );
 }
+
+/// The governor SHEDS on SQL Server, under real log-flush pressure.
+///
+/// The last engine on the shed axis. MSSQL's foreign signal is
+/// `Log Flush Waits/sec` (`_Total`) — a thread waiting for a redo flush to
+/// complete, which is WRITE-driven and so cannot be moved by a read-only
+/// export. Before this test the engine had only a must-not-shed canary plus a
+/// readability assert, and both are satisfied by a counter that never moves —
+/// the same hazard proven on MySQL, where a permanently-flat mutant left both
+/// pre-existing canaries green.
+///
+/// The mover here is plain COMMIT rate: every committed transaction forces a
+/// log flush, and a writer streaming ~200 KB rows one transaction at a time
+/// produces roughly one wait per commit. Measured on the stand before writing
+/// the test: `_Total` went 1273 -> 1681 across 400 commits in 1.8 s. Unlike
+/// the MySQL twin this needs NO server-wide setting flip — commits alone do
+/// it — so there is nothing to restore and no globals lock to take. The writer
+/// targets a SCRATCH table, never the exported one: the pressure must be
+/// FOREIGN, which is the point of the signal split.
+///
+/// Assertions in the order that makes each meaningful: the governor ARMED,
+/// the counter really moved (activation guard — an inert fixture must fail
+/// here, not silently pass the next one), it BACKED OFF, and every row still
+/// round-tripped.
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn mssql_governor_backs_off_under_real_log_flush_pressure() {
+    require_alive(LiveService::Mssql);
+    let _quiet = quiet_window_guard();
+
+    // The exact counter `MssqlSource::sample_governor_pressure` reads — the
+    // `_Total` row, not a SUM over the per-database rows (a SUM double-counts,
+    // and a dropped database SHRINKS it, reading as "pressure eased").
+    const FLUSH_WAITS: &str = "SELECT cntr_value FROM sys.dm_os_performance_counters \
+                               WHERE counter_name LIKE 'Log Flush Waits%' \
+                               AND instance_name = '_Total'";
+
+    const ROWS: i64 = 20_000;
+    let table = seed_mssql_numeric_table(ROWS);
+    let scratch = format!("{}_flush", table.name());
+    mssql_exec(&format!(
+        "IF OBJECT_ID('dbo.{scratch}') IS NOT NULL DROP TABLE dbo.{scratch}; \
+         CREATE TABLE dbo.{scratch} (id INT IDENTITY PRIMARY KEY, payload VARBINARY(MAX))"
+    ));
+
+    // Background writer: one COMMIT per row, each carrying ~200 KB, so the log
+    // manager flushes constantly and `Log Flush Waits` climbs pair-over-pair —
+    // the condition `GovernorState::observe` needs to shed.
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer = {
+        let stop = Arc::clone(&stop);
+        let scratch = scratch.clone();
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                // 40 committed transactions per batch keeps the round-trip
+                // count low while the commit RATE stays high.
+                mssql_exec(&format!(
+                    "SET NOCOUNT ON; \
+                     DECLARE @i INT = 0; \
+                     WHILE @i < 40 \
+                     BEGIN \
+                       BEGIN TRAN; \
+                       INSERT INTO dbo.{scratch} (payload) VALUES \
+                         (CONVERT(VARBINARY(MAX), REPLICATE(CAST('x' AS VARCHAR(MAX)), 200000))); \
+                       COMMIT; \
+                       SET @i = @i + 1; \
+                     END; \
+                     DELETE TOP (40) FROM dbo.{scratch}"
+                ));
+            }
+        })
+    };
+
+    // Let the writer drive the counter before rivet starts, so the governor's
+    // first sample PAIR already spans rising pressure.
+    std::thread::sleep(Duration::from_millis(500));
+    let waits_before = mssql_query_i64(FLUSH_WAITS);
+
+    let rig = Rig::mssql_batch(table.name())
+        .mode("chunked")
+        .source_line("tuning:")
+        .source_line("  adaptive: true")
+        .source_line("  min_parallel: 2")
+        .source_line("  batch_size: 250")
+        .source_line("  throttle_ms: 100")
+        .export_line("chunk_column: id")
+        .export_line("chunk_size: 1000")
+        .export_line("parallel: 8");
+    let out = rig.run_with_envs(&[("RUST_LOG", "info"), ("RIVET_GOVERNOR_INTERVAL_MS", "200")]);
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+
+    let waits_after = mssql_query_i64(FLUSH_WAITS);
+    stop.store(true, Ordering::Relaxed);
+    writer.join().expect("writer thread");
+    mssql_exec(&format!(
+        "IF OBJECT_ID('dbo.{scratch}') IS NOT NULL DROP TABLE dbo.{scratch}"
+    ));
+
+    assert!(
+        out.status.success(),
+        "the governed run must still complete under log-flush pressure; stderr:\n{stderr}"
+    );
+    assert_governor_awake(&stderr, "mssql");
+    // Activation guard BEFORE the shed assertion: an inert fixture must go RED
+    // here rather than make the shed assertion untestable.
+    let delta = waits_after.saturating_sub(waits_before);
+    assert!(
+        delta >= 10,
+        "fixture went inert: Log Flush Waits (_Total) moved by {delta} across the run, so \
+         the governor had no rising foreign signal to react to and the shed assertion \
+         below would grade nothing (did the writer connect?)"
+    );
+    assert!(
+        stderr.contains("backed off"),
+        "under rising Log Flush Waits the governor must shed at least one worker; \
+         counter moved by {delta}; stderr:\n{stderr}"
+    );
+    assert_eq!(
+        duckdb_total_parquet_rows(&rig.out_dir()),
+        ROWS as usize,
+        "every exported row must round-trip while the governor is shedding"
+    );
+}

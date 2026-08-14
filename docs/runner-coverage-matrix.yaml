@@ -97,11 +97,15 @@ scenarios:
       PostgreSQL (governor_backs_off_under_concurrent_write_pressure) and now on MySQL
       (mysql_governor_backs_off_under_real_redo_pressure — innodb_log_buffer_size shrunk to
       its 256 KB minimum plus a foreign blob writer, with an activation guard on the counter
-      delta). That test is the one that catches the hazard the round-3 critic named: under a
-      mutant that makes the MySQL sampler read permanently flat, BOTH pre-existing MySQL
-      canaries stay GREEN and only this test goes RED — a must-not-shed assertion cannot
-      tell a working signal from a dead one. STILL OPEN: SQL Server (Log Flush Waits/sec
-      _Total) has no shed test, so the same mutant would pass there."
+      delta). — and on SQL Server
+      (mssql_governor_backs_off_under_real_log_flush_pressure — a writer committing one
+      ~200 KB row per transaction, which forces a log flush per commit; measured 1273 ->
+      1681 over 400 commits, and unlike the MySQL twin it needs no server-wide flip). All
+      three shed tests exist because a must-not-shed assertion cannot tell a working signal
+      from a dead one: under a mutant that makes the engine's sampler read permanently
+      flat, every pre-existing canary on that engine stays GREEN and only the shed test
+      goes RED (verified on MySQL and on SQL Server). MongoDB has no governor (no permit
+      ceiling to shrink — see the mongo_parallel cell), so the axis is complete."
     single:         { na: "single has no worker fan-out to govern (parallel is a multi-part-runner concept)" }
     chunked:        { test: governor_backs_off_under_concurrent_write_pressure }
     keyset:         { test: keyset_governor_backs_off_under_concurrent_write_pressure }
