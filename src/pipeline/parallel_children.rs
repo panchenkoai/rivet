@@ -13,6 +13,31 @@ use crate::state::StateStore;
 use super::ipc::{ChildEvent, ENV_IPC_EVENTS};
 use super::parent_ui::{ChildWaitStatus, UiMessage, sanitize_terminal};
 
+/// Decode one stdout line from a CHILD PROCESS and adopt the process-local
+/// counters it carries into this process's totals.
+///
+/// This is the **only** place a `ChildEvent` crosses a process boundary, and
+/// therefore the only place its counters are provably FOREIGN: the child's
+/// `RetryLayer` incremented its own `TRANSIENT_RETRIES` atomic, which this
+/// process never saw, so folding it in is what makes the parent's "dest
+/// retries" line cover the whole run instead of just the parent's own probes.
+///
+/// The fold used to live in `parent_ui::Renderer::handle_event` — but the
+/// renderer is also fed by the SAME-process channel (`ipc::emit_event`, which
+/// every `--parallel-exports` / `--pool` / plain sequential run installs), so
+/// it re-added this process's own counter to itself: a run with 3 real
+/// retries reported 6, and each further export doubled the total again
+/// (bughunt 2026-08-14, finding #4). Keeping the fold here makes the
+/// invariant structural — a counter is folded only after arriving over a
+/// pipe from another process.
+fn adopt_child_event(line: &str) -> serde_json::Result<ChildEvent> {
+    let ev: ChildEvent = serde_json::from_str(line)?;
+    if let ChildEvent::Finished { dest_retries, .. } = &ev {
+        crate::destination::add_transient_retries(*dest_retries);
+    }
+    Ok(ev)
+}
+
 /// Re-invoke this binary once per export. Children do not inherit parallel flags, so there is no recursion.
 ///
 /// Each child has `RIVET_IPC_EVENTS=1` set in its environment and runs with
@@ -148,6 +173,16 @@ pub(super) fn run_exports_as_child_processes(
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .env(ENV_IPC_EVENTS, "1");
+        // Declare sibling concurrency to the child: it runs single-export in
+        // its own process, so MULTI_EXPORT_CONCURRENT reads false there and
+        // run_diagnosis would print the confident solo harm attribution while
+        // N sibling children share the same server-global counter window —
+        // the runner-bypass shape of the pool hedge fix (bughunt 2026-08-13).
+        // Only when this batch actually has siblings: a lone child (a heavy
+        // wave batch of one) keeps the truthful solo attribution.
+        if exports.len() > 1 {
+            cmd.env(super::run::ENV_CONCURRENT_SIBLINGS, "1");
+        }
         log::debug!("spawning child for export '{}': {:?}", export.name, cmd);
         match cmd.spawn() {
             Ok(mut child) => {
@@ -175,7 +210,7 @@ pub(super) fn run_exports_as_child_processes(
                                 if trimmed.is_empty() {
                                     continue;
                                 }
-                                match serde_json::from_str::<ChildEvent>(trimmed) {
+                                match adopt_child_event(trimmed) {
                                     Ok(ev) => {
                                         let _ = tx.send(UiMessage::Event(ev));
                                     }
@@ -565,6 +600,74 @@ mod child_reaper {
     pub(super) fn register(_pid: u32) {}
     pub(super) fn deregister(_pid: u32) {}
     pub(super) fn install_once() {}
+}
+
+#[cfg(test)]
+mod foreign_counter_tests {
+    use super::*;
+
+    /// The process boundary MUST still fold the child's retry counter — the
+    /// half of finding #4 that the fix could silently break by simply
+    /// deleting the fold from the renderer.
+    ///
+    /// The stdout reader thread needs a real spawned `rivet` child, so what is
+    /// pinned here is the decode-and-adopt seam the reader calls
+    /// ([`adopt_child_event`], its only call site) fed the exact wire bytes a
+    /// child writes — `serde_json::to_string(&ChildEvent)` is literally what
+    /// `ipc::emit` puts on stdout.
+    ///
+    /// TWO children, with different counts: the fold accumulates, so one
+    /// event cannot tell "added the child's count" from "assigned it".
+    ///
+    /// Mutant: drop the `add_transient_retries` call from
+    /// `adopt_child_event` → the counter does not move and `grew_by` is 0.
+    #[test]
+    fn a_child_processs_finished_line_folds_its_foreign_retry_counter() {
+        let _serial = super::super::parent_ui::retry_counter_test_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+
+        let line = |name: &str, dest_retries: u64| {
+            serde_json::to_string(&ChildEvent::Finished {
+                export_name: name.into(),
+                run_id: format!("{name}_20260814T000000"),
+                status: "success".into(),
+                total_rows: 10,
+                files_produced: 1,
+                bytes_written: 100,
+                duration_ms: 5,
+                peak_rss_mb: 7,
+                error_message: None,
+                dest_retries,
+            })
+            .unwrap()
+        };
+
+        let before = crate::destination::transient_retries_total();
+        for (name, n) in [("orders", 3u64), ("events", 4u64)] {
+            let ev = adopt_child_event(&line(name, n)).expect("child wire format must parse");
+            assert!(matches!(ev, ChildEvent::Finished { .. }));
+        }
+        let grew_by = crate::destination::transient_retries_total() - before;
+        // `>=` not `==`: `destination::cloud`'s interceptor test is outside
+        // this module's lock and adds 2. It cannot reach 7, so the mutant
+        // (growth 0..2) still goes RED.
+        assert!(
+            grew_by >= 7,
+            "both children's foreign counters must be folded (grew by {grew_by}, want >= 7)"
+        );
+    }
+
+    /// A line the child could not have written is rejected BEFORE the fold
+    /// (the `?` in `adopt_child_event`), so the reader keeps going and the
+    /// counter is untouched. Asserted on the return value rather than the
+    /// global counter — `destination::cloud`'s interceptor test runs outside
+    /// this lock, so an equality on a process-wide counter would flake.
+    #[test]
+    fn an_unparsable_line_is_rejected_before_the_fold() {
+        assert!(adopt_child_event("{not json").is_err());
+        assert!(adopt_child_event(r#"{"type":"nope"}"#).is_err());
+    }
 }
 
 #[cfg(test)]

@@ -216,6 +216,24 @@ which the unit tests cannot exercise.
   (`GovernorHarness::arm`/`spawn_into`/`drain_into`); the trait itself
   still lives in `src/tuning/adaptive.rs`).
 
+## Update 2026-08-13 — the governor gets its own pressure signal
+
+The extraction preserved a coupling this ADR did not name: the governor
+sampled `Source::sample_pressure` — the SAME counter the adaptive batch loop
+uses. When that counter was later re-pointed at own-read spill proxies
+(MySQL `Created_tmp_disk_tables` for the batch loop's benefit; MSSQL
+`Workfiles/Worktables Created`, which — correction — only the governor ever
+consumed: MSSQL's batch loop has no pressure sampling), the governor
+silently inherited a signal its own workload inflates. On keyset exports (pages spill by design) it read its own
+exhaust as "pressure rising", shed to the floor, and never recovered —
+measured in a production pool run as 2–2.7× per-export slowdowns, +1h48m
+makespan, on a source with no foreign load. The fix separates the signals:
+`Source::sample_governor_pressure` (write/redo counters a read-only export
+cannot move — PG `checkpoints_req`, MySQL `Innodb_log_waits`, MSSQL `Log
+Flush Waits/sec`) feeds the governor; the batch loop keeps the spill
+counters. Sheds now log at WARN (an invisible deliberate slowdown is the
+info-level trap the sparse-chunk rule already names).
+
 ## References
 
 - `src/tuning/adaptive.rs` — `Governor`, `PressureSource`, `tick`,

@@ -225,8 +225,10 @@ pub(crate) fn run_chunked_parallel(
     );
 
     let completed = AtomicUsize::new(0);
-    // Every worker bumps this exactly once — on success OR failure — so the
-    // governor thread can tell when the run is *done* regardless of outcome.
+    // Every worker bumps this exactly once — on success, failure, OR an
+    // unwinding panic (it is bumped by the `WorkerExit` RAII guard, not a tail
+    // statement) — so the governor thread can tell when the run is *done*
+    // regardless of outcome.
     // `completed` counts only successes (progress bar / summary); using it for
     // the governor's exit condition deadlocks the `thread::scope` whenever a
     // chunk fails (the governor would loop forever waiting for a success count
@@ -317,6 +319,14 @@ pub(crate) fn run_chunked_parallel(
             let shared_destination = std::sync::Arc::clone(&shared_destination);
 
             s.spawn(move || {
+                // Return the permit and mark this worker FINISHED on every exit path —
+                // including an unwinding panic, which the tail statements this replaced
+                // skipped: the governor thread's only exit is `finished >= total`, so a
+                // panicking worker left it looping forever and `thread::scope` could never
+                // join (the process hung instead of reporting the failure), while the
+                // un-released permit stalled the spawner loop at `parallel = 1` even with
+                // the governor disarmed. Same shape as the keyset runner's `FinishGuard`.
+                let _exit = crate::pipeline::governor::WorkerExit::new(semaphore, finished);
                 let result = (|| -> Result<()> {
                     let chunk_query = build_chunk_query_sql(
                         base_query,
@@ -407,16 +417,11 @@ pub(crate) fn run_chunked_parallel(
                     Ok(())
                 })();
 
-                semaphore.release();
-
                 if let Err(e) = result {
                     log::error!("export '{}': chunk {} failed: {:#}", export_name, i, e);
                     poison::lock_recover(errors).push(format!("chunk {}: {:#}", i, e));
                 }
-
-                // Mark this worker done (success OR failure) so the governor
-                // thread can terminate — must run on every exit path.
-                finished.fetch_add(1, Ordering::Relaxed);
+                // `_exit` drops here: permit released, `finished` bumped.
             });
         }
     });

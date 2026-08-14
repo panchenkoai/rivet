@@ -54,6 +54,12 @@ pub const GOVERNOR_SAMPLE_INTERVAL_MS: u64 = 1500;
 ///
 /// `min` is floored at 1 (a 0 ceiling would stall the pool) and `max` at `min`.
 /// Pure function — exported so the governor can be unit-tested without a live DB.
+///
+/// The step is deliberately SYMMETRIC (one down, one up), which — combined with
+/// [`GovernorState::observe`]'s strictly-rising pressure test — means a shed
+/// holds only while the signal keeps rising sample over sample. See that
+/// method's docs for why quick recovery is the intended policy and what it
+/// costs on a coarse per-event counter.
 pub fn next_parallel(current: usize, min: usize, max: usize, under_pressure: bool) -> usize {
     let lo = min.max(1);
     let hi = max.max(lo);
@@ -64,6 +70,16 @@ pub fn next_parallel(current: usize, min: usize, max: usize, under_pressure: boo
         (cur + 1).min(hi)
     }
 }
+
+/// Consecutive unreadable samples (`None`) before the governor declares its
+/// pressure signal LOST: warns once and starts stepping back toward the ceiling.
+///
+/// A single miss is a transient (a statement timeout, a busy catalog view) and
+/// must not move parallelism, so this is >1. It must also be small enough that
+/// the frozen window is bounded: at the production
+/// [`GOVERNOR_SAMPLE_INTERVAL_MS`] three misses is ~4.5 s, against runs that are
+/// hours long.
+pub const GOVERNOR_BLIND_SAMPLES: usize = 3;
 
 /// Decision state for the concurrency governor's control loop.
 ///
@@ -78,6 +94,12 @@ pub struct GovernorState {
     current: usize,
     floor: usize,
     ceiling: usize,
+    /// Consecutive `None` samples since the last readable one.
+    blind: usize,
+    /// One-shot: set on the tick where `blind` first reaches
+    /// [`GOVERNOR_BLIND_SAMPLES`], drained by [`GovernorState::take_signal_lost`]
+    /// so the runner warns ONCE per blindness episode, not once per tick.
+    signal_lost: bool,
 }
 
 impl GovernorState {
@@ -91,6 +113,8 @@ impl GovernorState {
             current: start.clamp(floor, ceiling),
             floor,
             ceiling,
+            blind: 0,
+            signal_lost: false,
         }
     }
 
@@ -102,13 +126,66 @@ impl GovernorState {
 
     /// Fold one pressure sample into the state. Returns `Some((from, to))` when
     /// the target changed (caller should resize the semaphore + journal it), or
-    /// `None` when nothing changed — including when `sample` is `None` (the
-    /// engine couldn't sample, so parallelism holds flat and the baseline is
-    /// left untouched).
+    /// `None` when nothing changed.
+    ///
+    /// Two policies live here, both learned the expensive way:
+    ///
+    /// **Rising-only pressure, immediate recovery.** `under_pressure` is
+    /// `cur > prev` and *anything else* (flat, falling) recovers a worker, so a
+    /// shed persists only while the signal keeps rising on EVERY sample. The
+    /// consequence is honest and deliberate: on a COARSE counter — PostgreSQL's
+    /// governor signal counts REQUESTED checkpoints only (`checkpoints_req`, or
+    /// `pg_stat_checkpointer.num_requested` on PG 17+), which ticks only when WAL
+    /// volume forces a checkpoint, i.e. far apart relative to the 1500 ms sample
+    /// interval (PostgreSQL flags requested checkpoints closer together than
+    /// `checkpoint_warning`, default 30 s, as a misconfiguration) — one rise
+    /// sheds a worker and the next flat sample puts it straight back, so
+    /// sustained foreign write pressure yields a repeated one-worker dip rather
+    /// than a held-down level. Hysteresis (hold the shed for K samples) would deepen
+    /// the back-off, and is NOT what this loop wants: the regression this
+    /// governor was rewritten for (#229) was a shed that would not come back —
+    /// it read its own extraction as foreign pressure and walked 4→3→2→1, and a
+    /// field pool run lost 1h48m to it. A shed that is cheap to undo bounds the
+    /// blast radius of a mis-read signal; a shed that is sticky does not. The
+    /// deeper fix for a coarse engine is a finer-grained SIGNAL (a monotonically
+    /// rising write counter), not a stickier policy on top of a signal that
+    /// barely moves — changing the policy would make every engine's false
+    /// positive more expensive to buy protection on one.
+    ///
+    /// **Fail open when the signal cannot be read.** A `None` sample holds
+    /// parallelism flat and preserves the baseline — right for a transient miss.
+    /// But nothing bounded a PERMANENT one: a monitoring connection reaped
+    /// mid-run (pooler idle timeout, server restart, tunnel drop) makes every
+    /// later sample `None`, and the run then stayed pinned at whatever level the
+    /// last shed reached for the rest of its hours, silently. After
+    /// [`GOVERNOR_BLIND_SAMPLES`] consecutive misses the state flags
+    /// [`take_signal_lost`](Self::take_signal_lost) (the runner warns once) and
+    /// treats the tick as NOT under pressure, stepping back toward the ceiling —
+    /// a signal that cannot be read is not evidence of pressure, and this repo's
+    /// convention on an unreadable boundary is to fail open (a run that is too
+    /// fast for the source sheds again the moment the signal returns; a run
+    /// silently pinned at the floor recovers never).
     pub fn observe(&mut self, sample: Option<u64>) -> Option<(usize, usize)> {
-        let cur_p = sample?;
-        let under_pressure = self.prev.is_some_and(|p| cur_p > p);
-        self.prev = Some(cur_p);
+        let under_pressure = match sample {
+            Some(cur_p) => {
+                self.blind = 0;
+                let rising = self.prev.is_some_and(|p| cur_p > p);
+                self.prev = Some(cur_p);
+                rising
+            }
+            None => {
+                self.blind += 1;
+                if self.blind < GOVERNOR_BLIND_SAMPLES {
+                    // Transient miss: hold flat, keep the baseline so a later
+                    // reading is still compared against the last real one.
+                    return None;
+                }
+                if self.blind == GOVERNOR_BLIND_SAMPLES {
+                    self.signal_lost = true;
+                }
+                false
+            }
+        };
         let next = next_parallel(self.current, self.floor, self.ceiling, under_pressure);
         if next == self.current {
             None
@@ -117,6 +194,15 @@ impl GovernorState {
             self.current = next;
             Some((from, next))
         }
+    }
+
+    /// Drain the one-shot "pressure signal lost" flag (see
+    /// [`observe`](Self::observe)). `true` at most once per blindness episode —
+    /// the flag re-arms only after a readable sample resets `blind`, so a
+    /// permanently dead monitor connection produces ONE warn line, not one per
+    /// sample interval for the rest of the run.
+    pub fn take_signal_lost(&mut self) -> bool {
+        std::mem::take(&mut self.signal_lost)
     }
 }
 
@@ -139,12 +225,21 @@ pub trait PressureSource: Send {
     /// Return the source's current pressure reading, or `None` when the
     /// source cannot sample this tick (the governor then holds parallelism
     /// flat — see [`GovernorState::observe`]).
-    fn sample_pressure(&mut self) -> Option<u64>;
+    /// One reading of the governor's foreign-pressure signal. (Named `sample`,
+    /// not `sample_pressure`: the latter was the retired Source-trait method
+    /// whose name colliding here sent greps to the wrong concept — walk find,
+    /// 2026-08-13.)
+    fn sample(&mut self) -> Option<u64>;
 }
 
 impl PressureSource for Box<dyn crate::source::Source> {
-    fn sample_pressure(&mut self) -> Option<u64> {
-        crate::source::Source::sample_pressure(self.as_mut())
+    fn sample(&mut self) -> Option<u64> {
+        // The governor's signal is the FOREIGN-pressure counter, not the batch
+        // loop's own-extraction counter: a keyset export's own pages inflate
+        // the spill counters by design, and a governor listening to them sheds
+        // its own workers to the floor and never recovers (field find,
+        // 2026-08-13 — see `Source::sample_governor_pressure`).
+        crate::source::Source::sample_governor_pressure(self.as_mut())
     }
 }
 
@@ -215,11 +310,26 @@ impl Governor {
     /// decision-log machinery. Polls every `poll_interval`, samples
     /// every `sample_interval`. The stop predicate is re-checked after
     /// each poll sleep so a finished run exits within one poll quantum.
-    pub fn run<S, Stop, Decide>(&mut self, source: &mut S, stop: Stop, mut on_decision: Decide)
-    where
+    ///
+    /// `on_signal_lost(frozen_at, ceiling)` fires ONCE per blindness
+    /// episode, on the tick where [`GOVERNOR_BLIND_SAMPLES`] consecutive
+    /// samples have come back unreadable — `frozen_at` is the level the
+    /// run had been pinned at, BEFORE this tick's step back toward the
+    /// ceiling. It is a separate callback (not another `on_decision`
+    /// reason) because there is no transition to journal when the
+    /// governor is already at the ceiling, and the operator still needs
+    /// the line.
+    pub fn run<S, Stop, Decide, Lost>(
+        &mut self,
+        source: &mut S,
+        stop: Stop,
+        mut on_decision: Decide,
+        mut on_signal_lost: Lost,
+    ) where
         S: PressureSource + ?Sized,
         Stop: Fn() -> bool,
         Decide: FnMut(usize, usize),
+        Lost: FnMut(usize, usize),
     {
         let mut last_sample = Instant::now();
         while !stop() {
@@ -231,7 +341,12 @@ impl Governor {
                 continue;
             }
             last_sample = Instant::now();
-            if let Some((from, to)) = self.tick(source.sample_pressure()) {
+            let frozen_at = self.state.current;
+            let decision = self.tick(source.sample());
+            if self.state.take_signal_lost() {
+                on_signal_lost(frozen_at, self.state.ceiling);
+            }
+            if let Some((from, to)) = decision {
                 on_decision(from, to);
             }
         }
@@ -401,6 +516,36 @@ mod tests {
         assert_eq!(g.observe(Some(100)), Some((4, 5)));
     }
 
+    /// Policy pin, not a bug report (#229 bughunt finding [2]): the shed is
+    /// CHEAP TO UNDO by construction — one rising sample sheds a worker and the
+    /// very next FLAT sample hands it straight back. On a coarse counter (PG's
+    /// `checkpoints_req` ticks roughly once a minute against a 1500 ms sample
+    /// interval) sustained foreign pressure therefore reads as a repeated
+    /// one-worker dip, NOT a held-down level.
+    ///
+    /// That is the deliberate trade: the regression this governor was rewritten
+    /// for was a shed that would not come back (4→3→2→1 off its own exhaust,
+    /// 1h48m lost in the field). Hysteresis would deepen the back-off on a
+    /// coarse signal at the cost of making every engine's false positive
+    /// stickier. Keep it here as an executable statement of the policy: adding
+    /// hysteresis turns this RED, which is exactly the review the change
+    /// deserves. Two rise→flat cycles, because a single one cannot show that
+    /// the dip REPEATS rather than converging.
+    #[test]
+    fn governor_state_returns_the_shed_worker_on_the_first_flat_sample_by_design() {
+        let mut g = GovernorState::new(6, 2, 6);
+        assert_eq!(g.observe(Some(10)), None, "baseline, already at ceiling");
+        assert_eq!(g.observe(Some(11)), Some((6, 5)), "one rise ⇒ shed one");
+        assert_eq!(g.observe(Some(11)), Some((5, 6)), "flat ⇒ back at once");
+        assert_eq!(g.observe(Some(11)), None, "at ceiling, nothing to recover");
+        assert_eq!(
+            g.observe(Some(12)),
+            Some((6, 5)),
+            "next tick of the counter"
+        );
+        assert_eq!(g.observe(Some(12)), Some((5, 6)), "and back again");
+    }
+
     #[test]
     fn governor_state_none_sample_holds_flat_and_keeps_baseline() {
         let mut g = GovernorState::new(4, 2, 6);
@@ -412,6 +557,56 @@ mod tests {
             Some((5, 4)),
             "rising vs preserved baseline"
         );
+    }
+
+    /// A transient miss holds parallelism flat; a PERMANENT one (monitor
+    /// connection reaped mid-run — every later sample `None`) must not leave the
+    /// run pinned at the shed floor for hours. After
+    /// [`GOVERNOR_BLIND_SAMPLES`] the state warns ONCE and fails open.
+    ///
+    /// Two blindness episodes, because the warn's one-shot flag accumulates: a
+    /// single episode cannot distinguish "one warn per episode" from "one warn
+    /// per process".
+    #[test]
+    fn governor_state_holds_flat_for_a_transient_miss_then_fails_open_when_the_signal_dies() {
+        let mut g = GovernorState::new(6, 2, 6);
+        assert_eq!(g.observe(Some(100)), None, "baseline at ceiling");
+        assert_eq!(g.observe(Some(200)), Some((6, 5)));
+        assert_eq!(g.observe(Some(300)), Some((5, 4)));
+
+        assert_eq!(g.observe(None), None, "miss 1 ⇒ hold flat");
+        assert!(!g.take_signal_lost(), "one miss is a transient, not a loss");
+        assert_eq!(g.observe(None), None, "miss 2 ⇒ still holding");
+        assert!(!g.take_signal_lost());
+        assert_eq!(
+            g.observe(None),
+            Some((4, 5)),
+            "miss 3 ⇒ the signal is gone; an unreadable signal is not evidence \
+             of pressure, so step back toward the ceiling"
+        );
+        assert!(g.take_signal_lost(), "the operator gets a line for this");
+        assert_eq!(g.observe(None), Some((5, 6)), "keeps stepping back");
+        assert!(
+            !g.take_signal_lost(),
+            "one warn per blindness episode, not one per sample interval"
+        );
+        assert_eq!(
+            g.observe(None),
+            None,
+            "at the ceiling there is nowhere left"
+        );
+
+        // The baseline was preserved across the blind span, so the first
+        // readable sample is still compared against the last real one (300).
+        assert_eq!(g.observe(Some(400)), Some((6, 5)), "rising vs the baseline");
+        assert_eq!(g.observe(None), None);
+        assert_eq!(g.observe(None), None);
+        assert_eq!(
+            g.observe(None),
+            Some((5, 6)),
+            "second episode fails open too"
+        );
+        assert!(g.take_signal_lost(), "a NEW episode re-arms the warn");
     }
 
     // ── Governor (the loop, not just the decision) ────────────────────────────
@@ -440,7 +635,7 @@ mod tests {
     }
 
     impl PressureSource for VecSource {
-        fn sample_pressure(&mut self) -> Option<u64> {
+        fn sample(&mut self) -> Option<u64> {
             self.sample_count
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.samples.pop_front().unwrap_or(None)
@@ -488,13 +683,64 @@ mod tests {
         let stop_count = Arc::clone(&sample_count);
         let stop = move || stop_count.load(Ordering::Relaxed) >= 5;
         let mut decisions: Vec<(usize, usize)> = Vec::new();
-        gov.run(&mut source, stop, |from, to| {
-            decisions.push((from, to));
-        });
+        gov.run(
+            &mut source,
+            stop,
+            |from, to| decisions.push((from, to)),
+            |_, _| panic!("the signal never went blind here"),
+        );
 
         // First sample (100) only seeds the baseline → no decision.
         // Samples 2..5 all rise → four shed-one decisions.
         assert_eq!(decisions, vec![(6, 5), (5, 4), (4, 3), (3, 2)]);
+    }
+
+    /// The loop half of the blind-signal policy: a monitor connection that dies
+    /// mid-run (`VecSource` returns `None` forever once exhausted — the same
+    /// shape as `postgres::Client` after a pooler reap, which never reconnects)
+    /// must not leave the run pinned at the level the last shed reached. The
+    /// governor warns once, naming the FROZEN level (the value before this
+    /// tick's recovery step), and walks back to the ceiling.
+    #[test]
+    fn governor_run_warns_once_and_steps_back_to_the_ceiling_when_the_signal_dies() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let sample_count = Arc::new(AtomicUsize::new(0));
+        let mut source = VecSource::new(
+            [
+                Some(100), // baseline (already at the ceiling)
+                Some(200), // rising → 6→5
+                Some(300), // rising → 5→4
+                None,      // miss 1 → hold
+                None,      // miss 2 → hold
+                None,      // miss 3 → signal lost: warn + 4→5
+                None,      // still blind → 5→6
+            ],
+            Arc::clone(&sample_count),
+        );
+        let mut gov =
+            Governor::with_intervals(6, 2, 6, Duration::from_millis(1), Duration::from_millis(1));
+        let stop_count = Arc::clone(&sample_count);
+        let stop = move || stop_count.load(Ordering::Relaxed) >= 7;
+        let mut decisions: Vec<(usize, usize)> = Vec::new();
+        let mut lost: Vec<(usize, usize)> = Vec::new();
+        gov.run(
+            &mut source,
+            stop,
+            |from, to| decisions.push((from, to)),
+            |frozen_at, ceiling| lost.push((frozen_at, ceiling)),
+        );
+
+        assert_eq!(
+            decisions,
+            vec![(6, 5), (5, 4), (4, 5), (5, 6)],
+            "two sheds, then the blind span walks back to the ceiling"
+        );
+        assert_eq!(
+            lost,
+            vec![(4, 6)],
+            "exactly one warn, naming the level the run was pinned at and the ceiling"
+        );
     }
 
     #[test]
@@ -509,7 +755,7 @@ mod tests {
         let mut gov =
             Governor::with_intervals(6, 2, 6, Duration::from_millis(50), Duration::from_millis(5));
         let start = std::time::Instant::now();
-        gov.run(&mut source, || true, |_, _| {});
+        gov.run(&mut source, || true, |_, _| {}, |_, _| {});
         assert!(
             start.elapsed() < Duration::from_millis(40),
             "run() must exit on stop without sleeping a full sample interval"

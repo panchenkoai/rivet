@@ -339,15 +339,42 @@ pub trait Source: Send {
         column_overrides: &ColumnOverrides,
     ) -> Result<Vec<TypeMapping>>;
 
-    /// Sample a monotonic source-pressure counter for the OPT-2 concurrency
-    /// governor (`pipeline::chunked::exec`).
+    /// Sample the monotonic FOREIGN-pressure counter for the OPT-2
+    /// concurrency governor — write/redo pressure a read-only export cannot
+    /// move (PG `checkpoints_req`, MySQL `Innodb_log_waits`, MSSQL `Log
+    /// Flush Waits/sec`).
     ///
-    /// Higher = more pressure. The governor compares successive samples
-    /// (`cur > prev` ⇒ under pressure) — the same convention the adaptive
-    /// batch-size loop already uses. Returns `None` when the engine can't
-    /// cheaply sample a pressure proxy, in which case the governor holds
-    /// parallelism flat. Default: `None`.
-    fn sample_pressure(&mut self) -> Option<u64> {
+    /// This is the governor's ONLY signal, and it is deliberately NOT the
+    /// adaptive batch loop's. The batch loops sample engine-internally:
+    /// MySQL its own-extraction spill sum (`mysql_sample_extraction_pressure`
+    /// — shrinking the batch genuinely shrinks the per-query spill), PG the
+    /// same `checkpoints_req` both loops share (write-driven, own reads
+    /// can't move it), MSSQL nothing (its batch adaptation is inert).
+    /// Feeding the governor
+    /// those same spill counters made it read its own exhaust (field find,
+    /// 2026-08-13): a keyset export whose pages spill by design saw a
+    /// permanently-rising counter on an idle server, shed workers 4→3→2→1,
+    /// and never recovered — every keyset export 2–2.7× slower with zero
+    /// foreign load. The governor's question is "is someone ELSE straining
+    /// this server while I run?" — only a counter the export itself cannot
+    /// inflate can answer it.
+    ///
+    /// Higher = more pressure; the governor compares successive samples
+    /// (`cur > prev` ⇒ under pressure). Returns `None` when the engine has
+    /// no such counter — the governor then holds parallelism flat.
+    /// Default: `None`.
+    fn sample_governor_pressure(&mut self) -> Option<u64> {
+        None
+    }
+
+    /// The Tier-2 source-harm counter snapshot (locks, rows read, buffer
+    /// misses, temp spills) the pipeline deltas around a run window and
+    /// stores in `export_harm` — the third telemetry axis beside
+    /// [`Source::sample_governor_pressure`] (governor) and each engine's
+    /// internal batch-pressure sampling. `None` when the engine can't sample
+    /// (e.g. MSSQL without `VIEW SERVER STATE`) — harm metrics are
+    /// observability, never a gate. Default: `None`.
+    fn harm_counters(&mut self) -> Option<Vec<(String, i64)>> {
         None
     }
 

@@ -181,52 +181,6 @@ pub(crate) fn sample_temp_bytes(url: &str, tls: Option<&TlsConfig>) -> Option<i6
         .and_then(|r| r.try_get::<_, i64>(0).ok())
 }
 
-/// Snapshot the broader source-harm counters from `pg_stat_database` for the
-/// current database — a superset of [`sample_temp_bytes`] (which the run summary
-/// tracks on its own). Returns `(metric, cumulative_value)` pairs; the pipeline
-/// captures these before and after the export and stores the per-metric delta in
-/// `export_harm`.
-///
-/// All counters live in `pg_stat_database` and are readable by **any** role — no
-/// `pg_monitor` membership or superuser needed (unlike `pg_stat_activity`'s view
-/// of other sessions). These are cluster-level cumulative counters, so concurrent
-/// activity inflates the delta; on a single-tenant pilot box it is the run's own
-/// footprint. `None` on connect/query failure — informational, never blocks the
-/// export.
-pub(crate) fn sample_harm_counters(
-    url: &str,
-    tls: Option<&TlsConfig>,
-) -> Option<Vec<(String, i64)>> {
-    let mut client = connect_client(url, tls).ok()?;
-    // `tup_returned` (rows the engine had to scan) is the read-amplification
-    // signal; `blks_read`/`blks_hit` the I/O vs cache split; `temp_files` the
-    // spill count; `deadlocks` contention. temp_bytes is intentionally omitted —
-    // it's already on the run summary (export_metrics.pg_temp_bytes_delta).
-    let row = client
-        .query_one(
-            "SELECT blks_read::bigint, blks_hit::bigint, tup_returned::bigint, \
-             tup_fetched::bigint, temp_files::bigint, deadlocks::bigint \
-             FROM pg_stat_database WHERE datname = current_database()",
-            &[],
-        )
-        .ok()?;
-    let names = [
-        "pg_blks_read",
-        "pg_blks_hit",
-        "pg_tup_returned",
-        "pg_tup_fetched",
-        "pg_temp_files",
-        "pg_deadlocks",
-    ];
-    let mut out = Vec::with_capacity(names.len());
-    for (i, name) in names.iter().enumerate() {
-        if let Ok(v) = row.try_get::<_, i64>(i) {
-            out.push(((*name).to_string(), v));
-        }
-    }
-    Some(out)
-}
-
 /// Probe `SHOW work_mem` and return the value in bytes.
 ///
 /// PostgreSQL spills FETCH-cursor output to `pgsql_tmp/` once the in-flight
@@ -278,15 +232,41 @@ fn parse_work_mem(raw: &str) -> Option<i64> {
     (bytes > 0).then_some(bytes)
 }
 
-/// Sample `checkpoints_req` from `pg_stat_bgwriter`.
+/// Sample requested-checkpoint pressure, version-portably.
 ///
 /// PostgreSQL caches the statistics snapshot at the start of each transaction.
 /// We call `pg_stat_clear_snapshot()` first to discard that cache so every
 /// adaptive sample sees fresh counters rather than the frozen value from BEGIN.
+///
+/// PG 17 moved the counter: `pg_stat_bgwriter.checkpoints_req` was removed and
+/// lives on as `pg_stat_checkpointer.num_requested` (bughunt 2026-08-13,
+/// proven on postgres:18). The old query on PG17+ is not merely a `None` —
+/// the batch loop samples INSIDE the export's cursor transaction, and any
+/// ERROR aborts that transaction, killing the next FETCH: every
+/// `adaptive: true` PG17+ export hard-failed. A probe-then-query pair avoids
+/// ever ERRORing on either vintage (a one-statement CASE still plans the dead
+/// branch and errors — proven on postgres:18).
 fn pg_sample_checkpoints_req(client: &mut Client) -> Option<i64> {
     let _ = client.execute("SELECT pg_stat_clear_snapshot()", &[]);
+    // Two steps, because PG plans a whole statement up front: a CASE whose
+    // dead branch references the missing column still ERRORs (proven on
+    // postgres:18), and an ERROR inside the export's cursor transaction
+    // aborts it. The existence probe can never error; only the matching
+    // query is then sent.
+    let has_checkpointer = client
+        .query_one(
+            "SELECT to_regclass('pg_catalog.pg_stat_checkpointer') IS NOT NULL",
+            &[],
+        )
+        .ok()
+        .and_then(|r| r.try_get::<_, bool>(0).ok())?;
+    let sql = if has_checkpointer {
+        "SELECT num_requested FROM pg_stat_checkpointer"
+    } else {
+        "SELECT checkpoints_req FROM pg_stat_bgwriter"
+    };
     client
-        .query_one("SELECT checkpoints_req FROM pg_stat_bgwriter", &[])
+        .query_one(sql, &[])
         .ok()
         .and_then(|r| r.try_get::<_, i64>(0).ok())
 }
@@ -793,10 +773,58 @@ impl super::Source for PostgresSource {
         Ok(mappings)
     }
 
-    /// Governor pressure proxy: `pg_stat_bgwriter.checkpoints_req` — the same
-    /// monotonic counter the adaptive batch loop samples. Rising between samples
-    /// means the source is checkpointing harder under write pressure.
-    fn sample_pressure(&mut self) -> Option<u64> {
+    /// Snapshot the source-harm counters from `pg_stat_database` for the current
+    /// database. Returns `(metric, cumulative_value)` pairs; the pipeline captures
+    /// these before and after the export and stores the per-metric delta in
+    /// `export_harm`.
+    ///
+    /// Every counter here is readable by **any** role — no `pg_monitor` membership
+    /// or superuser needed (unlike `pg_stat_activity`'s view of other sessions).
+    /// They are CLUSTER-level cumulative counters, so concurrent activity inflates
+    /// the delta; on a single-tenant box it is the run's own footprint. `None` on
+    /// connect/query failure — observability, never a gate.
+    fn harm_counters(&mut self) -> Option<Vec<(String, i64)>> {
+        let client = &mut self.client;
+        // `tup_returned` (rows the engine had to scan) is the read-amplification
+        // signal; `blks_read`/`blks_hit` the I/O vs cache split; `temp_files` the
+        // spill count; `deadlocks` contention. temp_bytes is intentionally omitted —
+        // it's already on the run summary (export_metrics.pg_temp_bytes_delta).
+        let row = client
+            .query_one(
+                "SELECT blks_read::bigint, blks_hit::bigint, tup_returned::bigint, \
+             tup_fetched::bigint, temp_files::bigint, deadlocks::bigint \
+             FROM pg_stat_database WHERE datname = current_database()",
+                &[],
+            )
+            .ok()?;
+        let names = [
+            "pg_blks_read",
+            "pg_blks_hit",
+            "pg_tup_returned",
+            "pg_tup_fetched",
+            "pg_temp_files",
+            "pg_deadlocks",
+        ];
+        let mut out = Vec::with_capacity(names.len());
+        for (i, name) in names.iter().enumerate() {
+            if let Ok(v) = row.try_get::<_, i64>(i) {
+                out.push(((*name).to_string(), v));
+            }
+        }
+        Some(out)
+    }
+
+    /// Governor pressure proxy: `checkpoints_req` — WAL volume forcing
+    /// checkpoints. Rising between samples means the source is checkpointing
+    /// harder under WRITE pressure, which a read-only export cannot cause; that
+    /// is why the governor may share this counter with the batch loop while the
+    /// other engines need a separate one.
+    fn sample_governor_pressure(&mut self) -> Option<u64> {
+        // `checkpoints_req` is WRITE-driven (WAL volume forcing checkpoints):
+        // a read-only export cannot move it, so the governor may share it
+        // with PG's batch loop (which samples it engine-internally) — unlike
+        // MySQL/MSSQL, whose batch loops listen to spill counters the
+        // export's own reads inflate.
         pg_sample_checkpoints_req(&mut self.client).map(|v| v.max(0) as u64)
     }
 

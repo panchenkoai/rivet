@@ -792,19 +792,25 @@ impl Source for MssqlSource {
         })
     }
 
-    fn sample_pressure(&mut self) -> Option<u64> {
+    fn harm_counters(&mut self) -> Option<Vec<(String, i64)>> {
+        // Delegates to the inherent method (same name; inherent wins in
+        // method-call resolution, so this is a delegation, not recursion).
+        MssqlSource::harm_counters(self)
+    }
+
+    fn sample_governor_pressure(&mut self) -> Option<u64> {
         let Self { rt, client, .. } = self;
-        // Extraction-pressure proxy (Epic 18 C2): cumulative `Workfiles Created`
-        // + `Worktables Created` (SQLServer:Access Methods). A workfile /
-        // worktable is created when a sort or hash spills to tempdb — the SQL
-        // Server analogue of PG `temp_bytes` / MySQL `Created_tmp_disk_tables`.
-        // The `cntr_value` of these `*/sec`-named perfmon counters is the raw
-        // cumulative count, so their sum is monotonic — exactly what the governor
-        // compares deltas of. Replaces `Log Flush Waits`, which is redo-**write**
-        // pressure and barely moves during a read-only export. Instance-level
-        // (no per-database `instance_name`), so no parameter is bound.
-        let sql = "SELECT SUM(cntr_value) FROM sys.dm_os_performance_counters \
-                   WHERE counter_name IN ('Workfiles Created/sec', 'Worktables Created/sec')";
+        // FOREIGN-pressure proxy for the governor: cumulative `Log Flush
+        // Waits/sec` (redo-WRITE pressure). A read-only export barely moves it
+        // — which is exactly what the governor needs: the export's own
+        // tempdb worktable spills cannot talk it into shedding its own workers
+        // (field find, 2026-08-13 — see `Source::sample_governor_pressure`).
+        // The Databases object exposes one row PER DATABASE plus a `_Total`
+        // row (verified live: _Total == the sum of the others), so a SUM over
+        // all rows double-counts — and a dropped database SHRINKS it, reading
+        // as "pressure eased". Read the `_Total` row directly.
+        let sql = "SELECT cntr_value FROM sys.dm_os_performance_counters \
+                   WHERE counter_name LIKE 'Log Flush Waits%' AND instance_name = '_Total'";
         rt.block_on(async {
             let row = client.query(sql, &[]).await.ok()?.into_row().await.ok()??;
             row.get::<i64, _>(0).map(|v| v.max(0) as u64)
@@ -967,16 +973,6 @@ pub(crate) struct MssqlCdcProbe {
     pub instance_min_lsn: Option<String>,
     /// `None` ⇒ could not verify (no `VIEW SERVER STATE`).
     pub agent_running: Option<bool>,
-}
-
-/// Connect and snapshot MSSQL harm counters; see [`MssqlSource::harm_counters`].
-/// `None` on connect failure or a missing `VIEW SERVER STATE` grant.
-pub(crate) fn sample_harm_counters(
-    url: &str,
-    tls: Option<&TlsConfig>,
-) -> Option<Vec<(String, i64)>> {
-    let mut src = MssqlSource::connect_with_tls(url, tls).ok()?;
-    src.harm_counters()
 }
 
 /// Connect and check whether the login has `VIEW SERVER STATE` — used by

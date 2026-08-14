@@ -369,31 +369,64 @@ impl StateStore {
         }
     }
 
+    /// [`Self::get_last_success_metric`], excluding one run_id — the caller's
+    /// own freshly-recorded row, so a run can baseline against its
+    /// predecessor rather than itself.
+    pub fn get_last_success_metric_excluding(
+        &self,
+        export_name: &str,
+        exclude_run_id: &str,
+    ) -> Result<Option<ExportMetric>> {
+        let cols = "export_name, run_id, run_at, duration_ms, total_rows, peak_rss_mb, \
+                    status, error_message, tuning_profile, format, mode, \
+                    files_produced, bytes_written, retries, validated, schema_changed, \
+                    bytes_read";
+        Ok(self
+            .query(
+                &format!(
+                    "SELECT {cols} FROM export_metrics \
+                     WHERE export_name = ?1 AND status = 'success' \
+                       AND (run_id IS NULL OR run_id != ?2) \
+                     ORDER BY id DESC LIMIT 1"
+                ),
+                &[export_name.into(), exclude_run_id.into()],
+                metric_from_row,
+            )?
+            .into_iter()
+            .next())
+    }
+
+    /// The most recent SUCCESS row for `export_name`, regardless of how many
+    /// failed/interrupted attempts sit between it and now. A fixed recent
+    /// window (`get_metrics(_, N)`) goes blind after N consecutive failures —
+    /// exactly during the degraded period the pool predictor and the
+    /// run-over-run regression baseline exist for (bughunt 2026-08-13).
+    pub fn get_last_success_metric(&self, export_name: &str) -> Result<Option<ExportMetric>> {
+        let cols = "export_name, run_id, run_at, duration_ms, total_rows, peak_rss_mb, \
+                    status, error_message, tuning_profile, format, mode, \
+                    files_produced, bytes_written, retries, validated, schema_changed, \
+                    bytes_read";
+        Ok(self
+            .query(
+                &format!(
+                    "SELECT {cols} FROM export_metrics \
+                     WHERE export_name = ?1 AND status = 'success' \
+                     ORDER BY id DESC LIMIT 1"
+                ),
+                &[export_name.into()],
+                metric_from_row,
+            )?
+            .into_iter()
+            .next())
+    }
+
     pub fn get_metrics(
         &self,
         export_name: Option<&str>,
         limit: usize,
     ) -> Result<Vec<ExportMetric>> {
         // One projection, written once for both backends (was duplicated per arm).
-        let extract = |r: &dyn super::row::StateRow| ExportMetric {
-            export_name: r.text(0),
-            run_id: r.opt_text(1),
-            run_at: r.text(2),
-            duration_ms: r.i64(3),
-            total_rows: r.i64(4),
-            peak_rss_mb: r.opt_i64(5),
-            status: r.text(6),
-            error_message: r.opt_text(7),
-            tuning_profile: r.opt_text(8),
-            format: r.opt_text(9),
-            mode: r.opt_text(10),
-            files_produced: r.opt_i64(11).unwrap_or(0),
-            bytes_written: r.opt_i64(12).unwrap_or(0),
-            retries: r.opt_i64(13).unwrap_or(0),
-            validated: r.opt_bool(14),
-            schema_changed: r.opt_bool(15),
-            bytes_read: r.opt_i64(16).unwrap_or(0),
-        };
+        let extract = metric_from_row;
         let cols = "export_name, run_id, run_at, duration_ms, total_rows, peak_rss_mb, \
                     status, error_message, tuning_profile, format, mode, \
                     files_produced, bytes_written, retries, validated, schema_changed, \
@@ -412,6 +445,30 @@ impl StateStore {
                 extract,
             ),
         }
+    }
+}
+
+/// Shared row→struct projection for every `export_metrics` query, written once
+/// for both state backends.
+fn metric_from_row(r: &dyn super::row::StateRow) -> ExportMetric {
+    ExportMetric {
+        export_name: r.text(0),
+        run_id: r.opt_text(1),
+        run_at: r.text(2),
+        duration_ms: r.i64(3),
+        total_rows: r.i64(4),
+        peak_rss_mb: r.opt_i64(5),
+        status: r.text(6),
+        error_message: r.opt_text(7),
+        tuning_profile: r.opt_text(8),
+        format: r.opt_text(9),
+        mode: r.opt_text(10),
+        files_produced: r.opt_i64(11).unwrap_or(0),
+        bytes_written: r.opt_i64(12).unwrap_or(0),
+        retries: r.opt_i64(13).unwrap_or(0),
+        validated: r.opt_bool(14),
+        schema_changed: r.opt_bool(15),
+        bytes_read: r.opt_i64(16).unwrap_or(0),
     }
 }
 

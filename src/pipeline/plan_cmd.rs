@@ -231,7 +231,18 @@ pub fn run_plan_command(
     // pool would achieve from measured durations, so the operator can weigh it
     // against the wave count. Printed only when we have real durations for more
     // than one export (a single export has nothing to schedule).
-    print_pool_estimate(&artifacts, &state);
+    // The same parallel_safe the annotations write is what the pool print
+    // must model — the old preview hardcoded `true` "because no config is in
+    // scope", while the flags were computed twenty lines up (walk find,
+    // 2026-08-13): heavies then predicted M-way parallelism apply-time
+    // serialization can never reach.
+    // …and the RECOMMENDATION is not what apply reads: `fields_to_write`
+    // deliberately preserves a hand-set `parallel_safe:`, so the preview must
+    // model the value now ON DISK (bughunt 2026-08-14).
+    let safe_of = effective_parallel_safe(&recs, &config, &fields, &written);
+    if pool_estimate_is_printable(&format) {
+        print_pool_estimate(&artifacts, &safe_of, &state);
+    }
 
     emit_artifacts(&artifacts, &format, multi_export, config_path)?;
 
@@ -434,13 +445,12 @@ fn build_plan_artifact(
     Ok((artifact, inputs, recommendation))
 }
 
-/// Compute the `ComputedPlanData` portion of the artifact.
-///
-/// For `Chunked` exports this opens a source connection and calls
-/// `detect_and_generate_chunks` to pre-compute chunk boundaries.  No rows are
-/// exported — we only run the `SELECT min(col) / max(col)` boundary queries.
-///
-/// For `Incremental` exports we read the last cursor value from `StateStore`.
+/// Below this span the catalog is not allowed to override it: the F4
+/// fresh-ANALYZE case is a SMALL table whose garbage `reltuples` (1130 on a
+/// 30-row table) would otherwise win over an exact tiny span. A genuinely
+/// non-unique chunk key on a table worth chunking has a span far above this.
+const CATALOG_OVERRIDE_MIN_SPAN: i64 = 10_000;
+
 /// The row estimate a chunked plan reports, from the two available signals.
 ///
 /// * A MEASURED whole-table actual (a prior run's row count) always wins —
@@ -455,20 +465,45 @@ fn build_plan_artifact(
 ///   ~831M catalog rows as ~333M, feeding the pool's makespan prediction.
 ///   When the catalog is the smaller side (the sparse case, or F4's
 ///   fresh-ANALYZE garbage) the span still wins, exactly as before.
+/// * `span_is_exact` short-circuits ALL of it. Under `chunk_dense: true` the
+///   ranges are ORDINALS `1..row_count` built from a real `COUNT(*)` taken in
+///   this very plan ([`super::chunked::detect`]) — the span IS the row count,
+///   not a key range, so `rows > distinct keys` cannot happen and there is
+///   nothing for the catalog to correct. Letting `max()` win there publishes a
+///   STALE `reltuples` over a fresh exact count: a table that lost 90% of its
+///   rows without `ANALYZE` would be scheduled at its old size (bughunt
+///   2026-08-13). Same reason the measured-actual branch is skipped — a prior
+///   run's actual is older than this run's COUNT.
 fn chunked_row_estimate(
     key_span: Option<i64>,
     catalog: Option<i64>,
     measured: bool,
+    span_is_exact: bool,
 ) -> Option<i64> {
+    // An exact count needs no second opinion, in either direction.
+    if span_is_exact && let Some(span) = key_span {
+        return Some(span);
+    }
     if measured {
         return catalog.or(key_span);
     }
     match (key_span, catalog) {
-        (Some(span), Some(cat)) => Some(span.max(cat)),
+        (Some(span), Some(cat)) if span >= CATALOG_OVERRIDE_MIN_SPAN => Some(span.max(cat)),
+        // Tiny span: keep the exact span — a larger catalog here is the
+        // fresh-ANALYZE garbage shape, not evidence of a non-unique key
+        // (bughunt 2026-08-13 push-back on the max() rule).
+        (Some(span), Some(_)) => Some(span),
         (a, b) => a.or(b),
     }
 }
 
+/// Compute the `ComputedPlanData` portion of the artifact.
+///
+/// For `Chunked` exports this opens a source connection and calls
+/// `detect_and_generate_chunks` to pre-compute chunk boundaries.  No rows are
+/// exported — we only run the `SELECT min(col) / max(col)` boundary queries.
+///
+/// For `Incremental` exports we read the last cursor value from `StateStore`.
 fn compute_plan_data(
     plan: &crate::plan::ResolvedRunPlan,
     row_estimate: Option<i64>,
@@ -504,11 +539,21 @@ fn compute_plan_data(
                 .first()
                 .zip(chunk_ranges.last())
                 .map(|(first, last)| (last.1 - first.0 + 1).max(0));
+            // The span is an exact ROW count only on the dense path, whose
+            // ranges are ordinals `1..COUNT(*)`. `by_days` is checked FIRST in
+            // `detect_and_generate_chunks`, so a config with both set produces
+            // DAY ordinals — a day span is not a row count, hence the guard.
+            let span_is_exact = cp.dense && cp.by_days.is_none();
             Ok(ComputedPlanData {
                 chunk_ranges,
                 chunk_count,
                 cursor_snapshot: None,
-                row_estimate: chunked_row_estimate(chunked_estimate, row_estimate, row_is_measured),
+                row_estimate: chunked_row_estimate(
+                    chunked_estimate,
+                    row_estimate,
+                    row_is_measured,
+                    span_is_exact,
+                ),
             })
         }
 
@@ -535,77 +580,56 @@ fn compute_plan_data(
     }
 }
 
-/// Print the pool scheduler's predicted makespan (#166) beside the wave plan.
-/// Reads each export's last successful duration from the state store; skips
-/// silently when fewer than two exports have history (nothing to schedule).
-/// Pure core of `print_pool_estimate`: given each export's run history
-/// (`(status, duration_ms)` rows, newest first), keep the most-recent
-/// **successful** run of each and convert it to a `PoolItem`. Returns `None`
-/// when fewer than two exports have a success on record — nothing to schedule,
-/// so the estimate is skipped.
+/// Print the pool scheduler's predicted makespan (#166) beside the wave plan,
+/// from the SAME predictor `apply --pool` schedules with
+/// ([`super::pool::predict_items`]) — the preview and the schedule are one
+/// number by construction. History-less exports are included at the
+/// placeholder (the old preview excluded them, so its makespan covered less
+/// work than the wave plan beside it); when any prediction rests on a
+/// placeholder or a failed attempt, the print says LOWER BOUND, mirroring
+/// `run_pool`'s accounting.
+/// May the pool advisory be printed for this output format?
 ///
-/// Extracted so the mutation gate can bite the three decisions the display
-/// glue used to hide: the `status == "success"` filter, the ms→s divide, and
-/// the `< 2` skip. RED-proven by `pool_items_from_history_*`.
-fn pool_items_from_history(
-    per_export: &[(String, Vec<(String, i64)>)],
-) -> Option<Vec<super::pool::PoolItem>> {
-    let items: Vec<super::pool::PoolItem> = per_export
-        .iter()
-        .filter_map(|(name, history)| {
-            let dur_ms = history
-                .iter()
-                .find(|(status, _)| status == "success")
-                .map(|(_, ms)| *ms)?;
-            Some(super::pool::PoolItem {
-                name: name.clone(),
-                predicted_secs: (dur_ms as f64 / 1000.0).max(0.001),
-                // This history-only preview has no config in scope, so it cannot
-                // read parallel_safe; assume safe (optimistic). The authoritative
-                // heavy-serialization-aware prediction is run_pool's at apply time
-                // (#166/#167 C3), where the real flag is known.
-                parallel_safe: true,
-            })
-        })
-        .collect();
-    if items.len() < 2 {
-        return None;
-    }
-    Some(items)
+/// `--format json` with no `--output` makes STDOUT the machine document: a
+/// human advisory printed beside it turns the stream into two documents, and
+/// `serde_json`/`jq` reject the whole thing. This used to be latent — the
+/// advisory required MEASURED durations, so a fresh config never reached it —
+/// until the predictor gained placeholder estimates and started printing for
+/// every multi-export plan (live-suite catch on this branch). The decision is
+/// a pure fn so it is unit-testable; the print itself writes to stdout and
+/// cannot be observed in-process.
+fn pool_estimate_is_printable(format: &PlanOutputFormat) -> bool {
+    !matches!(format, PlanOutputFormat::Json(None))
 }
 
-fn print_pool_estimate(artifacts: &[PlanArtifact], state: &StateStore) {
-    let per_export: Vec<(String, Vec<(String, i64)>)> = artifacts
+fn print_pool_estimate(
+    artifacts: &[PlanArtifact],
+    safe_of: &std::collections::HashMap<String, bool>,
+    state: &StateStore,
+) {
+    if artifacts.len() < 2 {
+        return; // a single export has nothing to schedule
+    }
+    let predicted = super::pool::predict_items(
+        state,
+        artifacts.iter().map(|a| {
+            (
+                a.export_name.as_str(),
+                safe_of.get(&a.export_name).copied().unwrap_or(false),
+            )
+        }),
+        &std::collections::HashMap::new(),
+    );
+    let items: Vec<super::pool::PoolItem> = predicted.iter().map(|(i, _)| i.clone()).collect();
+    let measured = predicted
         .iter()
-        .map(|a| {
-            let history = state
-                .get_metrics(Some(&a.export_name), 20)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|m| (m.status, m.duration_ms))
-                .collect();
-            (a.export_name.clone(), history)
-        })
-        .collect();
-    let Some(items) = pool_items_from_history(&per_export) else {
-        return;
-    };
+        .filter(|(_, f)| matches!(f, super::pool::PredictedFrom::Measured(_)))
+        .count();
+    let estimated = predicted.len() - measured;
     let total: f64 = items.iter().map(|i| i.predicted_secs).sum();
-    // Honesty: the estimate covers only exports with run history — a config with
-    // newly-added tables schedules more work than this, so an operator comparing
-    // the pool number against the (all-inclusive) wave plan must see the gap
-    // (roast 2026-08-09).
-    let excluded = per_export.len().saturating_sub(items.len());
-    let excluded_note = if excluded > 0 {
-        format!("; {excluded} without history excluded — real makespan is higher")
-    } else {
-        String::new()
-    };
     println!(
-        "\n  Pool scheduler (measured, {} of {} export(s) with history{}):",
-        items.len(),
-        per_export.len(),
-        excluded_note
+        "\n  Pool scheduler ({measured} measured, {estimated} estimated of {} export(s)):",
+        predicted.len(),
     );
     println!("    sequential: {:.0} min", total / 60.0);
     for m in [2usize, 4, 6] {
@@ -617,8 +641,15 @@ fn print_pool_estimate(artifacts: &[PlanArtifact], state: &StateStore) {
             floor / 60.0
         );
     }
+    if estimated > 0 {
+        println!(
+            "    prediction is a LOWER BOUND: {estimated} export(s) have no successful run to \
+             measure from — it tightens as runs complete"
+        );
+    }
     println!(
-        "    (a bounded work-stealing pool; --annotate-waves packs the wave          alternative — see #166)"
+        "    (a bounded work-stealing pool; --annotate-waves packs the wave \
+         alternative — see #166)"
     );
 }
 
@@ -845,6 +876,52 @@ fn fields_to_write(
     (fields, preserved)
 }
 
+/// What `apply --pool` will read for `parallel_safe` on each export AFTER this
+/// plan run finished writing — the value the preview must model.
+///
+/// The recommendation is NOT that value. `fields_to_write` preserves a hand-set
+/// `parallel_safe:` (the operator's decision, #150 config-clobber class), so a
+/// config that says `true` on an export the cost model rates High keeps `true`
+/// on disk while `recs` says `false`. Sourcing the preview from `recs` made the
+/// preview apply the C3 heavy-serialization floor to an export apply runs
+/// M-way (preview 90 min, real 30) — and inverted, advertised parallelism apply
+/// serializes, the exact defect the C3 model fixed on the apply side
+/// (bughunt 2026-08-14). Three inputs, one rule per export:
+///
+///  * this run WROTE `parallel_safe` for it (blank field, or `--annotate-waves`
+///    overwriting, AND a `- name:` line actually matched) → the recommendation
+///    is now on disk;
+///  * otherwise the config's own value survives;
+///  * otherwise the field is absent from the file and `apply` reads
+///    `unwrap_or(false)` — including the case where the write was attempted but
+///    matched no `- name:` line (the `unmatched` warning above).
+fn effective_parallel_safe(
+    recs: &[(String, u32, bool)],
+    config: &Config,
+    fields: &ExportFields,
+    written: &std::collections::HashSet<String>,
+) -> HashMap<String, bool> {
+    recs.iter()
+        .map(|(name, _, rec_safe)| {
+            let wrote_safe = written.contains(name)
+                && fields
+                    .get(name)
+                    .is_some_and(|items| items.iter().any(|(k, _)| *k == "parallel_safe"));
+            let effective = if wrote_safe {
+                *rec_safe
+            } else {
+                config
+                    .exports
+                    .iter()
+                    .find(|e| &e.name == name)
+                    .and_then(|e| e.parallel_safe)
+                    .unwrap_or(false)
+            };
+            (name.clone(), effective)
+        })
+        .collect()
+}
+
 fn write_plan_fields_to_config(
     config_path: &str,
     fields: &ExportFields,
@@ -947,7 +1024,7 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        ExportFields, apply_field_annotations, fields_to_write, pool_items_from_history,
+        ExportFields, apply_field_annotations, effective_parallel_safe, fields_to_write,
         refuse_annotate_scoped_to_export, repack_from_history,
     };
 
@@ -1136,50 +1213,12 @@ mod tests {
         );
     }
 
-    /// The pool estimate reads history through `pool_items_from_history`; these
-    /// pin the three decisions the mutation gate flagged as unguarded display
-    /// glue: the `status == "success"` filter, the ms→s divide, and the `< 2`
-    /// skip. Each assertion goes RED against the mutant named beside it.
-    #[test]
-    fn pool_items_from_history_keeps_only_the_latest_success_and_converts_ms() {
-        // Two exports, each newest-first history. "big" has a failed newer run
-        // ahead of its success — the `== "success"` filter (mutant `!=`) must
-        // skip the failure and take the success.
-        let per_export = vec![
-            (
-                "big".to_string(),
-                vec![
-                    ("failed".to_string(), 999_000),
-                    ("success".to_string(), 120_000),
-                ],
-            ),
-            ("small".to_string(), vec![("success".to_string(), 30_000)]),
-        ];
-        let items = pool_items_from_history(&per_export).expect("two successes → Some");
-        assert_eq!(items.len(), 2);
-        let big = items.iter().find(|i| i.name == "big").unwrap();
-        // 120_000 ms / 1000 = 120 s — kills `/`→`*`/`%` (443) and the `!=`
-        // filter (would have taken the 999_000 failure → 999.0).
-        assert_eq!(big.predicted_secs, 120.0);
-        let small = items.iter().find(|i| i.name == "small").unwrap();
-        assert_eq!(small.predicted_secs, 30.0);
-    }
-
-    #[test]
-    fn pool_items_from_history_skips_when_fewer_than_two_have_history() {
-        // One export with a success, one with only a failure → a single item.
-        // The `< 2` skip (mutants `==`/`>`/`<=`) must return None: with `>` or
-        // `<=` a one-item schedule would print, and `==` would skip the valid
-        // two-item case above.
-        let one = vec![
-            ("only".to_string(), vec![("success".to_string(), 10_000)]),
-            ("nope".to_string(), vec![("failed".to_string(), 5_000)]),
-        ];
-        assert!(pool_items_from_history(&one).is_none());
-        // Zero items → None as well.
-        assert!(pool_items_from_history(&[]).is_none());
-    }
-
+    /// The plan preview and apply --pool now share ONE predictor
+    /// ([`crate::pipeline::pool::predict_items`]) — its decisions (success
+    /// filter, ms→s, placeholder inclusion) are pinned in pool.rs beside the
+    /// implementation. What remains plan-side is only the wiring pinned by
+    /// `print_pool_estimate`'s callsite (real `parallel_safe` map + the
+    /// artifacts iterator), which the drift this closed lived in.
     /// The additive contract (#150): plan fills BLANKS; a value the operator
     /// set is untouched unless `--annotate-waves` says overwrite. Per FIELD —
     /// a hand-set `wave:` with no `parallel_safe:` gets only the missing half.
@@ -1252,6 +1291,88 @@ mod tests {
                 .map(|(k, _)| *k)
                 .collect::<Vec<_>>(),
             vec!["wave", "parallel_safe"]
+        );
+    }
+
+    /// The preview and the schedule must be ONE number: `plan`'s pool print
+    /// models the `parallel_safe` that is on DISK after the annotations were
+    /// written, not the recommendation — because `fields_to_write` deliberately
+    /// preserves a hand-set flag (the test directly above pins that
+    /// preservation, and that is exactly the state where the two disagreed).
+    ///
+    /// Fixture carries THREE exports, one per branch of the rule, because the
+    /// subject is a per-export fold: a hand-set flag that must WIN over the
+    /// rec, a blank one whose write LANDED (rec wins), and a blank one whose
+    /// write matched no `- name:` line (nothing on disk → `apply` reads
+    /// `unwrap_or(false)`).
+    ///
+    /// RED-proven against the pre-fix source — `recs.iter().map(|(n, _, s)| (n,
+    /// *s))` — which reports `hand_tuned = true` and `unmatched = true` where
+    /// apply reads `false` / `false`.
+    #[test]
+    fn pool_preview_models_the_parallel_safe_apply_will_read_not_the_recommendation() {
+        let source = crate::config::SourceConfig {
+            source_type: crate::config::SourceType::Postgres,
+            url: Some("postgresql://localhost/test".into()),
+            url_env: None,
+            url_file: None,
+            host: None,
+            port: None,
+            user: None,
+            password: None,
+            password_env: None,
+            database: None,
+            environment: None,
+            tuning: None,
+            tls: None,
+            mongo: None,
+        };
+        let mut cfg = crate::config::Config {
+            source,
+            exports: vec![
+                crate::config::sample_export("hand_tuned"),
+                crate::config::sample_export("blank"),
+                crate::config::sample_export("unmatched"),
+            ],
+            notifications: None,
+            parallel_exports: false,
+            parallel_export_processes: false,
+            load: None,
+        };
+        // The operator's decision: independent rows, run me concurrently.
+        cfg.exports[0].wave = Some(7);
+        cfg.exports[0].parallel_safe = Some(false);
+        // The recommendation disagrees with the config on every export.
+        let recs = vec![
+            ("hand_tuned".to_string(), 2, true),
+            ("blank".to_string(), 2, true),
+            ("unmatched".to_string(), 2, true),
+        ];
+        let (fields, _preserved) = fields_to_write(&recs, &cfg, false);
+        assert!(
+            fields.contains_key("unmatched"),
+            "the fixture must ATTEMPT the write it then fails to match"
+        );
+        // `write_plan_fields_to_config` returns only the names whose `- name:`
+        // line matched; a templated/oddly-quoted name writes nothing.
+        let written: std::collections::HashSet<String> =
+            ["blank".to_string()].into_iter().collect();
+
+        let safe = effective_parallel_safe(&recs, &cfg, &fields, &written);
+        assert_eq!(
+            safe.get("hand_tuned"),
+            Some(&false),
+            "a hand-set flag is what apply reads — the rec was never written"
+        );
+        assert_eq!(
+            safe.get("blank"),
+            Some(&true),
+            "a blank field the plan just filled reads back as the rec"
+        );
+        assert_eq!(
+            safe.get("unmatched"),
+            Some(&false),
+            "nothing landed on disk, so apply's `unwrap_or(false)` is the truth"
         );
     }
 
@@ -1360,6 +1481,25 @@ mod tests {
         );
     }
 
+    /// The pool advisory must never share STDOUT with the machine document.
+    ///
+    /// `rivet plan --format json` (no `--output`) makes stdout ONE JSON
+    /// document; the advisory printed before it produced "expected value at
+    /// line 2 column 3" for every multi-export config once the predictor
+    /// started estimating from placeholders instead of requiring measured
+    /// history. RED against `!matches!(..)` -> `true` (the shipped state).
+    #[test]
+    fn the_pool_advisory_never_shares_stdout_with_the_json_document() {
+        use super::{PlanOutputFormat, pool_estimate_is_printable};
+        // stdout carries the document — nothing else may be written there.
+        assert!(!pool_estimate_is_printable(&PlanOutputFormat::Json(None)));
+        // A file target leaves stdout free for the human lines.
+        assert!(pool_estimate_is_printable(&PlanOutputFormat::Json(Some(
+            "plan.json".to_string()
+        ))));
+        assert!(pool_estimate_is_printable(&PlanOutputFormat::Pretty));
+    }
+
     /// Field find (2026-08-13 pool dogfood): a chunked export on a NON-UNIQUE
     /// key (a versioned table, ~2.5 rows per key value) has `catalog > span`,
     /// and the old span-always-wins rule under-reported ~831M rows as the
@@ -1369,24 +1509,74 @@ mod tests {
         use super::chunked_row_estimate;
         // catalog > span ⇒ rows > distinct keys ⇒ the span is only a floor.
         assert_eq!(
-            chunked_row_estimate(Some(333_000_000), Some(831_000_000), false),
+            chunked_row_estimate(Some(333_000_000), Some(831_000_000), false, false),
             Some(831_000_000),
         );
         // Sparse key (#149 shape): span dwarfs the catalog — span still wins,
         // exactly the pre-existing behavior (over-estimating is the safe
         // direction for scheduling; the catalog is not trusted to shrink it).
         assert_eq!(
-            chunked_row_estimate(Some(342_000_000), Some(520_000), false),
+            chunked_row_estimate(Some(342_000_000), Some(520_000), false, false),
             Some(342_000_000),
         );
         // A measured whole-table actual beats the span in either direction.
         assert_eq!(
-            chunked_row_estimate(Some(342_000_000), Some(520_000), true),
+            chunked_row_estimate(Some(342_000_000), Some(520_000), true, false),
             Some(520_000),
         );
+        // F4 fresh-ANALYZE shape: tiny exact span, garbage catalog above it —
+        // the span must survive (the catalog override is gated on a span big
+        // enough to be worth chunking).
+        assert_eq!(
+            chunked_row_estimate(Some(30), Some(1130), false, false),
+            Some(30)
+        );
         // Missing signals degrade to whichever side exists.
-        assert_eq!(chunked_row_estimate(Some(42), None, false), Some(42));
-        assert_eq!(chunked_row_estimate(None, Some(42), false), Some(42));
-        assert_eq!(chunked_row_estimate(None, None, false), None);
+        assert_eq!(chunked_row_estimate(Some(42), None, false, false), Some(42));
+        assert_eq!(chunked_row_estimate(None, Some(42), false, false), Some(42));
+        assert_eq!(chunked_row_estimate(None, None, false, false), None);
+    }
+
+    /// `chunk_dense: true` makes the span an EXACT `COUNT(*)` over ordinals
+    /// `1..row_count`, so no catalog figure — and no older measured actual —
+    /// may override it. Bughunt 2026-08-13: the `span.max(catalog)` rule was
+    /// written for a KEY span (where `catalog > span` proves a non-unique key);
+    /// applied to a dense span it republishes a stale `reltuples`, so a table
+    /// that lost 90% of its rows without `ANALYZE` schedules at its old size.
+    /// Both directions are asserted — a fold that only checked the larger side
+    /// would pass on `max()` alone.
+    #[test]
+    fn a_dense_span_is_an_exact_count_and_no_catalog_may_override_it() {
+        use super::chunked_row_estimate;
+        // Stale catalog ABOVE the fresh exact count (the 90%-deleted table):
+        // the count wins. RED against `span.max(cat)` reaching the dense path.
+        assert_eq!(
+            chunked_row_estimate(Some(120_000), Some(1_200_000), false, true),
+            Some(120_000),
+        );
+        // Catalog BELOW it (the ordinary lagging-stats direction): unchanged.
+        assert_eq!(
+            chunked_row_estimate(Some(1_200_000), Some(120_000), false, true),
+            Some(1_200_000),
+        );
+        // A prior run's MEASURED actual is older than this plan's COUNT(*),
+        // so the exact count outranks it too (RED against an early
+        // `if measured` return).
+        assert_eq!(
+            chunked_row_estimate(Some(120_000), Some(1_200_000), true, true),
+            Some(120_000),
+        );
+        // Small dense tables take the same path — the tiny-span carve-out for
+        // fresh-ANALYZE garbage is subsumed, not contradicted.
+        assert_eq!(
+            chunked_row_estimate(Some(30), Some(1130), false, true),
+            Some(30)
+        );
+        // An empty dense table yields no ranges → no span; the catalog is all
+        // that is left, exactly as on the non-dense path.
+        assert_eq!(
+            chunked_row_estimate(None, Some(1130), false, true),
+            Some(1130)
+        );
     }
 }
