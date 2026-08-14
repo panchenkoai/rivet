@@ -93,10 +93,15 @@ scenarios:
       shipped with zero live coverage. Covered now on two layers: the branch itself by
       `checkpoints_req_sql_matches_the_servers_catalog` (offline, pure fn) and the real
       catalog by `pg18_governor_samples_the_modern_checkpointer_catalog` (live, skips when
-      the optional dev/stand pg18-batch on :5518 is down). STILL OPEN on the same axis: the
-      governor's ability to SHED is proven on PostgreSQL only — MySQL (Innodb_log_waits) and
-      SQL Server (Log Flush Waits/sec _Total) carry must-not-shed canaries plus a readability
-      assert, which a permanently-zero counter also satisfies."
+      the optional dev/stand pg18-batch on :5518 is down). The SHED half of the same axis: proven on
+      PostgreSQL (governor_backs_off_under_concurrent_write_pressure) and now on MySQL
+      (mysql_governor_backs_off_under_real_redo_pressure — innodb_log_buffer_size shrunk to
+      its 256 KB minimum plus a foreign blob writer, with an activation guard on the counter
+      delta). That test is the one that catches the hazard the round-3 critic named: under a
+      mutant that makes the MySQL sampler read permanently flat, BOTH pre-existing MySQL
+      canaries stay GREEN and only this test goes RED — a must-not-shed assertion cannot
+      tell a working signal from a dead one. STILL OPEN: SQL Server (Log Flush Waits/sec
+      _Total) has no shed test, so the same mutant would pass there."
     single:         { na: "single has no worker fan-out to govern (parallel is a multi-part-runner concept)" }
     chunked:        { test: governor_backs_off_under_concurrent_write_pressure }
     keyset:         { test: keyset_governor_backs_off_under_concurrent_write_pressure }

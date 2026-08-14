@@ -1013,3 +1013,210 @@ fn pg_modern_exec(sql: &str) {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+/// The governor SHEDS on MySQL, under real redo pressure it did not create.
+///
+/// The completeness critic of the round-3 bughunt named this gap: the
+/// governor's ability to BACK OFF was proven on PostgreSQL only. MySQL's new
+/// foreign signal (`Innodb_log_waits`) was covered by must-not-shed canaries
+/// plus a readability assert — and a counter that is permanently ZERO satisfies
+/// both. `Innodb_log_waits` ticks only when the redo log buffer fills and a
+/// thread must wait for a flush, which never happens on a default 16 MB buffer
+/// under test-sized load, so "no shed" proved nothing about the mechanism.
+///
+/// The fixture makes the signal move for real: `innodb_log_buffer_size` is
+/// shrunk to its 256 KB minimum for the test's duration (restored by a Drop
+/// guard on every exit path) and a background writer streams 256 KB blobs into
+/// a SCRATCH table — never the exported one, so the export's own rows are not
+/// the pressure. Measured on the dev stand before writing the test: the counter
+/// went 12 -> 390 in 2.4 s under exactly this shape, and stayed flat without
+/// the shrink.
+///
+/// Three assertions, in the order that makes each meaningful:
+///  1. the governor ARMED (otherwise the rest grades nothing),
+///  2. the counter really moved (the activation guard — an inert fixture must
+///     fail here rather than quietly pass the shed assertion),
+///  3. it BACKED OFF at least once.
+///
+/// Attribution honesty: `Innodb_log_waits` is a GLOBAL counter with no session
+/// twin (InnoDB status variables ignore `SHOW SESSION STATUS`), so the delta in
+/// (2) cannot be isolated to this test the way the spill test's session probe
+/// can. Both cross-process locks are therefore load-bearing here, not
+/// belt-and-suspenders: `quiet_window_guard` serialises every timing/pressure
+/// test, and `mysql_globals_guard` serialises the server-wide flip.
+#[test]
+#[ignore = "live: requires docker compose mysql"]
+fn mysql_governor_backs_off_under_real_redo_pressure() {
+    use mysql::prelude::Queryable;
+
+    require_alive(LiveService::Mysql);
+    let _quiet = quiet_window_guard();
+    let _globals = mysql_globals_guard();
+
+    // Globals need SYSTEM_VARIABLES_ADMIN — the app user deliberately lacks it,
+    // so the flip runs as root (compose: MYSQL_ROOT_PASSWORD=rivet).
+    const MYSQL_ROOT_URL: &str = "mysql://root:rivet@127.0.0.1:3306/rivet";
+    struct RedoBuffer(u64);
+    impl Drop for RedoBuffer {
+        fn drop(&mut self) {
+            if let Ok(pool) = mysql::Pool::new(MYSQL_ROOT_URL)
+                && let Ok(mut c) = pool.get_conn()
+            {
+                let _ = c.query_drop(format!("SET GLOBAL innodb_log_buffer_size = {}", self.0));
+            }
+        }
+    }
+    let mut root = mysql::Pool::new(MYSQL_ROOT_URL)
+        .expect("root pool")
+        .get_conn()
+        .expect("root conn");
+    let prior_buffer: u64 = {
+        let rows: Vec<(String, String)> = root
+            .query("SHOW GLOBAL VARIABLES LIKE 'innodb_log_buffer_size'")
+            .expect("read innodb_log_buffer_size");
+        rows.first()
+            .and_then(|(_, v)| v.parse().ok())
+            .unwrap_or(16_777_216)
+    };
+    root.query_drop("SET GLOBAL innodb_log_buffer_size = 262144")
+        .expect("shrink the redo log buffer");
+    let _restore = RedoBuffer(prior_buffer);
+
+    let log_waits = |c: &mut mysql::PooledConn| -> u64 {
+        let rows: Vec<(String, u64)> = c
+            .query("SHOW GLOBAL STATUS LIKE 'Innodb_log_waits'")
+            .expect("sample Innodb_log_waits");
+        rows.first().map(|(_, v)| *v).unwrap_or(0)
+    };
+
+    const ROWS: i64 = 20_000;
+    let table = seed_mysql_numeric_table(ROWS);
+    let scratch = format!("{}_redo", table.name());
+    root.query_drop(format!(
+        "CREATE TABLE {scratch} (id BIGINT AUTO_INCREMENT PRIMARY KEY, payload LONGBLOB) \
+         ENGINE=InnoDB"
+    ))
+    .expect("create the redo-pressure scratch table");
+
+    // Background writer: 8 x 256 KB blobs per statement is ~2 MB of redo
+    // against a 256 KB buffer, so each statement forces several waits. It
+    // writes to the SCRATCH table, never the exported one — the pressure must
+    // be FOREIGN, which is the whole point of the signal split.
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer = {
+        let stop = Arc::clone(&stop);
+        let scratch = scratch.clone();
+        std::thread::spawn(move || {
+            let Ok(pool) = mysql::Pool::new(MYSQL_ROOT_URL) else {
+                return;
+            };
+            let Ok(mut c) = pool.get_conn() else { return };
+            let values = std::iter::repeat_n("(REPEAT(0x61, 262144))", 8)
+                .collect::<Vec<_>>()
+                .join(",");
+            while !stop.load(Ordering::Relaxed) {
+                let _ = c.query_drop(format!("INSERT INTO {scratch} (payload) VALUES {values}"));
+                // Keep the table from growing without bound over the run.
+                let _ = c.query_drop(format!("DELETE FROM {scratch} ORDER BY id ASC LIMIT 8"));
+            }
+        })
+    };
+
+    // Let the writer drive the counter up before rivet starts, so the
+    // governor's first sample PAIR already spans rising pressure.
+    std::thread::sleep(Duration::from_millis(500));
+    let waits_before = log_waits(&mut root);
+
+    let out_dir = tempfile::tempdir().unwrap();
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let yaml = format!(
+        r#"
+source:
+  type: mysql
+  url: "{MYSQL_URL}"
+  tuning:
+    adaptive: true
+    min_parallel: 2
+    batch_size: 250
+    throttle_ms: 100
+exports:
+  - name: {name}
+    query: "SELECT id, name, amount FROM {name}"
+    mode: chunked
+    chunk_column: id
+    chunk_size: 1000
+    parallel: 8
+    format: parquet
+    destination:
+      type: local
+      path: {out}
+"#,
+        name = table.name(),
+        out = out_dir.path().display(),
+    );
+    let cfg = write_config(&cfg_dir, &yaml);
+
+    let log_path = cfg_dir.path().join("rivet.stderr");
+    let log_file = std::fs::File::create(&log_path).unwrap();
+    let mut child = std::process::Command::new(RIVET_BIN)
+        .args([
+            "run",
+            "--config",
+            cfg.to_str().unwrap(),
+            "--export",
+            table.name(),
+        ])
+        .env("RUST_LOG", "info")
+        .env("RIVET_GOVERNOR_INTERVAL_MS", "200")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::from(log_file))
+        .spawn()
+        .expect("spawn rivet run");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    let status = loop {
+        match child.try_wait().expect("try_wait on rivet child") {
+            Some(s) => break s,
+            None if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                stop.store(true, Ordering::Relaxed);
+                let _ = writer.join();
+                panic!("governed MySQL run under redo pressure did not finish within 120s");
+            }
+            None => std::thread::sleep(Duration::from_millis(100)),
+        }
+    };
+
+    let waits_after = log_waits(&mut root);
+    stop.store(true, Ordering::Relaxed);
+    writer.join().expect("writer thread");
+    let _ = root.query_drop(format!("DROP TABLE IF EXISTS {scratch}"));
+
+    let stderr = std::fs::read_to_string(&log_path).unwrap_or_default();
+    assert!(
+        status.success(),
+        "the governed run must still complete under redo pressure; stderr:\n{stderr}"
+    );
+    assert_governor_awake(&stderr, "mysql");
+    // Activation guard BEFORE the shed assertion: without it, a fixture that
+    // stopped moving the counter would make the shed assertion silently
+    // untestable rather than red.
+    let delta = waits_after.saturating_sub(waits_before);
+    assert!(
+        delta >= 10,
+        "fixture went inert: Innodb_log_waits moved by {delta} across the run, so the \
+         governor had no rising foreign signal to react to and the shed assertion below \
+         would grade nothing (is innodb_log_buffer_size still shrunk? did the writer \
+         connect?)"
+    );
+    assert!(
+        stderr.contains("backed off"),
+        "under rising Innodb_log_waits the governor must shed at least one worker; \
+         counter moved by {delta}; stderr:\n{stderr}"
+    );
+    assert_eq!(
+        duckdb_total_parquet_rows(out_dir.path()),
+        ROWS as usize,
+        "every exported row must round-trip while the governor is shedding"
+    );
+}
