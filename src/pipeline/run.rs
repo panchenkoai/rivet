@@ -340,7 +340,10 @@ pub fn run(
                     started_at,
                     finished_at,
                     Some(config_path),
-                    "parallel-processes",
+                    // From the count that ran at once, never the flag: one
+                    // child per export, all spawned before any is joined (see
+                    // [`run_mode_label`]).
+                    run_mode_label(exports.len(), true),
                 );
                 aggregate::print(&agg);
                 self_check_throughput(&state, &agg.per_export, &agg.parallel_mode);
@@ -393,6 +396,10 @@ pub fn run(
     // window ends when the exports do, not when the counter probe returns.
     // `None` on the sequential path, which opens no bracket.
     let mut window_end: Option<chrono::DateTime<chrono::Utc>> = None;
+    // How many exports ran AT ONCE — the measurement the run's mode label is
+    // derived from (see [`run_mode_label`]). 1 until a concurrent path raises
+    // it, so the sequential loop below cannot claim a concurrency it never had.
+    let mut peak_concurrency = 1usize;
 
     if run_parallel {
         log::info!(
@@ -448,6 +455,10 @@ pub fn run(
                     job::run_export_job(config_path, &config, export, &state, &config_dir, &opts)
                 }));
             }
+            // Every thread is spawned before any is joined, so the number of
+            // live handles IS the overlap this run reached — counted, not
+            // assumed from `run_parallel`.
+            peak_concurrency = peak_concurrency.max(handles.len());
             for h in handles {
                 match h.join() {
                     Ok(pair) => collected.lock().unwrap().push(pair),
@@ -522,11 +533,11 @@ pub fn run(
     // expands to NO children, and the previous `> 1` / `== 1` pair matched
     // neither, so `--json` printed nothing and `--summary-output` was never
     // created — on a run that exited 0 (bughunt 2026-08-14).
-    let parallel_mode = if run_parallel {
-        "parallel-threads"
-    } else {
-        "sequential"
-    };
+    // From the overlap this run REACHED, not from `run_parallel` — the label
+    // decides whether the throughput self-check keeps its actionable tail or
+    // excuses a regression as source sharing, so it is a measurement (see
+    // [`run_mode_label`]).
+    let parallel_mode = run_mode_label(peak_concurrency, false);
     let entries: Vec<_> = summaries
         .iter()
         .map(aggregate::entry_from_summary)
@@ -940,40 +951,70 @@ pub(super) fn wave_mode_label(peak: usize) -> &'static str {
     }
 }
 
+/// The widest overlap a pool of `slots` can reach over `safe` parallel-safe and
+/// `heavy` non-`parallel_safe` exports — the pool's sibling of the wave's
+/// "widest batch" peak, and derived the same way: from the SHAPE of the work,
+/// not from the invocation.
+///
+/// [`next_eligible`] never lets two heavies co-run, so heavies contribute at
+/// most ONE to the overlap however many are queued. The default config is
+/// exactly this case: `parallel_safe` is `Option<bool>` and
+/// [`is_parallel_safe`] reads `unwrap_or(false)`, so a hand-written config with
+/// no `rivet plan` cost classes makes EVERY export heavy — `--pool 5` over
+/// eight of them peaks at 1 and each worker but one sleeps in the
+/// `next_eligible` retry loop. `slots.min(pending)` called that a pool run
+/// (round-5 bughunt).
+///
+/// Structural, not sampled, and deliberately so: the same value must be known
+/// BEFORE the workers start (`MULTI_EXPORT_CONCURRENT` gates every per-export
+/// DIAGNOSIS hedge) and read again after they join (the harm frame, the mode
+/// label). A runtime `fetch_max` peak could only feed the latter two, and the
+/// three surfaces disagreeing about one run is the defect [`pool_is_concurrent`]
+/// exists to prevent.
+fn pool_peak_concurrency(slots: usize, safe: usize, heavy: usize) -> usize {
+    slots.min(safe + heavy.min(1))
+}
+
 /// Did the pool actually OVERLAP any work?
 ///
 /// `--pool 1`, or a single pending export left after the `--resume` skip, runs
-/// strictly serially however many slots were asked for. ONE predicate because
+/// strictly serially however many slots were asked for — and so does a pool
+/// whose queue is all heavy ([`pool_peak_concurrency`]). ONE predicate because
 /// THREE surfaces answer to it and must not disagree about the same run: the
 /// per-export DIAGNOSIS hedge (`MULTI_EXPORT_CONCURRENT`), the run-level harm
 /// frame ([`pool_harm_window`]) and the aggregate's mode label
 /// ([`pool_mode_label`]). Only the first read it before 2026-08-14, so a solo
 /// export got a correct un-hedged per-export attribution AND a second,
 /// flag-framed run-level line about the same spill.
-fn pool_is_concurrent(slots: usize, pending: usize) -> bool {
-    slots.min(pending) > 1
+fn pool_is_concurrent(slots: usize, safe: usize, heavy: usize) -> bool {
+    pool_peak_concurrency(slots, safe, heavy) > 1
 }
 
 /// The window a POOL run actually presented to the source — the pool's sibling
 /// of [`wave_harm_window`], and for the same reason: the frame is a concurrency
 /// claim, so it must come from the concurrency, not from `--pool N`.
 ///
-/// `--pool 5 --resume` with one export left, or `--pool 1` over eight, never
-/// overlapped anything; framing those as a pool window names "`--pool` slots"
-/// as the FIRST lever, which tells the operator to shrink a 1 (or to shrink
-/// five slots of which one was ever used) and pushes the two levers that DO
-/// work — `chunk_size`, `tuning.batch_size` — behind a lie. That is verbatim
-/// the harm [`HarmWindow::Serial`] was introduced for one runner over.
+/// `--pool 5 --resume` with one export left, `--pool 1` over eight, or a queue
+/// of eight heavies that serialize against each other, never overlapped
+/// anything; framing those as a pool window names "`--pool` slots" as the FIRST
+/// lever, which tells the operator to shrink a 1 (or to shrink five slots of
+/// which one was ever used) and pushes the two levers that DO work —
+/// `chunk_size`, `tuning.batch_size` — behind a lie. That is verbatim the harm
+/// [`HarmWindow::Serial`] was introduced for one runner over.
 ///
 /// `None` when the pool drained nothing, matching the wave rule: rivet's window
 /// then contains none of rivet's work, so a spill in it is foreign.
-fn pool_harm_window(slots: usize, pending: usize) -> Option<HarmWindow> {
+fn pool_harm_window(slots: usize, safe: usize, heavy: usize) -> Option<HarmWindow> {
+    let pending = safe + heavy;
     if pending == 0 {
         return None;
     }
-    Some(if pool_is_concurrent(slots, pending) {
+    Some(if pool_is_concurrent(slots, safe, heavy) {
         HarmWindow::Pool {
             exports: pending,
+            // The lever the operator can actually turn is the flag they typed;
+            // the peak may be narrower than it (heavies cap their own share),
+            // and lowering `--pool` still sheds the safe exports riding along.
             slots,
         }
     } else {
@@ -991,6 +1032,33 @@ fn pool_harm_window(slots: usize, pending: usize) -> Option<HarmWindow> {
 /// `aggregate::mode_shares_the_source` classifies it with the serial modes.
 pub(super) fn pool_mode_label(concurrent: bool) -> &'static str {
     if concurrent { "pool" } else { "pool-serial" }
+}
+
+/// The run-mode label the TOP-LEVEL runner ([`run`]) records — the third and
+/// fourth producers of the string `aggregate::mode_shares_the_source`
+/// classifies, and the two the round-4 fix left spelling their claim inline
+/// (`"parallel-processes"` at the child-process aggregate, `if run_parallel {
+/// "parallel-threads" } else { "sequential" }` at the tail).
+///
+/// `peak` is how many exports ran AT ONCE: `exports.len()` on both concurrent
+/// paths, which spawn one child process / one thread per export with no cap and
+/// join them all, and 1 on the sequential loop. Nothing serializes those paths
+/// today — the fix is that the CLAIM is now derived from a count rather than
+/// from `run_parallel`, so the first cost gate to split them (which is exactly
+/// how `apply --parallel`'s wave bug was born: a flag that meant "concurrent"
+/// until the gate started emitting single-child batches) cannot leave a
+/// concurrent label on a serial run.
+///
+/// `"sequential"` for either shape at peak ≤ 1 — the string the sequential loop
+/// already emitted, and one `aggregate::mode_shares_the_source` classifies
+/// explicitly, so a serialized run keeps the self-check's ACTIONABLE tail
+/// instead of excusing a regression as source sharing.
+pub(super) fn run_mode_label(peak: usize, processes: bool) -> &'static str {
+    match (peak > 1, processes) {
+        (false, _) => "sequential",
+        (true, true) => "parallel-processes",
+        (true, false) => "parallel-threads",
+    }
 }
 
 /// The "prediction is a LOWER BOUND" line — or `None` when every prediction in
@@ -1516,8 +1584,14 @@ pub(crate) fn run_pool(
     // Only claim concurrency when the pool can actually overlap work — a
     // `--pool 1` (or a single pending export) runs strictly serially, and the
     // hedge text run_diagnosis emits for concurrent siblings would be a false
-    // claim there (bughunt 2026-08-13).
-    let really_concurrent = pool_is_concurrent(m, pending.len());
+    // claim there (bughunt 2026-08-13). The SAFE/HEAVY split is part of that
+    // question, not decoration: `next_eligible` never co-runs two heavies, so a
+    // queue with no `parallel_safe` export — the default for a hand-written
+    // config — is strictly serial however many slots were asked for (round-5
+    // bughunt). Counted once, here, and read by all three surfaces.
+    let heavy_pending = pending.iter().filter(|e| !is_parallel_safe(e)).count();
+    let safe_pending = pending.len() - heavy_pending;
+    let really_concurrent = pool_is_concurrent(m, safe_pending, heavy_pending);
     let prev_concurrent = MULTI_EXPORT_CONCURRENT.swap(really_concurrent, AtomicOrdering::Relaxed);
     struct ResetPoolStatics(bool, bool);
     impl Drop for ResetPoolStatics {
@@ -1659,9 +1733,10 @@ pub(crate) fn run_pool(
     // at the default log level, with the levers that shrink the pressure.
     //
     // Framed by what OVERLAPPED, not by `--pool N`: a pool that ran everything
-    // serially (`--pool 1`, or one export left after the `--resume` skip) must
-    // not name a slot lever it does not have — see [`pool_harm_window`].
-    if let Some(window) = pool_harm_window(m, pending.len()) {
+    // serially (`--pool 1`, one export left after the `--resume` skip, or an
+    // all-heavy queue) must not name a slot lever it does not have — see
+    // [`pool_harm_window`].
+    if let Some(window) = pool_harm_window(m, safe_pending, heavy_pending) {
         run_harm.close_and_warn(window);
     }
 
@@ -1996,26 +2071,47 @@ mod pool_harm_tests {
     /// hedge, so the two lines about the same spill contradicted each other.
     ///
     /// RED against the shipped unconditional construction: the two serial cases
-    /// then read `Pool { .., slots: 5 }` / `Pool { .., slots: 1 }`.
+    /// then read `Pool { .., slots: 5 }` / `Pool { .., slots: 1 }`. And RED
+    /// against `pool_peak_concurrency`'s round-4 shape (`slots.min(pending)`,
+    /// blind to `parallel_safe`): the all-heavy case then reads
+    /// `Pool { exports: 8, slots: 5 }` for a run that never overlapped a thing.
     #[test]
     fn pool_harm_window_is_framed_by_the_concurrency_the_pool_had() {
         use super::pool_harm_window;
         // Five slots, one export left after the --resume skip: nothing overlapped.
         assert_eq!(
-            pool_harm_window(5, 1),
+            pool_harm_window(5, 1, 0),
             Some(HarmWindow::Serial { exports: 1 }),
             "a pool with one export to drain never overlapped anything"
         );
         // One slot, eight exports: strictly serial — naming `--pool` slots here
         // tells the operator to shrink a 1.
         assert_eq!(
-            pool_harm_window(1, 8),
+            pool_harm_window(1, 8, 0),
             Some(HarmWindow::Serial { exports: 8 }),
             "`--pool 1` is a serial run whatever the export count"
         );
+        // The default hand-written config: no export carries `parallel_safe`, so
+        // every one is heavy and `next_eligible` runs them ONE at a time — five
+        // slots of which four sleep. Structurally serial, and the frame must say
+        // so (round-5 bughunt).
+        assert_eq!(
+            pool_harm_window(5, 0, 8),
+            Some(HarmWindow::Serial { exports: 8 }),
+            "heavies never co-run, so an all-heavy pool overlapped nothing"
+        );
+        // One cheap export riding alongside the heavies IS an overlap of 2.
+        assert_eq!(
+            pool_harm_window(5, 1, 7),
+            Some(HarmWindow::Pool {
+                exports: 8,
+                slots: 5
+            }),
+            "one safe export can co-run with the single running heavy"
+        );
         // A real pool keeps its own frame AND its slot lever.
         assert_eq!(
-            pool_harm_window(5, 12),
+            pool_harm_window(5, 12, 0),
             Some(HarmWindow::Pool {
                 exports: 12,
                 slots: 5
@@ -2023,7 +2119,7 @@ mod pool_harm_tests {
         );
         // The narrowest window that still overlaps.
         assert_eq!(
-            pool_harm_window(2, 2),
+            pool_harm_window(2, 2, 0),
             Some(HarmWindow::Pool {
                 exports: 2,
                 slots: 2
@@ -2031,7 +2127,7 @@ mod pool_harm_tests {
         );
         // Nothing to drain: rivet's window holds none of rivet's work, so a
         // spill in it is foreign — same rule as the wave sibling.
-        assert_eq!(pool_harm_window(5, 0), None);
+        assert_eq!(pool_harm_window(5, 0, 0), None);
     }
 
     /// The run-mode label decides whether the throughput self-check keeps its
@@ -2044,13 +2140,14 @@ mod pool_harm_tests {
     ///
     /// The classification half is cross-checked from `aggregate`'s side by
     /// `every_run_mode_label_a_runner_can_emit_is_classified`, which reads these
-    /// two functions instead of re-typing the label list.
+    /// functions instead of re-typing the label list.
     ///
     /// RED against the flag-derived strings: peak 1 then reads
-    /// `wave-parallel-processes`, a serial pool reads `pool`.
+    /// `wave-parallel-processes`, a serial pool reads `pool`, and a serialized
+    /// top-level run reads `parallel-threads` / `parallel-processes`.
     #[test]
     fn run_mode_labels_report_the_concurrency_that_happened() {
-        use super::{pool_is_concurrent, pool_mode_label, wave_mode_label};
+        use super::{pool_is_concurrent, pool_mode_label, run_mode_label, wave_mode_label};
         assert_eq!(wave_mode_label(3), "wave-parallel-processes");
         assert_eq!(
             wave_mode_label(1),
@@ -2069,10 +2166,68 @@ mod pool_harm_tests {
             "a pool that never overlapped must not be labelled a pool run"
         );
         // The ONE predicate all three pool surfaces answer to.
-        assert!(pool_is_concurrent(5, 12) && pool_is_concurrent(2, 2));
-        assert!(!pool_is_concurrent(5, 1), "one export cannot overlap");
-        assert!(!pool_is_concurrent(1, 8), "one slot cannot overlap");
-        assert!(!pool_is_concurrent(4, 0));
+        assert!(pool_is_concurrent(5, 12, 0) && pool_is_concurrent(2, 2, 0));
+        assert!(!pool_is_concurrent(5, 1, 0), "one export cannot overlap");
+        assert!(!pool_is_concurrent(1, 8, 0), "one slot cannot overlap");
+        assert!(!pool_is_concurrent(4, 0, 0));
+        assert!(
+            !pool_is_concurrent(5, 0, 8),
+            "heavies serialize against each other, so an all-heavy queue never \
+             overlaps however many slots were asked for"
+        );
+        assert!(
+            pool_is_concurrent(5, 1, 7),
+            "one parallel_safe export rides alongside the running heavy"
+        );
+        // The top-level runner's two paths, same rule.
+        assert_eq!(run_mode_label(4, true), "parallel-processes");
+        assert_eq!(run_mode_label(4, false), "parallel-threads");
+        for processes in [true, false] {
+            assert_eq!(
+                run_mode_label(1, processes),
+                "sequential",
+                "a top-level run that overlapped nothing must keep the actionable \
+                 attribution, whichever path asked for concurrency"
+            );
+            assert_eq!(run_mode_label(0, processes), "sequential");
+        }
+    }
+
+    /// The peak a pool can reach is capped by BOTH the slots and the shape of
+    /// the queue: [`next_eligible`] never co-runs two heavies, so heavies
+    /// contribute at most one to the overlap.
+    ///
+    /// `slots.min(pending)` — the round-4 shape — reads `--pool 5` over eight
+    /// heavies as a 5-wide pool and hands `mode_shares_the_source` the string
+    /// that DELETES the self-check's actionable tail, on a run that overlapped
+    /// nothing. RED against it on the all-heavy rows below.
+    #[test]
+    fn pool_peak_counts_the_heavy_serialization_not_just_the_slots() {
+        use super::{next_eligible, pool_peak_concurrency};
+        // Slot-bound and queue-bound, no heavies: the old rule's cases.
+        assert_eq!(pool_peak_concurrency(5, 12, 0), 5);
+        assert_eq!(pool_peak_concurrency(5, 3, 0), 3);
+        assert_eq!(pool_peak_concurrency(1, 8, 0), 1);
+        assert_eq!(pool_peak_concurrency(5, 0, 0), 0);
+        // Heavy-bound: N heavies buy exactly ONE slot of overlap between them.
+        assert_eq!(
+            pool_peak_concurrency(5, 0, 8),
+            1,
+            "eight heavies through five slots still run one at a time"
+        );
+        assert_eq!(pool_peak_concurrency(5, 2, 6), 3);
+        assert_eq!(
+            pool_peak_concurrency(2, 9, 4),
+            2,
+            "the slot cap still binds when the queue could go wider"
+        );
+        // …and that "exactly one" is [`next_eligible`]'s rule, not a guess:
+        // with a heavy running, an all-heavy queue yields NO pick, so no second
+        // worker can start (the sleep-and-retry arm), while a queue holding one
+        // safe export yields it.
+        assert_eq!(next_eligible(&[false, false, false], true), None);
+        assert_eq!(next_eligible(&[false, true, false], true), Some(1));
+        assert_eq!(next_eligible(&[false, false], false), Some(0));
     }
 
     /// The serialized frame must also drop the LEVER — a remedy list that opens
@@ -2122,11 +2277,23 @@ mod pool_harm_tests {
     /// passed the flag instead of the measurement. The live oracles are
     /// `apply --parallel` / `apply --pool` runs against a real source.
     ///
+    /// FOUR producers, not two. Round 4 extracted the wave's and the pool's
+    /// deciders and this guard grew a needle per label — but `run` itself has
+    /// two more paths (child processes, in-process threads + the sequential
+    /// loop) and both still spelled their claim inline: `"parallel-processes"`
+    /// straight into `aggregate::build`, and `if run_parallel {
+    /// "parallel-threads" } else { "sequential" }` at the tail. A guard named
+    /// "a runner never spells its concurrency claim as a literal" that
+    /// enumerates half the runners grades only what its author already knew
+    /// (round-5 bughunt) — so the list below covers every producer, and
+    /// [`run_mode_label`] owns the three top-level strings.
+    ///
     /// RED against the pre-fix code, each of which puts a SECOND occurrence of
     /// its needle in the product half: `if parallel { "wave-parallel-processes" }
     /// else { "wave-sequential" }` at the wave aggregate, `aggregate::build(..,
-    /// "pool")` at the pool's, and the unconditional `HarmWindow::Pool { exports:
-    /// effective.len(), slots: m }` at the pool's bracket close.
+    /// "pool")` at the pool's, the unconditional `HarmWindow::Pool { exports:
+    /// effective.len(), slots: m }` at the pool's bracket close, and the two
+    /// top-level literals above.
     #[test]
     fn a_runner_never_spells_its_concurrency_claim_as_a_literal() {
         let whole = include_str!("run.rs");
@@ -2144,6 +2311,11 @@ mod pool_harm_tests {
             ("\"wave-sequential\"", "wave_mode_label"),
             ("\"pool\"", "pool_mode_label"),
             ("\"pool-serial\"", "pool_mode_label"),
+            // The top-level runner's three. The leading quote is what keeps
+            // `"sequential"` from matching `"wave-sequential"`.
+            ("\"parallel-processes\"", "run_mode_label"),
+            ("\"parallel-threads\"", "run_mode_label"),
+            ("\"sequential\"", "run_mode_label"),
         ] {
             assert_eq!(
                 code.matches(needle).count(),
@@ -2157,8 +2329,16 @@ mod pool_harm_tests {
         for call in [
             "wave_mode_label(peak_concurrency)",
             "pool_mode_label(really_concurrent)",
-            "pool_harm_window(m, pending.len())",
-            "pool_is_concurrent(m, pending.len())",
+            // The pool's peak is capped by the heavy serialization as well as
+            // by the slots, so both surfaces are fed the safe/heavy split — not
+            // `pending.len()`, which called an all-heavy queue a 5-wide pool.
+            "pool_harm_window(m, safe_pending, heavy_pending)",
+            "pool_is_concurrent(m, safe_pending, heavy_pending)",
+            // `run`'s two: the child-process aggregate counts the children it
+            // spawned, the tail counts the threads that overlapped (1 on the
+            // sequential loop).
+            "run_mode_label(exports.len(), true)",
+            "run_mode_label(peak_concurrency, false)",
         ] {
             assert!(
                 code.contains(call),

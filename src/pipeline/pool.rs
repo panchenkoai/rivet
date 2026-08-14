@@ -88,7 +88,7 @@ impl PredictedFrom {
 /// failures, misclassifying a measured export exactly during its degraded
 /// period (bughunt 2026-08-13).
 pub(crate) fn predict_secs(state: &crate::state::StateStore, name: &str) -> PredictedFrom {
-    predict_secs_and_rss(state, name).0
+    predict_history(state, name).0
 }
 
 /// [`predict_secs`] plus the peak RSS that belongs to the SAME history — the
@@ -115,9 +115,33 @@ pub(crate) fn predict_secs_and_rss(
     state: &crate::state::StateStore,
     name: &str,
 ) -> (PredictedFrom, Option<i64>) {
+    let (from, rss, _) = predict_history(state, name);
+    (from, rss)
+}
+
+/// The one state-store read behind [`predict_secs`] and [`predict_secs_and_rss`],
+/// plus the WHEN: the `run_at` of the row whose duration the prediction used.
+///
+/// That third member is the generation stamp the split census needs
+/// ([`newest_generation`]) — a unit's number means nothing without knowing which
+/// PARTITION recorded it, and `export_metrics` keeps a retired ordinal's row
+/// forever. It is deliberately the stamp of the row the prediction CAME FROM,
+/// not of the newest row under the name: a unit that succeeded 8-way and then
+/// only failed 3-way is still predicting the 8-way number, so it still belongs
+/// to the 8-way generation.
+///
+/// `run_at` is `chrono::Utc::now().to_rfc3339()` at every write path
+/// (`state::metrics`), so lexicographic order IS chronological order here — the
+/// zone is always `+00:00` and the subsecond field is a zero-padded prefix.
+/// Comparing the strings keeps the census clock-free: it reads only the ORDER
+/// two rows were written in, never a duration between them.
+fn predict_history(
+    state: &crate::state::StateStore,
+    name: &str,
+) -> (PredictedFrom, Option<i64>, Option<String>) {
     if let Some(m) = state.get_last_success_metric(name).ok().flatten() {
         let secs = (m.duration_ms as f64 / 1000.0).max(0.001);
-        return (PredictedFrom::Measured(secs), m.peak_rss_mb);
+        return (PredictedFrom::Measured(secs), m.peak_rss_mb, Some(m.run_at));
     }
     let attempts: Vec<crate::state::ExportMetric> = state
         .get_metrics(Some(name), 25)
@@ -125,17 +149,23 @@ pub(crate) fn predict_secs_and_rss(
         .into_iter()
         .flatten()
         .collect();
-    let last_attempt = attempts
-        .iter()
-        .map(|m| (m.duration_ms as f64 / 1000.0).max(0.001))
-        .reduce(f64::max);
+    let longest = attempts.iter().max_by_key(|m| m.duration_ms);
     let peak_rss = attempts.iter().filter_map(|m| m.peak_rss_mb).max();
-    match last_attempt {
-        Some(s) => (
-            PredictedFrom::FailedAttemptFloor(s.max(POOL_PLACEHOLDER_SECS)),
+    match longest {
+        Some(m) => (
+            PredictedFrom::FailedAttemptFloor(
+                (m.duration_ms as f64 / 1000.0)
+                    .max(0.001)
+                    .max(POOL_PLACEHOLDER_SECS),
+            ),
             peak_rss,
+            Some(m.run_at.clone()),
         ),
-        None => (PredictedFrom::Placeholder(POOL_PLACEHOLDER_SECS), None),
+        None => (
+            PredictedFrom::Placeholder(POOL_PLACEHOLDER_SECS),
+            None,
+            None,
+        ),
     }
 }
 
@@ -223,11 +253,16 @@ const SPLIT_CENSUS_CAP: usize = 256;
 /// the measured exports in LPT, and an advertised makespan wrong by the ratio
 /// of the two split factors (bughunt 2026-08-14, round 4).
 ///
-/// `prior` is the unit-name census: every `{giant}#i` that carries history, and
-/// what that history predicts. The cohort's SUM is the table's measured cost,
-/// so `sum / realized` re-cuts it for the partition that is about to run — and
-/// it also refreshes the seed's other stale input, since the giant's own rows
-/// froze at the failure that motivated the split and never move again.
+/// `prior` is the unit-name census: every `{giant}#i` that carries history,
+/// what that history predicts, and when it was recorded. ONE GENERATION of it
+/// sums to the table's measured cost, so `sum / realized` re-cuts that for the
+/// partition about to run — and it also refreshes the seed's other stale input,
+/// since the giant's own rows froze at the failure that motivated the split and
+/// never move again. The generation scoping is not optional bookkeeping: the
+/// census keeps returning a retired ordinal forever, so summing the raw census
+/// stacks the new partition's units on top of the old one's from the second
+/// re-cut onward — see [`newest_generation`] for the measured 1.67× and why the
+/// ambiguity is resolved toward the smaller cohort.
 ///
 /// Only the SHRINK direction is decidable. An ordinal at or past `realized` is
 /// proof a bigger partition ran (nothing else writes `giant#7` when the run has
@@ -241,23 +276,25 @@ const SPLIT_CENSUS_CAP: usize = 256;
 /// destination, not the state store; see `split::reconstruct_units_from_prefix`.
 pub(crate) fn repartitioned_unit_prediction(
     realized: usize,
-    prior: &[(usize, PredictedFrom)],
+    prior: &[UnitHistory],
 ) -> Option<PredictedFrom> {
     if realized == 0 || prior.is_empty() {
         return None; // nothing to re-cut, or a genuinely first split run
     }
-    let prior_n = prior.iter().map(|(i, _)| i + 1).max()?;
+    // ONE generation, or the sum is not a table (see `newest_generation`).
+    let cohort = newest_generation(prior);
+    let prior_n = cohort.iter().map(|u| u.ordinal + 1).max()?;
     if prior_n <= realized {
         return None; // same partition (or the undecidable growth case) — own history stands
     }
-    let share = prior.iter().map(|(_, p)| p.secs()).sum::<f64>() / realized as f64;
+    let share = cohort.iter().map(|u| u.from.secs()).sum::<f64>() / realized as f64;
     // Provenance folds pessimistically: the re-cut share is measured-by-proxy
     // only when EVERY contributing unit actually succeeded. One unit that only
     // ever failed makes the cohort's sum a floor, not a measurement, and the
     // LOWER BOUND hedge must keep printing for it.
-    if prior.iter().all(|(_, p)| {
+    if cohort.iter().all(|u| {
         matches!(
-            p,
+            u.from,
             PredictedFrom::Measured(_) | PredictedFrom::SeededSplit(_)
         )
     }) {
@@ -267,6 +304,74 @@ pub(crate) fn repartitioned_unit_prediction(
             share.max(POOL_PLACEHOLDER_SECS),
         ))
     }
+}
+
+/// One censused `{giant}#i`: what its OWN history predicts, and WHEN that
+/// history was recorded — the pair [`repartitioned_unit_prediction`] needs to
+/// tell this partition's units from a retired one's.
+#[derive(Debug, Clone)]
+pub(crate) struct UnitHistory {
+    pub ordinal: usize,
+    pub from: PredictedFrom,
+    /// `run_at` of the row the prediction came from ([`predict_history`]);
+    /// `None` only for a history the census would not have kept.
+    pub recorded_at: Option<String>,
+}
+
+/// The subset of the census that belongs to the LATEST partition generation —
+/// the only cohort whose durations sum to the table.
+///
+/// `repartitioned_unit_prediction`'s premise is "the cohort's SUM is the
+/// table's measured cost". That holds for ONE partition's units and for no
+/// other set, and nothing ever retires an ordinal a smaller partition stopped
+/// using (`export_metrics` only ever deletes `status='running'` rows). So from
+/// the SECOND re-cut onward the raw census is two generations stacked: after
+/// `--pool 8` → `--pool 3`, ordinals 0..2 carry the new 3-way durations while
+/// 3..7 still carry the old 8-way ones, and summing all eight predicts
+/// `(T + 5T/8)/3 = 0.54 T` per unit against a true `T/3` — a 1.67×
+/// over-prediction that NEVER self-corrects, because the retired ordinals never
+/// move again, and that compounds on every further shrink (bughunt 2026-08-14,
+/// round 5).
+///
+/// Two facts make the generation recoverable from the census alone, with no
+/// schema change and no clock: a run writes every one of its N units, so a
+/// generation's ordinals are `0..N-1` — CONTIGUOUS FROM ZERO — and runs are
+/// sequential, so every row of the newer generation is written after every row
+/// of the older one. Walk the census newest-first and close the generation at
+/// the first point where the ordinals collected form exactly `{0..k-1}`.
+///
+/// Honest limit, and why it errs the way it does: `{0,1,2} newest, {3..7}
+/// older` is genuinely ambiguous — it is equally "a 3-way run after an 8-way
+/// run" and "one 8-way run in which units 0..2 happened to finish last". Data
+/// cannot separate them (only a persisted partition size could, which would be
+/// a new `export_metrics` column). This reads it as the boundary, i.e. it
+/// prefers the SMALLER cohort, because the two mistakes are not equal: reading
+/// a boundary that is not there ends in `prior_n <= realized` → `None` → each
+/// unit's own history stands, which is at worst the pre-re-cut under-prediction
+/// for one run; missing a boundary that IS there is the permanent, compounding
+/// over-prediction above. Ties in the stamp (two rows written in the same
+/// instant, or a history with no stamp at all) break toward the HIGHER ordinal,
+/// so a fully-tied census closes only at the whole cohort — the round-4
+/// behaviour — rather than inventing a boundary out of clock resolution.
+fn newest_generation(prior: &[UnitHistory]) -> Vec<&UnitHistory> {
+    let mut by_recency: Vec<&UnitHistory> = prior.iter().collect();
+    by_recency.sort_by(|a, b| {
+        b.recorded_at
+            .cmp(&a.recorded_at)
+            .then_with(|| b.ordinal.cmp(&a.ordinal))
+    });
+    let mut seen: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+    for (taken, u) in by_recency.iter().enumerate() {
+        seen.insert(u.ordinal);
+        // `{0..k-1}` iff the set's max is its size minus one.
+        if seen.last() == Some(&(seen.len() - 1)) {
+            return by_recency[..=taken].to_vec();
+        }
+    }
+    // No generation closes (an ordinal with no history at all punches a hole in
+    // every prefix): fall back to the whole census, which is the shape the
+    // shrink test was written against.
+    by_recency
 }
 
 /// The unit-name census for one split giant: which `{giant}#i` ordinals carry
@@ -281,12 +386,12 @@ fn split_history_census(
     state: &crate::state::StateStore,
     giant: &str,
     realized: usize,
-) -> Vec<(usize, PredictedFrom)> {
-    let mut out: Vec<(usize, PredictedFrom)> = Vec::new();
+) -> Vec<UnitHistory> {
+    let mut out: Vec<UnitHistory> = Vec::new();
     let mut misses = 0usize;
     for i in 0..SPLIT_CENSUS_CAP {
-        let p = predict_secs(state, &format!("{giant}#{i}"));
-        if matches!(p, PredictedFrom::Placeholder(_)) {
+        let (from, _, recorded_at) = predict_history(state, &format!("{giant}#{i}"));
+        if matches!(from, PredictedFrom::Placeholder(_)) {
             if i >= realized {
                 misses += 1;
                 if misses >= SPLIT_CENSUS_LOOKAHEAD {
@@ -296,7 +401,11 @@ fn split_history_census(
             continue;
         }
         misses = 0;
-        out.push((i, p));
+        out.push(UnitHistory {
+            ordinal: i,
+            from,
+            recorded_at,
+        });
     }
     out
 }
@@ -762,11 +871,26 @@ mod tests {
 #[cfg(test)]
 mod prediction_tests {
     use super::{
-        POOL_PLACEHOLDER_SECS, PoolItem, PredictedFrom, classification_counts, pool_order,
-        predict_items, predict_secs, reconcile_split_seed, repartitioned_unit_prediction,
-        split_unit_from,
+        POOL_PLACEHOLDER_SECS, PoolItem, PredictedFrom, UnitHistory, classification_counts,
+        newest_generation, pool_order, predict_items, predict_secs, reconcile_split_seed,
+        repartitioned_unit_prediction, split_unit_from,
     };
     use crate::state::{MetricRow, StateStore};
+
+    /// One generation's census: the units a single run recorded, stamped in the
+    /// order that run finished them (`run` orders the runs). The stamp shape
+    /// mirrors `export_metrics.run_at` — an RFC3339 UTC string, which is what
+    /// makes the census's lexicographic compare chronological.
+    fn generation(run: u32, units: &[(usize, PredictedFrom)]) -> Vec<UnitHistory> {
+        units
+            .iter()
+            .map(|(ordinal, from)| UnitHistory {
+                ordinal: *ordinal,
+                from: from.clone(),
+                recorded_at: Some(format!("2026-08-{run:02}T00:00:{ordinal:02}+00:00")),
+            })
+            .collect()
+    }
 
     fn store_with(rows: &[(&str, &str, i64, &str)]) -> StateStore {
         let s = StateStore::open_in_memory().expect("in-memory store");
@@ -1075,6 +1199,9 @@ mod prediction_tests {
             seed_share, 600.0,
             "fixture: the stale seed is a third value"
         );
+        fn exports_of(names: &[String]) -> Vec<(&str, bool)> {
+            names.iter().map(|n| (n.as_str(), true)).collect()
+        }
         let seeds: std::collections::HashMap<String, PredictedFrom> = (0..3)
             .map(|i| {
                 (
@@ -1084,8 +1211,7 @@ mod prediction_tests {
             })
             .collect();
         let names: Vec<String> = (0..3).map(|i| format!("giant#{i}")).collect();
-        let exports: Vec<(&str, bool)> = names.iter().map(|n| (n.as_str(), true)).collect();
-        let predicted = predict_items(&s, exports, &seeds);
+        let predicted = predict_items(&s, exports_of(&names), &seeds);
         for (item, _) in &predicted {
             assert_eq!(
                 item.predicted_secs, 1200.0,
@@ -1107,14 +1233,75 @@ mod prediction_tests {
             "{classified:?}"
         );
 
+        // ── Run 3, the same `--pool 3 --split` again ─────────────────────────
+        //
+        // Run 2's three units really took the re-cut 1200 s and RECORDED it, so
+        // the cohort now holds TWO generations: ordinals 0..2 at the 3-way
+        // 1200 s, ordinals 3..7 still at run 1's 8-way numbers. Nothing ever
+        // retires a unit name that no longer runs (only `status='running'` rows
+        // are ever deleted), so summing the whole census mixes the two: 3600 +
+        // 2400 = 6000 over three units = 2000 s each, a permanent 1.67×
+        // over-prediction that the units' OWN, now-correct, history is
+        // overridden by (bughunt 2026-08-14, round 5).
+        //
+        // RED against summing the whole census: `left: 2000.0, right: 1200.0`.
+        for i in 0..3 {
+            s.record_metric_full(&MetricRow {
+                export_name: format!("giant#{i}"),
+                run_id: format!("r2_{i}"),
+                duration_ms: 1_200_000,
+                status: "success".into(),
+                ..Default::default()
+            })
+            .expect("record run-2 metric");
+        }
+        let run3 = predict_items(&s, exports_of(&names), &seeds);
+        for (item, _) in &run3 {
+            assert_eq!(
+                item.predicted_secs, 1200.0,
+                "{} ran at THIS partition last time — the re-cut must read the \
+                 newest generation only (or stand down and let the unit's own \
+                 measurement through), never sum run 2's 3-way units together \
+                 with run 1's retired 8-way ordinals",
+                item.name
+            );
+        }
+
+        // ── Run 4, a FURTHER shrink to `--pool 2` ────────────────────────────
+        //
+        // The re-cut must still fire — and from the 3-way generation (3600 s
+        // over two units = 1800 s), not from the sum of both generations
+        // (6000/2 = 3000 s). This is the leg that shows the scoping CONVERGES:
+        // one run at a new N is enough to make the next re-cut correct, where
+        // the whole-census sum compounds its error on every further shrink.
+        //
+        // RED against summing the whole census: `left: 3000.0, right: 1800.0`.
+        let two: Vec<String> = (0..2).map(|i| format!("giant#{i}")).collect();
+        let seeds2: std::collections::HashMap<String, PredictedFrom> = two
+            .iter()
+            .map(|n| (n.clone(), split_unit_from(&giant_from, 900.0)))
+            .collect();
+        let run4 = predict_items(&s, exports_of(&two), &seeds2);
+        for (item, _) in &run4 {
+            assert_eq!(
+                item.predicted_secs, 1800.0,
+                "{} must be re-cut from the NEWEST generation's measured 3600 s \
+                 over the two units running now",
+                item.name
+            );
+        }
+
         // …and the fold is pessimistic: one unit that only ever FAILED makes
         // the cohort's sum a floor, so the LOWER BOUND hedge keeps printing.
-        let mixed = vec![
-            (0usize, PredictedFrom::Measured(300.0)),
-            (1, PredictedFrom::FailedAttemptFloor(900.0)),
-            (2, PredictedFrom::Measured(300.0)),
-            (3, PredictedFrom::Measured(300.0)),
-        ];
+        let mixed = generation(
+            1,
+            &[
+                (0usize, PredictedFrom::Measured(300.0)),
+                (1, PredictedFrom::FailedAttemptFloor(900.0)),
+                (2, PredictedFrom::Measured(300.0)),
+                (3, PredictedFrom::Measured(300.0)),
+            ],
+        );
         match repartitioned_unit_prediction(2, &mixed) {
             Some(PredictedFrom::FailedAttemptFloor(secs)) => assert_eq!(secs, 900.0),
             other => panic!("a cohort holding an unmeasured unit is a floor, got {other:?}"),
@@ -1122,13 +1309,96 @@ mod prediction_tests {
         // The undecidable direction stays alone: `{0,1,2}` against 8 units now
         // is equally an interrupted 8-way run whose tail never recorded, and
         // re-cutting it would divide an already-correct number a second time.
-        let grown: Vec<(usize, PredictedFrom)> = (0..3)
-            .map(|i| (i, PredictedFrom::Measured(1200.0)))
-            .collect();
+        let grown: Vec<UnitHistory> = generation(
+            1,
+            &(0..3)
+                .map(|i| (i, PredictedFrom::Measured(1200.0)))
+                .collect::<Vec<_>>(),
+        );
         assert!(repartitioned_unit_prediction(8, &grown).is_none());
         // Same count, complete cohort: nothing to re-cut, per-unit history wins.
         assert!(repartitioned_unit_prediction(3, &grown).is_none());
         assert!(repartitioned_unit_prediction(3, &[]).is_none());
+    }
+
+    /// The generation boundary itself, pure: which censused ordinals the re-cut
+    /// is allowed to SUM.
+    ///
+    /// The invariant `repartitioned_unit_prediction` rests on — "the cohort's
+    /// sum is the table" — is a statement about ONE partition. A census is not
+    /// one partition after the first re-cut: retired ordinals keep their rows
+    /// forever, so `{0,1,2}` at the new N sits on top of `{3..7}` at the old
+    /// one, and the raw sum is `T + 5T/8`.
+    ///
+    /// RED against folding the whole census (the round-4 shape): the
+    /// two-generation cohort returns 8 ordinals instead of 3, `left: 8, right:
+    /// 3`, and the re-cut through it reads 3000 s where 1800 s is true.
+    #[test]
+    fn newest_generation_closes_at_the_partition_boundary_not_the_whole_census() {
+        // Run 1 cut the table 8 ways; run 2 re-cut it 3 ways, so ordinals 0..2
+        // carry the 3-way numbers and 3..7 are retired at their 8-way ones.
+        let mut census = generation(
+            2,
+            &[
+                (0usize, PredictedFrom::Measured(1200.0)),
+                (1, PredictedFrom::Measured(1200.0)),
+                (2, PredictedFrom::Measured(1200.0)),
+            ],
+        );
+        census.extend(generation(
+            1,
+            &[
+                (3usize, PredictedFrom::Measured(700.0)),
+                (4, PredictedFrom::Measured(300.0)),
+                (5, PredictedFrom::Measured(400.0)),
+                (6, PredictedFrom::Measured(500.0)),
+                (7, PredictedFrom::Measured(500.0)),
+            ],
+        ));
+        let newest: Vec<usize> = newest_generation(&census)
+            .iter()
+            .map(|u| u.ordinal)
+            .collect();
+        assert_eq!(
+            newest.len(),
+            3,
+            "only run 2's three units sum to the table; got ordinals {newest:?}"
+        );
+        assert_eq!(newest.iter().copied().max(), Some(2));
+        // …so a FURTHER shrink re-cuts from 3600 s, not from 6000 s.
+        match repartitioned_unit_prediction(2, &census) {
+            Some(f) => assert_eq!(f.secs(), 1800.0, "{f:?}"),
+            None => panic!("8→3→2 is still a shrink; the re-cut must fire"),
+        }
+
+        // A census that IS one generation stays whole — the boundary rule must
+        // not carve a cohort that was never re-cut (that would silently undo
+        // the round-4 fix, since the carved prior_n falls to <= realized).
+        let one_gen = generation(
+            1,
+            &(0..8)
+                .map(|i| (i, PredictedFrom::Measured(450.0)))
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(newest_generation(&one_gen).len(), 8);
+
+        // Unstamped / identically-stamped history is not evidence of a
+        // boundary: ties break toward the higher ordinal, so the whole cohort
+        // stands rather than a boundary being invented out of clock resolution.
+        let untimed: Vec<UnitHistory> = (0..8)
+            .map(|ordinal| UnitHistory {
+                ordinal,
+                from: PredictedFrom::Measured(450.0),
+                recorded_at: None,
+            })
+            .collect();
+        assert_eq!(newest_generation(&untimed).len(), 8);
+
+        // A hole (a unit of the newest partition that recorded nothing at all,
+        // so the census never saw it) closes no prefix — fall back to the whole
+        // census rather than reading the hole as a boundary.
+        let holed: Vec<UnitHistory> = census.iter().filter(|u| u.ordinal != 0).cloned().collect();
+        assert_eq!(newest_generation(&holed).len(), holed.len());
     }
 
     /// The reconcile rule itself, in isolation: seed only while the unit is

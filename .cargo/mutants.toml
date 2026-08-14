@@ -68,14 +68,14 @@ exclude_re = [
     # not depend on which arm renders it.
     "delete match arm .* in hash_value",
     "replace refuse_compressed_binlog -> Result<\\(\\)> with Ok\\(\\(\\)\\)",
-    # `repack_from_history` converts each run's duration ms→s only to feed
-    # `PackItem.predicted_secs`, whose SOLE consumer is `waves::pack`'s
-    # duration-DESC sort. Scaling every duration by the same factor (`/`→`*`)
-    # is order-preserving, so the packed schedule is byte-identical — the
-    # mutant is equivalent by construction. The real neighbour bugs (the pack
-    # RSS boundary and the annotate/export refuse-guard) are unit-tested and
-    # RED-proven (rss_split_is_strict_*, refuse_annotate_scoped_to_export_*).
-    "replace / with \\* in repack_from_history",
+    # (An entry triaging `replace / with *` in `repack_from_history` lived here
+    # until 2026-08-14. It had been DEAD since the ms→s conversion moved out of
+    # that function into `pool::predict_secs_and_rss` — 0 matches in the corpus.
+    # It is NOT re-pointed at the new site: the old equivalence argument was
+    # "the factor is order-preserving for waves::pack's sort", and at the new
+    # site the seconds are also compared against POOL_PLACEHOLDER_SECS and fed
+    # to the makespan budget, so scaling them is not obviously unobservable. If
+    # those mutants survive, they get their own triage with its own evidence.)
     # The DECISION whether an MSSQL TLS posture trusts an unverified cert lives
     # in `mssql_trusts_cert_without_verify`, unit-tested in both directions and
     # RED-proven (Require/VerifyFull/accept_invalid combos). The match GUARD at
@@ -103,7 +103,15 @@ exclude_re = [
     # audit_preflight_table + the check scenarios (cli/blessed-flow). The overlay
     # DECISIONS are unit-tested in overlay_measured_rows.
     "replace check -> Result<bool> with Ok",
-    "replace == with != in check",
+    # NOTE the `$`: cargo-mutants names a mutant `<path>:<line>:<col>: <what> in
+    # <fn>`, so an UNANCHORED `in check` also matches every `check_*` function.
+    # Written without it, this entry removed 13 further mutants in six unrelated
+    # files — quality.rs::check_null_ratios / check_uniqueness,
+    # resource.rs::check_memory, cli/dispatch.rs::check_export_selection /
+    # check_plan_compatibility, preflight/analysis.rs::check_* — all of which
+    # have offline tests and are exactly what the gate exists to grade. Anchored
+    # it matches the three preflight/mod.rs::check sites and nothing else.
+    "replace == with != in check$",
     # overlay_measured_rows: `est != before && est.is_some()` guards a RECOMPUTE
     # that is IDEMPOTENT when the estimate is unchanged (recomputing verdict/
     # profile from the same number yields the same values). `est` is None only
@@ -142,6 +150,12 @@ exclude_re = [
     # neighbours (a shed, a recovery) are pinned by
     # governor_run_warns_once_and_steps_back_to_the_ceiling_when_the_signal_dies
     # and the blind-trajectory tests.
-    "replace < with <= in decision_cause",
+    # NOTE the QUALIFIED name: cargo-mutants prints an impl method as
+    # `Type::method`, so the obvious `in decision_cause` matched ZERO mutants —
+    # a dead entry triages nothing, and the survivor it claimed to explain was
+    # still graded. Dead entries are now caught by the gate-sanity CI job
+    # (.github/scripts/mutants_exclusions.py), which fails when an exclusion
+    # matches no real mutant.
+    "replace < with <= in Governor::decision_cause",
     "replace match guard mssql_trusts_cert_without_verify\\(cfg\\) with (true|false) in MssqlSource::connect_with_tls",
 ]

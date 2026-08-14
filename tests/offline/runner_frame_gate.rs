@@ -255,11 +255,8 @@ fn every_run_harm_bracket_close_is_preceded_by_its_window_stamp() {
 /// `run_export_job`" (round-3 bughunt). An `apply` run wrote no `export_harm`
 /// rows and said nothing about a source it had just spilled to disk.
 ///
-/// The body is bounded by BRACE MATCHING, not by the next `fn` — the first
-/// draft of this guard sliced to end-of-file, so the `#[cfg(test)]` module's own
-/// eleven `run_diagnosis(` calls satisfied it and it stayed green against the
-/// exact mutant it exists to catch (this repo's "fixture against itself" class,
-/// caught here by RED-proving rather than by reading).
+/// The body is bounded by BRACE MATCHING, not by the next `fn` — see
+/// [`body_of`] for the vacuous-slice failure that rule exists for.
 ///
 /// Scope honesty: a SOURCE-ORDER lint, like its siblings above — both functions
 /// need a live source and a destination, so no unit test can observe the emitted
@@ -267,27 +264,86 @@ fn every_run_harm_bracket_close_is_preceded_by_its_window_stamp() {
 /// values are the business of `run_diagnosis`'s own unit matrix.
 #[test]
 fn both_job_entry_points_bracket_the_source_harm_window() {
+    assert_both_job_entry_points_do(
+        &[
+            ("opens the harm bracket", "harm_snapshot(&plan.source)"),
+            ("records the delta", "record_harm("),
+            ("emits the DIAGNOSIS", "run_diagnosis("),
+        ],
+        "a job entry point skips the source-harm bracket, so runs through it record \
+         no export_harm rows and never diagnose a spilling source",
+    );
+}
+
+/// Both job entry points must PERSIST the run journal they fill.
+///
+/// Its own test rather than three more needles on the harm gate above, because
+/// it is a different claim about the same seam and a name must not promise what
+/// its body does not check.
+///
+/// Every runner either entry point dispatches to records into `summary.journal`
+/// — `governor.drain_into` (`ParallelismAdjusted`, one per adaptive shed),
+/// `commit.rs`'s `ChunkCompleted`/`FileWritten`, `schema_drift`'s
+/// `SchemaChanged` — and the journal reaches `rivet journal` only through
+/// `state.store_journal`. `run_export_job` recorded the terminal `RunCompleted`
+/// and stored; `run_export_job_with_chunk_source` (the `rivet apply` path) did
+/// NEITHER for the whole 0.24.x series, so an apply run's structured history was
+/// built in memory and dropped — `rivet journal -e X` said "No journal entries
+/// for export 'X' yet." after a completed run, and `final_outcome()` would read
+/// "(incomplete)" for it even if a row existed (round-5 bughunt). The governor
+/// wiring landed the round before makes the loss concrete: every shed an
+/// adaptive apply takes is unrecorded.
+///
+/// Scope honesty: a SOURCE-ORDER lint, like its siblings — both functions need a
+/// live source, a state store and a destination, so no unit test can observe the
+/// stored row. It pins that each entry point records the terminal event and
+/// persists; the CONTENT is `RunJournal`'s own business. RED-proven by deleting
+/// the apply-side `store_journal` call.
+#[test]
+fn both_job_entry_points_persist_the_run_journal() {
+    assert_both_job_entry_points_do(
+        &[
+            ("records the terminal event", "RunEvent::RunCompleted {"),
+            (
+                "persists the journal",
+                "state.store_journal(&summary.journal)",
+            ),
+        ],
+        "a job entry point fills a run journal and never stores it, so `rivet journal` \
+         is blind to every run through it (the ParallelismAdjusted sheds, the chunk \
+         history) — the runner-bypass class",
+    );
+}
+
+/// The function body that starts at `from`, delimited by its own braces.
+///
+/// Brace matching, NOT "up to the next `fn`" — the first draft of the harm gate
+/// sliced to end-of-file, so the `#[cfg(test)]` module's own eleven
+/// `run_diagnosis(` calls satisfied it and it stayed green against the exact
+/// mutant it exists to catch (this repo's "fixture against itself" class, caught
+/// by RED-proving rather than by reading).
+fn body_of(text: &str, from: usize) -> &str {
+    let open = from + text[from..].find('{').expect("a fn has a body");
+    let mut depth = 0usize;
+    for (i, c) in text[open..].char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &text[from..open + i + 1];
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("unbalanced braces from byte {from}");
+}
+
+/// Assert each `(what, needle)` appears in the body of BOTH job entry points.
+fn assert_both_job_entry_points_do(needles: &[(&str, &str)], harm: &str) {
     let job_rs = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/pipeline/job.rs");
     let text = std::fs::read_to_string(&job_rs).expect("read src/pipeline/job.rs");
-
-    /// The function body that starts at `from`, delimited by its own braces.
-    fn body_of(text: &str, from: usize) -> &str {
-        let open = from + text[from..].find('{').expect("a fn has a body");
-        let mut depth = 0usize;
-        for (i, c) in text[open..].char_indices() {
-            match c {
-                '{' => depth += 1,
-                '}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        return &text[from..open + i + 1];
-                    }
-                }
-                _ => {}
-            }
-        }
-        panic!("unbalanced braces from byte {from}");
-    }
 
     let mut offenders = Vec::new();
     for entry in [
@@ -305,11 +361,7 @@ fn both_job_entry_points_bracket_the_source_harm_window() {
             "{entry}: the slice ran past the function into the test module — the \
              assertions below would be satisfied by the tests' own calls"
         );
-        for (what, needle) in [
-            ("opens the harm bracket", "harm_snapshot(&plan.source)"),
-            ("records the delta", "record_harm("),
-            ("emits the DIAGNOSIS", "run_diagnosis("),
-        ] {
+        for (what, needle) in needles {
             if !body.contains(needle) {
                 offenders.push(format!("{entry} never {what} ({needle})"));
             }
@@ -317,9 +369,8 @@ fn both_job_entry_points_bracket_the_source_harm_window() {
     }
     assert!(
         offenders.is_empty(),
-        "a job entry point skips the source-harm bracket, so runs through it record \
-         no export_harm rows and never diagnose a spilling source — the runner-bypass \
-         class (docs/runner-coverage-matrix.yaml). Re-apply it in that entry point:\n{}",
+        "{harm} (docs/runner-coverage-matrix.yaml). Re-apply it in that entry \
+         point:\n{}",
         offenders.join("\n")
     );
 }

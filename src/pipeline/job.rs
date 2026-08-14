@@ -1399,6 +1399,33 @@ pub(crate) fn run_export_job_with_chunk_source(
         log::warn!("{line}");
     }
 
+    // Runner parity, third facet: the run JOURNAL. Every runner this wrapper
+    // dispatches to records into `summary.journal` — `governor.drain_into`
+    // (`ParallelismAdjusted`, deliberately drained before the worker-error bail
+    // so a FAILED run still journals its sheds), `ChunkCompleted`/`FileWritten`
+    // from `commit.rs`, `SchemaChanged`, `RetryAttempted` — and apply then threw
+    // the whole thing away: no terminal `RunCompleted`, no `store_journal`, so
+    // `rivet journal -e X` answered "No journal entries" after a completed apply
+    // run while the byte-identical plan under `rivet run` had the full history
+    // (round-5 bughunt). An operator investigating a slow governed apply had no
+    // record that the governor shed at all.
+    //
+    // Same placement and same best-effort warn as `run_export_job`: before the
+    // print, so a later `finalize_manifest` gap that flips the status is NOT in
+    // the journal on either entry point (one behaviour, not two).
+    summary.journal.record(RunEvent::RunCompleted {
+        status: summary.status.clone(),
+        error_message: summary.error_message.clone(),
+        duration_ms: summary.duration_ms,
+    });
+    if let Err(e) = state.store_journal(&summary.journal) {
+        log::warn!(
+            "apply '{}': journal persist failed (run history not stored): {:#}",
+            summary.export_name,
+            e
+        );
+    }
+
     summary.print();
     ledger_finish_owned_runs(state, &plan.export_name, &ledger_run_id, &summary);
     // Apply replays a SEALED artifact and has no ExportConfig — correctly:

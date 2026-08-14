@@ -188,21 +188,11 @@ jobs:
           CARGO_PROFILE_DEV_DEBUG: "0"
         run: |
           git diff "origin/${{ github.base_ref }}"...HEAD > pr.diff
-          # A code diff that yields ZERO mutants is not a pass — it means the
-          # gate graded nothing, and it has happened: one unescaped `|` in
-          # .cargo/mutants.toml's exclude_re (regex ALTERNATION with an empty
-          # branch) excluded 18,568 of 18,670 mutants, and this job reported
-          # green in 23s with `INFO No mutants to filter` on every run of
-          # #227/#229/#230. `exclude_patterns_are_not_over_broad` now catches
-          # that class offline; this is the belt to its braces, because the next
-          # cause may not be a regex at all (a broken --in-diff parse, a moved
-          # path prefix, a cargo-mutants upgrade).
-          if ! cargo mutants --in-diff pr.diff --list | grep -q .; then
-            echo "::error::the mutation gate generated NO mutants for a diff that \
-          touches source — it graded nothing. Check .cargo/mutants.toml's \
-          exclude_re for an over-broad pattern, and that pr.diff is non-empty."
-            exit 1
-          fi
+          # "Did this gate grade anything at all?" is NOT asked here: this job is
+          # `continue-on-error: true`, so an `exit 1` in it is an annotation, not
+          # a failure — the very property that let the vacuous gate survive eight
+          # runs. It lives in the BLOCKING `mutants-gate-sanity` job below.
+          #
           # Exit code 2 = missed mutants (the gate's failure); 0 = all caught
           # or nothing to mutate in this diff.
           # --lib AND --bins: half this crate lives in the BINARY target
@@ -212,6 +202,91 @@ jobs:
           # those mutants sat green in `cargo test --bin rivet`. Scope honesty:
           # measure against every offline test target, then triage what's left.
           cargo mutants --in-diff pr.diff -j 2 -- --lib --bins
+
+  # Is the mutation gate GRADING ANYTHING? Split out of `mutants-in-diff` on
+  # purpose: that job is `continue-on-error: true` (a foundational-module PR
+  # genuinely cannot finish its 42-minute run), so nothing inside it can fail a
+  # PR — and "cannot fail" is exactly how the vacuous gate survived. One
+  # unescaped `|` in .cargo/mutants.toml's exclude_re (regex ALTERNATION with an
+  # EMPTY branch) excluded 18,568 of 18,670 mutants; the gate reported green in
+  # 23s with `INFO No mutants to filter` on all eight runs of #227/#229/#230 and
+  # nobody acted.
+  #
+  # Everything here is `--list` only: no mutant is built or run, so the whole
+  # job is seconds of cargo-mutants parsing plus its install. It is NOT
+  # continue-on-error — a failure here turns the workflow run red (and it is
+  # cheap enough to be a required check, unlike the run it protects).
+  mutants-gate-sanity:
+    name: Mutants (gate sanity)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Any non-docs changes?
+        id: scope
+        run: |
+          git fetch --no-tags origin "${{ github.base_ref }}" >/dev/null 2>&1 || true
+          if git diff --name-only "origin/${{ github.base_ref }}...HEAD" \
+               | grep -qvE '^(docs/|.*\.md$|\.githooks/)'; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "code=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Docs-only PR — nothing to grade."
+          fi
+      - uses: dtolnay/rust-toolchain@master
+        if: steps.scope.outputs.code == 'true'
+        with:
+          toolchain: "1.94"
+      - uses: Swatinem/rust-cache@v2
+        if: steps.scope.outputs.code == 'true'
+        with:
+          key: mutants
+      - name: Install cargo-mutants
+        if: steps.scope.outputs.code == 'true'
+        run: cargo install cargo-mutants --locked
+      # Every exclusion must triage a REAL mutant, and only the one it names.
+      # `tests/offline/mutation_gate_config.rs` grades the patterns' SHAPE; it
+      # cannot see the corpus, so it cannot see a DEAD entry (round-4's
+      # `"replace < with <= in decision_cause"` matched nothing, because
+      # cargo-mutants qualifies impl methods as `Governor::decision_cause` — a
+      # triage claim about no mutant, with the survivor still graded) nor an
+      # unanchored one (`in check` also ate `check_null_ratios`,
+      # `check_uniqueness`, `check_memory`, … — 13 mutants in six other files).
+      - name: Every exclusion triages exactly one real function
+        if: steps.scope.outputs.code == 'true'
+        run: |
+          set -euo pipefail
+          cargo mutants --list --no-config > mutants-corpus.txt
+          python3 .github/scripts/mutants_exclusions.py mutants-corpus.txt
+      # Did the exclusions eat this PR's own diff? The UNFILTERED list is the
+      # discriminator: zero mutants is the CORRECT answer for a diff that
+      # changes no mutable source (tests-only, docs+tests, a comment-only edit
+      # inside src/**.rs — all routine here, and the previous version of this
+      # check fired a red `::error::` on every one of them). Only "the diff HAS
+      # mutants and the config removes them all" is the defect.
+      - name: The PR diff is actually graded
+        if: steps.scope.outputs.code == 'true'
+        run: |
+          set -euo pipefail
+          git diff "origin/${{ github.base_ref }}"...HEAD > pr.diff
+          cargo mutants --in-diff pr.diff --list --no-config > diff-all.txt
+          cargo mutants --in-diff pr.diff --list > diff-graded.txt
+          all=$(grep -c . diff-all.txt || true)
+          graded=$(grep -c . diff-graded.txt || true)
+          if [ "$all" -eq 0 ]; then
+            echo "::notice::this diff changes no mutable source line — zero mutants is correct here."
+            exit 0
+          fi
+          if [ "$graded" -eq 0 ]; then
+            echo "::error::the mutation gate would grade NOTHING: this diff yields \
+          $all mutants, and .cargo/mutants.toml's exclude_re removes every one of \
+          them. That is the vacuous-gate failure (#227/#229/#230), not a pass."
+            exit 1
+          fi
+          echo "::notice::$graded of $all in-diff mutants will be graded ($((all - graded)) excluded as triaged-equivalent)."
 
   test:
     name: Tests
