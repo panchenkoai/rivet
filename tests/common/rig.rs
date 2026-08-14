@@ -24,6 +24,10 @@ pub struct Rig {
     cdc_lines: Vec<String>,
     extra_lines: Vec<String>,
     dest_override: Option<PathBuf>,
+    /// Pre-create the destination directory at `config_path()` time. False only
+    /// for [`Rig::unwritable_dest_path`], whose whole fixture is a destination
+    /// that cannot exist.
+    dest_precreate: bool,
     /// When set, the source declares `url_env: <name>` INSTEAD of an inline
     /// `url:`. See [`Rig::source_url_env`].
     url_env: Option<String>,
@@ -65,6 +69,7 @@ impl Rig {
             cdc_lines: Vec::new(),
             extra_lines: Vec::new(),
             dest_override: None,
+            dest_precreate: true,
             url_env: None,
             extra_exports: Vec::new(),
             oracle_container_dir: None,
@@ -200,6 +205,23 @@ impl Rig {
     /// mounted tiny filesystem for ENOSPC scenarios).
     pub fn dest_path(mut self, path: PathBuf) -> Self {
         self.dest_override = Some(path);
+        self
+    }
+
+    /// Point the destination at a path the rig must NOT create — the fixture
+    /// shape for a test whose subject is a destination that CANNOT be written.
+    ///
+    /// [`Rig::dest_path`] is pre-created at [`Rig::config_path`] time, which is
+    /// right for every run that wants its output back. A write-failure fixture
+    /// is the exact inverse: `governor_does_not_deadlock_when_chunks_fail`
+    /// points the local destination *under a regular file* so every chunk's
+    /// `dest.write` hits ENOTDIR, and the rig's own `create_dir_all` panics on
+    /// that path before rivet is ever spawned. Skipping the pre-create is the
+    /// entire difference — without it the all-chunks-fail path (and with it the
+    /// governor-deadlock regression) cannot be stated through the seam at all.
+    pub fn unwritable_dest_path(mut self, path: PathBuf) -> Self {
+        self.dest_override = Some(path);
+        self.dest_precreate = false;
         self
     }
 
@@ -428,7 +450,9 @@ impl Rig {
         // Materialization point: the ONLY place the rig touches the
         // filesystem (yaml()/render() stay pure — the offline goldens were
         // mkdir-ing /tmp/o as a side effect of rendering a string).
-        std::fs::create_dir_all(self.out_dir()).unwrap();
+        if self.dest_precreate {
+            std::fs::create_dir_all(self.out_dir()).unwrap();
+        }
         for e in &self.extra_exports {
             std::fs::create_dir_all(self.out_dir_for(&e.name)).unwrap();
         }

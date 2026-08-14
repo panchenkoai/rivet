@@ -86,44 +86,22 @@ fn governor_activates_and_run_completes() {
 
     const N: usize = 1000;
     let table = seed_pg_numeric_table(N as i64);
-    let out_dir = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        r#"
-source:
-  type: postgres
-  url: "{POSTGRES_URL}"
-  tuning:
-    adaptive: true
-    min_parallel: 2
-exports:
-  - name: {name}
-    query: "SELECT id, name FROM {name}"
-    mode: chunked
-    chunk_column: id
-    chunk_size: 100
-    parallel: 8
-    format: parquet
-    destination:
-      type: local
-      path: {out}
-"#,
-        name = table.name(),
-        out = out_dir.path().display(),
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
+    // Config through the canonical rig (it owns the tempdir and the
+    // destination); the governor knobs ride the `tuning:` block as source
+    // lines and the chunked plan as export lines.
+    let rig = Rig::pg_batch(table.name())
+        .query(&format!("SELECT id, name FROM {}", table.name()))
+        .mode("chunked")
+        .source_line("tuning:")
+        .source_line("  adaptive: true")
+        .source_line("  min_parallel: 2")
+        .export_line("chunk_column: id")
+        .export_line("chunk_size: 100")
+        .export_line("parallel: 8");
 
-    let out = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            table.name(),
-        ])
-        .env("RUST_LOG", "info")
-        .output()
-        .expect("spawn rivet run");
+    // `RUST_LOG=info` is load-bearing: the arming line the assertion below
+    // reads is emitted at info level.
+    let out = rig.run_with_envs(&[("RUST_LOG", "info")]);
 
     assert!(
         out.status.success(),
@@ -136,7 +114,7 @@ exports:
         "governor must activate for adaptive + parallel>1; stderr:\n{stderr}"
     );
     assert_eq!(
-        duckdb_total_parquet_rows(out_dir.path()),
+        duckdb_total_parquet_rows(&rig.out_dir()),
         N,
         "every row must round-trip through the governed parallel run"
     );
@@ -169,34 +147,20 @@ fn governor_backs_off_under_concurrent_write_pressure() {
     // window), giving the sampler many ticks under rising pressure.
     const ROWS: i64 = 20_000;
     let table = seed_pg_wide_table(ROWS, 1024);
-    let out_dir = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        r#"
-source:
-  type: postgres
-  url: "{POSTGRES_URL}"
-  tuning:
-    adaptive: true
-    min_parallel: 2
-    batch_size: 250
-    throttle_ms: 100
-exports:
-  - name: {name}
-    query: "SELECT id, payload FROM {name}"
-    mode: chunked
-    chunk_column: id
-    chunk_size: 1000
-    parallel: 8
-    format: parquet
-    destination:
-      type: local
-      path: {out}
-"#,
-        name = table.name(),
-        out = out_dir.path().display(),
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
+    // Config through the canonical rig (it owns the tempdir and the
+    // destination); the governor knobs ride the `tuning:` block as source
+    // lines and the chunked plan as export lines.
+    let rig = Rig::pg_batch(table.name())
+        .query(&format!("SELECT id, payload FROM {}", table.name()))
+        .mode("chunked")
+        .source_line("tuning:")
+        .source_line("  adaptive: true")
+        .source_line("  min_parallel: 2")
+        .source_line("  batch_size: 250")
+        .source_line("  throttle_ms: 100")
+        .export_line("chunk_column: id")
+        .export_line("chunk_size: 1000")
+        .export_line("parallel: 8");
 
     // Background writer: concurrent UPDATEs on the rows being exported plus a
     // CHECKPOINT every ~70 ms. The governor samples every 200 ms (set below),
@@ -237,45 +201,25 @@ exports:
     // early samples land before the writer's first checkpoint completes.
     std::thread::sleep(Duration::from_millis(400));
 
-    // Watchdog: redirect stderr to a file so we can both assert on it and avoid
-    // a piped-buffer deadlock while polling for exit.
-    let log_path = cfg_dir.path().join("rivet.stderr");
-    let log_file = std::fs::File::create(&log_path).unwrap();
-    let mut child = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            table.name(),
-        ])
-        .env("RUST_LOG", "info")
-        .env("RIVET_GOVERNOR_INTERVAL_MS", "200")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::from(log_file))
-        .spawn()
-        .expect("spawn rivet run");
+    // Watchdog through the rig: `run_with_envs_bounded` polls `try_wait` under a
+    // wall-clock ceiling with stdout/stderr on FILES (polling an undrained pipe
+    // is its own deadlock), so a governor hang fails THIS test instead of
+    // wedging the suite behind the quiet-window lock. `None` == had to be killed.
+    let out = rig.run_with_envs_bounded(
+        &[("RUST_LOG", "info"), ("RIVET_GOVERNOR_INTERVAL_MS", "200")],
+        Duration::from_secs(120),
+    );
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(120);
-    let status = loop {
-        match child.try_wait().expect("try_wait on rivet child") {
-            Some(s) => break s,
-            None if std::time::Instant::now() >= deadline => {
-                let _ = child.kill();
-                stop.store(true, Ordering::Relaxed);
-                let _ = writer.join();
-                panic!("governed run under concurrent write pressure did not finish within 120s");
-            }
-            None => std::thread::sleep(Duration::from_millis(100)),
-        }
-    };
-
+    // Stop the writer BEFORE any panic path, exactly as the hand-rolled
+    // watchdog did — a timeout must not leave a thread hammering the shared
+    // server (and CHECKPOINTing) for the rest of the run.
     stop.store(true, Ordering::Relaxed);
     writer.join().expect("writer thread");
+    let out = out.expect("governed run under concurrent write pressure did not finish within 120s");
 
-    let stderr = std::fs::read_to_string(&log_path).unwrap_or_default();
+    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        status.success(),
+        out.status.success(),
         "governed run under concurrent write pressure must still complete; stderr:\n{stderr}"
     );
     assert!(
@@ -288,7 +232,7 @@ exports:
          (a 'backed off' parallelism adjustment); stderr:\n{stderr}"
     );
     assert_eq!(
-        duckdb_total_parquet_rows(out_dir.path()),
+        duckdb_total_parquet_rows(&rig.out_dir()),
         ROWS as usize,
         "every exported row must round-trip despite concurrent writes to the same rows"
     );
@@ -313,72 +257,41 @@ fn governor_does_not_deadlock_when_chunks_fail() {
     require_alive(LiveService::Postgres);
 
     let table = seed_pg_numeric_table(500);
-    let out_dir = tempfile::tempdir().unwrap();
     // Point the local destination *under a regular file* so every chunk's
     // `dest.write` fails with ENOTDIR — a genuine per-chunk write failure that
     // drives the all-chunks-fail path through the real parallel write stage.
-    let blocker = out_dir.path().join("not_a_dir");
+    // The blocker lives in its own tempdir (the rig's destination must NOT be
+    // pre-created here — `unwritable_dest_path` is exactly that opt-out).
+    let fixture = tempfile::tempdir().unwrap();
+    let blocker = fixture.path().join("not_a_dir");
     std::fs::write(&blocker, b"x").expect("write blocker file");
-    let dest_path = blocker.join("sub");
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        r#"
-source:
-  type: postgres
-  url: "{POSTGRES_URL}"
-  tuning:
-    adaptive: true
-    min_parallel: 2
-exports:
-  - name: {name}
-    query: "SELECT id, name, amount FROM {name}"
-    mode: chunked
-    chunk_column: id
-    chunk_size: 100
-    parallel: 8
-    format: parquet
-    destination:
-      type: local
-      path: {out}
-"#,
-        name = table.name(),
-        out = dest_path.display(),
+    let rig = Rig::pg_batch(table.name())
+        .query(&format!("SELECT id, name, amount FROM {}", table.name()))
+        .mode("chunked")
+        .source_line("tuning:")
+        .source_line("  adaptive: true")
+        .source_line("  min_parallel: 2")
+        .export_line("chunk_column: id")
+        .export_line("chunk_size: 100")
+        .export_line("parallel: 8")
+        .unwritable_dest_path(blocker.join("sub"));
+
+    // Watchdog through the rig: `None` means the child had to be killed, i.e.
+    // the deadlock is back. Output goes to files, not pipes — polling an
+    // undrained pipe is its own deadlock.
+    let out = rig
+        .run_with_envs_bounded(&[], Duration::from_secs(30))
+        .unwrap_or_else(|| {
+            panic!(
+                "governor deadlock regression: adaptive chunked-parallel run did not \
+                 terminate within 30s when every chunk fails"
+            )
+        });
+    assert!(
+        !out.status.success(),
+        "run with all-failing chunks should exit non-zero; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
     );
-    let cfg = write_config(&cfg_dir, &yaml);
-
-    let mut child = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            table.name(),
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("spawn rivet run");
-
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
-    loop {
-        match child.try_wait().expect("try_wait on rivet child") {
-            Some(status) => {
-                assert!(
-                    !status.success(),
-                    "run with all-failing chunks should exit non-zero"
-                );
-                return;
-            }
-            None if std::time::Instant::now() >= deadline => {
-                let _ = child.kill();
-                panic!(
-                    "governor deadlock regression: adaptive chunked-parallel run did not \
-                     terminate within 30s when every chunk fails"
-                );
-            }
-            None => std::thread::sleep(Duration::from_millis(200)),
-        }
-    }
 }
 
 /// #152: the SAME back-off, on the KEYSET runner. The governor was chunked-only;
@@ -397,34 +310,20 @@ fn keyset_governor_backs_off_under_concurrent_write_pressure() {
 
     const ROWS: i64 = 20_000;
     let table = seed_pg_wide_table(ROWS, 1024);
-    let out_dir = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        r#"
-source:
-  type: postgres
-  url: "{POSTGRES_URL}"
-  tuning:
-    adaptive: true
-    min_parallel: 2
-    batch_size: 250
-    throttle_ms: 100
-exports:
-  - name: {name}
-    table: {name}
-    mode: chunked
-    chunk_by_key: id
-    chunk_size: 1000
-    parallel: 8
-    format: parquet
-    destination:
-      type: local
-      path: {out}
-"#,
-        name = table.name(),
-        out = out_dir.path().display(),
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
+    // Same rig, DIFFERENT plan: `table:` (the rig's default, no `query:`) and
+    // `chunk_by_key` — this is the KEYSET runner, not the range-chunked one.
+    // The two tests deliberately keep their own config builders: a shared
+    // helper would hide the one line that decides which runner is under test.
+    let rig = Rig::pg_batch(table.name())
+        .mode("chunked")
+        .source_line("tuning:")
+        .source_line("  adaptive: true")
+        .source_line("  min_parallel: 2")
+        .source_line("  batch_size: 250")
+        .source_line("  throttle_ms: 100")
+        .export_line("chunk_by_key: id")
+        .export_line("chunk_size: 1000")
+        .export_line("parallel: 8");
 
     let stop = Arc::new(AtomicBool::new(false));
     let table_name = table.name().to_string();
@@ -448,42 +347,19 @@ exports:
     };
     std::thread::sleep(Duration::from_millis(400));
 
-    let log_path = cfg_dir.path().join("rivet.stderr");
-    let log_file = std::fs::File::create(&log_path).unwrap();
-    let mut child = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            table.name(),
-        ])
-        .env("RUST_LOG", "info")
-        .env("RIVET_GOVERNOR_INTERVAL_MS", "200")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::from(log_file))
-        .spawn()
-        .expect("spawn rivet run");
-
-    let deadline = std::time::Instant::now() + Duration::from_secs(120);
-    let status = loop {
-        match child.try_wait().expect("try_wait") {
-            Some(s) => break s,
-            None if std::time::Instant::now() >= deadline => {
-                let _ = child.kill();
-                stop.store(true, Ordering::Relaxed);
-                let _ = writer.join();
-                panic!("governed keyset run under write pressure did not finish within 120s");
-            }
-            None => std::thread::sleep(Duration::from_millis(100)),
-        }
-    };
+    // Same bounded watchdog as the chunked twin (see there): stderr to a file,
+    // `None` == the run had to be killed at the ceiling.
+    let out = rig.run_with_envs_bounded(
+        &[("RUST_LOG", "info"), ("RIVET_GOVERNOR_INTERVAL_MS", "200")],
+        Duration::from_secs(120),
+    );
     stop.store(true, Ordering::Relaxed);
     writer.join().expect("writer thread");
+    let out = out.expect("governed keyset run under write pressure did not finish within 120s");
 
-    let stderr = std::fs::read_to_string(&log_path).unwrap_or_default();
+    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        status.success(),
+        out.status.success(),
         "governed keyset run must complete; stderr:\n{stderr}"
     );
     assert!(
@@ -498,7 +374,7 @@ exports:
         "#152: under rising pressure the keyset governor must shed at least one worker; stderr:\n{stderr}"
     );
     assert_eq!(
-        duckdb_total_parquet_rows(out_dir.path()),
+        duckdb_total_parquet_rows(&rig.out_dir()),
         ROWS as usize,
         "every row must round-trip through the governed keyset run"
     );
@@ -1154,64 +1030,32 @@ fn mysql_governor_backs_off_under_real_redo_pressure() {
     std::thread::sleep(Duration::from_millis(500));
     let waits_before = log_waits(&mut root);
 
-    let out_dir = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        r#"
-source:
-  type: mysql
-  url: "{MYSQL_URL}"
-  tuning:
-    adaptive: true
-    min_parallel: 2
-    batch_size: 250
-    throttle_ms: 100
-exports:
-  - name: {name}
-    query: "SELECT id, name, amount FROM {name}"
-    mode: chunked
-    chunk_column: id
-    chunk_size: 1000
-    parallel: 8
-    format: parquet
-    destination:
-      type: local
-      path: {out}
-"#,
-        name = table.name(),
-        out = out_dir.path().display(),
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
-
-    let log_path = cfg_dir.path().join("rivet.stderr");
-    let log_file = std::fs::File::create(&log_path).unwrap();
-    let mut child = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            table.name(),
-        ])
-        .env("RUST_LOG", "info")
-        .env("RIVET_GOVERNOR_INTERVAL_MS", "200")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::from(log_file))
-        .spawn()
-        .expect("spawn rivet run");
-
-    let deadline = std::time::Instant::now() + Duration::from_secs(120);
-    let status = loop {
-        match child.try_wait().expect("try_wait on rivet child") {
-            Some(s) => break s,
-            None if std::time::Instant::now() >= deadline => {
-                let _ = child.kill();
-                stop.store(true, Ordering::Relaxed);
-                let _ = writer.join();
-                panic!("governed MySQL run under redo pressure did not finish within 120s");
-            }
-            None => std::thread::sleep(Duration::from_millis(100)),
-        }
+    // Canonical Rig config + runner — no bespoke YAML/Command (this test was
+    // written by copying a legacy hand-rolled sibling; the harness rule says
+    // one seam). `run_with_envs_bounded` IS the watchdog: it polls the child
+    // under a wall-clock ceiling with stdout/stderr to files, so a governor
+    // hang fails THIS test instead of wedging the suite behind
+    // `quiet_window_guard` + `mysql_globals_guard` with a writer thread still
+    // hammering the shared server.
+    let rig = Rig::mysql_batch(table.name())
+        .query(&format!("SELECT id, name, amount FROM {}", table.name()))
+        .mode("chunked")
+        .source_line("tuning:")
+        .source_line("  adaptive: true")
+        .source_line("  min_parallel: 2")
+        .source_line("  batch_size: 250")
+        .source_line("  throttle_ms: 100")
+        .export_line("chunk_column: id")
+        .export_line("chunk_size: 1000")
+        .export_line("parallel: 8");
+    let out_dir = rig.out_dir();
+    let Some(out) = rig.run_with_envs_bounded(
+        &[("RUST_LOG", "info"), ("RIVET_GOVERNOR_INTERVAL_MS", "200")],
+        Duration::from_secs(120),
+    ) else {
+        stop.store(true, Ordering::Relaxed);
+        let _ = writer.join();
+        panic!("governed MySQL run under redo pressure did not finish within 120s");
     };
 
     let waits_after = log_waits(&mut root);
@@ -1220,9 +1064,9 @@ exports:
     let inserts = writer_inserts.load(Ordering::Relaxed);
     let _ = root.query_drop(format!("DROP TABLE IF EXISTS {scratch}"));
 
-    let stderr = std::fs::read_to_string(&log_path).unwrap_or_default();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
     assert!(
-        status.success(),
+        out.status.success(),
         "the governed run must still complete under redo pressure; stderr:\n{stderr}"
     );
     assert_governor_awake(&stderr, "mysql");
@@ -1257,7 +1101,7 @@ exports:
          counter moved by {delta} over {inserts} writer inserts; stderr:\n{stderr}"
     );
     assert_eq!(
-        duckdb_total_parquet_rows(out_dir.path()),
+        duckdb_total_parquet_rows(&out_dir),
         ROWS as usize,
         "every exported row must round-trip while the governor is shedding"
     );
