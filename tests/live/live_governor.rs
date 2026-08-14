@@ -918,3 +918,98 @@ fn mssql_adaptive_never_loses_to_its_own_baseline_on_an_idle_source() {
         "adaptive must not lose to its own baseline: on={wall_on:.2}s off={wall_off:.2}s"
     );
 }
+
+/// The governor's PG **17+** sampler arm, against a real modern catalog.
+///
+/// The main live stack is postgres:16, where `pg_stat_bgwriter.checkpoints_req`
+/// still resolves — so every other governor test takes the LEGACY arm and the
+/// modern one shipped with no live coverage at all (round-3 completeness
+/// critic). That arm is not a cosmetic difference: on PG 17+ the old query
+/// ERRORs, and the batch loop samples INSIDE the export's cursor transaction,
+/// so the error aborts it and the next FETCH dies. Verified by hand on the
+/// postgres:18 stand (2026-08-14):
+///
+/// ```text
+/// ERROR:  column "checkpoints_req" does not exist
+/// ERROR:  current transaction is aborted, commands ignored until end of transaction block
+/// ```
+///
+/// i.e. a wrong arm is a hard export failure, never a quiet `None`. This test
+/// runs a governed export against that stand and requires the governor to be
+/// AWAKE — armed, connected, and reading a signal — which is exactly what a
+/// sampler that ERRORs or returns `None` cannot be.
+///
+/// SKIPPED (not failed) when the optional `dev/stand` is down: it is opt-in,
+/// unlike the main compose stack. Bring it up with
+/// `docker compose --profile batch -f dev/stand/docker-compose.yaml up -d pg18-batch`.
+#[test]
+#[ignore = "live: requires the optional dev/stand pg18-batch (:5518)"]
+fn pg18_governor_samples_the_modern_checkpointer_catalog() {
+    if !pg_modern_alive() {
+        eprintln!(
+            "SKIP pg18_governor_samples_the_modern_checkpointer_catalog: the optional \
+             dev/stand pg18-batch (:5518) is not up"
+        );
+        return;
+    }
+    let _quiet = quiet_window_guard();
+
+    let table = format!("gov_pg18_{}", std::process::id());
+    let modern = POSTGRES_MODERN_URL;
+    pg_modern_exec(&format!(
+        "DROP TABLE IF EXISTS {table}; \
+         CREATE TABLE {table} (id bigint PRIMARY KEY, payload text); \
+         INSERT INTO {table} SELECT g, repeat('x', 512) FROM generate_series(1, 60000) g;"
+    ));
+
+    let rig = Rig::pg_batch(&table)
+        .source_url(modern)
+        .mode("chunked")
+        .export_line("chunk_by_key: id")
+        .export_line("chunk_size: 5000")
+        .export_line("parallel: 4")
+        .source_line("tuning:")
+        .source_line("  adaptive: true")
+        .source_line("  batch_size: 2000");
+    let out = rig.run_with_envs(&[("RUST_LOG", "info"), ("RIVET_GOVERNOR_INTERVAL_MS", "200")]);
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        out.status.success(),
+        "the governed export must succeed on a PG17+ catalog — a sampler naming the \
+         removed column would abort the cursor transaction; stderr:\n{stderr}"
+    );
+
+    // The whole point: on a PG17+ catalog the governor must be AWAKE. A sampler
+    // that named the removed column would have aborted the cursor transaction
+    // and failed the run outright; one that quietly returned None would trip
+    // the "provides no pressure signal" branch.
+    assert_governor_awake(&stderr, "postgres-18");
+    pg_modern_exec(&format!("DROP TABLE IF EXISTS {table};"));
+}
+
+/// Run SQL on the optional PG 17+ stand via `docker exec` — it is not part of
+/// the main stack, so the test helpers' pooled clients do not know about it.
+fn pg_modern_exec(sql: &str) {
+    let out = std::process::Command::new("docker")
+        .args([
+            "exec",
+            "-i",
+            "stand-pg18-batch-1",
+            "psql",
+            "-U",
+            "rivet",
+            "-d",
+            "rivet",
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-c",
+            sql,
+        ])
+        .output()
+        .expect("docker exec psql on the pg18 stand");
+    assert!(
+        out.status.success(),
+        "pg18 stand SQL failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

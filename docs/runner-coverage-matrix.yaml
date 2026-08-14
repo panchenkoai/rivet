@@ -80,7 +80,23 @@ scenarios:
     mongo_parallel: { na: "the drain does `let out = res?` — the FIRST worker error propagates immediately, so there is no keep-going path and therefore no end-of-run guard that can silently fail to fire. The residual risk is the opposite one (a later worker's parts unrecorded because the bail preceded their drain), which is the durable-part-count scenario, not this one" }
 
   - id: adaptive_concurrency_governor
-    what: "OPT-2 governor sheds parallel workers under source pressure (backs off to min_parallel, recovers as pressure eases). Runner-bypass class on the SAFETY knob: it was chunked-only, so a `parallel: N` keyset export on a straining replica adapted batches but never shed workers (#152). Now wired into keyset per-page (permit-per-page semaphore + the same Governor loop + min_parallel floor); the run journal records each ParallelismAdjusted."
+    what: "OPT-2 governor sheds parallel workers under source pressure (backs off to min_parallel, recovers as pressure eases). Runner-bypass class on the SAFETY knob: it was chunked-only, so a `parallel: N` keyset export on a straining replica adapted batches but never shed workers (#152). Now wired into keyset per-page (permit-per-page semaphore + the same Governor loop + min_parallel floor); the run journal records each ParallelismAdjusted.
+
+      ENGINE/VERSION AXIS (this ledger's columns are runners, so it cannot hold cells for
+      it — recorded here, 2026-08-14): the governor's pressure sampler is PER ENGINE and,
+      on PostgreSQL, PER SERVER VERSION. PG 17 removed pg_stat_bgwriter.checkpoints_req in
+      favour of pg_stat_checkpointer.num_requested, and a wrong arm is NOT a quiet None —
+      the batch loop samples inside the export's cursor transaction, so the ERROR aborts it
+      and every subsequent FETCH dies (proven on the postgres:18 stand: the mutant that
+      disables the modern arm fails the whole export with `current transaction is aborted`).
+      The main live stack is postgres:16, where both spellings resolve, so the modern arm
+      shipped with zero live coverage. Covered now on two layers: the branch itself by
+      `checkpoints_req_sql_matches_the_servers_catalog` (offline, pure fn) and the real
+      catalog by `pg18_governor_samples_the_modern_checkpointer_catalog` (live, skips when
+      the optional dev/stand pg18-batch on :5518 is down). STILL OPEN on the same axis: the
+      governor's ability to SHED is proven on PostgreSQL only — MySQL (Innodb_log_waits) and
+      SQL Server (Log Flush Waits/sec _Total) carry must-not-shed canaries plus a readability
+      assert, which a permanently-zero counter also satisfies."
     single:         { na: "single has no worker fan-out to govern (parallel is a multi-part-runner concept)" }
     chunked:        { test: governor_backs_off_under_concurrent_write_pressure }
     keyset:         { test: keyset_governor_backs_off_under_concurrent_write_pressure }
