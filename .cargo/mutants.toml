@@ -111,7 +111,13 @@ exclude_re = [
     # there is no measure), so `est != before && est.is_some()` never differs
     # observably from the `||` form — the guard is a skip-redundant-work
     # optimization, and the mutant is equivalent by construction.
-    "replace && with || in overlay_measured_rows",
+    # NOTE the escaping: `|` is regex ALTERNATION. Written as `||` this entry
+    # reads "replace && with " OR "" OR " in overlay_measured_rows" — the EMPTY
+    # alternative matches every mutant name, which silently disabled the whole
+    # gate (18,568 of 18,670 mutants excluded; the CI job reported "No mutants
+    # to filter" in 23s and, being continue-on-error, never complained).
+    # Guarded now by `exclude_patterns_are_not_over_broad`.
+    "replace && with \\|\\| in overlay_measured_rows",
     # run_exports_as_child_processes SPAWNS child `rivet run` processes and drives
     # the IPC card UI — it has no offline caller, so a body stub is unkillable
     # HERE by construction (the live-only class, cf. run_pool / density_probe). Its

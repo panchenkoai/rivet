@@ -3583,6 +3583,7 @@ dependencies = [
  "postgres-types",
  "proptest",
  "rand 0.10.1",
+ "regex",
  "reqsign",
  "reqwest",
  "rusqlite",

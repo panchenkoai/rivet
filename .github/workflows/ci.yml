@@ -188,6 +188,21 @@ jobs:
           CARGO_PROFILE_DEV_DEBUG: "0"
         run: |
           git diff "origin/${{ github.base_ref }}"...HEAD > pr.diff
+          # A code diff that yields ZERO mutants is not a pass — it means the
+          # gate graded nothing, and it has happened: one unescaped `|` in
+          # .cargo/mutants.toml's exclude_re (regex ALTERNATION with an empty
+          # branch) excluded 18,568 of 18,670 mutants, and this job reported
+          # green in 23s with `INFO No mutants to filter` on every run of
+          # #227/#229/#230. `exclude_patterns_are_not_over_broad` now catches
+          # that class offline; this is the belt to its braces, because the next
+          # cause may not be a regex at all (a broken --in-diff parse, a moved
+          # path prefix, a cargo-mutants upgrade).
+          if ! cargo mutants --in-diff pr.diff --list | grep -q .; then
+            echo "::error::the mutation gate generated NO mutants for a diff that \
+          touches source — it graded nothing. Check .cargo/mutants.toml's \
+          exclude_re for an over-broad pattern, and that pr.diff is non-empty."
+            exit 1
+          fi
           # Exit code 2 = missed mutants (the gate's failure); 0 = all caught
           # or nothing to mutate in this diff.
           # --lib AND --bins: half this crate lives in the BINARY target
