@@ -833,16 +833,15 @@ pub(crate) fn run_waves(
             .map(aggregate::entry_from_summary)
             .collect()
     };
+    // The mode label is decided from the concurrency the run ACHIEVED (the same
+    // `peak_concurrency` the harm frame above reads), never from the flag — see
+    // [`wave_mode_label`].
     let agg = aggregate::build(
         entries,
         started_at,
         finished_at,
         Some(config_path),
-        if parallel {
-            "wave-parallel-processes"
-        } else {
-            "wave-sequential"
-        },
+        wave_mode_label(peak_concurrency),
     );
     if total > 1 {
         aggregate::print(&agg);
@@ -921,6 +920,105 @@ fn wave_harm_window(peak: usize, exports: usize) -> Option<HarmWindow> {
     })
 }
 
+/// The run-mode label a wave run records on its aggregate — from the same
+/// measured `peak` [`wave_harm_window`] reads, never from the `--parallel` flag.
+///
+/// The label is not decoration: `aggregate::throughput_regressions` classifies
+/// it (`mode_shares_the_source`) to decide whether a per-export rows/s DROP is
+/// EXPECTED ("exports share the source … compare the run's makespan") or
+/// ACTIONABLE ("check governor sheds / adaptive batch shrinks / source load").
+/// `apply --parallel` over a hand-written config (`parallel_safe` unset → not
+/// safe) gives every export its own single-child batch and runs them one after
+/// another; passing the flag-derived string there excused a genuine 2.7×
+/// per-export regression as by-design and deleted the only actionable pointer —
+/// the exact text the 2026-08-13 field regression needed (bughunt 2026-08-14).
+pub(super) fn wave_mode_label(peak: usize) -> &'static str {
+    if peak > 1 {
+        "wave-parallel-processes"
+    } else {
+        "wave-sequential"
+    }
+}
+
+/// Did the pool actually OVERLAP any work?
+///
+/// `--pool 1`, or a single pending export left after the `--resume` skip, runs
+/// strictly serially however many slots were asked for. ONE predicate because
+/// THREE surfaces answer to it and must not disagree about the same run: the
+/// per-export DIAGNOSIS hedge (`MULTI_EXPORT_CONCURRENT`), the run-level harm
+/// frame ([`pool_harm_window`]) and the aggregate's mode label
+/// ([`pool_mode_label`]). Only the first read it before 2026-08-14, so a solo
+/// export got a correct un-hedged per-export attribution AND a second,
+/// flag-framed run-level line about the same spill.
+fn pool_is_concurrent(slots: usize, pending: usize) -> bool {
+    slots.min(pending) > 1
+}
+
+/// The window a POOL run actually presented to the source — the pool's sibling
+/// of [`wave_harm_window`], and for the same reason: the frame is a concurrency
+/// claim, so it must come from the concurrency, not from `--pool N`.
+///
+/// `--pool 5 --resume` with one export left, or `--pool 1` over eight, never
+/// overlapped anything; framing those as a pool window names "`--pool` slots"
+/// as the FIRST lever, which tells the operator to shrink a 1 (or to shrink
+/// five slots of which one was ever used) and pushes the two levers that DO
+/// work — `chunk_size`, `tuning.batch_size` — behind a lie. That is verbatim
+/// the harm [`HarmWindow::Serial`] was introduced for one runner over.
+///
+/// `None` when the pool drained nothing, matching the wave rule: rivet's window
+/// then contains none of rivet's work, so a spill in it is foreign.
+fn pool_harm_window(slots: usize, pending: usize) -> Option<HarmWindow> {
+    if pending == 0 {
+        return None;
+    }
+    Some(if pool_is_concurrent(slots, pending) {
+        HarmWindow::Pool {
+            exports: pending,
+            slots,
+        }
+    } else {
+        HarmWindow::Serial { exports: pending }
+    })
+}
+
+/// The run-mode label a pool run records — the [`wave_mode_label`] rule on the
+/// pool: a pool that never overlapped anything did not share the source, so the
+/// throughput self-check must keep its actionable pointer instead of excusing a
+/// regression with a concurrency the run did not have.
+///
+/// `"pool-serial"` is its own string (not `"sequential"`) so the aggregate card
+/// and the `run_aggregate` row still say WHICH runner produced it;
+/// `aggregate::mode_shares_the_source` classifies it with the serial modes.
+pub(super) fn pool_mode_label(concurrent: bool) -> &'static str {
+    if concurrent { "pool" } else { "pool-serial" }
+}
+
+/// The "prediction is a LOWER BOUND" line — or `None` when every prediction in
+/// the schedule rests on a real success.
+///
+/// ONE source for that claim, and it reads the RECONCILED classification
+/// (`pool::classification_counts` over the post-split `predict_items` sweep).
+/// The `--split` block cannot answer the question, because the only input it
+/// has is the SEED: unit names are stable across runs, so from run 2 onward
+/// each `{giant}#i` has history of its OWN that supersedes the seed
+/// (`pool::reconcile_split_seed`), while the giant is retained out of the run
+/// set and its rows stay frozen at the failure that motivated the split. A
+/// hedge derived there kept saying "the giant has no successful run to measure
+/// from" in the same run whose accounting printed "N measured, 0 estimated" —
+/// one run, two contradictory honesty claims about the same exports (bughunt
+/// 2026-08-14).
+fn lower_bound_hedge(attempt_n: usize, placeholder_n: usize) -> Option<String> {
+    let unmeasured = attempt_n + placeholder_n;
+    (unmeasured > 0).then(|| {
+        format!(
+            "        prediction is a LOWER BOUND: {unmeasured} export(s) have no successful run \
+             to measure from ({attempt_n} scheduled at a failed attempt's duration, \
+             {placeholder_n} at a {}s placeholder) — it tightens as runs complete",
+            super::pool::POOL_PLACEHOLDER_SECS as i64,
+        )
+    })
+}
+
 /// The run-window harm verdict, pure so the threshold and wording are
 /// unit-tested (its per-export sibling in `job::run_diagnosis` always was;
 /// this copy had zero cover behind a live-only seam — walk find, 2026-08-13).
@@ -994,8 +1092,11 @@ pub(crate) struct RunHarmBracket<'a> {
 /// cold link it costs seconds. A window stamped BEFORE it charges the run for
 /// rivet's own measurement — the pool then prints "actual makespan X vs
 /// predicted Y" grading its model against the cost of grading it, and the
-/// aggregate's rows/s (which `warn_throughput_regressions` compares run over
-/// run) is deflated by the same amount. The close side was fixed by hand at
+/// aggregate's own window (`RunAggregate.duration_ms`, and the run-level rows/s
+/// `aggregate::print` derives from it) is inflated by the same amount. NOT the
+/// run-over-run throughput self-check: that one compares each export's own
+/// `rows`/`duration_ms` from its `RunSummary` / `export_metrics` row, so the run
+/// window cannot move it (bughunt 2026-08-14). The close side was fixed by hand at
 /// four sites; this side is fixed by CONSTRUCTION — [`RunHarmBracket::open`]
 /// hands the caller the stamp, so no caller can order the probe inside the
 /// window it grades.
@@ -1222,23 +1323,29 @@ pub(crate) fn run_pool(
                         effective.extend(units);
                         // `items` is rebuilt by the single post-split
                         // classification sweep below.
-                        // The wall is only as good as the giant's prediction:
-                        // an unmeasured giant makes it a LOWER BOUND, and this
-                        // line is the one an operator reads while the run
-                        // starts (the accounting print below repeats it).
-                        let wall_hedge = match &unit_from {
-                            super::pool::PredictedFrom::SeededSplit(_) => "",
-                            _ => {
-                                " This wall is a LOWER BOUND: the giant has no successful run to \
-                                  measure from, so each unit is seeded from a failed attempt / \
-                                  placeholder."
-                            }
-                        };
+                        //
+                        // This line speaks for the SPLIT, not for the run's
+                        // prediction: `broken` is `advise_split`'s projection
+                        // over the PRE-split items (the giant at whatever its
+                        // frozen prediction was), and the seed it is derived
+                        // from is only a first-run bootstrap — from run 2 on,
+                        // each `{giant}#i` has history of its own that
+                        // supersedes it (`pool::reconcile_split_seed`). So the
+                        // honesty claim about the wall is NOT made here; it is
+                        // made once, from the reconciled classification, by
+                        // [`lower_bound_hedge`] beside the makespan print
+                        // below. Hedging from `unit_from` printed "the giant
+                        // has no successful run to measure from" in the same
+                        // run whose accounting said "N measured, 0 estimated"
+                        // (bughunt 2026-08-14).
                         log::warn!(
                             "apply --pool --split: split '{giant}' into {realized} range \
-                             sub-export(s) over its key — predicted wall ~{:.1} min (was the \
-                             single-export floor). The units share one prefix and fold to family \
-                             '{giant}', so the load view reads them as one table.{wall_hedge}",
+                             sub-export(s) over its key — projected wall ~{:.1} min from the \
+                             pre-split predictions (was the single-export floor). The units share \
+                             one prefix and fold to family '{giant}', so the load view reads them \
+                             as one table. The run's own predicted makespan — reconciled against \
+                             each unit's own history, and hedged when any of it rests on an \
+                             unmeasured export — prints below.",
                             broken / 60.0,
                         );
                     }
@@ -1370,20 +1477,9 @@ pub(crate) fn run_pool(
         measured_n,
         attempt_n + placeholder_n,
     );
-    // An unmeasured export is scheduled at a placeholder (or a failed
-    // attempt's floor) — the prediction cannot be better than its inputs, so
-    // say so up front instead of letting "~12 min" stand for a run that a
-    // single unmeasured giant can stretch to hours.
-    if attempt_n + placeholder_n > 0 {
-        println!(
-            "        prediction is a LOWER BOUND: {} export(s) have no successful run to \
-             measure from ({} scheduled at a failed attempt's duration, {} at a {}s \
-             placeholder) — it tightens as runs complete",
-            attempt_n + placeholder_n,
-            attempt_n,
-            placeholder_n,
-            super::pool::POOL_PLACEHOLDER_SECS as i64,
-        );
+    // The ONE honesty claim about the wall, from the RECONCILED classification.
+    if let Some(hedge) = lower_bound_hedge(attempt_n, placeholder_n) {
+        println!("{hedge}");
     }
 
     let pending: Vec<&ExportConfig> = effective.iter().collect();
@@ -1421,7 +1517,7 @@ pub(crate) fn run_pool(
     // `--pool 1` (or a single pending export) runs strictly serially, and the
     // hedge text run_diagnosis emits for concurrent siblings would be a false
     // claim there (bughunt 2026-08-13).
-    let really_concurrent = m.min(pending.len()) > 1;
+    let really_concurrent = pool_is_concurrent(m, pending.len());
     let prev_concurrent = MULTI_EXPORT_CONCURRENT.swap(really_concurrent, AtomicOrdering::Relaxed);
     struct ResetPoolStatics(bool, bool);
     impl Drop for ResetPoolStatics {
@@ -1561,10 +1657,13 @@ pub(crate) fn run_pool(
     // spills during the pool window are REAL harm to the source (disk-spilling
     // tmp tables, PG temp files) whoever triggered them — WARN so it is visible
     // at the default log level, with the levers that shrink the pressure.
-    run_harm.close_and_warn(HarmWindow::Pool {
-        exports: effective.len(),
-        slots: m,
-    });
+    //
+    // Framed by what OVERLAPPED, not by `--pool N`: a pool that ran everything
+    // serially (`--pool 1`, or one export left after the `--resume` skip) must
+    // not name a slot lever it does not have — see [`pool_harm_window`].
+    if let Some(window) = pool_harm_window(m, pending.len()) {
+        run_harm.close_and_warn(window);
+    }
 
     let actual_secs = (finished_at - started_at).num_milliseconds() as f64 / 1000.0;
     println!(
@@ -1623,7 +1722,16 @@ pub(crate) fn run_pool(
         .iter()
         .map(aggregate::entry_from_summary)
         .collect();
-    let agg = aggregate::build(entries, started_at, finished_at, Some(config_path), "pool");
+    let agg = aggregate::build(
+        entries,
+        started_at,
+        finished_at,
+        Some(config_path),
+        // From what overlapped, like the harm frame above — a serialized pool
+        // must keep the self-check's actionable pointer (see
+        // [`pool_mode_label`]).
+        pool_mode_label(really_concurrent),
+    );
     if pending.len() > 1 {
         aggregate::print(&agg);
     }
@@ -1877,6 +1985,96 @@ mod pool_harm_tests {
         assert_eq!(wave_harm_window(0, 0), None);
     }
 
+    /// The POOL's frame is a concurrency claim too, so it must come from the
+    /// concurrency — `--pool 5 --resume` with one export left, and `--pool 1`
+    /// over eight, both overlapped NOTHING. The shipped close read
+    /// `HarmWindow::Pool { exports: effective.len(), slots: m }` straight off
+    /// the invocation, so the operator was told to lower a 1 (or to lower five
+    /// slots of which one was ever used) — the very harm `HarmWindow::Serial`
+    /// was added for, one runner over, and worse here: with
+    /// `really_concurrent == false` the per-export DIAGNOSIS correctly does NOT
+    /// hedge, so the two lines about the same spill contradicted each other.
+    ///
+    /// RED against the shipped unconditional construction: the two serial cases
+    /// then read `Pool { .., slots: 5 }` / `Pool { .., slots: 1 }`.
+    #[test]
+    fn pool_harm_window_is_framed_by_the_concurrency_the_pool_had() {
+        use super::pool_harm_window;
+        // Five slots, one export left after the --resume skip: nothing overlapped.
+        assert_eq!(
+            pool_harm_window(5, 1),
+            Some(HarmWindow::Serial { exports: 1 }),
+            "a pool with one export to drain never overlapped anything"
+        );
+        // One slot, eight exports: strictly serial — naming `--pool` slots here
+        // tells the operator to shrink a 1.
+        assert_eq!(
+            pool_harm_window(1, 8),
+            Some(HarmWindow::Serial { exports: 8 }),
+            "`--pool 1` is a serial run whatever the export count"
+        );
+        // A real pool keeps its own frame AND its slot lever.
+        assert_eq!(
+            pool_harm_window(5, 12),
+            Some(HarmWindow::Pool {
+                exports: 12,
+                slots: 5
+            })
+        );
+        // The narrowest window that still overlaps.
+        assert_eq!(
+            pool_harm_window(2, 2),
+            Some(HarmWindow::Pool {
+                exports: 2,
+                slots: 2
+            })
+        );
+        // Nothing to drain: rivet's window holds none of rivet's work, so a
+        // spill in it is foreign — same rule as the wave sibling.
+        assert_eq!(pool_harm_window(5, 0), None);
+    }
+
+    /// The run-mode label decides whether the throughput self-check keeps its
+    /// ACTIONABLE tail ("check governor sheds / adaptive batch shrinks / source
+    /// load") or excuses the drop as source sharing. Both runners derived it
+    /// from the FLAG, so `apply --parallel` over a hand-written config (every
+    /// export in its own single-child batch → peak 1) and `apply --pool 1`
+    /// printed the by-design excuse for a real 2.7× regression — the exact
+    /// signal the 2026-08-13 field regression needed (bughunt 2026-08-14).
+    ///
+    /// The classification half is cross-checked from `aggregate`'s side by
+    /// `every_run_mode_label_a_runner_can_emit_is_classified`, which reads these
+    /// two functions instead of re-typing the label list.
+    ///
+    /// RED against the flag-derived strings: peak 1 then reads
+    /// `wave-parallel-processes`, a serial pool reads `pool`.
+    #[test]
+    fn run_mode_labels_report_the_concurrency_that_happened() {
+        use super::{pool_is_concurrent, pool_mode_label, wave_mode_label};
+        assert_eq!(wave_mode_label(3), "wave-parallel-processes");
+        assert_eq!(
+            wave_mode_label(1),
+            "wave-sequential",
+            "a `--parallel` run the cost gate serialized did not share the source"
+        );
+        assert_eq!(
+            wave_mode_label(0),
+            "wave-sequential",
+            "the non-parallel wave path never raises the peak"
+        );
+        assert_eq!(pool_mode_label(true), "pool");
+        assert_eq!(
+            pool_mode_label(false),
+            "pool-serial",
+            "a pool that never overlapped must not be labelled a pool run"
+        );
+        // The ONE predicate all three pool surfaces answer to.
+        assert!(pool_is_concurrent(5, 12) && pool_is_concurrent(2, 2));
+        assert!(!pool_is_concurrent(5, 1), "one export cannot overlap");
+        assert!(!pool_is_concurrent(1, 8), "one slot cannot overlap");
+        assert!(!pool_is_concurrent(4, 0));
+    }
+
     /// The serialized frame must also drop the LEVER — a remedy list that opens
     /// with "lower the export concurrency" on a run that had none buries the two
     /// levers that do work behind a false one (the same diagnostic-bypass harm a
@@ -1909,6 +2107,135 @@ mod pool_harm_tests {
         assert!(
             line.contains("`chunk_size`") && line.contains("`tuning.batch_size`"),
             "the levers this window DOES have must still be named: {line}"
+        );
+    }
+
+    /// A runner may not spell its own concurrency claim as a LITERAL: the harm
+    /// frame and the mode label are decided by the pure functions above, from
+    /// what OVERLAPPED, and each claim-string lives in exactly ONE of them.
+    ///
+    /// HONESTY: this pins the SEAM, not the values — `run_waves` and `run_pool`
+    /// both need a live source, a state DB and a destination, so no unit test in
+    /// this module can observe what they hand their aggregate or their bracket.
+    /// That is precisely where the defect lived: `wave_mode_label`'s rule (tested
+    /// above) was already right in `wave_harm_window`'s shape, and the CALLER
+    /// passed the flag instead of the measurement. The live oracles are
+    /// `apply --parallel` / `apply --pool` runs against a real source.
+    ///
+    /// RED against the pre-fix code, each of which puts a SECOND occurrence of
+    /// its needle in the product half: `if parallel { "wave-parallel-processes" }
+    /// else { "wave-sequential" }` at the wave aggregate, `aggregate::build(..,
+    /// "pool")` at the pool's, and the unconditional `HarmWindow::Pool { exports:
+    /// effective.len(), slots: m }` at the pool's bracket close.
+    #[test]
+    fn a_runner_never_spells_its_concurrency_claim_as_a_literal() {
+        let whole = include_str!("run.rs");
+        let src = &whole[..whole
+            .find("\n#[cfg(test)]")
+            .expect("run.rs has test modules")];
+        // CODE only: a doc comment naming a label is not a claim.
+        let code: String = src
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for (needle, owner) in [
+            ("\"wave-parallel-processes\"", "wave_mode_label"),
+            ("\"wave-sequential\"", "wave_mode_label"),
+            ("\"pool\"", "pool_mode_label"),
+            ("\"pool-serial\"", "pool_mode_label"),
+        ] {
+            assert_eq!(
+                code.matches(needle).count(),
+                1,
+                "{needle} must appear ONCE, inside {owner} — a second occurrence is a \
+                 runner claiming a concurrency it did not measure"
+            );
+        }
+        // …and each runner hands the decider the value it MEASURED. The rule
+        // being right is not the fix; the input being the measurement is.
+        for call in [
+            "wave_mode_label(peak_concurrency)",
+            "pool_mode_label(really_concurrent)",
+            "pool_harm_window(m, pending.len())",
+            "pool_is_concurrent(m, pending.len())",
+        ] {
+            assert!(
+                code.contains(call),
+                "expected the runner to decide from what happened: `{call}`"
+            );
+        }
+        // `run_pool` may not name a window VARIANT at all — the shipped close
+        // constructed `HarmWindow::Pool` inline from `--pool m` and the export
+        // count, which is the finding. Everything after its signature in the
+        // product half is `run_pool` plus small pure helpers that carry no
+        // window, so the absence is checkable directly (the wave side cannot be
+        // sliced this way: the deciders themselves live between the two
+        // signatures, which is why its needle above is the label literal).
+        let pool_body = &code[code
+            .find("\npub(crate) fn run_pool(")
+            .expect("run_pool's signature moved — update the anchor")..];
+        assert!(
+            !pool_body.contains("HarmWindow::"),
+            "the pool must route its harm frame through `pool_harm_window`, not \
+             construct a window from the invocation"
+        );
+    }
+
+    /// The run's "this wall is a LOWER BOUND" claim has exactly ONE source, and
+    /// it is the pure function fed the RECONCILED classification.
+    ///
+    /// The split block used to make the same claim from the pre-reconcile SEED,
+    /// so a steady-state split (giant frozen at a failed attempt; every
+    /// `{giant}#i` measured from run 1) printed the LOWER BOUND warn at start
+    /// and "N measured, 0 estimated" — with the hedge suppressed — 130 lines
+    /// later. One run, two contradictory honesty claims about the same exports.
+    ///
+    /// RED against restoring the `unit_from`-derived `wall_hedge` (the needle
+    /// count reads 2), and against a hedge that fires on a fully measured
+    /// schedule (`lower_bound_hedge(0, 0)` then returns `Some`).
+    #[test]
+    fn the_lower_bound_claim_has_one_source_and_reads_the_reconciled_counts() {
+        use super::lower_bound_hedge;
+        assert!(
+            lower_bound_hedge(0, 0).is_none(),
+            "a schedule resting entirely on successes is not a lower bound"
+        );
+        // ≥2 of each so the fold is a real fold and the two counts cannot be
+        // swapped without the assert noticing.
+        let hedge = lower_bound_hedge(2, 3).expect("5 unmeasured exports must hedge");
+        assert!(
+            hedge.contains("5 export(s)")
+                && hedge.contains("2 scheduled at a failed attempt")
+                && hedge.contains("3 at a"),
+            "the hedge must count both flavours of unmeasured: {hedge}"
+        );
+        // One claim in the product half, and it lives in the pure function —
+        // not in the split block, whose only input is the first-run seed.
+        let whole = include_str!("run.rs");
+        let src = &whole[..whole
+            .find("\n#[cfg(test)]")
+            .expect("run.rs has test modules")];
+        let code: String = src
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let needle = concat!("LOWER ", "BOUND");
+        assert_eq!(
+            code.matches(needle).count(),
+            1,
+            "the run must publish ONE honesty claim about its wall"
+        );
+        let at = code
+            .find(concat!("fn lower_bound", "_hedge"))
+            .expect("the pure hedge exists");
+        let until = code
+            .find("\npub(crate) fn run_pool(")
+            .expect("run_pool's signature moved — update the anchor");
+        assert!(
+            code[at..until].contains(needle),
+            "the claim must be made by the function fed the reconciled counts"
         );
     }
 }
@@ -1992,8 +2319,10 @@ mod run_tail_tests {
     /// handshake / pool build / MSSQL login) plus a catalog query, seconds over a
     /// tunnel. A `started_at` taken before it lands the instrumentation INSIDE
     /// the window that grades the run: the pool prints "actual makespan X vs
-    /// predicted Y" and the aggregate's rows/s (the input to the run-over-run
-    /// self-check) is deflated by the probe's own cost. The close side of the
+    /// predicted Y" and the aggregate's own window (`duration_ms`, and the
+    /// run-level rows/s printed from it) carries the probe's cost. The
+    /// run-over-run self-check is NOT downstream of this — it reads each
+    /// export's own duration, not the run window. The close side of the
     /// same rule was fixed at four sites by hand; this side is structural —
     /// `open` returns the stamp, so a caller cannot order it wrong.
     ///

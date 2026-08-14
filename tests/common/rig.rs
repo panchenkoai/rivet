@@ -341,6 +341,55 @@ impl Rig {
         super::runner::run_rivet_env(&["run", "--config", cfg.to_str().unwrap()], envs)
     }
 
+    /// [`Rig::run_with_envs`] under a WALL-CLOCK CEILING — `None` if the child
+    /// had to be killed.
+    ///
+    /// `run_with_envs` bottoms out in `Command::output()`, which blocks with no
+    /// timeout. That is fine for a test whose failure mode is a wrong value, and
+    /// wrong for one whose failure mode is a HANG: the governor deadlock
+    /// (`governor_does_not_deadlock_when_chunks_fail`) is a live regression
+    /// class, and a test that hangs while holding `quiet_window_guard` converts
+    /// one red test into an indefinite stall of every test that takes the same
+    /// cross-process lock — plus, for the pressure tests, a background writer
+    /// that keeps hammering the shared server forever.
+    ///
+    /// stdout/stderr go to FILES rather than pipes: polling `try_wait` while a
+    /// child fills a pipe buffer nobody drains is its own deadlock (the reason
+    /// the hand-rolled watchdogs in `live_governor.rs` redirect to a file).
+    pub fn run_with_envs_bounded(
+        &self,
+        envs: &[(&str, &str)],
+        timeout: std::time::Duration,
+    ) -> Option<std::process::Output> {
+        let cfg = self.config_path();
+        let out_path = self.dir.path().join("bounded.stdout");
+        let err_path = self.dir.path().join("bounded.stderr");
+        let mut cmd = std::process::Command::new(RIVET_BIN);
+        cmd.args(["run", "--config", cfg.to_str().unwrap()]);
+        for (k, v) in envs {
+            cmd.env(k, v);
+        }
+        cmd.stdout(std::fs::File::create(&out_path).expect("bounded stdout file"))
+            .stderr(std::fs::File::create(&err_path).expect("bounded stderr file"));
+        let mut child = cmd.spawn().expect("spawn rivet binary");
+        let start = std::time::Instant::now();
+        loop {
+            if let Some(status) = child.try_wait().expect("try_wait rivet") {
+                return Some(std::process::Output {
+                    status,
+                    stdout: std::fs::read(&out_path).unwrap_or_default(),
+                    stderr: std::fs::read(&err_path).unwrap_or_default(),
+                });
+            }
+            if start.elapsed() >= timeout {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
     pub fn checkpoint(&self) -> PathBuf {
         self.ckpt_override
             .clone()

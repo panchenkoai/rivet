@@ -126,5 +126,22 @@ exclude_re = [
     # collapse), and the heartbeat + card flow are live-guarded by
     # live_parallel_ux (common-mode banner + heartbeat) and the parallel-cards GIF.
     "replace run_exports_as_child_processes ->",
+    # `elapsed() < sample_interval` vs `<=` in Governor::run's pacing check:
+    # the two differ only when the elapsed time equals the interval to the
+    # NANOSECOND, and even then the `<=` form merely defers that one sample by a
+    # single poll quantum — the sampler's own cadence is unchanged and no
+    # decision differs. Verified against the wall-clock pacing test
+    # (governor_run_samples_on_the_sample_interval_not_on_every_poll), which
+    # grades the cadence from below and cannot distinguish them (round-4
+    # mutation run, 2026-08-14).
+    "replace < with <= in Governor::run",
+    # `to < from` vs `<=` in decision_cause: the sole caller is Governor::run
+    # inside `if let Some((from, to))`, and GovernorState::observe never yields a
+    # step where `to == from` (a no-change decision is None, not Some) — so the
+    # boundary the mutant moves is unreachable by construction. The two REAL
+    # neighbours (a shed, a recovery) are pinned by
+    # governor_run_warns_once_and_steps_back_to_the_ceiling_when_the_signal_dies
+    # and the blind-trajectory tests.
+    "replace < with <= in decision_cause",
     "replace match guard mssql_trusts_cert_without_verify\\(cfg\\) with (true|false) in MssqlSource::connect_with_tls",
 ]

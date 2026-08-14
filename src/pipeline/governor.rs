@@ -1,8 +1,11 @@
 //! Shared runner-side wiring for the OPT-2 adaptive concurrency governor (#152).
 //!
-//! The DECISION loop lives in [`crate::tuning::Governor`]; this is the per-runner scaffolding both
-//! the chunked and keyset parallel runners need — arm a monitoring connection, spawn the governor
-//! thread that resizes the permit semaphore, and drain its decisions into the run journal. It was
+//! The DECISION loop lives in [`crate::tuning::Governor`]; this is the per-runner scaffolding every
+//! parallel runner needs — arm a monitoring connection, spawn the governor thread that resizes the
+//! permit semaphore, and drain its decisions into the run journal. Three runners wire it today:
+//! `chunked/exec.rs` (spawner shape, one thread per chunk), `chunked/parallel_checkpoint.rs` (POOL
+//! shape — see [`TaskPermit`]), and `keyset.rs` (per page). A fourth, `mongo_parallel`, has no
+//! shared permit ceiling to resize and is out of scope by construction. It was
 //! copy-pasted between the two runners and drifted twice: (1) the log mutex was poison-recovered in
 //! chunked but plain-`unwrap()`ed in keyset (a panicked worker would then also take down the drain),
 //! and (2) keyset once drained AFTER its error check, losing every `ParallelismAdjusted` event on a
@@ -131,6 +134,72 @@ impl Drop for WorkerExit<'_> {
     }
 }
 
+/// RAII permit for ONE unit of work in a POOL-shaped runner — a fixed set of long-lived workers
+/// that claim tasks in a loop (`parallel_checkpoint`), as opposed to the SPAWNER shape
+/// (`chunked/exec.rs`) where the parent takes the permit and one thread runs one chunk.
+///
+/// Why the permit is per TASK and not per worker: the governor sheds by SHRINKING the semaphore's
+/// ceiling, and [`Semaphore::resize`] lowers it LAZILY — in-flight permits are honoured to
+/// completion. A pool worker that took its permit once at spawn holds it until the run ends, so a
+/// shed would resize a ceiling nobody ever re-tests and parallelism would never actually drop. One
+/// permit per claimed task is what makes the shed bite, at task granularity — the same shape the
+/// keyset runner uses at page granularity.
+///
+/// Released on EVERY exit path of the loop iteration — `break`, `continue`, an early `return`, or
+/// an unwinding panic — which is why it is a guard and not an `acquire()`/`release()` pair.
+pub(crate) struct TaskPermit<'a>(&'a Semaphore);
+
+impl<'a> TaskPermit<'a> {
+    /// Park until a permit is free, then hold it for the rest of this scope.
+    pub(crate) fn acquire(semaphore: &'a Semaphore) -> Self {
+        semaphore.acquire();
+        Self(semaphore)
+    }
+}
+
+impl Drop for TaskPermit<'_> {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
+/// RAII `finished` accounting for ONE pool worker: bumps the counter
+/// [`GovernorHarness::spawn_into`]'s stop predicate reads when the worker's claim loop EXITS
+/// (drained queue, claim error, or an unwinding panic).
+///
+/// The permit half lives in [`TaskPermit`] instead of here — a pool worker's permit is per TASK,
+/// so pairing the two the way [`WorkerExit`] does would release a permit the worker no longer
+/// holds (an unmatched `release()` underflows the semaphore's count). Same failure mode either way
+/// if the bump is skipped: the governor thread's only exit is `finished >= total`, so a missed
+/// bump loops it forever and `std::thread::scope` can never join.
+pub(crate) struct WorkerFinished<'a>(&'a AtomicUsize);
+
+impl<'a> WorkerFinished<'a> {
+    /// Bind at the TOP of the worker closure — before any fallible or panicking work.
+    pub(crate) fn new(finished: &'a AtomicUsize) -> Self {
+        Self(finished)
+    }
+}
+
+impl Drop for WorkerFinished<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Does this plan get a governor? Pure so the four ways to get it wrong
+/// (`&&`→`||`, `>`→`==`/`<`/`>=`) are unit-provable: the decision itself used to
+/// live inline in [`GovernorHarness::arm`], one line above a `create_source`
+/// call, so every mutant of it survived the whole offline suite (the first real
+/// run of the un-broken mutation gate, 2026-08-14, scored four survivors here).
+///
+/// `parallel > 1` and not `>= 1`: a single worker has nothing to shed (the floor
+/// is 1), so arming there would open a monitoring connection to drive a
+/// semaphore that can never move.
+fn should_arm(adaptive: bool, parallel: usize) -> bool {
+    adaptive && parallel > 1
+}
+
 /// The armed governor for one parallel runner invocation. Owns the monitoring connection and the
 /// off-thread decision log; [`spawn_into`](Self::spawn_into) runs the governor thread and
 /// [`drain_into`](Self::drain_into) records its decisions. Unarmed (adaptation off / no real
@@ -154,8 +223,7 @@ impl GovernorHarness {
             .min_parallel
             .unwrap_or(1)
             .clamp(1, parallel.max(1));
-        let on = plan.tuning.adaptive && parallel > 1;
-        let monitor: Option<Box<dyn Source>> = if on {
+        let monitor: Option<Box<dyn Source>> = if should_arm(plan.tuning.adaptive, parallel) {
             match source::create_source(&plan.source) {
                 Ok(s) => {
                     log::info!(
@@ -469,6 +537,215 @@ mod tests {
                  (probe={probe:?})"
             );
         }
+    }
+
+    /// The arm decision, all four ways to break it. It lived inline in
+    /// [`GovernorHarness::arm`] — one line above a `create_source` call, so no
+    /// unit test could reach it and every mutant of it survived (four of the
+    /// eighteen survivors of the first non-vacuous mutation run, 2026-08-14).
+    ///
+    /// Each row is here because it kills a specific mutant, so keep all four:
+    /// `(true, 1)` kills `>` → `>=` and `&&` → `||`; `(false, 8)` kills
+    /// `&&` → `||` from the other side; `(true, 2)` kills `>` → `<` and
+    /// `>` → `==`.
+    #[test]
+    fn the_governor_arms_only_for_adaptive_with_real_parallelism() {
+        assert!(
+            should_arm(true, 2),
+            "adaptive + parallel 2 is the whole point of the knob"
+        );
+        assert!(should_arm(true, 8));
+        assert!(
+            !should_arm(true, 1),
+            "one worker has nothing to shed — arming opens a monitoring connection to drive \
+             a semaphore that cannot move"
+        );
+        assert!(
+            !should_arm(true, 0),
+            "no work at all: `arm` is still called (parallel may be 0), and must not connect"
+        );
+        assert!(
+            !should_arm(false, 8),
+            "the user did not opt in — `adaptive: false` must not open a monitoring connection"
+        );
+        assert!(!should_arm(false, 1));
+    }
+
+    /// The POOL shape's shed, end to end through the real guards: a ceiling
+    /// shrunk below the pool size must actually cap concurrency, and every task
+    /// must still be claimed (a shed is a slowdown, never a stranded task).
+    ///
+    /// Both regimes from one fixture on purpose. The shrunken run alone cannot
+    /// tell a working permit ceiling from an inert fixture that never overlaps
+    /// anyway — so the wide run is the activation guard: same pool, same tasks,
+    /// ceiling left at the pool size, concurrency must exceed 1.
+    ///
+    /// The completion oracle is deadline-polled rather than joined because the
+    /// mutant that matters most (a [`TaskPermit`] whose `Drop` does not release)
+    /// HANGS the pool — a join would turn that into a hung test instead of a red
+    /// one.
+    #[test]
+    fn a_shrunken_permit_ceiling_sheds_pool_workers_without_stranding_a_task() {
+        const WORKERS: usize = 3;
+        const TASKS: usize = 12;
+
+        for ceiling in [1usize, WORKERS] {
+            let sem = Arc::new(Semaphore::new(WORKERS));
+            // What the governor does when it sheds: shrink the live ceiling of a
+            // pool that is already sized `WORKERS`.
+            sem.resize(ceiling);
+
+            let next = Arc::new(AtomicUsize::new(0));
+            let done = Arc::new(AtomicUsize::new(0));
+            let live = Arc::new(AtomicUsize::new(0));
+            let peak = Arc::new(AtomicUsize::new(0));
+            let finished = Arc::new(AtomicUsize::new(0));
+
+            for _ in 0..WORKERS {
+                let (sem, next, done, live, peak, finished) = (
+                    Arc::clone(&sem),
+                    Arc::clone(&next),
+                    Arc::clone(&done),
+                    Arc::clone(&live),
+                    Arc::clone(&peak),
+                    Arc::clone(&finished),
+                );
+                std::thread::spawn(move || {
+                    let _finish = WorkerFinished::new(&finished);
+                    loop {
+                        // Exactly the runner's shape: permit first, then claim.
+                        let _permit = TaskPermit::acquire(&sem);
+                        if next.fetch_add(1, Ordering::Relaxed) >= TASKS {
+                            break;
+                        }
+                        let now = live.fetch_add(1, Ordering::Relaxed) + 1;
+                        peak.fetch_max(now, Ordering::Relaxed);
+                        std::thread::sleep(Duration::from_millis(10));
+                        live.fetch_sub(1, Ordering::Relaxed);
+                        done.fetch_add(1, Ordering::Relaxed);
+                    }
+                });
+            }
+
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while done.load(Ordering::Relaxed) < TASKS && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(
+                done.load(Ordering::Relaxed),
+                TASKS,
+                "every task must still be claimed at ceiling {ceiling} — a shed slows the run \
+                 down, it must never strand work (a permit that is not returned parks the pool \
+                 forever)"
+            );
+
+            let observed = peak.load(Ordering::Relaxed);
+            if ceiling == 1 {
+                assert_eq!(
+                    observed, 1,
+                    "the governor shrank the ceiling to 1, so at most one task may run at a \
+                     time; observed {observed} concurrent"
+                );
+            } else {
+                assert!(
+                    observed > 1,
+                    "activation guard: at the full ceiling this pool MUST overlap, or the \
+                     shrunken half above proves nothing; observed {observed} concurrent"
+                );
+            }
+
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while finished.load(Ordering::Relaxed) < WORKERS && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(
+                finished.load(Ordering::Relaxed),
+                WORKERS,
+                "every pool worker must count itself finished — the governor thread's only \
+                 exit is `finished >= total`"
+            );
+        }
+    }
+
+    /// A task that UNWINDS must still return its permit and, when the worker
+    /// dies with it, still count as finished. Two iterations because both
+    /// subjects accumulate: with one task a guard that releases only on the
+    /// happy path is indistinguishable from a correct one.
+    ///
+    /// The panic is expected and its message is printed by the test harness.
+    #[test]
+    fn a_panicking_pool_task_returns_its_permit_and_counts_its_worker() {
+        let sem = Arc::new(Semaphore::new(2));
+        let finished = AtomicUsize::new(0);
+
+        for panics in [true, false] {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _finish = WorkerFinished::new(&finished);
+                let _permit = TaskPermit::acquire(&sem);
+                if panics {
+                    panic!("rivet test: injected pool-task panic (expected)");
+                }
+            }));
+            assert_eq!(outcome.is_err(), panics, "task outcome (panics={panics})");
+        }
+
+        assert_eq!(
+            finished.load(Ordering::Relaxed),
+            2,
+            "an UNWINDING pool worker must still count as finished, or the governor loops \
+             forever and `thread::scope` never joins"
+        );
+        assert!(
+            acquires_within(&sem, 2, Duration::from_secs(5)),
+            "both permits must return — a permit leaked by a panicking task parks the pool"
+        );
+    }
+
+    /// Call-site pin: the CHECKPOINT parallel chunked runner is governed.
+    ///
+    /// Honest about its strength — this greps source text, and the real oracle
+    /// is a live shed test (`governor_backs_off_under_concurrent_write_pressure`
+    /// grades `chunked/exec.rs`; there is no checkpoint-runner twin yet, and
+    /// this runner needs a real source + a state DB, so no unit test can drive
+    /// it). What it pins is the WIRING, which is exactly what was missing: the
+    /// runner shipped with no governor at all, so `tuning.adaptive: true` was a
+    /// silent no-op on the `chunk_checkpoint: true` + `parallel: N` shape
+    /// `rivet init` scaffolds — and `plan.strategy.is_resumable()` is the only
+    /// thing that routes a config to one runner or the other (job.rs:1042).
+    /// RED against deleting any of the four calls.
+    #[test]
+    fn the_parallel_checkpoint_runner_arms_spawns_and_drains_the_governor() {
+        let src = include_str!("chunked/parallel_checkpoint.rs");
+        assert!(
+            src.contains("GovernorHarness::arm(plan, parallel)"),
+            "the resumable chunked runner must arm the governor — without it `adaptive: true` \
+             is silent on the shape `rivet init` scaffolds"
+        );
+        assert!(
+            src.contains("governor.spawn_into(s, &semaphore, &finished, parallel,"),
+            "arming without spawning never resizes anything; `total` is the POOL SIZE here \
+             (workers that exit), not the task count"
+        );
+        assert!(
+            src.contains("governor.drain_into(summary);"),
+            "the ParallelismAdjusted events must reach the run journal"
+        );
+        assert!(
+            src.contains("TaskPermit::acquire(semaphore)"),
+            "a pool worker must take its permit PER TASK — one permit held for the worker's \
+             whole life is a ceiling the governor can shrink with no effect"
+        );
+        let drain = src
+            .find("governor.drain_into(summary);")
+            .expect("drain call site");
+        let bail = src
+            .find("parallel checkpoint worker errors")
+            .expect("worker-error bail");
+        assert!(
+            drain < bail,
+            "drain BEFORE the error bail, or a failed run journals none of its governor \
+             decisions — the drift the keyset copy re-introduced once"
+        );
     }
 
     /// Call-site pin for the guard above.

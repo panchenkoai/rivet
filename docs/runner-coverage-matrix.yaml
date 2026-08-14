@@ -101,6 +101,33 @@ scenarios:
       (mssql_governor_backs_off_under_real_log_flush_pressure — a writer committing one
       ~200 KB row per transaction, which forces a log flush per commit; measured 1273 ->
       1681 over 400 commits, and unlike the MySQL twin it needs no server-wide flip). All
+      RUNNER-VARIANT AXIS, and the exact hazard this ledger's four-column collapse warns
+      about in its header (found 2026-08-14, round-4 bughunt finding 0). The `chunked` cell
+      below is proven on chunked_PARALLEL (chunked/exec.rs) — and the CHECKPOINT twin
+      (parallel_checkpoint.rs, which job.rs dispatches whenever `plan.strategy.is_resumable()`,
+      i.e. `chunk_checkpoint: true`) had NO governor at all: no monitoring connection, no arm
+      line, no permit ceiling to resize. So `tuning.adaptive: true` was a silent no-op on
+      exactly the shape `rivet init` scaffolds (chunk_checkpoint + parallel), and dropping
+      `chunk_checkpoint` from an otherwise identical config was the difference between a
+      governed run and an ungoverned one, with nothing in the log to tell them apart. Now
+      wired through the same GovernorHarness seam, in the POOL shape it needs: one permit per
+      CLAIMED TASK (governor::TaskPermit, taken before the claim so a shed parks a worker
+      rather than pinning a chunk_task `running`) plus governor::WorkerFinished counting
+      worker exits, since `total` there is the pool size, not the task count. Three layers of
+      proof, named honestly: the wiring by
+      `the_parallel_checkpoint_runner_arms_spawns_and_drains_the_governor` (offline call-site
+      pin — it greps source text and says so); the pool shed MECHANISM by
+      `a_shrunken_permit_ceiling_sheds_pool_workers_without_stranding_a_task` (offline, real
+      guards, RED against a per-worker permit and against a leaked one); and the end-to-end
+      behaviour by an AD-HOC live run, not yet by a committed test — a chunk_checkpoint +
+      parallel:8 + adaptive PG export under a CHECKPOINT-spamming writer logged
+      `governor active (parallel 2..8)`, shed 8 -> 7 under rising pressure, recovered 7 -> 8,
+      journalled all four ParallelismAdjusted events and still delivered 20000/20000 rows in
+      20 parts (2026-08-14). The remaining follow-up is to make that fixture a COMMITTED
+      checkpoint-runner twin of the live test named in the cell below (tests/live/
+      live_governor.rs); until it exists, the `chunked` cell's live shed proof covers
+      exec.rs only. The
+
       three shed tests exist because a must-not-shed assertion cannot tell a working signal
       from a dead one: under a mutant that makes the engine's sampler read permanently
       flat, every pre-existing canary on that engine stays GREEN and only the shed test
@@ -225,4 +252,4 @@ scenarios:
     single:         { na: "shared seam — harm_snapshot/pg_temp_bytes_snapshot bracket the strategy dispatch inside run_export_job and run_diagnosis prints after it, covering all four runners in one place (like capture_open_forensics); no per-runner divergence on the `rivet run` path. Proven end-to-end by pg_run_persists_source_harm_rows / mysql_run_persists_source_harm_rows / mssql_run_persists_source_harm_rows (the rows land in export_harm) and the pure-fn decisions by run_diagnosis_flags_flaky_link_and_spill_signals_only + pg_temp_bytes_warning_hedges_attribution_under_concurrent_siblings" }
     chunked:        { na: "shared seam (run_export_job brackets the dispatch)" }
     keyset:         { na: "shared seam (run_export_job brackets the dispatch)" }
-    mongo_parallel: { na: "shared seam (run_export_job brackets the dispatch); the one distinct entry point is APPLY (run_export_job_with_chunk_source), which — unlike open_forensics — does NOT re-apply this bracket: see the KNOWN GAP in `what:` above" }
+    mongo_parallel: { na: "shared seam (run_export_job brackets the dispatch); the one distinct entry point is APPLY (run_export_job_with_chunk_source), which re-applies the SAME bracket (harm_snapshot + pg_temp_bytes_snapshot around the dispatch, run_diagnosis after status resolution — job.rs), guarded by both_job_entry_points_bracket_the_source_harm_window (tests/offline/runner_frame_gate.rs)" }

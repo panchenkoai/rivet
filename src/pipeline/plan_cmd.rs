@@ -782,7 +782,7 @@ type ExportFields = HashMap<String, Vec<(&'static str, String)>>;
 /// Replace the cost model's `recommended_wave` with waves PACKED from measured
 /// run history (`--annotate-waves` only). Tier = the export's existing `wave:`
 /// (the operator's priority) when set, else the cost model's recommendation;
-/// duration = the last successful run's, else a rows-based estimate; every
+/// duration AND peak RSS = [`super::pool::predict_secs_and_rss`]; every
 /// export is `parallel_safe: true` afterwards because under packing the WAVE
 /// is the concurrency cap (K by cost class, RSS-guarded).
 fn repack_from_history(
@@ -803,29 +803,28 @@ fn repack_from_history(
             // packing (bug hunt 2026-08-08); recommended_wave is deterministic
             // from the cost model, so re-annotation is idempotent.
             let tier = *rec_wave;
-            // Last successful run: the best predictor of the next one.
-            // Direct success query, the same one `pool::predict_secs` uses — a
-            // fixed 25-row window goes BLIND after 25 consecutive failures, so
-            // a chronically-failing export fell to the 5 s placeholder here
-            // while `apply --pool` still measured it from its real last
-            // success: two commands, one state DB, contradictory schedules for
-            // one config — and `--annotate-waves` WRITES its belief into the
-            // operator's config (bughunt 2026-08-14).
-            let last = state.get_last_success_metric(name).ok().flatten();
-            let (secs, rss) = match &last {
-                Some(m) => {
-                    measured_n += 1;
-                    (
-                        (m.duration_ms as f64 / 1000.0).max(0.001),
-                        m.peak_rss_mb.unwrap_or(150),
-                    )
-                }
-                // No history: a flat placeholder. Deliberately coarse — its
-                // only job is ORDERING within the tier until a real run
-                // exists; the label below says "estimated" so nobody mistakes
-                // it for knowledge (#148/#149 give it real numbers later).
-                None => (5.0, 150),
-            };
+            // THE predictor, shared with `apply --pool`
+            // ([`super::pool::predict_secs_and_rss`]) rather than re-derived
+            // here: two commands over one state DB must not produce
+            // contradictory schedules for one config, and `--annotate-waves`
+            // WRITES its belief into the operator's config, so its blindness
+            // outlives the command. A local copy diverged twice — first on the
+            // fixed 25-row window (blind past 25 consecutive failures), then on
+            // the missing failed-attempt tier: an export that has never
+            // succeeded but whose attempts run an hour at 3 GB was scheduled
+            // here at (5 s, 150 MB) while the pool floored it at the attempt
+            // (bughunt 2026-08-14, rounds 3 and 4).
+            let (from, peak_rss) = super::pool::predict_secs_and_rss(state, name);
+            // Only a SUCCESS is a measurement — a failed attempt's duration is
+            // a floor, so it stays out of the "N measured, M estimated" label
+            // even though it now carries a real number.
+            if matches!(from, super::pool::PredictedFrom::Measured(_)) {
+                measured_n += 1;
+            }
+            // 150 MB when the history carries no RSS at all: deliberately
+            // coarse, its only job is to order/budget until a real run exists
+            // (#148/#149 give it real numbers later).
+            let (secs, rss) = (from.secs(), peak_rss.unwrap_or(150));
             crate::plan::waves::PackItem {
                 name: name.clone(),
                 tier,
@@ -1227,6 +1226,82 @@ mod tests {
         );
         assert_eq!(wave("steady"), 1, "fixture: K=2 pairs the two heaviest");
         assert_eq!((wave("mid"), wave("tiny")), (2, 2), "…and the two lightest");
+    }
+
+    /// The NEVER-succeeded export: `--annotate-waves` must schedule it from the
+    /// same failed-attempt tier `apply --pool` uses, and must charge the wave
+    /// budget its real peak RSS.
+    ///
+    /// Round-3 converged the two predictors only on the succeeded-then-failed
+    /// case (the test above). An export with NO success ever — attempts running
+    /// an hour and peaking at 3 GB, a plausible reason it keeps failing — still
+    /// fell to the local `(5 s, 150 MB)` placeholder here while
+    /// `pool::predict_secs` floored it at the attempt: it sorted LAST in its
+    /// tier and was charged 150 MB of a 4096 MB wave budget, so it packed
+    /// beside exports the wave could not hold in memory — pressure re-creating
+    /// the very failure, written into the operator's config (bughunt
+    /// 2026-08-14, round 4).
+    ///
+    /// Both halves are RED-proven, and the two asserts fail against DIFFERENT
+    /// mutants, which is why both are here:
+    ///  * duration — restore `None => (5.0, 150)`: `doomed` sorts below the
+    ///    three measured exports and lands in wave 2 (`left: 2, right: 1`).
+    ///  * RSS — keep the duration but drop the peak (`peak_rss.unwrap_or(150)`
+    ///    → a flat `150`): `doomed` opens wave 1 but no longer fills the
+    ///    budget, so `steady` packs in beside it (`wave("steady")` 1, not 2).
+    #[test]
+    fn repack_predicts_an_export_that_has_never_succeeded_from_its_failed_attempts() {
+        let state = crate::state::StateStore::open_in_memory().expect("state");
+        let rec = |name: &str, run: &str, ms: i64, rss: i64, status: &str| {
+            state
+                .record_metric_full(&crate::state::MetricRow {
+                    export_name: name.to_string(),
+                    run_id: run.to_string(),
+                    duration_ms: ms,
+                    total_rows: 10,
+                    peak_rss_mb: Some(rss),
+                    status: status.to_string(),
+                    files_produced: 1,
+                    bytes_written: 100,
+                    ..Default::default()
+                })
+                .expect("record");
+        };
+        // Never a success: three attempts, and NEITHER the longest duration nor
+        // the largest peak is the most recent row — a fold that takes "the last
+        // attempt" instead of the worst one reads (600 s, 200 MB) and packs
+        // `doomed` beside `steady` again.
+        rec("doomed", "d1", 1_200_000, 900, "failed");
+        rec("doomed", "d2", 3_600_000, 3000, "interrupted");
+        rec("doomed", "d3", 600_000, 200, "failed");
+        rec("steady", "s_ok", 1_200_000, 2000, "success");
+        rec("mid", "m_ok", 600_000, 100, "success");
+        rec("tiny", "t_ok", 10_000, 100, "success");
+
+        let recs: Vec<(String, u32, bool)> = ["doomed", "steady", "mid", "tiny"]
+            .iter()
+            .map(|n| ((*n).to_string(), 2u32, false))
+            .collect();
+        // Medium → K=3, so the wave is NOT capped at 2 members: whether
+        // `steady` joins `doomed` is then decided by the RSS budget alone.
+        let cost_of = recs
+            .iter()
+            .map(|(n, _, _)| (n.clone(), crate::plan::CostClass::Medium))
+            .collect();
+        let packed = repack_from_history(recs, &cost_of, &std::collections::HashSet::new(), &state);
+        let wave = |n: &str| packed.iter().find(|(m, _, _)| m == n).unwrap().1;
+        assert_eq!(
+            wave("doomed"),
+            1,
+            "an hour-long failed attempt is a FLOOR on the real duration — it must \
+             open the tier, not sort below a 10 s export at the 5 s placeholder"
+        );
+        assert_eq!(
+            (wave("steady"), wave("mid"), wave("tiny")),
+            (2, 2, 2),
+            "3000 MB + 2000 MB exceeds the 4096 MB wave budget: the failed \
+             attempt's peak RSS must split the wave, not be discarded as 150 MB"
+        );
     }
 
     /// An isolate_on_source export must come out parallel_safe:FALSE even under

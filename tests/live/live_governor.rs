@@ -1032,18 +1032,32 @@ fn pg_modern_exec(sql: &str) {
 /// went 12 -> 390 in 2.4 s under exactly this shape, and stayed flat without
 /// the shrink.
 ///
-/// Three assertions, in the order that makes each meaningful:
+/// Four assertions, in the order that makes each meaningful:
 ///  1. the governor ARMED (otherwise the rest grades nothing),
-///  2. the counter really moved (the activation guard — an inert fixture must
-///     fail here rather than quietly pass the shed assertion),
-///  3. it BACKED OFF at least once.
+///  2. this test's OWN writer really committed (the attributable half of the
+///     activation guard),
+///  3. the counter really moved (the server-wide half),
+///  4. it BACKED OFF at least once.
 ///
-/// Attribution honesty: `Innodb_log_waits` is a GLOBAL counter with no session
-/// twin (InnoDB status variables ignore `SHOW SESSION STATUS`), so the delta in
-/// (2) cannot be isolated to this test the way the spill test's session probe
-/// can. Both cross-process locks are therefore load-bearing here, not
-/// belt-and-suspenders: `quiet_window_guard` serialises every timing/pressure
-/// test, and `mysql_globals_guard` serialises the server-wide flip.
+/// Attribution honesty — what each half of the activation guard can and cannot
+/// prove. `Innodb_log_waits` is a GLOBAL counter with no session twin (InnoDB
+/// status variables ignore `SHOW SESSION STATUS`), so unlike the spill test's
+/// session probe the delta in (3) is NOT isolated to this test: it is server-
+/// wide, and this test has just shrunk `innodb_log_buffer_size` server-wide, so
+/// any concurrent write anywhere on the instance contributes to it. The two
+/// cross-process locks do NOT close that: `quiet_window_guard` and
+/// `mysql_globals_guard` are taken only by the tests in this file (verified —
+/// no other live file references either), so they serialise the governor
+/// tests against each other and exclude nothing else on the shared server.
+/// Hence the split. (2) counts SUCCESSFUL statements from this test's own
+/// writer — state only this fixture can produce, and the only assertion that
+/// goes RED on the silent-return paths below (a bad root password, a revoked
+/// grant, an exhausted `max_connections`). (3) is a floor calibrated against
+/// measurement, not guessed: this fixture moves the counter by ~378, while an
+/// ordinary sibling seed (4 000 × 2 KB rows with the buffer already shrunk)
+/// moves it by 16 — measured on the dev stand 2026-08-14. So >= 100 excludes
+/// the sibling shape that the old `>= 10` admitted. Neither half alone is
+/// proof of attribution; (2) is the load-bearing one.
 #[test]
 #[ignore = "live: requires docker compose mysql"]
 fn mysql_governor_backs_off_under_real_redo_pressure() {
@@ -1103,8 +1117,15 @@ fn mysql_governor_backs_off_under_real_redo_pressure() {
     // writes to the SCRATCH table, never the exported one — the pressure must
     // be FOREIGN, which is the whole point of the signal split.
     let stop = Arc::new(AtomicBool::new(false));
+    // The ATTRIBUTABLE half of the activation guard: statements this test's own
+    // writer really committed. Every failure path in the thread below is silent
+    // by design (a dead writer must not abort the run mid-assertion), so without
+    // this counter the only detector of a writer that never connected is a
+    // GLOBAL counter every concurrent test also moves.
+    let writer_inserts = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let writer = {
         let stop = Arc::clone(&stop);
+        let inserts = Arc::clone(&writer_inserts);
         let scratch = scratch.clone();
         std::thread::spawn(move || {
             let Ok(pool) = mysql::Pool::new(MYSQL_ROOT_URL) else {
@@ -1115,7 +1136,13 @@ fn mysql_governor_backs_off_under_real_redo_pressure() {
                 .collect::<Vec<_>>()
                 .join(",");
             while !stop.load(Ordering::Relaxed) {
-                let _ = c.query_drop(format!("INSERT INTO {scratch} (payload) VALUES {values}"));
+                // Count only the INSERT: it is the redo mover (2 MB against a
+                // 256 KB buffer), the DELETE is just housekeeping.
+                if c.query_drop(format!("INSERT INTO {scratch} (payload) VALUES {values}"))
+                    .is_ok()
+                {
+                    inserts.fetch_add(1, Ordering::Relaxed);
+                }
                 // Keep the table from growing without bound over the run.
                 let _ = c.query_drop(format!("DELETE FROM {scratch} ORDER BY id ASC LIMIT 8"));
             }
@@ -1189,7 +1216,8 @@ exports:
 
     let waits_after = log_waits(&mut root);
     stop.store(true, Ordering::Relaxed);
-    writer.join().expect("writer thread");
+    let writer_panicked = writer.join().is_err();
+    let inserts = writer_inserts.load(Ordering::Relaxed);
     let _ = root.query_drop(format!("DROP TABLE IF EXISTS {scratch}"));
 
     let stderr = std::fs::read_to_string(&log_path).unwrap_or_default();
@@ -1200,19 +1228,33 @@ exports:
     assert_governor_awake(&stderr, "mysql");
     // Activation guard BEFORE the shed assertion: without it, a fixture that
     // stopped moving the counter would make the shed assertion silently
-    // untestable rather than red.
+    // untestable rather than red. Two halves — see the doc block: the writer's
+    // own success count is attributable to THIS test, the counter delta is
+    // server-wide.
+    assert!(
+        !writer_panicked,
+        "the redo-pressure writer PANICKED, so the shed assertion below grades \
+         something other than this fixture (it committed {inserts} inserts first)"
+    );
+    assert!(
+        inserts >= 5,
+        "fixture went inert: this test's OWN writer committed {inserts} redo-pressure \
+         inserts (needs >= 5) — it never connected or every statement failed (bad root \
+         password? revoked grant? max_connections exhausted?), so any counter movement \
+         below belongs to a concurrent sibling, not to this fixture"
+    );
     let delta = waits_after.saturating_sub(waits_before);
     assert!(
-        delta >= 10,
-        "fixture went inert: Innodb_log_waits moved by {delta} across the run, so the \
-         governor had no rising foreign signal to react to and the shed assertion below \
-         would grade nothing (is innodb_log_buffer_size still shrunk? did the writer \
-         connect?)"
+        delta >= 100,
+        "fixture went inert: Innodb_log_waits moved by {delta} across the run (needs \
+         >= 100; ~378 measured for this shape over 2.4 s), so the governor had no rising \
+         foreign signal to react to and the shed assertion below would grade nothing (is \
+         innodb_log_buffer_size still shrunk? {inserts} writer inserts landed)"
     );
     assert!(
         stderr.contains("backed off"),
         "under rising Innodb_log_waits the governor must shed at least one worker; \
-         counter moved by {delta}; stderr:\n{stderr}"
+         counter moved by {delta} over {inserts} writer inserts; stderr:\n{stderr}"
     );
     assert_eq!(
         duckdb_total_parquet_rows(out_dir.path()),
@@ -1241,9 +1283,28 @@ exports:
 /// FOREIGN, which is the point of the signal split.
 ///
 /// Assertions in the order that makes each meaningful: the governor ARMED,
-/// the counter really moved (activation guard — an inert fixture must fail
-/// here, not silently pass the next one), it BACKED OFF, and every row still
-/// round-tripped.
+/// this test's OWN writer really committed, the counter really moved, it
+/// BACKED OFF, and every row still round-tripped.
+///
+/// Attribution honesty, same shape as the MySQL twin but WEAKER on the counter
+/// half, and the difference is measured rather than assumed. `Log Flush Waits`
+/// is read for `instance_name = '_Total'`, i.e. EVERY database on the instance;
+/// `quiet_window_guard` is taken only by the tests in this file (verified — no
+/// other live file references it), so it serialises the governor tests against
+/// each other and excludes nothing else on the shared server. A plain sibling
+/// loop of 2 000 small committed INSERTs — the shape of any seeder in the live
+/// suite — moves `_Total` by 2 004 (measured on the dev stand, 2026-08-14),
+/// so NO threshold on this counter is sibling-proof: the old `>= 10` was
+/// satisfied 200× over by that traffic, and even the `>= 100` below is not
+/// immune to it. Raising it only excludes INCIDENTAL movement (a dead writer
+/// under a quiet stand measured a delta of 1). The attributable half is
+/// therefore the writer's own committed-batch count, which no sibling can
+/// produce — that is the assertion the inert-fixture proof goes RED on.
+///
+/// The run goes through the rig's BOUNDED runner: a governor deadlock (the
+/// regression `governor_does_not_deadlock_when_chunks_fail` exists for) must
+/// fail this one test, not wedge the suite behind `quiet_window_guard` while
+/// the writer hammers the shared server forever.
 #[test]
 #[ignore = "live: requires docker compose mssql"]
 fn mssql_governor_backs_off_under_real_log_flush_pressure() {
@@ -1264,19 +1325,32 @@ fn mssql_governor_backs_off_under_real_log_flush_pressure() {
         "IF OBJECT_ID('dbo.{scratch}') IS NOT NULL DROP TABLE dbo.{scratch}; \
          CREATE TABLE dbo.{scratch} (id INT IDENTITY PRIMARY KEY, payload VARBINARY(MAX))"
     ));
+    // RAII, not a trailing DROP: the scratch table holds ~200 KB rows on a
+    // SHARED server, and a trailing statement is skipped by every panic path
+    // (a failed assertion, the watchdog below, a panicking writer join).
+    let _scratch_guard = MssqlTable::adopt(format!("dbo.{scratch}"));
 
     // Background writer: one COMMIT per row, each carrying ~200 KB, so the log
     // manager flushes constantly and `Log Flush Waits` climbs pair-over-pair —
     // the condition `GovernorState::observe` needs to shed.
+    //
+    // It uses the ERROR-TOLERANT executor, not `mssql_exec`: this loop performs
+    // hundreds of fresh TDS logins under load it creates itself, and every step
+    // of the panicking executor is an `.expect` — one transient login failure or
+    // deadlock-victim error would abort the thread, make the test's verdict
+    // `writer thread`, and skip every real assertion. The returned bool keeps
+    // the tolerance honest by feeding the attributable activation guard below.
     let stop = Arc::new(AtomicBool::new(false));
+    let writer_batches = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let writer = {
         let stop = Arc::clone(&stop);
+        let batches = Arc::clone(&writer_batches);
         let scratch = scratch.clone();
         std::thread::spawn(move || {
             while !stop.load(Ordering::Relaxed) {
                 // 40 committed transactions per batch keeps the round-trip
                 // count low while the commit RATE stays high.
-                mssql_exec(&format!(
+                if mssql_try_exec(&format!(
                     "SET NOCOUNT ON; \
                      DECLARE @i INT = 0; \
                      WHILE @i < 40 \
@@ -1288,7 +1362,9 @@ fn mssql_governor_backs_off_under_real_log_flush_pressure() {
                        SET @i = @i + 1; \
                      END; \
                      DELETE TOP (40) FROM dbo.{scratch}"
-                ));
+                )) {
+                    batches.fetch_add(1, Ordering::Relaxed);
+                }
             }
         })
     };
@@ -1308,15 +1384,26 @@ fn mssql_governor_backs_off_under_real_log_flush_pressure() {
         .export_line("chunk_column: id")
         .export_line("chunk_size: 1000")
         .export_line("parallel: 8");
-    let out = rig.run_with_envs(&[("RUST_LOG", "info"), ("RIVET_GOVERNOR_INTERVAL_MS", "200")]);
-    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    // Watchdog: same 120 s ceiling as the PG and MySQL twins. Stop the writer
+    // and reap the thread BEFORE panicking on a timeout, so a wedged governor
+    // does not leave a 200 KB-per-commit loop running against the shared server.
+    let bounded = rig.run_with_envs_bounded(
+        &[("RUST_LOG", "info"), ("RIVET_GOVERNOR_INTERVAL_MS", "200")],
+        Duration::from_secs(120),
+    );
 
     let waits_after = mssql_query_i64(FLUSH_WAITS);
     stop.store(true, Ordering::Relaxed);
-    writer.join().expect("writer thread");
-    mssql_exec(&format!(
-        "IF OBJECT_ID('dbo.{scratch}') IS NOT NULL DROP TABLE dbo.{scratch}"
-    ));
+    let writer_panicked = writer.join().is_err();
+    let batches = writer_batches.load(Ordering::Relaxed);
+
+    let out = bounded.unwrap_or_else(|| {
+        panic!(
+            "the governed MSSQL run under log-flush pressure did not finish within 120s \
+             (governor deadlock regression?); the writer had committed {batches} batches"
+        )
+    });
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
 
     assert!(
         out.status.success(),
@@ -1324,18 +1411,32 @@ fn mssql_governor_backs_off_under_real_log_flush_pressure() {
     );
     assert_governor_awake(&stderr, "mssql");
     // Activation guard BEFORE the shed assertion: an inert fixture must go RED
-    // here rather than make the shed assertion untestable.
+    // here rather than make the shed assertion untestable. Two halves — see the
+    // doc block: the writer's own committed-batch count is attributable to THIS
+    // test, the `_Total` delta is instance-wide.
+    assert!(
+        !writer_panicked,
+        "the log-flush writer PANICKED, so the shed assertion below grades something \
+         other than this fixture (it committed {batches} batches first)"
+    );
+    assert!(
+        batches >= 5,
+        "fixture went inert: this test's OWN writer committed {batches} 40-transaction \
+         batches (needs >= 5) — it never connected or every batch failed, so any counter \
+         movement below belongs to a concurrent sibling, not to this fixture"
+    );
     let delta = waits_after.saturating_sub(waits_before);
     assert!(
-        delta >= 10,
-        "fixture went inert: Log Flush Waits (_Total) moved by {delta} across the run, so \
-         the governor had no rising foreign signal to react to and the shed assertion \
-         below would grade nothing (did the writer connect?)"
+        delta >= 100,
+        "fixture went inert: Log Flush Waits (_Total) moved by {delta} across the run \
+         (needs >= 100; ~408 measured for this shape over 400 commits), so the governor \
+         had no rising foreign signal to react to and the shed assertion below would \
+         grade nothing ({batches} writer batches landed)"
     );
     assert!(
         stderr.contains("backed off"),
         "under rising Log Flush Waits the governor must shed at least one worker; \
-         counter moved by {delta}; stderr:\n{stderr}"
+         counter moved by {delta} over {batches} writer batches; stderr:\n{stderr}"
     );
     assert_eq!(
         duckdb_total_parquet_rows(&rig.out_dir()),

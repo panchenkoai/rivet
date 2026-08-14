@@ -88,24 +88,54 @@ impl PredictedFrom {
 /// failures, misclassifying a measured export exactly during its degraded
 /// period (bughunt 2026-08-13).
 pub(crate) fn predict_secs(state: &crate::state::StateStore, name: &str) -> PredictedFrom {
-    let last_success = state
-        .get_last_success_metric(name)
-        .ok()
-        .flatten()
-        .map(|m| (m.duration_ms as f64 / 1000.0).max(0.001));
-    if let Some(s) = last_success {
-        return PredictedFrom::Measured(s);
+    predict_secs_and_rss(state, name).0
+}
+
+/// [`predict_secs`] plus the peak RSS that belongs to the SAME history — the
+/// wave packer's memory-budget input, which must come from the same predictor
+/// as the duration or the two commands disagree about the same export.
+///
+/// `rivet plan --annotate-waves` used to run its own two-tier lookup (last
+/// success, else a flat `(5 s, 150 MB)` placeholder) while `apply --pool` had
+/// three tiers here. On an export that has NEVER succeeded but whose attempts
+/// run an hour at 3 GB — a plausible reason it keeps failing — the pool
+/// predicted `FailedAttemptFloor(3600)` and the packer predicted `(5 s, 150 MB)`:
+/// it sorted LAST in its tier and was charged 150 MB against the 4096 MB wave
+/// budget, so it packed beside K−1 exports whose real peaks the wave could not
+/// hold — memory pressure re-creating the very failure. `--annotate-waves`
+/// WRITES that wave number into the operator's config, so the mis-schedule
+/// outlives the command (bughunt 2026-08-14, round 4).
+///
+/// The RSS is the MAX over the attempts, not the peak of whichever attempt
+/// happened to run longest: this number is a BUDGET, so it has to hold the
+/// worst peak on record. `None` means the history carries no RSS at all — the
+/// caller supplies its own conservative default rather than having one
+/// invented here.
+pub(crate) fn predict_secs_and_rss(
+    state: &crate::state::StateStore,
+    name: &str,
+) -> (PredictedFrom, Option<i64>) {
+    if let Some(m) = state.get_last_success_metric(name).ok().flatten() {
+        let secs = (m.duration_ms as f64 / 1000.0).max(0.001);
+        return (PredictedFrom::Measured(secs), m.peak_rss_mb);
     }
-    let last_attempt = state
+    let attempts: Vec<crate::state::ExportMetric> = state
         .get_metrics(Some(name), 25)
         .ok()
         .into_iter()
         .flatten()
+        .collect();
+    let last_attempt = attempts
+        .iter()
         .map(|m| (m.duration_ms as f64 / 1000.0).max(0.001))
         .reduce(f64::max);
+    let peak_rss = attempts.iter().filter_map(|m| m.peak_rss_mb).max();
     match last_attempt {
-        Some(s) => PredictedFrom::FailedAttemptFloor(s.max(POOL_PLACEHOLDER_SECS)),
-        None => PredictedFrom::Placeholder(POOL_PLACEHOLDER_SECS),
+        Some(s) => (
+            PredictedFrom::FailedAttemptFloor(s.max(POOL_PLACEHOLDER_SECS)),
+            peak_rss,
+        ),
+        None => (PredictedFrom::Placeholder(POOL_PLACEHOLDER_SECS), None),
     }
 }
 
@@ -158,6 +188,119 @@ pub(crate) fn reconcile_split_seed(seed: &PredictedFrom, own: &PredictedFrom) ->
     }
 }
 
+/// Split a synthesized unit name back into `(giant, ordinal)`.
+///
+/// `rsplit_once` so a giant whose own name contains `#` still resolves; a
+/// non-numeric tail is not a unit name (`None`), which is also what keeps an
+/// operator's ordinary export from being read as somebody's slice.
+pub(crate) fn split_unit_name(name: &str) -> Option<(&str, usize)> {
+    let (giant, ord) = name.rsplit_once('#')?;
+    Some((giant, ord.parse().ok()?))
+}
+
+/// How far PAST the current partition the unit-name census probes for ordinals
+/// a bigger prior partition left behind. Three consecutive absences end it: a
+/// pool runs every unit it synthesizes, so history is contiguous, and the
+/// lookahead only has to survive a unit or two that recorded nothing.
+const SPLIT_CENSUS_LOOKAHEAD: usize = 3;
+
+/// Hard ceiling on the census, so a pathological state store cannot turn run
+/// start into thousands of point queries.
+const SPLIT_CENSUS_CAP: usize = 256;
+
+/// Re-derive a split cohort's per-unit prediction when the partition CHANGED
+/// under it — the answer that must override every unit's own history.
+///
+/// A unit's measured duration means "the time to export 1/N of the ROWS", not
+/// "the time to export this key range": `probe_and_synthesize` re-samples the
+/// row percentiles on every non-`--resume` run (only `--resume` reconstructs
+/// the prior partition), and N itself is not stable — `advise_split` clamps it
+/// at `max_split = m.max(2)`, the `--pool M` value, and derives it from another
+/// export's measured duration. So a routine `--pool 8` → `--pool 3` re-run
+/// hands `giant#0..#2` the rows of a THIRD of the table while their own history
+/// measured an EIGHTH, and [`reconcile_split_seed`] hands that 8-way number
+/// straight to the scheduler: a ~2.7× under-prediction, every unit sorted below
+/// the measured exports in LPT, and an advertised makespan wrong by the ratio
+/// of the two split factors (bughunt 2026-08-14, round 4).
+///
+/// `prior` is the unit-name census: every `{giant}#i` that carries history, and
+/// what that history predicts. The cohort's SUM is the table's measured cost,
+/// so `sum / realized` re-cuts it for the partition that is about to run — and
+/// it also refreshes the seed's other stale input, since the giant's own rows
+/// froze at the failure that motivated the split and never move again.
+///
+/// Only the SHRINK direction is decidable. An ordinal at or past `realized` is
+/// proof a bigger partition ran (nothing else writes `giant#7` when the run has
+/// three units). The growth direction is NOT proof: a prior cohort of `{0,1,2}`
+/// against 8 units now is equally an interrupted 8-way run whose tail never
+/// recorded, and reading that as growth would divide an already-correct T/8 by
+/// another 8/3. Left alone it over-predicts by the split ratio instead — the
+/// safe direction for a wall an operator reads as a lower bound. The signal
+/// that WOULD decide it is the units' persisted `split_window` boundaries
+/// (compare the prior partition's cut points to this run's), which lives in the
+/// destination, not the state store; see `split::reconstruct_units_from_prefix`.
+pub(crate) fn repartitioned_unit_prediction(
+    realized: usize,
+    prior: &[(usize, PredictedFrom)],
+) -> Option<PredictedFrom> {
+    if realized == 0 || prior.is_empty() {
+        return None; // nothing to re-cut, or a genuinely first split run
+    }
+    let prior_n = prior.iter().map(|(i, _)| i + 1).max()?;
+    if prior_n <= realized {
+        return None; // same partition (or the undecidable growth case) — own history stands
+    }
+    let share = prior.iter().map(|(_, p)| p.secs()).sum::<f64>() / realized as f64;
+    // Provenance folds pessimistically: the re-cut share is measured-by-proxy
+    // only when EVERY contributing unit actually succeeded. One unit that only
+    // ever failed makes the cohort's sum a floor, not a measurement, and the
+    // LOWER BOUND hedge must keep printing for it.
+    if prior.iter().all(|(_, p)| {
+        matches!(
+            p,
+            PredictedFrom::Measured(_) | PredictedFrom::SeededSplit(_)
+        )
+    }) {
+        Some(PredictedFrom::SeededSplit(share))
+    } else {
+        Some(PredictedFrom::FailedAttemptFloor(
+            share.max(POOL_PLACEHOLDER_SECS),
+        ))
+    }
+}
+
+/// The unit-name census for one split giant: which `{giant}#i` ordinals carry
+/// OWN history, and what each predicts. Impure (state-store point queries);
+/// the decision it feeds is [`repartitioned_unit_prediction`], which is pure.
+///
+/// Always probes `0..realized` (a unit of the CURRENT partition that never ran
+/// is an absence, not the end of the cohort) and then keeps going while
+/// ordinals keep appearing — that tail is the whole point, since only an
+/// ordinal at or past `realized` proves the partition shrank.
+fn split_history_census(
+    state: &crate::state::StateStore,
+    giant: &str,
+    realized: usize,
+) -> Vec<(usize, PredictedFrom)> {
+    let mut out: Vec<(usize, PredictedFrom)> = Vec::new();
+    let mut misses = 0usize;
+    for i in 0..SPLIT_CENSUS_CAP {
+        let p = predict_secs(state, &format!("{giant}#{i}"));
+        if matches!(p, PredictedFrom::Placeholder(_)) {
+            if i >= realized {
+                misses += 1;
+                if misses >= SPLIT_CENSUS_LOOKAHEAD {
+                    break;
+                }
+            }
+            continue;
+        }
+        misses = 0;
+        out.push((i, p));
+    }
+    out
+}
+
 /// Fold classifications into the `(measured, failed-attempt, placeholder)`
 /// accounting the makespan print grades itself with — and whose second and
 /// third members decide the LOWER BOUND hedge. Pure so the hedge's input is
@@ -182,18 +325,40 @@ pub(crate) fn classification_counts(fs: &[PredictedFrom]) -> (usize, usize, usiz
 /// inherited prediction — duration AND provenance, built by
 /// [`split_unit_from`] (empty everywhere except the realized-split path) — and
 /// it yields to the unit's own history as soon as it has any, see
-/// [`reconcile_split_seed`].
+/// [`reconcile_split_seed`] — UNLESS that history was produced by a different
+/// PARTITION, in which case the whole cohort is re-cut, see
+/// [`repartitioned_unit_prediction`].
 pub(crate) fn predict_items<'a>(
     state: &crate::state::StateStore,
     exports: impl IntoIterator<Item = (&'a str, bool)>,
     split_seeds: &std::collections::HashMap<String, PredictedFrom>,
 ) -> Vec<(PoolItem, PredictedFrom)> {
+    // One census per split giant, before any per-unit reconciliation: the
+    // question "did the partition change" is about the COHORT, and each unit
+    // would answer it identically. `split_seeds` carries exactly one entry per
+    // realized unit, so its per-giant count IS this run's partition size.
+    let mut realized_of: std::collections::BTreeMap<&str, usize> =
+        std::collections::BTreeMap::new();
+    for name in split_seeds.keys() {
+        if let Some((giant, _)) = split_unit_name(name) {
+            *realized_of.entry(giant).or_default() += 1;
+        }
+    }
+    let recut: std::collections::HashMap<&str, PredictedFrom> = realized_of
+        .iter()
+        .filter_map(|(giant, realized)| {
+            let prior = split_history_census(state, giant, *realized);
+            repartitioned_unit_prediction(*realized, &prior).map(|f| (*giant, f))
+        })
+        .collect();
     exports
         .into_iter()
         .map(|(name, parallel_safe)| {
             let own = predict_secs(state, name);
             let from = match split_seeds.get(name) {
-                Some(seed) => reconcile_split_seed(seed, &own),
+                Some(seed) => split_unit_name(name)
+                    .and_then(|(giant, _)| recut.get(giant).cloned())
+                    .unwrap_or_else(|| reconcile_split_seed(seed, &own)),
                 None => own,
             };
             (
@@ -598,7 +763,8 @@ mod tests {
 mod prediction_tests {
     use super::{
         POOL_PLACEHOLDER_SECS, PoolItem, PredictedFrom, classification_counts, pool_order,
-        predict_items, predict_secs, reconcile_split_seed, split_unit_from,
+        predict_items, predict_secs, reconcile_split_seed, repartitioned_unit_prediction,
+        split_unit_from,
     };
     use crate::state::{MetricRow, StateStore};
 
@@ -853,6 +1019,116 @@ mod prediction_tests {
             (2, 1, 0),
             "the LOWER BOUND hedge shrinks to the units that really lack a success"
         );
+    }
+
+    /// Run 2 of `apply --pool --split` with a DIFFERENT unit count: the prior
+    /// partition's per-unit measurements must not be handed to units that now
+    /// cover a different share of the table.
+    ///
+    /// A unit's measured duration means "1/N of the ROWS" — the boundaries are
+    /// row percentiles, re-sampled on every non-`--resume` run — and N is not
+    /// stable: `advise_split` clamps it at `max_split = m.max(2)`, the `--pool
+    /// M` value. So `--pool 8 --split` then `--pool 3 --split`, a routine
+    /// "fewer slots" change, gave `giant#0..#2` the 8-way numbers for a 3-way
+    /// partition: a ~2.7× under-prediction on every unit, sorted below the
+    /// measured exports in LPT, with the run advertising a confident makespan
+    /// wrong by the ratio of the two split factors (bughunt 2026-08-14, round 4).
+    ///
+    /// The fixture is engineered past three thresholds. The eight prior units
+    /// carry FOUR different durations (a uniform cohort makes sum, mean, max
+    /// and first the same number); their sum, the giant's frozen seed and every
+    /// individual unit duration are three DISTINCT values, so the assert names
+    /// which of the three the code used; and the prior count (8) exceeds the
+    /// realized count (3), which is the only decidable direction — see
+    /// [`repartitioned_unit_prediction`].
+    ///
+    /// RED against `repartitioned_unit_prediction` returning `None` (the
+    /// pre-fix behaviour, own history wins): `left: 300.0, right: 1200.0`.
+    #[test]
+    fn a_shrunk_split_partition_re_cuts_the_cohort_instead_of_reusing_its_units_numbers() {
+        let mut rows: Vec<(String, String, i64, String)> = vec![
+            // The giant's frozen rows: it is retained OUT of the run set once
+            // split, so this failure is its prediction forever. 1800 s / 3 =
+            // 600 s is the SEED — a third distinct value.
+            ("giant".into(), "r0".into(), 1_800_000, "failed".into()),
+        ];
+        // Run 1 at `--pool 8`: eight units, each 1/8 of the rows. They sum to
+        // 3600 s — the table's measured cost.
+        for (i, ms) in [300, 400, 500, 700, 300, 400, 500, 500].iter().enumerate() {
+            rows.push((
+                format!("giant#{i}"),
+                format!("r1_{i}"),
+                ms * 1000,
+                "success".into(),
+            ));
+        }
+        let owned: Vec<(&str, &str, i64, &str)> = rows
+            .iter()
+            .map(|(e, r, d, s)| (e.as_str(), r.as_str(), *d, s.as_str()))
+            .collect();
+        let s = store_with(&owned);
+
+        // Run 2 at `--pool 3`: three units over the same table.
+        let giant_from = predict_secs(&s, "giant");
+        let seed_share = giant_from.secs() / 3.0;
+        assert_eq!(
+            seed_share, 600.0,
+            "fixture: the stale seed is a third value"
+        );
+        let seeds: std::collections::HashMap<String, PredictedFrom> = (0..3)
+            .map(|i| {
+                (
+                    format!("giant#{i}"),
+                    split_unit_from(&giant_from, seed_share),
+                )
+            })
+            .collect();
+        let names: Vec<String> = (0..3).map(|i| format!("giant#{i}")).collect();
+        let exports: Vec<(&str, bool)> = names.iter().map(|n| (n.as_str(), true)).collect();
+        let predicted = predict_items(&s, exports, &seeds);
+        for (item, _) in &predicted {
+            assert_eq!(
+                item.predicted_secs, 1200.0,
+                "{} must be re-cut from the cohort's measured 3600 s over the THREE \
+                 units running now — not its own 8-way number, and not the giant's \
+                 frozen 600 s seed",
+                item.name
+            );
+        }
+        // Provenance: eight successful units re-cut is measured-by-proxy, the
+        // same standing `split_unit_from` gives a measured giant's share — so
+        // the accounting does not start crying wolf over a number that rests
+        // entirely on completed runs.
+        let classified: Vec<PredictedFrom> = predicted.iter().map(|(_, f)| f.clone()).collect();
+        assert!(
+            classified
+                .iter()
+                .all(|f| matches!(f, PredictedFrom::SeededSplit(_))),
+            "{classified:?}"
+        );
+
+        // …and the fold is pessimistic: one unit that only ever FAILED makes
+        // the cohort's sum a floor, so the LOWER BOUND hedge keeps printing.
+        let mixed = vec![
+            (0usize, PredictedFrom::Measured(300.0)),
+            (1, PredictedFrom::FailedAttemptFloor(900.0)),
+            (2, PredictedFrom::Measured(300.0)),
+            (3, PredictedFrom::Measured(300.0)),
+        ];
+        match repartitioned_unit_prediction(2, &mixed) {
+            Some(PredictedFrom::FailedAttemptFloor(secs)) => assert_eq!(secs, 900.0),
+            other => panic!("a cohort holding an unmeasured unit is a floor, got {other:?}"),
+        }
+        // The undecidable direction stays alone: `{0,1,2}` against 8 units now
+        // is equally an interrupted 8-way run whose tail never recorded, and
+        // re-cutting it would divide an already-correct number a second time.
+        let grown: Vec<(usize, PredictedFrom)> = (0..3)
+            .map(|i| (i, PredictedFrom::Measured(1200.0)))
+            .collect();
+        assert!(repartitioned_unit_prediction(8, &grown).is_none());
+        // Same count, complete cohort: nothing to re-cut, per-unit history wins.
+        assert!(repartitioned_unit_prediction(3, &grown).is_none());
+        assert!(repartitioned_unit_prediction(3, &[]).is_none());
     }
 
     /// The reconcile rule itself, in isolation: seed only while the unit is

@@ -99,7 +99,7 @@ worst case held by any single query.
 | `max_batch_memory_mb` | integer | — | Hard cap on a single Arrow batch in MB. When exceeded, `on_batch_memory_exceeded` determines the response. |
 | `on_batch_memory_exceeded` | `warn` \| `fail` \| `auto_shrink` | `warn` | Policy applied when a batch exceeds `max_batch_memory_mb`. |
 | `max_value_mb` | integer | `256` | Hard ceiling on a **single cell** (text/JSON/blob) in MB. A value larger than this aborts the run with `RIVET_VALUE_TOO_LARGE`. Guards against one giant cell OOM-ing the process — the batch cap is average-based and can't bound a lone outlier. Set `0` to disable. See [Per-value ceiling](#per-value-ceiling-max_value_mb). |
-| `adaptive` | boolean | `false` | Sample source write-pressure at runtime and react: shrink/restore the fetch batch size, and — in chunked mode with `parallel > 1` — drive the [concurrency governor](#adaptive-concurrency-governor). |
+| `adaptive` | boolean | `false` | Sample source write-pressure at runtime and react: shrink/restore the fetch batch size, and — on a `parallel > 1` chunked or keyset export — drive the [concurrency governor](#adaptive-concurrency-governor) (see that section for the exact per-runner coverage). |
 | `min_parallel` | integer | `1` | Floor for the concurrency governor: the fewest workers it will back down to under pressure. Ceiling is the export's `parallel`. Only consulted when `adaptive` is on and `parallel > 1`. |
 
 ### Batch memory cap (`max_batch_memory_mb`)
@@ -220,7 +220,17 @@ statements. Pick the point that fits your source's tolerance.
 
 ## Adaptive concurrency governor
 
-In **chunked mode with `parallel > 1`**, setting `adaptive: true` arms a governor that adjusts how many chunk workers (and therefore source connections) run concurrently, in response to source write-pressure. It backs parallelism down when the source is under load and recovers it when the load eases, staying within `[min_parallel, parallel]`.
+On an export with `parallel > 1`, setting `adaptive: true` arms a governor that adjusts how many workers (and therefore source connections) run concurrently, in response to source write-pressure. It backs parallelism down when the source is under load and recovers it when the load eases, staying within `[min_parallel, parallel]`.
+
+Which runners it covers, precisely — the governor is per-runner wiring, so this list is the contract, not an approximation:
+
+| Runner | Governed? |
+|--------|-----------|
+| `mode: chunked`, `parallel > 1` | yes — sheds at chunk granularity |
+| `mode: chunked` + `chunk_checkpoint: true`, `parallel > 1` (the shape [`rivet init`](init.md) scaffolds) | yes — sheds at claimed-task granularity |
+| `chunk_by_key` (keyset), `parallel > 1` | yes — sheds at page granularity |
+| MongoDB `parallel: N` (`_id`-range fan-out) | **no** — that runner has no shared permit ceiling to shrink. `adaptive` still drives Mongo's batch-size adaptation; it does not vary worker count. |
+| Anything with `parallel: 1` (or unset) | **no** — one worker has nothing to shed. |
 
 ```yaml
 source:

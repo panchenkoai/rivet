@@ -238,8 +238,19 @@ pub(super) fn incomparable(p: &ThroughputPair) -> Option<Incomparable> {
 /// the run's makespan improves — the very trade `--pool` is for. Unknown modes
 /// are treated as concurrent: hedged text on a serial run is harmless, a
 /// confident "check governor sheds" on a pool run is a false accusation.
+///
+/// `pool-serial` is a pool run that never overlapped anything (`--pool 1`, or
+/// one export left after the `--resume` skip): nothing shared the source, so it
+/// belongs on the serial side however it was invoked. The label producers are
+/// `run::wave_mode_label` / `run::pool_mode_label`, and
+/// `every_run_mode_label_a_runner_can_emit_is_classified` reads them from HERE
+/// rather than re-typing the list (a producer that spells a new label inline
+/// falls through to the unknown arm and silently loses the actionable pointer).
 fn mode_shares_the_source(run_mode: &str) -> bool {
-    !matches!(run_mode, "sequential" | "wave-sequential" | "single")
+    !matches!(
+        run_mode,
+        "sequential" | "wave-sequential" | "single" | "pool-serial"
+    )
 }
 
 /// Pure run-over-run self-check: compare each export's throughput (rows/s)
@@ -975,6 +986,14 @@ mod tests {
         for m in ["sequential", "wave-sequential", "single"] {
             assert!(!mode_shares_the_source(m), "{m} is serial");
         }
+        // A pool that never overlapped anything shared nothing: `--pool 1`, or
+        // one export left after the `--resume` skip, must keep the ACTIONABLE
+        // tail. (See `every_run_mode_label_a_runner_can_emit_is_classified`.)
+        let serial_pool = throughput_regressions(&[p()], "pool-serial");
+        assert!(
+            serial_pool[0].contains("check governor sheds"),
+            "a serialized pool must not excuse a regression as source sharing: {serial_pool:?}"
+        );
         // An unrecognised mode must hedge, not accuse — hedged text on a serial
         // run is harmless, a confident "check governor sheds" on a concurrent
         // one is a false accusation. (This case used to be spelled
@@ -982,6 +1001,47 @@ mod tests {
         // re-exec'd child; that child now defers its self-check to the parent,
         // which reports under the run-wide mode, so no caller emits it.)
         assert!(mode_shares_the_source("a-mode-added-next-release"));
+    }
+
+    /// Derive the classified dimension from the PRODUCERS, never re-type it.
+    ///
+    /// `mode_shares_the_source` classifies by VALUE and treats anything it does
+    /// not recognise as concurrent — a deliberate fail-safe for the TEXT, but it
+    /// means a runner that starts emitting a new serial label silently loses the
+    /// actionable "check governor sheds / adaptive batch shrinks / source load"
+    /// pointer, and nothing fails. So this asks the two label functions in
+    /// `run` (the only producers) what they can emit, and classifies THAT.
+    ///
+    /// RED against dropping `"pool-serial"` from the serial arm (the serialized
+    /// pool then reads as source-sharing), and against a label function that
+    /// returns the concurrent string for a run that never overlapped.
+    #[test]
+    fn every_run_mode_label_a_runner_can_emit_is_classified() {
+        use crate::pipeline::run::{pool_mode_label, wave_mode_label};
+        // Concurrency achieved → the run really did share the source.
+        for m in [
+            wave_mode_label(2),
+            wave_mode_label(9),
+            pool_mode_label(true),
+        ] {
+            assert!(
+                mode_shares_the_source(m),
+                "{m} is emitted for a run that overlapped exports"
+            );
+        }
+        // Asked for concurrency, got none (the cost gate serialized the wave;
+        // `--pool 1` or a single pending export) → nothing shared the source.
+        for m in [
+            wave_mode_label(0),
+            wave_mode_label(1),
+            pool_mode_label(false),
+        ] {
+            assert!(
+                !mode_shares_the_source(m),
+                "{m} is emitted for a run whose exports ran one at a time — it must \
+                 keep the actionable attribution"
+            );
+        }
     }
 
     #[test]
