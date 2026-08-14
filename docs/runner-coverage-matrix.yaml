@@ -176,3 +176,28 @@ scenarios:
     chunked:        { na: "shared-seam (per-chunk sinks share the plan Arc — the two-sink case the unit test exercises)" }
     keyset:         { na: "shared-seam (worker plan clones share the Arc)" }
     mongo_parallel: { na: "shared-seam (worker plan clones share the Arc)" }
+
+  - id: source_harm_and_diagnosis
+    what: >-
+      the per-export SOURCE-HARM bracket and the DIAGNOSIS line — harm_snapshot before
+      the strategy dispatch and again after it (deltas persisted via record_harm into
+      export_harm), pg_temp_bytes_snapshot around the same window (pg_temp_bytes_delta +
+      the temp-file spill warning), and run_diagnosis printing the per-export DIAGNOSIS
+      that hedges attribution under concurrent siblings and points at the run-level harm
+      line. Same shape as open_forensics: taken ONCE in run_export_job around the strategy
+      branch, so no runner can bypass it — and, like open_forensics, the real bypass risk
+      is the SEPARATE apply entry point. That gap was REAL for the whole 0.24.x series
+      (found by the round-3 bughunt, 2026-08-14): run_export_job_with_chunk_source
+      (`rivet apply <plan.json>`) re-called capture_open_forensics and the bytes_read
+      harvest but had NO harm_snapshot, NO pg_temp_bytes_snapshot and NO run_diagnosis, so
+      an apply of a sealed plan recorded zero export_harm rows and never said a word about
+      a source it had just spilled to disk. CLOSED: the apply entry point now brackets the
+      same window and prints the same line, and the offline gate
+      `both_job_entry_points_bracket_the_source_harm_window`
+      (tests/offline/runner_frame_gate.rs) fails the build if either entry point loses it.
+      This is an ENTRY-POINT axis, not a runner axis — the cells below speak only about
+      the four runners.
+    single:         { na: "shared seam — harm_snapshot/pg_temp_bytes_snapshot bracket the strategy dispatch inside run_export_job and run_diagnosis prints after it, covering all four runners in one place (like capture_open_forensics); no per-runner divergence on the `rivet run` path. Proven end-to-end by pg_run_persists_source_harm_rows / mysql_run_persists_source_harm_rows / mssql_run_persists_source_harm_rows (the rows land in export_harm) and the pure-fn decisions by run_diagnosis_flags_flaky_link_and_spill_signals_only + pg_temp_bytes_warning_hedges_attribution_under_concurrent_siblings" }
+    chunked:        { na: "shared seam (run_export_job brackets the dispatch)" }
+    keyset:         { na: "shared seam (run_export_job brackets the dispatch)" }
+    mongo_parallel: { na: "shared seam (run_export_job brackets the dispatch); the one distinct entry point is APPLY (run_export_job_with_chunk_source), which — unlike open_forensics — does NOT re-apply this bracket: see the KNOWN GAP in `what:` above" }

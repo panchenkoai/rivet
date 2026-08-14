@@ -15,9 +15,80 @@ use crate::journal::RunEvent;
 use crate::plan::ResolvedRunPlan;
 use crate::resource::Semaphore;
 use crate::source::{self, Source};
-use crate::tuning::Governor;
+use crate::tuning::{BlindSignal, DecisionCause, Governor};
 
 use super::summary::RunSummary;
+
+/// The journalled reason for one parallelism transition. A step taken while the
+/// pressure signal is UNREADABLE is a fail-open, not evidence that pressure
+/// eased — labelling it `"source pressure eased: recovered"` wrote a statement
+/// about a signal nobody could read into the run journal (bughunt 2026-08-14).
+///
+/// Pure so the mapping is unit-provable; the `backed off` wording is asserted by
+/// the live governor suite, so keep it stable.
+fn decision_reason(cause: DecisionCause) -> &'static str {
+    match cause {
+        DecisionCause::PressureRising => "source pressure rising: backed off",
+        DecisionCause::PressureEased => "source pressure eased: recovered",
+        DecisionCause::SignalUnreadable => {
+            "pressure signal unreadable: failing open toward the ceiling"
+        }
+    }
+}
+
+/// The operator-facing WARN for a blind span — or `None` when there is nothing
+/// new to say.
+///
+/// [`BlindSignal::NeverReadable`] returns `None` on purpose: that state is
+/// permanent, it was already reported ONCE and correctly by
+/// [`GovernorHarness::spawn_into`]'s up-front probe, and saying it again in the
+/// language of a loss ("lost its pressure signal … was pinned at 4 of 4;
+/// stepping back toward 4") told the operator a healthy monitoring connection
+/// had died — on every run of an engine that simply has no counter, drowning the
+/// line that means something real. Reporting-only: the loop fails OPEN either
+/// way.
+///
+/// Pure (returns the string rather than logging it) so both trajectories are
+/// RED-provable without a live source.
+fn blind_signal_warning(
+    kind: BlindSignal,
+    export_name: &str,
+    frozen_at: usize,
+    ceiling: usize,
+) -> Option<String> {
+    match kind {
+        BlindSignal::Lost => Some(format!(
+            "export '{export_name}': governor lost its pressure signal (the monitoring \
+             connection can no longer sample) — parallelism was pinned at {frozen_at} of \
+             {ceiling}; stepping back toward {ceiling}. Set `adaptive: false` to disarm the \
+             governor, or `min_parallel` to floor it"
+        )),
+        BlindSignal::NeverReadable => None,
+    }
+}
+
+/// Fold the governor's UP-FRONT arm probe into `gov` and return the operator line the probe earns
+/// — `Some` exactly when the source could not be sampled at all.
+///
+/// Two jobs in one function on purpose: the probe's READABILITY is what lets a later blind span be
+/// classified ([`BlindSignal`]), and separating the `note_arm_probe` call from the warn is how the
+/// wiring gets forgotten. The probe's VALUE is deliberately NOT fed to the decision state — the
+/// baseline still comes from the loop's own first sample.
+fn arm_probe(
+    gov: &mut Governor,
+    probe: Option<u64>,
+    export_name: &str,
+    ceiling: usize,
+) -> Option<String> {
+    gov.note_arm_probe(probe.is_some());
+    probe.is_none().then(|| {
+        format!(
+            "export '{export_name}': governor armed, but the source provides no pressure signal \
+             (engine without a foreign-pressure counter, or the monitor connection cannot sample) \
+             — parallelism stays at {ceiling}"
+        )
+    })
+}
 
 /// Recover a poisoned lock instead of panicking: a worker that panicked mid-run must not also take
 /// down the governor's decision log — those decisions are still valid to journal.
@@ -119,9 +190,11 @@ impl GovernorHarness {
     /// not completed, so a failing worker can't strand it and deadlock the scope (a worker that
     /// PANICS counts too — that is [`WorkerExit`]'s job). Decisions are buffered in `self.log` (the
     /// journal is not thread-shared) and recorded by [`drain_into`](Self::drain_into) after the
-    /// scope joins. Two things get a `warn` line rather than silence: an armed governor whose very
-    /// first probe cannot sample, and a signal that DIES mid-run (see the `on_signal_lost` callback
-    /// below — the loop then also steps back toward the ceiling rather than staying pinned).
+    /// scope joins. Two things get a `warn` line rather than silence, and each gets exactly ONE:
+    /// an armed governor whose very first probe cannot sample (the never-readable engine), and a
+    /// signal that DIES mid-run (see the blind-signal callback below — the loop then also steps
+    /// back toward the ceiling rather than staying pinned). A never-readable signal does NOT also
+    /// get the death notice: see [`blind_signal_warning`].
     pub(crate) fn spawn_into<'s>(
         &'s self,
         scope: &'s std::thread::Scope<'s, '_>,
@@ -148,29 +221,25 @@ impl GovernorHarness {
             // protection is active when parallelism is in fact static
             // (bughunt 2026-08-13). The probe result is not fed to the
             // decision state, so the baseline still comes from the loop's own
-            // first sample.
-            if crate::source::Source::sample_governor_pressure(monitor.as_mut()).is_none() {
-                log::warn!(
-                    "export '{export_name}': governor armed, but the source provides no \
-                     pressure signal (engine without a foreign-pressure counter, or the \
-                     monitor connection cannot sample) — parallelism stays at {ceiling}"
-                );
+            // first sample. Its READABILITY is handed to the governor
+            // (`note_arm_probe`) so a signal this probe could read and the loop
+            // then loses is still reported as a LOSS, and one it never read is
+            // not reported twice.
+            let probe = crate::source::Source::sample_governor_pressure(monitor.as_mut());
+            if let Some(msg) = arm_probe(&mut gov, probe, export_name, ceiling) {
+                log::warn!("{msg}");
             }
             gov.run(
                 &mut monitor,
                 || finished.load(Ordering::Relaxed) >= total,
-                |from, to| {
+                |from, to, cause| {
                     semaphore.resize(to);
-                    let reason = if to < from {
-                        "source pressure rising: backed off"
-                    } else {
-                        "source pressure eased: recovered"
-                    };
+                    let reason = decision_reason(cause);
                     // A shed is a deliberate slowdown of the run — the operator
                     // must SEE it at the default log level (an info-level "this
                     // will be slower" is functionally silent; a field pool run
                     // lost 1h48m to invisible sheds). Recovery stays info.
-                    if to < from {
+                    if matches!(cause, DecisionCause::PressureRising) {
                         log::warn!(
                             "export '{export_name}': governor parallelism {from} → {to} ({reason}) — raise `min_parallel` to floor it, or set `adaptive: false` to disarm"
                         );
@@ -181,21 +250,21 @@ impl GovernorHarness {
                     }
                     recover(log).push((from, to, reason.to_string()));
                 },
-                |frozen_at, ceiling| {
-                    // The pressure signal died mid-run (monitor connection reaped by a
-                    // pooler / server restart / tunnel drop — `postgres::Client` does not
-                    // reconnect, so every later sample is `None`). Before this, the run
-                    // simply stayed pinned at whatever level the last shed reached, for
-                    // hours, silently: the up-front probe above fires only at tick zero,
-                    // i.e. exactly when no damage has been done yet. A signal that cannot
-                    // be READ is not evidence of pressure, so the loop also fails OPEN
-                    // (steps back toward the ceiling) — see `GovernorState::observe`.
-                    log::warn!(
-                        "export '{export_name}': governor lost its pressure signal (the \
-                         monitoring connection can no longer sample) — parallelism was pinned \
-                         at {frozen_at} of {ceiling}; stepping back toward {ceiling}. Set \
-                         `adaptive: false` to disarm the governor, or `min_parallel` to floor it"
-                    );
+                |kind, frozen_at, ceiling| {
+                    // The pressure signal went blind for GOVERNOR_BLIND_SAMPLES in a row.
+                    // Only a signal that WAS readable and stopped is a loss — a monitor
+                    // connection reaped by a pooler / server restart / tunnel drop
+                    // (`postgres::Client` does not reconnect, so every later sample is
+                    // `None`); before this, the run simply stayed pinned at whatever level
+                    // the last shed reached, for hours, silently, because the probe above
+                    // fires only at tick zero, i.e. exactly when no damage has been done
+                    // yet. A signal that was NEVER readable is the probe's story, already
+                    // told — `blind_signal_warning` returns `None` for it. Either way the
+                    // loop fails OPEN (steps back toward the ceiling): a signal that cannot
+                    // be READ is not evidence of pressure — see `GovernorState::observe`.
+                    if let Some(msg) = blind_signal_warning(kind, export_name, frozen_at, ceiling) {
+                        log::warn!("{msg}");
+                    }
                 },
             );
         });
@@ -279,6 +348,127 @@ mod tests {
             "both permits must return — a permit leaked by a panicking worker stalls the \
              spawner loop (permanently, at parallel = 1)"
         );
+    }
+
+    /// The two blind trajectories differ in what the OPERATOR is told, and only
+    /// one of them is an incident. Before the fix an engine with no
+    /// foreign-pressure counter got both lines per export per run — "governor
+    /// armed, but the source provides no pressure signal … parallelism stays at
+    /// 4" at tick 0, then ~4.5 s later "governor LOST its pressure signal …
+    /// parallelism was pinned at 4 of 4; stepping back toward 4", which is
+    /// mutually exclusive with the first, describes a step that is a no-op, and
+    /// makes a real mid-run monitor death (a reaped pooler connection, a tunnel
+    /// drop) indistinguishable from a permanent capability gap.
+    ///
+    /// Both cases are graded from one call site because this is a mapping: a
+    /// single case cannot show that the function DISCRIMINATES.
+    #[test]
+    fn a_blind_signal_is_only_reported_as_a_loss_when_it_was_ever_readable() {
+        let lost = blind_signal_warning(BlindSignal::Lost, "orders", 2, 6)
+            .expect("a signal that died mid-run must reach the operator");
+        assert!(lost.contains("lost its pressure signal"), "text: {lost}");
+        assert!(lost.contains("pinned at 2 of 6"), "text: {lost}");
+
+        assert_eq!(
+            blind_signal_warning(BlindSignal::NeverReadable, "orders", 6, 6),
+            None,
+            "the never-readable engine was already reported ONCE, correctly, by the \
+             up-front arm probe — repeating it as a death notice is the false alarm"
+        );
+    }
+
+    /// A transition taken while the signal is unreadable is a fail-open. It must
+    /// not be journalled as `source pressure eased: recovered` — that is a
+    /// statement about a signal nobody could read, written into the run
+    /// journal's `ParallelismAdjusted` reason. All three causes from one call
+    /// site: the mapping is the subject.
+    #[test]
+    fn a_blind_step_is_journalled_as_failing_open_not_as_pressure_easing() {
+        assert_eq!(
+            decision_reason(DecisionCause::PressureRising),
+            "source pressure rising: backed off",
+            "the live governor suite greps `backed off` — keep it stable"
+        );
+        assert_eq!(
+            decision_reason(DecisionCause::PressureEased),
+            "source pressure eased: recovered"
+        );
+        let blind = decision_reason(DecisionCause::SignalUnreadable);
+        assert!(
+            blind.contains("unreadable"),
+            "a blind step must name the unreadable signal, not claim pressure eased: {blind}"
+        );
+        assert_ne!(blind, decision_reason(DecisionCause::PressureEased));
+    }
+
+    /// A sampler that can never read the pressure signal — the shape of an
+    /// engine without a foreign-pressure counter AND of a monitor connection
+    /// reaped mid-run (`postgres::Client` does not reconnect). Counts its calls
+    /// so the loop's stop predicate can fire after a fixed number of samples.
+    struct DeadSampler(Arc<AtomicUsize>);
+
+    impl crate::tuning::PressureSource for DeadSampler {
+        fn sample(&mut self) -> Option<u64> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            None
+        }
+    }
+
+    /// The arm probe → blind-report seam, driven through the REAL producer
+    /// rather than a hand-supplied value: `arm_probe` folds the probe into the
+    /// governor, then the loop goes blind and reports.
+    ///
+    /// This is the boundary the classification actually depends on, and the
+    /// obvious fix for this defect (gate the loss on `prev.is_some()`) breaks it
+    /// silently: `spawn_into` deliberately does NOT feed the probe's value to
+    /// the baseline, so a monitor that answered the probe and died before sample
+    /// 1 leaves `prev == None` forever — a real loss, reported as a permanent
+    /// capability gap. Both trajectories from one call site: a single case
+    /// cannot show that the seam DISCRIMINATES.
+    #[test]
+    fn the_arm_probe_readability_decides_whether_a_later_blind_span_is_a_loss() {
+        for (probe, want_kind) in [
+            (Some(7u64), BlindSignal::Lost),
+            (None, BlindSignal::NeverReadable),
+        ] {
+            let mut gov = Governor::with_intervals(
+                4,
+                2,
+                4,
+                Duration::from_millis(1),
+                Duration::from_millis(1),
+            );
+            let line = arm_probe(&mut gov, probe, "orders", 4);
+            assert_eq!(
+                line.is_some(),
+                probe.is_none(),
+                "the probe's own line fires exactly when the signal is unreadable (probe={probe:?})"
+            );
+            if let Some(line) = &line {
+                assert!(
+                    line.contains("provides no pressure signal"),
+                    "the live suite greps this wording: {line}"
+                );
+            }
+
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mut source = DeadSampler(Arc::clone(&calls));
+            let stop_calls = Arc::clone(&calls);
+            let mut reports: Vec<BlindSignal> = Vec::new();
+            gov.run(
+                &mut source,
+                move || stop_calls.load(Ordering::Relaxed) >= 4,
+                |_, _, _| {},
+                |kind, _, _| reports.push(kind),
+            );
+
+            assert_eq!(
+                reports,
+                vec![want_kind],
+                "one report per blindness episode, and its KIND comes from the arm probe \
+                 (probe={probe:?})"
+            );
+        }
     }
 
     /// Call-site pin for the guard above.

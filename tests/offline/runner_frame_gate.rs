@@ -155,6 +155,17 @@ fn the_pool_stamps_its_makespan_before_the_harm_snapshot_that_grades_it() {
 /// Scope honesty: a SOURCE-ORDER lint like its sibling — the emission needs a
 /// live source, so no unit test can observe the numbers. RED-proven by moving
 /// any one stamp back below its `close_and_warn`.
+///
+/// The search window is the BRACKET, not the enclosing function. An earlier
+/// version sliced from the owning `fn`, which made the in-process-parallel site
+/// (`run.rs`, the `window_end = Some(...)` stamp) VACUOUS: that close lives in
+/// the same `pub fn run(` as the process-parallel one, so the sibling BRANCH's
+/// `let finished_at = chrono::Utc::now();` — on a code path this close can never
+/// take — already satisfied the search and deleting the real stamp stayed GREEN
+/// (bughunt 2026-08-13, finding #11). Bounding at the nearest preceding
+/// `RunHarmBracket::open(` narrows each window to the branch that actually opened
+/// the bracket being closed, so every close is answered by a stamp on its OWN
+/// path.
 #[test]
 fn every_run_harm_bracket_close_is_preceded_by_its_window_stamp() {
     let run_rs = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/pipeline/run.rs");
@@ -190,9 +201,31 @@ fn every_run_harm_bracket_close_is_preceded_by_its_window_stamp() {
         closes.len()
     );
 
+    // Each close is answered ONLY by a stamp inside its own bracket — from the
+    // `RunHarmBracket::open(` that opened it to the close itself. The owning fn
+    // is the outer bound (a bracket never spans functions); the open is what
+    // makes the window branch-local, which is the whole point (see the doc
+    // comment: the fn-wide slice let a sibling branch's stamp answer).
+    let opens: Vec<usize> = text
+        .match_indices("RunHarmBracket::open(")
+        .map(|(i, _)| i)
+        .collect();
+
     let mut offenders = Vec::new();
     for close in closes {
-        let body_start = owning_fn(close);
+        let nearest_open = opens
+            .iter()
+            .copied()
+            .filter(|&o| o < close)
+            .max()
+            .unwrap_or_else(|| {
+                panic!(
+                    "close_and_warn at run.rs:{} has no preceding RunHarmBracket::open — \
+                     the bracket seam moved; update this gate deliberately",
+                    text[..close].matches('\n').count() + 1
+                )
+            });
+        let body_start = owning_fn(close).max(nearest_open);
         let before = &text[body_start..close];
         let stamped = before.contains("let finished_at = chrono::Utc::now();")
             || before.contains("window_end = Some(chrono::Utc::now());");
@@ -208,5 +241,85 @@ fn every_run_harm_bracket_close_is_preceded_by_its_window_stamp() {
          never asked for. Stamp `finished_at` (or `window_end`) right after the \
          exports drain, then close the bracket: {}",
         offenders.join(", ")
+    );
+}
+
+/// Both job entry points must bracket the source-harm window.
+///
+/// `run_export_job` (the `rivet run` path) and `run_export_job_with_chunk_source`
+/// (the `rivet apply` path) are SEPARATE runners: apply replays a sealed artifact
+/// and skips `build_plan`, so every per-export feature has to be re-applied there
+/// by hand — the runner-bypass class this repo keeps paying for. Apply shipped
+/// without the harm bracket and without the DIAGNOSIS line for the whole 0.24.x
+/// series while its own doc comment claimed "everything else … is identical to
+/// `run_export_job`" (round-3 bughunt). An `apply` run wrote no `export_harm`
+/// rows and said nothing about a source it had just spilled to disk.
+///
+/// The body is bounded by BRACE MATCHING, not by the next `fn` — the first
+/// draft of this guard sliced to end-of-file, so the `#[cfg(test)]` module's own
+/// eleven `run_diagnosis(` calls satisfied it and it stayed green against the
+/// exact mutant it exists to catch (this repo's "fixture against itself" class,
+/// caught here by RED-proving rather than by reading).
+///
+/// Scope honesty: a SOURCE-ORDER lint, like its siblings above — both functions
+/// need a live source and a destination, so no unit test can observe the emitted
+/// line. It pins that each entry point brackets the window and diagnoses; the
+/// values are the business of `run_diagnosis`'s own unit matrix.
+#[test]
+fn both_job_entry_points_bracket_the_source_harm_window() {
+    let job_rs = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/pipeline/job.rs");
+    let text = std::fs::read_to_string(&job_rs).expect("read src/pipeline/job.rs");
+
+    /// The function body that starts at `from`, delimited by its own braces.
+    fn body_of(text: &str, from: usize) -> &str {
+        let open = from + text[from..].find('{').expect("a fn has a body");
+        let mut depth = 0usize;
+        for (i, c) in text[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &text[from..open + i + 1];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unbalanced braces from byte {from}");
+    }
+
+    let mut offenders = Vec::new();
+    for entry in [
+        "pub(super) fn run_export_job(",
+        "pub(crate) fn run_export_job_with_chunk_source(",
+    ] {
+        let start = text
+            .find(entry)
+            .unwrap_or_else(|| panic!("entry point moved or was renamed: {entry}"));
+        let body = body_of(&text, start);
+        // Guard the guard: a body that swallowed the test module would make every
+        // assertion below vacuous, which is exactly how the first draft failed.
+        assert!(
+            !body.contains("#[cfg(test)]"),
+            "{entry}: the slice ran past the function into the test module — the \
+             assertions below would be satisfied by the tests' own calls"
+        );
+        for (what, needle) in [
+            ("opens the harm bracket", "harm_snapshot(&plan.source)"),
+            ("records the delta", "record_harm("),
+            ("emits the DIAGNOSIS", "run_diagnosis("),
+        ] {
+            if !body.contains(needle) {
+                offenders.push(format!("{entry} never {what} ({needle})"));
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "a job entry point skips the source-harm bracket, so runs through it record \
+         no export_harm rows and never diagnose a spilling source — the runner-bypass \
+         class (docs/runner-coverage-matrix.yaml). Re-apply it in that entry point:\n{}",
+        offenders.join("\n")
     );
 }

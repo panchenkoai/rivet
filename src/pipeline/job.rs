@@ -1313,6 +1313,14 @@ pub(crate) fn run_export_job_with_chunk_source(
     // schema-at-open) or an apply-run failure records neither — the runner-bypass
     // class. See docs/runner-coverage-matrix.yaml.
     capture_open_forensics(plan, state, &mut summary);
+    // Same runner-parity reason: the source-harm bracket and the DIAGNOSIS line
+    // it feeds are re-applied here, or an `apply` run records no `export_harm`
+    // rows and never says a word about a source it spilled to disk — while the
+    // identical plan under `rivet run` does both (round-3 bughunt: the doc on
+    // this fn claimed "everything else is identical to run_export_job", and the
+    // harm half was the exception).
+    let pg_temp_bytes_before = pg_temp_bytes_snapshot(plan);
+    let harm_before = harm_snapshot(&plan.source);
 
     let result = if plan.strategy.requires_parallel_execution() {
         if plan.strategy.is_resumable() {
@@ -1334,6 +1342,35 @@ pub(crate) fn run_export_job_with_chunk_source(
     summary.duration_ms = start.elapsed().as_millis() as i64;
     summary.peak_rss_mb = rss_peak.max(rss_after).max(rss_before) as i64;
 
+    // Close the harm bracket on the SAME window the run occupied, before the
+    // status resolution below — the deltas are what the DIAGNOSIS reads.
+    if let Some(before) = pg_temp_bytes_before
+        && let Some(after) = pg_temp_bytes_snapshot(plan)
+    {
+        let delta = (after - before).max(0);
+        summary.pg_temp_bytes_delta = Some(delta);
+        if let Some(line) = pg_temp_bytes_warning(
+            &plan.export_name,
+            delta,
+            super::run::multi_export_concurrent(),
+        ) {
+            log::warn!("{line}");
+        }
+    }
+    let mut harm_delta_vec: Vec<(String, i64)> = Vec::new();
+    if let Some(before) = &harm_before
+        && let Some(after) = harm_snapshot(&plan.source)
+    {
+        harm_delta_vec = harm_deltas(before, &after);
+        if let Err(e) = state.record_harm(&summary.run_id, &summary.export_name, &harm_delta_vec) {
+            log::debug!(
+                "apply '{}': harm metrics write failed (informational): {:#}",
+                summary.export_name,
+                e
+            );
+        }
+    }
+
     let tuning_class = plan.tuning.profile_name().to_string();
     let result = run_chunked_quality_gate(result, plan, &mut summary);
     let failed = result.is_err();
@@ -1350,6 +1387,16 @@ pub(crate) fn run_export_job_with_chunk_source(
             summary.error_message = Some(redacted.clone());
             log::error!("apply '{}' failed: {}", plan.export_name, redacted);
         }
+    }
+
+    // Emitted after the status resolution for the same reason `run_export_job`
+    // does it there: the line must report the terminal status, not "running".
+    if let Some(line) = run_diagnosis(
+        &summary,
+        &harm_delta_vec,
+        super::run::multi_export_concurrent(),
+    ) {
+        log::warn!("{line}");
     }
 
     summary.print();

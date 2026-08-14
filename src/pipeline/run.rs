@@ -117,6 +117,81 @@ fn emit_child_stderr(dump: &str, dir: &Path) {
     }
 }
 
+/// Whether THIS process emits the run-over-run throughput self-check for the
+/// exports it just ran, or defers to the parent that spawned it.
+///
+/// The contract is EXACTLY ONCE per export per run, and there are two ways to
+/// break it. The first shipped: the check was wired into `run()` only, so
+/// `apply` and `apply --pool` skipped it whenever one export was in scope. The
+/// second is its mirror: `--parallel-export-processes` and `apply --parallel`
+/// re-exec each export as `rivet run --export X`, so every child ALSO reaches a
+/// tail — and it does not self-cancel, because the parent rebuilds each child's
+/// entry from the state DB carrying the CHILD's own `run_id`, so the parent's
+/// baseline query excludes the same row the child excluded and reproduces the
+/// child's line verbatim.
+///
+/// The parent wins the tie, for a reason stronger than symmetry: a child's
+/// stderr is CAPTURED (`emit_child_stderr` diverts it to a
+/// `rivet-child-stderr-*.log` beside the config), so a WARN the child emits is
+/// not on the operator's console at all — while the parent prints beside the run
+/// aggregate, and knows the run-wide concurrency mode the hedge text needs.
+/// `RIVET_IPC_EVENTS` is the marker: `run_exports_as_child_processes` sets it on
+/// EVERY child (not just concurrent batches, unlike `ENV_CONCURRENT_SIBLINGS`),
+/// which is exactly the "my parent is aggregating me" declaration.
+fn owns_throughput_self_check(reexec_child: bool) -> bool {
+    !reexec_child
+}
+
+/// The ONE call site of [`aggregate::warn_throughput_regressions`]: every
+/// orchestrator tail (`run`'s two branches, `run_waves`, `run_pool`) routes its
+/// entries through here, unconditionally — no `len() > 1` gate, because the
+/// field regression this check exists for hit a single-export config.
+///
+/// Structural, not conventional: the call is welded to the aggregate the tail
+/// already builds (build → print? → self-check → persist?), and
+/// `every_orchestrator_tail_routes_the_self_check_through_one_seam` fails the
+/// build if a tail grows a second path or calls the aggregate helper directly.
+fn self_check_throughput(
+    state: &StateStore,
+    entries: &[crate::state::RunAggregateEntry],
+    run_mode: &str,
+) {
+    if !owns_throughput_self_check(ipc::ipc_events_enabled()) {
+        log::debug!(
+            "throughput self-check: deferred to the parent process (this is a re-exec'd child; \
+             its stderr is captured, the parent prints beside the run aggregate)"
+        );
+        return;
+    }
+    aggregate::warn_throughput_regressions(state, entries, run_mode);
+}
+
+/// What [`run`]'s tail does with the aggregate it just built.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TailPlan {
+    /// Print the run-summary card and record the `run_aggregate` row.
+    aggregate: bool,
+    /// Write `--summary-output` from the tail itself (the aggregate path writes
+    /// it through [`aggregate::persist`], so exactly one of the two does).
+    machine_output: bool,
+}
+
+/// The tail's routing rule, pure because the value-level oracle needs a live
+/// source (a real `run()` needs a database, a destination and a state DB).
+///
+/// `n_exports` is the count AFTER `partition_by` expansion, which is why the
+/// zero case is not hypothetical: `expand_one` logs "found no rows — nothing to
+/// export" and pushes no children, so an empty table leaves the run with zero
+/// exports and a machine consumer still holding a `--json` pipe. `<= 1` (not
+/// `== 1`) is the whole fix — an empty-but-valid `total_exports: 0` document
+/// beats silence, which parses as neither JSON nor "nothing happened".
+fn tail_plan(n_exports: usize, machine_output_requested: bool) -> TailPlan {
+    TailPlan {
+        aggregate: n_exports > 1,
+        machine_output: machine_output_requested && n_exports <= 1,
+    }
+}
+
 #[allow(clippy::too_many_arguments)] // CLI fan-in; surface stays stable per ADR-0013
 pub fn run(
     config_path: &str,
@@ -207,7 +282,11 @@ pub fn run(
     let run_parallel_processes =
         process_mode_requested && export_name.is_none() && exports.len() > 1 && !partitioned;
 
-    let started_at = chrono::Utc::now();
+    // Stamped here for the paths that open no harm bracket; the bracketed paths
+    // below RE-stamp from `RunHarmBracket::open`, which hands back an instant
+    // taken AFTER its source probe so the window never charges the run for
+    // rivet's own instrumentation (see `snapshot_then_stamp`).
+    let mut started_at = chrono::Utc::now();
 
     if run_parallel_processes {
         // Run schema migrations once in the parent BEFORE forking children.
@@ -228,7 +307,8 @@ pub fn run(
         // DIAGNOSIS hedges and points at "the run-level harm line" — which only
         // the PARENT can emit (each child sees one export's window). Same
         // bracket the pool uses, so the pointer is not a dangling reference.
-        let run_harm = RunHarmBracket::open(&config.source);
+        let (run_harm, window_start) = RunHarmBracket::open(&config.source);
+        started_at = window_start;
         let (result, child_failures, stderr_dump) =
             parallel_children::run_exports_as_child_processes(
                 config_path,
@@ -263,7 +343,7 @@ pub fn run(
                     "parallel-processes",
                 );
                 aggregate::print(&agg);
-                aggregate::warn_throughput_regressions(&state, &agg.per_export, &agg.parallel_mode);
+                self_check_throughput(&state, &agg.per_export, &agg.parallel_mode);
                 aggregate::persist(&state, &agg, summary_output);
                 if json_output {
                     print_json_summary(&agg);
@@ -345,7 +425,8 @@ pub fn run(
         // In-process concurrency sets MULTI_EXPORT_CONCURRENT, so every export's
         // DIAGNOSIS hedges and points at the run-level harm line — emit it here
         // (same bracket as the pool and the process-parallel parent).
-        let run_harm = RunHarmBracket::open(&config.source);
+        let (run_harm, window_start) = RunHarmBracket::open(&config.source);
+        started_at = window_start;
         let collected: std::sync::Mutex<Vec<(Result<()>, RunSummary)>> =
             std::sync::Mutex::new(Vec::with_capacity(exports.len()));
         std::thread::scope(|s| {
@@ -435,87 +516,55 @@ pub fn run(
     }
 
     let finished_at = window_end.unwrap_or_else(chrono::Utc::now);
-    // Skip the aggregate for single-export runs.  Two cases this catches:
-    //   1) `rivet run --export X` (manual one-off): the per-export block
-    //      already says everything, an aggregate of one row is just noise.
-    //   2) Children spawned by `--parallel-export-processes`: each child
-    //      enters this code path with exports.len() == 1.  The parent
-    //      (parallel_processes branch above) builds the run-wide aggregate
-    //      from every child's `export_metrics` row, so a child-level
-    //      aggregate would just write a duplicate into `run_aggregate`.
-    // Force-write the JSON file even when skipping, so `--summary-output`
-    // remains useful for one-off runs.
-    if exports.len() > 1 {
-        let parallel_mode = if run_parallel {
-            "parallel-threads"
-        } else {
-            "sequential"
-        };
-        let entries: Vec<_> = summaries
-            .iter()
-            .map(aggregate::entry_from_summary)
-            .collect();
-        let agg = aggregate::build(
-            entries,
-            started_at,
-            finished_at,
-            Some(config_path),
-            parallel_mode,
-        );
-        aggregate::print(&agg);
-        // Open a fresh state handle for persisting the aggregate so we don't
-        // assume which thread owned the per-export `StateStore` above.
-        match StateStore::open(config_path) {
-            Ok(state) => {
-                aggregate::warn_throughput_regressions(&state, &agg.per_export, &agg.parallel_mode);
-                aggregate::persist(&state, &agg, summary_output)
-            }
-            Err(e) => log::warn!(
-                "aggregate: cannot open state DB to record run aggregate: {:#}",
-                e
-            ),
-        }
-        if json_output {
-            print_json_summary(&agg);
-        }
+    // ONE aggregate for every shape of this run, then a routing decision over
+    // it (see [`tail_plan`]). Building it unconditionally is what closes the
+    // zero-export hole: a `partition_by` export whose table is currently empty
+    // expands to NO children, and the previous `> 1` / `== 1` pair matched
+    // neither, so `--json` printed nothing and `--summary-output` was never
+    // created — on a run that exited 0 (bughunt 2026-08-14).
+    let parallel_mode = if run_parallel {
+        "parallel-threads"
     } else {
-        // Single-export run: the aggregate block is noise, but the
-        // run-over-run self-check must still fire — "EVERY run self-reports
-        // degradation" was false on exactly the `rivet run --export X` shape
-        // (bughunt 2026-08-13). Children of --parallel-export-processes also
-        // pass here; their baseline query excludes their own fresh row, so
-        // the report stays correct there too.
-        if let Ok(state) = StateStore::open(config_path) {
-            let entries: Vec<_> = summaries
-                .iter()
-                .map(aggregate::entry_from_summary)
-                .collect();
-            // A lone export has no aggregate, so name the mode here: a
-            // re-exec'd child of --parallel-export-processes / a wave batch
-            // runs single-export in its own process while N siblings share the
-            // source, and ENV_CONCURRENT_SIBLINGS is exactly that declaration.
-            let mode = if multi_export_concurrent() {
-                "concurrent-siblings"
-            } else {
-                "sequential"
-            };
-            aggregate::warn_throughput_regressions(&state, &entries, mode);
-        }
+        "sequential"
+    };
+    let entries: Vec<_> = summaries
+        .iter()
+        .map(aggregate::entry_from_summary)
+        .collect();
+    let agg = aggregate::build(
+        entries,
+        started_at,
+        finished_at,
+        Some(config_path),
+        parallel_mode,
+    );
+    let plan = tail_plan(exports.len(), summary_output.is_some() || json_output);
+    if plan.aggregate {
+        aggregate::print(&agg);
     }
-    if exports.len() == 1 && (summary_output.is_some() || json_output) {
-        // One export, but the user asked for a summary file and/or JSON stdout —
-        // honour both without polluting the DB or stderr.
-        let entries: Vec<_> = summaries
-            .iter()
-            .map(aggregate::entry_from_summary)
-            .collect();
-        let agg = aggregate::build(
-            entries,
-            started_at,
-            finished_at,
-            Some(config_path),
-            "sequential",
-        );
+    // Open a fresh state handle so we don't assume which thread owned the
+    // per-export `StateStore` above. The self-check runs for EVERY shape —
+    // including the lone export, which is exactly the shape the 2026-08-13
+    // field regression had — while the aggregate CARD and the `run_aggregate`
+    // row stay multi-export-only (an aggregate of one row is noise, and a
+    // child of --parallel-export-processes would write a duplicate of the
+    // parent's).
+    match StateStore::open(config_path) {
+        Ok(state) => {
+            self_check_throughput(&state, &agg.per_export, &agg.parallel_mode);
+            if plan.aggregate {
+                aggregate::persist(&state, &agg, summary_output);
+            }
+        }
+        Err(e) => log::warn!(
+            "aggregate: cannot open state DB to record run aggregate: {:#}",
+            e
+        ),
+    }
+    if plan.machine_output {
+        // 0 or 1 exports, and the user asked for a summary file and/or JSON
+        // stdout — honour both without polluting the DB or stderr (the
+        // multi-export path writes the file through `persist` above).
         if let Some(out) = summary_output
             && let Err(e) =
                 std::fs::write(out, serde_json::to_string_pretty(&agg).unwrap_or_default())
@@ -526,9 +575,9 @@ pub fn run(
                 e
             );
         }
-        if json_output {
-            print_json_summary(&agg);
-        }
+    }
+    if json_output {
+        print_json_summary(&agg);
     }
 
     if !failures.is_empty() {
@@ -615,7 +664,18 @@ pub(crate) fn run_waves(
     let _reset = ResetMulti(prev_multi);
 
     let state = StateStore::open(config_path)?;
-    let started_at = chrono::Utc::now();
+    // `apply --parallel` re-execs children with ENV_CONCURRENT_SIBLINGS, so each
+    // child's per-export DIAGNOSIS hedges and points at "the run-level harm
+    // line". Only this parent spans the whole concurrent window, so it owns the
+    // bracket — one per RUN, not per wave/batch, since the counters are
+    // server-global and the operator's lever (concurrency) is run-wide.
+    // Opened BEFORE the window is stamped: `open` probes the source and hands
+    // back the start instant, so the probe cannot land inside the window the
+    // aggregate's duration and rows/s are computed over.
+    let (run_harm, started_at) = match parallel.then(|| RunHarmBracket::open(&config.source)) {
+        Some((bracket, window_start)) => (Some(bracket), window_start),
+        None => (None, chrono::Utc::now()),
+    };
     let mut summaries: Vec<RunSummary> = Vec::with_capacity(total);
     let mut failures: Vec<anyhow::Error> = Vec::new();
     // Parallel-path accumulators: per-child metrics live in the state DB, so the
@@ -624,12 +684,10 @@ pub(crate) fn run_waves(
     let mut child_failures: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
     let mut combined_stderr = String::new();
-    // `apply --parallel` re-execs children with ENV_CONCURRENT_SIBLINGS, so each
-    // child's per-export DIAGNOSIS hedges and points at "the run-level harm
-    // line". Only this parent spans the whole concurrent window, so it owns the
-    // bracket — one per RUN, not per wave/batch, since the counters are
-    // server-global and the operator's lever (concurrency) is run-wide.
-    let run_harm = parallel.then(|| RunHarmBracket::open(&config.source));
+    // The widest batch that ever ran at once, across every wave — the run's REAL
+    // concurrency, which the cost gate (not the flag) decides. Frames the
+    // run-level harm line; see [`wave_harm_window`].
+    let mut peak_concurrency = 0usize;
 
     for (wave, exports) in &by_wave {
         let label = if *wave == u32::MAX {
@@ -698,6 +756,11 @@ pub(crate) fn run_waves(
             if !safe.is_empty() {
                 batches.push(safe);
             }
+            // Batches run one after another (the loop below blocks per batch),
+            // so the run's concurrency is the WIDEST batch, never the number of
+            // exports it covered.
+            peak_concurrency =
+                peak_concurrency.max(batches.iter().map(Vec::len).max().unwrap_or(0));
             // Wave-wide name floor so cards align across the safe/lone batches
             // (the cost gate splits a wave into one safe batch + N lone batches,
             // each its own renderer — without a shared floor they'd each pad to
@@ -746,33 +809,46 @@ pub(crate) fn run_waves(
     // aggregate's duration excludes the instrumentation round-trip.
     let finished_at = chrono::Utc::now();
     if let Some(bracket) = run_harm {
-        bracket.close_and_warn(HarmWindow::Parallel {
-            exports: all_exports.len(),
-        });
+        // Frame the window by what the run ACTUALLY did — the cost gate can put
+        // every export in its own single-child batch (the default, since
+        // `parallel_safe` is `None` unless `rivet plan` set it), in which case
+        // nothing overlapped and "N concurrent exports · lower the export
+        // concurrency" would tell the operator to shrink a 1 (bughunt
+        // 2026-08-14).
+        if let Some(window) = wave_harm_window(peak_concurrency, all_exports.len()) {
+            bracket.close_and_warn(window);
+        }
     }
 
-    if total > 1 {
-        let entries = if parallel {
-            aggregate::collect_child_entries(&state, &all_exports, started_at, &child_failures)
+    // ONE aggregate for both paths; the CARD and the `run_aggregate` row stay
+    // multi-export-only, but the run-over-run self-check fires whatever the
+    // count — `apply` has no `--export` flag, so a one-export config IS the
+    // whole invocation and skipping it there was the runner-bypass half of the
+    // fix that only reached `run()` (bughunt 2026-08-14).
+    let entries = if parallel {
+        aggregate::collect_child_entries(&state, &all_exports, started_at, &child_failures)
+    } else {
+        summaries
+            .iter()
+            .map(aggregate::entry_from_summary)
+            .collect()
+    };
+    let agg = aggregate::build(
+        entries,
+        started_at,
+        finished_at,
+        Some(config_path),
+        if parallel {
+            "wave-parallel-processes"
         } else {
-            summaries
-                .iter()
-                .map(aggregate::entry_from_summary)
-                .collect()
-        };
-        let agg = aggregate::build(
-            entries,
-            started_at,
-            finished_at,
-            Some(config_path),
-            if parallel {
-                "wave-parallel-processes"
-            } else {
-                "wave-sequential"
-            },
-        );
+            "wave-sequential"
+        },
+    );
+    if total > 1 {
         aggregate::print(&agg);
-        aggregate::warn_throughput_regressions(&state, &agg.per_export, &agg.parallel_mode);
+    }
+    self_check_throughput(&state, &agg.per_export, &agg.parallel_mode);
+    if total > 1 {
         aggregate::persist(&state, &agg, None);
     }
     // Captured child stderr (verbose per-export cards, parallel path only) goes
@@ -801,13 +877,48 @@ pub(crate) fn run_waves(
 /// How the run shaped its concurrency, for the run-level harm line's frame —
 /// the operator needs to know WHICH window the total covers before they can act
 /// on it (shed slots vs shed export concurrency).
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HarmWindow {
     /// `--pool m`: `exports` exports drained through `slots` slots.
     Pool { exports: usize, slots: usize },
     /// `--parallel-exports` / `--parallel-export-processes` / `apply --parallel`:
-    /// `exports` exports concurrent with no slot cap.
+    /// `exports` exports concurrent with no slot cap. `exports` is the PEAK
+    /// number that actually overlapped, not how many the run covered — the
+    /// frame is a concurrency claim, so it must count concurrency.
     Parallel { exports: usize },
+    /// A run that ASKED for parallelism and got none: `apply --parallel` whose
+    /// cost gate put every (non-`parallel_safe`) export in its own single-child
+    /// batch, which the wave loop then runs strictly one after another. Its own
+    /// arm because the parallel arm's frame ("N concurrent exports") and lever
+    /// ("lower the export concurrency") are both FALSE here — there was no
+    /// concurrency to lower, and naming it buries the levers that do exist
+    /// (bughunt 2026-08-14).
+    Serial { exports: usize },
+}
+
+/// The window a wave run actually presented to the source.
+///
+/// `peak` is the widest batch that ever ran at once across every wave;
+/// `exports` is how many ran in total. `apply --parallel` opens its bracket on
+/// the FLAG, before any batching is known — the cost gate may then serialize the
+/// whole run (the default: `parallel_safe` is `None` → not safe → one
+/// single-child batch per export), and the children agree, since
+/// `run_exports_as_child_processes` sets `ENV_CONCURRENT_SIBLINGS` only for a
+/// batch of >1. So the honest frame is decided HERE, at close, from what
+/// happened — never from the flag or from the export count.
+///
+/// `None` when the run executed nothing (every export resume-skipped): rivet's
+/// window then contains none of rivet's work, so any spill in it is foreign and
+/// blaming the run would be the same false accusation one step further out.
+fn wave_harm_window(peak: usize, exports: usize) -> Option<HarmWindow> {
+    if exports == 0 {
+        return None;
+    }
+    Some(if peak > 1 {
+        HarmWindow::Parallel { exports: peak }
+    } else {
+        HarmWindow::Serial { exports }
+    })
 }
 
 /// The run-window harm verdict, pure so the threshold and wording are
@@ -828,19 +939,30 @@ fn run_harm_verdict(deltas: &[(String, i64)], window: HarmWindow) -> Option<Stri
         HarmWindow::Pool { exports, slots } => (
             "pool run",
             format!("the pool window ({exports} exports, {slots} slots)"),
-            "`--pool` slots",
+            Some("`--pool` slots"),
         ),
         HarmWindow::Parallel { exports } => (
             "parallel run",
             format!("the run window ({exports} concurrent exports)"),
-            "the export concurrency (`--pool N` bounds it)",
+            Some("the export concurrency (`--pool N` bounds it)"),
         ),
+        // No concurrency lever: this window HAD no concurrency. Naming one
+        // would send the operator to shrink a 1, and would push the two levers
+        // that do work behind a lie.
+        HarmWindow::Serial { exports } => (
+            "serialized run",
+            format!("the run window ({exports} exports, run one at a time)"),
+            None,
+        ),
+    };
+    let levers = match lever {
+        Some(l) => format!("Lower {l}, `chunk_size` pages, or `tuning.batch_size`"),
+        None => "Lower `chunk_size` pages or `tuning.batch_size`".to_string(),
     };
     Some(format!(
         "{scope}: source harm — {spills} {unit} server-wide across {frame}: the source \
-         spilled to disk while rivet ran. Lower {lever}, `chunk_size` pages, or \
-         `tuning.batch_size` to shed pressure (foreign clients can contribute, but \
-         rivet's window is the frame)."
+         spilled to disk while rivet ran. {levers} to shed pressure (foreign clients can \
+         contribute, but rivet's window is the frame)."
     ))
 }
 
@@ -865,13 +987,35 @@ pub(crate) struct RunHarmBracket<'a> {
     before: Option<Vec<(String, i64)>>,
 }
 
+/// Probe FIRST, stamp SECOND — the open-side mirror of the `finished_at` rule.
+///
+/// `job::harm_snapshot` is a real source CONNECT plus a catalog query (TLS
+/// handshake, MySQL pool build, an MSSQL runtime + login): on a tunnelled or
+/// cold link it costs seconds. A window stamped BEFORE it charges the run for
+/// rivet's own measurement — the pool then prints "actual makespan X vs
+/// predicted Y" grading its model against the cost of grading it, and the
+/// aggregate's rows/s (which `warn_throughput_regressions` compares run over
+/// run) is deflated by the same amount. The close side was fixed by hand at
+/// four sites; this side is fixed by CONSTRUCTION — [`RunHarmBracket::open`]
+/// hands the caller the stamp, so no caller can order the probe inside the
+/// window it grades.
+///
+/// Split out of `open` so the ordering is provable without a live source: the
+/// probe is injected, and the test asserts the stamp is not older than the
+/// instant the probe finished.
+fn snapshot_then_stamp<T>(probe: impl FnOnce() -> T) -> (T, chrono::DateTime<chrono::Utc>) {
+    let before = probe();
+    (before, chrono::Utc::now())
+}
+
 impl<'a> RunHarmBracket<'a> {
-    /// Take the `before` snapshot. Call immediately before the concurrent work.
-    fn open(source: &'a crate::config::SourceConfig) -> Self {
-        Self {
-            source,
-            before: job::harm_snapshot(source),
-        }
+    /// Take the `before` snapshot and return it with the window-START stamp,
+    /// taken after the probe (see [`snapshot_then_stamp`]). Call immediately
+    /// before the concurrent work and use the returned instant as the run's
+    /// `started_at`.
+    fn open(source: &'a crate::config::SourceConfig) -> (Self, chrono::DateTime<chrono::Utc>) {
+        let (before, window_start) = snapshot_then_stamp(|| job::harm_snapshot(source));
+        (Self { source, before }, window_start)
     }
 
     /// Take the `after` snapshot and WARN the verdict if the window crossed the
@@ -1307,7 +1451,6 @@ pub(crate) fn run_pool(
         .spawn(move || parent_ui::run_ui(rx, name_floor, n_cards))
         .ok();
 
-    let started_at = chrono::Utc::now();
     // Run-level source-harm bracket: the per-export deltas overlap in time
     // under pool concurrency (each reads the same server-global counters over
     // its own window), so summing them double-counts and blaming one export
@@ -1315,7 +1458,13 @@ pub(crate) fn run_pool(
     // the dominant load in it, so `after - before` here is "what this run did
     // to the source" (modulo foreign clients). Best-effort, like the
     // per-export snapshots.
-    let run_harm = RunHarmBracket::open(&config.source);
+    //
+    // The OPEN comes first and hands back `started_at`: this probe is a source
+    // connect + catalog query, and the very next lines grade the schedule with
+    // "actual makespan X vs predicted Y". Stamping before it charged the model
+    // for the cost of measuring it — the unfixed mirror of the `finished_at`
+    // move below (bughunt 2026-08-14).
+    let (run_harm, started_at) = RunHarmBracket::open(&config.source);
     let collected: std::sync::Mutex<Vec<(Result<()>, RunSummary)>> =
         std::sync::Mutex::new(Vec::with_capacity(pending.len()));
     std::thread::scope(|s| {
@@ -1464,14 +1613,22 @@ pub(crate) fn run_pool(
             );
         }
     }
+    // ONE aggregate, then the same routing every other orchestrator uses: the
+    // card and the `run_aggregate` row are multi-export-only, the run-over-run
+    // self-check is not. A `--pool` run whose `--resume` skip leaves ONE pending
+    // export is the shape that silently dropped the check before (bughunt
+    // 2026-08-14) — and it is the shape a degraded export produces, since the
+    // others completed.
+    let entries = summaries
+        .iter()
+        .map(aggregate::entry_from_summary)
+        .collect();
+    let agg = aggregate::build(entries, started_at, finished_at, Some(config_path), "pool");
     if pending.len() > 1 {
-        let entries = summaries
-            .iter()
-            .map(aggregate::entry_from_summary)
-            .collect();
-        let agg = aggregate::build(entries, started_at, finished_at, Some(config_path), "pool");
         aggregate::print(&agg);
-        aggregate::warn_throughput_regressions(&state, &agg.per_export, &agg.parallel_mode);
+    }
+    self_check_throughput(&state, &agg.per_export, &agg.parallel_mode);
+    if pending.len() > 1 {
         aggregate::persist(&state, &agg, None);
     }
     if !failures.is_empty() {
@@ -1642,7 +1799,15 @@ mod pool_harm_tests {
         // Spelled in pieces so this needle does not match the assertion that
         // uses it (the same self-match that made the first draft read 6 of 4).
         let open = concat!("RunHarmBracket::", "open(&config.source)");
-        let close = concat!("close_and", "_warn(HarmWindow::");
+        // The needle stops at the paren: `run_waves` COMPUTES its window
+        // (`wave_harm_window`, since only the close knows what actually
+        // overlapped) rather than spelling a `HarmWindow::` literal inline, and
+        // requiring the literal would push the next parent back to a hard-coded
+        // frame — which is the bug this file just fixed. It keeps the leading
+        // DOT, so the method's own definition (which sits between two anchors
+        // and would otherwise answer for the parent whose slice it lands in)
+        // does not satisfy the check.
+        let close = concat!(".close_and", "_warn(");
         // Slice each concurrent parent's body by its signature anchor; the last
         // one runs to the end of the product half.
         let anchors = [
@@ -1678,6 +1843,267 @@ mod pool_harm_tests {
             4,
             "expected one bracket per concurrent path: run/processes, run/threads, \
              run_waves/parallel, run_pool"
+        );
+    }
+
+    /// A wave run's harm frame must describe what HAPPENED, not what was asked
+    /// for. `apply --parallel` opens its bracket on the flag, but the cost gate
+    /// then puts every non-`parallel_safe` export (the default, absent a `rivet
+    /// plan` annotation) in its own single-child batch, and the wave loop runs
+    /// batches strictly one after another — so a 12-export run can have a peak
+    /// concurrency of 1 while the shipped line said "12 concurrent exports" and
+    /// told the operator to lower a concurrency that never existed.
+    ///
+    /// RED against the shipped `HarmWindow::Parallel { exports: all_exports.len() }`:
+    /// the peak-1 case then reads `Parallel { exports: 12 }`.
+    #[test]
+    fn wave_harm_window_is_framed_by_the_peak_that_actually_overlapped() {
+        use super::wave_harm_window;
+        // Every export ran alone: 12 of them, none concurrent.
+        assert_eq!(
+            wave_harm_window(1, 12),
+            Some(HarmWindow::Serial { exports: 12 }),
+            "a serialized run must not be framed as a concurrent one"
+        );
+        // A mixed wave: the widest batch was 3 (the parallel_safe group), even
+        // though 12 exports ran across the run — the frame counts CONCURRENCY.
+        assert_eq!(
+            wave_harm_window(3, 12),
+            Some(HarmWindow::Parallel { exports: 3 }),
+            "the frame must report the peak width, not the export count"
+        );
+        // Nothing ran (every export resume-skipped): rivet's window holds none
+        // of rivet's work, so there is no run to blame for a spill in it.
+        assert_eq!(wave_harm_window(0, 0), None);
+    }
+
+    /// The serialized frame must also drop the LEVER — a remedy list that opens
+    /// with "lower the export concurrency" on a run that had none buries the two
+    /// levers that do work behind a false one (the same diagnostic-bypass harm a
+    /// false UNSAFE does in preflight).
+    ///
+    /// RED against reusing the `Parallel` arm for a serialized run, and against
+    /// a shared lever sentence that keeps the concurrency clause.
+    #[test]
+    fn run_harm_verdict_for_a_serialized_run_names_no_concurrency_lever() {
+        // ≥2 counters so the fold is a real fold.
+        let spills = vec![
+            ("Created_tmp_disk_tables".to_string(), 40_i64),
+            ("mysql_created_tmp_disk_tables".to_string(), 60_i64),
+        ];
+        let line = run_harm_verdict(&spills, HarmWindow::Serial { exports: 12 })
+            .expect("100 reaches the shared threshold");
+        assert!(
+            line.contains("12 exports, run one at a time"),
+            "the frame must say the exports did not overlap: {line}"
+        );
+        assert!(
+            !line.contains("concurrent"),
+            "a serialized run must claim no concurrency: {line}"
+        );
+        assert!(
+            !line.contains("--pool") && !line.contains("export concurrency"),
+            "there is no concurrency to lower on this path — naming the lever \
+             sends the operator to shrink a 1: {line}"
+        );
+        assert!(
+            line.contains("`chunk_size`") && line.contains("`tuning.batch_size`"),
+            "the levers this window DOES have must still be named: {line}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod run_tail_tests {
+    use super::{owns_throughput_self_check, snapshot_then_stamp, tail_plan};
+
+    /// `--json` / `--summary-output` must emit a document on EVERY run, including
+    /// one that exports nothing: a `partition_by` export over a currently-empty
+    /// table expands to zero children (`partition_expand::expand_one` logs
+    /// "found no rows — nothing to export" and pushes none), and the shipped
+    /// `exports.len() == 1` predicate matched neither that nor the `> 1`
+    /// aggregate branch — so stdout was EMPTY and the summary file was never
+    /// created, on a run that exited 0. A scheduler's `json.load(stdout)` raises
+    /// a parse error; an empty-but-valid `total_exports: 0` document does not.
+    ///
+    /// Pure because the value-level oracle needs a live source (a real `run()`
+    /// wants a database, a destination and a state DB); the aggregate this feeds
+    /// is proven serializable at zero exports by
+    /// `aggregate::a_zero_export_run_still_builds_a_valid_document`.
+    ///
+    /// RED against restoring `n_exports == 1`: the zero case reads `false`.
+    #[test]
+    fn tail_plan_emits_a_machine_document_for_a_zero_export_run() {
+        // Zero exports (partition_by over an empty table) — the regression.
+        assert!(
+            tail_plan(0, true).machine_output,
+            "a zero-export run must still write --summary-output / print --json"
+        );
+        assert!(
+            !tail_plan(0, true).aggregate,
+            "no card, no run_aggregate row"
+        );
+        // One export: unchanged — machine output from the tail, no card.
+        assert!(tail_plan(1, true).machine_output);
+        assert!(!tail_plan(1, true).aggregate);
+        // Two or more: the aggregate path owns both the card and the file
+        // (through `persist`), so the tail must NOT write it a second time.
+        assert!(tail_plan(2, true).aggregate);
+        assert!(
+            !tail_plan(2, true).machine_output,
+            "the aggregate path writes --summary-output via persist; a second \
+             write here would race it"
+        );
+        // Nobody asked for machine output → none, at every count.
+        assert!(!tail_plan(0, false).machine_output);
+        assert!(!tail_plan(1, false).machine_output);
+    }
+
+    /// Exactly once per export per run — the half that is easy to get backwards.
+    /// `--parallel-export-processes` and `apply --parallel` re-exec each export
+    /// as `rivet run --export X`, so parent AND child both reach a tail over the
+    /// same export, and it does not self-cancel: the parent rebuilds the child's
+    /// entry carrying the CHILD's `run_id`, so its baseline query excludes the
+    /// same row the child excluded and reproduces the child's line verbatim.
+    ///
+    /// The parent wins because a child's stderr is CAPTURED to
+    /// `rivet-child-stderr-*.log` — a WARN emitted there never reaches the
+    /// operator's console at all.
+    ///
+    /// RED against dropping the deferral (both cases read `true`) or inverting
+    /// it (the parent then goes silent and NOBODY reports).
+    #[test]
+    fn a_reexecd_child_defers_the_throughput_self_check_to_its_parent() {
+        assert!(
+            !owns_throughput_self_check(true),
+            "a re-exec'd child must defer — its parent aggregates the same row, \
+             and the child's stderr is captured to a file"
+        );
+        assert!(
+            owns_throughput_self_check(false),
+            "a top-level run owns its own self-check — deferring it to a parent \
+             that does not exist is how the check goes silent everywhere"
+        );
+    }
+
+    /// The window is stamped AFTER the source probe, never before.
+    ///
+    /// `RunHarmBracket::open` runs `job::harm_snapshot` — a real connect (TLS
+    /// handshake / pool build / MSSQL login) plus a catalog query, seconds over a
+    /// tunnel. A `started_at` taken before it lands the instrumentation INSIDE
+    /// the window that grades the run: the pool prints "actual makespan X vs
+    /// predicted Y" and the aggregate's rows/s (the input to the run-over-run
+    /// self-check) is deflated by the probe's own cost. The close side of the
+    /// same rule was fixed at four sites by hand; this side is structural —
+    /// `open` returns the stamp, so a caller cannot order it wrong.
+    ///
+    /// RED against the reversed body (`let at = Utc::now(); (probe(), at)`): the
+    /// stamp then predates the probe's completion by the sleep below.
+    #[test]
+    fn the_harm_window_is_stamped_after_the_probe_that_opens_it() {
+        let probe_finished = std::cell::Cell::new(None);
+        let (before, stamp) = snapshot_then_stamp(|| {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            probe_finished.set(Some(chrono::Utc::now()));
+            // ≥2 counters: the probe's value must pass through untouched, and a
+            // one-element fixture cannot show a container was preserved.
+            vec![
+                ("mysql_created_tmp_disk_tables".to_string(), 7_i64),
+                ("mysql_innodb_rows_read".to_string(), 11_i64),
+            ]
+        });
+        assert_eq!(
+            before.len(),
+            2,
+            "the probe's value passes through unchanged"
+        );
+        let probe_finished = probe_finished.get().expect("the probe ran");
+        assert!(
+            stamp >= probe_finished,
+            "the window start ({stamp}) predates the end of the probe that \
+             measures it ({probe_finished}) — the run is being charged for its \
+             own instrumentation"
+        );
+    }
+
+    /// The self-check reaches every orchestrator through ONE seam.
+    ///
+    /// The shipped bug was a runner bypass: the check was wired into `run()`'s
+    /// tail only, so `apply` (`run_waves`) and `apply --pool` (`run_pool`) fell
+    /// through their `total > 1` / `pending.len() > 1` gates and said nothing —
+    /// and `apply` has no `--export` flag, so a one-export config IS the whole
+    /// invocation. This makes the next bypass a diff-time failure: the aggregate
+    /// helper has exactly one caller, and every orchestrator calls it.
+    ///
+    /// HONESTY: this pins the WIRING, not the emission — the warning needs two
+    /// state-DB rows for one export across two runs, which no unit test in this
+    /// module can stage. What it goes RED on is a tail losing the call, or
+    /// growing a second path around the seam (verified by deleting `run_pool`'s
+    /// call, and by pointing one tail straight at `aggregate::`).
+    #[test]
+    fn every_orchestrator_tail_routes_the_self_check_through_one_seam() {
+        let whole = include_str!("run.rs");
+        // Product half only — the test modules below would otherwise answer for
+        // the code they are supposed to grade.
+        let src = &whole[..whole
+            .find("\n#[cfg(test)]")
+            .expect("run.rs has test modules")];
+        // CODE occurrences only: a doc comment naming the function is not a call.
+        let code: String = src
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Spelled in pieces so this test's own text cannot satisfy the count if
+        // the module boundary ever moves.
+        let helper = concat!("aggregate::warn_throughput", "_regressions(");
+        assert_eq!(
+            code.matches(helper).count(),
+            1,
+            "the aggregate helper must have exactly ONE caller — the \
+             `self_check_throughput` seam. A tail calling it directly skips the \
+             re-exec'd-child deferral and reports the same export twice."
+        );
+
+        let seam = concat!("self_check", "_throughput(");
+        let anchors = [
+            ("run", "\npub fn run("),
+            ("run_waves", "\npub(crate) fn run_waves("),
+            ("run_pool", "\npub(crate) fn run_pool("),
+        ];
+        let mut starts: Vec<(&str, usize)> = anchors
+            .iter()
+            .map(|(name, sig)| {
+                (
+                    *name,
+                    code.find(sig)
+                        .unwrap_or_else(|| panic!("{name}'s signature moved — update the anchor")),
+                )
+            })
+            .collect();
+        starts.sort_by_key(|(_, at)| *at);
+        for (i, (name, at)) in starts.iter().enumerate() {
+            let end = starts.get(i + 1).map(|(_, n)| *n).unwrap_or(code.len());
+            assert!(
+                code[*at..end].contains(seam),
+                "{name} ends a run, so it must self-check its exports' throughput \
+                 — 'EVERY run self-reports degradation' is the contract, and it \
+                 was false on `apply` and `apply --pool` for a whole release"
+            );
+        }
+        // `run` has TWO tails (the process-parallel parent returns early, the
+        // in-process one falls through); a single call would leave one silent.
+        // Fold ≥2 by construction, so count the sites. The seam's own `fn` is a
+        // definition, not a call.
+        let calls = code
+            .match_indices(seam)
+            .filter(|(i, _)| !code[..*i].ends_with("fn "))
+            .count();
+        assert_eq!(
+            calls, 4,
+            "expected one self-check per tail: run/processes, run/in-process, \
+             run_waves, run_pool"
         );
     }
 }

@@ -130,6 +130,34 @@ pub(crate) fn split_unit_from(giant: &PredictedFrom, share_secs: f64) -> Predict
     }
 }
 
+/// Reconcile a split unit's inherited SEED with the unit's OWN history.
+///
+/// The seed exists for ONE reason: a freshly synthesized `{giant}#N` has no
+/// rows under its own name. But unit names are STABLE across runs
+/// (`{giant}#{i}`, [`crate::pipeline::split`]) and the giant is retained OUT of
+/// the run set once split (`run_pool`'s `effective.retain`), so the giant's
+/// rows freeze at the state that motivated the split — failed / interrupted,
+/// forever. A seed that keeps winning therefore discards the units' own
+/// measurements on every run from the second onward (bughunt 2026-08-14):
+/// LPT ranks all N units at one identical derived number (the makespan the
+/// split exists to break), and the LOWER BOUND hedge — gated on the seed's
+/// inherited classification — becomes unclearable, since only a success on the
+/// giant, which never runs again, could clear it.
+///
+/// So: the seed applies only while the unit is genuinely history-less. Any row
+/// under the unit's OWN name supersedes it — a success measures THIS unit, and
+/// a failed attempt floors THIS unit ([`predict_secs`] already takes the
+/// LONGEST attempt in its window, so one fast crash cannot pin a unit low while
+/// a long attempt is on record). That is exactly the treatment every unsplit
+/// export gets from `predict_secs`; the seed is the first-run bootstrap, not a
+/// permanent override.
+pub(crate) fn reconcile_split_seed(seed: &PredictedFrom, own: &PredictedFrom) -> PredictedFrom {
+    match own {
+        PredictedFrom::Placeholder(_) => seed.clone(),
+        _ => own.clone(),
+    }
+}
+
 /// Fold classifications into the `(measured, failed-attempt, placeholder)`
 /// accounting the makespan print grades itself with — and whose second and
 /// third members decide the LOWER BOUND hedge. Pure so the hedge's input is
@@ -152,7 +180,9 @@ pub(crate) fn classification_counts(fs: &[PredictedFrom]) -> (usize, usize, usiz
 /// schedule go through here, so the two commands cannot print different
 /// makespans for one config again. `split_seeds` carries `{giant}#N` units'
 /// inherited prediction — duration AND provenance, built by
-/// [`split_unit_from`] (empty everywhere except the realized-split path).
+/// [`split_unit_from`] (empty everywhere except the realized-split path) — and
+/// it yields to the unit's own history as soon as it has any, see
+/// [`reconcile_split_seed`].
 pub(crate) fn predict_items<'a>(
     state: &crate::state::StateStore,
     exports: impl IntoIterator<Item = (&'a str, bool)>,
@@ -161,9 +191,10 @@ pub(crate) fn predict_items<'a>(
     exports
         .into_iter()
         .map(|(name, parallel_safe)| {
+            let own = predict_secs(state, name);
             let from = match split_seeds.get(name) {
-                Some(seed) => seed.clone(),
-                None => predict_secs(state, name),
+                Some(seed) => reconcile_split_seed(seed, &own),
+                None => own,
             };
             (
                 PoolItem {
@@ -566,8 +597,8 @@ mod tests {
 #[cfg(test)]
 mod prediction_tests {
     use super::{
-        POOL_PLACEHOLDER_SECS, PredictedFrom, classification_counts, predict_items, predict_secs,
-        split_unit_from,
+        POOL_PLACEHOLDER_SECS, PoolItem, PredictedFrom, classification_counts, pool_order,
+        predict_items, predict_secs, reconcile_split_seed, split_unit_from,
     };
     use crate::state::{MetricRow, StateStore};
 
@@ -672,7 +703,8 @@ mod prediction_tests {
         assert!(matches!(from, PredictedFrom::SeededSplit(_)));
         assert_eq!(
             unit.predicted_secs, 450.0,
-            "seed wins over any history lookup"
+            "the seed bootstraps a unit with no rows of its own \
+             (once it has some, see reconcile_split_seed)"
         );
         assert!(!unit.parallel_safe, "parallel_safe passes through verbatim");
         let (fresh, from) = &out[1];
@@ -752,6 +784,96 @@ mod prediction_tests {
         assert!(matches!(
             split_unit_from(&PredictedFrom::Placeholder(POOL_PLACEHOLDER_SECS), 1.25),
             PredictedFrom::Placeholder(_)
+        ));
+    }
+
+    /// Run 2+ of `apply --pool --split`: the units' OWN measurements must
+    /// supersede the inherited seed.
+    ///
+    /// The giant is retained out of the run set once split (`run_pool`), so its
+    /// rows freeze at the failed state that motivated the split and the seed is
+    /// rebuilt identically on every later run. A seed that keeps winning throws
+    /// away every unit's real history forever: LPT sees N identical durations
+    /// (no longest-first among the slices — the makespan the split exists to
+    /// break) and the LOWER BOUND hedge can never clear, because only a success
+    /// on the giant would clear it and the giant never runs again (bughunt
+    /// 2026-08-14).
+    ///
+    /// The fixture needs TWO measured units with DIFFERENT durations: with one,
+    /// "all units share the seed" and "each unit has its own number" are the
+    /// same schedule, so the seed-wins mutant survives. A third, history-less
+    /// unit pins the other half — the seed still bootstraps a genuinely fresh
+    /// slice.
+    #[test]
+    fn a_split_units_own_history_supersedes_the_inherited_seed() {
+        let s = store_with(&[
+            // The giant's frozen failed rows — the seed's source, forever.
+            ("giant", "r1", 3_600_000, "failed"),
+            ("giant", "r2", 3_000_000, "interrupted"),
+            // …and what run 1 of the split actually measured.
+            ("giant#0", "r3", 700_000, "success"),
+            ("giant#1", "r4", 1_100_000, "success"),
+        ]);
+        let giant_from = predict_secs(&s, "giant");
+        let share = giant_from.secs() / 3.0; // 1200.0, identical for all units
+        let seeds: std::collections::HashMap<String, PredictedFrom> = (0..3)
+            .map(|i| (format!("giant#{i}"), split_unit_from(&giant_from, share)))
+            .collect();
+        let names: Vec<String> = (0..3).map(|i| format!("giant#{i}")).collect();
+        let exports: Vec<(&str, bool)> = names.iter().map(|n| (n.as_str(), true)).collect();
+        let predicted = predict_items(&s, exports, &seeds);
+        let secs_of = |n: &str| {
+            predicted
+                .iter()
+                .find(|(i, _)| i.name == n)
+                .map(|(i, _)| i.predicted_secs)
+                .expect("unit present")
+        };
+        assert_eq!(secs_of("giant#0"), 700.0, "the unit's own success wins");
+        assert_eq!(secs_of("giant#1"), 1100.0, "…per unit, not one shared seed");
+        assert_eq!(
+            secs_of("giant#2"),
+            share,
+            "a unit with no rows of its own still takes the seed"
+        );
+        // LPT must now rank the slices by what they actually cost — the
+        // seed-wins behaviour ties all three at 1200 s and breaks the tie by
+        // NAME, putting the 700 s unit first.
+        let items: Vec<PoolItem> = predicted.iter().map(|(i, _)| i.clone()).collect();
+        assert_eq!(
+            pool_order(&items),
+            vec!["giant#2", "giant#1", "giant#0"],
+            "longest-first among the slices"
+        );
+        // …and the hedge self-clears as the units succeed: two measured, one
+        // still resting on the failed giant's floor.
+        let classified: Vec<PredictedFrom> = predicted.iter().map(|(_, f)| f.clone()).collect();
+        assert_eq!(
+            classification_counts(&classified),
+            (2, 1, 0),
+            "the LOWER BOUND hedge shrinks to the units that really lack a success"
+        );
+    }
+
+    /// The reconcile rule itself, in isolation: seed only while the unit is
+    /// genuinely history-less, own row otherwise (success OR attempt floor).
+    #[test]
+    fn reconcile_split_seed_yields_to_any_history_of_the_units_own() {
+        let seed = PredictedFrom::SeededSplit(1200.0);
+        assert!(matches!(
+            reconcile_split_seed(&seed, &PredictedFrom::Placeholder(POOL_PLACEHOLDER_SECS)),
+            PredictedFrom::SeededSplit(s) if s == 1200.0
+        ));
+        assert!(matches!(
+            reconcile_split_seed(&seed, &PredictedFrom::Measured(700.0)),
+            PredictedFrom::Measured(s) if s == 700.0
+        ));
+        // A unit that has only ever failed is floored by its OWN attempt — the
+        // seed's derived share is not evidence about this slice, and keeping it
+        // would re-freeze the number on the giant's stale rows.
+        assert!(matches!(
+            reconcile_split_seed(&seed, &PredictedFrom::FailedAttemptFloor(1800.0)),
+            PredictedFrom::FailedAttemptFloor(s) if s == 1800.0
         ));
     }
 }

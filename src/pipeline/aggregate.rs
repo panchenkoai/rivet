@@ -297,14 +297,19 @@ pub(super) fn throughput_regressions(pairs: &[ThroughputPair], run_mode: &str) -
 
 /// Read each successful export's previous success from the state DB and WARN
 /// about material throughput regressions. Best-effort: a state read failing
-/// never affects the run. Called beside [`print`] at every aggregate site so
-/// EVERY run self-reports degradation at the default log level — the answer
-/// to "prove the next run is not strangling itself" is that the run says so.
+/// never affects the run.
+///
+/// Call it through `run::self_check_throughput` — its ONE caller, and the seam
+/// that makes "EVERY run self-reports degradation" true rather than
+/// aspirational: every orchestrator tail (`run`'s two branches, `run_waves`,
+/// `run_pool`) routes through it with no export-count gate, and a re-exec'd
+/// child defers to the parent that aggregates it so no export is reported
+/// twice. Both halves shipped broken — the check reached `run()` alone
+/// (bughunt 2026-08-14).
 ///
 /// `run_mode` is the same string [`build`] records on the aggregate — passed
 /// here so the warning can say which concurrency the run used (see
-/// [`throughput_regressions`]); the single-export path has no aggregate and
-/// passes `sequential` / `concurrent-siblings` for itself.
+/// [`throughput_regressions`]).
 pub(super) fn warn_throughput_regressions(
     state: &StateStore,
     entries: &[RunAggregateEntry],
@@ -700,6 +705,49 @@ mod tests {
         }
     }
 
+    /// The honest output for a run that exported nothing is an empty-but-VALID
+    /// document, never silence.
+    ///
+    /// A `partition_by` export over a currently-empty table expands to zero
+    /// children, so `run()`'s tail reaches here with no entries. A machine
+    /// consumer on the other end of `--json` / `--summary-output` must still get
+    /// a parseable object saying so — `total_exports: 0` is an answer,
+    /// `json.load("")` is a crash. (The routing that decides whether to EMIT it
+    /// is pinned by `run::tail_plan_emits_a_machine_document_for_a_zero_export_run`;
+    /// this is the document half.)
+    ///
+    /// Distinct from `build_with_zero_exports_is_well_formed`, which checks the
+    /// STRUCT's counters: what a `--json` consumer holds is the SERIALIZED form,
+    /// where an absent `per_export` or a skipped zero field is just as
+    /// unparseable downstream as an empty stream.
+    ///
+    /// RED against a `build` that miscounts an empty entry list (proven with
+    /// `entries.len().max(1)`: `total_exports` reads 1) or a serializer that
+    /// drops zero-valued / empty fields.
+    #[test]
+    fn a_zero_export_run_still_builds_a_valid_document() {
+        let now = Utc::now();
+        let agg = build(
+            vec![],
+            now - Duration::seconds(3),
+            now,
+            Some("c.yaml"),
+            "sequential",
+        );
+        let json = serde_json::to_string_pretty(&agg).expect("must serialize");
+        let round: serde_json::Value = serde_json::from_str(&json).expect("must parse");
+        assert_eq!(round["total_exports"], 0);
+        assert_eq!(round["success_count"], 0);
+        assert_eq!(round["failed_count"], 0);
+        assert_eq!(round["total_rows"], 0);
+        assert!(
+            round["per_export"].as_array().is_some_and(|a| a.is_empty()),
+            "per_export must be present and empty, not absent: {json}"
+        );
+        assert_eq!(round["duration_ms"], 3000, "the window is still measured");
+        assert_eq!(round["config_path"], "c.yaml");
+    }
+
     fn entry(name: &str, status: &str, rows: i64, files: i64, bytes: u64) -> RunAggregateEntry {
         RunAggregateEntry {
             bytes_read: 0,
@@ -921,13 +969,19 @@ mod tests {
             "parallel-processes",
             "wave-parallel-processes",
             "pool",
-            "concurrent-siblings",
         ] {
             assert!(mode_shares_the_source(m), "{m} shares the source");
         }
         for m in ["sequential", "wave-sequential", "single"] {
             assert!(!mode_shares_the_source(m), "{m} is serial");
         }
+        // An unrecognised mode must hedge, not accuse — hedged text on a serial
+        // run is harmless, a confident "check governor sheds" on a concurrent
+        // one is a false accusation. (This case used to be spelled
+        // `concurrent-siblings`, the string the single-export tail passed for a
+        // re-exec'd child; that child now defers its self-check to the parent,
+        // which reports under the run-wide mode, so no caller emits it.)
+        assert!(mode_shares_the_source("a-mode-added-next-release"));
     }
 
     #[test]
