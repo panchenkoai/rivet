@@ -292,7 +292,7 @@ jobs:
         env:
           CARGO_PROFILE_DEV_DEBUG: "0" # mutants never need debuginfo
         run: |
-          case $(( $(date +%j) % 4 )) in
+          case $(( $(date +%j) % 5 )) in
             0)
               echo "group: ledger/pipeline (Tier 0)"
               FILES="-f src/pipeline/manifest_writer.rs -f src/pipeline/manifest_reconcile.rs \
@@ -329,6 +329,26 @@ jobs:
               FILES="-f src/pipeline/summary.rs -f src/pipeline/chunked/exec.rs \
                      -f src/pipeline/chunked/sequential_checkpoint.rs \
                      -f src/pipeline/chunked/parallel_checkpoint.rs"
+              ;;
+            4)
+              # Added 2026-08-14 for the same reason tier 3 was: these five were
+              # in NO group, so the rotation had never mutated the concurrency
+              # CONTROL surface — the governor that acts on the source, the pool
+              # that schedules it, and the job entry points that record what
+              # happened. That is the surface whose 0.24.4 regression cost a
+              # field run +1h48m, and whose PR-gate coverage was itself vacuous
+              # until the same day (one unescaped `|` in .cargo/mutants.toml
+              # excluded 18,568 of 18,670 mutants). A one-off run over two of
+              # these files scored 108 caught / 36 missed; the survivors that
+              # were unit-testable are closed, the live-only ones are named in
+              # the baseline. A guard nobody mutates is a guard nobody checked.
+              #
+              # A fifth arm rather than an append: the rotation is already at
+              # GitHub's six-hour ceiling, so each group must stay standalone.
+              echo "group: concurrency control + run records (Tier 4)"
+              FILES="-f src/pipeline/run.rs -f src/pipeline/pool.rs \
+                     -f src/pipeline/governor.rs -f src/tuning/adaptive.rs \
+                     -f src/pipeline/job.rs"
               ;;
           esac
           # `|| true`: known misses are adjudicated by the baseline diff below,

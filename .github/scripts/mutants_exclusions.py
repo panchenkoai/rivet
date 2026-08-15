@@ -51,14 +51,31 @@ def function_of(name: str) -> str:
     return desc
 
 
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _plain(line: str) -> str:
+    """Corpus lines with the colour taken back out.
+
+    `cargo mutants --list` honours CARGO_TERM_COLOR, and CI sets it to
+    `always` — so the names arrive wrapped in SGR escapes and a plain-text
+    pattern matches nothing. That is not hypothetical: it failed this job on
+    2026-08-14 with all 18 exclusions reported dead, one of them passing only
+    because its pattern happened to end before the first escape byte. The
+    step below also forces `--color=never`; this strips defensively, because
+    the next caller may not.
+    """
+    return _ANSI.sub("", line)
+
+
 def main() -> int:
     if len(sys.argv) != 2:
         print(__doc__, file=sys.stderr)
         return 2
     corpus = [
-        line.strip()
+        _plain(line).strip()
         for line in Path(sys.argv[1]).read_text().splitlines()
-        if line.strip()
+        if _plain(line).strip()
     ]
     if len(corpus) < 1000:
         print(

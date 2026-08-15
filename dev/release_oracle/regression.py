@@ -22,13 +22,28 @@ not the artifact users run. Comparing to the published binary is both cheaper
 and more honest. (`cargo install rivet-cli@<ver>` does not count either — it
 rebuilds from source, which is the exact cost this avoids.)
 
-Inputs, and the SKIP rule. `RIVET_PREV_RELEASE_BIN` is the prev binary,
+Inputs. `RIVET_PREV_RELEASE_BIN` is the prev binary,
 `RIVET_REGRESSION_SOURCE_URL` a Postgres this stage may seed a fixture into.
-When either is absent the stage SKIPs — never a silent pass, because "we could
-not check" and "we checked and it was fine" are different facts and only one of
-them is releasable. Wall tolerance is `RIVET_REGRESSION_WALL_TOL` (default
-1.5×): a go/no-go catches gross regressions, and fine-grained perf work belongs
-to the benchmark suite.
+Wall tolerance is `RIVET_REGRESSION_WALL_TOL` (default 1.5×): a go/no-go catches
+gross regressions, and fine-grained perf work belongs to the benchmark suite.
+
+A MISSING PREVIOUS-RELEASE BINARY IS A FAILURE, NOT A SKIP. This is the one
+place the general "a down service is SKIP" rule of the gate does NOT apply, and
+0.24.4 is why: a governor regression (+1h48m of makespan, 52 exports shedding
+workers in a field run) walked through a full release gate because the only
+stage that compares rivet to the version users are running reported a
+non-failure — it never ran, so it never disagreed with anything. "We could not
+check" and "we checked and it was fine" are different facts, and a gate that
+turns the first into a green table is worse than no gate: it manufactures
+confidence out of an absence. A check that GRADES NOTHING MUST FAIL.
+
+The escape is deliberate and named, never a default: `--without-prev-release-
+comparison` (or `RIVET_ORACLE_WITHOUT_PREV_RELEASE=1`) turns these stages back
+into SKIPs for a local partial run, and says out loud — in every row it records
+and in the driver's own summary — that the run cannot support a tag. Everything
+ELSE in this file keeps the ordinary SKIP contract: an absent
+`RIVET_REGRESSION_SOURCE_URL` or scale URL is a down service, not a missing
+baseline.
 
 CROSS-VERSION STATE IS THE TRAP. The state DB (`.rivet_state.db`) lives next to
 the config, so every binary here gets its OWN env directory. The new binary
@@ -40,6 +55,7 @@ regression being measured.
 
 from __future__ import annotations
 
+import ast
 import os
 import re
 import shutil
@@ -47,7 +63,16 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
-from .core import Ledger, Proc, container_for_port, docker_exec, port_of, rivet_bin, run
+from .core import (
+    Ledger,
+    Proc,
+    ROOT,
+    container_for_port,
+    docker_exec,
+    port_of,
+    rivet_bin,
+    run,
+)
 
 # ── ledger identity ────────────────────────────────────────────────────────────
 # The bash `add` calls in this file were missing the STORE column
@@ -58,6 +83,11 @@ from .core import Ledger, Proc, container_for_port, docker_exec, port_of, rivet_
 # `Ledger` derives the verdict from the rows, so the two cannot disagree.
 _R_ENGINE, _R_VERSION, _R_SCENARIO, _R_STORE = "release", "regression", "-", "-"
 _S_VERSION, _S_SCENARIO, _S_STORE = "scale", "memory", "-"
+# The two prev-release harness stages. `_AB_VERSION` / `_FR_VERSION` land in the
+# VER column, so the final table groups them with the regression rows above
+# rather than scattering them among the engines.
+_AB_VERSION, _AB_STORE = "ab-diff", "-"
+_FR_VERSION, _FR_STORE = "field", "-"
 
 _MIB = 1048576
 
@@ -291,15 +321,80 @@ def _prev_binary() -> Path | None:
     return p if p.is_file() and os.access(p, os.X_OK) else None
 
 
+# The named escape. Read from the ENVIRONMENT rather than threaded down as a
+# parameter, because that is how every other gate-wide knob reaches this layer
+# (`RIVET_STATE_URL`, `BLESS_*`): `__main__` exports it once after parsing argv,
+# and `core.run` merges os.environ into every child. It also means a CI job that
+# can set env but not argv has the same one switch, spelled the same way.
+_ESCAPE_FLAG = "--without-prev-release-comparison"
+_ESCAPE_ENV = "RIVET_ORACLE_WITHOUT_PREV_RELEASE"
+
+
+def without_prev_release_comparison() -> bool:
+    """True when the operator has DELIBERATELY given up every comparison against
+    the previously released binary. False (the default) means a missing baseline
+    FAILS the run — see the module docstring."""
+    return os.environ.get(_ESCAPE_ENV, "").strip().lower() not in ("", "0", "false", "no", "off")
+
+
+def set_without_prev_release_comparison(on: bool) -> None:
+    """Publish the escape into the environment (the driver calls this once, after
+    parsing argv). One writer, one reader, one spelling — the flag and the env
+    var are the same switch rather than two facts that can drift apart."""
+    if on:
+        os.environ[_ESCAPE_ENV] = "1"
+    else:
+        os.environ.pop(_ESCAPE_ENV, None)
+
+
+def _require_prev_binary(
+    led: Ledger, engine: str, version: str, scenario: str, store: str, what: str
+) -> Path | None:
+    """The previous-release binary, or None with the row already recorded.
+
+    Absent baseline ⇒ **FAIL** by default, **SKIP** only under the named escape.
+    One helper for all three stages so they cannot drift into disagreeing about
+    what an absent baseline means — the drift is exactly how the 0.24.4 gate
+    ended up with one leg that could not fail.
+    """
+    prev = _prev_binary()
+    if prev is not None:
+        return prev
+    raw = os.environ.get("RIVET_PREV_RELEASE_BIN", "")
+    why = (
+        f"RIVET_PREV_RELEASE_BIN={raw!r} is not an executable file"
+        if raw
+        else "RIVET_PREV_RELEASE_BIN is unset"
+    )
+    if without_prev_release_comparison():
+        led.skipped(
+            engine, version, scenario, store,
+            f"{what}: {why} — GIVEN UP on purpose by {_ESCAPE_FLAG}. "
+            "This run does NOT grade the release against the binary users are "
+            "running and cannot support a tag.",
+            "no prev binary (escape: NOT release-graded)",
+        )
+        return None
+    led.failed(
+        engine, version, scenario, store,
+        f"{what}: {why} — a release run must be GRADED against the binary users "
+        "are actually running, and a check that never ran is not a check. "
+        "(0.24.4 shipped a +1h48m governor regression through a full green gate "
+        "for exactly this reason: its only comparison leg SKIPped.) Get the "
+        "baseline with `make release-oracle-prev-bin` / `make "
+        f"release-oracle-full`, or state the loss out loud with {_ESCAPE_FLAG} "
+        "for a local partial run.",
+        "no prev binary (release runs REQUIRE one)",
+    )
+    return None
+
+
 # ── stage 1: format + perf vs the previous release ─────────────────────────────
 def verify_release_regression(led: Ledger) -> None:
-    prev = _prev_binary()
+    prev = _require_prev_binary(
+        led, _R_ENGINE, _R_VERSION, _R_SCENARIO, _R_STORE, "release regression"
+    )
     if prev is None:
-        led.skipped(
-            _R_ENGINE, _R_VERSION, _R_SCENARIO, _R_STORE,
-            "release regression: no RIVET_PREV_RELEASE_BIN (download a release asset)",
-            "no prev binary",
-        )
         return
     src = os.environ.get("RIVET_REGRESSION_SOURCE_URL", "")
     if not src:
@@ -480,3 +575,406 @@ def verify_scale_memory(led: Ledger) -> None:
             joined = "".join(fails)
             led.failed(engine, _S_VERSION, _S_SCENARIO, _S_STORE,
                        f"scale[{engine}]: {joined} —{report}", joined)
+
+
+# ── stage 3: the observable-surface differential vs the previous release ───────
+#
+# `dev/pytools/ab_regression.py` runs BOTH binaries over identical fixtures and
+# diffs everything a user can observe: exit code, rows read back by DuckDB (not
+# by rivet), file count, and the manifest's own accounting down to per-part
+# content fingerprints and per-column checksums. Stage 1 above asks "can the new
+# binary READ what the old one wrote, and is it no slower?"; this asks the
+# complementary question no self-comparison can — "does it still DO the same
+# thing?" — over the runners a release actually ships on.
+#
+# The harness is the oracle; this wrapper's job is only to run it in the gate's
+# environment and to turn its output into ledger rows. Two things it must not
+# get wrong:
+#
+#   * THE COUNT. A harness that compared zero scenarios also reports "no
+#     difference". So the number of scenarios GRADED is asserted, not just the
+#     verdict, and it is recorded in the row a reader sees.
+#   * THE STATE DIR. Two binary VERSIONS run here, so `RIVET_STATE_URL` must be
+#     cleared exactly as stage 1 clears it (`_ISOLATED_STATE`): under a shared
+#     Postgres state DB the new binary migrates the schema and the published one
+#     then refuses to open it, which reads as a differential failure and is not.
+_AB_MODULE = "dev.pytools.ab_regression"
+
+# A RATCHET, not a description: the harness compared 8 scenarios (6 config
+# shapes + crash_resume + surfaces) when this stage was written. Fewer means the
+# differential shrank — deliberately or by a harness that died half-way — and
+# either way the gate must say so instead of reporting agreement over a
+# remainder. Raise it when scenarios are added; lowering it is an explicit act.
+_AB_MIN_SCENARIOS = 8
+
+# `{name:20} {field:16} {old:>22} {new:>22}  {verdict}` — only the name, the
+# field and the verdict are load-bearing here; the two value columns can contain
+# spaces (a truncated dict), so they are matched loosely.
+_AB_ROW = re.compile(r"^(\S+)\s+(\S+)\s+.*\s(same|DIFFERS)\s*$")
+# The harness's own two self-audit blocks, which the table does NOT contain:
+#   `  ✗ <cell>: …`  a cell that GRADED NOTHING (both sides empty, the injected
+#                    crash never fired, the error path exited 0) — fatal there,
+#                    and fatal here: it is the vacuous green in miniature.
+#   `  ! <cell>: …`  a cell that graded LESS than it claims (no manifest to
+#                    compare, DuckDB could not read either side) — the harness
+#                    calls this loud-but-not-fatal, and this wrapper does NOT
+#                    overrule it; it carries the note onto the row so a reader
+#                    sees what was not compared.
+_AB_DEAD = re.compile(r"^\s*✗\s+(.*)$")
+_AB_PARTIAL = re.compile(r"^\s*!\s+(.*)$")
+
+
+@dataclass(frozen=True)
+class AbReport:
+    """What the differential harness said, per scenario."""
+
+    order: list[str]                    # scenarios in the order graded
+    diffs: dict[str, list[str]]         # scenario -> fields that DIFFER
+    dead: dict[str, list[str]]          # scenario -> "this graded nothing" notes
+    partial: dict[str, list[str]]       # scenario -> "this graded less" notes
+    # Notes that name no scenario the table listed, kept split by severity: an
+    # unattributable DEAD note is still a cell that graded nothing (fatal), while
+    # an unattributable PARTIAL note is usually housekeeping — the harness's own
+    # "could not drop the fixture" warning has exactly this shape — and must not
+    # turn a release red.
+    loose_dead: list[str]
+    loose_partial: list[str]
+
+
+def _ab_parse(text: str) -> AbReport:
+    """Parse the harness's transcript.
+
+    FOUR sources, deliberately, because each carries something the others do
+    not: the per-field TABLE gives the inventory (which scenarios ran at all);
+    the trailing `N DIFFERENCE(S)` tuple block is the harness's authoritative
+    regression list and carries findings the table never prints (`expected_rows`
+    — the guard that fires when BOTH binaries are broken the same way and every
+    table row therefore reads "same"); and the two self-audit blocks say which
+    cells graded nothing / graded less than they claim.
+    """
+    order: list[str] = []
+    diffs: dict[str, list[str]] = {}
+    dead: dict[str, list[str]] = {}
+    partial: dict[str, list[str]] = {}
+    loose_dead: list[str] = []
+    loose_partial: list[str] = []
+
+    def note(name: str, field: str | None = None) -> None:
+        if name not in order:
+            order.append(name)
+        if field is not None and field not in diffs.setdefault(name, []):
+            diffs[name].append(field)
+
+    def attribute(bucket: dict[str, list[str]], loose: list[str], text_: str) -> None:
+        # "<cell>: <why>" — attributed only to a cell the TABLE actually named,
+        # so an unrelated line (the fixture-teardown warning, which has the same
+        # shape) cannot invent a scenario. Anything else is carried whole.
+        head, _, rest = text_.partition(":")
+        if rest and head.strip() in order:
+            bucket.setdefault(head.strip(), []).append(rest.strip())
+        else:
+            loose.append(text_.strip())
+
+    for line in text.splitlines():
+        m = _AB_ROW.match(line.rstrip())
+        if m:
+            name, field, verdict = m.groups()
+            note(name, field if verdict == "DIFFERS" else None)
+            continue
+        s = line.strip()
+        if s.startswith("(") and s.endswith(")"):
+            try:
+                tup = ast.literal_eval(s)
+            except (ValueError, SyntaxError):
+                continue  # a line of data that merely looks like a tuple
+            if isinstance(tup, tuple) and len(tup) >= 2 and isinstance(tup[0], str):
+                note(tup[0], str(tup[1]))
+            continue
+        m = _AB_DEAD.match(line)
+        if m:
+            attribute(dead, loose_dead, m.group(1))
+            continue
+        m = _AB_PARTIAL.match(line)
+        if m:
+            attribute(partial, loose_partial, m.group(1))
+    return AbReport(order, diffs, dead, partial, loose_dead, loose_partial)
+
+
+def verify_previous_release_differential(led: Ledger) -> None:
+    prev = _require_prev_binary(
+        led, _R_ENGINE, _AB_VERSION, "differential", _AB_STORE,
+        "previous-release differential",
+    )
+    if prev is None:
+        return
+
+    prev_ver = run([str(prev), "--version"]).stdout.splitlines()
+    led.phase(
+        f"Previous-release differential vs {prev_ver[0] if prev_ver else 'prev'} — "
+        "identical fixtures, both binaries, every observable surface diffed"
+    )
+    # Not auto-deleted, same reasoning as stage 1: when a fingerprint differs the
+    # first thing a reader wants is both binaries' parts, side by side.
+    work = Path(tempfile.mkdtemp(prefix="rivet-oracle-abdiff-"))
+    timeout = float(os.environ.get("RIVET_AB_TIMEOUT") or 3600)
+    p = run(
+        ["python3", "-m", _AB_MODULE, str(prev), str(rivet_bin())],
+        cwd=ROOT, timeout=timeout,
+        env={**_ISOLATED_STATE, "RIVET_AB_WORKDIR": str(work)},
+    )
+    rep = _ab_parse(p.out)
+    order, diffs, dead = rep.order, rep.diffs, rep.dead
+
+    for name in order:
+        fields = diffs.get(name) or []
+        why = rep.partial.get(name) or []
+        extra = f" [graded less than it claims: {'; '.join(why)}]" if why else ""
+        if dead.get(name):
+            # A cell that compared two nothings. The harness calls this fatal and
+            # so does the ledger: it is the vacuous green this stage exists for.
+            led.failed(
+                _R_ENGINE, _AB_VERSION, name[:16], _AB_STORE,
+                f"ab-diff[{name}]: GRADED NOTHING — {'; '.join(dead[name])}. "
+                "Two empty runs compare equal; this row is not evidence that the "
+                "binaries agree.",
+                "graded nothing",
+            )
+        elif fields:
+            led.failed(
+                _R_ENGINE, _AB_VERSION, name[:16], _AB_STORE,
+                f"ab-diff[{name}]: DIFFERS from the previous release in "
+                f"{', '.join(fields)} — an observable behaviour change; it needs "
+                f"a verdict (intended and changelogged, or a regression){extra}",
+                f"differs: {','.join(fields)}",
+            )
+        else:
+            led.passed(
+                _R_ENGINE, _AB_VERSION, name[:16], _AB_STORE,
+                f"ab-diff[{name}]: identical to the previous release "
+                f"(exit, DuckDB readback, files, manifest incl. fingerprints)"
+                f"{extra}",
+                "identical" + (" (partial)" if why else ""),
+            )
+
+    # The count row. It grades the HARNESS, not the binaries — and it is the row
+    # that makes the ones above mean something.
+    n = len(order)
+    tail = " | ".join((p.out.strip().splitlines() or ["<no output>"])[-3:])[:300]
+    reasons: list[str] = []
+    if n < _AB_MIN_SCENARIOS:
+        reasons.append(
+            f"graded only {n} of the {_AB_MIN_SCENARIOS} scenarios it must "
+            "compare (a differential that compared nothing also reports no "
+            "difference)"
+        )
+    if not p.ok and not (any(diffs.values()) or dead):
+        reasons.append(
+            f"the harness exited {p.returncode} without naming a differing or "
+            "dead scenario (it crashed, timed out, or the stand is down)"
+        )
+    if p.ok and (any(diffs.values()) or dead):
+        reasons.append(
+            "the harness exited 0 while its own output reports a difference or a "
+            "dead cell — parser and harness disagree; trust neither until it is "
+            "explained"
+        )
+    if rep.loose_dead:
+        reasons.append(
+            "the harness reported a cell that graded NOTHING and named no "
+            "scenario: " + "; ".join(rep.loose_dead)[:200]
+        )
+    # Housekeeping notes the harness itself calls non-fatal: carried, never a
+    # verdict of their own (its "could not drop the fixture" warning is one).
+    housekeeping = (
+        " | harness notes: " + "; ".join(rep.loose_partial)[:200]
+        if rep.loose_partial else ""
+    )
+    differing = [k for k, v in diffs.items() if v]
+    if reasons:
+        led.failed(
+            _R_ENGINE, _AB_VERSION, "scenarios", _AB_STORE,
+            f"ab-diff: {'; '.join(reasons)} — last output: {tail}{housekeeping}",
+            f"{n} scenarios, exit {p.returncode}",
+        )
+    elif differing or dead:
+        # The count is sound; the comparison is not. This row must never read
+        # "no observable difference" while a row above says DIFFERS or GRADED
+        # NOTHING.
+        parts = []
+        if differing:
+            parts.append(f"{len(differing)} DIFFER ({', '.join(differing)})")
+        if dead:
+            parts.append(f"{len(dead)} GRADED NOTHING ({', '.join(dead)})")
+        led.failed(
+            _R_ENGINE, _AB_VERSION, "scenarios", _AB_STORE,
+            f"ab-diff: {n} scenarios compared, " + " and ".join(parts)
+            + f" — see the rows above{housekeeping}",
+            f"{n} compared, {len(differing)} differ, {len(dead)} dead",
+        )
+    else:
+        led.passed(
+            _R_ENGINE, _AB_VERSION, "scenarios", _AB_STORE,
+            f"ab-diff: {n} scenarios compared against the previous release, "
+            f"no observable difference{housekeeping}",
+            f"{n} scenarios compared" + (" (+harness notes)" if housekeeping else ""),
+        )
+
+
+# ── stage 4: the FIELD SYMPTOM, replayed against both binaries ────────────────
+#
+# `dev/pytools/field_replay.py` reconstructs the shape of the production run
+# that caught the 0.24.4 governor regression (a keyset-heavy census under a
+# pool) and grades four criteria that are fixed IN THE HARNESS, before any run,
+# so the verdict cannot be rationalised afterwards:
+#
+#   1 the OLD binary must shed at least once     (the fixture is live)
+#   2 the NEW binary sheds zero on an idle source (the symptom is gone)
+#   3 new makespan <= old * 1.05                  (the fix costs nothing)
+#   4 identical rows per export                   (it delivers the same data)
+#
+# Each becomes its own ledger row, because "field replay FAILED" as a single
+# cell tells a release manager nothing: criterion 3 failing is a perf call,
+# criterion 4 failing is a data-loss stop-the-release, and criterion 1 failing
+# means NONE of the others graded anything at all.
+#
+# THE FIXTURE HAS A SHELF LIFE, AND THE STAGE SAYS SO RATHER THAN DECAYING
+# QUIETLY. Criterion 1 asks the PREVIOUS RELEASE to reproduce the symptom, so
+# this stage is evidence only while `RIVET_PREV_RELEASE_BIN` is a release that
+# CARRIES the regression (0.24.4). Measured here on 2026-08-14 with the 0.24.3
+# asset — which predates the regression — criterion 1 correctly went RED (`old
+# shed 0x`) and criteria 2-4 were recorded vacuous. Once the fix has shipped,
+# the newest release no longer sheds either, and this stage will go permanently
+# red on criterion 1 for every future gate run. That is not a false alarm to
+# tune away: it is the honest report that the replay no longer replays
+# anything. The two real options at that point are to pin this stage's baseline
+# to the last regressing release, or to retire the fixture and replace it with
+# the next symptom worth reproducing — decide it deliberately, do NOT soften
+# criterion 1 into a warning, which is the vacuity this whole stage exists to
+# prevent.
+_FR_MODULE = "dev.pytools.field_replay"
+_FR_CRITERIA = 4  # ratchet, as above: the harness fixes four.
+# `  [PASS] 1 fixture is live (old must shed)  (old shed 3x)` — the criterion
+# name itself contains parentheses, so the detail is split on the TWO spaces the
+# harness prints before it, not on the first `(`.
+_FR_CRIT = re.compile(r"^\s*\[(PASS|FAIL)\]\s+(.+?)\s{2,}\((.*)\)\s*$")
+
+
+def verify_field_symptom_replay(led: Ledger) -> None:
+    prev = _require_prev_binary(
+        led, _R_ENGINE, _FR_VERSION, "replay", _FR_STORE, "field symptom replay"
+    )
+    if prev is None:
+        return
+
+    prev_ver = run([str(prev), "--version"]).stdout.splitlines()
+    led.phase(
+        f"Field symptom replay vs {prev_ver[0] if prev_ver else 'prev'} — the "
+        "production run's own shape, four criteria fixed before the run"
+    )
+    work = Path(tempfile.mkdtemp(prefix="rivet-oracle-field-"))
+    timeout = float(os.environ.get("RIVET_FIELD_TIMEOUT") or 5400)
+    p = run(
+        ["python3", "-m", _FR_MODULE, str(prev), str(rivet_bin())],
+        cwd=ROOT, timeout=timeout,
+        # Same cross-version state isolation as every other cell that runs two
+        # binary versions — and here it is doubly load-bearing: the harness reads
+        # sheds out of the SQLite `run_journal` beside each config, so a
+        # process-wide `RIVET_STATE_URL` would send the journal to Postgres and
+        # the fixture would read as "never shed" (criterion 1) for a reason that
+        # has nothing to do with the product.
+        env={**_ISOLATED_STATE, "RIVET_FIELD_WORKDIR": str(work)},
+    )
+
+    crits = [(m.group(1), m.group(2).strip(), m.group(3))
+             for m in (_FR_CRIT.match(l) for l in p.out.splitlines()) if m]
+    tail = " | ".join((p.out.strip().splitlines() or ["<no output>"])[-4:])[:300]
+
+    if not crits:
+        led.failed(
+            _R_ENGINE, _FR_VERSION, "criteria", _FR_STORE,
+            f"field replay: the harness graded NOTHING — no criterion verdict in "
+            f"its output (exit {p.returncode}). The replay needs the MySQL dev "
+            "stand (container `rivet-mysql-1` at 127.0.0.1:3306) and a pool; "
+            f"last output: {tail}",
+            f"0 criteria, exit {p.returncode}",
+        )
+        return
+
+    # Criterion 1 is the activation guard: it decides whether the other three
+    # graded a reproduction or graded air. Found by its own leading number
+    # rather than by position, so a reordered harness cannot silently promote a
+    # different criterion into the load-bearing slot.
+    live_idx = next((i for i, c in enumerate(crits) if c[1].lstrip().startswith("1")), None)
+    fixture_dead = live_idx is not None and crits[live_idx][0] == "FAIL"
+
+    for idx, (status, name, detail) in enumerate(crits, start=1):
+        num = name.split()[0] if name.split()[0].isdigit() else str(idx)
+        cell = f"criterion-{num}"
+        if fixture_dead and idx - 1 == live_idx:
+            led.failed(
+                _R_ENGINE, _FR_VERSION, cell, _FR_STORE,
+                f"field replay CRITERION 1 — THE FIXTURE IS DEAD: {name} "
+                f"({detail}). The PREVIOUS release never reproduced the symptom "
+                "in this run, so criteria 2-4 grade AIR: a green 'symptom gone' "
+                "means only that nothing happened. Nothing here is evidence "
+                "about the fix until this row is green. Check the MySQL dev "
+                "stand, the pool, and that RIVET_PREV_RELEASE_BIN is the release "
+                "that CARRIED the regression.",
+                "FIXTURE DEAD — criteria 2-4 grade air",
+            )
+            continue
+        if fixture_dead and status == "PASS":
+            # Not a pass: it is an ungraded criterion wearing a pass. SKIP is the
+            # ledger's word for "we could not check", which is exactly true — and
+            # the run is red regardless, from criterion 1.
+            led.skipped(
+                _R_ENGINE, _FR_VERSION, cell, _FR_STORE,
+                f"field replay [{name}]: reported PASS ({detail}) but the fixture "
+                "never activated (criterion 1 FAILED) — this grades air, not the "
+                "fix",
+                "vacuous (fixture dead)",
+            )
+        elif status == "PASS":
+            led.passed(_R_ENGINE, _FR_VERSION, cell, _FR_STORE,
+                       f"field replay [{name}]: {detail}", detail)
+        else:
+            led.failed(_R_ENGINE, _FR_VERSION, cell, _FR_STORE,
+                       f"field replay [{name}]: FAILED ({detail})", detail)
+
+    # …and the same count/exit reconciliation stage 3 makes: four criteria, and
+    # the harness's exit status must agree with the verdicts it printed.
+    reasons = []
+    if len(crits) < _FR_CRITERIA:
+        reasons.append(f"only {len(crits)} of {_FR_CRITERIA} criteria were graded")
+    printed_fail = any(s == "FAIL" for s, _, _ in crits)
+    if p.ok and printed_fail:
+        reasons.append("the harness exited 0 while printing a FAIL criterion")
+    if not p.ok and not printed_fail:
+        reasons.append(
+            f"the harness exited {p.returncode} with every criterion PASS "
+            "(it died after printing them, or the parse missed one)"
+        )
+    if reasons:
+        led.failed(
+            _R_ENGINE, _FR_VERSION, "criteria", _FR_STORE,
+            f"field replay: {'; '.join(reasons)} — last output: {tail}",
+            f"{len(crits)} criteria, exit {p.returncode}",
+        )
+    elif printed_fail:
+        # Never a green summary over a red criterion — and above all never one
+        # that says "fixture live" while criterion 1 says the fixture is dead.
+        bad = [n.split()[0] for s, n, _ in crits if s == "FAIL"]
+        led.failed(
+            _R_ENGINE, _FR_VERSION, "criteria", _FR_STORE,
+            f"field replay: {len(crits)} criteria graded, {len(bad)} FAILED "
+            f"(criterion {', '.join(bad)}) — see the rows above",
+            f"{len(crits)} graded, {len(bad)} failed",
+        )
+    else:
+        led.passed(
+            _R_ENGINE, _FR_VERSION, "criteria", _FR_STORE,
+            f"field replay: all {len(crits)} criteria graded and green against "
+            "the previous release (fixture live, symptom gone, no makespan "
+            "cost, same data)",
+            f"{len(crits)} criteria graded",
+        )

@@ -259,7 +259,12 @@ jobs:
         if: steps.scope.outputs.code == 'true'
         run: |
           set -euo pipefail
-          cargo mutants --list --no-config > mutants-corpus.txt
+          # --color=never: the workflow sets CARGO_TERM_COLOR=always, and a
+          # coloured corpus wraps every function name in SGR escapes, so
+          # plain-text exclusion patterns match nothing. That failed this job
+          # on 2026-08-14 with all 18 entries reported dead. The checker also
+          # strips ANSI defensively; this is the belt.
+          cargo mutants --list --no-config --colors=never > mutants-corpus.txt
           python3 .github/scripts/mutants_exclusions.py mutants-corpus.txt
       # Did the exclusions eat this PR's own diff? The UNFILTERED list is the
       # discriminator: zero mutants is the CORRECT answer for a diff that
