@@ -188,6 +188,21 @@ jobs:
           CARGO_PROFILE_DEV_DEBUG: "0"
         run: |
           git diff "origin/${{ github.base_ref }}"...HEAD > pr.diff
+          # BUDGET GUARD. Every mutant is its own incremental build — ~80s on a
+          # 2-core runner at -j2, so the 90-minute ceiling grades roughly 120.
+          # A five-round branch like #230 yields 416 (158 run.rs, 104 pool.rs,
+          # 44 adaptive.rs, ...) ≈ 4.6 h: the job dies at the ceiling with a
+          # CANCELLED conclusion. That is worse than wasted CI, because
+          # `Mutants (changed lines)` is a REQUIRED check in branch protection —
+          # so a timeout BLOCKS the merge while the header above calls this job
+          # advisory. Both cannot be true. Rather than pretend to grade 416 and
+          # die, report the count and hand the work to the nightly tier
+          # rotation, which is where foundational modules are ratcheted.
+          COUNT=$(cargo mutants --in-diff pr.diff --list --colors=never | grep -c . || true)
+          if [ "$COUNT" -gt 120 ]; then
+            echo "::notice::this diff yields $COUNT mutants — past the ~120 the 90-minute budget can grade (~80s each at -j2). NOT graded per-diff; these modules are covered by the nightly tier rotation (.github/workflows/nightly-live.yml). Split the PR for per-diff mutation coverage."
+            exit 0
+          fi
           # "Did this gate grade anything at all?" is NOT asked here: this job is
           # `continue-on-error: true`, so an `exit 1` in it is an annotation, not
           # a failure — the very property that let the vacuous gate survive eight
