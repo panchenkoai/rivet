@@ -324,6 +324,32 @@ fn pg_temp_bytes_snapshot(plan: &ResolvedRunPlan) -> Option<i64> {
     crate::source::postgres::sample_temp_bytes(&url, plan.source.tls.as_ref())
 }
 
+/// The temp-spill the run gets CREDITED with, from the two snapshots bracketing
+/// its window.
+///
+/// Pure and split out from its two call sites — `run_export_job` and
+/// `run_export_job_with_chunk_source` — because BOTH of those need a live
+/// PostgreSQL source to reach, so the arithmetic that decides the stored
+/// `pg_temp_bytes_delta` AND whether [`pg_temp_bytes_warning`] fires was graded
+/// by nothing offline. The first non-vacuous mutation run (2026-08-16) scored
+/// `-` → `+` and `-` → `/` as survivors at the apply call site, and the live
+/// oracle cannot see them either — the ONE live assertion on this field,
+/// `pg_chunked_run_persists_extended_metric_columns`
+/// (`tests/live/live_metrics_persist.rs`), asserts
+/// `pg_temp_bytes_delta.is_some()`, which is equally true of a SUM (and the
+/// apply-path metric test asserts nothing about the field at all). A `+`
+/// reports the absolute counter (a database that has ever
+/// spilled 200 MB warns "+200 MB spill" on every export that spills nothing) —
+/// the false-alarm harm class, not a crash.
+///
+/// Floored at 0 because `pg_stat_database.temp_bytes` restarts at `pg_stat_reset()`
+/// and at a server restart: `after < before` means the counter reset mid-window,
+/// not that the run RECLAIMED spill, and a negative "credit" would offset a
+/// sibling's real spill in any consumer that sums.
+fn pg_temp_bytes_delta(before: i64, after: i64) -> i64 {
+    (after - before).max(0)
+}
+
 /// Volume above which a `temp_bytes` delta is worth a WARN (100 MB).
 const PG_TEMP_BYTES_WARN_MIN: i64 = 100 * 1024 * 1024;
 
@@ -1076,7 +1102,7 @@ pub(super) fn run_export_job(
     if let Some(before) = pg_temp_bytes_before
         && let Some(after) = pg_temp_bytes_snapshot(&plan)
     {
-        let delta = (after - before).max(0);
+        let delta = pg_temp_bytes_delta(before, after);
         summary.pg_temp_bytes_delta = Some(delta);
         if let Some(line) = pg_temp_bytes_warning(
             &plan.export_name,
@@ -1263,7 +1289,22 @@ use super::finalize::{
 ///
 /// Used by `rivet apply`: the plan comes from a deserialized `PlanArtifact` so
 /// `build_plan` is skipped.  Everything else — quality gate, metrics, state
-/// persistence — is identical to `run_export_job`.
+/// persistence — is identical to `run_export_job` *except* the two runner-parity
+/// re-applications called out at their sites below (open forensics, the
+/// source-harm bracket).
+///
+/// LIVE-ONLY BY CONSTRUCTION, and deliberately not unit-tested: it needs a real
+/// source, a real destination and a `StateStore`, so a body stub
+/// (`-> Ok(())` — a survivor of the 2026-08-16 mutation run, which ran the
+/// OFFLINE suite only) is unkillable here. Its oracles are live and they do
+/// bite: `plan_and_apply_full_export_round_trip` and
+/// `plan_and_apply_chunked_export_round_trip_uses_precomputed_ranges`
+/// (`tests/live/live_plan_apply.rs`) read the destination back through DuckDB
+/// and assert the exact row count, which a no-op apply cannot produce, and
+/// `pg_apply_persists_metric_row` (`tests/live/live_metrics_persist.rs`) asserts
+/// the metric row this function writes. The pure DECISIONS it makes are
+/// extracted and unit-tested next door — [`pg_temp_bytes_delta`],
+/// [`pg_temp_bytes_warning`], `run_diagnosis`, `resolve_final_result`.
 pub(crate) fn run_export_job_with_chunk_source(
     plan: &ResolvedRunPlan,
     state: &StateStore,
@@ -1347,7 +1388,7 @@ pub(crate) fn run_export_job_with_chunk_source(
     if let Some(before) = pg_temp_bytes_before
         && let Some(after) = pg_temp_bytes_snapshot(plan)
     {
-        let delta = (after - before).max(0);
+        let delta = pg_temp_bytes_delta(before, after);
         summary.pg_temp_bytes_delta = Some(delta);
         if let Some(line) = pg_temp_bytes_warning(
             &plan.export_name,
@@ -1916,6 +1957,46 @@ mod tests {
         // Threshold is exclusive at 100 MB in both modes — a small spill is noise.
         assert!(pg_temp_bytes_warning("orders", 100 * 1024 * 1024, false).is_none());
         assert!(pg_temp_bytes_warning("orders", 100 * 1024 * 1024, true).is_none());
+    }
+
+    /// The bracket arithmetic itself — what the run is CREDITED with spilling.
+    ///
+    /// Both call sites need a live PostgreSQL source, so until
+    /// [`pg_temp_bytes_delta`] was split out nothing offline graded it and the
+    /// live oracle could not either (it asserts `is_some()`, which a sum
+    /// satisfies). The fixture is engineered so no operator agrees with the
+    /// difference: over `3 MB → 7 MB` the difference is 4 MB, the sum 10 MB, the
+    /// quotient 2 — three distinct values, all positive, so `.max(0)` cannot mask
+    /// the disagreement.
+    #[test]
+    fn pg_temp_bytes_delta_is_the_windows_growth_and_never_a_counter_reset() {
+        const MB: i64 = 1024 * 1024;
+        assert_eq!(
+            pg_temp_bytes_delta(3 * MB, 7 * MB),
+            4 * MB,
+            "the credited spill is what the window ADDED, not the counter's absolute value"
+        );
+        // The operator-facing consequence, at the boundary the warning reads: a
+        // 30 MB window on a database that has already spilled 120 MB is noise —
+        // reporting the absolute counter instead turns it into a false alarm.
+        assert!(
+            pg_temp_bytes_warning("orders", pg_temp_bytes_delta(120 * MB, 150 * MB), false)
+                .is_none(),
+            "a 30 MB window must stay below the warn floor"
+        );
+        assert!(
+            pg_temp_bytes_warning("orders", pg_temp_bytes_delta(0, 150 * MB), false).is_some(),
+            "activation guard: the same 150 MB counter DOES warn when the window really \
+             produced it — otherwise the assertion above passes on an inert threshold"
+        );
+        // `pg_stat_reset()` / a server restart mid-window: the counter went
+        // BACKWARDS. That is a lost measurement, never a reclaim — a negative
+        // credit would offset a sibling's real spill wherever these are summed.
+        assert_eq!(
+            pg_temp_bytes_delta(9 * MB, MB),
+            0,
+            "a counter reset mid-run must credit nothing, not a negative spill"
+        );
     }
 
     #[test]

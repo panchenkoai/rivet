@@ -871,9 +871,9 @@ mod tests {
 #[cfg(test)]
 mod prediction_tests {
     use super::{
-        POOL_PLACEHOLDER_SECS, PoolItem, PredictedFrom, UnitHistory, classification_counts,
-        newest_generation, pool_order, predict_items, predict_secs, reconcile_split_seed,
-        repartitioned_unit_prediction, split_unit_from,
+        POOL_PLACEHOLDER_SECS, PoolItem, PredictedFrom, SPLIT_CENSUS_LOOKAHEAD, UnitHistory,
+        classification_counts, newest_generation, pool_order, predict_items, predict_secs,
+        reconcile_split_seed, repartitioned_unit_prediction, split_history_census, split_unit_from,
     };
     use crate::state::{MetricRow, StateStore};
 
@@ -1421,5 +1421,134 @@ mod prediction_tests {
             reconcile_split_seed(&seed, &PredictedFrom::FailedAttemptFloor(1800.0)),
             PredictedFrom::FailedAttemptFloor(s) if s == 1800.0
         ));
+    }
+
+    /// A partition of ZERO units is not a partition to re-cut into — and the
+    /// re-cut's `sum / realized` would divide by it.
+    ///
+    /// `predict_items` only ever counts `realized >= 1` per giant, so this is a
+    /// PRECONDITION on a `pub(crate)` pure function rather than a live path;
+    /// which is exactly why nothing pinned it. The `prior.is_empty()` half of
+    /// the same guard IS pinned (the shrink test's
+    /// `repartitioned_unit_prediction(3, &[])`), and it alone leaves the guard's
+    /// operator free: with `&&` an empty cohort still returns `None` one line
+    /// later at `.max()?`, so only the `realized == 0` half distinguishes.
+    ///
+    /// RED against `replace || with && in repartitioned_unit_prediction`
+    /// (mutation run 2026-08-16, pool.rs:281): the guard falls through, the
+    /// shrink check `prior_n <= 0` is false, and `3600.0 / 0.0` returns
+    /// `Some(SeededSplit(inf))` — an infinite predicted duration handed to the
+    /// scheduler and to the advertised makespan.
+    #[test]
+    fn a_zero_unit_partition_is_not_re_cut_and_never_divides_by_zero() {
+        let cohort = generation(
+            1,
+            &(0..3)
+                .map(|i| (i, PredictedFrom::Measured(1200.0)))
+                .collect::<Vec<_>>(),
+        );
+        let got = repartitioned_unit_prediction(0, &cohort);
+        assert!(
+            got.is_none(),
+            "a zero-unit partition has nothing to re-cut into; got {got:?}"
+        );
+        // Belt and braces on the same guard: whatever the arithmetic does, no
+        // non-finite duration may ever leave this function.
+        assert!(
+            got.map(|f| f.secs().is_finite()).unwrap_or(true),
+            "the re-cut must never emit a non-finite prediction"
+        );
+    }
+
+    /// The census's TERMINATION rule, against a cohort with a hole in it — the
+    /// three-absence lookahead is the whole reason `split_history_census` can
+    /// see a retired ordinal at all.
+    ///
+    /// The census is what decides `prior_n`, so its stopping rule decides
+    /// whether the shrink is detected: it must survive a unit or two of the
+    /// prior partition that recorded NOTHING (a hard-killed unit leaves no
+    /// `export_metrics` row at all), and it must stop at three consecutive
+    /// absences so an ANCIENT ordinal from a long-retired, much larger
+    /// partition cannot be summed into a cohort it was never part of.
+    ///
+    /// Fixture past the thresholds: the hole at `#2` sits at/past `realized`
+    /// (the only region the miss counter is armed in), the run of absences
+    /// `#8..#14` is longer than the lookahead, and `#15` behind it is a real
+    /// recorded ordinal — so a census that stops too early, one that never
+    /// stops, and the correct one are three DISTINCT ordinal lists, and the
+    /// assert names which rule was applied.
+    ///
+    /// RED against the three survivors of the 2026-08-16 mutation run:
+    ///   * `replace >= with < in split_history_census` (pool.rs:395) — the miss
+    ///     counter arms BELOW `realized` instead of past it, so nothing ever
+    ///     ends the census: it runs to the cap and drags `#15` in.
+    ///     `left: [0, 1, 3, 4, 5, 6, 7, 15], right: [0, 1, 3, 4, 5, 6, 7]`.
+    ///   * `replace += with *= in split_history_census` (pool.rs:396) — the
+    ///     counter is pinned at zero, same runaway census, same RED.
+    ///   * `replace >= with < in split_history_census` (pool.rs:397) — the
+    ///     census breaks at the FIRST absence, losing every ordinal past the
+    ///     hole: `left: [0, 1], right: [0, 1, 3, 4, 5, 6, 7]`, and with it the
+    ///     shrink detection itself (`prior_n == realized` → `None`).
+    #[test]
+    fn the_census_survives_a_hole_and_stops_before_an_ancient_ordinal() {
+        assert_eq!(
+            SPLIT_CENSUS_LOOKAHEAD, 3,
+            "fixture: the gap at #8..#14 must be longer than the lookahead"
+        );
+        // Run 1 cut the table 8 ways. `giant#2` was hard-killed and left no row
+        // (only `status='running'` rows are ever deleted, and it never got one)
+        // — a hole INSIDE the newest generation. The seven that recorded sum to
+        // the table's 3600 s.
+        let mut rows: Vec<(String, String, i64, &str)> = Vec::new();
+        for (ordinal, secs) in [
+            (0, 300),
+            (1, 400),
+            (3, 500),
+            (4, 700),
+            (5, 600),
+            (6, 500),
+            (7, 600),
+        ] {
+            rows.push((
+                format!("giant#{ordinal}"),
+                format!("r1_{ordinal}"),
+                secs * 1000,
+                "success",
+            ));
+        }
+        // …and one ordinal from a long-retired 16-way partition, seven absences
+        // past the newest cohort's tail. It is NOT part of any cohort that runs
+        // today, and summing it would inflate every unit's prediction.
+        rows.push(("giant#15".into(), "r0_15".into(), 800_000, "success"));
+        let owned: Vec<(&str, &str, i64, &str)> = rows
+            .iter()
+            .map(|(e, r, d, s)| (e.as_str(), r.as_str(), *d, *s))
+            .collect();
+        let s = store_with(&owned);
+
+        // This run is `--pool 2`.
+        let census = split_history_census(&s, "giant", 2);
+        let ordinals: Vec<usize> = census.iter().map(|u| u.ordinal).collect();
+        assert_eq!(
+            ordinals,
+            vec![0, 1, 3, 4, 5, 6, 7],
+            "the census must step over the hole at #2 (a unit that recorded \
+             nothing is an absence, not the end of the cohort) and stop three \
+             absences later — never reaching the retired #15"
+        );
+
+        // …and the re-cut those ordinals feed: 3600 s over the two units
+        // running now. 2200 s would mean #15 was summed in; `None` would mean
+        // the census stopped at the hole and never saw the shrink at all.
+        match repartitioned_unit_prediction(2, &census) {
+            Some(f) => assert_eq!(
+                f.secs(),
+                1800.0,
+                "the newest generation's measured 3600 s, cut two ways: {f:?}"
+            ),
+            None => {
+                panic!("8 recorded ordinals against 2 units now is a shrink — the re-cut must fire")
+            }
+        }
     }
 }

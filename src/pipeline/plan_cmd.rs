@@ -514,6 +514,26 @@ fn chunked_row_estimate(
     }
 }
 
+/// The chunked key SPAN itself: how many ordinals the detector's first..last
+/// boundaries cover, INCLUSIVE, floored at zero.
+///
+/// Split out of [`compute_plan_data`] because that function opens a real source
+/// connection before it reaches this arithmetic, so the offline suite cannot
+/// execute the expression at ALL — the 2026-08-16 mutation run left four
+/// arithmetic mutants alive on the one line (`+`→`*`, `+`→`-`, `-`→`+`,
+/// `-`→`/`), and no live test asserts the artifact's `row_estimate` either.
+/// Extracted rather than fake-tested through a stub source, the same shape as
+/// [`chunked_row_estimate`] above: the DECISION is pure and unit-tested, the
+/// connection-owning glue stays live.
+///
+/// Inclusive because a chunk range is `[lo, hi]` on both ends — a single-ordinal
+/// table (`first.0 == last.1`) holds one row, not zero. Under `chunk_dense` this
+/// number reaches [`chunked_row_estimate`] as an EXACT row count that no catalog
+/// is allowed to correct, so an off-by-one here is published as fact.
+fn chunked_key_span(first_lo: i64, last_hi: i64) -> i64 {
+    (last_hi - first_lo + 1).max(0)
+}
+
 /// Compute the `ComputedPlanData` portion of the artifact.
 ///
 /// For `Chunked` exports this opens a source connection and calls
@@ -555,7 +575,7 @@ fn compute_plan_data(
             let chunked_estimate = chunk_ranges
                 .first()
                 .zip(chunk_ranges.last())
-                .map(|(first, last)| (last.1 - first.0 + 1).max(0));
+                .map(|(first, last)| chunked_key_span(first.0, last.1));
             // `chunked_estimate` is a span over WHATEVER ordinals the detector
             // chose, so pass the ordinals' MEANING with it — the two facts are
             // independent and both branches of the estimate need them:
@@ -791,6 +811,51 @@ fn repack_from_history(
     isolate_of: &std::collections::HashSet<String>,
     state: &crate::state::StateStore,
 ) -> Vec<(String, u32, bool)> {
+    let (items, measured_n) = history_pack_items(&recs, cost_of, state);
+    let waves = crate::plan::waves::pack(&items, 4096);
+    log::warn!(
+        "plan --annotate-waves: packed {} export(s) into {} wave(s) from run history \
+         ({} measured, {} estimated — an estimate orders the first run only)",
+        items.len(),
+        waves.len(),
+        measured_n,
+        items.len() - measured_n
+    );
+    let mut wave_of: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    for w in &waves {
+        for m in &w.members {
+            wave_of.insert(m.clone(), w.number);
+        }
+    }
+    recs.into_iter()
+        .map(|(name, rec_wave, _)| {
+            let w = wave_of.get(&name).copied().unwrap_or(rec_wave);
+            // parallel_safe: true so a packed wave's members run concurrently
+            // (the wave IS the cap) — EXCEPT an isolate_on_source export, which
+            // must run alone even among wave-mates, so run_waves keeps it in
+            // its own single-child batch (bug-hunt round 2: forcing true here
+            // discarded isolation and could overload a contended source).
+            let ps = !isolate_of.contains(&name);
+            (name, w, ps)
+        })
+        .collect()
+}
+
+/// The packer's input, plus the count the operator-facing label reports:
+/// `(items, measured_n)`.
+///
+/// The count is RETURNED rather than left as a local because the only thing it
+/// feeds is a `log::warn!` line, and an offline test cannot read a log line —
+/// `replace += with *= in repack_from_history` (2026-08-16 mutation run,
+/// plan_cmd.rs:822) pinned it at zero and every test of this function stayed
+/// green, because the wave assignment is indifferent to it. The label is not
+/// cosmetic: "0 measured, N estimated" is what tells an operator the schedule
+/// about to be WRITTEN into their config rests on placeholders.
+fn history_pack_items(
+    recs: &[(String, u32, bool)],
+    cost_of: &std::collections::HashMap<String, crate::plan::CostClass>,
+    state: &crate::state::StateStore,
+) -> (Vec<crate::plan::waves::PackItem>, usize) {
     let mut measured_n = 0usize;
     let items: Vec<crate::plan::waves::PackItem> = recs
         .iter()
@@ -837,33 +902,7 @@ fn repack_from_history(
             }
         })
         .collect();
-    let waves = crate::plan::waves::pack(&items, 4096);
-    log::warn!(
-        "plan --annotate-waves: packed {} export(s) into {} wave(s) from run history \
-         ({} measured, {} estimated — an estimate orders the first run only)",
-        items.len(),
-        waves.len(),
-        measured_n,
-        items.len() - measured_n
-    );
-    let mut wave_of: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
-    for w in &waves {
-        for m in &w.members {
-            wave_of.insert(m.clone(), w.number);
-        }
-    }
-    recs.into_iter()
-        .map(|(name, rec_wave, _)| {
-            let w = wave_of.get(&name).copied().unwrap_or(rec_wave);
-            // parallel_safe: true so a packed wave's members run concurrently
-            // (the wave IS the cap) — EXCEPT an isolate_on_source export, which
-            // must run alone even among wave-mates, so run_waves keeps it in
-            // its own single-child batch (bug-hunt round 2: forcing true here
-            // discarded isolation and could overload a contended source).
-            let ps = !isolate_of.contains(&name);
-            (name, w, ps)
-        })
-        .collect()
+    (items, measured_n)
 }
 
 /// Which of the plan's recommendations may actually be WRITTEN into the
@@ -1049,8 +1088,96 @@ mod tests {
 
     use super::{
         ExportFields, apply_field_annotations, effective_parallel_safe, fields_to_write,
-        refuse_annotate_scoped_to_export, repack_from_history,
+        history_pack_items, refuse_annotate_scoped_to_export, repack_from_history,
     };
+
+    /// The chunked key span is INCLUSIVE of both boundaries, and floored at 0.
+    ///
+    /// This arithmetic lives one call away from `source::create_source`, so the
+    /// offline suite never executes it in place: the 2026-08-16 mutation run
+    /// left FOUR arithmetic mutants alive on the single expression
+    /// (`(last.1 - first.0 + 1).max(0)`), and no live test asserts the
+    /// artifact's `row_estimate` either. Extracting
+    /// [`super::chunked_key_span`] is what makes the four killable.
+    ///
+    /// Fixture past the thresholds: a single-ordinal range, a negative lower
+    /// bound and a lower bound that is neither 0 nor 1, so no mutant can
+    /// survive on a coincidence of an identity element (`first_lo == 1` makes
+    /// `* first_lo` and `/ first_lo` no-ops on the SPAN, and `first_lo == 0`
+    /// does the same for `+`/`-` while making `/` a panic).
+    ///
+    /// RED, each verified by applying that exact mutation (first failing
+    /// assertion, verbatim):
+    ///   * `+`→`*`: `left: 29, right: 30` — an off-by-one row estimate, which
+    ///     under `chunk_dense` is published as an EXACT count.
+    ///   * `+`→`-`: `left: 28, right: 30`
+    ///   * `-`→`+`: `left: 32, right: 30`
+    ///   * `-`→`/`: `left: 31, right: 30`
+    #[test]
+    fn chunked_key_span_counts_both_boundaries_and_never_goes_negative() {
+        use super::chunked_key_span;
+        // The canonical 30-row table the legacy artifact fixture records.
+        assert_eq!(chunked_key_span(1, 30), 30);
+        // Keys that do not start at 1 — an inclusive span, not a difference.
+        assert_eq!(chunked_key_span(100, 100), 1, "one ordinal is one row");
+        assert_eq!(chunked_key_span(-5, 5), 11);
+        assert_eq!(chunked_key_span(950_000_000, 1_290_000_000), 340_000_001);
+        // A degenerate/empty detection must floor at zero, never report a
+        // negative row estimate to the scheduler.
+        assert_eq!(chunked_key_span(10, 5), 0);
+    }
+
+    /// The "N measured, M estimated" label counts MEASUREMENTS — a failed
+    /// attempt's floor and a history-less placeholder are both estimates.
+    ///
+    /// Observed at the boundary, from the real producer: `history_pack_items`
+    /// reads the shared predictor against a real (in-memory) state store, and
+    /// the test asserts the count it returns rather than re-deriving the rule.
+    ///
+    /// RED against `replace += with *= in repack_from_history`
+    /// (2026-08-16 mutation run, plan_cmd.rs:822): the counter is pinned at
+    /// zero — `left: 0, right: 2` — and the operator is told a schedule built
+    /// on two real measurements rests entirely on estimates.
+    #[test]
+    fn the_packer_counts_only_successes_as_measured() {
+        let state = crate::state::StateStore::open_in_memory().expect("state");
+        let rec = |name: &str, run: &str, ms: i64, status: &str| {
+            state
+                .record_metric_full(&crate::state::MetricRow {
+                    export_name: name.to_string(),
+                    run_id: run.to_string(),
+                    duration_ms: ms,
+                    total_rows: 10,
+                    peak_rss_mb: Some(120),
+                    status: status.to_string(),
+                    files_produced: 1,
+                    bytes_written: 100,
+                    ..Default::default()
+                })
+                .expect("record");
+        };
+        // Two measured (a success each), one attempt-floor (never succeeded),
+        // one with no history at all: ≥2 measured, so a counter that only ever
+        // reaches 1 is distinguishable too.
+        rec("ok_a", "a1", 900_000, "success");
+        rec("ok_b", "b1", 600_000, "success");
+        rec("never", "n1", 300_000, "failed");
+        let recs: Vec<(String, u32, bool)> = ["ok_a", "ok_b", "never", "fresh"]
+            .iter()
+            .map(|n| ((*n).to_string(), 2u32, false))
+            .collect();
+        let cost_of = recs
+            .iter()
+            .map(|(n, _, _)| (n.clone(), crate::plan::CostClass::High))
+            .collect();
+        let (items, measured_n) = history_pack_items(&recs, &cost_of, &state);
+        assert_eq!(items.len(), 4, "fixture: every rec becomes a pack item");
+        assert_eq!(
+            measured_n, 2,
+            "only the two exports with a SUCCESS are measurements; the \
+             failed-attempt floor and the history-less export are estimates"
+        );
+    }
 
     /// The refuse-guard fires ONLY when BOTH `--annotate-waves` and `--export`
     /// are set — the `&&` must not become `||` (which would reject a plain

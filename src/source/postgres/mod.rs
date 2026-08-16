@@ -265,6 +265,35 @@ fn checkpoints_req_sql(has_checkpointer: bool) -> &'static str {
     }
 }
 
+/// Read the requested-checkpoint counter off a LIVE server connection.
+///
+/// LIVE-ONLY BY CONSTRUCTION: it takes a `postgres::Client`, which no offline
+/// test can build, so every constant-return mutant of it (`None`, `Some(-1)`,
+/// `Some(0)`, `Some(1)` — all four survived the 2026-08-16 mutation run, which
+/// exercised the OFFLINE suite only) is unkillable here. Writing a unit test
+/// against a fake client would grade the fake, not the one thing that matters:
+/// WHICH catalog this connection is asked for, and that the answer really moves.
+///
+/// Its oracles are live, and each of the four dies on them:
+/// * `governor_backs_off_under_concurrent_write_pressure`
+///   (`tests/live/live_governor.rs`) drives real foreign write pressure and
+///   requires a `backed off` line. `GovernorState::observe` reads pressure ONLY
+///   as `cur > prev`, so a constant `Some(-1)`/`Some(0)`/`Some(1)` never rises
+///   and never sheds; `None` fails open by design and also never sheds. (The
+///   same argument, verified by hand against the `Some(0)` mutant on
+///   2026-08-14, is recorded on `impl PressureSource for Box<dyn Source>`, the
+///   bridge one layer up.)
+/// * `pg_adaptive_never_loses_to_its_own_baseline_on_an_idle_source` asserts
+///   `assert_governor_awake`, whose "provides no pressure signal" check is RED
+///   specifically against the `None` mutant — the deaf-governor state a rename
+///   of this counter produces.
+/// * `pg18_governor_samples_the_modern_checkpointer_catalog` covers the ARM the
+///   pure [`checkpoints_req_sql`] picks: on a real PG 17+ server a swapped arm
+///   is not a `None` but an ERROR that aborts the export's cursor transaction,
+///   so that test requires the run to SUCCEED and the governor to be awake.
+///
+/// The pure half — which SQL each vintage gets — is [`checkpoints_req_sql`],
+/// unit-tested offline by `checkpoints_req_sql_matches_the_servers_catalog`.
 fn pg_sample_checkpoints_req(client: &mut Client) -> Option<i64> {
     let _ = client.execute("SELECT pg_stat_clear_snapshot()", &[]);
     // Two steps, because PG plans a whole statement up front: a CASE whose

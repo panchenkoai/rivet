@@ -156,7 +156,35 @@ fn self_check_throughput(
     entries: &[crate::state::RunAggregateEntry],
     run_mode: &str,
 ) {
-    if !owns_throughput_self_check(ipc::ipc_events_enabled()) {
+    self_check_throughput_as(
+        state,
+        entries,
+        run_mode,
+        // The only untestable half: a process-global env read. Every other
+        // decision here is a parameter, so the polarity below is graded at
+        // value level (see [`self_check_throughput_as`]).
+        ipc::ipc_events_enabled(),
+    );
+}
+
+/// [`self_check_throughput`] with the "am I a re-exec'd child" answer INJECTED
+/// rather than read from the process environment.
+///
+/// The split exists because the polarity of the guard below is exactly what
+/// shipped broken twice (the check nowhere, then the check twice), and the env
+/// read cannot be flipped by a unit test — `RIVET_IPC_EVENTS` is process-global
+/// and the suite runs its tests in parallel threads. With the answer as an
+/// argument, `a_reexecd_child_stays_silent_while_a_parent_emits_the_regression`
+/// observes the EMISSION for both roles against a real `StateStore` baseline,
+/// so a dropped `!` here (parent silent, captured child talking to nobody) is a
+/// RED test rather than a survivor.
+fn self_check_throughput_as(
+    state: &StateStore,
+    entries: &[crate::state::RunAggregateEntry],
+    run_mode: &str,
+    reexec_child: bool,
+) {
+    if !owns_throughput_self_check(reexec_child) {
         log::debug!(
             "throughput self-check: deferred to the parent process (this is a re-exec'd child; \
              its stderr is captured, the parent prints beside the run aggregate)"
@@ -187,9 +215,27 @@ struct TailPlan {
 /// beats silence, which parses as neither JSON nor "nothing happened".
 fn tail_plan(n_exports: usize, machine_output_requested: bool) -> TailPlan {
     TailPlan {
-        aggregate: n_exports > 1,
+        aggregate: reports_run_aggregate(n_exports),
         machine_output: machine_output_requested && n_exports <= 1,
     }
+}
+
+/// Does a run of `n_exports` report a run AGGREGATE — the summary card on
+/// stderr and the `run_aggregate` row in the state DB?
+///
+/// ONE rule, called by every orchestrator tail that has a choice (`run` via
+/// [`tail_plan`], `run_waves`, `run_pool`), because it was three inline `> 1`
+/// comparisons in three live-only functions before — the shape the
+/// runner-bypass class keeps arriving in, and one no unit test could reach.
+/// An aggregate over a single row is noise: the per-export card already printed
+/// every number it would contain (and a child of `--parallel-export-processes`
+/// would write a duplicate of its parent's row).
+///
+/// Deliberately NOT the gate on the run-over-run self-check, which fires at
+/// every count — a one-export config IS the whole invocation of `apply`, and
+/// that is the shape the 2026-08-13 field regression had.
+fn reports_run_aggregate(n_exports: usize) -> bool {
+    n_exports > 1
 }
 
 #[allow(clippy::too_many_arguments)] // CLI fan-in; surface stays stable per ADR-0013
@@ -549,6 +595,14 @@ pub fn run(
         Some(config_path),
         parallel_mode,
     );
+    // EITHER machine channel asks for the document — `--summary-output` alone is
+    // the common scheduler shape, so this is `||`, never `&&`. Live-only by
+    // construction (a real `run()` needs a source, a destination and a state
+    // DB); the oracle that goes RED on `&&` is
+    // `run_summary_output_writes_json_to_file` (tests/live/live_cli_flags.rs) —
+    // one export, `--summary-output`, no `--json`, asserting the file exists.
+    // `run_json_flag_prints_aggregate_summary_to_stdout` does NOT grade this
+    // operator: `--json` prints from `json_output` directly a few lines below.
     let plan = tail_plan(exports.len(), summary_output.is_some() || json_output);
     if plan.aggregate {
         aggregate::print(&agg);
@@ -854,11 +908,14 @@ pub(crate) fn run_waves(
         Some(config_path),
         wave_mode_label(peak_concurrency),
     );
-    if total > 1 {
+    // The card + row gate is the SHARED rule (`run`'s tail asks the same
+    // question through `tail_plan`); the self-check between them is not gated at
+    // all — see [`reports_run_aggregate`].
+    if reports_run_aggregate(total) {
         aggregate::print(&agg);
     }
     self_check_throughput(&state, &agg.per_export, &agg.parallel_mode);
-    if total > 1 {
+    if reports_run_aggregate(total) {
         aggregate::persist(&state, &agg, None);
     }
     // Captured child stderr (verbose per-export cards, parallel path only) goes
@@ -1589,8 +1646,7 @@ pub(crate) fn run_pool(
     // queue with no `parallel_safe` export — the default for a hand-written
     // config — is strictly serial however many slots were asked for (round-5
     // bughunt). Counted once, here, and read by all three surfaces.
-    let heavy_pending = pending.iter().filter(|e| !is_parallel_safe(e)).count();
-    let safe_pending = pending.len() - heavy_pending;
+    let (safe_pending, heavy_pending) = pool_safe_heavy_split(&pending);
     let really_concurrent = pool_is_concurrent(m, safe_pending, heavy_pending);
     let prev_concurrent = MULTI_EXPORT_CONCURRENT.swap(really_concurrent, AtomicOrdering::Relaxed);
     struct ResetPoolStatics(bool, bool);
@@ -1807,11 +1863,14 @@ pub(crate) fn run_pool(
         // [`pool_mode_label`]).
         pool_mode_label(really_concurrent),
     );
-    if pending.len() > 1 {
+    // Same shared gate as the other two tails (see [`reports_run_aggregate`]) —
+    // the pool used to spell its own `> 1` inline, which is how a rule that must
+    // agree across three runners drifts.
+    if reports_run_aggregate(pending.len()) {
         aggregate::print(&agg);
     }
     self_check_throughput(&state, &agg.per_export, &agg.parallel_mode);
-    if pending.len() > 1 {
+    if reports_run_aggregate(pending.len()) {
         aggregate::persist(&state, &agg, None);
     }
     if !failures.is_empty() {
@@ -1856,6 +1915,23 @@ fn group_exports_by_wave(exports: &[ExportConfig]) -> Vec<(u32, Vec<&ExportConfi
 /// concurrent batch. `None` (un-planned / hand-written) is treated as not-safe.
 fn is_parallel_safe(export: &ExportConfig) -> bool {
     export.parallel_safe.unwrap_or(false)
+}
+
+/// The pool queue's `(safe, heavy)` census — the INPUT every pool concurrency
+/// claim is computed from ([`pool_is_concurrent`], [`pool_peak_concurrency`],
+/// [`pool_harm_window`], [`pool_mode_label`]).
+///
+/// Pure and unit-tested because those four consumers are, and a correct
+/// decision fed a wrong count is the defect this repo keeps paying for: the
+/// counts used to be derived inline inside `run_pool` (`len() - heavy`), which
+/// needs a live source, so the arithmetic that DECIDES "did this pool overlap
+/// anything" was the one link in the chain nothing graded. Getting it wrong is
+/// not cosmetic — an all-heavy queue that reports `safe > 0` claims a
+/// concurrent window it never had, and `run_diagnosis` then hedges every harm
+/// counter away as "shared with siblings" on a run that was strictly serial.
+fn pool_safe_heavy_split(pending: &[&ExportConfig]) -> (usize, usize) {
+    let heavy = pending.iter().filter(|e| !is_parallel_safe(e)).count();
+    (pending.len() - heavy, heavy)
 }
 
 /// The first synthesized split-unit name (`{giant}#i`) that collides with an EXISTING export's
@@ -2422,7 +2498,52 @@ mod pool_harm_tests {
 
 #[cfg(test)]
 mod run_tail_tests {
-    use super::{owns_throughput_self_check, snapshot_then_stamp, tail_plan};
+    use super::{
+        owns_throughput_self_check, pool_safe_heavy_split, reports_run_aggregate,
+        self_check_throughput_as, snapshot_then_stamp, tail_plan,
+    };
+    use crate::config::ExportConfig;
+
+    /// Captures WARN records, because the run-over-run self-check has no other
+    /// observable: it reads the state DB and LOGS. Installed once per test
+    /// binary and shared by every test in it, so a reader must filter by its own
+    /// unique export name rather than trusting the buffer to be its own.
+    struct WarnCapture;
+    static WARN_LINES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    static WARN_CAPTURE: WarnCapture = WarnCapture;
+
+    impl log::Log for WarnCapture {
+        fn enabled(&self, m: &log::Metadata) -> bool {
+            m.level() <= log::Level::Warn
+        }
+        fn log(&self, r: &log::Record) {
+            if r.level() <= log::Level::Warn {
+                WARN_LINES
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(r.args().to_string());
+            }
+        }
+        fn flush(&self) {}
+    }
+
+    fn install_warn_capture() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let _ = log::set_logger(&WARN_CAPTURE);
+            log::set_max_level(log::LevelFilter::Warn);
+        });
+    }
+
+    fn captured_warnings_mentioning(needle: &str) -> Vec<String> {
+        WARN_LINES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|l| l.contains(needle))
+            .cloned()
+            .collect()
+    }
 
     /// `--json` / `--summary-output` must emit a document on EVERY run, including
     /// one that exports nothing: a `partition_by` export over a currently-empty
@@ -2490,6 +2611,189 @@ mod run_tail_tests {
             owns_throughput_self_check(false),
             "a top-level run owns its own self-check — deferring it to a parent \
              that does not exist is how the check goes silent everywhere"
+        );
+    }
+
+    /// The same contract one layer up, at the EMISSION — because the test above
+    /// grades a correct rule and the seam that consumes it is where the polarity
+    /// actually lives (`if !owns_throughput_self_check(..)`). A dropped `!`
+    /// there leaves both halves of this module's evidence green: the predicate
+    /// still answers correctly, every tail still calls the seam, and the run
+    /// self-reports nothing while a captured child talks to a log file nobody
+    /// reads.
+    ///
+    /// Staged from the REAL producer: the baseline comes back through
+    /// `StateStore::get_last_success_metric_excluding` over a row this test
+    /// recorded with the state store's own recorder, not from a hand-built
+    /// `ThroughputPair` fed to the pure comparator.
+    ///
+    /// RED against `delete !` at the seam — both assertions invert (the child
+    /// emits the line, the parent emits none).
+    #[test]
+    fn a_reexecd_child_stays_silent_while_a_parent_emits_the_regression() {
+        install_warn_capture();
+        // Unique to this test: the capture buffer is shared by the whole binary.
+        let export = "run_tail_selfcheck_probe_export";
+        let state = crate::state::StateStore::open_in_memory().expect("in-memory state");
+        // 20 000 rows in 5 s = 4 000 rows/s, the previous SUCCESS.
+        state
+            .record_metric_full(&crate::state::MetricRow {
+                export_name: export.to_string(),
+                run_id: "baseline-run".to_string(),
+                duration_ms: 5_000,
+                total_rows: 20_000,
+                status: "success".to_string(),
+                mode: Some("full".to_string()),
+                ..Default::default()
+            })
+            .expect("record the baseline success");
+        // This run: the same rows in 20 s = 1 000 rows/s — 4× slower, past the
+        // 1.5× ratio, and comparable in shape (same mode, same scale, both
+        // sides past the min-rows / min-duration floors).
+        let entries = vec![crate::state::RunAggregateEntry {
+            export_name: export.to_string(),
+            status: "success".to_string(),
+            run_id: "this-run".to_string(),
+            rows: 20_000,
+            files: 1,
+            bytes: 0,
+            bytes_read: 0,
+            duration_ms: 20_000,
+            mode: "full".to_string(),
+            error_message: None,
+        }];
+
+        // A re-exec'd child (`--parallel-export-processes`): its parent rebuilds
+        // this very row and would print the identical line, so it must not.
+        self_check_throughput_as(&state, &entries, "sequential", true);
+        assert!(
+            captured_warnings_mentioning(export).is_empty(),
+            "a re-exec'd child must emit nothing — its stderr is captured to a \
+             file and its parent reports the same export: {:?}",
+            captured_warnings_mentioning(export)
+        );
+
+        // The top-level run: it owns the report.
+        self_check_throughput_as(&state, &entries, "sequential", false);
+        let lines = captured_warnings_mentioning(export);
+        assert_eq!(
+            lines.len(),
+            1,
+            "a top-level run must report its own regression exactly once (0 \
+             lines also means the WARN capture never installed): {lines:?}"
+        );
+        assert!(
+            lines[0].contains("slower than its last success"),
+            "the line must be the run-over-run self-check: {}",
+            lines[0]
+        );
+
+        // …and the WRAPPER every orchestrator tail actually calls must delegate
+        // to it. A stubbed seam is the 2026-08-14 bug itself (the check nowhere
+        // at all) and every other assertion in this module survives it.
+        // `RIVET_IPC_EVENTS` is process-global, so this READS the ambient answer
+        // instead of setting one — under a re-exec'd child's env there is
+        // nothing to assert here (the role is the case proven above).
+        if !super::ipc::ipc_events_enabled() {
+            super::self_check_throughput(&state, &entries, "sequential");
+            assert_eq!(
+                captured_warnings_mentioning(export).len(),
+                2,
+                "the seam every tail calls must reach the same report"
+            );
+        }
+    }
+
+    /// The card + `run_aggregate` row are multi-export-only, and it is ONE rule
+    /// for the three tails that gate it — `run` (through [`tail_plan`]),
+    /// `run_waves` and `run_pool` each spelled it inline as `> 1` before, inside
+    /// functions no unit test can enter.
+    ///
+    /// The boundary is the whole content: at 1 the per-export card already
+    /// printed every number the aggregate would carry and the `run_aggregate`
+    /// row would duplicate the export's own `export_metrics` row; at 2 the
+    /// aggregate is the only thing that reports the run.
+    ///
+    /// RED against `>=` (a single-export `apply` grows a summary card and a
+    /// duplicate row), `<` and `==` (a real multi-export run reports nothing).
+    #[test]
+    fn only_a_multi_export_run_reports_an_aggregate() {
+        assert!(
+            !reports_run_aggregate(0),
+            "a zero-export run has nothing to aggregate"
+        );
+        assert!(
+            !reports_run_aggregate(1),
+            "one export: the per-export card already said it"
+        );
+        assert!(
+            reports_run_aggregate(2),
+            "two exports: the aggregate reports"
+        );
+        assert!(reports_run_aggregate(9));
+        // The three tails ask the same question of the same rule.
+        assert_eq!(tail_plan(1, false).aggregate, reports_run_aggregate(1));
+        assert_eq!(tail_plan(2, false).aggregate, reports_run_aggregate(2));
+    }
+
+    /// The pool's `(safe, heavy)` census, which every concurrency claim is
+    /// computed FROM — `pool_is_concurrent`, `pool_peak_concurrency`,
+    /// `pool_harm_window`, `pool_mode_label`. All four are pure and tested; the
+    /// counts they consume were derived inline inside `run_pool` (live-only),
+    /// which is the fabricated-input class: correct decisions, ungraded input.
+    ///
+    /// Fixture past the threshold on purpose — ≥2 of each kind, plus the two
+    /// homogeneous queues, because a 1+1 split cannot tell `len - heavy` from
+    /// `len / heavy`, and an all-safe queue is where `/` divides by zero.
+    ///
+    /// RED against `-` → `+` (the all-heavy queue reports 2 safe exports and the
+    /// pool claims a concurrent window it never had) and `-` → `/` (the all-safe
+    /// queue panics on divide-by-zero).
+    #[test]
+    fn the_pool_census_counts_safe_and_heavy_exports_apart() {
+        // Through the real deserializer, so `parallel_safe:` reaches the field
+        // the way a config does — including the ABSENT case.
+        let mk = |name: &str, safe: Option<bool>| -> ExportConfig {
+            let line = safe
+                .map(|s| format!("parallel_safe: {s}\n"))
+                .unwrap_or_default();
+            serde_yaml_ng::from_str(&format!(
+                "name: {name}\nquery: \"SELECT 1\"\nformat: parquet\ndestination:\n  \
+                 type: local\n  path: /tmp\n{line}"
+            ))
+            .expect("parse test ExportConfig")
+        };
+        let mixed = [
+            mk("s1", Some(true)),
+            mk("h1", Some(false)),
+            mk("s2", Some(true)),
+            // No `parallel_safe:` at all — the hand-written-config default, and
+            // heavy by that default.
+            mk("h2", None),
+            mk("h3", Some(false)),
+        ];
+        let refs: Vec<&ExportConfig> = mixed.iter().collect();
+        assert_eq!(
+            pool_safe_heavy_split(&refs),
+            (2, 3),
+            "two parallel_safe, three heavy (one of them by default)"
+        );
+
+        let all_safe: Vec<&ExportConfig> =
+            mixed.iter().filter(|e| e.name.starts_with('s')).collect();
+        assert_eq!(
+            pool_safe_heavy_split(&all_safe),
+            (2, 0),
+            "no heavy export at all — heavy must be 0, not a divisor"
+        );
+
+        let all_heavy: Vec<&ExportConfig> =
+            mixed.iter().filter(|e| e.name.starts_with('h')).collect();
+        assert_eq!(
+            pool_safe_heavy_split(&all_heavy),
+            (0, 3),
+            "a queue of heavies has ZERO safe exports — the count that decides \
+             whether the pool ever overlapped anything"
         );
     }
 

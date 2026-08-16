@@ -701,6 +701,128 @@ mod tests {
         );
     }
 
+    /// A monitoring connection stand-in for the governor THREAD.
+    ///
+    /// It counts every sample and, on `Drop`, records that the thread owning it
+    /// has returned. `Drop` is the observation seam because
+    /// [`GovernorHarness::spawn_into`] MOVES the monitor into the spawned
+    /// closure — so the box is dropped exactly when the governor loop exits,
+    /// and nothing the test does can forge that.
+    ///
+    /// The three required `Source` methods are unreachable on purpose: a
+    /// monitoring connection only ever samples.
+    struct ThreadProbe {
+        samples: Arc<AtomicUsize>,
+        exited: Arc<AtomicBool>,
+    }
+
+    impl Drop for ThreadProbe {
+        fn drop(&mut self) {
+            self.exited.store(true, Ordering::Relaxed);
+        }
+    }
+
+    impl crate::source::Source for ThreadProbe {
+        fn export(
+            &mut self,
+            _request: &crate::source::ExportRequest<'_>,
+            _sink: &mut dyn crate::source::BatchSink,
+        ) -> crate::error::Result<()> {
+            unreachable!("the governor's monitoring connection never exports")
+        }
+        fn query_scalar(&mut self, _sql: &str) -> crate::error::Result<Option<String>> {
+            unreachable!("the governor's monitoring connection never runs scalars")
+        }
+        fn type_mappings(
+            &mut self,
+            _query: &str,
+            _column_overrides: &crate::types::ColumnOverrides,
+        ) -> crate::error::Result<Vec<crate::types::TypeMapping>> {
+            unreachable!("the governor's monitoring connection never maps types")
+        }
+        fn sample_governor_pressure(&mut self) -> Option<u64> {
+            Some(self.samples.fetch_add(1, Ordering::Relaxed) as u64)
+        }
+    }
+
+    /// The two halves of [`GovernorHarness::spawn_into`] that no offline test
+    /// reached: that an armed harness SPAWNS a thread which probes the source at
+    /// arm, and that the thread's only exit is `finished >= total`.
+    ///
+    /// Both were live-only until now — the three live shed tests
+    /// (`governor_backs_off_under_concurrent_write_pressure` and its MySQL/MSSQL
+    /// twins) do kill a stubbed `spawn_into`, but the offline gate is what runs
+    /// on every PR, and it graded neither (mutation run 2026-08-16: `replace
+    /// GovernorHarness::spawn_into with ()` and `replace >= with <` both
+    /// survived the whole offline suite). Nothing about the harness needs a
+    /// database: `Source` has three required methods and
+    /// `sample_governor_pressure` is a defaulted one, so a probe is ~20 lines.
+    ///
+    /// Scope honesty: this grades the THREAD (spawn, arm probe, exit
+    /// condition), not the shed policy — `Governor::new` reads
+    /// `RIVET_GOVERNOR_INTERVAL_MS`, which no test in this binary may set
+    /// (`sample_interval_ms_from_env`'s own guard), so a real transition is
+    /// three production sample intervals away. The policy is graded by
+    /// `GovernorState`'s unit tests and the live shed suite; the callback
+    /// wiring by `a_shrunken_permit_ceiling_sheds_pool_workers_without_
+    /// stranding_a_task`.
+    ///
+    /// `TOTAL = 2` with one worker finishing first: with a single worker
+    /// "finished at all" and "every worker finished" are the same fixture, and
+    /// the exit condition under test is the second one.
+    #[test]
+    fn the_governor_thread_probes_at_arm_and_runs_until_every_worker_is_finished() {
+        // `GOVERNOR_POLL_MS` (200) — the loop re-checks its stop predicate this
+        // often, so two quanta is a generous window for an exit to be observed.
+        const POLL_MS: u64 = 200;
+        const TOTAL: usize = 2;
+
+        let samples = Arc::new(AtomicUsize::new(0));
+        let exited = Arc::new(AtomicBool::new(false));
+        let harness = GovernorHarness {
+            floor: 1,
+            ceiling: 4,
+            monitor: Mutex::new(Some(Box::new(ThreadProbe {
+                samples: Arc::clone(&samples),
+                exited: Arc::clone(&exited),
+            }))),
+            log: Mutex::new(Vec::new()),
+        };
+        let semaphore = Semaphore::new(4);
+        let finished = AtomicUsize::new(0);
+
+        let mut alive_while_a_worker_ran = false;
+        std::thread::scope(|scope| {
+            harness.spawn_into(scope, &semaphore, &finished, TOTAL, "orders");
+            // One of two workers done: the run is still in flight, so the
+            // governor must still be watching it.
+            finished.store(1, Ordering::Relaxed);
+            std::thread::sleep(Duration::from_millis(2 * POLL_MS));
+            alive_while_a_worker_ran = !exited.load(Ordering::Relaxed);
+            // The last worker finishes — now, and only now, may it stop.
+            finished.store(TOTAL, Ordering::Relaxed);
+        });
+
+        assert!(
+            samples.load(Ordering::Relaxed) >= 1,
+            "an armed harness must SPAWN the governor and probe the source up front — without \
+             the probe an unsamplable monitor is never reported, and without the thread \
+             `adaptive: true` is a silent no-op"
+        );
+        assert!(
+            alive_while_a_worker_ran,
+            "the governor's exit is `finished >= total`: with 1 of {TOTAL} workers finished it \
+             must still be running, or every run stops adapting the moment its first chunk \
+             lands"
+        );
+        assert!(
+            exited.load(Ordering::Relaxed),
+            "once `finished` reaches {TOTAL} the thread must return — `thread::scope` cannot \
+             join until it does, so a missed exit hangs the run rather than failing it"
+        );
+        drop(harness);
+    }
+
     /// Call-site pin: the CHECKPOINT parallel chunked runner is governed.
     ///
     /// Honest about its strength — this greps source text, and the real oracle
