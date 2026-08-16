@@ -13,6 +13,7 @@
 //! | PA-L6 | `--force` bypasses 24 h staleness gate | PA3 |
 //! | PA-L7 | Missing plan file → non-zero exit | PA1 |
 //! | PA-L8 | `plan --param` substitutes query parameter | PA1 — artifact embeds params |
+//! | PA-L9 | A degraded re-apply WARNs run-over-run | not ADR-0005 — the orchestrator-tail throughput self-check, which `apply` bypassed until round 7 |
 
 use crate::common::*;
 
@@ -673,6 +674,245 @@ fn apply_missing_plan_file_exits_nonzero() {
     assert!(
         !stderr.is_empty(),
         "stderr must not be empty when plan file is missing"
+    );
+}
+
+// ─── the run-over-run throughput self-check, from a real `rivet apply` ───────
+
+/// One `export_metrics` success row, projected to exactly the four columns the
+/// throughput self-check reads (`aggregate::warn_throughput_regressions` →
+/// `ThroughputPair`). Read from the state DB the run itself wrote, so the
+/// activation facts below come from the REAL producer rather than from the
+/// test's own arithmetic about what it thinks it seeded.
+#[derive(Debug)]
+struct TputRow {
+    run_id: String,
+    total_rows: i64,
+    duration_ms: i64,
+    mode: String,
+}
+
+/// Every SUCCESS row for `export`, oldest first — the same order (`id ASC`) the
+/// self-check's `ORDER BY id DESC LIMIT 1` baseline lookup walks backwards.
+fn tput_success_rows(state_db: &std::path::Path, export: &str) -> Vec<TputRow> {
+    let conn = rusqlite::Connection::open(state_db)
+        .unwrap_or_else(|e| panic!("open state db {}: {e}", state_db.display()));
+    let mut stmt = conn
+        .prepare(
+            "SELECT run_id, total_rows, duration_ms, mode FROM export_metrics \
+             WHERE export_name = ?1 AND status = 'success' ORDER BY id ASC",
+        )
+        .expect("prepare export_metrics read");
+    let rows = stmt
+        .query_map([export], |r| {
+            Ok(TputRow {
+                run_id: r.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                total_rows: r.get(1)?,
+                duration_ms: r.get(2)?,
+                mode: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+            })
+        })
+        .expect("query export_metrics");
+    rows.map(|r| r.expect("export_metrics row")).collect()
+}
+
+/// `rivet apply <plan.json>` must EMIT the run-over-run throughput regression
+/// warning when the same export degrades — the value-level half of the round-7
+/// finding.
+///
+/// ## The debt this closes
+///
+/// The JSON plan-artifact arm of `run_apply_command` is a full orchestrator —
+/// it opens the state store, drives one export to completion and writes its
+/// `export_metrics` row — but it never reached the run-over-run self-check, so a
+/// real degradation exited 0 in silence AND the degraded row then became the
+/// next run's baseline, hiding the regression a second time. `apply_cmd.rs` now
+/// calls `run::self_check_throughput(…, RunModes::uniform(run_mode_label(1,
+/// false)))`, and a derived guard in `run.rs`
+/// (`every_orchestrator_tail_routes_the_self_check_through_one_seam`) pins the
+/// CALL SITE. Nothing pinned the OUTPUT: a call site that reaches a check whose
+/// pair is always refused emits nothing, and the guard stays green. This is the
+/// test that watches the warning come out of the real binary.
+///
+/// ## Why the fixture sleeps — and why that is NOT the forbidden sleep
+///
+/// CLAUDE.md forbids "a sleep in a test that compensates for PRODUCT behaviour"
+/// and REQUIRES that "fixtures must cross the mechanism's activation threshold".
+/// This is the second one. The self-check DELIBERATELY refuses pairs that are
+/// too small or too short to mean anything (`aggregate::incomparable`):
+///
+/// * `REGRESSION_MIN_ROWS = 10_000` — both sides
+/// * `REGRESSION_MIN_MS   = 5_000`  — both sides
+/// * `REGRESSION_MAX_SCALE = 2`     — neither side may exceed the other 2×
+/// * `prev_mode != cur_mode`        — a mode switch is not a slowdown
+/// * warns at `prev_tp / cur_tp >= REGRESSION_RATIO = 1.5`
+///
+/// A fixture that does not cross those floors cannot state the behaviour at all.
+/// The naive way to cross them — export enough real rows to take >5 s — makes
+/// the wall time a property of the MACHINE, so a fast host silently drops under
+/// the 5 s floor and the test goes green having checked nothing. So the wall
+/// time comes from `pg_sleep` on the SOURCE instead: a cross join against a
+/// one-row sleeping subquery pins the duration on any hardware while 20 000 real
+/// rows still move. Run 1 sleeps 6 s, run 2 sleeps 14 s over the SAME row count
+/// — no scale mismatch, both past the 5 s floor, ~3.1K → ~1.4K rows/s, ratio
+/// ~2.2. Do NOT "fix" the sleeps away: they are the fixture crossing a
+/// documented activation threshold, not a workaround for rivet's own timing.
+///
+/// Both runs are `rivet apply <plan.json>`, so both record `mode: full` and the
+/// same `sequential` concurrency label. The two artifacts differ ONLY in the
+/// substituted `${sleep_secs}` — the self-check compares by export name against
+/// the previous success and neither knows nor cares WHY the export got slower,
+/// which is exactly the field scenario (a source that degraded).
+///
+/// ## Non-vacuity
+///
+/// A test that goes green on a SKIPPED pair is the defect this repo forbids, so
+/// the activation facts are asserted first, and from the real producer: both
+/// runs' `export_metrics` rows must clear every floor above (rows, duration,
+/// scale, matching mode, distinct run_ids, ratio ≥ 1.5) BEFORE the warning is
+/// asserted. Shrink the fixture and this test fails on the activation assertion
+/// — never by passing quietly. The fast run is also asserted SILENT: with no
+/// prior success it has no baseline, so the line in run 2 is provably the
+/// run-over-run comparison firing and not something unconditional.
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn apply_warns_when_the_same_export_degrades_run_over_run() {
+    require_alive(LiveService::Postgres);
+
+    // No seeded table: `generate_series` supplies the rows and `pg_sleep`
+    // supplies the wall time, so the fixture owns both of the self-check's
+    // floors and needs nothing from the shared fixture DB.
+    let export = unique_name("tput_apply");
+    let rig = Rig::pg_batch(&export).source_url_env("DATABASE_URL").query(
+        "SELECT g AS id, repeat('x', 100) AS payload \
+             FROM generate_series(1, 20000) g, (SELECT pg_sleep(${sleep_secs})) AS _s",
+    );
+
+    let plan_dir = tempfile::tempdir().unwrap();
+    let plan_fast = plan_dir.path().join("plan_fast.json");
+    let plan_slow = plan_dir.path().join("plan_slow.json");
+    let envs = [("DATABASE_URL", POSTGRES_URL)];
+
+    for (path, secs) in [(&plan_fast, 6), (&plan_slow, 14)] {
+        let param = format!("sleep_secs={secs}");
+        let out = rig.plan_json_env(path, &["--param", &param], &envs);
+        assert!(
+            out.status.success(),
+            "rivet plan (sleep {secs}s) must exit 0; stderr:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // Run 1: the baseline. Run 2: the SAME export, 2.3× slower per row.
+    let fast = rig.apply_env(&plan_fast, &[], &envs);
+    assert!(
+        fast.status.success(),
+        "apply (baseline) must exit 0; stderr:\n{}",
+        String::from_utf8_lossy(&fast.stderr)
+    );
+    let slow = rig.apply_env(&plan_slow, &[], &envs);
+    assert!(
+        slow.status.success(),
+        "apply (degraded) must exit 0 — a throughput regression WARNS, it does not \
+         fail the run; stderr:\n{}",
+        String::from_utf8_lossy(&slow.stderr)
+    );
+
+    // ── activation: the pair the self-check saw must be a COMPARABLE one ──────
+    // Read from the state DB the two applies wrote (state lives next to the
+    // CONFIG — the artifact records its path — so it is the rig's dir).
+    let state_db = rig.config_path().parent().unwrap().join(".rivet_state.db");
+    let rows = tput_success_rows(&state_db, &export);
+    assert_eq!(
+        rows.len(),
+        2,
+        "both applies must have recorded a success row for '{export}'; got: {rows:?}"
+    );
+    let (base, degraded) = (&rows[0], &rows[1]);
+    assert!(
+        base.duration_ms < degraded.duration_ms,
+        "fixture ordering: run 1 is the FAST baseline and run 2 the degraded one; got {rows:?}"
+    );
+    assert_ne!(
+        base.run_id, degraded.run_id,
+        "the baseline lookup excludes the current run_id — identical ids would leave \
+         the degraded run with no baseline at all: {rows:?}"
+    );
+    for r in &rows {
+        assert!(
+            r.total_rows >= 10_000,
+            "REGRESSION_MIN_ROWS: both sides need ≥ 10_000 rows or the pair is refused \
+             as TooFewRows and this test proves nothing; got {r:?}"
+        );
+        assert!(
+            r.duration_ms >= 5_000,
+            "REGRESSION_MIN_MS: both sides need ≥ 5_000 ms or the pair is refused as \
+             TooShort — this is exactly the floor the pg_sleep fixture exists to cross; \
+             got {r:?}"
+        );
+    }
+    assert!(
+        base.total_rows <= degraded.total_rows * 2 && degraded.total_rows <= base.total_rows * 2,
+        "REGRESSION_MAX_SCALE: the two runs must move comparable row counts or the pair \
+         is refused as ScaleMismatch; got {rows:?}"
+    );
+    assert_eq!(
+        base.mode, degraded.mode,
+        "a mode switch is refused as ModeChanged — both applies must record the same \
+         export mode; got {rows:?}"
+    );
+    let ratio = (base.total_rows as f64 / base.duration_ms as f64)
+        / (degraded.total_rows as f64 / degraded.duration_ms as f64);
+    assert!(
+        ratio >= 1.5,
+        "REGRESSION_RATIO: the fixture must degrade throughput ≥ 1.5× or there is \
+         nothing to warn about; measured {ratio:.2}× from {rows:?}"
+    );
+
+    // ── the warning itself, out of the degraded run's stderr ──────────────────
+    let stderr = String::from_utf8_lossy(&slow.stderr);
+    let needle = format!("export '{export}': throughput ");
+    let line = stderr
+        .lines()
+        .find(|l| l.contains(&needle))
+        .unwrap_or_else(|| {
+            panic!(
+                "`rivet apply` must WARN that '{export}' degraded {ratio:.1}× run-over-run \
+             (rows/durations: {rows:?}) — the apply tail reached no self-check. \
+             stderr:\n{stderr}"
+            )
+        });
+    assert!(
+        line.contains("slower than its last success"),
+        "the warning must name the run-over-run comparison, not a bare rate: {line}"
+    );
+    // The mode `apply_cmd` passes is `run_mode_label(1, false)` = "sequential":
+    // a sealed single-export replay overlaps nothing, so the line must keep its
+    // ACTIONABLE tail rather than excusing the drop as source sharing.
+    assert!(
+        line.contains("check governor sheds"),
+        "a sealed single-export apply shares the source with nothing — the warning must \
+         keep the actionable tail, not the concurrent-run excuse: {line}"
+    );
+    // The printed ratio must agree with the metrics rows it was derived from.
+    // (Same inputs, so this grades the derivation/formatting, not the values.)
+    let printed: f64 = line
+        .split('(')
+        .nth(1)
+        .and_then(|s| s.split('×').next())
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or_else(|| panic!("the warning must print a ratio: {line}"));
+    assert!(
+        (printed - ratio).abs() < 0.2,
+        "the printed ratio {printed:.1}× must match the metrics rows ({ratio:.2}×): {line}"
+    );
+
+    // The baseline run must be SILENT — it had no previous success to compare
+    // against, so the line above is provably the run-over-run comparison.
+    let fast_stderr = String::from_utf8_lossy(&fast.stderr);
+    assert!(
+        !fast_stderr.contains("slower than its last success"),
+        "the first apply has no baseline and must not warn; stderr:\n{fast_stderr}"
     );
 }
 

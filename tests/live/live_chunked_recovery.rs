@@ -1166,3 +1166,113 @@ fn a_failed_chunk_must_fail_the_parallel_run_not_ship_a_short_export() {
         "a short export must not leave a _SUCCESS marker for a downstream loader to trust"
     );
 }
+
+/// The PLAIN parallel chunked runner's half — `chunk_checkpoint`-LESS, so it is
+/// `run_chunked_parallel` in `chunked/exec.rs`, a different function from the two
+/// tests above (both of which set `chunk_checkpoint: true` and therefore graded
+/// the CHECKPOINT runners).
+///
+/// Same end-of-loop shape, one guard instead of two: the workers push their
+/// errors into a shared vec and the run bails only AFTER `thread::scope` joins
+/// (`let errs = poison::into_recover(errors); if !errs.is_empty() { bail!(..) }`,
+/// exec.rs). Nothing else notices a failed chunk — the counters, the manifest and
+/// `_SUCCESS` are all produced from a summary a dead worker simply never added to.
+///
+/// It was untestable until this test landed: `RIVET_TEST_ERROR_AT=chunk_export:N`
+/// was wired into `sequential_checkpoint.rs`, `parallel_checkpoint.rs`, keyset and
+/// mongo_parallel but NOT into `exec.rs`, and the panic hook every other chunked
+/// test uses can never reach a guard that runs after the join. The hook is now
+/// wired into exec.rs's worker (same point name, same 0-based chunk index).
+///
+/// RED-PROOF, and the disagreement that is the finding. Measured 2026-08-16 with
+/// the guard REMOVED (`if !errs.is_empty() { bail!(..) }` deleted):
+///   * THIS test FAILS — the summary block reads `status: success`, `rows: 100`,
+///     `files: 2` for a 150-row table, exit 0. (`RIVET_TEST_ERROR_AT` is honoured
+///     — stderr still carries `chunk 1 failed: rivet test-hook: injected error` —
+///     the run simply does not care.)
+///   * All 11 other ignored tests in this file stay GREEN under the SAME mutant,
+///     including both `a_failed_chunk_must_fail_the_run_not_ship_a_short_export`
+///     and `a_failed_chunk_must_fail_the_parallel_run_not_ship_a_short_export`:
+///     they set `chunk_checkpoint: true`, so they grade the CHECKPOINT runners,
+///     never `exec.rs`. Every remaining one injects `RIVET_TEST_PANIC_AT`, and a
+///     process death never reaches a guard that runs after the join.
+///   * So do the tests that DO drive this very runner:
+///     `live_governor::governor_activates_and_run_completes`,
+///     `live_chunked_dense::dense_ties_pg_parallel_no_loss_no_dup` and
+///     `live_schema_drift::chunked_range_export_enforces_on_schema_drift_fail`
+///     are all `mode: chunked` + `parallel: N` with no checkpoint, and all pass
+///     with the guard gone — they never make a chunk fail.
+///   * The sharpest one is `live_governor::governor_does_not_deadlock_when_
+///     chunks_fail`: same runner, chunks that really DO fail, and an
+///     `!status.success()` assertion — and it is GREEN under the mutant, because
+///     it points the destination under a regular file, so the run exits non-zero
+///     from the unwritable destination whether or not the guard fires. A
+///     status-only oracle over a fixture that fails for a second reason grades
+///     nothing; that is why this test asserts on the LEDGER first.
+///
+/// That is a single-guard proof, not a redundant one: unlike the parallel
+/// CHECKPOINT twin above (which goes red only with BOTH its guards disabled,
+/// because the chunk-completion count backs the worker-error bail), the plain
+/// runner keeps no chunk_task ledger and has no completion count — this bail is
+/// the only thing between a partial export and a green `_SUCCESS`.
+///
+/// The oracle is the LEDGER, not a parquet glob: a worker retries its chunk
+/// internally and each attempt writes a part before the error discards its
+/// record, so the raw prefix of a FAILED run can legitimately hold MORE rows than
+/// the table (measured on the checkpoint twin: 303 files for 299 recorded). Those
+/// are unmanifested parts of a failed run — the `gc_orphans` case, not a loss —
+/// so what a downstream reader would trust (`files_committed` on the run's own
+/// metrics row) is what this asserts.
+#[test]
+#[ignore = "live: postgres"]
+fn a_failed_chunk_must_fail_the_plain_parallel_run_not_ship_a_short_export() {
+    require_alive(LiveService::Postgres);
+
+    let table = seed_pg_numeric_table(150);
+    let export = unique_name("chunk_fail_guard_plain_par");
+    let out = tempfile::tempdir().unwrap();
+    let rig = Rig::pg_batch(&export)
+        .query(&format!(
+            r#"SELECT id, name FROM {table_name}"#,
+            table_name = table.name()
+        ))
+        .mode("chunked")
+        .export_line("chunk_column: id")
+        .export_line("chunk_size: 50")
+        // NO `chunk_checkpoint` — that absence is what routes the run to
+        // chunked::run_chunked_parallel (job.rs: requires_parallel_execution()
+        // && !is_resumable()) instead of run_chunked_parallel_checkpoint.
+        .export_line("parallel: 4")
+        .dest_path(out.path().to_path_buf());
+    let cfg = rig.config_path();
+
+    let run = rig.run_args_env(
+        &["--export", &export],
+        &[("RIVET_TEST_ERROR_AT", "chunk_export:1")],
+    );
+    let stderr = String::from_utf8_lossy(&run.stderr).into_owned();
+
+    let committed = {
+        let db = StateDb::next_to_config(&cfg);
+        let run_id = db.latest_run_id(&export);
+        db.metrics_row(&run_id).files_committed.unwrap_or(0)
+    };
+    assert!(
+        committed > 0,
+        "fixture is inert — no chunk part was recorded, so the run failed for an unrelated \
+         reason (bad config, missing table, hook not wired into exec.rs) and proves nothing \
+         about the guard; stderr:\n{stderr}"
+    );
+
+    assert!(
+        !run.status.success(),
+        "a run that recorded only {committed} chunk part(s) of a 3-chunk export reported \
+         SUCCESS — the collected-worker-error bail after the scope join is the ONLY thing \
+         that notices a failed chunk on the plain parallel runner, and it did not; \
+         stderr:\n{stderr}"
+    );
+    assert!(
+        !out.path().join("_SUCCESS").exists(),
+        "a short export must not leave a _SUCCESS marker for a downstream loader to trust"
+    );
+}

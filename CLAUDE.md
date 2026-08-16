@@ -642,7 +642,28 @@ evidence about what the run delivered.
 Corollary on redundant guards: the parallel test goes RED only when BOTH guards
 are off. Say that in the test body rather than presenting it as two proofs —
 the same load-bearing / belt-and-suspenders distinction the `until_current`
-rule already insists on.
+rule already insists on. Not every runner is redundant, and the difference is
+worth stating: the PLAIN parallel runner keeps no `chunk_task` ledger and no
+completion count, so its single post-join bail is all that stands between a
+partial export and a green `_SUCCESS` — a single-guard RED, said so in the test.
+
+Sibling class the same fill exposed, and the reason the hook had to be wired at
+all: **an exit-status oracle over a fixture that fails for a SECOND reason
+grades nothing.** `governor_does_not_deadlock_when_chunks_fail` drives the exact
+runner, really does fail chunks, and asserts `!status.success()` — and it stays
+GREEN with the guard deleted, because its destination points under a regular
+file, so the run exits non-zero on the unwritable path whether or not the guard
+fires. It reads as a failure-path test and cannot distinguish rivet's guard from
+`Permission denied`. Process rule: **when a test's oracle is the exit status,
+name the ONE thing in the fixture that can produce it, and assert the delivered
+outcome (the ledger's `files_committed`, the absence of `_SUCCESS`) rather than
+the status alone** — otherwise the fixture's own breakage answers for the
+product. The tell is a fault-injection test whose fixture is ALSO misconfigured
+on purpose (an unwritable path, a missing table, a bad credential) to "make it
+fail": that second cause is now the thing being measured. RED-proven by the
+disagreement — `a_failed_chunk_must_fail_the_plain_parallel_run_not_ship_a_short_export`
+goes RED against the removed guard (100 of 150 rows shipped `status: success`,
+exit 0) while all 11 pre-existing tests in the same module stay green.
 
 ## A per-export feature must be wired into EVERY runner — the runner-bypass class
 

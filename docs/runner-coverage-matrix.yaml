@@ -95,7 +95,13 @@ scenarios:
   - id: failed_chunk_fails_the_run
     what: "a chunk/worker that FAILS (not crashes) must fail the run rather than ship a short export. Measured 2026-08-03: disabling the sequential guard (`pending > 0`) left 14 live tests green while a run shipped 100 of 150 rows as SUCCESS; disabling BOTH parallel-checkpoint guards left 56 green. Every prior test injected a PANIC, and a panic never reaches a guard that only runs once the loop finishes — hence the RIVET_TEST_ERROR_AT=chunk_export:N hook these tests added."
     single:         { na: "no chunk loop to continue past — a failed single export IS the run's failure (run_single_export returns Err); the retry side is decide_export_retry's own matrix" }
-    chunked:        { gap: "the SEQUENTIAL half is na by construction — run_chunked_sequential propagates a chunk failure with `?` (chunked/exec.rs, the src.export(..)? inside the per-chunk loop), so there is no keep-going path and no end-of-loop guard to forget. The PARALLEL half is NOT: workers push their errors into a shared vec and the run bails only AFTER the scope joins (`let errs = poison::into_recover(errors); if !errs.is_empty() { bail! }`, exec.rs) — the exact end-of-loop shape the checkpoint twin needed its own test for, with none here. It is also UNTESTABLE with today's vocabulary: the RETURNING-error hook `maybe_error_at_index(\"chunk_export\", …)` is wired into sequential_checkpoint.rs and parallel_checkpoint.rs (plus keyset/mongo_parallel) but NOT into exec.rs, and a PANIC can never reach a guard that runs after the loop. FILL = wire the hook into exec.rs's chunk worker + a chunk_checkpoint-LESS twin of a_failed_chunk_must_fail_the_parallel_run_not_ship_a_short_export, oracle on the ledger (files_committed) not the parquet glob."}
+    # The SEQUENTIAL half of this column stays `na` by construction — run_chunked_sequential
+    # propagates a chunk failure with `?` INSIDE the per-chunk loop (chunked/exec.rs), so there
+    # is no keep-going path and no end-of-loop guard to forget. The `test:` grades the PARALLEL
+    # half (run_chunked_parallel, exec.rs), and unlike its checkpoint twin it goes RED with its
+    # ONE guard disabled — closed 2026-08-16 by wiring maybe_error_at_index("chunk_export", i)
+    # into exec.rs's worker, the returning-error hook every other chunked runner already had.
+    chunked:        { test: a_failed_chunk_must_fail_the_plain_parallel_run_not_ship_a_short_export }
     # BOTH checkpoint runners are proven; the cell names the sequential one and
     # `a_failed_chunk_must_fail_the_parallel_run_not_ship_a_short_export` covers
     # the parallel twin. The parallel case goes RED only with BOTH its guards
@@ -327,11 +333,29 @@ scenarios:
       any tail in another file. CLOSED: one seam (run::self_check_throughput, which owns the
       re-exec'd-child deferral) and a guard that DERIVES its tail set by walking
       src/pipeline/**, requiring seam calls >= max(1, aggregate::build count) with a single
-      machine-checked exemption. FILL for the value level: no live test asserts the emission
-      from a real `rivet apply <plan.json>` — the comparability floors (>=10000 rows AND >=5s
-      wall on BOTH runs) make every fixture I could build machine-speed dependent, so a slow
-      run 1 would skip the pair and the test would pass VACUOUSLY. The call site is pinned by
-      the derived guard and the emission is proven at unit level through the same seam fn.
+      machine-checked exemption. CLOSED at the value level too, 2026-08-16:
+      apply_warns_when_the_same_export_degrades_run_over_run (tests/live/live_plan_apply.rs)
+      drives two real `rivet apply <plan.json>` runs of ONE export and asserts the WARNING on
+      the degraded run's stderr. The objection that had left this open — that the comparability
+      floors (>=10000 rows AND >=5s wall on BOTH runs) make any fixture machine-speed dependent,
+      so a fast host skips the pair and the test passes VACUOUSLY — is answered by taking the
+      wall time from the SOURCE rather than the machine: `generate_series(1, 20000) g, (SELECT
+      pg_sleep(${sleep_secs})) AS _s`, 6s then 14s over the SAME 20000 rows. Measured
+      20000/6454ms then 20000/14415ms, both mode=full, ratio 2.2x against REGRESSION_RATIO 1.5,
+      hardware-independent by construction. That is a fixture engineered past a DOCUMENTED
+      activation threshold, which this repo requires — not the forbidden sleep that compensates
+      for product behaviour; do not "simplify" it away. Non-vacuity is asserted FIRST and from
+      the real producer: both runs' export_metrics rows must clear >=10000 rows, >=5000 ms, the
+      2x scale bound, a matching mode and distinct run_ids, so a fixture that stops crossing a
+      floor FAILS on the activation assertion instead of passing on a skipped pair — RED-proven
+      both ways (500 rows -> the TooFewRows assert; sleeps removed, 413 ms -> the TooShort
+      assert). RED against the mutant deleting the self_check_throughput call from apply_cmd.rs.
+      It also pins the SERIAL attribution (the line must keep "check governor sheds", i.e.
+      run_mode_label(1, false), never the source-sharing excuse) and asserts the FIRST apply is
+      silent, so the run-2 line is provably the run-over-run comparison. ~23 s wall. Routed
+      through the rig's new Rig::plan_json_env / Rig::apply_env — apply takes a PLAN PATH so it
+      cannot go through cli_env, and that gap is why every prior plan/apply test hand-rolled
+      run_rivet_env; the 6 pre-existing raw sites are a follow-up.
     single:         { na: "tail-level, not runner-level: the seam fires once per RUN in the orchestrator tail, above the strategy dispatch, so no runner can apply or skip it. The axis that CAN forget it is the tail (run/processes, run/in-process, run_waves, run_pool, apply_cmd's plan-artifact replay), and that axis is graded by the derived every_orchestrator_tail_routes_the_self_check_through_one_seam" }
     chunked:        { na: "tail-level — see the single cell; the runner is not a participant" }
     chunked_checkpoint: { na: "tail-level — see the single cell; the runner is not a participant" }

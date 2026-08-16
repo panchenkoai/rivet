@@ -156,15 +156,18 @@ const MATRICES: &[(&str, usize)] = &[
     //      are proven offline. Was a paragraph in the cell's own `what` that said
     //      "OPEN … not a committed test" next to a `test:` cell. Fill = a checkpoint
     //      twin of governor_backs_off_under_concurrent_write_pressure.
-    //   2. failed_chunk_fails_the_run × chunked — plain chunked_PARALLEL bails on
-    //      collected worker errors AFTER the loop (exec.rs), the end-of-loop guard shape
-    //      that no PANIC test can reach; both committed failed-chunk tests set
-    //      `chunk_checkpoint: true`, so they grade the OTHER column. Not merely untested
-    //      but currently untestable: maybe_error_at_index("chunk_export", …) is wired
-    //      into the two checkpoint runners and keyset/mongo, never into exec.rs.
-    //      Fill = wire that hook into exec.rs's worker + a checkpoint-less twin.
-    // Any THIRD gap, or either of these surviving once its fill lands, fails here.
-    ("docs/runner-coverage-matrix.yaml", 2),
+    // FILLED 2026-08-16 (2 → 1): failed_chunk_fails_the_run × chunked. Plain
+    // chunked_PARALLEL bails on collected worker errors AFTER the loop (exec.rs), the
+    // end-of-loop guard shape no PANIC test can reach, and it was not merely untested
+    // but UNTESTABLE — maybe_error_at_index("chunk_export", …) was wired into the two
+    // checkpoint runners and keyset/mongo, never into exec.rs. Wiring the hook there
+    // (the returning error a panic can never be) let the checkpoint-less twin
+    // `a_failed_chunk_must_fail_the_plain_parallel_run_not_ship_a_short_export` go RED
+    // against the removed guard: 100 of 150 rows shipped with `status: success`, exit 0.
+    // Unlike the checkpoint twin (RED only with BOTH guards off) this is a single-guard
+    // RED — the plain runner keeps no chunk_task ledger, so that one bail is all there is.
+    // Any SECOND gap, or gap 1 surviving once its fill lands, fails here.
+    ("docs/runner-coverage-matrix.yaml", 1),
     // Pool-split — `apply --pool --split` per (strategy × source engine). Split is a
     // scheduler layer above the runners (each unit runs through chunked/keyset), so its
     // per-engine behaviour (boundary probe, crash-recovery, finding-2 exact-partition

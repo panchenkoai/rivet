@@ -286,8 +286,8 @@ impl Rig {
     /// Run an ARBITRARY subcommand against this rig's config: `rivet <args…>
     /// --config <cfg>`.
     ///
-    /// NOT for `apply`, which takes a PLAN PATH rather than `--config` — use
-    /// `run_rivet_env` directly there. This method appends the config flag, so it
+    /// NOT for `apply`, which takes a PLAN PATH rather than `--config` — that is
+    /// [`Rig::apply_env`]'s job. This method appends the config flag, so it
     /// fits the subcommands that read one: `plan`, `check`, `validate`, `doctor`.
     ///
     /// `run_args`/`run_args_env` hard-code the `run` subcommand, so a test for
@@ -306,6 +306,62 @@ impl Rig {
         all.push("--config");
         all.push(cfg.to_str().unwrap());
         super::runner::run_rivet_env(&all, envs)
+    }
+
+    /// `rivet plan --export <this rig's export> --format json --output <out>`,
+    /// plus `extra` args (`--param k=v`, `--annotate-waves`, …).
+    ///
+    /// The plan→apply pair is the one CLI flow whose two halves take DIFFERENT
+    /// subjects — `plan` reads the config, `apply` reads the artifact — so a
+    /// test that wants the round trip had to spell the six-flag `plan`
+    /// invocation itself and then drop out of the rig entirely for `apply`
+    /// (every call site in `live_plan_apply.rs` does exactly that). The export
+    /// name comes from the rig rather than the caller, which is what keeps the
+    /// artifact, the destination and the `export_metrics` rows talking about the
+    /// same export.
+    pub fn plan_json_env(
+        &self,
+        out: &Path,
+        extra: &[&str],
+        envs: &[(&str, &str)],
+    ) -> std::process::Output {
+        let out = out.to_str().expect("plan output path must be utf-8");
+        let mut args: Vec<&str> = vec![
+            "plan",
+            "--export",
+            self.name.as_str(),
+            "--format",
+            "json",
+            "--output",
+            out,
+        ];
+        args.extend_from_slice(extra);
+        self.cli_env(&args, envs)
+    }
+
+    /// `rivet apply <plan.json>` plus `extra` args (`--force`, `--resume`), with
+    /// `envs` set — the counterpart of [`Rig::plan_json_env`].
+    ///
+    /// The ONE subcommand that takes a PLAN PATH instead of `--config`, which is
+    /// why it cannot go through [`Rig::cli_env`] (that appends `--config`) and
+    /// why it needs its own method rather than a raw `Command`. It still belongs
+    /// on the rig: `apply` writes into the rig's destination and opens
+    /// `.rivet_state.db` next to the rig's CONFIG (the artifact records the
+    /// config path), so the read-backs a test does afterwards — `out_dir()`,
+    /// the state DB — are the rig's, not the plan file's.
+    ///
+    /// `envs` is not optional in practice: a plan/apply round trip needs
+    /// [`Rig::source_url_env`] (an inline URL is redacted into the artifact and
+    /// apply then cannot reconnect), so the variable must be set on BOTH legs.
+    pub fn apply_env(
+        &self,
+        plan: &Path,
+        extra: &[&str],
+        envs: &[(&str, &str)],
+    ) -> std::process::Output {
+        let mut args: Vec<&str> = vec!["apply", plan.to_str().expect("plan path must be utf-8")];
+        args.extend_from_slice(extra);
+        super::runner::run_rivet_env(&args, envs)
     }
 
     /// Spawn `rivet run` and hand back the LIVE child, output discarded.
