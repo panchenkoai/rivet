@@ -1473,6 +1473,78 @@ mod tests {
         );
     }
 
+    /// A `manifest.json` that is not valid JSON at all.
+    ///
+    /// The branch above this one — `self_inconsistent_manifest_is_flagged_but_
+    /// part_check_still_runs` — writes a manifest that PARSES cleanly and then
+    /// lies (`row_count = 9999`); that is the self-consistency check far below.
+    /// The branch here is the one where `serde_json::from_slice` itself FAILS,
+    /// and until now nothing reached it: the 2026-08-16 nightly rotation caught
+    /// `delete field manifest_found` and `delete field failures` from this very
+    /// struct expression, both surviving the whole lib suite.
+    ///
+    /// Two halves of the operator-facing contract, both ungraded:
+    ///  * the verdict must still say a manifest was FOUND — reading a corrupt
+    ///    manifest as ABSENT routes the reader to the ADR-0012 M6 legacy-run
+    ///    explanation, a different and wrong story about their destination;
+    ///  * it must carry a FAILURE naming why — without it `rivet validate`
+    ///    reports a destination that did not pass with an EMPTY `failures`
+    ///    list: a red verdict and no reason on it.
+    ///
+    /// (The third survivor from the same report, `delete field passed`, is
+    /// EQUIVALENT — every exit from the main body calls `recompute_passed()`,
+    /// so that literal is unobservable. It has been in `.cargo/mutants.toml`
+    /// with that reason since 2026-07-14 and needs no test.)
+    #[test]
+    fn an_unparseable_manifest_is_found_and_carries_a_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        // Present on disk so the fixture is not inert: if this early return
+        // ever stopped happening we would fall through to the part check
+        // rather than silently do nothing at all.
+        std::fs::write(dir.path().join("part-000001.parquet"), b"AAAA").unwrap();
+        std::fs::write(dir.path().join(MANIFEST_FILENAME), b"{ this is not json").unwrap();
+        let dest = local_dest(dir.path());
+
+        let v = verify_at_destination(&dest, "", ValidateDepth::Full).unwrap();
+
+        assert!(
+            v.manifest_found,
+            "an unreadable manifest.json is still a manifest that EXISTS — \
+             reporting it absent sends the operator to the legacy-run path \
+             instead of at the corruption: {v:?}"
+        );
+        assert!(
+            !v.legacy_run,
+            "a corrupt manifest is not a legacy run: {v:?}"
+        );
+        assert!(
+            v.failures
+                .iter()
+                .any(|f| matches!(f, Failure::ManifestSelfInconsistent { .. })),
+            "a parse failure must be RECORDED as a failure — a red verdict with \
+             an empty `failures` gives the operator no reason at all: {v:?}"
+        );
+        assert!(
+            !v.passed,
+            "a destination whose manifest cannot be parsed has not passed: {v:?}"
+        );
+
+        // The reason must name the artifact, not just the kind: the operator
+        // reads this line, never the enum variant.
+        let detail = v
+            .failures
+            .iter()
+            .find_map(|f| match f {
+                Failure::ManifestSelfInconsistent { detail } => Some(detail.clone()),
+                _ => None,
+            })
+            .expect("asserted present above");
+        assert!(
+            detail.contains("manifest.json"),
+            "the reason must name the file it is about: {detail}"
+        );
+    }
+
     // ── untracked objects ───────────────────────────────────────────────
 
     #[test]
