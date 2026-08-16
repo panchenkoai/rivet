@@ -148,3 +148,106 @@ fn plan_pretty_with_output_is_not_a_silent_noop() {
         );
     }
 }
+
+// ─── the artifact's row_estimate: the number nothing read ────────────────────
+
+/// `plan.json`'s `row_estimate` must describe the real table.
+///
+/// The 2026-08-16 mutation run left `compute_plan_data -> Ok(Default::default())`
+/// alive, and triage found why: the estimate had NO oracle at any level. The
+/// arithmetic is unreachable offline (the function opens a real source before
+/// computing anything), and nothing live ever read the value — `grep -rn
+/// row_estimate tests/` found only the PREFLIGHT estimate, which is a different
+/// code path (`src/preflight/analysis.rs`), and three frozen legacy fixtures
+/// that are compared against themselves. So a planner that reported a garbage
+/// row count — or none at all — shipped green through every gate.
+///
+/// The fixture makes the expected value EXACT rather than a tolerance: the seed
+/// helper writes dense ids `0..N-1`, and a chunked plan's estimate is the key
+/// SPAN (`last_hi - first_lo + 1`), which for a gapless key is the row count
+/// itself. A tolerance would have let `Default::default()` (None) and an
+/// off-by-one both pass.
+///
+/// Kills: `replace compute_plan_data -> Result<ComputedPlanData> with
+/// Ok(Default::default())`, and any arithmetic slip in the span it computes.
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn plan_artifact_row_estimate_matches_the_real_table() {
+    require_alive(LiveService::Postgres);
+
+    const ROWS: i64 = 5_000;
+    let table = seed_pg_numeric_table(ROWS);
+    let out_dir = tempfile::tempdir().unwrap();
+    let cfg_dir = tempfile::tempdir().unwrap();
+
+    // `table:` (not `query:`) so the planner can verify the key is integer-family
+    // and take the range-chunk path this estimate belongs to.
+    let yaml = format!(
+        "\nsource:\n  type: postgres\n  url_env: DATABASE_URL\n\nexports:\n\
+         \x20 - name: {name}\n    table: {name}\n    mode: chunked\n    chunk_column: id\n\
+         \x20   chunk_size: 1000\n    format: parquet\n    destination:\n      type: local\n\
+         \x20     path: {out}\n",
+        name = table.name(),
+        out = out_dir.path().display(),
+    );
+    let cfg = write_config(&cfg_dir, &yaml);
+
+    let out = std::process::Command::new(RIVET_BIN)
+        .args([
+            "plan",
+            "--config",
+            cfg.to_str().unwrap(),
+            "--export",
+            table.name(),
+            "--format",
+            "json",
+        ])
+        .env("DATABASE_URL", POSTGRES_URL)
+        .output()
+        .expect("spawn rivet plan --format json");
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        out.status.success(),
+        "rivet plan must exit 0; stderr:\n{stderr}"
+    );
+
+    let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "plan --format json must emit one JSON document; parse error: {e}\nstdout:\n{}",
+            String::from_utf8_lossy(&out.stdout)
+        )
+    });
+
+    // Fixture liveness: a plan that computed nothing at all would also have no
+    // chunks, and then the estimate assertion below would be grading absence
+    // against absence.
+    let chunks = doc["computed"]["chunk_count"]
+        .as_u64()
+        .or_else(|| {
+            doc["computed"]["chunk_ranges"]
+                .as_array()
+                .map(|c| c.len() as u64)
+        })
+        .unwrap_or(0) as usize;
+    assert!(
+        chunks >= 4,
+        "fixture went inert: a {ROWS}-row table at chunk_size 1000 must plan several \
+         chunks, got {chunks} — the estimate below would grade nothing:\n{doc:#}"
+    );
+
+    let est = doc["computed"]["row_estimate"].as_i64().unwrap_or_else(|| {
+        panic!(
+            "the plan artifact carries NO row_estimate — a planner that computes \
+             nothing reports nothing, and every downstream consumer (wave packing, \
+             the pool's makespan, the operator's `Row est.` line) reads it:\n{doc:#}"
+        )
+    });
+    assert_eq!(
+        est,
+        ROWS,
+        "the artifact's row_estimate must describe the real table: the seed writes \
+         dense ids 0..{last}, so the chunked key span IS the row count. Got {est} \
+         for {ROWS} rows",
+        last = ROWS - 1,
+    );
+}
