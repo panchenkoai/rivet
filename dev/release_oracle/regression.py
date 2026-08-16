@@ -65,16 +65,27 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
+from ..pytools.ab_regression import (
+    CASE_TIMEOUT as _AB_CASE_TIMEOUT,
+    RIVET_RUNS_TOTAL as _AB_CHILD_RUNS,
+    TEARDOWN_WORST_CASE as _AB_CLEANUP_WORST_CASE,
+)
 from ..pytools.field_replay import (
     FLIP as _FR_FLIP,
     LEG_PLAN as _FR_LEG_PLAN,
     LEG_TIMEOUT as _FR_LEG_TIMEOUT,
+    RESTORE_WORST_CASE as _FR_CLEANUP_WORST_CASE,
+    STAND_FLIPPED_MARKER as _FR_FLIPPED,
     STAND_MUTATED_MARKER as _FR_MUTATED,
+    STAND_RESTORED_MARKER as _FR_RESTORED,
+    StandLock as _StandLock,
 )
+from ..pytools.shell import Fail as _ChildFail
 from .core import (
     Ledger,
     Proc,
     ROOT,
+    Status,
     container_for_port,
     docker_exec,
     port_of,
@@ -105,7 +116,9 @@ _MIB = 1048576
 # Two stages here shell out to a harness that mutates something outside its own
 # process and cleans up on the way out: `field_replay` flips SERVER-WIDE
 # tmp-table globals on `rivet-mysql-1` and restores them, `ab_regression` seeds a
-# fixture table and drops it in a `finally`. Both cleanups were reachable by
+# fixture table and drops it in the `finally` of the `fixture()` context manager
+# that WRAPS the seed (the seed used to sit one line above that `try`, so an
+# interrupt during it leaked a 50 000-row table). Both cleanups were reachable by
 # every signal EXCEPT the one this wrapper actually sent.
 #
 # `core.run` is `subprocess.run(timeout=…)`, and CPython implements that timeout
@@ -134,7 +147,63 @@ _MIB = 1048576
 #      would still skip ab_regression's `DROP TABLE`.) SIGKILL remains the last
 #      resort for a child that ignores SIGINT for the whole grace period, and
 #      that case says so in the transcript instead of being silent.
-_GRACE = float(os.environ.get("RIVET_ORACLE_CHILD_GRACE") or 300)
+#
+#   3. THE GRACE PERIOD WAS A GUESS ABOUT SOMEONE ELSE'S CODE. Both BUDGETS above
+#      are derived from the child's own imported constants; the grace — the
+#      number the whole SIGINT fix depends on — was typed as a flat 300 s, while
+#      field_replay's restore retries 3 × (SET + read-back, each capped at 600 s)
+#      with a backoff: ~3602 s worst case. So a WEDGED container (precisely the
+#      condition that makes the wrapper's timeout fire AND the restore slow) was
+#      SIGKILLed mid-restore, leaving a partially-restored stand under a
+#      transcript asserting "the child's cleanup did NOT run". Each call site now
+#      passes the child's OWN cleanup worst case (`RESTORE_WORST_CASE` /
+#      `TEARDOWN_WORST_CASE`), imported like the budgets.
+_GRACE_ENV = "RIVET_ORACLE_CHILD_GRACE"
+# How long to keep draining a SIGKILLed child's pipes. See `_run_interruptible`.
+_KILL_DRAIN = 60.0
+
+
+def _child_grace(cleanup_worst_case: float) -> float:
+    """Seconds to wait after SIGINT before SIGKILL, for a child whose cleanup
+    takes at most `cleanup_worst_case`.
+
+    Read at CALL time and parsed explicitly. The one-liner it replaces —
+    `float(os.environ.get(_GRACE_ENV) or 300)` — got two things wrong at once,
+    both verified by running it:
+
+    * `RIVET_ORACLE_CHILD_GRACE=0` produced 0.0, not the documented default,
+      because `"0"` is a truthy STRING and `or` never fires. That is the same
+      `"0"`-is-truthy grammar bug this very commit fixed in `__main__.env_flag`,
+      and it lands on the natural spelling of "no grace" — i.e. it silently
+      restores the pre-fix SIGKILL-immediately behaviour. Zero is now HONOURED
+      (this is a duration, and "wait zero" is a coherent thing to ask for) but
+      never quietly: it prints what it costs, so the transcript carries the
+      reason a stand came back mutated.
+    * a non-numeric value raised ValueError at IMPORT time, taking the whole gate
+      down before it printed a line. A malformed knob now warns and falls back.
+    """
+    raw = os.environ.get(_GRACE_ENV, "").strip()
+    if not raw:
+        return cleanup_worst_case
+    try:
+        secs = float(raw)
+    except ValueError:
+        print(f"  ! {_GRACE_ENV}={raw!r} is not a number — using the derived "
+              f"{cleanup_worst_case:.0f}s grace")
+        return cleanup_worst_case
+    if secs < 0:
+        print(f"  ! {_GRACE_ENV}={raw!r} is negative — using the derived "
+              f"{cleanup_worst_case:.0f}s grace")
+        return cleanup_worst_case
+    if secs == 0:
+        print(f"  ! {_GRACE_ENV}=0 — a timed-out child harness will be SIGKILLed with NO "
+              "chance to run its cleanup; the shared stand (MySQL tmp-table globals / the "
+              "seeded fixture table) may be left mutated, and the stand row below is the "
+              "only thing that will say so")
+    elif secs < cleanup_worst_case:
+        print(f"  ! {_GRACE_ENV}={secs:.0f}s is shorter than the child's own cleanup worst "
+              f"case ({cleanup_worst_case:.0f}s) — a slow cleanup will be SIGKILLed part-way")
+    return secs
 
 
 def _wrapper_budget(own_env: str, child_budget: float, units: int, slack: float) -> float:
@@ -152,11 +221,15 @@ def _wrapper_budget(own_env: str, child_budget: float, units: int, slack: float)
 
 
 def _run_interruptible(argv, *, timeout: float, env: dict[str, str], cwd: Path,
-                       grace: float = _GRACE) -> Proc:
+                       grace: float) -> Proc:
     """`core.run`, except the timeout is SIGINT + grace + SIGKILL rather than an
     immediate SIGKILL. Returns 124 when the child cleaned up and exited within
     the grace period, 137 when it had to be killed — a distinction the ledger
     row repeats, because only the second leaves the stand's state unknown.
+
+    `grace` has no default: every caller states the CLEANUP it is waiting for
+    (`_child_grace(<child>.WORST_CASE)`), so a new child harness cannot inherit
+    a number that was sized for a different one's teardown.
     """
     full_env = {**os.environ, **env}
     with subprocess.Popen(
@@ -175,10 +248,26 @@ def _run_interruptible(argv, *, timeout: float, env: dict[str, str], cwd: Path,
                     f"and exited within {grace}s]"))
             except subprocess.TimeoutExpired:
                 proc.kill()
-                out, err = proc.communicate()
+                # BOUNDED. SIGKILL ends the CHILD, but the pipes stay open as long
+                # as any GRANDCHILD holds the inherited fd — a `docker exec`, a
+                # `rivet` leg — so an unbounded `communicate()` here can block
+                # forever, with the whole gate hung and not one line of diagnostic
+                # (the child's output is still inside this call). Draining is
+                # best-effort; the transcript is worth waiting a minute for, and
+                # not one second more.
+                try:
+                    out, err = proc.communicate(timeout=_KILL_DRAIN)
+                    drained = ""
+                except subprocess.TimeoutExpired:
+                    out, err = "", ""
+                    drained = (
+                        f" Its output could NOT be drained within {_KILL_DRAIN:.0f}s after the "
+                        "kill — something it spawned still holds the pipes open, so the "
+                        "transcript below is empty and any grandchild is still running.")
                 return Proc(argv, 137, out, err + (
                     f"\n[timeout after {timeout}s — SIGINT ignored for {grace}s, SIGKILLed; "
-                    "the child's cleanup did NOT run and the stand may be left mutated]"))
+                    "the child's cleanup did NOT run and the stand may be left mutated]"
+                    + drained))
 
 
 # ── timing / RSS measurement ───────────────────────────────────────────────────
@@ -396,12 +485,21 @@ def _scale_cfg(engine: str, url: str, table: str, envdir: Path) -> Path:
     return cfg
 
 
-def _prev_binary() -> Path | None:
+def prev_binary() -> Path | None:
     """The DOWNLOADED previous-release binary, or None.
 
     `is_file()` rather than a bare executable test: `[ -x ]` is also true for a
     directory, and a path that happens to name one would get as far as trying to
     exec it.
+
+    PUBLIC because the driver's banner and its closing `NOT RELEASE-GRADED` line
+    must ask the SAME question the stages ask. They used to branch on the ESCAPE
+    FLAG alone, which is not the same fact: `_require_prev_binary` returns the
+    baseline BEFORE consulting the flag, so a run with a baseline in the shell
+    and the flag set (exactly `RIVET_PREV_RELEASE_BIN=… make release-oracle`,
+    since that target passes the flag unconditionally) RAN all three comparison
+    stages and recorded real PASS/FAIL rows while the banner said they would
+    SKIP and the last line said nothing had compared anything.
     """
     raw = os.environ.get("RIVET_PREV_RELEASE_BIN", "")
     if not raw:
@@ -436,6 +534,45 @@ def set_without_prev_release_comparison(on: bool) -> None:
         os.environ.pop(_ESCAPE_ENV, None)
 
 
+def prev_release_banner(prev: Path | None, escape: bool) -> tuple[list[str], str | None]:
+    """What the driver PRINTS about the previous-release comparison: the start-up
+    banner lines, and the closing `NOT RELEASE-GRADED` line (or None).
+
+    Pure, and keyed on the BASELINE rather than on the flag, because the flag is
+    not what decides: `_require_prev_binary` returns the baseline before it ever
+    consults the escape, so a present baseline is COMPARED whatever the flag
+    says. Branching on the flag alone made `RIVET_PREV_RELEASE_BIN=… make
+    release-oracle` (the bare target passes the escape unconditionally) announce
+    a skip, run all three stages for real, and then close with "nothing above
+    compared this binary to the release users are running" over a table full of
+    genuine PASS/FAIL rows. The banner and the footer must describe what HAPPENED.
+    """
+    if prev is not None:
+        lines = [f"  previous-release baseline: {prev}",
+                 "    → the regression, differential and field-replay stages RUN and GRADE"]
+        if escape:
+            # Not a contradiction to smooth over: the escape only covers an
+            # ABSENT baseline, and saying so is the difference between a reader
+            # trusting these rows and discarding them.
+            lines.append(
+                f"    → {_ESCAPE_FLAG} was passed, but a baseline IS present: the escape "
+                "only excuses an ABSENT one, so nothing is given up and this run DOES "
+                "grade against the previous release")
+        return lines, None
+    if escape:
+        return ([f"  previous-release comparison: GIVEN UP ({_ESCAPE_FLAG}), and no baseline "
+                 "is present",
+                 "    → the regression, differential and field-replay stages SKIP instead of "
+                 "FAIL; this run CANNOT support a tag"],
+                f"  NOT RELEASE-GRADED: no previous-release baseline was used and "
+                f"{_ESCAPE_FLAG} turned those stages into SKIPs — nothing above compared "
+                "this binary to the release users are running.")
+    return (["  previous-release baseline: <ABSENT — the comparison stages will FAIL>"],
+            "  NOT RELEASE-GRADED: no previous-release baseline was used — nothing above "
+            "compared this binary to the release users are running (those stages FAILED "
+            f"for that reason; {_ESCAPE_FLAG} is the named way to give them up).")
+
+
 def _require_prev_binary(
     led: Ledger, engine: str, version: str, scenario: str, store: str, what: str
 ) -> Path | None:
@@ -446,7 +583,7 @@ def _require_prev_binary(
     what an absent baseline means — the drift is exactly how the 0.24.4 gate
     ended up with one leg that could not fail.
     """
-    prev = _prev_binary()
+    prev = prev_binary()
     if prev is not None:
         return prev
     raw = os.environ.get("RIVET_PREV_RELEASE_BIN", "")
@@ -601,7 +738,7 @@ def verify_scale_memory(led: Ledger) -> None:
     `RIVET_SCALE_<ENGINE>_SMALL` / `_LARGE` (default `users` / `events`). An
     engine with no URL SKIPs — never a silent pass.
     """
-    prev = _prev_binary()
+    prev = prev_binary()
     tol = os.environ.get("RIVET_SCALE_RSS_TOL") or "3"
     tol_n = _tolerance(tol)
     work = Path(tempfile.mkdtemp(prefix="rivet-oracle-scale-"))
@@ -696,19 +833,23 @@ _AB_MODULE = "dev.pytools.ab_regression"
 # remainder. Raise it when scenarios are added; lowering it is an explicit act.
 _AB_MIN_SCENARIOS = 8
 
-# The harness runs ~20 rivet invocations, each capped at its OWN `RIVET_AB_TIMEOUT`
-# (default 900 s): 6 scenarios × 2 binaries, crash_resume 2 runs × 2 binaries,
-# and failure_and_plan 2 runs × 2 binaries. The wrapper's budget must exceed
-# that worst case or it, not the harness, is what fires — and it used to, at a
-# flat 3600 s read from the harness's own env var. Slack covers seed + preflight
-# + the DuckDB readbacks. Override with `RIVET_ORACLE_AB_TIMEOUT`.
-_AB_CHILD_RUNS = 20
+# The harness runs `RIVET_RUNS_TOTAL` rivet invocations, each capped at its OWN
+# `CASE_TIMEOUT` (`RIVET_AB_TIMEOUT`, default 900 s). BOTH numbers are IMPORTED
+# from the harness rather than re-typed — the field path already did this with
+# `LEG_PLAN` / `LEG_TIMEOUT`, and this path (the one whose scenario list actually
+# grows) re-typed a 20 and a 900 instead: a 7th scenario would push the child's
+# worst case to 19 800 s against a wrapper budget of 18 900 s and the wrapper, not
+# the harness, would fire first again. The harness's own self-test COUNTS its
+# invocations against `RIVET_RUNS_TOTAL`, so the imported number is graded too.
+# Slack covers seed + preflight + the DuckDB readbacks. Override outright with
+# `RIVET_ORACLE_AB_TIMEOUT`.
 _AB_SLACK = 900.0
 
 
 def _ab_budget() -> float:
-    child = float(os.environ.get("RIVET_AB_TIMEOUT") or 900)
-    return _wrapper_budget("RIVET_ORACLE_AB_TIMEOUT", child, _AB_CHILD_RUNS, _AB_SLACK)
+    return _wrapper_budget(
+        "RIVET_ORACLE_AB_TIMEOUT", _AB_CASE_TIMEOUT, _AB_CHILD_RUNS, _AB_SLACK
+    )
 
 
 # `{name:20} {field:16} {old:>22} {new:>22}  {verdict}` — only the name, the
@@ -823,6 +964,9 @@ def verify_previous_release_differential(led: Ledger) -> None:
     p = _run_interruptible(
         ["python3", "-m", _AB_MODULE, str(prev), str(rivet_bin())],
         cwd=ROOT, timeout=_ab_budget(),
+        # The cleanup this waits for is the fixture DROP in the harness's own
+        # `finally` — its worst case, imported.
+        grace=_child_grace(_AB_CLEANUP_WORST_CASE),
         env={**_ISOLATED_STATE, "RIVET_AB_WORKDIR": str(work)},
     )
     rep = _ab_parse(p.out)
@@ -994,36 +1138,133 @@ def _stand_globals(container: str) -> dict[str, str] | None:
     return dict(zip(_FR_FLIP, parts))
 
 
+def _stand_risk(said_so: bool, flipped: bool, verified: bool) -> str:
+    """What the CHILD'S TRANSCRIPT alone says about the shared stand:
+
+    * `"mutated"` — the harness reported a failed restore (`STAND_MUTATED_MARKER`).
+    * `"unknown"` — it reached the flip and neither verified a restore nor said it
+      could not. A SIGKILLed run looks exactly like this: no marker, no `atexit`,
+      no handler. This is the case that used to produce NO ROW AT ALL.
+    * `"clean"` — it never reached the flip (nothing to restore), or it printed a
+      VERIFIED restore (it re-read `@@GLOBAL.*` itself).
+
+    Used when the container cannot be read back, i.e. when the transcript is the
+    only evidence there is. When the container CAN be read, the read wins.
+    """
+    if said_so:
+        return "mutated"
+    if flipped and not verified:
+        return "unknown"
+    return "clean"
+
+
 def _verify_stand_restored(led: Ledger, p: Proc) -> None:
     """Did the shared MySQL stand come back UNFLIPPED? Belt over the harness's own
     restore, and the only check that survives the harness being killed.
 
-    Three ways the stand stays mutated, and this is the one place that sees all
-    three: the harness's restore failed (it says so with `STAND_MUTATED_MARKER`),
-    the harness was SIGKILLed after ignoring SIGINT (no marker, no `atexit`, no
-    handler), or the machine lost the container mid-run. Reading `@@GLOBAL.*`
-    back is authoritative about all of them where the harness's own exit status
-    is not — and a stand left at `tmp_table_size=16384` silently rewrites
-    tmp-table behaviour for every later live MySQL test on this machine.
+    Scope, stated rather than implied — this used to claim it "sees all three"
+    ways the stand stays mutated, and it did so only while `docker exec … mysql`
+    ANSWERS. The three ways are: the harness's restore failed (it says so with
+    `STAND_MUTATED_MARKER`), the harness was SIGKILLed after ignoring SIGINT (no
+    marker, no `atexit`, no handler), or the container was lost mid-run. The last
+    two are precisely the ones where the read-back is ALSO likely to fail — a
+    wedged MySQL wedges both — and the old code returned SILENTLY on an
+    unreadable container unless the harness had printed the marker, i.e. it
+    reported the case with the MOST evidence and said nothing in the case with
+    NONE. An unreadable container is now classified from the transcript
+    (`_stand_risk`) and always produces a row: at minimum UNKNOWN, never clean.
 
     It restores to DEFAULT when it finds the flip, because the alternative is a
     FAIL row that tells a release manager the stand is poisoned and leaves it
     poisoned. The row is recorded EITHER WAY: an automatic repair is not a
     reason to hide that the gate mutated a shared server and did not clean up.
+
+    Both the read and the repair happen UNDER THE HARNESS'S OWN `StandLock`,
+    non-blocking. They are the same server-wide globals `field_replay` flips, so
+    an unlocked read-back could see a CONCURRENT replay's legitimate in-flight
+    flip, record a false "stand mutated" FAIL, and then `SET GLOBAL … = DEFAULT`
+    under a live harness — un-spilling its fixture so ITS criterion 1 fails for a
+    reason unrelated to the binaries. Two wrong verdicts from one unlocked read.
     """
     container = os.environ.get("RIVET_FIELD_MYSQL_CONTAINER", "rivet-mysql-1")
     said_so = _FR_MUTATED in p.out
-    now = _stand_globals(container)
-    if now is None:
-        if said_so:
+    risk = _stand_risk(said_so, _FR_FLIPPED in p.out, _FR_RESTORED in p.out)
+    # Only the ACQUISITION is guarded: an OSError raised by the read-back itself
+    # is a bug, and swallowing it here would file it under "another run holds the
+    # stand", which is a different fact.
+    lock = _StandLock(container, holder="release-oracle stand verify")
+    try:
+        lock.__enter__()
+    except (_ChildFail, OSError) as e:
+        # Someone else owns the stand right now. Do NOT read it (their flip is
+        # legitimate) and above all do NOT repair it (that breaks their run).
+        why = getattr(e, "message", None) or str(e)
+        # Precomputed (never a multi-line expression inside an f-string): this
+        # module must import on every Python the gate is run with, including the
+        # ones that predate PEP 701.
+        what = ("the harness said so" if said_so
+                else "it flipped and never confirmed a restore")
+        if risk == "clean":
+            led.skipped(
+                _R_ENGINE, _FR_VERSION, "stand", _FR_STORE,
+                f"field replay: {container}'s tmp-table globals were NOT checked — another "
+                f"run holds the stand lock ({why}). This replay's own transcript says it "
+                "left the stand clean (it never flipped, or it verified its own restore), "
+                "and reading or repairing the globals now would grade — and break — the "
+                "OTHER run's live flip.",
+                "stand busy — not checked",
+            )
+        else:
             led.failed(
                 _R_ENGINE, _FR_VERSION, "stand", _FR_STORE,
-                f"field replay: the harness reported it could NOT restore {container}'s "
-                "tmp-table globals, and this stage could not read them back either "
-                f"(is {container} still up?). Assume the stand is left at "
-                f"{_FR_FLIP} — every later live MySQL run on this machine inherits it.",
-                "stand mutated (unverifiable)",
+                f"field replay: this replay may have left {container} MUTATED "
+                f"({what}, exit {p.returncode}), and the stand could not be checked or "
+                f"repaired because another run holds the lock ({why}). Check "
+                f"{list(_FR_FLIP)} by hand once that run finishes.",
+                f"stand {risk} — busy, not repaired",
             )
+        return
+    try:
+        _check_stand_under_lock(led, p, container, said_so, risk)
+    finally:
+        lock.__exit__(None, None, None)
+
+
+def _check_stand_under_lock(led: Ledger, p: Proc, container: str, said_so: bool,
+                            risk: str) -> None:
+    """The read-back + repair, with the stand lock already held."""
+    now = _stand_globals(container)
+    if now is None:
+        # THE CASE WITH THE LEAST INFORMATION MUST BE THE LOUDEST. A SIGKILLed
+        # harness (rc 137) prints no marker, and the wedged container that
+        # provoked the kill is the same one that will not answer here — so the
+        # old `if said_so: … return` reported nothing at all in exactly the
+        # scenario this stage was built for.
+        if risk == "clean":
+            led.skipped(
+                _R_ENGINE, _FR_VERSION, "stand", _FR_STORE,
+                f"field replay: could not read {container}'s tmp-table globals back "
+                f"(is it up?), so the stand was NOT verified. Its own transcript says the "
+                f"harness left it clean — it never reached the flip, or it printed a "
+                f"verified restore — so nothing here is evidence of a mutated stand "
+                f"(exit {p.returncode}).",
+                "stand unreadable (transcript says clean)",
+            )
+            return
+        led.failed(
+            _R_ENGINE, _FR_VERSION, "stand", _FR_STORE,
+            f"field replay: {container} is UNREADABLE and this replay "
+            + ("reported it could NOT restore" if said_so else
+               "flipped the globals and never confirmed a restore (no restore line, no "
+               "failure line — the shape of a SIGKILLed run)")
+            + f" its tmp-table globals (exit {p.returncode}). The stand's state is UNKNOWN "
+              f"and must be assumed left at {_FR_FLIP}: every later live MySQL run on this "
+              "machine would inherit it, silently rewriting tmp-table behaviour. Check it "
+              f"by hand: docker exec -i {container} mysql -uroot -privet rivet -e "
+              f"\"SELECT {', '.join(f'@@GLOBAL.{k}' for k in _FR_FLIP)};\" and, if the flip "
+              f"is there, {'; '.join(f'SET GLOBAL {k} = DEFAULT' for k in _FR_FLIP)};",
+            "stand mutated (unverifiable)" if said_so else "stand UNKNOWN (unreadable)",
+        )
         return
 
     stuck = {k: v for k, v in now.items() if v == _FR_FLIP[k]}
@@ -1073,6 +1314,9 @@ def verify_field_symptom_replay(led: Ledger) -> None:
     p = _run_interruptible(
         ["python3", "-m", _FR_MODULE, str(prev), str(rivet_bin())],
         cwd=ROOT, timeout=_fr_budget(),
+        # The cleanup this waits for is the tmp-table RESTORE its SIGINT handler
+        # runs — 3 retries × (SET + read-back) — imported, not guessed.
+        grace=_child_grace(_FR_CLEANUP_WORST_CASE),
         # Same cross-version state isolation as every other cell that runs two
         # binary versions — and here it is doubly load-bearing: the harness reads
         # sheds out of the SQLite `run_journal` beside each config, so a
@@ -1188,3 +1432,287 @@ def verify_field_symptom_replay(led: Ledger) -> None:
             "cost, same data)",
             f"{len(crits)} criteria graded",
         )
+
+
+# ── self-test: the wrapper's own decisions, without a stand ───────────────────
+_SELFTEST_CLEANUP_CHILD = """
+import signal, sys, time
+def bye(signum, frame):
+    print("CLEANUP RAN", flush=True)
+    sys.exit(3)
+signal.signal(signal.SIGINT, bye)
+print("READY", flush=True)
+time.sleep(60)
+"""
+
+_SELFTEST_STUBBORN_CHILD = """
+import signal, subprocess, sys, time
+signal.signal(signal.SIGINT, signal.SIG_IGN)
+# A grandchild that INHERITS this process's stdout/stderr and outlives it: after
+# the SIGKILL the pipes stay open, which is what an unbounded drain waits on.
+subprocess.Popen(["/bin/sleep", "30"])
+print("READY", flush=True)
+time.sleep(30)
+"""
+
+
+def _self_test() -> int:
+    """The decisions this module makes ABOUT a child harness, graded without one.
+
+    Everything here is invisible to a live gate run: the SIGINT-vs-SIGKILL
+    signal, the grace period's grammar, what the stand row says when the
+    container cannot be read, what the driver announces about a comparison that
+    did or did not happen. A green release-oracle run exercises none of it —
+    which is why each of these shipped wrong.
+
+    Called by `__main__ --self-test` (CI, and `tests/offline/
+    release_oracle_entrypoint_guard.rs`).
+    """
+    import contextlib
+    import io
+    import tempfile
+    import threading
+    import time
+
+    from ..pytools.field_replay import report as _fr_report, stand_mutated_line
+
+    # Declared once, up front: several sections below swap a module-level name
+    # for a stub, and Python requires the declaration to precede every use.
+    global _run_interruptible, _stand_globals, _KILL_DRAIN
+
+    failures: list[str] = []
+
+    def want(name: str, cond: bool, detail: str = "") -> None:
+        print(f"  [{'PASS' if cond else 'FAIL'}] {name}{('  ' + detail) if detail else ''}")
+        if not cond:
+            failures.append(name)
+
+    @contextlib.contextmanager
+    def env(**kw):
+        """Set/clear env vars for one block and put them back."""
+        saved = {k: os.environ.get(k) for k in kw}
+        try:
+            for k, v in kw.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+            yield
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+    # ── 1. the grace period: grammar, and where the default comes from ────────
+    with env(**{_GRACE_ENV: None}):
+        want("an unset grace defaults to the CHILD's own cleanup worst case",
+             _child_grace(_FR_CLEANUP_WORST_CASE) == _FR_CLEANUP_WORST_CASE,
+             f"{_child_grace(_FR_CLEANUP_WORST_CASE):.0f}s vs field_replay's "
+             f"{_FR_CLEANUP_WORST_CASE:.0f}s")
+        want("…and that default really is longer than the restore it waits for "
+             "(a typed 300s was not)",
+             _child_grace(_FR_CLEANUP_WORST_CASE) > 300.0,
+             f"{_FR_CLEANUP_WORST_CASE:.0f}s")
+    with env(**{_GRACE_ENV: "0"}):
+        # A duration, so "0" means zero — but it must MEAN it rather than land
+        # there by way of `or 300` never firing on a truthy "0", and it must say
+        # what it costs (the printed warning, captured here).
+        zbuf = io.StringIO()
+        with contextlib.redirect_stdout(zbuf):
+            zero = _child_grace(_FR_CLEANUP_WORST_CASE)
+        want("an explicit grace of 0 is honoured as zero, not as the default",
+             zero == 0.0, str(zero))
+        want("…and says out loud that the child will be SIGKILLed with no cleanup",
+             "SIGKILLed with NO chance" in zbuf.getvalue(), zbuf.getvalue().strip()[:70])
+    with env(**{_GRACE_ENV: "45"}):
+        want("an explicit grace is honoured", _child_grace(_FR_CLEANUP_WORST_CASE) == 45.0)
+    for bad in ("abc", "-5", "  "):
+        with env(**{_GRACE_ENV: bad}):
+            try:
+                got = _child_grace(_FR_CLEANUP_WORST_CASE)
+                ok = got == _FR_CLEANUP_WORST_CASE
+            except Exception as e:  # noqa: BLE001
+                ok, got = False, f"raised {type(e).__name__}: {e}"
+            want(f"a malformed grace ({bad!r}) falls back instead of taking the gate down",
+                 ok, str(got))
+
+    # ── 2. the two-layer budgets: the wrapper must outlast its child ──────────
+    with env(RIVET_ORACLE_FIELD_TIMEOUT=None, RIVET_ORACLE_AB_TIMEOUT=None):
+        want("the field wrapper's budget exceeds the harness's own worst case",
+             _fr_budget() > _FR_LEG_TIMEOUT * len(_FR_LEG_PLAN),
+             f"{_fr_budget():.0f}s vs {_FR_LEG_TIMEOUT * len(_FR_LEG_PLAN):.0f}s")
+        want("the ab-diff wrapper's budget exceeds the harness's own worst case "
+             "(both numbers IMPORTED from it, never re-typed)",
+             _ab_budget() > _AB_CASE_TIMEOUT * _AB_CHILD_RUNS,
+             f"{_ab_budget():.0f}s vs {_AB_CASE_TIMEOUT * _AB_CHILD_RUNS:.0f}s "
+             f"({_AB_CHILD_RUNS} runs)")
+
+    # ── 2b. …and each STAGE hands the launcher its own child's cleanup budget ─
+    #
+    # Observed AT the boundary, produced by the real producer: the stage itself
+    # is run with the launcher stubbed, and the `grace` it passed is read back.
+    # Asserting `_child_grace(X) == X` alone would grade the helper while a call
+    # site quietly passed a literal — the "correct logic on a fabricated input"
+    # shape.
+    real_launcher, real_globals = _run_interruptible, _stand_globals
+    seen: dict[str, float] = {}
+    try:
+        def _stub_launcher(argv, *, timeout, env, cwd, grace):
+            seen[argv[2]] = grace
+            return Proc(argv, 0, "", "")
+
+        _run_interruptible = _stub_launcher
+        _stand_globals = lambda c: {k: "untouched" for k in _FR_FLIP}  # noqa: E731
+        with env(RIVET_PREV_RELEASE_BIN=(shutil.which("true") or "/usr/bin/true"),
+                 **{_GRACE_ENV: None}):
+            with contextlib.redirect_stdout(io.StringIO()):
+                verify_field_symptom_replay(Ledger(colour=False))
+                verify_previous_release_differential(Ledger(colour=False))
+        want("the field stage waits out field_replay's OWN restore worst case",
+             seen.get(_FR_MODULE) == _FR_CLEANUP_WORST_CASE,
+             f"{seen.get(_FR_MODULE)} vs {_FR_CLEANUP_WORST_CASE}")
+        want("the ab-diff stage waits out ab_regression's OWN teardown worst case",
+             seen.get(_AB_MODULE) == _AB_CLEANUP_WORST_CASE,
+             f"{seen.get(_AB_MODULE)} vs {_AB_CLEANUP_WORST_CASE}")
+    finally:
+        _run_interruptible, _stand_globals = real_launcher, real_globals
+
+    # ── 3. the criterion parser, over the harness's REAL rendered output ──────
+    rows = {"fr_x": 1}
+
+    def _leg(tag, wall, shed):
+        return {"tag": tag, "exit": 0, "wall": wall, "timed_out": False,
+                "backed_off": shed, "recovered": 0, "rows": rows, "stderr_tail": []}
+
+    runs = {}
+    for side, adaptive in _FR_LEG_PLAN:
+        tag = f"{side}-{'on' if adaptive else 'off'}"
+        runs[tag] = _leg(tag, 300, 3 if tag == "old-on" else 0)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        _fr_report(runs)
+    parsed = [_FR_CRIT.match(l) for l in buf.getvalue().splitlines()]
+    want(f"the wrapper parses all {_FR_CRITERIA} criteria out of report()'s own output",
+         sum(1 for m in parsed if m) == _FR_CRITERIA,
+         f"{sum(1 for m in parsed if m)} matched")
+    mutated_line = stand_mutated_line("still wrong after the SET: {'tmp_table_size': '16384'}")
+    want("…and does NOT mistake the printed stand-mutated line for a criterion",
+         _FR_CRIT.match(mutated_line) is None, mutated_line[:70])
+    want("…while still detecting it by the marker it imports",
+         _FR_MUTATED in mutated_line)
+
+    # ── 4. the banner / footer follow the BASELINE, not the flag ──────────────
+    here = Path(__file__)
+    for prev, escape, must_grade in ((here, True, True), (here, False, True),
+                                     (None, True, False), (None, False, False)):
+        lines, footer = prev_release_banner(prev, escape)
+        text = "\n".join(lines)
+        if must_grade:
+            want(f"a present baseline (escape={escape}) is announced as GRADING",
+                 "RUN and GRADE" in text and "GIVEN UP" not in text, text.splitlines()[0])
+            want(f"…and no NOT RELEASE-GRADED line closes it (escape={escape})",
+                 footer is None, str(footer))
+        else:
+            want(f"an absent baseline (escape={escape}) says so and closes with "
+                 "NOT RELEASE-GRADED",
+                 footer is not None and "NOT RELEASE-GRADED" in footer,
+                 str(footer)[:60])
+    lines, _ = prev_release_banner(here, True)
+    want("…and a baseline present UNDER the escape says the escape did not apply",
+         any("escape only excuses an ABSENT one" in l for l in lines))
+
+    # ── 5. the stand read-back: unreadable, and busy ──────────────────────────
+    dead_proc = Proc(["field_replay"], 137, _FR_FLIPPED + " (prior: x)\n", "")
+    clean_proc = Proc(["field_replay"], 0,
+                      _FR_FLIPPED + " (prior: x)\n" + _FR_RESTORED + " (normal exit): x\n", "")
+    with tempfile.TemporaryDirectory() as td:
+        with env(RIVET_FIELD_LOCK=str(Path(td) / "stand.lock"),
+                 RIVET_FIELD_MYSQL_CONTAINER="rivet-selftest-not-a-container"):
+            real_stand_globals = _stand_globals
+            reads: list[str] = []
+            try:
+                _stand_globals = lambda c: reads.append(c) or None  # noqa: E731
+                led = Ledger(colour=False)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    _verify_stand_restored(led, dead_proc)
+                cells = [c for c in led.cells if c.scenario == "stand"]
+                want("a SIGKILLed harness + an unreadable container records a LOUD row "
+                     "(it used to record nothing at all)",
+                     len(cells) == 1 and cells[0].status is Status.FAIL,
+                     str([(c.status.value, c.detail) for c in cells]))
+                want("…and the row says the stand's state is UNKNOWN, never clean",
+                     bool(cells) and "UNKNOWN" in cells[0].detail,
+                     cells[0].detail if cells else "<no row>")
+
+                led = Ledger(colour=False)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    _verify_stand_restored(led, clean_proc)
+                cells = [c for c in led.cells if c.scenario == "stand"]
+                want("an unreadable container after a VERIFIED restore is a SKIP, not a "
+                     "false alarm",
+                     len(cells) == 1 and cells[0].status is Status.SKIP,
+                     str([(c.status.value, c.detail) for c in cells]))
+
+                # …and with the stand LOCKED by someone else: read nothing, write
+                # nothing, say so.
+                reads.clear()
+                fd = os.open(os.environ["RIVET_FIELD_LOCK"], os.O_CREAT | os.O_RDWR, 0o666)
+                try:
+                    import fcntl
+
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    led = Ledger(colour=False)
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        _verify_stand_restored(led, clean_proc)
+                    cells = [c for c in led.cells if c.scenario == "stand"]
+                    want("a stand held by ANOTHER run is not read (and not repaired)",
+                         not reads, f"reads: {reads}")
+                    want("…and that is recorded, not silently skipped",
+                         len(cells) == 1 and "busy" in cells[0].detail,
+                         str([(c.status.value, c.detail) for c in cells]))
+                finally:
+                    os.close(fd)
+            finally:
+                _stand_globals = real_stand_globals
+
+    # ── 6. the SIGINT-first runner, and the bounded drain after a kill ────────
+    p = _run_interruptible(["python3", "-c", _SELFTEST_CLEANUP_CHILD],
+                           timeout=1.0, grace=10.0, env={}, cwd=ROOT)
+    want("a timed-out child is SIGINTed, so its cleanup RUNS", "CLEANUP RAN" in p.out,
+         p.out.strip().replace("\n", " | ")[:80])
+    want("…and the wrapper reports 124 (cleaned up), not 137 (killed)",
+         p.returncode == 124, str(p.returncode))
+
+    real_drain, _KILL_DRAIN = _KILL_DRAIN, 2.0
+    box: dict[str, object] = {}
+    try:
+        def _drain_case():
+            box["p"] = _run_interruptible(["python3", "-c", _SELFTEST_STUBBORN_CHILD],
+                                          timeout=1.0, grace=1.0, env={}, cwd=ROOT)
+
+        # In a DAEMON thread with a deadline: the bug this guards is a HANG, and a
+        # self-test that hangs reports nothing. This one fails instead.
+        t = threading.Thread(target=_drain_case, daemon=True)
+        t0 = time.monotonic()
+        t.start()
+        # Shorter than the grandchild's lifetime ON PURPOSE: an unbounded drain
+        # blocks until that grandchild exits, so a deadline longer than it would
+        # let the bug finish and report a pass.
+        t.join(12.0)
+        alive = t.is_alive()
+        want("a SIGKILLed child whose grandchild holds the pipes does not hang the gate",
+             not alive,
+             "STILL BLOCKED in communicate()" if alive
+             else f"returned in {time.monotonic() - t0:.0f}s")
+        q = box.get("p")
+        want("…and it reports 137 with the undrained output named",
+             q is not None and q.returncode == 137 and "could NOT be drained" in q.stderr,
+             (q.stderr.strip().replace("\n", " | ")[-90:]) if q is not None else "<hung>")
+    finally:
+        _KILL_DRAIN = real_drain
+
+    print(f"\nregression self-test: {len(failures)} failed" if failures
+          else "\nregression self-test ok")
+    return 1 if failures else 0

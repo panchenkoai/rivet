@@ -143,9 +143,28 @@ const MATRICES: &[(&str, usize)] = &[
     // The last 3 then closed: a chunked-range + a parallel-Mongo drift live test, a
     // parallel-Mongo clobber live test, and mongo schema_drift reclassified `na` (a
     // Mongo Arrow schema is a fixed {_id, document, meta} shape — the verbatim-blob
-    // document column cannot structurally drift). 0 gaps — every runner × feature cell
-    // is a test or a justified n/a.
-    ("docs/runner-coverage-matrix.yaml", 0),
+    // document column cannot structurally drift).
+    //
+    // 0 → 2 on 2026-08-16, and this is the ONE direction the ratchet may move up: the
+    // `chunked` column was SPLIT into `chunked` (chunked/exec.rs) + `chunked_checkpoint`
+    // (sequential_checkpoint.rs + parallel_checkpoint.rs), the two runner families
+    // job.rs dispatches on `is_resumable()`. Nothing regressed; two admissions that
+    // already existed in PROSE became cells a guard can read. The allowance is for
+    // EXACTLY these two, and no others:
+    //   1. adaptive_concurrency_governor × chunked_checkpoint — the checkpoint runner's
+    //      END-TO-END shed has only an ad-hoc live run; the wiring + pool-shed mechanism
+    //      are proven offline. Was a paragraph in the cell's own `what` that said
+    //      "OPEN … not a committed test" next to a `test:` cell. Fill = a checkpoint
+    //      twin of governor_backs_off_under_concurrent_write_pressure.
+    //   2. failed_chunk_fails_the_run × chunked — plain chunked_PARALLEL bails on
+    //      collected worker errors AFTER the loop (exec.rs), the end-of-loop guard shape
+    //      that no PANIC test can reach; both committed failed-chunk tests set
+    //      `chunk_checkpoint: true`, so they grade the OTHER column. Not merely untested
+    //      but currently untestable: maybe_error_at_index("chunk_export", …) is wired
+    //      into the two checkpoint runners and keyset/mongo, never into exec.rs.
+    //      Fill = wire that hook into exec.rs's worker + a checkpoint-less twin.
+    // Any THIRD gap, or either of these surviving once its fill lands, fails here.
+    ("docs/runner-coverage-matrix.yaml", 2),
     // Pool-split — `apply --pool --split` per (strategy × source engine). Split is a
     // scheduler layer above the runners (each unit runs through chunked/keyset), so its
     // per-engine behaviour (boundary probe, crash-recovery, finding-2 exact-partition
@@ -274,6 +293,81 @@ fn all_fn_names() -> HashSet<String> {
     names
 }
 
+/// Every fn under src/ or tests/ that actually RUNS as a test — i.e. one carrying a
+/// test attribute (`#[test]`, `#[tokio::test]`, `#[rstest]`, `#[test_case(..)]`).
+///
+/// [`all_fn_names`] answers "does this name exist", which is one step short of what a
+/// `test:` cell claims. A helper (`manifest_count`, `seed_pg_wide_table`) satisfies the
+/// existence check while proving nothing, so "fill the gap" can be faked by naming a
+/// helper — the ledger-grading sibling of "a coverage ledger must grade the CALL SITE,
+/// not the definition". This set is the call-site half: a cell may only name something
+/// the test runner will execute.
+fn all_test_fn_names() -> HashSet<String> {
+    let mut names = HashSet::new();
+    for dir in ["src", "tests"] {
+        collect_test_fn_names(&repo_root().join(dir), &mut names);
+    }
+    names
+}
+
+/// Is this line a TEST attribute (not `#[cfg(test)]`, not `#[ignore]`)? Compares the
+/// attribute path only — `#[test]`, `#[tokio::test]`, `#[rstest]`, `#[test_case(..)]`.
+fn is_test_attr(line: &str) -> bool {
+    let Some(rest) = line.trim_start().strip_prefix("#[") else {
+        return false;
+    };
+    let path: &str = rest.split(['(', ']', '=']).next().unwrap_or("").trim();
+    path == "test" || path.ends_with("::test") || path == "rstest" || path == "test_case"
+}
+
+fn collect_test_fn_names(dir: &Path, out: &mut HashSet<String>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_test_fn_names(&path, out);
+            continue;
+        }
+        if path.extension().is_none_or(|e| e != "rs") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        // A test fn is preceded by a contiguous run of attributes/doc comments, at
+        // least one of which is a test attribute. Any other statement resets the run.
+        let mut armed = false;
+        for line in text.lines() {
+            let t = line.trim_start();
+            if is_test_attr(t) {
+                armed = true;
+                continue;
+            }
+            if t.starts_with("#[") || t.starts_with("//") || t.is_empty() {
+                continue; // #[ignore]/#[should_panic]/docs sit between the attr and the fn
+            }
+            let mut rest = t;
+            for prefix in ["pub(crate) ", "pub(super) ", "pub ", "async ", "unsafe "] {
+                if let Some(r) = rest.strip_prefix(prefix) {
+                    rest = r;
+                }
+            }
+            if armed
+                && let Some(rest) = rest.strip_prefix("fn ")
+                && let Some(name) = rest
+                    .split(|c: char| !c.is_alphanumeric() && c != '_')
+                    .next()
+                && !name.is_empty()
+            {
+                out.insert(name.to_string());
+            }
+            armed = false;
+        }
+    }
+}
+
 fn collect_fn_names(dir: &Path, out: &mut HashSet<String>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -359,6 +453,63 @@ fn matrix_every_mapped_test_exists() {
                         test
                     );
                 }
+            }
+        }
+    }
+}
+
+/// Matrices whose `test:` cells legitimately name something that is NOT a `#[test]` fn,
+/// each with the reason. Keep this list at one entry unless a ledger genuinely grades a
+/// non-`cargo test` runner.
+const NON_TEST_CELL_MATRICES: &[(&str, &str)] = &[(
+    "docs/fuzz-matrix.yaml",
+    "cells name cargo-fuzz ENTRY fns in src/fuzz.rs (driven by fuzz.yml nightly), which \
+     are `pub fn`, not `#[test]` fns — asserted to live in src/fuzz.rs instead",
+)];
+
+/// Guard #3b — a `test:` cell must name a fn the test runner EXECUTES, not merely one
+/// that exists. [`matrix_every_mapped_test_exists`] accepts any `fn <name>` anywhere
+/// under src/ or tests/, so a helper (`manifest_count`, `chunk_run_id`, a seeding fn)
+/// satisfies it while proving nothing — and that is the cheapest way to make a `gap`
+/// look filled, which is exactly the move the gap ratchet makes tempting. Same rule as
+/// `every_gate_function_has_a_call_site` in release_gate_matrix_guard: registration is a
+/// claim about behaviour, only the runnable call site is evidence.
+#[test]
+fn matrix_mapped_tests_are_real_test_functions() {
+    let test_fns = all_test_fn_names();
+    // Parse sanity: a broken collector would silently accept everything.
+    assert!(
+        test_fns.len() > 500 && test_fns.contains("matrix_every_mapped_test_exists"),
+        "test-attribute scan produced {} names — the collector is broken, so this guard \
+         would pass vacuously",
+        test_fns.len()
+    );
+    let fuzz_src = std::fs::read_to_string(repo_root().join("src/fuzz.rs")).unwrap_or_default();
+    for (path, _) in MATRICES {
+        let exempt = NON_TEST_CELL_MATRICES.iter().find(|(p, _)| p == path);
+        let matrix = load_matrix(path);
+        for sc in &matrix.scenarios {
+            for (eng, cell) in sc.resolved_cells(&matrix.engines, path) {
+                let Some(name) = &cell.test else { continue };
+                if test_fns.contains(name) {
+                    continue;
+                }
+                let Some((_, why)) = exempt else {
+                    panic!(
+                        "{path} scenario '{}' column '{}' maps to `{name}`, which exists but \
+                         carries NO test attribute (#[test]/#[tokio::test]/…) — a helper fn is \
+                         not a proof. Name the test that RUNS, or record the cell as a `gap:` \
+                         with the reason.",
+                        sc.id, eng
+                    );
+                };
+                assert!(
+                    fuzz_src.contains(&format!("fn {name}(")),
+                    "{path} scenario '{}' column '{}' maps to `{name}`, which is neither a \
+                     #[test] fn nor a fuzz entry point in src/fuzz.rs. The exemption is: {why}",
+                    sc.id,
+                    eng
+                );
             }
         }
     }

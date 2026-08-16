@@ -169,15 +169,22 @@ seed-garbage-mysql:
 seed-garbage-mssql:
 	docker compose exec -T mssql /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 'Rivet_Passw0rd!' -C -d rivet -b -i /dev/stdin < dev/garbage/mssql.sql
 
-# The BARE target carries no baseline, so it must GIVE UP the prev-release
-# comparison BY NAME. Since a missing `RIVET_PREV_RELEASE_BIN` became a FAIL
-# rather than a SKIP (a check that grades nothing must fail — 0.24.4 shipped a
-# +1h48m regression through a green gate whose only comparison leg SKIPped),
-# a bare invocation without this flag goes red on three stages for a reason that
-# has nothing to do with what it is checking. `--without-prev-release-comparison`
-# is the deliberate, named escape: it says out loud, in every row it records and
-# in the summary, that this run cannot support a tag.
-release-oracle:  ## Release gate, BARE: only what is already in your shell, and the prev-release comparison GIVEN UP by name (cannot support a tag). Read the SKIP count — with nothing set it is ~95 PASS / 60 SKIP and still prints RELEASE-READY.
+# The BARE target ADDS no baseline of its own, so it must GIVE UP the
+# prev-release comparison BY NAME. Since a missing `RIVET_PREV_RELEASE_BIN`
+# became a FAIL rather than a SKIP (a check that grades nothing must fail —
+# 0.24.4 shipped a +1h48m regression through a green gate whose only comparison
+# leg SKIPped), a bare invocation without this flag goes red on three stages for
+# a reason that has nothing to do with what it is checking.
+# `--without-prev-release-comparison` is the deliberate, named escape: it says
+# out loud, in every row it records and in the summary, that this run cannot
+# support a tag.
+#
+# The escape only excuses an ABSENT baseline. This target is "whatever is already
+# in your shell", so `RIVET_PREV_RELEASE_BIN=… make release-oracle` DOES carry
+# one, and the three stages then run and grade for real — the driver's banner and
+# its closing line are keyed on the baseline rather than on this flag, so such a
+# run is reported honestly instead of being announced as a skip it was not.
+release-oracle:  ## Release gate, BARE: only what is already in your shell. With no RIVET_PREV_RELEASE_BIN in your environment the prev-release comparison is GIVEN UP by name (cannot support a tag); with one exported, those three stages run and grade. Read the SKIP count — with nothing set it is ~95 PASS / 60 SKIP and still prints RELEASE-READY.
 	python3 -m dev.release_oracle --without-prev-release-comparison $(ARGS)
 
 # ─── the gate's environment, assembled ────────────────────────────────────────

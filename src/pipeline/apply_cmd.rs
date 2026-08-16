@@ -212,13 +212,43 @@ pub fn run_apply_command(
         force_bypassed,
     };
     let plan = artifact.resolved_plan.clone();
-    super::run_export_job_with_chunk_source(
+    let (result, summary) = super::run_export_job_with_chunk_source(
         &plan,
         &state,
         chunk_source,
         plan_file,
         Some(apply_context),
-    )
+    );
+
+    // 7. The run's tail. This arm is a FULL orchestrator — it opens the state
+    // store, drives one export to completion and writes its `export_metrics`
+    // row — so it owes the same run-over-run self-check every other tail emits,
+    // through the same seam (`run::self_check_throughput`: it holds the
+    // exactly-once deferral for a re-exec'd child and the ONE call site of
+    // `aggregate::warn_throughput_regressions`).
+    //
+    // Without it, `rivet plan -c cfg.yaml -e orders -o plan.json && rivet apply
+    // plan.json` degraded 2.7× in silence — and the degraded row then became the
+    // baseline, so the NEXT run could not flag it either — while the byte-
+    // identical export under `rivet run` warned (round-7 bughunt, the fifth tail
+    // of the runner-bypass class).
+    //
+    // No aggregate card and no `run_aggregate` row: one export is exactly the
+    // count `run::reports_run_aggregate` refuses, and the per-export card above
+    // already printed every number it would carry. The self-check is not gated
+    // on that count — a sealed artifact IS the whole invocation.
+    //
+    // The mode is `run_mode_label(1, false)` — "sequential", asked of the same
+    // producer every other runner asks, never spelled here: this replay runs one
+    // export in this process, overlapping nothing, so the self-check must keep
+    // its ACTIONABLE tail rather than excusing a regression as source sharing.
+    let entries = vec![super::aggregate::entry_from_summary(&summary)];
+    super::run::self_check_throughput(
+        &state,
+        &entries,
+        &super::run::RunModes::uniform(super::run::run_mode_label(1, false)),
+    );
+    result
 }
 
 /// Finding #17: reject — with an actionable remedy — a plan whose source

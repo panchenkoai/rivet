@@ -1049,37 +1049,113 @@ mod tests {
         out
     }
 
-    /// Every `*_mode_label` function `pipeline::run` DEFINES, with the labels it
-    /// can return — parsed out of run.rs so this test's dimension is derived
-    /// from the producers rather than typed from the ones its author knew.
+    /// Every function `pipeline::run` DEFINES that can PRODUCE a label, with the
+    /// labels it can return — derived from the TYPE, not from the name.
     ///
-    /// Each producer is a top-level `fn` whose only `\n}` is its own close, so
-    /// the body slice is exact; the assertions below fail loudly if that stops
-    /// holding (a producer with no literals, or no terminator).
+    /// The dimension is "every value that can reach [`mode_shares_the_source`]",
+    /// and those values arrive as `&'static str` (through `RunModes`, whose map
+    /// is keyed by export and whose fallback is the run's own label). So a
+    /// producer is any top-level `fn` in run.rs whose RETURN type mentions
+    /// `&'static str` — directly (`wave_mode_label`, `pool_mode_label`,
+    /// `run_mode_label`) or inside a container (`wave_batch_modes` and
+    /// `pool_export_modes` return `Vec<(String, &'static str)>`).
+    ///
+    /// Naming was the earlier rule and it was narrower than its own claim:
+    /// `wave_batch_modes` is a real producer of the string that reaches the
+    /// classifier and matched no `*_mode_label` pattern. It is safe only because
+    /// it DELEGATES to `wave_mode_label`; one `else { "wave-solo" }` there would
+    /// have classified a serial label as concurrent with both guards green
+    /// (round-7 bughunt). A delegating producer therefore contributes no labels
+    /// of its own but must be SEEN — hence the emptiness rule below, which is
+    /// "no literals ⇒ must delegate", not the old unconditional "must have
+    /// literals" (a producer whose one non-literal arm returned a constant
+    /// passed on the strength of its siblings).
+    ///
+    /// Top-level `const NAME: &str = "…"` declarations are folded in so a
+    /// producer returning a named constant is still graded BY VALUE rather than
+    /// silently reading as a delegating one.
+    ///
+    /// LIMITS, since a text parser cannot be sound: it sees run.rs only (a
+    /// producer moved to another module is invisible), it reads the return type
+    /// syntactically (a type alias for `&'static str` would not match), and it
+    /// cannot evaluate an arm that returns a computed value — a `format!`-built
+    /// label, or one read from config. Every producer that exists today is a
+    /// total function over literals, and the emptiness rule turns the
+    /// computed-arm case into a loud failure rather than a silent pass.
     fn mode_label_producers() -> Vec<(String, Vec<String>)> {
         let whole = include_str!("run.rs");
         let product = &whole[..whole
             .find("\n#[cfg(test)]")
             .expect("run.rs has test modules")];
         let code = code_only(product);
-        let mut out: Vec<(String, Vec<String>)> = Vec::new();
-        for (at, _) in code.match_indices("_mode_label(") {
-            let start = code[..at]
-                .rfind(|c: char| !(c.is_alphanumeric() || c == '_'))
-                .map_or(0, |i| i + 1);
-            if !code[..start].trim_end().ends_with("fn") {
-                continue; // a call site, not a definition
+        // Top-level string constants, so a `return SOME_CONST` arm is graded.
+        let mut consts: Vec<(String, String)> = Vec::new();
+        for line in code.lines().filter(|l| !l.starts_with(char::is_whitespace)) {
+            let Some(rest) = line.split_once("const ").map(|(_, r)| r) else {
+                continue;
+            };
+            let Some((name, value)) = rest.split_once(':') else {
+                continue;
+            };
+            if let Some(lit) = string_literals(value).first() {
+                consts.push((name.trim().to_string(), lit.clone()));
             }
-            let name = code[start..at + "_mode_label".len()].to_string();
-            let body_end = code[at..]
+        }
+        let mut out: Vec<(String, Vec<String>)> = Vec::new();
+        for (at, line) in code
+            .match_indices('\n')
+            .map(|(i, _)| (i + 1, code[i + 1..].lines().next().unwrap_or("")))
+        {
+            // Top-level definitions only: a `fn` inside an `impl` or a test
+            // module is indented, and rustfmt keeps it that way.
+            let decl = line
+                .strip_prefix("pub ")
+                .or_else(|| {
+                    line.starts_with("pub(")
+                        .then(|| line.split_once(") ").map(|(_, r)| r))
+                        .flatten()
+                })
+                .unwrap_or(line);
+            if !decl.starts_with("fn ") {
+                continue;
+            }
+            let sig_end = at + code[at..].find('{').expect("a fn has a body");
+            let signature = &code[at..sig_end];
+            // The RETURN type, never a parameter: `RunModes::per_export` takes a
+            // map of `&'static str` and produces no label of its own.
+            let returns_label = signature
+                .split_once("->")
+                .is_some_and(|(_, ret)| ret.contains("&'static str"));
+            if !returns_label {
+                continue;
+            }
+            let name = decl["fn ".len()..]
+                .split(['(', '<'])
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            let body_end = code[sig_end..]
                 .find("\n}")
-                .map(|i| at + i)
+                .map(|i| sig_end + i)
                 .unwrap_or_else(|| panic!("no top-level close found for `{name}`"));
-            let labels = string_literals(&code[at..body_end]);
-            assert!(
-                !labels.is_empty(),
-                "`{name}` returned no string literal — the parser lost its body"
+            let body = &code[sig_end..body_end];
+            let mut labels = string_literals(body);
+            labels.extend(
+                consts
+                    .iter()
+                    .filter(|(c, _)| body.contains(c.as_str()))
+                    .map(|(_, v)| v.clone()),
             );
+            if labels.is_empty() {
+                assert!(
+                    body.contains("_mode_label("),
+                    "`{name}` returns a label but this parser found none — it \
+                     neither spells one as a literal (nor as a top-level const) \
+                     nor delegates to a `*_mode_label` decider, so nothing here \
+                     can grade what it emits. Give it literal arms, make it \
+                     delegate, or teach this parser the shape."
+                );
+            }
             out.push((name, labels));
         }
         out
@@ -1157,10 +1233,16 @@ mod tests {
         // The dimension itself, derived: every producer run.rs defines, and
         // every label it can return, must have been classified above.
         let producers = mode_label_producers();
+        // Anti-inertness floor, NOT the dimension: a parser that matched
+        // nothing (or lost the module boundary) would otherwise pass this test
+        // by grading an empty set. Today's five are the three deciders plus the
+        // wave's and the pool's per-export producers.
         assert!(
-            producers.len() >= 3,
-            "expected the wave's, the pool's and the top-level runner's deciders — \
-             parsed {producers:?}"
+            producers.len() >= 5,
+            "the producer parser found {} label producers — expected at least the \
+             three run-mode deciders plus the wave's and the pool's per-export \
+             producers, so the parser has gone blind: {producers:?}",
+            producers.len()
         );
         for (name, labels) in &producers {
             for label in labels {

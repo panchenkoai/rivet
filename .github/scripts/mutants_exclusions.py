@@ -30,6 +30,17 @@ cargo-mutants can produce:
      reason, and a declaration that no longer spans sites is itself an error —
      a stale exception is the same false claim as a dead exclusion.
 
+     A declaration NAMES ITS FILES. Declaring only "this one may span sites"
+     re-opened the hole a third time, from the growth direction: the reason text
+     argued about `src/init/mysql.rs` and `src/init/postgres.rs` while the
+     membership test was the bare `len(sites) > 1`, so when a THIRD engine grew
+     a `density_probe` the checker printed `ok  4 mutant(s) in density_probe
+     across 4 declared sites` — four mutants un-graded under a triage argument
+     written for two other files, and this tree adds engines. Every file a
+     multi-site entry reaches must be listed; an undeclared new one is an error
+     until someone extends the argument to cover it, and a declared file the
+     entry no longer reaches is stale.
+
 Usage:  mutants_exclusions.py <corpus-file>
         mutants_exclusions.py --self-test
 where <corpus-file> is the output of `cargo mutants --list --no-config`
@@ -44,6 +55,7 @@ from __future__ import annotations
 import re
 import sys
 import tomllib
+from dataclasses import dataclass
 from pathlib import Path
 
 CONFIG = Path(__file__).resolve().parents[2] / ".cargo" / "mutants.toml"
@@ -75,22 +87,44 @@ def site_of(name: str) -> tuple[str, str]:
     return (name.split(":", 1)[0], function_of(name))
 
 
-# Exclusions ALLOWED to span more than one file, each with the reason. The key
-# is the exact `exclude_re` string; the value is why one triage argument covers
-# every site it reaches. Anything not listed here that spans sites is an error,
-# and a listed entry that no longer spans sites (or is no longer in the config)
-# is an error too — an exception outliving its subject is a claim about nothing,
-# the dead-exclusion defect in a different costume.
-MULTI_SITE_OK: dict[str, str] = {
-    "replace density_probe with": (
-        "one function per engine — src/init/mysql.rs and src/init/postgres.rs each "
-        "define `density_probe`, and the triage argument (takes a live connection, "
-        "unkillable offline, decisions extracted into unit-tested helpers, glue "
-        "live-guarded) is the same for both. Named in the .cargo/mutants.toml comment."
+@dataclass(frozen=True)
+class MultiSite:
+    """Permission for one `exclude_re` entry to reach the NAMED files, and why.
+
+    `files` is the whole membership test, not a hint: an entry that reaches a
+    file this set does not name is an error even though the entry is declared.
+    The reason is an argument about specific code, so it can only cover the code
+    it was written about — `len(sites) > 1` (the previous test) let a third
+    engine's `density_probe` inherit an argument about two other modules.
+    """
+
+    files: frozenset[str]
+    reason: str
+
+
+# Exclusions ALLOWED to span more than one file, each with the files it may
+# reach and the reason one triage argument covers all of them. The key is the
+# exact `exclude_re` string. Anything not listed here that spans sites is an
+# error; so is a listed entry that reaches a file it does not name, that no
+# longer spans sites, that no longer reaches a file it names, or that is no
+# longer in the config at all — an exception outliving its subject is a claim
+# about nothing, the dead-exclusion defect in a different costume.
+MULTI_SITE_OK: dict[str, MultiSite] = {
+    "replace density_probe with": MultiSite(
+        files=frozenset({"src/init/mysql.rs", "src/init/postgres.rs"}),
+        reason=(
+            "one function per engine — src/init/mysql.rs and src/init/postgres.rs each "
+            "define `density_probe`, and the triage argument (takes a live connection, "
+            "unkillable offline, decisions extracted into unit-tested helpers, glue "
+            "live-guarded) is the same for both. Named in the .cargo/mutants.toml comment."
+        ),
     ),
-    "delete ! in density_probe": (
-        "same two per-engine `density_probe` bodies as the entry above; the `!` each "
-        "one negates is inside the same live-only glue."
+    "delete ! in density_probe": MultiSite(
+        files=frozenset({"src/init/mysql.rs", "src/init/postgres.rs"}),
+        reason=(
+            "same two per-engine `density_probe` bodies as the entry above; the `!` each "
+            "one negates is inside the same live-only glue."
+        ),
     ),
 }
 
@@ -115,7 +149,7 @@ def _plain(line: str) -> str:
 def grade(
     patterns: list[str],
     corpus: list[str],
-    multi_site_ok: dict[str, str] | None = None,
+    multi_site_ok: dict[str, MultiSite] | None = None,
 ) -> tuple[list[str], list[str]]:
     """(errors, ok-lines) for these exclusion patterns against this corpus.
 
@@ -153,41 +187,72 @@ def grade(
                 f"(`... in fn$`) or split it into one entry per function.\n  {sample}"
             )
             continue
-        if len(sites) > 1 and pat not in allow:
-            where = ", ".join(f for f, _ in sites)
-            errors.append(
-                f"::error::exclude_re `{pat}` reaches `{funcs[0]}` in {len(sites)} "
-                f"DIFFERENT FILES ({where}) — one triage argument is being applied to "
-                "code its author may never have opened (same-named free functions in "
-                "sibling engine modules are routine here). Qualify the entry with its "
-                "path, or declare it in MULTI_SITE_OK in this script with the reason "
-                f"one argument covers every site.\n  {sample}"
-            )
-            continue
         if len(sites) > 1:
+            where = ", ".join(f for f, _ in sites)
+            decl = allow.get(pat)
+            if decl is None:
+                errors.append(
+                    f"::error::exclude_re `{pat}` reaches `{funcs[0]}` in {len(sites)} "
+                    f"DIFFERENT FILES ({where}) — one triage argument is being applied to "
+                    "code its author may never have opened (same-named free functions in "
+                    "sibling engine modules are routine here). Qualify the entry with its "
+                    "path, or declare it in MULTI_SITE_OK in this script, naming every "
+                    f"file and the reason one argument covers them all.\n  {sample}"
+                )
+                continue
+            undeclared = sorted({f for f, _ in sites} - decl.files)
+            if undeclared:
+                errors.append(
+                    f"::error::exclude_re `{pat}` reaches `{funcs[0]}` in "
+                    f"{', '.join(undeclared)}, which its MULTI_SITE_OK declaration does "
+                    f"NOT name (it names {', '.join(sorted(decl.files))}). The declaration "
+                    "is an argument about specific code; a new engine module inherits the "
+                    "exemption without anyone checking it holds there. Extend the "
+                    "declaration's `files` once the reason has been verified for the new "
+                    f"site, or qualify the entry with its path.\n  {sample}"
+                )
+                continue
             oks.append(
                 f"ok  {len(hits):5d} mutant(s) in {funcs[0]} across {len(sites)} "
-                f"declared sites  <-  {pat}"
+                f"declared sites ({where})  <-  {pat}"
             )
         else:
             oks.append(f"ok  {len(hits):5d} mutant(s) in {sites[0][0]}::{funcs[0]}  <-  {pat}")
 
-    # The exception list is graded like the exclusions themselves.
-    for pat, reason in allow.items():
+    # The exception list is graded like the exclusions themselves — in BOTH
+    # directions. Downward: an entry that no longer spans sites (or is gone from
+    # the config) is a claim about nothing. Upward: a declared file the entry no
+    # longer reaches is the same staleness one rename later.
+    for pat, decl in allow.items():
         if pat not in patterns:
             errors.append(
                 f"::error::MULTI_SITE_OK declares `{pat}`, which is not in "
                 ".cargo/mutants.toml's exclude_re — a stale exception. Delete it."
             )
             continue
-        if not reason.strip():
+        if not decl.reason.strip():
             errors.append(f"::error::MULTI_SITE_OK entry `{pat}` has no reason.")
+        if not decl.files:
+            errors.append(
+                f"::error::MULTI_SITE_OK entry `{pat}` names no files — the declaration "
+                "must list every file the entry may reach, or it grants a blanket "
+                "exemption to whatever the pattern grows into."
+            )
         hits = [n for n in corpus if re.search(pat, n)]
         if len({site_of(n) for n in hits}) <= 1:
             errors.append(
                 f"::error::MULTI_SITE_OK declares `{pat}` as spanning several files, but "
                 "it now reaches at most one site. The exception outlived its subject — "
                 "delete it so a future multi-site match is caught."
+            )
+            continue
+        gone = sorted(decl.files - {site_of(n)[0] for n in hits})
+        if gone:
+            errors.append(
+                f"::error::MULTI_SITE_OK declares `{pat}` as covering {', '.join(gone)}, "
+                "which the entry no longer reaches (moved, renamed, or the mutant is "
+                "gone). Trim the declaration to the files it really covers — a "
+                "declaration wider than its subject silently re-admits the next site."
             )
     return errors, oks
 
@@ -205,20 +270,49 @@ _SELFTEST_CORPUS = [
 ]
 
 
+# The same corpus after a THIRD engine grows a `density_probe` — the growth the
+# bare `len(sites) > 1` membership test could not see.
+_SELFTEST_CORPUS_NEW_ENGINE = _SELFTEST_CORPUS + [
+    "src/init/mssql.rs:99:1: replace density_probe with None",
+]
+
+_DENSITY_TWO = MultiSite(
+    files=frozenset({"src/init/mysql.rs", "src/init/postgres.rs"}),
+    reason="declared for the two engines the argument was written about",
+)
+
+
 def self_test() -> int:
     """Unit-check the grader against a corpus holding each shape it must judge.
 
-    RED-provable: key `sites` on `function_of` alone (the pre-fix behaviour) and
-    the multi-file case below stops erroring; drop the MULTI_SITE_OK staleness
-    check and the stale-declaration case stops erroring.
+    RED-provable, one mutant per case: key `sites` on `function_of` alone (the
+    pre-fix behaviour) and the multi-file case below stops erroring; restore the
+    bare `len(sites) > 1 and pat not in allow` membership test and the
+    new-engine case stops erroring; drop the MULTI_SITE_OK staleness checks and
+    the two stale-declaration cases stop erroring.
     """
     two_files = ["replace density_probe with"]
     errs, oks = grade(two_files, _SELFTEST_CORPUS, multi_site_ok={})
     assert errs and "DIFFERENT FILES" in errs[0], (errs, oks)
     assert "src/init/mysql.rs" in errs[0] and "src/init/postgres.rs" in errs[0], errs
 
-    errs, oks = grade(two_files, _SELFTEST_CORPUS, multi_site_ok={"replace density_probe with": "declared"})
+    errs, oks = grade(
+        two_files, _SELFTEST_CORPUS, multi_site_ok={"replace density_probe with": _DENSITY_TWO}
+    )
     assert not errs and "2 declared sites" in oks[0], (errs, oks)
+
+    # A THIRD engine's `density_probe`: the declaration names two files, so the
+    # new site is an error until someone extends the argument to cover it. The
+    # previous membership test was the bare `len(sites) > 1`, which reported
+    # `ok  4 mutant(s) in density_probe across 4 declared sites`.
+    errs, oks = grade(
+        two_files,
+        _SELFTEST_CORPUS_NEW_ENGINE,
+        multi_site_ok={"replace density_probe with": _DENSITY_TWO},
+    )
+    assert errs and "does NOT name" in errs[0], (errs, oks)
+    assert "src/init/mssql.rs" in errs[0], errs
+    assert not oks, oks
 
     errs, oks = grade(["replace \\* with .* in compute_part_checksums"], _SELFTEST_CORPUS, multi_site_ok={})
     assert not errs and "src/manifest.rs::compute_part_checksums" in oks[0], (errs, oks)
@@ -229,24 +323,46 @@ def self_test() -> int:
     errs, _ = grade(["nothing matches this"], _SELFTEST_CORPUS, multi_site_ok={})
     assert errs and "matches NO mutant" in errs[0], errs
 
-    # A declaration for a pattern the config no longer carries, and one whose
-    # subject shrank to a single site — both stale, both errors.
-    errs, _ = grade([], _SELFTEST_CORPUS, multi_site_ok={"replace density_probe with": "r"})
+    # A declaration for a pattern the config no longer carries, one whose
+    # subject shrank to a single site, and one naming a file the entry no longer
+    # reaches — all stale, all errors.
+    errs, _ = grade([], _SELFTEST_CORPUS, multi_site_ok={"replace density_probe with": _DENSITY_TWO})
     assert errs and "stale exception" in errs[0], errs
     errs, _ = grade(
         ["replace \\* with \\+ in compute_part_checksums"],
         _SELFTEST_CORPUS,
-        multi_site_ok={"replace \\* with \\+ in compute_part_checksums": "r"},
+        multi_site_ok={
+            "replace \\* with \\+ in compute_part_checksums": MultiSite(
+                files=frozenset({"src/manifest.rs", "src/other.rs"}), reason="r"
+            )
+        },
     )
     assert errs and "outlived its subject" in errs[0], errs
+    errs, _ = grade(
+        two_files,
+        _SELFTEST_CORPUS,
+        multi_site_ok={
+            "replace density_probe with": MultiSite(
+                files=frozenset({"src/init/mysql.rs", "src/init/postgres.rs", "src/init/gone.rs"}),
+                reason="r",
+            )
+        },
+    )
+    assert errs and "no longer reaches" in errs[0], errs
 
-    # Every real declaration must still name a real config entry (the corpus
-    # half of that is graded in CI, where the corpus exists).
+    # Every real declaration must still name a real config entry, and must name
+    # at least the two files its reason argues about (the corpus half of that is
+    # graded in CI, where the corpus exists).
     patterns = tomllib.loads(CONFIG.read_text()).get("exclude_re", [])
-    for pat in MULTI_SITE_OK:
+    for pat, decl in MULTI_SITE_OK.items():
         assert pat in patterns, f"MULTI_SITE_OK declares `{pat}`, absent from exclude_re"
+        assert len(decl.files) > 1, f"MULTI_SITE_OK `{pat}` declares fewer than two files"
+        assert decl.reason.strip(), f"MULTI_SITE_OK `{pat}` has no reason"
 
-    print("self-test ok: multi-file, declared, single-site, prefix, dead, and both stale-exception cases")
+    print(
+        "self-test ok: multi-file, declared, UNDECLARED new site, single-site, prefix, "
+        "dead, and all three stale-exception cases"
+    )
     return 0
 
 

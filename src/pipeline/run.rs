@@ -69,6 +69,22 @@ pub(crate) fn multi_export_mode() -> bool {
 /// atomic; the env covers the process boundary the atomic cannot cross.
 pub(crate) const ENV_CONCURRENT_SIBLINGS: &str = "RIVET_CONCURRENT_SIBLINGS";
 
+/// Env marker a parent sets on re-exec'd children to claim their run-over-run
+/// throughput self-check: "I am aggregating you, and I will report your exports"
+/// (see [`owns_throughput_self_check`]).
+///
+/// A SECOND variable, set alongside `RIVET_IPC_EVENTS` by
+/// `parallel_children::run_exports_as_child_processes`, because the deferral
+/// must key on something only a real parent can supply. `RIVET_IPC_EVENTS` is
+/// not that: it is a presence flag documented to users in
+/// `docs/reference/cli.md` as the way to get the NDJSON progress stream, so an
+/// operator who sets it in an Airflow/K8s pod spec turned every plain `rivet
+/// run` into a process that defers its self-check to a parent that does not
+/// exist — the "check nowhere" failure the seam exists to prevent, made
+/// environment-dependent (round-7 bughunt). This one is internal, undocumented,
+/// and set only at the spawn site.
+pub(crate) const ENV_PARENT_SELF_CHECK: &str = "RIVET_PARENT_OWNS_SELF_CHECK";
+
 pub(crate) fn multi_export_concurrent() -> bool {
     MULTI_EXPORT_CONCURRENT.load(AtomicOrdering::Relaxed)
         || std::env::var_os(ENV_CONCURRENT_SIBLINGS).is_some()
@@ -135,23 +151,44 @@ fn emit_child_stderr(dump: &str, dir: &Path) {
 /// `rivet-child-stderr-*.log` beside the config), so a WARN the child emits is
 /// not on the operator's console at all — while the parent prints beside the run
 /// aggregate, and knows the run-wide concurrency mode the hedge text needs.
-/// `RIVET_IPC_EVENTS` is the marker: `run_exports_as_child_processes` sets it on
-/// EVERY child (not just concurrent batches, unlike `ENV_CONCURRENT_SIBLINGS`),
-/// which is exactly the "my parent is aggregating me" declaration.
 fn owns_throughput_self_check(reexec_child: bool) -> bool {
     !reexec_child
 }
 
+/// Is this process a re-exec'd child whose PARENT owns its self-check?
+///
+/// BOTH markers, and the second one is the fix. The deferral used to key on
+/// `RIVET_IPC_EVENTS` alone — but that variable is a documented USER-FACING
+/// switch (`docs/reference/cli.md`: it turns on the NDJSON progress stream) and
+/// a presence flag, so `RIVET_IPC_EVENTS=0` in an Airflow/K8s pod spec, or a
+/// wrapper that wants machine-readable progress, made every plain `rivet run` in
+/// that environment defer its self-check to a parent that does not exist. The
+/// check then ran NOWHERE — the exact failure the seam was built to prevent,
+/// now environment-dependent (round-7 bughunt).
+///
+/// [`ENV_PARENT_SELF_CHECK`] is the signal only a real parent can supply:
+/// internal, undocumented, and set at the one `current_exe` spawn site
+/// (`parallel_children::run_exports_as_child_processes`) alongside
+/// `RIVET_IPC_EVENTS`. Requiring BOTH also fails in the recoverable direction —
+/// an operator who somehow sets one of them gets the check RUN (a duplicate line
+/// at worst), never the silence.
+fn is_reexecd_child(ipc_events: bool, parent_owns_self_check: bool) -> bool {
+    ipc_events && parent_owns_self_check
+}
+
 /// The ONE call site of [`aggregate::warn_throughput_regressions`]: every
-/// orchestrator tail (`run`'s two branches, `run_waves`, `run_pool`) routes its
-/// entries through here, unconditionally — no `len() > 1` gate, because the
-/// field regression this check exists for hit a single-export config.
+/// orchestrator tail (`run`'s two branches, `run_waves`, `run_pool` and
+/// `apply_cmd::run_apply_command`'s plan-artifact replay) routes its entries
+/// through here, unconditionally — no `len() > 1` gate, because the field
+/// regression this check exists for hit a single-export config, and a sealed
+/// plan artifact IS a single-export run.
 ///
 /// Structural, not conventional: the call is welded to the aggregate the tail
 /// already builds (build → print? → self-check → persist?), and
-/// `every_orchestrator_tail_routes_the_self_check_through_one_seam` fails the
+/// `every_orchestrator_tail_routes_the_self_check_through_one_seam` — which
+/// DERIVES the tail set from `src/pipeline/**` rather than naming it — fails the
 /// build if a tail grows a second path or calls the aggregate helper directly.
-fn self_check_throughput(
+pub(super) fn self_check_throughput(
     state: &StateStore,
     entries: &[crate::state::RunAggregateEntry],
     modes: &RunModes<'_>,
@@ -160,10 +197,14 @@ fn self_check_throughput(
         state,
         entries,
         modes,
-        // The only untestable half: a process-global env read. Every other
+        // The only untestable half: two process-global env reads. Every other
         // decision here is a parameter, so the polarity below is graded at
-        // value level (see [`self_check_throughput_as`]).
-        ipc::ipc_events_enabled(),
+        // value level (see [`self_check_throughput_as`]), and the RULE joining
+        // the two markers is graded in [`is_reexecd_child`].
+        is_reexecd_child(
+            ipc::ipc_events_enabled(),
+            std::env::var_os(ENV_PARENT_SELF_CHECK).is_some(),
+        ),
     );
 }
 
@@ -209,35 +250,43 @@ fn self_check_throughput_as(
 
 /// Which concurrency label the throughput self-check applies to each export.
 ///
-/// Three of the four tails have ONE honest answer for the whole run: `run`'s two
-/// branches and `run_pool` overlap every export they run through the same window
-/// (the pool's slots interleave, `next_eligible` only serializes heavy-vs-heavy),
-/// so [`RunModes::uniform`] is the truth there.
+/// `run`'s two branches have ONE honest answer for the whole run: both spawn a
+/// child process / a thread PER EXPORT with no cap and join them all, so every
+/// export really did overlap every other one — [`RunModes::uniform`] is the
+/// truth there.
 ///
-/// The WAVE runner does not. Its cost gate emits one single-child batch per
-/// heavy export plus one concurrent batch for the `parallel_safe` ones, and
-/// those batches run strictly ONE AFTER ANOTHER — so an export in a lone batch
-/// shared the source with nothing, whatever the widest batch of the run was.
-/// Labelling it with the run's peak hands `aggregate::mode_shares_the_source`
-/// the source-sharing string for an export that ran alone: the self-check then
-/// excuses a real regression as "BY DESIGN — compare the run's makespan" and
-/// DELETES the actionable pointer ("check governor sheds / adaptive batch
-/// shrinks / source load"), which is the exact excuse round 4 removed from the
-/// flag-derived run-level label and round 6 found again one layer in
+/// The WAVE and POOL runners do not. The wave's cost gate emits one single-child
+/// batch per heavy export plus one concurrent batch for the `parallel_safe`
+/// ones, and those batches run strictly ONE AFTER ANOTHER — so an export in a
+/// lone batch shared the source with nothing, whatever the widest batch of the
+/// run was. The pool's queue has the same trailing shape for a different reason:
+/// [`next_eligible`] never co-runs two heavies, so ONE `parallel_safe` export is
+/// enough to make [`pool_is_concurrent`] true for the RUN while each heavy left
+/// after the safe work drains runs strictly ALONE (`--pool 5` over 1 safe + 7
+/// heavy: the safe export rides alongside the first heavy, the other six do not
+/// overlap anything).
+///
+/// Labelling those exports with the run's peak hands
+/// `aggregate::mode_shares_the_source` the source-sharing string for an export
+/// that ran alone: the self-check then excuses a real regression as "BY DESIGN —
+/// compare the run's makespan" and DELETES the actionable pointer ("check
+/// governor sheds / adaptive batch shrinks / source load"), which is the exact
+/// excuse round 4 removed from the flag-derived run-level label, round 6 found
+/// again one layer in on the wave, and round 7 found a third time on the pool
 /// (bughunt 2026-08-16).
 ///
 /// An export the map never saw falls back to the run-wide label — the same
 /// fail-safe direction `mode_shares_the_source` uses for an unknown mode: hedged
 /// text on a serial export is harmless, a confident "check governor sheds" on a
 /// concurrent one is a false accusation.
-struct RunModes<'a> {
+pub(super) struct RunModes<'a> {
     run: &'a str,
     per_export: std::collections::HashMap<String, &'static str>,
 }
 
 impl<'a> RunModes<'a> {
     /// Every export ran under the run's one mode.
-    fn uniform(run: &'a str) -> Self {
+    pub(super) fn uniform(run: &'a str) -> Self {
         Self {
             run,
             per_export: std::collections::HashMap::new(),
@@ -245,7 +294,7 @@ impl<'a> RunModes<'a> {
     }
 
     /// Each named export ran under its OWN mode; anything unnamed under `run`.
-    fn per_export(
+    pub(super) fn per_export(
         run: &'a str,
         per_export: std::collections::HashMap<String, &'static str>,
     ) -> Self {
@@ -271,21 +320,23 @@ struct TailPlan {
 /// The tail's routing rule, pure because the value-level oracle needs a live
 /// source (a real `run()` needs a database, a destination and a state DB).
 ///
-/// `n_exports` is the count AFTER `partition_by` expansion, which is why the
-/// zero case is not hypothetical: `expand_one` logs "found no rows — nothing to
-/// export" and pushes no children, so an empty table leaves the run with zero
-/// exports and a machine consumer still holding a `--json` pipe. `<= 1` (not
-/// `== 1`) is the whole fix — an empty-but-valid `total_exports: 0` document
-/// beats silence, which parses as neither JSON nor "nothing happened".
-fn tail_plan(n_exports: usize, machine_output_requested: bool) -> TailPlan {
+/// The subject is the AGGREGATE the tail just built — see
+/// [`reports_run_aggregate`] for why the count may not be re-derived at the call
+/// site. Its `total_exports` is the count AFTER `partition_by` expansion, which
+/// is why the zero case is not hypothetical: `expand_one` logs "found no rows —
+/// nothing to export" and pushes no children, so an empty table leaves the run
+/// with zero exports and a machine consumer still holding a `--json` pipe. `<=
+/// 1` (not `== 1`) is the whole fix — an empty-but-valid `total_exports: 0`
+/// document beats silence, which parses as neither JSON nor "nothing happened".
+fn tail_plan(agg: &crate::state::RunAggregate, machine_output_requested: bool) -> TailPlan {
     TailPlan {
-        aggregate: reports_run_aggregate(n_exports),
-        machine_output: machine_output_requested && n_exports <= 1,
+        aggregate: reports_run_aggregate(agg),
+        machine_output: machine_output_requested && agg.total_exports <= 1,
     }
 }
 
-/// Does a run of `n_exports` report a run AGGREGATE — the summary card on
-/// stderr and the `run_aggregate` row in the state DB?
+/// Does this run report a run AGGREGATE — the summary card on stderr and the
+/// `run_aggregate` row in the state DB?
 ///
 /// ONE rule, called by every orchestrator tail that has a choice (`run` via
 /// [`tail_plan`], `run_waves`, `run_pool`), because it was three inline `> 1`
@@ -295,11 +346,24 @@ fn tail_plan(n_exports: usize, machine_output_requested: bool) -> TailPlan {
 /// every number it would contain (and a child of `--parallel-export-processes`
 /// would write a duplicate of its parent's row).
 ///
+/// The argument is the AGGREGATE, not a count, because unifying the PREDICATE
+/// left the three tails disagreeing about its SUBJECT: `run` passed the
+/// post-expansion export count and `run_pool` the post-skip pending count (both
+/// equal to what lands in the aggregate), while `run_waves` passed
+/// `config.exports.len()`, computed BEFORE the per-wave `--resume` `_SUCCESS`
+/// skip. A five-export config with every destination already complete then
+/// printed "Run summary (0 exports) … rows: 0" and `aggregate::persist` wrote a
+/// `run_aggregate` row for a run that did no work — polluting the table an
+/// operator queries for history, while the same config under `--pool --resume`
+/// returned early and wrote nothing. One shared rule, opposite behaviour
+/// (round-7 bughunt). Taking the aggregate makes the subject the same quantity
+/// by construction: a caller cannot hand it a number it re-derived.
+///
 /// Deliberately NOT the gate on the run-over-run self-check, which fires at
 /// every count — a one-export config IS the whole invocation of `apply`, and
 /// that is the shape the 2026-08-13 field regression had.
-fn reports_run_aggregate(n_exports: usize) -> bool {
-    n_exports > 1
+fn reports_run_aggregate(agg: &crate::state::RunAggregate) -> bool {
+    agg.total_exports > 1
 }
 
 #[allow(clippy::too_many_arguments)] // CLI fan-in; surface stays stable per ADR-0013
@@ -671,7 +735,7 @@ pub fn run(
     // one export, `--summary-output`, no `--json`, asserting the file exists.
     // `run_json_flag_prints_aggregate_summary_to_stdout` does NOT grade this
     // operator: `--json` prints from `json_output` directly a few lines below.
-    let plan = tail_plan(exports.len(), summary_output.is_some() || json_output);
+    let plan = tail_plan(&agg, summary_output.is_some() || json_output);
     if plan.aggregate {
         aggregate::print(&agg);
     }
@@ -832,6 +896,9 @@ pub(crate) fn run_waves(
     // self-check's attribution only — see [`RunModes`].
     let mut export_modes: std::collections::HashMap<String, &'static str> =
         std::collections::HashMap::new();
+    // The "`--parallel` bought you nothing" warning is a run-level fact; emit it
+    // at the first wave that shows it and not once per wave.
+    let mut degenerate_parallel_warned = false;
 
     for (wave, exports) in &by_wave {
         let label = if *wave == u32::MAX {
@@ -889,6 +956,20 @@ pub(crate) fn run_waves(
                 pending.len() - safe_n
             );
             let batches = cost_gate_batches(&pending);
+            // …and the one fact that `info` line cannot deliver: `--parallel`
+            // that bought NO concurrency, at WARN, BEFORE this wave's batches
+            // execute, naming the lever (see [`degenerate_parallel_warning`]).
+            // Once per run — a second degenerate wave adds no information the
+            // first line did not already give, and repeating it buries it.
+            if !degenerate_parallel_warned
+                && let Some(line) = degenerate_parallel_warning(
+                    &label,
+                    &batches.iter().map(Vec::len).collect::<Vec<_>>(),
+                )
+            {
+                log::warn!("{line}");
+                degenerate_parallel_warned = true;
+            }
             // Batches run one after another (the loop below blocks per batch),
             // so the run's concurrency is the WIDEST batch, never the number of
             // exports it covered.
@@ -983,7 +1064,7 @@ pub(crate) fn run_waves(
     // The card + row gate is the SHARED rule (`run`'s tail asks the same
     // question through `tail_plan`); the self-check between them is not gated at
     // all — see [`reports_run_aggregate`].
-    if reports_run_aggregate(total) {
+    if reports_run_aggregate(&agg) {
         aggregate::print(&agg);
     }
     self_check_throughput(
@@ -993,7 +1074,7 @@ pub(crate) fn run_waves(
         // see [`RunModes`].
         &RunModes::per_export(&agg.parallel_mode, export_modes),
     );
-    if reports_run_aggregate(total) {
+    if reports_run_aggregate(&agg) {
         aggregate::persist(&state, &agg, None);
     }
     // Captured child stderr (verbose per-export cards, parallel path only) goes
@@ -1084,6 +1165,42 @@ pub(super) fn wave_mode_label(peak: usize) -> &'static str {
     } else {
         "wave-sequential"
     }
+}
+
+/// What `apply --parallel` owes the operator when the cost gate bought it NO
+/// concurrency — `None` when the wave really did overlap something.
+///
+/// `parallel_safe` is `Option<bool>` and [`is_parallel_safe`] reads
+/// `unwrap_or(false)`, so in a hand-written config (one `rivet plan` never
+/// annotated) EVERY export is heavy and [`cost_gate_batches`] gives each its own
+/// single-child batch — which the wave loop then runs strictly one after
+/// another. `--parallel` serialised the whole run, and the only thing rivet said
+/// about it was `log::info!("… {} parallel-safe export(s) in parallel, {} run
+/// alone")`, invisible at the default `warn` level (`main.rs`:
+/// `default_filter_or("warn")`). The operator waits out a sequential run
+/// believing they asked for a parallel one; the sibling `--pool` path prints its
+/// schedule with `println!`, so two runners disagreed about the visibility of
+/// the same fact (round-7 bughunt).
+///
+/// WARN, per the project rule that a run-start diagnostic telling the operator
+/// their config will be slow must be visible at the default level, and it names
+/// the lever rather than just the symptom. `None` at one export (nothing could
+/// have overlapped — that is not a config problem) and `None` the moment any
+/// batch is wider than 1, so the ordinary informative case stays at `info` and
+/// this does not fire on every wave of a healthy run.
+fn degenerate_parallel_warning(wave: &str, batch_widths: &[usize]) -> Option<String> {
+    let exports: usize = batch_widths.iter().sum();
+    if exports <= 1 || batch_widths.iter().copied().max().unwrap_or(0) > 1 {
+        return None;
+    }
+    Some(format!(
+        "apply --parallel: wave {wave} — all {exports} export(s) run ALONE, one after another, \
+         so `--parallel` bought no concurrency here. The cost gate only batches exports marked \
+         `parallel_safe: true`, and none of these are (an export with no `parallel_safe:` counts \
+         as heavy). Set `parallel_safe: true` on the cheap ones — or regenerate the config with \
+         `rivet plan`, which annotates it from the source-aware cost class — to actually overlap \
+         them."
+    ))
 }
 
 /// The wave cost-gate's batching, pure so the SHAPE the run executes is
@@ -1210,6 +1327,55 @@ fn pool_harm_window(slots: usize, safe: usize, heavy: usize) -> Option<HarmWindo
 /// `aggregate::mode_shares_the_source` classifies it with the serial modes.
 pub(super) fn pool_mode_label(concurrent: bool) -> &'static str {
     if concurrent { "pool" } else { "pool-serial" }
+}
+
+/// One pool worker's outcome: the export's result, its `RunSummary`, and the
+/// `(start_ms, end_ms)` window it occupied relative to the run's start — the
+/// measurement [`pool_export_modes`] reads to attribute concurrency per export.
+type PoolOutcome = (Result<()>, RunSummary, (i64, i64));
+
+/// Each pool export's OWN concurrency label — the pool's sibling of
+/// [`wave_batch_modes`], and the answer to the same question one runner over.
+///
+/// [`pool_is_concurrent`] answers for the RUN, and its own counter-example is in
+/// its doc: `next_eligible` never co-runs two heavies, so a single
+/// `parallel_safe` export riding alongside the first heavy makes the whole run
+/// "pool" while every heavy left after the safe work drains runs strictly ALONE.
+/// `--pool 5` over 1 safe + 7 heavy is that shape: six trailing heavies would
+/// each be told "this run ran pool, where exports share the source and
+/// per-export rows/s falls BY DESIGN" — six real regressions excused, and the
+/// actionable pointer deleted, verbatim the harm the wave half fixed.
+///
+/// So the label is MEASURED, not modelled: `windows` is one `(export, start_ms,
+/// end_ms)` per export that ran, stamped by the worker thread around
+/// `run_export_job` and relative to the run's own start. An export is labelled
+/// concurrent iff its window really intersects another export's. Deriving it
+/// from the schedule instead (LPT order + the safe/heavy split) would be a
+/// second model of what the workers do, free to disagree with them; the clock
+/// cannot.
+///
+/// Half-open intervals (`start < other_end && other_start < end`), so two
+/// exports that merely touch — one ending exactly when the next is claimed — do
+/// not count as overlapping. A zero-length window (a state-open failure that
+/// returns a synthetic summary immediately) overlaps only an export already
+/// running at that instant, which is the honest answer for a run that did no
+/// work.
+fn pool_export_modes(windows: &[(String, i64, i64)]) -> Vec<(String, &'static str)> {
+    windows
+        .iter()
+        .enumerate()
+        .map(|(i, (name, start, end))| {
+            let overlapped = windows
+                .iter()
+                .enumerate()
+                .any(|(j, (_, other_start, other_end))| {
+                    j != i && start < other_end && other_start < end
+                });
+            // The label comes from the run-level decider, never spelled here, so
+            // the two attributions cannot drift (same rule as the wave's).
+            (name.clone(), pool_mode_label(overlapped))
+        })
+        .collect()
 }
 
 /// The run-mode label the TOP-LEVEL runner ([`run`]) records — the third and
@@ -1846,7 +2012,11 @@ pub(crate) fn run_pool(
     // for the cost of measuring it — the unfixed mirror of the `finished_at`
     // move below (bughunt 2026-08-14).
     let (run_harm, started_at) = RunHarmBracket::open(&config.source);
-    let collected: std::sync::Mutex<Vec<(Result<()>, RunSummary)>> =
+    // Third element: the export's own `(start_ms, end_ms)` window, relative to
+    // `started_at` — the MEASUREMENT the per-export concurrency label is derived
+    // from (see [`pool_export_modes`]). Stamped by the worker around the job, so
+    // it reports what ran rather than what the schedule intended.
+    let collected: std::sync::Mutex<Vec<PoolOutcome>> =
         std::sync::Mutex::new(Vec::with_capacity(pending.len()));
     std::thread::scope(|s| {
         for _ in 0..m.min(pending.len()) {
@@ -1890,6 +2060,11 @@ pub(crate) fn run_pool(
                         }
                     }
                     let _heavy = HeavyGuard(&heavy_running, !is_parallel_safe(export));
+                    // The window this export actually occupied. Opened here —
+                    // AFTER the queue claim, so a worker that slept in the
+                    // `next_eligible` retry loop does not charge that wait to an
+                    // overlap it never had.
+                    let claimed_at = chrono::Utc::now();
                     let pair = match StateStore::open(config_path) {
                         Ok(st) => {
                             // #167 per-unit resume: a split unit resumes ONLY if it
@@ -1921,7 +2096,12 @@ pub(crate) fn run_pool(
                             (Err(err), summary)
                         }
                     };
-                    collected.lock().unwrap().push(pair);
+                    let window = (
+                        (claimed_at - started_at).num_milliseconds(),
+                        (chrono::Utc::now() - started_at).num_milliseconds(),
+                    );
+                    let (res, summary) = pair;
+                    collected.lock().unwrap().push((res, summary, window));
                 }
             });
         }
@@ -1970,7 +2150,10 @@ pub(crate) fn run_pool(
     // so the marker goes down only once the whole giant is complete.
     let unit_prefix = split_info.as_ref().map(|(_, family)| format!("{family}#"));
     let mut split_units_all_ok = true;
-    for (res, summary) in collected.into_inner().unwrap() {
+    // One `(export, start_ms, end_ms)` per export that ran — the input the
+    // per-export concurrency label is MEASURED from (see [`pool_export_modes`]).
+    let mut pool_windows: Vec<(String, i64, i64)> = Vec::with_capacity(summaries.capacity());
+    for (res, summary, (start_ms, end_ms)) in collected.into_inner().unwrap() {
         if let Some(pfx) = &unit_prefix
             && summary.export_name.starts_with(pfx.as_str())
             && (res.is_err() || summary.status != "success")
@@ -1980,6 +2163,7 @@ pub(crate) fn run_pool(
         if let Err(e) = res {
             failures.push(e);
         }
+        pool_windows.push((summary.export_name.clone(), start_ms, end_ms));
         summaries.push(summary);
     }
     // Every split unit succeeded → write the ONE prefix-level `_SUCCESS` the units
@@ -2021,15 +2205,21 @@ pub(crate) fn run_pool(
     // Same shared gate as the other two tails (see [`reports_run_aggregate`]) —
     // the pool used to spell its own `> 1` inline, which is how a rule that must
     // agree across three runners drifts.
-    if reports_run_aggregate(pending.len()) {
+    if reports_run_aggregate(&agg) {
         aggregate::print(&agg);
     }
     self_check_throughput(
         &state,
         &agg.per_export,
-        &RunModes::uniform(&agg.parallel_mode),
+        // NOT the run-wide label: one `parallel_safe` export makes the RUN a
+        // pool while every heavy after the safe work drains runs alone, so the
+        // attribution is per-export and MEASURED — see [`pool_export_modes`].
+        &RunModes::per_export(
+            &agg.parallel_mode,
+            pool_export_modes(&pool_windows).into_iter().collect(),
+        ),
     );
-    if reports_run_aggregate(pending.len()) {
+    if reports_run_aggregate(&agg) {
         aggregate::persist(&state, &agg, None);
     }
     if !failures.is_empty() {
@@ -2516,6 +2706,203 @@ mod pool_harm_tests {
         );
     }
 
+    /// The pool's label is a PER-EXPORT fact too, and for a reason its own
+    /// run-level predicate already documents: `next_eligible` never co-runs two
+    /// heavies, so ONE `parallel_safe` export riding alongside the first heavy
+    /// makes `pool_is_concurrent(5, 1, 7)` true for the RUN while the six
+    /// heavies left after the safe work drains each run strictly ALONE.
+    ///
+    /// The run-wide label then tells those six "this run ran pool, where exports
+    /// share the source and per-export rows/s falls BY DESIGN — compare the
+    /// run's makespan", deleting the actionable pointer on six real regressions.
+    /// Verbatim the harm the wave half of this fix removed one runner over.
+    ///
+    /// Staged from the shape `run_pool` really produces: the windows below are
+    /// the `(export, start_ms, end_ms)` triples its workers stamp around
+    /// `run_export_job`, and the label comes back from `pool_export_modes`, the
+    /// function the tail hands the self-check. ≥2 overlapping and ≥2 solo so
+    /// neither side is a one-element fold.
+    ///
+    /// RED against the shipped `RunModes::uniform(&agg.parallel_mode)`: every
+    /// export then reads `pool`, so the six trailing heavies lose the pointer.
+    /// RED too against a `pool_export_modes` that labels from the RUN's
+    /// concurrency (`pool_is_concurrent`) rather than from the windows.
+    ///
+    /// HONESTY: this pins the PRODUCER and the resolver plus the tail's SOURCE
+    /// wiring (the last assertions) — not the values `run_pool` stamps, which
+    /// need a live source, a state DB and a destination. The emission half is
+    /// `a_lone_pool_export_keeps_the_actionable_attribution_in_a_concurrent_run`.
+    #[test]
+    fn a_pool_export_is_labelled_by_the_overlap_it_measured_not_the_runs_widest() {
+        use super::{RunModes, pool_export_modes, pool_is_concurrent, pool_mode_label};
+        // The run-level truth first: one safe export IS enough to make the pool
+        // concurrent, which is exactly why the run-wide label hides the bug.
+        assert!(
+            pool_is_concurrent(5, 1, 7),
+            "one parallel_safe export rides alongside the running heavy"
+        );
+        // 1 safe + 7 heavy through 5 slots: the safe export backfills the slot
+        // beside the first heavy; the remaining heavies serialize behind it.
+        let mut windows: Vec<(String, i64, i64)> =
+            vec![("dim_small".into(), 0, 50), ("orders".into(), 0, 100)];
+        for (i, start) in (100..700).step_by(100).enumerate() {
+            windows.push((format!("heavy_{i}"), start, start + 100));
+        }
+        let modes: std::collections::HashMap<String, &'static str> =
+            pool_export_modes(&windows).into_iter().collect();
+        assert_eq!(modes.len(), windows.len(), "every export gets a label");
+        for overlapped in ["dim_small", "orders"] {
+            assert_eq!(
+                modes[overlapped],
+                pool_mode_label(true),
+                "'{overlapped}' really did share the window with a sibling"
+            );
+        }
+        for solo in (0..6).map(|i| format!("heavy_{i}")) {
+            assert_eq!(
+                modes[&solo], "pool-serial",
+                "'{solo}' ran after the safe work drained, alone — it must keep \
+                 the actionable pointer however concurrent the RUN was"
+            );
+        }
+        // Touching windows are not overlapping ones: `heavy_0` ends at 600 and
+        // `heavy_5` starts at 600 — a half-open interval, or every serialized
+        // pool reads as concurrent.
+        assert_eq!(
+            pool_export_modes(&[("a".into(), 0, 100), ("b".into(), 100, 200)])
+                .into_iter()
+                .map(|(_, m)| m)
+                .collect::<Vec<_>>(),
+            vec!["pool-serial", "pool-serial"],
+            "back-to-back exports did not overlap"
+        );
+
+        // …and the resolver the tail passes to the self-check.
+        let resolver = RunModes::per_export(pool_mode_label(true), modes);
+        assert_eq!(resolver.for_export("heavy_3"), "pool-serial");
+        assert_eq!(resolver.for_export("orders"), "pool");
+        assert_eq!(
+            resolver.for_export("an-export-no-window-covered"),
+            "pool",
+            "an export the map never saw falls back to the RUN label — the same \
+             fail-safe direction the wave twin uses"
+        );
+
+        // The tail's WIRING, since its values are live-only: `run_pool` must
+        // hand the self-check the measured per-export map, not a uniform label.
+        let whole = include_str!("run.rs");
+        let code: String = whole[..whole.find("\n#[cfg(test)]").expect("test modules")]
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let pool_body = &code[code
+            .find("\npub(crate) fn run_pool(")
+            .expect("run_pool's signature moved — update the anchor")..];
+        assert!(
+            pool_body.contains("pool_export_modes(&pool_windows)")
+                && pool_body.contains("RunModes::per_export("),
+            "the pool tail must attribute per export from the windows it \
+             measured; `RunModes::uniform` here is the defect"
+        );
+    }
+
+    /// `apply --parallel` that serialises the whole run must SAY so, at a level
+    /// the operator sees.
+    ///
+    /// `parallel_safe` is unset in any hand-written config, so `is_parallel_safe`
+    /// reads false for every export, the cost gate emits one single-child batch
+    /// each, and the wave loop runs them strictly one after another. The only
+    /// thing rivet said about it was an `info` line — and `main.rs` builds its
+    /// logger with `default_filter_or("warn")`, so it reached nobody. Meanwhile
+    /// the sibling `--pool` path `println!`s its schedule: two runners, one
+    /// fact, opposite visibility.
+    ///
+    /// Staged from the REAL producer: the widths come from `cost_gate_batches`
+    /// over exports built through the config deserializer, not from a hand-typed
+    /// batch shape.
+    ///
+    /// RED against returning `None` unconditionally (the shipped silence) and
+    /// against firing when the gate DID batch something (the noise failure — a
+    /// warning on every healthy wave is how a real one gets ignored).
+    #[test]
+    fn a_degenerate_parallel_apply_warns_instead_of_serialising_in_silence() {
+        use super::{cost_gate_batches, degenerate_parallel_warning};
+        use crate::config::{ExportConfig, sample_export};
+        let widths = |exports: &[ExportConfig]| -> Vec<usize> {
+            let refs: Vec<&ExportConfig> = exports.iter().collect();
+            cost_gate_batches(&refs).iter().map(Vec::len).collect()
+        };
+        let safe = |n: &str| {
+            let mut e = sample_export(n);
+            e.parallel_safe = Some(true);
+            e
+        };
+
+        // The hand-written config: ≥2 exports, none annotated → all lone.
+        let hand_written = [
+            sample_export("orders"),
+            sample_export("events"),
+            sample_export("users"),
+        ];
+        let w = widths(&hand_written);
+        assert_eq!(w, vec![1, 1, 1], "the cost gate serialised the whole wave");
+        let line = degenerate_parallel_warning("1", &w)
+            .expect("a `--parallel` run with no concurrency must say so");
+        assert!(
+            line.contains("no concurrency") && line.contains("3 export(s)"),
+            "the warning must name the symptom: {line}"
+        );
+        assert!(
+            line.contains("parallel_safe: true") && line.contains("rivet plan"),
+            "…and the lever, or it is a complaint rather than a diagnostic: {line}"
+        );
+
+        // A wave the gate really did batch: no warning (this is the ordinary
+        // case, and it keeps its `info` line).
+        let mixed = [sample_export("orders"), safe("dim_a"), safe("dim_b")];
+        assert_eq!(widths(&mixed), vec![1, 2]);
+        assert_eq!(degenerate_parallel_warning("1", &widths(&mixed)), None);
+        // One export cannot overlap anything — not a config problem.
+        assert_eq!(
+            degenerate_parallel_warning("1", &widths(&[safe("only")])),
+            None
+        );
+        assert_eq!(degenerate_parallel_warning("1", &[]), None);
+
+        // The EMISSION, since `run_waves` needs a live source: at WARN (an
+        // `info` here is functionally silent), and BEFORE the batches execute.
+        let whole = include_str!("run.rs");
+        let code: String = whole[..whole.find("\n#[cfg(test)]").expect("test modules")]
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Inside `run_waves`, not at the definition (which is a later `fn`).
+        let waves = &code[code
+            .find("\npub(crate) fn run_waves(")
+            .expect("run_waves' signature moved — update the anchor")..];
+        let at = waves
+            .find("degenerate_parallel_warning(")
+            .expect("run_waves must call the diagnostic");
+        let statement = &waves[at.saturating_sub(200)..waves.len().min(at + 400)];
+        assert!(
+            statement.contains("log::warn!"),
+            "the diagnostic must be emitted at WARN — the default log filter is \
+             `warn`, so an `info` line about a run being slow reaches nobody:\n\
+             {statement}"
+        );
+        let run_batches = waves
+            .find("for batch in &batches {")
+            .expect("run_waves runs its batches in a loop");
+        assert!(
+            at < run_batches,
+            "the warning must print BEFORE the wave's batches execute — a \
+             diagnostic that lands after the slow run has already happened is a \
+             post-mortem, not a lever"
+        );
+    }
+
     /// The peak a pool can reach is capped by BOTH the slots and the shape of
     /// the queue: [`next_eligible`] never co-runs two heavies, so heavies
     /// contribute at most one to the overlap.
@@ -2782,6 +3169,35 @@ mod run_tail_tests {
         });
     }
 
+    /// The aggregate a run of `n` exports leaves its tail, built by the REAL
+    /// producer (`aggregate::build`) over the per-export entries — so the gate
+    /// below is graded against the object the product passes it, not against a
+    /// number a test invented.
+    fn aggregate_of(n: usize) -> crate::state::RunAggregate {
+        let entries: Vec<crate::state::RunAggregateEntry> = (0..n)
+            .map(|i| crate::state::RunAggregateEntry {
+                export_name: format!("export_{i}"),
+                status: "success".to_string(),
+                run_id: "this-run".to_string(),
+                rows: 10,
+                files: 1,
+                bytes: 0,
+                bytes_read: 0,
+                duration_ms: 5,
+                mode: "full".to_string(),
+                error_message: None,
+            })
+            .collect();
+        let now = chrono::Utc::now();
+        super::aggregate::build(
+            entries,
+            now,
+            now,
+            Some("cfg.yaml"),
+            super::run_mode_label(n, false),
+        )
+    }
+
     fn captured_warnings_mentioning(needle: &str) -> Vec<String> {
         WARN_LINES
             .lock()
@@ -2811,27 +3227,27 @@ mod run_tail_tests {
     fn tail_plan_emits_a_machine_document_for_a_zero_export_run() {
         // Zero exports (partition_by over an empty table) — the regression.
         assert!(
-            tail_plan(0, true).machine_output,
+            tail_plan(&aggregate_of(0), true).machine_output,
             "a zero-export run must still write --summary-output / print --json"
         );
         assert!(
-            !tail_plan(0, true).aggregate,
+            !tail_plan(&aggregate_of(0), true).aggregate,
             "no card, no run_aggregate row"
         );
         // One export: unchanged — machine output from the tail, no card.
-        assert!(tail_plan(1, true).machine_output);
-        assert!(!tail_plan(1, true).aggregate);
+        assert!(tail_plan(&aggregate_of(1), true).machine_output);
+        assert!(!tail_plan(&aggregate_of(1), true).aggregate);
         // Two or more: the aggregate path owns both the card and the file
         // (through `persist`), so the tail must NOT write it a second time.
-        assert!(tail_plan(2, true).aggregate);
+        assert!(tail_plan(&aggregate_of(2), true).aggregate);
         assert!(
-            !tail_plan(2, true).machine_output,
+            !tail_plan(&aggregate_of(2), true).machine_output,
             "the aggregate path writes --summary-output via persist; a second \
              write here would race it"
         );
         // Nobody asked for machine output → none, at every count.
-        assert!(!tail_plan(0, false).machine_output);
-        assert!(!tail_plan(1, false).machine_output);
+        assert!(!tail_plan(&aggregate_of(0), false).machine_output);
+        assert!(!tail_plan(&aggregate_of(1), false).machine_output);
     }
 
     /// Exactly once per export per run — the half that is easy to get backwards.
@@ -2858,6 +3274,65 @@ mod run_tail_tests {
             owns_throughput_self_check(false),
             "a top-level run owns its own self-check — deferring it to a parent \
              that does not exist is how the check goes silent everywhere"
+        );
+    }
+
+    /// …and the MARKER the deferral keys on must be one only a real parent can
+    /// set — `RIVET_IPC_EVENTS` alone must never silence the check.
+    ///
+    /// That variable is documented to users (`docs/reference/cli.md`) as the way
+    /// to get the NDJSON progress stream, and it is a PRESENCE flag (`=0` is
+    /// still on — pinned by `ipc_events_are_off_unless_the_variable_is_set_and_
+    /// non_empty`). So an operator who exports it in an Airflow/K8s pod spec, or
+    /// a wrapper that consumes child events, turned every plain `rivet run` into
+    /// a process deferring its self-check to a parent that does not exist: the
+    /// check ran NOWHERE, environment-dependent and silent (round-7 bughunt).
+    ///
+    /// The second marker (`ENV_PARENT_SELF_CHECK`) is internal and set only at
+    /// the one `current_exe` spawn site — asserted here on the SPAWN SITE's own
+    /// source, since a unit test cannot fork the binary and read the child's env.
+    ///
+    /// RED against `is_reexecd_child` reading either marker alone (`||`, or
+    /// ignoring the parent flag): the first assertion fails.
+    #[test]
+    fn the_documented_ipc_variable_alone_does_not_silence_the_self_check() {
+        use super::is_reexecd_child;
+        assert!(
+            !is_reexecd_child(true, false),
+            "`RIVET_IPC_EVENTS` is a documented user-facing switch — a process \
+             that merely emits NDJSON progress has no parent to defer to, and \
+             deferring there is how the check goes silent everywhere"
+        );
+        assert!(
+            !is_reexecd_child(false, true),
+            "the internal marker without the IPC stream is not a child either"
+        );
+        assert!(
+            is_reexecd_child(true, true),
+            "a real re-exec'd child carries BOTH markers and must defer"
+        );
+        assert!(
+            !is_reexecd_child(false, false),
+            "a plain run owns its check"
+        );
+        // …and only a real parent sets the internal one: the single
+        // `current_exe` spawn site sets it on the same command as the IPC flag.
+        let spawner = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src/pipeline/parallel_children.rs"),
+        )
+        .expect("read the spawn site");
+        let code = pipeline_product_code(&spawner);
+        assert_eq!(
+            code.matches(".env(ENV_IPC_EVENTS").count(),
+            code.matches("ENV_PARENT_SELF_CHECK").count(),
+            "every child that gets the IPC flag must also get the parent's \
+             self-check claim, or the child reports a regression into a captured \
+             stderr file while the parent reports it too"
+        );
+        assert!(
+            code.contains("ENV_PARENT_SELF_CHECK"),
+            "the spawn site must claim the child's self-check"
         );
     }
 
@@ -2938,10 +3413,15 @@ mod run_tail_tests {
         // …and the WRAPPER every orchestrator tail actually calls must delegate
         // to it. A stubbed seam is the 2026-08-14 bug itself (the check nowhere
         // at all) and every other assertion in this module survives it.
-        // `RIVET_IPC_EVENTS` is process-global, so this READS the ambient answer
-        // instead of setting one — under a re-exec'd child's env there is
-        // nothing to assert here (the role is the case proven above).
-        if !super::ipc::ipc_events_enabled() {
+        // The markers are process-global, so this READS the ambient env rather
+        // than setting one. The condition is the REQUIREMENT, not the product's
+        // predicate restated: with no parent claiming this process
+        // (`ENV_PARENT_SELF_CHECK` unset) the seam MUST report, whatever
+        // `RIVET_IPC_EVENTS` says — asking `is_reexecd_child` here instead would
+        // let the mutant that ignores the parent marker silence BOTH the seam
+        // and the assertion, and the test would stay green under an operator's
+        // documented `RIVET_IPC_EVENTS=1` (self-oracle).
+        if std::env::var_os(super::ENV_PARENT_SELF_CHECK).is_none() {
             super::self_check_throughput(&state, &entries, &RunModes::uniform("sequential"));
             assert_eq!(
                 captured_warnings_mentioning(export).len(),
@@ -3035,6 +3515,98 @@ mod run_tail_tests {
         );
     }
 
+    /// The POOL's per-export label, at the EMISSION — the twin of the wave test
+    /// above, on the runner whose run-level label is TRUE and still wrong for
+    /// most of its exports.
+    ///
+    /// `--pool 5` over one `parallel_safe` export and seven heavies: the safe
+    /// one rides alongside the first heavy (so `pool_is_concurrent` is true and
+    /// the run records `pool`), and the six heavies after it each run strictly
+    /// alone. The shipped `RunModes::uniform` told all seven "exports share the
+    /// source and per-export rows/s falls BY DESIGN — compare the run's
+    /// makespan", excusing six real regressions.
+    ///
+    /// Staged from the real producer: the modes come back from
+    /// `pool_export_modes` over the windows `run_pool`'s workers stamp, and the
+    /// baseline from `StateStore::get_last_success_metric_excluding` over a row
+    /// this test recorded with the store's own recorder.
+    ///
+    /// RED against `RunModes::uniform(pool_mode_label(true))` (the shipped tail):
+    /// the solo export's line carries "BY DESIGN" and the assertion fails.
+    #[test]
+    fn a_lone_pool_export_keeps_the_actionable_attribution_in_a_concurrent_run() {
+        install_warn_capture();
+        let solo = "run_tail_pool_solo_probe_export";
+        let overlapped = "run_tail_pool_overlapped_probe_export";
+        let state = crate::state::StateStore::open_in_memory().expect("in-memory state");
+        let mut entries = Vec::new();
+        for name in [solo, overlapped] {
+            // 20 000 rows in 5 s = 4 000 rows/s, the previous SUCCESS.
+            state
+                .record_metric_full(&crate::state::MetricRow {
+                    export_name: name.to_string(),
+                    run_id: "baseline-run".to_string(),
+                    duration_ms: 5_000,
+                    total_rows: 20_000,
+                    status: "success".to_string(),
+                    mode: Some("full".to_string()),
+                    ..Default::default()
+                })
+                .expect("record the baseline success");
+            // This run: the same rows in 20 s = 4× slower, past the ratio.
+            entries.push(crate::state::RunAggregateEntry {
+                export_name: name.to_string(),
+                status: "success".to_string(),
+                run_id: "this-run".to_string(),
+                rows: 20_000,
+                files: 1,
+                bytes: 0,
+                bytes_read: 0,
+                duration_ms: 20_000,
+                mode: "full".to_string(),
+                error_message: None,
+            });
+        }
+        // The measured windows: a `parallel_safe` export overlapping the first
+        // heavy (not asserted on here — it is what makes the RUN concurrent),
+        // then the two exports under test, one solo and one overlapped.
+        let windows = vec![
+            ("a_parallel_safe_export".to_string(), 0, 5_000),
+            (overlapped.to_string(), 0, 20_000),
+            (solo.to_string(), 20_000, 40_000),
+        ];
+        let modes: std::collections::HashMap<String, &'static str> =
+            super::pool_export_modes(&windows).into_iter().collect();
+        self_check_throughput_as(
+            &state,
+            &entries,
+            // The RUN label is the concurrent one — the shape that hid the bug.
+            &RunModes::per_export(super::pool_mode_label(true), modes),
+            false,
+        );
+
+        let solo_lines = captured_warnings_mentioning(solo);
+        assert_eq!(solo_lines.len(), 1, "one line per export: {solo_lines:?}");
+        assert!(
+            solo_lines[0].contains("check governor sheds"),
+            "a pool export whose window overlapped nothing must keep the \
+             actionable pointer: {}",
+            solo_lines[0]
+        );
+        let overlapped_lines = captured_warnings_mentioning(overlapped);
+        assert_eq!(
+            overlapped_lines.len(),
+            1,
+            "one line per export: {overlapped_lines:?}"
+        );
+        assert!(
+            overlapped_lines[0].contains("share the source")
+                && overlapped_lines[0].contains("pool"),
+            "an export that really did share its window names its mode: {}",
+            overlapped_lines[0]
+        );
+    }
+
     /// `apply --pool --split`'s notice promises the run's own predicted makespan
     /// "prints with the pool schedule"; the all-units-complete `--resume` path
     /// returns ABOVE that block, so the promise cannot be kept there. The early
@@ -3090,21 +3662,114 @@ mod run_tail_tests {
     #[test]
     fn only_a_multi_export_run_reports_an_aggregate() {
         assert!(
-            !reports_run_aggregate(0),
+            !reports_run_aggregate(&aggregate_of(0)),
             "a zero-export run has nothing to aggregate"
         );
         assert!(
-            !reports_run_aggregate(1),
+            !reports_run_aggregate(&aggregate_of(1)),
             "one export: the per-export card already said it"
         );
         assert!(
-            reports_run_aggregate(2),
+            reports_run_aggregate(&aggregate_of(2)),
             "two exports: the aggregate reports"
         );
-        assert!(reports_run_aggregate(9));
+        assert!(reports_run_aggregate(&aggregate_of(9)));
         // The three tails ask the same question of the same rule.
-        assert_eq!(tail_plan(1, false).aggregate, reports_run_aggregate(1));
-        assert_eq!(tail_plan(2, false).aggregate, reports_run_aggregate(2));
+        assert_eq!(
+            tail_plan(&aggregate_of(1), false).aggregate,
+            reports_run_aggregate(&aggregate_of(1))
+        );
+        assert_eq!(
+            tail_plan(&aggregate_of(2), false).aggregate,
+            reports_run_aggregate(&aggregate_of(2))
+        );
+    }
+
+    /// The gate's SUBJECT, not just its predicate: the exports the run actually
+    /// RAN — which is exactly what lands in the aggregate.
+    ///
+    /// Round 6 unified the rule and left the three tails disagreeing about what
+    /// they asked it ABOUT: `run` passed the post-expansion export count,
+    /// `run_pool` the post-skip pending count — both equal to the aggregate's own
+    /// — while `run_waves` passed `config.exports.len()`, read BEFORE the
+    /// per-wave `--resume` `_SUCCESS` skip. So a five-export config whose
+    /// destinations were all already complete printed "Run summary (0 exports) …
+    /// rows: 0" and PERSISTED a `run_aggregate` row for a run that did no work,
+    /// while the same config under `--pool --resume` returned early and wrote
+    /// nothing: one shared rule, opposite behaviour, and a history table an
+    /// operator queries polluted with empty runs (round-7 bughunt).
+    ///
+    /// Half one is the value: the fully-skipped resume run's aggregate is the
+    /// zero-entry one `aggregate::build` really produces there. Half two is the
+    /// CALL SITE, derived — every call in the product half must pass the
+    /// aggregate the tail just built, never a count it re-derived. The type now
+    /// enforces that (a `usize` no longer compiles), and this keeps it true if
+    /// someone reaches for `RunAggregate { total_exports: total, .. }`.
+    ///
+    /// RED against `run_waves`' pre-skip subject (restore `total`: the source
+    /// half reads `reports_run_aggregate(total)`) and against `>= 1`.
+    #[test]
+    fn the_aggregate_gate_reads_the_exports_the_run_actually_ran() {
+        // A `--resume` run of a five-export config with every destination
+        // already `_SUCCESS`: every wave `continue`s, no summary is collected,
+        // and the tail builds an aggregate over ZERO entries.
+        let fully_skipped = aggregate_of(0);
+        assert_eq!(fully_skipped.total_exports, 0);
+        assert!(
+            !reports_run_aggregate(&fully_skipped),
+            "a run that ran nothing must print no card and write no \
+             `run_aggregate` row — the pre-skip config count (5) is what said \
+             otherwise"
+        );
+        // …and the same config when it really ran all five.
+        assert!(reports_run_aggregate(&aggregate_of(5)));
+
+        // The call sites, derived: no tail may re-derive the count.
+        let whole = include_str!("run.rs");
+        let code: String = whole[..whole.find("\n#[cfg(test)]").expect("test modules")]
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut sites = 0;
+        for (at, _) in code.match_indices(concat!("reports_run", "_aggregate(")) {
+            if code[..at].trim_end().ends_with("fn") {
+                continue; // the definition, not a call
+            }
+            let arg = code[at..]
+                .split_once('(')
+                .and_then(|(_, rest)| rest.split_once(')'))
+                .map(|(a, _)| a.trim().to_string())
+                .expect("a call has arguments");
+            assert!(
+                arg == "&agg" || arg == "agg",
+                "the aggregate gate must be asked about the aggregate the tail \
+                 built, not about a count re-derived at the call site (that is \
+                 how `run_waves` came to ask about exports it had already \
+                 skipped) — got `{arg}`"
+            );
+            sites += 1;
+        }
+        assert!(
+            sites >= 5,
+            "expected the gate at both of `run_waves`' sites, both of \
+             `run_pool`'s and inside `tail_plan` — found {sites}"
+        );
+        // …and no tail may OVERWRITE the subject on its way to the gate, which
+        // is the one way back to a re-derived count that still type-checks
+        // (`agg.total_exports = total;` before the call). Reading it is the
+        // gate's own job and happens in the two pure functions above; every
+        // other mention in the product half is a write.
+        for (at, _) in code.match_indices("total_exports") {
+            let after = code[at + "total_exports".len()..].trim_start();
+            assert!(
+                !after.starts_with('=') || after.starts_with("=="),
+                "run.rs ASSIGNS `total_exports` — a tail that overwrites the \
+                 aggregate's own count re-derives the subject the type signature \
+                 exists to fix, and it still type-checks: {}",
+                code[at..].lines().next().unwrap_or("").trim()
+            );
+        }
     }
 
     /// The pool's `(safe, heavy)` census, which every concurrency claim is
@@ -3210,85 +3875,283 @@ mod run_tail_tests {
         );
     }
 
-    /// The self-check reaches every orchestrator through ONE seam.
+    /// The product half of one `src/pipeline` source file: every top-level
+    /// `#[cfg(test)]` block REMOVED, `//` comments dropped OUTSIDE string
+    /// literals (a naive `split("//")` eats the rest of any line holding a
+    /// `://` URL, which is how a scanner silently loses a call it was written to
+    /// find).
+    ///
+    /// Blocks are removed rather than the file truncated at the first one:
+    /// `run.rs`, `cdc_job.rs`, `chunked/mod.rs` and three more all define
+    /// product functions BELOW a test module (24 of them), so truncating hides
+    /// real code from the scan — the blind spot that lets the next tail land
+    /// unseen. A top-level block runs from a column-0 `#[cfg(test)]` to the next
+    /// column-0 `}`, which rustfmt guarantees is its own close.
+    fn pipeline_product_code(text: &str) -> String {
+        let mut product = String::with_capacity(text.len());
+        let mut skipping = false;
+        for line in text.lines() {
+            if !skipping && line.starts_with("#[cfg(test)]") {
+                skipping = true;
+                continue;
+            }
+            if skipping {
+                if line == "}" {
+                    skipping = false;
+                }
+                continue;
+            }
+            product.push_str(line);
+            product.push('\n');
+        }
+        product
+            .lines()
+            .map(|line| {
+                let bytes = line.as_bytes();
+                let (mut in_str, mut escaped, mut cut, mut i) = (false, false, line.len(), 0);
+                while i < bytes.len() {
+                    match bytes[i] {
+                        _ if escaped => escaped = false,
+                        b'\\' if in_str => escaped = true,
+                        b'"' => in_str = !in_str,
+                        b'/' if !in_str && bytes.get(i + 1) == Some(&b'/') => {
+                            cut = i;
+                            break;
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                &line[..cut]
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Every top-level `fn` in `code`, as `(name, body)`.
+    ///
+    /// Top-level only — a `fn` inside an `impl`, a closure or a test module is
+    /// indented, and rustfmt keeps it so; the body therefore ends at the first
+    /// `\n}`, which is that function's own close. The body starts AFTER the
+    /// signature's `{`, or every function whose name contains a needle would
+    /// match itself.
+    fn top_level_fns(code: &str) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        for (at, line) in std::iter::once((0usize, code.lines().next().unwrap_or(""))).chain(
+            code.match_indices('\n')
+                .map(|(i, _)| (i + 1, code[i + 1..].lines().next().unwrap_or(""))),
+        ) {
+            let decl = line
+                .strip_prefix("pub ")
+                .or_else(|| {
+                    line.starts_with("pub(")
+                        .then(|| line.split_once(") ").map(|(_, r)| r))
+                        .flatten()
+                })
+                .unwrap_or(line);
+            let decl = decl.strip_prefix("async ").unwrap_or(decl);
+            if !decl.starts_with("fn ") {
+                continue;
+            }
+            let name = decl["fn ".len()..]
+                .split(['(', '<'])
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            let body_start = at
+                + code[at..]
+                    .find('{')
+                    .unwrap_or_else(|| panic!("no body found for `{name}`"));
+            let end = code[body_start..]
+                .find("\n}")
+                .map(|i| body_start + i)
+                .unwrap_or_else(|| panic!("no top-level close found for `{name}`"));
+            out.push((name, code[body_start..end].to_string()));
+        }
+        out
+    }
+
+    /// The self-check reaches every orchestrator through ONE seam — and the set
+    /// of orchestrators is DERIVED, not typed.
     ///
     /// The shipped bug was a runner bypass: the check was wired into `run()`'s
     /// tail only, so `apply` (`run_waves`) and `apply --pool` (`run_pool`) fell
     /// through their `total > 1` / `pending.len() > 1` gates and said nothing —
     /// and `apply` has no `--export` flag, so a one-export config IS the whole
-    /// invocation. This makes the next bypass a diff-time failure: the aggregate
-    /// helper has exactly one caller, and every orchestrator calls it.
+    /// invocation.
     ///
-    /// HONESTY: this pins the WIRING, not the emission — the warning needs two
-    /// state-DB rows for one export across two runs, which no unit test in this
-    /// module can stage. What it goes RED on is a tail losing the call, or
-    /// growing a second path around the seam (verified by deleting `run_pool`'s
-    /// call, and by pointing one tail straight at `aggregate::`).
+    /// The guard written for THAT fix then repeated the defect one level up: it
+    /// read `include_str!("run.rs")` and a hand-typed list of three anchors, so
+    /// the FIFTH tail — `apply_cmd::run_apply_command`'s plan-artifact replay,
+    /// which opens its own state store, runs an export and writes its metrics
+    /// row in another file — was invisible to it. A coverage ledger that names
+    /// its own dimension grades only what its author already knew (round-7
+    /// bughunt). So the dimension is now read off the tree:
+    ///
+    /// - SCOPE: every `.rs` file under `src/pipeline/**`, product half only.
+    /// - CANDIDATE (a run tail): a top-level `fn` that drives an export to
+    ///   completion — it calls a per-export job entry point (`run_export_job` /
+    ///   `run_export_job_with_chunk_source`, the two functions that write an
+    ///   `export_metrics` row) or builds a run aggregate (`aggregate::build`).
+    /// - RULE: it must call the seam at least once per aggregate it builds
+    ///   (`run` has TWO tails — the process-parallel parent returns early, the
+    ///   in-process one falls through — and one call would leave one silent).
+    /// - EXEMPTION: a candidate that legitimately must NOT self-check is listed
+    ///   below WITH its reason, and the list is checked for staleness rather
+    ///   than trusted.
+    ///
+    /// LIMITS, stated because a source lint cannot be sound: it sees
+    /// `src/pipeline/**` only; it recognises a tail by those three call
+    /// signatures, so an orchestrator that inlines the job logic or reaches the
+    /// state store some other way (`cdc_job`'s streaming tail, whose rows/s is
+    /// not comparable run-over-run anyway) is out of scope; and it grades the
+    /// PRESENCE of a call, not its reachability — a seam call behind a `false`
+    /// branch would satisfy it. The emission itself needs two state-DB rows for
+    /// one export across two runs, which the sibling tests in this module stage
+    /// through `self_check_throughput_as`.
+    ///
+    /// RED-proven by deleting `run_pool`'s call, by deleting
+    /// `run_apply_command`'s (the defect itself), by pointing a tail straight at
+    /// `aggregate::warn_throughput_regressions`, and by removing an exemption's
+    /// reason.
     #[test]
     fn every_orchestrator_tail_routes_the_self_check_through_one_seam() {
-        let whole = include_str!("run.rs");
-        // Product half only — the test modules below would otherwise answer for
-        // the code they are supposed to grade.
-        let src = &whole[..whole
-            .find("\n#[cfg(test)]")
-            .expect("run.rs has test modules")];
-        // CODE occurrences only: a doc comment naming the function is not a call.
-        let code: String = src
-            .lines()
-            .map(|l| l.split("//").next().unwrap_or(""))
-            .collect::<Vec<_>>()
-            .join("\n");
+        // (file, fn) -> why this candidate is not a run tail.
+        let exempt: &[(&str, &str, &str)] = &[(
+            "job.rs",
+            "run_export_job",
+            "a PER-EXPORT job, not a run tail: it calls itself only to dispatch a \
+             CDC initial-snapshot child. The orchestrator that drives it (run / \
+             run_waves / run_pool) owns the run's self-check, and emitting one \
+             here too would report every export twice.",
+        )];
 
-        // Spelled in pieces so this test's own text cannot satisfy the count if
-        // the module boundary ever moves.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/pipeline");
+        let mut files: Vec<(String, String)> = Vec::new();
+        let mut stack = vec![root.clone()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("read src/pipeline") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                let rel = path
+                    .strip_prefix(&root)
+                    .expect("under pipeline")
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let text = std::fs::read_to_string(&path).expect("read source");
+                files.push((rel, pipeline_product_code(&text)));
+            }
+        }
+        assert!(
+            files.len() > 10,
+            "the pipeline walk found only {} files — the scanner is blind",
+            files.len()
+        );
+
+        // Spelled in pieces so this test's own text cannot answer for the code
+        // it grades, whatever the module boundary does.
         let helper = concat!("aggregate::warn_throughput", "_regressions(");
+        let seam = concat!("self_check", "_throughput(");
+        let helper_callers: Vec<String> = files
+            .iter()
+            .flat_map(|(rel, code)| {
+                code.match_indices(helper)
+                    .map(move |(i, _)| format!("{rel}:{}", code[..i].lines().count() + 1))
+            })
+            .collect();
         assert_eq!(
-            code.matches(helper).count(),
+            helper_callers.len(),
             1,
             "the aggregate helper must have exactly ONE caller — the \
              `self_check_throughput` seam. A tail calling it directly skips the \
-             re-exec'd-child deferral and reports the same export twice."
+             re-exec'd-child deferral and reports the same export twice. Callers: \
+             {helper_callers:?}"
         );
 
-        let seam = concat!("self_check", "_throughput(");
-        let anchors = [
-            ("run", "\npub fn run("),
-            ("run_waves", "\npub(crate) fn run_waves("),
-            ("run_pool", "\npub(crate) fn run_pool("),
-        ];
-        let mut starts: Vec<(&str, usize)> = anchors
-            .iter()
-            .map(|(name, sig)| {
-                (
-                    *name,
-                    code.find(sig)
-                        .unwrap_or_else(|| panic!("{name}'s signature moved — update the anchor")),
-                )
-            })
-            .collect();
-        starts.sort_by_key(|(_, at)| *at);
-        for (i, (name, at)) in starts.iter().enumerate() {
-            let end = starts.get(i + 1).map(|(_, n)| *n).unwrap_or(code.len());
+        let job_entry = concat!("run_export", "_job(");
+        let apply_entry = concat!("run_export_job", "_with_chunk_source(");
+        let aggregate_build = concat!("aggregate::", "build(");
+        let mut candidates: Vec<String> = Vec::new();
+        for (rel, code) in &files {
+            for (name, body) in top_level_fns(code) {
+                let builds = body.matches(aggregate_build).count();
+                let drives_an_export =
+                    body.contains(job_entry) || body.contains(apply_entry) || builds > 0;
+                if !drives_an_export {
+                    continue;
+                }
+                candidates.push(format!("{rel}::{name}"));
+                if let Some((_, _, why)) = exempt
+                    .iter()
+                    .find(|(f, n, _)| *f == rel.as_str() && *n == name)
+                {
+                    assert!(
+                        why.len() > 40,
+                        "{rel}::{name} is exempt from the run-over-run self-check \
+                         with no real reason given"
+                    );
+                    continue;
+                }
+                // The seam's own definition is not a call.
+                let calls = body
+                    .match_indices(seam)
+                    .filter(|(i, _)| !body[..*i].ends_with("fn "))
+                    .count();
+                assert!(
+                    calls >= builds.max(1),
+                    "{rel}::{name} ends a run (it drives an export to completion \
+                     and/or builds {builds} run aggregate(s)) but calls the \
+                     throughput self-check {calls} time(s). 'EVERY run \
+                     self-reports degradation' is the contract, and it was false \
+                     on `apply`, on `apply --pool`, and then on `apply \
+                     <plan.json>` for a release each. Route the tail through \
+                     `self_check_throughput`, or add it to this test's exemption \
+                     list WITH the reason it must not."
+                );
+            }
+        }
+        // Anti-inertness floor, NOT the dimension: a parser that matched nothing
+        // would otherwise pass by grading an empty set. Today's candidates are
+        // `run`, `run_waves`, `run_pool`, `run_apply_command` and the exempt
+        // per-export job wrapper.
+        assert!(
+            candidates.len() >= 5,
+            "expected at least the four orchestrator tails plus the exempt \
+             per-export job; parsed {candidates:?}"
+        );
+        for (file, name, _) in exempt {
             assert!(
-                code[*at..end].contains(seam),
-                "{name} ends a run, so it must self-check its exports' throughput \
-                 — 'EVERY run self-reports degradation' is the contract, and it \
-                 was false on `apply` and `apply --pool` for a whole release"
+                candidates.contains(&format!("{file}::{name}")),
+                "the exemption for {file}::{name} is stale — nothing by that name \
+                 drives an export any more. Delete it rather than carrying a \
+                 reason for code that no longer exists."
             );
         }
-        // `run` has TWO tails (the process-parallel parent returns early, the
-        // in-process one falls through); a single call would leave one silent.
-        // Fold ≥2 by construction, so count the sites. The seam's own `fn` is a
-        // definition, not a call.
-        let calls = code
-            .match_indices(seam)
-            .filter(|(i, _)| !code[..*i].ends_with("fn "))
-            .count();
-        assert_eq!(
-            calls, 4,
-            "expected one self-check per tail: run/processes, run/in-process, \
-             run_waves, run_pool"
-        );
+
+        // …and a tail OUTSIDE run.rs may no more spell its concurrency claim
+        // than one inside it (`a_runner_never_spells_its_concurrency_claim_as_a_
+        // literal` grades run.rs). The label the self-check classifies must come
+        // from a `*_mode_label` decider, or a new tail can hand
+        // `mode_shares_the_source` "pool" for a run that overlapped nothing and
+        // delete the actionable pointer it exists to keep.
+        for (rel, code) in files.iter().filter(|(rel, _)| rel != "run.rs") {
+            for (at, _) in code.match_indices("RunModes::") {
+                let stmt = &code[at..code.len().min(at + 300)];
+                assert!(
+                    stmt.contains("_mode_label("),
+                    "{rel} builds a `RunModes` without asking a `*_mode_label` \
+                     decider for the label — the claim must be derived from what \
+                     the run did, never spelled at the call site:\n{}",
+                    stmt.lines().take(6).collect::<Vec<_>>().join("\n")
+                );
+            }
+        }
     }
 }
 

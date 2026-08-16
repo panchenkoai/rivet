@@ -67,6 +67,7 @@ mode a gate actually meets.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -92,6 +93,29 @@ ROOT = Path(os.environ.get("RIVET_AB_WORKDIR") or f"/tmp/rivet-ab-regression/{_T
 # enough that a hang ends the step instead of the CI job. A timeout surfaces as
 # returncode 124, i.e. as a DIFFERENCE, never as a quiet pass.
 CASE_TIMEOUT = float(os.environ.get("RIVET_AB_TIMEOUT") or 900)
+
+# How many rivet invocations one full comparison makes — DERIVED, because the
+# release-oracle wrapper sizes its whole-harness timeout as
+# `CASE_TIMEOUT * RIVET_RUNS_TOTAL + slack` and used to RE-TYPE the 20. Re-typed,
+# a 7th scenario silently pushes the child's worst case (22 × 900 = 19 800 s)
+# past the wrapper's budget (18 900 s) and the wrapper fires FIRST again — the
+# exact conflation the two-layer budget exists to prevent. The MySQL sibling
+# already imports `LEG_PLAN` / `LEG_TIMEOUT` for the same sum; this is the same
+# contract on the dimension that actually grows.
+#
+# `_self_test` COUNTS the invocations `compare()` makes and asserts this equals
+# them, so the derivation is graded rather than described.
+CRASH_RESUME_RUNS = 2   # the injected crash, then the resume
+SURFACE_RUNS = 2        # the deliberately-broken config, then `plan --format json`
+# RIVET_RUNS_PER_SIDE / RIVET_RUNS_TOTAL are defined just below SCENARIOS, which
+# they count.
+
+# How long the fixture teardown may take. The release-oracle wrapper's SIGINT
+# grace period is derived from it: SIGINT unwinds `main`'s `finally`, which runs
+# this DROP, and a SIGKILL before it lands leaves a 50 000-row `ab_src_<pid>`
+# table behind — the leak the SIGINT-first runner exists to prevent.
+TEARDOWN_TIMEOUT = 600.0
+TEARDOWN_WORST_CASE = TEARDOWN_TIMEOUT
 
 # Empty means "SQLite beside the config" — see the state-isolation note above.
 # `run()` merges over os.environ, so CLEARING an inherited value needs the empty
@@ -220,6 +244,11 @@ exports:
     destination: {{ type: local, path: {out} }}
 """, None),  # rows checked via file presence only
 }
+
+# One `run_case` per scenario, plus the crash/resume pair and the two surfaces —
+# per SIDE, and both binaries are run. See the note beside CRASH_RESUME_RUNS.
+RIVET_RUNS_PER_SIDE = len(SCENARIOS) + CRASH_RESUME_RUNS + SURFACE_RUNS
+RIVET_RUNS_TOTAL = 2 * RIVET_RUNS_PER_SIDE
 
 
 def _case_dir(name: str, side: str) -> Path:
@@ -488,10 +517,124 @@ def preflight(old_raw: str, new_raw: str) -> tuple[Path, Path]:
     return old, new
 
 
+@contextlib.contextmanager
+def fixture():
+    """Seed the fixture table and DROP it on every way out — including a Ctrl-C
+    that lands INSIDE `seed()`.
+
+    The seed used to sit one line ABOVE the `try:` whose `finally` dropped it, so
+    a SIGINT between the `CREATE TABLE` and that `try` left a 50 000-row
+    `ab_src_<pid>` behind. Narrow under the release-oracle wrapper (which sends
+    SIGINT deliberately, at a moment of its choosing), WIDE under a terminal
+    Ctrl-C: the child shares the process group, so the interrupt lands wherever
+    the harness happens to be — and the seed is minutes of the run, not an
+    instant. Inside the `try`, the window does not exist: `DROP TABLE IF EXISTS`
+    is safe against a table that was never created.
+    """
+    try:
+        seed()
+        yield
+    finally:
+        # A namespaced fixture MUST be cleaned up or the dev database collects one
+        # table per run forever. A teardown failure must not mask the verdict, so
+        # it is reported rather than raised.
+        drop = sh(["docker", "exec", "-i", PG_CONTAINER, "psql", "-U", "rivet", "-d", "rivet",
+                   "-tAc", f"DROP TABLE IF EXISTS {TABLE};"], timeout=TEARDOWN_TIMEOUT)
+        if not drop.ok:
+            print(f"   ! could not drop the fixture {TABLE}: "
+                  f"{(drop.stderr or drop.stdout).strip()[:160]} — drop it by hand")
+
+
 def _usage() -> str:
     return ("usage: python3 -m dev.pytools.ab_regression <old-binary> <new-binary>\n"
+            "         python3 -m dev.pytools.ab_regression --self-test\n"
             "  env: RIVET_AB_PG_URL / RIVET_AB_PG_CONTAINER / RIVET_AB_WORKDIR /\n"
             "       RIVET_AB_TAG (fixture namespace) / RIVET_AB_TIMEOUT")
+
+
+# ── self-test: the two facts a live run cannot check about itself ──────────────
+def _self_test() -> int:
+    """No docker, no Postgres, no binaries — the two things about this harness
+    that a GREEN live run is structurally unable to grade.
+
+    1. THE TEARDOWN SURVIVES AN INTERRUPT INSIDE THE SEED. A live run reaches
+       `compare()`, so it never exercises the window between the `CREATE TABLE`
+       and the `try` that dropped it; the leak only appears when someone hits
+       Ctrl-C during the seed, and then it appears as a stray table nobody
+       attributes to this harness.
+    2. THE DERIVED RUN COUNT IS THE REAL ONE. `RIVET_RUNS_TOTAL` sizes the
+       release-oracle's whole-harness timeout. Nothing about a passing run says
+       whether that number still matches how many times the binaries are
+       invoked — so it is COUNTED here, by running `compare()` with the process
+       runner stubbed out.
+
+    Its call site is `tests/offline/release_oracle_entrypoint_guard.rs`, so it
+    runs in the offline suite rather than waiting for someone to remember it.
+    """
+    import io
+    import tempfile
+
+    failures: list[str] = []
+
+    def want(name, cond, detail=""):
+        print(f"  [{'PASS' if cond else 'FAIL'}] {name}{('  ' + detail) if detail else ''}")
+        if not cond:
+            failures.append(name)
+
+    global sh, seed, duckdb_rows, ROOT
+    real_sh, real_seed, real_duckdb, real_root = sh, seed, duckdb_rows, ROOT
+
+    class _P:
+        returncode, stdout, stderr, ok = 0, "", "", True
+
+    try:
+        # ── 1. the fixture is dropped even when the SEED is interrupted ──
+        dropped: list[str] = []
+
+        def stub_sh(cmd, **kw):
+            if "DROP TABLE" in " ".join(str(c) for c in cmd):
+                dropped.append(" ".join(str(c) for c in cmd))
+            return _P()
+
+        def exploding_seed():
+            # …exactly where the real one is when a terminal Ctrl-C lands: the
+            # CREATE has run, the harness has not reached `compare` yet.
+            raise KeyboardInterrupt
+
+        sh, seed = stub_sh, exploding_seed
+        try:
+            with fixture():
+                want("unreachable: the interrupted seed must not yield", False)
+        except KeyboardInterrupt:
+            pass
+        want("a Ctrl-C inside seed() still DROPs the fixture table",
+             any(TABLE in d for d in dropped), f"drops seen: {len(dropped)}")
+
+        # ── 2. RIVET_RUNS_TOTAL is what `compare()` actually invokes ──
+        old, new = Path("/nonexistent/old-rivet"), Path("/nonexistent/new-rivet")
+        invocations: list[str] = []
+
+        def counting_sh(cmd, **kw):
+            argv = [str(c) for c in cmd]
+            if argv and argv[0] in (str(old), str(new)):
+                invocations.append(argv[0])
+            return _P()
+
+        with tempfile.TemporaryDirectory() as td:
+            sh, ROOT, duckdb_rows = counting_sh, Path(td), lambda d: 0
+            with contextlib.redirect_stdout(io.StringIO()):
+                compare(old, new)
+        want(f"RIVET_RUNS_TOTAL ({RIVET_RUNS_TOTAL}) is the number of rivet invocations "
+             "compare() makes",
+             len(invocations) == RIVET_RUNS_TOTAL, f"counted {len(invocations)}")
+        want("…and both binaries are run the same number of times",
+             invocations.count(str(old)) == invocations.count(str(new)) == RIVET_RUNS_PER_SIDE,
+             f"old={invocations.count(str(old))} new={invocations.count(str(new))}")
+    finally:
+        sh, seed, duckdb_rows, ROOT = real_sh, real_seed, real_duckdb, real_root
+
+    print(f"\nself-test: {len(failures)} failed" if failures else "\nself-test ok")
+    return 1 if failures else 0
 
 
 def main() -> int:
@@ -503,23 +646,15 @@ def main() -> int:
         print(__doc__)
         print(_usage())
         return 0
+    if argv == ["--self-test"]:
+        return _self_test()
     if len(argv) != 2:
         raise Fail("two binaries are required", hint=_usage())
     old, new = preflight(argv[0], argv[1])
 
     ROOT.mkdir(parents=True, exist_ok=True)
-    seed()
-    try:
+    with fixture():
         return compare(old, new)
-    finally:
-        # A namespaced fixture MUST be cleaned up or the dev database collects one
-        # table per run forever. A teardown failure must not mask the verdict, so
-        # it is reported rather than raised.
-        drop = sh(["docker", "exec", "-i", PG_CONTAINER, "psql", "-U", "rivet", "-d", "rivet",
-                   "-tAc", f"DROP TABLE IF EXISTS {TABLE};"], timeout=600)
-        if not drop.ok:
-            print(f"   ! could not drop the fixture {TABLE}: "
-                  f"{(drop.stderr or drop.stdout).strip()[:160]} — drop it by hand")
 
 
 def compare(old: Path, new: Path) -> int:

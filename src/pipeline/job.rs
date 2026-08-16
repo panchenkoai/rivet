@@ -1305,23 +1305,34 @@ use super::finalize::{
 /// the metric row this function writes. The pure DECISIONS it makes are
 /// extracted and unit-tested next door — [`pg_temp_bytes_delta`],
 /// [`pg_temp_bytes_warning`], `run_diagnosis`, `resolve_final_result`.
+///
+/// Returns the `RunSummary` alongside the result, exactly as [`run_export_job`]
+/// does, because the ORCHESTRATOR owns the run's tail: `run_apply_command` needs
+/// this run's rows/duration to route them through `run::self_check_throughput`.
+/// Discarding the summary here is what made the plan-artifact path the fifth
+/// orchestrator tail with no run-over-run self-check (round-7 bughunt).
 pub(crate) fn run_export_job_with_chunk_source(
     plan: &ResolvedRunPlan,
     state: &StateStore,
     chunk_source: chunked::ChunkSource,
     config_path: &str,
     apply_context: Option<crate::pipeline::summary::ApplyContext>,
-) -> Result<()> {
+) -> (Result<()>, RunSummary) {
     // Re-validate the plan from the artifact (fast, no DB queries).
     let diags = validate_plan(plan);
     for d in &diags {
         match d.level {
             DiagnosticLevel::Rejected => {
-                anyhow::bail!(
+                // A refusal BEFORE any work: the caller still gets a summary, so
+                // the run has one shape whatever it did (the same contract
+                // `run_export_job` keeps for its own early bails).
+                let err = anyhow::anyhow!(
                     "export '{}': plan validation rejected: {}",
                     plan.export_name,
                     d.message
                 );
+                let summary = synthetic_failed_summary(&plan.export_name, &err);
+                return (Err(err), summary);
             }
             DiagnosticLevel::Warning => {
                 log::warn!("[{}] plan validation warning: {}", d.rule, d.message);
@@ -1534,7 +1545,8 @@ pub(crate) fn run_export_job_with_chunk_source(
 
     // Same fold as the run path: an export failure wins, otherwise an unwritten
     // manifest fails the run. `apply` has no reconcile flag, so that leg is `Ok`.
-    resolve_final_result(failed, result, Ok(()), manifest_gap)
+    let final_result = resolve_final_result(failed, result, Ok(()), manifest_gap);
+    (final_result, summary)
 }
 
 #[cfg(test)]

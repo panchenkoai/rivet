@@ -172,7 +172,15 @@ pub(super) fn run_exports_as_child_processes(
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .env(ENV_IPC_EVENTS, "1");
+            .env(ENV_IPC_EVENTS, "1")
+            // …and the claim that goes with it: THIS parent will emit the
+            // run-over-run throughput self-check for the child's exports, so the
+            // child must not (its stderr is captured to a file nobody reads).
+            // A separate, internal variable because `RIVET_IPC_EVENTS` is a
+            // documented user-facing switch — keying the deferral on it alone
+            // silenced the check in any environment that set it (see
+            // `run::ENV_PARENT_SELF_CHECK`).
+            .env(super::run::ENV_PARENT_SELF_CHECK, "1");
         // Declare sibling concurrency to the child: it runs single-export in
         // its own process, so MULTI_EXPORT_CONCURRENT reads false there and
         // run_diagnosis would print the confident solo harm attribution while

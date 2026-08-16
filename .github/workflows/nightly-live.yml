@@ -292,7 +292,18 @@ jobs:
         env:
           CARGO_PROFILE_DEV_DEBUG: "0" # mutants never need debuginfo
         run: |
-          case $(( $(date +%j) % 5 )) in
+          # `10#` forces base 10. `date +%j` is ZERO-PADDED, and bash arithmetic
+          # reads a leading-zero literal as OCTAL: the unprefixed form died on
+          # every day whose padded number contains an 8 or a 9 — 008, 009, 018,
+          # 019, … 079 and all of 080-099, 36 nights a year — with
+          # `bash: 008: value too great for base (error token is "008")`. The
+          # default `run:` shell is `bash -e`, so the step aborted BEFORE $FILES
+          # was assigned and the nightly produced no mutation verdict at all;
+          # and on 010-077 it silently selected the octal reinterpretation
+          # (`$(( 010 % 5 ))` is 3, not 0), so the mapping was not `day % 5` for
+          # roughly a third of the year. `mutation_tiers.py check` (blocking, in
+          # ci.yml) now grades the base of this expression so it cannot come back.
+          case $(( 10#$(date +%j) % 5 )) in
             0)
               echo "group: ledger/pipeline (Tier 0)"
               FILES="-f src/pipeline/manifest_writer.rs -f src/pipeline/manifest_reconcile.rs \

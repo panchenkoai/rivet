@@ -205,28 +205,64 @@ records says the run *does not grade the release against the binary users are
 running*, the driver prints it beside the state backend at start-up, and it prints
 `NOT RELEASE-GRADED` after the final verdict — because `RELEASE-READY` is derived
 from the rows and is literally true ("every non-skipped cell is green"), which is
-exactly the sentence 0.24.4 shipped under. **A run carrying this flag cannot support
-a tag.** `make release-oracle-full` downloads the baseline for you and never needs it,
-and so does `make release-oracle-bless` (which depends on the download and now passes
-it through). `make release-oracle` — the BARE target, which by design carries only
-what is already in your shell — passes the flag for you: an entry point with no
-baseline must give the comparison up BY NAME rather than go red on three stages over
-an absence it was never going to carry.
+exactly the sentence 0.24.4 shipped under. **A run that grades nothing against the
+previous release cannot support a tag.** `make release-oracle-full` downloads the
+baseline for you and never needs it, and so does `make release-oracle-bless` (which
+depends on the download and now passes it through). `make release-oracle` — the BARE
+target, which by design carries only what is already in your shell — passes the flag
+for you: an entry point with no baseline must give the comparison up BY NAME rather
+than go red on three stages over an absence it was never going to carry.
+
+**The escape only excuses an ABSENT baseline, and the banner says which happened.**
+`_require_prev_binary` returns the baseline *before* it consults the flag, so a run
+that has one compares against it whatever the flag says — and `RIVET_PREV_RELEASE_BIN=…
+make release-oracle` is exactly that run, since the bare target passes the flag
+unconditionally. Both the start-up banner and the closing line are therefore keyed on
+the BASELINE, not on the flag: with one present they say the three stages *run and
+grade* (and note that the escape did not apply), and no `NOT RELEASE-GRADED` line is
+printed. Keyed on the flag alone, the gate announced a skip, ran all three stages for
+real, and then closed with "nothing above compared this binary to the release users
+are running" over a table full of genuine PASS/FAIL rows.
 
 Timeouts come in TWO layers, deliberately: the harness's own per-unit budget
 (`RIVET_AB_TIMEOUT`, default 900s per case-run; `RIVET_FIELD_TIMEOUT`, default 3600s
 per leg) and the *wrapper's* whole-harness budget (`RIVET_ORACLE_AB_TIMEOUT` /
 `RIVET_ORACLE_FIELD_TIMEOUT`, each defaulting to the harness's budget × its unit
-count + slack). They must not be one knob: reading the same variable for both made
-the wrapper's budget the smaller number, so it always fired first and the harness's
-own graceful timeout could never be reached. The wrapper's expiry sends **SIGINT**
-and waits `RIVET_ORACLE_CHILD_GRACE` (default 300s) before SIGKILL, because both
-harnesses clean up a SHARED stand on the way out (server-wide MySQL tmp-table
-globals; a seeded fixture table) and no SIGKILLed process runs its cleanup. After
-the replay returns — for any reason, including a kill — the wrapper reads
+count + slack, with BOTH numbers imported from the harness rather than re-typed).
+They must not be one knob: reading the same variable for both made the wrapper's
+budget the smaller number, so it always fired first and the harness's own graceful
+timeout could never be reached. The wrapper's expiry sends **SIGINT** and waits out a
+grace period before SIGKILL, because both harnesses clean up a SHARED stand on the
+way out (server-wide MySQL tmp-table globals; a seeded fixture table) and no SIGKILLed
+process runs its cleanup. That grace **defaults to the child's OWN cleanup worst
+case** — `field_replay.RESTORE_WORST_CASE` (3 retries × a `SET GLOBAL` + a read-back),
+`ab_regression.TEARDOWN_WORST_CASE` (the fixture `DROP`) — imported, not typed: a flat
+300s against a ~3600s restore meant a wedged container (precisely the condition that
+makes the wrapper fire AND the restore slow) was killed mid-restore under a transcript
+asserting the cleanup had not run. `RIVET_ORACLE_CHILD_GRACE` overrides it; `0` is
+honoured as zero and prints what it costs, and a malformed value warns and falls back
+instead of taking the gate down at import.
+
+After the replay returns — for any reason, including a kill — the wrapper reads
 `@@GLOBAL.{internal_tmp_mem_storage_engine,tmp_table_size,max_heap_table_size}` back
 off `rivet-mysql-1`, restores them to `DEFAULT` if the flip is still there, and
-records a FAIL row naming the poisoned stand. A harness that times out or dies
+records a FAIL row naming the poisoned stand. Two limits on that read, both of which
+now produce a row rather than silence:
+
+* **The container may not answer** — a wedged MySQL wedges the read-back too, which is
+  exactly the case a SIGKILLed harness leaves behind. The stand is then classified
+  from the harness's own transcript (`STAND_FLIPPED_MARKER` / `STAND_RESTORED_MARKER` /
+  `STAND_MUTATED_MARKER`): flipped-and-never-confirmed is a **FAIL** saying the state
+  is UNKNOWN and must be assumed mutated, with the SQL to check it by hand; a verified
+  restore, or a run that never reached the flip, is a **SKIP** saying so. Nothing is
+  ever silently treated as clean.
+* **Another run may own the stand** — the read *and* the repair take `field_replay`'s
+  own `StandLock` (`flock`, non-blocking). Unlocked, this read could see a concurrent
+  replay's legitimate in-flight flip, record a false "stand mutated" FAIL, and then
+  `SET GLOBAL … = DEFAULT` under a live harness, breaking ITS criterion 1 for a reason
+  unrelated to the binaries. A held lock records "stand busy — not checked".
+
+A harness that times out or dies
 without naming a scenario/criterion is a FAIL with its last output attached, never a
 quiet pass. The replay needs the **batch
 MySQL stand** (`rivet-mysql-1` at 127.0.0.1:3306) and the differential the **batch

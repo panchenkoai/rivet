@@ -35,7 +35,11 @@
 //!   not the bare name (`density_probe` is defined in both src/init/mysql.rs
 //!   and src/init/postgres.rs, so a name-keyed answer says "one function" for
 //!   an entry reaching two modules)? Entries that legitimately span files are
-//!   declared, with a reason, in that script's `MULTI_SITE_OK`.
+//!   declared in that script's `MULTI_SITE_OK`, which NAMES THE FILES the entry
+//!   may reach along with the reason one triage argument covers them: a bare
+//!   "this one may span sites" let a third engine's `density_probe` inherit an
+//!   argument written about two other modules, and the checker reported
+//!   `ok  4 mutant(s) … across 4 declared sites`.
 //!
 //! Both are checked by `.github/scripts/mutants_exclusions.py`, run in the
 //! BLOCKING `Mutants (gate sanity)` CI job against `cargo mutants --list

@@ -195,7 +195,14 @@ def _self_test() -> int:
 
     print(f"self-test ok: {len(_ENV_FLAG_TABLE)} spellings — argparse, env_flag and "
           "regression.without_prev_release_comparison() agree on every one")
-    return 0
+
+    # …and the regression module's own decisions about a child harness it cannot
+    # run here: the SIGINT-first timeout, the grace period's grammar and where
+    # its default comes from, the stand row when the container will not answer,
+    # and the banner/footer that describe whether anything was compared at all.
+    # One entry point, so CI and the offline suite get both halves.
+    print("\nregression stage (child harness, stand, banner):")
+    return regression._self_test()
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -678,14 +685,15 @@ def main(argv: list[str] | None = None) -> int:
         # loud — for the same reason the state backend is. The stages read this
         # from the environment (that is how every gate-wide knob reaches them and
         # how `run()` passes it to children), so argv and env are one switch.
+        #
+        # Both this banner and the closing line come from ONE pure function keyed
+        # on the BASELINE, never on the flag alone: the flag does not decide (see
+        # `regression.prev_release_banner`).
         regression.set_without_prev_release_comparison(ns.without_prev_release_comparison)
-        if ns.without_prev_release_comparison:
-            print("  previous-release comparison: GIVEN UP (--without-prev-release-comparison)")
-            print("    → the regression, differential and field-replay stages SKIP instead of "
-                  "FAIL; this run CANNOT support a tag")
-        else:
-            prev = os.environ.get("RIVET_PREV_RELEASE_BIN", "")
-            print(f"  previous-release baseline: {prev or '<ABSENT — the comparison stages will FAIL>'}")
+        banner, footer = regression.prev_release_banner(
+            regression.prev_binary(), ns.without_prev_release_comparison)
+        for line in banner:
+            print(line)
 
         if not ns.no_clean and not clean_tree_and_build(led, fast=ns.fast_clean):
             return 1
@@ -704,13 +712,14 @@ def main(argv: list[str] | None = None) -> int:
                                          keep=ns.keep, parallel=ns.engine_parallel,
                                          bring_up=bring_up, seed_engine=seed_engine)
         rc = led.report()
-        # The escape has to survive the final line. `RELEASE-READY` is derived
-        # from the rows and is literally true — "every non-skipped cell is
-        # green" — which is exactly the sentence 0.24.4 shipped under. Say what
-        # the run gave up, AFTER the verdict, where the reader's eye lands.
-        if ns.without_prev_release_comparison:
-            print("  NOT RELEASE-GRADED: --without-prev-release-comparison was set — nothing "
-                  "above compared this binary to the release users are running.")
+        # A run that graded nothing against the previous release has to say so
+        # AFTER the verdict, where the reader's eye lands: `RELEASE-READY` is
+        # derived from the rows and is literally true ("every non-skipped cell is
+        # green"), which is exactly the sentence 0.24.4 shipped under. The
+        # condition is the BASELINE, not the flag — a run that carried a baseline
+        # compared against it and must not be told it did not.
+        if footer:
+            print(footer)
         return rc
     finally:
         if not ns.keep:

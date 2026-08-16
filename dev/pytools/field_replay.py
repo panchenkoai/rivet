@@ -166,6 +166,13 @@ def sh(cmd, **kw):
     return run(cmd, **kw)
 
 
+# How long ONE `docker exec … mysql` round-trip may take. Named (not a literal
+# at the call site) because the restore's worst case is built from it, and the
+# release-oracle wrapper's SIGINT grace period is built from THAT — see
+# RESTORE_WORST_CASE below.
+MYSQL_ROOT_TIMEOUT = 600.0
+
+
 def mysql_root(sql: str, *, what: str = "mysql") -> str:
     """SQL as root inside the dev MySQL container.
 
@@ -174,7 +181,7 @@ def mysql_root(sql: str, *, what: str = "mysql") -> str:
     from success — and the restore is the one that leaves the stand poisoned.
     """
     p = run(["docker", "exec", "-i", MYSQL_CONTAINER, "mysql", "-uroot", "-privet",
-             "-N", "rivet"], stdin=sql, timeout=600)
+             "-N", "rivet"], stdin=sql, timeout=MYSQL_ROOT_TIMEOUT)
     if not p.ok:
         tail = [ln for ln in (p.stderr or "").splitlines() if "Using a password" not in ln]
         raise Fail(f"{what}: mysql root command failed on {MYSQL_CONTAINER}: "
@@ -236,6 +243,45 @@ RESTORE_FAILED: list[str] = []
 # fact was a poisoned shared MySQL server.
 STAND_MUTATED_MARKER = "!! STAND LEFT MUTATED:"
 
+# The other two machine-readable facts about the stand, printed by the flip and
+# by a VERIFIED restore. The release-oracle wrapper imports these NAMES (never a
+# re-typed copy) to tell three cases apart when it cannot read the container back
+# itself: the harness never reached the flip (the stand cannot be mutated), it
+# flipped and verified a restore (probably clean, unconfirmable), or it flipped
+# and neither restored nor said so — a SIGKILLed run, which is exactly the case
+# the wrapper used to report as nothing at all.
+STAND_FLIPPED_MARKER = "== flipping tmp-table globals"
+STAND_RESTORED_MARKER = "== tmp-table globals restored"
+
+# The restore's own worst case, in seconds, DERIVED from the numbers that produce
+# it: each attempt is a `SET GLOBAL` round-trip plus a read-back (two
+# `mysql_root` calls), followed by a backoff sleep.
+#
+# It exists because the release-oracle wrapper's SIGINT grace period must be at
+# least this long: the wrapper sends SIGINT, this class's handler runs `restore`,
+# and a SIGKILL before it finishes leaves the stand PARTIALLY restored while the
+# wrapper's transcript asserts "the child's cleanup did NOT run". A grace period
+# TYPED as a round number (it was 300 s, against a ~3600 s worst case) is a
+# guess about someone else's code; this is the number itself. The condition that
+# makes the restore slow — a wedged MySQL — is precisely the condition that makes
+# the wrapper's timeout fire, so the two meet in every real incident.
+RESTORE_ATTEMPTS = 3
+RESTORE_BACKOFF = 1.0
+RESTORE_WORST_CASE = RESTORE_ATTEMPTS * (2 * MYSQL_ROOT_TIMEOUT + RESTORE_BACKOFF)
+
+
+def stand_mutated_line(reason: str) -> str:
+    """The exact line `main` prints when the stand was left mutated.
+
+    A function rather than an inline f-string so the release-oracle's parser can
+    be graded against the RENDERED line — the thing it actually reads — instead
+    of against `STAND_MUTATED_MARKER`, the constant it already imports. (The old
+    self-test asserted the CONSTANT contains no `(`, while the line it stands for
+    contains two: it was grading a proxy, and the proxy passed.)
+    """
+    return (f"  {STAND_MUTATED_MARKER} {MYSQL_CONTAINER} still carries this run's tmp-table "
+            f"flip ({reason}) — see the restore banner above for the exact SQL")
+
 
 def read_globals() -> dict[str, str]:
     """The GLOBAL values — `@@GLOBAL.x`, never `@@x`.
@@ -295,8 +341,8 @@ class TmpTableGlobals:
             print(f"   ! {MYSQL_CONTAINER} was ALREADY flipped on {', '.join(leaked)} "
                   f"— a previous run did not restore. Those will be restored to DEFAULT, "
                   f"not to the leaked value.")
-        print(f"== flipping tmp-table globals (prior: "
-              + ", ".join(f"{k}={v}" for k, v in self.prior.items()) + ")")
+        print(f"{STAND_FLIPPED_MARKER} (prior: "
+              + ", ".join(f"{k}={v}" for k, v in self.prior.items()) + ")", flush=True)
 
         self._prior_handlers = {}
         for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
@@ -345,13 +391,13 @@ class TmpTableGlobals:
             return
         sql = "; ".join(f"SET GLOBAL {k} = {v}" for k, v in self.target.items()) + ";"
         last = ""
-        for attempt in (1, 2, 3):
+        for _attempt in range(RESTORE_ATTEMPTS):
             try:
                 mysql_root(sql, what="restore globals")
                 now = read_globals()
             except Exception as e:  # noqa: BLE001 — a restore retries on ANY failure
                 last = str(e)
-                time.sleep(1.0)
+                time.sleep(RESTORE_BACKOFF)
                 continue
             # For a DEFAULT target the value is whatever this server's default
             # is; all that can be asserted is that it is no longer OUR flip.
@@ -359,11 +405,11 @@ class TmpTableGlobals:
                    if (now[k] == FLIP[k] if want == "DEFAULT" else now[k] != want)}
             if not bad:
                 self.done = True
-                print(f"== tmp-table globals restored ({why}): "
+                print(f"{STAND_RESTORED_MARKER} ({why}): "
                       + ", ".join(f"{k}={v}" for k, v in now.items()), flush=True)
                 return
             last = f"still wrong after the SET: {bad}"
-            time.sleep(1.0)
+            time.sleep(RESTORE_BACKOFF)
         RESTORE_FAILED.append(last)
         print("\n" + "!" * 78, flush=True)
         print(f"  COULD NOT RESTORE {MYSQL_CONTAINER}'s tmp-table globals ({why}): {last}")
@@ -383,9 +429,15 @@ class StandLock:
     a freshness timer.
     """
 
-    def __init__(self, container: str) -> None:
+    def __init__(self, container: str, *, holder: str = "field_replay") -> None:
         self.path = Path(os.environ.get("RIVET_FIELD_LOCK")
                          or f"/tmp/rivet-stand-{container}.lock")
+        # Written into the lock file so a contender's error names WHO holds it.
+        # Parameterised because this harness is no longer the only taker: the
+        # release-oracle's stand read-back takes the same lock before it reads or
+        # repairs `@@GLOBAL.*` (it used to do both with no lock at all, and could
+        # therefore un-flip a CONCURRENT replay's fixture mid-run).
+        self.holder = holder
 
     def __enter__(self) -> "StandLock":
         self.fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o666)
@@ -406,7 +458,7 @@ class StandLock:
                      "CONTAINER/RIVET_FIELD_MYSQL_URL at a stand of your own",
             )
         os.ftruncate(self.fd, 0)
-        os.write(self.fd, f"pid {os.getpid()} field_replay\n".encode())
+        os.write(self.fd, f"pid {os.getpid()} {self.holder}\n".encode())
         return self
 
     def __exit__(self, *_exc) -> None:
@@ -627,19 +679,32 @@ def _self_test() -> int:
 
     def graded(old_on_wall, old_on_shed, new_on_wall, new_on_shed, *,
                old_timed_out=False, new_timed_out=False):
-        runs = {"old-off": leg("old-off", 300, 0), "new-off": leg("new-off", 300, 0),
-                "old-on": leg("old-on", old_on_wall, old_on_shed, old_timed_out),
-                "new-on": leg("new-on", new_on_wall, new_on_shed, new_timed_out)}
+        # Built from LEG_PLAN, not from a typed list of four tags: a fifth leg
+        # must extend this fixture rather than break it. (The `want` this
+        # replaces asserted `len(LEG_PLAN) == 4` against a literal sitting beside
+        # it — it graded nothing, and went RED on exactly the change the derived
+        # leg count exists to allow.)
+        runs = {}
+        for side, adaptive in LEG_PLAN:
+            tag = leg_tag(side, adaptive)
+            if tag == "old-on":
+                runs[tag] = leg(tag, old_on_wall, old_on_shed, old_timed_out)
+            elif tag == "new-on":
+                runs[tag] = leg(tag, new_on_wall, new_on_shed, new_timed_out)
+            else:
+                runs[tag] = leg(tag, 300, 0)
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             rc = report(runs)
         out = buf.getvalue()
         verdicts = {}
+        details = {}
         for line in out.splitlines():
             s = line.strip()
             if s.startswith("[PASS] ") or s.startswith("[FAIL] "):
                 verdicts[s[7:8]] = s[1:5]
-        return rc, verdicts, out
+                details[s[7:8]] = s
+        return rc, verdicts, out, details
 
     failures = []
 
@@ -648,27 +713,41 @@ def _self_test() -> int:
         if not cond:
             failures.append(name)
 
-    rc, v, out = graded(3600, 3, 400, 0, old_timed_out=True)
+    rc, v, out, d = graded(3600, 3, 400, 0, old_timed_out=True)
     want("a timed-out OLD leg does not let criterion 3 pass on its floor",
          v.get("3") == "FAIL", f"criterion 3 = {v.get('3')}")
     want("…and criterion 1 (a POSITIVE observation) still passes",
          v.get("1") == "PASS", f"criterion 1 = {v.get('1')}")
     want("…and the harness exits non-zero", rc != 0, f"rc={rc}")
 
-    rc, v, out = graded(3000, 3, 3600, 0, new_timed_out=True)
+    rc, v, out, d = graded(3000, 3, 3600, 0, new_timed_out=True)
     want("a timed-out NEW leg does not let criterion 2 ('sheds 0') pass vacuously",
          v.get("2") == "FAIL", f"criterion 2 = {v.get('2')}")
 
-    rc, v, out = graded(3000, 3, 400, 0)
+    rc, v, out, d = graded(3000, 3, 400, 0)
     want("control: with no timeout every criterion is graded and green",
          rc == 0 and set(v.values()) == {"PASS"}, f"rc={rc} {v}")
 
-    want(f"the wrapper's budget is derivable: {len(LEG_PLAN)} legs x LEG_TIMEOUT",
-         len(LEG_PLAN) == 4 and {s for s, _ in LEG_PLAN} == {"old", "new"},
-         str(LEG_PLAN))
-    want("the stand-mutated marker is not shaped like a criterion line",
-         not STAND_MUTATED_MARKER.startswith("[") and "(" not in STAND_MUTATED_MARKER,
-         repr(STAND_MUTATED_MARKER))
+    # A timed-out OLD leg that shed NOTHING. The note on criterion 1 asserts an
+    # OBSERVATION ("a shed was observed before it did"), so it must be gated on
+    # the observation, not on the timeout alone — the release-oracle copies this
+    # detail verbatim into a row headed "CRITERION 1 — THE FIXTURE IS DEAD", and
+    # printed both halves at once: `old shed 0x [leg timed out; a shed was
+    # observed before it did]`.
+    rc, v, out, d = graded(3600, 0, 400, 0, old_timed_out=True)
+    want("a timed-out OLD leg that shed NOTHING fails criterion 1",
+         v.get("1") == "FAIL", f"criterion 1 = {v.get('1')}")
+    want("…and its detail does NOT claim a shed was observed",
+         "a shed was observed" not in d.get("1", ""), d.get("1", "<no criterion 1 line>"))
+
+    # NOT here: whether the wrapper's criterion regex parses this harness's
+    # output (and refuses `stand_mutated_line`). That regex lives in
+    # `dev/release_oracle/regression.py`, which imports this module — re-typing a
+    # copy of it here would grade a proxy, which is exactly what the `want` this
+    # replaces did (it asserted `"(" not in STAND_MUTATED_MARKER`, a property of
+    # the CONSTANT, while the line it stands for contains two parentheses). It is
+    # graded from the other side, over `report()`'s REAL rendered output, in
+    # `regression._self_test`.
 
     print(f"\nself-test: {len(failures)} failed" if failures else "\nself-test ok")
     return 1 if failures else 0
@@ -703,8 +782,7 @@ def main() -> int:
         # Machine-readable, and NOT in the `[PASS]/[FAIL] <criterion>  (detail)`
         # shape the wrapper parses as a criterion — this is a fact about the
         # STAND, not a verdict about the binaries.
-        print(f"  {STAND_MUTATED_MARKER} {MYSQL_CONTAINER} still carries this run's tmp-table "
-              f"flip ({RESTORE_FAILED[-1]}) — see the restore banner above for the exact SQL")
+        print(stand_mutated_line(RESTORE_FAILED[-1]))
         return 1
     return rc
 
@@ -739,11 +817,22 @@ def report(runs: dict) -> int:
     # POSITIVE observation (the old binary shed at least once), and a truncated
     # leg can only under-report one. So a timed-out old leg that still shed is
     # honest evidence the fixture is live — noted, not poisoned.
-    verdicts.append(("1 fixture is live (old must shed)",
-                     old_on["backed_off"] > 0,
-                     f"old shed {old_on['backed_off']}x"
-                     + (" [leg timed out; a shed was observed before it did]"
-                        if old_on["timed_out"] else "")))
+    old_shed = old_on["backed_off"]
+    if not old_on["timed_out"]:
+        note = ""
+    elif old_shed > 0:
+        # The note asserts an OBSERVATION, so it is gated on the observation and
+        # not on the timeout alone. Gated on `timed_out` by itself it printed
+        # `old shed 0x [leg timed out; a shed was observed before it did]` — one
+        # detail string saying the fixture is dead and that it fired, and the
+        # release-oracle copies this string verbatim into the row it labels
+        # "CRITERION 1 — THE FIXTURE IS DEAD".
+        note = " [leg timed out; a shed was observed before it did]"
+    else:
+        note = (" [leg timed out having observed NO shed — a truncated leg can only "
+                "UNDER-report, so this is not evidence the symptom is absent]")
+    verdicts.append(("1 fixture is live (old must shed)", old_shed > 0,
+                     f"old shed {old_shed}x" + note))
     why = _ungraded(new_on)
     verdicts.append(("2 symptom gone (new sheds 0 on an idle source)",
                      not why and new_on["backed_off"] == 0,
