@@ -99,7 +99,7 @@ worst case held by any single query.
 | `max_batch_memory_mb` | integer | — | Hard cap on a single Arrow batch in MB. When exceeded, `on_batch_memory_exceeded` determines the response. |
 | `on_batch_memory_exceeded` | `warn` \| `fail` \| `auto_shrink` | `warn` | Policy applied when a batch exceeds `max_batch_memory_mb`. |
 | `max_value_mb` | integer | `256` | Hard ceiling on a **single cell** (text/JSON/blob) in MB. A value larger than this aborts the run with `RIVET_VALUE_TOO_LARGE`. Guards against one giant cell OOM-ing the process — the batch cap is average-based and can't bound a lone outlier. Set `0` to disable. See [Per-value ceiling](#per-value-ceiling-max_value_mb). |
-| `adaptive` | boolean | `false` | Sample source write-pressure at runtime and react: shrink/restore the fetch batch size, and — in chunked mode with `parallel > 1` — drive the [concurrency governor](#adaptive-concurrency-governor). |
+| `adaptive` | boolean | `false` | Sample source write-pressure at runtime and react: shrink/restore the fetch batch size, and — on a `parallel > 1` chunked or keyset export — drive the [concurrency governor](#adaptive-concurrency-governor) (see that section for the exact per-runner coverage). |
 | `min_parallel` | integer | `1` | Floor for the concurrency governor: the fewest workers it will back down to under pressure. Ceiling is the export's `parallel`. Only consulted when `adaptive` is on and `parallel > 1`. |
 
 ### Batch memory cap (`max_batch_memory_mb`)
@@ -220,7 +220,17 @@ statements. Pick the point that fits your source's tolerance.
 
 ## Adaptive concurrency governor
 
-In **chunked mode with `parallel > 1`**, setting `adaptive: true` arms a governor that adjusts how many chunk workers (and therefore source connections) run concurrently, in response to source write-pressure. It backs parallelism down when the source is under load and recovers it when the load eases, staying within `[min_parallel, parallel]`.
+On an export with `parallel > 1`, setting `adaptive: true` arms a governor that adjusts how many workers (and therefore source connections) run concurrently, in response to source write-pressure. It backs parallelism down when the source is under load and recovers it when the load eases, staying within `[min_parallel, parallel]`.
+
+Which runners it covers, precisely — the governor is per-runner wiring, so this list is the contract, not an approximation:
+
+| Runner | Governed? |
+|--------|-----------|
+| `mode: chunked`, `parallel > 1` | yes — sheds at chunk granularity |
+| `mode: chunked` + `chunk_checkpoint: true`, `parallel > 1` (the shape [`rivet init`](init.md) scaffolds) | yes — sheds at claimed-task granularity |
+| `chunk_by_key` (keyset), `parallel > 1` | yes — sheds at page granularity |
+| MongoDB `parallel: N` (`_id`-range fan-out) | **no** — that runner has no shared permit ceiling to shrink. `adaptive` still drives Mongo's batch-size adaptation; it does not vary worker count. |
+| Anything with `parallel: 1` (or unset) | **no** — one worker has nothing to shed. |
 
 ```yaml
 source:
@@ -244,9 +254,29 @@ exports:
 
 | Engine | Governor pressure proxy | Read via |
 |--------|-------------------------|----------|
-| PostgreSQL | `pg_stat_bgwriter.checkpoints_req` | `SELECT checkpoints_req FROM pg_stat_bgwriter` (preceded by `pg_stat_clear_snapshot()`) |
+| PostgreSQL (< 17) | `pg_stat_bgwriter.checkpoints_req` | `SELECT checkpoints_req FROM pg_stat_bgwriter` |
+| PostgreSQL (17+) | `pg_stat_checkpointer.num_requested` | `SELECT num_requested FROM pg_stat_checkpointer` |
 | MySQL | global `Innodb_log_waits` | `SHOW GLOBAL STATUS LIKE 'Innodb_log_waits'` |
-| SQL Server | `Log Flush Waits/sec` (summed cumulative `cntr_value`, instance-level) | `SELECT SUM(cntr_value) FROM sys.dm_os_performance_counters WHERE counter_name LIKE 'Log Flush Waits%'` |
+| SQL Server | `Log Flush Waits/sec`, cumulative `cntr_value` of the `_Total` row | `SELECT cntr_value FROM sys.dm_os_performance_counters WHERE counter_name LIKE 'Log Flush Waits%' AND instance_name = '_Total'` |
+
+Two per-engine details worth knowing if you correlate rivet's decisions with
+your own monitoring:
+
+- **PostgreSQL 17 moved the counter.** `pg_stat_bgwriter.checkpoints_req` was
+  removed in PG 17 and lives on as `pg_stat_checkpointer.num_requested`. rivet
+  picks the right one at runtime with an existence probe
+  (`SELECT to_regclass('pg_catalog.pg_stat_checkpointer') IS NOT NULL`) rather
+  than a single `CASE` statement, because PG plans the whole statement up front
+  — a dead branch referencing the missing column still ERRORs, and that error
+  would abort the export's own cursor transaction. Each sample is preceded by
+  `pg_stat_clear_snapshot()`.
+- **SQL Server reads the `_Total` row, it does not SUM.** The
+  `SQLServer:Databases` object exposes one row *per database* **plus** a
+  `_Total` row (verified live: `_Total` equals the sum of the others), so a
+  `SUM(cntr_value)` over all rows double-counts — and it *shrinks* when a
+  database is dropped, which the governor would read as "pressure eased". Use
+  the `_Total`-filtered single-row read above if you want the series rivet
+  actually sees.
 
 The governor's proxy is deliberately **NOT** the adaptive batch loop's. On
 MySQL the batch loop listens to **own-extraction** pressure (spill/temp
@@ -266,7 +296,7 @@ every keyset export slowing 2–2.7×.
 
 The governor needs **no elevated privileges**. A plain read-only role can run every query it issues — verified against PostgreSQL 16 and MySQL 8:
 
-- **PostgreSQL** — a role with only `CONNECT` + `USAGE ON SCHEMA` + `SELECT ON TABLES` can read `pg_stat_bgwriter` and call `pg_stat_clear_snapshot()` (both are available to `PUBLIC`). No `pg_read_all_stats`, no superuser.
+- **PostgreSQL** — a role with only `CONNECT` + `USAGE ON SCHEMA` + `SELECT ON TABLES` can read `pg_stat_bgwriter` (< PG 17) or `pg_stat_checkpointer` (PG 17+), run the `to_regclass` probe that chooses between them, and call `pg_stat_clear_snapshot()` — all are available to `PUBLIC`. No `pg_read_all_stats`, no superuser.
 
   ```sql
   CREATE ROLE rivet_ro LOGIN PASSWORD '…';
@@ -282,11 +312,50 @@ The governor needs **no elevated privileges**. A plain read-only role can run ev
   GRANT SELECT ON mydb.* TO 'rivet_ro'@'%';
   ```
 
-**Graceful degradation.** If the pressure query ever fails or returns nothing (locked-down role, unsupported engine view), the governor *holds parallelism flat* rather than failing the run — the export proceeds at the static `parallel` count. A failed monitoring connection logs a warning and disables the governor for that run; it never aborts the export.
+**Graceful degradation — a transient miss holds flat, a dead signal fails OPEN.**
+An unreadable pressure sample (locked-down role, unsupported engine view, a
+statement timeout on a busy catalog view) never fails the run. It degrades in
+two stages:
+
+1. **Transient miss** — fewer than 3 consecutive unreadable samples hold
+   parallelism exactly where it is, and keep the last real reading as the
+   baseline so the next successful sample is still compared against it.
+2. **Signal lost** — at 3 consecutive unreadable samples (~4.5 s at the default
+   1.5 s interval) the governor says so **once** for the episode — at `warn`
+   when a signal it *had* been reading died — and then steps parallelism *back
+   up* one worker per tick until it reaches the export's `parallel` ceiling. A
+   signal that cannot be READ is not evidence of pressure, so the governor
+   fails open rather than leaving the run pinned at whatever level the last
+   shed reached for the rest of its hours. If you need a hard cap while blind,
+   lower `parallel` (the ceiling) — `min_parallel` is a *floor* and does not
+   bound the recovery.
+
+A failed monitoring *connection* (as opposed to a failed sample) logs a warning
+and disables the governor entirely for that run; parallelism then stays static
+at `parallel`. Neither case aborts the export.
 
 > **Note on richer signals.** A future iteration may read lock waits / `idle in transaction` from `pg_stat_activity` or `SHOW PROCESSLIST`. Those *do* require elevated privileges (`pg_read_all_stats` on PostgreSQL; the `PROCESS` privilege on MySQL) to observe sessions other than your own. The current proxy was chosen specifically so the default least-privilege, read-only setup keeps working. When the richer signals land, this section will document the additional grants.
 
-**Visibility.** Each adjustment is recorded in the run journal as a `ParallelismAdjusted` event (`from`, `to`, `reason`) and logged at `info` (`governor parallelism 8 → 7 (source pressure rising: backed off)`).
+**Visibility.** Every adjustment is recorded in the run journal as a
+`ParallelismAdjusted` event (`from`, `to`, `reason`). The log level is
+**asymmetric on purpose**: a shed is a deliberate slowdown of your run, so it
+must be visible at the default level (an `info`-level "this will be slower" is
+functionally silent — a field pool run lost 1h48m to invisible sheds), while a
+recovery is good news and stays quiet.
+
+| Event | Level | Line |
+|---|---|---|
+| Governor armed | `info` | `export 'orders': adaptive concurrency governor active (parallel 2..8)` |
+| Shed | **`warn`** | ``export 'orders': governor parallelism 8 → 7 (source pressure rising: backed off) — raise `min_parallel` to floor it, or set `adaptive: false` to disarm`` |
+| Recovery | `info` | `export 'orders': governor parallelism 7 → 8 (source pressure eased: recovered)` |
+| Armed but no signal at all (first probe) | **`warn`** | `export 'orders': governor armed, but the source provides no pressure signal … — parallelism stays at 8` |
+| Signal died mid-run (see above) | **`warn`** | `export 'orders': governor lost its pressure signal … parallelism was pinned at 3 of 8; stepping back toward 8 …` |
+| Monitoring connection failed | **`warn`** | `export 'orders': governor monitoring connection failed; parallelism stays static at 8: …` |
+
+The lines above are quoted to show the level and the shape; grep for
+`governor parallelism` (adjustments) and `governor ` (everything else) rather
+than matching a full line, since the trailing hints get refined between
+releases.
 
 ## Write pipelining
 

@@ -79,6 +79,65 @@ fn duckdb_total_parquet_rows(dir: &std::path::Path) -> usize {
     n
 }
 
+/// RAII for a background pressure-writer thread: it sets the stop flag and
+/// REAPS the thread on every exit path, including the ones a trailing
+/// `stop.store(..)` + `join()` cannot reach.
+///
+/// Three such paths exist in every pressure test here and none of them is
+/// exotic: an assertion that fails ABOVE the join, the watchdog arm that
+/// `panic!`s on a timeout, and the four `.expect`s inside
+/// `Rig::run_with_envs_bounded` (create stdout/stderr file, spawn, try_wait) —
+/// a panic there unwinds straight past the test's own cleanup.
+///
+/// A leaked writer is not merely untidy. These loops hammer a SHARED server
+/// (~2 MB of redo per statement on MySQL, ~200 KB per commit on MSSQL) for the
+/// remaining lifetime of the test BINARY, i.e. they become exactly the foreign
+/// pressure every later governor test's `quiet_window_guard` exists to exclude
+/// — and on MySQL the loop would keep INSERTing into a table the scratch guard
+/// has already dropped, spinning on errors.
+///
+/// Declaration order is load-bearing: declare the writer AFTER the scratch
+/// table's guard so it drops FIRST (Rust drops in reverse declaration order).
+/// The writer must be stopped before the `DROP TABLE` it is inserting into,
+/// otherwise the drop blocks behind that statement's metadata lock.
+struct PressureWriter {
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl PressureWriter {
+    /// Spawn `body`, handing it the stop flag it must poll.
+    fn spawn<F>(body: F) -> Self
+    where
+        F: FnOnce(Arc<AtomicBool>) + Send + 'static,
+    {
+        let stop = Arc::new(AtomicBool::new(false));
+        let handle = {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || body(stop))
+        };
+        PressureWriter {
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    /// Stop the writer and reap the thread; `true` if it PANICKED (the
+    /// attribution guard the pressure tests assert on before grading a shed).
+    /// Idempotent: `Drop` is a no-op once this has run, so the explicit call
+    /// never double-joins.
+    fn reap(&mut self) -> bool {
+        self.stop.store(true, Ordering::Relaxed);
+        self.handle.take().is_some_and(|h| h.join().is_err())
+    }
+}
+
+impl Drop for PressureWriter {
+    fn drop(&mut self) {
+        let _ = self.reap();
+    }
+}
+
 #[test]
 #[ignore = "live: requires docker compose up -d postgres"]
 fn governor_activates_and_run_completes() {
@@ -86,44 +145,22 @@ fn governor_activates_and_run_completes() {
 
     const N: usize = 1000;
     let table = seed_pg_numeric_table(N as i64);
-    let out_dir = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        r#"
-source:
-  type: postgres
-  url: "{POSTGRES_URL}"
-  tuning:
-    adaptive: true
-    min_parallel: 2
-exports:
-  - name: {name}
-    query: "SELECT id, name FROM {name}"
-    mode: chunked
-    chunk_column: id
-    chunk_size: 100
-    parallel: 8
-    format: parquet
-    destination:
-      type: local
-      path: {out}
-"#,
-        name = table.name(),
-        out = out_dir.path().display(),
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
+    // Config through the canonical rig (it owns the tempdir and the
+    // destination); the governor knobs ride the `tuning:` block as source
+    // lines and the chunked plan as export lines.
+    let rig = Rig::pg_batch(table.name())
+        .query(&format!("SELECT id, name FROM {}", table.name()))
+        .mode("chunked")
+        .source_line("tuning:")
+        .source_line("  adaptive: true")
+        .source_line("  min_parallel: 2")
+        .export_line("chunk_column: id")
+        .export_line("chunk_size: 100")
+        .export_line("parallel: 8");
 
-    let out = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            table.name(),
-        ])
-        .env("RUST_LOG", "info")
-        .output()
-        .expect("spawn rivet run");
+    // `RUST_LOG=info` is load-bearing: the arming line the assertion below
+    // reads is emitted at info level.
+    let out = rig.run_with_envs(&[("RUST_LOG", "info")]);
 
     assert!(
         out.status.success(),
@@ -136,7 +173,7 @@ exports:
         "governor must activate for adaptive + parallel>1; stderr:\n{stderr}"
     );
     assert_eq!(
-        duckdb_total_parquet_rows(out_dir.path()),
+        duckdb_total_parquet_rows(&rig.out_dir()),
         N,
         "every row must round-trip through the governed parallel run"
     );
@@ -169,34 +206,20 @@ fn governor_backs_off_under_concurrent_write_pressure() {
     // window), giving the sampler many ticks under rising pressure.
     const ROWS: i64 = 20_000;
     let table = seed_pg_wide_table(ROWS, 1024);
-    let out_dir = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        r#"
-source:
-  type: postgres
-  url: "{POSTGRES_URL}"
-  tuning:
-    adaptive: true
-    min_parallel: 2
-    batch_size: 250
-    throttle_ms: 100
-exports:
-  - name: {name}
-    query: "SELECT id, payload FROM {name}"
-    mode: chunked
-    chunk_column: id
-    chunk_size: 1000
-    parallel: 8
-    format: parquet
-    destination:
-      type: local
-      path: {out}
-"#,
-        name = table.name(),
-        out = out_dir.path().display(),
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
+    // Config through the canonical rig (it owns the tempdir and the
+    // destination); the governor knobs ride the `tuning:` block as source
+    // lines and the chunked plan as export lines.
+    let rig = Rig::pg_batch(table.name())
+        .query(&format!("SELECT id, payload FROM {}", table.name()))
+        .mode("chunked")
+        .source_line("tuning:")
+        .source_line("  adaptive: true")
+        .source_line("  min_parallel: 2")
+        .source_line("  batch_size: 250")
+        .source_line("  throttle_ms: 100")
+        .export_line("chunk_column: id")
+        .export_line("chunk_size: 1000")
+        .export_line("parallel: 8");
 
     // Background writer: concurrent UPDATEs on the rows being exported plus a
     // CHECKPOINT every ~70 ms. The governor samples every 200 ms (set below),
@@ -210,26 +233,22 @@ exports:
     // `checkpoints_req` once WAL exceeds `max_wal_size` (1 GB) — impractical
     // here, and mutating that shared server setting is off-limits — so an
     // explicit CHECKPOINT stands in for a checkpoint-heavy workload.
-    let stop = Arc::new(AtomicBool::new(false));
     let table_name = table.name().to_string();
-    let writer = {
-        let stop = Arc::clone(&stop);
-        std::thread::spawn(move || {
-            let mut c = pg_connect();
-            let mut k: i64 = 1;
-            while !stop.load(Ordering::Relaxed) {
-                let _ = c.batch_execute(&format!(
-                    "UPDATE {table_name} SET payload = repeat('z', 1024), updated_at = now() \
-                     WHERE id BETWEEN {k} AND {k} + 999; CHECKPOINT;"
-                ));
-                k += 1000;
-                if k > ROWS {
-                    k = 1;
-                }
-                std::thread::sleep(Duration::from_millis(70));
+    let mut writer = PressureWriter::spawn(move |stop| {
+        let mut c = pg_connect();
+        let mut k: i64 = 1;
+        while !stop.load(Ordering::Relaxed) {
+            let _ = c.batch_execute(&format!(
+                "UPDATE {table_name} SET payload = repeat('z', 1024), updated_at = now() \
+                 WHERE id BETWEEN {k} AND {k} + 999; CHECKPOINT;"
+            ));
+            k += 1000;
+            if k > ROWS {
+                k = 1;
             }
-        })
-    };
+            std::thread::sleep(Duration::from_millis(70));
+        }
+    });
 
     // Pre-warm the pressure signal: let the writer connect and drive
     // `checkpoints_req` up before rivet launches, so the governor's first
@@ -237,45 +256,25 @@ exports:
     // early samples land before the writer's first checkpoint completes.
     std::thread::sleep(Duration::from_millis(400));
 
-    // Watchdog: redirect stderr to a file so we can both assert on it and avoid
-    // a piped-buffer deadlock while polling for exit.
-    let log_path = cfg_dir.path().join("rivet.stderr");
-    let log_file = std::fs::File::create(&log_path).unwrap();
-    let mut child = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            table.name(),
-        ])
-        .env("RUST_LOG", "info")
-        .env("RIVET_GOVERNOR_INTERVAL_MS", "200")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::from(log_file))
-        .spawn()
-        .expect("spawn rivet run");
+    // Watchdog through the rig: `run_with_envs_bounded` polls `try_wait` under a
+    // wall-clock ceiling with stdout/stderr on FILES (polling an undrained pipe
+    // is its own deadlock), so a governor hang fails THIS test instead of
+    // wedging the suite behind the quiet-window lock. `None` == had to be killed.
+    let out = rig.run_with_envs_bounded(
+        &[("RUST_LOG", "info"), ("RIVET_GOVERNOR_INTERVAL_MS", "200")],
+        Duration::from_secs(120),
+    );
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(120);
-    let status = loop {
-        match child.try_wait().expect("try_wait on rivet child") {
-            Some(s) => break s,
-            None if std::time::Instant::now() >= deadline => {
-                let _ = child.kill();
-                stop.store(true, Ordering::Relaxed);
-                let _ = writer.join();
-                panic!("governed run under concurrent write pressure did not finish within 120s");
-            }
-            None => std::thread::sleep(Duration::from_millis(100)),
-        }
-    };
+    // Stop the writer BEFORE any panic path — a timeout must not leave a thread
+    // hammering the shared server (and CHECKPOINTing) for the rest of the run.
+    // The explicit reap keeps the panicked-writer verdict; the guard's Drop
+    // covers the paths that never reach this line.
+    assert!(!writer.reap(), "the write-pressure writer thread PANICKED");
+    let out = out.expect("governed run under concurrent write pressure did not finish within 120s");
 
-    stop.store(true, Ordering::Relaxed);
-    writer.join().expect("writer thread");
-
-    let stderr = std::fs::read_to_string(&log_path).unwrap_or_default();
+    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        status.success(),
+        out.status.success(),
         "governed run under concurrent write pressure must still complete; stderr:\n{stderr}"
     );
     assert!(
@@ -288,7 +287,7 @@ exports:
          (a 'backed off' parallelism adjustment); stderr:\n{stderr}"
     );
     assert_eq!(
-        duckdb_total_parquet_rows(out_dir.path()),
+        duckdb_total_parquet_rows(&rig.out_dir()),
         ROWS as usize,
         "every exported row must round-trip despite concurrent writes to the same rows"
     );
@@ -313,72 +312,41 @@ fn governor_does_not_deadlock_when_chunks_fail() {
     require_alive(LiveService::Postgres);
 
     let table = seed_pg_numeric_table(500);
-    let out_dir = tempfile::tempdir().unwrap();
     // Point the local destination *under a regular file* so every chunk's
     // `dest.write` fails with ENOTDIR — a genuine per-chunk write failure that
     // drives the all-chunks-fail path through the real parallel write stage.
-    let blocker = out_dir.path().join("not_a_dir");
+    // The blocker lives in its own tempdir (the rig's destination must NOT be
+    // pre-created here — `unwritable_dest_path` is exactly that opt-out).
+    let fixture = tempfile::tempdir().unwrap();
+    let blocker = fixture.path().join("not_a_dir");
     std::fs::write(&blocker, b"x").expect("write blocker file");
-    let dest_path = blocker.join("sub");
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        r#"
-source:
-  type: postgres
-  url: "{POSTGRES_URL}"
-  tuning:
-    adaptive: true
-    min_parallel: 2
-exports:
-  - name: {name}
-    query: "SELECT id, name, amount FROM {name}"
-    mode: chunked
-    chunk_column: id
-    chunk_size: 100
-    parallel: 8
-    format: parquet
-    destination:
-      type: local
-      path: {out}
-"#,
-        name = table.name(),
-        out = dest_path.display(),
+    let rig = Rig::pg_batch(table.name())
+        .query(&format!("SELECT id, name, amount FROM {}", table.name()))
+        .mode("chunked")
+        .source_line("tuning:")
+        .source_line("  adaptive: true")
+        .source_line("  min_parallel: 2")
+        .export_line("chunk_column: id")
+        .export_line("chunk_size: 100")
+        .export_line("parallel: 8")
+        .unwritable_dest_path(blocker.join("sub"));
+
+    // Watchdog through the rig: `None` means the child had to be killed, i.e.
+    // the deadlock is back. Output goes to files, not pipes — polling an
+    // undrained pipe is its own deadlock.
+    let out = rig
+        .run_with_envs_bounded(&[], Duration::from_secs(30))
+        .unwrap_or_else(|| {
+            panic!(
+                "governor deadlock regression: adaptive chunked-parallel run did not \
+                 terminate within 30s when every chunk fails"
+            )
+        });
+    assert!(
+        !out.status.success(),
+        "run with all-failing chunks should exit non-zero; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
     );
-    let cfg = write_config(&cfg_dir, &yaml);
-
-    let mut child = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            table.name(),
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("spawn rivet run");
-
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
-    loop {
-        match child.try_wait().expect("try_wait on rivet child") {
-            Some(status) => {
-                assert!(
-                    !status.success(),
-                    "run with all-failing chunks should exit non-zero"
-                );
-                return;
-            }
-            None if std::time::Instant::now() >= deadline => {
-                let _ = child.kill();
-                panic!(
-                    "governor deadlock regression: adaptive chunked-parallel run did not \
-                     terminate within 30s when every chunk fails"
-                );
-            }
-            None => std::thread::sleep(Duration::from_millis(200)),
-        }
-    }
 }
 
 /// #152: the SAME back-off, on the KEYSET runner. The governor was chunked-only;
@@ -397,93 +365,51 @@ fn keyset_governor_backs_off_under_concurrent_write_pressure() {
 
     const ROWS: i64 = 20_000;
     let table = seed_pg_wide_table(ROWS, 1024);
-    let out_dir = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        r#"
-source:
-  type: postgres
-  url: "{POSTGRES_URL}"
-  tuning:
-    adaptive: true
-    min_parallel: 2
-    batch_size: 250
-    throttle_ms: 100
-exports:
-  - name: {name}
-    table: {name}
-    mode: chunked
-    chunk_by_key: id
-    chunk_size: 1000
-    parallel: 8
-    format: parquet
-    destination:
-      type: local
-      path: {out}
-"#,
-        name = table.name(),
-        out = out_dir.path().display(),
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
+    // Same rig, DIFFERENT plan: `table:` (the rig's default, no `query:`) and
+    // `chunk_by_key` — this is the KEYSET runner, not the range-chunked one.
+    // The two tests deliberately keep their own config builders: a shared
+    // helper would hide the one line that decides which runner is under test.
+    let rig = Rig::pg_batch(table.name())
+        .mode("chunked")
+        .source_line("tuning:")
+        .source_line("  adaptive: true")
+        .source_line("  min_parallel: 2")
+        .source_line("  batch_size: 250")
+        .source_line("  throttle_ms: 100")
+        .export_line("chunk_by_key: id")
+        .export_line("chunk_size: 1000")
+        .export_line("parallel: 8");
 
-    let stop = Arc::new(AtomicBool::new(false));
     let table_name = table.name().to_string();
-    let writer = {
-        let stop = Arc::clone(&stop);
-        std::thread::spawn(move || {
-            let mut c = pg_connect();
-            let mut k: i64 = 1;
-            while !stop.load(Ordering::Relaxed) {
-                let _ = c.batch_execute(&format!(
-                    "UPDATE {table_name} SET payload = repeat('z', 1024), updated_at = now() \
-                     WHERE id BETWEEN {k} AND {k} + 999; CHECKPOINT;"
-                ));
-                k += 1000;
-                if k > ROWS {
-                    k = 1;
-                }
-                std::thread::sleep(Duration::from_millis(70));
+    let mut writer = PressureWriter::spawn(move |stop| {
+        let mut c = pg_connect();
+        let mut k: i64 = 1;
+        while !stop.load(Ordering::Relaxed) {
+            let _ = c.batch_execute(&format!(
+                "UPDATE {table_name} SET payload = repeat('z', 1024), updated_at = now() \
+                 WHERE id BETWEEN {k} AND {k} + 999; CHECKPOINT;"
+            ));
+            k += 1000;
+            if k > ROWS {
+                k = 1;
             }
-        })
-    };
+            std::thread::sleep(Duration::from_millis(70));
+        }
+    });
     std::thread::sleep(Duration::from_millis(400));
 
-    let log_path = cfg_dir.path().join("rivet.stderr");
-    let log_file = std::fs::File::create(&log_path).unwrap();
-    let mut child = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            table.name(),
-        ])
-        .env("RUST_LOG", "info")
-        .env("RIVET_GOVERNOR_INTERVAL_MS", "200")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::from(log_file))
-        .spawn()
-        .expect("spawn rivet run");
+    // Same bounded watchdog as the chunked twin (see there): stderr to a file,
+    // `None` == the run had to be killed at the ceiling.
+    let out = rig.run_with_envs_bounded(
+        &[("RUST_LOG", "info"), ("RIVET_GOVERNOR_INTERVAL_MS", "200")],
+        Duration::from_secs(120),
+    );
+    assert!(!writer.reap(), "the write-pressure writer thread PANICKED");
+    let out = out.expect("governed keyset run under write pressure did not finish within 120s");
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(120);
-    let status = loop {
-        match child.try_wait().expect("try_wait") {
-            Some(s) => break s,
-            None if std::time::Instant::now() >= deadline => {
-                let _ = child.kill();
-                stop.store(true, Ordering::Relaxed);
-                let _ = writer.join();
-                panic!("governed keyset run under write pressure did not finish within 120s");
-            }
-            None => std::thread::sleep(Duration::from_millis(100)),
-        }
-    };
-    stop.store(true, Ordering::Relaxed);
-    writer.join().expect("writer thread");
-
-    let stderr = std::fs::read_to_string(&log_path).unwrap_or_default();
+    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        status.success(),
+        out.status.success(),
         "governed keyset run must complete; stderr:\n{stderr}"
     );
     assert!(
@@ -498,7 +424,7 @@ exports:
         "#152: under rising pressure the keyset governor must shed at least one worker; stderr:\n{stderr}"
     );
     assert_eq!(
-        duckdb_total_parquet_rows(out_dir.path()),
+        duckdb_total_parquet_rows(&rig.out_dir()),
         ROWS as usize,
         "every row must round-trip through the governed keyset run"
     );
@@ -916,5 +842,625 @@ fn mssql_adaptive_never_loses_to_its_own_baseline_on_an_idle_source() {
     assert!(
         wall_on <= wall_off * 1.6 + 1.0,
         "adaptive must not lose to its own baseline: on={wall_on:.2}s off={wall_off:.2}s"
+    );
+}
+
+/// The governor's PG **17+** sampler arm, against a real modern catalog.
+///
+/// The main live stack is postgres:16, where `pg_stat_bgwriter.checkpoints_req`
+/// still resolves — so every other governor test takes the LEGACY arm and the
+/// modern one shipped with no live coverage at all (round-3 completeness
+/// critic). That arm is not a cosmetic difference: on PG 17+ the old query
+/// ERRORs, and the batch loop samples INSIDE the export's cursor transaction,
+/// so the error aborts it and the next FETCH dies. Verified by hand on the
+/// postgres:18 stand (2026-08-14):
+///
+/// ```text
+/// ERROR:  column "checkpoints_req" does not exist
+/// ERROR:  current transaction is aborted, commands ignored until end of transaction block
+/// ```
+///
+/// i.e. a wrong arm is a hard export failure, never a quiet `None`. This test
+/// runs a governed export against that stand and requires the governor to be
+/// AWAKE — armed, connected, and reading a signal — which is exactly what a
+/// sampler that ERRORs or returns `None` cannot be.
+///
+/// SKIPPED (not failed) when the optional `dev/stand` is down: it is opt-in,
+/// unlike the main compose stack. Bring it up with
+/// `docker compose --profile batch -f dev/stand/docker-compose.yaml up -d pg18-batch`.
+#[test]
+#[ignore = "live: requires the optional dev/stand pg18-batch (:5518)"]
+fn pg18_governor_samples_the_modern_checkpointer_catalog() {
+    if !pg_modern_alive() {
+        eprintln!(
+            "SKIP pg18_governor_samples_the_modern_checkpointer_catalog: the optional \
+             dev/stand pg18-batch (:5518) is not up"
+        );
+        return;
+    }
+    let _quiet = quiet_window_guard();
+
+    let table = format!("gov_pg18_{}", std::process::id());
+    let modern = POSTGRES_MODERN_URL;
+    pg_modern_exec(&format!(
+        "DROP TABLE IF EXISTS {table}; \
+         CREATE TABLE {table} (id bigint PRIMARY KEY, payload text); \
+         INSERT INTO {table} SELECT g, repeat('x', 512) FROM generate_series(1, 60000) g;"
+    ));
+
+    let rig = Rig::pg_batch(&table)
+        .source_url(modern)
+        .mode("chunked")
+        .export_line("chunk_by_key: id")
+        .export_line("chunk_size: 5000")
+        .export_line("parallel: 4")
+        .source_line("tuning:")
+        .source_line("  adaptive: true")
+        .source_line("  batch_size: 2000");
+    let out = rig.run_with_envs(&[("RUST_LOG", "info"), ("RIVET_GOVERNOR_INTERVAL_MS", "200")]);
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        out.status.success(),
+        "the governed export must succeed on a PG17+ catalog — a sampler naming the \
+         removed column would abort the cursor transaction; stderr:\n{stderr}"
+    );
+
+    // The whole point: on a PG17+ catalog the governor must be AWAKE. A sampler
+    // that named the removed column would have aborted the cursor transaction
+    // and failed the run outright; one that quietly returned None would trip
+    // the "provides no pressure signal" branch.
+    assert_governor_awake(&stderr, "postgres-18");
+    pg_modern_exec(&format!("DROP TABLE IF EXISTS {table};"));
+}
+
+/// Run SQL on the optional PG 17+ stand via `docker exec` — it is not part of
+/// the main stack, so the test helpers' pooled clients do not know about it.
+fn pg_modern_exec(sql: &str) {
+    let out = std::process::Command::new("docker")
+        .args([
+            "exec",
+            "-i",
+            "stand-pg18-batch-1",
+            "psql",
+            "-U",
+            "rivet",
+            "-d",
+            "rivet",
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-c",
+            sql,
+        ])
+        .output()
+        .expect("docker exec psql on the pg18 stand");
+    assert!(
+        out.status.success(),
+        "pg18 stand SQL failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The governor SHEDS on MySQL, under real redo pressure it did not create.
+///
+/// The completeness critic of the round-3 bughunt named this gap: the
+/// governor's ability to BACK OFF was proven on PostgreSQL only. MySQL's new
+/// foreign signal (`Innodb_log_waits`) was covered by must-not-shed canaries
+/// plus a readability assert — and a counter that is permanently ZERO satisfies
+/// both. `Innodb_log_waits` ticks only when the redo log buffer fills and a
+/// thread must wait for a flush, which never happens on a default 16 MB buffer
+/// under test-sized load, so "no shed" proved nothing about the mechanism.
+///
+/// The fixture makes the signal move for real: `innodb_log_buffer_size` is
+/// shrunk to its 256 KB minimum for the test's duration (restored by a Drop
+/// guard on every exit path) and a background writer streams 256 KB blobs into
+/// a SCRATCH table — never the exported one, so the export's own rows are not
+/// the pressure. Measured on the dev stand before writing the test: the counter
+/// went 12 -> 390 in 2.4 s under exactly this shape, and stayed flat without
+/// the shrink.
+///
+/// Four assertions, in the order that makes each meaningful:
+///  1. the governor ARMED (otherwise the rest grades nothing),
+///  2. this test's OWN writer really committed (the attributable half of the
+///     activation guard),
+///  3. the counter really moved (the server-wide half),
+///  4. it BACKED OFF at least once.
+///
+/// Attribution honesty — what each half of the activation guard can and cannot
+/// prove. `Innodb_log_waits` is a GLOBAL counter with no session twin (InnoDB
+/// status variables ignore `SHOW SESSION STATUS`), so unlike the spill test's
+/// session probe the delta in (3) is NOT isolated to this test: it is server-
+/// wide, and this test has just shrunk `innodb_log_buffer_size` server-wide, so
+/// any concurrent write anywhere on the instance contributes to it. The two
+/// cross-process locks do NOT close that: `quiet_window_guard` and
+/// `mysql_globals_guard` are taken only by the tests in this file (verified —
+/// no other live file references either), so they serialise the governor
+/// tests against each other and exclude nothing else on the shared server.
+/// Hence the split. (2) counts SUCCESSFUL statements from this test's own
+/// writer — state only this fixture can produce, and the only assertion that
+/// goes RED on the silent-return paths below (a bad root password, a revoked
+/// grant, an exhausted `max_connections`). (3) is a floor calibrated against
+/// measurement, not guessed: this fixture moves the counter by ~378, while an
+/// ordinary sibling seed (4 000 × 2 KB rows with the buffer already shrunk)
+/// moves it by 16 — measured on the dev stand 2026-08-14. So >= 100 excludes
+/// the sibling shape that the old `>= 10` admitted. Neither half alone is
+/// proof of attribution; (2) is the load-bearing one.
+#[test]
+#[ignore = "live: requires docker compose mysql"]
+fn mysql_governor_backs_off_under_real_redo_pressure() {
+    use mysql::prelude::Queryable;
+
+    require_alive(LiveService::Mysql);
+    let _quiet = quiet_window_guard();
+    let _globals = mysql_globals_guard();
+
+    // Globals need SYSTEM_VARIABLES_ADMIN — the app user deliberately lacks it,
+    // so the flip runs as root (compose: MYSQL_ROOT_PASSWORD=rivet).
+    const MYSQL_ROOT_URL: &str = "mysql://root:rivet@127.0.0.1:3306/rivet";
+    struct RedoBuffer(u64);
+    impl Drop for RedoBuffer {
+        fn drop(&mut self) {
+            if let Ok(pool) = mysql::Pool::new(MYSQL_ROOT_URL)
+                && let Ok(mut c) = pool.get_conn()
+            {
+                let _ = c.query_drop(format!("SET GLOBAL innodb_log_buffer_size = {}", self.0));
+            }
+        }
+    }
+    let mut root = mysql::Pool::new(MYSQL_ROOT_URL)
+        .expect("root pool")
+        .get_conn()
+        .expect("root conn");
+    let prior_buffer: u64 = {
+        let rows: Vec<(String, String)> = root
+            .query("SHOW GLOBAL VARIABLES LIKE 'innodb_log_buffer_size'")
+            .expect("read innodb_log_buffer_size");
+        rows.first()
+            .and_then(|(_, v)| v.parse().ok())
+            .unwrap_or(16_777_216)
+    };
+    root.query_drop("SET GLOBAL innodb_log_buffer_size = 262144")
+        .expect("shrink the redo log buffer");
+    let _restore = RedoBuffer(prior_buffer);
+
+    let log_waits = |c: &mut mysql::PooledConn| -> u64 {
+        let rows: Vec<(String, u64)> = c
+            .query("SHOW GLOBAL STATUS LIKE 'Innodb_log_waits'")
+            .expect("sample Innodb_log_waits");
+        rows.first().map(|(_, v)| *v).unwrap_or(0)
+    };
+
+    const ROWS: i64 = 20_000;
+    let table = seed_mysql_numeric_table(ROWS);
+    let scratch = format!("{}_redo", table.name());
+    root.query_drop(format!(
+        "CREATE TABLE {scratch} (id BIGINT AUTO_INCREMENT PRIMARY KEY, payload LONGBLOB) \
+         ENGINE=InnoDB"
+    ))
+    .expect("create the redo-pressure scratch table");
+    // RAII, not a trailing DROP — the same treatment the MSSQL twin already
+    // carries, for the same reason: this table holds 256 KB blobs on a SHARED
+    // server, and a trailing statement is skipped by every panic path (a failed
+    // assertion, the watchdog arm below, an `.expect` inside the bounded
+    // runner), leaving one `<table>_redo` behind per timeout. Position is
+    // deliberate (drop runs in reverse declaration order): declared BEFORE the
+    // writer guard, so the writer is reaped first and the DROP does not queue
+    // behind its INSERT's metadata lock; declared AFTER `_restore` and the
+    // seeded `table`, so the log-buffer restore is the last thing to run.
+    let _scratch_guard = MysqlTable::adopt(scratch.clone());
+
+    // Background writer: 8 x 256 KB blobs per statement is ~2 MB of redo
+    // against a 256 KB buffer, so each statement forces several waits. It
+    // writes to the SCRATCH table, never the exported one — the pressure must
+    // be FOREIGN, which is the whole point of the signal split.
+    //
+    // The ATTRIBUTABLE half of the activation guard: statements this test's own
+    // writer really committed. Every failure path in the thread below is silent
+    // by design (a dead writer must not abort the run mid-assertion), so without
+    // this counter the only detector of a writer that never connected is a
+    // GLOBAL counter every concurrent test also moves.
+    let writer_inserts = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let mut writer = PressureWriter::spawn({
+        let inserts = Arc::clone(&writer_inserts);
+        let scratch = scratch.clone();
+        move |stop| {
+            let Ok(pool) = mysql::Pool::new(MYSQL_ROOT_URL) else {
+                return;
+            };
+            let Ok(mut c) = pool.get_conn() else { return };
+            let values = std::iter::repeat_n("(REPEAT(0x61, 262144))", 8)
+                .collect::<Vec<_>>()
+                .join(",");
+            while !stop.load(Ordering::Relaxed) {
+                // Count only the INSERT: it is the redo mover (2 MB against a
+                // 256 KB buffer), the DELETE is just housekeeping.
+                if c.query_drop(format!("INSERT INTO {scratch} (payload) VALUES {values}"))
+                    .is_ok()
+                {
+                    inserts.fetch_add(1, Ordering::Relaxed);
+                }
+                // Keep the table from growing without bound over the run.
+                let _ = c.query_drop(format!("DELETE FROM {scratch} ORDER BY id ASC LIMIT 8"));
+            }
+        }
+    });
+
+    // Let the writer drive the counter up before rivet starts, so the
+    // governor's first sample PAIR already spans rising pressure.
+    std::thread::sleep(Duration::from_millis(500));
+    let waits_before = log_waits(&mut root);
+
+    // Canonical Rig config + runner — no bespoke YAML/Command (this test was
+    // written by copying a legacy hand-rolled sibling; the harness rule says
+    // one seam). `run_with_envs_bounded` IS the watchdog: it polls the child
+    // under a wall-clock ceiling with stdout/stderr to files, so a governor
+    // hang fails THIS test instead of wedging the suite behind
+    // `quiet_window_guard` + `mysql_globals_guard` with a writer thread still
+    // hammering the shared server.
+    let rig = Rig::mysql_batch(table.name())
+        .query(&format!("SELECT id, name, amount FROM {}", table.name()))
+        .mode("chunked")
+        .source_line("tuning:")
+        .source_line("  adaptive: true")
+        .source_line("  min_parallel: 2")
+        .source_line("  batch_size: 250")
+        .source_line("  throttle_ms: 100")
+        .export_line("chunk_column: id")
+        .export_line("chunk_size: 1000")
+        .export_line("parallel: 8");
+    let out_dir = rig.out_dir();
+    let Some(out) = rig.run_with_envs_bounded(
+        &[("RUST_LOG", "info"), ("RIVET_GOVERNOR_INTERVAL_MS", "200")],
+        Duration::from_secs(120),
+    ) else {
+        // No hand-rolled stop/join here: unwinding reaps the writer through
+        // `PressureWriter`'s Drop and drops the scratch table through
+        // `_scratch_guard` — the paths a trailing statement misses.
+        panic!(
+            "governed MySQL run under redo pressure did not finish within 120s \
+             (governor deadlock regression?); the writer had committed {} inserts",
+            writer_inserts.load(Ordering::Relaxed)
+        );
+    };
+
+    let waits_after = log_waits(&mut root);
+    let writer_panicked = writer.reap();
+    let inserts = writer_inserts.load(Ordering::Relaxed);
+
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        out.status.success(),
+        "the governed run must still complete under redo pressure; stderr:\n{stderr}"
+    );
+    assert_governor_awake(&stderr, "mysql");
+    // Activation guard BEFORE the shed assertion: without it, a fixture that
+    // stopped moving the counter would make the shed assertion silently
+    // untestable rather than red. Two halves — see the doc block: the writer's
+    // own success count is attributable to THIS test, the counter delta is
+    // server-wide.
+    assert!(
+        !writer_panicked,
+        "the redo-pressure writer PANICKED, so the shed assertion below grades \
+         something other than this fixture (it committed {inserts} inserts first)"
+    );
+    assert!(
+        inserts >= 5,
+        "fixture went inert: this test's OWN writer committed {inserts} redo-pressure \
+         inserts (needs >= 5) — it never connected or every statement failed (bad root \
+         password? revoked grant? max_connections exhausted?), so any counter movement \
+         below belongs to a concurrent sibling, not to this fixture"
+    );
+    let delta = waits_after.saturating_sub(waits_before);
+    assert!(
+        delta >= 100,
+        "fixture went inert: Innodb_log_waits moved by {delta} across the run (needs \
+         >= 100; ~378 measured for this shape over 2.4 s), so the governor had no rising \
+         foreign signal to react to and the shed assertion below would grade nothing (is \
+         innodb_log_buffer_size still shrunk? {inserts} writer inserts landed)"
+    );
+    assert!(
+        stderr.contains("backed off"),
+        "under rising Innodb_log_waits the governor must shed at least one worker; \
+         counter moved by {delta} over {inserts} writer inserts; stderr:\n{stderr}"
+    );
+    assert_eq!(
+        duckdb_total_parquet_rows(&out_dir),
+        ROWS as usize,
+        "every exported row must round-trip while the governor is shedding"
+    );
+}
+
+/// The pressure fixtures' teardown must survive a PANIC — the exact path a
+/// trailing `DROP TABLE` / trailing `stop.store(..) + join()` cannot reach.
+///
+/// Every pressure test above leaves two things on a SHARED server while it
+/// runs: a scratch table full of multi-hundred-KB blobs, and a thread writing
+/// into it as fast as the server accepts. Both used to be cleaned up by
+/// statements at the END of the test, so a timeout (the watchdog arm), a failed
+/// assertion above them, or any `.expect` inside `Rig::run_with_envs_bounded`
+/// leaked BOTH — one `<table>_redo` table per timeout, plus a redo-hammering
+/// loop that outlives the test and becomes foreign pressure inside every later
+/// governor test's "quiet window". This pins the RAII contract that replaced
+/// them, by unwinding through a real panic and then asking the SERVER.
+///
+/// Both halves are RED-provable against the pre-fix shape, and each needs the
+/// other: (1) alone is satisfied by a leaked writer (once the table is gone its
+/// INSERTs just fail), which is why the writer counts LOOP ITERATIONS, not
+/// successful inserts — a leaked thread keeps spinning whether or not the table
+/// still exists. `landed` is the not-inert guard: without it a writer that
+/// never connected would freeze the iteration counter and pass (2) vacuously.
+///
+/// Scope honesty: this grades the CONTRACT (`MysqlTable::adopt` +
+/// `PressureWriter` both reap on unwind) that
+/// `mysql_governor_backs_off_under_real_redo_pressure` and its MSSQL twin now
+/// depend on. It cannot observe that those tests still USE the guards — a
+/// re-introduced trailing `DROP TABLE` there is caught by review, not by this
+/// test. The `panicked at ... simulated` line in the output is this test's own
+/// panic, deliberately raised.
+#[test]
+#[ignore = "live: requires docker compose mysql"]
+fn governor_pressure_fixtures_are_reaped_by_a_panicking_run() {
+    use mysql::prelude::Queryable;
+    use std::panic::AssertUnwindSafe;
+    use std::sync::atomic::AtomicU64;
+
+    require_alive(LiveService::Mysql);
+
+    let mut c = mysql_connect();
+    let scratch = unique_name("rivet_qa_redo_guard");
+    c.query_drop(format!(
+        "CREATE TABLE {scratch} (id BIGINT AUTO_INCREMENT PRIMARY KEY, payload LONGBLOB) \
+         ENGINE=InnoDB"
+    ))
+    .expect("create the guard-proof scratch table");
+
+    let iterations = Arc::new(AtomicU64::new(0));
+    let landed = Arc::new(AtomicU64::new(0));
+    let unwound = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        // Declaration order mirrors the redo-pressure test: the writer drops
+        // FIRST (stopped and joined), the scratch table second.
+        let _scratch_guard = MysqlTable::adopt(scratch.clone());
+        let _writer = PressureWriter::spawn({
+            let iterations = Arc::clone(&iterations);
+            let landed = Arc::clone(&landed);
+            let scratch = scratch.clone();
+            move |stop| {
+                let Ok(pool) = mysql::Pool::new(MYSQL_URL) else {
+                    return;
+                };
+                let Ok(mut conn) = pool.get_conn() else {
+                    return;
+                };
+                while !stop.load(Ordering::Relaxed) {
+                    if conn
+                        .query_drop(format!(
+                            "INSERT INTO {scratch} (payload) VALUES (REPEAT(0x61, 1024))"
+                        ))
+                        .is_ok()
+                    {
+                        landed.fetch_add(1, Ordering::Relaxed);
+                    }
+                    // Counted unconditionally: this is the LIVENESS signal, and
+                    // it must keep moving for a leaked writer even after the
+                    // table it writes to has been dropped.
+                    iterations.fetch_add(1, Ordering::Relaxed);
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+        });
+        // Let the writer really connect and land statements, so the reap below
+        // grades a LIVE thread rather than one that never started.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while landed.load(Ordering::Relaxed) < 2 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("simulated: the watchdog arm / a failed assertion / an `.expect` in the runner");
+    }))
+    .is_err();
+    assert!(unwound, "the simulated panic must actually unwind");
+
+    assert!(
+        landed.load(Ordering::Relaxed) >= 2,
+        "fixture went inert: the writer landed {} inserts (needs >= 2) — it never \
+         connected, so the liveness assertion below would grade a thread that was \
+         never running",
+        landed.load(Ordering::Relaxed)
+    );
+    let tables: Vec<String> = c
+        .query(format!("SHOW TABLES LIKE '{scratch}'"))
+        .expect("list the scratch table");
+    assert!(
+        tables.is_empty(),
+        "the scratch table {scratch} outlived a panicking run — a trailing DROP is \
+         skipped by every panic path; it must be an RAII guard"
+    );
+
+    let before = iterations.load(Ordering::Relaxed);
+    std::thread::sleep(Duration::from_millis(300));
+    let after = iterations.load(Ordering::Relaxed);
+    assert_eq!(
+        before, after,
+        "the pressure writer outlived a panicking run ({before} -> {after} loop \
+         iterations after the unwind) — it must be stopped and joined by Drop, not \
+         by a trailing stop.store()/join()"
+    );
+}
+
+/// The governor SHEDS on SQL Server, under real log-flush pressure.
+///
+/// The last engine on the shed axis. MSSQL's foreign signal is
+/// `Log Flush Waits/sec` (`_Total`) — a thread waiting for a redo flush to
+/// complete, which is WRITE-driven and so cannot be moved by a read-only
+/// export. Before this test the engine had only a must-not-shed canary plus a
+/// readability assert, and both are satisfied by a counter that never moves —
+/// the same hazard proven on MySQL, where a permanently-flat mutant left both
+/// pre-existing canaries green.
+///
+/// The mover here is plain COMMIT rate: every committed transaction forces a
+/// log flush, and a writer streaming ~200 KB rows one transaction at a time
+/// produces roughly one wait per commit. Measured on the stand before writing
+/// the test: `_Total` went 1273 -> 1681 across 400 commits in 1.8 s. Unlike
+/// the MySQL twin this needs NO server-wide setting flip — commits alone do
+/// it — so there is nothing to restore and no globals lock to take. The writer
+/// targets a SCRATCH table, never the exported one: the pressure must be
+/// FOREIGN, which is the point of the signal split.
+///
+/// Assertions in the order that makes each meaningful: the governor ARMED,
+/// this test's OWN writer really committed, the counter really moved, it
+/// BACKED OFF, and every row still round-tripped.
+///
+/// Attribution honesty, same shape as the MySQL twin but WEAKER on the counter
+/// half, and the difference is measured rather than assumed. `Log Flush Waits`
+/// is read for `instance_name = '_Total'`, i.e. EVERY database on the instance;
+/// `quiet_window_guard` is taken only by the tests in this file (verified — no
+/// other live file references it), so it serialises the governor tests against
+/// each other and excludes nothing else on the shared server. A plain sibling
+/// loop of 2 000 small committed INSERTs — the shape of any seeder in the live
+/// suite — moves `_Total` by 2 004 (measured on the dev stand, 2026-08-14),
+/// so NO threshold on this counter is sibling-proof: the old `>= 10` was
+/// satisfied 200× over by that traffic, and even the `>= 100` below is not
+/// immune to it. Raising it only excludes INCIDENTAL movement (a dead writer
+/// under a quiet stand measured a delta of 1). The attributable half is
+/// therefore the writer's own committed-batch count, which no sibling can
+/// produce — that is the assertion the inert-fixture proof goes RED on.
+///
+/// The run goes through the rig's BOUNDED runner: a governor deadlock (the
+/// regression `governor_does_not_deadlock_when_chunks_fail` exists for) must
+/// fail this one test, not wedge the suite behind `quiet_window_guard` while
+/// the writer hammers the shared server forever.
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn mssql_governor_backs_off_under_real_log_flush_pressure() {
+    require_alive(LiveService::Mssql);
+    let _quiet = quiet_window_guard();
+
+    // The exact counter `MssqlSource::sample_governor_pressure` reads — the
+    // `_Total` row, not a SUM over the per-database rows (a SUM double-counts,
+    // and a dropped database SHRINKS it, reading as "pressure eased").
+    const FLUSH_WAITS: &str = "SELECT cntr_value FROM sys.dm_os_performance_counters \
+                               WHERE counter_name LIKE 'Log Flush Waits%' \
+                               AND instance_name = '_Total'";
+
+    const ROWS: i64 = 20_000;
+    let table = seed_mssql_numeric_table(ROWS);
+    let scratch = format!("{}_flush", table.name());
+    mssql_exec(&format!(
+        "IF OBJECT_ID('dbo.{scratch}') IS NOT NULL DROP TABLE dbo.{scratch}; \
+         CREATE TABLE dbo.{scratch} (id INT IDENTITY PRIMARY KEY, payload VARBINARY(MAX))"
+    ));
+    // RAII, not a trailing DROP: the scratch table holds ~200 KB rows on a
+    // SHARED server, and a trailing statement is skipped by every panic path
+    // (a failed assertion, the watchdog below, a panicking writer join).
+    let _scratch_guard = MssqlTable::adopt(format!("dbo.{scratch}"));
+
+    // Background writer: one COMMIT per row, each carrying ~200 KB, so the log
+    // manager flushes constantly and `Log Flush Waits` climbs pair-over-pair —
+    // the condition `GovernorState::observe` needs to shed.
+    //
+    // It uses the ERROR-TOLERANT executor, not `mssql_exec`: this loop performs
+    // hundreds of fresh TDS logins under load it creates itself, and every step
+    // of the panicking executor is an `.expect` — one transient login failure or
+    // deadlock-victim error would abort the thread, make the test's verdict
+    // `writer thread`, and skip every real assertion. The returned bool keeps
+    // the tolerance honest by feeding the attributable activation guard below.
+    let writer_batches = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let mut writer = PressureWriter::spawn({
+        let batches = Arc::clone(&writer_batches);
+        let scratch = scratch.clone();
+        move |stop| {
+            while !stop.load(Ordering::Relaxed) {
+                // 40 committed transactions per batch keeps the round-trip
+                // count low while the commit RATE stays high.
+                if mssql_try_exec(&format!(
+                    "SET NOCOUNT ON; \
+                     DECLARE @i INT = 0; \
+                     WHILE @i < 40 \
+                     BEGIN \
+                       BEGIN TRAN; \
+                       INSERT INTO dbo.{scratch} (payload) VALUES \
+                         (CONVERT(VARBINARY(MAX), REPLICATE(CAST('x' AS VARCHAR(MAX)), 200000))); \
+                       COMMIT; \
+                       SET @i = @i + 1; \
+                     END; \
+                     DELETE TOP (40) FROM dbo.{scratch}"
+                )) {
+                    batches.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+    });
+
+    // Let the writer drive the counter before rivet starts, so the governor's
+    // first sample PAIR already spans rising pressure.
+    std::thread::sleep(Duration::from_millis(500));
+    let waits_before = mssql_query_i64(FLUSH_WAITS);
+
+    let rig = Rig::mssql_batch(table.name())
+        .mode("chunked")
+        .source_line("tuning:")
+        .source_line("  adaptive: true")
+        .source_line("  min_parallel: 2")
+        .source_line("  batch_size: 250")
+        .source_line("  throttle_ms: 100")
+        .export_line("chunk_column: id")
+        .export_line("chunk_size: 1000")
+        .export_line("parallel: 8");
+    // Watchdog: same 120 s ceiling as the PG and MySQL twins. The writer is
+    // reaped by `PressureWriter`'s Drop on every panic path (including the
+    // `.expect`s inside the bounded runner), so a wedged governor cannot leave
+    // a 200 KB-per-commit loop running against the shared server.
+    let bounded = rig.run_with_envs_bounded(
+        &[("RUST_LOG", "info"), ("RIVET_GOVERNOR_INTERVAL_MS", "200")],
+        Duration::from_secs(120),
+    );
+
+    let waits_after = mssql_query_i64(FLUSH_WAITS);
+    let writer_panicked = writer.reap();
+    let batches = writer_batches.load(Ordering::Relaxed);
+
+    let out = bounded.unwrap_or_else(|| {
+        panic!(
+            "the governed MSSQL run under log-flush pressure did not finish within 120s \
+             (governor deadlock regression?); the writer had committed {batches} batches"
+        )
+    });
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+
+    assert!(
+        out.status.success(),
+        "the governed run must still complete under log-flush pressure; stderr:\n{stderr}"
+    );
+    assert_governor_awake(&stderr, "mssql");
+    // Activation guard BEFORE the shed assertion: an inert fixture must go RED
+    // here rather than make the shed assertion untestable. Two halves — see the
+    // doc block: the writer's own committed-batch count is attributable to THIS
+    // test, the `_Total` delta is instance-wide.
+    assert!(
+        !writer_panicked,
+        "the log-flush writer PANICKED, so the shed assertion below grades something \
+         other than this fixture (it committed {batches} batches first)"
+    );
+    assert!(
+        batches >= 5,
+        "fixture went inert: this test's OWN writer committed {batches} 40-transaction \
+         batches (needs >= 5) — it never connected or every batch failed, so any counter \
+         movement below belongs to a concurrent sibling, not to this fixture"
+    );
+    let delta = waits_after.saturating_sub(waits_before);
+    assert!(
+        delta >= 100,
+        "fixture went inert: Log Flush Waits (_Total) moved by {delta} across the run \
+         (needs >= 100; ~408 measured for this shape over 400 commits), so the governor \
+         had no rising foreign signal to react to and the shed assertion below would \
+         grade nothing ({batches} writer batches landed)"
+    );
+    assert!(
+        stderr.contains("backed off"),
+        "under rising Log Flush Waits the governor must shed at least one worker; \
+         counter moved by {delta} over {batches} writer batches; stderr:\n{stderr}"
+    );
+    assert_eq!(
+        duckdb_total_parquet_rows(&rig.out_dir()),
+        ROWS as usize,
+        "every exported row must round-trip while the governor is shedding"
     );
 }

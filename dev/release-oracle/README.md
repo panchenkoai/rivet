@@ -76,12 +76,14 @@ Regenerate the snapshot golden on purpose with `python3 -m dev.release_oracle --
 ### The rest of the environment — and why a SKIP tally is the first thing to read
 
 The CDC block above is only part of it. A gate run with none of the below is
-**95 PASS / 60 SKIP** and still prints `RELEASE-READY`, which is literally true
-("every non-skipped cell is green") and nearly meaningless. With everything set
-it is **~125 PASS / ~36 SKIP**. Always read the SKIP count before the verdict.
+**95 PASS / 60 SKIP** and — apart from the previous-release stages, which now FAIL
+rather than skip when their baseline is missing — still prints `RELEASE-READY`, which
+is literally true ("every non-skipped cell is green") and nearly meaningless. With
+everything set it is **~125 PASS / ~36 SKIP**. Always read the SKIP count before the
+verdict.
 
 ```
-RIVET_PREV_RELEASE_BIN      /path/to/DOWNLOADED release binary   # release regression + scale baseline
+RIVET_PREV_RELEASE_BIN      /path/to/DOWNLOADED release binary   # REQUIRED for a release run: regression + differential + field replay (absent ⇒ FAIL, not SKIP); also the scale baseline
 RIVET_REGRESSION_SOURCE_URL postgresql://…                       # a PG the cell may seed regr_probe into
 RIVET_SCALE_<ENGINE>_URL    …                                    # batch-tier DBs, per engine
 BQ_ORACLE_PROJECT           …                                    # BigQuery golden stage
@@ -139,31 +141,138 @@ have published**, when the failure is no longer re-runnable from the immutable t
 RED-proven: a stale `Cargo.lock` reddens the lock check; a multi-line inline table
 reddens **both** the offline guard AND `cargo chef prepare`. SKIP when `cargo` is absent.
 
-## Regression vs the previous release (pre-tag preflight)
+## Comparison against the previous release — three stages, and they BLOCK
 
 The gate compares to checked-in **goldens** and to **itself**, never to the version
-users are actually running. Two regressions ship green through every correctness
-check yet are release-blocking. `verify_release_regression` (`dev/release_oracle/regression.py`)
-benchmarks against the **DOWNLOADED previous-release binary** (`RIVET_PREV_RELEASE_BIN`
-— a GitHub release asset / brew bottle, the artifact users run, never a rebuilt
-parent) over a seeded 100K keyset+zstd fixture:
+users are actually running. That gap shipped **0.24.4**: a governor regression
+(+1h48m makespan, 52 exports shedding workers in a field run) walked through a full
+green gate, because the one stage that would have seen it **reported a non-failure —
+it never ran**. Three stages now close it, all keyed off the same **DOWNLOADED
+previous-release binary** (`RIVET_PREV_RELEASE_BIN` — a GitHub release asset / brew
+bottle, the artifact users run, never a locally rebuilt parent):
 
-- **B-format (cross-version read)** — the previous release WRITES; the current binary
-  must READ its manifest + parts (`rivet validate` PASSED + an independent DuckDB
-  row-count == source). A format bump the new release can't read silently breaks every
-  existing user's data on upgrade — a quiet loss, worse than a crash.
-- **B-perf** — current wall-clock ≤ the previous release's × tolerance
-  (`RIVET_REGRESSION_WALL_TOL`, default 1.5×; RSS reported alongside). A 3× slowdown
-  or an RSS blow-up passes every count/value check.
+| stage (`dev/release_oracle/regression.py`) | compares | fails the release when | ledger rows |
+|---|---|---|---|
+| **`verify_release_regression`** | prev WRITES → cur READS (format compat), and cur's wall-clock/RSS vs prev over a seeded 100K keyset+zstd fixture | cur cannot open prev's manifest+parts (`rivet validate` + an independent DuckDB count == source), or cur is slower than prev × `RIVET_REGRESSION_WALL_TOL` (default 1.5×) | one (`release/regression`) |
+| **`verify_previous_release_differential`** | runs `dev/pytools/ab_regression.py` — **both** binaries over 8 identical scenarios (full, chunked-parallel, keyset-parallel, `chunk_checkpoint`, incremental, csv, crash+resume, error-exit + `plan --format json`) | **any** observable difference: exit code, DuckDB readback, file count, or the manifest's accounting **including per-part content fingerprints and column checksums** — or fewer than 8 scenarios were compared | one per scenario **+ a `scenarios` row carrying the COUNT** |
+| **`verify_field_symptom_replay`** | runs `dev/pytools/field_replay.py` — the field run's own shape (tiny `full` exports, a keyset majority at parallel 1/2/4, a few chunked, under a pool), both binaries, adaptive on and off | any of the four criteria fixed in the harness fails: **1** the OLD binary must shed at least once, **2** the NEW binary sheds zero on an idle source, **3** new makespan ≤ old × 1.05, **4** identical rows per export | one per criterion **+ a `criteria` row** |
+
+**Criterion 1 is the activation guard and is reported as such.** If the old binary
+never sheds, the fixture reproduced nothing and criteria 2–4 grade *air* — a green
+"symptom gone" then means only that nothing happened. That row fails **loudly**, and
+criteria 2–4 that "passed" underneath it are recorded **SKIP — vacuous**, never PASS.
+The same rule governs the differential's per-scenario rows (a cell the harness marks
+`GRADED NOTHING` — both sides empty, the injected crash never fired — is a **FAIL**,
+not agreement) and its count row: a harness that compared zero scenarios also reports
+"no difference", so the **number of scenarios graded** is asserted (ratchet: 8) and
+printed in the row a reader sees.
+
+> **The replay fixture has a shelf life — plan its retirement, don't tune it away.**
+> Criterion 1 asks the *previous release* to reproduce the symptom, so this stage is
+> evidence only while `RIVET_PREV_RELEASE_BIN` is a release that **carries** the
+> regression (0.24.4). Measured 2026-08-14 against the 0.24.3 asset, which predates
+> it: criterion 1 went RED (`old shed 0x`) and 2–4 were recorded vacuous — the stage
+> behaving exactly as designed. Once the fix has shipped, the newest release no
+> longer sheds either and this stage goes permanently red on criterion 1. Pin its
+> baseline to the last regressing release, or retire the fixture for the next symptom
+> worth reproducing. Do **not** soften criterion 1 into a warning — that is the
+> vacuity the stage exists to prevent.
 
 Each binary runs in its **own env dir** (its own `.rivet_state.db`, which lives next
-to the config): the new binary UPGRADES the state schema (v18→v19), which the old
-binary then cannot open — never share a state dir across versions.
+to the config), and all three stages pin `RIVET_STATE_URL=""`: the new binary UPGRADES
+the state schema (v18→v19), which the old binary then cannot open — never share a
+state dir across versions. The field replay additionally reads its shed counts out of
+that SQLite `run_journal`, so a leaked process-wide state URL would make a live
+fixture read as dead.
+
+### A missing baseline FAILS — that is the point
+
+`RIVET_PREV_RELEASE_BIN` absent (or not executable) is **FAIL**, not SKIP, for all
+three stages. This is the one deliberate exception to the gate's "a down service is
+SKIP" contract, and 0.24.4 is the reason: **a check that grades nothing must not
+report a non-failure.** Everything else in `regression.py` keeps the ordinary
+contract — an absent `RIVET_REGRESSION_SOURCE_URL` or `RIVET_SCALE_<ENGINE>_URL` is a
+down service, not a missing baseline, and still SKIPs.
+
+The escape is explicit, named after what it costs, and never a default:
+
+```
+python3 -m dev.release_oracle --without-prev-release-comparison   # or RIVET_ORACLE_WITHOUT_PREV_RELEASE=1
+```
+
+It turns those three stages back into SKIPs for a local partial run. Every row it
+records says the run *does not grade the release against the binary users are
+running*, the driver prints it beside the state backend at start-up, and it prints
+`NOT RELEASE-GRADED` after the final verdict — because `RELEASE-READY` is derived
+from the rows and is literally true ("every non-skipped cell is green"), which is
+exactly the sentence 0.24.4 shipped under. **A run that grades nothing against the
+previous release cannot support a tag.** `make release-oracle-full` downloads the
+baseline for you and never needs it, and so does `make release-oracle-bless` (which
+depends on the download and now passes it through). `make release-oracle` — the BARE
+target, which by design carries only what is already in your shell — passes the flag
+for you: an entry point with no baseline must give the comparison up BY NAME rather
+than go red on three stages over an absence it was never going to carry.
+
+**The escape only excuses an ABSENT baseline, and the banner says which happened.**
+`_require_prev_binary` returns the baseline *before* it consults the flag, so a run
+that has one compares against it whatever the flag says — and `RIVET_PREV_RELEASE_BIN=…
+make release-oracle` is exactly that run, since the bare target passes the flag
+unconditionally. Both the start-up banner and the closing line are therefore keyed on
+the BASELINE, not on the flag: with one present they say the three stages *run and
+grade* (and note that the escape did not apply), and no `NOT RELEASE-GRADED` line is
+printed. Keyed on the flag alone, the gate announced a skip, ran all three stages for
+real, and then closed with "nothing above compared this binary to the release users
+are running" over a table full of genuine PASS/FAIL rows.
+
+Timeouts come in TWO layers, deliberately: the harness's own per-unit budget
+(`RIVET_AB_TIMEOUT`, default 900s per case-run; `RIVET_FIELD_TIMEOUT`, default 3600s
+per leg) and the *wrapper's* whole-harness budget (`RIVET_ORACLE_AB_TIMEOUT` /
+`RIVET_ORACLE_FIELD_TIMEOUT`, each defaulting to the harness's budget × its unit
+count + slack, with BOTH numbers imported from the harness rather than re-typed).
+They must not be one knob: reading the same variable for both made the wrapper's
+budget the smaller number, so it always fired first and the harness's own graceful
+timeout could never be reached. The wrapper's expiry sends **SIGINT** and waits out a
+grace period before SIGKILL, because both harnesses clean up a SHARED stand on the
+way out (server-wide MySQL tmp-table globals; a seeded fixture table) and no SIGKILLed
+process runs its cleanup. That grace **defaults to the child's OWN cleanup worst
+case** — `field_replay.RESTORE_WORST_CASE` (3 retries × a `SET GLOBAL` + a read-back),
+`ab_regression.TEARDOWN_WORST_CASE` (the fixture `DROP`) — imported, not typed: a flat
+300s against a ~3600s restore meant a wedged container (precisely the condition that
+makes the wrapper fire AND the restore slow) was killed mid-restore under a transcript
+asserting the cleanup had not run. `RIVET_ORACLE_CHILD_GRACE` overrides it; `0` is
+honoured as zero and prints what it costs, and a malformed value warns and falls back
+instead of taking the gate down at import.
+
+After the replay returns — for any reason, including a kill — the wrapper reads
+`@@GLOBAL.{internal_tmp_mem_storage_engine,tmp_table_size,max_heap_table_size}` back
+off `rivet-mysql-1`, restores them to `DEFAULT` if the flip is still there, and
+records a FAIL row naming the poisoned stand. Two limits on that read, both of which
+now produce a row rather than silence:
+
+* **The container may not answer** — a wedged MySQL wedges the read-back too, which is
+  exactly the case a SIGKILLed harness leaves behind. The stand is then classified
+  from the harness's own transcript (`STAND_FLIPPED_MARKER` / `STAND_RESTORED_MARKER` /
+  `STAND_MUTATED_MARKER`): flipped-and-never-confirmed is a **FAIL** saying the state
+  is UNKNOWN and must be assumed mutated, with the SQL to check it by hand; a verified
+  restore, or a run that never reached the flip, is a **SKIP** saying so. Nothing is
+  ever silently treated as clean.
+* **Another run may own the stand** — the read *and* the repair take `field_replay`'s
+  own `StandLock` (`flock`, non-blocking). Unlocked, this read could see a concurrent
+  replay's legitimate in-flight flip, record a false "stand mutated" FAIL, and then
+  `SET GLOBAL … = DEFAULT` under a live harness, breaking ITS criterion 1 for a reason
+  unrelated to the binaries. A held lock records "stand busy — not checked".
+
+A harness that times out or dies
+without naming a scenario/criterion is a FAIL with its last output attached, never a
+quiet pass. The replay needs the **batch
+MySQL stand** (`rivet-mysql-1` at 127.0.0.1:3306) and the differential the **batch
+Postgres stand** (`rivet-postgres-1`) plus `duckdb` — with the stand down, criterion 1
+(or the harness's own `expected_rows` guard) fails, which is the intended report:
+"this did not grade anything", not a skip.
 
 RED-proven: corrupting a part the prev release wrote reddens the format check (cur
 `validate` no longer PASSES); a genuinely slower binary (a debug build, ~1.5×) reddens
-the perf check below its slowdown. SKIP when `RIVET_PREV_RELEASE_BIN` /
-`RIVET_REGRESSION_SOURCE_URL` are absent.
+the perf check below its slowdown.
 
 ## Final stage — BigQuery golden
 
@@ -184,6 +293,12 @@ green.
 
 - A cell is **PASS** only when its check RAN and MATCHED.
 - A down service / absent cloud cred is **SKIP** — never a silent pass.
+- **A missing previous-release baseline is a FAIL, not a SKIP.** A gate that grades
+  nothing must not report a non-failure; the only way to make those three stages skip
+  is `--without-prev-release-comparison`, which says so in every row and in the final
+  line. (0.24.4.)
+- A harness stage that graded **fewer subjects than it must** — scenarios compared,
+  criteria evaluated — fails on the COUNT, before anyone reads its verdict.
 - The gate exits non-zero (**NOT RELEASABLE**) if any non-skipped cell fails.
 
 ## Layout
@@ -193,7 +308,10 @@ matrix.yaml              # declarative source of truth (engines × versions × s
 python3 -m dev.release_oracle  # the driver (orchestration loop); --bless-local re-blesses the local goldens
 lib/cfg.py               # matrix query interface (dependency-free — no PyYAML)
 dev/release_oracle/scenarios.py         # the scenario implementations (verdicts / integrity_types / load / gc)
+dev/release_oracle/regression.py        # the three previous-release stages (format+perf, differential, field replay)
 dev/release_oracle/bigquery.py          # the BigQuery golden stage (rivet run → GCS, rivet load → BQ, bq query)
+dev/pytools/ab_regression.py            # the differential harness the gate drives (also runnable standalone)
+dev/pytools/field_replay.py             # the field-symptom replay harness (four criteria, fixed in the file)
 lib/parse_verdicts.py    # parse `rivet check` → {table: {strategy, verdict}}
 lib/gcs_pull.py          # independent fake-gcs readback (no gsutil needed)
 lib/normalize_bq.py      # canonicalize a read-back for the golden diff

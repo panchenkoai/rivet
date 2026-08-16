@@ -238,8 +238,28 @@ pub(super) fn incomparable(p: &ThroughputPair) -> Option<Incomparable> {
 /// the run's makespan improves — the very trade `--pool` is for. Unknown modes
 /// are treated as concurrent: hedged text on a serial run is harmless, a
 /// confident "check governor sheds" on a pool run is a false accusation.
+///
+/// `pool-serial` is a pool run that never overlapped anything (`--pool 1`, or
+/// one export left after the `--resume` skip): nothing shared the source, so it
+/// belongs on the serial side however it was invoked. The label producers are
+/// the three `*_mode_label` functions in `pipeline::run` — `wave_mode_label`,
+/// `pool_mode_label` and `run_mode_label` (the top-level runner's, added by the
+/// round-5 fix) — and `every_run_mode_label_a_runner_can_emit_is_classified`
+/// DERIVES that set from run.rs rather than naming it, so a fourth producer (or
+/// a fourth arm on one of the three) cannot land unclassified: an unclassified
+/// SERIAL label falls through the unknown arm below and silently loses the
+/// actionable pointer. `run.rs`'s `a_runner_never_spells_its_concurrency_claim_
+/// as_a_literal` grades the other half of the same contract (who may emit
+/// them); the two guards are one list, seen from each side.
+///
+/// `"single"` is recognised but has no producer today — see the RETIRED list in
+/// `every_run_mode_label_a_runner_can_emit_is_classified`, which is what keeps
+/// that fact true rather than merely written down.
 fn mode_shares_the_source(run_mode: &str) -> bool {
-    !matches!(run_mode, "sequential" | "wave-sequential" | "single")
+    !matches!(
+        run_mode,
+        "sequential" | "wave-sequential" | "single" | "pool-serial"
+    )
 }
 
 /// Pure run-over-run self-check: compare each export's throughput (rows/s)
@@ -297,14 +317,19 @@ pub(super) fn throughput_regressions(pairs: &[ThroughputPair], run_mode: &str) -
 
 /// Read each successful export's previous success from the state DB and WARN
 /// about material throughput regressions. Best-effort: a state read failing
-/// never affects the run. Called beside [`print`] at every aggregate site so
-/// EVERY run self-reports degradation at the default log level — the answer
-/// to "prove the next run is not strangling itself" is that the run says so.
+/// never affects the run.
+///
+/// Call it through `run::self_check_throughput` — its ONE caller, and the seam
+/// that makes "EVERY run self-reports degradation" true rather than
+/// aspirational: every orchestrator tail (`run`'s two branches, `run_waves`,
+/// `run_pool`) routes through it with no export-count gate, and a re-exec'd
+/// child defers to the parent that aggregates it so no export is reported
+/// twice. Both halves shipped broken — the check reached `run()` alone
+/// (bughunt 2026-08-14).
 ///
 /// `run_mode` is the same string [`build`] records on the aggregate — passed
 /// here so the warning can say which concurrency the run used (see
-/// [`throughput_regressions`]); the single-export path has no aggregate and
-/// passes `sequential` / `concurrent-siblings` for itself.
+/// [`throughput_regressions`]).
 pub(super) fn warn_throughput_regressions(
     state: &StateStore,
     entries: &[RunAggregateEntry],
@@ -700,6 +725,49 @@ mod tests {
         }
     }
 
+    /// The honest output for a run that exported nothing is an empty-but-VALID
+    /// document, never silence.
+    ///
+    /// A `partition_by` export over a currently-empty table expands to zero
+    /// children, so `run()`'s tail reaches here with no entries. A machine
+    /// consumer on the other end of `--json` / `--summary-output` must still get
+    /// a parseable object saying so — `total_exports: 0` is an answer,
+    /// `json.load("")` is a crash. (The routing that decides whether to EMIT it
+    /// is pinned by `run::tail_plan_emits_a_machine_document_for_a_zero_export_run`;
+    /// this is the document half.)
+    ///
+    /// Distinct from `build_with_zero_exports_is_well_formed`, which checks the
+    /// STRUCT's counters: what a `--json` consumer holds is the SERIALIZED form,
+    /// where an absent `per_export` or a skipped zero field is just as
+    /// unparseable downstream as an empty stream.
+    ///
+    /// RED against a `build` that miscounts an empty entry list (proven with
+    /// `entries.len().max(1)`: `total_exports` reads 1) or a serializer that
+    /// drops zero-valued / empty fields.
+    #[test]
+    fn a_zero_export_run_still_builds_a_valid_document() {
+        let now = Utc::now();
+        let agg = build(
+            vec![],
+            now - Duration::seconds(3),
+            now,
+            Some("c.yaml"),
+            "sequential",
+        );
+        let json = serde_json::to_string_pretty(&agg).expect("must serialize");
+        let round: serde_json::Value = serde_json::from_str(&json).expect("must parse");
+        assert_eq!(round["total_exports"], 0);
+        assert_eq!(round["success_count"], 0);
+        assert_eq!(round["failed_count"], 0);
+        assert_eq!(round["total_rows"], 0);
+        assert!(
+            round["per_export"].as_array().is_some_and(|a| a.is_empty()),
+            "per_export must be present and empty, not absent: {json}"
+        );
+        assert_eq!(round["duration_ms"], 3000, "the window is still measured");
+        assert_eq!(round["config_path"], "c.yaml");
+    }
+
     fn entry(name: &str, status: &str, rows: i64, files: i64, bytes: u64) -> RunAggregateEntry {
         RunAggregateEntry {
             bytes_read: 0,
@@ -921,12 +989,301 @@ mod tests {
             "parallel-processes",
             "wave-parallel-processes",
             "pool",
-            "concurrent-siblings",
         ] {
             assert!(mode_shares_the_source(m), "{m} shares the source");
         }
+        // `"single"` is here as a VALUE the classifier recognises, not as a
+        // label a runner emits — no producer has ever returned it (see the
+        // RETIRED list in `every_run_mode_label_a_runner_can_emit_is_classified`,
+        // which fails if that changes). Completeness over the labels runners
+        // really emit is that test's job, derived; this list is text coverage.
         for m in ["sequential", "wave-sequential", "single"] {
             assert!(!mode_shares_the_source(m), "{m} is serial");
+        }
+        // A pool that never overlapped anything shared nothing: `--pool 1`, or
+        // one export left after the `--resume` skip, must keep the ACTIONABLE
+        // tail. (See `every_run_mode_label_a_runner_can_emit_is_classified`.)
+        let serial_pool = throughput_regressions(&[p()], "pool-serial");
+        assert!(
+            serial_pool[0].contains("check governor sheds"),
+            "a serialized pool must not excuse a regression as source sharing: {serial_pool:?}"
+        );
+        // An unrecognised mode must hedge, not accuse — hedged text on a serial
+        // run is harmless, a confident "check governor sheds" on a concurrent
+        // one is a false accusation. (This case used to be spelled
+        // `concurrent-siblings`, the string the single-export tail passed for a
+        // re-exec'd child; that child now defers its self-check to the parent,
+        // which reports under the run-wide mode, so no caller emits it.)
+        assert!(mode_shares_the_source("a-mode-added-next-release"));
+    }
+
+    /// Drop `//` comments so a doc's ``[`wave_mode_label`]`` cannot be read as a
+    /// definition, and a doc's `"pool-serial"` cannot be read as a label a
+    /// function returns. (Line-scoped, like run.rs's sibling scanner: it is used
+    /// only to locate `fn` definitions and to slice their bodies, both of which
+    /// are comment-free.)
+    fn code_only(src: &str) -> String {
+        src.lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The string literals a function body can return, in source order.
+    fn string_literals(body: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut chars = body.chars();
+        while let Some(c) = chars.next() {
+            if c != '"' {
+                continue;
+            }
+            let mut lit = String::new();
+            for c in chars.by_ref() {
+                if c == '"' {
+                    break;
+                }
+                lit.push(c);
+            }
+            out.push(lit);
+        }
+        out
+    }
+
+    /// Every function `pipeline::run` DEFINES that can PRODUCE a label, with the
+    /// labels it can return — derived from the TYPE, not from the name.
+    ///
+    /// The dimension is "every value that can reach [`mode_shares_the_source`]",
+    /// and those values arrive as `&'static str` (through `RunModes`, whose map
+    /// is keyed by export and whose fallback is the run's own label). So a
+    /// producer is any top-level `fn` in run.rs whose RETURN type mentions
+    /// `&'static str` — directly (`wave_mode_label`, `pool_mode_label`,
+    /// `run_mode_label`) or inside a container (`wave_batch_modes` and
+    /// `pool_export_modes` return `Vec<(String, &'static str)>`).
+    ///
+    /// Naming was the earlier rule and it was narrower than its own claim:
+    /// `wave_batch_modes` is a real producer of the string that reaches the
+    /// classifier and matched no `*_mode_label` pattern. It is safe only because
+    /// it DELEGATES to `wave_mode_label`; one `else { "wave-solo" }` there would
+    /// have classified a serial label as concurrent with both guards green
+    /// (round-7 bughunt). A delegating producer therefore contributes no labels
+    /// of its own but must be SEEN — hence the emptiness rule below, which is
+    /// "no literals ⇒ must delegate", not the old unconditional "must have
+    /// literals" (a producer whose one non-literal arm returned a constant
+    /// passed on the strength of its siblings).
+    ///
+    /// Top-level `const NAME: &str = "…"` declarations are folded in so a
+    /// producer returning a named constant is still graded BY VALUE rather than
+    /// silently reading as a delegating one.
+    ///
+    /// LIMITS, since a text parser cannot be sound: it sees run.rs only (a
+    /// producer moved to another module is invisible), it reads the return type
+    /// syntactically (a type alias for `&'static str` would not match), and it
+    /// cannot evaluate an arm that returns a computed value — a `format!`-built
+    /// label, or one read from config. Every producer that exists today is a
+    /// total function over literals, and the emptiness rule turns the
+    /// computed-arm case into a loud failure rather than a silent pass.
+    fn mode_label_producers() -> Vec<(String, Vec<String>)> {
+        let whole = include_str!("run.rs");
+        let product = &whole[..whole
+            .find("\n#[cfg(test)]")
+            .expect("run.rs has test modules")];
+        let code = code_only(product);
+        // Top-level string constants, so a `return SOME_CONST` arm is graded.
+        let mut consts: Vec<(String, String)> = Vec::new();
+        for line in code.lines().filter(|l| !l.starts_with(char::is_whitespace)) {
+            let Some(rest) = line.split_once("const ").map(|(_, r)| r) else {
+                continue;
+            };
+            let Some((name, value)) = rest.split_once(':') else {
+                continue;
+            };
+            if let Some(lit) = string_literals(value).first() {
+                consts.push((name.trim().to_string(), lit.clone()));
+            }
+        }
+        let mut out: Vec<(String, Vec<String>)> = Vec::new();
+        for (at, line) in code
+            .match_indices('\n')
+            .map(|(i, _)| (i + 1, code[i + 1..].lines().next().unwrap_or("")))
+        {
+            // Top-level definitions only: a `fn` inside an `impl` or a test
+            // module is indented, and rustfmt keeps it that way.
+            let decl = line
+                .strip_prefix("pub ")
+                .or_else(|| {
+                    line.starts_with("pub(")
+                        .then(|| line.split_once(") ").map(|(_, r)| r))
+                        .flatten()
+                })
+                .unwrap_or(line);
+            if !decl.starts_with("fn ") {
+                continue;
+            }
+            let sig_end = at + code[at..].find('{').expect("a fn has a body");
+            let signature = &code[at..sig_end];
+            // The RETURN type, never a parameter: `RunModes::per_export` takes a
+            // map of `&'static str` and produces no label of its own.
+            let returns_label = signature
+                .split_once("->")
+                .is_some_and(|(_, ret)| ret.contains("&'static str"));
+            if !returns_label {
+                continue;
+            }
+            let name = decl["fn ".len()..]
+                .split(['(', '<'])
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            let body_end = code[sig_end..]
+                .find("\n}")
+                .map(|i| sig_end + i)
+                .unwrap_or_else(|| panic!("no top-level close found for `{name}`"));
+            let body = &code[sig_end..body_end];
+            let mut labels = string_literals(body);
+            labels.extend(
+                consts
+                    .iter()
+                    .filter(|(c, _)| body.contains(c.as_str()))
+                    .map(|(_, v)| v.clone()),
+            );
+            if labels.is_empty() {
+                assert!(
+                    body.contains("_mode_label("),
+                    "`{name}` returns a label but this parser found none — it \
+                     neither spells one as a literal (nor as a top-level const) \
+                     nor delegates to a `*_mode_label` decider, so nothing here \
+                     can grade what it emits. Give it literal arms, make it \
+                     delegate, or teach this parser the shape."
+                );
+            }
+            out.push((name, labels));
+        }
+        out
+    }
+
+    /// Derive the classified dimension from the PRODUCERS, never re-type it.
+    ///
+    /// `mode_shares_the_source` classifies by VALUE and treats anything it does
+    /// not recognise as concurrent — a deliberate fail-safe for the TEXT, but it
+    /// means a runner that starts emitting a new serial label silently loses the
+    /// actionable "check governor sheds / adaptive batch shrinks / source load"
+    /// pointer, and nothing fails.
+    ///
+    /// So this calls the label functions in `run` and classifies what they
+    /// return — and then, because "the producers" is itself a dimension someone
+    /// has to keep up to date, PARSES run.rs for every `*_mode_label` definition
+    /// and every literal in it, and fails if one was never classified above.
+    /// That second half is the finding: round 4 wrote this guard over the wave's
+    /// and the pool's deciders and its doc called them "the only producers";
+    /// round 5 extracted a THIRD, `run_mode_label`, taught run.rs's sibling
+    /// guard about it and left this one asking two of three — the arc's own
+    /// recurring defect (fix a class in one file, not in its sibling). A hand
+    /// list cannot catch its own omission, so the list is derived.
+    ///
+    /// The other half of the contract — that no runner spells a label inline
+    /// instead of asking a producer — is `run.rs`'s
+    /// `a_runner_never_spells_its_concurrency_claim_as_a_literal`. Both grade
+    /// the same set; only this one can grade it without naming it.
+    ///
+    /// RED against dropping `"pool-serial"` from the serial arm (the serialized
+    /// pool then reads as source-sharing), against a label function that returns
+    /// the concurrent string for a run that never overlapped, and — the
+    /// derivation half — against a fourth arm on any producer (verified with
+    /// `run_mode_label` returning `"threads-serial"` at `peak == 1 && !processes`:
+    /// `run_mode_label can emit "threads-serial", which no case above
+    /// classifies`).
+    #[test]
+    fn every_run_mode_label_a_runner_can_emit_is_classified() {
+        use crate::pipeline::run::{pool_mode_label, run_mode_label, wave_mode_label};
+        let mut classified: std::collections::BTreeSet<&'static str> = Default::default();
+        // Concurrency achieved → the run really did share the source.
+        for m in [
+            wave_mode_label(2),
+            wave_mode_label(9),
+            pool_mode_label(true),
+            run_mode_label(2, true),
+            run_mode_label(9, false),
+        ] {
+            classified.insert(m);
+            assert!(
+                mode_shares_the_source(m),
+                "{m} is emitted for a run that overlapped exports"
+            );
+        }
+        // Asked for concurrency, got none (the cost gate serialized the wave;
+        // `--pool 1` or a single pending export; a top-level run left with one
+        // export whichever path asked) → nothing shared the source.
+        for m in [
+            wave_mode_label(0),
+            wave_mode_label(1),
+            pool_mode_label(false),
+            run_mode_label(0, true),
+            run_mode_label(1, true),
+            run_mode_label(0, false),
+            run_mode_label(1, false),
+        ] {
+            classified.insert(m);
+            assert!(
+                !mode_shares_the_source(m),
+                "{m} is emitted for a run whose exports ran one at a time — it must \
+                 keep the actionable attribution"
+            );
+        }
+
+        // The dimension itself, derived: every producer run.rs defines, and
+        // every label it can return, must have been classified above.
+        let producers = mode_label_producers();
+        // Anti-inertness floor, NOT the dimension: a parser that matched
+        // nothing (or lost the module boundary) would otherwise pass this test
+        // by grading an empty set. Today's five are the three deciders plus the
+        // wave's and the pool's per-export producers.
+        assert!(
+            producers.len() >= 5,
+            "the producer parser found {} label producers — expected at least the \
+             three run-mode deciders plus the wave's and the pool's per-export \
+             producers, so the parser has gone blind: {producers:?}",
+            producers.len()
+        );
+        for (name, labels) in &producers {
+            for label in labels {
+                assert!(
+                    classified.contains(label.as_str()),
+                    "`{name}` can emit {label:?}, which no case above classifies — a new \
+                     label must be added to the concurrent or the serial arm here, or it \
+                     falls through `mode_shares_the_source`'s unknown arm and a serial run \
+                     silently loses the actionable attribution"
+                );
+            }
+        }
+
+        // …and the serial arm may not accumulate dead weight either: each label
+        // it recognises is either produced today or named RETIRED, which is
+        // checked, not asserted in prose. `"single"` has never had a producer
+        // (it shipped with the classifier in 884f3df2 as a defensive entry);
+        // `mode_shares_the_source`'s doc says so, and this is what keeps that
+        // sentence honest if a producer ever starts emitting it.
+        const RETIRED: [&str; 1] = ["single"];
+        let producible: std::collections::BTreeSet<&str> = producers
+            .iter()
+            .flat_map(|(_, l)| l.iter().map(String::as_str))
+            .collect();
+        let mine = code_only(include_str!("aggregate.rs"));
+        let at = mine
+            .find("fn mode_shares_the_source(")
+            .expect("mode_shares_the_source moved — update the anchor");
+        let end = mine[at..].find("\n}").map(|i| at + i).unwrap();
+        for label in string_literals(&mine[at..end]) {
+            assert!(
+                producible.contains(label.as_str()) || RETIRED.contains(&label.as_str()),
+                "`mode_shares_the_source` recognises {label:?}, which no producer emits — \
+                 delete it or add it to RETIRED with the reason"
+            );
+        }
+        for label in RETIRED {
+            assert!(
+                !producible.contains(label),
+                "{label:?} has a producer now — drop it from RETIRED and classify it above"
+            );
         }
     }
 

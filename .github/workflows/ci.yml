@@ -1,14 +1,50 @@
 name: CI
 
-# Required branch-protection checks (set in Settings → Branches → main):
-#   fmt · clippy · test · test-invariants · test-recovery · test-compatibility ·
-#   test-stability · test-type-validators
+# Required branch-protection checks on `main`, READ FROM THE API (not from
+# memory) on 2026-08-16 via
+#   gh api repos/:owner/:repo/branches/main/protection
+# and listed by CHECK NAME, which is the `name:` of the job — the previous
+# ledger listed eight JOB IDs (`fmt`, `clippy`, `test`, …), a naming GitHub
+# never uses, and omitted ten of the eighteen contexts that are actually
+# required. Three other comments in this file then contradicted it. Only the API
+# is truth; this list is a snapshot and must be re-read before it is trusted:
+#
+#   Clippy · Compatibility matrix tests (semantic gate) · E2E matrix ·
+#   Generated docs are in sync (docs-as-code) · Invariant tests (semantic gate) ·
+#   Mutants (changed lines) · New config keys carry tests ·
+#   OSS must not depend on rivet-pro (one-way seam, ADR-0026) ·
+#   PR regression matrices (cli + cfg + path) · Recovery tests (semantic gate) ·
+#   Release build · Rustfmt · Security audit ·
+#   Stability tests — Phase 1 (semantic gate) · Tests ·
+#   Type mapping contracts (semantic gate) ·
+#   Type round-trip validators — DuckDB · ClickHouse · pyarrow (semantic gate) ·
+#   Type-golden tests (semantic gate)
+#
+# (strict: true — a branch must be up to date with main before merging.)
+#
+# NOT required, as of the same read: `Mutants (gate sanity)`,
+# `Gate scripts (self-tests)` and `Mutants (coverage verdict)`. Two things
+# follow, and neither can be fixed from this file:
+#
+#  * `Mutants (changed lines)` IS required and is `continue-on-error: true`,
+#    which makes the job's CONCLUSION success even when its run fails. A
+#    required check that cannot report failure blocks nothing — that is how the
+#    vacuous gate survived eight runs. The evidence about what it actually
+#    graded is now published as job OUTPUTS and asserted by
+#    `Mutants (coverage verdict)`.
+#  * `Mutants (coverage verdict)` is the one check that has to be ADDED to
+#    branch protection for the mutation gate to block anything: it runs with
+#    `if: always()` and fails unless `Mutants (gate sanity)`,
+#    `Gate scripts (self-tests)` and the per-diff run all reached a real
+#    verdict, so requiring it transitively requires those three. (A job skipped
+#    by a failed `needs` counts as PASSING for a required check, which is why it
+#    is `always()` rather than a plain dependency.)
 #
 # The semantic-gate jobs below run each suite in isolation so GitHub can
 # block merges on named regressions, not just overall build failures.
-# `test-type-validators` brings up the DuckDB/ClickHouse oracle containers so
-# the type round-trip suite (previously only runnable by hand via the Makefile)
-# is enforced on every PR.
+# `Type round-trip validators` brings up the DuckDB/ClickHouse oracle containers
+# so the type round-trip suite (previously only runnable by hand via the
+# Makefile) is enforced on every PR.
 
 on:
   push:
@@ -18,6 +54,12 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # How many in-diff mutants the 90-minute `mutants-in-diff` budget can grade
+  # (~80s each at -j2 on a 2-core runner). ONE definition, read by both the job
+  # that spends the budget and the blocking `mutants-gate-sanity` job that
+  # audits what the budget skipped — two copies of this number are two gates
+  # that can disagree about whether a diff was graded.
+  MUTANTS_DIFF_BUDGET: 120
   # CI debug builds keep line-tables only (file:line in panics is enough for
   # triage) — not full DWARF. This shrinks the debug `target/` and the link
   # working set, speeding every `cargo test`/`cargo build` job and easing disk
@@ -150,7 +192,23 @@ jobs:
     # signal is still emitted for review; mutation coverage for such modules is
     # ratcheted in the nightly baseline (docs/mutants-baseline.txt), not gated
     # per-diff. Keep it a gate for normal-sized diffs.
+    #
+    # `continue-on-error` makes this job's CONCLUSION success whatever happens
+    # in it, so neither a required-check setting nor a `needs:` can observe what
+    # it did. What it did is therefore PUBLISHED as job outputs and asserted by
+    # the blocking `Mutants (coverage verdict)` job below — the coverage-ledger
+    # rule from CLAUDE.md: the claim "these files are graded" has to be read off
+    # the call site, not asserted about it.
     continue-on-error: true
+    outputs:
+      # `a || b` in a GitHub expression yields b when a is empty, so a step that
+      # never ran falls through to the always()-run reporter below.
+      state: ${{ steps.mutate.outputs.state || steps.report.outputs.state }}
+      result: ${{ steps.mutate.outputs.result || steps.report.outputs.result }}
+      untiered: ${{ steps.mutate.outputs.untiered }}
+      sub: ${{ steps.mutate.outputs.sub }}
+      count: ${{ steps.mutate.outputs.count }}
+      outcome: ${{ steps.report.outputs.outcome }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -159,12 +217,38 @@ jobs:
       # a 42-min run for a README edit is pure waste. The job itself still runs and
       # reports green (so it never blocks a docs merge, and were it ever promoted to
       # a required check a skipped step would not leave it pending).
+      #
+      # This step FAILS OPEN nowhere. The previous version swallowed a failed
+      # fetch with `|| true`; if `origin/<base>` was then unresolvable,
+      # `git diff` wrote nothing, `grep -qv` exited 1, `code=false`, and EVERY
+      # step of the job was skipped under a green "Docs-only PR" notice — a
+      # broken base ref silently disabled the whole gate. An unresolvable base
+      # is now an error, because "I could not read the diff" and "there is
+      # nothing to grade" must not arrive looking alike (the same rule
+      # mutation_tiers.py applies to an unreadable rotation).
+      #
+      # `mutants-gate-sanity` carries a byte-identical copy: GitHub Actions has
+      # no YAML anchors, and the two jobs must decide scope the same way. They
+      # are cross-checked at runtime — `Mutants (coverage verdict)` fails if the
+      # two jobs' pictures of this diff disagree.
       - name: Any non-docs changes?
         id: scope
         run: |
-          git fetch --no-tags origin "${{ github.base_ref }}" >/dev/null 2>&1 || true
-          if git diff --name-only "origin/${{ github.base_ref }}...HEAD" \
-               | grep -qvE '^(docs/|.*\.md$|\.githooks/)'; then
+          set -euo pipefail
+          base="${{ github.base_ref }}"
+          if ! git fetch --no-tags origin "$base"; then
+            echo "::error::could not fetch the base branch '$base' — refusing to guess this PR's scope. A failed fetch used to read as a docs-only PR and skip every check in this job."
+            exit 1
+          fi
+          if ! git rev-parse --verify --quiet "origin/$base^{commit}" >/dev/null; then
+            echo "::error::'origin/$base' does not resolve after a successful fetch — every diff below would be empty, which this gate would otherwise mistake for a docs-only PR."
+            exit 1
+          fi
+          changed=$(git diff --name-only "origin/$base...HEAD")
+          if [ -z "$changed" ]; then
+            echo "code=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::the diff against origin/$base is empty (the base has caught up with this branch) — nothing to mutate."
+          elif printf '%s\n' "$changed" | grep -qvE '^(docs/|.*\.md$|\.githooks/)'; then
             echo "code=true" >> "$GITHUB_OUTPUT"
           else
             echo "code=false" >> "$GITHUB_OUTPUT"
@@ -182,12 +266,141 @@ jobs:
         if: steps.scope.outputs.code == 'true'
         run: cargo install cargo-mutants --locked
       - name: Mutate the PR diff
+        id: mutate
         if: steps.scope.outputs.code == 'true'
         env:
           # Mutants never need debuginfo — halves build dirs, speeds links.
           CARGO_PROFILE_DEV_DEBUG: "0"
+          BASE_REF: ${{ github.base_ref }}
         run: |
-          git diff "origin/${{ github.base_ref }}"...HEAD > pr.diff
+          set -euo pipefail
+          # Everything this step decides is PUBLISHED, because the job's
+          # `continue-on-error: true` means no other job can observe its exit
+          # code. `state` is which branch of the budget guard was taken;
+          # `result` is what the mutation run itself concluded. The blocking
+          # `Mutants (coverage verdict)` job asserts both against its own
+          # independent measurement.
+          say() { echo "$1=$2" >> "$GITHUB_OUTPUT"; }
+          # cargo-mutants exit codes: 0 = every mutant caught, 2 = FOUND_PROBLEMS
+          # (a missed/timed-out mutant — the gate's own finding), anything else =
+          # the tool or the invocation broke, which is NOT a verdict.
+          verdict() {
+            case "$1" in
+              0) say result clean ;;
+              2) say result missed ;;
+              *) say result tool-error ;;
+            esac
+          }
+          # `cargo mutants --list | grep -c .` reads a TOOL FAILURE as the
+          # safest-looking number there is: `grep -c .` on empty stdin prints 0
+          # and exits 1, and the `|| true` that hid grep's status hid
+          # cargo-mutants' status with it. Measured: `cargo mutants --in-diff
+          # /nonexistent --list --colors=never` exits 6 with empty stdout, so
+          # every guard downstream saw "0 mutants" and reported ok having graded
+          # nothing — with cargo-mutants installed unpinned, one `--in-diff`
+          # rename is enough to trigger it. The exit status is therefore captured
+          # BEFORE anything counts lines, and a failure ends the step.
+          list_into() {  # list_into <outfile> <extra cargo-mutants args...>
+            local out="$1"; shift
+            local rc=0
+            cargo mutants --in-diff pr.diff "$@" --list --colors=never > "$out" || rc=$?
+            if [ "$rc" -ne 0 ]; then
+              say state tool-error
+              say result tool-error
+              echo "::error::cargo mutants --list failed (exit $rc) while counting this diff ($*). This gate cannot tell 'no mutants' from 'the tool broke', and the broken answer looks like a clean pass — refusing to report one."
+              sed -n '1,20p' "$out" >&2 || true
+              exit 1
+            fi
+          }
+          git diff "origin/$BASE_REF"...HEAD > pr.diff
+          # BUDGET GUARD. Every mutant is its own incremental build — ~80s on a
+          # 2-core runner at -j2, so the 90-minute ceiling grades roughly 120
+          # ($MUTANTS_DIFF_BUDGET). A five-round branch like #230 yields 416
+          # (158 run.rs, 104 pool.rs, 44 adaptive.rs, ...) ≈ 4.6 h: the job dies
+          # at the ceiling having graded a fraction of the diff and reported
+          # nothing about the rest. `Mutants (changed lines)` IS a required check
+          # (verified against the API — see the ledger at the top of this file),
+          # but `continue-on-error: true` makes its conclusion success no matter
+          # how it ends, so the requirement blocks nothing; what a timeout really
+          # costs is a diff nobody graded. The blocking `Mutants (coverage
+          # verdict)` job fails on the "no verdict recorded" case, which is what
+          # a timeout looks like from outside.
+          #
+          # What the guard hands the work to is CHECKED, not claimed. The first
+          # version of this notice said "these modules are covered by the nightly
+          # tier rotation" — a statement about a hand-written list of 31 files in
+          # nightly-live.yml, while the tree has 198 `src/**.rs`. The branch that
+          # introduced the notice rewrote plan_cmd.rs (+478) and aggregate.rs
+          # (+128), neither in ANY tier: 606 lines graded by nothing, under a
+          # notice saying otherwise. `mutation_tiers.py` now DERIVES tier
+          # membership from the rotation's own `case` arms, and the untiered
+          # remainder — the part nightly will never mutate — is graded HERE,
+          # within the same budget, instead of being waved through.
+          list_into diff-list.txt
+          COUNT=$(grep -c . diff-list.txt || true)
+          say count "$COUNT"
+          if [ "$COUNT" -gt "$MUTANTS_DIFF_BUDGET" ]; then
+            CHANGED=$(git diff --name-only "origin/$BASE_REF"...HEAD -- src | grep '\.rs$' || true)
+            # A parse failure is checked EXPLICITLY rather than left to the
+            # runner's `bash -e`, so it says what it means: "I cannot read the
+            # rotation" must not arrive looking like "the rotation covers this".
+            if ! UNTIERED=$(printf '%s\n' "$CHANGED" | python3 .github/scripts/mutation_tiers.py untiered); then
+              say state tool-error
+              say result tool-error
+              echo "::error::could not read the nightly tier rotation — refusing to claim it covers this diff"
+              exit 1
+            fi
+            if [ -z "$UNTIERED" ]; then
+              say state over-budget-all-tiered
+              say result n/a
+              echo "::notice::this diff yields $COUNT mutants — past the $MUTANTS_DIFF_BUDGET the 90-minute budget can grade (~80s each at -j2). NOT graded per-diff; every changed source file IS in a nightly tier (checked against nightly-live.yml's rotation), so the rotation ratchets them. Split the PR for per-diff mutation coverage."
+              exit 0
+            fi
+            FARGS=""
+            for f in $UNTIERED; do FARGS="$FARGS -f $f"; done
+            NLIST=$(printf '%s' "$UNTIERED" | tr '\n' ' ')
+            say untiered "$NLIST"
+            list_into sub-list.txt $FARGS
+            SUB=$(grep -c . sub-list.txt || true)
+            say sub "$SUB"
+            # Zero is two different answers here, and only one of them is fine:
+            # "these files changed no mutable line" (routine — a comment edit) vs
+            # ".cargo/mutants.toml's exclusions removed every mutant in exactly
+            # the files nothing else grades". The UNFILTERED list is the
+            # discriminator, the same one the sanity job uses for the whole diff.
+            list_into sub-unfiltered.txt $FARGS --no-config
+            SUB_ALL=$(grep -c . sub-unfiltered.txt || true)
+            if [ "$SUB" -eq 0 ] && [ "$SUB_ALL" -gt 0 ]; then
+              say state over-budget-untiered-all-excluded
+              say result n/a
+              echo "::error::the changed files that NO nightly tier covers ($NLIST) yield $SUB_ALL mutants, and .cargo/mutants.toml's exclude_re removes every one of them — so nothing grades them here and nothing grades them nightly. The blocking 'Mutants (coverage verdict)' job reports this as a failure."
+              exit 0
+            fi
+            if [ "$SUB" -eq 0 ]; then
+              say state over-budget-untiered-empty
+              say result n/a
+              echo "::notice::this diff yields $COUNT mutants — past the $MUTANTS_DIFF_BUDGET budget. The changed files in NO nightly tier ($NLIST) contribute no mutable in-diff line, so the rotation covers the rest. Split the PR for per-diff mutation coverage."
+              exit 0
+            fi
+            if [ "$SUB" -gt "$MUTANTS_DIFF_BUDGET" ]; then
+              say state over-budget-untiered-unbudgeted
+              say result n/a
+              echo "::notice::this diff yields $COUNT mutants — past the $MUTANTS_DIFF_BUDGET budget — and its UNTIERED files alone yield $SUB, also past it. These are graded by NOTHING (not here, not nightly): $NLIST. The blocking 'Mutants (coverage verdict)' job reports this as an error; split the PR."
+              exit 0
+            fi
+            say state over-budget-untiered-graded
+            echo "::notice::this diff yields $COUNT mutants — past the $MUTANTS_DIFF_BUDGET budget. Grading the $SUB mutants in the changed files NO nightly tier covers ($NLIST); the tiered remainder goes to the rotation (nightly-live.yml). Split the PR for full per-diff coverage."
+            rc=0
+            cargo mutants --in-diff pr.diff $FARGS -j 2 -- --lib --bins || rc=$?
+            verdict "$rc"
+            exit "$rc"
+          fi
+          # "Did this gate grade anything at all?" is NOT asked here: this job is
+          # `continue-on-error: true`, so an `exit 1` in it is an annotation, not
+          # a failure — the very property that let the vacuous gate survive eight
+          # runs. It lives in the BLOCKING `mutants-gate-sanity` /
+          # `mutants-verdict` jobs below, which read the outputs recorded above.
+          #
           # Exit code 2 = missed mutants (the gate's failure); 0 = all caught
           # or nothing to mutate in this diff.
           # --lib AND --bins: half this crate lives in the BINARY target
@@ -196,7 +409,355 @@ jobs:
           # first run scored 35/47 MISSED while direct unit tests for most of
           # those mutants sat green in `cargo test --bin rivet`. Scope honesty:
           # measure against every offline test target, then triage what's left.
-          cargo mutants --in-diff pr.diff -j 2 -- --lib --bins
+          say state in-budget
+          rc=0
+          cargo mutants --in-diff pr.diff -j 2 -- --lib --bins || rc=$?
+          verdict "$rc"
+          exit "$rc"
+      # The job's own conclusion is unreadable (continue-on-error), so the last
+      # thing it does is write down what happened — including the cases where
+      # the step above never ran at all. Without this, "the run was skipped
+      # because the scope step broke" and "there was nothing to grade" arrive at
+      # the blocking job as the same empty value.
+      - name: Publish this run's verdict
+        id: report
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.scope.outcome }}" != "success" ]; then
+            echo "state=scope-error" >> "$GITHUB_OUTPUT"
+            echo "result=tool-error" >> "$GITHUB_OUTPUT"
+          elif [ "${{ steps.scope.outputs.code }}" != "true" ]; then
+            echo "state=docs-only" >> "$GITHUB_OUTPUT"
+            echo "result=n/a" >> "$GITHUB_OUTPUT"
+          fi
+          echo "outcome=${{ steps.mutate.outcome }}" >> "$GITHUB_OUTPUT"
+
+  # Is the mutation gate GRADING ANYTHING? Split out of `mutants-in-diff` on
+  # purpose: that job is `continue-on-error: true` (a foundational-module PR
+  # genuinely cannot finish its 42-minute run), so nothing inside it can fail a
+  # PR — and "cannot fail" is exactly how the vacuous gate survived. One
+  # unescaped `|` in .cargo/mutants.toml's exclude_re (regex ALTERNATION with an
+  # EMPTY branch) excluded 18,568 of 18,670 mutants; the gate reported green in
+  # 23s with `INFO No mutants to filter` on all eight runs of #227/#229/#230 and
+  # nobody acted.
+  #
+  # Everything here is `--list` only: no mutant is built or run, so the whole
+  # job is seconds of cargo-mutants parsing plus its install. It is NOT
+  # continue-on-error — a failure here turns the workflow run red. It is not (as
+  # an earlier comment here claimed) a required check: see the ledger at the top
+  # of this file, read from the API. `Mutants (coverage verdict)` requires this
+  # job to have SUCCEEDED, so making that one required is what gives this one
+  # teeth.
+  mutants-gate-sanity:
+    name: Mutants (gate sanity)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    timeout-minutes: 30
+    outputs:
+      # The audited picture of this diff, for the verdict job to compare the
+      # per-diff run's own report against.
+      expected_state: ${{ steps.coverage.outputs.expected_state || steps.scope.outputs.expected_state }}
+      graded: ${{ steps.graded.outputs.graded }}
+      untiered: ${{ steps.coverage.outputs.untiered }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      # Byte-identical to `mutants-in-diff`'s scope step, and for the same
+      # reason: a swallowed fetch failure used to make an unresolvable base read
+      # as "docs-only", skipping every step of this BLOCKING job under a green
+      # notice. Fail-open on the scope question disables the gate silently.
+      - name: Any non-docs changes?
+        id: scope
+        run: |
+          set -euo pipefail
+          base="${{ github.base_ref }}"
+          if ! git fetch --no-tags origin "$base"; then
+            echo "::error::could not fetch the base branch '$base' — refusing to guess this PR's scope. A failed fetch used to read as a docs-only PR and skip every check in this job."
+            exit 1
+          fi
+          if ! git rev-parse --verify --quiet "origin/$base^{commit}" >/dev/null; then
+            echo "::error::'origin/$base' does not resolve after a successful fetch — every diff below would be empty, which this gate would otherwise mistake for a docs-only PR."
+            exit 1
+          fi
+          changed=$(git diff --name-only "origin/$base...HEAD")
+          if [ -z "$changed" ]; then
+            echo "code=false" >> "$GITHUB_OUTPUT"
+            echo "expected_state=docs-only" >> "$GITHUB_OUTPUT"
+            echo "::notice::the diff against origin/$base is empty (the base has caught up with this branch) — nothing to grade."
+          elif printf '%s\n' "$changed" | grep -qvE '^(docs/|.*\.md$|\.githooks/)'; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "code=false" >> "$GITHUB_OUTPUT"
+            echo "expected_state=docs-only" >> "$GITHUB_OUTPUT"
+            echo "::notice::Docs-only PR — nothing to grade."
+          fi
+      - uses: dtolnay/rust-toolchain@master
+        if: steps.scope.outputs.code == 'true'
+        with:
+          toolchain: "1.94"
+      - uses: Swatinem/rust-cache@v2
+        if: steps.scope.outputs.code == 'true'
+        with:
+          key: mutants
+      - name: Install cargo-mutants
+        if: steps.scope.outputs.code == 'true'
+        run: cargo install cargo-mutants --locked
+      # Every exclusion must triage a REAL mutant, and only the one it names.
+      # `tests/offline/mutation_gate_config.rs` grades the patterns' SHAPE; it
+      # cannot see the corpus, so it cannot see a DEAD entry (round-4's
+      # `"replace < with <= in decision_cause"` matched nothing, because
+      # cargo-mutants qualifies impl methods as `Governor::decision_cause` — a
+      # triage claim about no mutant, with the survivor still graded) nor an
+      # unanchored one (`in check` also ate `check_null_ratios`,
+      # `check_uniqueness`, `check_memory`, … — 13 mutants in six other files).
+      # "Only the one it names" is keyed on the SITE — (file, function) — since
+      # the bare name is not an identity here: `density_probe` is defined in
+      # both src/init/mysql.rs and src/init/postgres.rs, and the name-keyed
+      # version of this check called that "1 function" and passed. Entries that
+      # legitimately span files are declared in the checker's MULTI_SITE_OK.
+      - name: Every exclusion triages exactly one real, declared site
+        if: steps.scope.outputs.code == 'true'
+        run: |
+          set -euo pipefail
+          # --color=never: the workflow sets CARGO_TERM_COLOR=always, and a
+          # coloured corpus wraps every function name in SGR escapes, so
+          # plain-text exclusion patterns match nothing. That failed this job
+          # on 2026-08-14 with all 18 entries reported dead. The checker also
+          # strips ANSI defensively; this is the belt.
+          cargo mutants --list --no-config --colors=never > mutants-corpus.txt
+          python3 .github/scripts/mutants_exclusions.py mutants-corpus.txt
+      # Did the exclusions eat this PR's own diff? The UNFILTERED list is the
+      # discriminator: zero mutants is the CORRECT answer for a diff that
+      # changes no mutable source (tests-only, docs+tests, a comment-only edit
+      # inside src/**.rs — all routine here, and the previous version of this
+      # check fired a red `::error::` on every one of them). Only "the diff HAS
+      # mutants and the config removes them all" is the defect.
+      - name: The PR diff is actually graded
+        id: graded
+        if: steps.scope.outputs.code == 'true'
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+          git diff "origin/$BASE_REF"...HEAD > pr.diff
+          # No `|| true` anywhere near these two: under `set -e` a cargo-mutants
+          # failure ends the step, which is the whole difference between "the
+          # tool found nothing" and "the tool broke". The counting below runs on
+          # files that a SUCCESSFUL invocation wrote.
+          cargo mutants --in-diff pr.diff --list --no-config --colors=never > diff-all.txt
+          cargo mutants --in-diff pr.diff --list --colors=never > diff-graded.txt
+          all=$(grep -c . diff-all.txt || true)
+          graded=$(grep -c . diff-graded.txt || true)
+          echo "graded=$graded" >> "$GITHUB_OUTPUT"
+          if [ "$all" -eq 0 ]; then
+            echo "::notice::this diff changes no mutable source line — zero mutants is correct here."
+            exit 0
+          fi
+          if [ "$graded" -eq 0 ]; then
+            echo "::error::the mutation gate would grade NOTHING: this diff yields \
+          $all mutants, and .cargo/mutants.toml's exclude_re removes every one of \
+          them. That is the vacuous-gate failure (#227/#229/#230), not a pass."
+            exit 1
+          fi
+          echo "$graded" > graded-count.txt
+          echo "::notice::$graded of $all in-diff mutants pass the exclusions ($((all - graded)) excluded as triaged-equivalent) — whether they are all RUN is the budget question the next step audits."
+      # …and is anything grading the files the budget guard SKIPS? The notice
+      # above says "will be graded", which is true only while the diff fits the
+      # per-diff budget. Past it, `mutants-in-diff` grades the untiered subset
+      # and hands the REST to the nightly rotation — and if the untiered subset
+      # is itself past the budget, those files are graded NOWHERE.
+      #
+      # This step AUDITS; it does not claim. The previous version ended with
+      # "…fits it and is graded per-diff" — a statement about a DIFFERENT job
+      # that nothing here observes (no `needs:`, no artifact, no exit status),
+      # in a job whose own comment named that hazard two lines earlier. So a PR
+      # whose untiered subset MISSED a mutant printed `ok … is graded per-diff`
+      # and merged with a live gap in the one file nothing else grades. What
+      # this step knows — the audited state of the diff — is now an OUTPUT, and
+      # `Mutants (coverage verdict)` compares it against what the run reports it
+      # actually did.
+      - name: Nothing in this diff is graded by NOTHING
+        id: coverage
+        if: steps.scope.outputs.code == 'true'
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+          state() { echo "expected_state=$1" >> "$GITHUB_OUTPUT"; }
+          # Same rule as the run job: a cargo-mutants FAILURE must not arrive as
+          # the number 0. `grep -c .` on empty stdin prints 0 and exits 1, so the
+          # `| grep -c . || true` that used to compute `sub` swallowed the tool's
+          # status along with grep's — `cargo mutants --in-diff /nonexistent
+          # --list` exits 6 with empty stdout, and this guard then printed
+          # `ok: … (0 mutants …)` and exited 0 having graded nothing.
+          list_into() {  # list_into <outfile> <extra cargo-mutants args...>
+            local out="$1"; shift
+            local rc=0
+            cargo mutants --in-diff pr.diff "$@" --list --colors=never > "$out" || rc=$?
+            if [ "$rc" -ne 0 ]; then
+              state tool-error
+              echo "::error::cargo mutants --list failed (exit $rc) while auditing the untiered subset ($*) — this gate cannot tell 'no mutants' from 'the tool broke', and refuses to report the reassuring one."
+              sed -n '1,20p' "$out" >&2 || true
+              exit 1
+            fi
+          }
+          graded='${{ steps.graded.outputs.graded }}'
+          if [ -z "$graded" ]; then
+            state tool-error
+            echo "::error::the previous step recorded no in-diff mutant count — it did not complete, so there is nothing to audit."
+            exit 1
+          fi
+          if [ "$graded" -le "$MUTANTS_DIFF_BUDGET" ]; then
+            state in-budget
+            echo "ok: $graded in-diff mutants is within the $MUTANTS_DIFF_BUDGET budget, so the whole diff is in the per-diff gate's SCOPE. Whether that run reached a verdict is asserted by 'Mutants (coverage verdict)', which reads the run's own recorded outcome."
+            exit 0
+          fi
+          CHANGED=$(git diff --name-only "origin/$BASE_REF"...HEAD -- src | grep '\.rs$' || true)
+          UNTIERED=$(printf '%s\n' "$CHANGED" | python3 .github/scripts/mutation_tiers.py untiered)
+          if [ -z "$UNTIERED" ]; then
+            state over-budget-all-tiered
+            echo "ok: past the budget, but every changed source file is in a nightly tier (derived from nightly-live.yml) — the rotation ratchets them."
+            exit 0
+          fi
+          FARGS=""
+          for f in $UNTIERED; do FARGS="$FARGS -f $f"; done
+          NLIST=$(printf '%s' "$UNTIERED" | tr '\n' ' ')
+          echo "untiered=$NLIST" >> "$GITHUB_OUTPUT"
+          list_into sub-list.txt $FARGS
+          sub=$(grep -c . sub-list.txt || true)
+          list_into sub-unfiltered.txt $FARGS --no-config
+          sub_all=$(grep -c . sub-unfiltered.txt || true)
+          if [ "$sub" -eq 0 ] && [ "$sub_all" -gt 0 ]; then
+            state over-budget-untiered-all-excluded
+            echo "::error::the changed files that NO nightly tier covers ($NLIST) yield $sub_all mutants, and .cargo/mutants.toml's exclude_re removes every one of them — the vacuous-gate failure narrowed to exactly the files nothing else grades. Un-exclude them, or qualify the exclusion to the site it was written for."
+            exit 1
+          fi
+          if [ "$sub" -eq 0 ]; then
+            state over-budget-untiered-empty
+            echo "ok: past the budget, but the changed files in no nightly tier ($NLIST) contribute no mutable in-diff line."
+            exit 0
+          fi
+          if [ "$sub" -gt "$MUTANTS_DIFF_BUDGET" ]; then
+            state over-budget-untiered-unbudgeted
+            echo "::error::this diff yields $graded mutants — past the $MUTANTS_DIFF_BUDGET the per-diff budget can grade — and the changed files that NO nightly tier covers yield $sub on their own, also past it. So these files are mutated NOWHERE: $NLIST. Split the PR so the untiered part fits the budget, or add those files to a tier arm in .github/workflows/nightly-live.yml (splitting an arm — the rotation is at GitHub's 6h ceiling)."
+            exit 1
+          fi
+          state over-budget-untiered-graded
+          echo "ok: past the budget; the untiered remainder ($sub mutants in $NLIST) fits it, so 'Mutants (changed lines)' is expected to have graded exactly those. 'Mutants (coverage verdict)' fails unless that run reports it did."
+
+  # The claim the two jobs above make about each other, checked. `mutants-in-diff`
+  # is `continue-on-error: true`, so its conclusion is SUCCESS however it ends —
+  # no `needs:`, no required-check setting and no branch protection can see that
+  # one of its mutants was MISSED, that cargo-mutants failed, or that it timed
+  # out. This job reads the evidence it recorded (job outputs) and compares it
+  # with the audit `mutants-gate-sanity` computed independently.
+  #
+  # `if: always()` rather than a plain `needs:` because GitHub counts a job
+  # SKIPPED by a failed dependency as passing for a required check — a blocking
+  # job that vanishes when its dependency breaks is the fail-open shape this
+  # whole file keeps paying for. Every dependency's result is asserted here
+  # instead.
+  mutants-verdict:
+    name: Mutants (coverage verdict)
+    runs-on: ubuntu-latest
+    needs: [mutants-in-diff, mutants-gate-sanity, gate-scripts]
+    if: always() && github.event_name == 'pull_request'
+    timeout-minutes: 10
+    steps:
+      - name: The per-diff mutation run did what the audit says it must
+        env:
+          SCRIPTS_RESULT: ${{ needs.gate-scripts.result }}
+          SANITY_RESULT: ${{ needs.mutants-gate-sanity.result }}
+          RUN_RESULT: ${{ needs.mutants-in-diff.result }}
+          EXPECTED: ${{ needs.mutants-gate-sanity.outputs.expected_state }}
+          STATE: ${{ needs.mutants-in-diff.outputs.state }}
+          RESULT: ${{ needs.mutants-in-diff.outputs.result }}
+          OUTCOME: ${{ needs.mutants-in-diff.outputs.outcome }}
+          UNTIERED: ${{ needs.mutants-in-diff.outputs.untiered }}
+          SUB: ${{ needs.mutants-in-diff.outputs.sub }}
+          COUNT: ${{ needs.mutants-in-diff.outputs.count }}
+        run: |
+          set -euo pipefail
+          if [ "$SCRIPTS_RESULT" != "success" ]; then
+            echo "::error::'Gate scripts (self-tests)' did not succeed ($SCRIPTS_RESULT) — the tier rotation and exclusion checkers this verdict rests on are unverified."
+            exit 1
+          fi
+          if [ "$SANITY_RESULT" != "success" ]; then
+            echo "::error::'Mutants (gate sanity)' did not succeed ($SANITY_RESULT) — there is no audited picture of what this diff needs graded, so this job has nothing to certify. Read that job's log."
+            exit 1
+          fi
+          if [ "$RUN_RESULT" = "cancelled" ] || [ "$RUN_RESULT" = "skipped" ]; then
+            echo "::error::'Mutants (changed lines)' was $RUN_RESULT — no mutation verdict exists for this diff."
+            exit 1
+          fi
+          if [ "$EXPECTED" = "docs-only" ] && [ "$STATE" = "docs-only" ]; then
+            echo "ok: docs-only PR — both jobs agree there is nothing to mutate."
+            exit 0
+          fi
+          if [ -z "$STATE" ]; then
+            echo "::error::'Mutants (changed lines)' recorded NO state (step outcome: ${OUTCOME:-none}) — it never reached a verdict about this diff. Because that job is continue-on-error its own red X does not block; this one does. Read its log: the usual causes are a failed cargo-mutants install and the 90-minute timeout (if it timed out inside the budget, MUTANTS_DIFF_BUDGET is set too high)."
+            exit 1
+          fi
+          if [ "$STATE" != "$EXPECTED" ]; then
+            echo "::error::the two mutation gates disagree about this diff: the audit computed '$EXPECTED', the run reported '$STATE'. One of them mis-measured, and one of them is the source of the coverage claim — neither may be believed until they agree."
+            exit 1
+          fi
+          if [ "$RESULT" = "tool-error" ]; then
+            echo "::error::'Mutants (changed lines)' ended in a TOOL error, not a verdict (state '$STATE'). A broken cargo-mutants invocation used to read as 'zero mutants' and pass; it is a failure."
+            exit 1
+          fi
+          case "$STATE" in
+            in-budget|over-budget-untiered-graded)
+              if [ -z "$RESULT" ]; then
+                echo "::error::'Mutants (changed lines)' had this diff in scope (state '$STATE', step outcome ${OUTCOME:-none}) and recorded NO verdict — the run was killed mid-flight, which on this job means the 90-minute timeout. An in-scope diff that nothing finished grading is the vacuous gate with a longer runtime. If it timed out while under the count guard, MUTANTS_DIFF_BUDGET ($MUTANTS_DIFF_BUDGET) is set too high for this runner."
+                exit 1
+              fi
+              ;;
+          esac
+          if [ "$STATE" = "over-budget-untiered-graded" ]; then
+            if [ "$RESULT" != "clean" ]; then
+              echo "::error::the changed files that NO nightly tier covers ($UNTIERED, $SUB mutants) are graded ONLY by the per-diff run, and it reported '$RESULT'. A missed mutant there is graded by nothing else — not per-diff (the rest of the diff is over budget), not nightly (no tier names these files). Close the assertion gap, or add the files to a tier arm in .github/workflows/nightly-live.yml."
+              exit 1
+            fi
+            echo "ok: the $SUB mutants in the untiered files ($UNTIERED) were graded per-diff and all were caught; the tiered remainder goes to the nightly rotation."
+            exit 0
+          fi
+          if [ "$RESULT" = "missed" ]; then
+            echo "::warning::'Mutants (changed lines)' reports MISSED mutants in this diff ($COUNT in scope). That job is advisory by design (a foundational-module PR cannot finish its run), so this does not block — but a missed mutant in your own diff is an assertion gap in your own code. Read its log."
+          fi
+          echo "ok: audit and run agree on '$STATE'; the run's verdict is '${RESULT:-n/a}'."
+
+  # The gate's own scripts, graded. Seconds, no toolchain. Each `selftest` is a
+  # unit check of the parser or coercion the gate depends on; `check` grades the
+  # nightly rotation itself (a tier naming a moved file, an arm that tiers no
+  # file, or a day expression bash reads as OCTAL are all dead claims of
+  # coverage, the same class as a dead exclusion).
+  #
+  # This job is NOT a required check (verified against the API — see the ledger
+  # at the top of this file); an earlier comment here called it "blocking",
+  # which it is not on its own. `Mutants (coverage verdict)` refuses to certify
+  # anything unless this job succeeded, so requiring THAT one is what makes this
+  # one block.
+  gate-scripts:
+    name: Gate scripts (self-tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Mutation tier rotation parses, and every tiered file exists
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/mutation_tiers.py selftest
+          python3 .github/scripts/mutation_tiers.py check
+      - name: The exclusion checker's own site/function keying
+        run: python3 .github/scripts/mutants_exclusions.py --self-test
+      # `--self-test` returns before any stage, container or binary is touched —
+      # it grades the argv/env coercion only, so this invocation needs no
+      # RIVET_PREV_RELEASE_BIN and is not a gate run (cf. the Makefile-scoped
+      # entry-point guard in tests/offline/release_oracle_entrypoint_guard.rs).
+      - name: The release oracle's env-flag grammar is one grammar
+        run: python3 -m dev.release_oracle --self-test
 
   test:
     name: Tests

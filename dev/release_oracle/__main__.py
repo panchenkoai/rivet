@@ -123,16 +123,116 @@ def start_stores(led: Ledger) -> None:
     led.ok(f"stores up (bucket/container {BUCKET}: minio {mark('s3')} gcs {mark('gcs')} azure {mark('azure')})")
 
 
+def env_flag(name: str) -> bool:
+    """An environment variable read as a BOOLEAN, in the project's one grammar.
+
+    `bool(os.environ.get(NAME))` is not that grammar: it is TRUE for the string
+    `"0"`. Both gate-wide knobs below defaulted that way, so
+    `RIVET_ORACLE_WITHOUT_PREV_RELEASE=0` — the natural spelling of "no, keep
+    comparing against the last release" — TURNED THE ESCAPE ON, downgrading all
+    three previous-release stages from FAIL to SKIP. `regression.py` already
+    read the same variable with the opposite (correct) grammar, so one variable
+    had two parsers written in the same change and the coarser one won.
+
+    Empty/unset/`0`/`false`/`no`/`off` ⇒ False; anything else ⇒ True. The
+    direction for an UNRECOGNISED value (`ture`) is stated rather than implied:
+    strictly, the fail-safe answer for a knob that gives up grading is False,
+    and this returns True — because `regression.without_prev_release_comparison`
+    is the authoritative reader the stages themselves consult, and ONE grammar
+    that is imperfect at the edge beats two that disagree in the middle (`0`
+    parsed both ways is exactly the defect). The spellings an operator actually
+    reaches for to say "no" are all False now, and an opt-in is loud: the run
+    banner prints "previous-release comparison: GIVEN UP" and every affected
+    stage records SKIP.
+
+    Kept identical to `regression.without_prev_release_comparison`'s coercion;
+    `--self-test` asserts the two agree value-by-value so they cannot drift.
+    """
+    return os.environ.get(name, "").strip().lower() not in ("", "0", "false", "no", "off")
+
+
+_ENV_FLAG_TABLE = {
+    "": False, "0": False, "false": False, "FALSE": False, "no": False, "off": False,
+    " 0 ": False, "1": True, "true": True, "TRUE": True, "yes": True, "on": True,
+    # An unrecognised value is TRUE — see env_flag's docstring on direction.
+    "maybe": True,
+}
+
+
+def _self_test() -> int:
+    """Grade this module's env-flag grammar against `regression`'s.
+
+    RED-provable: restore `default=bool(os.environ.get(...))` in `parse_args`
+    and the `--without-prev-release-comparison` case below fails on `"0"`.
+    """
+    for raw, expect in _ENV_FLAG_TABLE.items():
+        os.environ["RIVET_ORACLE_SELFTEST_FLAG"] = raw
+        got = env_flag("RIVET_ORACLE_SELFTEST_FLAG")
+        assert got is expect, f"env_flag({raw!r}) = {got}, expected {expect}"
+    os.environ.pop("RIVET_ORACLE_SELFTEST_FLAG", None)
+
+    # The escape is the one that costs a release: argparse's default, the
+    # authoritative reader in regression.py, and this table must agree on EVERY
+    # spelling — that disagreement is what let `=0` give up the baseline.
+    saved = os.environ.pop(regression._ESCAPE_ENV, None)
+    try:
+        for raw, expect in _ENV_FLAG_TABLE.items():
+            os.environ[regression._ESCAPE_ENV] = raw
+            assert regression.without_prev_release_comparison() is expect, raw
+            ns = parse_args([])
+            assert ns.without_prev_release_comparison is expect, (
+                f"{regression._ESCAPE_ENV}={raw!r} parses as "
+                f"{ns.without_prev_release_comparison}, but regression.py reads it as {expect}"
+            )
+            assert parse_args(["--without-prev-release-comparison"]).without_prev_release_comparison
+            os.environ["RIVET_ORACLE_LATEST_ONLY"] = raw
+            assert parse_args([]).latest_only is expect, raw
+    finally:
+        os.environ.pop(regression._ESCAPE_ENV, None)
+        os.environ.pop("RIVET_ORACLE_LATEST_ONLY", None)
+        if saved is not None:
+            os.environ[regression._ESCAPE_ENV] = saved
+
+    print(f"self-test ok: {len(_ENV_FLAG_TABLE)} spellings — argparse, env_flag and "
+          "regression.without_prev_release_comparison() agree on every one")
+
+    # …and the regression module's own decisions about a child harness it cannot
+    # run here: the SIGINT-first timeout, the grace period's grammar and where
+    # its default comes from, the stand row when the container will not answer,
+    # and the banner/footer that describe whether anything was compared at all.
+    # One entry point, so CI and the offline suite get both halves.
+    print("\nregression stage (child harness, stand, banner):")
+    return regression._self_test()
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(prog="release-oracle", add_help=True)
     ap.add_argument("--engines", default="", help="comma-separated subset, e.g. postgres,mysql")
     ap.add_argument(
         "--latest-only",
         action="store_true",
-        default=bool(os.environ.get("RIVET_ORACLE_LATEST_ONLY")),
+        default=env_flag("RIVET_ORACLE_LATEST_ONLY"),
         help="run only the LAST version of each engine family (fast dev loop). "
         "The full version matrix is for release tags; a single-version pass "
         "still covers every scenario × store × state-backend cell.",
+    )
+    ap.add_argument(
+        "--without-prev-release-comparison",
+        action="store_true",
+        # The AUTHORITATIVE reader, not a second parse of the same variable:
+        # `bool(os.environ.get(...))` made `RIVET_ORACLE_WITHOUT_PREV_RELEASE=0`
+        # — and `false`, `no`, `off` — turn the escape ON, silently downgrading
+        # every previous-release stage to SKIP. regression.py owns the grammar
+        # (it is what the stages themselves consult); argparse now asks it.
+        default=regression.without_prev_release_comparison(),
+        help="GIVE UP every comparison against the previously released binary — the "
+        "regression (format+perf), the observable-surface differential, and the field "
+        "symptom replay all become SKIP instead of FAIL when RIVET_PREV_RELEASE_BIN is "
+        "absent. Named after what it costs, and never a default: a release run without "
+        "a baseline is exactly how 0.24.4 shipped a +1h48m governor regression through a "
+        "green gate — the one leg that would have caught it reported a non-failure "
+        "because it never ran. Use it for local partial runs; a run carrying this flag "
+        "cannot support a tag.",
     )
     ap.add_argument("--no-cloud", action="store_true", help="local stage only (skip BigQuery)")
     ap.add_argument("--keep", action="store_true", help="leave engine containers up (debug)")
@@ -251,6 +351,19 @@ def preflight(led: Ledger, *, bless_gifs: bool = False) -> None:
     scenarios.verify_pool_split(led)
     cdc.verify_cdc_e2e(led)
     regression.verify_release_regression(led)
+    # The two prev-release harnesses, next to the stage that shares their
+    # baseline (`RIVET_PREV_RELEASE_BIN`) — and, like it, they FAIL rather than
+    # SKIP when that baseline is absent (see `regression`'s module docstring):
+    # a release is graded against the version users are running, or it is not
+    # graded at all.
+    #   * the DIFFERENTIAL asks whether anything a user can observe changed
+    #     (exit code, DuckDB readback, files, manifest incl. per-part
+    #     fingerprints) across every runner shape — the question the fix rounds
+    #     cannot ask about themselves;
+    #   * the SYMPTOM REPLAY re-measures the field regression's own numbers on a
+    #     workload shaped like the run that found it.
+    regression.verify_previous_release_differential(led)
+    regression.verify_field_symptom_replay(led)
     regression.verify_scale_memory(led)
     # Several writers into ONE prefix and ONE state backend. Placed in the
     # source-agnostic preflight because the property is the WRITERS' — a shared
@@ -512,6 +625,8 @@ def engine_loop(led: Ledger, ns: argparse.Namespace) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    if (argv if argv is not None else sys.argv[1:]) == ["--self-test"]:
+        return _self_test()
     ns = parse_args(argv)
     from .core import set_cell_parallel
     set_cell_parallel(ns.cell_parallel)
@@ -566,6 +681,20 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  state backend under test: {backend}")
         print("  a pass grades ONE backend; --state-url runs the same cells against the other")
 
+        # WHETHER THE RELEASE IS BEING GRADED AGAINST THE PREVIOUS ONE, said out
+        # loud — for the same reason the state backend is. The stages read this
+        # from the environment (that is how every gate-wide knob reaches them and
+        # how `run()` passes it to children), so argv and env are one switch.
+        #
+        # Both this banner and the closing line come from ONE pure function keyed
+        # on the BASELINE, never on the flag alone: the flag does not decide (see
+        # `regression.prev_release_banner`).
+        regression.set_without_prev_release_comparison(ns.without_prev_release_comparison)
+        banner, footer = regression.prev_release_banner(
+            regression.prev_binary(), ns.without_prev_release_comparison)
+        for line in banner:
+            print(line)
+
         if not ns.no_clean and not clean_tree_and_build(led, fast=ns.fast_clean):
             return 1
         start_stores(led)
@@ -582,7 +711,16 @@ def main(argv: list[str] | None = None) -> int:
             bigquery.run_bigquery_golden(led, bless=ns.bless_bigquery_golden,
                                          keep=ns.keep, parallel=ns.engine_parallel,
                                          bring_up=bring_up, seed_engine=seed_engine)
-        return led.report()
+        rc = led.report()
+        # A run that graded nothing against the previous release has to say so
+        # AFTER the verdict, where the reader's eye lands: `RELEASE-READY` is
+        # derived from the rows and is literally true ("every non-skipped cell is
+        # green"), which is exactly the sentence 0.24.4 shipped under. The
+        # condition is the BASELINE, not the flag — a run that carried a baseline
+        # compared against it and must not be told it did not.
+        if footer:
+            print(footer)
+        return rc
     finally:
         if not ns.keep:
             remove_engine_containers()

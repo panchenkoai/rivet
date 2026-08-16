@@ -246,6 +246,54 @@ fn parse_work_mem(raw: &str) -> Option<i64> {
 /// `adaptive: true` PG17+ export hard-failed. A probe-then-query pair avoids
 /// ever ERRORing on either vintage (a one-statement CASE still plans the dead
 /// branch and errors — proven on postgres:18).
+/// The requested-checkpoint query for this server vintage.
+///
+/// Split out as a pure fn so the BRANCH is unit-testable: the live suite runs
+/// on postgres:16, where both spellings resolve, so nothing offline could see a
+/// swapped arm — and a swapped arm is not a `None`, it is an ERROR inside the
+/// export's cursor transaction, which kills the next FETCH (verified on
+/// postgres:18, 2026-08-14: `SELECT checkpoints_req FROM pg_stat_bgwriter`
+/// there answers `column "checkpoints_req" does not exist`, and the following
+/// FETCH gets `current transaction is aborted`).
+///
+/// `true` ⇒ the server has `pg_stat_checkpointer` (PG 17+).
+fn checkpoints_req_sql(has_checkpointer: bool) -> &'static str {
+    if has_checkpointer {
+        "SELECT num_requested FROM pg_stat_checkpointer"
+    } else {
+        "SELECT checkpoints_req FROM pg_stat_bgwriter"
+    }
+}
+
+/// Read the requested-checkpoint counter off a LIVE server connection.
+///
+/// LIVE-ONLY BY CONSTRUCTION: it takes a `postgres::Client`, which no offline
+/// test can build, so every constant-return mutant of it (`None`, `Some(-1)`,
+/// `Some(0)`, `Some(1)` — all four survived the 2026-08-16 mutation run, which
+/// exercised the OFFLINE suite only) is unkillable here. Writing a unit test
+/// against a fake client would grade the fake, not the one thing that matters:
+/// WHICH catalog this connection is asked for, and that the answer really moves.
+///
+/// Its oracles are live, and each of the four dies on them:
+/// * `governor_backs_off_under_concurrent_write_pressure`
+///   (`tests/live/live_governor.rs`) drives real foreign write pressure and
+///   requires a `backed off` line. `GovernorState::observe` reads pressure ONLY
+///   as `cur > prev`, so a constant `Some(-1)`/`Some(0)`/`Some(1)` never rises
+///   and never sheds; `None` fails open by design and also never sheds. (The
+///   same argument, verified by hand against the `Some(0)` mutant on
+///   2026-08-14, is recorded on `impl PressureSource for Box<dyn Source>`, the
+///   bridge one layer up.)
+/// * `pg_adaptive_never_loses_to_its_own_baseline_on_an_idle_source` asserts
+///   `assert_governor_awake`, whose "provides no pressure signal" check is RED
+///   specifically against the `None` mutant — the deaf-governor state a rename
+///   of this counter produces.
+/// * `pg18_governor_samples_the_modern_checkpointer_catalog` covers the ARM the
+///   pure [`checkpoints_req_sql`] picks: on a real PG 17+ server a swapped arm
+///   is not a `None` but an ERROR that aborts the export's cursor transaction,
+///   so that test requires the run to SUCCEED and the governor to be awake.
+///
+/// The pure half — which SQL each vintage gets — is [`checkpoints_req_sql`],
+/// unit-tested offline by `checkpoints_req_sql_matches_the_servers_catalog`.
 fn pg_sample_checkpoints_req(client: &mut Client) -> Option<i64> {
     let _ = client.execute("SELECT pg_stat_clear_snapshot()", &[]);
     // Two steps, because PG plans a whole statement up front: a CASE whose
@@ -260,11 +308,7 @@ fn pg_sample_checkpoints_req(client: &mut Client) -> Option<i64> {
         )
         .ok()
         .and_then(|r| r.try_get::<_, bool>(0).ok())?;
-    let sql = if has_checkpointer {
-        "SELECT num_requested FROM pg_stat_checkpointer"
-    } else {
-        "SELECT checkpoints_req FROM pg_stat_bgwriter"
-    };
+    let sql = checkpoints_req_sql(has_checkpointer);
     client
         .query_one(sql, &[])
         .ok()
@@ -970,6 +1014,46 @@ fn catalog_numeric_to_decimal_params(precision: i32, scale: i32) -> Option<(u8, 
 
 #[cfg(test)]
 mod tests {
+
+    /// The version branch of the checkpoint sampler, pinned offline.
+    ///
+    /// The live stack runs postgres:16, where `pg_stat_bgwriter.checkpoints_req`
+    /// still resolves — so every governor test takes the LEGACY arm and no live
+    /// test can see the modern one. Verified by hand against the postgres:18
+    /// stand (2026-08-14): `pg_stat_checkpointer` exists there, the bgwriter
+    /// column does NOT, and sending the legacy query inside a cursor
+    /// transaction answers `column "checkpoints_req" does not exist` and then
+    /// `current transaction is aborted, commands ignored` on the next FETCH —
+    /// i.e. a swapped arm does not degrade to `None`, it kills the export.
+    ///
+    /// Scope honesty: this pins the SQL each vintage gets, not that the probe
+    /// classifies a real server correctly — that half needs a live PG 17+ and
+    /// is covered by `pg18_governor_samples_the_modern_checkpointer_catalog`
+    /// in the live suite (skipped unless the stand is up).
+    #[test]
+    fn checkpoints_req_sql_matches_the_servers_catalog() {
+        use super::checkpoints_req_sql;
+        // PG 17+: the counter lives on pg_stat_checkpointer.
+        let modern = checkpoints_req_sql(true);
+        assert!(
+            modern.contains("pg_stat_checkpointer") && modern.contains("num_requested"),
+            "a PG17+ server must be asked for num_requested: {modern}"
+        );
+        assert!(
+            !modern.contains("pg_stat_bgwriter"),
+            "the removed relation must never be named on PG17+: {modern}"
+        );
+        // PG 16 and older: the column is still on pg_stat_bgwriter.
+        let legacy = checkpoints_req_sql(false);
+        assert!(
+            legacy.contains("pg_stat_bgwriter") && legacy.contains("checkpoints_req"),
+            "a pre-17 server must be asked for checkpoints_req: {legacy}"
+        );
+        assert!(
+            !legacy.contains("pg_stat_checkpointer"),
+            "the not-yet-existing relation must never be named pre-17: {legacy}"
+        );
+    }
     use super::catalog_numeric_to_decimal_params;
 
     /// The TLS-honesty fix (bug hunt 2026-08-08): under an enforced `tls:`

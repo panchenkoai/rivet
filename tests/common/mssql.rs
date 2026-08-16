@@ -15,7 +15,7 @@ use super::unique_name;
 
 /// Connect to a SQL Server instance on `port` — `:1433` is the shared `mssql`
 /// service, `:1434` is the CDC-configured `mssql-cdc` (cdc profile).
-async fn connect_at(port: u16) -> Client<Compat<TcpStream>> {
+async fn try_connect_at(port: u16) -> Result<Client<Compat<TcpStream>>, String> {
     let mut config = Config::new();
     config.host("127.0.0.1");
     config.port(port);
@@ -25,11 +25,18 @@ async fn connect_at(port: u16) -> Client<Compat<TcpStream>> {
     config.trust_cert();
     let tcp = TcpStream::connect(config.get_addr())
         .await
-        .expect("mssql: tcp connect (is the service up?)");
+        .map_err(|e| format!("mssql: tcp connect (is the service up?): {e}"))?;
     tcp.set_nodelay(true).ok();
     Client::connect(config, tcp.compat_write())
         .await
-        .expect("mssql: login")
+        .map_err(|e| format!("mssql: login: {e}"))
+}
+
+async fn connect_at(port: u16) -> Client<Compat<TcpStream>> {
+    match try_connect_at(port).await {
+        Ok(c) => c,
+        Err(e) => panic!("{e}"),
+    }
 }
 
 /// Like `exec_at`, but tolerates server errors — for Agent job control, whose
@@ -51,6 +58,42 @@ fn try_exec_at(port: u16, sql: &str) {
             }
         }
     });
+}
+
+/// Fully error-tolerant executor: returns `true` only if the connection AND
+/// every batch succeeded, `false` on ANY failure (connect, login, a batch
+/// error). Unlike [`try_exec_at`] it also absorbs the CONNECT half.
+///
+/// For BACKGROUND LOAD threads, which are not fixture setup: they run hundreds
+/// of fresh logins under load they create themselves, so a single transient
+/// connect failure or deadlock-victim error must not abort the thread and turn
+/// the test's verdict into `writer thread` — that verdict skips every real
+/// assertion AND the scratch-table cleanup. The returned bool is what keeps the
+/// tolerance honest: the caller counts SUCCESSES, so a writer that absorbs
+/// every statement is still detectable (a silent writer is exactly the inert
+/// fixture the activation guards exist to catch).
+fn soft_exec_at(port: u16, sql: &str) -> bool {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("mssql: tokio runtime");
+    rt.block_on(async {
+        let Ok(mut client) = try_connect_at(port).await else {
+            return false;
+        };
+        for batch in split_go(sql) {
+            if batch.trim().is_empty() {
+                continue;
+            }
+            let Ok(stream) = client.simple_query(batch.as_str()).await else {
+                return false;
+            };
+            if stream.into_results().await.is_err() {
+                return false;
+            }
+        }
+        true
+    })
 }
 
 fn exec_at(port: u16, sql: &str) {
@@ -103,6 +146,13 @@ fn query_i64_at(port: u16, sql: &str) -> i64 {
 /// order; statements within a batch run together. Panics on error (test setup).
 pub fn mssql_exec(sql: &str) {
     exec_at(1433, sql)
+}
+
+/// Error-tolerant twin of [`mssql_exec`] for BACKGROUND LOAD threads against
+/// the shared `mssql` (`:1433`) — `true` when the statement really ran. See
+/// [`soft_exec_at`] for why a load loop must not use the panicking executor.
+pub fn mssql_try_exec(sql: &str) -> bool {
+    soft_exec_at(1433, sql)
 }
 
 /// As [`mssql_exec`], but against the CDC `mssql-cdc` instance (`:1434`).
@@ -185,7 +235,14 @@ impl MssqlTable {
 
 impl Drop for MssqlTable {
     fn drop(&mut self) {
-        mssql_drop_table(&self.name);
+        // Best-effort, deliberately NOT [`mssql_drop_table`]: this Drop runs
+        // while the test may already be UNWINDING from a failed assertion, and
+        // a panicking executor there aborts the process — replacing a readable
+        // assertion message with a SIGABRT. Cleanup is not the verdict.
+        let name = &self.name;
+        mssql_try_exec(&format!(
+            "IF OBJECT_ID('{name}','U') IS NOT NULL DROP TABLE {name}"
+        ));
     }
 }
 

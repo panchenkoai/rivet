@@ -16,7 +16,7 @@
 //! `ensure_chunk_checkpoint_plan`, `record_chunked_commit`) live in
 //! [`super`]. The sequential runner lives in [`super::sequential_checkpoint`].
 
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use super::super::{RunSummary, progress::ChunkProgress, retry::classify_error, sink::ExportSink};
@@ -159,7 +159,31 @@ pub(crate) fn run_chunked_parallel_checkpoint(
         plan.tuning.max_retries,
     );
 
+    // OPT-2 adaptive concurrency governor, through the SHARED seam (identical wiring in
+    // `chunked/exec.rs` and `keyset.rs`; #152). This runner shipped WITHOUT it, so
+    // `tuning.adaptive: true` was a silent no-op on exactly the shape `rivet init` scaffolds
+    // (`chunk_checkpoint: true` + `parallel: N`): job.rs dispatches a RESUMABLE chunked plan
+    // here, so dropping `chunk_checkpoint` from an otherwise identical config was the
+    // difference between a governed run and an ungoverned one — with nothing in the log to
+    // tell them apart (bughunt 2026-08-14, finding 0).
+    //
+    // Pool shape, not spawner shape: `parallel` long-lived workers claim tasks in a loop, so
+    // the permit is taken PER CLAIMED TASK (`TaskPermit`, acquired before the claim) and the
+    // governor's stop predicate counts WORKERS that exited (`WorkerFinished`), i.e. `total`
+    // is the pool size, not the task count. Disarmed (the default) the semaphore starts with
+    // one permit per worker and never resizes, so no worker ever parks — the run behaves
+    // exactly as it did before.
+    let semaphore = resource::Semaphore::new(parallel.max(1));
+    let finished = AtomicUsize::new(0);
+    let governor = crate::pipeline::governor::GovernorHarness::arm(plan, parallel);
+
     std::thread::scope(|s| {
+        // Governor thread (shared seam): samples source pressure on its own monitoring
+        // connection and resizes the permit ceiling within [floor, ceiling], self-terminating
+        // once every pool worker has FINISHED (drained, errored, or panicked) so a failing
+        // worker can't strand it and deadlock the scope.
+        governor.spawn_into(s, &semaphore, &finished, parallel, &plan.export_name);
+
         for _ in 0..parallel {
             let state_ref = state_ref.clone();
             let shared_destination = std::sync::Arc::clone(&shared_destination);
@@ -178,10 +202,21 @@ pub(crate) fn run_chunked_parallel_checkpoint(
             let mode_label_w = mode_label;
             let pb_w = pb_cp_handle.clone();
             let streamed_rows = std::sync::Arc::clone(&streamed_rows);
+            let semaphore = &semaphore;
+            let finished = &finished;
 
             s.spawn(move || {
+                // Count this worker as FINISHED on every exit path (drained queue, claim
+                // error, unwinding panic) — the governor thread's only exit is
+                // `finished >= total`, so a missed bump hangs `thread::scope` forever.
+                let _finish = crate::pipeline::governor::WorkerFinished::new(finished);
                 let shared_destination = shared_destination;
                 loop {
+                    // One permit per claimed task, taken BEFORE the claim: a shed then
+                    // parks this worker without leaving a chunk_task pinned `running`
+                    // while it waits. The guard releases at the end of THIS iteration on
+                    // every path (`break`, `continue`, panic).
+                    let _permit = crate::pipeline::governor::TaskPermit::acquire(semaphore);
                     let claimed = match StateStore::claim_next_chunk_task_at_ref(
                         &state_ref,
                         run_id_arc.as_str(),
@@ -509,6 +544,11 @@ pub(crate) fn run_chunked_parallel_checkpoint(
     // `= agg_rows` clobbered it, so total_rows under-reported while parts/bytes/
     // files stayed cumulative — see accumulate_run_rows.
     super::super::commit::accumulate_run_rows(summary, agg_rows.load(Ordering::Relaxed));
+    // Drain the governor's decisions (buffered off-thread) into the run journal — BEFORE the
+    // worker-error / pending-task bails below, so a FAILED run still journals its
+    // ParallelismAdjusted events. That ordering is the drift the keyset copy re-introduced
+    // once; it is why this is the shared seam's contract and not a local convention.
+    governor.drain_into(summary);
     summary.retries = summary
         .retries
         .saturating_add(agg_retries.load(Ordering::Relaxed));

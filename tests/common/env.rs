@@ -19,6 +19,21 @@ pub const POSTGRES_PASSWORD: &str = "rivet";
 pub const POSTGRES_DB: &str = "rivet";
 pub const POSTGRES_URL: &str = "postgresql://rivet:rivet@127.0.0.1:5432/rivet";
 
+/// The PG **18** batch stand (`dev/stand`, :5518) — a MODERN catalog where
+/// `pg_stat_bgwriter.checkpoints_req` no longer exists and the counter lives on
+/// `pg_stat_checkpointer.num_requested`. The main stack is postgres:16, so this
+/// is the only place a test can exercise the governor sampler's PG17+ arm.
+/// Optional: tests using it SKIP when the stand is down (see `pg_modern_alive`).
+pub const POSTGRES_MODERN_URL: &str = "postgresql://rivet:rivet@127.0.0.1:5518/rivet";
+
+/// Is the optional PG 17+ stand reachable? Unlike [`require_alive`], a missing
+/// stand is not a failure — `dev/stand` is opt-in (`make stand-up`), so a test
+/// that needs a modern catalog reports SKIPPED instead of failing a developer
+/// who only brought up the main stack.
+pub fn pg_modern_alive() -> bool {
+    tcp_alive("127.0.0.1", 5518, Duration::from_millis(500))
+}
+
 /// Same Postgres as `POSTGRES_URL` but routed through Toxiproxy on :15432.
 /// Use this for retry / chaos tests that need to inject latency, timeouts or
 /// RST mid-connection.

@@ -465,7 +465,19 @@ const CATALOG_OVERRIDE_MIN_SPAN: i64 = 10_000;
 ///   ~831M catalog rows as ~333M, feeding the pool's makespan prediction.
 ///   When the catalog is the smaller side (the sparse case, or F4's
 ///   fresh-ANALYZE garbage) the span still wins, exactly as before.
-/// * `span_is_exact` short-circuits ALL of it. Under `chunk_dense: true` the
+/// * `span_is_days` short-circuits it FIRST, and in the other direction: under
+///   `chunk_by_days` the ordinals are DAYS since the epoch (`by_days` is
+///   checked first in [`super::chunked::detect::detect_and_generate_chunks`]),
+///   so the span is `1095` for a three-year date range — not a row count, and
+///   not comparable to one in either direction or at any magnitude. The catalog
+///   is then the ONLY row signal, and its absence is `None` ("no row estimate",
+///   which classifies Medium) rather than a fabricated one. Publishing the day
+///   count instead classified an 831M-row date-chunked table as ~1095 rows →
+///   `CostClass::Low` → `parallel_safe: true`, which `plan` writes into the
+///   config and the pool then reads as "cheap, run it concurrently with another
+///   heavy" (bughunt 2026-08-14). The `CATALOG_OVERRIDE_MIN_SPAN` floor cannot
+///   rescue this: a day span is always far below it.
+/// * `span_is_exact` short-circuits the rest. Under `chunk_dense: true` the
 ///   ranges are ORDINALS `1..row_count` built from a real `COUNT(*)` taken in
 ///   this very plan ([`super::chunked::detect`]) — the span IS the row count,
 ///   not a key range, so `rows > distinct keys` cannot happen and there is
@@ -479,7 +491,12 @@ fn chunked_row_estimate(
     catalog: Option<i64>,
     measured: bool,
     span_is_exact: bool,
+    span_is_days: bool,
 ) -> Option<i64> {
+    // A day span is not a row count — it is not a candidate at all.
+    if span_is_days {
+        return catalog;
+    }
     // An exact count needs no second opinion, in either direction.
     if span_is_exact && let Some(span) = key_span {
         return Some(span);
@@ -495,6 +512,26 @@ fn chunked_row_estimate(
         (Some(span), Some(_)) => Some(span),
         (a, b) => a.or(b),
     }
+}
+
+/// The chunked key SPAN itself: how many ordinals the detector's first..last
+/// boundaries cover, INCLUSIVE, floored at zero.
+///
+/// Split out of [`compute_plan_data`] because that function opens a real source
+/// connection before it reaches this arithmetic, so the offline suite cannot
+/// execute the expression at ALL — the 2026-08-16 mutation run left four
+/// arithmetic mutants alive on the one line (`+`→`*`, `+`→`-`, `-`→`+`,
+/// `-`→`/`), and no live test asserts the artifact's `row_estimate` either.
+/// Extracted rather than fake-tested through a stub source, the same shape as
+/// [`chunked_row_estimate`] above: the DECISION is pure and unit-tested, the
+/// connection-owning glue stays live.
+///
+/// Inclusive because a chunk range is `[lo, hi]` on both ends — a single-ordinal
+/// table (`first.0 == last.1`) holds one row, not zero. Under `chunk_dense` this
+/// number reaches [`chunked_row_estimate`] as an EXACT row count that no catalog
+/// is allowed to correct, so an off-by-one here is published as fact.
+fn chunked_key_span(first_lo: i64, last_hi: i64) -> i64 {
+    (last_hi - first_lo + 1).max(0)
 }
 
 /// Compute the `ComputedPlanData` portion of the artifact.
@@ -538,12 +575,17 @@ fn compute_plan_data(
             let chunked_estimate = chunk_ranges
                 .first()
                 .zip(chunk_ranges.last())
-                .map(|(first, last)| (last.1 - first.0 + 1).max(0));
-            // The span is an exact ROW count only on the dense path, whose
-            // ranges are ordinals `1..COUNT(*)`. `by_days` is checked FIRST in
-            // `detect_and_generate_chunks`, so a config with both set produces
-            // DAY ordinals — a day span is not a row count, hence the guard.
-            let span_is_exact = cp.dense && cp.by_days.is_none();
+                .map(|(first, last)| chunked_key_span(first.0, last.1));
+            // `chunked_estimate` is a span over WHATEVER ordinals the detector
+            // chose, so pass the ordinals' MEANING with it — the two facts are
+            // independent and both branches of the estimate need them:
+            //  * days: `by_days` is checked FIRST in `detect_and_generate_chunks`,
+            //    so a config with both set produces DAY ordinals. A day count is
+            //    never a row count, in either direction (bughunt 2026-08-14).
+            //  * exact: only the dense path's ordinals are `1..COUNT(*)`, i.e.
+            //    the span IS the row count and no catalog may correct it.
+            let span_is_days = cp.by_days.is_some();
+            let span_is_exact = cp.dense;
             Ok(ComputedPlanData {
                 chunk_ranges,
                 chunk_count,
@@ -553,6 +595,7 @@ fn compute_plan_data(
                     row_estimate,
                     row_is_measured,
                     span_is_exact,
+                    span_is_days,
                 ),
             })
         }
@@ -759,7 +802,7 @@ type ExportFields = HashMap<String, Vec<(&'static str, String)>>;
 /// Replace the cost model's `recommended_wave` with waves PACKED from measured
 /// run history (`--annotate-waves` only). Tier = the export's existing `wave:`
 /// (the operator's priority) when set, else the cost model's recommendation;
-/// duration = the last successful run's, else a rows-based estimate; every
+/// duration AND peak RSS = [`super::pool::predict_secs_and_rss`]; every
 /// export is `parallel_safe: true` afterwards because under packing the WAVE
 /// is the concurrency cap (K by cost class, RSS-guarded).
 fn repack_from_history(
@@ -768,51 +811,7 @@ fn repack_from_history(
     isolate_of: &std::collections::HashSet<String>,
     state: &crate::state::StateStore,
 ) -> Vec<(String, u32, bool)> {
-    let mut measured_n = 0usize;
-    let items: Vec<crate::plan::waves::PackItem> = recs
-        .iter()
-        .map(|(name, rec_wave, _)| {
-            // Tier by the cost model's recommended_wave, NOT the config's
-            // current wave: under --annotate-waves the planner OWNS the schedule
-            // (the additive default path preserves hand-set waves instead).
-            // Tiering by existing.wave made a second annotate read the first
-            // run's machine-written waves as operator tiers and froze the
-            // packing (bug hunt 2026-08-08); recommended_wave is deterministic
-            // from the cost model, so re-annotation is idempotent.
-            let tier = *rec_wave;
-            // Last successful run: the best predictor of the next one.
-            let last = state
-                .get_metrics(Some(name), 25)
-                .ok()
-                .into_iter()
-                .flatten()
-                .find(|m| m.status == "success");
-            let (secs, rss) = match &last {
-                Some(m) => {
-                    measured_n += 1;
-                    (
-                        (m.duration_ms as f64 / 1000.0).max(0.001),
-                        m.peak_rss_mb.unwrap_or(150),
-                    )
-                }
-                // No history: a flat placeholder. Deliberately coarse — its
-                // only job is ORDERING within the tier until a real run
-                // exists; the label below says "estimated" so nobody mistakes
-                // it for knowledge (#148/#149 give it real numbers later).
-                None => (5.0, 150),
-            };
-            crate::plan::waves::PackItem {
-                name: name.clone(),
-                tier,
-                cost_class: cost_of
-                    .get(name)
-                    .copied()
-                    .unwrap_or(crate::plan::CostClass::Medium),
-                predicted_secs: secs,
-                peak_rss_mb: rss,
-            }
-        })
-        .collect();
+    let (items, measured_n) = history_pack_items(&recs, cost_of, state);
     let waves = crate::plan::waves::pack(&items, 4096);
     log::warn!(
         "plan --annotate-waves: packed {} export(s) into {} wave(s) from run history \
@@ -840,6 +839,70 @@ fn repack_from_history(
             (name, w, ps)
         })
         .collect()
+}
+
+/// The packer's input, plus the count the operator-facing label reports:
+/// `(items, measured_n)`.
+///
+/// The count is RETURNED rather than left as a local because the only thing it
+/// feeds is a `log::warn!` line, and an offline test cannot read a log line —
+/// `replace += with *= in repack_from_history` (2026-08-16 mutation run,
+/// plan_cmd.rs:822) pinned it at zero and every test of this function stayed
+/// green, because the wave assignment is indifferent to it. The label is not
+/// cosmetic: "0 measured, N estimated" is what tells an operator the schedule
+/// about to be WRITTEN into their config rests on placeholders.
+fn history_pack_items(
+    recs: &[(String, u32, bool)],
+    cost_of: &std::collections::HashMap<String, crate::plan::CostClass>,
+    state: &crate::state::StateStore,
+) -> (Vec<crate::plan::waves::PackItem>, usize) {
+    let mut measured_n = 0usize;
+    let items: Vec<crate::plan::waves::PackItem> = recs
+        .iter()
+        .map(|(name, rec_wave, _)| {
+            // Tier by the cost model's recommended_wave, NOT the config's
+            // current wave: under --annotate-waves the planner OWNS the schedule
+            // (the additive default path preserves hand-set waves instead).
+            // Tiering by existing.wave made a second annotate read the first
+            // run's machine-written waves as operator tiers and froze the
+            // packing (bug hunt 2026-08-08); recommended_wave is deterministic
+            // from the cost model, so re-annotation is idempotent.
+            let tier = *rec_wave;
+            // THE predictor, shared with `apply --pool`
+            // ([`super::pool::predict_secs_and_rss`]) rather than re-derived
+            // here: two commands over one state DB must not produce
+            // contradictory schedules for one config, and `--annotate-waves`
+            // WRITES its belief into the operator's config, so its blindness
+            // outlives the command. A local copy diverged twice — first on the
+            // fixed 25-row window (blind past 25 consecutive failures), then on
+            // the missing failed-attempt tier: an export that has never
+            // succeeded but whose attempts run an hour at 3 GB was scheduled
+            // here at (5 s, 150 MB) while the pool floored it at the attempt
+            // (bughunt 2026-08-14, rounds 3 and 4).
+            let (from, peak_rss) = super::pool::predict_secs_and_rss(state, name);
+            // Only a SUCCESS is a measurement — a failed attempt's duration is
+            // a floor, so it stays out of the "N measured, M estimated" label
+            // even though it now carries a real number.
+            if matches!(from, super::pool::PredictedFrom::Measured(_)) {
+                measured_n += 1;
+            }
+            // 150 MB when the history carries no RSS at all: deliberately
+            // coarse, its only job is to order/budget until a real run exists
+            // (#148/#149 give it real numbers later).
+            let (secs, rss) = (from.secs(), peak_rss.unwrap_or(150));
+            crate::plan::waves::PackItem {
+                name: name.clone(),
+                tier,
+                cost_class: cost_of
+                    .get(name)
+                    .copied()
+                    .unwrap_or(crate::plan::CostClass::Medium),
+                predicted_secs: secs,
+                peak_rss_mb: rss,
+            }
+        })
+        .collect();
+    (items, measured_n)
 }
 
 /// Which of the plan's recommendations may actually be WRITTEN into the
@@ -1025,8 +1088,96 @@ mod tests {
 
     use super::{
         ExportFields, apply_field_annotations, effective_parallel_safe, fields_to_write,
-        refuse_annotate_scoped_to_export, repack_from_history,
+        history_pack_items, refuse_annotate_scoped_to_export, repack_from_history,
     };
+
+    /// The chunked key span is INCLUSIVE of both boundaries, and floored at 0.
+    ///
+    /// This arithmetic lives one call away from `source::create_source`, so the
+    /// offline suite never executes it in place: the 2026-08-16 mutation run
+    /// left FOUR arithmetic mutants alive on the single expression
+    /// (`(last.1 - first.0 + 1).max(0)`), and no live test asserts the
+    /// artifact's `row_estimate` either. Extracting
+    /// [`super::chunked_key_span`] is what makes the four killable.
+    ///
+    /// Fixture past the thresholds: a single-ordinal range, a negative lower
+    /// bound and a lower bound that is neither 0 nor 1, so no mutant can
+    /// survive on a coincidence of an identity element (`first_lo == 1` makes
+    /// `* first_lo` and `/ first_lo` no-ops on the SPAN, and `first_lo == 0`
+    /// does the same for `+`/`-` while making `/` a panic).
+    ///
+    /// RED, each verified by applying that exact mutation (first failing
+    /// assertion, verbatim):
+    ///   * `+`→`*`: `left: 29, right: 30` — an off-by-one row estimate, which
+    ///     under `chunk_dense` is published as an EXACT count.
+    ///   * `+`→`-`: `left: 28, right: 30`
+    ///   * `-`→`+`: `left: 32, right: 30`
+    ///   * `-`→`/`: `left: 31, right: 30`
+    #[test]
+    fn chunked_key_span_counts_both_boundaries_and_never_goes_negative() {
+        use super::chunked_key_span;
+        // The canonical 30-row table the legacy artifact fixture records.
+        assert_eq!(chunked_key_span(1, 30), 30);
+        // Keys that do not start at 1 — an inclusive span, not a difference.
+        assert_eq!(chunked_key_span(100, 100), 1, "one ordinal is one row");
+        assert_eq!(chunked_key_span(-5, 5), 11);
+        assert_eq!(chunked_key_span(950_000_000, 1_290_000_000), 340_000_001);
+        // A degenerate/empty detection must floor at zero, never report a
+        // negative row estimate to the scheduler.
+        assert_eq!(chunked_key_span(10, 5), 0);
+    }
+
+    /// The "N measured, M estimated" label counts MEASUREMENTS — a failed
+    /// attempt's floor and a history-less placeholder are both estimates.
+    ///
+    /// Observed at the boundary, from the real producer: `history_pack_items`
+    /// reads the shared predictor against a real (in-memory) state store, and
+    /// the test asserts the count it returns rather than re-deriving the rule.
+    ///
+    /// RED against `replace += with *= in repack_from_history`
+    /// (2026-08-16 mutation run, plan_cmd.rs:822): the counter is pinned at
+    /// zero — `left: 0, right: 2` — and the operator is told a schedule built
+    /// on two real measurements rests entirely on estimates.
+    #[test]
+    fn the_packer_counts_only_successes_as_measured() {
+        let state = crate::state::StateStore::open_in_memory().expect("state");
+        let rec = |name: &str, run: &str, ms: i64, status: &str| {
+            state
+                .record_metric_full(&crate::state::MetricRow {
+                    export_name: name.to_string(),
+                    run_id: run.to_string(),
+                    duration_ms: ms,
+                    total_rows: 10,
+                    peak_rss_mb: Some(120),
+                    status: status.to_string(),
+                    files_produced: 1,
+                    bytes_written: 100,
+                    ..Default::default()
+                })
+                .expect("record");
+        };
+        // Two measured (a success each), one attempt-floor (never succeeded),
+        // one with no history at all: ≥2 measured, so a counter that only ever
+        // reaches 1 is distinguishable too.
+        rec("ok_a", "a1", 900_000, "success");
+        rec("ok_b", "b1", 600_000, "success");
+        rec("never", "n1", 300_000, "failed");
+        let recs: Vec<(String, u32, bool)> = ["ok_a", "ok_b", "never", "fresh"]
+            .iter()
+            .map(|n| ((*n).to_string(), 2u32, false))
+            .collect();
+        let cost_of = recs
+            .iter()
+            .map(|(n, _, _)| (n.clone(), crate::plan::CostClass::High))
+            .collect();
+        let (items, measured_n) = history_pack_items(&recs, &cost_of, &state);
+        assert_eq!(items.len(), 4, "fixture: every rec becomes a pack item");
+        assert_eq!(
+            measured_n, 2,
+            "only the two exports with a SUCCESS are measurements; the \
+             failed-attempt floor and the history-less export are estimates"
+        );
+    }
 
     /// The refuse-guard fires ONLY when BOTH `--annotate-waves` and `--export`
     /// are set — the `&&` must not become `||` (which would reject a plain
@@ -1140,6 +1291,144 @@ mod tests {
             .map(|(n, _, _)| n.as_str())
             .collect();
         assert!(w1.contains(&"slowpoke"), "w1={w1:?}");
+    }
+
+    /// `plan --annotate-waves` and `apply --pool` must not disagree about a
+    /// CHRONICALLY-FAILING export — and `--annotate-waves` writes its belief
+    /// into the operator's config, so its blindness outlives the command.
+    ///
+    /// The packer's history lookup was left on a fixed 25-row window while
+    /// `pool::predict_secs` moved to the direct last-success query: past 25
+    /// consecutive failures the window holds no `success` row at all, so an
+    /// hour-long export fell to the 5 s placeholder here while the pool still
+    /// measured it (bughunt 2026-08-14). RED against the window scan
+    /// (`get_metrics(Some(name), 25).find(status == "success")`): `chronic`
+    /// drops to the placeholder, sorts LAST of the four, and lands in wave 2 —
+    /// `left: 2, right: 1` on the wave assert below.
+    ///
+    /// Four exports, two waves (K=2 at High cost): the fixture must span more
+    /// than one wave, or every ordering error still lands everyone in wave 1.
+    #[test]
+    fn repack_measures_an_export_that_has_failed_past_the_recent_window() {
+        let state = crate::state::StateStore::open_in_memory().expect("state");
+        let rec = |name: &str, run: &str, ms: i64, status: &str| {
+            state
+                .record_metric_full(&crate::state::MetricRow {
+                    export_name: name.to_string(),
+                    run_id: run.to_string(),
+                    duration_ms: ms,
+                    total_rows: 10,
+                    peak_rss_mb: Some(120),
+                    status: status.to_string(),
+                    files_produced: 1,
+                    bytes_written: 100,
+                    ..Default::default()
+                })
+                .expect("record");
+        };
+        // The chronic case: one real success a month ago, then 30 failures —
+        // deeper than the 25-row window the packer used to read.
+        rec("chronic", "chronic_ok", 900_000, "success");
+        for i in 0..30 {
+            rec("chronic", &format!("chronic_bad{i}"), 60_000, "failed");
+        }
+        rec("steady", "steady_ok", 600_000, "success");
+        rec("mid", "mid_ok", 300_000, "success");
+        rec("tiny", "tiny_ok", 10_000, "success");
+
+        let recs: Vec<(String, u32, bool)> = ["chronic", "steady", "mid", "tiny"]
+            .iter()
+            .map(|n| ((*n).to_string(), 2u32, false))
+            .collect();
+        let cost_of = recs
+            .iter()
+            .map(|(n, _, _)| (n.clone(), crate::plan::CostClass::High))
+            .collect();
+        let packed = repack_from_history(recs, &cost_of, &std::collections::HashSet::new(), &state);
+        let wave = |n: &str| packed.iter().find(|(m, _, _)| m == n).unwrap().1;
+        assert_eq!(
+            wave("chronic"),
+            1,
+            "the 900 s success is still this export's prediction, 30 failures later"
+        );
+        assert_eq!(wave("steady"), 1, "fixture: K=2 pairs the two heaviest");
+        assert_eq!((wave("mid"), wave("tiny")), (2, 2), "…and the two lightest");
+    }
+
+    /// The NEVER-succeeded export: `--annotate-waves` must schedule it from the
+    /// same failed-attempt tier `apply --pool` uses, and must charge the wave
+    /// budget its real peak RSS.
+    ///
+    /// Round-3 converged the two predictors only on the succeeded-then-failed
+    /// case (the test above). An export with NO success ever — attempts running
+    /// an hour and peaking at 3 GB, a plausible reason it keeps failing — still
+    /// fell to the local `(5 s, 150 MB)` placeholder here while
+    /// `pool::predict_secs` floored it at the attempt: it sorted LAST in its
+    /// tier and was charged 150 MB of a 4096 MB wave budget, so it packed
+    /// beside exports the wave could not hold in memory — pressure re-creating
+    /// the very failure, written into the operator's config (bughunt
+    /// 2026-08-14, round 4).
+    ///
+    /// Both halves are RED-proven, and the two asserts fail against DIFFERENT
+    /// mutants, which is why both are here:
+    ///  * duration — restore `None => (5.0, 150)`: `doomed` sorts below the
+    ///    three measured exports and lands in wave 2 (`left: 2, right: 1`).
+    ///  * RSS — keep the duration but drop the peak (`peak_rss.unwrap_or(150)`
+    ///    → a flat `150`): `doomed` opens wave 1 but no longer fills the
+    ///    budget, so `steady` packs in beside it (`wave("steady")` 1, not 2).
+    #[test]
+    fn repack_predicts_an_export_that_has_never_succeeded_from_its_failed_attempts() {
+        let state = crate::state::StateStore::open_in_memory().expect("state");
+        let rec = |name: &str, run: &str, ms: i64, rss: i64, status: &str| {
+            state
+                .record_metric_full(&crate::state::MetricRow {
+                    export_name: name.to_string(),
+                    run_id: run.to_string(),
+                    duration_ms: ms,
+                    total_rows: 10,
+                    peak_rss_mb: Some(rss),
+                    status: status.to_string(),
+                    files_produced: 1,
+                    bytes_written: 100,
+                    ..Default::default()
+                })
+                .expect("record");
+        };
+        // Never a success: three attempts, and NEITHER the longest duration nor
+        // the largest peak is the most recent row — a fold that takes "the last
+        // attempt" instead of the worst one reads (600 s, 200 MB) and packs
+        // `doomed` beside `steady` again.
+        rec("doomed", "d1", 1_200_000, 900, "failed");
+        rec("doomed", "d2", 3_600_000, 3000, "interrupted");
+        rec("doomed", "d3", 600_000, 200, "failed");
+        rec("steady", "s_ok", 1_200_000, 2000, "success");
+        rec("mid", "m_ok", 600_000, 100, "success");
+        rec("tiny", "t_ok", 10_000, 100, "success");
+
+        let recs: Vec<(String, u32, bool)> = ["doomed", "steady", "mid", "tiny"]
+            .iter()
+            .map(|n| ((*n).to_string(), 2u32, false))
+            .collect();
+        // Medium → K=3, so the wave is NOT capped at 2 members: whether
+        // `steady` joins `doomed` is then decided by the RSS budget alone.
+        let cost_of = recs
+            .iter()
+            .map(|(n, _, _)| (n.clone(), crate::plan::CostClass::Medium))
+            .collect();
+        let packed = repack_from_history(recs, &cost_of, &std::collections::HashSet::new(), &state);
+        let wave = |n: &str| packed.iter().find(|(m, _, _)| m == n).unwrap().1;
+        assert_eq!(
+            wave("doomed"),
+            1,
+            "an hour-long failed attempt is a FLOOR on the real duration — it must \
+             open the tier, not sort below a 10 s export at the 5 s placeholder"
+        );
+        assert_eq!(
+            (wave("steady"), wave("mid"), wave("tiny")),
+            (2, 2, 2),
+            "3000 MB + 2000 MB exceeds the 4096 MB wave budget: the failed \
+             attempt's peak RSS must split the wave, not be discarded as 150 MB"
+        );
     }
 
     /// An isolate_on_source export must come out parallel_safe:FALSE even under
@@ -1509,32 +1798,38 @@ mod tests {
         use super::chunked_row_estimate;
         // catalog > span ⇒ rows > distinct keys ⇒ the span is only a floor.
         assert_eq!(
-            chunked_row_estimate(Some(333_000_000), Some(831_000_000), false, false),
+            chunked_row_estimate(Some(333_000_000), Some(831_000_000), false, false, false),
             Some(831_000_000),
         );
         // Sparse key (#149 shape): span dwarfs the catalog — span still wins,
         // exactly the pre-existing behavior (over-estimating is the safe
         // direction for scheduling; the catalog is not trusted to shrink it).
         assert_eq!(
-            chunked_row_estimate(Some(342_000_000), Some(520_000), false, false),
+            chunked_row_estimate(Some(342_000_000), Some(520_000), false, false, false),
             Some(342_000_000),
         );
         // A measured whole-table actual beats the span in either direction.
         assert_eq!(
-            chunked_row_estimate(Some(342_000_000), Some(520_000), true, false),
+            chunked_row_estimate(Some(342_000_000), Some(520_000), true, false, false),
             Some(520_000),
         );
         // F4 fresh-ANALYZE shape: tiny exact span, garbage catalog above it —
         // the span must survive (the catalog override is gated on a span big
         // enough to be worth chunking).
         assert_eq!(
-            chunked_row_estimate(Some(30), Some(1130), false, false),
+            chunked_row_estimate(Some(30), Some(1130), false, false, false),
             Some(30)
         );
         // Missing signals degrade to whichever side exists.
-        assert_eq!(chunked_row_estimate(Some(42), None, false, false), Some(42));
-        assert_eq!(chunked_row_estimate(None, Some(42), false, false), Some(42));
-        assert_eq!(chunked_row_estimate(None, None, false, false), None);
+        assert_eq!(
+            chunked_row_estimate(Some(42), None, false, false, false),
+            Some(42)
+        );
+        assert_eq!(
+            chunked_row_estimate(None, Some(42), false, false, false),
+            Some(42)
+        );
+        assert_eq!(chunked_row_estimate(None, None, false, false, false), None);
     }
 
     /// `chunk_dense: true` makes the span an EXACT `COUNT(*)` over ordinals
@@ -1551,32 +1846,83 @@ mod tests {
         // Stale catalog ABOVE the fresh exact count (the 90%-deleted table):
         // the count wins. RED against `span.max(cat)` reaching the dense path.
         assert_eq!(
-            chunked_row_estimate(Some(120_000), Some(1_200_000), false, true),
+            chunked_row_estimate(Some(120_000), Some(1_200_000), false, true, false),
             Some(120_000),
         );
         // Catalog BELOW it (the ordinary lagging-stats direction): unchanged.
         assert_eq!(
-            chunked_row_estimate(Some(1_200_000), Some(120_000), false, true),
+            chunked_row_estimate(Some(1_200_000), Some(120_000), false, true, false),
             Some(1_200_000),
         );
         // A prior run's MEASURED actual is older than this plan's COUNT(*),
         // so the exact count outranks it too (RED against an early
         // `if measured` return).
         assert_eq!(
-            chunked_row_estimate(Some(120_000), Some(1_200_000), true, true),
+            chunked_row_estimate(Some(120_000), Some(1_200_000), true, true, false),
             Some(120_000),
         );
         // Small dense tables take the same path — the tiny-span carve-out for
         // fresh-ANALYZE garbage is subsumed, not contradicted.
         assert_eq!(
-            chunked_row_estimate(Some(30), Some(1130), false, true),
+            chunked_row_estimate(Some(30), Some(1130), false, true, false),
             Some(30)
         );
         // An empty dense table yields no ranges → no span; the catalog is all
         // that is left, exactly as on the non-dense path.
         assert_eq!(
-            chunked_row_estimate(None, Some(1130), false, true),
+            chunked_row_estimate(None, Some(1130), false, true, false),
             Some(1130)
+        );
+    }
+
+    /// `chunk_by_days` ordinals are DAYS, so the span is not a row figure at
+    /// all — the catalog wins unconditionally, in both directions and at any
+    /// magnitude, and its absence leaves NO estimate rather than a fake one.
+    ///
+    /// Bughunt 2026-08-14: `by_days` is checked first in
+    /// `detect_and_generate_chunks`, so a 3-year date-chunked table produced
+    /// `span = 1095` — under `CATALOG_OVERRIDE_MIN_SPAN` (10 000), which routed
+    /// it to the tiny-span-wins arm and published "~1095 rows" for an 831M-row
+    /// table. That is `CostClass::Low` → `parallel_safe: true` written into the
+    /// operator's config, and the pool then schedules the giant as a cheap
+    /// concurrent export and drops it out of the heavy makespan floor. The
+    /// exactness guard at the call site was applied to the dense
+    /// short-circuit only; the `max()`/tiny-span rules underneath it needed the
+    /// OPPOSITE treatment, which is what `span_is_days` now carries.
+    #[test]
+    fn a_by_days_span_is_a_day_count_and_never_a_row_estimate() {
+        use super::chunked_row_estimate;
+        // The field shape: tiny day span, huge catalog. RED against today's
+        // tiny-span-wins arm, which returned Some(1095).
+        assert_eq!(
+            chunked_row_estimate(Some(1095), Some(831_000_000), false, false, true),
+            Some(831_000_000),
+        );
+        // The other direction too — a day span ABOVE the catalog is still not
+        // a row count, so `max()` must not reach it either (a fixture that
+        // only tested the first direction would pass on `span.max(cat)`).
+        assert_eq!(
+            chunked_row_estimate(Some(20_000), Some(4_000), false, false, true),
+            Some(4_000),
+        );
+        // A measured whole-table actual arrives in the same argument and wins
+        // for the same reason.
+        assert_eq!(
+            chunked_row_estimate(Some(1095), Some(520_000), true, false, true),
+            Some(520_000),
+        );
+        // No catalog: NO estimate. `None` classifies Medium ("assume medium
+        // cost until preflight succeeds"), which is the conservative answer;
+        // the day count would classify Low.
+        assert_eq!(
+            chunked_row_estimate(Some(1095), None, false, false, true),
+            None
+        );
+        // `chunk_dense` + `chunk_by_days` together still produce DAY ordinals
+        // (by_days is checked first), so the exactness claim must not win here.
+        assert_eq!(
+            chunked_row_estimate(Some(1095), Some(831_000_000), false, true, true),
+            Some(831_000_000),
         );
     }
 }

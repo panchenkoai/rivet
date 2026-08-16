@@ -40,6 +40,8 @@ mod extension_seam;
 mod format_fuzz;
 #[path = "offline/mssql_column_data_fixture_guard.rs"]
 mod mssql_column_data_fixture_guard;
+#[path = "offline/mutation_gate_config.rs"]
+mod mutation_gate_config;
 #[path = "offline/mysql_wire_type_fixture_guard.rs"]
 mod mysql_wire_type_fixture_guard;
 #[path = "offline/perf_matrix_guard.rs"]
@@ -50,12 +52,15 @@ mod planner_fuzz;
 mod redaction_invariant;
 #[path = "offline/release_gate_matrix_guard.rs"]
 mod release_gate_matrix_guard;
+#[path = "offline/release_oracle_entrypoint_guard.rs"]
+mod release_oracle_entrypoint_guard;
 #[path = "offline/resource_smoke.rs"]
 mod resource_smoke;
 #[path = "offline/retry_integration.rs"]
 mod retry_integration;
 #[path = "offline/run_summary_contract.rs"]
 mod run_summary_contract;
+
 #[path = "offline/runner_frame_gate.rs"]
 mod runner_frame_gate;
 #[path = "offline/scenario_artifact_matrix_guard.rs"]

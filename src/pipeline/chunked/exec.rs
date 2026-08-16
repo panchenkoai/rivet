@@ -328,6 +328,17 @@ pub(crate) fn run_chunked_parallel(
                 // the governor disarmed. Same shape as the keyset runner's `FinishGuard`.
                 let _exit = crate::pipeline::governor::WorkerExit::new(semaphore, finished);
                 let result = (|| -> Result<()> {
+                    // Test-only, mirroring both checkpoint runners
+                    // (sequential_checkpoint.rs / parallel_checkpoint.rs): make ONE
+                    // chunk fail without killing the process, so the collected-worker-
+                    // error guard AFTER the scope join can be exercised. A panic hook
+                    // cannot reach that guard — it only runs once every worker has
+                    // joined, which a crashed process never does. Same point name and
+                    // 0-based chunk index as the checkpoint runners
+                    // (`RIVET_TEST_ERROR_AT=chunk_export:1`).
+                    crate::test_hook::maybe_error_at_index("chunk_export", i as i64)
+                        .map_err(|msg| anyhow::anyhow!(msg))?;
+
                     let chunk_query = build_chunk_query_sql(
                         base_query,
                         col,
