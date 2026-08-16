@@ -232,7 +232,14 @@ jobs:
         # audit found all four cells never ran in any CI job).
         run: |
           mkdir -p tests/.live-tmp
-          docker compose up -d --wait mongo mongo-rs mongo-auth toxiproxy minio fake-gcs
+          # `duckdb` is the CDC readback ORACLE (rivet-duckdb; tests/common/env.rs
+          # DUCKDB_CONTAINER), not a source — an independent reader, so the CDC
+          # tests do not grade rivet's output with rivet. It has no compose
+          # profile, so a bare `up -d` would start it and an EXPLICIT service list
+          # silently does not: every live_cdc_mongo test died on
+          # `docker inspect failed: No such object: rivet-duckdb`, red on all five
+          # matrix cells for at least ten consecutive nights (2026-08-16).
+          docker compose up -d --wait mongo mongo-rs mongo-auth toxiproxy minio fake-gcs duckdb
           sudo chmod -R 0777 tests/.live-tmp
 
       - name: Run Mongo live tests
@@ -441,8 +448,15 @@ jobs:
           PREV=$(gh release list --limit 20 --json tagName,isPrerelease \
                    --jq '[.[] | select(.isPrerelease == false) | .tagName][0]')
           echo "baseline release: $PREV"
+          # The asset is `rivet-<tag>-<triple>.tar.gz` — the VERSION sits between
+          # the name and the triple, so the old `rivet-x86_64-...` glob matched
+          # NOTHING and `gh release download` failed under `set -e` before a
+          # single test ran. This job was red 10 of 10 nights, i.e. the
+          # cross-version artifact contract was never once checked. The Makefile's
+          # release-oracle-prev-bin target spells the same pattern correctly
+          # (`rivet-$$tag-$$triple.tar.gz`); this copy had drifted.
           gh release download "$PREV" \
-            --pattern 'rivet-x86_64-unknown-linux-gnu*' --dir baseline --clobber
+            --pattern "rivet-$PREV-x86_64-unknown-linux-gnu.tar.gz" --dir baseline --clobber
           cd baseline
           for f in *; do case "$f" in *.tar.gz) tar xzf "$f";; esac; done
           BIN=$(find . -type f -name rivet | head -1)
