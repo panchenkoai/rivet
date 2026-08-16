@@ -82,57 +82,70 @@ scenarios:
   - id: adaptive_concurrency_governor
     what: "OPT-2 governor sheds parallel workers under source pressure (backs off to min_parallel, recovers as pressure eases). Runner-bypass class on the SAFETY knob: it was chunked-only, so a `parallel: N` keyset export on a straining replica adapted batches but never shed workers (#152). Now wired into keyset per-page (permit-per-page semaphore + the same Governor loop + min_parallel floor); the run journal records each ParallelismAdjusted.
 
-      ENGINE/VERSION AXIS (this ledger's columns are runners, so it cannot hold cells for
-      it — recorded here, 2026-08-14): the governor's pressure sampler is PER ENGINE and,
-      on PostgreSQL, PER SERVER VERSION. PG 17 removed pg_stat_bgwriter.checkpoints_req in
-      favour of pg_stat_checkpointer.num_requested, and a wrong arm is NOT a quiet None —
-      the batch loop samples inside the export's cursor transaction, so the ERROR aborts it
-      and every subsequent FETCH dies (proven on the postgres:18 stand: the mutant that
-      disables the modern arm fails the whole export with `current transaction is aborted`).
-      The main live stack is postgres:16, where both spellings resolve, so the modern arm
-      shipped with zero live coverage. Covered now on two layers: the branch itself by
-      `checkpoints_req_sql_matches_the_servers_catalog` (offline, pure fn) and the real
-      catalog by `pg18_governor_samples_the_modern_checkpointer_catalog` (live, skips when
-      the optional dev/stand pg18-batch on :5518 is down). The SHED half of the same axis: proven on
-      PostgreSQL (governor_backs_off_under_concurrent_write_pressure) and now on MySQL
-      (mysql_governor_backs_off_under_real_redo_pressure — innodb_log_buffer_size shrunk to
+      TWO AXES, kept apart on purpose. This ledger's columns are RUNNERS, so the ENGINE
+      axis has no cells here and is recorded in prose; the RUNNER axis is what the cells
+      below grade. Every claim in one paragraph is evidence about that paragraph's axis
+      only — a shed test proves an ENGINE's sampler moves, not that a second runner is
+      wired; a wiring pin proves a RUNNER arms the harness, not that an engine's counters
+      rise. (Rewritten 2026-08-16, round-6 bughunt: three rounds of appends had left this
+      cell asserting the engine axis' three shed tests were `RUNNER-VARIANT AXIS`
+      evidence.)
+
+      ENGINE/VERSION AXIS (recorded here, 2026-08-14). The governor's pressure sampler is
+      PER ENGINE and, on PostgreSQL, PER SERVER VERSION. PG 17 removed
+      pg_stat_bgwriter.checkpoints_req in favour of pg_stat_checkpointer.num_requested, and
+      a wrong arm is NOT a quiet None — the batch loop samples inside the export's cursor
+      transaction, so the ERROR aborts it and every subsequent FETCH dies (proven on the
+      postgres:18 stand: the mutant that disables the modern arm fails the whole export with
+      `current transaction is aborted`). The main live stack is postgres:16, where both
+      spellings resolve, so the modern arm shipped with zero live coverage; it is covered now
+      on two layers — the branch itself by `checkpoints_req_sql_matches_the_servers_catalog`
+      (offline, pure fn beside `checkpoints_req_sql` in src/source/postgres/mod.rs) and the
+      real catalog by `pg18_governor_samples_the_modern_checkpointer_catalog` (live, skips
+      when the optional dev/stand pg18-batch on :5518 is down).
+      The SHED half of THIS axis is proven by one live test per engine that has a sampler:
+      PostgreSQL `governor_backs_off_under_concurrent_write_pressure`; MySQL
+      `mysql_governor_backs_off_under_real_redo_pressure` (innodb_log_buffer_size shrunk to
       its 256 KB minimum plus a foreign blob writer, with an activation guard on the counter
-      delta). — and on SQL Server
-      (mssql_governor_backs_off_under_real_log_flush_pressure — a writer committing one
-      ~200 KB row per transaction, which forces a log flush per commit; measured 1273 ->
-      1681 over 400 commits, and unlike the MySQL twin it needs no server-wide flip). All
-      RUNNER-VARIANT AXIS, and the exact hazard this ledger's four-column collapse warns
-      about in its header (found 2026-08-14, round-4 bughunt finding 0). The `chunked` cell
-      below is proven on chunked_PARALLEL (chunked/exec.rs) — and the CHECKPOINT twin
+      delta); SQL Server `mssql_governor_backs_off_under_real_log_flush_pressure` (a writer
+      committing one ~200 KB row per transaction, which forces a log flush per commit;
+      measured 1273 -> 1681 over 400 commits, and unlike the MySQL twin it needs no
+      server-wide flip). All three are ENGINE-axis evidence — each says that engine's
+      counters really move and the sampler really reads them, whichever runner drove the
+      test — and they exist because a must-not-shed assertion cannot tell a working signal
+      from a dead one: under a mutant that makes the engine's sampler read permanently flat,
+      every pre-existing canary on that engine stays GREEN and only the shed test goes RED
+      (verified on MySQL and on SQL Server). MongoDB has no governor (no permit ceiling to
+      shrink — see the mongo_parallel cell), so the ENGINE axis is complete: three engines
+      proven, one structurally n/a.
+
+      RUNNER-VARIANT AXIS — the hazard this ledger's four-column collapse warns about in its
+      header (found 2026-08-14, round-4 bughunt finding 0). The `chunked` cell below is proven
+      live on chunked_PARALLEL (chunked/exec.rs:271); its CHECKPOINT twin
       (parallel_checkpoint.rs, which job.rs dispatches whenever `plan.strategy.is_resumable()`,
       i.e. `chunk_checkpoint: true`) had NO governor at all: no monitoring connection, no arm
       line, no permit ceiling to resize. So `tuning.adaptive: true` was a silent no-op on
       exactly the shape `rivet init` scaffolds (chunk_checkpoint + parallel), and dropping
       `chunk_checkpoint` from an otherwise identical config was the difference between a
-      governed run and an ungoverned one, with nothing in the log to tell them apart. Now
-      wired through the same GovernorHarness seam, in the POOL shape it needs: one permit per
-      CLAIMED TASK (governor::TaskPermit, taken before the claim so a shed parks a worker
-      rather than pinning a chunk_task `running`) plus governor::WorkerFinished counting
-      worker exits, since `total` there is the pool size, not the task count. Three layers of
-      proof, named honestly: the wiring by
+      governed run and an ungoverned one, with nothing in the log to tell them apart. It is
+      now wired through the same GovernorHarness seam (parallel_checkpoint.rs:178), in the
+      POOL shape it needs: one permit per CLAIMED TASK (governor::TaskPermit, taken before the
+      claim so a shed parks a worker rather than pinning a chunk_task `running`) plus
+      governor::WorkerFinished counting worker exits, since `total` there is the pool size,
+      not the task count.
+      What is PROVEN on this axis, and what is still OPEN. Proven: the wiring, by
       `the_parallel_checkpoint_runner_arms_spawns_and_drains_the_governor` (offline call-site
-      pin — it greps source text and says so); the pool shed MECHANISM by
+      pin — it greps source text and says so in its own doc); and the pool shed MECHANISM, by
       `a_shrunken_permit_ceiling_sheds_pool_workers_without_stranding_a_task` (offline, real
-      guards, RED against a per-worker permit and against a leaked one); and the end-to-end
-      behaviour by an AD-HOC live run, not yet by a committed test — a chunk_checkpoint +
-      parallel:8 + adaptive PG export under a CHECKPOINT-spamming writer logged
-      `governor active (parallel 2..8)`, shed 8 -> 7 under rising pressure, recovered 7 -> 8,
-      journalled all four ParallelismAdjusted events and still delivered 20000/20000 rows in
-      20 parts (2026-08-14). The remaining follow-up is to make that fixture a COMMITTED
-      checkpoint-runner twin of the live test named in the cell below (tests/live/
-      live_governor.rs); until it exists, the `chunked` cell's live shed proof covers
-      exec.rs only. The
-
-      three shed tests exist because a must-not-shed assertion cannot tell a working signal
-      from a dead one: under a mutant that makes the engine's sampler read permanently
-      flat, every pre-existing canary on that engine stays GREEN and only the shed test
-      goes RED (verified on MySQL and on SQL Server). MongoDB has no governor (no permit
-      ceiling to shrink — see the mongo_parallel cell), so the axis is complete."
+      guards, RED against a per-worker permit and against a leaked one). OPEN: the
+      checkpoint runner's END-TO-END shed has only an AD-HOC live run behind it, not a
+      committed test — a chunk_checkpoint + parallel:8 + adaptive PG export under a
+      CHECKPOINT-spamming writer logged `governor active (parallel 2..8)`, shed 8 -> 7 under
+      rising pressure, recovered 7 -> 8, journalled all four ParallelismAdjusted events and
+      still delivered 20000/20000 rows in 20 parts (2026-08-14). The follow-up is to commit
+      that fixture as a checkpoint-runner twin of the live test named in the `chunked` cell
+      (tests/live/live_governor.rs). Until it lands, read the `chunked` cell as: live shed
+      proven on exec.rs, the checkpoint variant resting on the two offline proofs above."
     single:         { na: "single has no worker fan-out to govern (parallel is a multi-part-runner concept)" }
     chunked:        { test: governor_backs_off_under_concurrent_write_pressure }
     keyset:         { test: keyset_governor_backs_off_under_concurrent_write_pressure }

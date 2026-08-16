@@ -65,8 +65,18 @@ MUTATES A SHARED SERVER and it MEASURES WALL-CLOCK.
   exception (`__exit__`), SIGINT/SIGTERM/SIGHUP (handlers installed on entry),
   and any other interpreter exit (`atexit`); it is idempotent, RETRIED, and
   VERIFIED by reading the globals back; a restore that cannot be verified turns
-  the run red and prints the exact SQL to run by hand. `SIGKILL` is the one hole
-  and it is named here rather than papered over.
+  the run red, prints the exact SQL to run by hand, and emits the machine-
+  readable `STAND_MUTATED_MARKER` so the release-oracle wrapper records it as a
+  poisoned STAND rather than as "the parse missed a criterion".
+  `SIGKILL` remains the one hole, and it is now closed from BOTH sides rather
+  than only named: the wrapper that used to send it
+  (`dev/release_oracle/regression.py`) sends SIGINT and waits out a grace period
+  first — SIGINT is caught by the handler below — and after the child returns
+  for ANY reason it reads `@@GLOBAL.*` back off the stand itself, restoring to
+  DEFAULT and failing the cell if the flip is still there. A SIGKILL that
+  happens anyway (the gate's own process dying, `kill -9` by hand) is still
+  detected on the NEXT run (prior == FLIP) and restored to DEFAULT rather than
+  perpetuated.
 
 * **`@@GLOBAL.x`, never `@@x`.** `@@tmp_table_size` is the SESSION copy, taken
   from the global when the connection opened — so a verification issued in the
@@ -104,9 +114,29 @@ WORK = Path(os.environ.get("RIVET_FIELD_WORKDIR", "/tmp/rivet-field-replay"))
 POOL_SLOTS = "5"
 
 # Generous: a leg of this fixture is minutes, and a timeout must mean "hung",
-# never "slow". A timed-out leg surfaces as returncode 124 and a wall-clock that
-# fails criterion 3 loudly, rather than as a hang that outlives the CI job.
+# never "slow".
+#
+# A timed-out leg surfaces as returncode 124 — and, since 2026-08-16, as a
+# `timed_out` flag that POISONS every criterion which consumes that leg. The
+# comment here used to claim a timeout "fails criterion 3 loudly", which is true
+# only when the NEW leg is the one that dies: criterion 3 is `new <= old * 1.05`,
+# so a killed OLD leg hands it a 3600 s ceiling that any real new run beats, and
+# the wall-clock FLOOR of a killed process is then graded as a measurement
+# ("400.0s vs 3600.0s — PASS"). Criterion 2 has the same shape from the other
+# side: a killed NEW leg sheds no more, so "new shed 0x" passes vacuously. Both
+# now report UNGRADED and FAIL. Criterion 1 is the exception, and deliberately:
+# it asks for a POSITIVE observation (the old binary shed at least once), which
+# a truncated leg can only under-report, never manufacture.
 LEG_TIMEOUT = float(os.environ.get("RIVET_FIELD_TIMEOUT") or 3600)
+
+# The legs, in the order they run and the order `report` prints them. ONE list,
+# so the leg COUNT is derivable rather than re-typed: the release-oracle wrapper
+# (dev/release_oracle/regression.py) sizes its own budget as
+# `len(LEG_PLAN) * LEG_TIMEOUT + slack` by importing these two names. Before that
+# it read the SAME `RIVET_FIELD_TIMEOUT` for a single whole-harness budget, so
+# the wrapper always expired first (X vs 4X) and SIGKILLed the harness — the one
+# signal the restore contract below cannot survive.
+LEG_PLAN = (("old", False), ("old", True), ("new", False), ("new", True))
 
 # Empty means "SQLite beside the config" — see the state note in the docstring.
 # `run()` merges over os.environ, so CLEARING an inherited value needs the empty
@@ -197,6 +227,14 @@ _GLOBALS = tuple(FLIP)
 # Set when a restore could not be verified. `main` returns non-zero on it, so a
 # poisoned stand can never be reported as a passing gate step.
 RESTORE_FAILED: list[str] = []
+
+# The machine-readable line `main` prints when the stand was left mutated. The
+# release-oracle wrapper imports this NAME (never a re-typed copy of the text)
+# and turns it into its own FAIL row, because the alternative reading of "exit 1
+# with four green criteria" is "it died after printing them, or the parse missed
+# one" — a parser bug, which is what the wrapper used to report while the actual
+# fact was a poisoned shared MySQL server.
+STAND_MUTATED_MARKER = "!! STAND LEFT MUTATED:"
 
 
 def read_globals() -> dict[str, str]:
@@ -453,11 +491,15 @@ def delivered(state_db: Path, tag: str) -> dict:
         raise Fail(f"leg {tag}: cannot read export_metrics from {state_db}: {e}") from e
 
 
+def leg_tag(side: str, adaptive: bool) -> str:
+    return f"{side}-{'on' if adaptive else 'off'}"
+
+
 def run_leg(binary: Path, side: str, adaptive: bool) -> dict:
     """One leg. `side` is passed in rather than derived from the binary path, so
     pointing the harness at the same binary twice (its own self-test) still gives
     each leg its own work dir instead of the second overwriting the first."""
-    tag = f"{side}-{'on' if adaptive else 'off'}"
+    tag = leg_tag(side, adaptive)
     work = WORK / tag
     if work.exists():
         shutil.rmtree(work)
@@ -467,12 +509,15 @@ def run_leg(binary: Path, side: str, adaptive: bool) -> dict:
     t0 = time.monotonic()
     r = sh([str(binary), "apply", str(cfg), "--pool", POOL_SLOTS], env=CHILD_ENV, cwd=work)
     wall = time.monotonic() - t0
-    if r.returncode == 124:
+    timed_out = r.returncode == 124
+    if timed_out:
         print(f"   ! leg {tag} TIMED OUT after {LEG_TIMEOUT:.0f}s — its wall time is a floor, "
-              "not a measurement")
+              "not a measurement, and every criterion that reads this leg is UNGRADED")
     db = _state_db(work, tag)
     back, rec = journal_sheds(db, tag)
-    return {"tag": tag, "exit": r.returncode, "wall": wall,
+    # `timed_out` is CARRIED, not just printed: a note in the log is invisible to
+    # the verdict, and the verdict is what the release gate records.
+    return {"tag": tag, "exit": r.returncode, "wall": wall, "timed_out": timed_out,
             "backed_off": back, "recovered": rec, "rows": delivered(db, tag),
             "stderr_tail": r.stderr.strip().splitlines()[-4:]}
 
@@ -550,8 +595,83 @@ def preflight(old_raw: str, new_raw: str) -> tuple[Path, Path]:
 
 def _usage() -> str:
     return ("usage: python3 -m dev.pytools.field_replay <old-binary> <new-binary>\n"
+            "         python3 -m dev.pytools.field_replay --self-test\n"
             "  env: RIVET_FIELD_MYSQL_URL / RIVET_FIELD_MYSQL_CONTAINER /\n"
             "       RIVET_FIELD_WORKDIR / RIVET_FIELD_LOCK / RIVET_FIELD_TIMEOUT")
+
+
+# ── self-test: the verdict logic, without a stand ──────────────────────────────
+def _self_test() -> int:
+    """`report()`'s handling of a TIMED-OUT leg, over synthetic legs.
+
+    No docker, no MySQL, no binaries — this grades the one part of the harness
+    that decides the release verdict, and it is here because the bug it guards
+    was invisible to every live run: a leg killed at `LEG_TIMEOUT` reports
+    numbers that are FLOORS, and each criterion is directional, so the floor
+    lands on the PASSING side. Before the fix, an old-leg timeout printed
+    `[PASS] 3 no makespan regression … (400.0s vs 3600.0s)` — a wall-clock
+    ceiling graded as a measurement, and recorded as a green release-gate row.
+
+    Its call site is `tests/offline/release_oracle_entrypoint_guard.rs`, so it
+    runs in the offline suite rather than waiting for someone to remember it.
+    """
+    import contextlib
+    import io
+
+    rows = {"fr_heavy_0": 60_000}
+
+    def leg(tag, wall, backed_off, timed_out=False):
+        return {"tag": tag, "exit": 124 if timed_out else 0, "wall": wall,
+                "timed_out": timed_out, "backed_off": backed_off, "recovered": 0,
+                "rows": rows, "stderr_tail": []}
+
+    def graded(old_on_wall, old_on_shed, new_on_wall, new_on_shed, *,
+               old_timed_out=False, new_timed_out=False):
+        runs = {"old-off": leg("old-off", 300, 0), "new-off": leg("new-off", 300, 0),
+                "old-on": leg("old-on", old_on_wall, old_on_shed, old_timed_out),
+                "new-on": leg("new-on", new_on_wall, new_on_shed, new_timed_out)}
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = report(runs)
+        out = buf.getvalue()
+        verdicts = {}
+        for line in out.splitlines():
+            s = line.strip()
+            if s.startswith("[PASS] ") or s.startswith("[FAIL] "):
+                verdicts[s[7:8]] = s[1:5]
+        return rc, verdicts, out
+
+    failures = []
+
+    def want(name, cond, detail=""):
+        print(f"  [{'PASS' if cond else 'FAIL'}] {name}{('  ' + detail) if detail else ''}")
+        if not cond:
+            failures.append(name)
+
+    rc, v, out = graded(3600, 3, 400, 0, old_timed_out=True)
+    want("a timed-out OLD leg does not let criterion 3 pass on its floor",
+         v.get("3") == "FAIL", f"criterion 3 = {v.get('3')}")
+    want("…and criterion 1 (a POSITIVE observation) still passes",
+         v.get("1") == "PASS", f"criterion 1 = {v.get('1')}")
+    want("…and the harness exits non-zero", rc != 0, f"rc={rc}")
+
+    rc, v, out = graded(3000, 3, 3600, 0, new_timed_out=True)
+    want("a timed-out NEW leg does not let criterion 2 ('sheds 0') pass vacuously",
+         v.get("2") == "FAIL", f"criterion 2 = {v.get('2')}")
+
+    rc, v, out = graded(3000, 3, 400, 0)
+    want("control: with no timeout every criterion is graded and green",
+         rc == 0 and set(v.values()) == {"PASS"}, f"rc={rc} {v}")
+
+    want(f"the wrapper's budget is derivable: {len(LEG_PLAN)} legs x LEG_TIMEOUT",
+         len(LEG_PLAN) == 4 and {s for s, _ in LEG_PLAN} == {"old", "new"},
+         str(LEG_PLAN))
+    want("the stand-mutated marker is not shaped like a criterion line",
+         not STAND_MUTATED_MARKER.startswith("[") and "(" not in STAND_MUTATED_MARKER,
+         repr(STAND_MUTATED_MARKER))
+
+    print(f"\nself-test: {len(failures)} failed" if failures else "\nself-test ok")
+    return 1 if failures else 0
 
 
 def main() -> int:
@@ -563,50 +683,87 @@ def main() -> int:
         print(__doc__)
         print(_usage())
         return 0
+    if argv == ["--self-test"]:
+        return _self_test()
     if len(argv) != 2:
         raise Fail("two binaries are required", hint=_usage())
     old, new = preflight(argv[0], argv[1])
 
     WORK.mkdir(parents=True, exist_ok=True)
+    binaries = {"old": old, "new": new}
     with StandLock(MYSQL_CONTAINER):
         seed()
         with TmpTableGlobals():
-            runs = {r["tag"]: r for r in (
-                run_leg(old, "old", False), run_leg(old, "old", True),
-                run_leg(new, "new", False), run_leg(new, "new", True))}
+            runs = {}
+            for side, adaptive in LEG_PLAN:
+                r = run_leg(binaries[side], side, adaptive)
+                runs[r["tag"]] = r
         rc = report(runs)
     if RESTORE_FAILED:
-        print("  [FAIL] the stand was left MUTATED — see the restore banner above")
+        # Machine-readable, and NOT in the `[PASS]/[FAIL] <criterion>  (detail)`
+        # shape the wrapper parses as a criterion — this is a fact about the
+        # STAND, not a verdict about the binaries.
+        print(f"  {STAND_MUTATED_MARKER} {MYSQL_CONTAINER} still carries this run's tmp-table "
+              f"flip ({RESTORE_FAILED[-1]}) — see the restore banner above for the exact SQL")
         return 1
     return rc
 
 
+def _ungraded(*legs: dict) -> str:
+    """The reason a criterion built from `legs` grades NOTHING, or "".
+
+    A leg killed at `LEG_TIMEOUT` reports a wall-clock, a shed count and a row
+    set that are all FLOORS of what the run would have produced. Comparing
+    against a floor is not a measurement, and every one of these criteria is
+    directional, so the floor lands on the PASSING side: `new <= old*1.05` when
+    the old leg is the corpse, `new sheds 0` when the new one is.
+    """
+    dead = [r["tag"] for r in legs if r.get("timed_out")]
+    if not dead:
+        return ""
+    return (f"UNGRADED: leg{'s' if len(dead) > 1 else ''} {', '.join(dead)} TIMED OUT at "
+            f"{LEG_TIMEOUT:.0f}s - a killed leg's numbers are a floor, not a measurement")
+
+
 def report(runs: dict) -> int:
     print(f"\n{'run':12}{'exit':>6}{'wall_s':>9}{'backed_off':>12}{'recovered':>11}{'exports':>9}")
-    for tag in ("old-off", "old-on", "new-off", "new-on"):
-        r = runs[tag]
-        print(f"{tag:12}{r['exit']:>6}{r['wall']:>9.1f}{r['backed_off']:>12}"
-              f"{r['recovered']:>11}{len(r['rows']):>9}")
+    for side, adaptive in LEG_PLAN:
+        r = runs[leg_tag(side, adaptive)]
+        print(f"{r['tag']:12}{r['exit']:>6}{r['wall']:>9.1f}{r['backed_off']:>12}"
+              f"{r['recovered']:>11}{len(r['rows']):>9}"
+              + ("   ! TIMED OUT — a floor, not a measurement" if r["timed_out"] else ""))
 
     old_on, new_on = runs["old-on"], runs["new-on"]
     verdicts = []
+    # Criterion 1 is the only one a timeout cannot flatter: it asks for a
+    # POSITIVE observation (the old binary shed at least once), and a truncated
+    # leg can only under-report one. So a timed-out old leg that still shed is
+    # honest evidence the fixture is live — noted, not poisoned.
     verdicts.append(("1 fixture is live (old must shed)",
                      old_on["backed_off"] > 0,
-                     f"old shed {old_on['backed_off']}x"))
+                     f"old shed {old_on['backed_off']}x"
+                     + (" [leg timed out; a shed was observed before it did]"
+                        if old_on["timed_out"] else "")))
+    why = _ungraded(new_on)
     verdicts.append(("2 symptom gone (new sheds 0 on an idle source)",
-                     new_on["backed_off"] == 0,
-                     f"new shed {new_on['backed_off']}x"))
+                     not why and new_on["backed_off"] == 0,
+                     why or f"new shed {new_on['backed_off']}x"))
+    why = _ungraded(old_on, new_on)
     verdicts.append(("3 no makespan regression (new <= old * 1.05)",
-                     new_on["wall"] <= old_on["wall"] * 1.05,
-                     f"{new_on['wall']:.1f}s vs {old_on['wall']:.1f}s"))
+                     not why and new_on["wall"] <= old_on["wall"] * 1.05,
+                     why or f"{new_on['wall']:.1f}s vs {old_on['wall']:.1f}s"))
+    why = _ungraded(old_on, new_on)
     same = old_on["rows"] == new_on["rows"] and bool(new_on["rows"])
-    verdicts.append(("4 same data delivered", same,
-                     f"{len(new_on['rows'])} exports, "
-                     f"{sum(new_on['rows'].values()):,} rows"))
+    verdicts.append(("4 same data delivered", not why and same,
+                     why or f"{len(new_on['rows'])} exports, "
+                            f"{sum(new_on['rows'].values()):,} rows"))
     # Informational, not a gate: the adaptive-vs-baseline cost on each binary.
     for tag in ("old", "new"):
-        on, off = runs[f"{tag}-on"]["wall"], runs[f"{tag}-off"]["wall"]
-        print(f"\n{tag}: adaptive ON {on:.1f}s vs OFF {off:.1f}s -> ratio {on / off:.2f}")
+        on_leg, off_leg = runs[f"{tag}-on"], runs[f"{tag}-off"]
+        on, off = on_leg["wall"], off_leg["wall"]
+        floor = _ungraded(on_leg, off_leg)
+        print(f"\n{tag}: adaptive ON {on:.1f}s vs OFF {off:.1f}s -> ratio {on / off:.2f}"
+              + (f"  [{floor}]" if floor else ""))
 
     print()
     ok = True

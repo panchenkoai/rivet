@@ -59,10 +59,18 @@ import ast
 import os
 import re
 import shutil
+import signal
+import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
+from ..pytools.field_replay import (
+    FLIP as _FR_FLIP,
+    LEG_PLAN as _FR_LEG_PLAN,
+    LEG_TIMEOUT as _FR_LEG_TIMEOUT,
+    STAND_MUTATED_MARKER as _FR_MUTATED,
+)
 from .core import (
     Ledger,
     Proc,
@@ -90,6 +98,87 @@ _AB_VERSION, _AB_STORE = "ab-diff", "-"
 _FR_VERSION, _FR_STORE = "field", "-"
 
 _MIB = 1048576
+
+
+# ── running a CHILD HARNESS that owns a shared stand ──────────────────────────
+#
+# Two stages here shell out to a harness that mutates something outside its own
+# process and cleans up on the way out: `field_replay` flips SERVER-WIDE
+# tmp-table globals on `rivet-mysql-1` and restores them, `ab_regression` seeds a
+# fixture table and drops it in a `finally`. Both cleanups were reachable by
+# every signal EXCEPT the one this wrapper actually sent.
+#
+# `core.run` is `subprocess.run(timeout=…)`, and CPython implements that timeout
+# with `Popen.kill()` — SIGKILL. SIGKILL runs no `__exit__`, no signal handler
+# and no `atexit`, so a wrapper timeout left the shared MySQL server sitting at
+# `internal_tmp_mem_storage_engine=MEMORY / tmp_table_size=16384` for every later
+# test and every later run (exactly the poisoned stand found on 2026-08-14), and
+# left one 50 000-row `ab_src_<pid>` table behind per timed-out run.
+#
+# Two things are wrong with that and both are fixed here:
+#
+#   1. THE BUDGETS WERE CONFLATED. The wrapper read the SAME env var as the
+#      harness's own PER-LEG / PER-CASE budget, so the wrapper's whole-harness
+#      timeout was always the smaller number (X vs 4X for field_replay, X vs
+#      ~20X for ab_regression) and fired FIRST — the harness's own graceful
+#      leg-timeout escape could never be reached under the oracle, no matter
+#      what an operator set. Each wrapper now has its OWN override and derives
+#      its default from the child's budget times the child's own unit count.
+#
+#   2. THE SIGNAL WAS UNCATCHABLE. `_run_interruptible` sends SIGINT first and
+#      waits out a grace period before escalating. SIGINT — not SIGTERM — is the
+#      terminating signal BOTH children honour: field_replay installs a handler
+#      that restores the globals and re-raises, and ab_regression relies on
+#      Python's default SIGINT→KeyboardInterrupt, which runs its `finally`.
+#      (Python's DEFAULT SIGTERM disposition exits without unwinding, so SIGTERM
+#      would still skip ab_regression's `DROP TABLE`.) SIGKILL remains the last
+#      resort for a child that ignores SIGINT for the whole grace period, and
+#      that case says so in the transcript instead of being silent.
+_GRACE = float(os.environ.get("RIVET_ORACLE_CHILD_GRACE") or 300)
+
+
+def _wrapper_budget(own_env: str, child_budget: float, units: int, slack: float) -> float:
+    """The WRAPPER's timeout for a child that enforces its own per-unit budget.
+
+    Always strictly greater than the child's worst case, so the child's own
+    timeout handling is what fires in a slow run and this one only ever catches
+    a genuine HANG. `own_env` overrides it outright — one operator knob per
+    wrapper, distinct from the child's.
+    """
+    explicit = os.environ.get(own_env)
+    if explicit:
+        return float(explicit)
+    return child_budget * units + slack
+
+
+def _run_interruptible(argv, *, timeout: float, env: dict[str, str], cwd: Path,
+                       grace: float = _GRACE) -> Proc:
+    """`core.run`, except the timeout is SIGINT + grace + SIGKILL rather than an
+    immediate SIGKILL. Returns 124 when the child cleaned up and exited within
+    the grace period, 137 when it had to be killed — a distinction the ledger
+    row repeats, because only the second leaves the stand's state unknown.
+    """
+    full_env = {**os.environ, **env}
+    with subprocess.Popen(
+        list(argv), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        env=full_env, cwd=str(cwd),
+    ) as proc:
+        try:
+            out, err = proc.communicate(timeout=timeout)
+            return Proc(argv, proc.returncode, out, err)
+        except subprocess.TimeoutExpired:
+            proc.send_signal(signal.SIGINT)
+            try:
+                out, err = proc.communicate(timeout=grace)
+                return Proc(argv, 124, out, err + (
+                    f"\n[timeout after {timeout}s — SIGINT sent; the harness ran its cleanup "
+                    f"and exited within {grace}s]"))
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                out, err = proc.communicate()
+                return Proc(argv, 137, out, err + (
+                    f"\n[timeout after {timeout}s — SIGINT ignored for {grace}s, SIGKILLed; "
+                    "the child's cleanup did NOT run and the stand may be left mutated]"))
 
 
 # ── timing / RSS measurement ───────────────────────────────────────────────────
@@ -607,6 +696,21 @@ _AB_MODULE = "dev.pytools.ab_regression"
 # remainder. Raise it when scenarios are added; lowering it is an explicit act.
 _AB_MIN_SCENARIOS = 8
 
+# The harness runs ~20 rivet invocations, each capped at its OWN `RIVET_AB_TIMEOUT`
+# (default 900 s): 6 scenarios × 2 binaries, crash_resume 2 runs × 2 binaries,
+# and failure_and_plan 2 runs × 2 binaries. The wrapper's budget must exceed
+# that worst case or it, not the harness, is what fires — and it used to, at a
+# flat 3600 s read from the harness's own env var. Slack covers seed + preflight
+# + the DuckDB readbacks. Override with `RIVET_ORACLE_AB_TIMEOUT`.
+_AB_CHILD_RUNS = 20
+_AB_SLACK = 900.0
+
+
+def _ab_budget() -> float:
+    child = float(os.environ.get("RIVET_AB_TIMEOUT") or 900)
+    return _wrapper_budget("RIVET_ORACLE_AB_TIMEOUT", child, _AB_CHILD_RUNS, _AB_SLACK)
+
+
 # `{name:20} {field:16} {old:>22} {new:>22}  {verdict}` — only the name, the
 # field and the verdict are load-bearing here; the two value columns can contain
 # spaces (a truncated dict), so they are matched loosely.
@@ -716,10 +820,9 @@ def verify_previous_release_differential(led: Ledger) -> None:
     # Not auto-deleted, same reasoning as stage 1: when a fingerprint differs the
     # first thing a reader wants is both binaries' parts, side by side.
     work = Path(tempfile.mkdtemp(prefix="rivet-oracle-abdiff-"))
-    timeout = float(os.environ.get("RIVET_AB_TIMEOUT") or 3600)
-    p = run(
+    p = _run_interruptible(
         ["python3", "-m", _AB_MODULE, str(prev), str(rivet_bin())],
-        cwd=ROOT, timeout=timeout,
+        cwd=ROOT, timeout=_ab_budget(),
         env={**_ISOLATED_STATE, "RIVET_AB_WORKDIR": str(work)},
     )
     rep = _ab_parse(p.out)
@@ -858,6 +961,101 @@ _FR_CRITERIA = 4  # ratchet, as above: the harness fixes four.
 # harness prints before it, not on the first `(`.
 _FR_CRIT = re.compile(r"^\s*\[(PASS|FAIL)\]\s+(.+?)\s{2,}\((.*)\)\s*$")
 
+# The harness runs `len(LEG_PLAN)` legs, each capped at its OWN `LEG_TIMEOUT`
+# (`RIVET_FIELD_TIMEOUT`, default 3600 s). Both numbers are IMPORTED from the
+# harness rather than re-typed, so adding a leg or changing the per-leg budget
+# moves this wrapper's budget with it. Slack covers preflight, the seed (24
+# tables) and the report. Override outright with `RIVET_ORACLE_FIELD_TIMEOUT`.
+_FR_SLACK = 1800.0
+
+
+def _fr_budget() -> float:
+    return _wrapper_budget(
+        "RIVET_ORACLE_FIELD_TIMEOUT", _FR_LEG_TIMEOUT, len(_FR_LEG_PLAN), _FR_SLACK
+    )
+
+
+def _stand_globals(container: str) -> dict[str, str] | None:
+    """The MySQL stand's tmp-table globals, or None if they cannot be read.
+
+    `@@GLOBAL.x`, never `@@x` — the session copy is taken when the connection
+    opens and would confirm a restore that never happened (the harness's own
+    docstring records reproducing exactly that).
+    """
+    sql = "SELECT CONCAT_WS(',', " + ", ".join(f"@@GLOBAL.{k}" for k in _FR_FLIP) + ");"
+    p = docker_exec(container, "mysql", "-uroot", "-privet", "-N", "rivet",
+                    stdin=sql, timeout=60)
+    lines = [l for l in p.stdout.strip().splitlines() if "," in l]
+    if not p.ok or not lines:
+        return None
+    parts = [x.strip() for x in lines[-1].split(",")]
+    if len(parts) != len(_FR_FLIP) or any(not x for x in parts):
+        return None
+    return dict(zip(_FR_FLIP, parts))
+
+
+def _verify_stand_restored(led: Ledger, p: Proc) -> None:
+    """Did the shared MySQL stand come back UNFLIPPED? Belt over the harness's own
+    restore, and the only check that survives the harness being killed.
+
+    Three ways the stand stays mutated, and this is the one place that sees all
+    three: the harness's restore failed (it says so with `STAND_MUTATED_MARKER`),
+    the harness was SIGKILLed after ignoring SIGINT (no marker, no `atexit`, no
+    handler), or the machine lost the container mid-run. Reading `@@GLOBAL.*`
+    back is authoritative about all of them where the harness's own exit status
+    is not — and a stand left at `tmp_table_size=16384` silently rewrites
+    tmp-table behaviour for every later live MySQL test on this machine.
+
+    It restores to DEFAULT when it finds the flip, because the alternative is a
+    FAIL row that tells a release manager the stand is poisoned and leaves it
+    poisoned. The row is recorded EITHER WAY: an automatic repair is not a
+    reason to hide that the gate mutated a shared server and did not clean up.
+    """
+    container = os.environ.get("RIVET_FIELD_MYSQL_CONTAINER", "rivet-mysql-1")
+    said_so = _FR_MUTATED in p.out
+    now = _stand_globals(container)
+    if now is None:
+        if said_so:
+            led.failed(
+                _R_ENGINE, _FR_VERSION, "stand", _FR_STORE,
+                f"field replay: the harness reported it could NOT restore {container}'s "
+                "tmp-table globals, and this stage could not read them back either "
+                f"(is {container} still up?). Assume the stand is left at "
+                f"{_FR_FLIP} — every later live MySQL run on this machine inherits it.",
+                "stand mutated (unverifiable)",
+            )
+        return
+
+    stuck = {k: v for k, v in now.items() if v == _FR_FLIP[k]}
+    if not stuck and not said_so:
+        return
+
+    repaired = None
+    if stuck:
+        sql = "; ".join(f"SET GLOBAL {k} = DEFAULT" for k in stuck) + ";"
+        docker_exec(container, "mysql", "-uroot", "-privet", "-N", "rivet",
+                    stdin=sql, timeout=60)
+        after = _stand_globals(container)
+        repaired = after is not None and not any(after[k] == _FR_FLIP[k] for k in stuck)
+    led.failed(
+        _R_ENGINE, _FR_VERSION, "stand", _FR_STORE,
+        f"field replay: {container} was left MUTATED by the replay "
+        f"({', '.join(f'{k}={v}' for k, v in (stuck or now).items())}"
+        + (f"; the harness said so: exit {p.returncode}" if said_so else
+           f"; the harness did not report it — exit {p.returncode}")
+        + "). The gate flipped SERVER-WIDE tmp-table globals and did not put them "
+          "back, so every later live MySQL test on this machine runs against a "
+          "server whose tmp-table behaviour is silently rewritten. "
+        + ("This stage restored them to DEFAULT." if repaired is True else
+           "This stage tried to restore them to DEFAULT and could NOT — do it by "
+           f"hand: docker exec -i {container} mysql -uroot -privet rivet -e "
+           f"\"{'; '.join(f'SET GLOBAL {k} = DEFAULT' for k in (stuck or _FR_FLIP))};\""
+           if repaired is False else
+           "The harness reported a failed restore but the globals now read clean — "
+           "someone or something else restored them; treat the stand as suspect."),
+        "stand mutated" + (" (auto-restored)" if repaired is True else ""),
+    )
+
 
 def verify_field_symptom_replay(led: Ledger) -> None:
     prev = _require_prev_binary(
@@ -872,10 +1070,9 @@ def verify_field_symptom_replay(led: Ledger) -> None:
         "production run's own shape, four criteria fixed before the run"
     )
     work = Path(tempfile.mkdtemp(prefix="rivet-oracle-field-"))
-    timeout = float(os.environ.get("RIVET_FIELD_TIMEOUT") or 5400)
-    p = run(
+    p = _run_interruptible(
         ["python3", "-m", _FR_MODULE, str(prev), str(rivet_bin())],
-        cwd=ROOT, timeout=timeout,
+        cwd=ROOT, timeout=_fr_budget(),
         # Same cross-version state isolation as every other cell that runs two
         # binary versions — and here it is doubly load-bearing: the harness reads
         # sheds out of the SQLite `run_journal` beside each config, so a
@@ -884,6 +1081,10 @@ def verify_field_symptom_replay(led: Ledger) -> None:
         # has nothing to do with the product.
         env={**_ISOLATED_STATE, "RIVET_FIELD_WORKDIR": str(work)},
     )
+    # BEFORE anything is parsed: the stand is shared, and whether it came back
+    # clean is a fact about the machine every later cell runs on — not something
+    # to discover from a criterion row that may not exist.
+    _verify_stand_restored(led, p)
 
     crits = [(m.group(1), m.group(2).strip(), m.group(3))
              for m in (_FR_CRIT.match(l) for l in p.out.splitlines()) if m]
@@ -950,7 +1151,16 @@ def verify_field_symptom_replay(led: Ledger) -> None:
     if p.ok and printed_fail:
         reasons.append("the harness exited 0 while printing a FAIL criterion")
     if not p.ok and not printed_fail:
+        # Name the cause the harness itself named. A failed RESTORE is the one
+        # non-zero exit that has nothing to do with the criteria, and reporting
+        # it as "it died after printing them, or the parse missed one" sent the
+        # reader hunting a parser bug while the actual fact was a poisoned
+        # shared MySQL server (see the `stand` row recorded above).
         reasons.append(
+            f"the harness exited {p.returncode} because it could NOT restore the "
+            "shared MySQL stand's tmp-table globals — the criteria it printed are "
+            "unaffected; see the `stand` row"
+            if _FR_MUTATED in p.out else
             f"the harness exited {p.returncode} with every criterion PASS "
             "(it died after printing them, or the parse missed one)"
         )

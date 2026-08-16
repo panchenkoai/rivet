@@ -52,6 +52,8 @@ mod planner_fuzz;
 mod redaction_invariant;
 #[path = "offline/release_gate_matrix_guard.rs"]
 mod release_gate_matrix_guard;
+#[path = "offline/release_oracle_entrypoint_guard.rs"]
+mod release_oracle_entrypoint_guard;
 #[path = "offline/resource_smoke.rs"]
 mod resource_smoke;
 #[path = "offline/retry_integration.rs"]

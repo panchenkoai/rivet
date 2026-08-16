@@ -206,11 +206,29 @@ running*, the driver prints it beside the state backend at start-up, and it prin
 `NOT RELEASE-GRADED` after the final verdict — because `RELEASE-READY` is derived
 from the rows and is literally true ("every non-skipped cell is green"), which is
 exactly the sentence 0.24.4 shipped under. **A run carrying this flag cannot support
-a tag.** `make release-oracle-full` downloads the baseline for you and never needs it.
+a tag.** `make release-oracle-full` downloads the baseline for you and never needs it,
+and so does `make release-oracle-bless` (which depends on the download and now passes
+it through). `make release-oracle` — the BARE target, which by design carries only
+what is already in your shell — passes the flag for you: an entry point with no
+baseline must give the comparison up BY NAME rather than go red on three stages over
+an absence it was never going to carry.
 
-Timeouts are `RIVET_AB_TIMEOUT` (default 3600s) and `RIVET_FIELD_TIMEOUT` (default
-5400s); a harness that times out or dies without naming a scenario/criterion is a
-FAIL with its last output attached, never a quiet pass. The replay needs the **batch
+Timeouts come in TWO layers, deliberately: the harness's own per-unit budget
+(`RIVET_AB_TIMEOUT`, default 900s per case-run; `RIVET_FIELD_TIMEOUT`, default 3600s
+per leg) and the *wrapper's* whole-harness budget (`RIVET_ORACLE_AB_TIMEOUT` /
+`RIVET_ORACLE_FIELD_TIMEOUT`, each defaulting to the harness's budget × its unit
+count + slack). They must not be one knob: reading the same variable for both made
+the wrapper's budget the smaller number, so it always fired first and the harness's
+own graceful timeout could never be reached. The wrapper's expiry sends **SIGINT**
+and waits `RIVET_ORACLE_CHILD_GRACE` (default 300s) before SIGKILL, because both
+harnesses clean up a SHARED stand on the way out (server-wide MySQL tmp-table
+globals; a seeded fixture table) and no SIGKILLed process runs its cleanup. After
+the replay returns — for any reason, including a kill — the wrapper reads
+`@@GLOBAL.{internal_tmp_mem_storage_engine,tmp_table_size,max_heap_table_size}` back
+off `rivet-mysql-1`, restores them to `DEFAULT` if the flip is still there, and
+records a FAIL row naming the poisoned stand. A harness that times out or dies
+without naming a scenario/criterion is a FAIL with its last output attached, never a
+quiet pass. The replay needs the **batch
 MySQL stand** (`rivet-mysql-1` at 127.0.0.1:3306) and the differential the **batch
 Postgres stand** (`rivet-postgres-1`) plus `duckdb` — with the stand down, criterion 1
 (or the harness's own `expected_rows` guard) fails, which is the intended report:

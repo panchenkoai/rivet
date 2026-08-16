@@ -127,3 +127,11 @@ __pycache__/
 
 # downloaded previous-release binary — the release gate's regression baseline
 /.gate-baseline/
+
+# Cross-compilation target dirs. `cargo` only ever ignores `target/` itself, so
+# a build driven with `--target-dir target-linux` (e.g. `docker run ... cargo
+# build --target-dir /w/target-amd64` when producing a Linux binary from a Mac)
+# lands 7.5k files and ~1.2 GB per arch INSIDE the crate — where `cargo
+# package` would happily pick them up. Ignore every sibling target dir, not
+# just the two that bit us on 2026-08-16.
+/target-*/

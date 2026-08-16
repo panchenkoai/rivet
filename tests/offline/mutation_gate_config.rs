@@ -31,7 +31,11 @@
 //! * does an entry match at least ONE real mutant? (a DEAD entry is a false
 //!   triage claim — it says "this mutant is equivalent, ignore it" about
 //!   nothing, and the mutant it meant to triage is still graded);
-//! * does an entry match mutants in more than one FUNCTION?
+//! * does an entry match mutants at more than one SITE — `(file, function)`,
+//!   not the bare name (`density_probe` is defined in both src/init/mysql.rs
+//!   and src/init/postgres.rs, so a name-keyed answer says "one function" for
+//!   an entry reaching two modules)? Entries that legitimately span files are
+//!   declared, with a reason, in that script's `MULTI_SITE_OK`.
 //!
 //! Both are checked by `.github/scripts/mutants_exclusions.py`, run in the
 //! BLOCKING `Mutants (gate sanity)` CI job against `cargo mutants --list

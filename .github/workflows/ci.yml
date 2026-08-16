@@ -18,6 +18,12 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # How many in-diff mutants the 90-minute `mutants-in-diff` budget can grade
+  # (~80s each at -j2 on a 2-core runner). ONE definition, read by both the job
+  # that spends the budget and the blocking `mutants-gate-sanity` job that
+  # audits what the budget skipped — two copies of this number are two gates
+  # that can disagree about whether a diff was graded.
+  MUTANTS_DIFF_BUDGET: 120
   # CI debug builds keep line-tables only (file:line in panics is enough for
   # triage) — not full DWARF. This shrinks the debug `target/` and the link
   # working set, speeding every `cargo test`/`cargo build` job and easing disk
@@ -189,19 +195,53 @@ jobs:
         run: |
           git diff "origin/${{ github.base_ref }}"...HEAD > pr.diff
           # BUDGET GUARD. Every mutant is its own incremental build — ~80s on a
-          # 2-core runner at -j2, so the 90-minute ceiling grades roughly 120.
-          # A five-round branch like #230 yields 416 (158 run.rs, 104 pool.rs,
-          # 44 adaptive.rs, ...) ≈ 4.6 h: the job dies at the ceiling with a
-          # CANCELLED conclusion. That is worse than wasted CI, because
-          # `Mutants (changed lines)` is a REQUIRED check in branch protection —
-          # so a timeout BLOCKS the merge while the header above calls this job
-          # advisory. Both cannot be true. Rather than pretend to grade 416 and
-          # die, report the count and hand the work to the nightly tier
-          # rotation, which is where foundational modules are ratcheted.
+          # 2-core runner at -j2, so the 90-minute ceiling grades roughly 120
+          # ($MUTANTS_DIFF_BUDGET). A five-round branch like #230 yields 416
+          # (158 run.rs, 104 pool.rs, 44 adaptive.rs, ...) ≈ 4.6 h: the job dies
+          # at the ceiling with a CANCELLED conclusion. That is worse than wasted
+          # CI, because `Mutants (changed lines)` is a REQUIRED check in branch
+          # protection — so a timeout BLOCKS the merge while the header above
+          # calls this job advisory. Both cannot be true.
+          #
+          # What the guard hands the work to is CHECKED, not claimed. The first
+          # version of this notice said "these modules are covered by the nightly
+          # tier rotation" — a statement about a hand-written list of 31 files in
+          # nightly-live.yml, while the tree has 198 `src/**.rs`. The branch that
+          # introduced the notice rewrote plan_cmd.rs (+478) and aggregate.rs
+          # (+128), neither in ANY tier: 606 lines graded by nothing, under a
+          # notice saying otherwise. `mutation_tiers.py` now DERIVES tier
+          # membership from the rotation's own `case` arms, and the untiered
+          # remainder — the part nightly will never mutate — is graded HERE,
+          # within the same budget, instead of being waved through.
           COUNT=$(cargo mutants --in-diff pr.diff --list --colors=never | grep -c . || true)
-          if [ "$COUNT" -gt 120 ]; then
-            echo "::notice::this diff yields $COUNT mutants — past the ~120 the 90-minute budget can grade (~80s each at -j2). NOT graded per-diff; these modules are covered by the nightly tier rotation (.github/workflows/nightly-live.yml). Split the PR for per-diff mutation coverage."
-            exit 0
+          if [ "$COUNT" -gt "$MUTANTS_DIFF_BUDGET" ]; then
+            CHANGED=$(git diff --name-only "origin/${{ github.base_ref }}"...HEAD -- src | grep '\.rs$' || true)
+            # A parse failure is checked EXPLICITLY rather than left to the
+            # runner's `bash -e`, so it says what it means: "I cannot read the
+            # rotation" must not arrive looking like "the rotation covers this".
+            if ! UNTIERED=$(printf '%s\n' "$CHANGED" | python3 .github/scripts/mutation_tiers.py untiered); then
+              echo "::error::could not read the nightly tier rotation — refusing to claim it covers this diff"
+              exit 1
+            fi
+            if [ -z "$UNTIERED" ]; then
+              echo "::notice::this diff yields $COUNT mutants — past the $MUTANTS_DIFF_BUDGET the 90-minute budget can grade (~80s each at -j2). NOT graded per-diff; every changed source file IS in a nightly tier (checked against nightly-live.yml's rotation), so the rotation ratchets them. Split the PR for per-diff mutation coverage."
+              exit 0
+            fi
+            FARGS=""
+            for f in $UNTIERED; do FARGS="$FARGS -f $f"; done
+            SUB=$(cargo mutants --in-diff pr.diff $FARGS --list --colors=never | grep -c . || true)
+            NLIST=$(printf '%s' "$UNTIERED" | tr '\n' ' ')
+            if [ "$SUB" -eq 0 ]; then
+              echo "::notice::this diff yields $COUNT mutants — past the $MUTANTS_DIFF_BUDGET budget. The changed files in NO nightly tier ($NLIST) contribute no mutable in-diff line, so the rotation covers the rest. Split the PR for per-diff mutation coverage."
+              exit 0
+            fi
+            if [ "$SUB" -gt "$MUTANTS_DIFF_BUDGET" ]; then
+              echo "::notice::this diff yields $COUNT mutants — past the $MUTANTS_DIFF_BUDGET budget — and its UNTIERED files alone yield $SUB, also past it. These are graded by NOTHING (not here, not nightly): $NLIST. The blocking 'Mutants (gate sanity)' job reports this as an error; split the PR."
+              exit 0
+            fi
+            echo "::notice::this diff yields $COUNT mutants — past the $MUTANTS_DIFF_BUDGET budget. Grading the $SUB mutants in the changed files NO nightly tier covers ($NLIST); the tiered remainder goes to the rotation (nightly-live.yml). Split the PR for full per-diff coverage."
+            cargo mutants --in-diff pr.diff $FARGS -j 2 -- --lib --bins
+            exit $?
           fi
           # "Did this gate grade anything at all?" is NOT asked here: this job is
           # `continue-on-error: true`, so an `exit 1` in it is an annotation, not
@@ -270,7 +310,12 @@ jobs:
       # triage claim about no mutant, with the survivor still graded) nor an
       # unanchored one (`in check` also ate `check_null_ratios`,
       # `check_uniqueness`, `check_memory`, … — 13 mutants in six other files).
-      - name: Every exclusion triages exactly one real function
+      # "Only the one it names" is keyed on the SITE — (file, function) — since
+      # the bare name is not an identity here: `density_probe` is defined in
+      # both src/init/mysql.rs and src/init/postgres.rs, and the name-keyed
+      # version of this check called that "1 function" and passed. Entries that
+      # legitimately span files are declared in the checker's MULTI_SITE_OK.
+      - name: Every exclusion triages exactly one real, declared site
         if: steps.scope.outputs.code == 'true'
         run: |
           set -euo pipefail
@@ -306,7 +351,64 @@ jobs:
           them. That is the vacuous-gate failure (#227/#229/#230), not a pass."
             exit 1
           fi
-          echo "::notice::$graded of $all in-diff mutants will be graded ($((all - graded)) excluded as triaged-equivalent)."
+          echo "$graded" > graded-count.txt
+          echo "::notice::$graded of $all in-diff mutants pass the exclusions ($((all - graded)) excluded as triaged-equivalent) — whether they are all RUN is the budget question the next step audits."
+      # …and is anything grading the files the budget guard SKIPS? The notice
+      # above says "will be graded", which is true only while the diff fits the
+      # per-diff budget. Past it, `mutants-in-diff` grades the untiered subset
+      # and hands the REST to the nightly rotation — and if the untiered subset
+      # is itself past the budget, those files are graded NOWHERE. That is a
+      # coverage hole, and it belongs in THIS job because this one can fail:
+      # `mutants-in-diff` is continue-on-error, which is exactly how the vacuous
+      # gate survived eight runs.
+      - name: Nothing in this diff is graded by NOTHING
+        if: steps.scope.outputs.code == 'true'
+        run: |
+          set -euo pipefail
+          graded=$(cat graded-count.txt 2>/dev/null || echo 0)
+          if [ "$graded" -le "$MUTANTS_DIFF_BUDGET" ]; then
+            echo "ok: $graded in-diff mutants is within the $MUTANTS_DIFF_BUDGET budget — the per-diff gate grades all of them."
+            exit 0
+          fi
+          CHANGED=$(git diff --name-only "origin/${{ github.base_ref }}"...HEAD -- src | grep '\.rs$' || true)
+          UNTIERED=$(printf '%s\n' "$CHANGED" | python3 .github/scripts/mutation_tiers.py untiered)
+          if [ -z "$UNTIERED" ]; then
+            echo "ok: past the budget, but every changed source file is in a nightly tier (derived from nightly-live.yml) — the rotation ratchets them."
+            exit 0
+          fi
+          FARGS=""
+          for f in $UNTIERED; do FARGS="$FARGS -f $f"; done
+          sub=$(cargo mutants --in-diff pr.diff $FARGS --list --colors=never | grep -c . || true)
+          NLIST=$(printf '%s' "$UNTIERED" | tr '\n' ' ')
+          if [ "$sub" -gt "$MUTANTS_DIFF_BUDGET" ]; then
+            echo "::error::this diff yields $graded mutants — past the $MUTANTS_DIFF_BUDGET the per-diff budget can grade — and the changed files that NO nightly tier covers yield $sub on their own, also past it. So these files are mutated NOWHERE: $NLIST. Split the PR so the untiered part fits the budget, or add those files to a tier arm in .github/workflows/nightly-live.yml (splitting an arm — the rotation is at GitHub's 6h ceiling)."
+            exit 1
+          fi
+          echo "ok: past the budget, but the untiered remainder ($sub mutants in $NLIST) fits it and is graded per-diff; the tiered rest goes to the nightly rotation."
+
+  # The gate's own scripts, graded. Seconds, no toolchain — and blocking, unlike
+  # the mutation run they protect. Each `selftest` is a unit check of the parser
+  # or coercion the gate depends on; `check` grades the nightly rotation itself
+  # (a tier naming a moved file is a dead claim of coverage, the same class as a
+  # dead exclusion).
+  gate-scripts:
+    name: Gate scripts (self-tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Mutation tier rotation parses, and every tiered file exists
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/mutation_tiers.py selftest
+          python3 .github/scripts/mutation_tiers.py check
+      - name: The exclusion checker's own site/function keying
+        run: python3 .github/scripts/mutants_exclusions.py --self-test
+      # `--self-test` returns before any stage, container or binary is touched —
+      # it grades the argv/env coercion only, so this invocation needs no
+      # RIVET_PREV_RELEASE_BIN and is not a gate run (cf. the Makefile-scoped
+      # entry-point guard in tests/offline/release_oracle_entrypoint_guard.rs).
+      - name: The release oracle's env-flag grammar is one grammar
+        run: python3 -m dev.release_oracle --self-test
 
   test:
     name: Tests
