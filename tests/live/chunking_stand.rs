@@ -231,6 +231,66 @@ fn run_pool_split_resume_with(
         &["apply", cfg.to_str().unwrap(), "--pool", "2", "--split"],
         &[crash],
     );
+    // PRECONDITION before the product assertion. `--split` is purely ADVISORY:
+    // `pool::advise_split` declines unless the giant beats the next-longest by
+    // more than R (3.0 at the `apply --pool --split` call site in run.rs) on
+    // PREDICTED seconds, which come from the priming run's recorded durations.
+    // The sibling is 100 rows but still pays a full connect + plan + write, so
+    // on a fast engine or a loaded runner the ratio can fall under 3 and NO
+    // units are produced — nothing to error, run 1 succeeds, and the assertion
+    // below then blames the product for an inert fixture. That is exactly how
+    // this read in CI (`stand_pool_split_gappy_key_{mysql,mssql}` and
+    // `..._resume_grows_mssql`, red on the 2026-08-16 nightly while green
+    // locally, and green on postgres in the same run — a ratio, not a bug).
+    //
+    // So: check the fixture FIRST, and when it is inert say so with the numbers
+    // the advisor actually used, rather than reporting a product failure.
+    {
+        let db = StateDb::next_to_config(&cfg);
+        let runs = db.export_runs();
+        // ANY status: this run crashes its units on purpose, so a unit that did
+        // its job records a FAILED row, not a successful one.
+        let units = runs.iter().filter(|(n, ..)| n.contains('#')).count();
+        if units < 2 {
+            // The priming run's successes are what the advisor predicted from.
+            // ONE entry per export NAME (its longest run): the advisor compares
+            // the longest export to the next-longest OTHER export, so a list
+            // that repeats one name would report it dominating ITSELF — ratio
+            // 1.00 on a giant that in fact dominates 15x (caught RED-proving
+            // this guard, 2026-08-16).
+            let mut best: std::collections::BTreeMap<String, (i64, i64)> =
+                std::collections::BTreeMap::new();
+            for (n, st, ms, rows) in &runs {
+                if n.contains('#') || st != "success" {
+                    continue;
+                }
+                let e = best.entry(n.clone()).or_insert((0, 0));
+                if *ms > e.0 {
+                    *e = (*ms, *rows);
+                }
+            }
+            let mut primed: Vec<_> = best
+                .into_iter()
+                .map(|(n, (ms, rows))| (n, ms, rows))
+                .collect();
+            primed.sort_by_key(|(_, ms, _)| -*ms);
+            let ratio = match primed.as_slice() {
+                [(_, a, _), (_, b, _), ..] if *b > 0 => *a as f64 / *b as f64,
+                _ => f64::NAN,
+            };
+            panic!(
+                "FIXTURE INERT, not a product failure: `--split` produced {units} unit(s), so no \
+                 unit could error and run 1 was always going to succeed — the assertion below \
+                 would blame the product for the fixture's own failure to set up. \
+                 `pool::advise_split` declines unless the giant beats the next-longest by more \
+                 than R=3.0 on PREDICTED seconds (from the priming run) AND the split lowers the \
+                 predicted wall. The priming run measured {primed:?} (ratio {ratio:.2} vs R=3.0). \
+                 If the ratio is comfortably past 3, the decline came from another gate — read \
+                 `pool::advise_split`. Do not relax the assertion below."
+            );
+        }
+    }
+
     assert!(
         !crashed.status.success(),
         "run 1 must fail (a unit errored mid-split):\n{}",

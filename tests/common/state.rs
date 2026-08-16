@@ -138,4 +138,37 @@ impl StateDb {
             .expect("query export_harm");
         rows.filter_map(|r| r.ok()).collect()
     }
+
+    /// Every export-run `(name, status, duration_ms, total_rows)`, oldest first.
+    ///
+    /// Deliberately UNFILTERED by status. The pool's split advisor predicts from
+    /// these durations, so a test whose fixture depends on one export DOMINATING
+    /// another must be able to read them — and a test that then CRASHES the
+    /// split's units must still be able to see that the units EXISTED. Filtering
+    /// to `status = 'success'` hides exactly that: a run whose every unit errors
+    /// records no successful unit row, so a fixture check written against
+    /// successes alone reports "no split happened" for a split that happened and
+    /// did its job. (Measured 2026-08-16: the first draft of
+    /// `run_pool_split_resume_with`'s precondition did this and failed on
+    /// postgres, which passes in CI.)
+    pub fn export_runs(&self) -> Vec<(String, String, i64, i64)> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT export_name, status, duration_ms, total_rows \
+                 FROM export_metrics ORDER BY id",
+            )
+            .expect("prepare export_metrics read");
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1).unwrap_or_default(),
+                    r.get::<_, i64>(2).unwrap_or(0),
+                    r.get::<_, i64>(3).unwrap_or(0),
+                ))
+            })
+            .expect("query export_metrics");
+        rows.filter_map(|r| r.ok()).collect()
+    }
 }
