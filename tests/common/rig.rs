@@ -50,7 +50,16 @@ pub struct Rig {
 #[derive(Clone)]
 struct SecondaryExport {
     name: String,
+    /// A secondary declared by QUERY (the batch shape). Mutually exclusive with
+    /// `table` — CDC exports address a table, not a query.
     query: String,
+    /// A secondary declared by TABLE, with its own `cdc:` block. SQL Server CDC
+    /// needs this: the product REFUSES `tables:` on that engine ("its capture
+    /// instances are per-table; use one cdc export per table"), so a multi-table
+    /// SQL Server capture is N exports in one config, not one export over N
+    /// tables — and `query:` cannot express any of them.
+    table: Option<String>,
+    cdc_lines: Vec<String>,
     mode: String,
     lines: Vec<String>,
 }
@@ -259,7 +268,38 @@ impl Rig {
         self.extra_exports.push(SecondaryExport {
             name: name.to_string(),
             query: query.to_string(),
+            table: None,
+            cdc_lines: Vec::new(),
             mode: "full".to_string(),
+            lines: Vec::new(),
+        });
+        self
+    }
+
+    /// A second CDC export over its OWN table, with its own `cdc:` block and its
+    /// own checkpoint file.
+    ///
+    /// Exists because SQL Server cannot express a multi-table capture any other
+    /// way: `Config` bails with "`tables:` is not yet supported for SQL Server —
+    /// its capture instances are per-table; use one cdc export per table
+    /// (capture_instance each)". Every routing question on that engine therefore
+    /// needs TWO exports, and until now the suite had none — the whole
+    /// multi-table SQL Server CDC surface was untested, including the routing
+    /// bug that once dropped 100% of events for 6 of 8 tables (audit 2026-08-17).
+    ///
+    /// `cdc` lines are rendered verbatim into the map; `checkpoint:` is supplied
+    /// here rather than by the caller, because two CDC exports sharing one
+    /// checkpoint file would silently overwrite each other's position.
+    pub fn also_cdc_export(mut self, name: &str, table: &str, cdc: &[&str]) -> Self {
+        let ckpt = self.dir.path().join(format!("cdc_{name}.ckpt"));
+        let mut cdc_lines: Vec<String> = cdc.iter().map(|l| l.to_string()).collect();
+        cdc_lines.push(format!("checkpoint: \"{}\"", ckpt.display()));
+        self.extra_exports.push(SecondaryExport {
+            name: name.to_string(),
+            query: String::new(),
+            table: Some(table.to_string()),
+            cdc_lines,
+            mode: "cdc".to_string(),
             lines: Vec::new(),
         });
         self
@@ -580,10 +620,18 @@ impl Rig {
             .iter()
             .map(|e| {
                 let lines: String = e.lines.iter().map(|l| format!("    {l}\n")).collect();
+                let subject = match &e.table {
+                    Some(t) => format!("table: {t}"),
+                    None => format!("query: \"{}\"", e.query),
+                };
+                let cdc = if e.cdc_lines.is_empty() {
+                    String::new()
+                } else {
+                    format!("    cdc: {{ {} }}\n", e.cdc_lines.join(", "))
+                };
                 format!(
-                    "  - name: {n}\n    query: \"{q}\"\n    mode: {m}\n    format: {f}\n{lines}    destination: {{ type: local, path: \"{o}\" }}\n",
+                    "  - name: {n}\n    {subject}\n    mode: {m}\n    format: {f}\n{cdc}{lines}    destination: {{ type: local, path: \"{o}\" }}\n",
                     n = e.name,
-                    q = e.query,
                     m = e.mode,
                     f = self.format,
                     o = self.out_dir_for(&e.name).display(),

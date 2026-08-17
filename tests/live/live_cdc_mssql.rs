@@ -651,6 +651,91 @@ fn mssql_cdc_capture_instance_name_must_not_decide_the_table() {
     );
 }
 
+/// The routing bug's actual SHAPE needs two tables — the test above cannot
+/// express it.
+///
+/// The field failure was events for 6 of 8 tables landing under the WRONG table
+/// (the capture-instance name was split on `_`, so `product_catalog` became
+/// schema `product` / table `catalog`), while every run reported success. With
+/// ONE table a mis-route can only drop to zero, which `manifest_rows == 2`
+/// catches. With two, a swap keeps BOTH counts at 2 and only the CONTENT
+/// differs — and nothing in the suite looked at content, on this engine, until
+/// now (audit 2026-08-17). Its own rule: a guard against confusing two things
+/// needs two of the thing.
+///
+/// SQL Server cannot do this in one export — `Config` refuses `tables:` there
+/// because capture instances are per-table — so this is two CDC exports over one
+/// config, which is what `Rig::also_cdc_export` was added for.
+///
+/// The ids are deliberately DISJOINT (10,11 vs 20,21): identical ids in both
+/// tables would make a perfect swap invisible even to a content check, which is
+/// how the PG/MySQL uncaptured-table fixtures are shaped today (both insert
+/// `id = 1`).
+///
+/// HONEST LIMIT, stated because a reader will otherwise assume more. I could not
+/// build a mutant where this test bites and the single-table one above does not.
+/// Four were tried: ignore the catalog and split the instance name; the same with
+/// the identity guard disabled; resolve without `WHERE capture_instance`; and both
+/// together. The first and third fail LOUDLY in `rig.run_ok()` — the identity
+/// guard (`table_matches` against the catalog's spelling) refuses before any event
+/// moves. With the guard disabled the routing filter is byte-exact, so a
+/// mis-resolved export matches NOTHING and the prefix comes back EMPTY (`left:
+/// []`) rather than holding the other table's rows. Drop-to-zero is what the count
+/// assertion above already catches.
+///
+/// So what this adds is coverage, not proven sensitivity: multi-table SQL Server
+/// CDC had NO test at all before it (`Rig::also_cdc_export` had to be written for
+/// it), and per-prefix CONTENT is the assertion PG and MySQL already make and this
+/// engine did not. If someone later makes routing tolerant enough to place a row
+/// under the wrong prefix instead of dropping it, this is the test that sees it —
+/// but that is an argument from shape, and it has not been demonstrated.
+#[test]
+#[ignore = "live: requires docker compose mssql with SQL Server Agent + CDC"]
+fn mssql_cdc_two_underscored_tables_do_not_cross_route() {
+    let _serial = CDC_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let d = tempfile::tempdir().unwrap();
+
+    let t1 = unique_name("rivet_cdc_ord");
+    let t2 = unique_name("rivet_cdc_inv");
+    let (ci1, ci2) = (t1.clone(), t2.clone());
+    for (t, ci) in [(&t1, &ci1), (&t2, &ci2)] {
+        mssql_cdc_drop_table(&format!("dbo.{t}"));
+        mssql_cdc_exec(&format!("CREATE TABLE dbo.{t}(id INT PRIMARY KEY, v INT)"));
+        enable_cdc(t, ci);
+    }
+    let _g1 = MssqlCdcTable {
+        table: t1.clone(),
+        ci: ci1.clone(),
+    };
+    let _g2 = MssqlCdcTable {
+        table: t2.clone(),
+        ci: ci2.clone(),
+    };
+
+    mssql_cdc_exec(&format!("INSERT INTO dbo.{t1} VALUES (10,1),(11,1)"));
+    mssql_cdc_exec(&format!("INSERT INTO dbo.{t2} VALUES (20,2),(21,2)"));
+    wait_for_capture(&ci1, 2);
+    wait_for_capture(&ci2, 2);
+
+    let rig = Rig::mssql_cdc(&t1, &ci1)
+        .checkpoint_path(d.path().join("cdc1.ckpt"))
+        .also_cdc_export(&t2, &t2, &[&format!("capture_instance: {ci2}")]);
+    rig.run_ok();
+
+    // Content, per export prefix. A swap leaves both counts at 2.
+    assert_eq!(
+        cdc_id_ops(&rig.out_dir()),
+        vec![(10, "insert".to_string()), (11, "insert".to_string())],
+        "export '{t1}' must hold ONLY its own rows — a cross-route keeps the count \
+         at 2 and swaps the ids, which is the shape the field failure had"
+    );
+    assert_eq!(
+        cdc_id_ops(&rig.out_dir_for(&t2)),
+        vec![(20, "insert".to_string()), (21, "insert".to_string())],
+        "export '{t2}' must hold ONLY its own rows"
+    );
+}
+
 #[test]
 #[ignore = "live: requires docker compose mssql with SQL Server Agent + CDC"]
 fn mssql_cdc_crash_before_checkpoint_re_reads_on_resume() {
