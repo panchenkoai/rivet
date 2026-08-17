@@ -175,8 +175,15 @@ pub(crate) fn decode_resume_token(
     // handed to the `ResumeToken`/bson deserializer, which PANICS (not `Err`s)
     // on a type mismatch. The release build is `panic = "abort"`, so an unguarded
     // deserialize would abort the whole run on a corrupt/foreign checkpoint.
-    if v.get("_data").and_then(|x| x.as_str()).is_some() {
-        return Ok(serde_json::from_value(v.clone())?);
+    // Deserialize a document built from `_data` ALONE, never `v` itself: a file
+    // carrying `_data` beside foreign keys panicked the bson visitor rather than
+    // erroring (fuzz crash 1c53b95b, 2026-08-17), so passing `v` through checked
+    // one key and then trusted the whole object. A resume token's meaning is
+    // entirely in `_data`; anything else in the file is noise to drop.
+    if let Some(data) = v.get("_data").and_then(|x| x.as_str()) {
+        return Ok(serde_json::from_value(
+            serde_json::json!({ "_data": data }),
+        )?);
     }
     anyhow::bail!(
         "mongodb cdc: unrecognized resume-token checkpoint shape \
@@ -563,6 +570,45 @@ mod tests {
     // in the release profile that aborts the whole run on a corrupt/foreign
     // checkpoint. The decoder must return a clean error for any unrecognized
     // shape. (RED before the shape-guard: `decode_resume_token` panics here.)
+
+    /// The exact input libFuzzer crashed on (nightly Fuzz, run 31998520492,
+    /// 2026-08-17): a `_data` STRING sitting beside a dozen unrelated keys, one
+    /// of them deeply nested. The guard below checked that `_data` was a string
+    /// and then handed the WHOLE object to the deserializer, which PANICS
+    /// (`unreachable!` in bson's seeded visitor) instead of erroring — so the
+    /// precondition its own comment claimed ("Deserialize ONLY that exact
+    /// shape") was named but never established. `panic = "abort"` in release
+    /// makes that an aborted run on a foreign checkpoint file.
+    #[test]
+    fn decode_resume_token_survives_foreign_keys_beside_data() {
+        let raw = r##"{"rz~tt":"t'" ,    "/":{"":{"":{"":{"t":{}}}}},   " t":"t'" ,    "RRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRR   ~vrtt":"t'" ,    "_data":"8" ,    " jjjjjjjjjjjr~tt":    "_data'" ,    "   rt":" E" }"##;
+        let v: serde_json::Value = serde_json::from_str(raw).expect("corpus input is valid JSON");
+        let token = decode_resume_token(&v)
+            .expect("a `_data` string is a resume token whatever else the file carries");
+        // Non-inert: the token really is the one `_data` named, not a default.
+        let round: serde_json::Value = serde_json::to_value(&token).unwrap();
+        assert_eq!(round.get("_data").and_then(|d| d.as_str()), Some("8"));
+    }
+
+    /// The `rt` branch is the SIBLING of the `_data` one and was never fuzzed
+    /// past the hex gate — libFuzzer cannot readily synthesise valid BSON, so a
+    /// well-formed document of the WRONG SHAPE is a hole the corpus cannot
+    /// reach. Probed directly with real BSON: it does NOT panic, because
+    /// `from_bson` decodes a `ResumeToken` as an opaque raw document rather than
+    /// through the serde_json visitor that blew up on the `_data` path. It is
+    /// ACCEPTED and rejected later by the server (`Bad resume token`, 40648) —
+    /// loud and lossless, which is why this asserts no-panic rather than `Err`.
+    #[test]
+    fn decode_resume_token_does_not_panic_on_wellformed_bson_of_the_wrong_shape() {
+        let mut doc = Document::new();
+        doc.insert("x", mongodb::bson::doc! { "y": 1i32 });
+        let mut buf = Vec::new();
+        doc.to_writer(&mut buf).unwrap();
+        let hex: String = buf.iter().map(|b| format!("{b:02x}")).collect();
+        // The point of the test is that this returns at all.
+        let _ = decode_resume_token(&json!({ "rt": hex }));
+    }
+
     #[test]
     fn decode_resume_token_rejects_malformed_shapes_without_panicking() {
         for bad in [
