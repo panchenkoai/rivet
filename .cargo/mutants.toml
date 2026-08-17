@@ -11,7 +11,29 @@
 # `cargo test` suite the mutation gate runs — so a body-stub mutant on them is
 # uncatchable HERE by construction (the parsers they call ARE mutation-covered
 # via their normal code paths).
-exclude_globs = ["src/fuzz.rs"]
+# `src/bin/seed/*` is the DEV-ONLY test-fixture generator: `[[bin]] seed` is
+# `required-features = ["dev-seed"]`, off by default, so `cargo install
+# rivet-cli` never ships it. Mutating a fixture generator grades nothing a user
+# can be hurt by, and it is not free — 581 of the corpus's 18,794 mutants (3%)
+# lived there, 321 in `insert.rs` alone, at a measured ~90s each in CI.
+#
+# Named FILE BY FILE, not `src/bin/**`. That wildcard is what the first version
+# of this exclusion used, and `no_wildcard_file_exclusion_and_no_narrowing_
+# examine_keys` rejected it — correctly, twice over: a `**` silently drops
+# FUTURE files as well, and `src/bin/` also holds `rivet-mcp.rs`, which IS a
+# shipped binary (`[[bin]] rivet-mcp`, no feature gate). Naming files fails
+# toward GRADING: a new binary is in the corpus until someone argues it out.
+# `src/main.rs` stays in for the same reason — it is the shipped CLI's entry
+# point (2026-08-17).
+exclude_globs = [
+    "src/fuzz.rs",
+    "src/bin/seed/main.rs",
+    "src/bin/seed/args.rs",
+    "src/bin/seed/insert.rs",
+    "src/bin/seed/fast.rs",
+    "src/bin/seed/copy_pg.rs",
+    "src/bin/seed/mssql.rs",
+]
 
 exclude_re = [
     # 64*1024 is a streaming READ BUFFER size in compute_part_checksums —

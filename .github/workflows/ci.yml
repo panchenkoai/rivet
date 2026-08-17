@@ -231,8 +231,7 @@ jobs:
       # step of the job was skipped under a green "Docs-only PR" notice — a
       # broken base ref silently disabled the whole gate. An unresolvable base
       # is now an error, because "I could not read the diff" and "there is
-      # nothing to grade" must not arrive looking alike (the same rule
-      # mutation_tiers.py applies to an unreadable rotation).
+      # nothing to grade" must not arrive looking alike.
       #
       # `mutants-gate-sanity` carries a byte-identical copy: GitHub Actions has
       # no YAML anchors, and the two jobs must decide scope the same way. They
@@ -341,68 +340,30 @@ jobs:
           # nightly-live.yml, while the tree has 198 `src/**.rs`. The branch that
           # introduced the notice rewrote plan_cmd.rs (+478) and aggregate.rs
           # (+128), neither in ANY tier: 606 lines graded by nothing, under a
-          # notice saying otherwise. `mutation_tiers.py` now DERIVES tier
-          # membership from the rotation's own `case` arms, and the untiered
-          # remainder — the part nightly will never mutate — is graded HERE,
-          # within the same budget, instead of being waved through.
+          # notice saying otherwise. The rotation is gone (2026-08-17) and so is
+          # the deferral: an over-budget diff is now reported as UNGRADED rather
+          # than handed to a mechanism that never finished a tier.
           list_into diff-list.txt
           COUNT=$(grep -c . diff-list.txt || true)
           say count "$COUNT"
           if [ "$COUNT" -gt "$MUTANTS_DIFF_BUDGET" ]; then
-            CHANGED=$(git diff --name-only "origin/$BASE_REF"...HEAD -- src | grep '\.rs$' || true)
-            # A parse failure is checked EXPLICITLY rather than left to the
-            # runner's `bash -e`, so it says what it means: "I cannot read the
-            # rotation" must not arrive looking like "the rotation covers this".
-            if ! UNTIERED=$(printf '%s\n' "$CHANGED" | python3 .github/scripts/mutation_tiers.py untiered); then
-              say state tool-error
-              say result tool-error
-              echo "::error::could not read the nightly tier rotation — refusing to claim it covers this diff"
-              exit 1
-            fi
-            if [ -z "$UNTIERED" ]; then
-              say state over-budget-all-tiered
-              say result n/a
-              echo "::notice::this diff yields $COUNT mutants — past the $MUTANTS_DIFF_BUDGET the 90-minute budget can grade (~80s each at -j2). NOT graded per-diff; every changed source file IS in a nightly tier (checked against nightly-live.yml's rotation), so the rotation ratchets them. Split the PR for per-diff mutation coverage."
-              exit 0
-            fi
-            FARGS=""
-            for f in $UNTIERED; do FARGS="$FARGS -f $f"; done
-            NLIST=$(printf '%s' "$UNTIERED" | tr '\n' ' ')
-            say untiered "$NLIST"
-            list_into sub-list.txt $FARGS
-            SUB=$(grep -c . sub-list.txt || true)
-            say sub "$SUB"
-            # Zero is two different answers here, and only one of them is fine:
-            # "these files changed no mutable line" (routine — a comment edit) vs
-            # ".cargo/mutants.toml's exclusions removed every mutant in exactly
-            # the files nothing else grades". The UNFILTERED list is the
-            # discriminator, the same one the sanity job uses for the whole diff.
-            list_into sub-unfiltered.txt $FARGS --no-config
-            SUB_ALL=$(grep -c . sub-unfiltered.txt || true)
-            if [ "$SUB" -eq 0 ] && [ "$SUB_ALL" -gt 0 ]; then
-              say state over-budget-untiered-all-excluded
-              say result n/a
-              echo "::error::the changed files that NO nightly tier covers ($NLIST) yield $SUB_ALL mutants, and .cargo/mutants.toml's exclude_re removes every one of them — so nothing grades them here and nothing grades them nightly. The blocking 'Mutants (coverage verdict)' job reports this as a failure."
-              exit 0
-            fi
-            if [ "$SUB" -eq 0 ]; then
-              say state over-budget-untiered-empty
-              say result n/a
-              echo "::notice::this diff yields $COUNT mutants — past the $MUTANTS_DIFF_BUDGET budget. The changed files in NO nightly tier ($NLIST) contribute no mutable in-diff line, so the rotation covers the rest. Split the PR for per-diff mutation coverage."
-              exit 0
-            fi
-            if [ "$SUB" -gt "$MUTANTS_DIFF_BUDGET" ]; then
-              say state over-budget-untiered-unbudgeted
-              say result n/a
-              echo "::notice::this diff yields $COUNT mutants — past the $MUTANTS_DIFF_BUDGET budget — and its UNTIERED files alone yield $SUB, also past it. These are graded by NOTHING (not here, not nightly): $NLIST. The blocking 'Mutants (coverage verdict)' job reports this as an error; split the PR."
-              exit 0
-            fi
-            say state over-budget-untiered-graded
-            echo "::notice::this diff yields $COUNT mutants — past the $MUTANTS_DIFF_BUDGET budget. Grading the $SUB mutants in the changed files NO nightly tier covers ($NLIST); the tiered remainder goes to the rotation (nightly-live.yml). Split the PR for full per-diff coverage."
-            rc=0
-            cargo mutants --in-diff pr.diff $FARGS -j 2 -- --lib --bins || rc=$?
-            verdict "$rc"
-            exit "$rc"
+            # ONE over-budget state now, where there used to be five.
+            #
+            # All five partitioned the diff into files the nightly tier rotation
+            # covered and files it did not, graded the latter, and deferred the
+            # rest. The rotation was removed 2026-08-17 (see nightly-live.yml):
+            # its smallest tier, 446 mutants, hit the six-hour ceiling and
+            # reported `cancelled`, so the deferral was to a mechanism that
+            # graded nothing. Round 7 taught this escape to check the rotation
+            # EXISTED; it could not check that it FINISHED.
+            #
+            # With nothing to defer to, grading an arbitrary SUBSET would be the
+            # worse option: a partial pass reads as coverage. So an over-budget
+            # diff is simply not graded, and says so.
+            say state over-budget-ungraded
+            say result n/a
+            echo "::notice::this diff yields $COUNT mutants, past the $MUTANTS_DIFF_BUDGET this job's 90-minute budget can grade (~90s each in CI, dominated by the rebuild). It is NOT graded — there is no nightly rotation to defer to, and grading a slice would look like coverage without being it. Split the PR into changes that fit, or accept that mutation testing has nothing to say about this one."
+            exit 0
           fi
           # "Did this gate grade anything at all?" is NOT asked here: this job is
           # `continue-on-error: true`, so an `exit 1` in it is an annotation, not
@@ -623,38 +584,21 @@ jobs:
             echo "ok: $graded in-diff mutants is within the $MUTANTS_DIFF_BUDGET budget, so the whole diff is in the per-diff gate's SCOPE. Whether that run reached a verdict is asserted by 'Mutants (coverage verdict)', which reads the run's own recorded outcome."
             exit 0
           fi
-          CHANGED=$(git diff --name-only "origin/$BASE_REF"...HEAD -- src | grep '\.rs$' || true)
-          UNTIERED=$(printf '%s\n' "$CHANGED" | python3 .github/scripts/mutation_tiers.py untiered)
-          if [ -z "$UNTIERED" ]; then
-            state over-budget-all-tiered
-            echo "ok: past the budget, but every changed source file is in a nightly tier (derived from nightly-live.yml) — the rotation ratchets them."
-            exit 0
-          fi
-          FARGS=""
-          for f in $UNTIERED; do FARGS="$FARGS -f $f"; done
-          NLIST=$(printf '%s' "$UNTIERED" | tr '\n' ' ')
-          echo "untiered=$NLIST" >> "$GITHUB_OUTPUT"
-          list_into sub-list.txt $FARGS
-          sub=$(grep -c . sub-list.txt || true)
-          list_into sub-unfiltered.txt $FARGS --no-config
-          sub_all=$(grep -c . sub-unfiltered.txt || true)
-          if [ "$sub" -eq 0 ] && [ "$sub_all" -gt 0 ]; then
-            state over-budget-untiered-all-excluded
-            echo "::error::the changed files that NO nightly tier covers ($NLIST) yield $sub_all mutants, and .cargo/mutants.toml's exclude_re removes every one of them — the vacuous-gate failure narrowed to exactly the files nothing else grades. Un-exclude them, or qualify the exclusion to the site it was written for."
-            exit 1
-          fi
-          if [ "$sub" -eq 0 ]; then
-            state over-budget-untiered-empty
-            echo "ok: past the budget, but the changed files in no nightly tier ($NLIST) contribute no mutable in-diff line."
-            exit 0
-          fi
-          if [ "$sub" -gt "$MUTANTS_DIFF_BUDGET" ]; then
-            state over-budget-untiered-unbudgeted
-            echo "::error::this diff yields $graded mutants — past the $MUTANTS_DIFF_BUDGET the per-diff budget can grade — and the changed files that NO nightly tier covers yield $sub on their own, also past it. So these files are mutated NOWHERE: $NLIST. Split the PR so the untiered part fits the budget, or add those files to a tier arm in .github/workflows/nightly-live.yml (splitting an arm — the rotation is at GitHub's 6h ceiling)."
-            exit 1
-          fi
-          state over-budget-untiered-graded
-          echo "ok: past the budget; the untiered remainder ($sub mutants in $NLIST) fits it, so 'Mutants (changed lines)' is expected to have graded exactly those. 'Mutants (coverage verdict)' fails unless that run reports it did."
+          # The auditor's half of the over-budget case, and — since the nightly
+          # tier rotation was removed 2026-08-17 — there is only one now. The
+          # four states below this line used to partition the diff by whether a
+          # rotation tier covered each file. That rotation never finished a
+          # single tier (446 mutants against a six-hour ceiling), so every
+          # "the rotation ratchets them" was a claim about a mechanism that
+          # graded nothing.
+          #
+          # This is reported, not failed. An over-budget diff is a fact about
+          # its size, not a defect: the alternative is blocking every large PR
+          # on a tool that costs ~90s a mutant. What must NOT happen is the
+          # silent version — which is why it is a named state the verdict job
+          # reads, and why the notice says outright that nothing graded it.
+          state over-budget-ungraded
+          echo "::notice::this diff yields $graded mutants, past the $MUTANTS_DIFF_BUDGET the per-diff budget can grade, and there is no nightly rotation to defer to — so mutation testing says NOTHING about this diff. That is a size fact, not a failure; split the PR if you want the coverage."
 
   # The claim the two jobs above make about each other, checked. `mutants-in-diff`
   # is `continue-on-error: true`, so its conclusion is SUCCESS however it ends —
@@ -718,19 +662,26 @@ jobs:
             exit 1
           fi
           case "$STATE" in
-            in-budget|over-budget-untiered-graded)
+            in-budget)
               if [ -z "$RESULT" ]; then
                 echo "::error::'Mutants (changed lines)' had this diff in scope (state '$STATE', step outcome ${OUTCOME:-none}) and recorded NO verdict — the run was killed mid-flight, which on this job means the 90-minute timeout. An in-scope diff that nothing finished grading is the vacuous gate with a longer runtime. If it timed out while under the count guard, MUTANTS_DIFF_BUDGET ($MUTANTS_DIFF_BUDGET) is set too high for this runner."
                 exit 1
               fi
               ;;
           esac
-          if [ "$STATE" = "over-budget-untiered-graded" ]; then
-            if [ "$RESULT" != "clean" ]; then
-              echo "::error::the changed files that NO nightly tier covers ($UNTIERED, $SUB mutants) are graded ONLY by the per-diff run, and it reported '$RESULT'. A missed mutant there is graded by nothing else — not per-diff (the rest of the diff is over budget), not nightly (no tier names these files). Close the assertion gap, or add the files to a tier arm in .github/workflows/nightly-live.yml."
-              exit 1
-            fi
-            echo "ok: the $SUB mutants in the untiered files ($UNTIERED) were graded per-diff and all were caught; the tiered remainder goes to the nightly rotation."
+          # The over-budget case is REPORTED, and reported as what it is. Before
+          # 2026-08-17 it was four states that partitioned the diff against the
+          # nightly tier rotation and deferred part of it there; the rotation
+          # never finished a tier, so the deferral was to nothing. It is gone,
+          # and so is the pretence.
+          #
+          # Not a failure: an over-budget diff is a fact about its size, and
+          # failing it would block every large PR on a tool that costs ~90s a
+          # mutant. But it is said OUT LOUD, because the thing this whole job
+          # exists to prevent is a diff nobody graded arriving as a green check.
+          if [ "$STATE" = "over-budget-ungraded" ]; then
+            echo "::warning::mutation testing says NOTHING about this diff — it yields more mutants than the per-diff budget can grade, and there is no rotation to defer to. Not a failure; split the PR if you want the coverage."
+            echo "ok: audit and run agree on '$STATE' — ungraded, and recorded as ungraded."
             exit 0
           fi
           if [ "$RESULT" = "missed" ]; then
@@ -754,11 +705,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - name: Mutation tier rotation parses, and every tiered file exists
-        run: |
-          set -euo pipefail
-          python3 .github/scripts/mutation_tiers.py selftest
-          python3 .github/scripts/mutation_tiers.py check
+      # `mutation_tiers.py` was removed with the rotation it graded (2026-08-17).
+      # It existed to prove the nightly `case` arms named real files and that the
+      # day expression was base-10 — questions with no subject once the rotation
+      # is gone.
       - name: The exclusion checker's own site/function keying
         run: python3 .github/scripts/mutants_exclusions.py --self-test
       # `--self-test` returns before any stage, container or binary is touched —

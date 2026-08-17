@@ -6,55 +6,17 @@
 # ACCEPTED (operator-UX output, Display impls, log-only paths). Equivalent
 # mutants are NOT here — they are excluded with reasons in .cargo/mutants.toml.
 #
-# The nightly mutants job diffs its missed list against this file: a missed
-# mutant NOT listed here fails the job. This file only ever SHRINKS (delete
-# lines as tests close them); adding a line requires the same adjudication.
-# Corpus: 3766 mutants over 3 tiers, 2026-07-14 (docs/mutation-plan.md).#
-# v2 (2026-07-14): + waves 4-6 leftovers (chunk planning / source builders /
-# destinations / formats / plan / cmd layer) — orchestration & live-guarded
-# paths plus accepted cosmetics. NOTE: entries carry file:line, so refactors
-# shift them; the nightly triage re-anchors moved entries instead of treating
-# them as new misses.
-# ── LIVE-GUARDED, MEASURED (2026-08-02) ─────────────────────────────────────
-# The four `cell_to_rivet` temporal arms below stay, and their verdict is now a
-# MEASUREMENT rather than a claim. tiberius decodes temporals through `Row::
-# try_get`, not from `ColumnData`, so these arms need a real `Row` — a type with
-# no public constructor — and the lib cycle cannot reach them at all. Each was
-# deleted in turn and the LIVE suite run:
+# NO AUTOMATED CONSUMER since 2026-08-17. The nightly tier rotation that diffed
+# its missed list against this file was removed (see nightly-live.yml): its
+# smallest tier, 446 mutants, hit the six-hour ceiling and never produced a
+# verdict. The per-diff gate does NOT read this file and never did — it grades
+# changed lines and expects a unit-level oracle there.
 #
-#   ColumnData::Date(_)                            -> mssql_cdc_full_type_matrix_matches_batch
-#                                                     RED: "column d: CDC differs from the batch export"
-#   ColumnData::Time(_)                            -> same test, RED on "column t"
-#   DateTime | DateTime2 | SmallDateTime           -> same test, RED on "column dt2"
-#   ColumnData::DateTimeOffset(_)                  -> mssql_cdc_datetimeoffset_value_is_preserved
-#                                                     RED: got "1970-01-01 00:00:00"
-#
-# The oracle is not a self-oracle: the CDC path (`cdc.rs::cell_to_rivet`) is
-# compared against the BATCH path (`mssql::arrow_convert`), two independent
-# decoders, and the matrix fixture carries all three DATETIME spellings as
-# separate columns so a future split of that shared arm cannot leave one
-# untested. The other seventeen entries for this function are GONE, not
-# accepted: the data-only arms and the time arithmetic were split into
-# `cell_from_data` / `naive_time_to_micros` and are now unit-tested (44 mutants,
-# 42 caught, 0 missed, 2 unviable).
-#
-# ── CLOSED (2026-08-02) ─────────────────────────────────────────────────────
-# The `CellSource for PgCellSource::list` entries are GONE from this file, not
-# accepted: `seeds/common/postgres.sql` now carries `array_matrix` (one column
-# per element type `list_elem_covered` checks, with distinct per-position values,
-# inner NULLs, and an EMPTY array beside a NULL array), and
-# `live_keyset::array_columns_reach_the_value_checksum` exports it.
-#
-# CORRECTED: the seed FILE does declare arrays (`rivet_type_matrix.tags`,
-# `.nums`), but the dev stand predates them — its copy of that table has 9
-# columns and neither array — so no export on it carried a LIST cell and the
-# checksum path went unexercised. Stand drift, not a missing declaration.
-# Arrays landed 2026-05-12 and reached neither this mechanism nor the row hash,
-# which is why `_rivet_row_hash` also shipped collapsing `['a, b']` with
-# `['a','b']`. One missing fixture, two blind integrity oracles.
-#
-# RED-proven: stubbing the whole function to `None` fails the new test.
-# ────────────────────────────────────────────────────────────────────────────
+# The file is kept because it records ADJUDICATION, not coverage: 1412 lines of
+# "this survivor is live-guarded / accepted, and here is why". That reasoning is
+# expensive to rebuild and is the honest answer to "why does this mutant
+# survive". Treat it as a reference, not a gate — and be aware it can no longer
+# be trusted to be current, because nothing re-derives it.
 src/destination/cloud.rs:180:9: replace <impl super::Destination for CloudDestination<B>>::write -> Result<super::WriteOutcome> with Ok(Default::default())
 src/destination/cloud.rs:233:9: replace <impl super::Destination for CloudDestination<B>>::list_prefix -> Result<Vec<super::ObjectMeta>> with Ok(vec![])
 src/destination/cloud.rs:237:41: replace || with && in <impl super::Destination for CloudDestination<B>>::list_prefix
