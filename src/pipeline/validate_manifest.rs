@@ -2289,6 +2289,12 @@ mod tests {
                 },
                 "RIVET_VERIFY_CDC_POSITION",
             ),
+            (
+                Failure::PartRowCountMismatch {
+                    detail: "declared 500, holds 400".into(),
+                },
+                "RIVET_VERIFY_PART_ROW_COUNT",
+            ),
         ];
         for (failure, code) in cases {
             assert_eq!(&failure.error_code(), code, "code for {failure:?}");
@@ -2297,6 +2303,66 @@ mod tests {
                 "every code shares the RIVET_VERIFY_ prefix"
             );
         }
+
+        // COMPLETENESS, derived from the enum rather than trusted to the list
+        // above. The list is hand-written — that is unavoidable, since each case
+        // must construct a value — so the thing that CANNOT be hand-written is
+        // the check that it covers everything. It did not:
+        // `PartRowCountMismatch` was absent, the one code with no stability
+        // guard, in the test whose comment says renaming a code is a silent
+        // break for any CI gate keying off it (audit 2026-08-17).
+        let src = include_str!("validate_manifest.rs");
+        let enum_body = {
+            let at = src
+                .find("pub enum Failure {")
+                .expect("the Failure enum must be declared here");
+            let rest = &src[at..];
+            &rest[..rest.find("\n}").expect("the enum must close")]
+        };
+        let declared: Vec<&str> = enum_body
+            .lines()
+            .skip(1)
+            .filter(|l| l.starts_with("    ") && !l.starts_with("     "))
+            .filter_map(|l| {
+                let t = l.trim();
+                t.chars().next().filter(|c| c.is_ascii_uppercase())?;
+                Some(t.split(|c: char| !c.is_alphanumeric()).next().unwrap_or(""))
+            })
+            .filter(|v| !v.is_empty())
+            .collect();
+        assert!(
+            declared.len() >= 12,
+            "parsed only {} variant(s) from `Failure` — an empty dimension would \
+             make this assertion vacuous, which is the defect it replaces: {declared:?}",
+            declared.len()
+        );
+        let covered: Vec<&str> = cases
+            .iter()
+            .map(|(f, _)| match f {
+                Failure::PartMissing { .. } => "PartMissing",
+                Failure::PartSizeMismatch { .. } => "PartSizeMismatch",
+                Failure::PartChecksumMismatch { .. } => "PartChecksumMismatch",
+                Failure::ValueChecksumMismatch { .. } => "ValueChecksumMismatch",
+                Failure::PartRowCountMismatch { .. } => "PartRowCountMismatch",
+                Failure::CdcPositionViolation { .. } => "CdcPositionViolation",
+                Failure::SuccessMarkerMalformed { .. } => "SuccessMarkerMalformed",
+                Failure::SuccessMarkerStale { .. } => "SuccessMarkerStale",
+                Failure::ManifestSelfInconsistent { .. } => "ManifestSelfInconsistent",
+                Failure::ManifestReadError { .. } => "ManifestReadError",
+                Failure::SuccessMarkerReadError { .. } => "SuccessMarkerReadError",
+                Failure::ListPrefixError { .. } => "ListPrefixError",
+                Failure::UntrackedObject { .. } => "UntrackedObject",
+                Failure::ContentVerificationUnmet { .. } => "ContentVerificationUnmet",
+                Failure::ManifestRequiredButAbsent { .. } => "ManifestRequiredButAbsent",
+            })
+            .collect();
+        let missing: Vec<&&str> = declared.iter().filter(|v| !covered.contains(v)).collect();
+        assert!(
+            missing.is_empty(),
+            "`Failure` declares {} variant(s); these have no error-code case, so \
+             renaming their code would break a CI gate silently: {missing:?}",
+            declared.len()
+        );
     }
 
     #[test]
