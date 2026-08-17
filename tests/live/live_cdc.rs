@@ -2247,6 +2247,89 @@ exports:
     );
     run_rivet_ok(&write_config(&d, &batch_yaml));
     assert_cdc_matches_batch(&cdc_out, &batch_out);
+
+    // HONEST LIMIT, first, because it changes how to read what follows: I could
+    // not construct a mutant where this assertion bites and the run still
+    // SUCCEEDS. Three were tried — delete the text-uuid second chance in the
+    // shared `fixed_binary_bytes` (no effect on PG: that path is MySQL's
+    // `columns: {uid: uuid}` override), null every `Float` cell at the
+    // normalisation step, and null every text cell in the BUILDER only, which is
+    // the original bug's exact shape. The last two both FAIL LOUDLY in the run
+    // itself: the two-ended value checksum compares the typed fold against the
+    // built batch and bails. That is a real result about the product — the
+    // asymmetric version of this class is now caught before any oracle sees it.
+    //
+    // The version that would still be silent is a SHARED-path change, where both
+    // folds agree on the wrong value; that is precisely how the uuid bug hid
+    // ("side A skipped the 36-byte cell (contributing 0) and side B hashed a null
+    // (also 0), so the folds agreed and the mismatch bail never fired"), and I
+    // could not build one for a type this PG fixture uses. So this earns its
+    // place as the INDEPENDENT witness the shared-fold case needs — not on a
+    // demonstrated kill.
+    //
+    // SECOND oracle, and an INDEPENDENT one. The comparison above is
+    // differential — CDC against batch, both decoded by rivet — so a fault the
+    // two share passes its own inspection. This asks PostgreSQL instead.
+    //
+    // The class it exists for is not hypothetical: the `FixedSizeBinary(16)`
+    // builder nulled anything not exactly 16 bytes, and `test_decoding` renders
+    // uuids as 36-char TEXT, so 100% of a uuid column became NULL on a real
+    // bucket while every count and sum check passed. A per-column NULL profile
+    // is what sees that; a row count never can. The batch path has had this
+    // oracle on three engines (type_roundtrip/duckdb_load.rs) — CDC had it on
+    // none (audit 2026-08-17).
+    //
+    // Only the INSERT images: a CDC part holds one row per change, so the
+    // source's 3 rows are the 3 inserts, and reading the whole part would
+    // compare different populations.
+    let cols: Vec<String> = c
+        .query(
+            "SELECT column_name FROM information_schema.columns \
+             WHERE table_name = $1 ORDER BY ordinal_position",
+            &[&tbl],
+        )
+        .unwrap()
+        .iter()
+        .map(|r| r.get::<_, String>(0))
+        .collect();
+    assert!(
+        cols.len() >= 20,
+        "the fixture must present a rich column set to profile; got {}",
+        cols.len()
+    );
+    let mut columns_with_nulls = 0;
+    for col in &cols {
+        let src_nulls: i64 = c
+            .query_one(
+                &format!("SELECT count(*) - count(\"{col}\") FROM {tbl}"),
+                &[],
+            )
+            .unwrap()
+            .get(0);
+        columns_with_nulls += i32::from(src_nulls > 0);
+        let dst_nulls = duckdb_dir_scalar(
+            &cdc_out,
+            &format!("count(*) - count(\"{col}\")"),
+            Some("__op = 'insert'"),
+        );
+        assert_eq!(
+            src_nulls, dst_nulls,
+            "column '{col}': NULL-count parity against PostgreSQL itself — source \
+             {src_nulls}, captured {dst_nulls}. A per-cell decode that degrades to \
+             NULL moves this and nothing else; the uuid column that went 100% NULL \
+             through test_decoding passed every count and sum check."
+        );
+    }
+    // The fixture must actually LOAD this axis. A column compared at 0-vs-0 is a
+    // green that proves nothing, and that is what this check would decay into if
+    // someone later simplified the INSERTs. Row 2 is all-NULL and row 3 sets only
+    // (id, tags, nums), so nearly every column must show source NULLs.
+    assert!(
+        columns_with_nulls >= 15,
+        "only {columns_with_nulls} of {} columns carry a source NULL — the fixture \
+         stopped exercising the null axis, so the parity above is comparing zeros",
+        cols.len()
+    );
 }
 
 // Slot multiplexing: several tables through ONE PostgreSQL slot (`tables:`),

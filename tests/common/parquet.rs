@@ -78,6 +78,39 @@ pub fn duckdb_total_parquet_rows(dir: &Path) -> usize {
     super::duckdb_parquet_rows(&c) as usize
 }
 
+/// One scalar aggregate over every parquet under `dir`, read by DuckDB.
+///
+/// `expr` is the SELECT list (e.g. `count(*) - count("uid")`) and `filter` an
+/// optional WHERE (e.g. `__op = 'insert'` — a CDC part holds one row per CHANGE,
+/// so only the insert images correspond to source rows).
+///
+/// The seam a per-column NULL/distinct profile needs. rivet's own decoder is the
+/// thing under suspicion in that class — a lenient per-cell fallback that nulls
+/// what it cannot parse — so the count has to come from a reader that shares no
+/// code with the writer. Measured cost of not having one: 100% of a uuid column
+/// rendered NULL through PostgreSQL CDC while every count and sum check passed,
+/// found by a human eye on a real bucket.
+pub fn duckdb_dir_scalar(dir: &Path, expr: &str, filter: Option<&str>) -> i64 {
+    assert!(
+        !files_with_extension(dir, "parquet").is_empty(),
+        "duckdb_dir_scalar on a directory with no parquet — an empty destination \
+         cannot answer a per-column question, and reading 0 as the answer is how \
+         this class hides"
+    );
+    let c = stage_for_duckdb(dir);
+    let where_ = filter.map(|f| format!(" WHERE {f}")).unwrap_or_default();
+    let sql = format!("SELECT {expr} FROM read_parquet('{c}/**/*.parquet'){where_}");
+    // `duckdb_run_sql_json` emits {columns:[..], rows:[[..]]} with every cell
+    // stringified, so the scalar is rows[0][0] parsed — not an object field.
+    let v = super::duckdb_run_sql_json(&sql);
+    v["rows"]
+        .get(0)
+        .and_then(|r| r.get(0))
+        .and_then(|x| x.as_str())
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or_else(|| panic!("duckdb returned no scalar for `{sql}`: {v}"))
+}
+
 /// Every `id` value under `dir`, WITH multiplicity, read by DuckDB.
 ///
 /// Multiplicity is the point: a completeness claim needs to tell LOSS (fewer
