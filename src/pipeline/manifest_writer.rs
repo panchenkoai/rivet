@@ -830,6 +830,74 @@ mod tests {
         assert_eq!(ex.source_row_count, Some(123));
     }
 
+    /// The source count must reach the extraction section WITHOUT a cursor.
+    ///
+    /// It used to be a parameter of `set_cursor_range`, which `finalize` calls
+    /// only when the run has one — so on a `full` or `chunked` export the count
+    /// could not have reached the manifest even with a caller willing to supply
+    /// it. That is half of why `load::reconcile`'s source→file bail had never
+    /// executed; the other half was all three writers passing `None`.
+    ///
+    /// Written because the mutation gate caught `set_source_row_count with ()`
+    /// surviving: the setter's only coverage was a LIVE test
+    /// (`run_reconcile_flag_exits_zero_when_counts_match`), which the `--lib`
+    /// run cannot see. The live test stays — it observes the value at the
+    /// boundary, out of the artifact the real producer wrote — and this pins the
+    /// cursor-independence the live fixture happens not to exercise.
+    #[test]
+    fn builder_carries_the_source_row_count_without_a_cursor() {
+        let mut b = ManifestBuilder::new(
+            &plan_snapshot(),
+            "e",
+            "run_src",
+            chrono::Utc::now(),
+            "xxh3:0".into(),
+            "postgres",
+            None,
+            None,
+            "file:///tmp/out/".into(),
+        );
+        // No `set_cursor_range` call at all — the `full`/`chunked` shape.
+        b.set_source_row_count(Some(4242));
+        let m = b.finalize(ManifestStatus::Success);
+        let ex = m.source.extraction.expect("extraction section present");
+        assert_eq!(
+            ex.source_row_count,
+            Some(4242),
+            "a run with no cursor must still record the source count — otherwise \
+             load::reconcile's source→file leg stays unreachable on every \
+             non-incremental export"
+        );
+        assert_eq!(
+            ex.cursor_column, None,
+            "and it must not fabricate a cursor to carry it"
+        );
+    }
+
+    /// `None` must survive as absent, not become 0.
+    ///
+    /// `load::reconcile` branches on `if let Some(src)`, so a `Some(0)` where no
+    /// probe ran would compare a real `row_count` against zero and bail on every
+    /// export that did not use `--reconcile`.
+    #[test]
+    fn an_unprobed_run_records_no_source_row_count() {
+        let mut b = ManifestBuilder::new(
+            &plan_snapshot(),
+            "e",
+            "run_none",
+            chrono::Utc::now(),
+            "xxh3:0".into(),
+            "postgres",
+            None,
+            None,
+            "file:///tmp/out/".into(),
+        );
+        b.set_source_row_count(None);
+        let m = b.finalize(ManifestStatus::Success);
+        let ex = m.source.extraction.expect("extraction section present");
+        assert_eq!(ex.source_row_count, None);
+    }
+
     #[test]
     fn record_committed_part_assigns_max_plus_one_over_id_gaps() {
         // Mutants killed: `m + 1` → `m - 1` / `m * 1` in the part-id

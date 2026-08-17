@@ -26,12 +26,19 @@ name: CI
 # `Gate scripts (self-tests)` and `Mutants (coverage verdict)`. Two things
 # follow, and neither can be fixed from this file:
 #
-#  * `Mutants (changed lines)` IS required and is `continue-on-error: true`,
-#    which makes the job's CONCLUSION success even when its run fails. A
-#    required check that cannot report failure blocks nothing — that is how the
-#    vacuous gate survived eight runs. The evidence about what it actually
-#    graded is now published as job OUTPUTS and asserted by
-#    `Mutants (coverage verdict)`.
+#  * `Mutants (changed lines)` IS required and is `continue-on-error: true`.
+#    CORRECTED 2026-08-17 by observation, having been asserted the other way
+#    here and at the budget guard below: job-level `continue-on-error` does NOT
+#    launder the conclusion. A run whose mutate step exits 2 reports
+#    `conclusion: failure`, the check shows `fail`, and with the context in
+#    branch protection the PR is BLOCKED. Measured on PR #233, whose four missed
+#    mutants held the merge. So the requirement is load-bearing after all, and
+#    the practical consequence is the one the previous note missed: this gate
+#    does NOT consult `docs/mutants-baseline.txt` (that ledger is the NIGHTLY
+#    job's), so "live-guarded, see the baseline" is not an answer it accepts —
+#    a live-only path touched by a PR must grow a unit-level oracle or the PR
+#    cannot merge. The evidence about what it actually graded is published as
+#    job OUTPUTS and asserted by `Mutants (coverage verdict)` regardless.
 #  * `Mutants (coverage verdict)` is the one check that has to be ADDED to
 #    branch protection for the mutation gate to block anything: it runs with
 #    `if: always()` and fails unless `Mutants (gate sanity)`,
@@ -320,11 +327,13 @@ jobs:
           # at the ceiling having graded a fraction of the diff and reported
           # nothing about the rest. `Mutants (changed lines)` IS a required check
           # (verified against the API — see the ledger at the top of this file),
-          # but `continue-on-error: true` makes its conclusion success no matter
-          # how it ends, so the requirement blocks nothing; what a timeout really
-          # costs is a diff nobody graded. The blocking `Mutants (coverage
-          # verdict)` job fails on the "no verdict recorded" case, which is what
-          # a timeout looks like from outside.
+          # and — corrected 2026-08-17 — it DOES block: `continue-on-error` does
+          # not launder the conclusion, so a failed mutate step holds the merge
+          # (measured on PR #233). What a timeout costs is therefore worse than a
+          # diff nobody graded: it is a diff nobody graded AND a merge nobody can
+          # complete. The blocking `Mutants (coverage verdict)` job fails on the
+          # "no verdict recorded" case, which is what a timeout looks like from
+          # outside.
           #
           # What the guard hands the work to is CHECKED, not claimed. The first
           # version of this notice said "these modules are covered by the nightly
