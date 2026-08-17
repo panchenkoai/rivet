@@ -458,6 +458,76 @@ fn run_reconcile_flag_exits_zero_when_counts_match() {
         25,
         "destination must physically hold all 25 rows"
     );
+
+    // The COUNT(*) this run just paid for must be RECORDED, not discarded.
+    // `load::reconcile` checks the source→file leg only `if let Some(src) =
+    // …source_row_count`, and until 2026-08-17 every production writer passed
+    // `None` — so that bail, `LoadIntegrity.source_rows` and the whole
+    // `--allow-source-drift` flag were unreachable, and a loader's only
+    // evidence about the extract was rivet's own part arithmetic compared
+    // against itself. This asserts the value AT THE BOUNDARY, read out of the
+    // artifact the real producer wrote — not handed to a decider by a test.
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(out.path().join("manifest.json"))
+            .expect("run --reconcile must leave a manifest"),
+    )
+    .expect("manifest.json must parse");
+    assert_eq!(
+        manifest["source"]["extraction"]["source_row_count"].as_i64(),
+        Some(25),
+        "the source COUNT(*) --reconcile ran must reach the manifest, so the LOAD \
+         side can check source→file; manifest:\n{manifest:#}"
+    );
+}
+
+/// A run WITHOUT `--reconcile` must leave `source_row_count` absent.
+///
+/// The field's contract is "when cheaply known" — recording anything else would
+/// mean either a `COUNT(*)` nobody asked for on every export, or (worse) copying
+/// rivet's own extracted-row counter into the field the load side treats as the
+/// INDEPENDENT source number, which would make `load::reconcile`'s source→file
+/// leg compare rivet to itself while reading as a real check.
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn a_run_without_reconcile_records_no_source_row_count() {
+    require_alive(LiveService::Postgres);
+
+    let table = seed_pg_numeric_table(25);
+    let out = tempfile::tempdir().unwrap();
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let cfg = write_config(&cfg_dir, &simple_config(table.name(), out.path()));
+
+    let result = std::process::Command::new(RIVET_BIN)
+        .args([
+            "run",
+            "--config",
+            cfg.to_str().unwrap(),
+            "--export",
+            table.name(),
+        ])
+        .output()
+        .expect("spawn rivet run");
+    assert!(result.status.success(), "the plain run must succeed");
+
+    // Not inert: the run really did export, so an absent field is a decision,
+    // not a missing manifest.
+    assert_eq!(
+        duckdb_total_parquet_rows(out.path()),
+        25,
+        "the fixture must actually export before absence means anything"
+    );
+
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(out.path().join("manifest.json")).expect("a manifest"),
+    )
+    .expect("manifest.json must parse");
+    assert_eq!(
+        manifest["source"]["extraction"]["source_row_count"].as_i64(),
+        None,
+        "no probe ran, so there is no independent source number to record — \
+         recording one anyway would hand the load side rivet's own counter \
+         dressed as the source's; manifest:\n{manifest:#}"
+    );
 }
 
 #[test]

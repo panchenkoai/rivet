@@ -177,6 +177,30 @@ impl ManifestBuilder {
     ///
     /// `status` reflects the overall run outcome — `Success` is the only
     /// status that licenses the `_SUCCESS` marker (M2).
+    /// Record the source-side `COUNT(*)` this run probed, so the load side can
+    /// check the **source→file** leg (`load::reconcile` bails when
+    /// `source_row_count != row_count` — the extract silently dropped rows).
+    ///
+    /// Separate from [`set_cursor_range`] on purpose. The field used to be one
+    /// of that method's parameters, and that method is only called when the run
+    /// has a CURSOR — so on a `full` or `chunked` export the count could not
+    /// reach the manifest even if a caller had one to give. Combined with all
+    /// three production writers passing `None` there, the effect was that
+    /// `load::reconcile`'s source→file bail, its `LoadIntegrity.source_rows`
+    /// field and the whole `--allow-source-drift` flag were unreachable code:
+    /// the chain of custody always ended at "rivet says it wrote N" (audit
+    /// 2026-08-17).
+    ///
+    /// Still `None` unless the run actually probed the source — the field's
+    /// contract is "when cheaply known", and a blanket `COUNT(*)` on every
+    /// export is a scan nobody asked for. Today the probe is `--reconcile`,
+    /// which already runs the count and, before this, threw it away.
+    pub fn set_source_row_count(&mut self, source_row_count: Option<i64>) {
+        if let Some(ex) = self.source.extraction.as_mut() {
+            ex.source_row_count = source_row_count;
+        }
+    }
+
     /// Record the cursor range this run covered (incremental strategies) so
     /// the warehouse can prove continuity across runs. `low` is the prior
     /// run's high (or the min seen this run); `high` is the value the next run

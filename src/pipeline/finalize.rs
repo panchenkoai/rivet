@@ -325,9 +325,19 @@ pub(super) fn finalize_manifest(
             None, // cursor_type: follow-up (needs source-type plumbing)
             summary.cursor_low.clone(),
             summary.cursor_high.clone(),
-            None, // source_row_count: follow-up (needs a source COUNT)
+            None, // set below, for every strategy — not just cursored ones
         );
     }
+    // The source COUNT(*) `--reconcile` already ran. Recording it is what makes
+    // `load::reconcile`'s source→file leg executable: without it that check,
+    // `LoadIntegrity.source_rows` and `--allow-source-drift` are unreachable,
+    // and the only "did the extract drop rows" evidence a loader ever sees is
+    // rivet's own part-row arithmetic compared against itself.
+    //
+    // UNCONDITIONAL by strategy, deliberately: the count belongs to the run,
+    // not to the cursor. It stays `None` unless the run probed the source, so
+    // this adds no query — it stops discarding one already paid for.
+    builder.set_source_row_count(summary.source_count);
     let manifest = builder.finalize(status);
 
     let dest = match crate::destination::create_destination(&plan.destination) {
