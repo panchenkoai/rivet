@@ -407,6 +407,14 @@ fn every_live_cdc_test_asserts_an_outcome() {
             // destination listing, or the state DB) — not merely that the
             // process exited 0.
             let asserts_outcome = chunk.contains("manifest_rows")
+                // `cdc_id_ops` (-> `read_cdc_changes`, arrow straight off the
+                // parquet) is the STRONGEST marker in this list and was missing
+                // from it: a test asserting only that — i.e. reading the
+                // delivered rows and nothing else — was reported as asserting no
+                // outcome, while `manifest_rows` alone (rivet's own summary of
+                // its own writes) counted. Found when the first test to use the
+                // independent reader ALONE was rejected here (2026-08-17).
+                || chunk.contains("cdc_id_ops")
                 || chunk.contains("assert_cdc_matches_batch")
                 || chunk.contains("read_one_batch")
                 || chunk.contains("parquet_")
