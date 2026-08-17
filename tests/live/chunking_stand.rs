@@ -108,6 +108,48 @@ impl Eng {
     }
 }
 
+/// As [`insert_dense_range`], but also fills the `pad` column — for the SEEDING
+/// leg of a split fixture, whose giant must carry bytes across its whole span.
+/// The grow leg deliberately keeps using the narrow twin: `pad` is NULLable, and
+/// the width is only needed for the PRIMING run that sets the split ratio.
+fn insert_dense_range_padded(eng: Eng, table: &str, lo: i64, hi: i64, pad_bytes: usize) {
+    let (pg, my, ms) = (
+        format!("repeat('x', {pad_bytes})"),
+        format!("REPEAT('x', {pad_bytes})"),
+        format!("REPLICATE('x', {pad_bytes})"),
+    );
+    match eng {
+        Eng::Pg => {
+            let mut c = pg_connect();
+            c.batch_execute(&format!(
+                "INSERT INTO {table} (id, payload, pad) \
+                 SELECT g, g, {pg} FROM generate_series({lo}, {hi}) g"
+            ))
+            .unwrap();
+        }
+        Eng::My => {
+            let mut c = mysql_connect();
+            c.query_drop(format!(
+                "SET SESSION cte_max_recursion_depth = {}",
+                hi - lo + 10
+            ))
+            .unwrap();
+            c.query_drop(format!(
+                "INSERT INTO {table} (id, payload, pad) \
+                 WITH RECURSIVE seq AS (SELECT {lo} n UNION ALL SELECT n+1 FROM seq WHERE n < {hi}) \
+                 SELECT n, n, {my} FROM seq"
+            ))
+            .unwrap();
+        }
+        Eng::Ms => {
+            mssql_exec(&format!(
+                "INSERT INTO {table} (id, payload, pad) \
+                 SELECT value, value, {ms} FROM GENERATE_SERIES(CAST({lo} AS BIGINT), CAST({hi} AS BIGINT))"
+            ));
+        }
+    }
+}
+
 /// Append `id`s `lo..=hi` (payload = id) to a `(id BIGINT PK, payload INT)` stand
 /// table — the source-GROWTH leg of the split-resume scenario, per engine.
 fn insert_dense_range(eng: Eng, table: &str, lo: i64, hi: i64) {
@@ -153,8 +195,15 @@ fn seed_gappy_split(
     eng: Eng,
     block: i64,
 ) -> (String, StandCleanup, std::collections::BTreeSet<i64>) {
-    let (table, guard) = seed_dense(eng, block); // 1..=block
-    insert_dense_range(eng, &table, 2 * block + 1, 3 * block); // the far block, past the hole
+    // WIDE, for the same reason the dense split fixture is (see `seed_dense_wide`):
+    // this is a `_split_` fixture, and a narrow giant does not beat the sibling's
+    // fixed connect+plan floor by R=3.0. Widening the dense fixture on 08-17 left
+    // this one narrow — and `stand_pool_split_gappy_key_mssql` was one of the four
+    // nightly failures the next morning (giant 612 ms vs sibling 403 ms, ratio
+    // 1.52). Both blocks are padded, so the giant carries the bytes across the
+    // whole span rather than only its first half.
+    let (table, guard) = seed_dense_wide(eng, block, SPLIT_PAD_BYTES); // 1..=block
+    insert_dense_range_padded(eng, &table, 2 * block + 1, 3 * block, SPLIT_PAD_BYTES);
     let ids: std::collections::BTreeSet<i64> =
         (1..=block).chain(2 * block + 1..=3 * block).collect();
     (table, guard, ids)
@@ -251,7 +300,7 @@ fn run_pool_split_resume_with(
         // ANY status: this run crashes its units on purpose, so a unit that did
         // its job records a FAILED row, not a successful one.
         let units = runs.iter().filter(|(n, ..)| n.contains('#')).count();
-        if units < 2 {
+        {
             // The priming run's successes are what the advisor predicted from.
             // ONE entry per export NAME (its longest run): the advisor compares
             // the longest export to the next-longest OTHER export, so a list
@@ -278,7 +327,16 @@ fn run_pool_split_resume_with(
                 [(_, a, _), (_, b, _), ..] if *b > 0 => *a as f64 / *b as f64,
                 _ => f64::NAN,
             };
-            panic!(
+            // Report the MARGIN on every run, not only on the failing one. The
+            // ratio is a property of the machine as much as the fixture (local
+            // 15x, CI 1.52), so a nightly that passes at 3.1 is one slow disk
+            // away from the failure this guard exists to explain — and without
+            // this line the log says nothing until it is already red.
+            eprintln!(
+                "split fixture margin: ratio {ratio:.2} vs R=3.0, {units} unit(s), primed {primed:?}"
+            );
+            assert!(
+                units >= 2,
                 "FIXTURE INERT, not a product failure: `--split` produced {units} unit(s), so no \
                  unit could error and run 1 was always going to succeed — the assertion below \
                  would blame the product for the fixture's own failure to set up. \
@@ -632,8 +690,13 @@ fn seed_dense(eng: Eng, rows: i64) -> (String, StandCleanup) {
 /// it. The width is the only thing that changes: the id space, `dense_ids`, the
 /// grow ranges and every caller stay exactly as they were.
 fn seed_dense_wide_for_split(eng: Eng, rows: i64) -> (String, StandCleanup) {
-    seed_dense_wide(eng, rows, 200)
+    seed_dense_wide(eng, rows, SPLIT_PAD_BYTES)
 }
+
+/// One width for every split fixture. Named rather than repeated so widening it
+/// again (if a future runner still lands under R=3.0) is one edit, and so a
+/// reader can see the dense and gappy fixtures are deliberately the same shape.
+const SPLIT_PAD_BYTES: usize = 200;
 
 /// `seed_dense` with a `pad` column of `pad_bytes` characters.
 ///
