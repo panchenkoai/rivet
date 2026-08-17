@@ -537,6 +537,44 @@ mod tests {
         assert!(enforce_reconcile_exit(&summary(0, 1, 2)).is_err());
     }
 
+    /// `emit_report` must actually EMIT — the dispatcher, not just the writer.
+    ///
+    /// `replace emit_report -> Result<()> with Ok(())` survived even after
+    /// `write_report_pretty` got its own unit test: stubbing the CALLER makes
+    /// every format silently produce nothing while the command still exits 0.
+    /// That is the layer-boundary shape this repo keeps paying for — a correct
+    /// test of correct logic, one layer below the thing that decides whether the
+    /// logic runs at all.
+    ///
+    /// Driven through the `Json(Some(path))` arm because its effect is a FILE,
+    /// readable without capturing stdout; the pretty arm is covered by the test
+    /// below and by the live reconcile suites.
+    #[test]
+    fn emit_report_actually_writes_the_json_report() {
+        let report = ReconcileReport::new(
+            "orders".into(),
+            "run_j".into(),
+            "chunked".into(),
+            Vec::new(),
+        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("report.json");
+        emit_report(
+            &report,
+            &ReconcileOutputFormat::Json(Some(path.to_string_lossy().into_owned())),
+        )
+        .expect("emit_report must succeed");
+
+        let body = std::fs::read_to_string(&path)
+            .expect("emit_report must have WRITTEN the file, not merely returned Ok");
+        let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(
+            v["export_name"].as_str(),
+            Some("orders"),
+            "the emitted document must be this report; got:\n{body}"
+        );
+    }
+
     /// The report must reach the operator, and must NAME its evidence.
     ///
     /// `replace print_report_pretty with ()` — the whole report silently gone —
