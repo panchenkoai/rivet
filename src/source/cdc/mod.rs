@@ -330,7 +330,15 @@ pub(crate) fn run(
         if committed && let Some(p) = &checkpoint {
             ev.position.save(p)?;
         }
-        if max_events.is_some_and(|m| emitted >= m) {
+        // A SOFT cap, landing on the commit boundary — the same semantics the file
+        // sink already had (`max_events_stops_at_a_commit_boundary_never_inside_a_
+        // transaction`). Breaking on the count alone lost nothing (the save above is
+        // gated on `committed`, so a cut transaction re-emits on resume), but a
+        // transaction LONGER than the cap then held no boundary to save: every run
+        // re-read the same position, re-printed the same prefix, and stopped in the
+        // same place. `--checkpoint ck --max-events 100` against a bulk load made no
+        // progress, ever. Overshooting to the boundary is the price of progressing.
+        if committed && max_events.is_some_and(|m| emitted >= m) {
             break;
         }
     }
@@ -1091,6 +1099,63 @@ pub(crate) fn run_capture(
 
 #[cfg(test)]
 mod tests {
+
+    /// `--max-events` must not be able to WEDGE a checkpointed NDJSON run.
+    ///
+    /// The two drivers of the same flag disagreed. The file sink defers the cap
+    /// to a commit boundary (`max_events_stops_at_a_commit_boundary_never_inside_
+    /// a_transaction`); this NDJSON loop broke on the event count alone. That
+    /// loses nothing — the checkpoint save is gated on `committed`, so a cut
+    /// transaction re-emits rather than being skipped — but a transaction LONGER
+    /// than the cap then contains no boundary to save, so every run re-reads from
+    /// the same position, re-prints the same prefix, and stops in the same place.
+    /// `rivet cdc --checkpoint ck --max-events 100` against a 10k-row bulk load
+    /// makes no progress, ever, and says nothing about why.
+    ///
+    /// RED before the fix: the checkpoint file is never written.
+    #[test]
+    fn max_events_cannot_wedge_a_checkpointed_run_on_a_long_transaction() {
+        use super::*;
+        use std::collections::VecDeque;
+
+        struct FiveInOneTxn(VecDeque<ChangeEvent>);
+        impl ChangeStream for FiveInOneTxn {
+            fn next_change(&mut self) -> Option<Result<ChangeEvent>> {
+                self.0.pop_front().map(Ok)
+            }
+        }
+        let ev = |id: i64, committed: bool| ChangeEvent {
+            op: ChangeOp::Insert,
+            schema: "s".into(),
+            table: "t".into(),
+            before: None,
+            after: Some(vec![crate::source::cdc::value::RivetValue::Int(id)]),
+            position: Position(serde_json::json!({ "lsn": format!("{id:08X}") })),
+            committed,
+            image_names: None,
+            seq: 0,
+            poison: None,
+        };
+        // One transaction of five events: only the last carries the boundary.
+        let mut stream = FiveInOneTxn((1..=5).map(|i| ev(i, i == 5)).collect());
+
+        let dir = tempfile::tempdir().unwrap();
+        let ckpt = dir.path().join("ck");
+        run(&mut stream, Some(ckpt.clone()), Vec::new(), Some(3)).expect("run");
+
+        assert!(
+            ckpt.exists(),
+            "a cap that lands inside a transaction must still reach the boundary and \
+             checkpoint — otherwise the next run resumes at the same place and the \
+             export never progresses"
+        );
+        let saved = Position::load(&ckpt).expect("load").expect("some");
+        assert_eq!(
+            saved.0["lsn"], "00000005",
+            "and the position saved must be the transaction's COMMIT, not a mid-transaction event"
+        );
+    }
+
     // The offline mutation guard for the DrainMode glue: both helpers are
     // otherwise exercised only through I/O paths (dispatch, cdc_job, adapter
     // opens), so an inverted mapping would survive the CI mutants gate's

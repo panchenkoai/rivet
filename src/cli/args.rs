@@ -142,9 +142,13 @@ pub enum Commands {
         /// Only emit changes for this table (repeatable; default: all tables).
         #[arg(long, value_name = "TABLE")]
         table: Vec<String>,
-        /// Stop after N change events. Without it the default bounded run drains
-        /// to the log end as of open and exits; streaming until interrupted needs
-        /// `--stream`.
+        /// Stop at the first COMMIT BOUNDARY once N change events have been
+        /// emitted — a soft cap, so the run may overshoot N by the remainder of
+        /// the transaction the cap lands in. A hard per-event stop cannot
+        /// checkpoint inside a transaction, so a transaction longer than N left
+        /// the run re-reading the same position on every restart. Without it the
+        /// default bounded run drains to the log end as of open and exits;
+        /// streaming until interrupted needs `--stream`.
         #[arg(long, value_name = "N")]
         max_events: Option<usize>,
         /// Write typed Parquet/CSV files to this directory (the upsert/after-image
