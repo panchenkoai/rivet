@@ -814,6 +814,18 @@ fn mssql_adaptive_never_loses_to_its_own_baseline_on_an_idle_source() {
     let _quiet = quiet_window_guard();
     const ROWS: i64 = 40_000;
     let table = seed_mssql_governor_numeric_table(ROWS);
+    // ...and the OTHER half of "idle", which the dedicated instance did NOT fix:
+    // this fixture's own seed. It failed again on main at 07:40 with the
+    // dedicated container up (job 95318036698), and the shed pattern names the
+    // cause — parallelism dropped ONE SECOND into the adaptive run and recovered
+    // immediately after ("source pressure rising" → "source pressure eased"),
+    // which is SQL Server's automatic CHECKPOINT flushing the 40k-row seed on a
+    // slower disk, not a busy server. (The sibling that deliberately creates
+    // flush pressure did not overlap: it finished at 07:51:11, this test at
+    // 07:51:05 — `quiet_window_guard` held.) Force that deferred work to happen
+    // NOW and wait for the counter to go flat, so the run measures the run.
+    mssql_governor_exec("CHECKPOINT");
+    wait_for_quiet_mssql_governor_log();
     let run = |adaptive: bool| -> (f64, String) {
         let rig = Rig::mssql_governor_batch(table.name())
             .mode("chunked")
@@ -840,11 +852,37 @@ fn mssql_adaptive_never_loses_to_its_own_baseline_on_an_idle_source() {
         (wall, stderr)
     };
     let (wall_off, _) = run(false);
+    // Bracket the graded run with the EXACT counter the governor samples, so a
+    // failure says which of the two things broke instead of costing another
+    // session of inference. The 07:40 failure had no such evidence: "nothing to
+    // shed for" is a product accusation, and the product was innocent.
+    const FLUSH_WAITS: &str = "SELECT cntr_value FROM sys.dm_os_performance_counters \
+                               WHERE counter_name LIKE 'Log Flush Waits%' \
+                               AND instance_name = '_Total'";
+    let waits_before = mssql_governor_query_i64(FLUSH_WAITS);
     let (wall_on, stderr_on) = run(true);
+    let flush_waits = mssql_governor_query_i64(FLUSH_WAITS) - waits_before;
     assert_governor_awake(&stderr_on, "mssql");
+    // A quiet stand measures a delta of 1 across a read-only run (2026-08-14);
+    // the sibling pressure test needs THOUSANDS to shed. Anything past this
+    // floor means the source genuinely was not idle.
+    const IDLE_CEILING: i64 = 50;
     assert!(
         !stderr_on.contains("backed off"),
-        "idle source: the MSSQL governor has nothing to shed for; stderr:\n{stderr_on}"
+        "{}",
+        if flush_waits > IDLE_CEILING {
+            format!(
+                "FIXTURE, not product: the source was NOT idle during the graded run \
+                 (+{flush_waits} log flush waits, ceiling {IDLE_CEILING}) — the governor \
+                 shed for real pressure and was RIGHT. Something is still writing to \
+                 :1435, or the seed's deferred work outlived the CHECKPOINT above.\n{stderr_on}"
+            )
+        } else {
+            format!(
+                "idle source (+{flush_waits} log flush waits, genuinely quiet): the MSSQL \
+                 governor has nothing to shed for; stderr:\n{stderr_on}"
+            )
+        }
     );
     assert!(
         wall_on <= wall_off * 1.6 + 1.0,

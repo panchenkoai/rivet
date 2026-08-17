@@ -187,6 +187,63 @@ pub fn mssql_governor_query_i64(sql: &str) -> i64 {
     query_i64_at(1435, sql)
 }
 
+/// Block until the governor instance's transaction log has stopped accumulating
+/// flush waits, so an "idle source" assertion grades the RUN rather than the
+/// fixture's own seed still draining.
+///
+/// Despite the name, `Log Flush Waits/sec` is a CUMULATIVE counter — two equal
+/// consecutive reads mean no wait was recorded in between, which is exactly the
+/// condition the no-shed canaries assert holds during their runs. Seeding 40k
+/// rows in 1000-row batches leaves the log draining for as long as the host's
+/// disk needs: under a second on a laptop, but long enough on CI's disk that the
+/// governor (correctly) shed for pressure the test itself had created. Giving
+/// the shared instance its own container fixed the SIBLING half of that; this
+/// fixes the half the fixture creates for itself.
+///
+/// Panics rather than proceeding when the log never settles: a bounded wait that
+/// gives up quietly is a `sleep` wearing a loop, and would hand the caller the
+/// same unestablished precondition it was called to establish.
+pub fn wait_for_quiet_mssql_governor_log() {
+    const FLUSH_WAITS: &str = "SELECT cntr_value FROM sys.dm_os_performance_counters \
+                               WHERE counter_name LIKE 'Log Flush Waits%' \
+                               AND instance_name = '_Total'";
+    /// Equal reads required in a row (i.e. two consecutive quiet intervals).
+    const SETTLED_READS: usize = 3;
+    const INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+    const MAX_ATTEMPTS: usize = 60; // ~30s ceiling
+
+    let started = std::time::Instant::now();
+    let mut last = mssql_governor_query_i64(FLUSH_WAITS);
+    let mut equal_runs = 1usize;
+    for _ in 0..MAX_ATTEMPTS {
+        std::thread::sleep(INTERVAL);
+        let now = mssql_governor_query_i64(FLUSH_WAITS);
+        if now == last {
+            equal_runs += 1;
+            if equal_runs >= SETTLED_READS {
+                // Report the wait: on a fast disk the log is already quiet and
+                // this returns at the floor, which is exactly why the CI-only
+                // failure was invisible locally. Printing it means a future
+                // reader can tell a firing wait from an inert one.
+                eprintln!(
+                    "governor log settled after {:.1}s (flush waits steady at {last})",
+                    started.elapsed().as_secs_f64()
+                );
+                return;
+            }
+        } else {
+            equal_runs = 1;
+        }
+        last = now;
+    }
+    panic!(
+        "the governor instance's log never went quiet within {}s (Log Flush Waits still \
+         advancing, last={last}) — an idle-source assertion taken now would grade the \
+         fixture's own seed, not the run",
+        (MAX_ATTEMPTS as u64 * INTERVAL.as_millis() as u64) / 1000
+    );
+}
+
 /// As [`mssql_query_i64`], but against `mssql-cdc` (`:1434`) — e.g. polling a CDC
 /// change table's row count while the capture job catches up.
 pub fn mssql_cdc_query_i64(sql: &str) -> i64 {
