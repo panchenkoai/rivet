@@ -171,6 +171,22 @@ pub fn mssql_query_i64(sql: &str) -> i64 {
     query_i64_at(1433, sql)
 }
 
+/// The governor instance's twins (`mssql-governor`, :1435). Kept beside their
+/// `:1433` siblings so a reader sees the two servers are DIFFERENT servers, not
+/// two spellings of one — the whole point of the split is that
+/// `Log Flush Waits/sec (_Total)` is server-wide.
+pub fn mssql_governor_exec(sql: &str) {
+    exec_at(1435, sql)
+}
+
+pub fn mssql_governor_try_exec(sql: &str) -> bool {
+    soft_exec_at(1435, sql)
+}
+
+pub fn mssql_governor_query_i64(sql: &str) -> i64 {
+    query_i64_at(1435, sql)
+}
+
 /// As [`mssql_query_i64`], but against `mssql-cdc` (`:1434`) — e.g. polling a CDC
 /// change table's row count while the capture job catches up.
 pub fn mssql_cdc_query_i64(sql: &str) -> i64 {
@@ -253,16 +269,35 @@ impl Drop for MssqlTable {
 /// `created_at`, matching the MySQL/PG seeders so the same export queries and
 /// row-count assertions hold across engines.
 pub fn seed_mssql_numeric_table(row_count: i64) -> MssqlTable {
+    seed_mssql_numeric_table_at(1433, row_count)
+}
+
+/// Seed the same fixture on the GOVERNOR instance (`mssql-governor`, :1435).
+///
+/// The concurrency-governor canaries need a SQL Server nobody else is writing
+/// to: the signal they assert on is `Log Flush Waits/sec` with the `_Total`
+/// instance, which is server-wide. See `env::MSSQL_GOVERNOR_URL`.
+pub fn seed_mssql_governor_numeric_table(row_count: i64) -> MssqlTable {
+    seed_mssql_numeric_table_at(1435, row_count)
+}
+
+fn seed_mssql_numeric_table_at(port: u16, row_count: i64) -> MssqlTable {
     let name = unique_name("rivet_qa_tbl");
-    mssql_drop_table(&name);
-    mssql_exec(&format!(
-        "CREATE TABLE {name} (
+    exec_at(
+        port,
+        &format!("IF OBJECT_ID('{name}','U') IS NOT NULL DROP TABLE {name}"),
+    );
+    exec_at(
+        port,
+        &format!(
+            "CREATE TABLE {name} (
             id BIGINT PRIMARY KEY,
             name NVARCHAR(100) NOT NULL,
             amount DECIMAL(12,2) NOT NULL,
             created_at DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME()
         );"
-    ));
+        ),
+    );
     if row_count > 0 {
         // T-SQL caps a multi-row VALUES clause at 1000 rows per INSERT — chunk.
         let mut start = 0;
@@ -279,7 +314,7 @@ pub fn seed_mssql_numeric_table(row_count: i64) -> MssqlTable {
                     row_count - i
                 ));
             }
-            mssql_exec(&sql);
+            exec_at(port, &sql);
             start = end;
         }
     }

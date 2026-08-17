@@ -124,6 +124,19 @@ impl Rig {
         Self::new("postgres", super::env::POSTGRES_URL, table)
     }
 
+    /// SQL Server batch against the GOVERNOR instance (:1435).
+    ///
+    /// For the two concurrency-governor canaries only. They assert opposite
+    /// things about `Log Flush Waits/sec (_Total)` — a server-wide counter — so
+    /// on the shared `mssql` service both were decided by whichever sibling test
+    /// happened to be committing. See `env::MSSQL_GOVERNOR_URL`.
+    pub fn mssql_governor_batch(table: &str) -> Self {
+        let mut r = Self::new("mssql", super::env::MSSQL_GOVERNOR_URL, table);
+        r.source_lines.push("tls:".into());
+        r.source_lines.push("  accept_invalid_certs: true".into());
+        r
+    }
+
     pub fn mssql_batch(table: &str) -> Self {
         let mut r = Self::new("mssql", super::env::MSSQL_URL, table);
         // The test stack's SQL Server runs a self-signed cert — every mssql

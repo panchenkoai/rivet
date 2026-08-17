@@ -59,6 +59,20 @@ pub const POSTGRES_CDC_URL: &str = "postgresql://rivet:rivet@127.0.0.1:5434/rive
 pub const MYSQL_CDC_URL: &str = "mysql://rivet:rivet@127.0.0.1:3307/rivet";
 pub const MSSQL_CDC_URL: &str = "sqlserver://sa:Rivet_Passw0rd!@127.0.0.1:1434/rivet";
 
+/// SQL Server for the CONCURRENCY GOVERNOR canaries (`service: mssql-governor`,
+/// port :1435, `governor` profile).
+///
+/// Dedicated because the governor's SQL Server signal is `Log Flush Waits/sec`
+/// read with the `_Total` instance — INSTANCE-WIDE, across every database on the
+/// server. On the shared `mssql` service the two canaries failed in OPPOSITE
+/// directions and both were wrong about the product: the idle one blamed the
+/// governor for a shed a sibling's commits had genuinely earned, and the
+/// pressure one could not get its own writer enough of the machine to move the
+/// counter at all. 72 of the 74 SQL Server live tests do not take the
+/// quiet-window lock, so "idle" was never a property of the fixture — only of
+/// the schedule (audit 2026-08-16).
+pub const MSSQL_GOVERNOR_URL: &str = "sqlserver://sa:Rivet_Passw0rd!@127.0.0.1:1435/rivet";
+
 /// ProxySQL in transaction-persistent mode, port :6033.
 /// Opt in: docker compose --profile pool up -d proxysql
 /// Backend forwards to the same `mysql` service used by `MYSQL_URL`.
@@ -287,6 +301,9 @@ pub enum LiveService {
     MysqlToxi,
     /// SQL Server source engine. TCP :1433.
     Mssql,
+    /// SQL Server dedicated to the concurrency-governor canaries. TCP :1435.
+    /// See [`MSSQL_GOVERNOR_URL`] for why it is not the shared instance.
+    MssqlGovernor,
     /// MongoDB standalone source engine (batch JSON-blob). TCP :27017.
     Mongo,
     /// MongoDB single-node replica set (change-stream CDC). TCP :27018.
@@ -327,6 +344,11 @@ impl LiveService {
             ),
             LiveService::Mysql => ("127.0.0.1", 3306, "service `mysql` in docker-compose.yaml"),
             LiveService::Mssql => ("127.0.0.1", 1433, "service `mssql` in docker-compose.yaml"),
+            LiveService::MssqlGovernor => (
+                "127.0.0.1",
+                1435,
+                "service `mssql-governor` — run: docker compose --profile governor up -d mssql-governor",
+            ),
             LiveService::Mongo => ("127.0.0.1", 27017, "service `mongo` in docker-compose.yaml"),
             LiveService::MongoRs => (
                 "127.0.0.1",
