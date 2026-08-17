@@ -52,6 +52,41 @@ use serde::Deserialize;
 /// → 12 (chunk_count ×2) → 7 (chunk_by_days ×3 + keyset-non-usable ×2) → 3
 /// (sparse-gappy ×2 + memory_mb-PG + keyset-auto-MSSQL→na) → 1 (small-table-escape
 /// ×2→na) → 0 (chunk_count-Mongo→na).
+/// Coverage ledgers that this guard does NOT cover, each naming the guard that
+/// does. Membership is checked against the file GLOB, and each named guard file
+/// must exist — a claim of coverage is not coverage.
+///
+/// The list used to be implicit: `MATRICES` held 20 of the 25
+/// `docs/*matrix*.yaml` files and nothing compared it to what is on disk, so a
+/// ledger could sit ungoverned indefinitely and read as governed. One of the
+/// five did worse than that — `scenario-artifact-matrix.yaml` was not valid
+/// YAML (three keys at column 0 among siblings indented 6) and neither of its
+/// two readers noticed, because both scan lines and strip them rather than
+/// parsing. Fixed in the same commit; the parse check below is what would have
+/// caught it (audit 2026-08-17).
+const EXEMPT: &[(&str, &str)] = &[
+    (
+        "docs/attestation-matrix.yaml",
+        "tests/offline/attestation_matrix_guard.rs",
+    ),
+    (
+        "docs/cdc-axis-matrix.yaml",
+        "tests/offline/cdc_axis_matrix_guard.rs",
+    ),
+    (
+        "docs/perf-matrix.yaml",
+        "tests/offline/perf_matrix_guard.rs",
+    ),
+    (
+        "docs/release-gate-matrix.yaml",
+        "tests/offline/release_gate_matrix_guard.rs",
+    ),
+    (
+        "docs/scenario-artifact-matrix.yaml",
+        "tests/offline/scenario_artifact_matrix_guard.rs",
+    ),
+];
+
 const MATRICES: &[(&str, usize)] = &[
     ("docs/chunking-matrix.yaml", 0),
     // Export-STRATEGY flag × engine, verified on GOLDEN fixtures + a distilled
@@ -647,6 +682,13 @@ fn enum_variants_lowercased(rel: &str, enum_name: &str) -> HashSet<String> {
 fn matrix_columns_cover_every_source_and_target_enum_variant() {
     let sources = enum_variants_lowercased("src/config/source.rs", "SourceType");
     let targets = enum_variants_lowercased("src/types/target.rs", "ExportTarget");
+    // The THIRD axis. This guard derived two of the six enums a ledger can be
+    // keyed on, so `docs/destination-matrix.yaml` — `engines: [local, gcs, s3,
+    // azure]` — matched neither predicate and was generatively ungraded: it was
+    // missing `stdout`, `DestinationType`'s fifth variant, and NO guard could
+    // see the hole. That is worse than an unproven cell, because the check that
+    // exists to find missing columns structurally could not (audit 2026-08-17).
+    let dests = enum_variants_lowercased("src/config/destination.rs", "DestinationType");
     // Parse sanity: a drift here would silently UNDER-require, defeating the guard.
     assert!(
         sources.len() == 4 && sources.contains("postgres") && sources.contains("mongo"),
@@ -656,12 +698,23 @@ fn matrix_columns_cover_every_source_and_target_enum_variant() {
         targets.len() == 4 && targets.contains("duckdb") && targets.contains("clickhouse"),
         "ExportTarget parse produced {targets:?} (expected the 4 warehouse targets)"
     );
+    assert!(
+        dests.len() == 5 && dests.contains("local") && dests.contains("stdout"),
+        "DestinationType parse produced {dests:?} (expected the 5 destination kinds)"
+    );
 
     for (path, _) in MATRICES {
         let matrix = load_matrix(path);
         let declared: HashSet<&str> = matrix.engines.iter().map(String::as_str).collect();
         let keyed_on_sources = matrix.engines.iter().any(|e| sources.contains(e.as_str()));
         let keyed_on_targets = matrix.engines.iter().any(|e| targets.contains(e.as_str()));
+        // Ordered after the other two on purpose: `local`/`s3`/`gcs` are unique
+        // to DestinationType, but a ledger keyed on SOURCES must not be dragged
+        // in by a coincidental name, so this only claims a matrix no other axis
+        // claimed.
+        let keyed_on_dests = !keyed_on_sources
+            && !keyed_on_targets
+            && matrix.engines.iter().any(|e| dests.contains(e.as_str()));
         if keyed_on_sources {
             for s in &sources {
                 assert!(
@@ -670,6 +723,16 @@ fn matrix_columns_cover_every_source_and_target_enum_variant() {
                      SourceType must be a column (a test/gap/na cell per scenario) — a \
                      silently-absent engine is the un-enumerated-sibling hole the audit found. \
                      Add it, or n/a it with a reason."
+                );
+            }
+        }
+        if keyed_on_dests {
+            for d in &dests {
+                assert!(
+                    declared.contains(d.as_str()),
+                    "{path} is keyed on destination kinds but is MISSING the '{d}' column. \
+                     Every DestinationType must be a column (test/gap/na per scenario) — \
+                     `stdout` was absent from this ledger and no guard could see it."
                 );
             }
         }
@@ -792,4 +855,91 @@ fn matrix_oracle_strength_ratchet() {
              ORACLE_TRACKED to {weak} to lock the win."
         );
     }
+}
+
+/// Every `docs/*matrix*.yaml` on disk is either ratcheted here or exempted by
+/// name — and every exemption names a guard file that EXISTS.
+///
+/// The dimension is the GLOB, not a list: a hand-written list of ledgers cannot
+/// notice a ledger nobody added to it, which is the defect this repo has now
+/// corrected in five places. Before this, `MATRICES` held 20 of 25 and the other
+/// five were invisible; one of them was not even valid YAML.
+#[test]
+fn every_coverage_ledger_is_ratcheted_here_or_exempted_by_name() {
+    let docs = repo_root().join("docs");
+    let mut on_disk: Vec<String> = std::fs::read_dir(&docs)
+        .expect("read docs/")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains("matrix") && n.ends_with(".yaml"))
+        .map(|n| format!("docs/{n}"))
+        .collect();
+    on_disk.sort();
+    assert!(
+        on_disk.len() >= 20,
+        "found only {} ledger(s) under docs/ — the glob lost its subject, and an \
+         empty dimension is exactly the failure this check replaces: {on_disk:?}",
+        on_disk.len()
+    );
+
+    let ratcheted: Vec<&str> = MATRICES.iter().map(|(f, _)| *f).collect();
+    let exempt: Vec<&str> = EXEMPT.iter().map(|(f, _)| *f).collect();
+    let ungoverned: Vec<&String> = on_disk
+        .iter()
+        .filter(|f| !ratcheted.contains(&f.as_str()) && !exempt.contains(&f.as_str()))
+        .collect();
+    assert!(
+        ungoverned.is_empty(),
+        "these coverage ledgers are governed by nothing — add them to MATRICES \
+         (with a ratchet) or to EXEMPT (naming the guard that covers them): {ungoverned:?}"
+    );
+
+    // An exemption is a CLAIM about another guard. Check the claim.
+    for (ledger, guard) in EXEMPT {
+        assert!(
+            repo_root().join(guard).exists(),
+            "{ledger} is exempted on the grounds that {guard} covers it, and that \
+             file does not exist"
+        );
+        assert!(
+            on_disk.contains(&ledger.to_string()),
+            "{ledger} is exempted but no longer exists — delete the exemption"
+        );
+    }
+    for (ledger, _) in MATRICES {
+        assert!(
+            on_disk.contains(&ledger.to_string()),
+            "{ledger} is ratcheted but no longer exists — delete the entry"
+        );
+    }
+}
+
+/// Every YAML under `docs/` actually parses as YAML.
+///
+/// A NEW axis, not a duplicate of the cell checks above: those read a ledger's
+/// CONTENT and only run on the files they know about. This asks whether a file
+/// is the format it claims to be, which nothing asked — `scenario-artifact-
+/// matrix.yaml` had three keys at column 0 among siblings indented 6 and was
+/// unparseable for as long as anyone can tell, because both of its readers scan
+/// lines and `strip()` them instead of parsing. It worked by luck: the day a
+/// reader is switched to a real parser, the harness breaks rather than the file.
+#[test]
+fn every_docs_yaml_parses_as_yaml() {
+    let docs = repo_root().join("docs");
+    let mut checked = 0;
+    for entry in std::fs::read_dir(&docs).expect("read docs/") {
+        let path = entry.expect("dir entry").path();
+        if path.extension().and_then(|e| e.to_str()) != Some("yaml") {
+            continue;
+        }
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {name}: {e}"));
+        serde_yaml_ng::from_str::<serde_yaml_ng::Value>(&text)
+            .unwrap_or_else(|e| panic!("docs/{name} is not valid YAML: {e}"));
+        checked += 1;
+    }
+    assert!(
+        checked >= 20,
+        "parsed only {checked} YAML file(s) under docs/ — the walk found nothing to grade"
+    );
 }
