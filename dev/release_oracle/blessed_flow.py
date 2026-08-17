@@ -1419,6 +1419,27 @@ def _cli_flags(cmd: str) -> set[str]:
     return got
 
 
+def _declared_subcommands() -> list[str]:
+    """Every subcommand `rivet --help` LISTS, read from the binary under test.
+
+    From the `Commands:` block rather than a substring search: `"run"` also
+    occurs in prose ("Run export jobs…"), which is how the Rust-side twin of
+    this check passed for names it never verified.
+    """
+    out = rivet("--help").out
+    block = out.split("Commands:", 1)
+    if len(block) < 2:
+        return []
+    body = block[1].split("\nOptions:", 1)[0]
+    names = []
+    for line in body.splitlines():
+        if line.startswith("  ") and not line.startswith("   "):
+            parts = line.split()
+            if parts:
+                names.append(parts[0])
+    return names
+
+
 def verify_flag_surface(led: Ledger) -> None:
     """Every flag of every command in the chain is carried, or excused by name."""
     led.phase("blessed flow · flag surface (derived from the CLI, not from a list)")
@@ -1427,7 +1448,33 @@ def verify_flag_surface(led: Ledger) -> None:
     carried = {f for fl in cov.values() for f in fl}
     # `-c`, `-o` and load's two are carried by the executor rather than declared.
     carried |= {"--config", "--output", "--rivet-bin", "--run-id", "--prefix", "--date"}
-    for cmd in ("plan", "apply", "run", "validate", "check", "load", "doctor", "init"):
+    # The chain, DERIVED from what the cells actually run — not a literal tuple.
+    # It used to be eight names written out here while the CLI declares sixteen
+    # subcommands, in a function whose docstring says "derived from the CLI, not
+    # from a list": the FLAGS were derived, the COMMANDS were not, and nothing
+    # could notice the two drifting apart. The command with the most untested
+    # surface, `cdc` (13 flags, including `--stream`, which disables the
+    # until_current bound this repo documents as load-bearing on PG and Mongo),
+    # was one of the eight missing (audit 2026-08-17).
+    chain = sorted(cov)
+    assert chain, "no cell declares any flags — the flag surface would grade nothing"
+
+    # And the OTHER half of the omission, now a visible row instead of silence:
+    # subcommands rivet ships that this chain never runs. Not a failure — the
+    # blessed flow's subject is the chain — but not invisible either.
+    declared = _declared_subcommands()
+    outside = [c for c in declared if c not in cov and c != "help"]
+    if outside:
+        ungraded = {c: len(_cli_flags(c)) for c in outside}
+        led.skipped(
+            "-", "flow", "flow:flags", "outside-chain",
+            "flag surface · these subcommands are OUTSIDE the blessed flow, so none of "
+            "their flags is graded here: "
+            + ", ".join(f"{c}({n})" for c, n in sorted(ungraded.items())),
+            ",".join(outside),
+        )
+
+    for cmd in chain:
         real = _cli_flags(cmd)
         if not real:
             led.failed("-", "flow", "flow:flags", cmd,

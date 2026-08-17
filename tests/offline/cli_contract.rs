@@ -43,27 +43,76 @@ fn run(args: &[&str]) -> (i32, String, String) {
 
 // ─── --help / --version shape ────────────────────────────────
 
+/// Every variant of `Commands`, lowercased — clap's default rename for a
+/// subcommand name, and this enum declares no `command(name = ..)` override.
+///
+/// DERIVED, not typed. The list used to be eleven names written out by hand
+/// while `Commands` had sixteen variants: `cdc`, `load`, `validate`, `schema`
+/// and `journal` were missing, in a test called
+/// `root_help_lists_every_top_level_subcommand` inside a file called
+/// `cli_contract.rs`. A hand-written dimension cannot notice its own omission —
+/// the defect this repo has now paid for in five separate places (audit
+/// 2026-08-17).
+fn declared_subcommands() -> Vec<String> {
+    let src = include_str!("../../src/cli/args.rs");
+    let start = src
+        .find("pub enum Commands {")
+        .expect("src/cli/args.rs must declare `pub enum Commands`");
+    let body = &src[start..];
+    let end = body.find("\n}").expect("the enum must close");
+    let mut out = Vec::new();
+    for line in body[..end].lines().skip(1) {
+        let t = line.trim();
+        // Variants sit at one indent level and start with an uppercase letter;
+        // attributes, doc comments and nested field lines do not.
+        if line.starts_with("    ")
+            && !line.starts_with("     ")
+            && t.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+        {
+            let name: String = t
+                .chars()
+                .take_while(|c| c.is_alphanumeric())
+                .collect::<String>()
+                .to_lowercase();
+            if !name.is_empty() {
+                out.push(name);
+            }
+        }
+    }
+    assert!(
+        out.len() >= 12,
+        "parsed only {} subcommand(s) from `Commands` — the parser lost the enum, \
+         and an empty dimension is exactly the failure this derivation replaces: {out:?}",
+        out.len()
+    );
+    out
+}
+
 #[test]
 fn root_help_lists_every_top_level_subcommand() {
     let (code, stdout, _stderr) = run(&["--help"]);
     assert_eq!(code, 0, "`rivet --help` must exit 0");
 
-    for sub in [
-        "run",
-        "check",
-        "doctor",
-        "state",
-        "plan",
-        "apply",
-        "repair",
-        "reconcile",
-        "metrics",
-        "init",
-        "completions",
-    ] {
+    // The `Commands:` block only — `stdout.contains("run")` also matches prose
+    // ("Run export jobs…", "run `doctor` first"), so the old check passed for
+    // names that were never listed.
+    let block = stdout
+        .split("Commands:")
+        .nth(1)
+        .and_then(|s| s.split("\nOptions:").next())
+        .expect("`rivet --help` must have a Commands: block");
+    let listed: Vec<&str> = block
+        .lines()
+        .filter_map(|l| l.strip_prefix("  "))
+        .filter(|l| !l.starts_with(' '))
+        .filter_map(|l| l.split_whitespace().next())
+        .collect();
+
+    for sub in declared_subcommands() {
         assert!(
-            stdout.contains(sub),
-            "root --help must mention subcommand '{sub}'; got:\n{stdout}"
+            listed.contains(&sub.as_str()),
+            "`Commands` declares `{sub}` but root --help does not LIST it \
+             (listed: {listed:?})"
         );
     }
 }
