@@ -815,27 +815,31 @@ fn mssql_adaptive_never_loses_to_its_own_baseline_on_an_idle_source() {
     const ROWS: i64 = 40_000;
     let table = seed_mssql_governor_numeric_table(ROWS);
     // ...and the OTHER half of "idle", which the dedicated instance did NOT fix:
-    // this fixture's own seed. It failed again on main at 07:40 with the
-    // dedicated container up (job 95318036698), and the shed pattern names the
-    // cause — parallelism dropped ONE SECOND into the adaptive run and recovered
-    // immediately after ("source pressure rising" → "source pressure eased"),
-    // which is SQL Server's automatic CHECKPOINT flushing the 40k-row seed on a
-    // slower disk, not a busy server. (The sibling that deliberately creates
-    // flush pressure did not overlap: it finished at 07:51:11, this test at
-    // 07:51:05 — `quiet_window_guard` held.) Force that deferred work to happen
-    // NOW and wait for the counter to go flat, so the run measures the run.
+    // this fixture's own seed: SQL Server's automatic CHECKPOINT can flush a 40k-row
+    // seed well after the INSERTs return, landing inside the graded run. Forcing it
+    // here and waiting for the counter to go flat means the run measures the run.
+    //
+    // Honest scope: this was NOT what turned CI red. The bracket below measured +4
+    // flush waits on the 11:00 failure — genuinely idle — so the shed came from the
+    // governor's documented `cur > prev` rule, not from the seed. The CHECKPOINT
+    // stays because removing the fixture's own deferred work is right regardless;
+    // the ASSERTION, not the fixture, was the actual defect.
     mssql_governor_exec("CHECKPOINT");
     wait_for_quiet_mssql_governor_log();
+    // Declared once and rendered INTO the config, so the assertion below cannot
+    // drift from the run it grades — the hand-typed-dimension trap, in miniature.
+    const MIN_PARALLEL: usize = 1;
+    const CEILING: usize = 4;
     let run = |adaptive: bool| -> (f64, String) {
         let rig = Rig::mssql_governor_batch(table.name())
             .mode("chunked")
             .source_line("tuning:")
             .source_line(&format!("  adaptive: {adaptive}"))
-            .source_line("  min_parallel: 1")
+            .source_line(&format!("  min_parallel: {MIN_PARALLEL}"))
             .source_line("  batch_size: 500")
             .export_line("chunk_column: id")
             .export_line("chunk_size: 5000")
-            .export_line("parallel: 4");
+            .export_line(&format!("parallel: {CEILING}"));
         let started = std::time::Instant::now();
         let out = rig.run_with_envs(&[("RUST_LOG", "info"), ("RIVET_GOVERNOR_INTERVAL_MS", "200")]);
         let wall = started.elapsed().as_secs_f64();
@@ -863,31 +867,128 @@ fn mssql_adaptive_never_loses_to_its_own_baseline_on_an_idle_source() {
     let (wall_on, stderr_on) = run(true);
     let flush_waits = mssql_governor_query_i64(FLUSH_WAITS) - waits_before;
     assert_governor_awake(&stderr_on, "mssql");
+    // What an idle source must NOT produce is a shed that STAYS — not a shed.
+    //
+    // This assertion was `!stderr.contains("backed off")` and failed twice on CI
+    // (07:40, 11:00) against a genuinely quiet server: the bracket below measured
+    // +4 log flush waits across the whole graded run, then one 4→3 dip and an
+    // immediate 3→4 recovery. That is not a defect, it is the DOCUMENTED policy
+    // (`GovernorState::observe`): `under_pressure` is `cur > prev`, so on a
+    // fine-grained cumulative counter any incidental server movement sheds one
+    // worker and the next flat sample puts it straight back. Those docs also
+    // record why hysteresis was REJECTED — #229 was a shed that would not come
+    // back (4→3→2→1 read off the governor's own extraction, 1h48m lost on a field
+    // pool run), and a sticky policy makes every engine's false positive more
+    // expensive to buy protection on one.
+    //
+    // So the strict form asserted against the design, and only MSSQL noticed:
+    // its signal is the fine-grained one. PG's `checkpoints_req` genuinely should
+    // not move on an idle box, which is why its twin keeps the stricter form.
+    // What this test is FOR is the #229 shape — a descent that never recovers.
+    let levels = governor_transitions(&stderr_on);
+    let sheds = levels.iter().filter(|(f, t)| t < f).count();
+    let recoveries = levels.iter().filter(|(f, t)| t > f).count();
+    let lowest = levels.iter().map(|(_, t)| *t).min().unwrap_or(CEILING);
     // A quiet stand measures a delta of 1 across a read-only run (2026-08-14);
-    // the sibling pressure test needs THOUSANDS to shed. Anything past this
-    // floor means the source genuinely was not idle.
+    // the sibling pressure test needs THOUSANDS to shed. Past this the source was
+    // not idle at all, and the FIXTURE is what broke, not the product.
     const IDLE_CEILING: i64 = 50;
     assert!(
-        !stderr_on.contains("backed off"),
-        "{}",
-        if flush_waits > IDLE_CEILING {
-            format!(
-                "FIXTURE, not product: the source was NOT idle during the graded run \
-                 (+{flush_waits} log flush waits, ceiling {IDLE_CEILING}) — the governor \
-                 shed for real pressure and was RIGHT. Something is still writing to \
-                 :1435, or the seed's deferred work outlived the CHECKPOINT above.\n{stderr_on}"
-            )
-        } else {
-            format!(
-                "idle source (+{flush_waits} log flush waits, genuinely quiet): the MSSQL \
-                 governor has nothing to shed for; stderr:\n{stderr_on}"
-            )
-        }
+        flush_waits <= IDLE_CEILING,
+        "FIXTURE, not product: the source was NOT idle during the graded run \
+         (+{flush_waits} log flush waits, ceiling {IDLE_CEILING}) — the governor shed for \
+         real pressure and was RIGHT. Something is still writing to :1435.\n{stderr_on}"
+    );
+    assert!(
+        !shed_never_recovered(&levels, MIN_PARALLEL, CEILING),
+        "idle source (+{flush_waits} log flush waits, genuinely quiet): the MSSQL governor \
+         shed {sheds} time(s) against {recoveries} recovery/ies, reaching parallelism {lowest} \
+         (ceiling {CEILING}, floor {MIN_PARALLEL}) — a shed that does not come back is #229, \
+         the regression this governor was rewritten for. One transient dip is the documented \
+         steady state and is allowed; this is not one.\nstderr:\n{stderr_on}"
     );
     assert!(
         wall_on <= wall_off * 1.6 + 1.0,
         "adaptive must not lose to its own baseline: on={wall_on:.2}s off={wall_off:.2}s"
     );
+}
+
+// ─── The idle-canary verdict, as pure functions with an independent oracle ────
+//
+// A live run on a quiet server can legitimately produce ZERO transitions, so the
+// canary's own assertion is vacuous exactly when the source behaves. Splitting
+// the parse and the verdict out means the grading logic is provable against
+// hand-written logs — the #229 walk must be REFUSED and the documented dip
+// ALLOWED — instead of resting on a live run that may never exercise either.
+// These two `#[test]`s are deliberately NOT `#[ignore]`: `cargo test
+// --all-targets` (ci.yml) runs them with no database in sight.
+
+/// Parse `governor parallelism A → B` transitions out of a run's stderr.
+fn governor_transitions(stderr: &str) -> Vec<(usize, usize)> {
+    stderr
+        .lines()
+        .filter_map(|l| l.split_once("governor parallelism ")?.1.split_once(" → "))
+        .filter_map(|(from, rest)| {
+            let to = rest.split_whitespace().next()?;
+            Some((from.trim().parse().ok()?, to.parse().ok()?))
+        })
+        .collect()
+}
+
+/// The #229 shape: sheds that outnumber recoveries by more than the one
+/// transient dip the policy documents, or a descent that reaches the floor.
+fn shed_never_recovered(levels: &[(usize, usize)], floor: usize, ceiling: usize) -> bool {
+    let sheds = levels.iter().filter(|(f, t)| t < f).count();
+    let recoveries = levels.iter().filter(|(f, t)| t > f).count();
+    let lowest = levels.iter().map(|(_, t)| *t).min().unwrap_or(ceiling);
+    sheds > recoveries + 1 || lowest <= floor
+}
+
+#[test]
+fn the_idle_canary_refuses_the_229_walk_and_allows_the_documented_dip() {
+    let line = |from: usize, to: usize, why: &str| {
+        format!(
+            "[2026-08-17T11:14:05Z WARN rivet::pipeline::governor] export 'e': governor parallelism {from} → {to} ({why})"
+        )
+    };
+    // #229: the shed that would not come back — 4→3→2→1, no recovery.
+    let walk = [
+        line(4, 3, "source pressure rising: backed off"),
+        line(3, 2, "source pressure rising: backed off"),
+        line(2, 1, "source pressure rising: backed off"),
+    ]
+    .join("\n");
+    let levels = governor_transitions(&walk);
+    assert_eq!(
+        levels,
+        vec![(4, 3), (3, 2), (2, 1)],
+        "the parse must not be inert"
+    );
+    assert!(
+        shed_never_recovered(&levels, 1, 4),
+        "a descent to the floor with no recovery is exactly the regression this canary is for"
+    );
+
+    // The documented steady state: one dip, immediately undone.
+    let dip = [
+        line(4, 3, "source pressure rising: backed off"),
+        line(3, 4, "source pressure eased: recovered"),
+    ]
+    .join("\n");
+    let levels = governor_transitions(&dip);
+    assert_eq!(levels, vec![(4, 3), (3, 4)]);
+    assert!(
+        !shed_never_recovered(&levels, 1, 4),
+        "`cur > prev` on a fine-grained counter DOCUMENTS this dip — failing it \
+         asserts against the design, which is what turned CI red twice"
+    );
+
+    // And a quiet run: no transitions at all is healthy, not a failure.
+    assert!(!shed_never_recovered(
+        &governor_transitions("nothing here"),
+        1,
+        4
+    ));
 }
 
 /// The governor's PG **17+** sampler arm, against a real modern catalog.
