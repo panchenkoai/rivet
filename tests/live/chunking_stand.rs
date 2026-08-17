@@ -620,14 +620,61 @@ fn stand_keyset_decimal_key_bails_mssql() {
 /// Seed a DENSE contiguous integer-PK table (`id` = 1..rows), the well-behaved
 /// shape for range chunking / chunk_count.
 fn seed_dense(eng: Eng, rows: i64) -> (String, StandCleanup) {
+    seed_dense_wide(eng, rows, 0)
+}
+
+/// The dense fixture the `apply --pool --split` tests need.
+///
+/// 200 bytes a row, so the giant's export is dominated by BYTES WRITTEN rather
+/// than by how fast the machine gets through 300k narrow ints. That is what
+/// makes `pool::advise_split`'s R=3.0 threshold clear on a fast runner as well
+/// as a slow laptop — see [`seed_dense_wide`] for the measurements that forced
+/// it. The width is the only thing that changes: the id space, `dense_ids`, the
+/// grow ranges and every caller stay exactly as they were.
+fn seed_dense_wide_for_split(eng: Eng, rows: i64) -> (String, StandCleanup) {
+    seed_dense_wide(eng, rows, 200)
+}
+
+/// `seed_dense` with a `pad` column of `pad_bytes` characters.
+///
+/// The split fixtures need it. `pool::advise_split` declines unless the giant
+/// beats the next-longest by more than R=3.0 on PREDICTED SECONDS, and the
+/// sibling — 100 rows — costs whatever a connect + plan + tiny write costs on
+/// that machine, a FIXED floor that does not shrink with the fixture. Measured
+/// on CI 2026-08-17: the giant did 300k narrow rows in 601 ms while the sibling
+/// took 201-403 ms, so the ratio landed at 1.52-2.99 against a threshold of 3.0
+/// and `--split` produced no units at all. Locally the same fixture reads 15x,
+/// because the local giant takes 3.3 s — the ratio was measuring the machine.
+///
+/// Widening the ROW rather than adding rows is deliberate: export time is
+/// dominated by bytes written, so this buys the giant seconds without touching
+/// `dense_ids(300_000)`, the grow ranges, or anything else every caller passes,
+/// and the seed stays one bulk INSERT.
+fn seed_dense_wide(eng: Eng, rows: i64, pad_bytes: usize) -> (String, StandCleanup) {
     let table = unique_name("stand_dense");
     let guard = StandCleanup(eng, table.clone());
+    let (pad_col, pad_val_pg, pad_val_my, pad_val_ms) = if pad_bytes == 0 {
+        (String::new(), String::new(), String::new(), String::new())
+    } else {
+        (
+            format!(
+                // NULLable on purpose: `insert_dense_range` (the GROW step) inserts
+                // (id, payload) only, and the width is needed just for the PRIMING
+                // run, whose durations set the split ratio — the grow happens after.
+                ", pad VARCHAR({pad_bytes})"
+            ),
+            format!(", repeat('x', {pad_bytes})"),
+            format!(", REPEAT('x', {pad_bytes})"),
+            format!(", REPLICATE('x', {pad_bytes})"),
+        )
+    };
+    let cols = if pad_bytes == 0 { "" } else { ", pad" };
     match eng {
         Eng::Pg => {
             let mut c = pg_connect();
             c.batch_execute(&format!(
-                "CREATE TABLE {table} (id BIGINT PRIMARY KEY, payload INT NOT NULL);
-                 INSERT INTO {table} (id, payload) SELECT g, g FROM generate_series(1, {rows}) g;
+                "CREATE TABLE {table} (id BIGINT PRIMARY KEY, payload INT NOT NULL{pad_col});
+                 INSERT INTO {table} (id, payload{cols}) SELECT g, g{pad_val_pg} FROM generate_series(1, {rows}) g;
                  ANALYZE {table};"
             ))
             .unwrap();
@@ -635,7 +682,7 @@ fn seed_dense(eng: Eng, rows: i64) -> (String, StandCleanup) {
         Eng::My => {
             let mut c = mysql_connect();
             c.query_drop(format!(
-                "CREATE TABLE {table} (id BIGINT PRIMARY KEY, payload INT NOT NULL)"
+                "CREATE TABLE {table} (id BIGINT PRIMARY KEY, payload INT NOT NULL{pad_col})"
             ))
             .unwrap();
             c.query_drop(format!(
@@ -644,19 +691,19 @@ fn seed_dense(eng: Eng, rows: i64) -> (String, StandCleanup) {
             ))
             .unwrap();
             c.query_drop(format!(
-                "INSERT INTO {table} (id, payload) \
+                "INSERT INTO {table} (id, payload{cols}) \
                  WITH RECURSIVE seq AS (SELECT 1 n UNION ALL SELECT n+1 FROM seq WHERE n < {rows}) \
-                 SELECT n, n FROM seq"
+                 SELECT n, n{pad_val_my} FROM seq"
             ))
             .unwrap();
         }
         Eng::Ms => {
             mssql_exec(&format!(
-                "CREATE TABLE {table} (id BIGINT PRIMARY KEY, payload INT NOT NULL)"
+                "CREATE TABLE {table} (id BIGINT PRIMARY KEY, payload INT NOT NULL{pad_col})"
             ));
             mssql_exec(&format!(
-                "INSERT INTO {table} (id, payload) \
-                 SELECT value, value FROM GENERATE_SERIES(CAST(1 AS BIGINT), CAST({rows} AS BIGINT))"
+                "INSERT INTO {table} (id, payload{cols}) \
+                 SELECT value, value{pad_val_ms} FROM GENERATE_SERIES(CAST(1 AS BIGINT), CAST({rows} AS BIGINT))"
             ));
             mssql_exec(&format!("UPDATE STATISTICS {table}"));
         }
@@ -2320,7 +2367,7 @@ fn dense_ids(n: i64) -> std::collections::BTreeSet<i64> {
 #[ignore = "live: requires docker compose up -d postgres"]
 fn stand_pool_split_resume_grows_postgres() {
     Eng::Pg.require();
-    let (table, _g) = seed_dense(Eng::Pg, 300_000);
+    let (table, _g) = seed_dense_wide_for_split(Eng::Pg, 300_000);
     run_pool_split_resume(
         Eng::Pg,
         &table,
@@ -2333,7 +2380,7 @@ fn stand_pool_split_resume_grows_postgres() {
 #[ignore = "live: requires docker compose up -d mysql"]
 fn stand_pool_split_resume_grows_mysql() {
     Eng::My.require();
-    let (table, _g) = seed_dense(Eng::My, 300_000);
+    let (table, _g) = seed_dense_wide_for_split(Eng::My, 300_000);
     run_pool_split_resume(
         Eng::My,
         &table,
@@ -2346,7 +2393,7 @@ fn stand_pool_split_resume_grows_mysql() {
 #[ignore = "live: requires docker compose up -d mssql"]
 fn stand_pool_split_resume_grows_mssql() {
     Eng::Ms.require();
-    let (table, _g) = seed_dense(Eng::Ms, 300_000);
+    let (table, _g) = seed_dense_wide_for_split(Eng::Ms, 300_000);
     run_pool_split_resume(
         Eng::Ms,
         &table,
@@ -2414,7 +2461,7 @@ fn stand_pool_split_gappy_key_mssql() {
 #[ignore = "live: requires docker compose up -d postgres"]
 fn stand_pool_split_keyset_recovers_a_crash_postgres() {
     Eng::Pg.require();
-    let (table, _g) = seed_dense(Eng::Pg, 300_000);
+    let (table, _g) = seed_dense_wide_for_split(Eng::Pg, 300_000);
     run_pool_split_resume_with(
         Eng::Pg,
         &table,
@@ -2429,7 +2476,7 @@ fn stand_pool_split_keyset_recovers_a_crash_postgres() {
 #[ignore = "live: requires docker compose up -d mysql"]
 fn stand_pool_split_keyset_recovers_a_crash_mysql() {
     Eng::My.require();
-    let (table, _g) = seed_dense(Eng::My, 300_000);
+    let (table, _g) = seed_dense_wide_for_split(Eng::My, 300_000);
     run_pool_split_resume_with(
         Eng::My,
         &table,
@@ -2444,7 +2491,7 @@ fn stand_pool_split_keyset_recovers_a_crash_mysql() {
 #[ignore = "live: requires docker compose up -d mssql"]
 fn stand_pool_split_keyset_recovers_a_crash_mssql() {
     Eng::Ms.require();
-    let (table, _g) = seed_dense(Eng::Ms, 300_000);
+    let (table, _g) = seed_dense_wide_for_split(Eng::Ms, 300_000);
     run_pool_split_resume_with(
         Eng::Ms,
         &table,
