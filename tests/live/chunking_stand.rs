@@ -703,9 +703,11 @@ fn seed_mysql_unsigned_key(rows: i64) -> (String, StandCleanup) {
 /// on a dense key. Assert the run succeeds and emits exactly N parquet parts.
 fn run_chunk_count(eng: Eng, n: usize) {
     eng.require();
-    let (table, _guard) = seed_dense(eng, 4000);
+    const ROWS: i64 = 4000;
+    let (table, _guard) = seed_dense(eng, ROWS);
     let rig = eng
         .rig(&table)
+        .duckdb_oracle()
         .mode("chunked")
         .export_line("chunk_column: id")
         .export_line(&format!("chunk_count: {n}"));
@@ -726,6 +728,17 @@ fn run_chunk_count(eng: Eng, n: usize) {
         "chunk_count: {n} must emit exactly {n} part files on a dense key; got {}: {files:?}",
         files.len()
     );
+    // The file COUNT is the shape; the ROWS are the point. `chunk_count` divides
+    // the key range into N windows, so the failure this knob can produce is a
+    // divisor that drops or double-covers a boundary — and that leaves the part
+    // count untouched. Until 2026-08-17 nothing anywhere in the tree read a row
+    // from a `chunk_count` export, on any engine (audit).
+    //
+    // DuckDB, not `count_parquet_rows`: the arrow helper decodes with the same
+    // crate rivet encodes with, so a fault in that shared path cancels out.
+    // Distinct-on-`id` is what separates the two failures — a lost window and a
+    // double-covered one can both leave the row total looking plausible.
+    rig.assert_complete("id", ROWS, "chunk_count over a dense key");
 }
 
 /// Seed a table keyed by a DATE column `d` spanning `days` distinct days
@@ -793,9 +806,11 @@ fn seed_dated(eng: Eng, rows: i64, days: i64, recent: bool) -> (String, StandCle
 /// the run succeeds and emits exactly 5 parts on every engine.
 fn run_chunk_by_days(eng: Eng) {
     eng.require();
-    let (table, _guard) = seed_dated(eng, 350, 35, false);
+    const ROWS: i64 = 350;
+    let (table, _guard) = seed_dated(eng, ROWS, 35, false);
     let rig = eng
         .rig(&table)
+        .duckdb_oracle()
         .mode("chunked")
         .export_line("chunk_column: d")
         .export_line("chunk_by_days: 7");
@@ -816,6 +831,15 @@ fn run_chunk_by_days(eng: Eng) {
         "chunk_by_days: 7 over a 35-day span must emit 5 weekly parts; got {}: {files:?}",
         files.len()
     );
+    // Five files is the shape; the rows are the point. Date windows are the
+    // likeliest place in the tree for an off-by-one — an inclusive/exclusive
+    // slip at a week boundary loses a day's rows or emits them twice, and both
+    // leave FIVE parts sitting there looking correct. Until 2026-08-17 no test
+    // on any engine read a row out of a `chunk_by_days` export (audit).
+    //
+    // Distinct-on-`id` separates the two: a dropped boundary day shows up in the
+    // row total, a double-covered one only in the distinct count.
+    rig.assert_complete("id", ROWS, "chunk_by_days over a 35-day span");
 }
 
 /// `mode: time_window` — a bounded date scan (`time_column` + `days_window`)
@@ -1191,6 +1215,18 @@ fn stand_chunked_nondefault_schema_probe_degrades_and_exports_all_postgres() {
         40,
         "all 40 rows must export via the degrade fast-path"
     );
+}
+
+/// PostgreSQL was the one engine with no `chunk_count` EXPORT at all. The
+/// chunking matrix pointed its `chunk_count_n x postgres` cell at
+/// `roast_small_table_escape_respects_explicit_chunk_count`, which runs `rivet
+/// plan` and asserts the resolved strategy — planning, not data. So the knob's
+/// row-level behaviour was unproven on PG in both directions: no export ran, and
+/// the cell read `test` (audit 2026-08-17).
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn stand_chunk_count_postgres() {
+    run_chunk_count(Eng::Pg, 4);
 }
 
 #[test]
