@@ -135,6 +135,211 @@ fn keyset_export_records_form_b_checksums_and_validate_passes() {
     );
 }
 
+/// The NEGATIVE control Form B never had on the batch path.
+///
+/// Every batch Form B test until now proved the POSITIVE direction: the manifest
+/// records checksums and a clean `validate` passes. That leaves the question the
+/// mechanism exists to answer unasked — would a corrupted part be DETECTED? CDC
+/// has its negative control (`live_cdc_mbt.rs` tampers the recorded sum); batch
+/// had none, on any runner (audit 2026-08-17).
+///
+/// The tamper is on the DATA, not on the manifest, and deliberately so. Editing
+/// the recorded checksum proves `validate` compares two numbers; corrupting the
+/// PART proves it detects the thing an operator actually fears. It is also the
+/// harder case to pass: the rewritten file must stay a VALID parquet with the
+/// SAME row count, or `validate` fails for a second reason and the test would be
+/// measuring the corruption's clumsiness rather than Form B — the exact
+/// "fails-for-another-reason" shape this session found in three other places.
+/// Both of those are asserted before the verdict is read.
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn a_corrupted_part_fails_validate_on_the_value_checksum() {
+    use arrow::array::{Int64Array, RecordBatch};
+    use parquet::arrow::ArrowWriter;
+
+    require_alive(LiveService::Postgres);
+    let table = seed_pg_numeric_table(500);
+    let out = tempfile::tempdir().unwrap();
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let yaml = Rig::pg_batch(table.name())
+        .mode("chunked")
+        .export_line("chunk_by_key: id")
+        .export_line("chunk_size: 200")
+        .dest_path(out.path().to_path_buf())
+        .yaml();
+    let cfg = write_config(&cfg_dir, &yaml);
+    let r = run_rivet_env(&["run", "--config", cfg.to_str().unwrap()], &[]);
+    assert!(
+        r.status.success(),
+        "the export must succeed before anything is corrupted; stderr:\n{}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+
+    // The mechanism must be ARMED: no recorded checksums, nothing to detect
+    // with, and the tamper below would prove nothing.
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(out.path().join("manifest.json")).expect("manifest.json"),
+    )
+    .expect("parse manifest");
+    assert!(
+        manifest["column_checksums"]
+            .as_array()
+            .is_some_and(|a| !a.is_empty()),
+        "Form B must be recorded or this test grades nothing: {}",
+        manifest["column_checksums"]
+    );
+    let clean = std::process::Command::new(RIVET_BIN)
+        .args([
+            "validate",
+            "--config",
+            cfg.to_str().unwrap(),
+            "--export",
+            table.name(),
+        ])
+        .output()
+        .expect("spawn validate");
+    assert!(
+        clean.status.success(),
+        "validate must PASS before the tamper, or the failure after it means nothing"
+    );
+
+    // Rewrite one part with a single `amount`… no: `id` is the keyed column, so
+    // change a NON-key value column. One cell, same schema, same row count.
+    let part = files_with_extension(out.path(), "parquet")
+        .into_iter()
+        .next()
+        .expect("at least one part");
+    let before = std::fs::read(&part).unwrap();
+    let batches: Vec<RecordBatch> = {
+        let f = std::fs::File::open(&part).unwrap();
+        ParquetRecordBatchReaderBuilder::try_new(f)
+            .unwrap()
+            .build()
+            .unwrap()
+            .map(|b| b.unwrap())
+            .collect()
+    };
+    let rows_before: usize = batches.iter().map(|b| b.num_rows()).sum();
+    let schema = batches[0].schema();
+    let idx = schema
+        .index_of("id")
+        .expect("the fixture's keyed column is `id`");
+    let tampered: Vec<RecordBatch> = batches
+        .iter()
+        .enumerate()
+        .map(|(bi, b)| {
+            if bi != 0 {
+                return b.clone();
+            }
+            let col = b
+                .column(idx)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("id is Int64");
+            // +1 on ONE cell: the row count, the schema and every other column
+            // are untouched, so only a VALUE oracle can see it.
+            let mut v: Vec<i64> = col.iter().map(|x| x.unwrap_or(0)).collect();
+            v[0] += 1;
+            let mut cols = b.columns().to_vec();
+            cols[idx] = std::sync::Arc::new(Int64Array::from(v));
+            RecordBatch::try_new(b.schema(), cols).unwrap()
+        })
+        .collect();
+    {
+        let f = std::fs::File::create(&part).unwrap();
+        let mut w = ArrowWriter::try_new(f, schema.clone(), None).unwrap();
+        for b in &tampered {
+            w.write(b).unwrap();
+        }
+        w.close().unwrap();
+    }
+
+    // Re-encoding changes the FILE SIZE, and validate checks size first: the
+    // first run of this test failed on
+    // `[RIVET_VERIFY_PART_SIZE_MISMATCH] manifest 4371, dest 9813` and never
+    // reached the value leg — the "fails for another reason" trap, on my own
+    // test. Patching the recorded size is not cheating, it is the POINT: Form B
+    // exists for corruption the size and count checks cannot see, so isolating
+    // it means neutralising the gates that would fire first. (Locally only size
+    // applies — validate reports "0 md5, 1 size-only" for a local destination.)
+    let part_name = part.file_name().unwrap().to_string_lossy().into_owned();
+    let new_size = std::fs::metadata(&part).unwrap().len();
+    let mpath = out.path().join("manifest.json");
+    let mut m: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&mpath).unwrap()).unwrap();
+    let mut patched = false;
+    for p in m["parts"].as_array_mut().expect("parts array") {
+        if p["path"].as_str().is_some_and(|x| x.ends_with(&part_name)) {
+            p["size_bytes"] = serde_json::json!(new_size);
+            patched = true;
+        }
+    }
+    assert!(patched, "the tampered part must be named in the manifest");
+    let manifest_bytes = serde_json::to_string_pretty(&m).unwrap().into_bytes();
+    std::fs::write(&mpath, &manifest_bytes).unwrap();
+    // `_SUCCESS` carries a fingerprint OF THE MANIFEST BYTES, so editing the
+    // manifest staled it and validate stopped there instead
+    // (`[RIVET_VERIFY_SUCCESS_STALE]`). Re-stamped with the product's own
+    // helper. That is three gates now standing between crude corruption and the
+    // value leg — size, marker freshness, and (on a store that surfaces one)
+    // md5. Each had to be satisfied to ask the question Form B answers, which is
+    // worth knowing on its own: the value checksum is the LAST line, not the
+    // first, and everything ahead of it works.
+    std::fs::write(
+        out.path().join("_SUCCESS"),
+        rivet::manifest::success_marker_body(&manifest_bytes),
+    )
+    .unwrap();
+
+    // NON-INERTNESS, both halves: the file changed, and it is still a readable
+    // parquet with the same row count. Without these two, a `validate` failure
+    // below could be a parse error or a count mismatch wearing Form B's clothes.
+    assert_ne!(
+        before,
+        std::fs::read(&part).unwrap(),
+        "the tamper must actually change the file"
+    );
+    let rows_after: usize = {
+        let f = std::fs::File::open(&part).unwrap();
+        ParquetRecordBatchReaderBuilder::try_new(f)
+            .unwrap()
+            .build()
+            .unwrap()
+            .map(|b| b.unwrap().num_rows())
+            .sum()
+    };
+    assert_eq!(
+        rows_before, rows_after,
+        "the corrupted part must still hold the SAME number of rows — otherwise \
+         validate can fail on the count and Form B is never exercised"
+    );
+
+    let bad = std::process::Command::new(RIVET_BIN)
+        .args([
+            "validate",
+            "--config",
+            cfg.to_str().unwrap(),
+            "--export",
+            table.name(),
+        ])
+        .output()
+        .expect("spawn validate");
+    let err = format!(
+        "{}{}",
+        String::from_utf8_lossy(&bad.stdout),
+        String::from_utf8_lossy(&bad.stderr)
+    );
+    assert!(
+        !bad.status.success(),
+        "a part whose VALUES were altered must fail validate — this is the whole \
+         point of recording per-column checksums; got:\n{err}"
+    );
+    assert!(
+        err.to_lowercase().contains("checksum") || err.contains("VALUE_CHECKSUM"),
+        "and it must fail on the VALUE leg, not incidentally: {err}"
+    );
+}
+
 /// v18 failure-forensics on the KEYSET runner: a keyset export must persist the
 /// self-sufficient debug columns on its `export_metrics` row + a schema-at-open
 /// `export_schema` row, so a keyset FAILURE is legible WITHOUT re-querying the
