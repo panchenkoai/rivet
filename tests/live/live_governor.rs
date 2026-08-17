@@ -802,13 +802,20 @@ fn pg_adaptive_never_loses_to_its_own_baseline_on_an_idle_source() {
 #[test]
 #[ignore = "live: requires docker-compose mssql"]
 fn mssql_adaptive_never_loses_to_its_own_baseline_on_an_idle_source() {
-    require_alive(LiveService::Mssql);
+    // The GOVERNOR instance, not the shared `mssql`. "Idle" is the whole
+    // assertion, and on :1433 it was never a property of this fixture — 72 of
+    // the 74 SQL Server live tests do not take the quiet-window lock, and
+    // `Log Flush Waits/sec` is read with the `_Total` instance, i.e. server-wide.
+    // Reproduced 2026-08-16: alone it passes in 12.98s; under a concurrent
+    // commit driver it fails with CI's exact message and shed pattern
+    // (4 -> 3 -> 2 -> 1). The governor was RIGHT both times; the fixture was not.
+    require_alive(LiveService::MssqlGovernor);
     // Quiet window: the no-shed and ratio gates need no sibling pressure/CPU.
     let _quiet = quiet_window_guard();
     const ROWS: i64 = 40_000;
-    let table = seed_mssql_numeric_table(ROWS);
+    let table = seed_mssql_governor_numeric_table(ROWS);
     let run = |adaptive: bool| -> (f64, String) {
-        let rig = Rig::mssql_batch(table.name())
+        let rig = Rig::mssql_governor_batch(table.name())
             .mode("chunked")
             .source_line("tuning:")
             .source_line(&format!("  adaptive: {adaptive}"))
@@ -1330,7 +1337,11 @@ fn governor_pressure_fixtures_are_reaped_by_a_panicking_run() {
 #[test]
 #[ignore = "live: requires docker compose mssql"]
 fn mssql_governor_backs_off_under_real_log_flush_pressure() {
-    require_alive(LiveService::Mssql);
+    // Same dedicated instance, opposite direction: this one needs its OWN
+    // writer to be the thing moving the counter. On the shared server it failed
+    // by going inert — "committed 3 40-transaction batches (needs >= 5)" — a
+    // loaded runner starving the fixture rather than the product misbehaving.
+    require_alive(LiveService::MssqlGovernor);
     let _quiet = quiet_window_guard();
 
     // The exact counter `MssqlSource::sample_governor_pressure` reads — the
@@ -1341,9 +1352,9 @@ fn mssql_governor_backs_off_under_real_log_flush_pressure() {
                                AND instance_name = '_Total'";
 
     const ROWS: i64 = 20_000;
-    let table = seed_mssql_numeric_table(ROWS);
+    let table = seed_mssql_governor_numeric_table(ROWS);
     let scratch = format!("{}_flush", table.name());
-    mssql_exec(&format!(
+    mssql_governor_exec(&format!(
         "IF OBJECT_ID('dbo.{scratch}') IS NOT NULL DROP TABLE dbo.{scratch}; \
          CREATE TABLE dbo.{scratch} (id INT IDENTITY PRIMARY KEY, payload VARBINARY(MAX))"
     ));
@@ -1370,7 +1381,7 @@ fn mssql_governor_backs_off_under_real_log_flush_pressure() {
             while !stop.load(Ordering::Relaxed) {
                 // 40 committed transactions per batch keeps the round-trip
                 // count low while the commit RATE stays high.
-                if mssql_try_exec(&format!(
+                if mssql_governor_try_exec(&format!(
                     "SET NOCOUNT ON; \
                      DECLARE @i INT = 0; \
                      WHILE @i < 40 \
@@ -1392,9 +1403,9 @@ fn mssql_governor_backs_off_under_real_log_flush_pressure() {
     // Let the writer drive the counter before rivet starts, so the governor's
     // first sample PAIR already spans rising pressure.
     std::thread::sleep(Duration::from_millis(500));
-    let waits_before = mssql_query_i64(FLUSH_WAITS);
+    let waits_before = mssql_governor_query_i64(FLUSH_WAITS);
 
-    let rig = Rig::mssql_batch(table.name())
+    let rig = Rig::mssql_governor_batch(table.name())
         .mode("chunked")
         .source_line("tuning:")
         .source_line("  adaptive: true")
@@ -1413,7 +1424,7 @@ fn mssql_governor_backs_off_under_real_log_flush_pressure() {
         Duration::from_secs(120),
     );
 
-    let waits_after = mssql_query_i64(FLUSH_WAITS);
+    let waits_after = mssql_governor_query_i64(FLUSH_WAITS);
     let writer_panicked = writer.reap();
     let batches = writer_batches.load(Ordering::Relaxed);
 
