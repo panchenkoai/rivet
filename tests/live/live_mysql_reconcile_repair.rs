@@ -80,6 +80,28 @@ fn mysql_reconcile_all_match_exits_zero_with_pretty_output() {
         100,
         "destination parquet must physically hold every source row, independent of the reconcile verdict"
     );
+
+    // The report must NAME its evidence. `exported` is `chunk_task.rows_written`
+    // — what rivet RECORDED per window, never a re-read of the parts — so
+    // "all partitions match" means the source agrees with rivet's own ledger.
+    // A chunk recorded at 500 rows whose file holds 400 reconciles clean, and
+    // the assertion above is the only thing in this test that would notice.
+    // Without this line an operator reads a clean reconcile as proof the files
+    // are right; the line is what makes the report honest about its own reach
+    // (audit 2026-08-17), so it is pinned rather than left to drift.
+    assert!(
+        stdout.contains("Evidence"),
+        "the reconcile report must name what it compared; got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("RECORDED") && stdout.contains("not a re-read"),
+        "the evidence line must say the right-hand number is rivet's own record, \
+         not a re-read of the parts — that distinction is the whole point; got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("rivet validate --depth full"),
+        "and must point at the check that DOES read the files; got:\n{stdout}"
+    );
 }
 
 // ─── RR2: reconcile --format json ────────────────────────────────────────────

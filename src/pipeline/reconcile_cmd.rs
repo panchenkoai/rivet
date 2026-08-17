@@ -281,6 +281,19 @@ fn print_report_pretty(report: &ReconcileReport) {
         report.summary.total_source_rows, report.summary.total_exported_rows,
     );
 
+    // Say what the right-hand number IS. `exported` is `chunk_task.rows_written`
+    // — the count rivet RECORDED for each window, not a re-read of the parts. So
+    // "all partitions match" means the source agrees with rivet's own ledger; a
+    // part that was recorded at 500 rows and holds 400 reconciles clean. Naming
+    // the evidence is the difference between a report and a reassurance, and it
+    // is the same rule the preflight already follows: a diagnostic must not
+    // claim more than it checked (audit 2026-08-17).
+    println!(
+        "  Evidence  : source COUNT(*) per window vs the per-chunk counts rivet \
+         RECORDED (state DB), not a re-read of the parts"
+    );
+    println!("              to check the files themselves: rivet validate --depth full");
+
     let repair = report.repair_candidates();
     if repair.is_empty() {
         println!("  Status    : all partitions match");
