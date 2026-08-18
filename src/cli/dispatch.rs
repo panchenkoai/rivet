@@ -1912,3 +1912,41 @@ mod init_tls_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod rivet_bin_tests {
+    use super::resolve_rivet_bin;
+
+    /// `rivet load` shells out to a rivet subprocess for the type report, and
+    /// WHICH binary that is decides whether the types it resolves match the
+    /// version doing the load. The default must therefore be THIS executable, not
+    /// the name `rivet` — a `rivet` on `$PATH` may be an older, skewed build, and
+    /// a type report from a skewed build is wrong in exactly the way nobody
+    /// checks: it still parses, still loads, and describes different columns.
+    ///
+    /// `--rivet-bin` had no test of any kind, and this is its whole contract:
+    /// honour an explicit path, and otherwise resolve to self rather than to a
+    /// bare name the shell would look up.
+    #[test]
+    fn rivet_bin_defaults_to_this_executable_never_a_path_lookup() {
+        let explicit = resolve_rivet_bin(Some("/opt/pinned/rivet".to_string()));
+        assert_eq!(
+            explicit, "/opt/pinned/rivet",
+            "an explicit --rivet-bin must be used verbatim — the flag exists to PIN a build"
+        );
+
+        let default = resolve_rivet_bin(None);
+        assert_ne!(
+            default, "rivet",
+            "the default must not be the bare name `rivet`: that is a $PATH lookup, and the \
+             binary it finds may be a different version than the one running the load"
+        );
+        let me = std::env::current_exe().expect("current_exe");
+        assert_eq!(
+            std::path::Path::new(&default),
+            me.as_path(),
+            "the default must be THIS executable, so the type-report subprocess resolves \
+             types with the same version as the load"
+        );
+    }
+}
