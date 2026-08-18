@@ -2569,21 +2569,22 @@ fn stand_pool_split_keyset_recovers_a_crash_mssql() {
 /// coverage, and the one where every silent-loss class this repo has paid for
 /// meets at once.
 ///
-/// Locally, `stand_pool_split_*` prove split+resume on a filesystem. On a bucket
-/// the same run has three extra ways to lose data, all of them already bitten
-/// here: split UNITS write into ONE shared prefix (part-name collision), each
-/// unit writes its own manifest SIDECAR to that prefix (the fixed
-/// `manifest.json` clobber that under-counted 30 parts as 55 rows), and the
-/// read-back is a different reader from the local one (the cloud oracle that
-/// counted every object under the prefix, orphans included, and read 2000 rows
-/// from a 1000-row table).
+/// Locally, `stand_pool_split_*` prove split (and split+resume) on a filesystem.
+/// On a bucket the same run has three extra ways to lose data, all already
+/// bitten here: split UNITS write into ONE shared prefix (part-name collision),
+/// each unit writes its own manifest SIDECAR there (the fixed-name clobber that
+/// under-counted 30 parts as 55 rows), and the read-back has historically been a
+/// DIFFERENT reader from the local one (the cloud oracle that counted every
+/// object under the prefix, orphans included, and read 2000 rows from 1000).
 ///
-/// So the oracle is deliberately NOT a cloud-specific one: the prefix is PULLED
-/// whole and graded by `dir_manifest_copy_id_set`, the identical function the
-/// local tests use. One definition of "what was delivered", not two that drift.
-#[test]
-#[ignore = "live: requires docker compose up -d postgres minio"]
-fn stand_pool_split_into_one_cloud_prefix_loses_nothing_postgres() {
+/// So the oracle is deliberately NOT cloud-specific: the prefix is PULLED whole
+/// and graded by `dir_manifest_copy_id_set`, the identical function the local
+/// tests use. One definition of "what was delivered", not two that drift.
+///
+/// `crash` injects a unit failure into run 1; the resume then has to reconstruct
+/// the original partition with run 1's ORPHAN parts already sitting in the
+/// bucket — unmanifested objects a prefix-wide reader would happily count.
+fn pool_split_cloud(crash: Option<(&str, &str)>) {
     Eng::Pg.require();
     require_alive(LiveService::Minio);
     const ROWS: i64 = 300_000;
@@ -2607,7 +2608,7 @@ fn stand_pool_split_into_one_cloud_prefix_loses_nothing_postgres() {
         .also_export_line("parallel_safe: true")
         .dest_s3(bucket, &prefix, MINIO_ENDPOINT);
     let cfg = rig.config_path();
-    let env = [
+    let creds = [
         ("RIVET_TEST_MINIO_AK", MINIO_ACCESS_KEY),
         ("RIVET_TEST_MINIO_SK", MINIO_SECRET_KEY),
         ("AWS_EC2_METADATA_DISABLED", "true"),
@@ -2615,20 +2616,20 @@ fn stand_pool_split_into_one_cloud_prefix_loses_nothing_postgres() {
 
     // Prime: `advise_split` predicts from RECORDED durations, so a first run must
     // exist before `--split` can decide anything.
-    let prime = run_rivet_env(&["apply", cfg.to_str().unwrap(), "--pool", "2"], &env);
+    let prime = run_rivet_env(&["apply", cfg.to_str().unwrap(), "--pool", "2"], &creds);
     assert!(
         prime.status.success(),
         "priming run failed:\n{}",
         String::from_utf8_lossy(&prime.stderr)
     );
-    let split = run_rivet_env(
+
+    let mut env: Vec<(&str, &str)> = creds.to_vec();
+    if let Some(c) = crash {
+        env.push(c);
+    }
+    let run1 = run_rivet_env(
         &["apply", cfg.to_str().unwrap(), "--pool", "2", "--split"],
         &env,
-    );
-    assert!(
-        split.status.success(),
-        "split run failed:\n{}",
-        String::from_utf8_lossy(&split.stderr)
     );
 
     // PRECONDITION, before any product assertion: `--split` is ADVISORY, and on a
@@ -2649,7 +2650,37 @@ fn stand_pool_split_into_one_cloud_prefix_loses_nothing_postgres() {
          writers into one prefix and the union below proves nothing about the class"
     );
 
-    // The union, graded by the LOCAL oracle over the pulled prefix.
+    if crash.is_some() {
+        assert!(
+            !run1.status.success(),
+            "run 1 must FAIL (a unit errored mid-split) — a green run here means the crash \
+             hook never fired and the resume below has nothing to reconstruct:\n{}",
+            String::from_utf8_lossy(&run1.stderr)
+        );
+        let resumed = run_rivet_env(
+            &[
+                "apply",
+                cfg.to_str().unwrap(),
+                "--pool",
+                "2",
+                "--split",
+                "--resume",
+            ],
+            &creds,
+        );
+        assert!(
+            resumed.status.success(),
+            "resume run must succeed:\n{}",
+            String::from_utf8_lossy(&resumed.stderr)
+        );
+    } else {
+        assert!(
+            run1.status.success(),
+            "split run failed:\n{}",
+            String::from_utf8_lossy(&run1.stderr)
+        );
+    }
+
     // The GIANT's sub-prefix only. The class under test is several split UNITS
     // writing into ONE export's prefix; the sibling export has its own prefix and
     // its own `_SUCCESS`, so pulling both would collide on marker names and grade
@@ -2662,21 +2693,100 @@ fn stand_pool_split_into_one_cloud_prefix_loses_nothing_postgres() {
         "nothing was pulled from s3://{bucket}/{giant_prefix} — the run reported success, so an \
          empty prefix means the destination wiring, not the data"
     );
+    // MEASURED, not assumed. This variant was written expecting the crashed run to
+    // leave ORPHANS — parts written before the unit died, named by no manifest —
+    // and the first run of the assertion disproved it: 9 parts pulled, all 9
+    // DECLARED, zero unmanifested. The resume re-declares what attempt 1 had
+    // already written rather than stranding it.
+    //
+    // So the check is inverted into the property that measurement found, because
+    // it is worth keeping: a resumed split must not leave unmanifested objects in
+    // a bucket. They cost storage forever, they are what `gc_orphans` then has to
+    // reason about, and a prefix-wide reader counts them as delivered rows.
+    if crash.is_some() {
+        let declared: std::collections::BTreeSet<String> =
+            files_with_extension(pulled.path(), "json")
+                .iter()
+                .filter(|p| {
+                    p.file_name()
+                        .map(|n| n.to_string_lossy().starts_with("manifest-"))
+                        .unwrap_or(false)
+                })
+                .filter_map(|p| std::fs::read(p).ok())
+                .filter_map(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+                .flat_map(|v| {
+                    v.get("parts")
+                        .and_then(serde_json::Value::as_array)
+                        .cloned()
+                        .unwrap_or_default()
+                })
+                .filter_map(|part| {
+                    part.get("path")
+                        .and_then(serde_json::Value::as_str)
+                        .map(|p| p.rsplit('/').next().unwrap_or(p).to_string())
+                })
+                .collect();
+        let parts = files_with_extension(pulled.path(), "parquet");
+        let orphans: Vec<String> = parts
+            .iter()
+            .map(|p| {
+                p.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .filter(|n| !declared.contains(n))
+            .collect();
+        assert!(
+            parts.len() >= 2 && !declared.is_empty(),
+            "fixture inert: {} part(s) pulled, {} declared — nothing to check",
+            parts.len(),
+            declared.len()
+        );
+        assert!(
+            orphans.is_empty(),
+            "the resumed split left {} unmanifested part(s) in the bucket (e.g. {:?}) — a \
+             crashed attempt's parts must be re-declared by the resume, not stranded: an \
+             orphan is billed forever and reads as delivered to any prefix-wide counter",
+            orphans.len(),
+            orphans.iter().take(3).collect::<Vec<_>>()
+        );
+    }
+
     let ids = dir_manifest_copy_id_set(pulled.path());
     // Report the SHAPE of the gap, never the sets: a 300k-element set printed on
-    // failure buries the one number a reader needs under a screen-fulls of ids.
+    // failure buries the one number a reader needs under screenfuls of ids.
     let expected = dense_ids(ROWS);
     let missing: Vec<i64> = expected.difference(&ids).take(5).copied().collect();
     let extra: Vec<i64> = ids.difference(&expected).take(5).copied().collect();
     assert!(
         ids == expected,
         "every source id must be DECLARED by a manifest copy in the cloud prefix: {} of \
-         {ROWS} present, {} object(s) pulled. First missing: {missing:?}; unexpected: \
+         {ROWS} present, {objects} object(s) pulled. First missing: {missing:?}; unexpected: \
          {extra:?}. A gap here is the split units overwriting each other's parts or each \
          other's manifest sidecar — the shapes that survive every row count because the \
          surviving artifacts stay self-consistent. (RED-proven: a non-run-unique manifest \
          copy name leaves 150001 of 300000.)",
-        ids.len(),
-        objects
+        ids.len()
     );
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d postgres minio"]
+fn stand_pool_split_into_one_cloud_prefix_loses_nothing_postgres() {
+    pool_split_cloud(None);
+}
+
+/// The same prefix, entered TWICE — once by a run that died mid-split.
+///
+/// The crash is what makes this different from its sibling above: run 1 leaves
+/// ORPHAN parts in the bucket (written, never manifested), and the resume writes
+/// its own parts and manifest copies beside them. `dir_manifest_copy_id_set` is
+/// orphan-immune by construction — it reads only what a manifest DECLARES — which
+/// is exactly the property a prefix-wide object count does not have, and exactly
+/// why the cloud read-back once reported 2000 rows for a 1000-row table.
+#[test]
+#[ignore = "live: requires docker compose up -d postgres minio"]
+fn stand_pool_split_cloud_crash_then_resume_declares_every_id_postgres() {
+    pool_split_cloud(Some(("RIVET_TEST_ERROR_AT", "chunk_export:1")));
 }
