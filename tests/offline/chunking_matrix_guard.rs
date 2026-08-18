@@ -98,9 +98,13 @@ const MATRICES: &[(&str, usize)] = &[
     ("docs/cli-flag-matrix.yaml", 0),
     // Destination-backend correctness (local/gcs/s3/azure × scenario): the dogfood
     // cloud findings (prefix normalization B, --validate-is-advisory A) + the
-    // emulator round-trip + cross-backend parity. 1 gap: no azurite full-round-trip
-    // stand test (the CloudDestination path is shared + proven on S3/GCS).
-    ("docs/destination-matrix.yaml", 1),
+    // emulator round-trip + cross-backend parity.
+    //
+    // Lowered 1 -> 0 (2026-08-18): the azurite full-round-trip is written
+    // (`stand_dest_azure_{mysql,postgres}`), reading CONTENT back through the same
+    // `azure_parquet_total_rows` the multipart test uses rather than a second
+    // per-backend definition of delivered.
+    ("docs/destination-matrix.yaml", 0),
     ("docs/behaviour-matrix.yaml", 0),
     ("docs/type-fidelity-matrix.yaml", 0),
     // Cross config × db: 15 honest holes on the non-PG engines (cloud dests, codec

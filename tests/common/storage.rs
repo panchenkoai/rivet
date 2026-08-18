@@ -236,3 +236,60 @@ pub fn minio_pull_prefix(bucket: &str, prefix: &str, into: &std::path::Path) -> 
     }
     pulled
 }
+
+/// Blob names under `prefix` in an azurite container, via anonymous HTTP
+/// `List Blobs` (the container is provisioned public-read by
+/// [`ensure_azure_container`]).
+///
+/// Shared rather than private to one test: `live_azure_multipart.rs` grew this
+/// XML walk locally, and a second azure test copying it would be the two-readers
+/// problem the cloud read-back already paid for once — a store-specific "what
+/// was delivered" drifts on the first fix.
+pub fn azure_blob_names(container: &str, prefix: &str) -> Vec<String> {
+    let url = format!(
+        "{}/{container}?restype=container&comp=list&prefix={prefix}",
+        super::env::AZURITE_ENDPOINT
+    );
+    let xml = reqwest::blocking::Client::new()
+        .get(&url)
+        .send()
+        .expect("azure list request")
+        .text()
+        .expect("azure list body");
+    azure_blob_names_from_list_xml(&xml)
+}
+
+/// Extract blob names from an Azure "List Blobs" XML body: each blob is
+/// `<Blob><Name>…</Name>…</Blob>`. Split out so a caller that already holds the
+/// XML (a test asserting on the listing itself) parses it the same way.
+pub fn azure_blob_names_from_list_xml(xml: &str) -> Vec<String> {
+    xml.split("<Name>")
+        .skip(1)
+        .filter_map(|seg| seg.split("</Name>").next())
+        .map(String::from)
+        .collect()
+}
+
+/// The independent read-back oracle for azurite: download every `.parquet` blob
+/// under `prefix` and sum its row count — CONTENT, not object presence, which is
+/// the distinction the destination matrix's round-trip row asks for.
+pub fn azure_parquet_total_rows(container: &str, prefix: &str) -> usize {
+    let http = reqwest::blocking::Client::new();
+    azure_blob_names(container, prefix)
+        .iter()
+        .filter(|k| k.ends_with(".parquet"))
+        .map(|key| {
+            let bytes = http
+                .get(format!(
+                    "{}/{container}/{key}",
+                    super::env::AZURITE_ENDPOINT
+                ))
+                .send()
+                .expect("azure blob download")
+                .bytes()
+                .expect("azure blob body")
+                .to_vec();
+            super::parquet_rows_from_bytes(bytes)
+        })
+        .sum()
+}

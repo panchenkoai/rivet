@@ -1921,6 +1921,66 @@ fn run_dest_s3(eng: Eng) {
     );
 }
 
+/// The azure twin of [`run_dest_s3`] — the destination matrix's last `gap:`.
+///
+/// The `CloudDestination` path is shared with S3/GCS and proven there, so what
+/// this adds is the AZURE-specific leg: the account/key/endpoint config shape,
+/// the blob naming, and a read-back over the store's own list+get. The cell asked
+/// for CONTENT rather than object presence, so it sums the downloaded parquet's
+/// rows through the shared `azure_parquet_total_rows` — the same reader
+/// `live_azure_multipart.rs` uses, not a second definition of delivered.
+fn run_dest_azure(eng: Eng) {
+    eng.require();
+    require_alive(LiveService::Azurite);
+    let (table, _guard) = seed_dense(eng, 100);
+    let (src, tbl) = source_block(eng, &table);
+    let container = unique_name("stand-az").to_lowercase().replace('_', "-");
+    ensure_azure_container(&container);
+    let prefix = unique_name("stand_az");
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let yaml = format!(
+        "{src}\nexports:\n  - name: ca\n    table: {tbl}\n    mode: full\n    format: parquet\n    \
+         destination:\n      type: azure\n      bucket: {container}\n      prefix: {prefix}\n      \
+         account_name: {AZURITE_ACCOUNT}\n      account_key_env: RIVET_TEST_AZURITE_KEY\n      \
+         endpoint: {AZURITE_ENDPOINT}\n"
+    );
+    let cfg = write_config(&cfg_dir, &yaml);
+    let out = run_rivet_env(
+        &["run", "--config", cfg.to_str().unwrap()],
+        &[
+            ("RIVET_TEST_AZURITE_KEY", AZURITE_KEY),
+            ("RUST_LOG", "warn"),
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "azure run failed; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let blobs = azure_blob_names(&container, &prefix);
+    assert!(
+        blobs.iter().any(|b| b.ends_with(".parquet")),
+        "azurite must hold >=1 parquet under {prefix}; got: {blobs:?}"
+    );
+    assert_eq!(
+        azure_parquet_total_rows(&container, &prefix),
+        100,
+        "all rows: the downloaded azure blobs must hold every seeded row (presence is not content)"
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mysql azurite"]
+fn stand_dest_azure_mysql() {
+    run_dest_azure(Eng::My);
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d postgres azurite"]
+fn stand_dest_azure_postgres() {
+    run_dest_azure(Eng::Pg);
+}
+
 #[test]
 #[ignore = "live: requires docker compose up -d mysql fake-gcs"]
 fn stand_dest_gcs_mysql() {
