@@ -36,6 +36,9 @@ pub struct Rig {
     /// Container-visible twin of `dest_override`, set by [`Rig::duckdb_oracle`].
     oracle_container_dir: Option<String>,
     ckpt_override: Option<PathBuf>,
+    /// `(bucket, prefix, endpoint)` when the exports write to an S3-compatible
+    /// store instead of the tempdir. See [`Rig::dest_s3`].
+    s3_dest: Option<(String, String, String)>,
     dir: tempfile::TempDir,
 }
 
@@ -83,6 +86,7 @@ impl Rig {
             extra_exports: Vec::new(),
             oracle_container_dir: None,
             ckpt_override: None,
+            s3_dest: None,
             dir: tempfile::tempdir().expect("rig tempdir"),
         }
     }
@@ -221,6 +225,37 @@ impl Rig {
         self.dest_override
             .clone()
             .unwrap_or_else(|| self.dir.path().join("out"))
+    }
+
+    /// Send every export to an S3-compatible bucket instead of the rig's local
+    /// tempdir — the SAME rig, so a cloud test does not fork into a hand-rolled
+    /// YAML builder (the ~250 templates the rig replaced came back one engine at
+    /// a time exactly that way).
+    ///
+    /// The prefix is per-export: each export lands under `<prefix>/<export>/`, so
+    /// a multi-export config (a `--split` giant plus its sibling) stays separable
+    /// on the cloud the way it is locally. Credentials go through `*_env` — the
+    /// caller passes them in the run env, never inline in a committed config.
+    pub fn dest_s3(mut self, bucket: &str, prefix: &str, endpoint: &str) -> Self {
+        self.s3_dest = Some((bucket.to_string(), prefix.to_string(), endpoint.to_string()));
+        self
+    }
+
+    /// The destination YAML for `export` — S3 when [`Rig::dest_s3`] was called,
+    /// the local tempdir otherwise. ONE renderer for both, so the primary and
+    /// secondary exports cannot drift apart (they were two `format!`s before).
+    fn dest_yaml(&self, export: &str) -> String {
+        match &self.s3_dest {
+            Some((bucket, prefix, endpoint)) => format!(
+                "{{ type: s3, bucket: {bucket}, prefix: \"{prefix}/{export}/\", region: us-east-1, \
+                 endpoint: \"{endpoint}\", access_key_env: RIVET_TEST_MINIO_AK, \
+                 secret_key_env: RIVET_TEST_MINIO_SK }}"
+            ),
+            None => format!(
+                "{{ type: local, path: \"{}\" }}",
+                self.out_dir_for(export).display()
+            ),
+        }
     }
 
     /// Point the destination somewhere outside the rig's tempdir (e.g. a
@@ -643,21 +678,21 @@ impl Rig {
                     format!("    cdc: {{ {} }}\n", e.cdc_lines.join(", "))
                 };
                 format!(
-                    "  - name: {n}\n    {subject}\n    mode: {m}\n    format: {f}\n{cdc}{lines}    destination: {{ type: local, path: \"{o}\" }}\n",
+                    "  - name: {n}\n    {subject}\n    mode: {m}\n    format: {f}\n{cdc}{lines}    destination: {o}\n",
                     n = e.name,
                     m = e.mode,
                     f = self.format,
-                    o = self.out_dir_for(&e.name).display(),
+                    o = self.dest_yaml(&e.name),
                 )
             })
             .collect();
         let yaml = format!(
-            "{source}\nexports:\n  - name: {name}\n    {tables}\n    mode: {mode}\n    format: {fmt}\n{cdc}{extra}    destination: {{ type: local, path: \"{out}\" }}\n{secondaries}",
+            "{source}\nexports:\n  - name: {name}\n    {tables}\n    mode: {mode}\n    format: {fmt}\n{cdc}{extra}    destination: {out}\n{secondaries}",
             name = self.name,
             tables = tables,
             mode = self.mode,
             fmt = self.format,
-            out = self.out_dir().display(),
+            out = self.dest_yaml(&self.name.clone()),
         );
         yaml
     }

@@ -2564,3 +2564,119 @@ fn stand_pool_split_keyset_recovers_a_crash_mssql() {
         ("RIVET_TEST_PANIC_AT", "after_keyset_page:1"),
     );
 }
+
+/// `apply --pool --split` into a CLOUD prefix — the combination with zero
+/// coverage, and the one where every silent-loss class this repo has paid for
+/// meets at once.
+///
+/// Locally, `stand_pool_split_*` prove split+resume on a filesystem. On a bucket
+/// the same run has three extra ways to lose data, all of them already bitten
+/// here: split UNITS write into ONE shared prefix (part-name collision), each
+/// unit writes its own manifest SIDECAR to that prefix (the fixed
+/// `manifest.json` clobber that under-counted 30 parts as 55 rows), and the
+/// read-back is a different reader from the local one (the cloud oracle that
+/// counted every object under the prefix, orphans included, and read 2000 rows
+/// from a 1000-row table).
+///
+/// So the oracle is deliberately NOT a cloud-specific one: the prefix is PULLED
+/// whole and graded by `dir_manifest_copy_id_set`, the identical function the
+/// local tests use. One definition of "what was delivered", not two that drift.
+#[test]
+#[ignore = "live: requires docker compose up -d postgres minio"]
+fn stand_pool_split_into_one_cloud_prefix_loses_nothing_postgres() {
+    Eng::Pg.require();
+    require_alive(LiveService::Minio);
+    const ROWS: i64 = 300_000;
+    let (table, _g) = seed_dense_wide_for_split(Eng::Pg, ROWS);
+
+    let bucket = "rivet-qa-parity";
+    ensure_minio_bucket(bucket);
+    let prefix = unique_name("pool_split_cloud");
+
+    let sibling_q = format!(
+        "SELECT id FROM {} WHERE id <= 100",
+        Eng::Pg.qualified(&table)
+    );
+    let rig = Eng::Pg
+        .rig(&table)
+        .mode("chunked")
+        .export_line("chunk_column: id")
+        .export_line(&format!("chunk_size: {}", ROWS / 4))
+        .export_line("parallel_safe: true")
+        .also_export("split_sibling", &sibling_q)
+        .also_export_line("parallel_safe: true")
+        .dest_s3(bucket, &prefix, MINIO_ENDPOINT);
+    let cfg = rig.config_path();
+    let env = [
+        ("RIVET_TEST_MINIO_AK", MINIO_ACCESS_KEY),
+        ("RIVET_TEST_MINIO_SK", MINIO_SECRET_KEY),
+        ("AWS_EC2_METADATA_DISABLED", "true"),
+    ];
+
+    // Prime: `advise_split` predicts from RECORDED durations, so a first run must
+    // exist before `--split` can decide anything.
+    let prime = run_rivet_env(&["apply", cfg.to_str().unwrap(), "--pool", "2"], &env);
+    assert!(
+        prime.status.success(),
+        "priming run failed:\n{}",
+        String::from_utf8_lossy(&prime.stderr)
+    );
+    let split = run_rivet_env(
+        &["apply", cfg.to_str().unwrap(), "--pool", "2", "--split"],
+        &env,
+    );
+    assert!(
+        split.status.success(),
+        "split run failed:\n{}",
+        String::from_utf8_lossy(&split.stderr)
+    );
+
+    // PRECONDITION, before any product assertion: `--split` is ADVISORY, and on a
+    // machine where the giant does not beat the sibling by R=3.0 it declines and
+    // produces no units at all — then the assertion below would pass while
+    // grading a plain pool run. (The same guard the local siblings carry, for the
+    // same reason: it fired for real on CI at ratio 1.52.)
+    let units = {
+        let db = StateDb::next_to_config(&cfg);
+        db.export_runs()
+            .iter()
+            .filter(|(n, ..)| n.contains('#'))
+            .count()
+    };
+    assert!(
+        units >= 2,
+        "FIXTURE INERT: `--split` produced {units} unit(s), so nothing was written by two \
+         writers into one prefix and the union below proves nothing about the class"
+    );
+
+    // The union, graded by the LOCAL oracle over the pulled prefix.
+    // The GIANT's sub-prefix only. The class under test is several split UNITS
+    // writing into ONE export's prefix; the sibling export has its own prefix and
+    // its own `_SUCCESS`, so pulling both would collide on marker names and grade
+    // a population the assertion does not describe.
+    let pulled = tempfile::tempdir().unwrap();
+    let giant_prefix = format!("{prefix}/{}", rig.export_name());
+    let objects = minio_pull_prefix(bucket, &giant_prefix, pulled.path());
+    assert!(
+        objects > 0,
+        "nothing was pulled from s3://{bucket}/{giant_prefix} — the run reported success, so an \
+         empty prefix means the destination wiring, not the data"
+    );
+    let ids = dir_manifest_copy_id_set(pulled.path());
+    // Report the SHAPE of the gap, never the sets: a 300k-element set printed on
+    // failure buries the one number a reader needs under a screen-fulls of ids.
+    let expected = dense_ids(ROWS);
+    let missing: Vec<i64> = expected.difference(&ids).take(5).copied().collect();
+    let extra: Vec<i64> = ids.difference(&expected).take(5).copied().collect();
+    assert!(
+        ids == expected,
+        "every source id must be DECLARED by a manifest copy in the cloud prefix: {} of \
+         {ROWS} present, {} object(s) pulled. First missing: {missing:?}; unexpected: \
+         {extra:?}. A gap here is the split units overwriting each other's parts or each \
+         other's manifest sidecar — the shapes that survive every row count because the \
+         surviving artifacts stay self-consistent. (RED-proven: a non-run-unique manifest \
+         copy name leaves 150001 of 300000.)",
+        ids.len(),
+        objects
+    );
+}

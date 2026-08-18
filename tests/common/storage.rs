@@ -181,3 +181,58 @@ pub fn ensure_azure_container(container: &str) {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+/// Pull every object under `prefix` into a LOCAL directory, preserving base
+/// names, and return how many were written.
+///
+/// This exists so a cloud destination can be graded by the SAME oracle as a
+/// local one. The alternative — a store-specific "what was delivered" reader —
+/// is a second definition of delivered, and it drifts on the first fix: the
+/// local read-back was corrected to count only manifest-DECLARED parts (a crash
+/// leaves orphans no manifest names) while the cloud reader kept summing every
+/// object under the prefix, so resume cells on s3/gcs read 2000 rows from a
+/// 1000-row table. Pull the prefix, then run `dir_manifest_copy_id_set` /
+/// `dir_manifest_copy_total_rows` over it exactly as the local tests do.
+///
+/// Base names are preserved because that is what a manifest's `parts[].path`
+/// resolves to; a collision would silently drop an object, so it PANICS instead.
+pub fn minio_pull_prefix(bucket: &str, prefix: &str, into: &std::path::Path) -> usize {
+    std::fs::create_dir_all(into).expect("create pull dir");
+    let ls_script = format!(
+        "mc alias set local http://127.0.0.1:9000 {MINIO_ACCESS_KEY} {MINIO_SECRET_KEY} >/dev/null 2>&1 && \
+         mc ls --recursive local/{bucket} 2>/dev/null"
+    );
+    let ls = Command::new("docker")
+        .args(["compose", "exec", "-T", "minio", "sh", "-c", &ls_script])
+        .output()
+        .expect("mc ls");
+    assert!(ls.status.success(), "mc ls failed");
+    let mut pulled = 0usize;
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for line in String::from_utf8_lossy(&ls.stdout).lines() {
+        let Some(name) = line.split_whitespace().last() else {
+            continue;
+        };
+        if !name.starts_with(prefix) {
+            continue;
+        }
+        let base = name.rsplit('/').next().unwrap_or(name).to_string();
+        assert!(
+            seen.insert(base.clone()),
+            "two objects under {prefix} share the base name {base} — flattening would \
+             silently drop one, and the manifest oracle resolves parts by base name"
+        );
+        let cat_script = format!(
+            "mc alias set local http://127.0.0.1:9000 {MINIO_ACCESS_KEY} {MINIO_SECRET_KEY} >/dev/null 2>&1 && \
+             mc cat local/{bucket}/{name}"
+        );
+        let cat = Command::new("docker")
+            .args(["compose", "exec", "-T", "minio", "sh", "-c", &cat_script])
+            .output()
+            .expect("mc cat");
+        assert!(cat.status.success(), "mc cat {name} failed");
+        std::fs::write(into.join(&base), cat.stdout).expect("write pulled object");
+        pulled += 1;
+    }
+    pulled
+}
