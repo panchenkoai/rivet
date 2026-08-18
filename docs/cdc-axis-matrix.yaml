@@ -74,6 +74,18 @@ config_fields:
       DEFER-NOT-DROP — a follow-up bounded run must pick up the remainder, and
       the union across both runs must hold every change.
 
+      TWO DRIVERS, and for months only one of them had this. The flag is read by
+      the file sink (`sink::run_to_files`, config mode) AND by the NDJSON loop
+      (`cdc::run`, the `rivet cdc` CLI), and the second broke on the event count
+      alone. That lost nothing — the checkpoint save is gated on `committed`, so
+      a cut transaction re-emits — but a transaction LONGER than the cap held no
+      boundary to save, so `--checkpoint ck --max-events 100` against a bulk load
+      re-read the same position and re-printed the same prefix on every run,
+      forever. The row above described the sink's behaviour and read as if it
+      described the flag. Both drivers now defer to the boundary; the NDJSON half
+      is pinned by `max_events_cannot_wedge_a_checkpointed_run_on_a_long_
+      transaction` (RED before the fix: the checkpoint file was never written).
+
   - id: rollover
     coverage: swept
     case: rollover_1
