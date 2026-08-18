@@ -5287,3 +5287,76 @@ fn roast_mysql_cdc_cli_rollover_keeps_transactions_whole_and_two_runs_do_not_clo
          advanced past them — gone from the binlog and the destination both"
     );
 }
+
+/// `rivet cdc --output --format csv` — the WIRING, not the fidelity.
+///
+/// Scope, stated because it decides what this test is worth: CSV value rendering
+/// and RFC-4180 escaping are NOT re-tested here. Both sinks call the same
+/// `fmt.create_writer` (`pipeline/sink/mod.rs` and `source/cdc/sink.rs`), so the
+/// text-writer class is a shared seam the `csv-fidelity-matrix` already pins on
+/// the batch path; asserting it again here would grade the same code twice and
+/// read like new coverage.
+///
+/// What is NOT shared is whether this combination runs at all. The CDC sink hands
+/// the writer a schema the batch path never produces — the source columns PLUS
+/// `__op`/`__pos`/`__seq` — and CSV cannot serialize every Arrow type (rivet has
+/// `csv_serializable` in preflight for exactly that reason). `rivet cdc --output
+/// --format csv` is documented, and had zero tests: nobody had ever run it.
+#[test]
+#[ignore = "live: requires docker compose mysql-cdc (binlog)"]
+fn mysql_cdc_cli_csv_output_is_wired_and_readable() {
+    require_alive(LiveService::DuckDb);
+    let mut c = conn();
+    let tbl = unique_name("rivet_cdc_csv");
+    c.query_drop(format!(
+        "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v INT)"
+    ))
+    .expect("create table");
+    let _t = MysqlCdcTable(tbl.clone());
+
+    let d = tempfile::tempdir().unwrap();
+    let ckpt = d.path().join("ck");
+    let out = d.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    write_checkpoint(&mut c, &ckpt);
+
+    c.query_drop(format!("INSERT INTO {tbl} VALUES (1,1),(2,2),(3,3)"))
+        .expect("seed");
+    let r = run_rivet_env(
+        &[
+            "cdc",
+            "--source",
+            MYSQL_CDC_URL,
+            "--table",
+            &tbl,
+            "--checkpoint",
+            ckpt.to_str().unwrap(),
+            "--output",
+            out.to_str().unwrap(),
+            "--format",
+            "csv",
+        ],
+        &[],
+    );
+    assert!(
+        r.status.success(),
+        "cdc --format csv failed — the CDC schema carries __op/__pos/__seq beside the \
+         source columns, and a type CSV cannot serialize fails the whole run:\n{}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+
+    // The format really is CSV, not parquet under a different name: a wiring that
+    // maps "csv" to the wrong FormatType writes parquet and every row-count check
+    // still passes.
+    assert!(
+        !files_with_extension(&out, "csv").is_empty(),
+        "no .csv part written; directory holds {} parquet file(s)",
+        files_with_extension(&out, "parquet").len()
+    );
+    // And it is readable by a reader that is not rivet.
+    assert_eq!(
+        duckdb_dir_csv_id_set(&out),
+        (1..=3).collect::<std::collections::BTreeSet<i64>>(),
+        "DuckDB must read back every captured id from the CSV parts"
+    );
+}
