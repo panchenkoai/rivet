@@ -5360,3 +5360,120 @@ fn mysql_cdc_cli_csv_output_is_wired_and_readable() {
         "DuckDB must read back every captured id from the CSV parts"
     );
 }
+
+/// `rivet cdc --stream` and `--server-id`: the last two CLI flags with zero test
+/// references anywhere in the tree.
+///
+/// `--stream` is not cosmetic — it flips `until_current` OFF, i.e. selects
+/// `DrainMode::Continuous`, the one mode with no open-time bound to stop it. The
+/// risk it carries is the opposite of the bounded run's: a continuous drain that
+/// never terminates wedges a scheduler slot forever. Bounding it with
+/// `--max-events` is the only way to assert on it at all, and that pairing is
+/// itself the documented way to run a capped stream.
+///
+/// `--server-id` is MySQL's replica identity on the binlog connection. HONEST
+/// LIMIT, stated because the test name would otherwise over-promise: this pins
+/// only that a NON-DEFAULT value (919191, which no default produces) is accepted
+/// and the run works with it — a parse/validation regression. It does NOT prove
+/// the value reaches the dump request, and that is a measured conclusion rather
+/// than an untried one: with a live `--stream` connected, MySQL showed the id
+/// NOWHERE — `SHOW REPLICAS` is empty and `information_schema.PROCESSLIST` has no
+/// `Binlog Dump` row, because the client sends the id in COM_BINLOG_DUMP without
+/// registering via COM_REGISTER_SLAVE. There is no server-side view to assert
+/// against; proving it would take a protocol-level capture, which is a different
+/// test than this one.
+#[test]
+#[ignore = "live: requires docker compose mysql-cdc (binlog)"]
+fn mysql_cdc_cli_stream_with_a_cap_terminates_and_accepts_a_server_id() {
+    let mut c = conn();
+    let tbl = unique_name("rivet_cdc_stream");
+    c.query_drop(format!(
+        "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v INT)"
+    ))
+    .expect("create table");
+    let _t = MysqlCdcTable(tbl.clone());
+
+    let d = tempfile::tempdir().unwrap();
+    let ckpt = d.path().join("ck");
+    write_checkpoint(&mut c, &ckpt);
+    // Two transactions, so the soft cap has a boundary to stop at that is NOT the
+    // end of the stream — the same activation threshold the bounded-cap test needs.
+    c.query_drop(format!("INSERT INTO {tbl} VALUES (1,1),(2,2),(3,3)"))
+        .expect("tx1");
+    c.query_drop(format!("INSERT INTO {tbl} VALUES (4,4),(5,5),(6,6)"))
+        .expect("tx2");
+
+    // A NON-DEFAULT server id (the default is 4271): if the flag were dropped on
+    // the floor this run would still pass, so the value is deliberately one no
+    // default would produce, and the run must succeed WITH it.
+    let out = run_rivet_args_bounded(
+        &[
+            "cdc",
+            "--source",
+            MYSQL_CDC_URL,
+            "--table",
+            &tbl,
+            "--checkpoint",
+            ckpt.to_str().unwrap(),
+            "--stream",
+            "--max-events",
+            "2",
+            "--server-id",
+            "919191",
+        ],
+        std::time::Duration::from_secs(60),
+    );
+    // `None` == the watchdog had to kill it. THAT is the assertion: a continuous
+    // drain with a cap must end itself, not be ended.
+    let stdout = out.expect(
+        "`--stream --max-events` must TERMINATE on its own — a continuous drain that only \
+         stops when the watchdog kills it wedges every scheduler slot it runs in",
+    );
+
+    let ids: std::collections::BTreeSet<i64> = stdout
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|v| v.get("table").and_then(|t| t.as_str()) == Some(tbl.as_str()))
+        .filter_map(|v| v.get("after")?.get(0)?.as_i64())
+        .collect();
+    // The cap is SOFT: it stops at the first commit boundary past N, so tx1 lands
+    // whole and tx2 does not. Asserting the exact set pins both halves — that it
+    // did not cut tx1 at 2, and that it did not run the stream to its end.
+    assert_eq!(
+        ids,
+        (1..=3).collect::<std::collections::BTreeSet<i64>>(),
+        "a cap of 2 must stop at tx1's boundary: {{1,2}} means it cut the transaction, \
+         {{1..=6}} means the cap stopped nothing"
+    );
+
+    // And the half that actually proves `--stream` was HONOURED. Everything above
+    // holds for a bounded run too — with a cap of 2 both modes stop at the same
+    // boundary — so on its own it would pass with the flag dropped on the floor.
+    //
+    // The distinguishing property is termination: `--stream` selects
+    // `DrainMode::Continuous`, which on MySQL is a BLOCKING binlog dump with no
+    // open-time bound, so with no cap it must NOT end by itself. The default
+    // bounded run does (its twin: roast_pg_cdc_ndjson_until_current_terminates).
+    // `None` here means the watchdog had to kill it — which is the pass.
+    let ckpt2 = d.path().join("ck2");
+    write_checkpoint(&mut c, &ckpt2);
+    let never = run_rivet_args_bounded(
+        &[
+            "cdc",
+            "--source",
+            MYSQL_CDC_URL,
+            "--table",
+            &tbl,
+            "--checkpoint",
+            ckpt2.to_str().unwrap(),
+            "--stream",
+        ],
+        std::time::Duration::from_secs(15),
+    );
+    assert!(
+        never.is_none(),
+        "`--stream` with no cap must keep running until it is stopped — it terminated on \
+         its own, which is the BOUNDED behaviour and means the flag never reached \
+         `until_current` (dispatch.rs: `until_current: !stream`)"
+    );
+}
