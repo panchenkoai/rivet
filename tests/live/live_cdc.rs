@@ -5178,3 +5178,404 @@ fn mysql_cdc_compressed_payload_in_stream_refuses_not_skips() {
         "a refused resume must not write _SUCCESS"
     );
 }
+
+/// `rivet cdc --output --rollover N`: two invariants that had ZERO coverage on
+/// this path, and both are the shapes that have already lost data here.
+///
+/// 1. A part NEVER splits a transaction. `rollover` is a soft target — the sink
+///    rolls at a commit boundary — so a 3-row transaction under `--rollover 2`
+///    must land as ONE part, not two. Splitting it is what makes a crash between
+///    the two parts leave half a transaction durable.
+/// 2. Two consecutive runs into the SAME `--output` directory must not clobber
+///    each other. This is the class that cost real rows: run N+1's first part
+///    overwrote run N's `cdc-000000.parquet` AFTER the position had advanced past
+///    those changes, so the data was gone from the source log and the destination
+///    both. The config path was fixed and regression-tested; the CLI path — which
+///    takes `--output` as a bare directory and is the most natural way to point
+///    two scheduled runs at one place — was never tested at all.
+///
+/// The oracle is DuckDB over the directory, never rivet's own manifest: the
+/// manifest is exactly what a clobber leaves looking consistent.
+#[test]
+#[ignore = "live: requires docker compose mysql-cdc (binlog)"]
+fn roast_mysql_cdc_cli_rollover_keeps_transactions_whole_and_two_runs_do_not_clobber() {
+    require_alive(LiveService::DuckDb);
+    let mut c = conn();
+    let tbl = unique_name("rivet_cdc_roll");
+    c.query_drop(format!(
+        "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v INT)"
+    ))
+    .expect("create table");
+    let _t = MysqlCdcTable(tbl.clone());
+
+    let d = tempfile::tempdir().unwrap();
+    let ckpt = d.path().join("ck");
+    let out = d.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    write_checkpoint(&mut c, &ckpt); // anchor at NOW
+
+    let ckpt_s = ckpt.to_str().unwrap().to_string();
+    let out_s = out.to_str().unwrap().to_string();
+    let tbl_q = tbl.clone();
+    let cdc_run = move || {
+        run_rivet_env(
+            &[
+                "cdc",
+                "--source",
+                MYSQL_CDC_URL,
+                "--table",
+                &tbl_q,
+                "--checkpoint",
+                &ckpt_s,
+                "--output",
+                &out_s,
+                "--rollover",
+                "2",
+            ],
+            &[],
+        )
+    };
+
+    // Run 1: ONE transaction of three rows, under a rollover of two.
+    c.query_drop(format!("INSERT INTO {tbl} VALUES (1,1),(2,2),(3,3)"))
+        .expect("tx1");
+    let r1 = cdc_run();
+    assert!(
+        r1.status.success(),
+        "cdc run 1 failed:\n{}",
+        String::from_utf8_lossy(&r1.stderr)
+    );
+    let parts_after_1 = files_with_extension(&out, "parquet").len();
+    assert_eq!(
+        duckdb_total_parquet_rows(&out),
+        3,
+        "run 1 must capture the whole transaction"
+    );
+    assert_eq!(
+        parts_after_1, 1,
+        "a 3-row transaction at --rollover 2 must land as ONE part: the sink rolls at a \
+         COMMIT boundary, so splitting it into 2 parts means a crash between them leaves \
+         half a transaction durable"
+    );
+
+    // Run 2: a second transaction into the SAME --output directory.
+    c.query_drop(format!("INSERT INTO {tbl} VALUES (4,4),(5,5),(6,6)"))
+        .expect("tx2");
+    let r2 = cdc_run();
+    assert!(
+        r2.status.success(),
+        "cdc run 2 failed:\n{}",
+        String::from_utf8_lossy(&r2.stderr)
+    );
+
+    // The id SET separates the two failures a file COUNT conflates. An inert
+    // fixture (run 2 captured nothing) leaves {1,2,3}; a clobber leaves {4,5,6},
+    // because run 2 really did capture and then wrote over run 1's part. Counting
+    // files reports both as "no new part" and blames the fixture for the product.
+    let ids = duckdb_dir_parquet_id_set(&out);
+    let _ = parts_after_1;
+    assert!(
+        (4..=6).all(|i| ids.contains(&i)),
+        "run 2 captured nothing of its own (ids {ids:?}) — the fixture is inert, so the \
+         union below would pass without testing anything"
+    );
+    assert_eq!(
+        ids,
+        (1..=6).collect::<std::collections::BTreeSet<i64>>(),
+        "both runs' rows must survive in one --output directory; a missing 1..=3 is the \
+         clobber class (run 2's first part overwriting run 1's) AFTER the checkpoint \
+         advanced past them — gone from the binlog and the destination both"
+    );
+}
+
+/// `rivet cdc --output --format csv` — the WIRING, not the fidelity.
+///
+/// Scope, stated because it decides what this test is worth: CSV value rendering
+/// and RFC-4180 escaping are NOT re-tested here. Both sinks call the same
+/// `fmt.create_writer` (`pipeline/sink/mod.rs` and `source/cdc/sink.rs`), so the
+/// text-writer class is a shared seam the `csv-fidelity-matrix` already pins on
+/// the batch path; asserting it again here would grade the same code twice and
+/// read like new coverage.
+///
+/// What is NOT shared is whether this combination runs at all. The CDC sink hands
+/// the writer a schema the batch path never produces — the source columns PLUS
+/// `__op`/`__pos`/`__seq` — and CSV cannot serialize every Arrow type (rivet has
+/// `csv_serializable` in preflight for exactly that reason). `rivet cdc --output
+/// --format csv` is documented, and had zero tests: nobody had ever run it.
+#[test]
+#[ignore = "live: requires docker compose mysql-cdc (binlog)"]
+fn mysql_cdc_cli_csv_output_is_wired_and_readable() {
+    require_alive(LiveService::DuckDb);
+    let mut c = conn();
+    let tbl = unique_name("rivet_cdc_csv");
+    c.query_drop(format!(
+        "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v INT)"
+    ))
+    .expect("create table");
+    let _t = MysqlCdcTable(tbl.clone());
+
+    let d = tempfile::tempdir().unwrap();
+    let ckpt = d.path().join("ck");
+    let out = d.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    write_checkpoint(&mut c, &ckpt);
+
+    c.query_drop(format!("INSERT INTO {tbl} VALUES (1,1),(2,2),(3,3)"))
+        .expect("seed");
+    let r = run_rivet_env(
+        &[
+            "cdc",
+            "--source",
+            MYSQL_CDC_URL,
+            "--table",
+            &tbl,
+            "--checkpoint",
+            ckpt.to_str().unwrap(),
+            "--output",
+            out.to_str().unwrap(),
+            "--format",
+            "csv",
+        ],
+        &[],
+    );
+    assert!(
+        r.status.success(),
+        "cdc --format csv failed — the CDC schema carries __op/__pos/__seq beside the \
+         source columns, and a type CSV cannot serialize fails the whole run:\n{}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+
+    // The format really is CSV, not parquet under a different name: a wiring that
+    // maps "csv" to the wrong FormatType writes parquet and every row-count check
+    // still passes.
+    assert!(
+        !files_with_extension(&out, "csv").is_empty(),
+        "no .csv part written; directory holds {} parquet file(s)",
+        files_with_extension(&out, "parquet").len()
+    );
+    // And it is readable by a reader that is not rivet.
+    assert_eq!(
+        duckdb_dir_csv_id_set(&out),
+        (1..=3).collect::<std::collections::BTreeSet<i64>>(),
+        "DuckDB must read back every captured id from the CSV parts"
+    );
+}
+
+/// `rivet cdc --stream` and `--server-id`: the last two CLI flags with zero test
+/// references anywhere in the tree.
+///
+/// `--stream` is not cosmetic — it flips `until_current` OFF, i.e. selects
+/// `DrainMode::Continuous`, the one mode with no open-time bound to stop it. The
+/// risk it carries is the opposite of the bounded run's: a continuous drain that
+/// never terminates wedges a scheduler slot forever. Bounding it with
+/// `--max-events` is the only way to assert on it at all, and that pairing is
+/// itself the documented way to run a capped stream.
+///
+/// `--server-id` is MySQL's replica identity on the binlog connection. HONEST
+/// LIMIT, stated because the test name would otherwise over-promise: this pins
+/// only that a NON-DEFAULT value (919191, which no default produces) is accepted
+/// and the run works with it — a parse/validation regression. It does NOT prove
+/// the value reaches the dump request, and that is a measured conclusion rather
+/// than an untried one: with a live `--stream` connected, MySQL showed the id
+/// NOWHERE — `SHOW REPLICAS` is empty and `information_schema.PROCESSLIST` has no
+/// `Binlog Dump` row, because the client sends the id in COM_BINLOG_DUMP without
+/// registering via COM_REGISTER_SLAVE. There is no server-side view to assert
+/// against; proving it would take a protocol-level capture, which is a different
+/// test than this one.
+#[test]
+#[ignore = "live: requires docker compose mysql-cdc (binlog)"]
+fn mysql_cdc_cli_stream_with_a_cap_terminates_and_accepts_a_server_id() {
+    let mut c = conn();
+    let tbl = unique_name("rivet_cdc_stream");
+    c.query_drop(format!(
+        "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v INT)"
+    ))
+    .expect("create table");
+    let _t = MysqlCdcTable(tbl.clone());
+
+    let d = tempfile::tempdir().unwrap();
+    let ckpt = d.path().join("ck");
+    write_checkpoint(&mut c, &ckpt);
+    // Two transactions, so the soft cap has a boundary to stop at that is NOT the
+    // end of the stream — the same activation threshold the bounded-cap test needs.
+    c.query_drop(format!("INSERT INTO {tbl} VALUES (1,1),(2,2),(3,3)"))
+        .expect("tx1");
+    c.query_drop(format!("INSERT INTO {tbl} VALUES (4,4),(5,5),(6,6)"))
+        .expect("tx2");
+
+    // A NON-DEFAULT server id (the default is 4271): if the flag were dropped on
+    // the floor this run would still pass, so the value is deliberately one no
+    // default would produce, and the run must succeed WITH it.
+    let out = run_rivet_args_bounded(
+        &[
+            "cdc",
+            "--source",
+            MYSQL_CDC_URL,
+            "--table",
+            &tbl,
+            "--checkpoint",
+            ckpt.to_str().unwrap(),
+            "--stream",
+            "--max-events",
+            "2",
+            "--server-id",
+            "919191",
+        ],
+        std::time::Duration::from_secs(60),
+    );
+    // `None` == the watchdog had to kill it. THAT is the assertion: a continuous
+    // drain with a cap must end itself, not be ended.
+    let stdout = out.expect(
+        "`--stream --max-events` must TERMINATE on its own — a continuous drain that only \
+         stops when the watchdog kills it wedges every scheduler slot it runs in",
+    );
+
+    let ids: std::collections::BTreeSet<i64> = stdout
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|v| v.get("table").and_then(|t| t.as_str()) == Some(tbl.as_str()))
+        .filter_map(|v| v.get("after")?.get(0)?.as_i64())
+        .collect();
+    // The cap is SOFT: it stops at the first commit boundary past N, so tx1 lands
+    // whole and tx2 does not. Asserting the exact set pins both halves — that it
+    // did not cut tx1 at 2, and that it did not run the stream to its end.
+    assert_eq!(
+        ids,
+        (1..=3).collect::<std::collections::BTreeSet<i64>>(),
+        "a cap of 2 must stop at tx1's boundary: {{1,2}} means it cut the transaction, \
+         {{1..=6}} means the cap stopped nothing"
+    );
+
+    // And the half that actually proves `--stream` was HONOURED. Everything above
+    // holds for a bounded run too — with a cap of 2 both modes stop at the same
+    // boundary — so on its own it would pass with the flag dropped on the floor.
+    //
+    // The distinguishing property is termination: `--stream` selects
+    // `DrainMode::Continuous`, which on MySQL is a BLOCKING binlog dump with no
+    // open-time bound, so with no cap it must NOT end by itself. The default
+    // bounded run does (its twin: roast_pg_cdc_ndjson_until_current_terminates).
+    // `None` here means the watchdog had to kill it — which is the pass.
+    let ckpt2 = d.path().join("ck2");
+    write_checkpoint(&mut c, &ckpt2);
+    let never = run_rivet_args_bounded(
+        &[
+            "cdc",
+            "--source",
+            MYSQL_CDC_URL,
+            "--table",
+            &tbl,
+            "--checkpoint",
+            ckpt2.to_str().unwrap(),
+            "--stream",
+            // A DISTINCT non-default id here too. Omitting it took the default
+            // (4271), which every other concurrent `rivet cdc` also takes, and
+            // MySQL kicks the older connection off when two replicas claim one
+            // server_id — the run then exits non-zero and this reads as a
+            // termination bug. Caught by the full suite at --test-threads=4;
+            // green in isolation, which is exactly how a shared-identity fixture
+            // hides.
+            "--server-id",
+            "919192",
+        ],
+        std::time::Duration::from_secs(15),
+    );
+    assert!(
+        never.is_none(),
+        "`--stream` with no cap must keep running until it is stopped — it terminated on \
+         its own, which is the BOUNDED behaviour and means the flag never reached \
+         `until_current` (dispatch.rs: `until_current: !stream`)"
+    );
+}
+
+/// `rivet cdc --source-env` / `--source-file`, and the ArgGroup that keeps them
+/// mutually exclusive.
+///
+/// These are the CREDENTIAL-SAFETY path: `--source` puts the URL (password and
+/// all) in `ps` output, and rivet warns about the same shape in a config file.
+/// The only reference to `--source-env` anywhere in the tree was for `rivet
+/// init`, so the CDC subcommand's own resolution had never been exercised — and a
+/// user whose `--source-env` silently failed would go straight back to the inline
+/// form the warning exists to discourage.
+///
+/// The oracle is the SAME capture through all three forms: whatever the flag
+/// does, it must resolve to one URL. Asserting only "exit 0" would pass on a
+/// resolver that connected to something else entirely.
+#[test]
+#[ignore = "live: requires docker compose mysql-cdc (binlog)"]
+fn mysql_cdc_cli_resolves_the_source_from_env_and_file_alike() {
+    let mut c = conn();
+    let tbl = unique_name("rivet_cdc_src");
+    c.query_drop(format!(
+        "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v INT)"
+    ))
+    .expect("create table");
+    let _t = MysqlCdcTable(tbl.clone());
+
+    let d = tempfile::tempdir().unwrap();
+    let url_file = d.path().join("url.txt");
+    std::fs::write(&url_file, MYSQL_CDC_URL).expect("write url file");
+
+    let capture = |form: &[&str], envs: &[(&str, &str)]| -> std::collections::BTreeSet<i64> {
+        let ckpt = d
+            .path()
+            .join(format!("ck_{}", form.join("_").replace('/', "_")));
+        write_checkpoint(&mut conn(), &ckpt);
+        // Each form captures the SAME change, written after its own anchor.
+        conn()
+            .query_drop(format!("INSERT INTO {tbl} VALUES (7,7)"))
+            .expect("seed");
+        conn()
+            .query_drop(format!("DELETE FROM {tbl} WHERE id = 7"))
+            .expect("cleanup seed");
+        let mut args: Vec<&str> = vec!["cdc"];
+        args.extend_from_slice(form);
+        let ck = ckpt.to_str().unwrap().to_string();
+        args.extend_from_slice(&["--table", &tbl, "--checkpoint", &ck]);
+        let out = run_rivet_args_bounded_env(&args, envs, std::time::Duration::from_secs(60))
+            .unwrap_or_else(|| panic!("`rivet cdc {}` did not terminate", form.join(" ")));
+        out.lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| v.get("table").and_then(|t| t.as_str()) == Some(tbl.as_str()))
+            .filter_map(|v| v.get("after")?.get(0)?.as_i64())
+            .collect()
+    };
+
+    let inline = capture(&["--source", MYSQL_CDC_URL], &[]);
+    assert!(
+        inline.contains(&7),
+        "the inline form must capture the seeded change — the fixture is inert otherwise: {inline:?}"
+    );
+    let from_env = capture(
+        &["--source-env", "RIVET_TEST_CDC_URL"],
+        &[("RIVET_TEST_CDC_URL", MYSQL_CDC_URL)],
+    );
+    assert_eq!(
+        from_env, inline,
+        "`--source-env` must resolve to the same source as `--source`; exit 0 alone would \
+         pass on a resolver that connected somewhere else"
+    );
+    let from_file = capture(&["--source-file", url_file.to_str().unwrap()], &[]);
+    assert_eq!(
+        from_file, inline,
+        "`--source-file` must resolve to the same source as `--source`"
+    );
+
+    // The ArgGroup: exactly one form, never two. Without it a config that sets
+    // both silently picks a winner, and which one is invisible to the operator.
+    let both = run_rivet_env(
+        &[
+            "cdc",
+            "--source",
+            MYSQL_CDC_URL,
+            "--source-env",
+            "RIVET_TEST_CDC_URL",
+            "--table",
+            &tbl,
+        ],
+        &[("RIVET_TEST_CDC_URL", MYSQL_CDC_URL)],
+    );
+    assert!(
+        !both.status.success(),
+        "passing two source forms must be REFUSED, not silently resolved to one of them"
+    );
+}

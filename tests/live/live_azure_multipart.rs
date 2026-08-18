@@ -47,16 +47,6 @@ fn seed_distinct_payload() -> (String, PgTable) {
     (name.clone(), PgTable::adopt(name))
 }
 
-/// Extract blob names from an Azure "List Blobs" XML body: each blob is
-/// `<Blob><Name>…</Name>…</Blob>`.
-fn blob_names_from_list_xml(xml: &str) -> Vec<String> {
-    xml.split("<Name>")
-        .skip(1)
-        .filter_map(|seg| seg.split("</Name>").next())
-        .map(|s| s.to_string())
-        .collect()
-}
-
 #[test]
 #[ignore = "live: requires docker compose postgres + azurite, and the az CLI on PATH"]
 fn cloud_multipart_azure_rotation_distinct_keys_and_all_rows() {
@@ -122,7 +112,7 @@ exports:
         .expect("azure list request")
         .text()
         .expect("azure list body");
-    let keys = blob_names_from_list_xml(&xml);
+    let keys = azure_blob_names_from_list_xml(&xml);
 
     let parquet: Vec<&String> = keys.iter().filter(|k| k.ends_with(".parquet")).collect();
     assert!(

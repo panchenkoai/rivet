@@ -229,3 +229,47 @@ fn check_help_and_run_help_advertise_config_flag_consistently() {
     assert!(h_run.contains("--config"));
     assert!(h_check.contains("--config"));
 }
+
+/// `--json-errors` — a GLOBAL flag with zero references anywhere in the tree,
+/// found by deriving the flag list from `args.rs` rather than reading a
+/// remembered one.
+///
+/// Its whole purpose is machine-readable orchestration: a wrapper parses stderr
+/// to decide what failed. So the contract is not "an error is printed" but
+/// "stderr PARSES as JSON carrying `error`" — and the pairing matters, because a
+/// flag that silently did nothing still prints a perfectly good human message and
+/// every exit code stays identical. The caller's parser is the only thing that
+/// notices, in production.
+///
+/// A missing config is the failure used because it needs no database, so this
+/// lives with the other offline CLI-contract checks.
+#[test]
+fn json_errors_makes_stderr_machine_readable_and_is_off_by_default() {
+    let missing = "/nonexistent/rivet-json-errors-probe.yaml";
+
+    let (code, _, plain) = run(&["check", "--config", missing]);
+    assert_ne!(code, 0, "a missing config must fail");
+    assert!(
+        serde_json::from_str::<serde_json::Value>(plain.trim()).is_err(),
+        "WITHOUT the flag stderr must stay the human message — emitting JSON by default \
+         would break every operator reading a terminal; got:\n{plain}"
+    );
+
+    let (json_code, _, raw) = run(&["--json-errors", "check", "--config", missing]);
+    assert_eq!(
+        json_code, code,
+        "--json-errors must change the RENDERING only: an exit code that moves with it \
+         means the flag is on a different failure path than the one it formats"
+    );
+    let v: serde_json::Value = serde_json::from_str(raw.trim()).unwrap_or_else(|e| {
+        panic!("--json-errors must make stderr parse as JSON ({e}); got:\n{raw}")
+    });
+    let msg = v
+        .get("error")
+        .and_then(|e| e.as_str())
+        .unwrap_or_else(|| panic!("the JSON must carry a string `error` field; got:\n{raw}"));
+    assert!(
+        !msg.trim().is_empty(),
+        "the `error` field must carry the reason, not an empty string; got:\n{raw}"
+    );
+}

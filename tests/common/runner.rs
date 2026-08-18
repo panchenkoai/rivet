@@ -108,15 +108,26 @@ pub fn files_with_extension(dir: &std::path::Path, ext: &str) -> Vec<std::path::
 /// NDJSON driver) with stdout captured — `Some(stdout)` on clean exit within
 /// the ceiling, `None` if it had to be killed (the caller asserts on that).
 pub fn run_rivet_args_bounded(args: &[&str], timeout: std::time::Duration) -> Option<String> {
+    run_rivet_args_bounded_env(args, &[], timeout)
+}
+
+/// As [`run_rivet_args_bounded`], with environment for the child — the
+/// credential-safety forms (`--source-env`) cannot be exercised without it.
+pub fn run_rivet_args_bounded_env(
+    args: &[&str],
+    envs: &[(&str, &str)],
+    timeout: std::time::Duration,
+) -> Option<String> {
     let dir = tempfile::tempdir().expect("stdout tempdir");
     let path = dir.path().join("stdout");
     let stdout = std::fs::File::create(&path).expect("stdout capture file");
     let start = std::time::Instant::now();
-    let mut child = Command::new(RIVET_BIN)
-        .args(args)
-        .stdout(stdout)
-        .spawn()
-        .expect("spawn rivet binary");
+    let mut cmd = Command::new(RIVET_BIN);
+    cmd.args(args).stdout(stdout);
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let mut child = cmd.spawn().expect("spawn rivet binary");
     loop {
         if let Some(status) = child.try_wait().expect("try_wait rivet") {
             assert!(status.success(), "bounded rivet run exited non-zero");

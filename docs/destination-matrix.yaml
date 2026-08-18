@@ -31,7 +31,7 @@ scenarios:
     local: { na: "local round-trip is the implicit default of every batch stand/live test (count_parquet_rows re-reads the written files)." }
     gcs:   { test: stand_dest_gcs_mysql }
     s3:    { test: stand_dest_s3_mysql }
-    azure: { gap: "no azurite full-round-trip stand test yet — the CloudDestination path is shared with S3/GCS (proven above), but an azure-specific emulator round-trip is unwritten." }
+    azure: { test: stand_dest_azure_mysql, note: "was this ledger's last gap. The CloudDestination path is shared with S3/GCS and proven there; what these add is the AZURE leg — the account/key/endpoint config shape, the blob naming, and a read-back over the store's own list+get. CONTENT, not presence: `azure_parquet_total_rows` downloads every blob and sums rows, and it is the SAME reader live_azure_multipart.rs uses (moved into tests/common/storage.rs rather than copied, so there is one definition of delivered per backend). Twin on postgres: stand_dest_azure_postgres." }
     stdout:  { na: "nothing to read BACK — the bytes go to the caller's pipe, there is no addressable destination to re-open. The stdout happy path is covered as a GOLDEN instead: dev/path_matrix p05_stdout diffs the literal CSV rivet emits" }
 
   - id: row_count_parity_across_backends

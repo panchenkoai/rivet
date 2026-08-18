@@ -55,10 +55,16 @@ fn stage_for_duckdb(dir: &Path) -> String {
             .collect::<String>()
     );
     let (host, container) = super::live_shared_workdir(&label);
-    for f in files_with_extension(dir, "parquet") {
-        let name = f.file_name().expect("parquet file has a name");
-        std::fs::copy(&f, host.join(name))
-            .unwrap_or_else(|e| panic!("stage {} for duckdb: {e}", f.display()));
+    // Both output formats rivet ships. Staging only parquet made every TEXT
+    // output unreadable through this seam — a CSV destination staged to an empty
+    // directory and DuckDB failed with "no files match", which reads as a broken
+    // test rather than a helper that cannot see the format under test.
+    for ext in ["parquet", "csv"] {
+        for f in files_with_extension(dir, ext) {
+            let name = f.file_name().expect("output file has a name");
+            std::fs::copy(&f, host.join(name))
+                .unwrap_or_else(|e| panic!("stage {} for duckdb: {e}", f.display()));
+        }
     }
     container
 }
@@ -748,4 +754,30 @@ pub fn mongo_deduped_field(
         }
     }
     state
+}
+
+/// Every `id` under `dir` read from CSV by DuckDB — the CSV twin of
+/// [`duckdb_dir_parquet_id_set`], for the paths that write text.
+///
+/// A separate reader on purpose: `read_parquet` cannot open a `.csv`, so a test
+/// that meant to grade the CSV writer and used the parquet helper would panic on
+/// "no parquet here" rather than quietly grade nothing — but it also could not
+/// grade anything. This is the reader that can.
+pub fn duckdb_dir_csv_id_set(dir: &Path) -> BTreeSet<i64> {
+    assert!(
+        !files_with_extension(dir, "csv").is_empty(),
+        "duckdb_dir_csv_id_set on a directory with no .csv — reading an empty set as \
+         the answer is how a wrong-format wiring hides"
+    );
+    let c = stage_for_duckdb(dir);
+    let sql = format!("SELECT id FROM read_csv_auto('{c}/**/*.csv', header=true)");
+    let v = super::duckdb_run_sql_json(&sql);
+    v["rows"]
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|r| r.get(0)?.as_str()?.parse::<i64>().ok())
+                .collect()
+        })
+        .unwrap_or_default()
 }

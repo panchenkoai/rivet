@@ -545,11 +545,15 @@ fn run_reconcile_reports_mismatch_when_source_grows_after_snapshot() {
     let table = seed_pg_numeric_table(200);
     let out = tempfile::tempdir().unwrap();
     let cfg_dir = tempfile::tempdir().unwrap();
+    // Tag THIS export's connection so the writer can wait for exactly it. Without
+    // a marker the only observable is the cursor name `_rivet`, which every
+    // concurrent rivet export in the suite also shows.
+    let marker = unique_name("qa_snapmark");
     let yaml = format!(
         r#"
 source:
   type: postgres
-  url: "{POSTGRES_URL}"
+  url: "{POSTGRES_URL}?application_name={marker}"
   tuning: {{batch_size: 10, throttle_ms: 60}}
 exports:
   - name: {name}
@@ -559,16 +563,64 @@ exports:
     destination: {{type: local, path: {dir}}}
 "#,
         name = table.name(),
-        dir = out.path().display()
+        dir = out.path().display(),
+        marker = marker
     );
     let cfg = write_config(&cfg_dir, &yaml);
 
-    // Writer: after the snapshot has opened (and while the throttled export is
-    // still running), commit 50 new rows the export's snapshot can't see.
+    // Writer: commit 50 rows the export's snapshot cannot see — which requires
+    // landing AFTER that snapshot opens and BEFORE the end-of-run recount.
+    //
+    // It waits on the SNAPSHOT, not on a clock. A fixed 600 ms sleep was timed
+    // from the thread's start, so it raced rivet's STARTUP (connect + plan +
+    // preflight) rather than the export: on a loaded machine startup outran it,
+    // the 50 rows landed BEFORE the snapshot, the export read 250 and reconcile
+    // found nothing to report. Verified pre-existing — this test fails the same
+    // way on a clean main, so the sleep had simply stopped being long enough.
+    //
+    // `pg_stat_activity` is the real precondition: the export's own backend shows
+    // up running a query against this table. Polling for it is clock-free (the
+    // condition IS the event) and fails loudly if the export never appears rather
+    // than quietly inserting at the wrong moment.
     let table_name = table.name().to_string();
+    let marker_for_writer = marker.clone();
     let writer = std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(600));
         let mut c = pg_connect();
+        let seen = (0..600).any(|_| {
+            let active: i64 = c
+                .query_one(
+                    // Matched on application_name, NOT on the query text. Measured:
+                    // rivet reads through a server-side cursor, so a moment after
+                    // `DECLARE _rivet ... FOR <query>` the backend's `query` column
+                    // already reads `FETCH 10 FROM _rivet` — the table name is gone,
+                    // and `_rivet` is what every concurrent export shows too. The
+                    // marker identifies THIS export's connection and nothing else.
+                    // The marker alone is NOT the precondition — measured: the
+                    // connection appears at CONNECT, while rivet then plans and
+                    // probes before `DECLARE _rivet ... FOR <query>`. Inserting in
+                    // that window lands BEFORE the snapshot and the export reads
+                    // 250. The cursor's presence in the backend's current statement
+                    // (`DECLARE _rivet` / `FETCH .. FROM _rivet`) is the real one.
+                    // `strpos`, not LIKE: `_` is a LIKE wildcard.
+                    "SELECT count(*) FROM pg_stat_activity \
+                     WHERE pid <> pg_backend_pid() AND application_name = $1 \
+                       AND strpos(query, '_rivet') > 0",
+                    &[&marker_for_writer],
+                )
+                .map(|r| r.get(0))
+                .unwrap_or(0);
+            if active > 0 {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            false
+        });
+        assert!(
+            seen,
+            "the export never appeared in pg_stat_activity within 12s — the writer would \
+             insert at an arbitrary moment and the mismatch this test constructs would be a \
+             coin flip"
+        );
         let _ = c.batch_execute(&format!(
             "INSERT INTO {table_name} (id, name, amount) \
              SELECT g, 'late', 1.0 FROM generate_series(201, 250) g"

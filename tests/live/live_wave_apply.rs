@@ -262,3 +262,106 @@ exports:
         "a plain re-run (no --resume) must re-export, adding a manifest copy",
     );
 }
+
+/// `rivet plan` must NOT rewrite a hand-tuned schedule unless asked, and
+/// `--annotate-waves` is the asking.
+///
+/// This is a regression with an incident behind it, recorded on the flag itself:
+/// before 0.24.4 a read-only-LOOKING `rivet plan` replaced the operator's
+/// `wave:` values, and a 5-per-wave split became one 76-export wave. The pure
+/// annotation logic has unit tests (`wave_annotations_insert_replace_and_preserve`),
+/// but nothing ran the FLAG: a correct function reached through a wrong wiring is
+/// exactly the shape that costs a production schedule, and the unit test cannot
+/// see it because the test supplies the input the CLI is meant to supply.
+///
+/// So both directions go through the real binary and read the CONFIG FILE back:
+/// without the flag the hand-set waves must survive byte-for-byte, with it they
+/// must change. Asserting only the first would pass on a `plan` that never
+/// annotates at all.
+///
+/// The load-bearing gate is `fields_to_write(&recs, &config, annotate_waves)` —
+/// RED-proven by forcing its third argument to `true`, which rewrites the config
+/// with no flag and fires the preservation assertion. The OTHER `annotate_waves`
+/// branch a reader meets first (`repack_from_history` at plan_cmd.rs:191) is
+/// EQUIVALENT for this property: it changes what the recommendation says, not
+/// whether anything is written. Named here so the next person mutating this file
+/// does not conclude the test is insensitive after trying the wrong one.
+#[test]
+#[ignore = "live: postgres"]
+fn plan_preserves_hand_tuned_waves_unless_annotate_is_asked() {
+    require_alive(LiveService::Postgres);
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let out = tempfile::tempdir().unwrap();
+    let a = unique_name("wave_keep_a");
+    let b = unique_name("wave_keep_b");
+    let root = out.path().display();
+
+    // Hand-tuned: two exports the planner would happily put in ONE wave, split
+    // across two on purpose. That split is the thing an operator owns.
+    let yaml = format!(
+        r#"
+source:
+  type: postgres
+  url: "{POSTGRES_URL}"
+
+exports:
+  - name: {a}
+    query: "SELECT id FROM orders"
+    mode: full
+    format: parquet
+    wave: 7
+    parallel_safe: false
+    destination: {{ type: local, path: {root}/{a} }}
+  - name: {b}
+    query: "SELECT id FROM orders"
+    mode: full
+    format: parquet
+    wave: 9
+    parallel_safe: false
+    destination: {{ type: local, path: {root}/{b} }}
+"#
+    );
+    let cfg = write_config(&cfg_dir, &yaml);
+    let before = std::fs::read_to_string(&cfg).expect("read config");
+
+    let plain = std::process::Command::new(RIVET_BIN)
+        .args(["plan", "--config", cfg.to_str().unwrap()])
+        .output()
+        .expect("spawn rivet plan");
+    assert!(
+        plain.status.success(),
+        "rivet plan must exit 0; stderr:\n{}",
+        String::from_utf8_lossy(&plain.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&cfg).expect("re-read config"),
+        before,
+        "`rivet plan` without --annotate-waves must leave the config BYTE-FOR-BYTE alone — \
+         it reads as a read-only command, and silently replacing a hand-tuned `wave:` is \
+         the 0.24.4 incident this flag was introduced for"
+    );
+
+    // …and the flag must actually do the thing, or the assertion above is
+    // satisfied by a `plan` that simply never annotates.
+    let annotated = std::process::Command::new(RIVET_BIN)
+        .args([
+            "plan",
+            "--config",
+            cfg.to_str().unwrap(),
+            "--annotate-waves",
+        ])
+        .output()
+        .expect("spawn rivet plan --annotate-waves");
+    assert!(
+        annotated.status.success(),
+        "rivet plan --annotate-waves must exit 0; stderr:\n{}",
+        String::from_utf8_lossy(&annotated.stderr)
+    );
+    let after = std::fs::read_to_string(&cfg).expect("re-read config after annotate");
+    assert_ne!(
+        after, before,
+        "--annotate-waves must REWRITE the hand-set schedule (waves 7/9 were chosen so any \
+         real plan disagrees); an unchanged file means the flag never reached the annotator \
+         and the preservation assertion above proves nothing"
+    );
+}
