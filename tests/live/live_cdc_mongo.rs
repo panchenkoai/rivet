@@ -636,3 +636,93 @@ fn mongo_cdc_change_stream_renders_tricky_bson_verbatim_like_batch() {
         );
     }
 }
+
+/// Per-FIELD presence profile against MONGODB ITSELF — the schemaless analogue
+/// of the per-column NULL profile the SQL engines carry.
+///
+/// Mongo's CDC image is a JSON BLOB (`_id` + `document`), so "a column silently
+/// became NULL" has no direct shape here. The equivalent silent loss is a FIELD
+/// vanishing from the rendered document while every count still balances: the
+/// change count matches, `_id`s all present, and one key is simply gone from the
+/// post-images. The existing oracles cannot see it — the soak test deduplicates
+/// on ONE field (`v`) and the tricky-BSON test reads a SINGLE document, so a
+/// fault that drops a different field, or drops it in only some documents, is
+/// invisible to both.
+///
+/// The oracle is MongoDB's own per-field presence count, compared against
+/// DuckDB's `json_extract` over the captured `document` column — two readers
+/// that share no code with rivet's renderer.
+#[test]
+#[ignore = "live: requires docker compose up -d mongo-rs"]
+fn mongo_cdc_per_field_presence_matches_the_source() {
+    require_alive(LiveService::MongoRs);
+    require_alive(LiveService::DuckDb);
+    use mongodb::bson::doc;
+    let db = unique_name("cdc_fields");
+    let m = MongoTest::connect(PORT, &db);
+    m.drop_collection("f");
+
+    let rig = cdc(&db, "f");
+    rig.run_ok(); // anchor over the empty collection
+
+    // A POPULATION, not one document: a fault that drops a field in only some
+    // renderings needs more than one to be distinguishable from a fixture typo.
+    // `opt` is deliberately present on only half the documents, so the profile
+    // has to match a NON-TRIVIAL number on at least one field — a check where
+    // every field is present everywhere passes just as well when the extraction
+    // is broken and returns everything.
+    const DOCS: i64 = 24;
+    let docs: Vec<_> = (1..=DOCS)
+        .map(|i| {
+            let mut d = doc! { "_id": i, "always": format!("a{i}"), "nested": doc!{ "k": i } };
+            if i % 2 == 0 {
+                d.insert("opt", format!("o{i}"));
+            }
+            d
+        })
+        .collect();
+    m.insert_many("f", docs);
+    for _ in 0..3 {
+        rig.run_ok();
+    }
+
+    let captured = read_mongo_cdc_changes(&rig.out_dir()).len() as i64;
+    assert!(
+        captured >= DOCS,
+        "fixture inert: only {captured} change(s) captured for {DOCS} inserted documents"
+    );
+
+    // Every post-image must CARRY its document. A delete has none by design, so
+    // the profile is taken over the non-delete ops only.
+    let missing_doc = duckdb_dir_scalar(
+        &rig.out_dir(),
+        "count(*) - count(\"document\")",
+        Some("__op <> 'delete'"),
+    );
+    assert_eq!(
+        missing_doc, 0,
+        "{missing_doc} captured post-image(s) carry no document at all — a blob that \
+         degrades to NULL is this model's whole-row silent loss"
+    );
+
+    for (field, expected) in [("always", DOCS), ("opt", DOCS / 2), ("nested", DOCS)] {
+        // MongoDB's own answer, not a number this test assumes.
+        let src = m.count_field_present("f", field) as i64;
+        assert_eq!(
+            src, expected,
+            "fixture drifted: MongoDB reports {src} document(s) with '{field}', the fixture \
+             builds {expected} — the comparison below would then grade the wrong population"
+        );
+        let dst = duckdb_dir_scalar(
+            &rig.out_dir(),
+            &format!("count(json_extract(\"document\", '$.{field}'))"),
+            Some("__op <> 'delete'"),
+        );
+        assert_eq!(
+            src, dst,
+            "field '{field}': presence parity against MongoDB itself — source {src}, \
+             captured {dst}. A renderer that drops a field moves this and nothing else; \
+             the change count, the `_id` set and a single-field dedup all still balance."
+        );
+    }
+}
