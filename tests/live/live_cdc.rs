@@ -5178,3 +5178,112 @@ fn mysql_cdc_compressed_payload_in_stream_refuses_not_skips() {
         "a refused resume must not write _SUCCESS"
     );
 }
+
+/// `rivet cdc --output --rollover N`: two invariants that had ZERO coverage on
+/// this path, and both are the shapes that have already lost data here.
+///
+/// 1. A part NEVER splits a transaction. `rollover` is a soft target — the sink
+///    rolls at a commit boundary — so a 3-row transaction under `--rollover 2`
+///    must land as ONE part, not two. Splitting it is what makes a crash between
+///    the two parts leave half a transaction durable.
+/// 2. Two consecutive runs into the SAME `--output` directory must not clobber
+///    each other. This is the class that cost real rows: run N+1's first part
+///    overwrote run N's `cdc-000000.parquet` AFTER the position had advanced past
+///    those changes, so the data was gone from the source log and the destination
+///    both. The config path was fixed and regression-tested; the CLI path — which
+///    takes `--output` as a bare directory and is the most natural way to point
+///    two scheduled runs at one place — was never tested at all.
+///
+/// The oracle is DuckDB over the directory, never rivet's own manifest: the
+/// manifest is exactly what a clobber leaves looking consistent.
+#[test]
+#[ignore = "live: requires docker compose mysql-cdc (binlog)"]
+fn roast_mysql_cdc_cli_rollover_keeps_transactions_whole_and_two_runs_do_not_clobber() {
+    require_alive(LiveService::DuckDb);
+    let mut c = conn();
+    let tbl = unique_name("rivet_cdc_roll");
+    c.query_drop(format!(
+        "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v INT)"
+    ))
+    .expect("create table");
+    let _t = MysqlCdcTable(tbl.clone());
+
+    let d = tempfile::tempdir().unwrap();
+    let ckpt = d.path().join("ck");
+    let out = d.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    write_checkpoint(&mut c, &ckpt); // anchor at NOW
+
+    let ckpt_s = ckpt.to_str().unwrap().to_string();
+    let out_s = out.to_str().unwrap().to_string();
+    let tbl_q = tbl.clone();
+    let cdc_run = move || {
+        run_rivet_env(
+            &[
+                "cdc",
+                "--source",
+                MYSQL_CDC_URL,
+                "--table",
+                &tbl_q,
+                "--checkpoint",
+                &ckpt_s,
+                "--output",
+                &out_s,
+                "--rollover",
+                "2",
+            ],
+            &[],
+        )
+    };
+
+    // Run 1: ONE transaction of three rows, under a rollover of two.
+    c.query_drop(format!("INSERT INTO {tbl} VALUES (1,1),(2,2),(3,3)"))
+        .expect("tx1");
+    let r1 = cdc_run();
+    assert!(
+        r1.status.success(),
+        "cdc run 1 failed:\n{}",
+        String::from_utf8_lossy(&r1.stderr)
+    );
+    let parts_after_1 = files_with_extension(&out, "parquet").len();
+    assert_eq!(
+        duckdb_total_parquet_rows(&out),
+        3,
+        "run 1 must capture the whole transaction"
+    );
+    assert_eq!(
+        parts_after_1, 1,
+        "a 3-row transaction at --rollover 2 must land as ONE part: the sink rolls at a \
+         COMMIT boundary, so splitting it into 2 parts means a crash between them leaves \
+         half a transaction durable"
+    );
+
+    // Run 2: a second transaction into the SAME --output directory.
+    c.query_drop(format!("INSERT INTO {tbl} VALUES (4,4),(5,5),(6,6)"))
+        .expect("tx2");
+    let r2 = cdc_run();
+    assert!(
+        r2.status.success(),
+        "cdc run 2 failed:\n{}",
+        String::from_utf8_lossy(&r2.stderr)
+    );
+
+    // The id SET separates the two failures a file COUNT conflates. An inert
+    // fixture (run 2 captured nothing) leaves {1,2,3}; a clobber leaves {4,5,6},
+    // because run 2 really did capture and then wrote over run 1's part. Counting
+    // files reports both as "no new part" and blames the fixture for the product.
+    let ids = duckdb_dir_parquet_id_set(&out);
+    let _ = parts_after_1;
+    assert!(
+        (4..=6).all(|i| ids.contains(&i)),
+        "run 2 captured nothing of its own (ids {ids:?}) — the fixture is inert, so the \
+         union below would pass without testing anything"
+    );
+    assert_eq!(
+        ids,
+        (1..=6).collect::<std::collections::BTreeSet<i64>>(),
+        "both runs' rows must survive in one --output directory; a missing 1..=3 is the \
+         clobber class (run 2's first part overwriting run 1's) AFTER the checkpoint \
+         advanced past them — gone from the binlog and the destination both"
+    );
+}
