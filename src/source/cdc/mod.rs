@@ -1100,26 +1100,31 @@ pub(crate) fn run_capture(
 #[cfg(test)]
 mod tests {
 
-    /// `--max-events` must not be able to WEDGE a checkpointed NDJSON run.
+    /// `--max-events` must not be able to WEDGE a checkpointed NDJSON run, and
+    /// must still CAP.
     ///
     /// The two drivers of the same flag disagreed. The file sink defers the cap
     /// to a commit boundary (`max_events_stops_at_a_commit_boundary_never_inside_
     /// a_transaction`); this NDJSON loop broke on the event count alone. That
     /// loses nothing — the checkpoint save is gated on `committed`, so a cut
-    /// transaction re-emits rather than being skipped — but a transaction LONGER
-    /// than the cap then contains no boundary to save, so every run re-reads from
-    /// the same position, re-prints the same prefix, and stops in the same place.
-    /// `rivet cdc --checkpoint ck --max-events 100` against a 10k-row bulk load
-    /// makes no progress, ever, and says nothing about why.
+    /// transaction re-emits — but a transaction LONGER than the cap held no
+    /// boundary to save, so every run re-read the same position, re-printed the
+    /// same prefix, and stopped in the same place. `rivet cdc --checkpoint ck
+    /// --max-events 100` against a 10k-row bulk load made no progress, ever.
     ///
-    /// RED before the fix: the checkpoint file is never written.
+    /// TWO transactions, deliberately. A single-transaction fixture cannot tell
+    /// "stopped at the boundary" from "ran to the end of the stream", because its
+    /// only commit IS the end — the `>=`→`<` mutant survived exactly that shape
+    /// (CI mutation gate, PR #238). With a second transaction the saved position
+    /// distinguishes them: stopping at tx1's boundary saves tx1's commit, running
+    /// on saves tx2's.
     #[test]
-    fn max_events_cannot_wedge_a_checkpointed_run_on_a_long_transaction() {
+    fn max_events_stops_at_the_first_boundary_past_the_cap_and_checkpoints_there() {
         use super::*;
         use std::collections::VecDeque;
 
-        struct FiveInOneTxn(VecDeque<ChangeEvent>);
-        impl ChangeStream for FiveInOneTxn {
+        struct Fake(VecDeque<ChangeEvent>);
+        impl ChangeStream for Fake {
             fn next_change(&mut self) -> Option<Result<ChangeEvent>> {
                 self.0.pop_front().map(Ok)
             }
@@ -1136,23 +1141,43 @@ mod tests {
             seq: 0,
             poison: None,
         };
-        // One transaction of five events: only the last carries the boundary.
-        let mut stream = FiveInOneTxn((1..=5).map(|i| ev(i, i == 5)).collect());
+        // tx1 = 1,2,3 (boundary at 3) and tx2 = 4,5,6 (boundary at 6). The cap is
+        // 2, so it lands INSIDE tx1 — the shape with no boundary to stop at.
+        let mut stream = Fake(
+            [
+                ev(1, false),
+                ev(2, false),
+                ev(3, true),
+                ev(4, false),
+                ev(5, false),
+                ev(6, true),
+            ]
+            .into_iter()
+            .collect(),
+        );
 
         let dir = tempfile::tempdir().unwrap();
         let ckpt = dir.path().join("ck");
-        run(&mut stream, Some(ckpt.clone()), Vec::new(), Some(3)).expect("run");
+        run(&mut stream, Some(ckpt.clone()), Vec::new(), Some(2)).expect("run");
 
         assert!(
             ckpt.exists(),
-            "a cap that lands inside a transaction must still reach the boundary and \
+            "a cap landing inside a transaction must still reach the boundary and \
              checkpoint — otherwise the next run resumes at the same place and the \
              export never progresses"
         );
         let saved = Position::load(&ckpt).expect("load").expect("some");
         assert_eq!(
-            saved.0["lsn"], "00000005",
-            "and the position saved must be the transaction's COMMIT, not a mid-transaction event"
+            saved.0["lsn"], "00000003",
+            "the cap must stop at tx1's COMMIT — 00000006 means it ran to the end of \
+             the stream and capped nothing, 00000001/2 would mean it saved a \
+             mid-transaction position"
+        );
+        assert_eq!(
+            stream.0.len(),
+            3,
+            "tx2 must be left UNCONSUMED for the next run; draining it means the cap \
+             stopped nothing"
         );
     }
 
