@@ -989,6 +989,79 @@ fn mssql_cdc_full_type_matrix_matches_batch() {
     }
     // CDC adds its change-metadata columns the batch export doesn't have.
     assert!(cdc.schema().index_of("__op").is_ok() && cdc.schema().index_of("__pos").is_ok());
+
+    // ─── Per-column NULL profile against SQL SERVER ITSELF ────────────────────
+    //
+    // HONEST LIMIT, first, because it changes how to read what follows: no mutant
+    // was found where THIS assertion is the one that bites. Two were tried.
+    // (1) `ColumnData::Guid(Some(g))` → `RivetValue::Null` in the MSSQL CDC
+    // decoder — the exact degrade-to-NULL shape — is caught FIRST by the
+    // ArrayData comparison above (`column u: CDC differs from the batch export`),
+    // because only the CDC side degrades. (2) The shared decision point, where a
+    // fault WOULD be symmetric — `RivetType::Uuid => FixedSizeBinary(16)` in
+    // `types/mapping.rs`, which both paths read — narrowed to `(8)` never runs:
+    // the product rejects it at `mapping.rs:294` ("Uuid extension only valid on
+    // FixedSizeBinary(16)"). That is a real result about the product, not a gap:
+    // the one place both paths could go wrong together is guarded by its own
+    // invariant.
+    //
+    // So this earns its place as defence in depth, not on a demonstrated kill —
+    // and the distinction is stated here rather than left for a reader to assume
+    // a kill. What it uniquely covers is the SYMMETRIC fault: the comparison
+    // above is differential (CDC against batch, both decoded by rivet), so a
+    // fault the two share passes its own inspection. This asks SQL Server.
+    //
+    // The class is not hypothetical on other engines: the `FixedSizeBinary(16)`
+    // builder nulled anything not exactly 16 bytes and `test_decoding` renders
+    // uuids as 36-char TEXT, so 100% of a PostgreSQL uuid column became NULL on a
+    // real bucket while every count and sum check passed.
+    //
+    // The column list is DERIVED from the catalog, never re-typed here: a
+    // hand-written list grades only the columns its author remembered and
+    // silently stops covering any the fixture gains later.
+    //
+    // INSERT images only — a CDC part holds one row per change, so the source's
+    // 2 rows are the 2 inserts; reading the whole part compares different
+    // populations.
+    let cols = mssql_cdc_query_strings(&format!(
+        "SELECT c.name FROM sys.columns c \
+         JOIN sys.tables t ON t.object_id = c.object_id \
+         WHERE t.name = '{table}' ORDER BY c.column_id"
+    ));
+    assert!(
+        cols.len() >= 20,
+        "the fixture must present a rich column set to profile; got {} — did the \
+         catalog query stop resolving the table?",
+        cols.len()
+    );
+    let mut columns_with_nulls = 0;
+    for col in &cols {
+        let src_nulls = mssql_cdc_query_i64(&format!(
+            "SELECT COUNT(*) - COUNT([{col}]) FROM dbo.{table}"
+        ));
+        columns_with_nulls += i32::from(src_nulls > 0);
+        let dst_nulls = duckdb_dir_scalar(
+            &cdc_out,
+            &format!("count(*) - count(\"{col}\")"),
+            Some("__op = 'insert'"),
+        );
+        assert_eq!(
+            src_nulls, dst_nulls,
+            "column '{col}': NULL-count parity against SQL Server itself — source \
+             {src_nulls}, captured {dst_nulls}. A per-cell decode that degrades to \
+             NULL moves this and nothing else."
+        );
+    }
+    // The fixture must actually LOAD this axis: row 2 sets only `id`, so every
+    // other column must show a source NULL. A column compared at 0-vs-0 is a
+    // green that proves nothing, and that is what this decays into if someone
+    // later simplifies the INSERTs.
+    assert!(
+        columns_with_nulls >= 15,
+        "only {columns_with_nulls} of {} columns carry a source NULL — the fixture \
+         stopped exercising the null axis, so the parity above is comparing zeros",
+        cols.len()
+    );
 }
 
 #[test]

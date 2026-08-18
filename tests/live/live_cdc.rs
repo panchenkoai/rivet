@@ -3852,6 +3852,91 @@ fn roast_pg_cdc_empty_transaction_churn_must_not_pin_the_slot() {
     );
 }
 
+/// `rivet cdc --max-events` must not be able to WEDGE a checkpointed CLI run.
+///
+/// The CLI leg of the driver-bypass this closed: the file sink deferred the cap
+/// to a commit boundary, the NDJSON loop (`cdc::run`, i.e. `rivet cdc` with no
+/// `--output`) broke on the event count alone. Nothing was LOST — the checkpoint
+/// save is gated on `committed`, so a cut transaction re-emits on resume — but a
+/// transaction LONGER than the cap held no boundary to save, so the checkpoint
+/// never advanced and every run re-printed the same prefix and stopped in the
+/// same place. Silent, and shaped like a config problem.
+///
+/// MySQL, deliberately: it is the engine whose NDJSON resume IS the checkpoint
+/// file (`dispatch.rs` — PostgreSQL re-reads from its slot on this path and does
+/// not ack by design, so the wedge is invisible there). MySQL also buffers a
+/// transaction and releases it whole at XID with only the LAST row `committed`,
+/// which is exactly the shape that has no boundary to stop at mid-way.
+///
+/// RED before the fix: run 2 re-emits rows 1..=2 forever.
+#[test]
+#[ignore = "live: requires docker compose mysql-cdc (binlog)"]
+fn roast_mysql_cdc_cli_max_events_below_a_transaction_still_advances_the_checkpoint() {
+    let mut c = conn();
+    let tbl = unique_name("rivet_cdc_cap");
+    c.query_drop(format!(
+        "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v INT)"
+    ))
+    .expect("create table");
+    let _t = MysqlCdcTable(tbl.clone());
+
+    let d = tempfile::tempdir().unwrap();
+    let ckpt = d.path().join("ck");
+    write_checkpoint(&mut c, &ckpt); // anchor at NOW, so only what follows is in scope
+
+    // ONE transaction of five rows — longer than the cap below, and released
+    // whole at its XID, so a hard per-event stop lands with no boundary to save.
+    c.query_drop(format!(
+        "INSERT INTO {tbl} VALUES (1,1),(2,2),(3,3),(4,4),(5,5)"
+    ))
+    .expect("seed one transaction");
+
+    let ckpt_s = ckpt.to_str().unwrap().to_string();
+    let tbl_q = tbl.clone();
+    let cdc_run = move || {
+        run_rivet_args_bounded(
+            &[
+                "cdc",
+                "--source",
+                MYSQL_CDC_URL,
+                "--table",
+                &tbl_q,
+                "--checkpoint",
+                &ckpt_s,
+                "--max-events",
+                "2",
+            ],
+            std::time::Duration::from_secs(60),
+        )
+    };
+    let ids = |out: &str, tbl: &str| -> std::collections::BTreeSet<i64> {
+        out.lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| v.get("table").and_then(|t| t.as_str()) == Some(tbl))
+            .filter_map(|v| v.get("after")?.get(0)?.as_i64())
+            .collect()
+    };
+
+    let first = cdc_run().expect("run 1 must terminate");
+    let ids1 = ids(&first, &tbl);
+    // The cap is SOFT: it overshoots to the commit boundary rather than cutting
+    // the transaction, which is the only way it can checkpoint at all.
+    assert_eq!(
+        ids1,
+        (1..=5).collect::<std::collections::BTreeSet<i64>>(),
+        "a cap of 2 inside a 5-row transaction must reach the boundary, not cut it; got {ids1:?}\n{first}"
+    );
+
+    let second = cdc_run().expect("run 2 must terminate");
+    let ids2 = ids(&second, &tbl);
+    assert!(
+        ids2.is_empty(),
+        "run 2 must emit nothing — the checkpoint advanced past the transaction. Re-emitting \
+         {ids2:?} is the wedge: pre-fix no boundary was ever saved, so every run re-printed the \
+         same prefix and the export never progressed"
+    );
+}
+
 #[test]
 #[ignore = "live: requires docker compose postgres (wal_level=logical)"]
 fn roast_pg_cdc_ndjson_until_current_terminates_and_emits_backlog() {
