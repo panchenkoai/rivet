@@ -201,8 +201,12 @@ const MATRICES: &[(&str, usize)] = &[
     // against the removed guard: 100 of 150 rows shipped with `status: success`, exit 0.
     // Unlike the checkpoint twin (RED only with BOTH guards off) this is a single-guard
     // RED — the plain runner keeps no chunk_task ledger, so that one bail is all there is.
-    // Any SECOND gap, or gap 1 surviving once its fill lands, fails here.
-    ("docs/runner-coverage-matrix.yaml", 1),
+    //
+    // Lowered 1 -> 0 (2026-08-18): the last admitted gap — the parallel checkpoint
+    // runner's END-TO-END governor shed, which two offline proofs could not reach —
+    // was filled by `checkpoint_governor_backs_off_under_concurrent_write_pressure`.
+    // At 0 this ledger admits nothing: any new gap cell fails here immediately.
+    ("docs/runner-coverage-matrix.yaml", 0),
     // Pool-split — `apply --pool --split` per (strategy × source engine). Split is a
     // scheduler layer above the runners (each unit runs through chunked/keyset), so its
     // per-engine behaviour (boundary probe, crash-recovery, finding-2 exact-partition

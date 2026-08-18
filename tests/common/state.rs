@@ -69,6 +69,24 @@ impl StateDb {
             .expect("export_metrics.run_id must be set by the run path")
     }
 
+    /// The stored `run_journal.journal_json` for `export`'s newest run.
+    ///
+    /// The RECORDED journal, not `rivet journal`'s human rendering — that command
+    /// prints a SUBSET (files, retries, quality issues) and never shows a
+    /// `ParallelismAdjusted`, so a test asserting a governor shed through it reads
+    /// an empty result and blames the runner. The stored JSON is the artifact the
+    /// run actually wrote.
+    pub fn latest_journal_json(&self, export: &str) -> String {
+        self.conn
+            .query_row(
+                "SELECT journal_json FROM run_journal \
+                 WHERE export_name = ?1 ORDER BY rowid DESC LIMIT 1",
+                [export],
+                |r| r.get::<_, String>(0),
+            )
+            .expect("a run_journal row must exist after the run")
+    }
+
     /// The persisted incremental cursor for `export`, or `None` when the export
     /// has no `export_state` row at all.
     ///

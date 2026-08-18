@@ -1614,3 +1614,111 @@ fn mssql_governor_backs_off_under_real_log_flush_pressure() {
         "every exported row must round-trip while the governor is shedding"
     );
 }
+
+/// The checkpoint twin of [`governor_backs_off_under_concurrent_write_pressure`]
+/// — the LAST `gap:` cell in `docs/runner-coverage-matrix.yaml`, filled to its
+/// own recipe.
+///
+/// `chunked_checkpoint`'s parallel half IS wired to the governor
+/// (`GovernorHarness::arm`/`spawn_into`/`drain_into` in `parallel_checkpoint.rs`)
+/// and had two OFFLINE proofs: a call-site pin over the source text, and the
+/// pool shed mechanism against real permit guards. Neither can catch a run whose
+/// SAMPLER never moves under real pressure — which is precisely what the
+/// `chunked` cell's live test does for `exec.rs`. The end-to-end shed on this
+/// runner had been observed only in an ad-hoc run that was never committed
+/// (2026-08-14), so the matrix carried it as an admission rather than a cell.
+///
+/// The journal, not just stderr, is the oracle for the shed: `ParallelismAdjusted`
+/// is drained BEFORE the runner's error/bail check precisely so the record
+/// survives, and a log line proves the message was formatted while the journal
+/// proves the event was RECORDED — the artifact an operator actually reads back.
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn checkpoint_governor_backs_off_under_concurrent_write_pressure() {
+    require_alive(LiveService::Postgres);
+    let _quiet = quiet_window_guard();
+
+    const ROWS: i64 = 20_000;
+    let table = seed_pg_wide_table(ROWS, 1024);
+    // Identical to the twin, plus the one line this cell exists for.
+    let rig = Rig::pg_batch(table.name())
+        .query(&format!("SELECT id, payload FROM {}", table.name()))
+        .mode("chunked")
+        .source_line("tuning:")
+        .source_line("  adaptive: true")
+        .source_line("  min_parallel: 2")
+        .source_line("  batch_size: 250")
+        .source_line("  throttle_ms: 100")
+        .export_line("chunk_column: id")
+        .export_line("chunk_size: 1000")
+        .export_line("parallel: 8")
+        .export_line("chunk_checkpoint: true");
+
+    let table_name = table.name().to_string();
+    let mut writer = PressureWriter::spawn(move |stop| {
+        let mut c = pg_connect();
+        let mut k: i64 = 1;
+        while !stop.load(Ordering::Relaxed) {
+            let _ = c.batch_execute(&format!(
+                "UPDATE {table_name} SET payload = repeat('z', 1024), updated_at = now() \
+                 WHERE id BETWEEN {k} AND {k} + 999; CHECKPOINT;"
+            ));
+            k += 1000;
+            if k > ROWS {
+                k = 1;
+            }
+            std::thread::sleep(Duration::from_millis(70));
+        }
+    });
+    std::thread::sleep(Duration::from_millis(400)); // pre-warm the signal
+
+    let out = rig.run_with_envs_bounded(
+        &[("RUST_LOG", "info"), ("RIVET_GOVERNOR_INTERVAL_MS", "200")],
+        Duration::from_secs(120),
+    );
+    assert!(!writer.reap(), "the write-pressure writer thread PANICKED");
+    let out = out.expect("governed checkpoint run under write pressure did not finish within 120s");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "governed checkpoint run must still complete; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("adaptive concurrency governor active"),
+        "governor must arm on the PARALLEL checkpoint runner too; stderr:\n{stderr}"
+    );
+    assert_eq!(
+        duckdb_total_parquet_rows(&rig.out_dir()),
+        ROWS as usize,
+        "every row must round-trip while the governor resizes the pool mid-run — a shed \
+         that strands a chunk delivers a short export with a green exit"
+    );
+
+    // The RECORDED shed, read from the STORED journal rather than `rivet journal`.
+    //
+    // That command's human output renders a SUBSET — files, retries, quality
+    // issues — and never prints a `ParallelismAdjusted` at all, so the first
+    // version of this assertion read an empty result while stderr showed the shed
+    // had happened, and would have blamed the runner for a rendering gap. The
+    // stored `run_journal.journal_json` is what the run actually wrote, and it is
+    // what any later reader (a support dump, a post-mortem) parses.
+    let journal = StateDb::next_to_config(&rig.config_path()).latest_journal_json(table.name());
+    let v: serde_json::Value = serde_json::from_str(&journal).expect("journal_json parses");
+    let sheds = v["entries"]
+        .as_array()
+        .map(|evs| {
+            evs.iter()
+                .filter_map(|e| e.get("event")?.get("ParallelismAdjusted"))
+                .filter(|a| a["to"].as_u64() < a["from"].as_u64())
+                .count()
+        })
+        .unwrap_or(0);
+    assert!(
+        sheds > 0,
+        "under rising checkpoint pressure the PARALLEL checkpoint runner must RECORD at \
+         least one shed as a ParallelismAdjusted event with to < from. stderr showed a \
+         back-off: {}. journal_json:\n{journal}",
+        stderr.contains("backed off")
+    );
+}
