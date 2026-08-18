@@ -143,7 +143,7 @@ The engine is chosen from the URL scheme: `mysql://` (binlog), `postgresql://` (
   Default value: `4271`
 * `--checkpoint <PATH>` — Persist/resume the engine's log position to this file (MySQL binlog coordinates / PostgreSQL slot-resume marker / SQL Server from-LSN / MongoDB resume token). If omitted, each engine falls back to its own anchor: MySQL and MongoDB start at the source's CURRENT position (nothing written before now is captured), PostgreSQL resumes from the slot itself (server-side — a slot created here pins at the current WAL position), and SQL Server starts at the capture instance's `fn_cdc_get_min_lsn` (it over-reads the retained backlog rather than skipping)
 * `--table <TABLE>` — Only emit changes for this table (repeatable; default: all tables)
-* `--max-events <N>` — Stop after N change events. Without it the default bounded run drains to the log end as of open and exits; streaming until interrupted needs `--stream`
+* `--max-events <N>` — Stop at the first COMMIT BOUNDARY once N change events have been emitted — a soft cap, so the run may overshoot N by the remainder of the transaction the cap lands in. A hard per-event stop cannot checkpoint inside a transaction, so a transaction longer than N left the run re-reading the same position on every restart. Without it the default bounded run drains to the log end as of open and exits; streaming until interrupted needs `--stream`
 * `--output <DIR>` — Write typed Parquet/CSV files to this directory (the upsert/after-image shape) instead of NDJSON to stdout. Requires exactly one `--table` — its schema is resolved from the source
 * `--format <FORMAT>` — Output file format when `--output` is set: `parquet` (default) or `csv`
 
