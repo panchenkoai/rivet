@@ -5477,3 +5477,96 @@ fn mysql_cdc_cli_stream_with_a_cap_terminates_and_accepts_a_server_id() {
          `until_current` (dispatch.rs: `until_current: !stream`)"
     );
 }
+
+/// `rivet cdc --source-env` / `--source-file`, and the ArgGroup that keeps them
+/// mutually exclusive.
+///
+/// These are the CREDENTIAL-SAFETY path: `--source` puts the URL (password and
+/// all) in `ps` output, and rivet warns about the same shape in a config file.
+/// The only reference to `--source-env` anywhere in the tree was for `rivet
+/// init`, so the CDC subcommand's own resolution had never been exercised — and a
+/// user whose `--source-env` silently failed would go straight back to the inline
+/// form the warning exists to discourage.
+///
+/// The oracle is the SAME capture through all three forms: whatever the flag
+/// does, it must resolve to one URL. Asserting only "exit 0" would pass on a
+/// resolver that connected to something else entirely.
+#[test]
+#[ignore = "live: requires docker compose mysql-cdc (binlog)"]
+fn mysql_cdc_cli_resolves_the_source_from_env_and_file_alike() {
+    let mut c = conn();
+    let tbl = unique_name("rivet_cdc_src");
+    c.query_drop(format!(
+        "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v INT)"
+    ))
+    .expect("create table");
+    let _t = MysqlCdcTable(tbl.clone());
+
+    let d = tempfile::tempdir().unwrap();
+    let url_file = d.path().join("url.txt");
+    std::fs::write(&url_file, MYSQL_CDC_URL).expect("write url file");
+
+    let capture = |form: &[&str], envs: &[(&str, &str)]| -> std::collections::BTreeSet<i64> {
+        let ckpt = d
+            .path()
+            .join(format!("ck_{}", form.join("_").replace('/', "_")));
+        write_checkpoint(&mut conn(), &ckpt);
+        // Each form captures the SAME change, written after its own anchor.
+        conn()
+            .query_drop(format!("INSERT INTO {tbl} VALUES (7,7)"))
+            .expect("seed");
+        conn()
+            .query_drop(format!("DELETE FROM {tbl} WHERE id = 7"))
+            .expect("cleanup seed");
+        let mut args: Vec<&str> = vec!["cdc"];
+        args.extend_from_slice(form);
+        let ck = ckpt.to_str().unwrap().to_string();
+        args.extend_from_slice(&["--table", &tbl, "--checkpoint", &ck]);
+        let out = run_rivet_args_bounded_env(&args, envs, std::time::Duration::from_secs(60))
+            .unwrap_or_else(|| panic!("`rivet cdc {}` did not terminate", form.join(" ")));
+        out.lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| v.get("table").and_then(|t| t.as_str()) == Some(tbl.as_str()))
+            .filter_map(|v| v.get("after")?.get(0)?.as_i64())
+            .collect()
+    };
+
+    let inline = capture(&["--source", MYSQL_CDC_URL], &[]);
+    assert!(
+        inline.contains(&7),
+        "the inline form must capture the seeded change — the fixture is inert otherwise: {inline:?}"
+    );
+    let from_env = capture(
+        &["--source-env", "RIVET_TEST_CDC_URL"],
+        &[("RIVET_TEST_CDC_URL", MYSQL_CDC_URL)],
+    );
+    assert_eq!(
+        from_env, inline,
+        "`--source-env` must resolve to the same source as `--source`; exit 0 alone would \
+         pass on a resolver that connected somewhere else"
+    );
+    let from_file = capture(&["--source-file", url_file.to_str().unwrap()], &[]);
+    assert_eq!(
+        from_file, inline,
+        "`--source-file` must resolve to the same source as `--source`"
+    );
+
+    // The ArgGroup: exactly one form, never two. Without it a config that sets
+    // both silently picks a winner, and which one is invisible to the operator.
+    let both = run_rivet_env(
+        &[
+            "cdc",
+            "--source",
+            MYSQL_CDC_URL,
+            "--source-env",
+            "RIVET_TEST_CDC_URL",
+            "--table",
+            &tbl,
+        ],
+        &[("RIVET_TEST_CDC_URL", MYSQL_CDC_URL)],
+    );
+    assert!(
+        !both.status.success(),
+        "passing two source forms must be REFUSED, not silently resolved to one of them"
+    );
+}
