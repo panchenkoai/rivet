@@ -5467,6 +5467,15 @@ fn mysql_cdc_cli_stream_with_a_cap_terminates_and_accepts_a_server_id() {
             "--checkpoint",
             ckpt2.to_str().unwrap(),
             "--stream",
+            // A DISTINCT non-default id here too. Omitting it took the default
+            // (4271), which every other concurrent `rivet cdc` also takes, and
+            // MySQL kicks the older connection off when two replicas claim one
+            // server_id — the run then exits non-zero and this reads as a
+            // termination bug. Caught by the full suite at --test-threads=4;
+            // green in isolation, which is exactly how a shared-identity fixture
+            // hides.
+            "--server-id",
+            "919192",
         ],
         std::time::Duration::from_secs(15),
     );
