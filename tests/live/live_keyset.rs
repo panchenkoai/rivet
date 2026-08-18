@@ -2276,3 +2276,95 @@ fn array_columns_reach_the_value_checksum() {
         String::from_utf8_lossy(&v.stderr)
     );
 }
+
+/// `rivet validate --depth full` — the command the reconcile report TELLS the
+/// operator to run, never once run by the suite.
+///
+/// Its only reference anywhere in the tree is inside an assertion STRING
+/// (`live_mysql_reconcile_repair.rs`: the report must point at "rivet validate
+/// --depth full"). That report says, correctly, that reconcile compares the
+/// source to a number rivet RECORDED and that this is the check which re-reads
+/// the files — so the remediation the product hands out led to a code path no
+/// test executed. A remediation hint has to work from the state it is offered in.
+///
+/// `Full` is `Sample` plus the Form B value-checksum re-read, which DOWNLOADS the
+/// parts. Both halves are asserted: it passes on a clean export, and it FAILS on
+/// a part whose bytes were altered while every lighter level still passes — the
+/// difference between the depths is the whole point of naming one in a hint.
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn validate_depth_full_rereads_the_parts_the_lighter_depths_never_open() {
+    require_alive(LiveService::Postgres);
+    let table = seed_pg_numeric_table(300);
+    let rig = Rig::pg_batch(table.name())
+        .mode("chunked")
+        .export_line("chunk_column: id")
+        .export_line("chunk_size: 100");
+    rig.run_ok();
+
+    // Clean: every depth passes.
+    for depth in ["light", "sample", "full"] {
+        let out = rig.cli(&["validate", "--depth", depth]);
+        assert!(
+            out.status.success(),
+            "validate --depth {depth} must pass on a clean export; stderr:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // Corrupt a part's BYTES without touching its size: a value-level fault, which
+    // is exactly what the lighter depths cannot see (they check the manifest, the
+    // `_SUCCESS` marker, part presence and size — none of which move).
+    let parts = files_with_extension(&rig.out_dir(), "parquet");
+    assert!(!parts.is_empty(), "the export must have written a part");
+    let victim = &parts[0];
+    let before = std::fs::metadata(victim).expect("stat part").len();
+    let mut bytes = std::fs::read(victim).expect("read part");
+    // Flip bits in the middle of the data region, away from the header/footer, so
+    // the file stays a readable parquet whose VALUES changed.
+    let mid = bytes.len() / 2;
+    for b in bytes.iter_mut().skip(mid).take(64) {
+        *b ^= 0xFF;
+    }
+    std::fs::write(victim, &bytes).expect("write corrupted part");
+    assert_eq!(
+        std::fs::metadata(victim).expect("re-stat part").len(),
+        before,
+        "the corruption must not change the SIZE — otherwise the lighter depths catch it \
+         on size alone and this test proves nothing about depth"
+    );
+
+    // The DEPTH distinction, measured rather than assumed: whatever the lighter
+    // levels do on this exact corruption is recorded below, because "full fails"
+    // alone would be satisfied by a failure for any reason at all.
+    let light = rig.cli(&["validate", "--depth", "light"]);
+    let sample = rig.cli(&["validate", "--depth", "sample"]);
+    // Measured 2026-08-18: light=true sample=true, full=false. `sample` adds a
+    // prefix listing (presence, size, surplus) and a byte flip moves none of
+    // those, which is what makes `--depth full` genuinely load-bearing rather than
+    // a slower spelling of the same check. Its verdict is REPORTED, not asserted:
+    // pinning "sample passes" would forbid ever strengthening it, and this test's
+    // subject is the depth the report recommends, not the ceiling of the one below.
+    eprintln!(
+        "depth verdicts on a byte-corrupted part: light={} sample={}",
+        light.status.success(),
+        sample.status.success()
+    );
+    assert!(
+        light.status.success(),
+        "`light` reads the manifest, `_SUCCESS` and self-consistency — none of which a \
+         byte flip moves. If it fails, the fixture broke something else and the depth \
+         comparison below is meaningless; stderr:\n{}",
+        String::from_utf8_lossy(&light.stderr)
+    );
+
+    let full = rig.cli(&["validate", "--depth", "full"]);
+    assert!(
+        !full.status.success(),
+        "validate --depth full must FAIL on a part whose bytes changed — it is the depth \
+         that re-reads them, and it is what `rivet reconcile` tells the operator to run \
+         when its own verdict is only rivet's recorded count; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&full.stdout),
+        String::from_utf8_lossy(&full.stderr)
+    );
+}
