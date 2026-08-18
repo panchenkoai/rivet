@@ -396,3 +396,28 @@ fn split_go(sql: &str) -> Vec<String> {
     }
     out
 }
+
+/// Every row's first column as a `String`, against the CDC `mssql-cdc` (`:1434`).
+///
+/// For DERIVING an enumeration from the catalog rather than re-typing it in a
+/// test — a hand-written column list grades only what its author remembered, and
+/// silently stops covering a column the fixture gains later.
+pub fn mssql_cdc_query_strings(sql: &str) -> Vec<String> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("mssql: tokio runtime");
+    rt.block_on(async {
+        let mut client = connect_at(1434).await;
+        let rows = client
+            .simple_query(sql)
+            .await
+            .expect("mssql: query")
+            .into_first_result()
+            .await
+            .expect("mssql: rows");
+        rows.iter()
+            .filter_map(|r| r.get::<&str, _>(0).map(String::from))
+            .collect()
+    })
+}
