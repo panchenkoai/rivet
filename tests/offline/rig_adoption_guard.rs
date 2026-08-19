@@ -68,7 +68,6 @@ const BASELINE: &[(&str, usize)] = &[
     ("live_partition_by.rs", 4),
     ("live_partition_cloud.rs", 2),
     ("live_performance_smoke.rs", 3),
-    ("live_plan_output_ux.rs", 6),
     ("live_resume.rs", 2),
     ("live_retry_and_faults.rs", 5),
     ("live_schema_drift.rs", 6),
