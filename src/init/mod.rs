@@ -968,6 +968,28 @@ fn table_discovery(info: &TableInfo) -> TableDiscovery {
     }
 }
 
+/// Classify one table's introspection result during a WHOLE-SCHEMA scan: keep
+/// it, skip it, or abort the scan.
+///
+/// Skip covers exactly the "listed but not introspectable" shape every engine
+/// can produce — a table dropped between `list_tables` and `introspect` (the
+/// live suite's parallelism does this constantly), and MySQL's broken VIEW,
+/// which stays listed with zero columns after its base table is gone. Any OTHER
+/// error must abort: a scan that shrugged off a connection drop or a permission
+/// error would emit a silently truncated scaffold that reads as a small schema.
+///
+/// Pure and shared by all three engine arms, so the tolerance cannot drift
+/// per-engine again (MySQL shipped without it — one stale view failed every
+/// schema-wide init) and so both mutants of the guard (`skip everything` /
+/// `skip nothing`) die in a unit test rather than surviving on a live-only path.
+fn scan_step(res: Result<TableInfo>) -> Result<Option<TableInfo>> {
+    match res {
+        Ok(info) => Ok(Some(info)),
+        Err(e) if e.to_string().contains("not found or has no columns") => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 fn introspect_all(
     tls: Option<&crate::config::TlsConfig>,
     source_url: &str,
@@ -986,15 +1008,9 @@ fn introspect_all(
             let names = retain_filtered(postgres::list_tables(&mut client, sch)?, filter);
             let mut out = Vec::with_capacity(names.len());
             for n in names {
-                match postgres::introspect(&mut client, sch, &n) {
-                    Ok(mut info) => {
-                        postgres::density_probe(&mut client, &mut info);
-                        out.push(info)
-                    }
-                    // Table may have been dropped between list_tables and introspect.
-                    // Skip it rather than aborting the whole schema scan.
-                    Err(e) if e.to_string().contains("not found or has no columns") => {}
-                    Err(e) => return Err(e),
+                if let Some(mut info) = scan_step(postgres::introspect(&mut client, sch, &n))? {
+                    postgres::density_probe(&mut client, &mut info);
+                    out.push(info)
                 }
             }
             Ok(out)
@@ -1026,21 +1042,12 @@ fn introspect_all(
             let names = retain_filtered(mysql::list_tables(&mut conn, &db)?, filter);
             let mut out = Vec::with_capacity(names.len());
             for n in names {
-                match mysql::introspect(&mut conn, &n) {
-                    Ok(mut info) => {
-                        mysql::density_probe(&mut conn, &mut info);
-                        out.push(info);
-                    }
-                    // Same tolerance as the PG and MSSQL arms above/below — MySQL
-                    // was the one arm that aborted the whole scan instead. Two
-                    // real inputs hit it: a table dropped between list_tables and
-                    // introspect (the parallel suite does this constantly), and a
-                    // BROKEN VIEW — list_tables includes views, and a view whose
-                    // base table is gone stays listed in information_schema.tables
-                    // with ZERO columns, so ONE stale view made every schema-wide
-                    // `rivet init` fail, deterministically, no race required.
-                    Err(e) if e.to_string().contains("not found or has no columns") => {}
-                    Err(e) => return Err(e),
+                // MySQL was the one arm WITHOUT the vanished-table tolerance: a
+                // BROKEN VIEW (listed, zero columns once its base is dropped)
+                // made every schema-wide init fail — see scan_step.
+                if let Some(mut info) = scan_step(mysql::introspect(&mut conn, &n))? {
+                    mysql::density_probe(&mut conn, &mut info);
+                    out.push(info);
                 }
             }
             Ok(out)
@@ -1056,14 +1063,9 @@ fn introspect_all(
             let names = retain_filtered(mssql::list_tables(&mut conn, sch)?, filter);
             let mut out = Vec::with_capacity(names.len());
             for n in names {
-                match mssql::introspect(&mut conn, sch, &n) {
-                    Ok(mut info) => {
-                        mark_mssql_catalog_exact(&mut info);
-                        out.push(info)
-                    }
-                    // Dropped between list and introspect — skip, don't abort.
-                    Err(e) if e.to_string().contains("not found or has no columns") => {}
-                    Err(e) => return Err(e),
+                if let Some(mut info) = scan_step(mssql::introspect(&mut conn, sch, &n))? {
+                    mark_mssql_catalog_exact(&mut info);
+                    out.push(info)
                 }
             }
             Ok(out)
@@ -1160,6 +1162,43 @@ fn record_strategy_snapshots(config_path: &str, snapshots: &[crate::state::Strat
 
 #[cfg(test)]
 mod tests {
+    /// Both mutants of `scan_step`'s guard, killed where the CI gate can see
+    /// them: the whole-schema scan is a live-only path, so `guard -> true` and
+    /// `guard -> false` survived `cargo mutants -- --lib --bins` on PR #245
+    /// until the decision was extracted into this pure function.
+    #[test]
+    fn scan_step_skips_only_the_vanished_table_shape() {
+        // The real message every engine's introspect emits for the shape.
+        let vanished = Err(anyhow::anyhow!(
+            "Table 'qa_broken_v' not found or has no columns. Check the table name \
+             and that the user has SELECT privilege."
+        ));
+        assert!(
+            matches!(scan_step(vanished), Ok(None)),
+            "a listed-but-vanished table (dropped mid-scan, or a broken view) must be \
+             SKIPPED — aborting on it is how one stale view failed every schema-wide init"
+        );
+
+        // `guard -> true` makes EVERY error a skip; this is what kills it.
+        let real = Err(anyhow::anyhow!("connection refused (os error 61)"));
+        assert!(
+            scan_step(real).is_err(),
+            "any other error must ABORT the scan — swallowing a connection drop emits a \
+             silently truncated scaffold that reads as a small schema"
+        );
+
+        // And the pass-through, so the extraction cannot quietly drop tables.
+        let info = TableInfo {
+            schema: "s".into(),
+            table: "t".into(),
+            row_estimate: 1,
+            total_bytes: None,
+            columns: Vec::new(),
+            density: None,
+        };
+        assert!(matches!(scan_step(Ok(info)), Ok(Some(i)) if i.table == "t"));
+    }
+
     use super::*;
 
     fn col(name: &str, ty: &str, pk: bool) -> ColumnInfo {
