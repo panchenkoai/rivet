@@ -25,7 +25,9 @@ const BASELINE: &[(&str, usize)] = &[
     ("audit_doctor_probe.rs", 2),
     ("audit_init_deferred.rs", 4),
     ("audit_maxfile.rs", 2),
-    ("audit_observability.rs", 4),
+    // audit_metrics_validates_config_path's SUBJECT is a nonexistent --config
+    // path — a rig owns a real config, so that one raw invocation is the test.
+    ("audit_observability.rs", 1),
     ("audit_plan_apply.rs", 4),
     ("audit_preflight_table.rs", 7),
     ("audit_repair.rs", 6),

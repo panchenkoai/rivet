@@ -17,28 +17,6 @@
 
 use crate::common::*;
 
-/// Minimal single-export full-mode parquet config for `table` writing to
-/// `out_dir`.  Mirrors the `simple_config` helper used by `live_cli_flags.rs`.
-fn simple_config(table: &str, out_dir: &std::path::Path) -> String {
-    format!(
-        r#"
-source:
-  type: postgres
-  url: "{POSTGRES_URL}"
-
-exports:
-  - name: {table}
-    query: "SELECT id, name FROM {table}"
-    mode: full
-    format: parquet
-    destination:
-      type: local
-      path: {out}
-"#,
-        out = out_dir.display()
-    )
-}
-
 // ─── Finding #9: metrics/journal must validate the --config PATH ───────────────
 
 #[test]
@@ -96,23 +74,13 @@ fn audit_journal_shows_file_names() {
     require_alive(LiveService::Postgres);
 
     let table = seed_pg_numeric_table(10);
-    let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let cfg = write_config(&cfg_dir, &simple_config(table.name(), out.path()));
+    // The canonical Rig, not a per-file config builder (rig-adoption ratchet).
+    let rig = Rig::pg_batch(table.name()).query(&format!("SELECT id, name FROM {}", table.name()));
 
     // Run a small export. The committed part's file_name is recorded in the
     // run journal as a `FileWritten` event (src/pipeline/commit.rs record_part)
     // — the exact same name the manifest stores and `state files` displays.
-    let run = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            table.name(),
-        ])
-        .output()
-        .expect("spawn rivet run");
+    let run = rig.run_args(&["--export", table.name()]);
     assert!(
         run.status.success(),
         "setup export must succeed; stderr:\n{}",
@@ -121,7 +89,7 @@ fn audit_journal_shows_file_names() {
 
     // Discover the produced parquet file's basename — this is the FileWritten
     // file_name that the journal must surface.
-    let produced = files_with_extension(out.path(), "parquet");
+    let produced = files_with_extension(&rig.out_dir(), "parquet");
     assert_eq!(
         produced.len(),
         1,
@@ -133,16 +101,7 @@ fn audit_journal_shows_file_names() {
         .expect("produced parquet path must have a file name")
         .to_string();
 
-    let result = std::process::Command::new(RIVET_BIN)
-        .args([
-            "journal",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            table.name(),
-        ])
-        .output()
-        .expect("spawn rivet journal");
+    let result = rig.cli(&["journal", "--export", table.name()]);
 
     assert!(
         result.status.success(),
