@@ -536,11 +536,19 @@ fn run_reconcile_reports_mismatch_when_source_grows_after_snapshot() {
     // `run --reconcile` reconciles what it exported (a consistent source
     // snapshot) against a *fresh* source COUNT(*). There is no deterministic
     // single-snapshot mismatch — by construction the export and the recount read
-    // the same source moments apart — so a real mismatch is a concurrency event.
-    // We construct it deterministically: full mode holds one snapshot for the
-    // whole read; a throttle keeps the run alive while a writer inserts 50 rows
-    // *after* the snapshot opens but *before* the end-of-run recount. The export
-    // therefore sees 200 and reconcile sees 250 → MISMATCH.
+    // the same source moments apart — so a real mismatch is a concurrency event:
+    // 50 rows must land AFTER the snapshot opens and BEFORE the end-of-run
+    // recount.
+    //
+    // The window is constructed by the PRODUCT's own pause hook
+    // (`pg_after_snapshot_open`, src/source/postgres/mod.rs), not by racing it.
+    // This fixture's history is the argument for the hook: a 600 ms sleep in the
+    // writer lost to rivet's startup on a loaded box (rows landed BEFORE the
+    // snapshot, export read 250, no mismatch); the pg_stat_activity rewrite that
+    // replaced it turned a CI-green test red for a cause never identified and
+    // was reverted. A pause at the sequence point does not race anything: when
+    // the hook fires, the snapshot IS open, and the writer gets the whole pause
+    // to commit inside the window.
     require_alive(LiveService::Postgres);
     let table = seed_pg_numeric_table(200);
     let out = tempfile::tempdir().unwrap();
@@ -550,7 +558,6 @@ fn run_reconcile_reports_mismatch_when_source_grows_after_snapshot() {
 source:
   type: postgres
   url: "{POSTGRES_URL}"
-  tuning: {{batch_size: 10, throttle_ms: 60}}
 exports:
   - name: {name}
     query: "SELECT id, name FROM {name}"
@@ -563,47 +570,66 @@ exports:
     );
     let cfg = write_config(&cfg_dir, &yaml);
 
-    // Writer: after the snapshot has opened (and while the throttled export is
-    // still running), commit 50 new rows the export's snapshot can't see.
-    //
-    // The 600 ms is a clock, and a clock is the wrong shape here — but the
-    // replacement was WORSE and is recorded so nobody repeats it. On 2026-08-18
-    // this was rewritten to wait on `pg_stat_activity` (an `application_name`
-    // marker on this export's connection, plus the `_rivet` cursor present in the
-    // backend's current statement). Locally that fixed a failure this machine sees
-    // in isolation, 3 runs of 3. In CI it turned a GREEN test RED — E2E passed on
-    // main at 19:04 and 19:23 and failed at 21:01, on this test alone — and the
-    // cause was never identified, so it was reverted rather than iterated on main.
-    //
-    // If this is revisited: the sleep is sufficient in CI and insufficient on a
-    // loaded dev box, so the failure to reproduce is environmental, and the fix
-    // has to be verified THERE, not here. A pause hook in the export (there is
-    // none today) would remove the race instead of racing it better.
+    // Writer: waits for the hook's MARKER FILE — the product touches it at the
+    // sequence point, right as the pause begins — then inserts inside the
+    // window. The first draft fired the writer immediately and re-created the
+    // startup race from the other side (rows landed BEFORE the snapshot; the
+    // window was pause-shaped but empty). The marker is a condition, not a
+    // clock: it appears exactly when the snapshot is pinned, and the insert
+    // takes milliseconds against a 5 s pause.
+    let marker = cfg_dir.path().join("snapshot_open.marker");
     let table_name = table.name().to_string();
+    let marker_for_writer = marker.clone();
     let writer = std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(600));
+        let waited = (0..500).any(|_| {
+            if marker_for_writer.exists() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            false
+        });
+        assert!(
+            waited,
+            "the pause marker never appeared within 10s — the hook did not fire, so the \
+             insert would race startup and the mismatch would be a coin flip"
+        );
         let mut c = pg_connect();
-        let _ = c.batch_execute(&format!(
+        c.batch_execute(&format!(
             "INSERT INTO {table_name} (id, name, amount) \
              SELECT g, 'late', 1.0 FROM generate_series(201, 250) g"
-        ));
+        ))
+        .expect("late insert");
     });
 
-    let result = run_rivet(&[
-        "run",
-        "--config",
-        cfg.to_str().unwrap(),
-        "--export",
-        table.name(),
-        "--reconcile",
-    ]);
-    let _ = writer.join();
+    let result = run_rivet_env(
+        &[
+            "run",
+            "--config",
+            cfg.to_str().unwrap(),
+            "--export",
+            table.name(),
+            "--reconcile",
+        ],
+        &[
+            ("RIVET_TEST_PAUSE_AT", "pg_after_snapshot_open:5000"),
+            ("RIVET_TEST_PAUSE_MARKER", marker.to_str().unwrap()),
+        ],
+    );
+    writer.join().expect("writer thread");
 
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(
         stderr.contains("MISMATCH"),
         "run --reconcile must report MISMATCH when the source grew (250) past what \
          was exported (200); stderr:\n{stderr}"
+    );
+    // And the export itself must still be the SNAPSHOT's 200 rows — if the late
+    // rows are in the parquet, the pause fired before the snapshot opened and
+    // the MISMATCH above is measuring a different event than this test claims.
+    assert_eq!(
+        total_parquet_rows(out.path()),
+        200,
+        "the exported parquet must hold the snapshot's 200 rows, not the late 50"
     );
 }
 
