@@ -1026,9 +1026,22 @@ fn introspect_all(
             let names = retain_filtered(mysql::list_tables(&mut conn, &db)?, filter);
             let mut out = Vec::with_capacity(names.len());
             for n in names {
-                let mut info = mysql::introspect(&mut conn, &n)?;
-                mysql::density_probe(&mut conn, &mut info);
-                out.push(info);
+                match mysql::introspect(&mut conn, &n) {
+                    Ok(mut info) => {
+                        mysql::density_probe(&mut conn, &mut info);
+                        out.push(info);
+                    }
+                    // Same tolerance as the PG and MSSQL arms above/below — MySQL
+                    // was the one arm that aborted the whole scan instead. Two
+                    // real inputs hit it: a table dropped between list_tables and
+                    // introspect (the parallel suite does this constantly), and a
+                    // BROKEN VIEW — list_tables includes views, and a view whose
+                    // base table is gone stays listed in information_schema.tables
+                    // with ZERO columns, so ONE stale view made every schema-wide
+                    // `rivet init` fail, deterministically, no race required.
+                    Err(e) if e.to_string().contains("not found or has no columns") => {}
+                    Err(e) => return Err(e),
+                }
             }
             Ok(out)
         }
