@@ -2,6 +2,64 @@
 
 ## Unreleased
 
+## 0.24.5 — 2026-08-19
+
+Product fixes surfaced by the harness-conceptual audit ("does rivet verify
+against the source, or against its own counters?") and the coverage passes
+that followed it:
+
+- **reconcile now records the source COUNT the run already paid for** and its
+  report names its own evidence: the right-hand number is rivet's RECORDED
+  per-window count, never a re-read of the parts, and the report says so and
+  points at `rivet validate --depth full` — the check that does read the files.
+  The one code path carrying the source count into the manifest was dead
+  (`set_source_row_count` was cursor-gated); full/chunked runs now carry it.
+- **`rivet cdc --max-events` could wedge a checkpointed NDJSON run forever**:
+  the cap broke on the event count alone, so a transaction longer than the cap
+  held no commit boundary to checkpoint — every run re-read the same position
+  and re-printed the same prefix. The cap now defers to the first commit
+  boundary past N (the semantics the config field always documented), matching
+  the file sink. Nothing was ever lost — the failure mode was no progress plus
+  duplicates, never a skip.
+- **a corrupt/foreign CDC checkpoint no longer aborts the run** (fuzz find):
+  a `_data` resume-token field sitting beside foreign keys reached an
+  `unreachable!` panic inside the bson deserializer; with `panic = "abort"`
+  that took the whole process down. The decoder now deserializes from `_data`
+  alone and errors cleanly on every malformed shape.
+- **one broken view no longer fails every schema-wide MySQL `rivet init`**:
+  a view whose base table is gone stays listed in the catalog with zero
+  columns, and the MySQL arm of the schema scan — alone of the three engines —
+  aborted the whole scan on it. All three arms now share one `scan_step`
+  tolerance: skip exactly the listed-but-vanished shape, abort on any real
+  error (a scan that shrugged off a connection drop would emit a silently
+  truncated scaffold).
+- **the concurrency governor reads pressure the export cannot inflate**
+  (0.24.5 carries the follow-through of the #229 rewrite): per-engine
+  write/redo counters, idle canaries on all three engines asserting the #229
+  shape (a shed that never recovers) stays impossible, an end-to-end shed
+  proof on the parallel checkpoint runner including the journalled
+  `ParallelismAdjusted` record, and the pool-level canary — `apply --pool`
+  with the governor armed, the exact field-incident combination, delivering
+  every row with no walk toward the floor.
+- **multi-table SQL Server CDC capture** is exercised end to end (the first
+  multi-table capture test, through the canonical Rig).
+- test-hook vocabulary grew a fourth primitive: `RIVET_TEST_PAUSE_AT`
+  pauses the product at its own sequence point (with a marker-file handshake),
+  so concurrency-window fixtures wait on a condition instead of racing
+  rivet's startup with a clock.
+
+Harness/CI (the larger half of this release by commit count): every coverage
+ledger in docs/ now admits zero gaps and each ratchet is at its floor; the
+azurite round-trip closed the destination matrix; per-column NULL profiles
+(MSSQL) and per-field presence profiles (Mongo) give the CDC matrices
+engine-independent oracles; the CDC CLI's untested flags (`--rollover`,
+`--stream`, `--source-env`/`--source-file`, `--format csv`) are covered with
+RED-proven tests; `apply --pool --split` into a cloud prefix is proven against
+the manifest-sidecar clobber (RED: 150001 of 300000); the workflow service
+stacks, LiveService ports, and CLI flag coverage are now derived-and-guarded
+rather than hand-typed; and a rig-adoption ratchet freezes bespoke test-runner
+sites at today's counts, shrink-only.
+
 ## 0.24.4 — 2026-08-11
 
 Silent-loss hardening of the `apply --pool --split` GA (#167), driven to convergence:

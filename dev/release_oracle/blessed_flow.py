@@ -1456,7 +1456,14 @@ def verify_flag_surface(led: Ledger) -> None:
     # surface, `cdc` (13 flags, including `--stream`, which disables the
     # until_current bound this repo documents as load-bearing on PG and Mongo),
     # was one of the eight missing (audit 2026-08-17).
-    chain = sorted(cov)
+    # BASE subcommands only: `cov` also keys stage-qualified entries
+    # (`apply:crash`, `apply:second`, `validate:addr` — hook/stage parameters,
+    # not CLI commands), and deriving the chain from raw keys ran
+    # `rivet apply:crash --help`, which no binary answers — three "cannot
+    # grade" FAILs on the 0.24.5 gate over commands that were graded fine
+    # under their base names. The stage suffix is the gate's own notation;
+    # strip it before asking the CLI.
+    chain = sorted({c.split(":", 1)[0] for c in cov})
     assert chain, "no cell declares any flags — the flag surface would grade nothing"
 
     # And the OTHER half of the omission, now a visible row instead of silence:

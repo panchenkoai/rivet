@@ -19,7 +19,7 @@ the automated PR CI matrix described in
 | S3 | env access key | 2026-05-22 | maintainer |
 | S3 | session token (STS) | 2026-05-22 | maintainer |
 | S3 | AWS profile | 2026-05-22 | maintainer |
-| GCS | ADC / service account | 2026-05-22 | maintainer |
+| GCS | ADC / service account | 2026-08-19 | maintainer + assistant (0.24.5 pre-tag) |
 | Azure Blob | account key env | 2026-05-21 | maintainer |
 | Azure Blob | SAS token env | 2026-05-22 | maintainer |
 
@@ -62,6 +62,23 @@ For each backend, the smoke run covers:
 | `validate --prefix` | ✅ | — |
 | Manifest fingerprint match | ✅ | M2 |
 | Auth-failure secret-leak audit | ✅ | URL password redacted; access keys not echoed |
+
+### GCS — `2026-08-19` (0.24.5 pre-tag)
+
+Scope decision, recorded rather than implied: this release's real-cloud smoke
+was deliberately LIMITED to GCS. S3 and Azure keep their 2026-05-22/21 dates —
+their sessions were expired at smoke time and the release rides the emulator
+(MinIO / Azurite) coverage plus the shared `CloudDestination` path, which this
+GCS run exercises for real.
+
+| Scenario | Result | Notes |
+|---|:---:|---|
+| Fresh export | ✅ | real GCS bucket `rivet-matrix-smoke-…`, ADC; release binary |
+| `validate` | ✅ | — |
+| `validate --date` (historical) | ✅ | — |
+| `validate --prefix` | ✅ | prefix taken from validate's own JSON report |
+| `validate --run-id` | ✅ | re-check of the smoke run |
+| Auth-failure secret-leak audit | ✅ | probe password absent from stderr + every run artifact |
 
 ### GCS — `2026-05-22`
 
