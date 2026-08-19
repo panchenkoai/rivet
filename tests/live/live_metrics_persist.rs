@@ -27,7 +27,6 @@
 //! completions post-scope and yields `None`).
 
 use crate::common::*;
-use std::process::Command;
 
 /// The complete set of harm counters each engine's probe reads. The probe
 /// queries a fixed column list and both snapshots see the same columns, so
@@ -86,44 +85,22 @@ fn pg_chunked_run_persists_extended_metric_columns() {
 
     let table = seed_pg_numeric_table(ROWS);
     let export = unique_name("metrics_persist");
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let out = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        r#"source: {{type: postgres, url: "{POSTGRES_URL}"}}
-exports:
-  - name: {export}
-    query: "SELECT id, name FROM {table_name}"
-    mode: chunked
-    chunk_column: id
-    chunk_size: {CHUNK}
-    parallel: 1
-    format: parquet
-    compression: none
-    destination: {{type: local, path: {dir}}}
-"#,
-        table_name = table.name(),
-        dir = out.path().display(),
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
-
-    let run = Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            &export,
-            "--reconcile",
-        ])
-        .output()
-        .expect("spawn rivet run");
+    let rig = Rig::pg_batch(table.name())
+        .query(&format!("SELECT id, name FROM {}", table.name()))
+        .export_named(&export)
+        .mode("chunked")
+        .export_line("chunk_column: id")
+        .export_line(&format!("chunk_size: {CHUNK}"))
+        .export_line("parallel: 1")
+        .export_line("compression: none");
+    let run = rig.run_args(&["--export", &export, "--reconcile"]);
     assert!(
         run.status.success(),
         "chunked --reconcile run must succeed; stderr:\n{}",
         String::from_utf8_lossy(&run.stderr)
     );
 
-    let db = StateDb::next_to_config(&cfg);
+    let db = StateDb::next_to_config(&rig.config_path());
     let run_id = db.latest_run_id(&export);
     let m = db.metrics_row(&run_id);
 
@@ -198,60 +175,28 @@ fn pg_apply_persists_metric_row() {
     // source must reference the URL via env (`url_env`) to stay re-resolvable.
     const ROWS: i64 = 30;
     let table = seed_pg_numeric_table(ROWS);
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let out = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        r#"source:
-  type: postgres
-  url_env: DATABASE_URL
-exports:
-  - name: {export}
-    query: "SELECT id, name FROM {export}"
-    mode: full
-    format: parquet
-    compression: none
-    destination: {{type: local, path: {dir}}}
-"#,
-        export = table.name(),
-        dir = out.path().display(),
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
-    let plan_path = cfg_dir.path().join("plan.json");
+    let rig = Rig::pg_batch(table.name())
+        .query(&format!("SELECT id, name FROM {}", table.name()))
+        .source_url_env("DATABASE_URL")
+        .export_line("compression: none");
+    let plan_path = rig.config_path().with_file_name("plan.json");
 
-    let plan = Command::new(RIVET_BIN)
-        .args([
-            "plan",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            table.name(),
-            "--format",
-            "json",
-            "--output",
-            plan_path.to_str().unwrap(),
-        ])
-        .env("DATABASE_URL", POSTGRES_URL)
-        .output()
-        .expect("spawn rivet plan");
+    let plan = rig.plan_json_env(&plan_path, &[], &[("DATABASE_URL", POSTGRES_URL)]);
     assert!(
         plan.status.success(),
         "rivet plan must exit 0; stderr:\n{}",
         String::from_utf8_lossy(&plan.stderr)
     );
 
-    let apply = Command::new(RIVET_BIN)
-        .args(["apply", plan_path.to_str().unwrap()])
-        .env("DATABASE_URL", POSTGRES_URL)
-        .output()
-        .expect("spawn rivet apply");
+    let apply = rig.apply_env(&plan_path, &[], &[("DATABASE_URL", POSTGRES_URL)]);
     assert!(
         apply.status.success(),
         "rivet apply must exit 0; stderr:\n{}",
         String::from_utf8_lossy(&apply.stderr)
     );
 
-    // apply opens state next to the original config dir (still present here).
-    let db = StateDb::next_to_config(&cfg);
+    // apply opens state next to the original config dir (the rig owns it).
+    let db = StateDb::next_to_config(&rig.config_path());
     let run_id = db.latest_run_id(table.name());
     let m = db.metrics_row(&run_id);
 
@@ -282,11 +227,14 @@ fn pg_run_persists_source_harm_rows() {
 
     let table = seed_pg_numeric_table(200);
     let export = unique_name("metrics_harm_pg");
-    let out = tempfile::tempdir().unwrap();
-    let yaml = pg_full_yaml(&export, table.name(), out.path());
-    let (cfg, _cfg_dir, run_id) = run_full_export_capture(&yaml, &export);
+    let rig = harm_rig(Rig::pg_batch(table.name()), table.name(), &export);
+    let run_id = run_and_latest_run_id(&rig, &export);
 
-    assert_harm_contract(&StateDb::next_to_config(&cfg), &run_id, PG_HARM_COUNTERS);
+    assert_harm_contract(
+        &StateDb::next_to_config(&rig.config_path()),
+        &run_id,
+        PG_HARM_COUNTERS,
+    );
 
     // `table`, `out`, `cfg_dir` are guards bound for the whole function; Rust
     // keeps Drop types to scope end, so they outlive every read above.
@@ -299,23 +247,14 @@ fn mysql_run_persists_source_harm_rows() {
 
     let table = seed_mysql_numeric_table(200);
     let export = unique_name("metrics_harm_mysql");
-    let out = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        r#"source: {{type: mysql, url: "{MYSQL_URL}"}}
-exports:
-  - name: {export}
-    query: "SELECT id, name FROM {table_name}"
-    mode: full
-    format: parquet
-    compression: none
-    destination: {{type: local, path: {dir}}}
-"#,
-        table_name = table.name(),
-        dir = out.path().display(),
-    );
-    let (cfg, _cfg_dir, run_id) = run_full_export_capture(&yaml, &export);
+    let rig = harm_rig(Rig::mysql_batch(table.name()), table.name(), &export);
+    let run_id = run_and_latest_run_id(&rig, &export);
 
-    assert_harm_contract(&StateDb::next_to_config(&cfg), &run_id, MYSQL_HARM_COUNTERS);
+    assert_harm_contract(
+        &StateDb::next_to_config(&rig.config_path()),
+        &run_id,
+        MYSQL_HARM_COUNTERS,
+    );
 
     // `table`, `out`, `cfg_dir` are guards bound for the whole function; Rust
     // keeps Drop types to scope end, so they outlive every read above.
@@ -328,30 +267,18 @@ fn mssql_run_persists_source_harm_rows() {
 
     let table = seed_mssql_numeric_table(200);
     let export = unique_name("metrics_harm_mssql");
-    let out = tempfile::tempdir().unwrap();
     // The harm probe reads sys.dm_os_wait_stats, which needs VIEW SERVER STATE;
     // the `sa` test login is sysadmin, so the LCK% aggregate always returns one
     // row and both counters persist (delta may be 0 with no contention).
-    let yaml = format!(
-        r#"source:
-  type: mssql
-  url: "{MSSQL_URL}"
-  tls:
-    accept_invalid_certs: true
-exports:
-  - name: {export}
-    query: "SELECT id, name FROM {table_name}"
-    mode: full
-    format: parquet
-    compression: none
-    destination: {{type: local, path: {dir}}}
-"#,
-        table_name = table.name(),
-        dir = out.path().display(),
-    );
-    let (cfg, _cfg_dir, run_id) = run_full_export_capture(&yaml, &export);
+    // (`Rig::mssql_batch` already declares the accept_invalid_certs TLS block.)
+    let rig = harm_rig(Rig::mssql_batch(table.name()), table.name(), &export);
+    let run_id = run_and_latest_run_id(&rig, &export);
 
-    assert_harm_contract(&StateDb::next_to_config(&cfg), &run_id, MSSQL_HARM_COUNTERS);
+    assert_harm_contract(
+        &StateDb::next_to_config(&rig.config_path()),
+        &run_id,
+        MSSQL_HARM_COUNTERS,
+    );
 
     // `table`, `out`, `cfg_dir` are guards bound for the whole function; Rust
     // keeps Drop types to scope end, so they outlive every read above.
@@ -359,39 +286,23 @@ exports:
 
 // ── helpers ────────────────────────────────────────────────────────────────
 
-fn pg_full_yaml(export: &str, table: &str, out: &std::path::Path) -> String {
-    format!(
-        r#"source: {{type: postgres, url: "{POSTGRES_URL}"}}
-exports:
-  - name: {export}
-    query: "SELECT id, name FROM {table}"
-    mode: full
-    format: parquet
-    compression: none
-    destination: {{type: local, path: {dir}}}
-"#,
-        dir = out.display(),
-    )
+/// One shape for every engine's harm test: the seeded table read back by a
+/// simple query, full mode, no compression — through the canonical Rig rather
+/// than the per-file YAML builder + raw binary invocation pair this file
+/// carried (the exact smell the rig replaced; rig-adoption ratchet, 2026-08-19).
+fn harm_rig(base: Rig, table: &str, export: &str) -> Rig {
+    base.query(&format!("SELECT id, name FROM {table}"))
+        .export_named(export)
+        .export_line("compression: none")
 }
 
-/// Run a single export from an already-rendered `yaml` (no `--reconcile`) and
-/// return `(cfg path, cfg TempDir guard, run_id)`. The caller owns the source
-/// table guard and the destination TempDir.
-fn run_full_export_capture(
-    yaml: &str,
-    export: &str,
-) -> (std::path::PathBuf, tempfile::TempDir, String) {
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let cfg = write_config(&cfg_dir, yaml);
-    let run = Command::new(RIVET_BIN)
-        .args(["run", "--config", cfg.to_str().unwrap(), "--export", export])
-        .output()
-        .expect("spawn rivet run");
+/// Run the rig's single export and return the run_id the state DB recorded.
+fn run_and_latest_run_id(rig: &Rig, export: &str) -> String {
+    let run = rig.run_args(&["--export", export]);
     assert!(
         run.status.success(),
         "run must succeed; stderr:\n{}",
         String::from_utf8_lossy(&run.stderr)
     );
-    let run_id = StateDb::next_to_config(&cfg).latest_run_id(export);
-    (cfg, cfg_dir, run_id)
+    StateDb::next_to_config(&rig.config_path()).latest_run_id(export)
 }
