@@ -1722,3 +1722,80 @@ fn checkpoint_governor_backs_off_under_concurrent_write_pressure() {
         stderr.contains("backed off")
     );
 }
+
+/// `apply --pool` with the governor ARMED — the exact combination of the #229
+/// field incident, never once run by a test.
+///
+/// The self-throttle fix is proven at the SINGLE-export level (per-engine
+/// backs-off tests + idle canaries + the checkpoint runner's end-to-end shed),
+/// and the pool's permit mechanics are unit-proven — but the 1h48m field loss
+/// was a POOL run with adaptive on, and no live test combined the two: every
+/// stand pool-split test runs with the governor disarmed. This is the pool-level
+/// idle canary: two governed exports through one pool on an idle source must
+/// arm, deliver everything, and never walk toward the floor (#229's shape),
+/// judged by the same pure verdict the single-export canaries use.
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn pool_of_governed_exports_on_an_idle_source_delivers_all_and_never_walks_down() {
+    require_alive(LiveService::Postgres);
+    let _quiet = quiet_window_guard();
+
+    const ROWS: i64 = 20_000;
+    const MIN_PARALLEL: usize = 1;
+    const CEILING: usize = 4;
+    let table = seed_pg_wide_table(ROWS, 512);
+    let sibling_q = format!("SELECT id FROM {} WHERE id <= 500", table.name());
+    let rig = Rig::pg_batch(table.name())
+        .query(&format!("SELECT id, payload FROM {}", table.name()))
+        .mode("chunked")
+        .source_line("tuning:")
+        .source_line("  adaptive: true")
+        .source_line(&format!("  min_parallel: {MIN_PARALLEL}"))
+        .export_line("chunk_column: id")
+        .export_line("chunk_size: 1000")
+        .export_line(&format!("parallel: {CEILING}"))
+        .export_line("parallel_safe: true")
+        .also_export("pool_gov_sibling", &sibling_q)
+        .also_export_line("parallel_safe: true");
+    let cfg = rig.config_path();
+
+    let out = run_rivet_env(
+        &["apply", cfg.to_str().unwrap(), "--pool", "2"],
+        &[("RUST_LOG", "info"), ("RIVET_GOVERNOR_INTERVAL_MS", "200")],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "pooled governed apply must succeed; stderr:\n{stderr}"
+    );
+
+    // The governor must actually be ARMED inside the pool worker — a pool that
+    // silently disarms adaptive would pass every other assertion here while
+    // testing nothing about the incident's combination.
+    assert!(
+        stderr.contains("adaptive concurrency governor active"),
+        "the governor must arm for the pooled chunked export; stderr:\n{stderr}"
+    );
+
+    // The #229 verdict, over the pool's merged stderr: transitions from both
+    // exports interleave line-wise, and the pure verdict counts sheds against
+    // recoveries — a descent that never recovers, or a floor touch, fails.
+    let levels = governor_transitions(&stderr);
+    assert!(
+        !shed_never_recovered(&levels, MIN_PARALLEL, CEILING),
+        "idle source under --pool: a shed that does not come back is #229 — the exact \
+         field-incident combination (pool + adaptive). transitions: {levels:?}\nstderr:\n{stderr}"
+    );
+
+    // Delivery, by the independent oracle: every row of both exports.
+    assert_eq!(
+        duckdb_total_parquet_rows(&rig.out_dir()),
+        ROWS as usize,
+        "the governed pooled giant must deliver every row"
+    );
+    assert_eq!(
+        duckdb_total_parquet_rows(&rig.out_dir_for("pool_gov_sibling")),
+        500,
+        "the sibling export must deliver every row too"
+    );
+}
