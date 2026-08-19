@@ -316,3 +316,38 @@ impl Drop for MysqlViewGuard {
         }
     }
 }
+
+// ─── I9: schema-wide MSSQL init — the arm no test entered ─────────────────────
+
+/// Schema-wide `rivet init` against SQL Server had NO test at any level: the
+/// only MSSQL init test is single-table (`--table dbo.…`, audit_init_deferred),
+/// which never enters `introspect_all`'s engine dispatch. Found by the mutation
+/// gate on PR #245 and then PROVEN empirically — with the whole `"mssql"` match
+/// arm DELETED, all 15 init live tests stayed green. Its PG twin
+/// (`init_schema_flag_filters_to_schema`) goes RED on the same mutation of its
+/// own arm, which is the difference between a live-guarded arm and an unguarded
+/// one.
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn init_mssql_schema_wide_discovers_seeded_table() {
+    require_alive(LiveService::Mssql);
+
+    let table = seed_mssql_numeric_table(10);
+
+    let out = run_rivet(&["init", "--source", MSSQL_URL]);
+    assert!(
+        out.status.success(),
+        "schema-wide rivet init (mssql) must exit 0; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let yaml = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        yaml.contains("type: mssql"),
+        "emitted YAML must declare the mssql source; got:\n{yaml}"
+    );
+    assert!(
+        yaml.contains(table.name()),
+        "seeded table '{}' must be discovered by the schema-wide scan; got:\n{yaml}",
+        table.name()
+    );
+}
