@@ -59,6 +59,24 @@ exclude_re = [
     # RED-proven); the dispatch itself is live-guarded (query_scalar feeds
     # min/max bounds exercised by the live planner suites).
     "replace scalar_to_string -> Option<String>",
+    # introspect_all (init/mod.rs) is the whole-schema scan: every arm opens a
+    # live engine connection, so its dispatch mutants (delete match arm
+    # "postgres"/"mysql"/"mssql") are unkillable OFFLINE. The DECISION logic was
+    # extracted into `scan_step` (unit-tested, both guard mutants RED-proven);
+    # the dispatch itself is live-guarded, one schema-wide init test per arm:
+    # init_schema_flag_filters_to_schema (pg), init_mysql_schema_wide_discovers_
+    # seeded_table (mysql), init_mssql_schema_wide_discovers_seeded_table (mssql
+    # — added 2026-08-19 after THIS exclusion's first draft found the arm had no
+    # test at all: deleting it left 15 init tests green). Each proven by deleting
+    # the arm and watching its test go RED.
+    # The body stubs (`-> Ok(vec![])` / `Ok(vec![Default::default()])`) share the
+    # same live oracle: an empty scan scaffolds no exports, and the schema-wide
+    # init tests assert the seeded table APPEARS. Stub proven live-killed by hand
+    # (init_schema_flag_filters_to_schema goes RED on `return Ok(vec![])`).
+    "replace introspect_all -> Result<Vec<TableInfo>>",
+    "delete match arm \"postgres\" in introspect_all",
+    "delete match arm \"mysql\" in introspect_all",
+    "delete match arm \"mssql\" in introspect_all",
     # density_probe (init/mysql.rs, init/postgres.rs) takes a live DB connection
     # (mysql::PooledConn / postgres::Client) to run MIN/MAX + the windowed COUNTs
     # — unkillable OFFLINE (the --in-diff gate has no DB). Its DECISION logic is
