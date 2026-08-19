@@ -27,6 +27,20 @@
 # point (2026-08-17).
 exclude_globs = [
     "src/fuzz.rs",
+    # src/test_hook.rs is TEST INSTRUMENTATION: every primitive is env-gated
+    # (RIVET_TEST_PANIC_AT / _ERROR_AT / _PAUSE_AT) and a no-op in production,
+    # and the code that READS the env is exercised only by the LIVE
+    # fault-injection suites — not by the `--lib --bins` run this gate does, so
+    # every mutant here is born MISSED (maybe_pause_at scored 4/4 on PR #246).
+    # Live oracle proven by hand before excluding: stubbing maybe_pause_at and
+    # flipping its point comparison EACH fail run_reconcile_reports_mismatch_
+    # when_source_grows_after_snapshot loudly at the marker wait (the second
+    # after first catching a vacuous probe — the identical comparison exists in
+    # maybe_panic_at, and a blind replace mutated the wrong fn and passed).
+    # The panic/exit/error primitives are guarded the same way by the whole
+    # crash-injection suite: a hook that stops firing leaves those tests unable
+    # to construct their crash and they fail on "the run succeeded".
+    "src/test_hook.rs",
     "src/bin/seed/main.rs",
     "src/bin/seed/args.rs",
     "src/bin/seed/insert.rs",
