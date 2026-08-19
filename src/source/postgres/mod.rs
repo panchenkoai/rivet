@@ -611,10 +611,21 @@ fn pg_run_export(
     // the buffer. Same source of truth as the sink's backstop guard.
     let max_value_bytes = tuning.max_value_bytes();
 
+    let mut first_fetch_done = false;
     loop {
         let requested = ctl.target();
         let fetch_sql = format!("FETCH {} FROM _rivet", requested);
         let rows = guard.client_mut().query(&fetch_sql, &[])?;
+        if !first_fetch_done {
+            first_fetch_done = true;
+            // The cursor's snapshot is pinned as of the FIRST FETCH, not the
+            // DECLARE — measured, not assumed: with the pause placed after
+            // DECLARE, a row committed during it was VISIBLE to the export
+            // (250 of 200). A paused window here is the race-free way for a
+            // test to commit writes strictly invisible to this read but
+            // visible to anything after it (the reconcile recount).
+            crate::test_hook::maybe_pause_at("pg_after_snapshot_open");
+        }
         if rows.is_empty() {
             break;
         }
