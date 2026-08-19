@@ -590,6 +590,26 @@ impl Rig {
         &self.name
     }
 
+    /// Re-render THIS rig's config with extra export lines appended, over the
+    /// SAME config path (and therefore the same adjacent `.rivet_state.db`).
+    ///
+    /// For two-phase fixtures whose subject is a SECOND run under a CHANGED
+    /// config against the FIRST run's state — e.g. gremlin G2: run 1 advances an
+    /// incremental cursor with no quality gate, run 2 adds `row_count_min` and
+    /// must see the gate fire on the exhausted cursor. Without this the test
+    /// hand-writes a second YAML into the rig's dir (`write_config`), which is
+    /// the per-file config builder the rig exists to replace.
+    pub fn amend_export_lines(&mut self, lines: &[&str]) -> PathBuf {
+        for l in lines {
+            self.extra_lines.push((*l).to_string());
+        }
+        // Same filename and same renderer as config_path — a divergent copy
+        // here would run yesterday's config while looking amended.
+        let path = self.dir.path().join("rig.yaml");
+        std::fs::write(&path, self.render()).expect("re-render rig config");
+        path
+    }
+
     pub fn config_path(&self) -> PathBuf {
         // Materialization point: the ONLY place the rig touches the
         // filesystem (yaml()/render() stay pure — the offline goldens were
