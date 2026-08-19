@@ -30,7 +30,6 @@ const BASELINE: &[(&str, usize)] = &[
     ("audit_observability.rs", 1),
     ("audit_plan_apply.rs", 4),
     ("audit_preflight_table.rs", 7),
-    ("audit_repair.rs", 6),
     ("audit_repair_chunk_index.rs", 3),
     ("audit_rerun.rs", 4),
     ("audit_state.rs", 4),
