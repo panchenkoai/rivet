@@ -72,7 +72,6 @@ const BASELINE: &[(&str, usize)] = &[
     ("live_retry_and_faults.rs", 5),
     ("live_schema_drift.rs", 6),
     ("live_temp_spill.rs", 1),
-    ("live_wave_apply.rs", 9),
     ("preflight_missing_table.rs", 2),
     ("preflight_target_fail_note.rs", 2),
     ("quality_live.rs", 1),
