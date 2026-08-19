@@ -65,6 +65,8 @@ mod run_summary_contract;
 mod cli_flag_coverage_guard;
 #[path = "offline/live_service_ports_guard.rs"]
 mod live_service_ports_guard;
+#[path = "offline/rig_adoption_guard.rs"]
+mod rig_adoption_guard;
 #[path = "offline/runner_frame_gate.rs"]
 mod runner_frame_gate;
 #[path = "offline/scenario_artifact_matrix_guard.rs"]
