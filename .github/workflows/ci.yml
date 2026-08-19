@@ -502,8 +502,11 @@ jobs:
       # discriminator: zero mutants is the CORRECT answer for a diff that
       # changes no mutable source (tests-only, docs+tests, a comment-only edit
       # inside src/**.rs — all routine here, and the previous version of this
-      # check fired a red `::error::` on every one of them). Only "the diff HAS
-      # mutants and the config removes them all" is the defect.
+      # check fired a red `::error::` on every one of them). The defect is
+      # narrower than "the config removes them all": it is the SELF-EXCUSING
+      # case, where the same diff edits the exclusions that swallow its own
+      # mutants. All-excluded under PRE-EXISTING exclusions is a live-only diff,
+      # reported loudly rather than failed — see the split below.
       - name: The PR diff is actually graded
         id: graded
         if: steps.scope.outputs.code == 'true'
@@ -526,10 +529,35 @@ jobs:
             exit 0
           fi
           if [ "$graded" -eq 0 ]; then
-            echo "::error::the mutation gate would grade NOTHING: this diff yields \
-          $all mutants, and .cargo/mutants.toml's exclude_re removes every one of \
-          them. That is the vacuous-gate failure (#227/#229/#230), not a pass."
-            exit 1
+            # All-excluded has TWO honest readings, split by one observable: did
+            # THIS diff edit the exclusions it benefits from?
+            #
+            #  * mutants.toml touched in-diff — a SELF-EXCUSING PR: the same
+            #    change that adds code adds the entries that exempt it from the
+            #    gate. That is the vacuous-gate shape (#227/#229/#230) and stays
+            #    a hard failure: a human must review the exclusions' proofs
+            #    before anything rides on them (PR #246 sat exactly here — its
+            #    triage was honest, live-proven, and still the reviewer's call,
+            #    not this script's).
+            #  * mutants.toml untouched — a LIVE-ONLY diff riding exclusions a
+            #    reviewer already accepted: every mutant it yields lands in code
+            #    the --lib --bins run cannot execute, triaged before this PR
+            #    existed. Failing that forever would teach people to stop
+            #    touching live-only files, or worse, to pad diffs with mutable
+            #    noise. It passes, LOUDLY: the notice says outright that offline
+            #    mutation says nothing about this diff.
+            if git diff --name-only "origin/$BASE_REF"...HEAD | grep -qx '.cargo/mutants.toml'; then
+              echo "::error::the mutation gate would grade NOTHING: this diff yields \
+          $all mutants, .cargo/mutants.toml removes every one — and this SAME diff \
+          edits mutants.toml. A PR must not excuse itself from the gate unreviewed \
+          (#227/#229/#230): a human confirms the exclusions' live-oracle proofs, \
+          then the merge proceeds over this red or the triage merges separately."
+              exit 1
+            fi
+            echo "::notice::live-only diff: all $all in-diff mutants land in code \
+          the offline gate cannot execute, under exclusions reviewed before this \
+          PR (mutants.toml untouched here). Offline mutation testing says NOTHING \
+          about this diff — its oracle is the live suite named in each exclusion."
           fi
           echo "$graded" > graded-count.txt
           echo "::notice::$graded of $all in-diff mutants pass the exclusions ($((all - graded)) excluded as triaged-equivalent) — whether they are all RUN is the budget question the next step audits."
