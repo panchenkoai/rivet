@@ -27,6 +27,20 @@
 # point (2026-08-17).
 exclude_globs = [
     "src/fuzz.rs",
+    # src/test_hook.rs is TEST INSTRUMENTATION: every primitive is env-gated
+    # (RIVET_TEST_PANIC_AT / _ERROR_AT / _PAUSE_AT) and a no-op in production,
+    # and the code that READS the env is exercised only by the LIVE
+    # fault-injection suites — not by the `--lib --bins` run this gate does, so
+    # every mutant here is born MISSED (maybe_pause_at scored 4/4 on PR #246).
+    # Live oracle proven by hand before excluding: stubbing maybe_pause_at and
+    # flipping its point comparison EACH fail run_reconcile_reports_mismatch_
+    # when_source_grows_after_snapshot loudly at the marker wait (the second
+    # after first catching a vacuous probe — the identical comparison exists in
+    # maybe_panic_at, and a blind replace mutated the wrong fn and passed).
+    # The panic/exit/error primitives are guarded the same way by the whole
+    # crash-injection suite: a hook that stops firing leaves those tests unable
+    # to construct their crash and they fail on "the run succeeded".
+    "src/test_hook.rs",
     "src/bin/seed/main.rs",
     "src/bin/seed/args.rs",
     "src/bin/seed/insert.rs",
@@ -59,6 +73,21 @@ exclude_re = [
     # RED-proven); the dispatch itself is live-guarded (query_scalar feeds
     # min/max bounds exercised by the live planner suites).
     "replace scalar_to_string -> Option<String>",
+    # pg_run_export (source/postgres/mod.rs) is the PG batch export loop: it
+    # opens a real connection, BEGINs, declares the server-side cursor and
+    # drives the FETCH loop — unkillable OFFLINE end to end. It entered the
+    # in-diff scope via a three-line pause-hook insertion (PR #246) and scored
+    # 14/14 MISSED, which per the scope-honesty rule reads "no unit test
+    # executes this", not "14 gaps". Live oracle proven by hand on both
+    # representative shapes before excluding: the body stub `Ok((0, false))`
+    # fails run_reconcile_implies_validate_produces_manifest_verdict (an export
+    # that reads nothing has nothing to validate), and `delete !` on the hook's
+    # first-fetch flag fails run_reconcile_reports_mismatch_when_source_grows_
+    # after_snapshot (the marker never appears on the first fetch and the
+    # writer aborts loudly). Every PG batch live test transitively guards the
+    # rest of the loop — the whole live_suite runs through it.
+    "replace pg_run_export ->",
+    " in pg_run_export",
     # introspect_all (init/mod.rs) is the whole-schema scan: every arm opens a
     # live engine connection, so its dispatch mutants (delete match arm
     # "postgres"/"mysql"/"mssql") are unkillable OFFLINE. The DECISION logic was
