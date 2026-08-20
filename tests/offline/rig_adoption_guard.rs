@@ -39,7 +39,6 @@ const BASELINE: &[(&str, usize)] = &[
     ("gremlin_cdc.rs", 4),
     ("live_azure_multipart.rs", 2),
     ("live_batch_switch_golden.rs", 3),
-    ("live_catalog_hints.rs", 9),
     ("live_cdc.rs", 33),
     ("live_cdc_mbt.rs", 4),
     ("live_cdc_mssql.rs", 7),
