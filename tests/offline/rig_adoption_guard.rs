@@ -31,7 +31,6 @@ const BASELINE: &[(&str, usize)] = &[
     // path — a rig owns a real config, so that one raw invocation is the test.
     ("audit_observability.rs", 1),
     ("audit_state.rs", 1), // missing-config-path IS the subject
-    ("audit_target_typo.rs", 3),
     ("batch_memory_policy.rs", 1),
     ("live_azure_multipart.rs", 2),
     ("live_batch_switch_golden.rs", 3),
