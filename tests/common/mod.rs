@@ -143,6 +143,53 @@ pub fn cross_process_serial(name: &str) -> QuietWindowGuard {
     QuietWindowGuard { _file: file }
 }
 
+/// RAII background-writer: a thread that loops until its stop flag flips, and
+/// on Drop (INCLUDING a panic unwind) sets the flag and JOINS. The sustained-
+/// writes CDC tests spawned a bare JoinHandle then called a panic-capable
+/// `run_rivet_bounded` BEFORE their manual stop+join — a non-zero exit
+/// unwound past the join, DETACHED the writer, and it kept INSERTing into a
+/// table the slot/table guard was about to drop (metadata-lock race + foreign
+/// write pressure that later CDC tests in the same binary measure). Declared
+/// AFTER the table/slot guards so it drops (and stops the writer) FIRST.
+/// r7 bughunt; same reap-on-Drop shape as governor PressureWriter.
+pub struct BgWriter {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl BgWriter {
+    pub fn spawn<F>(body: F) -> Self
+    where
+        F: FnOnce(&std::sync::atomic::AtomicBool) + Send + 'static,
+    {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let s2 = stop.clone();
+        let handle = std::thread::spawn(move || body(&s2));
+        Self {
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    /// Stop + join now (idempotent) — for tests that must QUIESCE the writer
+    /// before a post-drain assertion reads stable state. Drop then no-ops.
+    pub fn stop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+impl Drop for BgWriter {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
 pub fn quiet_window_guard() -> QuietWindowGuard {
     use std::os::unix::io::AsRawFd;
     let path = std::env::temp_dir().join("rivet_qa_quiet_window.lock");

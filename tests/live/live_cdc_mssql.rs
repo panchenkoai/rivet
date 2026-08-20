@@ -1246,10 +1246,8 @@ fn mssql_cdc_until_current_terminates_under_sustained_writes() {
     wait_for_capture(&ci, 30);
 
     // A writer committing continuously while the bounded run drains.
-    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let stop_bg = stop.clone();
     let table_bg = table.clone();
-    let bg = std::thread::spawn(move || {
+    let mut bg = BgWriter::spawn(move |stop_bg| {
         let mut i = 10_000i64;
         while !stop_bg.load(std::sync::atomic::Ordering::Relaxed) {
             mssql_cdc_try_exec(&format!("INSERT INTO dbo.{table_bg} VALUES ({i},{i})"));
@@ -1263,8 +1261,7 @@ fn mssql_cdc_until_current_terminates_under_sustained_writes() {
     std::fs::create_dir_all(&out).unwrap();
     let bounded_rig = mssql_cdc_rig(&table, &ci, &ckpt, &out);
     let elapsed = run_rivet_bounded(&bounded_rig.config_path(), Duration::from_secs(30));
-    stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    let _ = bg.join();
+    bg.stop();
 
     assert!(
         elapsed.is_some(),
@@ -1318,10 +1315,8 @@ fn roast_mssql_until_current_open_bound_two_runs_lose_nothing() {
     wait_for_capture(&ci, 30);
 
     // A writer committing continuously while the bounded run drains.
-    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let stop_bg = stop.clone();
     let table_bg = table.clone();
-    let bg = std::thread::spawn(move || {
+    let mut bg = BgWriter::spawn(move |stop_bg| {
         let mut i = 10_000i64;
         while !stop_bg.load(std::sync::atomic::Ordering::Relaxed) {
             mssql_cdc_try_exec(&format!("INSERT INTO dbo.{table_bg} VALUES ({i},{i})"));
@@ -1333,8 +1328,7 @@ fn roast_mssql_until_current_open_bound_two_runs_lose_nothing() {
     let rig = Rig::mssql_cdc(&table, &ci).cdc("until_current: true");
     let cfg = rig.config_path();
     let elapsed = run_rivet_bounded(&cfg, Duration::from_secs(30));
-    stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    let _ = bg.join();
+    bg.stop();
     assert!(
         elapsed.is_some(),
         "run 1 must terminate at the open-time max-LSN bound under sustained writes"

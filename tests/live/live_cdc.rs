@@ -3204,14 +3204,15 @@ fn pg_cdc_until_current_terminates_under_sustained_writes() {
             .unwrap();
     }
 
-    // A writer committing continuously while the bounded run drains.
-    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let stop_bg = stop.clone();
+    // A writer committing continuously while the bounded run drains. RAII
+    // (BgWriter): if run_rivet_bounded panics on a non-zero exit, the writer is
+    // stopped+joined on unwind — never detached to hammer a table its guard is
+    // dropping (r7 bughunt). Declared after _tbl/_slot so it drops first.
     let tbl_bg = tbl.clone();
-    let bg = std::thread::spawn(move || {
+    let _bg = BgWriter::spawn(move |stop| {
         let mut w = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("bg connect");
         let mut i = 10_000i64;
-        while !stop_bg.load(std::sync::atomic::Ordering::Relaxed) {
+        while !stop.load(std::sync::atomic::Ordering::Relaxed) {
             let _ = w.execute(&format!("INSERT INTO {tbl_bg} VALUES ({i},{i})"), &[]);
             i += 1;
             std::thread::sleep(std::time::Duration::from_millis(15));
@@ -3224,8 +3225,6 @@ fn pg_cdc_until_current_terminates_under_sustained_writes() {
         &pg_cdc_config(&d, &tbl, &slot, &out),
         std::time::Duration::from_secs(30),
     );
-    stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    let _ = bg.join();
 
     assert!(
         elapsed.is_some(),
@@ -3265,10 +3264,8 @@ fn cdc_until_current_terminates_under_sustained_writes() {
         .unwrap();
 
     // A writer committing continuously while the bounded run drains.
-    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let stop_bg = stop.clone();
     let tbl_bg = tbl.clone();
-    let bg = std::thread::spawn(move || {
+    let mut bg = BgWriter::spawn(move |stop_bg| {
         let mut w = conn();
         let mut i = 10_000i64;
         while !stop_bg.load(std::sync::atomic::Ordering::Relaxed) {
@@ -3284,8 +3281,7 @@ fn cdc_until_current_terminates_under_sustained_writes() {
         &cdc_config(&d, &tbl, &ckpt, &out),
         std::time::Duration::from_secs(30),
     );
-    stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    let _ = bg.join();
+    bg.stop();
 
     assert!(
         elapsed.is_some(),
@@ -3344,10 +3340,8 @@ fn roast_pg_until_current_open_bound_two_runs_lose_nothing() {
     // a FULL peek every time: the catch-up exit (short/empty peek) never
     // fires. Paced (not flooding) so the pre-open backlog stays small enough
     // for run 1 to reach its bound inside the kill ceiling at 5-row parts.
-    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let stop_bg = stop.clone();
     let tbl_bg = tbl.clone();
-    let bg = std::thread::spawn(move || {
+    let mut bg = BgWriter::spawn(move |stop_bg| {
         let mut w = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("bg connect");
         let mut i = 10_000i64;
         while !stop_bg.load(std::sync::atomic::Ordering::Relaxed) {
@@ -3361,8 +3355,7 @@ fn roast_pg_until_current_open_bound_two_runs_lose_nothing() {
     let rig = Rig::pg_cdc(&tbl, &slot).cdc("rollover: 5");
     let cfg = rig.config_path();
     let elapsed = run_rivet_bounded(&cfg, std::time::Duration::from_secs(30));
-    stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    let _ = bg.join();
+    bg.stop();
     assert!(
         elapsed.is_some(),
         "run 1 must terminate at the open-time WAL bound under sustained writes \
@@ -3425,10 +3418,8 @@ fn roast_mysql_until_current_open_bound_two_runs_lose_nothing() {
     c.query_drop(format!("INSERT INTO {tbl} VALUES {}", vals.join(",")))
         .unwrap();
 
-    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let stop_bg = stop.clone();
     let tbl_bg = tbl.clone();
-    let bg = std::thread::spawn(move || {
+    let mut bg = BgWriter::spawn(move |stop_bg| {
         let mut w = conn();
         let mut i = 10_000i64;
         while !stop_bg.load(std::sync::atomic::Ordering::Relaxed) {
@@ -3440,8 +3431,7 @@ fn roast_mysql_until_current_open_bound_two_runs_lose_nothing() {
 
     let cfg = rig.config_path();
     let elapsed = run_rivet_bounded(&cfg, std::time::Duration::from_secs(30));
-    stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    let _ = bg.join();
+    bg.stop();
     assert!(
         elapsed.is_some(),
         "run 1 must terminate under sustained writes (NON_BLOCK EOF; killed at 30s)"
@@ -3774,10 +3764,8 @@ fn roast_pg_cdc_ndjson_until_current_terminates_and_emits_backlog() {
             .unwrap();
     }
 
-    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let stop_bg = stop.clone();
     let tbl_bg = tbl.clone();
-    let bg = std::thread::spawn(move || {
+    let mut bg = BgWriter::spawn(move |stop_bg| {
         let mut w = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("bg connect");
         let mut i = 10_000i64;
         while !stop_bg.load(std::sync::atomic::Ordering::Relaxed) {
@@ -3803,8 +3791,7 @@ fn roast_pg_cdc_ndjson_until_current_terminates_and_emits_backlog() {
         ],
         std::time::Duration::from_secs(30),
     );
-    stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    let _ = bg.join();
+    bg.stop();
     let stdout = out.expect("bounded NDJSON run must terminate under sustained writes");
 
     let ids: std::collections::BTreeSet<i64> = stdout
