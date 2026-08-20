@@ -76,6 +76,12 @@ impl Rig {
     /// panics). Called after every completed invocation (invoke.rs), so a
     /// PRODUCT write is absorbed while a TEST's hand-edit — which happens
     /// outside any invocation — still trips the guard.
+    /// CONTRACT (r3 bughunt): absorbed product content is accepted, NOT
+    /// adopted — the builder stays the single source of truth, so the NEXT
+    /// materialization overwrites the product's write with the pristine
+    /// render. A test asserting on product-written config content (plan's
+    /// annotations) must read the file BEFORE any further rig call; the
+    /// golden `product_config_write_is_absorbed_then_overwritten` pins this.
     pub(crate) fn absorb_product_config_writes(&self) {
         let mut paths = vec![self.dir.path().join("rig.yaml")];
         paths.extend(self.materialized_copies.borrow().iter().cloned());

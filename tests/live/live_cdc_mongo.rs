@@ -381,11 +381,17 @@ fn roast_until_current_terminates_under_sustained_writes_and_keeps_backlog() {
         }
     });
 
-    let start = std::time::Instant::now();
-    rig.run_ok(); // must return at the time bound, not hang until the writer stops
-    let elapsed = start.elapsed();
+    // BOUNDED, like every peer of this test shape (pg/mysql/mssql sustained-
+    // writes all use run_rivet_bounded): Mongo is the LOAD-BEARING engine for
+    // the open-bound — its tailable stream never empty-polls under sustained
+    // writes, so a regression here HANGS run_ok forever, fed by the 15ms
+    // upserter below (r3 bughunt: the one unbounded drain among four peers).
+    let elapsed = run_rivet_bounded(&rig.config_path(), std::time::Duration::from_secs(30));
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     let _ = bg.join();
+    let elapsed = elapsed.unwrap_or_else(|| {
+        panic!("until_current drain HUNG past the 30s watchdog under sustained writes")
+    });
 
     assert!(
         elapsed < std::time::Duration::from_secs(6),

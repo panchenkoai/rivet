@@ -922,6 +922,28 @@ fn run_and_read_refuses_a_cloud_rig() {
     let _ = rig.run_and_read();
 }
 
+/// DOCUMENTS the absorb contract (r3 bughunt): a product write into the
+/// config (rivet plan annotating a wave-less config) is absorbed — no
+/// hand-edit panic — and then OVERWRITTEN by the next materialization,
+/// because the builder is the single source of truth. A test that wants to
+/// assert on product-written content must read the file BEFORE any further
+/// rig call. This golden makes the silent overwrite a stated behavior, not
+/// an accident.
+#[test]
+fn product_config_write_is_absorbed_then_overwritten_documents_the_contract() {
+    let rig = Rig::pg_batch("t").export_named("e");
+    let cfg = rig.config_path();
+    let pristine = std::fs::read_to_string(&cfg).unwrap();
+    // Simulate the product's write the way absorb sees it: foreign content on
+    // disk, then an invocation completes (absorb runs).
+    let annotated = format!("{pristine}    wave: 3\n");
+    std::fs::write(&cfg, &annotated).unwrap();
+    rig.absorb_product_config_writes();
+    // No panic — absorbed. And the next materialization restores the render:
+    let after = std::fs::read_to_string(rig.config_path()).unwrap();
+    assert_eq!(after, pristine, "the builder's render wins after absorb");
+}
+
 /// A caller-owned `config_in` copy must FOLLOW a sanctioned mutation — the
 /// r2 bughunt found amend/replace re-rendered only the rig-dir config, so the
 /// caller's path kept executing yesterday's knobs while the builder (and the

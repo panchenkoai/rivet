@@ -407,6 +407,47 @@ fn derived_capture_marker_set_is_pinned() {
     );
 }
 
+/// Clip a `#[test]`-split span to the FIRST function's body (attrs +
+/// signature + brace-matched block). Everything after — helper fns, the
+/// next test's doc comment — belongs to no test and must not lend markers
+/// to this one.
+fn clip_to_first_fn_body(raw: &str) -> &str {
+    let Some(fn_pos) = raw.find("fn ") else {
+        return raw;
+    };
+    let Some(open_rel) = raw[fn_pos..].find('{') else {
+        return raw;
+    };
+    let start = fn_pos + open_rel;
+    let mut depth = 0usize;
+    for (i, b) in raw[start..].bytes().enumerate() {
+        match b {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &raw[..start + i + 1];
+                }
+            }
+            _ => {}
+        }
+    }
+    raw
+}
+
+/// The clipper itself must not lend a neighbor's marker — RED against the
+/// unclipped split (the helper text below would leak into the chunk).
+#[test]
+fn chunk_clipper_drops_trailing_helper_text() {
+    let span = "\n#[ignore]\nfn my_test() {\n    rig.run_ok();\n}\n\nfn helper_parquet_ids(dir: &Path) -> Vec<i64> {\n    duckdb_dir_parquet_ids(dir)\n}\n";
+    let clipped = clip_to_first_fn_body(span);
+    assert!(clipped.contains("run_ok"), "the test body itself stays");
+    assert!(
+        !clipped.contains("parquet_ids"),
+        "the trailing helper must be clipped, not credited to the test: {clipped}"
+    );
+}
+
 fn derived_capture_markers() -> &'static Vec<String> {
     use std::sync::OnceLock;
     static MARKERS: OnceLock<Vec<String>> = OnceLock::new();
@@ -483,8 +524,16 @@ fn every_live_cdc_test_asserts_an_outcome() {
     );
     for file in files {
         let src = fs::read_to_string(root.join(&file)).unwrap();
-        // Split on test attributes; each chunk is one test body (plus tail).
-        for chunk in src.split("#[test]").skip(1) {
+        // Split on test attributes, then CLIP each chunk to the first fn's
+        // body via brace counting. The raw span-to-next-#[test] merged any
+        // helper fn (and the next test's doc comment) into the PRECEDING
+        // test's chunk — a helper named `walkdir_parquet_ids` sat between two
+        // tests and its `parquet_` substring credited the previous test with
+        // an outcome it never asserted; a hollowed body (run_ok(); no
+        // asserts) graded green off the neighbor's text (r3 bughunt,
+        // reproduced against live_cdc_mongo).
+        for raw in src.split("#[test]").skip(1) {
+            let chunk = clip_to_first_fn_body(raw);
             let name = chunk
                 .lines()
                 .find_map(|l| l.trim().strip_prefix("fn "))

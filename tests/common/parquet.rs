@@ -48,8 +48,16 @@ fn stage_for_duckdb(dir: &Path) -> String {
     // A per-thread name is stable across the thousands of calls one test binary
     // makes, so the container resolves each path once and keeps seeing it.
     let tid = format!("{:?}", std::thread::current().id());
+    // PID + thread id: ThreadId is a PER-PROCESS counter, and the canonical
+    // runner (`make test-live` = nextest) runs every test in its OWN process
+    // with an identical startup sequence — so every concurrent test got the
+    // SAME small N and they cleared/graded each other's staged files (r3
+    // bughunt; the identical class rig::unique_name already fixed for oracle
+    // labels). The per-thread inode-stability property the comment above
+    // demands is preserved: within one process the label is still stable.
     let label = format!(
-        "stage_t{}",
+        "stage_p{}_t{}",
+        std::process::id(),
         tid.chars()
             .filter(|c| c.is_ascii_digit())
             .collect::<String>()

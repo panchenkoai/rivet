@@ -105,6 +105,32 @@ pub struct QuietWindowGuard {
     _file: std::fs::File,
 }
 
+/// Cross-PROCESS serialization for tests that flip a shared server GLOBAL —
+/// a `static Mutex` serializes only within one process, and the canonical
+/// runner (nextest) puts every test in its OWN process, so a per-process lock
+/// is a no-op exactly where it matters (r3 bughunt: the two :3306
+/// binlog-compression tests raced their SET GLOBAL windows). Same flock
+/// pattern as `quiet_window_guard`, keyed by `name`.
+pub fn cross_process_serial(name: &str) -> QuietWindowGuard {
+    use std::os::unix::io::AsRawFd;
+    let path = std::env::temp_dir().join(format!("rivet_qa_serial_{name}.lock"));
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+        .unwrap_or_else(|e| panic!("open serial lock {}: {e}", path.display()));
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    if rc != 0 {
+        panic!(
+            "flock(LOCK_EX) on {} failed: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        );
+    }
+    QuietWindowGuard { _file: file }
+}
+
 pub fn quiet_window_guard() -> QuietWindowGuard {
     use std::os::unix::io::AsRawFd;
     let path = std::env::temp_dir().join("rivet_qa_quiet_window.lock");
