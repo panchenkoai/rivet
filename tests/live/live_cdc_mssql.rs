@@ -33,13 +33,17 @@ fn enable_cdc(table: &str, ci: &str) {
 /// Block until the capture job has copied at least `want` rows into the change
 /// table — the job runs asynchronously, so the test must wait for it.
 fn wait_for_capture(ci: &str, want: i64) {
-    for _ in 0..60 {
+    // 60s ceiling: the SQL Server Agent capture job is asynchronous and its
+    // scan interval stretches under a loaded E2E runner — a 30s bound flaked
+    // one test at ~456s suite wall-clock (r6 CI). Doubling the ceiling matches
+    // the async reality; it does NOT mask a bug (a real drop still times out).
+    for _ in 0..120 {
         if mssql_cdc_query_i64(&format!("SELECT COUNT(*) FROM cdc.{ci}_CT")) >= want {
             return;
         }
         std::thread::sleep(Duration::from_millis(500));
     }
-    panic!("capture job did not populate cdc.{ci}_CT to {want} rows in 30s");
+    panic!("capture job did not populate cdc.{ci}_CT to {want} rows in 60s");
 }
 
 /// One CDC rig per (table, capture instance, checkpoint, destination). Callers
