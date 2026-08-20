@@ -3687,12 +3687,15 @@ fn roast_mysql_cdc_cli_max_events_below_a_transaction_still_advances_the_checkpo
 
     let ckpt_s = ckpt.to_str().unwrap().to_string();
     let tbl_q = tbl.clone();
+    let sid = server_id_for(&tbl).to_string();
     let cdc_run = move || {
         run_rivet_args_bounded(
             &[
                 "cdc",
                 "--source",
                 MYSQL_CDC_URL,
+                "--server-id",
+                &sid,
                 "--table",
                 &tbl_q,
                 "--checkpoint",
@@ -4655,7 +4658,7 @@ fn roast_pg_cdc_destination_placeholders_resolve_like_the_batch_path() {
 // The two :3306 binlog-compression tests both flip
 // `SET GLOBAL binlog_transaction_compression` on the shared batch server, so
 // running them in parallel races (one turns it OFF mid-way through the other's
-// ON window). They serialize via `cross_process_serial("binlog_compression")`
+// ON window). They serialize via `quiet_window_guard()` — the single shared-
 // — a static Mutex sat here first, and it serialized NOTHING under the
 // canonical nextest runner (per-test processes; r3 bughunt find).
 
@@ -4702,7 +4705,7 @@ fn roast_pg_cdc_destination_placeholders_resolve_like_the_batch_path() {
 #[test]
 #[ignore = "live: requires docker compose up -d mysql (:3306, log_bin=ON)"]
 fn mysql_cdc_refuses_a_compressed_binlog_instead_of_capturing_nothing() {
-    let _serial = cross_process_serial("binlog_compression");
+    let _serial = quiet_window_guard(); // :3306 GLOBAL flip — same lock as governor
     let root_url = MYSQL_URL.replace("rivet:rivet@", "root:rivet@");
     let mut admin = match mysql::Conn::new(mysql::Opts::from_url(&root_url).unwrap()) {
         Ok(c) => c,
@@ -4832,7 +4835,7 @@ fn mysql_cdc_refuses_a_compressed_binlog_instead_of_capturing_nothing() {
 #[test]
 #[ignore = "live: requires docker compose up -d mysql (:3306, log_bin=ON, 8.0.20+)"]
 fn mysql_cdc_compressed_payload_in_stream_refuses_not_skips() {
-    let _serial = cross_process_serial("binlog_compression");
+    let _serial = quiet_window_guard(); // :3306 GLOBAL flip — same lock as governor
     let root_url = MYSQL_URL.replace("rivet:rivet@", "root:rivet@");
     let mut admin = match mysql::Conn::new(mysql::Opts::from_url(&root_url).unwrap()) {
         Ok(c) => c,
@@ -4981,12 +4984,15 @@ fn roast_mysql_cdc_cli_rollover_keeps_transactions_whole_and_two_runs_do_not_clo
     let ckpt_s = ckpt.to_str().unwrap().to_string();
     let out_s = out.to_str().unwrap().to_string();
     let tbl_q = tbl.clone();
+    let sid = server_id_for(&tbl).to_string();
     let cdc_run = move || {
         run_rivet_env(
             &[
                 "cdc",
                 "--source",
                 MYSQL_CDC_URL,
+                "--server-id",
+                &sid,
                 "--table",
                 &tbl_q,
                 "--checkpoint",
@@ -5086,11 +5092,18 @@ fn mysql_cdc_cli_csv_output_is_wired_and_readable() {
 
     c.query_drop(format!("INSERT INTO {tbl} VALUES (1,1),(2,2),(3,3)"))
         .expect("seed");
+    // Explicit unique replica id: two parallel `rivet cdc` on the shared :3307
+    // with the DEFAULT server-id collide (COM_REGISTER_SLAVE) — a pre-existing
+    // CLI-path flake the r5 parallel run surfaced (the rig config path already
+    // routes through server_id_for; the CLI path had no id at all).
+    let sid = server_id_for(&tbl).to_string();
     let r = run_rivet_env(
         &[
             "cdc",
             "--source",
             MYSQL_CDC_URL,
+            "--server-id",
+            &sid,
             "--table",
             &tbl,
             "--checkpoint",

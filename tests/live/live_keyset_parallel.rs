@@ -643,6 +643,10 @@ fn parallel_keyset_incremental_survives_no_backslash_escapes_mysql() {
     require_alive(LiveService::Mysql);
     use mysql::prelude::Queryable;
     let table = unique_name("pk_nbs");
+    // :3306 GLOBAL flip — mutually exclude with every other shared-batch-server
+    // GLOBAL mutator (binlog-compression, governor tmp-storage) and the timing
+    // canaries under the SAME lock (r5 bughunt: a per-name lock excluded none).
+    let _serial = quiet_window_guard();
     let mut c = mysql_connect();
     let orig: String = c.query_first("SELECT @@global.sql_mode").unwrap().unwrap();
     // The hostile sql_mode must be the SERVER default so rivet's OWN connections inherit

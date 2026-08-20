@@ -659,6 +659,15 @@ impl CdcScenario {
         let table = super::unique_name(label);
         let ci = format!("dbo_{table}");
         super::mssql::mssql_cdc_exec(&format!("CREATE TABLE dbo.{table} ({cols})"));
+        // Build the drop guard RIGHT AFTER CREATE, BEFORE sp_cdc_enable_* — a
+        // panic in either enable call would otherwise leak dbo.{table} on the
+        // :1434 CDC instance (no outer sweep cleans it; r5 bughunt, the r4
+        // governor-leak class). The siblings (mysql:617, pg:639) already build
+        // their guard immediately after CREATE.
+        let guard = MssqlCdcTable {
+            table: table.clone(),
+            ci: ci.clone(),
+        };
         super::mssql::mssql_cdc_exec(
             "IF NOT EXISTS(SELECT 1 FROM sys.databases WHERE name='rivet' \
               AND is_cdc_enabled=1) EXEC sys.sp_cdc_enable_db;",
@@ -667,10 +676,6 @@ impl CdcScenario {
             "EXEC sys.sp_cdc_enable_table @source_schema=N'dbo', \
              @source_name=N'{table}', @role_name=NULL, @capture_instance=N'{ci}';"
         ));
-        let guard = MssqlCdcTable {
-            table: table.clone(),
-            ci: ci.clone(),
-        };
         let rig = Rig::mssql_cdc(&table, &ci);
         rig.run_ok(); // pin
         Self {

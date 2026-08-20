@@ -99,6 +99,20 @@ fn grid_matches_the_oracle_matrix_versions() {
     let grid = gate.get("grid").expect("gate matrix has a `grid`");
     let engines = oracle.get("engines").expect("oracle matrix has `engines`");
 
+    // r5 bughunt: this hand-typed list is ungoverned by the generative
+    // column-completeness guard (it iterates only the non-EXEMPT MATRICES),
+    // so a new SourceType variant would leave this matrix un-forced. Assert
+    // the list IS the enum — add a variant to SourceType and this goes RED
+    // until the matrix (and this const) gain the column.
+    {
+        let derived = super::chunking_matrix_guard::source_engine_variants();
+        let listed: std::collections::HashSet<String> =
+            ENGINES.iter().map(|e| e.to_string()).collect();
+        assert_eq!(
+            listed, derived,
+            "ENGINES hand-list drifted from the SourceType enum: listed {listed:?} vs enum {derived:?}"
+        );
+    }
     for eng in ENGINES {
         let gated: BTreeSet<String> = grid
             .get(eng)

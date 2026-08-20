@@ -93,8 +93,12 @@ pub fn unique_name(prefix: &str) -> String {
 }
 
 /// RAII cross-process lock for the suite's QUIET WINDOW: taken by every test
-/// that measures a wall-clock ratio (the adaptive canaries) or generates
-/// deliberate source pressure (the governor backs-off drivers). Cargo runs
+/// that measures a wall-clock ratio (the adaptive canaries), generates
+/// deliberate source pressure (the governor backs-off drivers), OR flips a
+/// GLOBAL on the shared :3306 batch server (binlog_transaction_compression,
+/// sql_mode, tmp-storage) — one lock so all of them mutually exclude (r5
+/// bughunt: per-variable locks let a :3306 global flip skew a concurrent
+/// canary and contaminate its sessions). Cargo runs
 /// integration binaries and threads in parallel; a heavy sibling starting
 /// mid-A/B skews a timing bound, and one test's CHECKPOINT spam is another's
 /// false foreign pressure — engine-specific locks cannot cover cross-engine
@@ -105,12 +109,20 @@ pub struct QuietWindowGuard {
     _file: std::fs::File,
 }
 
-/// Cross-PROCESS serialization for tests that flip a shared server GLOBAL —
-/// a `static Mutex` serializes only within one process, and the canonical
-/// runner (nextest) puts every test in its OWN process, so a per-process lock
-/// is a no-op exactly where it matters (r3 bughunt: the two :3306
-/// binlog-compression tests raced their SET GLOBAL windows). Same flock
-/// pattern as `quiet_window_guard`, keyed by `name`.
+/// Cross-PROCESS serialization keyed by `name` — for shared-server GLOBAL
+/// flips on a server that has NO timing canaries (currently only the MSSQL
+/// CDC instance :1434, key "mssql_cdc"; the name is the SERVER, not the
+/// variable). A `static Mutex` serializes only within one process, and the
+/// canonical runner (nextest) puts every test in its OWN process, so a
+/// per-process lock is a no-op exactly where it matters (r3 bughunt).
+///
+/// The KEY MUST IDENTIFY THE SERVER, not the global being flipped: two tests
+/// flipping DIFFERENT globals on the SAME server still contaminate each
+/// other's fresh sessions, so a per-variable name mutually excludes nothing
+/// (r5 bughunt — binlog_compression, sql_mode and the governor tmp-storage
+/// globals all live on :3306 and were under three disjoint locks). Every
+/// :3306 GLOBAL flip therefore takes `quiet_window_guard` (the single shared
+/// batch-server + timing lock) instead of a per-name key.
 pub fn cross_process_serial(name: &str) -> QuietWindowGuard {
     use std::os::unix::io::AsRawFd;
     let path = std::env::temp_dir().join(format!("rivet_qa_serial_{name}.lock"));

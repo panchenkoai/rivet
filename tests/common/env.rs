@@ -402,12 +402,33 @@ impl LiveService {
     }
 }
 
-/// Deterministic, collision-free binlog server id for a test, derived from
-/// its unique table name. (Was copy-pasted into four live files before the
-/// rig standardization pass.)
+/// Binlog server id for a test — STABLE within a process (so a resume
+/// reopening the checkpoint keeps the same replica id), DISTINCT across
+/// processes (so the canonical nextest one-process-per-test parallel runner
+/// cannot land two live mysql_cdc tests on one id and have MySQL reject the
+/// second `COM_REGISTER_SLAVE`). Derived from the PID xor the table-name
+/// hash: an FNV hash of the name ALONE reduced into a 50k window can collide
+/// by pigeonhole across ~35 concurrent tests (~1% per run, cumulative), and
+/// the old doc's "collision-free" was aspirational (r5 bughunt). The PID term
+/// makes a cross-test collision require BOTH a name and a PID clash — never in
+/// practice. Same process-keyed shape as the `stage_p{pid}` staging fix.
 pub fn server_id_for(tbl: &str) -> u32 {
     let h = tbl.bytes().fold(2_166_136_261u32, |a, b| {
         (a ^ b as u32).wrapping_mul(16_777_619)
     });
-    10_000 + (h % 50_000)
+    // PID xor THREAD-id: nextest gives each test its own PROCESS (distinct pid),
+    // but `cargo test --test-threads N` runs them as THREADS in one process
+    // (shared pid) — so fold the thread id too, covering both runners. Both are
+    // stable for the life of one test (a resume reopens on the same thread), so
+    // the checkpoint's replica id stays put; across tests either the pid or the
+    // tid differs, so two concurrent mysql_cdc tests never share an id.
+    let pid = std::process::id() as u64;
+    let tid = {
+        let s = format!("{:?}", std::thread::current().id());
+        s.bytes().filter(u8::is_ascii_digit).fold(0u64, |a, b| {
+            a.wrapping_mul(10).wrapping_add((b - b'0') as u64)
+        })
+    };
+    let mix = (h as u64) ^ pid.wrapping_mul(2_654_435_761) ^ tid.wrapping_mul(40_503);
+    10_000 + (mix % 50_000) as u32
 }
