@@ -35,7 +35,7 @@ const BASELINE: &[(&str, usize)] = &[
     ("audit_plan_apply.rs", 4),
     ("audit_repair_chunk_index.rs", 3),
     ("audit_rerun.rs", 4),
-    ("audit_state.rs", 4),
+    ("audit_state.rs", 1), // missing-config-path IS the subject
     ("audit_target_typo.rs", 3),
     ("batch_memory_policy.rs", 1),
     ("live_azure_multipart.rs", 2),
