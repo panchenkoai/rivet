@@ -42,7 +42,6 @@ const BASELINE: &[(&str, usize)] = &[
     ("roast_pg_json_fidelity.rs", 1),
     ("roast_validate_exit.rs", 1),
     ("sec_exit_codes.rs", 1),
-    ("sec_terminal_inject.rs", 2),
     ("sec_tls_defaults.rs", 2),
 ];
 
