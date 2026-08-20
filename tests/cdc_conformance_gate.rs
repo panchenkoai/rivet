@@ -402,7 +402,11 @@ fn every_live_cdc_test_asserts_an_outcome() {
                 || chunk.contains("run_ok(")
                 || chunk.contains("run_with_env(")
                 || chunk.contains("run_expect_fail(")
-                || chunk.contains("run_and_read(");
+                || chunk.contains("run_and_read(")
+                // The helper 105 call sites reach rivet through; its absence
+                // here is exactly how two mssql capture tests stayed invisible
+                // to this gate until the rig migration renamed their runner.
+                || chunk.contains("run_rivet_ok(");
             // Outcome = the test READS BACK what the capture produced (files,
             // destination listing, or the state DB) — not merely that the
             // process exited 0.
@@ -430,6 +434,26 @@ fn every_live_cdc_test_asserts_an_outcome() {
                 || chunk.contains("!res.status.success()")
                 || chunk.contains("!output.status.success()")
                 || chunk.contains("read_cdc_rows(") // replica-suite replay oracle
+                // Parquet re-read helpers (tests/common/parquet.rs): the seq
+                // helper reads __seq/__pos/counter columns back with DuckDB;
+                // deduped_current_sum folds a re-read change log. Registered
+                // when the rig migration made two mssql tests VISIBLE to this
+                // gate for the first time — they ran captures via a helper
+                // (`run_rivet_ok`) the capture list never matched, so the gate
+                // had never graded them at all.
+                || chunk.contains("assert_intra_transaction_seq(")
+                || chunk.contains("deduped_current_sum(")
+                // The SERVER's own slot position — the strongest oracle a
+                // slot-release test can have (roast_pg_cdc_empty_transaction_
+                // churn asserts confirmed_flush_lsn advanced past the churn,
+                // asked of PostgreSQL, never of rivet's counters).
+                || chunk.contains("confirmed_flush_lsn")
+                // A REFUSAL test's outcome is the named diagnostic, not a
+                // delivery: the compressed-binlog test asserts stderr names
+                // the event AND the setting (actionable), which is exactly the
+                // refusal contract. `status.success()` alone stays a
+                // non-marker; a named-diagnostic assertion does not.
+                || chunk.contains("the stream-time refusal must name")
                 // `rivet validate` re-reads the destination (parts + manifest +
                 // checksums) — an independent read-back, not the capture's exit.
                 || chunk.contains("args([\"validate\"")
