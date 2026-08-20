@@ -68,7 +68,6 @@ const BASELINE: &[(&str, usize)] = &[
     ("roast_small_table_escape.rs", 3),
     ("roast_validate_exit.rs", 1),
     ("sec_exit_codes.rs", 1),
-    ("sec_preflight_sqli.rs", 3),
     ("sec_terminal_inject.rs", 2),
     ("sec_tls_defaults.rs", 2),
 ];

@@ -58,55 +58,28 @@ struct CheckOutput {
     stderr: String,
 }
 
-/// Run `rivet check --config <cfg> --export <name>` against a live DB and
-/// capture stdout/stderr. Does not assert exit status — see `CheckOutput`.
-fn run_check(config_path: &std::path::Path, export_name: &str) -> CheckOutput {
-    let out = std::process::Command::new(RIVET_BIN)
-        .args([
-            "check",
-            "--config",
-            config_path.to_str().unwrap(),
-            "--export",
-            export_name,
-        ])
-        .output()
-        .expect("spawn rivet check");
+/// Run the rig's `rivet check --export <name>` and capture stdout/stderr.
+/// Does not assert exit status — see `CheckOutput`.
+fn run_check(rig: &Rig, export_name: &str) -> CheckOutput {
+    let out = rig.cli(&["check", "--export", export_name]);
     CheckOutput {
         stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
     }
 }
 
-/// Build a chunked `rivet.yaml` whose `chunk_column` is the injection payload.
-/// `source_block` selects the engine; `payload` is emitted as a double-quoted
-/// YAML scalar so its parens/commas/colons survive parsing intact.
-fn config_with_chunk_column(
-    out_dir: &std::path::Path,
-    name: &str,
-    source_block: &str,
-    payload: &str,
-) -> String {
+/// Turn an engine's base rig into the chunked injection fixture: `chunk_column`
+/// carries the payload as a double-quoted YAML scalar so its parens/commas/
+/// colons survive parsing intact.
+fn rig_with_chunk_column(base: Rig, name: &str, payload: &str, out_dir: &std::path::Path) -> Rig {
     // Defensive: our payloads contain no `"`, but escape anyway so a future
     // payload edit can't silently break the YAML.
     let yaml_payload = payload.replace('\\', "\\\\").replace('"', "\\\"");
-    format!(
-        r#"
-source:
-{source_block}
-
-exports:
-  - name: {name}
-    table: {SEEDED_TABLE}
-    mode: chunked
-    chunk_column: "{yaml_payload}"
-    chunk_size: 500
-    format: parquet
-    destination:
-      type: local
-      path: {out}
-"#,
-        out = out_dir.display()
-    )
+    base.export_named(name)
+        .mode("chunked")
+        .export_line(&format!("chunk_column: \"{yaml_payload}\""))
+        .export_line("chunk_size: 500")
+        .dest_path(out_dir.to_path_buf())
 }
 
 // ── V0 (Postgres) ──────────────────────────────────────────────────────────
@@ -118,7 +91,6 @@ fn sec_pg_chunk_column_quoted_not_injected() {
     require_alive(LiveService::Postgres);
 
     let out_dir = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
 
     // Raw template: `SELECT min(COL)::text, max(COL)::text FROM orders`.
     // With this payload the raw form becomes
@@ -128,11 +100,9 @@ fn sec_pg_chunk_column_quoted_not_injected() {
     // not exist on `orders`, so the probe fails and prints no range line.
     let payload = "id)::text, max(id";
     let name = unique_name("sec_pg_sqli");
-    let source_block = format!("  type: postgres\n  url: \"{POSTGRES_URL}\"");
-    let yaml = config_with_chunk_column(out_dir.path(), &name, &source_block, payload);
-    let cfg = write_config(&cfg_dir, &yaml);
+    let rig = rig_with_chunk_column(Rig::pg_batch(SEEDED_TABLE), &name, payload, out_dir.path());
 
-    let out = run_check(&cfg, &name);
+    let out = run_check(&rig, &name);
 
     // SECURE: a column literally named `id)::text, max(id` does not exist, so a
     // quote_ident'd probe finds nothing and the diagnostic prints NO cursor
@@ -159,7 +129,6 @@ fn sec_mysql_chunk_column_quoted_not_injected() {
     require_alive(LiveService::Mysql);
 
     let out_dir = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
 
     // Raw template (no strip-star on MySQL; always a derived table):
     //   SELECT CAST(min(COL) AS CHAR), CAST(max(COL) AS CHAR) FROM (SELECT * FROM orders) AS _rivet
@@ -170,11 +139,14 @@ fn sec_mysql_chunk_column_quoted_not_injected() {
     // Backtick-quoted, the whole thing is one identifier that does not exist.
     let payload = "id) AS CHAR), CAST(min(id";
     let name = unique_name("sec_mysql_sqli");
-    let source_block = format!("  type: mysql\n  url: \"{MYSQL_URL}\"");
-    let yaml = config_with_chunk_column(out_dir.path(), &name, &source_block, payload);
-    let cfg = write_config(&cfg_dir, &yaml);
+    let rig = rig_with_chunk_column(
+        Rig::mysql_batch(SEEDED_TABLE),
+        &name,
+        payload,
+        out_dir.path(),
+    );
 
-    let out = run_check(&cfg, &name);
+    let out = run_check(&rig, &name);
 
     // SECURE: a column literally named `id) AS CHAR), CAST(min(id` does not
     // exist, so a quote_ident'd probe finds nothing and the diagnostic prints
