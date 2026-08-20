@@ -244,6 +244,22 @@ fn sanitize_run_id(s: &str) -> String {
         .collect()
 }
 
+/// The run-unique tag used INSIDE a keyset part name — the sanitized run_id
+/// with a redundant leading `<export>_` stripped.
+///
+/// The production run_id is `<export>_<ms-stamp>` (job.rs), and the part-name
+/// format already prepends `<export>_`, so using the raw run_id produced
+/// `<export>_<export>_<stamp>_pk_w...` — the export name TWICE (field-run
+/// observation). The chunked and mongo-parallel siblings key their middle
+/// segment off a fresh stamp, not the run_id, so they never doubled; keyset was
+/// the odd one out. Stripping only a PRESENT `<export>_` prefix keeps run-
+/// uniqueness (the ms stamp survives) and leaves a bare/custom run_id (e.g. a
+/// synthetic `run-1`) untouched.
+fn run_scoped_tag(run_id: &str, export_name: &str) -> String {
+    let tag = sanitize_run_id(run_id);
+    let prefix = format!("{}_", sanitize_run_id(export_name));
+    tag.strip_prefix(&prefix).unwrap_or(&tag).to_string()
+}
 /// Sample the N ROW-percentile ranges for a FRESH parallel keyset run:
 /// `(range_index, lo_exclusive, hi_inclusive, done=false)`. The N−1 boundaries
 /// partition the key into half-open intervals whose union is the whole key space.
@@ -464,7 +480,7 @@ fn run_keyset_parallel(
     // Part names key off the run_id, not a wall-clock stamp: unique per fresh run
     // AND stable across a resume, so a re-run range's parts OVERWRITE its crashed
     // partial parts (idempotent) instead of accumulating duplicates.
-    let run_tag = sanitize_run_id(&summary.run_id);
+    let run_tag = run_scoped_tag(&summary.run_id, &plan.export_name);
     let run_id = summary.run_id.clone();
     // Workers commit to keyset_range + file_log ONLY on a checkpoint run — a
     // non-checkpoint run persists no ranges (the `_ =>` sample arm), so letting its
@@ -1050,7 +1066,7 @@ pub(crate) fn run_keyset(
     // rows on a live mysql keyset resume; convergence round-1 HIGH). Matches the parallel path.
     let frame = super::frame::RunnerFrame::open(plan)?;
     let (dest, ext) = (frame.dest, frame.ext);
-    let run_tag = sanitize_run_id(&summary.run_id);
+    let run_tag = run_scoped_tag(&summary.run_id, &plan.export_name);
 
     loop {
         // Name the part by the SEEK cursor (`last`), not the per-invocation page counter: a
@@ -1339,6 +1355,29 @@ mod tests {
     }
 
     // ── sanitize_run_id: filename-safe token for part names ──────────────────
+    #[test]
+    fn run_scoped_tag_strips_a_redundant_export_prefix_but_keeps_a_bare_run_id() {
+        // Production run_id is `<export>_<stamp>`; the part-name format prepends
+        // `<export>_`, so the raw run_id doubled the export name in the file
+        // (field-run: `aa_bonus_conversions_usd_aa_bonus_conversions_usd_...`).
+        assert_eq!(
+            run_scoped_tag(
+                "aa_bonus_conversions_usd_20260820T104554088",
+                "aa_bonus_conversions_usd"
+            ),
+            "20260820T104554088",
+            "the leading <export>_ must be stripped so the part name is not <export>_<export>_<stamp>"
+        );
+        // A bare / custom run_id (no export prefix) is left untouched — the
+        // synthetic keyset_range fixtures rely on `exp_run-1_pk_w1_0`.
+        assert_eq!(run_scoped_tag("run-1", "exp"), "run-1");
+        // Uniqueness survives: two runs -> two stamps -> two tags.
+        assert_ne!(
+            run_scoped_tag("e_20260820T104554088", "e"),
+            run_scoped_tag("e_20260820T104554090", "e")
+        );
+    }
+
     #[test]
     fn sanitize_run_id_keeps_safe_chars_and_replaces_the_rest() {
         // alnum, '-', '_' survive; everything else becomes '_'.
