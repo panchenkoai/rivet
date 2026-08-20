@@ -39,7 +39,6 @@ const BASELINE: &[(&str, usize)] = &[
     ("live_mysql_resume.rs", 1),
     ("live_temp_spill.rs", 1),
     ("quality_live.rs", 1),
-    ("roast_mssql_decimal_scale.rs", 2),
     ("roast_pg_json_fidelity.rs", 1),
     ("roast_validate_exit.rs", 1),
     ("sec_exit_codes.rs", 1),
