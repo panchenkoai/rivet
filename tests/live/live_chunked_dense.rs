@@ -84,11 +84,22 @@ fn assert_each_id_exactly_once(dir: &std::path::Path, ctx: &str) {
     );
 }
 
-/// Drive a dense export from a fully-formed YAML and assert exactly-once.
-fn run_dense_assert(yaml: &str, export: &str, out: &std::path::Path, ctx: &str) {
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let cfg = write_config(&cfg_dir, yaml);
-    let run = run_rivet_export(&cfg, export);
+/// Turn an engine's base rig into the shared dense-chunked shape.
+fn dense_rig(base: Rig, name: &str, out: &std::path::Path, parallel: usize) -> Rig {
+    base.query(&format!("SELECT id, grp FROM {name}"))
+        .mode("chunked")
+        .export_line("chunk_column: grp")
+        .export_line(&format!("chunk_size: {CHUNK}"))
+        .export_line("chunk_dense: true")
+        .export_line("chunk_checkpoint: true")
+        .export_line(&format!("parallel: {parallel}"))
+        .export_line("compression: none")
+        .dest_path(out.to_path_buf())
+}
+
+/// Drive a dense export through its rig and assert exactly-once.
+fn run_dense_assert(rig: &Rig, export: &str, out: &std::path::Path, ctx: &str) {
+    let run = rig.run_args(&["--export", export]);
     assert!(
         run.status.success(),
         "{ctx}: dense chunked export must succeed; stderr:\n{}",
@@ -114,24 +125,8 @@ fn seed_pg_tied() -> (String, PgTable) {
     (name.clone(), PgTable::adopt(name))
 }
 
-fn pg_yaml(name: &str, out: &std::path::Path, parallel: usize) -> String {
-    format!(
-        r#"source: {{type: postgres, url: "{POSTGRES_URL}"}}
-exports:
-  - name: {name}
-    query: "SELECT id, grp FROM {name}"
-    mode: chunked
-    chunk_column: grp
-    chunk_size: {CHUNK}
-    chunk_dense: true
-    chunk_checkpoint: true
-    parallel: {parallel}
-    format: parquet
-    compression: none
-    destination: {{type: local, path: {out}}}
-"#,
-        out = out.display(),
-    )
+fn pg_rig(name: &str, out: &std::path::Path, parallel: usize) -> Rig {
+    dense_rig(Rig::pg_batch(name), name, out, parallel)
 }
 
 #[test]
@@ -141,7 +136,7 @@ fn dense_ties_pg_sequential_no_loss_no_dup() {
     let (name, _g) = seed_pg_tied();
     let out = tempfile::tempdir().unwrap();
     run_dense_assert(
-        &pg_yaml(&name, out.path(), 1),
+        &pg_rig(&name, out.path(), 1),
         &name,
         out.path(),
         "pg dense seq",
@@ -155,7 +150,7 @@ fn dense_ties_pg_parallel_no_loss_no_dup() {
     let (name, _g) = seed_pg_tied();
     let out = tempfile::tempdir().unwrap();
     run_dense_assert(
-        &pg_yaml(&name, out.path(), 4),
+        &pg_rig(&name, out.path(), 4),
         &name,
         out.path(),
         "pg dense parallel:4",
@@ -181,9 +176,8 @@ fn chunked_checkpoint_refuses_to_clobber_a_cdc_manifest() {
             br#"{"manifest_version":1,"run_id":"prior-cdc","mode":"cdc","parts":[]}"#,
         )
         .unwrap();
-        let cfg_dir = tempfile::tempdir().unwrap();
-        let cfg = write_config(&cfg_dir, &pg_yaml(&name, out.path(), parallel));
-        let run = run_rivet_export(&cfg, &name);
+        let rig = pg_rig(&name, out.path(), parallel);
+        let run = rig.run_args(&["--export", &name]);
         assert!(
             !run.status.success(),
             "parallel={parallel}: a chunked-checkpoint batch export must REFUSE to \
@@ -224,24 +218,8 @@ fn seed_mysql_tied() -> (String, MysqlTable) {
     (name.clone(), MysqlTable::adopt(name))
 }
 
-fn mysql_yaml(name: &str, out: &std::path::Path, parallel: usize) -> String {
-    format!(
-        r#"source: {{type: mysql, url: "{MYSQL_URL}"}}
-exports:
-  - name: {name}
-    query: "SELECT id, grp FROM {name}"
-    mode: chunked
-    chunk_column: grp
-    chunk_size: {CHUNK}
-    chunk_dense: true
-    chunk_checkpoint: true
-    parallel: {parallel}
-    format: parquet
-    compression: none
-    destination: {{type: local, path: {out}}}
-"#,
-        out = out.display(),
-    )
+fn mysql_rig(name: &str, out: &std::path::Path, parallel: usize) -> Rig {
+    dense_rig(Rig::mysql_batch(name), name, out, parallel)
 }
 
 #[test]
@@ -251,7 +229,7 @@ fn dense_ties_mysql_sequential_no_loss_no_dup() {
     let (name, _g) = seed_mysql_tied();
     let out = tempfile::tempdir().unwrap();
     run_dense_assert(
-        &mysql_yaml(&name, out.path(), 1),
+        &mysql_rig(&name, out.path(), 1),
         &name,
         out.path(),
         "mysql dense seq",
@@ -265,7 +243,7 @@ fn dense_ties_mysql_parallel_no_loss_no_dup() {
     let (name, _g) = seed_mysql_tied();
     let out = tempfile::tempdir().unwrap();
     run_dense_assert(
-        &mysql_yaml(&name, out.path(), 4),
+        &mysql_rig(&name, out.path(), 4),
         &name,
         out.path(),
         "mysql dense parallel:4",
@@ -287,29 +265,8 @@ fn seed_mssql_tied() -> (String, MssqlTable) {
     (name.clone(), MssqlTable::adopt(name))
 }
 
-fn mssql_yaml(name: &str, out: &std::path::Path, parallel: usize) -> String {
-    format!(
-        r#"source:
-  type: mssql
-  url: "{MSSQL_URL}"
-  tls:
-    accept_invalid_certs: true
-
-exports:
-  - name: {name}
-    query: "SELECT id, grp FROM {name}"
-    mode: chunked
-    chunk_column: grp
-    chunk_size: {CHUNK}
-    chunk_dense: true
-    chunk_checkpoint: true
-    parallel: {parallel}
-    format: parquet
-    compression: none
-    destination: {{type: local, path: {out}}}
-"#,
-        out = out.display(),
-    )
+fn mssql_rig(name: &str, out: &std::path::Path, parallel: usize) -> Rig {
+    dense_rig(Rig::mssql_batch(name), name, out, parallel)
 }
 
 #[test]
@@ -319,7 +276,7 @@ fn dense_ties_mssql_sequential_no_loss_no_dup() {
     let (name, _g) = seed_mssql_tied();
     let out = tempfile::tempdir().unwrap();
     run_dense_assert(
-        &mssql_yaml(&name, out.path(), 1),
+        &mssql_rig(&name, out.path(), 1),
         &name,
         out.path(),
         "mssql dense seq",
@@ -333,7 +290,7 @@ fn dense_ties_mssql_parallel_no_loss_no_dup() {
     let (name, _g) = seed_mssql_tied();
     let out = tempfile::tempdir().unwrap();
     run_dense_assert(
-        &mssql_yaml(&name, out.path(), 4),
+        &mssql_rig(&name, out.path(), 4),
         &name,
         out.path(),
         "mssql dense parallel:4",
