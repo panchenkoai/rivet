@@ -61,6 +61,9 @@ pub struct Rig {
     /// instead of the tempdir. See [`Rig::dest_s3`] / [`Rig::dest_gcs`] /
     /// [`Rig::dest_azure`].
     cloud_dest: Option<CloudDest>,
+    /// `destination: { type: stdout }` — for dispatch tests whose subject is
+    /// the stdout destination itself. See [`Rig::dest_stdout`].
+    dest_stdout: bool,
     dir: tempfile::TempDir,
 }
 
@@ -108,6 +111,7 @@ impl Rig {
             extra_exports: Vec::new(),
             oracle_container_dir: None,
             ckpt_override: None,
+            dest_stdout: false,
             cloud_dest: None,
             dir: tempfile::tempdir().expect("rig tempdir"),
         }
@@ -269,6 +273,13 @@ impl Rig {
 
     /// The fake-gcs sibling of [`Rig::dest_s3`]: anonymous access against the
     /// emulator endpoint, same per-export prefix layout.
+    /// Write to `destination: { type: stdout }` — no directory is created.
+    pub fn dest_stdout(mut self) -> Self {
+        self.dest_stdout = true;
+        self.dest_precreate = false;
+        self
+    }
+
     pub fn dest_gcs(mut self, bucket: &str, prefix: &str, endpoint: &str) -> Self {
         self.cloud_dest = Some(CloudDest::Gcs {
             bucket: bucket.to_string(),
@@ -292,6 +303,9 @@ impl Rig {
     /// the local tempdir otherwise. ONE renderer for both, so the primary and
     /// secondary exports cannot drift apart (they were two `format!`s before).
     fn dest_yaml(&self, export: &str) -> String {
+        if self.dest_stdout {
+            return "{ type: stdout }".to_string();
+        }
         match &self.cloud_dest {
             Some(CloudDest::S3 {
                 bucket,
@@ -1276,6 +1290,11 @@ fn cloud_dest_render_goldens() {
         az.contains("type: azure, bucket: ctr, prefix: \"pfx/e/\"")
             && az.contains("account_key_env: RIVET_TEST_AZURITE_KEY"),
         "dest_azure render drifted:\n{az}"
+    );
+    let so = Rig::pg_batch("t").export_named("e").dest_stdout().yaml();
+    assert!(
+        so.contains("destination: { type: stdout }"),
+        "dest_stdout render drifted:\n{so}"
     );
 }
 

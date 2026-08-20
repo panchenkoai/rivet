@@ -18,7 +18,6 @@ use std::collections::BTreeMap;
 /// `Command::new(RIVET_BIN)` + `write_config(` in the file. Shrink freely;
 /// grow only with a reason in the PR.
 const BASELINE: &[(&str, usize)] = &[
-    ("audit_cli_dispatch.rs", 4),
     ("audit_cloud_multipart.rs", 3),
     ("audit_doctor_fastfail.rs", 2),
     ("audit_doctor_probe.rs", 2),
