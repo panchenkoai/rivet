@@ -33,27 +33,12 @@ fn op_strategy() -> impl Strategy<Value = Op> {
     ]
 }
 
-fn cdc_config(
-    d: &tempfile::TempDir,
-    table: &str,
-    server_id: u32,
-    ckpt: &std::path::Path,
-    out: &std::path::Path,
-) -> std::path::PathBuf {
-    let yaml = format!(
-        r#"source: {{type: mysql, url: "{MYSQL_CDC_URL}"}}
-exports:
-  - name: {table}
-    table: {table}
-    mode: cdc
-    format: parquet
-    cdc: {{ checkpoint: "{ckpt}", until_current: true, server_id: {server_id} }}
-    destination: {{ type: local, path: "{out}" }}
-"#,
-        ckpt = ckpt.display(),
-        out = out.display(),
-    );
-    write_config(d, &yaml)
+fn cdc_rig(table: &str, ckpt: &std::path::Path, out: &std::path::Path) -> Rig {
+    // server_id comes from the rig's server_id_for(table) — stable and
+    // distinct per table, replacing the hand-picked 9_998/9_999.
+    Rig::mysql_cdc(table)
+        .checkpoint_path(ckpt.to_path_buf())
+        .dest_path(out.to_path_buf())
 }
 
 /// Clear `table`, checkpoint at the current binlog position, then apply `ops` and
@@ -150,13 +135,15 @@ fn replay(rows: Vec<(String, i32, Option<i32>)>) -> HashMap<u32, i32> {
     m
 }
 
-fn run_cdc(cfg: &std::path::Path, crash: bool) -> std::process::Output {
-    let mut cmd = std::process::Command::new(RIVET_BIN);
-    cmd.args(["run", "--config", cfg.to_str().unwrap()]);
+fn run_cdc(rig: &Rig, crash: bool) -> std::process::Output {
     if crash {
-        cmd.env("RIVET_TEST_PANIC_AT", "cdc_after_flush_before_ack");
+        rig.run_args_env(
+            &[],
+            &[("RIVET_TEST_PANIC_AT", "cdc_after_flush_before_ack")],
+        )
+    } else {
+        rig.run_args(&[])
     }
-    cmd.output().expect("spawn rivet")
 }
 
 proptest! {
@@ -168,7 +155,7 @@ proptest! {
         let (d, ckpt, expected) = setup_and_apply("cdc_prop", &ops);
         let out = d.path().join("out");
         std::fs::create_dir_all(&out).unwrap();
-        let res = run_cdc(&cdc_config(&d, "cdc_prop", 9_999, &ckpt, &out), false);
+        let res = run_cdc(&cdc_rig("cdc_prop", &ckpt, &out), false);
         prop_assert!(res.status.success(), "cdc run failed:\n{}", String::from_utf8_lossy(&res.stderr));
         prop_assert_eq!(
             &replay(read_cdc_rows(&out)), &expected,
@@ -192,14 +179,14 @@ proptest! {
         // Run 1 crashes after the part is durable but before the checkpoint advances.
         let crash_out = d.path().join("crash");
         std::fs::create_dir_all(&crash_out).unwrap();
-        let crashed = run_cdc(&cdc_config(&d, "cdc_prop_crash", 9_998, &ckpt, &crash_out), true);
+        let crashed = run_cdc(&cdc_rig("cdc_prop_crash", &ckpt, &crash_out), true);
         prop_assert!(!crashed.status.success(), "the injected crash must fail run 1");
 
         // Run 2 (clean): the checkpoint never advanced, so it re-reads everything —
         // at-least-once, nothing lost — and the replay reconstructs the source.
         let out = d.path().join("out");
         std::fs::create_dir_all(&out).unwrap();
-        let res = run_cdc(&cdc_config(&d, "cdc_prop_crash", 9_998, &ckpt, &out), false);
+        let res = run_cdc(&cdc_rig("cdc_prop_crash", &ckpt, &out), false);
         prop_assert!(res.status.success(), "resume run failed:\n{}", String::from_utf8_lossy(&res.stderr));
         prop_assert_eq!(
             &replay(read_cdc_rows(&out)), &expected,
