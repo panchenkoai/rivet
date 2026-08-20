@@ -40,7 +40,6 @@ const BASELINE: &[(&str, usize)] = &[
     ("live_batch_switch_golden.rs", 3),
     ("live_cdc.rs", 33),
     ("live_cdc_mbt.rs", 4),
-    ("live_cdc_mssql.rs", 7),
     ("live_cdc_oracle.rs", 4),
     ("live_cdc_property.rs", 2),
     ("live_cdc_replica.rs", 2),
