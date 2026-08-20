@@ -45,7 +45,6 @@ const BASELINE: &[(&str, usize)] = &[
     ("live_cdc_oracle.rs", 4),
     ("live_cdc_property.rs", 2),
     ("live_cdc_replica.rs", 2),
-    ("live_chaos.rs", 8),
     ("live_chunked_dense.rs", 2),
     ("live_chunked_recovery.rs", 1),
     ("live_cli_flags.rs", 76),
