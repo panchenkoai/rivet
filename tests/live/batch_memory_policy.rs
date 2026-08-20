@@ -20,9 +20,9 @@ use crate::common::*;
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 /// Write a config YAML to a tempdir and return (dir_guard, path_to_yaml).
-fn cfg(yaml: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+fn cfg(rig: &Rig) -> (tempfile::TempDir, std::path::PathBuf) {
     let d = tempfile::tempdir().unwrap();
-    let p = write_config(&d, yaml);
+    let p = rig.config_in(d.path());
     (d, p)
 }
 
@@ -36,7 +36,7 @@ fn batch_below_cap_succeeds_silently() {
     let out = tempfile::tempdir().unwrap();
     let export_name = unique_name("bmp_below_cap");
 
-    let yaml = Rig::pg_batch(&export_name)
+    let rig = Rig::pg_batch(&export_name)
         .query(&format!(
             r#"SELECT id, name, amount FROM {table_name}"#,
             table_name = table.name()
@@ -46,9 +46,8 @@ fn batch_below_cap_succeeds_silently() {
         .export_line("tuning:")
         .export_line("  max_batch_memory_mb: 512")
         .export_line("  on_batch_memory_exceeded: warn")
-        .dest_path(out.path().to_path_buf())
-        .yaml();
-    let (_cfgdir, cfgpath) = cfg(&yaml);
+        .dest_path(out.path().to_path_buf());
+    let (_cfgdir, cfgpath) = cfg(&rig);
 
     let result = run_rivet_export(&cfgpath, &export_name);
     assert!(
@@ -73,7 +72,7 @@ fn warn_policy_succeeds_and_emits_warning() {
     let out = tempfile::tempdir().unwrap();
     let export_name = unique_name("bmp_warn");
 
-    let yaml = Rig::pg_batch(&export_name)
+    let rig = Rig::pg_batch(&export_name)
         .query(&format!(
             r#"SELECT id, payload FROM {table_name}"#,
             table_name = table.name()
@@ -83,9 +82,8 @@ fn warn_policy_succeeds_and_emits_warning() {
         .export_line("  batch_size: 2000")
         .export_line("  max_batch_memory_mb: 1")
         .export_line("  on_batch_memory_exceeded: warn")
-        .dest_path(out.path().to_path_buf())
-        .yaml();
-    let (_cfgdir, cfgpath) = cfg(&yaml);
+        .dest_path(out.path().to_path_buf());
+    let (_cfgdir, cfgpath) = cfg(&rig);
 
     // Use RUST_LOG=warn so that log::warn! output is visible in stderr.
     let result = run_rivet_with_warn_log(&[
@@ -117,7 +115,7 @@ fn fail_policy_exits_nonzero_when_batch_exceeds_cap() {
     let out = tempfile::tempdir().unwrap();
     let export_name = unique_name("bmp_fail");
 
-    let yaml = Rig::pg_batch(&export_name)
+    let rig = Rig::pg_batch(&export_name)
         .query(&format!(
             r#"SELECT id, payload FROM {table_name}"#,
             table_name = table.name()
@@ -127,9 +125,8 @@ fn fail_policy_exits_nonzero_when_batch_exceeds_cap() {
         .export_line("  batch_size: 2000")
         .export_line("  max_batch_memory_mb: 1")
         .export_line("  on_batch_memory_exceeded: fail")
-        .dest_path(out.path().to_path_buf())
-        .yaml();
-    let (_cfgdir, cfgpath) = cfg(&yaml);
+        .dest_path(out.path().to_path_buf());
+    let (_cfgdir, cfgpath) = cfg(&rig);
 
     let result = run_rivet_export(&cfgpath, &export_name);
     assert!(
@@ -154,7 +151,7 @@ fn auto_shrink_parquet_output_is_complete_and_readable() {
     let out = tempfile::tempdir().unwrap();
     let export_name = unique_name("bmp_shrink_pq");
 
-    let yaml = Rig::pg_batch(&export_name)
+    let rig = Rig::pg_batch(&export_name)
         .query(&format!(
             r#"SELECT id, payload FROM {table_name}"#,
             table_name = table.name()
@@ -164,9 +161,8 @@ fn auto_shrink_parquet_output_is_complete_and_readable() {
         .export_line("  batch_size: 2000")
         .export_line("  max_batch_memory_mb: 1")
         .export_line("  on_batch_memory_exceeded: auto_shrink")
-        .dest_path(out.path().to_path_buf())
-        .yaml();
-    let (_cfgdir, cfgpath) = cfg(&yaml);
+        .dest_path(out.path().to_path_buf());
+    let (_cfgdir, cfgpath) = cfg(&rig);
 
     let result = run_rivet_export(&cfgpath, &export_name);
     assert!(
@@ -205,7 +201,7 @@ fn auto_shrink_csv_output_is_complete_and_valid() {
     let out = tempfile::tempdir().unwrap();
     let export_name = unique_name("bmp_shrink_csv");
 
-    let yaml = Rig::pg_batch(&export_name)
+    let rig = Rig::pg_batch(&export_name)
         .query(&format!(
             r#"SELECT id, payload FROM {table_name}"#,
             table_name = table.name()
@@ -216,9 +212,8 @@ fn auto_shrink_csv_output_is_complete_and_valid() {
         .export_line("  batch_size: 2000")
         .export_line("  max_batch_memory_mb: 1")
         .export_line("  on_batch_memory_exceeded: auto_shrink")
-        .dest_path(out.path().to_path_buf())
-        .yaml();
-    let (_cfgdir, cfgpath) = cfg(&yaml);
+        .dest_path(out.path().to_path_buf());
+    let (_cfgdir, cfgpath) = cfg(&rig);
 
     let result = run_rivet_export(&cfgpath, &export_name);
     assert!(
@@ -303,7 +298,7 @@ fn auto_shrink_incremental_cursor_is_correct() {
 
     let export_name = unique_name("bmp_inc_exp");
     let out = tempfile::tempdir().unwrap();
-    let yaml = Rig::pg_batch(&export_name)
+    let rig = Rig::pg_batch(&export_name)
         .query(&format!(
             r#"SELECT id, payload, updated_at FROM {table_name}"#
         ))
@@ -313,9 +308,8 @@ fn auto_shrink_incremental_cursor_is_correct() {
         .export_line("  batch_size: 2000")
         .export_line("  max_batch_memory_mb: 1")
         .export_line("  on_batch_memory_exceeded: auto_shrink")
-        .dest_path(out.path().to_path_buf())
-        .yaml();
-    let (_cfgdir, cfgpath) = cfg(&yaml);
+        .dest_path(out.path().to_path_buf());
+    let (_cfgdir, cfgpath) = cfg(&rig);
 
     // Run #1 — must export all 2000 rows.
     let r1 = run_rivet_export(&cfgpath, &export_name);

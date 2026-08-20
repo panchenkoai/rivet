@@ -29,16 +29,11 @@ const BASELINE: &[(&str, usize)] = &[
     // path — a rig owns a real config, so that one raw invocation is the test.
     ("audit_observability.rs", 1),
     ("audit_state.rs", 1), // missing-config-path IS the subject
-    ("batch_memory_policy.rs", 1),
     ("live_cdc.rs", 33),
-    ("live_chunked_recovery.rs", 1),
     ("live_cli_flags.rs", 76),
     ("live_crash_recovery.rs", 1),
     ("live_init_extended.rs", 6),
-    ("live_mssql_resume.rs", 1),
-    ("live_mysql_resume.rs", 1),
     ("live_temp_spill.rs", 1),
-    ("quality_live.rs", 1),
     ("roast_pg_json_fidelity.rs", 1),
     ("roast_validate_exit.rs", 1),
     ("sec_exit_codes.rs", 1),

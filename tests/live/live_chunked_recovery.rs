@@ -722,8 +722,9 @@ fn chunked_checkpoint_resume_suppresses_form_b_so_validate_does_not_false_fail()
                           cfg_dir: &tempfile::TempDir,
                           parallel: u32| {
         // Caller-owned dir: a Rig owns its tempdir, so returning rig.config_path()
-        // from this closure would drop the rig and delete the config. Keep yaml().
-        let yaml = Rig::pg_batch(export)
+        // from this closure would drop the rig and delete the config — config_in
+        // materializes into the caller's dir instead.
+        Rig::pg_batch(export)
             .query(&format!("SELECT id, name FROM {table_name}"))
             .mode("chunked")
             .export_line("chunk_column: id")
@@ -731,8 +732,7 @@ fn chunked_checkpoint_resume_suppresses_form_b_so_validate_does_not_false_fail()
             .export_line("chunk_checkpoint: true")
             .export_line(&format!("parallel: {parallel}"))
             .dest_path(out.to_path_buf())
-            .yaml();
-        write_config(cfg_dir, &yaml)
+            .config_in(cfg_dir.path())
     };
     let validate = |cfg: &std::path::Path, export: &str| {
         run_rivet_env(
