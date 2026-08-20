@@ -36,7 +36,6 @@ const BASELINE: &[(&str, usize)] = &[
     ("live_temp_spill.rs", 1),
     ("roast_pg_json_fidelity.rs", 1),
     ("roast_validate_exit.rs", 1),
-    ("sec_exit_codes.rs", 1),
 ];
 
 fn bespoke_sites(path: &std::path::Path) -> usize {
