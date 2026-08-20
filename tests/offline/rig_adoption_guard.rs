@@ -31,7 +31,7 @@ const BASELINE: &[(&str, usize)] = &[
     // path — a rig owns a real config, so that one raw invocation is the test.
     ("audit_observability.rs", 1),
     ("audit_state.rs", 1), // missing-config-path IS the subject
-    ("live_cdc.rs", 24),
+    ("live_cdc.rs", 17),
     ("live_cli_flags.rs", 76),
 ];
 

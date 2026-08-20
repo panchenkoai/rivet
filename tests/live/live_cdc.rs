@@ -735,21 +735,11 @@ fn cdc_csv_rendering_matches_batch_csv() {
     let ckpt = d.path().join("cdc.ckpt");
     std::fs::create_dir_all(&out).unwrap();
     std::fs::create_dir_all(&batch_out).unwrap();
-    let cdc_yaml = format!(
-        r#"source: {{type: mysql, url: "{MYSQL_CDC_URL}"}}
-exports:
-  - name: {tbl}
-    table: {tbl}
-    mode: cdc
-    format: csv
-    cdc: {{ checkpoint: "{ckpt}", until_current: true, server_id: {sid} }}
-    destination: {{ type: local, path: "{out}" }}
-"#,
-        ckpt = ckpt.display(),
-        out = out.display(),
-        sid = server_id_for(&tbl),
-    );
-    let cfg = write_config(&d, &cdc_yaml);
+    let cdc_rig = Rig::mysql_cdc(&tbl)
+        .with_format("csv")
+        .checkpoint_path(ckpt.clone())
+        .dest_path(out.clone());
+    let cfg = cdc_rig.config_path();
     run_rivet_ok(&cfg); // pin
     c.query_drop(format!(
         "INSERT INTO {tbl} VALUES \
@@ -1420,22 +1410,15 @@ fn cdc_qualified_overrides_target_one_table_bare_applies_to_the_rest() {
     let ckpt = d.path().join("cdc.ckpt");
     std::fs::create_dir_all(&out).unwrap();
     // Bare `v: text` hits every table; the qualified key retargets ONLY tb.
-    let yaml = format!(
-        r#"source: {{type: mysql, url: "{MYSQL_CDC_URL}"}}
-exports:
-  - name: app_cdc
-    tables: [{ta}, {tb}]
-    mode: cdc
-    format: parquet
-    columns: {{ v: text, "{tb}.v": "decimal(20,4)" }}
-    cdc: {{ checkpoint: "{ckpt}", until_current: true, server_id: {sid} }}
-    destination: {{ type: local, path: "{out}" }}
-"#,
-        ckpt = ckpt.display(),
-        out = out.display(),
-        sid = server_id_for(&ta),
-    );
-    let cfg = write_config(&d, &yaml);
+    let rig = Rig::mysql_cdc(&ta)
+        .tables(&[&ta, &tb])
+        .export_named("app_cdc")
+        .export_line(&format!(
+            "columns: {{ v: text, \"{tb}.v\": \"decimal(20,4)\" }}"
+        ))
+        .checkpoint_path(ckpt.clone())
+        .dest_path(out.clone());
+    let cfg = rig.config_path();
 
     run_rivet_ok(&cfg); // pin
     c.query_drop(format!("INSERT INTO {ta} VALUES (1, -42)"))
@@ -1497,21 +1480,12 @@ fn cdc_multi_table_same_column_name_different_types_resolve_per_table() {
     let out = d.path().join("out");
     let ckpt = d.path().join("cdc.ckpt");
     std::fs::create_dir_all(&out).unwrap();
-    let yaml = format!(
-        r#"source: {{type: mysql, url: "{MYSQL_CDC_URL}"}}
-exports:
-  - name: app_cdc
-    tables: [{ta}, {tb}, {tc}]
-    mode: cdc
-    format: parquet
-    cdc: {{ checkpoint: "{ckpt}", until_current: true, server_id: {sid} }}
-    destination: {{ type: local, path: "{out}" }}
-"#,
-        ckpt = ckpt.display(),
-        out = out.display(),
-        sid = server_id_for(&ta),
-    );
-    let cfg = write_config(&d, &yaml);
+    let rig = Rig::mysql_cdc(&ta)
+        .tables(&[&ta, &tb, &tc])
+        .export_named("app_cdc")
+        .checkpoint_path(ckpt.clone())
+        .dest_path(out.clone());
+    let cfg = rig.config_path();
 
     run_rivet_ok(&cfg); // pin
     c.query_drop(format!("INSERT INTO {ta} VALUES (1, -42)"))
@@ -1572,21 +1546,11 @@ fn cdc_initial_snapshot_covers_preexisting_rows_then_streams() {
     let out = d.path().join("out");
     let ckpt = d.path().join("cdc.ckpt");
     std::fs::create_dir_all(&out).unwrap();
-    let yaml = format!(
-        r#"source: {{type: mysql, url: "{MYSQL_CDC_URL}"}}
-exports:
-  - name: {tbl}
-    table: {tbl}
-    mode: cdc
-    format: parquet
-    cdc: {{ initial: snapshot, checkpoint: "{ckpt}", until_current: true, server_id: {sid} }}
-    destination: {{ type: local, path: "{out}" }}
-"#,
-        ckpt = ckpt.display(),
-        out = out.display(),
-        sid = server_id_for(&tbl),
-    );
-    let cfg = write_config(&d, &yaml);
+    let rig = Rig::mysql_cdc(&tbl)
+        .cdc_line("initial: snapshot")
+        .checkpoint_path(ckpt.clone())
+        .dest_path(out.clone());
+    let cfg = rig.config_path();
 
     // Run 1: anchor → snapshot(2 rows) → drain(0).
     run_rivet_ok(&cfg);
@@ -1656,22 +1620,12 @@ fn cdc_initial_snapshot_leg_drops_batch_meta_columns_for_load_parity() {
     std::fs::create_dir_all(&out).unwrap();
     // The CDC export REQUESTS batch meta columns — they must be dropped from the
     // snapshot leg so its parquet matches the CDC stream's columns.
-    let yaml = format!(
-        r#"source: {{type: mysql, url: "{MYSQL_CDC_URL}"}}
-exports:
-  - name: {tbl}
-    table: {tbl}
-    mode: cdc
-    format: parquet
-    meta_columns: {{ exported_at: true, row_hash: true }}
-    cdc: {{ initial: snapshot, checkpoint: "{ckpt}", until_current: true, server_id: {sid} }}
-    destination: {{ type: local, path: "{out}" }}
-"#,
-        ckpt = ckpt.display(),
-        out = out.display(),
-        sid = server_id_for(&tbl),
-    );
-    let cfg = write_config(&d, &yaml);
+    let rig = Rig::mysql_cdc(&tbl)
+        .cdc_line("initial: snapshot")
+        .export_line("meta_columns: { exported_at: true, row_hash: true }")
+        .checkpoint_path(ckpt.clone())
+        .dest_path(out.clone());
+    let cfg = rig.config_path();
     run_rivet_ok(&cfg);
 
     let snap = out.join("snapshot");
@@ -1744,19 +1698,10 @@ fn pg_initial_snapshot_vanished_slot_fails_loudly_not_recreates() {
 
     let out = d.path().join("out");
     std::fs::create_dir_all(&out).unwrap();
-    let yaml = format!(
-        r#"source: {{type: postgres, url: "{POSTGRES_CDC_URL}"}}
-exports:
-  - name: {tbl}
-    table: {tbl}
-    mode: cdc
-    format: parquet
-    cdc: {{ initial: snapshot, slot: {slot}, until_current: true }}
-    destination: {{ type: local, path: "{out}" }}
-"#,
-        out = out.display(),
-    );
-    let cfg = write_config(&d, &yaml);
+    let rig = Rig::pg_cdc(&tbl, &slot)
+        .cdc_line("initial: snapshot")
+        .dest_path(out.clone());
+    let cfg = rig.config_path();
 
     // Run 1: anchor + snapshot(1 row) + drain(0).
     run_rivet_ok(&cfg);
@@ -2015,19 +1960,10 @@ fn pg_cdc_initial_snapshot_covers_preexisting_rows_then_streams() {
 
     let out = d.path().join("out");
     std::fs::create_dir_all(&out).unwrap();
-    let yaml = format!(
-        r#"source: {{type: postgres, url: "{POSTGRES_CDC_URL}"}}
-exports:
-  - name: {tbl}
-    table: {tbl}
-    mode: cdc
-    format: parquet
-    cdc: {{ initial: snapshot, slot: {slot}, until_current: true }}
-    destination: {{ type: local, path: "{out}" }}
-"#,
-        out = out.display(),
-    );
-    let cfg = write_config(&d, &yaml);
+    let rig = Rig::pg_cdc(&tbl, &slot)
+        .cdc_line("initial: snapshot")
+        .dest_path(out.clone());
+    let cfg = rig.config_path();
 
     run_rivet_ok(&cfg);
     let _slot = Slot(slot.clone());
