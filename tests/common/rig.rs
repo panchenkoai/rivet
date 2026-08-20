@@ -459,6 +459,53 @@ impl Rig {
         self.dir.path().join(format!("out_{name}"))
     }
 
+    // ── THE invocation seam ─────────────────────────────────────────────
+    // Every rig method that reaches the rivet binary goes through
+    // `invoke_command` — one place for cross-cutting execution concerns
+    // (env, io, future timeouts/log capture), and ONE spelling family for
+    // the CDC conformance gate to derive its capture markers from (the
+    // hand-maintained marker dictionary drifted twice in a month; see the
+    // gate's `derived_capture_markers`).
+
+    /// argv for a `run` invocation: `run --config <cfg> <extra…>`.
+    fn run_argv(&self, extra: &[&str]) -> Vec<String> {
+        let cfg = self.config_path();
+        let mut v = vec![
+            "run".to_string(),
+            "--config".to_string(),
+            cfg.display().to_string(),
+        ];
+        v.extend(extra.iter().map(|a| a.to_string()));
+        v
+    }
+
+    /// argv for a non-`run` subcommand: `<args…> --config <cfg>` (clap
+    /// accepts the flag in any position).
+    fn cli_argv(&self, args: &[&str]) -> Vec<String> {
+        let cfg = self.config_path();
+        let mut v: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+        v.push("--config".to_string());
+        v.push(cfg.display().to_string());
+        v
+    }
+
+    /// The single `Command` builder behind every runner wrapper.
+    fn invoke_command(&self, argv: &[String], envs: &[(&str, &str)]) -> std::process::Command {
+        let mut cmd = std::process::Command::new(super::runner::RIVET_BIN);
+        cmd.args(argv);
+        for (k, v) in envs {
+            cmd.env(k, v);
+        }
+        cmd
+    }
+
+    /// Run to completion and collect the output.
+    fn invoke(&self, argv: &[String], envs: &[(&str, &str)]) -> std::process::Output {
+        self.invoke_command(argv, envs)
+            .output()
+            .expect("spawn rivet binary")
+    }
+
     /// Run an ARBITRARY subcommand against this rig's config: `rivet <args…>
     /// --config <cfg>`.
     ///
@@ -477,11 +524,7 @@ impl Rig {
     /// [`Rig::cli`] with environment variables — needed wherever the config
     /// declares `url_env:`, since the process must be able to resolve it.
     pub fn cli_env(&self, args: &[&str], envs: &[(&str, &str)]) -> std::process::Output {
-        let cfg = self.config_path();
-        let mut all: Vec<&str> = args.to_vec();
-        all.push("--config");
-        all.push(cfg.to_str().unwrap());
-        super::runner::run_rivet_env(&all, envs)
+        self.invoke(&self.cli_argv(args), envs)
     }
 
     /// `rivet plan --export <this rig's export> --format json --output <out>`,
@@ -547,14 +590,8 @@ impl Rig {
     /// status. `run_args_env` blocks until completion and so cannot express them.
     /// The caller owns the `Child` and must reap it.
     pub fn spawn_args_env(&self, extra: &[&str], envs: &[(&str, &str)]) -> std::process::Child {
-        let cfg = self.config_path();
-        let mut cmd = std::process::Command::new(super::runner::RIVET_BIN);
-        cmd.args(["run", "--config", cfg.to_str().unwrap()]);
-        cmd.args(extra);
-        for (k, v) in envs {
-            cmd.env(k, v);
-        }
-        cmd.stdout(std::process::Stdio::null())
+        self.invoke_command(&self.run_argv(extra), envs)
+            .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
             .expect("spawn rivet")
@@ -569,10 +606,7 @@ impl Rig {
     /// injection. That one gap accounted for most of the hand-rolled invocations
     /// in `live_chunked_recovery.rs` and its siblings.
     pub fn run_args_env(&self, extra: &[&str], envs: &[(&str, &str)]) -> std::process::Output {
-        let cfg = self.config_path();
-        let mut args: Vec<&str> = vec!["run", "--config", cfg.to_str().unwrap()];
-        args.extend_from_slice(extra);
-        super::runner::run_rivet_env(&args, envs)
+        self.invoke(&self.run_argv(extra), envs)
     }
 
     /// `run_args_env` with no env — a plain run with extra flags.
@@ -583,16 +617,14 @@ impl Rig {
     /// Run with an extra environment variable (fault injection); returns the
     /// raw output — the caller asserts success or failure.
     pub fn run_with_env(&self, key: &str, val: &str) -> std::process::Output {
-        let cfg = self.config_path();
-        super::runner::run_rivet_env(&["run", "--config", cfg.to_str().unwrap()], &[(key, val)])
+        self.run_args_env(&[], &[(key, val)])
     }
 
     /// Run with SEVERAL extra environment variables (e.g. RIVET_STATE_URL to pick the
     /// Postgres state backend AND RIVET_TEST_PANIC_AT to inject a crash in one run);
     /// returns the raw output — the caller asserts success or failure.
     pub fn run_with_envs(&self, envs: &[(&str, &str)]) -> std::process::Output {
-        let cfg = self.config_path();
-        super::runner::run_rivet_env(&["run", "--config", cfg.to_str().unwrap()], envs)
+        self.run_args_env(&[], envs)
     }
 
     /// [`Rig::run_with_envs`] under a WALL-CLOCK CEILING — `None` if the child
@@ -615,14 +647,9 @@ impl Rig {
         envs: &[(&str, &str)],
         timeout: std::time::Duration,
     ) -> Option<std::process::Output> {
-        let cfg = self.config_path();
         let out_path = self.dir.path().join("bounded.stdout");
         let err_path = self.dir.path().join("bounded.stderr");
-        let mut cmd = std::process::Command::new(RIVET_BIN);
-        cmd.args(["run", "--config", cfg.to_str().unwrap()]);
-        for (k, v) in envs {
-            cmd.env(k, v);
-        }
+        let mut cmd = self.invoke_command(&self.run_argv(&[]), envs);
         cmd.stdout(std::fs::File::create(&out_path).expect("bounded stdout file"))
             .stderr(std::fs::File::create(&err_path).expect("bounded stderr file"));
         let mut child = cmd.spawn().expect("spawn rivet binary");
@@ -874,8 +901,7 @@ impl Rig {
 
     /// Run rivet; panic unless it succeeds.
     pub fn run_ok(&self) {
-        let cfg = self.config_path();
-        let out = super::runner::run_rivet(&["run", "--config", cfg.to_str().unwrap()]);
+        let out = self.run_args(&[]);
         assert!(
             out.status.success(),
             "rig run failed for '{}':\n{}",
@@ -886,8 +912,7 @@ impl Rig {
 
     /// Run rivet expecting a loud failure; returns combined output.
     pub fn run_expect_fail(&self) -> String {
-        let cfg = self.config_path();
-        let out = super::runner::run_rivet(&["run", "--config", cfg.to_str().unwrap()]);
+        let out = self.run_args(&[]);
         assert!(
             !out.status.success(),
             "rig run for '{}' was expected to fail",
@@ -904,8 +929,7 @@ impl Rig {
     /// whose VALID outcomes include both success and a loud failure (e.g. a
     /// mid-stream outage that rivet may either retry through or safely refuse).
     pub fn run(&self) -> std::process::Output {
-        let cfg = self.config_path();
-        super::runner::run_rivet(&["run", "--config", cfg.to_str().unwrap()])
+        self.run_args(&[])
     }
 
     /// Put the destination under the shared bind mount so the DuckDB validator

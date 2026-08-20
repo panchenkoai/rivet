@@ -361,6 +361,53 @@ fn every_cdc_engine_covers_every_conformance_case() {
 /// manifested as 0-row successes that a bare `run_cdc(&cfg)` + no assertion
 /// would wave through. Every live CDC test that runs a capture must assert an
 /// outcome: manifest rows, a batch comparison, or an explicit failure check.
+/// Capture markers DERIVED from the harness sources: the name of every
+/// `pub fn` starting with run/cli/spawn/drain in the rig and the runner
+/// module, as a `name(` spelling. A new runner method is born graded — the
+/// failure mode this replaces is the hand dictionary silently lagging the
+/// rig's API (bughunt find #3: ~28 CDC tests ungraded).
+fn derived_capture_markers() -> &'static Vec<String> {
+    use std::sync::OnceLock;
+    static MARKERS: OnceLock<Vec<String>> = OnceLock::new();
+    MARKERS.get_or_init(|| {
+        let mut out = Vec::new();
+        for src in ["tests/common/rig.rs", "tests/common/runner.rs"] {
+            let text = std::fs::read_to_string(src)
+                .unwrap_or_else(|e| panic!("derive capture markers: read {src}: {e}"));
+            for line in text.lines() {
+                let l = line.trim_start();
+                if let Some(rest) = l.strip_prefix("pub fn ")
+                    && let Some(name) = rest.split('(').next()
+                    && ["run", "cli", "spawn", "drain"]
+                        .iter()
+                        .any(|p| name.starts_with(p))
+                {
+                    out.push(format!("{name}("));
+                }
+            }
+        }
+        out.sort();
+        out.dedup();
+        // An empty or shrunken derivation would silently hollow the gate
+        // (runs_capture=false SKIPS a test rather than failing it) — so the
+        // floor is a hard panic, and the trickiest historical miss is pinned
+        // by name: the trailing 's' that defeated the run_with_env( substring.
+        assert!(
+            out.len() >= 12,
+            "capture-marker derivation collapsed to {} markers — the harness \
+             sources moved or the regex rotted; the gate would silently skip \
+             every CDC test: {out:?}",
+            out.len()
+        );
+        assert!(
+            out.iter().any(|m| m == "run_with_envs("),
+            "derived markers must include run_with_envs( — the spelling whose \
+             absence hid the crash-injection tests: {out:?}"
+        );
+        out
+    })
+}
+
 #[test]
 fn every_live_cdc_test_asserts_an_outcome() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -399,29 +446,15 @@ fn every_live_cdc_test_asserts_an_outcome() {
             // forms (run_cdc helper, direct Command) bespoke sites keep.
             let runs_capture = chunk.contains("run_cdc(")
                 || chunk.contains("Command::new(RIVET_BIN)")
-                || chunk.contains("run_ok(")
-                || chunk.contains("run_with_env(")
-                || chunk.contains("run_expect_fail(")
-                || chunk.contains("run_and_read(")
-                // The helper 105 call sites reach rivet through; its absence
-                // here is exactly how two mssql capture tests stayed invisible
-                // to this gate until the rig migration renamed their runner.
-                || chunk.contains("run_rivet_ok(")
-                // The rest of the rig's runner surface + the runner-module
-                // helpers. The bughunt re-ran this scan with these spellings
-                // and found ~28 CDC tests whose ONLY capture spelling was
-                // unlisted — silently ungraded; `run_with_envs(` in particular
-                // defeats the `run_with_env(` substring via the trailing 's'.
-                || chunk.contains("run_args(")
-                || chunk.contains("run_args_env(")
-                || chunk.contains("run_with_envs(")
-                || chunk.contains("run_with_envs_bounded(")
-                || chunk.contains("spawn_args_env(")
-                || chunk.contains("drain_and_read(")
-                || chunk.contains("run_rivet(")
-                || chunk.contains("run_rivet_env(")
-                || chunk.contains("run_rivet_bounded(")
-                || chunk.contains("run_rivet_args_bounded(");
+                // DERIVED, not hand-listed: every `pub fn run*/cli*/spawn*/
+                // drain*` in the rig and the runner module is a capture
+                // spelling by construction. The hand dictionary drifted twice
+                // in a month (run_rivet_ok, then the whole run_args family —
+                // ~28 tests silently ungraded); "derive the enumerated
+                // dimension, never type it in".
+                || derived_capture_markers()
+                    .iter()
+                    .any(|m| chunk.contains(m.as_str()));
             // Outcome = the test READS BACK what the capture produced (files,
             // destination listing, or the state DB) — not merely that the
             // process exited 0.
