@@ -23,6 +23,11 @@ const BASELINE: &[(&str, usize)] = &[
     ("audit_column_validation.rs", 5),
     ("audit_doctor_fastfail.rs", 2),
     ("audit_doctor_probe.rs", 2),
+    // ── the init-subject class: REASONED ceilings, not migration targets ──
+    // `rivet init` PRODUCES configs; the rig OWNS a config. A rig-shaped init
+    // test would test the rig's YAML against init's YAML — two generators, no
+    // subject. Raw invocations of `rivet init <flags>` ARE these files' subject,
+    // so their ceilings hold them at today's counts rather than at zero.
     ("audit_init_deferred.rs", 4),
     ("audit_maxfile.rs", 2),
     // audit_metrics_validates_config_path's SUBJECT is a nonexistent --config
