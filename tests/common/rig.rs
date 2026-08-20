@@ -676,6 +676,27 @@ impl Rig {
         path
     }
 
+    /// Materialize this rig's config into a CALLER-owned directory and return
+    /// the path — for scenarios where the config must OUTLIVE the rig value.
+    ///
+    /// This is the sanctioned answer to the temporary-rig-drop trap: a
+    /// `rig.config_path()` handed out of a helper dies with the rig's tempdir
+    /// (live_cdc documented the trap and kept `write_config(d, &rig.yaml())`
+    /// round-trips as the workaround; live_cdc_mssql hit it live during the
+    /// migration). Destinations are still pre-created exactly as
+    /// [`Rig::config_path`] does, so the two materializations cannot drift.
+    pub fn config_in(&self, dir: &std::path::Path) -> PathBuf {
+        if self.dest_precreate {
+            std::fs::create_dir_all(self.out_dir()).unwrap();
+        }
+        for e in &self.extra_exports {
+            std::fs::create_dir_all(self.out_dir_for(&e.name)).unwrap();
+        }
+        let cfg = dir.join("rig.yaml");
+        std::fs::write(&cfg, self.render()).unwrap();
+        cfg
+    }
+
     pub fn config_path(&self) -> PathBuf {
         // Materialization point: the ONLY place the rig touches the
         // filesystem (yaml()/render() stay pure — the offline goldens were

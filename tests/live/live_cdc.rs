@@ -38,17 +38,17 @@ fn cdc_rig(tbl: &str, ckpt: &std::path::Path, out: &std::path::Path) -> Rig {
         .dest_path(out.to_path_buf())
 }
 
-/// Config PATH in a CALLER-owned dir. Kept because ~46 sites here only need a
-/// path (and the state DB beside it); a `Rig` owns its own tempdir, so handing
-/// back `rig.config_path()` from a helper would drop the rig and delete the file.
-/// Tests that need `run_args_env` (fault injection) take [`cdc_rig`] instead.
+/// Config PATH in a CALLER-owned dir, via [`Rig::config_in`] — the rig-level
+/// answer to the temporary-rig-drop trap this helper used to work around with
+/// a `write_config(d, &rig.yaml())` round-trip. Tests that need
+/// `run_args_env` (fault injection) take [`cdc_rig`] instead.
 fn cdc_config(
     d: &tempfile::TempDir,
     tbl: &str,
     ckpt: &std::path::Path,
     out: &std::path::Path,
 ) -> std::path::PathBuf {
-    write_config(d, &cdc_rig(tbl, ckpt, out).yaml())
+    cdc_rig(tbl, ckpt, out).config_in(d.path())
 }
 
 /// Template-equivalence golden: the rig must render EXACTLY the config the
