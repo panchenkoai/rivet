@@ -521,24 +521,11 @@ fn doctor_sees_the_fault_states_the_gremlins_create() {
     // the first attempt used 000001 and doctor CORRECTLY reported it healthy,
     // because the shared instance still retains its first file.)
     let out = d.path().join("out");
-    std::fs::create_dir_all(&out).unwrap();
-    let yaml = format!(
-        r#"source: {{type: mysql, url: "{MYSQL_CDC_URL}"}}
-exports:
-  - name: {tbl}
-    table: {tbl}
-    mode: cdc
-    format: parquet
-    cdc: {{ checkpoint: "{ckpt}", until_current: true, server_id: {sid} }}
-    destination: {{ type: local, path: "{out}" }}
-"#,
-        ckpt = ckpt.display(),
-        out = out.display(),
-        sid = server_id_for(&tbl),
-    );
-    let cfg = write_config(&d, &yaml);
+    let rig = Rig::mysql_cdc(&tbl)
+        .checkpoint_path(ckpt.clone())
+        .dest_path(out.clone());
 
-    let doc = run_rivet(&["doctor", "--config", cfg.to_str().unwrap(), "--json"]);
+    let doc = rig.cli(&["doctor", "--json"]);
     let j: serde_json::Value = serde_json::from_slice(&doc.stdout).expect("doctor --json parses");
     let checks = j["checks"].as_array().expect("checks array");
     // The sensor contract: SOME cdc check must be non-ok and name the binlog
@@ -561,7 +548,7 @@ exports:
     // And the healthy baseline: with a fresh checkpoint doctor is green again
     // (the sensor has no stuck-at-fail failure mode).
     std::fs::remove_file(&ckpt).unwrap();
-    let doc = run_rivet(&["doctor", "--config", cfg.to_str().unwrap(), "--json"]);
+    let doc = rig.cli(&["doctor", "--json"]);
     let j: serde_json::Value = serde_json::from_slice(&doc.stdout).expect("doctor --json parses");
     assert_eq!(j["all_ok"], true, "healthy state must read green: {j}");
 }
@@ -791,28 +778,15 @@ fn cdc_all_features_combined_on_gcs() {
     ensure_gcs_bucket(bucket);
     let prefix = unique_name("allfeat");
     let ckpt = d.path().join("cdc.ckpt");
-    let yaml = format!(
-        r#"source: {{type: mysql, url: "{MYSQL_CDC_URL}"}}
-exports:
-  - name: all_features
-    tables: [{ta}, {tb}]
-    mode: cdc
-    format: parquet
-    columns: {{ "{tb}.v": "decimal(20,0)" }}
-    cdc: {{ initial: snapshot, checkpoint: "{ckpt}", until_current: true, server_id: {sid} }}
-    destination:
-      type: gcs
-      bucket: {bucket}
-      prefix: {prefix}
-      endpoint: {FAKE_GCS_ENDPOINT}
-      allow_anonymous: true
-"#,
-        ckpt = ckpt.display(),
-        sid = server_id_for(&ta),
-    );
-    let cfg = write_config(&d, &yaml);
+    let rig = Rig::mysql_cdc(&ta)
+        .tables(&[&ta, &tb])
+        .export_named("all_features")
+        .cdc_line("initial: snapshot")
+        .export_line(&format!("columns: {{ \"{tb}.v\": \"decimal(20,0)\" }}"))
+        .checkpoint_path(ckpt.clone())
+        .dest_gcs(bucket, &prefix, FAKE_GCS_ENDPOINT);
     let run = || {
-        let st = run_rivet(&["run", "--config", cfg.to_str().unwrap()]).status;
+        let st = rig.run_args(&[]).status;
         assert!(st.success());
     };
     run(); // anchor → per-table snapshots on GCS → drain(0)
@@ -1001,21 +975,11 @@ fn cdc_replication_grant_revoked_mid_life_fails_loud_and_resumes_after_regrant()
     let ckpt = d.path().join("cdc.ckpt");
     std::fs::create_dir_all(&out).unwrap();
     let user_url = MYSQL_CDC_URL.replace("rivet:rivet@", &format!("{user}:pw@"));
-    let yaml = format!(
-        r#"source: {{type: mysql, url: "{user_url}"}}
-exports:
-  - name: {tbl}
-    table: {tbl}
-    mode: cdc
-    format: parquet
-    cdc: {{ checkpoint: "{ckpt}", until_current: true, server_id: {sid} }}
-    destination: {{ type: local, path: "{out}" }}
-"#,
-        ckpt = ckpt.display(),
-        out = out.display(),
-        sid = server_id_for(&tbl),
-    );
-    let cfg = write_config(&d, &yaml);
+    let rig = Rig::mysql_cdc(&tbl)
+        .source_url(&user_url)
+        .checkpoint_path(ckpt.clone())
+        .dest_path(out.clone());
+    let cfg = rig.config_path();
     run_ok(&cfg); // pin under full rights
     let ckpt_before = std::fs::read_to_string(&ckpt).unwrap();
 
@@ -1086,22 +1050,13 @@ fn cdc_destination_disk_full_is_loud_and_lossless() {
     let ckpt = d.path().join("cdc.ckpt");
     let out_tiny = tiny.join(unique_name("out"));
     std::fs::create_dir_all(&out_tiny).unwrap();
+    // Rebuilt per destination; config_in(&d) keeps the config (and its
+    // adjacent state db) on the caller-owned dir across both rigs.
     let mk_cfg = |out: &std::path::Path| {
-        let yaml = format!(
-            r#"source: {{type: mysql, url: "{MYSQL_CDC_URL}"}}
-exports:
-  - name: {tbl}
-    table: {tbl}
-    mode: cdc
-    format: parquet
-    cdc: {{ checkpoint: "{ckpt}", until_current: true, server_id: {sid} }}
-    destination: {{ type: local, path: "{o}" }}
-"#,
-            ckpt = ckpt.display(),
-            o = out.display(),
-            sid = server_id_for(&tbl),
-        );
-        write_config(&d, &yaml)
+        Rig::mysql_cdc(&tbl)
+            .checkpoint_path(ckpt.clone())
+            .dest_path(out.to_path_buf())
+            .config_in(d.path())
     };
     run_ok(&mk_cfg(&out_tiny)); // pin
     let ckpt_before = std::fs::read_to_string(&ckpt).unwrap();

@@ -361,6 +361,14 @@ impl Rig {
         self
     }
 
+    /// Append a raw line inside the `cdc: { … }` block — for per-test CDC
+    /// knobs the constructors don't set (`initial: snapshot`, a bespoke
+    /// `server_id`). Same escape-hatch contract as [`Rig::export_line`].
+    pub fn cdc_line(mut self, line: &str) -> Self {
+        self.cdc_lines.push(line.to_string());
+        self
+    }
+
     /// Declare the source URL through an ENV VAR (`url_env:`) instead of inline.
     ///
     /// Load-bearing for plan/apply round-trips, not a style choice: an inline URL
