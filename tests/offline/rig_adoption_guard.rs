@@ -37,7 +37,6 @@ const BASELINE: &[(&str, usize)] = &[
     ("live_init_extended.rs", 6),
     ("live_mssql_resume.rs", 1),
     ("live_mysql_resume.rs", 1),
-    ("live_parallel_ux.rs", 2),
     ("live_partition_cloud.rs", 2),
     ("live_resume.rs", 2),
     ("live_temp_spill.rs", 1),
