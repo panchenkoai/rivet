@@ -65,7 +65,6 @@ const BASELINE: &[(&str, usize)] = &[
     ("roast_mssql_decimal_scale.rs", 2),
     ("roast_part_loss.rs", 3),
     ("roast_pg_json_fidelity.rs", 1),
-    ("roast_small_table_escape.rs", 3),
     ("roast_validate_exit.rs", 1),
     ("sec_exit_codes.rs", 1),
     ("sec_terminal_inject.rs", 2),
