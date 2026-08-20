@@ -371,9 +371,19 @@ fn derived_capture_markers() -> &'static Vec<String> {
     static MARKERS: OnceLock<Vec<String>> = OnceLock::new();
     MARKERS.get_or_init(|| {
         let mut out = Vec::new();
-        for src in ["tests/common/rig.rs", "tests/common/runner.rs"] {
-            let text = std::fs::read_to_string(src)
-                .unwrap_or_else(|e| panic!("derive capture markers: read {src}: {e}"));
+        // The rig is a directory module (role split: render/materialize/
+        // invoke/oracle) — scan every .rs under it plus the runner module.
+        // The hollowing floor below fired the moment rig.rs became rig/ —
+        // exactly the failure mode it exists for.
+        let mut sources: Vec<std::path::PathBuf> = std::fs::read_dir("tests/common/rig")
+            .expect("derive capture markers: read tests/common/rig")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x == "rs"))
+            .collect();
+        sources.push("tests/common/runner.rs".into());
+        for src in sources {
+            let text = std::fs::read_to_string(&src)
+                .unwrap_or_else(|e| panic!("derive capture markers: read {}: {e}", src.display()));
             for line in text.lines() {
                 let l = line.trim_start();
                 if let Some(rest) = l.strip_prefix("pub fn ")
