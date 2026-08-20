@@ -199,28 +199,31 @@ pub fn run_plan_command(
     } else {
         write_plan_fields_to_config(config_path, &fields)?
     };
-    // `warn`, not `info`: a command that MUTATES the operator's config file
-    // must say so at a level the default log setup shows — the info-level
-    // version of this line is how a hand-tuned 5-per-wave schedule silently
-    // became one 76-export wave (#150). Report ACTUAL writes, not intent
-    // (bug hunt 2026-08-08).
-    if !written.is_empty() {
-        log::warn!(
+    // The DECISION (warn / read-only info / silent) is a pure helper so it can
+    // be unit-tested — the two branch conditions here are otherwise live-only
+    // (they sit in a command that needs a real source), and "which line the
+    // operator sees" is real UX, not log noise. The glue below only formats.
+    match plan_write_report(written.len(), annotate_waves, recs.len()) {
+        // `warn`, not `info`: a command that MUTATES the operator's config file
+        // must say so at a level the default log setup shows — the info-level
+        // version of this line is how a hand-tuned 5-per-wave schedule silently
+        // became one 76-export wave (#150). Report ACTUAL writes, not intent.
+        PlanWriteReport::Wrote(n) => log::warn!(
             "plan --annotate-waves: (over)wrote wave/parallel_safe on {} export(s) in {}",
-            written.len(),
+            n,
             config_path,
-        );
-    } else if !annotate_waves && !recs.is_empty() {
+        ),
         // Read-only by default (bug hunt 2026-08-20): plan computed a schedule
         // but did NOT touch the config. Say so, and how to persist it — so the
         // recommendation isn't silently lost AND the operator isn't surprised
         // by a mutated file. `info`: this is discoverability, not a hazard.
-        log::info!(
+        PlanWriteReport::ReadOnly(n) => log::info!(
             "plan: read-only — scheduled {} export(s) but left {} unchanged; \
              rerun with --annotate-waves to write wave/parallel_safe into it",
-            recs.len(),
+            n,
             config_path,
-        );
+        ),
+        PlanWriteReport::Silent => {}
     }
     // A field we meant to write but no `- name:` line matched is a SILENT
     // no-write — the loaded export name and the YAML text disagree (templated
@@ -950,6 +953,37 @@ fn fields_to_write(recs: &[(String, u32, bool)], annotate_waves: bool) -> Export
         .collect()
 }
 
+/// What `run_plan_command` should tell the operator about config writes.
+#[derive(Debug, PartialEq, Eq)]
+enum PlanWriteReport {
+    /// `--annotate-waves` (over)wrote N exports — warn, config was mutated.
+    Wrote(usize),
+    /// Read-only: N exports were scheduled but the config was left untouched —
+    /// info hint that `--annotate-waves` persists it.
+    ReadOnly(usize),
+    /// Nothing to say: an annotate run whose writes all failed to match a
+    /// `- name:` line (the separate `unmatched` warning covers it), or an empty
+    /// plan.
+    Silent,
+}
+
+/// Decide the write-report from the outcome — PURE so the branch logic the
+/// caller would otherwise bury in a live-only command is unit-testable.
+///
+/// A WRITE (any export landed on disk) always warns. Otherwise, a read-only
+/// run (no `--annotate-waves`) with something to schedule prints the persist
+/// hint. An annotate run that wrote nothing is Silent here — its zero-match
+/// case is reported by the `unmatched` warning, not this line.
+fn plan_write_report(written: usize, annotate_waves: bool, recs: usize) -> PlanWriteReport {
+    if written > 0 {
+        PlanWriteReport::Wrote(written)
+    } else if !annotate_waves && recs > 0 {
+        PlanWriteReport::ReadOnly(recs)
+    } else {
+        PlanWriteReport::Silent
+    }
+}
+
 /// What `apply --pool` will read for `parallel_safe` on each export AFTER this
 /// plan run finished writing — the value the preview must model.
 ///
@@ -1099,9 +1133,31 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        ExportFields, apply_field_annotations, effective_parallel_safe, fields_to_write,
-        history_pack_items, refuse_annotate_scoped_to_export, repack_from_history,
+        ExportFields, PlanWriteReport, apply_field_annotations, effective_parallel_safe,
+        fields_to_write, history_pack_items, plan_write_report, refuse_annotate_scoped_to_export,
+        repack_from_history,
     };
+
+    /// The write-report the operator sees, per outcome. A WRITE always warns;
+    /// a read-only run (no flag) with work to schedule prints the persist hint;
+    /// everything else is silent. RED-proven against each branch flip: `> 0` →
+    /// `>= 0` (Silent/ReadOnly become Wrote(0)), `!annotate_waves` → dropped
+    /// (an annotate run would falsely claim read-only), `recs > 0` dropped (an
+    /// empty plan would print a read-only hint about nothing).
+    #[test]
+    fn plan_write_report_maps_outcome_to_the_right_operator_message() {
+        // A write happened → warn, regardless of the flag or recs.
+        assert_eq!(plan_write_report(3, true, 3), PlanWriteReport::Wrote(3));
+        assert_eq!(plan_write_report(1, false, 5), PlanWriteReport::Wrote(1));
+        // Read-only default with exports to schedule → the persist hint.
+        assert_eq!(plan_write_report(0, false, 4), PlanWriteReport::ReadOnly(4));
+        // Annotate run that wrote nothing (all unmatched) → Silent here; the
+        // `unmatched` warning covers that case, not this line.
+        assert_eq!(plan_write_report(0, true, 4), PlanWriteReport::Silent);
+        // Nothing to schedule → nothing to say, either mode.
+        assert_eq!(plan_write_report(0, false, 0), PlanWriteReport::Silent);
+        assert_eq!(plan_write_report(0, true, 0), PlanWriteReport::Silent);
+    }
 
     /// The chunked key span is INCLUSIVE of both boundaries, and floored at 0.
     ///

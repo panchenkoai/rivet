@@ -1163,6 +1163,38 @@ fn record_strategy_snapshots(config_path: &str, snapshots: &[crate::state::Strat
 
 #[cfg(test)]
 mod tests {
+    /// `next_steps_block` is a pure string builder reached only via the init
+    /// command's `eprint!` (live/CLI-only), so its `-> String::new()` /
+    /// `"xyzzy"` stubs survive `cargo mutants -- --lib --bins`. This pins the
+    /// content directly — including the read-only-vs-annotate distinction the
+    /// 2026-08-20 plan change added — so the stubs die at the lib gate and the
+    /// help text can't silently drift back to "plan writes waves".
+    #[test]
+    fn next_steps_block_shows_read_only_plan_then_annotate() {
+        let s = super::next_steps_block("rivet.yaml", &super::SourceProvenance::Env("X".into()));
+        // The core three-step path is always present.
+        assert!(s.contains("rivet doctor -c rivet.yaml"), "block:\n{s}");
+        assert!(
+            s.contains("rivet run    -c rivet.yaml --validate"),
+            "block:\n{s}"
+        );
+        // Plain plan is advertised as READ-ONLY, and --annotate-waves as the
+        // thing that writes — the exact contract the code now enforces.
+        assert!(
+            s.contains("rivet plan  -c rivet.yaml") && s.contains("read-only"),
+            "next-steps must present plain `rivet plan` as read-only; block:\n{s}"
+        );
+        assert!(
+            s.contains("--annotate-waves") && s.contains("write wave:/parallel_safe:"),
+            "next-steps must show --annotate-waves as the config-writing step; block:\n{s}"
+        );
+        // Env provenance does not print the inline DATABASE_URL export line.
+        assert!(
+            !s.contains("export DATABASE_URL"),
+            "Env provenance must not print the Inline-only export line; block:\n{s}"
+        );
+    }
+
     /// Both mutants of `scan_step`'s guard, killed where the CI gate can see
     /// them: the whole-schema scan is a live-only path, so `guard -> true` and
     /// `guard -> false` survived `cargo mutants -- --lib --bins` on PR #245
