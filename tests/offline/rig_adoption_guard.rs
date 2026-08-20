@@ -31,7 +31,6 @@ const BASELINE: &[(&str, usize)] = &[
     ("audit_state.rs", 1), // missing-config-path IS the subject
     ("batch_memory_policy.rs", 1),
     ("live_cdc.rs", 33),
-    ("live_cdc_replica.rs", 2),
     ("live_chunked_dense.rs", 2),
     ("live_chunked_recovery.rs", 1),
     ("live_cli_flags.rs", 76),
