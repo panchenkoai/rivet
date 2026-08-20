@@ -38,7 +38,6 @@ const BASELINE: &[(&str, usize)] = &[
     ("audit_state.rs", 4),
     ("audit_target_typo.rs", 3),
     ("batch_memory_policy.rs", 1),
-    ("gremlin_cdc.rs", 4),
     ("live_azure_multipart.rs", 2),
     ("live_batch_switch_golden.rs", 3),
     ("live_cdc.rs", 33),
