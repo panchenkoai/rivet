@@ -382,7 +382,7 @@ fn mssql_parallel_chunked_crash_after_chunk_file_stuck_running_resume_reruns_chu
 
     let table = seed_mssql_numeric_table(ROW_COUNT);
     let export = unique_name("ms_c4_parallel_stuck_running");
-    let rig = Rig::mssql_batch(&export)
+    let mut rig = Rig::mssql_batch(&export)
         .query(&format!("SELECT id, name FROM {}", table.name()))
         .mode("chunked")
         .export_line("chunk_column: id")
@@ -420,8 +420,11 @@ fn mssql_parallel_chunked_crash_after_chunk_file_stuck_running_resume_reruns_chu
 
     // Resume with parallel: 2 — proves reset works regardless of worker
     // count change between crash and resume.
-    let yaml_resume = rig.yaml().replace("parallel: 1", "parallel: 2");
-    std::fs::write(&cfg, yaml_resume).expect("rewrite config for resume");
+    // Mutate the RIG, not the file: every rig run re-renders the config, so a
+    // hand-written patch would be silently clobbered by the next run_args and
+    // the resume would run with the ORIGINAL worker count while looking
+    // patched (bughunt find; config_path now refuses hand-edits loudly).
+    rig.replace_export_line("parallel:", "parallel: 2");
 
     let resume = rig.run_args(&["--export", &export, "--resume"]);
     assert!(

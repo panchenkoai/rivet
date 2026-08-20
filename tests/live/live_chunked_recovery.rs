@@ -878,7 +878,7 @@ fn parallel_chunked_crash_after_chunk_file_stuck_running_resume_reruns_chunk() {
     let table = seed_pg_numeric_table(ROW_COUNT);
     let export = unique_name("c4_parallel_stuck_running");
     let out = tempfile::tempdir().unwrap();
-    let rig = Rig::pg_batch(&export)
+    let mut rig = Rig::pg_batch(&export)
         .query(&format!(
             r#"SELECT id, name FROM {table_name}"#,
             table_name = table.name()
@@ -925,8 +925,11 @@ fn parallel_chunked_crash_after_chunk_file_stuck_running_resume_reruns_chunk() {
     // reset_stale_running_chunk_tasks works regardless of whether the resume
     // worker count matches the crash worker count.
     // yaml() borrows, so the variant config comes from the rig itself.
-    let yaml_resume = rig.yaml().replace("parallel: 1", "parallel: 2");
-    std::fs::write(&cfg, yaml_resume).expect("rewrite config for resume");
+    // Mutate the RIG, not the file: every rig run re-renders the config, so a
+    // hand-written patch would be silently clobbered by the next run_args and
+    // the resume would run with the ORIGINAL worker count while looking
+    // patched (bughunt find; config_path now refuses hand-edits loudly).
+    rig.replace_export_line("parallel:", "parallel: 2");
 
     let resume = rig.run_args(&["--export", &export, "--resume"]);
     assert!(

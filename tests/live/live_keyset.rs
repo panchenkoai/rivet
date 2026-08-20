@@ -1160,7 +1160,7 @@ fn keyset_checkpoint_resume_survives_a_changed_max_file_size_config() {
     .unwrap();
 
     let export = unique_name("keyset_mp_exp");
-    let rig = Rig::mysql_batch(&table)
+    let mut rig = Rig::mysql_batch(&table)
         .export_named(&export)
         .mode("chunked")
         .export_line("chunk_by_key: uid")
@@ -1179,10 +1179,10 @@ fn keyset_checkpoint_resume_survives_a_changed_max_file_size_config() {
     // DIFFERENT number of parts — the exact multi-part-ROTATION the seek_tag+dedup band-aid cannot
     // dedup (the re-read's part paths no longer match the rehydrated ones). Only the v25
     // cursor-atomic reconcile survives it, because it never re-reads the committed page at all.
-    let cfg_text = std::fs::read_to_string(&cfg)
-        .unwrap()
-        .replace("max_file_size: 8KB", "max_file_size: 128KB");
-    std::fs::write(&cfg, cfg_text).unwrap();
+    // Through the rig's sanctioned mutation path — a raw fs::write patch would
+    // now be refused by config_path's hand-edit guard (and was only ever safe
+    // here because the resume ran through a raw helper, not the rig).
+    rig.replace_export_line("max_file_size:", "max_file_size: 128KB");
 
     let resume = run_rivet_export(&cfg, &export);
     assert!(

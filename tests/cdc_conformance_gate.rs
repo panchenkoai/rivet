@@ -406,7 +406,22 @@ fn every_live_cdc_test_asserts_an_outcome() {
                 // The helper 105 call sites reach rivet through; its absence
                 // here is exactly how two mssql capture tests stayed invisible
                 // to this gate until the rig migration renamed their runner.
-                || chunk.contains("run_rivet_ok(");
+                || chunk.contains("run_rivet_ok(")
+                // The rest of the rig's runner surface + the runner-module
+                // helpers. The bughunt re-ran this scan with these spellings
+                // and found ~28 CDC tests whose ONLY capture spelling was
+                // unlisted — silently ungraded; `run_with_envs(` in particular
+                // defeats the `run_with_env(` substring via the trailing 's'.
+                || chunk.contains("run_args(")
+                || chunk.contains("run_args_env(")
+                || chunk.contains("run_with_envs(")
+                || chunk.contains("run_with_envs_bounded(")
+                || chunk.contains("spawn_args_env(")
+                || chunk.contains("drain_and_read(")
+                || chunk.contains("run_rivet(")
+                || chunk.contains("run_rivet_env(")
+                || chunk.contains("run_rivet_bounded(")
+                || chunk.contains("run_rivet_args_bounded(");
             // Outcome = the test READS BACK what the capture produced (files,
             // destination listing, or the state DB) — not merely that the
             // process exited 0.

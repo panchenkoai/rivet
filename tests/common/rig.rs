@@ -696,6 +696,24 @@ impl Rig {
     /// must see the gate fire on the exhausted cursor. Without this the test
     /// hand-writes a second YAML into the rig's dir (`write_config`), which is
     /// the per-file config builder the rig exists to replace.
+    /// Replace the first export line starting with `prefix` — for two-phase
+    /// fixtures whose SECOND run must change a knob (`parallel: 1` -> `2`)
+    /// over the SAME config path and state DB. Panics if no line matches:
+    /// silently not-replacing is how a resume leg measures nothing.
+    pub fn replace_export_line(&mut self, prefix: &str, new_line: &str) -> PathBuf {
+        let slot = self
+            .extra_lines
+            .iter_mut()
+            .find(|l| l.starts_with(prefix))
+            .unwrap_or_else(|| {
+                panic!("replace_export_line: no export line starts with {prefix:?}")
+            });
+        *slot = new_line.to_string();
+        let path = self.dir.path().join("rig.yaml");
+        std::fs::write(&path, self.render()).expect("re-render rig config");
+        path
+    }
+
     pub fn amend_export_lines(&mut self, lines: &[&str]) -> PathBuf {
         for l in lines {
             self.extra_lines.push((*l).to_string());
@@ -739,7 +757,26 @@ impl Rig {
             std::fs::create_dir_all(self.out_dir_for(&e.name)).unwrap();
         }
         let cfg = self.dir.path().join("rig.yaml");
-        std::fs::write(&cfg, self.render()).unwrap();
+        let rendered = self.render();
+        // Every run helper re-materializes through here, so a caller who
+        // HAND-EDITED the file would have the patch silently clobbered and the
+        // test would run the un-patched config while looking patched (bughunt:
+        // three chunked-recovery resume tests measured nothing on their
+        // changed-parallelism leg exactly this way). Refuse loudly instead:
+        // the sanctioned ways to change a materialized config are
+        // [`Rig::amend_export_lines`] and [`Rig::replace_export_line`].
+        if let Ok(existing) = std::fs::read_to_string(&cfg)
+            && existing != rendered
+        {
+            panic!(
+                "rig.yaml at {} was edited outside the rig; every rig run \
+                 re-renders the config, so the edit would be silently \
+                 discarded. Mutate the rig instead (amend_export_lines / \
+                 replace_export_line), or run the edited file via run_rivet.",
+                cfg.display()
+            );
+        }
+        std::fs::write(&cfg, rendered).unwrap();
         cfg
     }
 
@@ -917,7 +954,23 @@ impl Rig {
 
     /// Run and read every parquet part back — the canonical
     /// capture-and-verify shape the outcome gate keys on.
+    ///
+    /// CUMULATIVE: reads the whole out dir, so a second call after more runs
+    /// returns old parts too — poll loops must ASSIGN the result, never `+=`
+    /// it (bughunt: a `rows +=` poll double-counted one part and masked a
+    /// dropped event).
+    ///
+    /// Refuses cloud/stdout rigs loudly: the data lands in the bucket (or on
+    /// stdout), the local out dir is empty by construction, and the returned
+    /// `[]` is indistinguishable from "the run wrote zero rows" — every
+    /// negative assertion downstream would be vacuous forever.
     pub fn run_and_read(&self) -> Vec<arrow::record_batch::RecordBatch> {
+        assert!(
+            self.cloud_dest.is_none() && !self.dest_stdout,
+            "run_and_read reads the rig's LOCAL out dir, but this rig writes to \
+             a cloud/stdout destination — read the destination store directly \
+             (mc/HTTP oracle), or drop the cloud dest"
+        );
         self.run_ok();
         read_all_parts(&self.out_dir())
     }
@@ -925,13 +978,14 @@ impl Rig {
 
 /// Read every parquet part under `dir` (non-recursive), in filename order.
 pub fn read_all_parts(dir: &Path) -> Vec<arrow::record_batch::RecordBatch> {
+    // A MISSING dir is a harness bug (wrong path, dest never created), not
+    // "zero parts" — swallowing it made a wrong out_dir read as an empty
+    // export and every is_empty()-style assertion vacuous.
     let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
-        .map(|rd| {
-            rd.filter_map(|e| e.ok().map(|e| e.path()))
-                .filter(|p| p.extension().is_some_and(|x| x == "parquet"))
-                .collect()
-        })
-        .unwrap_or_default();
+        .unwrap_or_else(|e| panic!("read_all_parts: {} is unreadable: {e}", dir.display()))
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "parquet"))
+        .collect();
     files.sort();
     let mut out = Vec::new();
     for f in files {
@@ -1305,6 +1359,48 @@ fn cloud_dest_render_goldens() {
         so.contains("destination: { type: stdout }"),
         "dest_stdout render drifted:\n{so}"
     );
+}
+
+/// A hand-edited rig.yaml must be REFUSED, not silently clobbered by the
+/// next run's re-render (bughunt: three resume tests measured nothing on
+/// their changed-parallelism leg exactly this way).
+#[test]
+#[should_panic(expected = "edited outside the rig")]
+fn config_path_refuses_a_hand_edited_config() {
+    let rig = Rig::pg_batch("t").export_named("e");
+    let cfg = rig.config_path();
+    std::fs::write(&cfg, "hand-patched\n").unwrap();
+    let _ = rig.config_path();
+}
+
+/// The sanctioned mutation path: replace_export_line changes the knob in
+/// the BUILDER, so the re-render and the file agree.
+#[test]
+fn replace_export_line_changes_the_rendered_knob() {
+    let mut rig = Rig::pg_batch("t")
+        .export_named("e")
+        .export_line("parallel: 1");
+    let cfg = rig.config_path();
+    rig.replace_export_line("parallel:", "parallel: 2");
+    let text = std::fs::read_to_string(rig.config_path()).unwrap();
+    assert!(text.contains("parallel: 2"), "knob must change: {text}");
+    assert!(
+        !text.contains("parallel: 1"),
+        "old knob must be gone: {text}"
+    );
+    assert_eq!(cfg, rig.config_path(), "same config path throughout");
+}
+
+/// run_and_read on a cloud/stdout rig must refuse — the local out dir is
+/// empty by construction and `[]` would make every negative assertion
+/// vacuous forever.
+#[test]
+#[should_panic(expected = "LOCAL out dir")]
+fn run_and_read_refuses_a_cloud_rig() {
+    let rig = Rig::pg_batch("t")
+        .export_named("e")
+        .dest_gcs("bkt", "pfx", "http://127.0.0.1:4443");
+    let _ = rig.run_and_read();
 }
 
 /// `config_in` must write the SAME bytes `config_path` writes — the "two

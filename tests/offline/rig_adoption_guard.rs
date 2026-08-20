@@ -38,7 +38,14 @@ const BASELINE: &[(&str, usize)] = &[
 
 fn bespoke_sites(path: &std::path::Path) -> usize {
     let text = std::fs::read_to_string(path).unwrap_or_default();
-    text.matches("Command::new(RIVET_BIN)").count() + text.matches("write_config(").count()
+    // Raw invocations, the shared config-writer, AND hand-rolled yaml source
+    // headers: the run_rivet* helper family spawns RIVET_BIN without either of
+    // the first two tokens, so a file could hand-build a config via fs::write
+    // and stay invisible — the r#"-string source header is the tell.
+    text.matches("Command::new(RIVET_BIN)").count()
+        + text.matches("write_config(").count()
+        + text.matches("r#\"source:").count()
+        + text.matches("r#\"\nsource:").count()
 }
 
 #[test]

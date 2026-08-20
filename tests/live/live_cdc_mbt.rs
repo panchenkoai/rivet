@@ -1288,9 +1288,12 @@ fn cdc_scenario_smoke_mssql() {
         scn.table
     ));
     // The capture job is asynchronous — poll the drain until the rows land.
+    // ASSIGN, never `+=`: drain_and_read is CUMULATIVE (re-reads every part),
+    // so `+=` double-counts one captured row across polls and masks a dropped
+    // event (bughunt find on this exact loop).
     let mut rows = 0usize;
     for _ in 0..15 {
-        rows += scn
+        rows = scn
             .drain_and_read()
             .iter()
             .map(|b| b.num_rows())
