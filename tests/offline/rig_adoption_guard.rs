@@ -31,7 +31,9 @@ const BASELINE: &[(&str, usize)] = &[
     // path — a rig owns a real config, so that one raw invocation is the test.
     ("audit_observability.rs", 1),
     ("audit_state.rs", 1), // missing-config-path IS the subject
-    ("live_cli_flags.rs", 76),
+    // live_cli_flags: the one kept site is `rivet completions bash` — a
+    // config-less subcommand a rig (which OWNS a config) cannot express.
+    ("live_cli_flags.rs", 1),
 ];
 
 fn bespoke_sites(path: &std::path::Path) -> usize {
