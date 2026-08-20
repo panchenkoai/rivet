@@ -69,6 +69,12 @@ pub struct Rig {
     /// `destination: { type: stdout }` — for dispatch tests whose subject is
     /// the stdout destination itself. See [`Rig::dest_stdout`].
     dest_stdout: bool,
+    /// Caller-owned config copies produced by [`Rig::config_in`] — a
+    /// sanctioned mutation re-renders every one of them (materialize.rs).
+    materialized_copies: std::cell::RefCell<Vec<PathBuf>>,
+    /// Every YAML this rig has materialized, so the hand-edit guard can tell
+    /// "stale rig render" (fine to overwrite) from "foreign edit" (refused).
+    past_renders: std::cell::RefCell<Vec<String>>,
     dir: tempfile::TempDir,
 }
 
@@ -118,6 +124,8 @@ impl Rig {
             ckpt_override: None,
             dest_stdout: false,
             cloud_dest: None,
+            materialized_copies: std::cell::RefCell::new(Vec::new()),
+            past_renders: std::cell::RefCell::new(Vec::new()),
             dir: tempfile::tempdir().expect("rig tempdir"),
         }
     }
@@ -912,6 +920,25 @@ fn run_and_read_refuses_a_cloud_rig() {
         .export_named("e")
         .dest_gcs("bkt", "pfx", "http://127.0.0.1:4443");
     let _ = rig.run_and_read();
+}
+
+/// A caller-owned `config_in` copy must FOLLOW a sanctioned mutation — the
+/// r2 bughunt found amend/replace re-rendered only the rig-dir config, so the
+/// caller's path kept executing yesterday's knobs while the builder (and the
+/// test's text) looked amended.
+#[test]
+fn config_in_copy_follows_replace_export_line() {
+    let dir = tempfile::tempdir().expect("caller dir");
+    let mut rig = Rig::pg_batch("t")
+        .export_named("e")
+        .export_line("parallel: 1");
+    let copy = rig.config_in(dir.path());
+    rig.replace_export_line("parallel:", "parallel: 2");
+    let text = std::fs::read_to_string(&copy).expect("caller copy");
+    assert!(
+        text.contains("parallel: 2") && !text.contains("parallel: 1"),
+        "the config_in copy must be re-rendered by the mutation: {text}"
+    );
 }
 
 /// `config_in` must write the SAME bytes `config_path` writes — the "two

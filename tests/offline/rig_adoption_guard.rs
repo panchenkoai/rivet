@@ -46,6 +46,10 @@ fn bespoke_sites(path: &std::path::Path) -> usize {
         + text.matches("write_config(").count()
         + text.matches("r#\"source:").count()
         + text.matches("r#\"\nsource:").count()
+        // …and the format!-built spelling (plain-string lines joined and
+        // fs::write'"'"'n) — live_keyset_parallel slipped through exactly this
+        // way (r2 bughunt find).
+        + text.matches("format!(\"source:").count()
 }
 
 #[test]

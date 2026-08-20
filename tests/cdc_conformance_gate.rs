@@ -366,6 +366,47 @@ fn every_cdc_engine_covers_every_conformance_case() {
 /// module, as a `name(` spelling. A new runner method is born graded — the
 /// failure mode this replaces is the hand dictionary silently lagging the
 /// rig's API (bughunt find #3: ~28 CDC tests ungraded).
+/// The derived capture-marker SET is pinned exactly — the >=12 floor alone
+/// left 9 markers of silent-shrink headroom (r2 bughunt: renaming the 7
+/// runner.rs wrappers to a non-prefix spelling dropped 21 -> 14, the floor
+/// stayed quiet, and 14 real CDC tests flipped to ungraded). A lost marker
+/// SKIPS tests rather than failing them, so shrink must be loud here.
+/// Renaming/removing a runner is fine — update this list in the same commit.
+#[test]
+fn derived_capture_marker_set_is_pinned() {
+    let expected: Vec<&str> = vec![
+        "cli(",
+        "cli_env(",
+        "drain_and_read(",
+        "run(",
+        "run_and_read(",
+        "run_args(",
+        "run_args_env(",
+        "run_expect_fail(",
+        "run_ok(",
+        "run_rivet(",
+        "run_rivet_args_bounded(",
+        "run_rivet_args_bounded_env(",
+        "run_rivet_bounded(",
+        "run_rivet_env(",
+        "run_rivet_export(",
+        "run_rivet_ok(",
+        "run_rivet_with_warn_log(",
+        "run_with_env(",
+        "run_with_envs(",
+        "run_with_envs_bounded(",
+        "spawn_args_env(",
+    ];
+    let derived = derived_capture_markers();
+    let derived_refs: Vec<&str> = derived.iter().map(|s| s.as_str()).collect();
+    assert_eq!(
+        derived_refs, expected,
+        "the derived capture-marker set changed — if a runner was renamed or \
+         added on purpose, update this pin in the same commit; if not, the \
+         derivation regex or the harness layout rotted"
+    );
+}
+
 fn derived_capture_markers() -> &'static Vec<String> {
     use std::sync::OnceLock;
     static MARKERS: OnceLock<Vec<String>> = OnceLock::new();
@@ -504,9 +545,15 @@ fn every_live_cdc_test_asserts_an_outcome() {
                 || chunk.contains("manifest.json")
                 // the mssql change-row replay oracle (read_cdc_rows' sibling);
                 || chunk.contains("read_cdc_changes(")
-                // capture-and-read in one call — run_and_read's CDC-scenario
-                // twin (the smoke asserts summed num_rows off the parts);
-                || chunk.contains("drain_and_read(")
+                // The read-back DERIVED value the scenario smokes assert on.
+                // drain_and_read(/run_and_read( themselves are NOT outcome
+                // markers: they sit in the derived CAPTURE set too, so a
+                // `let _ = rig.run_and_read();` with the result discarded
+                // would self-satisfy the gate (r2 bughunt find).
+                || chunk.contains("num_rows()")
+                // …or typed CELL reads off the returned batches (downcasting a
+                // column and asserting on its values — the TOAST-recovery test).
+                || chunk.contains("downcast_ref::<")
                 // decoding the CLI's NDJSON event stream and asserting on the
                 // decoded events (the cdc-cli termination/backlog tests);
                 || chunk.contains("serde_json::from_str::<serde_json::Value>")
@@ -565,11 +612,11 @@ fn every_live_cdc_test_asserts_an_outcome() {
                 || chunk.contains("assert_complete(")
                 || chunk.contains("read_all(")
                 || chunk.contains("read_all_parts(")
-                // `Rig::run_and_read` runs the capture AND returns every part as
-                // RecordBatches for the caller to assert on (it calls
-                // `read_all_parts` internally) — a read-back oracle, not the
-                // process exit. Same class as `read_all_parts(` above.
-                || chunk.contains("run_and_read(")
+                // run_and_read( is deliberately NOT here: it is a CAPTURE
+                // marker (derived set), and a dual-role spelling lets
+                // `let _ = rig.run_and_read();` self-satisfy the gate. The
+                // outcome is the assertion on the returned batches —
+                // num_rows()/assert markers above (r2 bughunt find).
                 || chunk.contains("stage_metrics(")
                 || chunk.contains("collect(") && chunk.contains("Metrics")
                 || chunk.contains("all_ok") // doctor --json contract
@@ -580,11 +627,18 @@ fn every_live_cdc_test_asserts_an_outcome() {
                 // it (the exact risk this gate guards). E.g. the corrupt-checkpoint
                 // roast — the run must fail loudly, not re-anchor and exit 0.
                 || chunk.contains("run_expect_fail(")
-                // Reads the persisted CDC checkpoint/anchor bytes back
-                // (`std::fs::read(rig.checkpoint())`) — the client-anchor engines'
-                // state-DB oracle. A checkpoint-advance/pin assertion is a real
-                // outcome (the committed log position), distinct from row read-back.
-                || chunk.contains("checkpoint())");
+                // Reads the persisted CDC checkpoint/anchor bytes back — the
+                // client-anchor engines' state-DB oracle. The spelling is the
+                // READ, not the accessor: the bare `checkpoint())` substring
+                // also matched pure builder configuration
+                // (`.checkpoint_path(rig.checkpoint())`, live_cdc_mongo.rs) and
+                // a setup WRITE (`write_checkpoint(.., &rig.checkpoint())`),
+                // so a test could satisfy the gate without reading anything
+                // back (r2 bughunt find).
+                || chunk.contains("fs::read(rig.checkpoint())")
+                || chunk.contains("read_to_string(rig.checkpoint())")
+                || chunk.contains("fs::read(&ckpt")
+                || chunk.contains("read_to_string(&ckpt");
             if runs_capture && !asserts_outcome {
                 naked.push(format!("{file}::{name}"));
             }

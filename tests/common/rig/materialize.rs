@@ -23,8 +23,36 @@ impl Rig {
             std::fs::create_dir_all(self.out_dir_for(&e.name)).unwrap();
         }
         let cfg = dir.join("rig.yaml");
-        std::fs::write(&cfg, self.render()).unwrap();
+        self.write_guarded(&cfg, &self.render());
+        // Track the caller-owned copy so amend/replace re-render it too —
+        // otherwise a sanctioned mutation updates only the rig-dir config and
+        // the caller's path silently keeps executing the OLD knobs (r2
+        // bughunt: exactly the measured-nothing class the guard exists for).
+        self.materialized_copies.borrow_mut().push(cfg.clone());
         cfg
+    }
+
+    /// Write `rendered` to `path`, refusing to clobber a HAND-EDITED file
+    /// (one whose current content matches neither the new render nor any
+    /// prior rig render — i.e. someone else wrote it).
+    fn write_guarded(&self, path: &std::path::Path, rendered: &str) {
+        if let Ok(existing) = std::fs::read_to_string(path)
+            && existing != rendered
+            && !self.past_renders.borrow().iter().any(|r| r == &existing)
+        {
+            panic!(
+                "rig config at {} was edited outside the rig; every rig \
+                 materialization re-renders it, so the edit would be silently \
+                 discarded. Mutate the rig instead (amend_export_lines / \
+                 replace_export_line), or run the edited file via run_rivet.",
+                path.display()
+            );
+        }
+        std::fs::write(path, rendered).unwrap();
+        let mut past = self.past_renders.borrow_mut();
+        if !past.iter().any(|r| r == rendered) {
+            past.push(rendered.to_string());
+        }
     }
 
     pub fn config_path(&self) -> PathBuf {
@@ -38,26 +66,14 @@ impl Rig {
             std::fs::create_dir_all(self.out_dir_for(&e.name)).unwrap();
         }
         let cfg = self.dir.path().join("rig.yaml");
-        let rendered = self.render();
         // Every run helper re-materializes through here, so a caller who
         // HAND-EDITED the file would have the patch silently clobbered and the
         // test would run the un-patched config while looking patched (bughunt:
         // three chunked-recovery resume tests measured nothing on their
-        // changed-parallelism leg exactly this way). Refuse loudly instead:
-        // the sanctioned ways to change a materialized config are
-        // [`Rig::amend_export_lines`] and [`Rig::replace_export_line`].
-        if let Ok(existing) = std::fs::read_to_string(&cfg)
-            && existing != rendered
-        {
-            panic!(
-                "rig.yaml at {} was edited outside the rig; every rig run \
-                 re-renders the config, so the edit would be silently \
-                 discarded. Mutate the rig instead (amend_export_lines / \
-                 replace_export_line), or run the edited file via run_rivet.",
-                cfg.display()
-            );
-        }
-        std::fs::write(&cfg, rendered).unwrap();
+        // changed-parallelism leg exactly this way). write_guarded refuses
+        // loudly; the sanctioned mutations are amend_export_lines /
+        // replace_export_line.
+        self.write_guarded(&cfg, &self.render());
         cfg
     }
 
@@ -65,10 +81,19 @@ impl Rig {
         for l in lines {
             self.extra_lines.push((*l).to_string());
         }
-        // Same filename and same renderer as config_path — a divergent copy
-        // here would run yesterday's config while looking amended.
+        self.rerender_all_materializations()
+    }
+
+    /// Re-render the rig-dir config AND every caller-owned `config_in` copy —
+    /// a mutation that updated only one of them would leave the other
+    /// silently executing yesterday's knobs.
+    fn rerender_all_materializations(&self) -> PathBuf {
+        let rendered = self.render();
         let path = self.dir.path().join("rig.yaml");
-        std::fs::write(&path, self.render()).expect("re-render rig config");
+        self.write_guarded(&path, &rendered);
+        for copy in self.materialized_copies.borrow().iter() {
+            self.write_guarded(copy, &rendered);
+        }
         path
     }
 
@@ -94,9 +119,7 @@ impl Rig {
                 panic!("replace_export_line: no export line starts with {prefix:?}")
             });
         *slot = new_line.to_string();
-        let path = self.dir.path().join("rig.yaml");
-        std::fs::write(&path, self.render()).expect("re-render rig config");
-        path
+        self.rerender_all_materializations()
     }
 
     pub fn checkpoint(&self) -> PathBuf {
