@@ -965,6 +965,13 @@ fn pg_cdc_unchanged_toast_recovers_from_replica_identity_full() {
         &[&slot],
     )
     .unwrap();
+    // RAII, not trailing drops: a panic in the assertions below would otherwise
+    // leak the slot on the shared :5434 CDC db and pin WAL against
+    // max_replication_slots=32, cascading into unrelated PG-CDC failures that
+    // mask the real regression (r6 bughunt — the class the file's own SlotGuard
+    // comment documents; the fix had guarded one test only).
+    let _slot = Slot(slot.clone());
+    let _tbl = PgTable::adopt_on(POSTGRES_CDC_URL, tbl.clone());
     // Incompressible >2KB value → genuine external TOAST; then touch only `small`
     // so `big` decodes as the unchanged-toast marker in the new tuple.
     c.batch_execute(&format!(
@@ -1006,9 +1013,6 @@ fn pg_cdc_unchanged_toast_recovers_from_replica_identity_full() {
         bigs.iter().filter(|v| **v == real).count() >= 2,
         "both the INSERT and the recovered UPDATE row must carry the real value"
     );
-
-    let _ = c.execute(&format!("SELECT pg_drop_replication_slot('{slot}')"), &[]);
-    let _ = c.batch_execute(&format!("DROP TABLE IF EXISTS {tbl}"));
 }
 
 // The DEFAULT replica-identity case: the pre-image carries only the key, so the
@@ -1035,6 +1039,10 @@ fn pg_cdc_unchanged_toast_without_full_identity_fails_loud() {
         &[&slot],
     )
     .unwrap();
+    // RAII (r6 bughunt): the run_expect_fail below panics if rivet DOESN'T fail
+    // loud — the trailing drop would then leak the slot on :5434.
+    let _slot = Slot(slot.clone());
+    let _tbl = PgTable::adopt_on(POSTGRES_CDC_URL, tbl.clone());
     c.batch_execute(&format!(
         "INSERT INTO {tbl} (id, small, big) VALUES \
            (1, 'a', (SELECT string_agg(md5(g::text || random()::text), '') \
@@ -1054,9 +1062,6 @@ fn pg_cdc_unchanged_toast_without_full_identity_fails_loud() {
         err.contains("REPLICA IDENTITY FULL"),
         "must name the upstream fix; got: {err}"
     );
-
-    let _ = c.execute(&format!("SELECT pg_drop_replication_slot('{slot}')"), &[]);
-    let _ = c.batch_execute(&format!("DROP TABLE IF EXISTS {tbl}"));
 }
 
 #[test]

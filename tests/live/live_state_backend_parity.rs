@@ -160,10 +160,14 @@ fn state_parity_incremental_cursor() {
     let t = format!("public.{table}");
 
     // SQLite: run twice; the persisted anchor must make run 2 add zero.
+    // RIVET_STATE_URL="" pinned so an ambient value can't switch this "SQLite"
+    // leg to Postgres and make the parity vacuous (r6 bughunt; the helper
+    // assert_single_run_parity pins it, these hand-rolled twins did not).
     let s = incremental(Rig::pg_batch(&t));
-    s.run_ok();
+    let sqlite = [("RIVET_STATE_URL", "")];
+    assert!(s.run_with_envs(&sqlite).status.success(), "sqlite run 1");
     assert_eq!(id_count_set(&s.out_dir()).0, N, "sqlite run 1 exports all");
-    s.run_ok();
+    assert!(s.run_with_envs(&sqlite).status.success(), "sqlite run 2");
     let (sc, sk) = id_count_set(&s.out_dir());
     assert_eq!(
         sc, N,
@@ -214,14 +218,18 @@ fn state_parity_parallel_keyset_crash_resume() {
     let t = format!("public.{table}");
     let panic_at = "keyset_parallel_range_committed:0";
 
-    // SQLite: crash after range 0 commits, then resume.
+    // SQLite: crash after range 0 commits, then resume. RIVET_STATE_URL=""
+    // pinned so an ambient value can't make this the Postgres leg (r6 bughunt).
     let s = parallel_checkpoint(Rig::pg_batch(&t));
-    let c1 = s.run_with_env("RIVET_TEST_PANIC_AT", panic_at);
+    let c1 = s.run_with_envs(&[("RIVET_STATE_URL", ""), ("RIVET_TEST_PANIC_AT", panic_at)]);
     assert!(
         !c1.status.success(),
         "sqlite crash run must fail by injection"
     );
-    s.run_ok();
+    assert!(
+        s.run_with_envs(&[("RIVET_STATE_URL", "")]).status.success(),
+        "sqlite resume"
+    );
     let (sc, sk) = id_count_set(&s.out_dir());
     assert_eq!(sc, N, "sqlite crash-resume recovers every row");
 
