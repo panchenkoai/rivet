@@ -16,49 +16,26 @@ use crate::common::*;
 fn wave_failure_isolates_later_waves() {
     require_alive(LiveService::Postgres);
 
-    let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
     let bad = unique_name("bad");
     let good_a = unique_name("orders_w2");
     let good_b = unique_name("users_w3");
 
     // wave 1 fails (query against a nonexistent table); waves 2/3 are valid
     // tables. Waves are hand-set so apply runs them in order regardless of cost.
-    let yaml = format!(
-        r#"
-source:
-  type: postgres
-  url_env: DATABASE_URL
+    let rig = Rig::pg_batch(&bad)
+        .query(&format!("SELECT id FROM no_such_table_{bad}"))
+        .source_url_env("DATABASE_URL")
+        .export_line("wave: 1")
+        .also_export(&good_a, "SELECT id FROM orders")
+        .also_export_line("wave: 2")
+        .also_export(&good_b, "SELECT id FROM users")
+        .also_export_line("wave: 3");
+    let cfg = rig.config_path();
 
-exports:
-  - name: {bad}
-    query: "SELECT id FROM no_such_table_{bad}"
-    mode: full
-    format: parquet
-    wave: 1
-    destination: {{ type: local, path: {root}/{bad} }}
-  - name: {good_a}
-    query: "SELECT id FROM orders"
-    mode: full
-    format: parquet
-    wave: 2
-    destination: {{ type: local, path: {root}/{good_a} }}
-  - name: {good_b}
-    query: "SELECT id FROM users"
-    mode: full
-    format: parquet
-    wave: 3
-    destination: {{ type: local, path: {root}/{good_b} }}
-"#,
-        root = out.path().display(),
+    let apply = run_rivet_env(
+        &["apply", cfg.to_str().unwrap()],
+        &[("DATABASE_URL", POSTGRES_URL)],
     );
-    let cfg = write_config(&cfg_dir, &yaml);
-
-    let apply = std::process::Command::new(RIVET_BIN)
-        .args(["apply", cfg.to_str().unwrap()])
-        .env("DATABASE_URL", POSTGRES_URL)
-        .output()
-        .expect("spawn rivet apply");
 
     // wave 1 failed → apply exits non-zero...
     assert!(
@@ -69,8 +46,8 @@ exports:
     );
 
     // ...but the later waves still ran: both downstream exports produced Parquet.
-    let a_files = files_with_extension(&out.path().join(&good_a), "parquet");
-    let b_files = files_with_extension(&out.path().join(&good_b), "parquet");
+    let a_files = files_with_extension(&rig.out_dir_for(&good_a), "parquet");
+    let b_files = files_with_extension(&rig.out_dir_for(&good_b), "parquet");
     assert!(
         !a_files.is_empty(),
         "wave 2 export '{good_a}' must produce Parquet despite the wave-1 failure \
@@ -93,38 +70,20 @@ exports:
 fn resume_skips_completed_exports() {
     require_alive(LiveService::Postgres);
 
-    let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
     let exp = unique_name("orders_done");
 
-    let yaml = format!(
-        r#"
-source:
-  type: postgres
-  url_env: DATABASE_URL
-
-exports:
-  - name: {exp}
-    query: "SELECT id FROM orders"
-    mode: full
-    format: parquet
-    wave: 1
-    destination: {{ type: local, path: {root} }}
-"#,
-        root = out.path().display(),
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
+    let rig = Rig::pg_batch(&exp)
+        .query("SELECT id FROM orders")
+        .source_url_env("DATABASE_URL")
+        .export_line("wave: 1");
+    let cfg = rig.config_path();
 
     let run = |args: &[&str]| {
-        std::process::Command::new(RIVET_BIN)
-            .arg("apply")
-            .arg(cfg.to_str().unwrap())
-            .args(args)
-            .env("DATABASE_URL", POSTGRES_URL)
-            .output()
-            .expect("spawn rivet apply")
+        let mut all = vec!["apply", cfg.to_str().unwrap()];
+        all.extend_from_slice(args);
+        run_rivet_env(&all, &[("DATABASE_URL", POSTGRES_URL)])
     };
-    let parquet_count = || files_with_extension(out.path(), "parquet").len();
+    let parquet_count = || files_with_extension(&rig.out_dir(), "parquet").len();
 
     // Phase 1 — fresh run writes one Parquet + a `_SUCCESS` marker.
     let first = run(&[]);
@@ -180,34 +139,20 @@ fn resume_skips_a_completed_export_with_a_templated_destination() {
     // way `rivet run` does at write time. RED before that expansion.
     require_alive(LiveService::Postgres);
     let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
     let exp = unique_name("orders_tmpl");
     // Destination path carries the `{export}` token → writes under `<root>/<exp>/`.
-    let yaml = format!(
-        r#"
-source:
-  type: postgres
-  url_env: DATABASE_URL
-
-exports:
-  - name: {exp}
-    query: "SELECT id FROM orders"
-    mode: full
-    format: parquet
-    wave: 1
-    destination: {{ type: local, path: "{root}/{{export}}" }}
-"#,
-        root = out.path().display(),
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
+    // The templated SUBPATH is the fixture's subject, so the rig's dest is
+    // overridden with it (a PathBuf carries the literal braces fine).
+    let rig = Rig::pg_batch(&exp)
+        .query("SELECT id FROM orders")
+        .source_url_env("DATABASE_URL")
+        .export_line("wave: 1")
+        .dest_path(out.path().join("{export}"));
+    let cfg = rig.config_path();
     let run = |args: &[&str]| {
-        std::process::Command::new(RIVET_BIN)
-            .arg("apply")
-            .arg(cfg.to_str().unwrap())
-            .args(args)
-            .env("DATABASE_URL", POSTGRES_URL)
-            .output()
-            .expect("spawn rivet apply")
+        let mut all = vec!["apply", cfg.to_str().unwrap()];
+        all.extend_from_slice(args);
+        run_rivet_env(&all, &[("DATABASE_URL", POSTGRES_URL)])
     };
     // Detect a skip by the run-unique `manifest-<run_id>.json` copies under the
     // EXPANDED `<root>/<exp>/` prefix: a SKIP writes none, a re-run adds one. This
@@ -290,44 +235,22 @@ exports:
 #[ignore = "live: postgres"]
 fn plan_preserves_hand_tuned_waves_unless_annotate_is_asked() {
     require_alive(LiveService::Postgres);
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let out = tempfile::tempdir().unwrap();
     let a = unique_name("wave_keep_a");
     let b = unique_name("wave_keep_b");
-    let root = out.path().display();
 
     // Hand-tuned: two exports the planner would happily put in ONE wave, split
     // across two on purpose. That split is the thing an operator owns.
-    let yaml = format!(
-        r#"
-source:
-  type: postgres
-  url: "{POSTGRES_URL}"
-
-exports:
-  - name: {a}
-    query: "SELECT id FROM orders"
-    mode: full
-    format: parquet
-    wave: 7
-    parallel_safe: false
-    destination: {{ type: local, path: {root}/{a} }}
-  - name: {b}
-    query: "SELECT id FROM orders"
-    mode: full
-    format: parquet
-    wave: 9
-    parallel_safe: false
-    destination: {{ type: local, path: {root}/{b} }}
-"#
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
+    let rig = Rig::pg_batch(&a)
+        .query("SELECT id FROM orders")
+        .export_line("wave: 7")
+        .export_line("parallel_safe: false")
+        .also_export(&b, "SELECT id FROM orders")
+        .also_export_line("wave: 9")
+        .also_export_line("parallel_safe: false");
+    let cfg = rig.config_path();
     let before = std::fs::read_to_string(&cfg).expect("read config");
 
-    let plain = std::process::Command::new(RIVET_BIN)
-        .args(["plan", "--config", cfg.to_str().unwrap()])
-        .output()
-        .expect("spawn rivet plan");
+    let plain = rig.cli(&["plan"]);
     assert!(
         plain.status.success(),
         "rivet plan must exit 0; stderr:\n{}",
@@ -343,15 +266,7 @@ exports:
 
     // …and the flag must actually do the thing, or the assertion above is
     // satisfied by a `plan` that simply never annotates.
-    let annotated = std::process::Command::new(RIVET_BIN)
-        .args([
-            "plan",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--annotate-waves",
-        ])
-        .output()
-        .expect("spawn rivet plan --annotate-waves");
+    let annotated = rig.cli(&["plan", "--annotate-waves"]);
     assert!(
         annotated.status.success(),
         "rivet plan --annotate-waves must exit 0; stderr:\n{}",

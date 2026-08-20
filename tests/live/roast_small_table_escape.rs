@@ -23,27 +23,15 @@
 
 use crate::common::*;
 
-/// Chunked-mode config using the `table:` shortcut with NO `chunk_column:` so
+/// Chunked-mode rig using the `table:` shortcut with NO `chunk_column:` so
 /// plan-build takes the introspection path where the small-table escape lives.
-fn pg_chunked_table_config(table: &str, chunk_knob: &str, out_dir: &std::path::Path) -> String {
-    format!(
-        r#"
-source:
-  type: postgres
-  url_env: DATABASE_URL
-
-exports:
-  - name: {table}
-    table: public.{table}
-    mode: chunked
-    {chunk_knob}
-    format: parquet
-    destination:
-      type: local
-      path: {out}
-"#,
-        out = out_dir.display()
-    )
+fn pg_chunked_table_rig(table: &str, chunk_knob: &str, out_dir: &std::path::Path) -> Rig {
+    Rig::pg_batch(&format!("public.{table}"))
+        .export_named(table)
+        .source_url_env("DATABASE_URL")
+        .mode("chunked")
+        .export_line(chunk_knob)
+        .dest_path(out_dir.to_path_buf())
 }
 
 /// Seed a small canonical table and ANALYZE it so `pg_class.reltuples` holds a
@@ -57,26 +45,12 @@ fn seed_small_analyzed_table(rows: i64) -> PgTable {
     table
 }
 
-/// Run `rivet plan --format json --output …` for the export and return the
-/// parsed plan artifact. Panics (setup failure, not the bug under test) if the
-/// plan command itself fails.
-fn run_plan(cfg_dir: &tempfile::TempDir, cfg: &std::path::Path, export: &str) -> serde_json::Value {
+/// Run `rivet plan --format json --output …` for the rig's export and return
+/// the parsed plan artifact. Panics (setup failure, not the bug under test) if
+/// the plan command itself fails.
+fn run_plan(cfg_dir: &tempfile::TempDir, rig: &Rig) -> serde_json::Value {
     let plan_path = cfg_dir.path().join("plan.json");
-    let plan_out = std::process::Command::new(RIVET_BIN)
-        .args([
-            "plan",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            export,
-            "--format",
-            "json",
-            "--output",
-            plan_path.to_str().unwrap(),
-        ])
-        .env("DATABASE_URL", POSTGRES_URL)
-        .output()
-        .expect("spawn rivet plan");
+    let plan_out = rig.plan_json_env(&plan_path, &[], &[("DATABASE_URL", POSTGRES_URL)]);
     assert!(
         plan_out.status.success(),
         "rivet plan must exit 0 (setup, not the bug under test); stderr:\n{}",
@@ -101,9 +75,8 @@ fn roast_small_table_escape_respects_explicit_chunk_count() {
     let out_dir = tempfile::tempdir().unwrap();
     let cfg_dir = tempfile::tempdir().unwrap();
 
-    let yaml = pg_chunked_table_config(table.name(), "chunk_count: 5", out_dir.path());
-    let cfg = write_config(&cfg_dir, &yaml);
-    let plan = run_plan(&cfg_dir, &cfg, table.name());
+    let rig = pg_chunked_table_rig(table.name(), "chunk_count: 5", out_dir.path());
+    let plan = run_plan(&cfg_dir, &rig);
 
     let strategy = plan["strategy"].as_str().unwrap_or("");
     assert_eq!(
@@ -131,9 +104,8 @@ fn roast_small_table_escape_respects_explicit_chunk_checkpoint() {
     let out_dir = tempfile::tempdir().unwrap();
     let cfg_dir = tempfile::tempdir().unwrap();
 
-    let yaml = pg_chunked_table_config(table.name(), "chunk_checkpoint: true", out_dir.path());
-    let cfg = write_config(&cfg_dir, &yaml);
-    let plan = run_plan(&cfg_dir, &cfg, table.name());
+    let rig = pg_chunked_table_rig(table.name(), "chunk_checkpoint: true", out_dir.path());
+    let plan = run_plan(&cfg_dir, &rig);
 
     let strategy = plan["strategy"].as_str().unwrap_or("");
     assert_eq!(

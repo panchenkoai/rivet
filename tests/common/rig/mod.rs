@@ -12,6 +12,32 @@ use super::runner::RIVET_BIN;
 
 /// Builder for a single-export rivet config. Defaults: parquet, local
 /// destination inside the rig's tempdir, `until_current` CDC runs.
+/// One cloud destination per rig — the S3/GCS/Azure emulator triple the live
+/// stack ships. Kept as an enum so `dest_yaml` stays the single renderer for
+/// every backend (two renderers per backend is the drift the rig exists to
+/// prevent).
+mod invoke;
+mod materialize;
+mod oracle;
+mod render;
+
+enum CloudDest {
+    S3 {
+        bucket: String,
+        prefix: String,
+        endpoint: String,
+    },
+    Gcs {
+        bucket: String,
+        prefix: String,
+        endpoint: String,
+    },
+    Azure {
+        container: String,
+        prefix: String,
+    },
+}
+
 pub struct Rig {
     source_type: &'static str,
     source_url: String,
@@ -36,9 +62,19 @@ pub struct Rig {
     /// Container-visible twin of `dest_override`, set by [`Rig::duckdb_oracle`].
     oracle_container_dir: Option<String>,
     ckpt_override: Option<PathBuf>,
-    /// `(bucket, prefix, endpoint)` when the exports write to an S3-compatible
-    /// store instead of the tempdir. See [`Rig::dest_s3`].
-    s3_dest: Option<(String, String, String)>,
+    /// Cloud destination override when the exports write to a bucket/container
+    /// instead of the tempdir. See [`Rig::dest_s3`] / [`Rig::dest_gcs`] /
+    /// [`Rig::dest_azure`].
+    cloud_dest: Option<CloudDest>,
+    /// `destination: { type: stdout }` — for dispatch tests whose subject is
+    /// the stdout destination itself. See [`Rig::dest_stdout`].
+    dest_stdout: bool,
+    /// Caller-owned config copies produced by [`Rig::config_in`] — a
+    /// sanctioned mutation re-renders every one of them (materialize.rs).
+    materialized_copies: std::cell::RefCell<Vec<PathBuf>>,
+    /// Every YAML this rig has materialized, so the hand-edit guard can tell
+    /// "stale rig render" (fine to overwrite) from "foreign edit" (refused).
+    past_renders: std::cell::RefCell<Vec<String>>,
     dir: tempfile::TempDir,
 }
 
@@ -86,7 +122,10 @@ impl Rig {
             extra_exports: Vec::new(),
             oracle_container_dir: None,
             ckpt_override: None,
-            s3_dest: None,
+            dest_stdout: false,
+            cloud_dest: None,
+            materialized_copies: std::cell::RefCell::new(Vec::new()),
+            past_renders: std::cell::RefCell::new(Vec::new()),
             dir: tempfile::tempdir().expect("rig tempdir"),
         }
     }
@@ -221,12 +260,6 @@ impl Rig {
         self
     }
 
-    pub fn out_dir(&self) -> PathBuf {
-        self.dest_override
-            .clone()
-            .unwrap_or_else(|| self.dir.path().join("out"))
-    }
-
     /// Send every export to an S3-compatible bucket instead of the rig's local
     /// tempdir — the SAME rig, so a cloud test does not fork into a hand-rolled
     /// YAML builder (the ~250 templates the rig replaced came back one engine at
@@ -237,25 +270,40 @@ impl Rig {
     /// on the cloud the way it is locally. Credentials go through `*_env` — the
     /// caller passes them in the run env, never inline in a committed config.
     pub fn dest_s3(mut self, bucket: &str, prefix: &str, endpoint: &str) -> Self {
-        self.s3_dest = Some((bucket.to_string(), prefix.to_string(), endpoint.to_string()));
+        self.cloud_dest = Some(CloudDest::S3 {
+            bucket: bucket.to_string(),
+            prefix: prefix.to_string(),
+            endpoint: endpoint.to_string(),
+        });
         self
     }
 
-    /// The destination YAML for `export` — S3 when [`Rig::dest_s3`] was called,
-    /// the local tempdir otherwise. ONE renderer for both, so the primary and
-    /// secondary exports cannot drift apart (they were two `format!`s before).
-    fn dest_yaml(&self, export: &str) -> String {
-        match &self.s3_dest {
-            Some((bucket, prefix, endpoint)) => format!(
-                "{{ type: s3, bucket: {bucket}, prefix: \"{prefix}/{export}/\", region: us-east-1, \
-                 endpoint: \"{endpoint}\", access_key_env: RIVET_TEST_MINIO_AK, \
-                 secret_key_env: RIVET_TEST_MINIO_SK }}"
-            ),
-            None => format!(
-                "{{ type: local, path: \"{}\" }}",
-                self.out_dir_for(export).display()
-            ),
-        }
+    /// The fake-gcs sibling of [`Rig::dest_s3`]: anonymous access against the
+    /// emulator endpoint, same per-export prefix layout.
+    /// Write to `destination: { type: stdout }` — no directory is created.
+    pub fn dest_stdout(mut self) -> Self {
+        self.dest_stdout = true;
+        self.dest_precreate = false;
+        self
+    }
+
+    pub fn dest_gcs(mut self, bucket: &str, prefix: &str, endpoint: &str) -> Self {
+        self.cloud_dest = Some(CloudDest::Gcs {
+            bucket: bucket.to_string(),
+            prefix: prefix.to_string(),
+            endpoint: endpoint.to_string(),
+        });
+        self
+    }
+
+    /// The azurite sibling: the well-known dev account via
+    /// `RIVET_TEST_AZURITE_KEY` (pass it in the run env), same layout.
+    pub fn dest_azure(mut self, container: &str, prefix: &str) -> Self {
+        self.cloud_dest = Some(CloudDest::Azure {
+            container: container.to_string(),
+            prefix: prefix.to_string(),
+        });
+        self
     }
 
     /// Point the destination somewhere outside the rig's tempdir (e.g. a
@@ -292,6 +340,14 @@ impl Rig {
     /// which fails at RUN time, not compile time.
     pub fn export_named(mut self, name: &str) -> Self {
         self.name = name.to_string();
+        self
+    }
+
+    /// Append a raw line inside the `cdc: { … }` block — for per-test CDC
+    /// knobs the constructors don't set (`initial: snapshot`, a bespoke
+    /// `server_id`). Same escape-hatch contract as [`Rig::export_line`].
+    pub fn cdc_line(mut self, line: &str) -> Self {
+        self.cdc_lines.push(line.to_string());
         self
     }
 
@@ -363,210 +419,28 @@ impl Rig {
         self
     }
 
-    /// Destination directory of a named export — the primary or any secondary.
-    pub fn out_dir_for(&self, name: &str) -> PathBuf {
-        if name == self.name {
-            return self.out_dir();
-        }
-        self.dir.path().join(format!("out_{name}"))
-    }
-
-    /// Run an ARBITRARY subcommand against this rig's config: `rivet <args…>
-    /// --config <cfg>`.
-    ///
-    /// NOT for `apply`, which takes a PLAN PATH rather than `--config` — that is
-    /// [`Rig::apply_env`]'s job. This method appends the config flag, so it
-    /// fits the subcommands that read one: `plan`, `check`, `validate`, `doctor`.
-    ///
-    /// `run_args`/`run_args_env` hard-code the `run` subcommand, so a test for
-    /// `check`, `validate`, `doctor` or `init` had no way through the rig and
-    /// dropped to a raw `Command`. The config flag is appended, which clap
-    /// accepts in any position.
-    pub fn cli(&self, args: &[&str]) -> std::process::Output {
-        self.cli_env(args, &[])
-    }
-
-    /// [`Rig::cli`] with environment variables — needed wherever the config
-    /// declares `url_env:`, since the process must be able to resolve it.
-    pub fn cli_env(&self, args: &[&str], envs: &[(&str, &str)]) -> std::process::Output {
-        let cfg = self.config_path();
-        let mut all: Vec<&str> = args.to_vec();
-        all.push("--config");
-        all.push(cfg.to_str().unwrap());
-        super::runner::run_rivet_env(&all, envs)
-    }
-
-    /// `rivet plan --export <this rig's export> --format json --output <out>`,
-    /// plus `extra` args (`--param k=v`, `--annotate-waves`, …).
-    ///
-    /// The plan→apply pair is the one CLI flow whose two halves take DIFFERENT
-    /// subjects — `plan` reads the config, `apply` reads the artifact — so a
-    /// test that wants the round trip had to spell the six-flag `plan`
-    /// invocation itself and then drop out of the rig entirely for `apply`
-    /// (every call site in `live_plan_apply.rs` does exactly that). The export
-    /// name comes from the rig rather than the caller, which is what keeps the
-    /// artifact, the destination and the `export_metrics` rows talking about the
-    /// same export.
-    pub fn plan_json_env(
-        &self,
-        out: &Path,
-        extra: &[&str],
-        envs: &[(&str, &str)],
-    ) -> std::process::Output {
-        let out = out.to_str().expect("plan output path must be utf-8");
-        let mut args: Vec<&str> = vec![
-            "plan",
-            "--export",
-            self.name.as_str(),
-            "--format",
-            "json",
-            "--output",
-            out,
-        ];
-        args.extend_from_slice(extra);
-        self.cli_env(&args, envs)
-    }
-
-    /// `rivet apply <plan.json>` plus `extra` args (`--force`, `--resume`), with
-    /// `envs` set — the counterpart of [`Rig::plan_json_env`].
-    ///
-    /// The ONE subcommand that takes a PLAN PATH instead of `--config`, which is
-    /// why it cannot go through [`Rig::cli_env`] (that appends `--config`) and
-    /// why it needs its own method rather than a raw `Command`. It still belongs
-    /// on the rig: `apply` writes into the rig's destination and opens
-    /// `.rivet_state.db` next to the rig's CONFIG (the artifact records the
-    /// config path), so the read-backs a test does afterwards — `out_dir()`,
-    /// the state DB — are the rig's, not the plan file's.
-    ///
-    /// `envs` is not optional in practice: a plan/apply round trip needs
-    /// [`Rig::source_url_env`] (an inline URL is redacted into the artifact and
-    /// apply then cannot reconnect), so the variable must be set on BOTH legs.
-    pub fn apply_env(
-        &self,
-        plan: &Path,
-        extra: &[&str],
-        envs: &[(&str, &str)],
-    ) -> std::process::Output {
-        let mut args: Vec<&str> = vec!["apply", plan.to_str().expect("plan path must be utf-8")];
-        args.extend_from_slice(extra);
-        super::runner::run_rivet_env(&args, envs)
-    }
-
-    /// Spawn `rivet run` and hand back the LIVE child, output discarded.
-    ///
-    /// For tests that must act on a running process — signal it, inspect its
-    /// children, watch the staged `.tmp` appear — rather than wait for an exit
-    /// status. `run_args_env` blocks until completion and so cannot express them.
-    /// The caller owns the `Child` and must reap it.
-    pub fn spawn_args_env(&self, extra: &[&str], envs: &[(&str, &str)]) -> std::process::Child {
-        let cfg = self.config_path();
-        let mut cmd = std::process::Command::new(super::runner::RIVET_BIN);
-        cmd.args(["run", "--config", cfg.to_str().unwrap()]);
-        cmd.args(extra);
-        for (k, v) in envs {
-            cmd.env(k, v);
-        }
-        cmd.stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("spawn rivet")
-    }
-
-    /// Run `rivet run --config <rig cfg>` plus `extra` args, with `envs` set.
-    ///
-    /// The affordance the crash-recovery files were bypassing the rig for: they
-    /// built their YAML through `Rig` and then dropped to a raw
-    /// `Command::new(RIVET_BIN)` because the rig could express an env var OR a
-    /// config, never extra ARGS (`--export`, `--resume`) alongside a fault
-    /// injection. That one gap accounted for most of the hand-rolled invocations
-    /// in `live_chunked_recovery.rs` and its siblings.
-    pub fn run_args_env(&self, extra: &[&str], envs: &[(&str, &str)]) -> std::process::Output {
-        let cfg = self.config_path();
-        let mut args: Vec<&str> = vec!["run", "--config", cfg.to_str().unwrap()];
-        args.extend_from_slice(extra);
-        super::runner::run_rivet_env(&args, envs)
-    }
-
-    /// `run_args_env` with no env — a plain run with extra flags.
-    pub fn run_args(&self, extra: &[&str]) -> std::process::Output {
-        self.run_args_env(extra, &[])
-    }
-
-    /// Run with an extra environment variable (fault injection); returns the
-    /// raw output — the caller asserts success or failure.
-    pub fn run_with_env(&self, key: &str, val: &str) -> std::process::Output {
-        let cfg = self.config_path();
-        super::runner::run_rivet_env(&["run", "--config", cfg.to_str().unwrap()], &[(key, val)])
-    }
-
-    /// Run with SEVERAL extra environment variables (e.g. RIVET_STATE_URL to pick the
-    /// Postgres state backend AND RIVET_TEST_PANIC_AT to inject a crash in one run);
-    /// returns the raw output — the caller asserts success or failure.
-    pub fn run_with_envs(&self, envs: &[(&str, &str)]) -> std::process::Output {
-        let cfg = self.config_path();
-        super::runner::run_rivet_env(&["run", "--config", cfg.to_str().unwrap()], envs)
-    }
-
-    /// [`Rig::run_with_envs`] under a WALL-CLOCK CEILING — `None` if the child
-    /// had to be killed.
-    ///
-    /// `run_with_envs` bottoms out in `Command::output()`, which blocks with no
-    /// timeout. That is fine for a test whose failure mode is a wrong value, and
-    /// wrong for one whose failure mode is a HANG: the governor deadlock
-    /// (`governor_does_not_deadlock_when_chunks_fail`) is a live regression
-    /// class, and a test that hangs while holding `quiet_window_guard` converts
-    /// one red test into an indefinite stall of every test that takes the same
-    /// cross-process lock — plus, for the pressure tests, a background writer
-    /// that keeps hammering the shared server forever.
-    ///
-    /// stdout/stderr go to FILES rather than pipes: polling `try_wait` while a
-    /// child fills a pipe buffer nobody drains is its own deadlock (the reason
-    /// the hand-rolled watchdogs in `live_governor.rs` redirect to a file).
-    pub fn run_with_envs_bounded(
-        &self,
-        envs: &[(&str, &str)],
-        timeout: std::time::Duration,
-    ) -> Option<std::process::Output> {
-        let cfg = self.config_path();
-        let out_path = self.dir.path().join("bounded.stdout");
-        let err_path = self.dir.path().join("bounded.stderr");
-        let mut cmd = std::process::Command::new(RIVET_BIN);
-        cmd.args(["run", "--config", cfg.to_str().unwrap()]);
-        for (k, v) in envs {
-            cmd.env(k, v);
-        }
-        cmd.stdout(std::fs::File::create(&out_path).expect("bounded stdout file"))
-            .stderr(std::fs::File::create(&err_path).expect("bounded stderr file"));
-        let mut child = cmd.spawn().expect("spawn rivet binary");
-        let start = std::time::Instant::now();
-        loop {
-            if let Some(status) = child.try_wait().expect("try_wait rivet") {
-                return Some(std::process::Output {
-                    status,
-                    stdout: std::fs::read(&out_path).unwrap_or_default(),
-                    stderr: std::fs::read(&err_path).unwrap_or_default(),
-                });
-            }
-            if start.elapsed() >= timeout {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-    }
-
-    pub fn checkpoint(&self) -> PathBuf {
-        self.ckpt_override
-            .clone()
-            .unwrap_or_else(|| self.dir.path().join("cdc.ckpt"))
-    }
+    // ── THE invocation seam ─────────────────────────────────────────────
+    // Every rig method that reaches the rivet binary goes through
+    // `invoke_command` — one place for cross-cutting execution concerns
+    // (env, io, future timeouts/log capture), and ONE spelling family for
+    // the CDC conformance gate to derive its capture markers from (the
+    // hand-maintained marker dictionary drifted twice in a month; see the
+    // gate's `derived_capture_markers`).
 
     /// Override the checkpoint path (resume/crash suites share one
     /// checkpoint across several configs — the rig renders, the test owns
     /// the file's lifetime).
     pub fn checkpoint_path(mut self, path: PathBuf) -> Self {
         self.ckpt_override = Some(path);
+        // The checkpoint only reaches the config if the cdc block renders it.
+        // mysql_cdc/mssql_cdc seed the marker in their constructors; pg_cdc is
+        // slot-anchored and doesn't — so a caller-supplied checkpoint must add
+        // it, or the path is silently ABSENT from the rendered config (bitten:
+        // live_cdc's corrupt-checkpoint tests ran checkpoint-less and green-
+        // failed on the wrong arm).
+        if self.mode == "cdc" && !self.cdc_lines.iter().any(|l| l == "__CKPT__") {
+            self.cdc_lines.push("__CKPT__".to_string());
+        }
         self
     }
 
@@ -574,163 +448,6 @@ impl Rig {
     pub fn with_format(mut self, fmt: &'static str) -> Self {
         self.format = fmt;
         self
-    }
-
-    /// The rendered YAML — for suites that own their config-file lifetime.
-    pub fn yaml(&self) -> String {
-        self.render()
-    }
-
-    /// Materialized config path — for bespoke invocations (`validate`,
-    /// custom envs) the rig doesn't wrap.
-    /// The export name this rig rendered into the config — the key
-    /// `export_metrics` rows are stored under, so a test can read the run's own
-    /// metrics without re-deriving the name it did not choose.
-    pub fn export_name(&self) -> &str {
-        &self.name
-    }
-
-    pub fn config_path(&self) -> PathBuf {
-        // Materialization point: the ONLY place the rig touches the
-        // filesystem (yaml()/render() stay pure — the offline goldens were
-        // mkdir-ing /tmp/o as a side effect of rendering a string).
-        if self.dest_precreate {
-            std::fs::create_dir_all(self.out_dir()).unwrap();
-        }
-        for e in &self.extra_exports {
-            std::fs::create_dir_all(self.out_dir_for(&e.name)).unwrap();
-        }
-        let cfg = self.dir.path().join("rig.yaml");
-        std::fs::write(&cfg, self.render()).unwrap();
-        cfg
-    }
-
-    fn render(&self) -> String {
-        let tables = match &self.query {
-            Some(q) => format!("query: \"{q}\""),
-            None if self.tables.len() == 1 => format!("table: {}", self.tables[0]),
-            None => format!("tables: [{}]", self.tables.join(", ")),
-        };
-        let cdc_lines: Vec<String> = self
-            .cdc_lines
-            .iter()
-            .map(|l| {
-                if l == "__CKPT__" {
-                    format!("checkpoint: \"{}\"", self.checkpoint().display())
-                } else {
-                    l.clone()
-                }
-            })
-            .collect();
-        let cdc = if cdc_lines.is_empty() {
-            String::new()
-        } else {
-            format!("    cdc: {{ {} }}\n", cdc_lines.join(", "))
-        };
-        let extra: String = self
-            .extra_lines
-            .iter()
-            .map(|l| format!("    {l}\n"))
-            .collect();
-        let source = if self.source_lines.is_empty() {
-            match &self.url_env {
-                Some(v) => format!("source: {{ type: {}, url_env: {v} }}", self.source_type),
-                None => format!(
-                    "source: {{ type: {}, url: \"{}\" }}",
-                    self.source_type, self.source_url
-                ),
-            }
-        } else {
-            let extra: String = self
-                .source_lines
-                .iter()
-                .map(|l| format!("  {l}\n"))
-                .collect();
-            match &self.url_env {
-                Some(v) => format!(
-                    "source:\n  type: {}\n  url_env: {v}\n{extra}",
-                    self.source_type
-                ),
-                None => format!(
-                    "source:\n  type: {}\n  url: \"{}\"\n{extra}",
-                    self.source_type, self.source_url
-                ),
-            }
-            .trim_end()
-            .to_string()
-        };
-        // Secondary exports (see `Rig::also_export`) each get their OWN
-        // destination, which is what the multi-export configs under test
-        // actually declare — per-export failure isolation is only observable
-        // when the outputs are separable.
-        let secondaries: String = self
-            .extra_exports
-            .iter()
-            .map(|e| {
-                let lines: String = e.lines.iter().map(|l| format!("    {l}\n")).collect();
-                let subject = match &e.table {
-                    Some(t) => format!("table: {t}"),
-                    None => format!("query: \"{}\"", e.query),
-                };
-                let cdc = if e.cdc_lines.is_empty() {
-                    String::new()
-                } else {
-                    format!("    cdc: {{ {} }}\n", e.cdc_lines.join(", "))
-                };
-                format!(
-                    "  - name: {n}\n    {subject}\n    mode: {m}\n    format: {f}\n{cdc}{lines}    destination: {o}\n",
-                    n = e.name,
-                    m = e.mode,
-                    f = self.format,
-                    o = self.dest_yaml(&e.name),
-                )
-            })
-            .collect();
-        let yaml = format!(
-            "{source}\nexports:\n  - name: {name}\n    {tables}\n    mode: {mode}\n    format: {fmt}\n{cdc}{extra}    destination: {out}\n{secondaries}",
-            name = self.name,
-            tables = tables,
-            mode = self.mode,
-            fmt = self.format,
-            out = self.dest_yaml(&self.name.clone()),
-        );
-        yaml
-    }
-
-    /// Run rivet; panic unless it succeeds.
-    pub fn run_ok(&self) {
-        let cfg = self.config_path();
-        let out = super::runner::run_rivet(&["run", "--config", cfg.to_str().unwrap()]);
-        assert!(
-            out.status.success(),
-            "rig run failed for '{}':\n{}",
-            self.name,
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-
-    /// Run rivet expecting a loud failure; returns combined output.
-    pub fn run_expect_fail(&self) -> String {
-        let cfg = self.config_path();
-        let out = super::runner::run_rivet(&["run", "--config", cfg.to_str().unwrap()]);
-        assert!(
-            !out.status.success(),
-            "rig run for '{}' was expected to fail",
-            self.name
-        );
-        format!(
-            "{}{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        )
-    }
-
-    /// Run rivet; return the raw output without asserting either way — for tests
-    /// whose VALID outcomes include both success and a loud failure (e.g. a
-    /// mid-stream outage that rivet may either retry through or safely refuse).
-    pub fn run(&self) -> std::process::Output {
-        let cfg = self.config_path();
-        super::runner::run_rivet(&["run", "--config", cfg.to_str().unwrap()])
     }
 
     /// Put the destination under the shared bind mount so the DuckDB validator
@@ -776,24 +493,18 @@ impl Rig {
             .as_deref()
             .expect("oracle_dir needs Rig::duckdb_oracle() at construction")
     }
-
-    /// Run and read every parquet part back — the canonical
-    /// capture-and-verify shape the outcome gate keys on.
-    pub fn run_and_read(&self) -> Vec<arrow::record_batch::RecordBatch> {
-        self.run_ok();
-        read_all_parts(&self.out_dir())
-    }
 }
 
 /// Read every parquet part under `dir` (non-recursive), in filename order.
 pub fn read_all_parts(dir: &Path) -> Vec<arrow::record_batch::RecordBatch> {
+    // A MISSING dir is a harness bug (wrong path, dest never created), not
+    // "zero parts" — swallowing it made a wrong out_dir read as an empty
+    // export and every is_empty()-style assertion vacuous.
     let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
-        .map(|rd| {
-            rd.filter_map(|e| e.ok().map(|e| e.path()))
-                .filter(|p| p.extension().is_some_and(|x| x == "parquet"))
-                .collect()
-        })
-        .unwrap_or_default();
+        .unwrap_or_else(|e| panic!("read_all_parts: {} is unreadable: {e}", dir.display()))
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "parquet"))
+        .collect();
     files.sort();
     let mut out = Vec::new();
     for f in files {
@@ -925,7 +636,7 @@ impl CdcScenario {
                 "DROP TABLE IF EXISTS {table}; CREATE TABLE {table} ({cols})"
             ))
             .unwrap();
-        let tguard = super::pg::PgTable::adopt(table.clone());
+        let tguard = super::pg::PgTable::adopt_on(super::env::POSTGRES_CDC_URL, table.clone());
         client
             .execute(
                 "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
@@ -948,6 +659,15 @@ impl CdcScenario {
         let table = super::unique_name(label);
         let ci = format!("dbo_{table}");
         super::mssql::mssql_cdc_exec(&format!("CREATE TABLE dbo.{table} ({cols})"));
+        // Build the drop guard RIGHT AFTER CREATE, BEFORE sp_cdc_enable_* — a
+        // panic in either enable call would otherwise leak dbo.{table} on the
+        // :1434 CDC instance (no outer sweep cleans it; r5 bughunt, the r4
+        // governor-leak class). The siblings (mysql:617, pg:639) already build
+        // their guard immediately after CREATE.
+        let guard = MssqlCdcTable {
+            table: table.clone(),
+            ci: ci.clone(),
+        };
         super::mssql::mssql_cdc_exec(
             "IF NOT EXISTS(SELECT 1 FROM sys.databases WHERE name='rivet' \
               AND is_cdc_enabled=1) EXEC sys.sp_cdc_enable_db;",
@@ -956,10 +676,6 @@ impl CdcScenario {
             "EXEC sys.sp_cdc_enable_table @source_schema=N'dbo', \
              @source_name=N'{table}', @role_name=NULL, @capture_instance=N'{ci}';"
         ));
-        let guard = MssqlCdcTable {
-            table: table.clone(),
-            ci: ci.clone(),
-        };
         let rig = Rig::mssql_cdc(&table, &ci);
         rig.run_ok(); // pin
         Self {
@@ -1118,4 +834,150 @@ mod rig_render_goldens {
             assert_eq!(rig.yaml(), want, "constructor '{name}' drifted");
         }
     }
+}
+
+// ─── render goldens (offline; they run under the live_suite target with no DB) ───
+
+/// Render goldens for the rig affordances this wave grew — the offline half of
+/// the migration-equivalence protocol. A live run proves a rendered config
+/// WORKS today; the golden pins what it SAYS, so a rig refactor that silently
+/// changes a destination block (the exact risk of centralizing 72 files'
+/// config-building into one renderer) fails here with a diff, not in a cloud
+/// test's 404. Same shape as live_cdc's rig_renders_the_exact_legacy_cdc_template.
+#[test]
+fn cloud_dest_render_goldens() {
+    let s3 = Rig::pg_batch("t")
+        .export_named("e")
+        .dest_s3("bkt", "pfx", "http://127.0.0.1:9000")
+        .yaml();
+    assert!(
+        s3.contains(
+            "destination: { type: s3, bucket: bkt, prefix: \"pfx/e/\", region: us-east-1, \
+             endpoint: \"http://127.0.0.1:9000\", access_key_env: RIVET_TEST_MINIO_AK, \
+             secret_key_env: RIVET_TEST_MINIO_SK }"
+        ),
+        "dest_s3 render drifted:\n{s3}"
+    );
+    let gcs = Rig::pg_batch("t")
+        .export_named("e")
+        .dest_gcs("bkt", "pfx", "http://127.0.0.1:4443")
+        .yaml();
+    assert!(
+        gcs.contains(
+            "destination: { type: gcs, bucket: bkt, prefix: \"pfx/e/\", \
+             endpoint: \"http://127.0.0.1:4443\", allow_anonymous: true }"
+        ),
+        "dest_gcs render drifted:\n{gcs}"
+    );
+    let az = Rig::pg_batch("t")
+        .export_named("e")
+        .dest_azure("ctr", "pfx")
+        .yaml();
+    assert!(
+        az.contains("type: azure, bucket: ctr, prefix: \"pfx/e/\"")
+            && az.contains("account_key_env: RIVET_TEST_AZURITE_KEY"),
+        "dest_azure render drifted:\n{az}"
+    );
+    let so = Rig::pg_batch("t").export_named("e").dest_stdout().yaml();
+    assert!(
+        so.contains("destination: { type: stdout }"),
+        "dest_stdout render drifted:\n{so}"
+    );
+}
+
+/// A hand-edited rig.yaml must be REFUSED, not silently clobbered by the
+/// next run's re-render (bughunt: three resume tests measured nothing on
+/// their changed-parallelism leg exactly this way).
+#[test]
+#[should_panic(expected = "edited outside the rig")]
+fn config_path_refuses_a_hand_edited_config() {
+    let rig = Rig::pg_batch("t").export_named("e");
+    let cfg = rig.config_path();
+    std::fs::write(&cfg, "hand-patched\n").unwrap();
+    let _ = rig.config_path();
+}
+
+/// The sanctioned mutation path: replace_export_line changes the knob in
+/// the BUILDER, so the re-render and the file agree.
+#[test]
+fn replace_export_line_changes_the_rendered_knob() {
+    let mut rig = Rig::pg_batch("t")
+        .export_named("e")
+        .export_line("parallel: 1");
+    let cfg = rig.config_path();
+    rig.replace_export_line("parallel:", "parallel: 2");
+    let text = std::fs::read_to_string(rig.config_path()).unwrap();
+    assert!(text.contains("parallel: 2"), "knob must change: {text}");
+    assert!(
+        !text.contains("parallel: 1"),
+        "old knob must be gone: {text}"
+    );
+    assert_eq!(cfg, rig.config_path(), "same config path throughout");
+}
+
+/// run_and_read on a cloud/stdout rig must refuse — the local out dir is
+/// empty by construction and `[]` would make every negative assertion
+/// vacuous forever.
+#[test]
+#[should_panic(expected = "LOCAL out dir")]
+fn run_and_read_refuses_a_cloud_rig() {
+    let rig = Rig::pg_batch("t")
+        .export_named("e")
+        .dest_gcs("bkt", "pfx", "http://127.0.0.1:4443");
+    let _ = rig.run_and_read();
+}
+
+/// DOCUMENTS the absorb contract (r3 bughunt): a product write into the
+/// config (rivet plan annotating a wave-less config) is absorbed — no
+/// hand-edit panic — and then OVERWRITTEN by the next materialization,
+/// because the builder is the single source of truth. A test that wants to
+/// assert on product-written content must read the file BEFORE any further
+/// rig call. This golden makes the silent overwrite a stated behavior, not
+/// an accident.
+#[test]
+fn product_config_write_is_absorbed_then_overwritten_documents_the_contract() {
+    let rig = Rig::pg_batch("t").export_named("e");
+    let cfg = rig.config_path();
+    let pristine = std::fs::read_to_string(&cfg).unwrap();
+    // Simulate the product's write the way absorb sees it: foreign content on
+    // disk, then an invocation completes (absorb runs).
+    let annotated = format!("{pristine}    wave: 3\n");
+    std::fs::write(&cfg, &annotated).unwrap();
+    rig.absorb_product_config_writes();
+    // No panic — absorbed. And the next materialization restores the render:
+    let after = std::fs::read_to_string(rig.config_path()).unwrap();
+    assert_eq!(after, pristine, "the builder's render wins after absorb");
+}
+
+/// A caller-owned `config_in` copy must FOLLOW a sanctioned mutation — the
+/// r2 bughunt found amend/replace re-rendered only the rig-dir config, so the
+/// caller's path kept executing yesterday's knobs while the builder (and the
+/// test's text) looked amended.
+#[test]
+fn config_in_copy_follows_replace_export_line() {
+    let dir = tempfile::tempdir().expect("caller dir");
+    let mut rig = Rig::pg_batch("t")
+        .export_named("e")
+        .export_line("parallel: 1");
+    let copy = rig.config_in(dir.path());
+    rig.replace_export_line("parallel:", "parallel: 2");
+    let text = std::fs::read_to_string(&copy).expect("caller copy");
+    assert!(
+        text.contains("parallel: 2") && !text.contains("parallel: 1"),
+        "the config_in copy must be re-rendered by the mutation: {text}"
+    );
+}
+
+/// `config_in` must write the SAME bytes `config_path` writes — the "two
+/// materializations cannot drift" claim, asserted rather than commented.
+#[test]
+fn config_in_matches_config_path_byte_for_byte() {
+    let rig = Rig::pg_batch("t").export_named("e");
+    let own = std::fs::read_to_string(rig.config_path()).expect("own config");
+    let dir = tempfile::tempdir().expect("caller dir");
+    let theirs = std::fs::read_to_string(rig.config_in(dir.path())).expect("caller config");
+    assert_eq!(
+        own, theirs,
+        "config_in and config_path rendered different configs"
+    );
 }

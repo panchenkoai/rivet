@@ -369,9 +369,7 @@ fn roast_until_current_terminates_under_sustained_writes_and_keeps_backlog() {
     }
 
     let bg_db = db.clone();
-    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let stop_bg = stop.clone();
-    let bg = std::thread::spawn(move || {
+    let mut bg = BgWriter::spawn(move |stop_bg| {
         let w = MongoTest::connect(PORT, &bg_db);
         let mut i = 10_000;
         while !stop_bg.load(std::sync::atomic::Ordering::Relaxed) {
@@ -381,11 +379,16 @@ fn roast_until_current_terminates_under_sustained_writes_and_keeps_backlog() {
         }
     });
 
-    let start = std::time::Instant::now();
-    rig.run_ok(); // must return at the time bound, not hang until the writer stops
-    let elapsed = start.elapsed();
-    stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    let _ = bg.join();
+    // BOUNDED, like every peer of this test shape (pg/mysql/mssql sustained-
+    // writes all use run_rivet_bounded): Mongo is the LOAD-BEARING engine for
+    // the open-bound — its tailable stream never empty-polls under sustained
+    // writes, so a regression here HANGS run_ok forever, fed by the 15ms
+    // upserter below (r3 bughunt: the one unbounded drain among four peers).
+    let elapsed = run_rivet_bounded(&rig.config_path(), std::time::Duration::from_secs(30));
+    bg.stop();
+    let elapsed = elapsed.unwrap_or_else(|| {
+        panic!("until_current drain HUNG past the 30s watchdog under sustained writes")
+    });
 
     assert!(
         elapsed < std::time::Duration::from_secs(6),
@@ -447,9 +450,7 @@ fn roast_mongo_cdc_until_current_open_bound_two_runs_lose_nothing() {
     // A writer floods _id 10000+ THROUGH run 1, so run 1's open-time cluster-time
     // bound falls mid-stream and it must terminate on a PREFIX, deferring the tail.
     let bg_db = db.clone();
-    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let stop_bg = stop.clone();
-    let bg = std::thread::spawn(move || {
+    let mut bg = BgWriter::spawn(move |stop_bg| {
         let w = MongoTest::connect(PORT, &bg_db);
         let mut i = 10_000i64;
         while !stop_bg.load(std::sync::atomic::Ordering::Relaxed) {
@@ -463,8 +464,7 @@ fn roast_mongo_cdc_until_current_open_bound_two_runs_lose_nothing() {
     // Run 1 must TERMINATE under sustained writes (the cluster-time bound clips
     // it); killed at 30s if it hangs.
     let elapsed = run_rivet_bounded(&cfg, std::time::Duration::from_secs(30));
-    stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    let _ = bg.join();
+    bg.stop();
     assert!(
         elapsed.is_some(),
         "run 1 must terminate at the open-time cluster-time bound under sustained writes (killed at 30s)"

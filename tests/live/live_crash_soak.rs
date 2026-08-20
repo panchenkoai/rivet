@@ -33,49 +33,31 @@ const FAULTS: &[&str] = &[
     "after_chunk_complete:5",
 ];
 
-fn rivet(
-    cfg: &std::path::Path,
-    export: &str,
-    resume: bool,
-    panic_at: Option<&str>,
-) -> std::process::Output {
-    let mut args = vec!["run", "--config", cfg.to_str().unwrap(), "--export", export];
+fn rivet(rig: &Rig, export: &str, resume: bool, panic_at: Option<&str>) -> std::process::Output {
+    let mut args = vec!["--export", export];
     if resume {
         args.push("--resume");
     }
-    let mut cmd = std::process::Command::new(RIVET_BIN);
-    cmd.args(&args);
-    if let Some(p) = panic_at {
-        cmd.env("RIVET_TEST_PANIC_AT", p);
+    match panic_at {
+        Some(p) => rig.run_args_env(&args, &[("RIVET_TEST_PANIC_AT", p)]),
+        None => rig.run_args(&args),
     }
-    cmd.output().expect("spawn rivet")
 }
 
 fn run_soak_case(fault: &str) {
     let table = seed_pg_numeric_table(N);
     let export = unique_name("soak");
     let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        r#"
-source: {{type: postgres, url: "{POSTGRES_URL}"}}
-exports:
-  - name: {export}
-    query: "SELECT id, name FROM {table_name}"
-    mode: chunked
-    chunk_column: id
-    chunk_size: {CHUNK}
-    chunk_checkpoint: true
-    format: parquet
-    destination: {{type: local, path: {dir}}}
-"#,
-        table_name = table.name(),
-        dir = out.path().display()
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
+    let rig = Rig::pg_batch(&export)
+        .query(&format!("SELECT id, name FROM {}", table.name()))
+        .mode("chunked")
+        .export_line("chunk_column: id")
+        .export_line(&format!("chunk_size: {CHUNK}"))
+        .export_line("chunk_checkpoint: true")
+        .dest_path(out.path().to_path_buf());
 
     // Crash mid-run at the fault point.
-    let crash = rivet(&cfg, &export, false, Some(fault));
+    let crash = rivet(&rig, &export, false, Some(fault));
     assert!(
         !crash.status.success(),
         "[{fault}] crash run must exit non-zero; stderr:\n{}",
@@ -87,7 +69,7 @@ exports:
     // mask exactly that regression (matrix audit: sleep-masked class).
 
     // Resume to completion.
-    let resume = rivet(&cfg, &export, true, None);
+    let resume = rivet(&rig, &export, true, None);
     assert!(
         resume.status.success(),
         "[{fault}] --resume must succeed; stderr:\n{}",

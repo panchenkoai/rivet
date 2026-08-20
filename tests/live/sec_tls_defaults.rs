@@ -42,25 +42,15 @@
 
 use crate::common::*;
 
-/// Minimal Postgres export config with NO `tls:` block, pointed at `url`.
+/// Minimal Postgres export rig with NO `tls:` block, pointed at `url`.
 /// Inline `url:` (not `url_env:`) so the host the policy gate inspects is
 /// fully determined by this string.
-fn pg_no_tls_config(tmp: &tempfile::TempDir, url: &str, out_dir: &str) -> std::path::PathBuf {
-    let yaml = format!(
-        r#"source:
-  type: postgres
-  url: "{url}"
-exports:
-  - name: sec_tls_probe
-    query: "SELECT 1"
-    mode: full
-    format: csv
-    destination:
-      type: local
-      path: "{out_dir}"
-"#
-    );
-    write_config(tmp, &yaml)
+fn pg_no_tls_rig(url: &str, out_dir: &std::path::Path) -> Rig {
+    Rig::pg_batch("sec_tls_probe")
+        .query("SELECT 1")
+        .source_url(url)
+        .with_format("csv")
+        .dest_path(out_dir.to_path_buf())
 }
 
 /// Heuristic: does this stderr look like a *generic connection error* rather
@@ -120,9 +110,9 @@ fn sec_remote_plaintext_pg_is_loud() {
     // Non-loopback, unroutable host: the secure path refuses on policy before
     // the socket even matters; the vulnerable path attempts a cleartext dial.
     let remote_url = "postgresql://rivet:rivet@10.255.255.1:5432/rivet";
-    let cfg = pg_no_tls_config(&tmp, remote_url, out.to_str().unwrap());
+    let rig = pg_no_tls_rig(remote_url, &out);
 
-    let result = run_rivet_with_warn_log(&["doctor", "--config", cfg.to_str().unwrap()]);
+    let result = rig.cli_env(&["doctor"], &[("RUST_LOG", "warn")]);
     let stderr = String::from_utf8_lossy(&result.stderr).to_lowercase();
 
     // 1) It must fail (today a connection error also fails, so this alone is
@@ -170,9 +160,9 @@ fn sec_loopback_plaintext_pg_is_allowed() {
     std::fs::create_dir_all(&out).unwrap();
     // POSTGRES_URL is the 127.0.0.1 loopback docker DB with no TLS — the dev
     // case the secure policy explicitly permits.
-    let cfg = pg_no_tls_config(&tmp, POSTGRES_URL, out.to_str().unwrap());
+    let rig = pg_no_tls_rig(POSTGRES_URL, &out);
 
-    let result = run_rivet_with_warn_log(&["doctor", "--config", cfg.to_str().unwrap()]);
+    let result = rig.cli_env(&["doctor"], &[("RUST_LOG", "warn")]);
     let stderr = String::from_utf8_lossy(&result.stderr);
 
     assert!(
@@ -201,28 +191,13 @@ fn sec_loopback_plaintext_pg_is_allowed() {
 /// run REFUSES. The assertion is "does not silently succeed in plaintext".
 ///
 /// RED against `main`: there the run exits 0 with a written CSV part.
-fn pg_tls_config(
-    tmp: &tempfile::TempDir,
-    url: &str,
-    out_dir: &str,
-    mode: &str,
-) -> std::path::PathBuf {
-    let yaml = format!(
-        r#"source:
-  type: postgres
-  url: "{url}"
-  tls: {{ mode: {mode} }}
-exports:
-  - name: sec_tls_honesty
-    query: "SELECT 1"
-    mode: full
-    format: csv
-    destination:
-      type: local
-      path: "{out_dir}"
-"#
-    );
-    write_config(tmp, &yaml)
+fn pg_tls_rig(url: &str, out_dir: &std::path::Path, mode: &str) -> Rig {
+    Rig::pg_batch("sec_tls_honesty")
+        .query("SELECT 1")
+        .source_url(url)
+        .source_line(&format!("tls: {{ mode: {mode} }}"))
+        .with_format("csv")
+        .dest_path(out_dir.to_path_buf())
 }
 
 #[test]
@@ -236,9 +211,9 @@ fn sec_enforced_tls_is_not_overridden_by_url_sslmode_disable() {
     // NOT fire — the ONLY thing that can refuse plaintext here is the driver
     // actually honoring the enforced mode, which is what this pins.
     let url = format!("{POSTGRES_URL}?sslmode=disable");
-    let cfg = pg_tls_config(&tmp, &url, out.to_str().unwrap(), "verify-full");
+    let rig = pg_tls_rig(&url, &out, "verify-full");
 
-    let r = run_rivet(&["run", "--config", cfg.to_str().unwrap()]);
+    let r = rig.run_args(&[]);
     let stderr = String::from_utf8_lossy(&r.stderr);
     assert!(
         !r.status.success(),

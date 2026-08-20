@@ -12,30 +12,16 @@ fn mysql_chunked_auto_resolves_chunk_column_from_pk() {
     let tbl = seed_mysql_numeric_table(2_000);
     let tmp = tempfile::tempdir().expect("tmpdir");
     let out_dir = tmp.path().join("out");
-    let yaml = format!(
-        r#"source:
-  type: mysql
-  url: "{MYSQL_URL}"
+    let rig = Rig::mysql_batch(tbl.name())
+        .export_named("chunked_auto_pk")
+        .mode("chunked")
+        .export_line("chunk_size: 500")
+        .export_line("compression: snappy")
+        .export_line("columns:")
+        .export_line("  amount: \"decimal(12,2)\"")
+        .dest_path(out_dir.clone());
 
-exports:
-  - name: chunked_auto_pk
-    table: {name}
-    mode: chunked
-    chunk_size: 500
-    format: parquet
-    compression: snappy
-    destination:
-      type: local
-      path: {out}
-    columns:
-      amount: "decimal(12,2)"
-"#,
-        name = tbl.name(),
-        out = out_dir.display(),
-    );
-    let cfg = write_config(&tmp, &yaml);
-
-    let out = run_rivet(&["run", "-c", cfg.to_str().unwrap()]);
+    let out = rig.run_args(&[]);
     assert!(
         out.status.success(),
         "MySQL chunked + table: with no explicit chunk_column must auto-resolve from PK:\n\
@@ -73,30 +59,16 @@ fn mysql_chunk_size_memory_mb_derives_chunk_size() {
 
     let tmp = tempfile::tempdir().expect("tmpdir");
     let out_dir = tmp.path().join("out");
-    let yaml = format!(
-        r#"source:
-  type: mysql
-  url: "{MYSQL_URL}"
+    let rig = Rig::mysql_batch(tbl.name())
+        .export_named("mem_budget")
+        .mode("chunked")
+        .export_line("chunk_size_memory_mb: 1")
+        .export_line("compression: snappy")
+        .export_line("columns:")
+        .export_line("  amount: \"decimal(12,2)\"")
+        .dest_path(out_dir.clone());
 
-exports:
-  - name: mem_budget
-    table: {name}
-    mode: chunked
-    chunk_size_memory_mb: 1
-    format: parquet
-    compression: snappy
-    destination:
-      type: local
-      path: {out}
-    columns:
-      amount: "decimal(12,2)"
-"#,
-        name = tbl.name(),
-        out = out_dir.display(),
-    );
-    let cfg = write_config(&tmp, &yaml);
-
-    let out = run_rivet(&["run", "-c", cfg.to_str().unwrap()]);
+    let out = rig.run_args(&[]);
     assert!(
         out.status.success(),
         "MySQL memory-budgeted chunked run must succeed:\n\

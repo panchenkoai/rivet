@@ -101,21 +101,48 @@ fn exec_at(port: u16, sql: &str) {
         .enable_all()
         .build()
         .expect("mssql: tokio runtime");
+    // Bounded retry: under the full E2E matrix the SQL Server container drops
+    // connections / times out queries mid-batch (a transient the loaded runner
+    // hits — two setup flakes: wait_for_capture, then this exec). These are
+    // test-SETUP batches (seed / CDC-enable); seeds are DROP-first idempotent,
+    // and a DETERMINISTIC error (bad SQL, permission) still surfaces after the
+    // last attempt rather than being masked. Re-establishes the connection
+    // each try. r7/r8: the mssql-under-load class.
     rt.block_on(async {
-        let mut client = connect_at(port).await;
-        for batch in split_go(sql) {
-            if batch.trim().is_empty() {
-                continue;
+        let mut last_err: Option<String> = None;
+        for attempt in 0..3 {
+            match run_batch(port, sql).await {
+                Ok(()) => return,
+                Err(e) => {
+                    last_err = Some(e);
+                    tokio::time::sleep(std::time::Duration::from_millis(500 * (attempt + 1))).await;
+                }
             }
-            client
-                .simple_query(batch.as_str())
-                .await
-                .expect("mssql: exec batch")
-                .into_results()
-                .await
-                .expect("mssql: drain batch");
         }
+        panic!(
+            "mssql: exec batch failed after 3 attempts: {}",
+            last_err.unwrap()
+        );
     });
+}
+
+/// One connect + batch execution, fallible (so [`exec_at`] can retry a
+/// transient transport failure under load).
+async fn run_batch(port: u16, sql: &str) -> Result<(), String> {
+    let mut client = try_connect_at(port).await.map_err(|e| e.to_string())?;
+    for batch in split_go(sql) {
+        if batch.trim().is_empty() {
+            continue;
+        }
+        client
+            .simple_query(batch.as_str())
+            .await
+            .map_err(|e| format!("exec: {e}"))?
+            .into_results()
+            .await
+            .map_err(|e| format!("drain: {e}"))?;
+    }
+    Ok(())
 }
 
 fn query_i64_at(port: u16, sql: &str) -> i64 {
@@ -293,6 +320,11 @@ pub fn mssql_cdc_drop_table(name: &str) {
 /// Server twin of [`super::mysql::MysqlTable`].
 pub struct MssqlTable {
     name: String,
+    /// The instance the table LIVES on — Drop targets this port, not a
+    /// hardcoded :1433 (r4 bughunt: governor-instance fixtures — a 20k-row
+    /// seed + a multi-hundred-MB VARBINARY scratch per canary run — were
+    /// "dropped" on the wrong server and accumulated unboundedly).
+    port: u16,
 }
 
 impl MssqlTable {
@@ -302,7 +334,12 @@ impl MssqlTable {
 
     /// Wrap an already-created table (custom schema) in the RAII drop guard.
     pub fn adopt(name: String) -> Self {
-        MssqlTable { name }
+        Self::adopt_at(1433, name)
+    }
+
+    /// Adopt a table on a NON-primary instance (mssql-governor :1435).
+    pub fn adopt_at(port: u16, name: String) -> Self {
+        MssqlTable { name, port }
     }
 }
 
@@ -313,9 +350,10 @@ impl Drop for MssqlTable {
         // a panicking executor there aborts the process — replacing a readable
         // assertion message with a SIGABRT. Cleanup is not the verdict.
         let name = &self.name;
-        mssql_try_exec(&format!(
-            "IF OBJECT_ID('{name}','U') IS NOT NULL DROP TABLE {name}"
-        ));
+        soft_exec_at(
+            self.port,
+            &format!("IF OBJECT_ID('{name}','U') IS NOT NULL DROP TABLE {name}"),
+        );
     }
 }
 
@@ -375,7 +413,7 @@ fn seed_mssql_numeric_table_at(port: u16, row_count: i64) -> MssqlTable {
             start = end;
         }
     }
-    MssqlTable { name }
+    MssqlTable::adopt_at(port, name)
 }
 
 /// Split a script on lines that are exactly `GO` (the sqlcmd batch separator,

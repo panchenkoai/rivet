@@ -17,9 +17,9 @@
 
 use crate::common::*;
 
-fn cfg(yaml: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+fn cfg(rig: &Rig) -> (tempfile::TempDir, std::path::PathBuf) {
     let d = tempfile::tempdir().unwrap();
-    let p = write_config(&d, yaml);
+    let p = rig.config_in(d.path());
     (d, p)
 }
 
@@ -33,7 +33,7 @@ fn unique_column_on_clean_data_passes() {
     let out = tempfile::tempdir().unwrap();
     let export_name = unique_name("ql_uniq_ok");
 
-    let yaml = Rig::pg_batch(&export_name)
+    let rig = Rig::pg_batch(&export_name)
         .query(&format!(
             r#"SELECT id, name, amount FROM {table_name}"#,
             table_name = table.name()
@@ -43,9 +43,8 @@ fn unique_column_on_clean_data_passes() {
         .export_line("quality:")
         .export_line("  unique_columns: [id]")
         .export_line("  unique_max_entries: 1000")
-        .dest_path(out.path().to_path_buf())
-        .yaml();
-    let (_cfgdir, cfgpath) = cfg(&yaml);
+        .dest_path(out.path().to_path_buf());
+    let (_cfgdir, cfgpath) = cfg(&rig);
 
     let result = run_rivet_export(&cfgpath, &export_name);
     assert!(
@@ -66,7 +65,7 @@ fn unique_column_on_duplicate_data_fails_export() {
     let out = tempfile::tempdir().unwrap();
     let export_name = unique_name("ql_uniq_dup");
 
-    let yaml = Rig::pg_batch(&export_name)
+    let rig = Rig::pg_batch(&export_name)
         .query(&format!(
             "SELECT id FROM {t} UNION ALL SELECT id FROM {t}",
             t = table.name()
@@ -74,9 +73,8 @@ fn unique_column_on_duplicate_data_fails_export() {
         .mode("full")
         .export_line("quality:")
         .export_line("  unique_columns: [id]")
-        .dest_path(out.path().to_path_buf())
-        .yaml();
-    let (_cfgdir, cfgpath) = cfg(&yaml);
+        .dest_path(out.path().to_path_buf());
+    let (_cfgdir, cfgpath) = cfg(&rig);
 
     let result = run_rivet_export(&cfgpath, &export_name);
     assert!(
@@ -101,7 +99,7 @@ fn unique_columns_without_cap_emits_plan_warning() {
     let out = tempfile::tempdir().unwrap();
     let export_name = unique_name("ql_uniq_no_cap");
 
-    let yaml = Rig::pg_batch(&export_name)
+    let rig = Rig::pg_batch(&export_name)
         .query(&format!(
             r#"SELECT id FROM {table_name}"#,
             table_name = table.name()
@@ -109,9 +107,8 @@ fn unique_columns_without_cap_emits_plan_warning() {
         .mode("full")
         .export_line("quality:")
         .export_line("  unique_columns: [id]")
-        .dest_path(out.path().to_path_buf())
-        .yaml();
-    let (_cfgdir, cfgpath) = cfg(&yaml);
+        .dest_path(out.path().to_path_buf());
+    let (_cfgdir, cfgpath) = cfg(&rig);
 
     let result = run_rivet_with_warn_log(&[
         "run",
@@ -143,7 +140,7 @@ fn row_count_min_gate_fails_when_below_threshold() {
     let out = tempfile::tempdir().unwrap();
     let export_name = unique_name("ql_rowmin");
 
-    let yaml = Rig::pg_batch(&export_name)
+    let rig = Rig::pg_batch(&export_name)
         .query(&format!(
             r#"SELECT id FROM {table_name}"#,
             table_name = table.name()
@@ -151,9 +148,8 @@ fn row_count_min_gate_fails_when_below_threshold() {
         .mode("full")
         .export_line("quality:")
         .export_line("  row_count_min: 100")
-        .dest_path(out.path().to_path_buf())
-        .yaml();
-    let (_cfgdir, cfgpath) = cfg(&yaml);
+        .dest_path(out.path().to_path_buf());
+    let (_cfgdir, cfgpath) = cfg(&rig);
 
     let result = run_rivet_export(&cfgpath, &export_name);
     assert!(
@@ -175,7 +171,7 @@ fn row_count_max_gate_fails_when_above_threshold() {
     let out = tempfile::tempdir().unwrap();
     let export_name = unique_name("ql_rowmax");
 
-    let yaml = Rig::pg_batch(&export_name)
+    let rig = Rig::pg_batch(&export_name)
         .query(&format!(
             r#"SELECT id FROM {table_name}"#,
             table_name = table.name()
@@ -183,9 +179,8 @@ fn row_count_max_gate_fails_when_above_threshold() {
         .mode("full")
         .export_line("quality:")
         .export_line("  row_count_max: 10")
-        .dest_path(out.path().to_path_buf())
-        .yaml();
-    let (_cfgdir, cfgpath) = cfg(&yaml);
+        .dest_path(out.path().to_path_buf());
+    let (_cfgdir, cfgpath) = cfg(&rig);
 
     let result = run_rivet_export(&cfgpath, &export_name);
     assert!(
@@ -221,15 +216,14 @@ fn null_ratio_max_gate_fails_when_exceeded() {
 
     let out = tempfile::tempdir().unwrap();
     let export_name = unique_name("ql_null_exp");
-    let yaml = Rig::pg_batch(&export_name)
+    let rig = Rig::pg_batch(&export_name)
         .query(&format!(r#"SELECT id, val FROM {table_name}"#))
         .mode("full")
         .export_line("quality:")
         .export_line("  null_ratio_max:")
         .export_line("    val: 0.1")
-        .dest_path(out.path().to_path_buf())
-        .yaml();
-    let (_cfgdir, cfgpath) = cfg(&yaml);
+        .dest_path(out.path().to_path_buf());
+    let (_cfgdir, cfgpath) = cfg(&rig);
 
     let result = run_rivet_export(&cfgpath, &export_name);
     assert!(

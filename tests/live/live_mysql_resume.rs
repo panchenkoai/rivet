@@ -21,9 +21,9 @@
 use crate::common::*;
 use mysql::prelude::Queryable;
 
-fn cfg_dir_with(yaml: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+fn cfg_dir_with(rig: &Rig) -> (tempfile::TempDir, std::path::PathBuf) {
     let d = tempfile::tempdir().unwrap();
-    let p = write_config(&d, yaml);
+    let p = rig.config_in(d.path());
     (d, p)
 }
 
@@ -77,16 +77,15 @@ fn mysql_full_mode_repeated_run_accumulates_manifest_entries() {
     let out = tempfile::tempdir().unwrap();
     let export_name = unique_name("qa12my_full");
 
-    let yaml = Rig::mysql_batch(&export_name)
+    let rig = Rig::mysql_batch(&export_name)
         .query(&format!(
             r#"SELECT id, name, amount FROM {table_name}"#,
             table_name = table.name()
         ))
         .mode("full")
         .export_line(r#"columns: { amount: "decimal(12,2)" }"#)
-        .dest_path(out.path().to_path_buf())
-        .yaml();
-    let (_cfgdir, cfg) = cfg_dir_with(&yaml);
+        .dest_path(out.path().to_path_buf());
+    let (_cfgdir, cfg) = cfg_dir_with(&rig);
 
     let r1 = run_rivet_export(&cfg, &export_name);
     assert!(r1.status.success(), "first full run failed");
@@ -141,13 +140,12 @@ fn mysql_roast_rapid_incremental_runs_into_same_prefix_must_not_clobber_prior_pa
 
     let export_name = unique_name("my_clobber_exp");
     let out = tempfile::tempdir().unwrap();
-    let yaml = Rig::mysql_batch(&export_name)
+    let rig = Rig::mysql_batch(&export_name)
         .query(&format!("SELECT id, updated_at FROM {name}"))
         .mode("incremental")
         .export_line("cursor_column: updated_at")
-        .dest_path(out.path().to_path_buf())
-        .yaml();
-    let (_cfgdir, cfg) = cfg_dir_with(&yaml);
+        .dest_path(out.path().to_path_buf());
+    let (_cfgdir, cfg) = cfg_dir_with(&rig);
 
     // Each run inserts one new row (strictly increasing cursor) then exports
     // just that delta — back to back, no sleep, so several runs share a second.
@@ -185,13 +183,12 @@ fn mysql_incremental_second_run_on_unchanged_source_exports_zero_new_rows() {
     let (table_name, _guard) = seed_cursor_table(15);
     let export_name = unique_name("qa12my_inc_exp");
     let out = tempfile::tempdir().unwrap();
-    let yaml = Rig::mysql_batch(&export_name)
+    let rig = Rig::mysql_batch(&export_name)
         .query(&format!(r#"SELECT id, updated_at FROM {table_name}"#))
         .mode("incremental")
         .export_line("cursor_column: updated_at")
-        .dest_path(out.path().to_path_buf())
-        .yaml();
-    let (_cfgdir, cfg) = cfg_dir_with(&yaml);
+        .dest_path(out.path().to_path_buf());
+    let (_cfgdir, cfg) = cfg_dir_with(&rig);
 
     let r1 = run_rivet_export(&cfg, &export_name);
     assert!(
@@ -223,13 +220,12 @@ fn mysql_incremental_third_run_picks_up_newly_inserted_rows() {
     let (table_name, _guard) = seed_cursor_table(5);
     let export_name = unique_name("qa12my_inc2_exp");
     let out = tempfile::tempdir().unwrap();
-    let yaml = Rig::mysql_batch(&export_name)
+    let rig = Rig::mysql_batch(&export_name)
         .query(&format!(r#"SELECT id, updated_at FROM {table_name}"#))
         .mode("incremental")
         .export_line("cursor_column: updated_at")
-        .dest_path(out.path().to_path_buf())
-        .yaml();
-    let (_cfgdir, cfg) = cfg_dir_with(&yaml);
+        .dest_path(out.path().to_path_buf());
+    let (_cfgdir, cfg) = cfg_dir_with(&rig);
 
     assert!(run_rivet_export(&cfg, &export_name).status.success());
     let files_1 = files_with_extension(out.path(), "parquet").len();
@@ -262,7 +258,7 @@ fn mysql_chunked_resume_without_prior_run_fails_with_actionable_message() {
     let table = seed_mysql_numeric_table(20);
     let export_name = unique_name("qa12my_chunk");
     let out = tempfile::tempdir().unwrap();
-    let yaml = Rig::mysql_batch(&export_name)
+    let rig = Rig::mysql_batch(&export_name)
         .query(&format!(
             r#"SELECT id, name FROM {table_name}"#,
             table_name = table.name()
@@ -271,9 +267,8 @@ fn mysql_chunked_resume_without_prior_run_fails_with_actionable_message() {
         .export_line("chunk_column: id")
         .export_line("chunk_size: 5")
         .export_line("chunk_checkpoint: true")
-        .dest_path(out.path().to_path_buf())
-        .yaml();
-    let (_cfgdir, cfg) = cfg_dir_with(&yaml);
+        .dest_path(out.path().to_path_buf());
+    let (_cfgdir, cfg) = cfg_dir_with(&rig);
 
     let out = run_rivet(&[
         "run",
@@ -301,7 +296,7 @@ fn mysql_chunked_resume_with_completed_run_gives_actionable_message() {
     let table = seed_mysql_numeric_table(20);
     let export_name = unique_name("qa12my_resume_done");
     let out = tempfile::tempdir().unwrap();
-    let yaml = Rig::mysql_batch(&export_name)
+    let rig = Rig::mysql_batch(&export_name)
         .query(&format!(
             r#"SELECT id, name FROM {table_name}"#,
             table_name = table.name()
@@ -310,9 +305,8 @@ fn mysql_chunked_resume_with_completed_run_gives_actionable_message() {
         .export_line("chunk_column: id")
         .export_line("chunk_size: 5")
         .export_line("chunk_checkpoint: true")
-        .dest_path(out.path().to_path_buf())
-        .yaml();
-    let (_cfgdir, cfg) = cfg_dir_with(&yaml);
+        .dest_path(out.path().to_path_buf());
+    let (_cfgdir, cfg) = cfg_dir_with(&rig);
 
     let first_run = run_rivet_export(&cfg, &export_name);
     assert!(
@@ -350,15 +344,14 @@ fn mysql_full_mode_resume_flag_is_rejected() {
     let table = seed_mysql_numeric_table(10);
     let export_name = unique_name("qa12my_full_norsm");
     let out = tempfile::tempdir().unwrap();
-    let yaml = Rig::mysql_batch(&export_name)
+    let rig = Rig::mysql_batch(&export_name)
         .query(&format!(
             r#"SELECT id, name FROM {table_name}"#,
             table_name = table.name()
         ))
         .mode("full")
-        .dest_path(out.path().to_path_buf())
-        .yaml();
-    let (_cfgdir, cfg) = cfg_dir_with(&yaml);
+        .dest_path(out.path().to_path_buf());
+    let (_cfgdir, cfg) = cfg_dir_with(&rig);
 
     let result = run_rivet(&[
         "run",

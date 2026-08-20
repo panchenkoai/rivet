@@ -135,6 +135,23 @@ fn every_expect_key_is_a_declared_artifact_class() {
     );
 }
 
+/// The matrix's self-declared `engines:` universe must BE the SourceType enum
+/// — not merely self-consistent. r5 wired this derive-check into release_gate
+/// but left this sibling hand-declaring the same universe (r6 bughunt): a new
+/// SourceType variant would not force a column here.
+#[test]
+fn declared_engines_are_the_source_type_enum() {
+    let declared = declared_engines(&matrix_text());
+    let derived: std::collections::BTreeSet<String> =
+        super::chunking_matrix_guard::source_engine_variants()
+            .into_iter()
+            .collect();
+    assert_eq!(
+        declared, derived,
+        "scenario-artifact matrix's declared engines drifted from SourceType:          declared {declared:?} vs enum {derived:?}"
+    );
+}
+
 #[test]
 fn every_scenario_engine_is_declared() {
     let text = matrix_text();

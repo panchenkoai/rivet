@@ -141,24 +141,11 @@ fn cdc_reads_changes_from_a_replica() {
     // Capture from the REPLICA (rivet user, :3309).
     let out = d.path().join("out");
     std::fs::create_dir_all(&out).unwrap();
-    let yaml = format!(
-        r#"source: {{type: mysql, url: "{REPLICA_RIVET}"}}
-exports:
-  - name: {table}
-    table: {table}
-    mode: cdc
-    format: parquet
-    cdc: {{ checkpoint: "{ckpt}", until_current: true, server_id: 7777 }}
-    destination: {{ type: local, path: "{out}" }}
-"#,
-        ckpt = ckpt.display(),
-        out = out.display(),
-    );
-    let cfg = write_config(&d, &yaml);
-    let res = std::process::Command::new(RIVET_BIN)
-        .args(["run", "--config", cfg.to_str().unwrap()])
-        .output()
-        .expect("spawn rivet");
+    let rig = Rig::mysql_cdc(&table)
+        .source_url(REPLICA_RIVET)
+        .checkpoint_path(ckpt.clone())
+        .dest_path(out.clone());
+    let res = rig.run_args(&[]);
     assert!(
         res.status.success(),
         "cdc-from-replica failed:\n{}",

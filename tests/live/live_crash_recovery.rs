@@ -67,6 +67,18 @@ fn run_rivet_crash(
 
 /// Open the state DB that rivet wrote next to the given config file.
 fn open_state_db(cfg: &std::path::Path) -> rusqlite::Connection {
+    // This test's ORACLE is the SQLite state file — valid only if rivet wrote
+    // SQLite. The harness only ADDS env (no env_clear), so an ambient
+    // RIVET_STATE_URL=postgres would route rivet's state to Postgres while this
+    // reads a fresh empty .rivet_state.db (silent wrong verdict). Assert the
+    // precondition loudly (r7 bughunt; the un-migrated sibling of the parity
+    // tests' RIVET_STATE_URL pin). No-op under default CI (var unset).
+    assert!(
+        std::env::var("RIVET_STATE_URL").map_or(true, |u| !u.starts_with("postgres")),
+        "recovery test reads the SQLite .rivet_state.db, but RIVET_STATE_URL \
+         points at Postgres — rivet wrote its state there, not to this file. \
+         Unset RIVET_STATE_URL for the crash/chunked-recovery suite."
+    );
     let db = cfg.parent().unwrap().join(".rivet_state.db");
     rusqlite::Connection::open(db).expect("open state db")
 }
@@ -124,20 +136,12 @@ fn write_cfg(
     export_name: &str,
     cfg_dir: &tempfile::TempDir,
 ) -> std::path::PathBuf {
-    let yaml = format!(
-        r#"
-source: {{type: postgres, url: "{POSTGRES_URL}"}}
-exports:
-  - name: {export_name}
-    query: "SELECT id, updated_at FROM {table_name}"
-    mode: incremental
-    cursor_column: updated_at
-    format: parquet
-    destination: {{type: local, path: {dir}}}
-"#,
-        dir = out_dir.display()
-    );
-    write_config(cfg_dir, &yaml)
+    Rig::pg_batch(export_name)
+        .query(&format!("SELECT id, updated_at FROM {table_name}"))
+        .mode("incremental")
+        .export_line("cursor_column: updated_at")
+        .dest_path(out_dir.to_path_buf())
+        .config_in(cfg_dir.path())
 }
 
 #[test]

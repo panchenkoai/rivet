@@ -7,24 +7,6 @@
 
 use crate::common::*;
 
-/// One Postgres export block (full mode, parquet to `out_dir`).
-fn pg_export_block(table: &str, out_dir: &std::path::Path) -> String {
-    format!(
-        "  - name: {table}\n    query: \"SELECT id, name FROM {table}\"\n    mode: full\n    format: parquet\n    destination:\n      type: local\n      path: {out}\n",
-        out = out_dir.display()
-    )
-}
-
-/// Postgres config with one export block per table (`--export` omitted plans all).
-fn pg_config(tables: &[&str], out_dir: &std::path::Path) -> String {
-    let mut yaml =
-        String::from("\nsource:\n  type: postgres\n  url_env: DATABASE_URL\n\nexports:\n");
-    for t in tables {
-        yaml.push_str(&pg_export_block(t, out_dir));
-    }
-    yaml
-}
-
 // ─── L10: multi-export JSON to stdout must be one valid JSON document ─────────
 
 #[test]
@@ -34,24 +16,19 @@ fn plan_multi_export_json_stdout_is_valid_json_array() {
 
     let table_a = seed_pg_numeric_table(10);
     let table_b = seed_pg_numeric_table(10);
-    let out_dir = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-
-    let yaml = pg_config(&[table_a.name(), table_b.name()], out_dir.path());
-    let cfg = write_config(&cfg_dir, &yaml);
+    let rig = Rig::pg_batch(table_a.name())
+        .query(&format!("SELECT id, name FROM {}", table_a.name()))
+        .source_url_env("DATABASE_URL")
+        .also_export(
+            table_b.name(),
+            &format!("SELECT id, name FROM {}", table_b.name()),
+        );
 
     // No `--export`, no `--output`: plan ALL exports, JSON to stdout.
-    let plan_out = std::process::Command::new(RIVET_BIN)
-        .args([
-            "plan",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--format",
-            "json",
-        ])
-        .env("DATABASE_URL", POSTGRES_URL)
-        .output()
-        .expect("spawn rivet plan --format json");
+    let plan_out = rig.cli_env(
+        &["plan", "--format", "json"],
+        &[("DATABASE_URL", POSTGRES_URL)],
+    );
 
     assert!(
         plan_out.status.success(),
@@ -99,28 +76,23 @@ fn plan_pretty_with_output_is_not_a_silent_noop() {
     require_alive(LiveService::Postgres);
 
     let table = seed_pg_numeric_table(10);
-    let out_dir = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
+    let rig = Rig::pg_batch(table.name())
+        .query(&format!("SELECT id, name FROM {}", table.name()))
+        .source_url_env("DATABASE_URL");
+    let plan_path = rig.config_path().with_file_name("plan.json");
 
-    let yaml = pg_config(&[table.name()], out_dir.path());
-    let cfg = write_config(&cfg_dir, &yaml);
-    let plan_path = cfg_dir.path().join("plan.json");
-
-    let plan_out = std::process::Command::new(RIVET_BIN)
-        .args([
+    let plan_out = rig.cli_env(
+        &[
             "plan",
-            "--config",
-            cfg.to_str().unwrap(),
             "--export",
             table.name(),
             "--format",
             "pretty",
             "--output",
             plan_path.to_str().unwrap(),
-        ])
-        .env("DATABASE_URL", POSTGRES_URL)
-        .output()
-        .expect("spawn rivet plan --format pretty --output");
+        ],
+        &[("DATABASE_URL", POSTGRES_URL)],
+    );
 
     let stderr = String::from_utf8_lossy(&plan_out.stderr);
     let stdout = String::from_utf8_lossy(&plan_out.stdout);
@@ -177,34 +149,18 @@ fn plan_artifact_row_estimate_matches_the_real_table() {
 
     const ROWS: i64 = 5_000;
     let table = seed_pg_numeric_table(ROWS);
-    let out_dir = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-
     // `table:` (not `query:`) so the planner can verify the key is integer-family
     // and take the range-chunk path this estimate belongs to.
-    let yaml = format!(
-        "\nsource:\n  type: postgres\n  url_env: DATABASE_URL\n\nexports:\n\
-         \x20 - name: {name}\n    table: {name}\n    mode: chunked\n    chunk_column: id\n\
-         \x20   chunk_size: 1000\n    format: parquet\n    destination:\n      type: local\n\
-         \x20     path: {out}\n",
-        name = table.name(),
-        out = out_dir.path().display(),
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
+    let rig = Rig::pg_batch(table.name())
+        .source_url_env("DATABASE_URL")
+        .mode("chunked")
+        .export_line("chunk_column: id")
+        .export_line("chunk_size: 1000");
 
-    let out = std::process::Command::new(RIVET_BIN)
-        .args([
-            "plan",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            table.name(),
-            "--format",
-            "json",
-        ])
-        .env("DATABASE_URL", POSTGRES_URL)
-        .output()
-        .expect("spawn rivet plan --format json");
+    let out = rig.cli_env(
+        &["plan", "--export", table.name(), "--format", "json"],
+        &[("DATABASE_URL", POSTGRES_URL)],
+    );
     let stderr = String::from_utf8_lossy(&out.stderr).to_string();
     assert!(
         out.status.success(),

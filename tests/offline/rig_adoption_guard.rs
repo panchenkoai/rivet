@@ -18,82 +18,38 @@ use std::collections::BTreeMap;
 /// `Command::new(RIVET_BIN)` + `write_config(` in the file. Shrink freely;
 /// grow only with a reason in the PR.
 const BASELINE: &[(&str, usize)] = &[
-    ("audit_cli_dispatch.rs", 4),
-    ("audit_cloud_multipart.rs", 3),
-    ("audit_column_validation.rs", 5),
-    ("audit_doctor_fastfail.rs", 2),
-    ("audit_doctor_probe.rs", 2),
+    // ── the init-subject class: REASONED ceilings, not migration targets ──
+    // `rivet init` PRODUCES configs; the rig OWNS a config. A rig-shaped init
+    // test would test the rig's YAML against init's YAML — two generators, no
+    // subject. Raw invocations of `rivet init <flags>` ARE these files' subject,
+    // so their ceilings hold them at today's counts rather than at zero.
     ("audit_init_deferred.rs", 4),
-    ("audit_maxfile.rs", 2),
-    ("audit_observability.rs", 4),
-    ("audit_plan_apply.rs", 4),
-    ("audit_preflight_table.rs", 7),
-    ("audit_repair.rs", 6),
-    ("audit_repair_chunk_index.rs", 3),
-    ("audit_rerun.rs", 4),
-    ("audit_state.rs", 4),
-    ("audit_target_typo.rs", 3),
-    ("batch_memory_policy.rs", 1),
-    ("chunking_stand.rs", 6),
-    ("gremlin.rs", 4),
-    ("gremlin_cdc.rs", 4),
-    ("live_azure_multipart.rs", 2),
-    ("live_batch_switch_golden.rs", 3),
-    ("live_catalog_hints.rs", 9),
-    ("live_cdc.rs", 33),
-    ("live_cdc_mbt.rs", 4),
-    ("live_cdc_mssql.rs", 7),
-    ("live_cdc_oracle.rs", 4),
-    ("live_cdc_property.rs", 2),
-    ("live_cdc_replica.rs", 2),
-    ("live_chaos.rs", 8),
-    ("live_chunked_dense.rs", 2),
-    ("live_chunked_recovery.rs", 1),
-    ("live_cli_flags.rs", 76),
-    ("live_crash_recovery.rs", 1),
-    ("live_crash_soak.rs", 2),
-    ("live_cross_db_parity.rs", 5),
-    ("live_destination_parity.rs", 2),
+    // live_init_extended: all six sites are `rivet init <flags>` invocations
+    // (schema/discover/source-env/table variants) — the subject itself.
     ("live_init_extended.rs", 6),
-    ("live_keyset.rs", 14),
-    ("live_mssql_chunked.rs", 3),
-    ("live_mssql_crash_recovery.rs", 6),
-    ("live_mssql_harm_permission.rs", 2),
-    ("live_mssql_resume.rs", 1),
-    ("live_mysql_chunked.rs", 2),
-    ("live_mysql_crash_recovery.rs", 6),
-    ("live_mysql_resume.rs", 1),
-    ("live_mysql_retry_and_faults.rs", 5),
-    ("live_mysql_schema_drift.rs", 3),
-    ("live_parallel_ux.rs", 2),
-    ("live_parquet_roundtrip.rs", 4),
-    ("live_partition_by.rs", 4),
-    ("live_partition_cloud.rs", 2),
-    ("live_performance_smoke.rs", 3),
-    ("live_plan_output_ux.rs", 6),
-    ("live_resume.rs", 2),
-    ("live_retry_and_faults.rs", 5),
-    ("live_schema_drift.rs", 6),
-    ("live_temp_spill.rs", 1),
-    ("live_wave_apply.rs", 9),
-    ("preflight_missing_table.rs", 2),
-    ("preflight_target_fail_note.rs", 2),
-    ("quality_live.rs", 1),
-    ("roast_metric_validated_ordering.rs", 2),
-    ("roast_mssql_decimal_scale.rs", 2),
-    ("roast_part_loss.rs", 3),
-    ("roast_pg_json_fidelity.rs", 1),
-    ("roast_small_table_escape.rs", 3),
-    ("roast_validate_exit.rs", 1),
-    ("sec_exit_codes.rs", 1),
-    ("sec_preflight_sqli.rs", 3),
-    ("sec_terminal_inject.rs", 2),
-    ("sec_tls_defaults.rs", 2),
+    // audit_metrics_validates_config_path's SUBJECT is a nonexistent --config
+    // path — a rig owns a real config, so that one raw invocation is the test.
+    ("audit_observability.rs", 1),
+    ("audit_state.rs", 1), // missing-config-path IS the subject
+    // live_cli_flags: the one kept site is `rivet completions bash` — a
+    // config-less subcommand a rig (which OWNS a config) cannot express.
+    ("live_cli_flags.rs", 1),
 ];
 
 fn bespoke_sites(path: &std::path::Path) -> usize {
     let text = std::fs::read_to_string(path).unwrap_or_default();
-    text.matches("Command::new(RIVET_BIN)").count() + text.matches("write_config(").count()
+    // Raw invocations, the shared config-writer, AND hand-rolled yaml source
+    // headers: the run_rivet* helper family spawns RIVET_BIN without either of
+    // the first two tokens, so a file could hand-build a config via fs::write
+    // and stay invisible — the r#"-string source header is the tell.
+    text.matches("Command::new(RIVET_BIN)").count()
+        + text.matches("write_config(").count()
+        + text.matches("r#\"source:").count()
+        + text.matches("r#\"\nsource:").count()
+        // …and the format!-built spelling (plain-string lines joined and
+        // fs::write'"'"'n) — live_keyset_parallel slipped through exactly this
+        // way (r2 bughunt find).
+        + text.matches("format!(\"source:").count()
 }
 
 #[test]

@@ -44,27 +44,12 @@ impl Drop for PgCleanup {
 fn export_doc_column_cell(table_name: &str, prefix: &str) -> String {
     let export_name = unique_name(prefix);
     let out_dir = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        r#"
-source:
-  type: postgres
-  url: "{POSTGRES_URL}"
-exports:
-  - name: {export_name}
-    query: "SELECT id, doc FROM {table_name} ORDER BY id"
-    mode: full
-    format: parquet
-    compression: zstd
-    destination:
-      type: local
-      path: {out_dir}
-"#,
-        out_dir = out_dir.path().display()
-    );
-    let cfg_path = write_config(&cfg_dir, &yaml);
+    let rig = Rig::pg_batch(&export_name)
+        .query(&format!("SELECT id, doc FROM {table_name} ORDER BY id"))
+        .export_line("compression: zstd")
+        .dest_path(out_dir.path().to_path_buf());
 
-    let out = run_rivet_export(&cfg_path, &export_name);
+    let out = rig.run_args(&["--export", &export_name]);
     assert!(
         out.status.success(),
         "rivet exited {}; stderr:\n{}",

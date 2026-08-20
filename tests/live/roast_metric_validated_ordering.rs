@@ -69,39 +69,18 @@ fn roast_metric_validated_matches_final_summary_verdict() {
     let table = seed_pg_numeric_table(50);
     let export = unique_name("roast_metric_order");
     let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
     // `verify: content` + local destination (no store checksum) is the
     // deterministic stage: per-file row validation passes mid-run, then the
     // end-of-run manifest pass fails fatally (ContentVerificationUnmet).
-    let yaml = format!(
-        r#"
-source: {{type: postgres, url: "{POSTGRES_URL}"}}
-exports:
-  - name: {export}
-    query: "SELECT id, name FROM {table_name}"
-    mode: full
-    format: parquet
-    verify: content
-    destination: {{type: local, path: {dir}}}
-"#,
-        table_name = table.name(),
-        dir = out.path().display()
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
+    let rig = Rig::pg_batch(&export)
+        .query(&format!("SELECT id, name FROM {}", table.name()))
+        .export_line("verify: content")
+        .dest_path(out.path().to_path_buf());
+    let cfg = rig.config_path();
 
     // The manifest-verification failure is non-fatal by design (ADR-0001 §I7):
     // the run itself still exits 0.
-    let run = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            &export,
-            "--validate",
-        ])
-        .output()
-        .expect("spawn rivet");
+    let run = rig.run_args(&["--export", &export, "--validate"]);
     assert!(
         run.status.success(),
         "run must succeed (manifest verification failures are non-fatal); stderr:\n{}",

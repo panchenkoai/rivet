@@ -116,16 +116,7 @@ fn keyset_export_records_form_b_checksums_and_validate_passes() {
 
     // (2) validate (default depth Full → runs the Form B re-read) re-reads the
     // parts; the recorded checksums must MATCH.
-    let v = std::process::Command::new(RIVET_BIN)
-        .args([
-            "validate",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            &export,
-        ])
-        .output()
-        .expect("spawn rivet validate");
+    let v = rig.cli(&["validate", "--export", &export]);
     assert!(
         v.status.success(),
         "rivet validate must PASS — the recorded Form B checksums must match the re-read parts; \
@@ -160,15 +151,12 @@ fn a_corrupted_part_fails_validate_on_the_value_checksum() {
     require_alive(LiveService::Postgres);
     let table = seed_pg_numeric_table(500);
     let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = Rig::pg_batch(table.name())
+    let rig = Rig::pg_batch(table.name())
         .mode("chunked")
         .export_line("chunk_by_key: id")
         .export_line("chunk_size: 200")
-        .dest_path(out.path().to_path_buf())
-        .yaml();
-    let cfg = write_config(&cfg_dir, &yaml);
-    let r = run_rivet_env(&["run", "--config", cfg.to_str().unwrap()], &[]);
+        .dest_path(out.path().to_path_buf());
+    let r = rig.run_args(&[]);
     assert!(
         r.status.success(),
         "the export must succeed before anything is corrupted; stderr:\n{}",
@@ -188,16 +176,7 @@ fn a_corrupted_part_fails_validate_on_the_value_checksum() {
         "Form B must be recorded or this test grades nothing: {}",
         manifest["column_checksums"]
     );
-    let clean = std::process::Command::new(RIVET_BIN)
-        .args([
-            "validate",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            table.name(),
-        ])
-        .output()
-        .expect("spawn validate");
+    let clean = rig.cli(&["validate", "--export", table.name()]);
     assert!(
         clean.status.success(),
         "validate must PASS before the tamper, or the failure after it means nothing"
@@ -314,16 +293,7 @@ fn a_corrupted_part_fails_validate_on_the_value_checksum() {
          validate can fail on the count and Form B is never exercised"
     );
 
-    let bad = std::process::Command::new(RIVET_BIN)
-        .args([
-            "validate",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            table.name(),
-        ])
-        .output()
-        .expect("spawn validate");
+    let bad = rig.cli(&["validate", "--export", table.name()]);
     let err = format!(
         "{}{}",
         String::from_utf8_lossy(&bad.stdout),
@@ -523,16 +493,7 @@ fn chunked_export_records_form_b_checksums_and_validate_passes() {
         manifest["column_checksums"]
     );
 
-    let v = std::process::Command::new(RIVET_BIN)
-        .args([
-            "validate",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            &export,
-        ])
-        .output()
-        .expect("spawn rivet validate");
+    let v = rig.cli(&["validate", "--export", &export]);
     assert!(
         v.status.success(),
         "rivet validate must PASS on the chunked export — recorded Form B must match the re-read; \
@@ -586,16 +547,7 @@ fn chunked_checkpoint_export_records_form_b_checksums_and_validate_passes() {
         manifest["column_checksums"]
     );
 
-    let v = std::process::Command::new(RIVET_BIN)
-        .args([
-            "validate",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            &export,
-        ])
-        .output()
-        .expect("spawn rivet validate");
+    let v = rig.cli(&["validate", "--export", &export]);
     assert!(
         v.status.success(),
         "rivet validate must PASS on the checkpoint chunked export — recorded Form B must match; \
@@ -894,17 +846,10 @@ fn keyset_parallel_crash_resume_writes_a_complete_destination_manifest() {
 
     // Run 1: HARD-EXIT (process dies) right after range 0's atomic checkpoint commit
     // — range 0 is durably `done`, ranges 1-3 wrote parts to disk but never committed.
-    let crash = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            &export,
-        ])
-        .env("RIVET_TEST_PANIC_AT", "keyset_parallel_range_committed:0")
-        .output()
-        .expect("spawn rivet");
+    let crash = rig.run_args_env(
+        &["--export", &export],
+        &[("RIVET_TEST_PANIC_AT", "keyset_parallel_range_committed:0")],
+    );
     assert!(
         !crash.status.success(),
         "the injected hard-exit must make run 1 fail"
@@ -1079,17 +1024,10 @@ fn keyset_checkpoint_crash_resume_writes_a_complete_destination_manifest() {
     let cfg = rig.config_path();
 
     // Crash after page 0 commits (300 rows durable, cursor advanced, no manifest).
-    let crash = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            &export,
-        ])
-        .env("RIVET_TEST_PANIC_AT", "after_keyset_page:0")
-        .output()
-        .expect("spawn rivet");
+    let crash = rig.run_args_env(
+        &["--export", &export],
+        &[("RIVET_TEST_PANIC_AT", "after_keyset_page:0")],
+    );
     assert!(!crash.status.success(), "crash run must exit non-zero");
 
     // Resume (keyset checkpoint auto-resumes from the cursor).
@@ -1155,17 +1093,10 @@ fn keyset_checkpoint_crash_in_manifest_window_must_not_duplicate_a_page() {
     let cfg = rig.config_path();
 
     // Crash in the I3 window: page 0's file_log row is written, cursor NOT advanced.
-    let crash = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            &export,
-        ])
-        .env("RIVET_TEST_PANIC_AT", "after_manifest_update")
-        .output()
-        .expect("spawn rivet");
+    let crash = rig.run_args_env(
+        &["--export", &export],
+        &[("RIVET_TEST_PANIC_AT", "after_manifest_update")],
+    );
     assert!(!crash.status.success(), "crash run must exit non-zero");
 
     // Resume (NO panic env) — the cursor was never advanced, so it re-reads page 0.
@@ -1229,7 +1160,7 @@ fn keyset_checkpoint_resume_survives_a_changed_max_file_size_config() {
     .unwrap();
 
     let export = unique_name("keyset_mp_exp");
-    let rig = Rig::mysql_batch(&table)
+    let mut rig = Rig::mysql_batch(&table)
         .export_named(&export)
         .mode("chunked")
         .export_line("chunk_by_key: uid")
@@ -1238,27 +1169,20 @@ fn keyset_checkpoint_resume_survives_a_changed_max_file_size_config() {
         .export_line("max_file_size: 8KB"); // forces each 300-row page to rotate into several parts
     let cfg = rig.config_path();
 
-    let crash = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            &export,
-        ])
-        .env("RIVET_TEST_PANIC_AT", "after_manifest_update")
-        .output()
-        .expect("spawn rivet");
+    let crash = rig.run_args_env(
+        &["--export", &export],
+        &[("RIVET_TEST_PANIC_AT", "after_manifest_update")],
+    );
     assert!(!crash.status.success(), "crash run must exit non-zero");
 
     // RESUME with a DIFFERENT max_file_size so the re-read would rotate the same page into a
     // DIFFERENT number of parts — the exact multi-part-ROTATION the seek_tag+dedup band-aid cannot
     // dedup (the re-read's part paths no longer match the rehydrated ones). Only the v25
     // cursor-atomic reconcile survives it, because it never re-reads the committed page at all.
-    let cfg_text = std::fs::read_to_string(&cfg)
-        .unwrap()
-        .replace("max_file_size: 8KB", "max_file_size: 128KB");
-    std::fs::write(&cfg, cfg_text).unwrap();
+    // Through the rig's sanctioned mutation path — a raw fs::write patch would
+    // now be refused by config_path's hand-edit guard (and was only ever safe
+    // here because the resume ran through a raw helper, not the rig).
+    rig.replace_export_line("max_file_size:", "max_file_size: 128KB");
 
     let resume = run_rivet_export(&cfg, &export);
     assert!(
@@ -1496,17 +1420,10 @@ fn keyset_fresh_run_crash_before_first_page_does_not_skip_the_table() {
     assert_eq!(count1, 1000, "run 1 must export all 1000");
 
     // Run 2: a FRESH run that crashes right after open (no page committed).
-    let crash = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            &export,
-        ])
-        .env("RIVET_TEST_PANIC_AT", "keyset_after_open_before_first_page")
-        .output()
-        .expect("spawn rivet");
+    let crash = rig.run_args_env(
+        &["--export", &export],
+        &[("RIVET_TEST_PANIC_AT", "keyset_after_open_before_first_page")],
+    );
     assert!(!crash.status.success(), "crash run must exit non-zero");
 
     // Run 3: recovery. It MUST re-read all 1000 (total across run1+run3 = 2000).
@@ -1565,17 +1482,10 @@ fn keyset_failure_after_data_complete_does_not_resume_and_skip_on_the_next_run()
 
     // Run 1: commits ALL 1000, then fails AFTER data-completion (a stand-in for a
     // post-data gate rejection). Data-completion has already cleared resume_run_id.
-    let fail = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            &export,
-        ])
-        .env("RIVET_TEST_PANIC_AT", "keyset_after_data_complete")
-        .output()
-        .expect("spawn rivet");
+    let fail = rig.run_args_env(
+        &["--export", &export],
+        &[("RIVET_TEST_PANIC_AT", "keyset_after_data_complete")],
+    );
     assert!(
         !fail.status.success(),
         "the post-data failure must exit non-zero"
@@ -1640,17 +1550,10 @@ fn keyset_incremental_crash_before_finalize_rehydrates_not_orphans_the_manifest(
 
     // Run 1: commits all 1000 pages under R1, then crashes AFTER data-complete but
     // BEFORE finalize_manifest — so NO destination manifest for R1 is written.
-    let crash = std::process::Command::new(RIVET_BIN)
-        .args([
-            "run",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            &export,
-        ])
-        .env("RIVET_TEST_PANIC_AT", "keyset_after_data_complete")
-        .output()
-        .expect("spawn rivet");
+    let crash = rig.run_args_env(
+        &["--export", &export],
+        &[("RIVET_TEST_PANIC_AT", "keyset_after_data_complete")],
+    );
     assert!(!crash.status.success(), "crash run must exit non-zero");
 
     // Run 2 (incremental): must REHYDRATE R1's committed pages into a complete
@@ -2260,16 +2163,7 @@ fn array_columns_reach_the_value_checksum() {
 
     // And the two sides must agree on them: `validate` re-reads the parts and
     // recomputes side B against the recorded side A.
-    let v = std::process::Command::new(RIVET_BIN)
-        .args([
-            "validate",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--export",
-            &export,
-        ])
-        .output()
-        .expect("spawn rivet validate");
+    let v = rig.cli(&["validate", "--export", &export]);
     assert!(
         v.status.success(),
         "validate must re-verify the ARRAY columns' checksums; stderr:\n{}",

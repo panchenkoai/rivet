@@ -53,28 +53,14 @@ fn chunked_min_max_count_do_not_materialise_wrapped_subquery() {
 
     let tmp = tempfile::tempdir().expect("tmpdir");
     let out_dir = tmp.path().join("out");
-    let yaml = format!(
-        r#"source:
-  type: postgres
-  url: "{POSTGRES_URL}"
+    let rig = Rig::pg_batch(&format!("public.{}", tbl.name()))
+        .export_named("no_wrap_spill")
+        .mode("chunked")
+        .export_line("chunk_size: 5000")
+        .export_line("compression: snappy")
+        .dest_path(out_dir.clone());
 
-exports:
-  - name: no_wrap_spill
-    table: public.{name}
-    mode: chunked
-    chunk_size: 5000
-    format: parquet
-    compression: snappy
-    destination:
-      type: local
-      path: {out}
-"#,
-        name = tbl.name(),
-        out = out_dir.display(),
-    );
-    let cfg = write_config(&tmp, &yaml);
-
-    let out = run_rivet(&["run", "-c", cfg.to_str().unwrap()]);
+    let out = rig.run_args(&[]);
     assert!(
         out.status.success(),
         "chunked run must succeed:\n\

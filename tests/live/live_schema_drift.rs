@@ -61,25 +61,15 @@ fn schema_drift_added_column_is_detected_and_second_run_succeeds() {
 
     let export_name = unique_name("qa71_add_exp");
     let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        r#"
-source: {{type: postgres, url: "{POSTGRES_URL}"}}
-exports:
-  - name: {export_name}
-    # `SELECT *` so adding a column widens the schema observed by rivet.
-    query: "SELECT * FROM {table_name}"
-    mode: full
-    format: parquet
-    destination: {{type: local, path: {dir}}}
-"#,
-        dir = out.path().display()
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
+    let rig = Rig::pg_batch(&export_name)
+        .query(&format!("SELECT * FROM {table_name}"))
+        .mode("full")
+        .dest_path(out.path().to_path_buf());
+    let cfg = rig.config_path();
 
     // Run #1 — baseline schema (id, name).
     assert!(
-        run_rivet_export(&cfg, &export_name).status.success(),
+        rig.run_args(&["--export", &export_name]).status.success(),
         "run 1"
     );
 
@@ -94,7 +84,7 @@ exports:
     // mask exactly that regression (matrix audit: sleep-masked class).
 
     // Run #2 — schema has drifted.  Must complete successfully.
-    let r2 = run_rivet_export(&cfg, &export_name);
+    let r2 = rig.run_args(&["--export", &export_name]);
     assert!(
         r2.status.success(),
         "second run must survive an added column; stderr:\n{}",
@@ -131,23 +121,14 @@ fn schema_drift_removed_column_is_detected() {
 
     let export_name = unique_name("qa71_rm_exp");
     let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        r#"
-source: {{type: postgres, url: "{POSTGRES_URL}"}}
-exports:
-  - name: {export_name}
-    query: "SELECT * FROM {table_name}"
-    mode: full
-    format: parquet
-    destination: {{type: local, path: {dir}}}
-"#,
-        dir = out.path().display()
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
+    let rig = Rig::pg_batch(&export_name)
+        .query(&format!("SELECT * FROM {table_name}"))
+        .mode("full")
+        .dest_path(out.path().to_path_buf());
+    let cfg = rig.config_path();
 
     assert!(
-        run_rivet_export(&cfg, &export_name).status.success(),
+        rig.run_args(&["--export", &export_name]).status.success(),
         "run 1"
     );
 
@@ -157,7 +138,7 @@ exports:
     // back-to-back sub-second runs must not collide — sleeping here would
     // mask exactly that regression (matrix audit: sleep-masked class).
 
-    let r2 = run_rivet_export(&cfg, &export_name);
+    let r2 = rig.run_args(&["--export", &export_name]);
     assert!(
         r2.status.success(),
         "second run must survive a removed column; stderr:\n{}",
@@ -194,33 +175,23 @@ fn keyset_export_enforces_on_schema_drift_fail() {
 
     let export_name = unique_name("keyset_drift_exp");
     let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        r#"
-source: {{type: postgres, url: "{POSTGRES_URL}"}}
-exports:
-  - name: {export_name}
-    table: {table_name}
-    mode: chunked
-    chunk_by_key: k
-    chunk_size: 2
-    on_schema_drift: fail
-    format: parquet
-    destination: {{type: local, path: {dir}}}
-"#,
-        dir = out.path().display()
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
+    let rig = Rig::pg_batch(&table_name)
+        .export_named(&export_name)
+        .mode("chunked")
+        .export_line("chunk_by_key: k")
+        .export_line("chunk_size: 2")
+        .export_line("on_schema_drift: fail")
+        .dest_path(out.path().to_path_buf());
 
     assert!(
-        run_rivet_export(&cfg, &export_name).status.success(),
+        rig.run_args(&["--export", &export_name]).status.success(),
         "run 1 (records the schema) must succeed"
     );
 
     c.batch_execute(&format!("ALTER TABLE {table_name} DROP COLUMN tmp_col;"))
         .unwrap();
 
-    let r2 = run_rivet_export(&cfg, &export_name);
+    let r2 = rig.run_args(&["--export", &export_name]);
     assert!(
         !r2.status.success(),
         "a keyset export with `on_schema_drift: fail` must FAIL (exit 4) on a dropped \
@@ -255,34 +226,24 @@ fn keyset_parallel_export_enforces_on_schema_drift_fail() {
 
     let export_name = unique_name("keyset_par_drift_exp");
     let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        r#"
-source: {{type: postgres, url: "{POSTGRES_URL}"}}
-exports:
-  - name: {export_name}
-    table: {table_name}
-    mode: chunked
-    chunk_by_key: k
-    parallel: 4
-    chunk_size: 3
-    on_schema_drift: fail
-    format: parquet
-    destination: {{type: local, path: {dir}}}
-"#,
-        dir = out.path().display()
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
+    let rig = Rig::pg_batch(&table_name)
+        .export_named(&export_name)
+        .mode("chunked")
+        .export_line("chunk_by_key: k")
+        .export_line("parallel: 4")
+        .export_line("chunk_size: 3")
+        .export_line("on_schema_drift: fail")
+        .dest_path(out.path().to_path_buf());
 
     assert!(
-        run_rivet_export(&cfg, &export_name).status.success(),
+        rig.run_args(&["--export", &export_name]).status.success(),
         "run 1 (records the schema) must succeed"
     );
 
     c.batch_execute(&format!("ALTER TABLE {table_name} DROP COLUMN tmp_col;"))
         .unwrap();
 
-    let r2 = run_rivet_export(&cfg, &export_name);
+    let r2 = rig.run_args(&["--export", &export_name]);
     assert!(
         !r2.status.success(),
         "a PARALLEL keyset export with `on_schema_drift: fail` must FAIL (exit 4) on a dropped \
@@ -311,32 +272,22 @@ fn chunked_range_export_enforces_on_schema_drift_fail() {
 
     let export_name = unique_name("chunked_drift_exp");
     let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
     // Integer chunk_column → RANGE chunking (the chunked runner, not keyset).
-    let yaml = format!(
-        r#"
-source: {{type: postgres, url: "{POSTGRES_URL}"}}
-exports:
-  - name: {export_name}
-    table: {table_name}
-    mode: chunked
-    chunk_column: id
-    chunk_size: 2
-    on_schema_drift: fail
-    format: parquet
-    destination: {{type: local, path: {dir}}}
-"#,
-        dir = out.path().display()
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
+    let rig = Rig::pg_batch(&table_name)
+        .export_named(&export_name)
+        .mode("chunked")
+        .export_line("chunk_column: id")
+        .export_line("chunk_size: 2")
+        .export_line("on_schema_drift: fail")
+        .dest_path(out.path().to_path_buf());
 
     assert!(
-        run_rivet_export(&cfg, &export_name).status.success(),
+        rig.run_args(&["--export", &export_name]).status.success(),
         "run 1 (records the schema) must succeed"
     );
     c.batch_execute(&format!("ALTER TABLE {table_name} DROP COLUMN tmp_col;"))
         .unwrap();
-    let r2 = run_rivet_export(&cfg, &export_name);
+    let r2 = rig.run_args(&["--export", &export_name]);
     assert!(
         !r2.status.success(),
         "a chunked (range) export with `on_schema_drift: fail` must FAIL on a dropped column; \
@@ -354,29 +305,19 @@ fn stable_schema_across_runs_reports_no_drift() {
     let table = seed_pg_numeric_table(5);
     let export_name = unique_name("qa71_stable");
     let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        r#"
-source: {{type: postgres, url: "{POSTGRES_URL}"}}
-exports:
-  - name: {export_name}
-    query: "SELECT id, name, amount FROM {table_name}"
-    mode: full
-    format: parquet
-    columns:
-      amount: "decimal(12,2)"
-    destination: {{type: local, path: {dir}}}
-"#,
-        table_name = table.name(),
-        dir = out.path().display()
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
+    let rig = Rig::pg_batch(&export_name)
+        .query(&format!("SELECT id, name, amount FROM {}", table.name()))
+        .mode("full")
+        .export_line("columns:")
+        .export_line("  amount: \"decimal(12,2)\"")
+        .dest_path(out.path().to_path_buf());
+    let cfg = rig.config_path();
 
-    assert!(run_rivet_export(&cfg, &export_name).status.success());
+    assert!(rig.run_args(&["--export", &export_name]).status.success());
     // No sleep: parts and run_ids are millisecond-stamped (`%3f`), so
     // back-to-back sub-second runs must not collide — sleeping here would
     // mask exactly that regression (matrix audit: sleep-masked class).
-    assert!(run_rivet_export(&cfg, &export_name).status.success());
+    assert!(rig.run_args(&["--export", &export_name]).status.success());
 
     let state_db = cfg.parent().unwrap().join(".rivet_state.db");
     assert_eq!(

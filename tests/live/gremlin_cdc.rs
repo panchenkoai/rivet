@@ -299,39 +299,19 @@ fn gremlin_cdc_gcs_upload_cut_fails_loud_then_recovers_without_clobber() {
     ensure_gcs_bucket(bucket);
     let prefix = unique_name("gremlin");
     let ckpt = d.path().join("cdc.ckpt");
-    let cfg_for = |d: &tempfile::TempDir, endpoint: &str| {
-        let yaml = format!(
-            r#"source: {{type: mysql, url: "{MYSQL_CDC_URL}"}}
-exports:
-  - name: {tbl}
-    table: {tbl}
-    mode: cdc
-    format: parquet
-    cdc: {{ checkpoint: "{ckpt}", until_current: true, server_id: {sid}, rollover: 200 }}
-    destination:
-      type: gcs
-      bucket: {bucket}
-      prefix: {prefix}
-      endpoint: {endpoint}
-      allow_anonymous: true
-"#,
-            ckpt = ckpt.display(),
-            sid = server_id_for(&tbl),
-        );
-        write_config(d, &yaml)
+    let rig_for = |endpoint: &str| {
+        Rig::mysql_cdc(&tbl)
+            .checkpoint_path(ckpt.clone())
+            .cdc_line("rollover: 200")
+            .dest_gcs(bucket, &prefix, endpoint)
     };
 
     // Pin through the healthy proxy, seed, then cut uploads after 128 KB.
+    // (This test predates the rig's cloud destinations and carried a
+    // "hand-rolled on purpose" note; dest_gcs made that limit obsolete.)
     let proxied = "http://127.0.0.1:14443";
-    let cfg = cfg_for(&d, proxied);
-    // Hand-rolled config on purpose: this test writes to GCS through a proxied
-    // endpoint, and the rig renders only `type: local` destinations. Adding
-    // cloud destinations to the seam for one test would be speculative; the gap
-    // is named here so the next reader knows it is a limit, not an oversight.
-    let st = std::process::Command::new(RIVET_BIN)
-        .args(["run", "--config", cfg.to_str().unwrap()])
-        .status()
-        .unwrap();
+    let rig = rig_for(proxied);
+    let st = rig.run_args(&[]).status;
     assert!(st.success(), "pin run through the healthy proxy");
     seed_backlog(&mut c, &tbl, 3_000);
     // A per-connection limit_data is DEFEATED by the destination retry layer
@@ -339,12 +319,7 @@ exports:
     // observed live). The honest mid-drain destination fault is a hard outage:
     // disable the proxy once the first part is up, so every retry is refused
     // and the run must fail loudly.
-    let mut child = std::process::Command::new(RIVET_BIN)
-        .args(["run", "--config", cfg.to_str().unwrap()])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .unwrap();
+    let mut child = rig.spawn_args_env(&[], &[]);
     let first_part_up = |prefix: &str| -> bool {
         reqwest::blocking::get(format!(
             "{FAKE_GCS_ENDPOINT}/storage/v1/b/{bucket}/o?prefix={prefix}"
@@ -374,7 +349,7 @@ exports:
     // Heal (direct endpoint) and retry until every id is present in the union
     // of GCS parts; a clobbered part would show up as a GAP in the union.
     toxi_reset_toxics("fake_gcs_gremlin");
-    let cfg_direct = cfg_for(&d, FAKE_GCS_ENDPOINT);
+    let rig_direct = rig_for(FAKE_GCS_ENDPOINT);
     let list_ids = || -> std::collections::HashSet<i64> {
         // Pull every parquet object under the prefix into a temp dir, reuse
         // the local reader.
@@ -407,10 +382,7 @@ exports:
         distinct_ids(tmp.path())
     };
     for _ in 0..5 {
-        let st = std::process::Command::new(RIVET_BIN)
-            .args(["run", "--config", cfg_direct.to_str().unwrap()])
-            .status()
-            .unwrap();
+        let st = rig_direct.run_args(&[]).status;
         assert!(st.success(), "post-heal run must succeed");
         if list_ids().len() >= 3_000 {
             break;

@@ -668,6 +668,14 @@ fn enum_variants(rel: &str, enum_name: &str) -> HashSet<String> {
 
 /// [`enum_variants`] lowercased — `SourceType::Postgres` → `"postgres"`,
 /// `ExportTarget::DuckDb` → `"duckdb"`, matching the matrix column labels exactly.
+/// The SourceType enum's variants, lowercased — for sibling matrix guards that
+/// hand-list engine columns and must fail if that list drifts from the enum
+/// (r5 bughunt: perf/release-gate hand-typed `const ENGINES` was ungoverned by
+/// the generative column check, which only iterates the non-EXEMPT MATRICES).
+pub(crate) fn source_engine_variants() -> HashSet<String> {
+    enum_variants_lowercased("src/config/source.rs", "SourceType")
+}
+
 fn enum_variants_lowercased(rel: &str, enum_name: &str) -> HashSet<String> {
     enum_variants(rel, enum_name)
         .into_iter()

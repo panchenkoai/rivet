@@ -1732,34 +1732,22 @@ fn stand_format_csv_mssql() {
 }
 
 /// `source.environment: local` → the tuning profile defaults to `fast`; the run
-/// summary names the env-derived profile on stderr. Source-level, so raw YAML
-/// (the Rig has no environment knob). PG is covered in live_catalog_hints.
+/// summary names the env-derived profile on stderr. Through the rig's
+/// source_line (the "Rig has no environment knob" era ended with it). PG is
+/// covered in live_catalog_hints.
 fn run_environment_profile(eng: Eng) {
     eng.require();
     let (table, _guard) = seed_dense(eng, 50);
-    let (src, tbl_ref) = match eng {
-        Eng::My => (
-            format!("source:\n  type: mysql\n  url: \"{MYSQL_URL}\"\n  environment: local"),
-            table.clone(),
-        ),
-        Eng::Ms => (
-            format!(
-                "source:\n  type: mssql\n  url: \"{MSSQL_URL}\"\n  tls:\n    \
-                 accept_invalid_certs: true\n  environment: local"
-            ),
-            format!("dbo.{table}"),
-        ),
-        Eng::Pg => unreachable!("PG environment→profile is covered in live_catalog_hints"),
-    };
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let out_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        "{src}\nexports:\n  - name: env_prof\n    table: {tbl_ref}\n    mode: full\n    \
-         format: parquet\n    destination: {{ type: local, path: {out} }}\n",
-        out = out_dir.path().display(),
+    assert!(
+        !matches!(eng, Eng::Pg),
+        "PG environment→profile is covered in live_catalog_hints"
     );
-    let cfg = write_config(&cfg_dir, &yaml);
-    let out = run_rivet_with_warn_log(&["run", "-c", cfg.to_str().unwrap()]);
+    let rig = eng
+        .rig(&table)
+        .source_line("environment: local")
+        .export_named("env_prof")
+        .mode("full");
+    let out = rig.run_args_env(&[], &[("RUST_LOG", "warn")]);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         out.status.success(),
@@ -1800,27 +1788,6 @@ fn run_codec_matrix(eng: Eng) {
     }
 }
 
-/// The source YAML block + the table reference for `eng` (for raw-YAML tests that
-/// the Rig can't render — cloud destinations, environment).
-fn source_block(eng: Eng, table: &str) -> (String, String) {
-    match eng {
-        Eng::Pg => (
-            format!("source:\n  type: postgres\n  url: \"{POSTGRES_URL}\""),
-            format!("public.{table}"),
-        ),
-        Eng::My => (
-            format!("source:\n  type: mysql\n  url: \"{MYSQL_URL}\""),
-            table.to_string(),
-        ),
-        Eng::Ms => (
-            format!(
-                "source:\n  type: mssql\n  url: \"{MSSQL_URL}\"\n  tls:\n    accept_invalid_certs: true"
-            ),
-            format!("dbo.{table}"),
-        ),
-    }
-}
-
 /// Count `.parquet` objects fake-gcs holds under `bucket/prefix` (its JSON list API).
 fn count_gcs_parquet(bucket: &str, prefix: &str) -> usize {
     use std::io::{Read, Write};
@@ -1839,21 +1806,15 @@ fn run_dest_gcs(eng: Eng) {
     eng.require();
     require_alive(LiveService::FakeGcs);
     let (table, _guard) = seed_dense(eng, 100);
-    let (src, tbl) = source_block(eng, &table);
     let bucket = "rivet-qa-stand-gcs";
     ensure_gcs_bucket(bucket);
     let prefix = unique_name("stand_gcs");
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        "{src}\nexports:\n  - name: cg\n    table: {tbl}\n    mode: full\n    format: parquet\n    \
-         destination:\n      type: gcs\n      bucket: {bucket}\n      prefix: {prefix}\n      \
-         endpoint: {FAKE_GCS_ENDPOINT}\n      allow_anonymous: true\n"
+    let rig = eng.rig(&table).export_named("cg").mode("full").dest_gcs(
+        bucket,
+        &prefix,
+        FAKE_GCS_ENDPOINT,
     );
-    let cfg = write_config(&cfg_dir, &yaml);
-    let out = run_rivet_env(
-        &["run", "--config", cfg.to_str().unwrap()],
-        &[("RUST_LOG", "warn")],
-    );
+    let out = rig.run_args_env(&[], &[("RUST_LOG", "warn")]);
     assert!(
         out.status.success(),
         "gcs run failed; stderr:\n{}",
@@ -1875,20 +1836,16 @@ fn run_dest_s3(eng: Eng) {
     eng.require();
     require_alive(LiveService::Minio);
     let (table, _guard) = seed_dense(eng, 100);
-    let (src, tbl) = source_block(eng, &table);
     let bucket = "rivet-qa-stand-s3";
     ensure_minio_bucket(bucket);
     let prefix = unique_name("stand_s3");
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        "{src}\nexports:\n  - name: cs\n    table: {tbl}\n    mode: full\n    format: parquet\n    \
-         destination:\n      type: s3\n      bucket: {bucket}\n      prefix: {prefix}\n      \
-         region: us-east-1\n      endpoint: {MINIO_ENDPOINT}\n      \
-         access_key_env: RIVET_TEST_MINIO_AK\n      secret_key_env: RIVET_TEST_MINIO_SK\n"
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
-    let out = run_rivet_env(
-        &["run", "--config", cfg.to_str().unwrap()],
+    let rig =
+        eng.rig(&table)
+            .export_named("cs")
+            .mode("full")
+            .dest_s3(bucket, &prefix, MINIO_ENDPOINT);
+    let out = rig.run_args_env(
+        &[],
         &[
             ("RIVET_TEST_MINIO_AK", MINIO_ACCESS_KEY),
             ("RIVET_TEST_MINIO_SK", MINIO_SECRET_KEY),
@@ -1933,20 +1890,16 @@ fn run_dest_azure(eng: Eng) {
     eng.require();
     require_alive(LiveService::Azurite);
     let (table, _guard) = seed_dense(eng, 100);
-    let (src, tbl) = source_block(eng, &table);
     let container = unique_name("stand-az").to_lowercase().replace('_', "-");
     ensure_azure_container(&container);
     let prefix = unique_name("stand_az");
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        "{src}\nexports:\n  - name: ca\n    table: {tbl}\n    mode: full\n    format: parquet\n    \
-         destination:\n      type: azure\n      bucket: {container}\n      prefix: {prefix}\n      \
-         account_name: {AZURITE_ACCOUNT}\n      account_key_env: RIVET_TEST_AZURITE_KEY\n      \
-         endpoint: {AZURITE_ENDPOINT}\n"
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
-    let out = run_rivet_env(
-        &["run", "--config", cfg.to_str().unwrap()],
+    let rig = eng
+        .rig(&table)
+        .export_named("ca")
+        .mode("full")
+        .dest_azure(&container, &prefix);
+    let out = rig.run_args_env(
+        &[],
         &[
             ("RIVET_TEST_AZURITE_KEY", AZURITE_KEY),
             ("RUST_LOG", "warn"),
@@ -2076,21 +2029,15 @@ fn stand_dest_gcs_mongo() {
     require_alive(LiveService::Mongo);
     require_alive(LiveService::FakeGcs);
     let db = mongo_seed(100);
-    let url = MongoTest::url(MONGO_PORT, &db);
     let bucket = "rivet-qa-stand-gcs";
     ensure_gcs_bucket(bucket);
     let prefix = unique_name("stand_gcs_mg");
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        "source:\n  type: mongo\n  url: \"{url}\"\nexports:\n  - name: cg\n    table: c\n    \
-         mode: full\n    format: parquet\n    destination:\n      type: gcs\n      bucket: {bucket}\n      \
-         prefix: {prefix}\n      endpoint: {FAKE_GCS_ENDPOINT}\n      allow_anonymous: true\n"
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
-    let out = run_rivet_env(
-        &["run", "--config", cfg.to_str().unwrap()],
-        &[("RUST_LOG", "warn")],
-    );
+    let rig = Rig::mongo_batch("c")
+        .source_url(&MongoTest::url(MONGO_PORT, &db))
+        .export_named("cg")
+        .mode("full")
+        .dest_gcs(bucket, &prefix, FAKE_GCS_ENDPOINT);
+    let out = rig.run_args_env(&[], &[("RUST_LOG", "warn")]);
     assert!(
         out.status.success(),
         "mongo gcs run failed; stderr:\n{}",
@@ -2113,20 +2060,16 @@ fn stand_dest_s3_mongo() {
     require_alive(LiveService::Mongo);
     require_alive(LiveService::Minio);
     let db = mongo_seed(100);
-    let url = MongoTest::url(MONGO_PORT, &db);
     let bucket = "rivet-qa-stand-s3";
     ensure_minio_bucket(bucket);
     let prefix = unique_name("stand_s3_mg");
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        "source:\n  type: mongo\n  url: \"{url}\"\nexports:\n  - name: cs\n    table: c\n    \
-         mode: full\n    format: parquet\n    destination:\n      type: s3\n      bucket: {bucket}\n      \
-         prefix: {prefix}\n      region: us-east-1\n      endpoint: {MINIO_ENDPOINT}\n      \
-         access_key_env: RIVET_TEST_MINIO_AK\n      secret_key_env: RIVET_TEST_MINIO_SK\n"
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
-    let out = run_rivet_env(
-        &["run", "--config", cfg.to_str().unwrap()],
+    let rig = Rig::mongo_batch("c")
+        .source_url(&MongoTest::url(MONGO_PORT, &db))
+        .export_named("cs")
+        .mode("full")
+        .dest_s3(bucket, &prefix, MINIO_ENDPOINT);
+    let out = rig.run_args_env(
+        &[],
         &[
             ("RIVET_TEST_MINIO_AK", MINIO_ACCESS_KEY),
             ("RIVET_TEST_MINIO_SK", MINIO_SECRET_KEY),

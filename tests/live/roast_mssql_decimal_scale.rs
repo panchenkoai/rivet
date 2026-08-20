@@ -73,30 +73,13 @@ fn roast_mssql_decimal_scale_survives_all_null_first_batch() {
 
     let export_name = unique_name("roast_dec_freeze_run");
     let out_dir = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
     // No `columns:` override for `amount` — the bug lives in the autodetect
     // (scale-inference) path; an override would mask it.
-    let yaml = format!(
-        r#"
-source:
-  type: mssql
-  url: "{MSSQL_URL}"
-  tls:
-    accept_invalid_certs: true
-exports:
-  - name: {export_name}
-    query: "SELECT id, amount FROM {table_name} ORDER BY id"
-    mode: full
-    format: parquet
-    destination:
-      type: local
-      path: {out_dir}
-"#,
-        out_dir = out_dir.path().display()
-    );
-    let cfg_path = write_config(&cfg_dir, &yaml);
+    let rig = Rig::mssql_batch(&export_name)
+        .query(&format!("SELECT id, amount FROM {table_name} ORDER BY id"))
+        .dest_path(out_dir.path().to_path_buf());
 
-    let out = run_rivet_export(&cfg_path, &export_name);
+    let out = rig.run_args(&["--export", &export_name]);
     assert!(
         out.status.success(),
         "mssql decimal export must succeed:\nstdout:\n{}\nstderr:\n{}",
@@ -176,27 +159,10 @@ fn mssql_batch_datetimeoffset_exports_the_utc_instant() {
 
     let export_name = unique_name("dto_batch_run");
     let out_dir = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        r#"
-source:
-  type: mssql
-  url: "{MSSQL_URL}"
-  tls:
-    accept_invalid_certs: true
-exports:
-  - name: {export_name}
-    query: "SELECT id, dto FROM {table_name}"
-    mode: full
-    format: parquet
-    destination:
-      type: local
-      path: {out_dir}
-"#,
-        out_dir = out_dir.path().display()
-    );
-    let cfg_path = write_config(&cfg_dir, &yaml);
-    let out = run_rivet_export(&cfg_path, &export_name);
+    let rig = Rig::mssql_batch(&export_name)
+        .query(&format!("SELECT id, dto FROM {table_name}"))
+        .dest_path(out_dir.path().to_path_buf());
+    let out = rig.run_args(&["--export", &export_name]);
     assert!(
         out.status.success(),
         "datetimeoffset export must not fail:\nstderr:\n{}",

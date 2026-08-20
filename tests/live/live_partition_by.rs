@@ -90,27 +90,13 @@ fn partition_by_day_splits_into_hive_dirs_with_null_bucket() {
 
     let export = unique_name("ci_part");
     let out_dir = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        r#"
-source:
-  type: postgres
-  url: "{POSTGRES_URL}"
-exports:
-  - name: {export}
-    query: "SELECT id, created_at FROM {table}"
-    partition_by: created_at
-    partition_granularity: day
-    format: parquet
-    destination:
-      type: local
-      path: {out}/{{partition}}
-"#,
-        out = out_dir.path().display()
-    );
-    let cfg_path = write_config(&cfg_dir, &yaml);
+    let rig = Rig::pg_batch(&export)
+        .query(&format!("SELECT id, created_at FROM {table}"))
+        .export_line("partition_by: created_at")
+        .export_line("partition_granularity: day")
+        .dest_path(out_dir.path().join("{partition}"));
 
-    let result = run_rivet_export(&cfg_path, &export);
+    let result = rig.run_args(&["--export", &export]);
     assert!(
         result.status.success(),
         "partitioned run failed: {}",
@@ -185,27 +171,13 @@ fn partition_by_month_granularity_buckets_by_month() {
 
     let export = unique_name("ci_mon");
     let out_dir = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        r#"
-source:
-  type: postgres
-  url: "{POSTGRES_URL}"
-exports:
-  - name: {export}
-    query: "SELECT id, d FROM {table}"
-    partition_by: d
-    partition_granularity: month
-    format: parquet
-    destination:
-      type: local
-      path: {out}/{{partition}}
-"#,
-        out = out_dir.path().display()
-    );
-    let cfg_path = write_config(&cfg_dir, &yaml);
+    let rig = Rig::pg_batch(&export)
+        .query(&format!("SELECT id, d FROM {table}"))
+        .export_line("partition_by: d")
+        .export_line("partition_granularity: month")
+        .dest_path(out_dir.path().join("{partition}"));
 
-    let result = run_rivet_export(&cfg_path, &export);
+    let result = rig.run_args(&["--export", &export]);
     assert!(
         result.status.success(),
         "month-partitioned run failed: {}",
@@ -240,30 +212,16 @@ fn partition_by_with_chunked_mode_preserves_row_counts() {
 
     let export = unique_name("ci_pc");
     let out_dir = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        r#"
-source:
-  type: postgres
-  url: "{POSTGRES_URL}"
-exports:
-  - name: {export}
-    query: "SELECT id, created_at FROM {table}"
-    partition_by: created_at
-    partition_granularity: day
-    mode: chunked
-    chunk_column: id
-    chunk_size: 2
-    format: parquet
-    destination:
-      type: local
-      path: {out}/{{partition}}
-"#,
-        out = out_dir.path().display()
-    );
-    let cfg_path = write_config(&cfg_dir, &yaml);
+    let rig = Rig::pg_batch(&export)
+        .query(&format!("SELECT id, created_at FROM {table}"))
+        .mode("chunked")
+        .export_line("partition_by: created_at")
+        .export_line("partition_granularity: day")
+        .export_line("chunk_column: id")
+        .export_line("chunk_size: 2")
+        .dest_path(out_dir.path().join("{partition}"));
 
-    let result = run_rivet_export(&cfg_path, &export);
+    let result = rig.run_args(&["--export", &export]);
     assert!(
         result.status.success(),
         "chunked+partition run failed: {}",
@@ -296,27 +254,13 @@ fn partition_by_rejects_missing_token() {
 
     let export = unique_name("ci_notok");
     let out_dir = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
     // No {partition} token in the destination — must be refused up front.
-    let yaml = format!(
-        r#"
-source:
-  type: postgres
-  url: "{POSTGRES_URL}"
-exports:
-  - name: {export}
-    query: "SELECT id, created_at FROM {table}"
-    partition_by: created_at
-    format: parquet
-    destination:
-      type: local
-      path: {out}
-"#,
-        out = out_dir.path().display()
-    );
-    let cfg_path = write_config(&cfg_dir, &yaml);
+    let rig = Rig::pg_batch(&export)
+        .query(&format!("SELECT id, created_at FROM {table}"))
+        .export_line("partition_by: created_at")
+        .dest_path(out_dir.path().to_path_buf());
 
-    let result = run_rivet_export(&cfg_path, &export);
+    let result = rig.run_args(&["--export", &export]);
     assert!(
         !result.status.success(),
         "run without a {{partition}} token must fail"

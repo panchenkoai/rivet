@@ -34,6 +34,18 @@ use crate::common::*;
 // ─── Test helpers ─────────────────────────────────────────────────────────────
 
 fn open_state_db(cfg: &std::path::Path) -> rusqlite::Connection {
+    // This test's ORACLE is the SQLite state file — valid only if rivet wrote
+    // SQLite. The harness only ADDS env (no env_clear), so an ambient
+    // RIVET_STATE_URL=postgres would route rivet's state to Postgres while this
+    // reads a fresh empty .rivet_state.db (silent wrong verdict). Assert the
+    // precondition loudly (r7 bughunt; the un-migrated sibling of the parity
+    // tests' RIVET_STATE_URL pin). No-op under default CI (var unset).
+    assert!(
+        std::env::var("RIVET_STATE_URL").map_or(true, |u| !u.starts_with("postgres")),
+        "recovery test reads the SQLite .rivet_state.db, but RIVET_STATE_URL \
+         points at Postgres — rivet wrote its state there, not to this file. \
+         Unset RIVET_STATE_URL for the crash/chunked-recovery suite."
+    );
     let db = cfg.parent().unwrap().join(".rivet_state.db");
     rusqlite::Connection::open(db).expect("open state db")
 }
@@ -722,8 +734,9 @@ fn chunked_checkpoint_resume_suppresses_form_b_so_validate_does_not_false_fail()
                           cfg_dir: &tempfile::TempDir,
                           parallel: u32| {
         // Caller-owned dir: a Rig owns its tempdir, so returning rig.config_path()
-        // from this closure would drop the rig and delete the config. Keep yaml().
-        let yaml = Rig::pg_batch(export)
+        // from this closure would drop the rig and delete the config — config_in
+        // materializes into the caller's dir instead.
+        Rig::pg_batch(export)
             .query(&format!("SELECT id, name FROM {table_name}"))
             .mode("chunked")
             .export_line("chunk_column: id")
@@ -731,8 +744,7 @@ fn chunked_checkpoint_resume_suppresses_form_b_so_validate_does_not_false_fail()
             .export_line("chunk_checkpoint: true")
             .export_line(&format!("parallel: {parallel}"))
             .dest_path(out.to_path_buf())
-            .yaml();
-        write_config(cfg_dir, &yaml)
+            .config_in(cfg_dir.path())
     };
     let validate = |cfg: &std::path::Path, export: &str| {
         run_rivet_env(
@@ -878,7 +890,7 @@ fn parallel_chunked_crash_after_chunk_file_stuck_running_resume_reruns_chunk() {
     let table = seed_pg_numeric_table(ROW_COUNT);
     let export = unique_name("c4_parallel_stuck_running");
     let out = tempfile::tempdir().unwrap();
-    let rig = Rig::pg_batch(&export)
+    let mut rig = Rig::pg_batch(&export)
         .query(&format!(
             r#"SELECT id, name FROM {table_name}"#,
             table_name = table.name()
@@ -925,8 +937,11 @@ fn parallel_chunked_crash_after_chunk_file_stuck_running_resume_reruns_chunk() {
     // reset_stale_running_chunk_tasks works regardless of whether the resume
     // worker count matches the crash worker count.
     // yaml() borrows, so the variant config comes from the rig itself.
-    let yaml_resume = rig.yaml().replace("parallel: 1", "parallel: 2");
-    std::fs::write(&cfg, yaml_resume).expect("rewrite config for resume");
+    // Mutate the RIG, not the file: every rig run re-renders the config, so a
+    // hand-written patch would be silently clobbered by the next run_args and
+    // the resume would run with the ORIGINAL worker count while looking
+    // patched (bughunt find; config_path now refuses hand-edits loudly).
+    rig.replace_export_line("parallel:", "parallel: 2");
 
     let resume = rig.run_args(&["--export", &export, "--resume"]);
     assert!(

@@ -85,27 +85,18 @@ fn task_9_1_moderate_dataset_exports_within_time_budget() {
 
     let export_name = unique_name("qa91_moderate");
     let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        r#"
-source: {{type: postgres, url: "{POSTGRES_URL}"}}
-exports:
-  - name: {export_name}
-    query: "SELECT id, name, amount, created_at, payload FROM {table}"
-    mode: full
-    format: parquet
-    compression: zstd
-    columns:
-      amount: "decimal(12,2)"
-    destination: {{type: local, path: {dir}}}
-    tuning: {{batch_size: 500}}
-"#,
-        dir = out.path().display()
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
+    let rig = Rig::pg_batch(&export_name)
+        .query(&format!(
+            "SELECT id, name, amount, created_at, payload FROM {table}"
+        ))
+        .export_line("compression: zstd")
+        .export_line("columns:")
+        .export_line("  amount: \"decimal(12,2)\"")
+        .export_line("tuning: {batch_size: 500}")
+        .dest_path(out.path().to_path_buf());
 
     let t0 = Instant::now();
-    let out_run = run_rivet_export(&cfg, &export_name);
+    let out_run = rig.run_args(&["--export", &export_name]);
     let elapsed = t0.elapsed();
 
     assert!(
@@ -145,32 +136,21 @@ fn task_9_1_split_by_size_produces_multiple_files_and_no_row_loss() {
 
     let export_name = unique_name("qa91_split");
     let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        r#"
-source: {{type: postgres, url: "{POSTGRES_URL}"}}
-exports:
-  - name: {export_name}
-    query: "SELECT id, name, amount, payload FROM {table}"
-    mode: full
-    format: parquet
-    compression: none  # deterministic size → deterministic split count
-    max_file_size: 64KB
-    columns:
-      amount: "decimal(12,2)"
-    # Small row groups so Parquet flushes to disk during the run:
-    # bytes_written() only counts completed row groups, not the in-progress one.
-    parquet:
-      row_group_strategy: fixed_rows
-      row_group_rows: 100
-    destination: {{type: local, path: {dir}}}
-    tuning: {{batch_size: 250}}
-"#,
-        dir = out.path().display()
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
+    let rig = Rig::pg_batch(&export_name)
+        .query(&format!("SELECT id, name, amount, payload FROM {table}"))
+        .export_line("compression: none # deterministic size -> deterministic split count")
+        .export_line("max_file_size: 64KB")
+        .export_line("columns:")
+        .export_line("  amount: \"decimal(12,2)\"")
+        // Small row groups so Parquet flushes to disk during the run:
+        // bytes_written() only counts completed row groups, not the in-progress one.
+        .export_line("parquet:")
+        .export_line("  row_group_strategy: fixed_rows")
+        .export_line("  row_group_rows: 100")
+        .export_line("tuning: {batch_size: 250}")
+        .dest_path(out.path().to_path_buf());
 
-    assert!(run_rivet_export(&cfg, &export_name).status.success());
+    assert!(rig.run_args(&["--export", &export_name]).status.success());
 
     let files = files_with_extension(out.path(), "parquet");
     assert!(
@@ -209,27 +189,17 @@ fn task_9_2_chunked_parallelism_exports_all_rows_without_duplicates() {
 
     let export_name = unique_name("qa92_par");
     let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        r#"
-source: {{type: postgres, url: "{POSTGRES_URL}"}}
-exports:
-  - name: {export_name}
-    query: "SELECT id, name FROM {table}"
-    mode: chunked
-    chunk_column: id
-    chunk_size: 30
-    parallel: 4
-    format: parquet
-    compression: none
-    destination: {{type: local, path: {dir}}}
-"#,
-        dir = out.path().display()
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
+    let rig = Rig::pg_batch(&export_name)
+        .query(&format!("SELECT id, name FROM {table}"))
+        .mode("chunked")
+        .export_line("chunk_column: id")
+        .export_line("chunk_size: 30")
+        .export_line("parallel: 4")
+        .export_line("compression: none")
+        .dest_path(out.path().to_path_buf());
 
     let t0 = Instant::now();
-    let out_run = run_rivet_export(&cfg, &export_name);
+    let out_run = rig.run_args(&["--export", &export_name]);
     let elapsed = t0.elapsed();
 
     assert!(

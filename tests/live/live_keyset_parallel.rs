@@ -643,6 +643,10 @@ fn parallel_keyset_incremental_survives_no_backslash_escapes_mysql() {
     require_alive(LiveService::Mysql);
     use mysql::prelude::Queryable;
     let table = unique_name("pk_nbs");
+    // :3306 GLOBAL flip — mutually exclude with every other shared-batch-server
+    // GLOBAL mutator (binlog-compression, governor tmp-storage) and the timing
+    // canaries under the SAME lock (r5 bughunt: a per-name lock excluded none).
+    let _serial = quiet_window_guard();
     let mut c = mysql_connect();
     let orig: String = c.query_first("SELECT @@global.sql_mode").unwrap().unwrap();
     // The hostile sql_mode must be the SERVER default so rivet's OWN connections inherit
@@ -1060,37 +1064,29 @@ fn parallel_keyset_resume_with_changed_worker_count_postgres() {
     ))
     .unwrap();
     let dir = tempfile::tempdir().unwrap();
-    let cfg = dir.path().join("cfg.yaml");
     let out = dir.path().join("out");
-    let write_cfg = |n: usize| {
-        let lines = [
-            format!("source: {{ type: postgres, url: \"{POSTGRES_URL}\" }}"),
-            "exports:".to_string(),
-            "  - name: pk_resn".to_string(),
-            format!("    table: public.{table}"),
-            "    mode: chunked".to_string(),
-            "    chunk_by_key: id".to_string(),
-            format!("    parallel: {n}"),
-            "    chunk_checkpoint: true".to_string(),
-            "    chunk_size: 200".to_string(),
-            "    format: parquet".to_string(),
-            format!(
-                "    destination: {{ type: local, path: \"{}/\" }}",
-                out.display()
-            ),
-        ];
-        std::fs::write(&cfg, lines.join("\n")).unwrap();
-    };
+    // Through the rig: the old hand-built config here justified itself with
+    // "the only way to vary N across a crash/resume pair" — false since
+    // replace_export_line exists for exactly that shape (and the r2 bughunt
+    // flagged this file as a live ratchet bypass: format!-built yaml +
+    // fs::write scored zero bespoke sites).
+    let mut rig = Rig::pg_batch(&format!("public.{table}"))
+        .export_named("pk_resn")
+        .mode("chunked")
+        .export_line("chunk_by_key: id")
+        .export_line("parallel: 4")
+        .export_line("chunk_checkpoint: true")
+        .export_line("chunk_size: 200")
+        .dest_path(out.clone());
     // Run 1: parallel:4, crash after range 1 commits (durable in keyset_range).
-    write_cfg(4);
-    let crash = run_rivet_env(
-        &["run", "-c", cfg.to_str().unwrap()],
+    let crash = rig.run_args_env(
+        &[],
         &[("RIVET_TEST_PANIC_AT", "keyset_parallel_range_committed:1")],
     );
     assert!(!crash.status.success(), "the crash run must fail");
     // Run 2: parallel:8 — resume must reuse the crashed run's 4 persisted ranges.
-    write_cfg(8);
-    let resume = run_rivet_env(&["run", "-c", cfg.to_str().unwrap()], &[]);
+    rig.replace_export_line("parallel:", "parallel: 8");
+    let resume = rig.run_args(&[]);
     assert!(
         resume.status.success(),
         "resume with a changed parallel N must succeed: {}",

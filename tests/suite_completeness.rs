@@ -19,12 +19,50 @@ use std::fs;
 /// `*.rs` file names directly under `tests/<subdir>/`.
 fn dir_rs_files(subdir: &str) -> BTreeSet<String> {
     let dir = format!("{}/tests/{subdir}", env!("CARGO_MANIFEST_DIR"));
-    fs::read_dir(&dir)
-        .unwrap_or_else(|e| panic!("read dir {dir}: {e}"))
-        .filter_map(|e| e.ok())
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|n| n.ends_with(".rs"))
-        .collect()
+    let mut out = BTreeSet::new();
+    for e in fs::read_dir(&dir).unwrap_or_else(|e| panic!("read dir {dir}: {e}")) {
+        let e = e.expect("dir entry");
+        let name = e.file_name().to_string_lossy().into_owned();
+        // A SUBDIRECTORY here is a layout error, not a thing to skip: nothing
+        // under it is ever compiled (cargo builds only what the entry
+        // #[path]-includes, and the includes are flat), yet a planted
+        // tests/live/<sub>/probe.rs with #[test] fns passed every matrix
+        // guard while never running (r4 bughunt, RED-proven live).
+        if e.file_type().expect("file type").is_dir() {
+            // Data-only subdirs (fixtures/) are fine; a subdir holding .rs is
+            // the trap — those files never compile.
+            let has_rs = walk_has_rs(&e.path());
+            assert!(
+                !has_rs,
+                "tests/{subdir}/{name}/ contains .rs files — the consolidated \
+                 layout is FLAT; files under a subdirectory compile and run as \
+                 NOTHING while text-scanning guards still see them"
+            );
+            continue;
+        }
+        if name.ends_with(".rs") {
+            out.insert(name);
+        }
+    }
+    out
+}
+
+/// Any `.rs` anywhere under `dir` (recursive) — the compile-and-run-as-nothing trap.
+fn walk_has_rs(dir: &std::path::Path) -> bool {
+    let Ok(rd) = fs::read_dir(dir) else {
+        return false;
+    };
+    for e in rd.filter_map(|e| e.ok()) {
+        let p = e.path();
+        if p.is_dir() {
+            if walk_has_rs(&p) {
+                return true;
+            }
+        } else if p.extension().is_some_and(|x| x == "rs") {
+            return true;
+        }
+    }
+    false
 }
 
 /// File names referenced by `#[path = "<subdir>/<file>.rs"]` lines in the entry.
@@ -68,4 +106,12 @@ fn offline_suite_registers_every_file() {
 #[test]
 fn live_suite_registers_every_file() {
     assert_suite_complete("live", "live_suite.rs");
+}
+
+/// The third consolidated suite — it had NO registration guard (r4 bughunt):
+/// a new tests/type_roundtrip/*.rs file compiled and ran as nothing, exactly
+/// the footgun this file's header describes.
+#[test]
+fn type_roundtrip_suite_registers_every_file() {
+    assert_suite_complete("type_roundtrip", "type_roundtrip.rs");
 }
