@@ -511,7 +511,7 @@ fn pg_cdc_resume_captures_only_new_changes() {
         "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id INT PRIMARY KEY, v INT)"
     ))
     .unwrap();
-    let _tbl = PgTable::adopt(tbl.clone());
+    let _tbl = PgTable::adopt_on(POSTGRES_CDC_URL, tbl.clone());
     // The slot must exist *before* the changes so it captures them; the guard drops it.
     c.execute(
         "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
@@ -563,7 +563,7 @@ fn pg_cdc_intra_transaction_updates_get_distinct_seq() {
          ALTER TABLE {tbl} REPLICA IDENTITY FULL; INSERT INTO {tbl} VALUES (1, 0)"
     ))
     .unwrap();
-    let _tbl = PgTable::adopt(tbl.clone());
+    let _tbl = PgTable::adopt_on(POSTGRES_CDC_URL, tbl.clone());
     c.execute(
         "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
         &[&slot],
@@ -598,7 +598,7 @@ fn pg_cdc_sum_reconciles_across_intra_txn_updates() {
          ALTER TABLE {tbl} REPLICA IDENTITY FULL"
     ))
     .unwrap();
-    let _tbl = PgTable::adopt(tbl.clone());
+    let _tbl = PgTable::adopt_on(POSTGRES_CDC_URL, tbl.clone());
     c.execute(
         "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
         &[&slot],
@@ -1206,7 +1206,7 @@ fn pg_cdc_update_and_delete_carry_full_types() {
            tags TEXT[], nums INTEGER[], iv INTERVAL, note TEXT)"
     ))
     .unwrap();
-    let _tbl = PgTable::adopt(tbl.clone());
+    let _tbl = PgTable::adopt_on(POSTGRES_CDC_URL, tbl.clone());
     c.execute(
         "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
         &[&slot],
@@ -1287,7 +1287,7 @@ fn pg_cdc_hostile_floats_match_batch_and_nan_numeric_fails_loudly() {
            id INT PRIMARY KEY, f8 FLOAT8, f4 REAL, n NUMERIC(18,2))"
     ))
     .unwrap();
-    let _tbl = PgTable::adopt(tbl.clone());
+    let _tbl = PgTable::adopt_on(POSTGRES_CDC_URL, tbl.clone());
     c.execute(
         "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
         &[&slot],
@@ -1694,7 +1694,7 @@ fn pg_initial_snapshot_vanished_slot_fails_loudly_not_recreates() {
          INSERT INTO {tbl} VALUES (1,10)"
     ))
     .unwrap();
-    let _tbl = PgTable::adopt(tbl.clone());
+    let _tbl = PgTable::adopt_on(POSTGRES_CDC_URL, tbl.clone());
 
     let out = d.path().join("out");
     std::fs::create_dir_all(&out).unwrap();
@@ -1794,8 +1794,8 @@ fn pg_cdc_mixed_transaction_ending_on_uncaptured_table_advances_checkpoint() {
     ))
     .unwrap();
     let (_t1, _t2) = (
-        PgTable::adopt(orders.clone()),
-        PgTable::adopt(audit.clone()),
+        PgTable::adopt_on(POSTGRES_CDC_URL, orders.clone()),
+        PgTable::adopt_on(POSTGRES_CDC_URL, audit.clone()),
     );
     c.execute(
         "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
@@ -1865,7 +1865,7 @@ fn pg_cdc_schema_qualified_table_config_captures_events() {
         "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id INT PRIMARY KEY, v INT)"
     ))
     .unwrap();
-    let _tbl = PgTable::adopt(tbl.clone());
+    let _tbl = PgTable::adopt_on(POSTGRES_CDC_URL, tbl.clone());
     c.execute(
         "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
         &[&slot],
@@ -1946,7 +1946,7 @@ fn pg_cdc_initial_snapshot_covers_preexisting_rows_then_streams() {
          INSERT INTO {tbl} VALUES (1,10),(2,20)"
     ))
     .unwrap();
-    let _tbl = PgTable::adopt(tbl.clone());
+    let _tbl = PgTable::adopt_on(POSTGRES_CDC_URL, tbl.clone());
 
     let out = d.path().join("out");
     std::fs::create_dir_all(&out).unwrap();
@@ -2057,7 +2057,7 @@ fn pg_cdc_full_type_matrix_matches_batch() {
            big_num NUMERIC(60,10))"
     ))
     .unwrap();
-    let _tbl = PgTable::adopt(tbl.clone());
+    let _tbl = PgTable::adopt_on(POSTGRES_CDC_URL, tbl.clone());
 
     // Slot first, then the changes (they must land inside the slot's window).
     c.execute(
@@ -2194,7 +2194,10 @@ fn pg_cdc_multi_table_stream_uses_one_slot_and_resumes() {
         ))
         .unwrap();
     }
-    let (_g1, _g2) = (PgTable::adopt(t1.clone()), PgTable::adopt(t2.clone()));
+    let (_g1, _g2) = (
+        PgTable::adopt_on(POSTGRES_CDC_URL, t1.clone()),
+        PgTable::adopt_on(POSTGRES_CDC_URL, t2.clone()),
+    );
 
     let out = d.path().join("out");
     std::fs::create_dir_all(&out).unwrap();
@@ -2477,7 +2480,7 @@ fn pg_cdc_vanished_slot_with_checkpoint_fails_loudly_not_recreates() {
         "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id INT PRIMARY KEY, v INT)"
     ))
     .unwrap();
-    let _tbl = PgTable::adopt(tbl.clone());
+    let _tbl = PgTable::adopt_on(POSTGRES_CDC_URL, tbl.clone());
 
     // Run 1 (with a checkpoint configured): creates the slot, captures one
     // change, persists the checkpoint.
@@ -2539,7 +2542,7 @@ fn pg_cdc_corrupt_checkpoint_fails_loud_not_silently_absent() {
         "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id INT PRIMARY KEY, v INT)"
     ))
     .unwrap();
-    let _tbl = PgTable::adopt(tbl.clone());
+    let _tbl = PgTable::adopt_on(POSTGRES_CDC_URL, tbl.clone());
 
     let ckpt = d.path().join("cdc.ckpt");
     let rig_for = |out: &std::path::Path| {
@@ -2605,7 +2608,7 @@ fn doctor_reports_cdc_slot_health_and_flags_foreign_inactive_slots() {
         "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id INT PRIMARY KEY, v INT)"
     ))
     .unwrap();
-    let _tbl = PgTable::adopt(tbl.clone());
+    let _tbl = PgTable::adopt_on(POSTGRES_CDC_URL, tbl.clone());
     // A foreign, inactive slot — some other tool created it and walked away.
     c.execute(
         "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
@@ -2670,7 +2673,7 @@ fn pg_cdc_idle_first_run_then_change_is_captured_not_skipped() {
         "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id INT PRIMARY KEY, v INT)"
     ))
     .unwrap();
-    let _tbl = PgTable::adopt(tbl.clone());
+    let _tbl = PgTable::adopt_on(POSTGRES_CDC_URL, tbl.clone());
 
     // Run 1: the slot does not exist yet — rivet creates it and drains nothing.
     let out1 = d.path().join("out1");
@@ -2714,7 +2717,7 @@ fn pg_cdc_crash_after_flush_before_ack_does_not_advance_the_slot() {
         "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id INT PRIMARY KEY, v INT)"
     ))
     .unwrap();
-    let _tbl = PgTable::adopt(tbl.clone());
+    let _tbl = PgTable::adopt_on(POSTGRES_CDC_URL, tbl.clone());
     c.execute(
         "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
         &[&slot],
@@ -2780,8 +2783,8 @@ fn roast_pg_cdc_crash_in_a_re_drain_pass_stays_at_least_once() {
          CREATE TABLE {b} (id BIGINT PRIMARY KEY, v INT)"
     ))
     .unwrap();
-    let _ta = PgTable::adopt(a.clone());
-    let _tb = PgTable::adopt(b.clone());
+    let _ta = PgTable::adopt_on(POSTGRES_CDC_URL, a.clone());
+    let _tb = PgTable::adopt_on(POSTGRES_CDC_URL, b.clone());
     c.execute(
         "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
         &[&slot],
@@ -2857,7 +2860,7 @@ fn roast_pg_cdc_large_transaction_is_atomic_across_a_mid_flush_crash() {
         "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v INT)"
     ))
     .unwrap();
-    let _tbl = PgTable::adopt(tbl.clone());
+    let _tbl = PgTable::adopt_on(POSTGRES_CDC_URL, tbl.clone());
     c.execute(
         "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
         &[&slot],
@@ -2985,7 +2988,7 @@ fn pg_cdc_column_types_match_batch_export() {
          meta jsonb, label text, ts timestamp, tstz timestamptz, u uuid)"
     ))
     .unwrap();
-    let _tbl = PgTable::adopt(tbl.clone());
+    let _tbl = PgTable::adopt_on(POSTGRES_CDC_URL, tbl.clone());
     c.execute(
         "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
         &[&slot],
@@ -3130,7 +3133,7 @@ fn pg_cdc_column_added_mid_stream_is_captured() {
         "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id INT PRIMARY KEY, v INT)"
     ))
     .unwrap();
-    let _tbl = PgTable::adopt(tbl.clone());
+    let _tbl = PgTable::adopt_on(POSTGRES_CDC_URL, tbl.clone());
     c.execute(
         "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
         &[&slot],
@@ -3182,7 +3185,7 @@ fn pg_cdc_until_current_terminates_under_sustained_writes() {
         "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v INT)"
     ))
     .unwrap();
-    let _tbl = PgTable::adopt(tbl.clone());
+    let _tbl = PgTable::adopt_on(POSTGRES_CDC_URL, tbl.clone());
     c.execute(
         "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
         &[&slot],
@@ -3316,7 +3319,7 @@ fn roast_pg_until_current_open_bound_two_runs_lose_nothing() {
         "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v INT)"
     ))
     .unwrap();
-    let _tbl = PgTable::adopt(tbl.clone());
+    let _tbl = PgTable::adopt_on(POSTGRES_CDC_URL, tbl.clone());
     c.execute(
         "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
         &[&slot],
@@ -3750,7 +3753,7 @@ fn roast_pg_cdc_ndjson_until_current_terminates_and_emits_backlog() {
         "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v INT)"
     ))
     .unwrap();
-    let _tbl = PgTable::adopt(tbl.clone());
+    let _tbl = PgTable::adopt_on(POSTGRES_CDC_URL, tbl.clone());
     c.execute(
         "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
         &[&slot],
@@ -3991,7 +3994,7 @@ fn roast_pg_cdc_captures_a_silent_update_a_watermark_sync_would_miss() {
          CREATE TABLE {tbl} (id bigint primary key, v bigint, updated_at timestamptz)"
     ))
     .unwrap();
-    let _tbl = PgTable::adopt(tbl.clone());
+    let _tbl = PgTable::adopt_on(POSTGRES_CDC_URL, tbl.clone());
     c.execute(
         "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
         &[&slot],
@@ -4059,7 +4062,7 @@ fn roast_pg_cdc_oversized_transaction_bails_loud_not_oom() {
         "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id bigint primary key, v bigint)"
     ))
     .unwrap();
-    let _tbl = PgTable::adopt(tbl.clone());
+    let _tbl = PgTable::adopt_on(POSTGRES_CDC_URL, tbl.clone());
     c.execute(
         "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
         &[&slot],

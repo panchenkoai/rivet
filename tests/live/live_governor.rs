@@ -1500,7 +1500,7 @@ fn mssql_governor_backs_off_under_real_log_flush_pressure() {
     // RAII, not a trailing DROP: the scratch table holds ~200 KB rows on a
     // SHARED server, and a trailing statement is skipped by every panic path
     // (a failed assertion, the watchdog below, a panicking writer join).
-    let _scratch_guard = MssqlTable::adopt(format!("dbo.{scratch}"));
+    let _scratch_guard = MssqlTable::adopt_at(1435, format!("dbo.{scratch}"));
 
     // Background writer: one COMMIT per row, each carrying ~200 KB, so the log
     // manager flushes constantly and `Log Flush Waits` climbs pair-over-pair —

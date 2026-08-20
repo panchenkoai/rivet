@@ -69,9 +69,19 @@ fn drop_source(table: &str) {
 /// yields a FRESH Rig (own tempdir + isolated SQLite state) each call, both reading
 /// the same pre-seeded source table.
 fn assert_single_run_parity(build: impl Fn() -> Rig, pg_url: &str, expected: usize) {
-    // SQLite state (default — no RIVET_STATE_URL).
+    // SQLite state — RIVET_STATE_URL pinned EMPTY on the child, not merely
+    // absent: the harness only ADDS env (no env_clear), so an ambient
+    // RIVET_STATE_URL from the operator's shell would silently switch this
+    // leg to Postgres and the parity test would compare Postgres to Postgres
+    // (r4 bughunt). Empty fails the starts_with("postgres") check in
+    // StateStore::open, forcing the SQLite arm regardless of the shell.
     let s = build();
-    s.run_ok();
+    let out = s.run_with_env("RIVET_STATE_URL", "");
+    assert!(
+        out.status.success(),
+        "sqlite-state run failed; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let (sc, sk) = id_count_set(&s.out_dir());
     assert_eq!(sc, expected, "sqlite-state row count must equal the seed");
 

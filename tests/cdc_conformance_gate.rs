@@ -419,18 +419,117 @@ fn clip_to_first_fn_body(raw: &str) -> &str {
         return raw;
     };
     let start = fn_pos + open_rel;
+    // STRING-AWARE brace counting: the r3 byte counter counted braces inside
+    // literals, so any corrupt-checkpoint fixture (`b"{ truncated"`) left the
+    // depth unbalanced and the clip silently no-opped on exactly those tests
+    // (r4 bughunt: 6 of 153 chunks; the opposite polarity — an unmatched `}`
+    // in a string — would TRUNCATE the chunk and silently ungrade the test).
+    // Handles "…" and b"…" with \-escapes, char literals, r"…"/r#"…"#
+    // raw strings, // line comments, and /* */ block comments.
+    let bytes = raw.as_bytes();
     let mut depth = 0usize;
-    for (i, b) in raw[start..].bytes().enumerate() {
+    let mut i = start;
+    while i < bytes.len() {
+        let b = bytes[i];
         match b {
             b'{' => depth += 1,
             b'}' => {
-                depth -= 1;
+                depth = depth.saturating_sub(1);
                 if depth == 0 {
-                    return &raw[..start + i + 1];
+                    return &raw[..i + 1];
                 }
+            }
+            b'"' => {
+                // plain (or byte) string: skip to the unescaped closing quote
+                i += 1;
+                while i < bytes.len() {
+                    match bytes[i] {
+                        b'\\' => i += 1,
+                        b'"' => break,
+                        _ => {}
+                    }
+                    i += 1;
+                }
+            }
+            b'r' | b'b'
+                if i + 1 < bytes.len()
+                    && (bytes[i + 1] == b'"' || bytes[i + 1] == b'#' || bytes[i + 1] == b'r') =>
+            {
+                // possible raw / byte / byte-raw string: br#"…"#, r#"…"#, r"…", b"…"
+                let mut j = i + 1;
+                if bytes[j] == b'r' {
+                    j += 1; // br…
+                }
+                let mut hashes = 0;
+                while j < bytes.len() && bytes[j] == b'#' {
+                    hashes += 1;
+                    j += 1;
+                }
+                if j < bytes.len() && bytes[j] == b'"' {
+                    if bytes[i] == b'b' && bytes[i + 1] == b'"' {
+                        // b"…" is handled by the '"' arm next iteration; the
+                        // 'b' itself is inert
+                    } else {
+                        // raw string: scan for `"` followed by `hashes` #s
+                        j += 1;
+                        'raw: while j < bytes.len() {
+                            if bytes[j] == b'"' {
+                                let mut k = 0;
+                                while k < hashes
+                                    && j + 1 + k < bytes.len()
+                                    && bytes[j + 1 + k] == b'#'
+                                {
+                                    k += 1;
+                                }
+                                if k == hashes {
+                                    i = j + hashes;
+                                    break 'raw;
+                                }
+                            }
+                            j += 1;
+                        }
+                        if j >= bytes.len() {
+                            return raw; // unterminated — bail to the old behavior
+                        }
+                    }
+                }
+            }
+            b'\'' => {
+                // char literal (or lifetime — a lifetime has no closing quote
+                // within 3 bytes with an escape shape, so bound the scan)
+                if i + 2 < bytes.len() && bytes[i + 1] == b'\\' {
+                    i += 3; // '\x' escape form start; closing quote next
+                    while i < bytes.len() && bytes[i] != b'\'' {
+                        i += 1;
+                    }
+                } else if i + 2 < bytes.len() && bytes[i + 2] == b'\'' {
+                    i += 2; // 'c'
+                }
+                // else: lifetime like 'a — leave as-is
+            }
+            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'/' => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
+                let mut nest = 1;
+                i += 2;
+                while i + 1 < bytes.len() && nest > 0 {
+                    if bytes[i] == b'/' && bytes[i + 1] == b'*' {
+                        nest += 1;
+                        i += 1;
+                    } else if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                        nest -= 1;
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                continue;
             }
             _ => {}
         }
+        i += 1;
     }
     raw
 }
@@ -445,6 +544,28 @@ fn chunk_clipper_drops_trailing_helper_text() {
     assert!(
         !clipped.contains("parquet_ids"),
         "the trailing helper must be clipped, not credited to the test: {clipped}"
+    );
+}
+
+/// Braces inside STRING literals must not unbalance the clip — the standard
+/// corrupt-checkpoint fixture writes `b"{ truncated"`, which no-opped the r3
+/// byte counter on exactly those tests (r4 bughunt; RED against it).
+#[test]
+fn chunk_clipper_ignores_braces_in_literals() {
+    let span = concat!(
+        "\nfn corrupt_test() {\n",
+        "    std::fs::write(&ckpt, b\"{ truncated\").unwrap();\n",
+        "    let y = r#\"source: { type: pg }\n  unbalanced { here\"#;\n",
+        "    // a } in a comment\n",
+        "    rig.run_ok();\n",
+        "}\n\n",
+        "fn helper_parquet_ids() {}\n"
+    );
+    let clipped = clip_to_first_fn_body(span);
+    assert!(clipped.contains("run_ok"), "body stays: {clipped}");
+    assert!(
+        !clipped.contains("helper_parquet_ids"),
+        "literal braces must not extend the chunk into the helper: {clipped}"
     );
 }
 
@@ -516,6 +637,35 @@ fn every_live_cdc_test_asserts_an_outcome() {
         .map(|n| format!("tests/live/{n}"))
         .collect();
     files.push("tests/live/live_batch_switch_golden.rs".to_string());
+    // CONTENT net on top of the name filter: a CDC test in a file named
+    // without "cdc" was invisible to this gate (r4 bughunt —
+    // live_source_parity_sweep shipped exactly that shape). Any live file
+    // whose text constructs a CDC rig or declares a cdc-mode config gets
+    // scanned too, whatever it is called.
+    for e in fs::read_dir(root.join("tests/live"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+    {
+        let n = e.file_name().to_string_lossy().into_owned();
+        let path = format!("tests/live/{n}");
+        if !n.ends_with(".rs") || files.contains(&path) {
+            continue;
+        }
+        let text = fs::read_to_string(e.path()).unwrap_or_default();
+        if [
+            "mysql_cdc(",
+            "pg_cdc(",
+            "mssql_cdc(",
+            "mongo_cdc(",
+            "mode: cdc",
+            "mode(\"cdc\")",
+        ]
+        .iter()
+        .any(|m| text.contains(m))
+        {
+            files.push(path);
+        }
+    }
     files.sort();
     assert!(
         files.len() >= 10,

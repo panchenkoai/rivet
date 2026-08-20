@@ -1127,7 +1127,7 @@ fn pg_cdc_delete_with_non_first_pk_lands_in_the_pk_column() {
          CREATE TABLE {tbl} (name TEXT, id INT PRIMARY KEY)"
     ))
     .unwrap();
-    let _tbl = PgTable::adopt(tbl.clone());
+    let _tbl = PgTable::adopt_on(POSTGRES_CDC_URL, tbl.clone());
     c.execute(
         "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
         &[&slot],
@@ -1202,7 +1202,7 @@ fn pg_cdc_pk_changing_update_captures_and_does_not_brick() {
         "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id INT PRIMARY KEY, v TEXT)"
     ))
     .unwrap();
-    let _tbl = PgTable::adopt(tbl.clone());
+    let _tbl = PgTable::adopt_on(POSTGRES_CDC_URL, tbl.clone());
     c.execute(
         "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
         &[&slot],

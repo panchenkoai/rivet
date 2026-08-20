@@ -636,7 +636,7 @@ impl CdcScenario {
                 "DROP TABLE IF EXISTS {table}; CREATE TABLE {table} ({cols})"
             ))
             .unwrap();
-        let tguard = super::pg::PgTable::adopt(table.clone());
+        let tguard = super::pg::PgTable::adopt_on(super::env::POSTGRES_CDC_URL, table.clone());
         client
             .execute(
                 "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
