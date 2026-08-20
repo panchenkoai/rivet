@@ -449,6 +449,24 @@ fn every_live_cdc_test_asserts_an_outcome() {
                 || chunk.contains("!res.status.success()")
                 || chunk.contains("!output.status.success()")
                 || chunk.contains("read_cdc_rows(") // replica-suite replay oracle
+                // Registered when the capture-marker fill (bughunt find #3)
+                // surfaced 11 tests whose ORACLES were real but unlisted —
+                // each spelling verified by reading the test, not guessed:
+                // the DuckDB re-read helper family (duckdb_dir_csv_id_set,
+                // duckdb_dir_parquet_ids, duckdb_total_parquet_rows, ...) —
+                // an independent reader, the strongest oracle class here;
+                || chunk.contains("duckdb_")
+                // reading the manifest SIDECAR back (source-identity /
+                // snapshot-leg tests assert on its recorded fields);
+                || chunk.contains("manifest.json")
+                // the mssql change-row replay oracle (read_cdc_rows' sibling);
+                || chunk.contains("read_cdc_changes(")
+                // capture-and-read in one call — run_and_read's CDC-scenario
+                // twin (the smoke asserts summed num_rows off the parts);
+                || chunk.contains("drain_and_read(")
+                // decoding the CLI's NDJSON event stream and asserting on the
+                // decoded events (the cdc-cli termination/backlog tests);
+                || chunk.contains("serde_json::from_str::<serde_json::Value>")
                 // Parquet re-read helpers (tests/common/parquet.rs): the seq
                 // helper reads __seq/__pos/counter columns back with DuckDB;
                 // deduped_current_sum folds a re-read change log. Registered

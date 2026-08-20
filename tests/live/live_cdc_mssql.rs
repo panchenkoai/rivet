@@ -1771,10 +1771,10 @@ fn mssql_cdc_cli_path_case_only_table_mismatch_must_not_silently_drop_events() {
         return; // refused — the guard the fix adds; correct
     }
 
-    // A 0-capture CDC run writes NO parquet parts (the sink rolls only on a
-    // committed event), so part presence is the robust "did it capture" signal —
-    // avoiding a cell-type parse of the CLI --output shape.
-    let captured = files_with_extension(out.path(), "parquet").len();
+    // Read the captured EVENTS back (the sibling test's oracle) — part
+    // presence alone is the weak "mc ls | wc -l" class the matrix audit
+    // banned; the content read costs nothing more and grades honestly.
+    let captured = read_cdc_changes(out.path()).len();
     if captured > 0 {
         return; // routed correctly; nothing to guard
     }
@@ -1801,7 +1801,7 @@ fn mssql_cdc_cli_path_case_only_table_mismatch_must_not_silently_drop_events() {
         ],
         &[],
     );
-    let after_fix = files_with_extension(out_fixed.path(), "parquet").len();
+    let after_fix = read_cdc_changes(out_fixed.path()).len();
 
     panic!(
         "the `rivet cdc` CLI path captured 0 of the {still_in_ct} change row(s) on a case-only \
