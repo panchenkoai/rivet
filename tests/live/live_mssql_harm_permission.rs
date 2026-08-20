@@ -15,7 +15,6 @@
 //! same path as `sa` to pin that the note is conditional, not unconditional.
 
 use crate::common::*;
-use std::process::Command;
 
 /// The stable identifying phrase of the advisory note. Matching a substring
 /// (not the whole sentence) keeps the test robust to wording tweaks in the
@@ -82,43 +81,20 @@ fn drop_principal(login: &str) {
     ));
 }
 
-/// Write a doctor config whose MSSQL source authenticates with `source_url`.
-/// Doctor only connects + `SELECT 1` for source auth and write-probes the local
+/// Doctor rig whose MSSQL source authenticates with `source_url`. Doctor only
+/// connects + `SELECT 1` for source auth and write-probes the local
 /// destination, so the restricted login needs nothing beyond connect/read.
-fn doctor_config(
-    source_url: &str,
-    table: &str,
-    out: &std::path::Path,
-) -> (std::path::PathBuf, tempfile::TempDir) {
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let export = unique_name("doctor_harm");
-    let yaml = format!(
-        r#"source:
-  type: mssql
-  url: "{source_url}"
-  tls:
-    accept_invalid_certs: true
-exports:
-  - name: {export}
-    query: "SELECT id, name FROM {table}"
-    mode: full
-    format: parquet
-    destination:
-      type: local
-      path: {dir}
-"#,
-        dir = out.display(),
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
-    (cfg, cfg_dir)
+fn doctor_rig(source_url: &str, table: &str, out: &std::path::Path) -> Rig {
+    Rig::mssql_batch(table)
+        .export_named(&unique_name("doctor_harm"))
+        .query(&format!("SELECT id, name FROM {table}"))
+        .source_url(source_url)
+        .dest_path(out.to_path_buf())
 }
 
-/// Run `rivet doctor -c <cfg>` and return its stdout (the note prints there).
-fn run_doctor(cfg: &std::path::Path) -> String {
-    let out = Command::new(RIVET_BIN)
-        .args(["doctor", "-c", cfg.to_str().unwrap()])
-        .output()
-        .expect("spawn rivet doctor");
+/// Run `rivet doctor` on the rig and return its stdout (the note prints there).
+fn run_doctor(rig: &Rig) -> String {
+    let out = rig.cli(&["doctor"]);
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     // Source auth must succeed, else the note path (gated on the Source-OK arm)
     // is never reached and a missing note would be a false negative. Match the
@@ -143,9 +119,9 @@ fn doctor_notes_missing_view_server_state_for_restricted_login() {
     let login = LowPermLogin::create();
     let table = seed_mssql_numeric_table(5);
     let out = tempfile::tempdir().unwrap();
-    let (cfg, _cfg_dir) = doctor_config(&login.url(), table.name(), out.path());
+    let rig = doctor_rig(&login.url(), table.name(), out.path());
 
-    let stdout = run_doctor(&cfg);
+    let stdout = run_doctor(&rig);
     assert!(
         stdout.contains(NOTE_MARKER),
         "doctor must advise about the missing VIEW SERVER STATE grant for an \
@@ -163,9 +139,9 @@ fn doctor_silent_on_view_server_state_for_sysadmin() {
     // unconditionally would still pass the positive test above.
     let table = seed_mssql_numeric_table(5);
     let out = tempfile::tempdir().unwrap();
-    let (cfg, _cfg_dir) = doctor_config(MSSQL_URL, table.name(), out.path());
+    let rig = doctor_rig(MSSQL_URL, table.name(), out.path());
 
-    let stdout = run_doctor(&cfg);
+    let stdout = run_doctor(&rig);
     assert!(
         !stdout.contains(NOTE_MARKER),
         "doctor must stay silent about VIEW SERVER STATE for a login that holds \

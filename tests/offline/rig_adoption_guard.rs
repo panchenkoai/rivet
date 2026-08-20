@@ -35,7 +35,6 @@ const BASELINE: &[(&str, usize)] = &[
     ("live_cli_flags.rs", 76),
     ("live_crash_recovery.rs", 1),
     ("live_init_extended.rs", 6),
-    ("live_mssql_harm_permission.rs", 2),
     ("live_mssql_resume.rs", 1),
     ("live_mysql_chunked.rs", 2),
     ("live_mysql_resume.rs", 1),
