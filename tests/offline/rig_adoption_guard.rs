@@ -18,7 +18,6 @@ use std::collections::BTreeMap;
 /// `Command::new(RIVET_BIN)` + `write_config(` in the file. Shrink freely;
 /// grow only with a reason in the PR.
 const BASELINE: &[(&str, usize)] = &[
-    ("audit_doctor_probe.rs", 2),
     // ── the init-subject class: REASONED ceilings, not migration targets ──
     // `rivet init` PRODUCES configs; the rig OWNS a config. A rig-shaped init
     // test would test the rig's YAML against init's YAML — two generators, no

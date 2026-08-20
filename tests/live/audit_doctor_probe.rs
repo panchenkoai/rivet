@@ -32,32 +32,11 @@ fn audit_doctor_removes_destination_probe_after_local_write_check() {
     // A fresh, empty destination directory: anything found here afterward was
     // put there by doctor.
     let dest = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
+    let rig = Rig::pg_batch(table.name())
+        .query(&format!("SELECT id, name FROM {}", table.name()))
+        .dest_path(dest.path().to_path_buf());
 
-    let yaml = format!(
-        r#"
-source:
-  type: postgres
-  url: "{POSTGRES_URL}"
-
-exports:
-  - name: {name}
-    query: "SELECT id, name FROM {name}"
-    mode: full
-    format: parquet
-    destination:
-      type: local
-      path: {out}
-"#,
-        name = table.name(),
-        out = dest.path().display()
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
-
-    let result = std::process::Command::new(RIVET_BIN)
-        .args(["doctor", "-c", cfg.to_str().unwrap()])
-        .output()
-        .expect("spawn rivet doctor");
+    let result = rig.cli(&["doctor"]);
 
     // Doctor must pass (source reachable, destination writable) — this is the
     // happy path where the probe write succeeds and therefore must be cleaned.
