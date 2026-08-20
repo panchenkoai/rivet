@@ -10,8 +10,6 @@
 //!     docker compose --profile cdc --profile loaders up -d mysql-cdc duckdb clickhouse
 //!     cargo test --test live_suite -- --ignored
 
-use std::process::Command;
-
 use crate::common::*;
 use mysql::prelude::Queryable;
 
@@ -43,15 +41,10 @@ fn cdc_types_round_trip_via_duckdb_and_clickhouse() {
 
     // Capture into the shared bind mount both engines can read.
     let (host, container) = clickhouse_shared_workdir("cdc_oracle");
-    let yaml = Rig::mysql_cdc(table)
+    let rig = Rig::mysql_cdc(table)
         .checkpoint_path(ckpt.clone())
-        .dest_path(host.clone())
-        .yaml();
-    let cfg = write_config(&d, &yaml);
-    let res = Command::new(RIVET_BIN)
-        .args(["run", "--config", cfg.to_str().unwrap()])
-        .output()
-        .expect("spawn rivet");
+        .dest_path(host.clone());
+    let res = rig.run_args(&[]);
     assert!(
         res.status.success(),
         "cdc capture failed:\n{}",
@@ -192,33 +185,25 @@ fn cdc_full_surface_cross_oracle_matches_literals() {
     let batch_dir = host.join("batch");
     std::fs::create_dir_all(&cdc_dir).unwrap();
     std::fs::create_dir_all(&batch_dir).unwrap();
-    let yaml = format!(
-        r#"source: {{type: mysql, url: "{MYSQL_CDC_URL}"}}
-exports:
-  - name: {table}
-    table: {table}
-    mode: cdc
-    format: parquet
-    cdc: {{ checkpoint: "{ckpt}", until_current: true, server_id: 8889 }}
-    destination: {{ type: local, path: "{o}" }}
-  - name: {table}_batch
-    query: "SELECT * FROM {table}"
-    mode: full
-    format: parquet
-    destination: {{ type: local, path: "{b}" }}
-"#,
-        ckpt = ckpt.display(),
-        o = cdc_dir.display(),
-        b = batch_dir.display(),
-    );
-    let cfg = write_config(&d, &yaml);
-    let res = std::process::Command::new(RIVET_BIN)
-        .args(["run", "--config", cfg.to_str().unwrap()])
-        .output()
-        .unwrap();
+    // Two rigs, run in the same order the old two-export config executed:
+    // CDC drain first, then the batch snapshot of the quiesced table.
+    let cdc_rig = Rig::mysql_cdc(table)
+        .checkpoint_path(ckpt.clone())
+        .dest_path(cdc_dir.clone());
+    let res = cdc_rig.run_args(&[]);
     assert!(
         res.status.success(),
-        "cdc+batch runs failed:\n{}",
+        "cdc run failed:\n{}",
+        String::from_utf8_lossy(&res.stderr)
+    );
+    let batch_rig = Rig::mysql_batch(&format!("{table}_batch"))
+        .query(&format!("SELECT * FROM {table}"))
+        .source_url(MYSQL_CDC_URL)
+        .dest_path(batch_dir.clone());
+    let res = batch_rig.run_args(&[]);
+    assert!(
+        res.status.success(),
+        "batch run failed:\n{}",
         String::from_utf8_lossy(&res.stderr)
     );
     let _ = c.query_drop(format!("DROP TABLE IF EXISTS {table}"));
