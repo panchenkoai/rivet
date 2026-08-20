@@ -24,6 +24,9 @@ const BASELINE: &[(&str, usize)] = &[
     // subject. Raw invocations of `rivet init <flags>` ARE these files' subject,
     // so their ceilings hold them at today's counts rather than at zero.
     ("audit_init_deferred.rs", 4),
+    // live_init_extended: all six sites are `rivet init <flags>` invocations
+    // (schema/discover/source-env/table variants) — the subject itself.
+    ("live_init_extended.rs", 6),
     ("audit_maxfile.rs", 2),
     // audit_metrics_validates_config_path's SUBJECT is a nonexistent --config
     // path — a rig owns a real config, so that one raw invocation is the test.
@@ -31,7 +34,6 @@ const BASELINE: &[(&str, usize)] = &[
     ("audit_state.rs", 1), // missing-config-path IS the subject
     ("live_cdc.rs", 33),
     ("live_cli_flags.rs", 76),
-    ("live_init_extended.rs", 6),
 ];
 
 fn bespoke_sites(path: &std::path::Path) -> usize {
