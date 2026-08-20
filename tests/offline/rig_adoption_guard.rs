@@ -27,7 +27,6 @@ const BASELINE: &[(&str, usize)] = &[
     // live_init_extended: all six sites are `rivet init <flags>` invocations
     // (schema/discover/source-env/table variants) — the subject itself.
     ("live_init_extended.rs", 6),
-    ("audit_maxfile.rs", 2),
     // audit_metrics_validates_config_path's SUBJECT is a nonexistent --config
     // path — a rig owns a real config, so that one raw invocation is the test.
     ("audit_observability.rs", 1),
