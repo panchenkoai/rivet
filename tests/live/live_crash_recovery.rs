@@ -124,20 +124,12 @@ fn write_cfg(
     export_name: &str,
     cfg_dir: &tempfile::TempDir,
 ) -> std::path::PathBuf {
-    let yaml = format!(
-        r#"
-source: {{type: postgres, url: "{POSTGRES_URL}"}}
-exports:
-  - name: {export_name}
-    query: "SELECT id, updated_at FROM {table_name}"
-    mode: incremental
-    cursor_column: updated_at
-    format: parquet
-    destination: {{type: local, path: {dir}}}
-"#,
-        dir = out_dir.display()
-    );
-    write_config(cfg_dir, &yaml)
+    Rig::pg_batch(export_name)
+        .query(&format!("SELECT id, updated_at FROM {table_name}"))
+        .mode("incremental")
+        .export_line("cursor_column: updated_at")
+        .dest_path(out_dir.to_path_buf())
+        .config_in(cfg_dir.path())
 }
 
 #[test]

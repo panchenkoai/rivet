@@ -31,11 +31,7 @@ const BASELINE: &[(&str, usize)] = &[
     ("audit_state.rs", 1), // missing-config-path IS the subject
     ("live_cdc.rs", 33),
     ("live_cli_flags.rs", 76),
-    ("live_crash_recovery.rs", 1),
     ("live_init_extended.rs", 6),
-    ("live_temp_spill.rs", 1),
-    ("roast_pg_json_fidelity.rs", 1),
-    ("roast_validate_exit.rs", 1),
 ];
 
 fn bespoke_sites(path: &std::path::Path) -> usize {
