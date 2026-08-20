@@ -20,7 +20,6 @@ use std::collections::BTreeMap;
 const BASELINE: &[(&str, usize)] = &[
     ("audit_cli_dispatch.rs", 4),
     ("audit_cloud_multipart.rs", 3),
-    ("audit_column_validation.rs", 5),
     ("audit_doctor_fastfail.rs", 2),
     ("audit_doctor_probe.rs", 2),
     // ── the init-subject class: REASONED ceilings, not migration targets ──
