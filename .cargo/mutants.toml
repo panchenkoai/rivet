@@ -88,6 +88,21 @@ exclude_re = [
     # rest of the loop — the whole live_suite runs through it.
     "replace pg_run_export ->",
     " in pg_run_export",
+    # run_plan_command (pipeline/plan_cmd.rs) is the whole `rivet plan` command:
+    # it builds a StateStore, opens a real source per export, runs preflight and
+    # the cost model, and emits artifacts — unkillable OFFLINE. It entered the
+    # in-diff scope via the read-only change (PR #254); cargo-mutants generated
+    # the whole-function `-> Ok(())` stub, which `--lib --bins` cannot reach
+    # (the "--lib on a live-only path" class; it is also a nightly-baseline
+    # entry). The DECISION logic the PR changed was EXTRACTED into pure helpers
+    # that ARE unit-tested and whose in-diff mutants are all caught:
+    # `fields_to_write` (plan_is_read_only_without_annotate_and_packs_the_whole_
+    # config_with_it) and `plan_write_report` (plan_write_report_maps_outcome_
+    # to_the_right_operator_message). The stub itself is live-guarded: `Ok(())`
+    # emits no plan artifact and writes no config, so it fails the live plan
+    # suite (e.g. plan_is_read_only_without_annotate_waves, which asserts the
+    # artifact/paths, and audit_plan_apply's plan.json reads).
+    "replace run_plan_command ->",
     # introspect_all (init/mod.rs) is the whole-schema scan: every arm opens a
     # live engine connection, so its dispatch mutants (delete match arm
     # "postgres"/"mysql"/"mssql") are unkillable OFFLINE. The DECISION logic was
