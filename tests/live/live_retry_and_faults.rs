@@ -34,18 +34,15 @@ fn clean_postgres_via_toxi_works_as_a_baseline_and_exports_successfully() {
     let table = seed_pg_numeric_table(5);
     let export_name = unique_name("qa41_baseline");
     let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = Rig::pg_batch(&export_name)
+    let rig = Rig::pg_batch(&export_name)
         .source_url(POSTGRES_TOXI_URL)
         .query(&format!(
             r#"SELECT id FROM {table_name}"#,
             table_name = table.name()
         ))
         .mode("full")
-        .dest_path(out.path().to_path_buf())
-        .yaml();
-    let cfg_path = write_config(&cfg_dir, &yaml);
-    let out_run = run_rivet_export(&cfg_path, &export_name);
+        .dest_path(out.path().to_path_buf());
+    let out_run = rig.run_args(&["--export", &export_name]);
     assert!(
         out_run.status.success(),
         "baseline run through toxiproxy failed; stderr:\n{}",
@@ -69,8 +66,7 @@ fn export_survives_transient_latency_added_via_toxiproxy() {
     let table = seed_pg_numeric_table(5);
     let export_name = unique_name("qa41_latency");
     let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = Rig::pg_batch(&export_name)
+    let rig = Rig::pg_batch(&export_name)
         .source_url(POSTGRES_TOXI_URL)
         .query(&format!(
             r#"SELECT id FROM {table_name}"#,
@@ -79,10 +75,8 @@ fn export_survives_transient_latency_added_via_toxiproxy() {
         .mode("full")
         .export_line("tuning:")
         .export_line("  max_retries: 2")
-        .dest_path(out.path().to_path_buf())
-        .yaml();
-    let cfg_path = write_config(&cfg_dir, &yaml);
-    let out_run = run_rivet_export(&cfg_path, &export_name);
+        .dest_path(out.path().to_path_buf());
+    let out_run = rig.run_args(&["--export", &export_name]);
 
     // Clean up before asserting so we don't leak toxics on failure.
     let _ = toxic;
@@ -110,17 +104,14 @@ fn export_fails_cleanly_when_toxiproxy_is_disabled_before_run() {
 
     let export_name = unique_name("qa42_disabled");
     let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = Rig::pg_batch(&export_name)
+    let rig = Rig::pg_batch(&export_name)
         .source_url(POSTGRES_TOXI_URL)
         .query("SELECT 1::int")
         .mode("full")
         .export_line("tuning:")
         .export_line("  max_retries: 0")
-        .dest_path(out.path().to_path_buf())
-        .yaml();
-    let cfg_path = write_config(&cfg_dir, &yaml);
-    let out_run = run_rivet_export(&cfg_path, &export_name);
+        .dest_path(out.path().to_path_buf());
+    let out_run = rig.run_args(&["--export", &export_name]);
 
     // Re-enable before assertions so subsequent tests are not affected.
     toxi_enable("postgres");
@@ -164,8 +155,7 @@ fn export_recovers_after_mid_stream_proxy_disable_then_enable_with_retries() {
     // Output lands in the shared bind mount so the DuckDB container can read
     // it — the oracle below must not share rivet's own parquet codec.
     let (out_host, out_container) = duckdb_shared_workdir("qa42_midstream_oracle");
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = Rig::pg_batch(&export_name)
+    let rig = Rig::pg_batch(&export_name)
         .source_url(POSTGRES_TOXI_URL)
         .query(&format!(
             r#"SELECT id FROM {table_name}"#,
@@ -175,9 +165,7 @@ fn export_recovers_after_mid_stream_proxy_disable_then_enable_with_retries() {
         .export_line("tuning:")
         .export_line("  max_retries: 3")
         .export_line("  retry_backoff_ms: 200")
-        .dest_path(out_host.clone())
-        .yaml();
-    let cfg_path = write_config(&cfg_dir, &yaml);
+        .dest_path(out_host.clone());
 
     // Disable/enable cycle runs in the background.
     let bg = std::thread::spawn(|| {
@@ -187,7 +175,7 @@ fn export_recovers_after_mid_stream_proxy_disable_then_enable_with_retries() {
         toxi_enable("postgres");
     });
 
-    let out_run = run_rivet_export(&cfg_path, &export_name);
+    let out_run = rig.run_args(&["--export", &export_name]);
     let _ = bg.join();
 
     assert!(
@@ -230,20 +218,17 @@ fn permanent_sql_error_fails_fast_without_exhausting_retries() {
 
     let export_name = unique_name("qa43_permerr");
     let out = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = Rig::pg_batch(&export_name)
+    let rig = Rig::pg_batch(&export_name)
         // intentional typo → a permanent SQL syntax error
         .query("SELCT 1")
         .mode("full")
         .export_line("tuning:")
         .export_line("  max_retries: 5")
         .export_line("  retry_backoff_ms: 5000")
-        .dest_path(out.path().to_path_buf())
-        .yaml();
-    let cfg_path = write_config(&cfg_dir, &yaml);
+        .dest_path(out.path().to_path_buf());
 
     let t0 = std::time::Instant::now();
-    let out_run = run_rivet_export(&cfg_path, &export_name);
+    let out_run = rig.run_args(&["--export", &export_name]);
     let elapsed = t0.elapsed();
 
     assert!(
