@@ -9,26 +9,12 @@
 
 use crate::common::*;
 
-fn check_rejects_missing_table(source_yaml: &str, what: &str) {
-    let cfg_dir = tempfile::tempdir().unwrap();
-    let yaml = format!(
-        r#"{source_yaml}
-exports:
-  - name: probe
-    query: "SELECT * FROM definitely_not_a_real_table_xyzzy"
-    mode: full
-    format: csv
-    destination:
-      type: local
-      path: {dir}
-"#,
-        dir = cfg_dir.path().display()
-    );
-    let cfg = write_config(&cfg_dir, &yaml);
-    let out = std::process::Command::new(RIVET_BIN)
-        .args(["check", "-c", cfg.to_str().unwrap()])
-        .output()
-        .expect("spawn rivet check");
+fn check_rejects_missing_table(base: Rig, what: &str) {
+    let rig = base
+        .export_named("probe")
+        .query("SELECT * FROM definitely_not_a_real_table_xyzzy")
+        .with_format("csv");
+    let out = rig.cli(&["check"]);
     assert!(
         !out.status.success(),
         "{what}: `rivet check` must FAIL (non-zero) on a non-existent table, not pass to run time. \
@@ -52,28 +38,19 @@ exports:
 #[ignore = "live: postgres"]
 fn pg_check_rejects_missing_table() {
     require_alive(LiveService::Postgres);
-    check_rejects_missing_table(
-        &format!("source: {{type: postgres, url: \"{POSTGRES_URL}\"}}"),
-        "postgres",
-    );
+    check_rejects_missing_table(Rig::pg_batch("probe"), "postgres");
 }
 
 #[test]
 #[ignore = "live: mysql"]
 fn mysql_check_rejects_missing_table() {
     require_alive(LiveService::Mysql);
-    check_rejects_missing_table(
-        &format!("source: {{type: mysql, url: \"{MYSQL_URL}\"}}"),
-        "mysql",
-    );
+    check_rejects_missing_table(Rig::mysql_batch("probe"), "mysql");
 }
 
 #[test]
 #[ignore = "live: mssql"]
 fn mssql_check_rejects_missing_table() {
     require_alive(LiveService::Mssql);
-    check_rejects_missing_table(
-        &format!("source: {{type: mssql, url: \"{MSSQL_URL}\"}}"),
-        "mssql",
-    );
+    check_rejects_missing_table(Rig::mssql_batch("probe"), "mssql");
 }
