@@ -23,11 +23,22 @@ impl Rig {
             std::fs::create_dir_all(self.out_dir_for(&e.name)).unwrap();
         }
         let cfg = dir.join("rig.yaml");
-        self.write_guarded(&cfg, &self.render());
-        // Track the caller-owned copy so amend/replace re-render it too —
-        // otherwise a sanctioned mutation updates only the rig-dir config and
-        // the caller's path silently keeps executing the OLD knobs (r2
-        // bughunt: exactly the measured-nothing class the guard exists for).
+        // NO hand-edit refusal here, deliberately: a caller-owned dir may hold
+        // a PRIOR rig's config (the sequential-overwrite pattern —
+        // live_batch_switch_golden materializes a fresh rig per stage into ONE
+        // dir), and a fresh instance cannot recognize another rig's render.
+        // The lifecycle half of the r2 finding still holds: the copy is
+        // tracked and re-rendered by every sanctioned mutation.
+        let rendered = self.render();
+        std::fs::write(&cfg, &rendered).unwrap();
+        // Still RECORD the render (unlike the refusal, which is dropped
+        // above): a later sanctioned mutation re-renders this copy through
+        // write_guarded, which must recognize its own prior render as ours.
+        let mut past = self.past_renders.borrow_mut();
+        if !past.iter().any(|r| r == &rendered) {
+            past.push(rendered);
+        }
+        drop(past);
         self.materialized_copies.borrow_mut().push(cfg.clone());
         cfg
     }
@@ -52,6 +63,29 @@ impl Rig {
         let mut past = self.past_renders.borrow_mut();
         if !past.iter().any(|r| r == rendered) {
             past.push(rendered.to_string());
+        }
+    }
+
+    /// Accept whatever rivet itself just wrote into the materialized configs.
+    ///
+    /// The guard's model was "only the rig writes the config" — false:
+    /// `rivet plan` WITHOUT --annotate-waves annotates a wave-less config
+    /// (adds `wave:`/`parallel_safe:`; the 0.24.4 fix pinned only the
+    /// don't-REPLACE-hand-tuned arm), which the guard then flagged as a
+    /// foreign edit on the next materialization (CI: dozens of false
+    /// panics). Called after every completed invocation (invoke.rs), so a
+    /// PRODUCT write is absorbed while a TEST's hand-edit — which happens
+    /// outside any invocation — still trips the guard.
+    pub(crate) fn absorb_product_config_writes(&self) {
+        let mut paths = vec![self.dir.path().join("rig.yaml")];
+        paths.extend(self.materialized_copies.borrow().iter().cloned());
+        let mut past = self.past_renders.borrow_mut();
+        for p in paths {
+            if let Ok(existing) = std::fs::read_to_string(&p)
+                && !past.iter().any(|r| r == &existing)
+            {
+                past.push(existing);
+            }
         }
     }
 

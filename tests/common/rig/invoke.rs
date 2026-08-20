@@ -41,9 +41,15 @@ impl Rig {
 
     /// Run to completion and collect the output.
     fn invoke(&self, argv: &[String], envs: &[(&str, &str)]) -> std::process::Output {
-        self.invoke_command(argv, envs)
+        let out = self
+            .invoke_command(argv, envs)
             .output()
-            .expect("spawn rivet binary")
+            .expect("spawn rivet binary");
+        // rivet itself may write into the config (`plan` annotates wave-less
+        // configs even without --annotate-waves) — absorb it so the hand-edit
+        // guard keeps firing only on edits made OUTSIDE an invocation.
+        self.absorb_product_config_writes();
+        out
     }
 
     /// Run an ARBITRARY subcommand against this rig's config: `rivet <args…>
@@ -182,6 +188,7 @@ impl Rig {
         let start = std::time::Instant::now();
         loop {
             if let Some(status) = child.try_wait().expect("try_wait rivet") {
+                self.absorb_product_config_writes();
                 return Some(std::process::Output {
                     status,
                     stdout: std::fs::read(&out_path).unwrap_or_default(),
