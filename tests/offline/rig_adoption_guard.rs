@@ -33,7 +33,6 @@ const BASELINE: &[(&str, usize)] = &[
     ("audit_state.rs", 1), // missing-config-path IS the subject
     ("batch_memory_policy.rs", 1),
     ("live_azure_multipart.rs", 2),
-    ("live_batch_switch_golden.rs", 3),
     ("live_cdc.rs", 33),
     ("live_cdc_property.rs", 2),
     ("live_cdc_replica.rs", 2),
