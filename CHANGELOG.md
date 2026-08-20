@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- **`rivet plan` is now READ-ONLY without `--annotate-waves`.** It computes and
+  prints the advisory schedule (and the reviewable plan artifact) but no longer
+  touches your config file unless you pass `--annotate-waves`. Previously, plan
+  gated only the *overwrite* of an existing `wave:`/`parallel_safe:` behind the
+  flag but still SILENTLY ADDED those fields to any export that lacked them — so
+  a read-only-looking `rivet plan` mutated a fresh config (the ADD-arm of the
+  0.24.4 config-clobber incident, whose overwrite half `--annotate-waves` was
+  introduced to require consent for). Now config mutation is a single explicit
+  opt-in: no flag ⇒ no write, present field or absent. `--annotate-waves`
+  (over)writes the whole schedule as before. `rivet apply` is unaffected —
+  exports with no `wave:` run last, as one implicit final wave.
+
 ## 0.24.5 — 2026-08-19
 
 Product fixes surfaced by the harness-conceptual audit ("does rivet verify

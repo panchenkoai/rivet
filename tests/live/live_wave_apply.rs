@@ -208,45 +208,49 @@ fn resume_skips_a_completed_export_with_a_templated_destination() {
     );
 }
 
-/// `rivet plan` must NOT rewrite a hand-tuned schedule unless asked, and
-/// `--annotate-waves` is the asking.
+/// `rivet plan` is READ-ONLY without `--annotate-waves`: it must not write the
+/// config AT ALL — neither replace a hand-tuned `wave:` nor ADD one to a blank
+/// export. `--annotate-waves` is the only thing that writes.
 ///
 /// This is a regression with an incident behind it, recorded on the flag itself:
 /// before 0.24.4 a read-only-LOOKING `rivet plan` replaced the operator's
-/// `wave:` values, and a 5-per-wave split became one 76-export wave. The pure
-/// annotation logic has unit tests (`wave_annotations_insert_replace_and_preserve`),
-/// but nothing ran the FLAG: a correct function reached through a wrong wiring is
-/// exactly the shape that costs a production schedule, and the unit test cannot
-/// see it because the test supplies the input the CLI is meant to supply.
+/// `wave:` values, and a 5-per-wave split became one 76-export wave. 0.24.4
+/// gated the OVERWRITE — but left the ADD-arm open: plain `plan` still silently
+/// wrote `wave:`/`parallel_safe:` onto any export that LACKED them, so a fresh
+/// config was still mutated by a command that looks read-only. The read-only
+/// contract (2026-08-20) closes that arm: no flag ⇒ no write, present or absent.
 ///
-/// So both directions go through the real binary and read the CONFIG FILE back:
-/// without the flag the hand-set waves must survive byte-for-byte, with it they
-/// must change. Asserting only the first would pass on a `plan` that never
-/// annotates at all.
+/// The fixture carries BOTH arms so the byte-for-byte assertion below covers
+/// each: two hand-tuned exports (the OVERWRITE the flag once did silently) and
+/// one BLANK export with no wave at all (the ADD-arm 0.24.4 missed). Pre-fix,
+/// plain `plan` adds `wave:` to the blank export → the config changes → RED.
 ///
-/// The load-bearing gate is `fields_to_write(&recs, &config, annotate_waves)` —
-/// RED-proven by forcing its third argument to `true`, which rewrites the config
-/// with no flag and fires the preservation assertion. The OTHER `annotate_waves`
-/// branch a reader meets first (`repack_from_history` at plan_cmd.rs:191) is
-/// EQUIVALENT for this property: it changes what the recommendation says, not
-/// whether anything is written. Named here so the next person mutating this file
-/// does not conclude the test is insensitive after trying the wrong one.
+/// Both directions go through the real binary and read the CONFIG FILE back:
+/// without the flag it must survive byte-for-byte, with it it must change.
+/// Asserting only the first would pass on a `plan` that never annotates at all.
+/// The load-bearing gate is `fields_to_write(&recs, annotate_waves)` in
+/// plan_cmd.rs — the unit test `plan_is_read_only_without_annotate_and_packs_
+/// the_whole_config_with_it` pins it directly; this one pins the WIRING (the
+/// CLI actually reaches the gate with the flag the operator passed).
 #[test]
 #[ignore = "live: postgres"]
-fn plan_preserves_hand_tuned_waves_unless_annotate_is_asked() {
+fn plan_is_read_only_without_annotate_waves() {
     require_alive(LiveService::Postgres);
     let a = unique_name("wave_keep_a");
     let b = unique_name("wave_keep_b");
+    let c = unique_name("wave_blank_c");
 
     // Hand-tuned: two exports the planner would happily put in ONE wave, split
-    // across two on purpose. That split is the thing an operator owns.
+    // across two on purpose (the OVERWRITE arm). Plus a THIRD export with NO
+    // wave/parallel_safe at all — the ADD-arm 0.24.4 left silently open.
     let rig = Rig::pg_batch(&a)
         .query("SELECT id FROM orders")
         .export_line("wave: 7")
         .export_line("parallel_safe: false")
         .also_export(&b, "SELECT id FROM orders")
         .also_export_line("wave: 9")
-        .also_export_line("parallel_safe: false");
+        .also_export_line("parallel_safe: false")
+        .also_export(&c, "SELECT id FROM orders"); // blank: no wave, no parallel_safe
     let cfg = rig.config_path();
     let before = std::fs::read_to_string(&cfg).expect("read config");
 
@@ -260,8 +264,9 @@ fn plan_preserves_hand_tuned_waves_unless_annotate_is_asked() {
         std::fs::read_to_string(&cfg).expect("re-read config"),
         before,
         "`rivet plan` without --annotate-waves must leave the config BYTE-FOR-BYTE alone — \
-         it reads as a read-only command, and silently replacing a hand-tuned `wave:` is \
-         the 0.24.4 incident this flag was introduced for"
+         not replace the hand-tuned waves (7/9) AND not ADD a `wave:` to the blank export \
+         '{c}'. A read-only-looking command that mutates the file is the 0.24.4 incident \
+         class; the ADD-arm is the half 0.24.4 left open."
     );
 
     // …and the flag must actually do the thing, or the assertion above is
@@ -275,8 +280,8 @@ fn plan_preserves_hand_tuned_waves_unless_annotate_is_asked() {
     let after = std::fs::read_to_string(&cfg).expect("re-read config after annotate");
     assert_ne!(
         after, before,
-        "--annotate-waves must REWRITE the hand-set schedule (waves 7/9 were chosen so any \
-         real plan disagrees); an unchanged file means the flag never reached the annotator \
-         and the preservation assertion above proves nothing"
+        "--annotate-waves must REWRITE the schedule (waves 7/9 were chosen so any real plan \
+         disagrees, and the blank export gains a wave); an unchanged file means the flag never \
+         reached the annotator and the read-only assertion above proves nothing"
     );
 }

@@ -193,7 +193,7 @@ pub fn run_plan_command(
     } else {
         recs
     };
-    let (fields, preserved) = fields_to_write(&recs, &config, annotate_waves);
+    let fields = fields_to_write(&recs, annotate_waves);
     let written = if fields.is_empty() {
         std::collections::HashSet::new()
     } else {
@@ -204,13 +204,22 @@ pub fn run_plan_command(
     // version of this line is how a hand-tuned 5-per-wave schedule silently
     // became one 76-export wave (#150). Report ACTUAL writes, not intent
     // (bug hunt 2026-08-08).
-    if !written.is_empty() || preserved > 0 {
+    if !written.is_empty() {
         log::warn!(
-            "plan: annotated {} export(s) in {}; left {} untouched (wave/parallel_safe already \
-             set — rerun with --annotate-waves to overwrite)",
+            "plan --annotate-waves: (over)wrote wave/parallel_safe on {} export(s) in {}",
             written.len(),
             config_path,
-            preserved
+        );
+    } else if !annotate_waves && !recs.is_empty() {
+        // Read-only by default (bug hunt 2026-08-20): plan computed a schedule
+        // but did NOT touch the config. Say so, and how to persist it — so the
+        // recommendation isn't silently lost AND the operator isn't surprised
+        // by a mutated file. `info`: this is discoverability, not a hazard.
+        log::info!(
+            "plan: read-only — scheduled {} export(s) but left {} unchanged; \
+             rerun with --annotate-waves to write wave/parallel_safe into it",
+            recs.len(),
+            config_path,
         );
     }
     // A field we meant to write but no `- name:` line matched is a SILENT
@@ -236,9 +245,10 @@ pub fn run_plan_command(
     // scope", while the flags were computed twenty lines up (walk find,
     // 2026-08-13): heavies then predicted M-way parallelism apply-time
     // serialization can never reach.
-    // …and the RECOMMENDATION is not what apply reads: `fields_to_write`
-    // deliberately preserves a hand-set `parallel_safe:`, so the preview must
-    // model the value now ON DISK (bughunt 2026-08-14).
+    // …and the RECOMMENDATION is not what apply reads: without --annotate-waves
+    // plan writes nothing (read-only), and even WITH it a write can fail to
+    // match a `- name:` line — so the preview must model the value now ON DISK,
+    // not `recs` (bughunt 2026-08-14; read-only contract 2026-08-20).
     let safe_of = effective_parallel_safe(&recs, &config, &fields, &written);
     if pool_estimate_is_printable(&format) {
         print_pool_estimate(&artifacts, &safe_of, &state);
@@ -905,55 +915,57 @@ fn history_pack_items(
     (items, measured_n)
 }
 
-/// Which of the plan's recommendations may actually be WRITTEN into the
-/// operator's config: absent fields always; present fields only under
-/// `--annotate-waves`. Returns the fields plus how many exports were fully
-/// preserved (had every recommended field already set).
+/// Which of the plan's recommendations get WRITTEN into the operator's config.
 ///
-/// PURE, and per-FIELD rather than per-export: an export with a hand-set
-/// `wave:` but no `parallel_safe:` gets only the missing half. The operator's
-/// schedule is a decision; plan's job is to fill blanks, not to have opinions
-/// about decisions already made (#150 — the config-clobber class).
-fn fields_to_write(
-    recs: &[(String, u32, bool)],
-    config: &Config,
-    annotate_waves: bool,
-) -> (ExportFields, usize) {
-    let mut fields: ExportFields = HashMap::new();
-    let mut preserved = 0usize;
-    for (name, wave, parallel_safe) in recs {
-        let existing = config.exports.iter().find(|e| &e.name == name);
-        let mut items: Vec<(&'static str, String)> = Vec::new();
-        if annotate_waves || existing.is_none_or(|e| e.wave.is_none()) {
-            items.push(("wave", wave.to_string()));
-        }
-        if annotate_waves || existing.is_none_or(|e| e.parallel_safe.is_none()) {
-            items.push(("parallel_safe", parallel_safe.to_string()));
-        }
-        if items.is_empty() {
-            preserved += 1;
-        } else {
-            fields.insert(name.clone(), items);
-        }
+/// `rivet plan` is READ-ONLY by default: it computes and prints the advisory
+/// schedule but never mutates the config file. Writing happens ONLY under
+/// `--annotate-waves`, and when it does it packs the WHOLE config coherently —
+/// every export's `wave:`/`parallel_safe:` is (over)written with this plan's
+/// recommendation, because a schedule is only coherent as a set.
+///
+/// This closes the ADD-arm of the #150 config-clobber class. The pre-0.24.6
+/// gate gated only the OVERWRITE of a present field; it still SILENTLY ADDED
+/// `wave:`/`parallel_safe:` to any export that lacked them — so a
+/// read-only-looking `rivet plan` mutated a fresh config, the exact surprise
+/// `--annotate-waves` exists to require consent for. A command that writes the
+/// operator's file must be asked to, whether the field is present or absent
+/// (bug hunt 2026-08-20).
+///
+/// PURE. Returns the empty map when the flag is off, so the caller writes
+/// nothing and reports read-only.
+fn fields_to_write(recs: &[(String, u32, bool)], annotate_waves: bool) -> ExportFields {
+    if !annotate_waves {
+        return HashMap::new();
     }
-    (fields, preserved)
+    recs.iter()
+        .map(|(name, wave, parallel_safe)| {
+            (
+                name.clone(),
+                vec![
+                    ("wave", wave.to_string()),
+                    ("parallel_safe", parallel_safe.to_string()),
+                ],
+            )
+        })
+        .collect()
 }
 
 /// What `apply --pool` will read for `parallel_safe` on each export AFTER this
 /// plan run finished writing — the value the preview must model.
 ///
-/// The recommendation is NOT that value. `fields_to_write` preserves a hand-set
-/// `parallel_safe:` (the operator's decision, #150 config-clobber class), so a
-/// config that says `true` on an export the cost model rates High keeps `true`
-/// on disk while `recs` says `false`. Sourcing the preview from `recs` made the
+/// The recommendation is NOT that value. Without `--annotate-waves` plan is
+/// read-only and writes nothing, so a config that says `true` on an export the
+/// cost model rates High keeps `true` on disk while `recs` says `false`
+/// (#150 config-clobber class — the read-only default is the strongest form of
+/// not-clobbering). Sourcing the preview from `recs` made the
 /// preview apply the C3 heavy-serialization floor to an export apply runs
 /// M-way (preview 90 min, real 30) — and inverted, advertised parallelism apply
 /// serializes, the exact defect the C3 model fixed on the apply side
 /// (bughunt 2026-08-14). Three inputs, one rule per export:
 ///
-///  * this run WROTE `parallel_safe` for it (blank field, or `--annotate-waves`
-///    overwriting, AND a `- name:` line actually matched) → the recommendation
-///    is now on disk;
+///  * this run WROTE `parallel_safe` for it (only under `--annotate-waves`,
+///    AND a `- name:` line actually matched) → the recommendation is now on
+///    disk;
 ///  * otherwise the config's own value survives;
 ///  * otherwise the field is absent from the file and `apply` reads
 ///    `unwrap_or(false)` — including the case where the write was attempted but
@@ -1508,16 +1520,17 @@ mod tests {
     /// implementation. What remains plan-side is only the wiring pinned by
     /// `print_pool_estimate`'s callsite (real `parallel_safe` map + the
     /// artifacts iterator), which the drift this closed lived in.
-    /// The additive contract (#150): plan fills BLANKS; a value the operator
-    /// set is untouched unless `--annotate-waves` says overwrite. Per FIELD —
-    /// a hand-set `wave:` with no `parallel_safe:` gets only the missing half.
+    /// The read-only contract (bug hunt 2026-08-20): without `--annotate-waves`
+    /// `rivet plan` writes NOTHING — not the hand-set exports, and not the
+    /// BLANK ones either (the ADD-arm the pre-0.24.6 gate left open). With the
+    /// flag it packs the WHOLE config: every export, both fields.
     ///
-    /// RED against the pre-fix behavior (every recommendation written
-    /// unconditionally): the hand-tuned case below would come back with a
-    /// `wave` entry and the test fails on the exact clobber the field hit —
-    /// a 5-per-wave split becoming one 76-export wave.
+    /// RED against the pre-fix gate (`annotate_waves || existing.is_none_or(..)`):
+    /// the no-flag call below would ADD `wave`+`parallel_safe` to `blank` and
+    /// `parallel_safe` to `half_set`, so `fields.is_empty()` fails on the exact
+    /// silent-mutation this fix closes.
     #[test]
-    fn plan_fills_blanks_and_never_clobbers_a_hand_set_schedule() {
+    fn plan_is_read_only_without_annotate_and_packs_the_whole_config_with_it() {
         let source = crate::config::SourceConfig {
             source_type: crate::config::SourceType::Postgres,
             url: Some("postgresql://localhost/test".into()),
@@ -1549,51 +1562,51 @@ mod tests {
         cfg.exports[0].wave = Some(7);
         cfg.exports[0].parallel_safe = Some(false);
         cfg.exports[1].wave = Some(7); // parallel_safe left blank
+        // `cfg` is intentionally unused by the read-only path — `fields_to_write`
+        // no longer consults the config to decide what to ADD; the flag alone
+        // decides. Kept as the fixture the strengthened live test mirrors.
+        let _ = &cfg;
         let recs = vec![
             ("hand_tuned".to_string(), 2, true),
             ("half_set".to_string(), 2, true),
             ("blank".to_string(), 2, true),
         ];
 
-        let (fields, preserved) = fields_to_write(&recs, &cfg, false);
+        // No flag → nothing is written, INCLUDING the blank export. This is the
+        // ADD-arm the pre-fix gate left open (it would return `blank` here).
+        let fields = fields_to_write(&recs, false);
         assert!(
-            !fields.contains_key("hand_tuned"),
-            "a fully hand-set export must not be touched: {fields:?}"
+            fields.is_empty(),
+            "plain `rivet plan` is read-only: it must write NOTHING, not even \
+             fill a blank export's wave/parallel_safe; got {fields:?}"
         );
-        assert_eq!(preserved, 1, "exactly the fully-set export is preserved");
-        let half: Vec<&str> = fields["half_set"].iter().map(|(k, _)| *k).collect();
-        assert_eq!(
-            half,
-            vec!["parallel_safe"],
-            "only the MISSING half is written"
-        );
-        let blank: Vec<&str> = fields["blank"].iter().map(|(k, _)| *k).collect();
-        assert_eq!(blank, vec!["wave", "parallel_safe"]);
 
-        // --annotate-waves is the explicit overwrite: everything is written.
-        let (fields, preserved) = fields_to_write(&recs, &cfg, true);
-        assert_eq!(preserved, 0);
-        assert_eq!(fields.len(), 3);
-        assert_eq!(
-            fields["hand_tuned"]
-                .iter()
-                .map(|(k, _)| *k)
-                .collect::<Vec<_>>(),
-            vec!["wave", "parallel_safe"]
-        );
+        // --annotate-waves is the explicit, whole-config write: every export,
+        // both fields — the hand-set values included (a coherent repacking).
+        let fields = fields_to_write(&recs, true);
+        assert_eq!(fields.len(), 3, "the flag packs every export");
+        for name in ["hand_tuned", "half_set", "blank"] {
+            let keys: Vec<&str> = fields[name].iter().map(|(k, _)| *k).collect();
+            assert_eq!(
+                keys,
+                vec!["wave", "parallel_safe"],
+                "--annotate-waves writes both fields on {name}"
+            );
+        }
     }
 
     /// The preview and the schedule must be ONE number: `plan`'s pool print
     /// models the `parallel_safe` that is on DISK after the annotations were
-    /// written, not the recommendation — because `fields_to_write` deliberately
-    /// preserves a hand-set flag (the test directly above pins that
-    /// preservation, and that is exactly the state where the two disagreed).
+    /// written, not the recommendation. Even under `--annotate-waves` the two
+    /// disagree when the write did NOT LAND — a recommendation whose `- name:`
+    /// line was templated/oddly-quoted never reaches disk, so `apply` still
+    /// reads the config's own value (or `unwrap_or(false)`), never the rec.
     ///
     /// Fixture carries THREE exports, one per branch of the rule, because the
-    /// subject is a per-export fold: a hand-set flag that must WIN over the
-    /// rec, a blank one whose write LANDED (rec wins), and a blank one whose
-    /// write matched no `- name:` line (nothing on disk → `apply` reads
-    /// `unwrap_or(false)`).
+    /// subject is a per-export fold: a write that never landed → the config's
+    /// hand-set flag still WINS, a blank one whose write LANDED (rec wins), and
+    /// a blank one whose write matched no `- name:` line (nothing on disk →
+    /// `apply` reads `unwrap_or(false)`).
     ///
     /// RED-proven against the pre-fix source — `recs.iter().map(|(n, _, s)| (n,
     /// *s))` — which reports `hand_tuned = true` and `unmatched = true` where
@@ -1637,7 +1650,9 @@ mod tests {
             ("blank".to_string(), 2, true),
             ("unmatched".to_string(), 2, true),
         ];
-        let (fields, _preserved) = fields_to_write(&recs, &cfg, false);
+        // The write path only exists under --annotate-waves now (read-only by
+        // default), so the preview's on-disk model is only interesting there.
+        let fields = fields_to_write(&recs, true);
         assert!(
             fields.contains_key("unmatched"),
             "the fixture must ATTEMPT the write it then fails to match"
@@ -1651,12 +1666,12 @@ mod tests {
         assert_eq!(
             safe.get("hand_tuned"),
             Some(&false),
-            "a hand-set flag is what apply reads — the rec was never written"
+            "the write never landed on disk, so apply reads the config's flag — not the rec"
         );
         assert_eq!(
             safe.get("blank"),
             Some(&true),
-            "a blank field the plan just filled reads back as the rec"
+            "a field whose write DID land reads back as the rec"
         );
         assert_eq!(
             safe.get("unmatched"),

@@ -644,8 +644,9 @@ fn next_steps_block(path: &str, provenance: &SourceProvenance) -> String {
     ));
     s.push_str(&format!(
         "\nOr seal a reviewable plan, then apply it (runs many tables by priority wave):\n  \
-         rivet plan  -c {path}     # assigns waves + writes a reviewable plan\n  \
-         rivet apply {path}        # runs wave-by-wave (parallel where safe)\n"
+         rivet plan  -c {path}                    # review the schedule (read-only)\n  \
+         rivet plan  -c {path} --annotate-waves   # write wave:/parallel_safe: into the config\n  \
+         rivet apply {path}                       # runs wave-by-wave (parallel where safe)\n"
     ));
     s
 }
