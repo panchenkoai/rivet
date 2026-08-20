@@ -29,7 +29,6 @@ const BASELINE: &[(&str, usize)] = &[
     // path — a rig owns a real config, so that one raw invocation is the test.
     ("audit_observability.rs", 1),
     ("audit_plan_apply.rs", 4),
-    ("audit_preflight_table.rs", 7),
     ("audit_repair_chunk_index.rs", 3),
     ("audit_rerun.rs", 4),
     ("audit_state.rs", 4),
