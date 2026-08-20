@@ -12,6 +12,27 @@ use super::runner::RIVET_BIN;
 
 /// Builder for a single-export rivet config. Defaults: parquet, local
 /// destination inside the rig's tempdir, `until_current` CDC runs.
+/// One cloud destination per rig — the S3/GCS/Azure emulator triple the live
+/// stack ships. Kept as an enum so `dest_yaml` stays the single renderer for
+/// every backend (two renderers per backend is the drift the rig exists to
+/// prevent).
+enum CloudDest {
+    S3 {
+        bucket: String,
+        prefix: String,
+        endpoint: String,
+    },
+    Gcs {
+        bucket: String,
+        prefix: String,
+        endpoint: String,
+    },
+    Azure {
+        container: String,
+        prefix: String,
+    },
+}
+
 pub struct Rig {
     source_type: &'static str,
     source_url: String,
@@ -36,9 +57,10 @@ pub struct Rig {
     /// Container-visible twin of `dest_override`, set by [`Rig::duckdb_oracle`].
     oracle_container_dir: Option<String>,
     ckpt_override: Option<PathBuf>,
-    /// `(bucket, prefix, endpoint)` when the exports write to an S3-compatible
-    /// store instead of the tempdir. See [`Rig::dest_s3`].
-    s3_dest: Option<(String, String, String)>,
+    /// Cloud destination override when the exports write to a bucket/container
+    /// instead of the tempdir. See [`Rig::dest_s3`] / [`Rig::dest_gcs`] /
+    /// [`Rig::dest_azure`].
+    cloud_dest: Option<CloudDest>,
     dir: tempfile::TempDir,
 }
 
@@ -86,7 +108,7 @@ impl Rig {
             extra_exports: Vec::new(),
             oracle_container_dir: None,
             ckpt_override: None,
-            s3_dest: None,
+            cloud_dest: None,
             dir: tempfile::tempdir().expect("rig tempdir"),
         }
     }
@@ -237,7 +259,32 @@ impl Rig {
     /// on the cloud the way it is locally. Credentials go through `*_env` — the
     /// caller passes them in the run env, never inline in a committed config.
     pub fn dest_s3(mut self, bucket: &str, prefix: &str, endpoint: &str) -> Self {
-        self.s3_dest = Some((bucket.to_string(), prefix.to_string(), endpoint.to_string()));
+        self.cloud_dest = Some(CloudDest::S3 {
+            bucket: bucket.to_string(),
+            prefix: prefix.to_string(),
+            endpoint: endpoint.to_string(),
+        });
+        self
+    }
+
+    /// The fake-gcs sibling of [`Rig::dest_s3`]: anonymous access against the
+    /// emulator endpoint, same per-export prefix layout.
+    pub fn dest_gcs(mut self, bucket: &str, prefix: &str, endpoint: &str) -> Self {
+        self.cloud_dest = Some(CloudDest::Gcs {
+            bucket: bucket.to_string(),
+            prefix: prefix.to_string(),
+            endpoint: endpoint.to_string(),
+        });
+        self
+    }
+
+    /// The azurite sibling: the well-known dev account via
+    /// `RIVET_TEST_AZURITE_KEY` (pass it in the run env), same layout.
+    pub fn dest_azure(mut self, container: &str, prefix: &str) -> Self {
+        self.cloud_dest = Some(CloudDest::Azure {
+            container: container.to_string(),
+            prefix: prefix.to_string(),
+        });
         self
     }
 
@@ -245,11 +292,30 @@ impl Rig {
     /// the local tempdir otherwise. ONE renderer for both, so the primary and
     /// secondary exports cannot drift apart (they were two `format!`s before).
     fn dest_yaml(&self, export: &str) -> String {
-        match &self.s3_dest {
-            Some((bucket, prefix, endpoint)) => format!(
+        match &self.cloud_dest {
+            Some(CloudDest::S3 {
+                bucket,
+                prefix,
+                endpoint,
+            }) => format!(
                 "{{ type: s3, bucket: {bucket}, prefix: \"{prefix}/{export}/\", region: us-east-1, \
                  endpoint: \"{endpoint}\", access_key_env: RIVET_TEST_MINIO_AK, \
                  secret_key_env: RIVET_TEST_MINIO_SK }}"
+            ),
+            Some(CloudDest::Gcs {
+                bucket,
+                prefix,
+                endpoint,
+            }) => format!(
+                "{{ type: gcs, bucket: {bucket}, prefix: \"{prefix}/{export}/\", \
+                 endpoint: \"{endpoint}\", allow_anonymous: true }}"
+            ),
+            Some(CloudDest::Azure { container, prefix }) => format!(
+                "{{ type: azure, bucket: {container}, prefix: \"{prefix}/{export}/\", \
+                 account_name: {act}, account_key_env: RIVET_TEST_AZURITE_KEY, \
+                 endpoint: \"{ep}\" }}",
+                act = super::env::AZURITE_ACCOUNT,
+                ep = super::env::AZURITE_ENDPOINT,
             ),
             None => format!(
                 "{{ type: local, path: \"{}\" }}",
