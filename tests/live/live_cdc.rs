@@ -112,18 +112,26 @@ fn parquet_one_string(dir: &std::path::Path, col: &str) -> String {
 }
 
 fn full_config(d: &tempfile::TempDir, tbl: &str, out: &std::path::Path) -> std::path::PathBuf {
-    let yaml = format!(
-        r#"source: {{type: mysql, url: "{MYSQL_CDC_URL}"}}
-exports:
-  - name: {tbl}_batch
-    query: "SELECT * FROM {tbl}"
-    mode: full
-    format: parquet
-    destination: {{ type: local, path: "{out}" }}
-"#,
-        out = out.display(),
-    );
-    write_config(d, &yaml)
+    full_rig(tbl, out, "parquet").config_in(d.path())
+}
+
+/// The `<tbl>_batch` table-form full export against a Postgres `url` — the
+/// batch side of the PG cdc-vs-batch parity oracles.
+fn pg_full_rig(tbl: &str, url: &str, out: &std::path::Path) -> Rig {
+    Rig::pg_batch(tbl)
+        .export_named(&format!("{tbl}_batch"))
+        .source_url(url)
+        .dest_path(out.to_path_buf())
+}
+
+/// The `<tbl>_batch` SELECT-* full export against the CDC MySQL — the batch
+/// side of every cdc-vs-batch parity oracle in this file.
+fn full_rig(tbl: &str, out: &std::path::Path, format: &'static str) -> Rig {
+    Rig::mysql_batch(&format!("{tbl}_batch"))
+        .query(&format!("SELECT * FROM {tbl}"))
+        .source_url(MYSQL_CDC_URL)
+        .with_format(format)
+        .dest_path(out.to_path_buf())
 }
 
 #[test]
@@ -486,19 +494,9 @@ fn pg_cdc_config(
     slot: &str,
     out: &std::path::Path,
 ) -> std::path::PathBuf {
-    let yaml = format!(
-        r#"source: {{type: postgres, url: "{POSTGRES_CDC_URL}"}}
-exports:
-  - name: {tbl}
-    table: {tbl}
-    mode: cdc
-    format: parquet
-    cdc: {{ slot: {slot}, until_current: true }}
-    destination: {{ type: local, path: "{out}" }}
-"#,
-        out = out.display(),
-    );
-    write_config(d, &yaml)
+    Rig::pg_cdc(tbl, slot)
+        .dest_path(out.to_path_buf())
+        .config_in(d.path())
 }
 
 #[test]
@@ -761,18 +759,8 @@ exports:
     ))
     .unwrap();
     run_rivet_ok(&cfg);
-    let batch_yaml = format!(
-        r#"source: {{type: mysql, url: "{MYSQL_CDC_URL}"}}
-exports:
-  - name: {tbl}_batch
-    query: "SELECT * FROM {tbl}"
-    mode: full
-    format: csv
-    destination: {{ type: local, path: "{out}" }}
-"#,
-        out = batch_out.display(),
-    );
-    run_rivet_ok(&write_config(&d, &batch_yaml));
+    let batch_rig = full_rig(&tbl, &batch_out, "csv");
+    run_rivet_ok(&batch_rig.config_path());
 
     let read_csv = |dir: &std::path::Path| -> Vec<String> {
         let p = std::fs::read_dir(dir)
@@ -931,19 +919,8 @@ fn pg_cdc_non_utc_database_timezone_matches_batch() {
         .source_url(cdc_db.url())
         .dest_path(out.clone());
     run_rivet_ok(&rig.config_path());
-    let batch_yaml = format!(
-        r#"source: {{type: postgres, url: "{url}"}}
-exports:
-  - name: {tbl}_batch
-    table: {tbl}
-    mode: full
-    format: parquet
-    destination: {{ type: local, path: "{out}" }}
-"#,
-        url = cdc_db.url(),
-        out = batch_out.display(),
-    );
-    run_rivet_ok(&write_config(&d, &batch_yaml));
+    let batch_rig = pg_full_rig(&tbl, cdc_db.url(), &batch_out);
+    run_rivet_ok(&batch_rig.config_path());
     assert_cdc_matches_batch(&out, &batch_out);
 
     use arrow::array::TimestampMicrosecondArray;
@@ -1138,19 +1115,8 @@ fn pg_cdc_non_iso_datestyle_and_escape_bytea_match_batch() {
         .source_url(cdc_db.url())
         .dest_path(out.clone());
     run_rivet_ok(&rig.config_path());
-    let batch_yaml = format!(
-        r#"source: {{type: postgres, url: "{url}"}}
-exports:
-  - name: {tbl}_batch
-    table: {tbl}
-    mode: full
-    format: parquet
-    destination: {{ type: local, path: "{out}" }}
-"#,
-        url = cdc_db.url(),
-        out = batch_out.display(),
-    );
-    run_rivet_ok(&write_config(&d, &batch_yaml));
+    let batch_rig = pg_full_rig(&tbl, cdc_db.url(), &batch_out);
+    run_rivet_ok(&batch_rig.config_path());
     // Batch reads via the binary protocol (format-immune); CDC via test_decoding
     // TEXT. Equal ⇒ the session-state pin held: date not nulled, bytea not mangled.
     assert_cdc_matches_batch(&out, &batch_out);
@@ -1279,18 +1245,8 @@ fn pg_cdc_update_and_delete_carry_full_types() {
     std::fs::create_dir_all(&upd_out).unwrap();
     std::fs::create_dir_all(&batch_out).unwrap();
     run_rivet_ok(&pg_cdc_config(&d, &tbl, &slot, &upd_out));
-    let batch_yaml = format!(
-        r#"source: {{type: postgres, url: "{POSTGRES_CDC_URL}"}}
-exports:
-  - name: {tbl}_batch
-    table: {tbl}
-    mode: full
-    format: parquet
-    destination: {{ type: local, path: "{out}" }}
-"#,
-        out = batch_out.display(),
-    );
-    run_rivet_ok(&write_config(&d, &batch_yaml));
+    let batch_rig = pg_full_rig(&tbl, POSTGRES_CDC_URL, &batch_out);
+    run_rivet_ok(&batch_rig.config_path());
     let upd = read_one_batch(&upd_out);
     assert_eq!(upd.num_rows(), 1, "exactly the update event");
     assert_eq!(parquet_one_string(&upd_out, "__op"), "update");
@@ -1363,18 +1319,8 @@ fn pg_cdc_hostile_floats_match_batch_and_nan_numeric_fails_loudly() {
     std::fs::create_dir_all(&cdc_out).unwrap();
     std::fs::create_dir_all(&batch_out).unwrap();
     run_rivet_ok(&pg_cdc_config(&d, &tbl, &slot, &cdc_out));
-    let batch_yaml = format!(
-        r#"source: {{type: postgres, url: "{POSTGRES_CDC_URL}"}}
-exports:
-  - name: {tbl}_batch
-    table: {tbl}
-    mode: full
-    format: parquet
-    destination: {{ type: local, path: "{out}" }}
-"#,
-        out = batch_out.display(),
-    );
-    run_rivet_ok(&write_config(&d, &batch_yaml));
+    let batch_rig = pg_full_rig(&tbl, POSTGRES_CDC_URL, &batch_out);
+    run_rivet_ok(&batch_rig.config_path());
     assert_cdc_matches_batch(&cdc_out, &batch_out);
 
     // Leg 2: 'NaN'::NUMERIC — the CDC run must FAIL, naming the payload.
@@ -2149,20 +2095,13 @@ exports:
         cdc_out = cdc_out.display(),
         sid = server_id_for(&tbl),
     );
-    let batch_yaml = format!(
-        r#"source: {{type: mysql, url: "{MYSQL_CDC_URL}"}}
-exports:
-  - name: {tbl}_batch
-    table: {tbl}
-    mode: full
-    format: parquet
-    columns: {{ bigu: "decimal(20,0)" }}
-    destination: {{ type: local, path: "{batch_out}" }}
-"#,
-        batch_out = batch_out.display(),
-    );
+    let batch_rig = Rig::mysql_batch(&tbl)
+        .export_named(&format!("{tbl}_batch"))
+        .source_url(MYSQL_CDC_URL)
+        .export_line("columns: { bigu: \"decimal(20,0)\" }")
+        .dest_path(batch_out.clone());
     run_rivet_ok(&write_config(&d, &cdc_yaml));
-    run_rivet_ok(&write_config(&d, &batch_yaml));
+    run_rivet_ok(&batch_rig.config_path());
 
     let fields: std::collections::HashMap<_, _> = parquet_fields(&cdc_out).into_iter().collect();
     assert_eq!(
@@ -2234,18 +2173,8 @@ fn pg_cdc_full_type_matrix_matches_batch() {
     std::fs::create_dir_all(&cdc_out).unwrap();
     std::fs::create_dir_all(&batch_out).unwrap();
     run_rivet_ok(&pg_cdc_config(&d, &tbl, &slot, &cdc_out));
-    let batch_yaml = format!(
-        r#"source: {{type: postgres, url: "{POSTGRES_CDC_URL}"}}
-exports:
-  - name: {tbl}_batch
-    table: {tbl}
-    mode: full
-    format: parquet
-    destination: {{ type: local, path: "{out}" }}
-"#,
-        out = batch_out.display(),
-    );
-    run_rivet_ok(&write_config(&d, &batch_yaml));
+    let batch_rig = pg_full_rig(&tbl, POSTGRES_CDC_URL, &batch_out);
+    run_rivet_ok(&batch_rig.config_path());
     assert_cdc_matches_batch(&cdc_out, &batch_out);
 
     // HONEST LIMIT, first, because it changes how to read what follows: I could
