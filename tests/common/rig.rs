@@ -1226,3 +1226,61 @@ mod rig_render_goldens {
         }
     }
 }
+
+// ─── render goldens (offline; they run under the live_suite target with no DB) ───
+
+/// Render goldens for the rig affordances this wave grew — the offline half of
+/// the migration-equivalence protocol. A live run proves a rendered config
+/// WORKS today; the golden pins what it SAYS, so a rig refactor that silently
+/// changes a destination block (the exact risk of centralizing 72 files'
+/// config-building into one renderer) fails here with a diff, not in a cloud
+/// test's 404. Same shape as live_cdc's rig_renders_the_exact_legacy_cdc_template.
+#[test]
+fn cloud_dest_render_goldens() {
+    let s3 = Rig::pg_batch("t")
+        .export_named("e")
+        .dest_s3("bkt", "pfx", "http://127.0.0.1:9000")
+        .yaml();
+    assert!(
+        s3.contains(
+            "destination: { type: s3, bucket: bkt, prefix: \"pfx/e/\", region: us-east-1, \
+             endpoint: \"http://127.0.0.1:9000\", access_key_env: RIVET_TEST_MINIO_AK, \
+             secret_key_env: RIVET_TEST_MINIO_SK }"
+        ),
+        "dest_s3 render drifted:\n{s3}"
+    );
+    let gcs = Rig::pg_batch("t")
+        .export_named("e")
+        .dest_gcs("bkt", "pfx", "http://127.0.0.1:4443")
+        .yaml();
+    assert!(
+        gcs.contains(
+            "destination: { type: gcs, bucket: bkt, prefix: \"pfx/e/\", \
+             endpoint: \"http://127.0.0.1:4443\", allow_anonymous: true }"
+        ),
+        "dest_gcs render drifted:\n{gcs}"
+    );
+    let az = Rig::pg_batch("t")
+        .export_named("e")
+        .dest_azure("ctr", "pfx")
+        .yaml();
+    assert!(
+        az.contains("type: azure, bucket: ctr, prefix: \"pfx/e/\"")
+            && az.contains("account_key_env: RIVET_TEST_AZURITE_KEY"),
+        "dest_azure render drifted:\n{az}"
+    );
+}
+
+/// `config_in` must write the SAME bytes `config_path` writes — the "two
+/// materializations cannot drift" claim, asserted rather than commented.
+#[test]
+fn config_in_matches_config_path_byte_for_byte() {
+    let rig = Rig::pg_batch("t").export_named("e");
+    let own = std::fs::read_to_string(rig.config_path()).expect("own config");
+    let dir = tempfile::tempdir().expect("caller dir");
+    let theirs = std::fs::read_to_string(rig.config_in(dir.path())).expect("caller config");
+    assert_eq!(
+        own, theirs,
+        "config_in and config_path rendered different configs"
+    );
+}
