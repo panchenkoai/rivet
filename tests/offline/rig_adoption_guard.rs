@@ -30,7 +30,6 @@ const BASELINE: &[(&str, usize)] = &[
     // audit_metrics_validates_config_path's SUBJECT is a nonexistent --config
     // path — a rig owns a real config, so that one raw invocation is the test.
     ("audit_observability.rs", 1),
-    ("audit_repair_chunk_index.rs", 3),
     ("audit_state.rs", 1), // missing-config-path IS the subject
     ("audit_target_typo.rs", 3),
     ("batch_memory_policy.rs", 1),
