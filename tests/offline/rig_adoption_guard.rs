@@ -55,7 +55,6 @@ const BASELINE: &[(&str, usize)] = &[
     ("live_mysql_schema_drift.rs", 3),
     ("live_parallel_ux.rs", 2),
     ("live_partition_cloud.rs", 2),
-    ("live_performance_smoke.rs", 3),
     ("live_resume.rs", 2),
     ("live_temp_spill.rs", 1),
     ("preflight_missing_table.rs", 2),
