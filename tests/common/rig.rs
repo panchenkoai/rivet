@@ -655,6 +655,15 @@ impl Rig {
     /// the file's lifetime).
     pub fn checkpoint_path(mut self, path: PathBuf) -> Self {
         self.ckpt_override = Some(path);
+        // The checkpoint only reaches the config if the cdc block renders it.
+        // mysql_cdc/mssql_cdc seed the marker in their constructors; pg_cdc is
+        // slot-anchored and doesn't — so a caller-supplied checkpoint must add
+        // it, or the path is silently ABSENT from the rendered config (bitten:
+        // live_cdc's corrupt-checkpoint tests ran checkpoint-less and green-
+        // failed on the wrong arm).
+        if self.mode == "cdc" && !self.cdc_lines.iter().any(|l| l == "__CKPT__") {
+            self.cdc_lines.push("__CKPT__".to_string());
+        }
         self
     }
 

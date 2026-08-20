@@ -40,7 +40,7 @@ fn cdc_rig(tbl: &str, ckpt: &std::path::Path, out: &std::path::Path) -> Rig {
 
 /// Config PATH in a CALLER-owned dir, via [`Rig::config_in`] — the rig-level
 /// answer to the temporary-rig-drop trap this helper used to work around with
-/// a `write_config(d, &rig.yaml())` round-trip. Tests that need
+/// a hand-yaml round-trip through the caller dir. Tests that need
 /// `run_args_env` (fault injection) take [`cdc_rig`] instead.
 fn cdc_config(
     d: &tempfile::TempDir,
@@ -1905,22 +1905,12 @@ fn cdc_initial_snapshot_of_an_empty_table_converges_despite_skip_empty() {
     let out = d.path().join("out");
     let ckpt = d.path().join("cdc.ckpt");
     std::fs::create_dir_all(&out).unwrap();
-    let yaml = format!(
-        r#"source: {{type: mysql, url: "{MYSQL_CDC_URL}"}}
-exports:
-  - name: {tbl}
-    table: {tbl}
-    mode: cdc
-    format: parquet
-    skip_empty: true
-    cdc: {{ initial: snapshot, checkpoint: "{ckpt}", until_current: true, server_id: {sid} }}
-    destination: {{ type: local, path: "{out}" }}
-"#,
-        ckpt = ckpt.display(),
-        out = out.display(),
-        sid = server_id_for(&tbl),
-    );
-    let cfg = write_config(&d, &yaml);
+    let rig = Rig::mysql_cdc(&tbl)
+        .cdc_line("initial: snapshot")
+        .export_line("skip_empty: true")
+        .checkpoint_path(ckpt.clone())
+        .dest_path(out.clone());
+    let cfg = rig.config_path();
 
     run_rivet_ok(&cfg);
     let marker = out.join("snapshot").join("_SUCCESS");
@@ -2016,27 +2006,16 @@ fn cdc_column_overrides_apply_like_batch() {
     let batch_out = d.path().join("batch");
     std::fs::create_dir_all(&cdc_out).unwrap();
     std::fs::create_dir_all(&batch_out).unwrap();
-    let cdc_yaml = format!(
-        r#"source: {{type: mysql, url: "{MYSQL_CDC_URL}"}}
-exports:
-  - name: {tbl}
-    table: {tbl}
-    mode: cdc
-    format: parquet
-    columns: {{ bigu: "decimal(20,0)" }}
-    cdc: {{ checkpoint: "{ckpt}", until_current: true, server_id: {sid} }}
-    destination: {{ type: local, path: "{cdc_out}" }}
-"#,
-        ckpt = ckpt.display(),
-        cdc_out = cdc_out.display(),
-        sid = server_id_for(&tbl),
-    );
+    let cdc_rig = Rig::mysql_cdc(&tbl)
+        .export_line("columns: { bigu: \"decimal(20,0)\" }")
+        .checkpoint_path(ckpt.clone())
+        .dest_path(cdc_out.clone());
     let batch_rig = Rig::mysql_batch(&tbl)
         .export_named(&format!("{tbl}_batch"))
         .source_url(MYSQL_CDC_URL)
         .export_line("columns: { bigu: \"decimal(20,0)\" }")
         .dest_path(batch_out.clone());
-    run_rivet_ok(&write_config(&d, &cdc_yaml));
+    run_rivet_ok(&cdc_rig.config_path());
     run_rivet_ok(&batch_rig.config_path());
 
     let fields: std::collections::HashMap<_, _> = parquet_fields(&cdc_out).into_iter().collect();
@@ -2219,19 +2198,11 @@ fn pg_cdc_multi_table_stream_uses_one_slot_and_resumes() {
 
     let out = d.path().join("out");
     std::fs::create_dir_all(&out).unwrap();
-    let yaml = format!(
-        r#"source: {{type: postgres, url: "{POSTGRES_CDC_URL}"}}
-exports:
-  - name: app_cdc
-    tables: [{t1}, {t2}]
-    mode: cdc
-    format: parquet
-    cdc: {{ slot: {slot}, until_current: true }}
-    destination: {{ type: local, path: "{out}" }}
-"#,
-        out = out.display(),
-    );
-    let cfg = write_config(&d, &yaml);
+    let rig = Rig::pg_cdc(&t1, &slot)
+        .tables(&[&t1, &t2])
+        .export_named("app_cdc")
+        .dest_path(out.clone());
+    let cfg = rig.config_path();
 
     // Run 1 creates the ONE slot and drains nothing.
     run_rivet_ok(&cfg);
@@ -2289,21 +2260,12 @@ fn cdc_multi_table_stream_one_binlog_connection_and_resumes() {
     let out = d.path().join("out");
     let ckpt = d.path().join("cdc.ckpt");
     std::fs::create_dir_all(&out).unwrap();
-    let yaml = format!(
-        r#"source: {{type: mysql, url: "{MYSQL_CDC_URL}"}}
-exports:
-  - name: app_cdc
-    tables: [{ta}, {tb}]
-    mode: cdc
-    format: parquet
-    cdc: {{ checkpoint: "{ckpt}", until_current: true, server_id: {sid} }}
-    destination: {{ type: local, path: "{out}" }}
-"#,
-        ckpt = ckpt.display(),
-        out = out.display(),
-        sid = server_id_for(&ta),
-    );
-    let cfg = write_config(&d, &yaml);
+    let rig = Rig::mysql_cdc(&ta)
+        .tables(&[&ta, &tb])
+        .export_named("app_cdc")
+        .checkpoint_path(ckpt.clone())
+        .dest_path(out.clone());
+    let cfg = rig.config_path();
 
     // Run 1: pins the checkpoint (idle-first-run) with zero captures.
     run_rivet_ok(&cfg);
@@ -2355,25 +2317,15 @@ fn cdc_multi_table_to_gcs_lands_per_table_prefixes() {
     ensure_gcs_bucket(bucket);
     let prefix = unique_name("cdcgcs");
     let ckpt = d.path().join("cdc.ckpt");
-    let yaml = format!(
-        r#"source: {{type: mysql, url: "{MYSQL_CDC_URL}"}}
-exports:
-  - name: app_cdc
-    tables: [{ta}, {tb}]
-    mode: cdc
-    format: parquet
-    cdc: {{ checkpoint: "{ckpt}", until_current: true, server_id: {sid} }}
-    destination:
-      type: gcs
-      bucket: {bucket}
-      prefix: {prefix}
-      endpoint: {FAKE_GCS_ENDPOINT}
-      allow_anonymous: true
-"#,
-        ckpt = ckpt.display(),
-        sid = server_id_for(&ta),
-    );
-    let cfg = write_config(&d, &yaml);
+    let rig = Rig::mysql_cdc(&ta)
+        .tables(&[&ta, &tb])
+        .export_named("app_cdc")
+        .checkpoint_path(ckpt.clone())
+        .dest_gcs(bucket, &prefix, FAKE_GCS_ENDPOINT);
+    let cfg = rig.config_path();
+    // The rig's cloud dest renders prefix "<prefix>/<export>/" — the per-TABLE
+    // subprefixes under test now hang off that root.
+    let root = format!("{prefix}/app_cdc");
 
     run_rivet_ok(&cfg); // pin
     c.query_drop(format!("INSERT INTO {ta} VALUES (1,10),(2,20)"))
@@ -2398,16 +2350,16 @@ exports:
     for t in [&ta, &tb] {
         assert!(
             keys.iter()
-                .any(|k| *k == format!("{prefix}/{t}/manifest.json")),
+                .any(|k| *k == format!("{root}/{t}/manifest.json")),
             "per-table manifest key missing for {t}; keys: {keys:?}"
         );
         assert!(
-            keys.iter().any(|k| *k == format!("{prefix}/{t}/_SUCCESS")),
+            keys.iter().any(|k| *k == format!("{root}/{t}/_SUCCESS")),
             "per-table _SUCCESS key missing for {t}; keys: {keys:?}"
         );
         assert!(
             keys.iter()
-                .any(|k| k.starts_with(&format!("{prefix}/{t}/cdc-")) && k.ends_with(".parquet")),
+                .any(|k| k.starts_with(&format!("{root}/{t}/cdc-")) && k.ends_with(".parquet")),
             "per-table part key missing for {t}; keys: {keys:?}"
         );
         assert!(
@@ -2532,27 +2484,19 @@ fn pg_cdc_vanished_slot_with_checkpoint_fails_loudly_not_recreates() {
     let out1 = d.path().join("out1");
     std::fs::create_dir_all(&out1).unwrap();
     let ckpt = d.path().join("cdc.ckpt");
-    let yaml = |out: &std::path::Path| {
-        format!(
-            r#"source: {{type: postgres, url: "{POSTGRES_CDC_URL}"}}
-exports:
-  - name: {tbl}
-    table: {tbl}
-    mode: cdc
-    format: parquet
-    cdc: {{ slot: {slot}, until_current: true, checkpoint: "{ckpt}" }}
-    destination: {{ type: local, path: "{out}" }}
-"#,
-            ckpt = ckpt.display(),
-            out = out.display(),
-        )
+    let rig_for = |out: &std::path::Path| {
+        Rig::pg_cdc(&tbl, &slot)
+            .checkpoint_path(ckpt.clone())
+            .dest_path(out.to_path_buf())
     };
-    run_rivet_ok(&write_config(&d, &yaml(&out1)));
+    let rig1 = rig_for(&out1);
+    run_rivet_ok(&rig1.config_path());
     c.execute(&format!("INSERT INTO {tbl} VALUES (1,10)"), &[])
         .unwrap();
     let out2 = d.path().join("out2");
     std::fs::create_dir_all(&out2).unwrap();
-    run_rivet_ok(&write_config(&d, &yaml(&out2)));
+    let rig2 = rig_for(&out2);
+    run_rivet_ok(&rig2.config_path());
     assert_eq!(manifest_rows(&out2), 1, "run 2 captured the change");
     assert!(ckpt.exists(), "checkpoint persisted");
 
@@ -2565,8 +2509,8 @@ exports:
     // Run 3 must FAIL loudly — recreating the slot would silently skip id=2.
     let out3 = d.path().join("out3");
     std::fs::create_dir_all(&out3).unwrap();
-    let cfg3 = write_config(&d, &yaml(&out3));
-    let out = run_rivet_env(&["run", "--config", cfg3.to_str().unwrap()], &[]);
+    let rig3 = rig_for(&out3);
+    let out = rig3.run_args(&[]);
     assert!(
         !out.status.success(),
         "a vanished slot with an existing checkpoint must fail the run, not silently re-create"
@@ -2598,27 +2542,18 @@ fn pg_cdc_corrupt_checkpoint_fails_loud_not_silently_absent() {
     let _tbl = PgTable::adopt(tbl.clone());
 
     let ckpt = d.path().join("cdc.ckpt");
-    let yaml = |out: &std::path::Path| {
-        format!(
-            r#"source: {{type: postgres, url: "{POSTGRES_CDC_URL}"}}
-exports:
-  - name: {tbl}
-    table: {tbl}
-    mode: cdc
-    format: parquet
-    cdc: {{ slot: {slot}, until_current: true, checkpoint: "{ckpt}" }}
-    destination: {{ type: local, path: "{out}" }}
-"#,
-            ckpt = ckpt.display(),
-            out = out.display(),
-        )
+    let rig_for = |out: &std::path::Path| {
+        Rig::pg_cdc(&tbl, &slot)
+            .checkpoint_path(ckpt.clone())
+            .dest_path(out.to_path_buf())
     };
 
     // Run 1 (idle) creates the slot — PG anchors server-side, so an idle run
     // does not yet write the checkpoint FILE (unlike the client-anchor engines).
     let out1 = d.path().join("out1");
     std::fs::create_dir_all(&out1).unwrap();
-    run_rivet_ok(&write_config(&d, &yaml(&out1)));
+    let rig1 = rig_for(&out1);
+    run_rivet_ok(&rig1.config_path());
     let _slot = Slot(slot.clone());
 
     // Run 2 captures a change and pins a valid checkpoint file.
@@ -2626,7 +2561,8 @@ exports:
         .unwrap();
     let out2 = d.path().join("out2");
     std::fs::create_dir_all(&out2).unwrap();
-    run_rivet_ok(&write_config(&d, &yaml(&out2)));
+    let rig2 = rig_for(&out2);
+    run_rivet_ok(&rig2.config_path());
     assert_eq!(manifest_rows(&out2), 1, "run 2 captures the change");
     assert!(ckpt.exists(), "run 2 pins a checkpoint");
 
@@ -2639,11 +2575,8 @@ exports:
     // Run 3 must FAIL loudly — never read the corrupt checkpoint as absent.
     let out3 = d.path().join("out3");
     std::fs::create_dir_all(&out3).unwrap();
-    let res = run_rivet(&[
-        "run",
-        "--config",
-        write_config(&d, &yaml(&out3)).to_str().unwrap(),
-    ]);
+    let rig3 = rig_for(&out3);
+    let res = rig3.run_args(&[]);
     assert!(
         !res.status.success(),
         "a corrupt checkpoint must fail the run, not be read as absent and re-anchor"
@@ -3028,18 +2961,11 @@ fn roast_mysql_cdc_large_transaction_is_atomic_across_a_mid_flush_crash() {
 }
 
 fn pg_full_config(d: &tempfile::TempDir, tbl: &str, out: &std::path::Path) -> std::path::PathBuf {
-    let yaml = format!(
-        r#"source: {{type: postgres, url: "{POSTGRES_CDC_URL}"}}
-exports:
-  - name: {tbl}_batch
-    query: "SELECT * FROM {tbl}"
-    mode: full
-    format: parquet
-    destination: {{ type: local, path: "{out}" }}
-"#,
-        out = out.display(),
-    );
-    write_config(d, &yaml)
+    Rig::pg_batch(&format!("{tbl}_batch"))
+        .query(&format!("SELECT * FROM {tbl}"))
+        .source_url(POSTGRES_CDC_URL)
+        .dest_path(out.to_path_buf())
+        .config_in(d.path())
 }
 
 #[test]
@@ -4324,22 +4250,12 @@ fn cdc_changes_parquet_loads_into_a_warehouse_and_dedups_to_current_state() {
     let ckpt = d.path().join("cdc.ckpt");
     // meta_columns are REQUESTED: the fda1653 trap. They must be dropped from the
     // snapshot leg so both legs' data columns match in the shared __changes append.
-    let yaml = format!(
-        r#"source: {{type: mysql, url: "{MYSQL_CDC_URL}"}}
-exports:
-  - name: {tbl}
-    table: {tbl}
-    mode: cdc
-    format: parquet
-    meta_columns: {{ exported_at: true, row_hash: true }}
-    cdc: {{ initial: snapshot, checkpoint: "{ckpt}", until_current: true, server_id: {sid} }}
-    destination: {{ type: local, path: "{out}" }}
-"#,
-        ckpt = ckpt.display(),
-        out = host_dir.display(),
-        sid = server_id_for(&tbl),
-    );
-    let cfg = write_config(&d, &yaml);
+    let rig = Rig::mysql_cdc(&tbl)
+        .cdc_line("initial: snapshot")
+        .export_line("meta_columns: { exported_at: true, row_hash: true }")
+        .checkpoint_path(ckpt.clone())
+        .dest_path(host_dir.clone());
+    let cfg = rig.config_path();
     run_rivet_ok(&cfg); // snapshot leg → host_dir/snapshot/*.parquet
 
     // Post-snapshot changes: an UPDATE (dedup must pick the new value over the
@@ -4581,31 +4497,17 @@ fn both_legs_of_an_initial_snapshot_export_claim_one_source_identity() {
     let out = d.path().join("out");
     std::fs::create_dir_all(&out).unwrap();
     let ckpt = d.path().join("cdc.ckpt");
-    let cfg_text = format!(
-        r#"
-source: {{ type: mysql, url_env: MYSQL_CDC_URL }}
-exports:
-  - name: {tbl}
-    table: {tbl}
-    mode: cdc
-    cdc: {{ initial: snapshot, checkpoint: "{ckpt}", until_current: true, server_id: {sid} }}
-    format: parquet
-    destination: {{ type: local, path: "{out}" }}
-"#,
-        ckpt = ckpt.display(),
-        out = out.display(),
-        sid = server_id_for(&tbl),
-    );
-    let cfg = write_config(&d, &cfg_text);
+    let rig = Rig::mysql_cdc(&tbl)
+        .source_url_env("MYSQL_CDC_URL")
+        .cdc_line("initial: snapshot")
+        .checkpoint_path(ckpt.clone())
+        .dest_path(out.clone());
     // The config resolves its source through `url_env:` ON PURPOSE — this test is
     // about SOURCE IDENTITY, and the env form is the one a deployment uses when a
     // plaintext URL would be redacted out of the artifact. But nothing ever SET
     // the variable, so every run of this test died at config load with "env var
     // 'MYSQL_CDC_URL' is not set" before reaching a single assertion. Pass it.
-    let out_run = run_rivet_env(
-        &["run", "--config", cfg.to_str().unwrap()],
-        &[("MYSQL_CDC_URL", MYSQL_CDC_URL)],
-    );
+    let out_run = rig.run_args_env(&[], &[("MYSQL_CDC_URL", MYSQL_CDC_URL)]);
     assert!(
         out_run.status.success(),
         "the snapshot+cdc run must succeed; stderr:\n{}",
@@ -4853,14 +4755,11 @@ fn mysql_cdc_refuses_a_compressed_binlog_instead_of_capturing_nothing() {
     // `cdc_config` (the file's shared helper) points at :3307; every run here
     // must go to the isolated :3306 instead, so the config is built locally.
     let cfg_into = |dest: &std::path::Path| {
-        write_config(
-            &d,
-            &Rig::mysql_cdc(&tbl)
-                .source_url(&root_url)
-                .checkpoint_path(ckpt.clone())
-                .dest_path(dest.to_path_buf())
-                .yaml(),
-        )
+        Rig::mysql_cdc(&tbl)
+            .source_url(&root_url)
+            .checkpoint_path(ckpt.clone())
+            .dest_path(dest.to_path_buf())
+            .config_in(d.path())
     };
     // The refusal must come from the OPEN, before any capture claim — so it
     // fires on the anchoring run, not only once changes exist.
@@ -4977,14 +4876,11 @@ fn mysql_cdc_compressed_payload_in_stream_refuses_not_skips() {
     let d = tempfile::tempdir().unwrap();
     let ckpt = d.path().join("cdc.ckpt");
     let cfg_into = |dest: &std::path::Path| {
-        write_config(
-            &d,
-            &Rig::mysql_cdc(&tbl)
-                .source_url(&root_url)
-                .checkpoint_path(ckpt.clone())
-                .dest_path(dest.to_path_buf())
-                .yaml(),
-        )
+        Rig::mysql_cdc(&tbl)
+            .source_url(&root_url)
+            .checkpoint_path(ckpt.clone())
+            .dest_path(dest.to_path_buf())
+            .config_in(d.path())
     };
 
     // 1) Anchor with compression OFF — pins the checkpoint at the current coords,
