@@ -943,6 +943,51 @@ fn should_reconcile(allow_reconcile: bool, plan_reconcile: bool, failed: bool) -
     allow_reconcile && plan_reconcile && !failed
 }
 
+/// The plan-validation verdict, pure: `Some(err)` when the plan carries
+/// REJECTED diagnostics, `None` when it may run. Extracted because the
+/// `!rejected.is_empty()` gate sits in the live-only `run_export_job` body and
+/// its `!` survived the in-diff mutation gate — dropping it inverts the verdict,
+/// so a clean plan would be refused and a rejected one would RUN.
+fn plan_rejection_error(export_name: &str, rejected: &[String]) -> Option<anyhow::Error> {
+    if rejected.is_empty() {
+        return None;
+    }
+    Some(anyhow::anyhow!(
+        "export '{}': plan validation failed:\n  {}",
+        export_name,
+        rejected.join("\n  ")
+    ))
+}
+
+/// The two `--resume` / `--force` gates, pure. Both live inside `run_export_job`
+/// — a live-only body the in-diff mutation gate cannot reach, which is why its
+/// `&&` and both its `!`s survived (2026-08-21 run: 6 of the 16 misses were
+/// these three operators). The conditions are opposite halves of one policy, so
+/// they are stated together and unit-tested as one truth table.
+///
+/// `resume` asks to continue into a prefix; `force` is the audited override.
+/// A `--resume` into a COMPLETE prefix is refused unless forced (re-exporting a
+/// verified dataset is almost never meant); a FRESH run into a complete prefix
+/// is only warned about, because refusing or auto-deleting would destroy
+/// operator data.
+fn resume_success_gate_applies(resume: bool, force: bool) -> bool {
+    resume && !force
+}
+
+/// Sibling of [`resume_success_gate_applies`] — the fresh-run rerun-accumulation
+/// warning (audit findings #5/#19/#30).
+fn rerun_warning_applies(resume: bool, force: bool) -> bool {
+    !resume && !force
+}
+
+/// Does this export bypass the batch plan/strategy machinery for the dedicated
+/// CDC runner? Pure so the dispatch condition is graded offline — the `==`
+/// survived as a live-only mutant (flipping it to `!=` sends every BATCH export
+/// through the CDC runner and every CDC export through the batch planner).
+fn dispatches_to_cdc_runner(mode: crate::config::ExportMode) -> bool {
+    mode == crate::config::ExportMode::Cdc
+}
+
 /// THE post-plan execution script, written once: rss/forensics/harm bracket →
 /// dispatch → ADR-0028 seam → bracket close → quality gate → status → diagnosis
 /// → [reconcile] → journal → ledger close → manifest → cursor → keyset anchor →
@@ -1252,7 +1297,7 @@ pub(super) fn run_export_job(
     // CDC exports read the transaction log, not a query — they bypass the batch
     // plan/strategy machinery entirely and run through the dedicated CDC runner,
     // which produces the same (Result, RunSummary) contract + metric row.
-    if export.mode == crate::config::ExportMode::Cdc {
+    if dispatches_to_cdc_runner(export.mode) {
         // `initial: snapshot`: anchor first, then each pending table's full
         // snapshot (a recursive `mode: full` run into `…/snapshot/`, with its
         // own metric + journal), then the drain below. A failed snapshot fails
@@ -1327,12 +1372,7 @@ pub(super) fn run_export_job(
             }
         }
     }
-    if !rejected.is_empty() {
-        let err = anyhow::anyhow!(
-            "export '{}': plan validation failed:\n  {}",
-            plan.export_name,
-            rejected.join("\n  ")
-        );
+    if let Some(err) = plan_rejection_error(&plan.export_name, &rejected) {
         let summary = synthetic_failed_summary(&export.name, &err);
         return (Err(err), summary);
     }
@@ -1342,8 +1382,7 @@ pub(super) fn run_export_job(
     // overrode the gate with `--force`.  Re-exporting over a verified
     // dataset is almost never what the operator meant; the gate makes the
     // override an audited decision.
-    if opts.resume
-        && !opts.force
+    if resume_success_gate_applies(opts.resume, opts.force)
         && let Err(e) = check_success_gate_for_resume(&plan)
     {
         let summary = synthetic_failed_summary(&export.name, &e);
@@ -1358,7 +1397,7 @@ pub(super) fn run_export_job(
     // parts.  Refusing or auto-deleting would destroy operator data, so this
     // is a loud, non-fatal WARN instead (the `--resume` path above keeps its
     // refuse-without-`--force` gate).  `--force` is the explicit opt-out.
-    if !opts.resume && !opts.force {
+    if rerun_warning_applies(opts.resume, opts.force) {
         warn_if_prefix_has_completed_run(&plan);
     }
 
@@ -1650,6 +1689,79 @@ mod tests {
     /// no `&&`→`||` and no dropped `!` survives (the in-diff mutation gate found
     /// all three of those alive in the live-only script body; extracting the
     /// decision is what makes them killable offline).
+    /// The plan-validation verdict: a clean plan RUNS, a rejected one is
+    /// refused with every reason named. Kills the `delete !` mutant, which
+    /// inverts both halves — refusing valid plans and running rejected ones.
+    #[test]
+    fn plan_rejection_error_refuses_only_a_rejected_plan_and_names_every_reason() {
+        use super::plan_rejection_error;
+        assert!(
+            plan_rejection_error("orders", &[]).is_none(),
+            "a plan with no REJECTED diagnostics must run"
+        );
+        let err = plan_rejection_error(
+            "orders",
+            &[
+                "chunk key is nullable".to_string(),
+                "no primary key".to_string(),
+            ],
+        )
+        .expect("a rejected plan must not run");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("export 'orders'"),
+            "names the export; got {msg}"
+        );
+        assert!(
+            msg.contains("chunk key is nullable") && msg.contains("no primary key"),
+            "every rejection reason must reach the operator; got {msg}"
+        );
+    }
+
+    /// The resume/force policy as ONE truth table: the refuse-gate and the
+    /// warn-gate are opposite halves, and `--force` disables both. Kills the
+    /// `&&`→`||` and both `delete !` mutants the in-diff gate found alive in
+    /// `run_export_job`.
+    #[test]
+    fn resume_and_rerun_gates_are_opposite_halves_disabled_by_force() {
+        use super::{rerun_warning_applies, resume_success_gate_applies};
+        // --resume, no --force: refuse a complete prefix; do NOT warn (the
+        // resume path owns this case).
+        assert!(resume_success_gate_applies(true, false));
+        assert!(!rerun_warning_applies(true, false));
+        // fresh run, no --force: warn about accumulation; the refuse-gate is
+        // not this path's.
+        assert!(!resume_success_gate_applies(false, false));
+        assert!(rerun_warning_applies(false, false));
+        // --force is the audited override: BOTH gates go quiet, resumed or not.
+        for resume in [true, false] {
+            assert!(
+                !resume_success_gate_applies(resume, true),
+                "--force must disable the resume refusal (resume={resume})"
+            );
+            assert!(
+                !rerun_warning_applies(resume, true),
+                "--force must disable the rerun warning (resume={resume})"
+            );
+        }
+    }
+
+    /// The CDC dispatch fork: exactly one mode takes the CDC runner, every other
+    /// mode takes the batch planner. Kills the `==`→`!=` mutant (which would
+    /// invert the whole fork).
+    #[test]
+    fn only_cdc_mode_dispatches_to_the_cdc_runner() {
+        use super::dispatches_to_cdc_runner;
+        use crate::config::ExportMode;
+        assert!(dispatches_to_cdc_runner(ExportMode::Cdc));
+        for m in [ExportMode::Full, ExportMode::Incremental] {
+            assert!(
+                !dispatches_to_cdc_runner(m),
+                "{m:?} is a BATCH mode and must not reach the CDC runner"
+            );
+        }
+    }
+
     #[test]
     fn should_reconcile_requires_permission_request_and_success() {
         use super::should_reconcile;

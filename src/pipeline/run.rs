@@ -3126,10 +3126,66 @@ mod pool_harm_tests {
 #[cfg(test)]
 mod run_tail_tests {
     use super::{
-        RunModes, owns_throughput_self_check, pool_safe_heavy_split, reports_run_aggregate,
-        self_check_throughput_as, snapshot_then_stamp, tail_plan,
+        RunModes, fold_failures, owns_throughput_self_check, pool_safe_heavy_split,
+        reports_run_aggregate, self_check_throughput_as, snapshot_then_stamp, tail_plan,
     };
     use crate::config::ExportConfig;
+
+    /// `fold_failures` is the shared representative-failure fold the three
+    /// orchestrator tails route through (arch-roast 2026-08-21). Its whole-body
+    /// stub `Ok(())` survived the in-diff mutation gate — a run that FAILED
+    /// would then exit 0 — because every caller is a live-only tail. It is
+    /// pure, so it is graded here directly.
+    ///
+    /// Three cases, and the typed-marker downcast is the load-bearing one:
+    /// `error::classify_exit` reads the marker THROUGH anyhow's context chain,
+    /// so a multi-failure fold must keep the representative error underneath
+    /// its summary context or a data-integrity batch would exit 1 instead of 3.
+    #[test]
+    fn fold_failures_returns_ok_only_when_empty_and_keeps_the_typed_marker() {
+        use crate::error::DataIntegrityError;
+
+        // No failures → Ok. (The stub mutant makes EVERY case look like this.)
+        assert!(fold_failures(Vec::new(), " in the pool").is_ok());
+
+        // One failure → returned verbatim, marker intact.
+        let one = fold_failures(
+            vec![DataIntegrityError::new("rows differ").into()],
+            " across waves",
+        )
+        .expect_err("a failure must not fold to Ok");
+        assert_eq!(
+            crate::error::classify_exit(&one),
+            3,
+            "a single data-integrity failure must still exit 3"
+        );
+
+        // Several → the SCARIEST class is representative and its marker must
+        // survive the added context; the others are named in the message.
+        let many = fold_failures(
+            vec![
+                anyhow::anyhow!("plain boom"),
+                DataIntegrityError::new("rows differ").into(),
+            ],
+            " in the pool",
+        )
+        .expect_err("failures must not fold to Ok");
+        assert_eq!(
+            crate::error::classify_exit(&many),
+            3,
+            "the data-integrity marker must survive under the summary context, \
+             or a mixed batch exits on the wrong reason"
+        );
+        let msg = format!("{many:#}");
+        assert!(
+            msg.contains("2 export(s) failed in the pool"),
+            "the fold must count every failure and carry the caller's context; got: {msg}"
+        );
+        assert!(
+            msg.contains("plain boom"),
+            "the non-representative failures must still be listed; got: {msg}"
+        );
+    }
 
     /// Captures WARN records, because the run-over-run self-check has no other
     /// observable: it reads the state DB and LOGS. Installed once per test

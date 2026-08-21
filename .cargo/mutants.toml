@@ -103,6 +103,22 @@ exclude_re = [
     # suite (e.g. plan_is_read_only_without_annotate_waves, which asserts the
     # artifact/paths, and audit_plan_apply's plan.json reads).
     "replace run_plan_command ->",
+    # execute_resolved_plan (pipeline/job.rs) is THE post-plan execution script
+    # both orchestrator entry points route through (arch-roast 2026-08-21): it
+    # opens a real source, drives a runner, brackets source-harm, finalizes the
+    # manifest and writes the metric row — live-only end to end, so its
+    # whole-function stub `(Ok(()), Default::default())` is unkillable under
+    # `--lib --bins` (the documented "--lib on a live-only path" class; the two
+    # entry points it replaced were excluded for the same reason before it).
+    # Every DECISION it makes is extracted and unit-tested next door and each
+    # was RED-proven against the exact mutant the in-diff gate reported:
+    # should_reconcile (the reconcile leg's three operators),
+    # resume_success_gate_applies / rerun_warning_applies (the --resume/--force
+    # truth table), dispatches_to_cdc_runner, plan_rejection_error. Live oracle:
+    # the stub exports nothing and writes no manifest, so it fails every batch
+    # live test — proven by hand on run_with_reconnect and
+    # run_export_job_with_chunk_source, which stub the same way.
+    "replace execute_resolved_plan ->",
     # run_keyset / run_keyset_parallel (pipeline/keyset.rs) are the keyset export
     # RUNNERS — each opens a real source, drives the seek-paged FETCH loop and
     # streams parts to the sink. Unkillable OFFLINE (the --in-diff gate has no
