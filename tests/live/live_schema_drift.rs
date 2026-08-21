@@ -326,3 +326,96 @@ fn stable_schema_across_runs_reports_no_drift() {
         "stable schema across runs must record schema_changed = Some(false), not None"
     );
 }
+
+/// ADR-0028 bughunt (2026-08-21, MED): a run that FAILS must still RECORD what it
+/// observed — the seam's records half (fingerprint pin + Form-B harvest) applies
+/// on the failure path too; only the gates (drift policy, shape warn) are
+/// success-only. Pre-fix the seam ran only on runner Ok, so a drift-FAIL keyset
+/// run wrote a Failed manifest whose fingerprint fell back to the STALE open
+/// baseline (actively wrong: the durable parquet carries the new schema) and
+/// whose Form-B checksums — which mongo/keyset recorded pre-bail before the
+/// seam — were silently dropped. "Recording first is the truthful thing": the
+/// Failed manifest lists the durable debris, so it must describe it honestly.
+///
+/// Oracle is INDEPENDENT of the code under test: run 2's Failed manifest is
+/// compared against run 1's Success manifest (two artifacts on disk) — the
+/// fingerprint must DIFFER (run 2 observed the post-DROP schema) and the
+/// Form-B checksums must be present (the data phase completed; only the gate
+/// failed). RED pre-fix on both assertions.
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn drift_failed_keyset_run_still_records_observed_fingerprint_and_form_b() {
+    require_alive(LiveService::Postgres);
+    let table_name = unique_name("keyset_drift_rec");
+    let mut c = pg_connect();
+    c.batch_execute(&format!(
+        "CREATE TABLE {table_name} (k TEXT PRIMARY KEY, name TEXT NOT NULL, tmp_col INT DEFAULT 0);
+         INSERT INTO {table_name} (k, name) VALUES ('a','x'), ('b','y'), ('c','z');"
+    ))
+    .unwrap();
+    let _guard = PgCleanup(table_name.clone());
+
+    let export_name = unique_name("keyset_drift_rec_exp");
+    let out = tempfile::tempdir().unwrap();
+    let rig = Rig::pg_batch(&table_name)
+        .export_named(&export_name)
+        .mode("chunked")
+        .export_line("chunk_by_key: k")
+        .export_line("chunk_size: 2")
+        .export_line("on_schema_drift: fail")
+        .dest_path(out.path().to_path_buf());
+
+    assert!(
+        rig.run_args(&["--export", &export_name]).status.success(),
+        "run 1 (records the schema baseline) must succeed"
+    );
+    let m1: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(out.path().join("manifest.json")).expect("run-1 manifest"),
+    )
+    .unwrap();
+    let fp1 = m1["schema_fingerprint"]
+        .as_str()
+        .expect("run-1 fingerprint")
+        .to_string();
+
+    c.batch_execute(&format!("ALTER TABLE {table_name} DROP COLUMN tmp_col;"))
+        .unwrap();
+
+    let r2 = rig.run_args(&["--export", &export_name]);
+    assert!(
+        !r2.status.success(),
+        "run 2 must FAIL on the drift gate (the fixture's premise)"
+    );
+
+    let m2: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(out.path().join("manifest.json")).expect("run-2 manifest"),
+    )
+    .unwrap();
+    assert_eq!(
+        m2["status"].as_str(),
+        Some("failed"),
+        "run 2 writes a Failed manifest"
+    );
+
+    // (a) the OBSERVED fingerprint, not the stale baseline: run 2 read the
+    // post-DROP schema, so its manifest fingerprint must differ from run 1's.
+    let fp2 = m2["schema_fingerprint"]
+        .as_str()
+        .expect("run-2 fingerprint");
+    assert_ne!(
+        fp2, fp1,
+        "a drift-FAILED run's manifest must record the fingerprint it OBSERVED \
+         (post-DROP), not fall back to the stale baseline run 1 stored — the \
+         durable parts carry the new schema and the manifest must describe them"
+    );
+
+    // (b) Form-B survives the gate: the data phase completed before the gate
+    // fired, so the Failed manifest must carry the run-wide column checksums.
+    let checks = m2["column_checksums"].as_array();
+    assert!(
+        checks.is_some_and(|c| !c.is_empty()),
+        "a drift-FAILED keyset run must still record Form-B checksums for its \
+         durable parts (it did before ADR-0028 unified the tail); got: {:?}",
+        m2["column_checksums"]
+    );
+}

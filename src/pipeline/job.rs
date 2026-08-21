@@ -1087,12 +1087,20 @@ pub(super) fn run_export_job(
             chunked::ChunkSource::Detect,
         )
     };
-    // ADR-0028: THE export tail — apply the ledger the runner fed (fingerprint
-    // pin, drift gate, Form-B harvest, shape warn) exactly once, here, before
-    // anything downstream reads the summary. A drift `fail` folds into `result`
-    // and flows the same failed-status path a runner error does.
-    let result =
-        result.and_then(|()| super::finalize::finalize_export(&plan, Some(state), &mut summary));
+    // ADR-0028: THE export tail — apply the ledger the runner fed exactly once,
+    // here, before anything downstream reads the summary. On runner success the
+    // full seam runs (records + gates; a drift `fail` folds into `result` and
+    // flows the same failed-status path a runner error does). On runner FAILURE
+    // the records half still applies — the Failed manifest must describe the
+    // durable debris with the OBSERVED fingerprint + Form-B, never the stale
+    // baseline (seam bughunt 2026-08-21).
+    let result = match result {
+        Ok(()) => super::finalize::finalize_export(&plan, Some(state), &mut summary),
+        Err(e) => {
+            super::finalize::finalize_export_records(&mut summary);
+            Err(e)
+        }
+    };
 
     let rss_peak = rss_sampler.stop();
     let rss_after = crate::resource::get_rss_mb();
@@ -1391,12 +1399,16 @@ pub(crate) fn run_export_job_with_chunk_source(
     } else {
         run_with_reconnect(state, plan, &mut summary, "", chunk_source)
     };
-    // ADR-0028: THE export tail — apply the ledger the runner fed (fingerprint
-    // pin, drift gate, Form-B harvest, shape warn) exactly once, here, before
-    // anything downstream reads the summary. A drift `fail` folds into `result`
-    // and flows the same failed-status path a runner error does.
-    let result =
-        result.and_then(|()| super::finalize::finalize_export(plan, Some(state), &mut summary));
+    // ADR-0028: THE export tail — same contract as run_export_job's site: full
+    // seam on success, records half on failure (the Failed manifest must carry
+    // the OBSERVED fingerprint + Form-B, never the stale baseline).
+    let result = match result {
+        Ok(()) => super::finalize::finalize_export(plan, Some(state), &mut summary),
+        Err(e) => {
+            super::finalize::finalize_export_records(&mut summary);
+            Err(e)
+        }
+    };
 
     let rss_peak = rss_sampler.stop();
     let rss_after = crate::resource::get_rss_mb();

@@ -477,7 +477,11 @@ pub(super) fn run_single_export(
     // The application no longer lives in any runner.
     sink.drain_tail_into(&mut summary.ledger);
 
-    log::info!("export '{}' completed successfully", plan.export_name);
+    // "data phase complete", not "completed successfully": the post-run gates
+    // (drift policy, quality) run at the dispatcher AFTER this returns — a run
+    // they abort must not have already logged itself successful (seam bughunt
+    // 2026-08-21, LOW).
+    log::info!("export '{}': data phase complete", plan.export_name);
     Ok(())
 }
 

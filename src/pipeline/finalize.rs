@@ -57,22 +57,19 @@ pub(super) fn finalize_export(
 ) -> Result<()> {
     let ledger = std::mem::take(&mut summary.ledger);
 
+    // RECORDS before GATES (seam bughunt 2026-08-21): the fingerprint pin and
+    // the Form-B harvest describe the durable parts and must land on the
+    // summary even when the drift gate below ABORTS the run — the Failed
+    // manifest lists the debris, so it must describe it honestly ("recording
+    // first is the truthful thing", the rule mongo_parallel's pre-seam drain
+    // already followed). Pre-fix the gate's `?` skipped the harvest and a
+    // drift-FAILED keyset/mongo run wrote a Failed manifest with no Form-B.
     if let Some(schema) = &ledger.drift_schema {
         // Fingerprint pin is idempotent (first call wins) — uniform across
         // runners now, so keyset/mongo manifests carry the fingerprint single
         // mode always recorded.
         super::manifest_writer::record_run_schema_fingerprint(summary, schema);
-        if let Some(st) = state {
-            super::schema_drift::check_from_sink_schema(
-                st,
-                &plan.export_name,
-                schema,
-                plan.schema_drift_policy,
-                summary,
-            )?;
-        }
     }
-
     // Form B: record the run-wide checksums so the manifest carries them.
     // `harvest_column_checksums` itself suppresses on
     // `column_checksums_incomplete` (checkpoint-resume hydration) — that
@@ -82,6 +79,16 @@ pub(super) fn finalize_export(
         ledger.column_checksums,
         ledger.checksum_key_column,
     );
+
+    if let (Some(schema), Some(st)) = (&ledger.drift_schema, state) {
+        super::schema_drift::check_from_sink_schema(
+            st,
+            &plan.export_name,
+            schema,
+            plan.schema_drift_policy,
+            summary,
+        )?;
+    }
 
     // Epic 8: data shape drift — warn when string/binary columns grow beyond
     // threshold. Applied wherever a runner fed shape bytes (today the single
@@ -126,6 +133,27 @@ pub(super) fn finalize_export(
     }
 
     Ok(())
+}
+
+/// ADR-0028, the FAILURE half of the seam (bughunt 2026-08-21, MED): a run
+/// whose RUNNER errored still fed the ledger up to the failure, and its Failed
+/// manifest lists the durable debris — so the RECORDS (fingerprint pin, Form-B
+/// harvest) must still apply, or the manifest falls back to the STALE open
+/// baseline fingerprint while the durable parquet carries the observed schema
+/// (actively wrong forensics), and the checksums mongo/keyset recorded
+/// pre-seam vanish. GATES (drift policy, shape warn) are deliberately NOT run
+/// here: the run is already failing with the runner's own error, and a gate
+/// error would mask it.
+pub(super) fn finalize_export_records(summary: &mut RunSummary) {
+    let ledger = std::mem::take(&mut summary.ledger);
+    if let Some(schema) = &ledger.drift_schema {
+        super::manifest_writer::record_run_schema_fingerprint(summary, schema);
+    }
+    super::commit::harvest_column_checksums(
+        summary,
+        ledger.column_checksums,
+        ledger.checksum_key_column,
+    );
 }
 
 /// Write `.rivet/runs/<run_id>/{summary.md,summary.json}` and surface a
@@ -1092,6 +1120,43 @@ mod tests {
     /// drift suite + the RED-proven telltale backstop). RED against a seam that
     /// reads the ledger without applying (checksums stay empty) and against one
     /// that clones instead of takes (second call re-harvests).
+    /// The FAILURE half (seam bughunt 2026-08-21): a runner error must still
+    /// apply the RECORDS — fingerprint pinned from the fed schema, Form-B
+    /// harvested — with no state and no gates. RED against an Err arm that
+    /// skips the records call (fingerprint stays None, checksums empty).
+    #[test]
+    fn finalize_export_records_applies_pin_and_harvest_on_the_failure_path() {
+        use arrow::datatypes::{DataType, Field, Schema};
+        let mut summary = crate::pipeline::summary::RunSummary::default();
+        summary
+            .ledger
+            .note_schema(&Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        summary
+            .ledger
+            .merge_checksums(&[("id".to_string(), 5u64)].into());
+        summary.ledger.note_key_column(Some("id".into()));
+
+        finalize_export_records(&mut summary);
+
+        assert!(
+            summary.schema_fingerprint.is_some(),
+            "a FAILED run must record the fingerprint it OBSERVED — the Failed              manifest otherwise falls back to the stale open baseline"
+        );
+        assert_eq!(
+            summary
+                .column_checksums
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["id"],
+            "a FAILED run must still harvest Form-B for its durable parts"
+        );
+        assert!(
+            summary.ledger.column_checksums.is_empty(),
+            "ledger is taken"
+        );
+    }
+
     #[test]
     fn finalize_export_harvests_the_ledger_and_takes_it() {
         let dir = tempfile::tempdir().unwrap();

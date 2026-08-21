@@ -1191,7 +1191,7 @@ pub(crate) fn run_keyset(
 
     // DATA COMPLETE: the page loop exhausted the key range, so there is no
     // uncommitted work left to resume — for a NON-INCREMENTAL run, clear the
-    // in-progress run_id NOW, BEFORE the post-data gates (schema-drift below, and
+    // in-progress run_id NOW, BEFORE the post-data gates (schema-drift at the finalize_export seam, and
     // the quality gate in job.rs). A gate that fails AFTER all data is durable must
     // not leave a resume anchor, or the operator's intended full re-run would be
     // treated as a crash-recovery and continue from the high-water mark, silently
