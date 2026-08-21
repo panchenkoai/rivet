@@ -894,6 +894,339 @@ fn ledger_finish_run(state: &StateStore, export_name: &str, run_id: &str, status
     }
 }
 
+/// ADR-0028 follow-up (arch roast 2026-08-21, Strong #1): the policy divergences
+/// between the TWO orchestrator entry points — `run_export_job` (config-driven
+/// `rivet run`) and `run_export_job_with_chunk_source` (artifact-driven
+/// `rivet apply`). Everything else about the post-plan execution script is ONE
+/// sequence, and it used to be written twice (~250 lines each): this session
+/// alone paid that two-sites tax twice (the finalize seam call, then its
+/// records-on-failure fix — each wired at both bodies). The policy is data;
+/// the script lives once in [`execute_resolved_plan`].
+struct TailPolicy<'a> {
+    /// "export" | "apply" — log prefixes, manifest kind, report kind.
+    kind: &'static str,
+    /// Ledger/manifest family: `export.family()` on the run path (the CDC
+    /// snapshot leg differs from the export name), the export name on apply
+    /// (a sealed artifact has no ExportConfig — correctly, see the manifest
+    /// call's comment in git history).
+    family: &'a str,
+    /// Where the run report lands.
+    config_path: &'a str,
+    /// What the runners receive as their config-path argument: the real path
+    /// on the run path (chunk-checkpoint resume reads it), "" on apply (which
+    /// does not support checkpoint-parallel resume).
+    runner_config_path: &'a str,
+    chunk_source: chunked::ChunkSource,
+    /// Apply-only provenance recorded on the summary.
+    apply_context: Option<crate::pipeline::summary::ApplyContext>,
+    /// The reconcile leg exists only on the run path; apply folds `Ok(())`.
+    allow_reconcile: bool,
+    /// Run-path notifications; apply sends none.
+    notifications: Option<&'a crate::config::NotificationsConfig>,
+    /// Plan (rule, message) warnings the run path journals as `PlanWarning`
+    /// events; apply logs them at validate time and journals none (existing
+    /// behavior, preserved).
+    plan_warnings: Vec<(String, String)>,
+}
+
+/// THE post-plan execution script, written once: rss/forensics/harm bracket →
+/// dispatch → ADR-0028 seam → bracket close → quality gate → status → diagnosis
+/// → [reconcile] → journal → ledger close → manifest → cursor → keyset anchor →
+/// validate → metrics → report → [notify] → final fold. Ordering comments are
+/// load-bearing and live HERE only. LIVE-ONLY BY CONSTRUCTION (real source +
+/// destination + StateStore) — the pure decisions are extracted and unit-tested
+/// next door ([`pg_temp_bytes_delta`], [`pg_temp_bytes_warning`],
+/// `run_diagnosis`, `resolve_final_result`, `keyset_anchor_survives`); the live
+/// oracles are the plan/apply round-trips and the whole live suite.
+fn execute_resolved_plan(
+    plan: &ResolvedRunPlan,
+    state: &StateStore,
+    tail: TailPolicy<'_>,
+) -> (Result<()>, RunSummary) {
+    let start = std::time::Instant::now();
+    let rss_before = crate::resource::get_rss_mb();
+    let rss_sampler = crate::resource::RssPeakSampler::start(rss_before, 100);
+    let mut summary = RunSummary::new(plan);
+    summary.apply_context = tail.apply_context;
+    // Record this run `running` BEFORE any part lands — in the ledger + a bucket
+    // marker manifest — the authority `gc_orphans` reads to spare a live extract's
+    // committed-but-not-yet-manifested parts. (finish_run transitions it below.)
+    ledger_begin_run(state, plan, tail.family, &summary.run_id);
+    // The id the LEDGER row was opened under. A chunk-checkpoint RESUME adopts the
+    // prior run's id (chunked/mod.rs) — `summary.run_id` changes AFTER this point —
+    // and `finish_run` is a bare UPDATE, so closing the run under the adopted id
+    // matched no row and left this one `running` forever.
+    //
+    // That leak is not cosmetic: `has_active_run_on_prefix` keeps answering true,
+    // so `gc_orphans` defers cleanup, and since the load now excludes active runs
+    // from the consumed set (dispatch.rs), every later load on that prefix
+    // re-appends instead of recording progress — until an unrelated newer run of
+    // the same export happens to supersede it.
+    let ledger_run_id = summary.run_id.clone();
+    // Failure forensics at open: source schema + server limits, so a run that fails
+    // before finalize still explains itself (export_schema is otherwise success-only).
+    capture_open_forensics(plan, state, &mut summary);
+
+    // PG cursor / sort spill probe — captured around the actual run window.
+    // Cluster-level counter, so this is a noisy upper bound on a shared host
+    // but accurate on the single-tenant test DBs pilots typically use.
+    let pg_temp_bytes_before = pg_temp_bytes_snapshot(plan);
+    // Tier 2: broader source-harm counters (locks, rows read, buffer misses,
+    // temp files) bracketed around the same run window; the per-counter delta is
+    // stored in export_harm. Best-effort — see `harm_snapshot`.
+    let harm_before = harm_snapshot(&plan.source);
+
+    // Record plan diagnostics the caller already logged at validate time.
+    for (rule, message) in &tail.plan_warnings {
+        summary.journal.record(RunEvent::PlanWarning {
+            rule: rule.clone(),
+            message: message.clone(),
+        });
+    }
+
+    let result = if plan.strategy.requires_parallel_execution() {
+        if plan.strategy.is_resumable() {
+            run_chunked_parallel_checkpoint(
+                tail.runner_config_path,
+                state,
+                plan,
+                &mut summary,
+                tail.chunk_source,
+            )
+        } else {
+            chunked::run_chunked_parallel(state, plan, &mut summary, tail.chunk_source)
+        }
+    } else {
+        run_with_reconnect(
+            state,
+            plan,
+            &mut summary,
+            tail.runner_config_path,
+            tail.chunk_source,
+        )
+    };
+    // ADR-0028: THE export tail — apply the ledger the runner fed exactly once,
+    // here, before anything downstream reads the summary. On runner success the
+    // full seam runs (records + gates; a drift `fail` folds into `result` and
+    // flows the same failed-status path a runner error does). On runner FAILURE
+    // the records half still applies — the Failed manifest must describe the
+    // durable debris with the OBSERVED fingerprint + Form-B, never the stale
+    // baseline (seam bughunt 2026-08-21).
+    let result = match result {
+        Ok(()) => super::finalize::finalize_export(plan, Some(state), &mut summary),
+        Err(e) => {
+            super::finalize::finalize_export_records(&mut summary);
+            Err(e)
+        }
+    };
+
+    let rss_peak = rss_sampler.stop();
+    let rss_after = crate::resource::get_rss_mb();
+    // Harvest the run's bytes-read counter ONCE — every sink (per chunk, per
+    // worker) incremented plan.bytes_read, so this single read covers every
+    // runner by construction (#175).
+    summary.bytes_read = plan.bytes_read.load(std::sync::atomic::Ordering::Relaxed);
+    summary.duration_ms = start.elapsed().as_millis() as i64;
+    summary.peak_rss_mb = rss_peak.max(rss_after).max(rss_before) as i64;
+
+    // Close the harm bracket on the SAME window the run occupied, before the
+    // status resolution below — the deltas are what the DIAGNOSIS reads.
+    // Compute the temp_bytes delta only when both snapshots succeeded — partial
+    // failures (e.g. dropped connection between runs) leave the field None so
+    // the summary card omits the line entirely.
+    if let Some(before) = pg_temp_bytes_before
+        && let Some(after) = pg_temp_bytes_snapshot(plan)
+    {
+        let delta = pg_temp_bytes_delta(before, after);
+        summary.pg_temp_bytes_delta = Some(delta);
+        if let Some(line) = pg_temp_bytes_warning(
+            &plan.export_name,
+            delta,
+            super::run::multi_export_concurrent(),
+        ) {
+            log::warn!("{line}");
+        }
+    }
+
+    // Tier 2: record the per-counter source-harm delta. A failed or absent probe
+    // (e.g. missing VIEW SERVER STATE on MSSQL) leaves no rows — never fatal.
+    let mut harm_delta_vec: Vec<(String, i64)> = Vec::new();
+    if let Some(before) = &harm_before
+        && let Some(after) = harm_snapshot(&plan.source)
+    {
+        harm_delta_vec = harm_deltas(before, &after);
+        if let Err(e) = state.record_harm(&summary.run_id, &summary.export_name, &harm_delta_vec) {
+            log::debug!(
+                "{} '{}': harm metrics write failed (informational): {:#}",
+                tail.kind,
+                summary.export_name,
+                e
+            );
+        }
+    }
+    let tuning_class = plan.tuning.profile_name().to_string();
+    let result = run_chunked_quality_gate(result, plan, &mut summary);
+    let failed = result.is_err();
+    match &result {
+        Ok(()) => {
+            if summary.status == "running" {
+                summary.status = "success".into();
+            }
+        }
+        Err(e) => {
+            summary.status = "failed".into();
+            let redacted = crate::redact::redact_error(e);
+            summary.error_message = Some(redacted.clone());
+            log::error!("{} '{}' failed: {}", tail.kind, plan.export_name, redacted);
+        }
+    }
+
+    // Self-diagnosing run-health line — makes a log the field team sends back
+    // readable at a glance (reconnects survived, a resume-hit, a source spill).
+    // Emitted AFTER the success/failed resolution above so the line reports the
+    // real terminal status, not the transient "running" it was built with (#18
+    // bughunt: it ran before the status was resolved, so it always said running).
+    if let Some(line) = run_diagnosis(
+        &summary,
+        &harm_delta_vec,
+        super::run::multi_export_concurrent(),
+    ) {
+        log::warn!("{line}");
+    }
+
+    let mut reconcile_gate: crate::error::Result<()> = Ok(());
+    if tail.allow_reconcile && plan.reconcile && !failed {
+        let could_not_verify = reconcile_source_count(plan, &mut summary);
+        if let (Some(source_count), Some(matched)) = (summary.source_count, summary.reconciled) {
+            summary.journal.record(RunEvent::ReconciliationResult {
+                source_count,
+                exported_rows: summary.total_rows,
+                matched,
+            });
+        }
+        // The reconcile verdict drives the EXIT CODE (folded into `final_result`):
+        // exit 3 on a mismatch, exit 1 on a could-not-verify. It does NOT flip
+        // `summary.status` to "failed" — that would make `finalize_manifest` write
+        // a Failed manifest with no _SUCCESS, so `rivet load` would REFUSE a
+        // COMPLETE, durable export because a post-hoc COUNT(*) raced a concurrent
+        // write on a live source (#2 bughunt). The export succeeded and stays
+        // loadable; the mismatch surfaces via `summary.reconciled` (report +
+        // metrics + the ReconciliationResult journal event) and the non-zero exit.
+        reconcile_gate = reconcile_run_gate(&summary, could_not_verify.as_deref());
+    }
+
+    // Terminal journal entry BEFORE the print, so a later `finalize_manifest`
+    // gap that flips the status is NOT in the journal on either entry point
+    // (one behaviour, not two — the round-5 apply-journal-bypass fix).
+    summary.journal.record(RunEvent::RunCompleted {
+        status: summary.status.clone(),
+        error_message: summary.error_message.clone(),
+        duration_ms: summary.duration_ms,
+    });
+
+    if let Err(e) = state.store_journal(&summary.journal) {
+        log::warn!(
+            "{} '{}': journal persist failed (run history not stored): {:#}",
+            tail.kind,
+            summary.export_name,
+            e
+        );
+    }
+
+    summary.print();
+    // Transition the run-status ledger to its terminal status — the manifest
+    // written just below is a PROJECTION of this record, so both carry the same
+    // status. A crash before here leaves the row `running`; supersession by a
+    // later run reconciles it (no age timer).
+    ledger_finish_owned_runs(state, &plan.export_name, &ledger_run_id, &summary);
+    // Order matters: write the manifest first, then run the manifest-aware
+    // `--validate` pass against the destination, then persist the metrics
+    // row, then write the run report.  The report sees the verification
+    // verdict only because we run it before `finalize_run_report`; the
+    // metrics row must also wait for `finalize_validate_manifest`, which can
+    // downgrade `summary.validated` — recording earlier left `rivet metrics`
+    // permanently saying validated=pass for a run whose report says it
+    // failed.  The notification fires last so it carries the most complete
+    // summary.
+    // A run whose manifest never landed is NOT a success, whatever its rows say.
+    // The parts are durable and the counts are right — and no manifest names them,
+    // so the loader will not read them. Reporting success there is a claim the
+    // artifacts do not support.
+    //
+    // The status has already been printed and the ledger row already closed by
+    // this point, so both are corrected: the metrics row is written below and
+    // picks up the new status, and the ledger row is re-closed. The manifest
+    // itself cannot be re-written to say `failed` — failing to write it is the
+    // problem.
+    let manifest_gap = finalize_manifest(plan, tail.family, state, &summary, tail.kind);
+    if let Some(why) = &manifest_gap {
+        summary.status = "failed".into();
+        summary.error_message = Some(why.clone());
+        ledger_finish_owned_runs(state, &plan.export_name, &ledger_run_id, &summary);
+    }
+    // Round-2 audit #12: advance the incremental cursor now that the destination
+    // manifest is durable — never before. A failure here is at-least-once safe (the
+    // data + manifest are durable; the next run re-exports from the prior cursor),
+    // so log loudly rather than fail a run whose write cycle already succeeded.
+    //
+    // "now that the manifest is durable" was a PREMISE, not a check: the cursor
+    // advanced even when the manifest write had just failed, so the next run
+    // started past data nothing described. Guarded now.
+    if manifest_gap.is_some() {
+        log::error!(
+            "{} '{}': incremental cursor NOT advanced — the manifest did not land, so the \
+             next run must re-export this window rather than skip past it",
+            tail.kind,
+            summary.export_name,
+        );
+    } else if let Err(e) = commit_incremental_cursor(state, plan, &summary) {
+        log::error!(
+            "{} '{}': cursor advance failed AFTER the manifest was written — the next run \
+             re-exports from the prior cursor (at-least-once, no loss): {:#}",
+            tail.kind,
+            summary.export_name,
+            e
+        );
+    }
+    // Round-5: a keyset checkpoint run has now finalized its COMPLETE destination
+    // manifest — clear the in-progress run_id (persisted for crash rehydration) so a
+    // later run isn't treated as a resume of this finished one. Clearing AFTER the
+    // manifest write is the same ordering as the cursor advance: a crash before here
+    // leaves resume_run_id set, so the next run rehydrates rather than orphans.
+    // EVERY entry point must clear it — a wrapper that skips it strands
+    // resume_run_id forever (round-3 wrapper-bypass regression), which is exactly
+    // why this script now exists once.
+    finalize_keyset_anchor(
+        state,
+        plan,
+        &summary.export_name,
+        keyset_anchor_survives(RunOutcome {
+            failed,
+            manifest_gap: &manifest_gap,
+        }),
+    );
+    if plan.validate {
+        finalize_validate_manifest(plan, &mut summary, tail.kind);
+    }
+    // After finalize_validate_manifest: it can downgrade summary.validated, and
+    // the metrics row must carry the final verdict.
+    if let Err(e) = state.record_metric_full(&build_metric_row(&summary, plan, &tuning_class)) {
+        log::warn!(
+            "{} '{}': metrics write failed (run outcome not stored): {:#}",
+            tail.kind,
+            summary.export_name,
+            e
+        );
+    }
+    finalize_run_report(tail.config_path, &summary, tail.kind);
+    crate::notify::maybe_send(tail.notifications, &summary);
+
+    // An export failure wins, otherwise an unwritten manifest fails the run;
+    // the reconcile leg is `Ok(())` where the policy disables it.
+    let final_result = resolve_final_result(failed, result, reconcile_gate, manifest_gap);
+    (final_result, summary)
+}
+
 pub(super) fn run_export_job(
     config_path: &str,
     config: &Config,
@@ -1021,275 +1354,34 @@ pub(super) fn run_export_job(
         plan.tuning
     );
 
-    let start = std::time::Instant::now();
-    let rss_before = crate::resource::get_rss_mb();
-    let rss_sampler = crate::resource::RssPeakSampler::start(rss_before, 100);
-    let mut summary = RunSummary::new(&plan);
-    // Record this run `running` BEFORE any part lands — in the ledger + a bucket
-    // marker manifest — the authority `gc_orphans` reads to spare a live extract's
-    // committed-but-not-yet-manifested parts. (finish_run transitions it below.)
-    ledger_begin_run(state, &plan, &export.family(), &summary.run_id);
-    // The id the LEDGER row was opened under. A chunk-checkpoint RESUME adopts the
-    // prior run's id (chunked/mod.rs) — `summary.run_id` changes AFTER this point —
-    // and `finish_run` is a bare UPDATE, so closing the run under the adopted id
-    // matched no row and left this one `running` forever.
-    //
-    // That leak is not cosmetic: `has_active_run_on_prefix` keeps answering true,
-    // so `gc_orphans` defers cleanup, and since the load now excludes active runs
-    // from the consumed set (dispatch.rs), every later load on that prefix
-    // re-appends instead of recording progress — until an unrelated newer run of
-    // the same export happens to supersede it.
-    let ledger_run_id = summary.run_id.clone();
-    // Failure forensics at open: source schema + server limits, so a run that fails
-    // before finalize still explains itself (export_schema is otherwise success-only).
-    capture_open_forensics(&plan, state, &mut summary);
-
-    // PG cursor / sort spill probe — captured around the actual run window.
-    // Cluster-level counter, so this is a noisy upper bound on a shared host
-    // but accurate on the single-tenant test DBs pilots typically use.
-    let pg_temp_bytes_before = pg_temp_bytes_snapshot(&plan);
-    // Tier 2: broader source-harm counters (locks, rows read, buffer misses,
-    // temp files) bracketed around the same run window; the per-counter delta is
-    // stored in export_harm. Best-effort — see `harm_snapshot`.
-    let harm_before = harm_snapshot(&plan.source);
-
-    // Record plan diagnostics that were already logged above.
-    for d in &diags {
-        if matches!(
-            d.level,
-            DiagnosticLevel::Warning | DiagnosticLevel::Degraded
-        ) {
-            summary.journal.record(RunEvent::PlanWarning {
-                rule: d.rule.to_string(),
-                message: d.message.clone(),
-            });
-        }
-    }
-
-    let result = if plan.strategy.requires_parallel_execution() {
-        if plan.strategy.is_resumable() {
-            run_chunked_parallel_checkpoint(
-                config_path,
-                state,
-                &plan,
-                &mut summary,
-                chunked::ChunkSource::Detect,
+    // The post-plan execution script lives ONCE in `execute_resolved_plan`;
+    // this entry point only supplies the run-path policy.
+    let plan_warnings: Vec<(String, String)> = diags
+        .iter()
+        .filter(|d| {
+            matches!(
+                d.level,
+                DiagnosticLevel::Warning | DiagnosticLevel::Degraded
             )
-        } else {
-            chunked::run_chunked_parallel(state, &plan, &mut summary, chunked::ChunkSource::Detect)
-        }
-    } else {
-        run_with_reconnect(
-            state,
-            &plan,
-            &mut summary,
-            config_path,
-            chunked::ChunkSource::Detect,
-        )
-    };
-    // ADR-0028: THE export tail — apply the ledger the runner fed exactly once,
-    // here, before anything downstream reads the summary. On runner success the
-    // full seam runs (records + gates; a drift `fail` folds into `result` and
-    // flows the same failed-status path a runner error does). On runner FAILURE
-    // the records half still applies — the Failed manifest must describe the
-    // durable debris with the OBSERVED fingerprint + Form-B, never the stale
-    // baseline (seam bughunt 2026-08-21).
-    let result = match result {
-        Ok(()) => super::finalize::finalize_export(&plan, Some(state), &mut summary),
-        Err(e) => {
-            super::finalize::finalize_export_records(&mut summary);
-            Err(e)
-        }
-    };
-
-    let rss_peak = rss_sampler.stop();
-    let rss_after = crate::resource::get_rss_mb();
-    // Harvest the run's bytes-read counter ONCE — every sink (per chunk, per
-    // worker) incremented plan.bytes_read, so this single read covers every
-    // runner by construction (#175).
-    summary.bytes_read = plan.bytes_read.load(std::sync::atomic::Ordering::Relaxed);
-    summary.duration_ms = start.elapsed().as_millis() as i64;
-    summary.peak_rss_mb = rss_peak.max(rss_after).max(rss_before) as i64;
-
-    // Compute the temp_bytes delta only when both snapshots succeeded — partial
-    // failures (e.g. dropped connection between runs) leave the field None so
-    // the summary card omits the line entirely.
-    if let Some(before) = pg_temp_bytes_before
-        && let Some(after) = pg_temp_bytes_snapshot(&plan)
-    {
-        let delta = pg_temp_bytes_delta(before, after);
-        summary.pg_temp_bytes_delta = Some(delta);
-        if let Some(line) = pg_temp_bytes_warning(
-            &plan.export_name,
-            delta,
-            super::run::multi_export_concurrent(),
-        ) {
-            log::warn!("{line}");
-        }
-    }
-
-    // Tier 2: record the per-counter source-harm delta. A failed or absent probe
-    // (e.g. missing VIEW SERVER STATE on MSSQL) leaves no rows — never fatal.
-    let mut harm_delta_vec: Vec<(String, i64)> = Vec::new();
-    if let Some(before) = &harm_before
-        && let Some(after) = harm_snapshot(&plan.source)
-    {
-        harm_delta_vec = harm_deltas(before, &after);
-        if let Err(e) = state.record_harm(&summary.run_id, &summary.export_name, &harm_delta_vec) {
-            log::debug!(
-                "export '{}': harm metrics write failed (informational): {:#}",
-                summary.export_name,
-                e
-            );
-        }
-    }
-    let tuning_class = plan.tuning.profile_name().to_string();
-    let result = run_chunked_quality_gate(result, &plan, &mut summary);
-    let failed = result.is_err();
-    match &result {
-        Ok(()) => {
-            if summary.status == "running" {
-                summary.status = "success".into();
-            }
-        }
-        Err(e) => {
-            summary.status = "failed".into();
-            let redacted = crate::redact::redact_error(e);
-            summary.error_message = Some(redacted.clone());
-            log::error!("export '{}' failed: {}", plan.export_name, redacted);
-        }
-    }
-
-    // Self-diagnosing run-health line — makes a log the field team sends back
-    // readable at a glance (reconnects survived, a resume-hit, a source spill).
-    // Emitted AFTER the success/failed resolution above so the line reports the
-    // real terminal status, not the transient "running" it was built with (#18
-    // bughunt: it ran before the status was resolved, so it always said running).
-    if let Some(line) = run_diagnosis(
-        &summary,
-        &harm_delta_vec,
-        super::run::multi_export_concurrent(),
-    ) {
-        log::warn!("{line}");
-    }
-
-    let mut reconcile_gate: crate::error::Result<()> = Ok(());
-    if plan.reconcile && !failed {
-        let could_not_verify = reconcile_source_count(&plan, &mut summary);
-        if let (Some(source_count), Some(matched)) = (summary.source_count, summary.reconciled) {
-            summary.journal.record(RunEvent::ReconciliationResult {
-                source_count,
-                exported_rows: summary.total_rows,
-                matched,
-            });
-        }
-        // The reconcile verdict drives the EXIT CODE (folded into `final_result`):
-        // exit 3 on a mismatch, exit 1 on a could-not-verify. It does NOT flip
-        // `summary.status` to "failed" — that would make `finalize_manifest` write
-        // a Failed manifest with no _SUCCESS, so `rivet load` would REFUSE a
-        // COMPLETE, durable export because a post-hoc COUNT(*) raced a concurrent
-        // write on a live source (#2 bughunt). The export succeeded and stays
-        // loadable; the mismatch surfaces via `summary.reconciled` (report +
-        // metrics + the ReconciliationResult journal event) and the non-zero exit.
-        reconcile_gate = reconcile_run_gate(&summary, could_not_verify.as_deref());
-    }
-
-    summary.journal.record(RunEvent::RunCompleted {
-        status: summary.status.clone(),
-        error_message: summary.error_message.clone(),
-        duration_ms: summary.duration_ms,
-    });
-
-    if let Err(e) = state.store_journal(&summary.journal) {
-        log::warn!(
-            "export '{}': journal persist failed (run history not stored): {:#}",
-            summary.export_name,
-            e
-        );
-    }
-
-    summary.print();
-    // Transition the run-status ledger to its terminal status — the manifest
-    // written just below is a PROJECTION of this record, so both carry the same
-    // status. A crash before here leaves the row `running`; supersession by a
-    // later run reconciles it (no age timer).
-    ledger_finish_owned_runs(state, &plan.export_name, &ledger_run_id, &summary);
-    // Order matters: write the manifest first, then run the manifest-aware
-    // `--validate` pass against the destination, then persist the metrics
-    // row, then write the run report.  The report sees the verification
-    // verdict only because we run it before `finalize_run_report`; the
-    // metrics row must also wait for `finalize_validate_manifest`, which can
-    // downgrade `summary.validated` — recording earlier left `rivet metrics`
-    // permanently saying validated=pass for a run whose report says it
-    // failed.  The notification fires last so it carries the most complete
-    // summary.
-    // A run whose manifest never landed is NOT a success, whatever its rows say.
-    // The parts are durable and the counts are right — and no manifest names them,
-    // so the loader will not read them. Reporting success there is a claim the
-    // artifacts do not support.
-    //
-    // The status has already been printed and the ledger row already closed by
-    // this point, so both are corrected: the metrics row is written below and
-    // picks up the new status, and the ledger row is re-closed. The manifest
-    // itself cannot be re-written to say `failed` — failing to write it is the
-    // problem.
-    let manifest_gap = finalize_manifest(&plan, &export.family(), state, &summary, "export");
-    if let Some(why) = &manifest_gap {
-        summary.status = "failed".into();
-        summary.error_message = Some(why.clone());
-        ledger_finish_owned_runs(state, &plan.export_name, &ledger_run_id, &summary);
-    }
-    // Round-2 audit #12: advance the incremental cursor now that the destination
-    // manifest is durable — never before. A failure here is at-least-once safe (the
-    // data + manifest are durable; the next run re-exports from the prior cursor),
-    // so log loudly rather than fail a run whose write cycle already succeeded.
-    //
-    // "now that the manifest is durable" was a PREMISE, not a check: the cursor
-    // advanced even when the manifest write had just failed, so the next run
-    // started past data nothing described. Guarded now.
-    if manifest_gap.is_some() {
-        log::error!(
-            "export '{}': incremental cursor NOT advanced — the manifest did not land, so the \
-             next run must re-export this window rather than skip past it",
-            summary.export_name,
-        );
-    } else if let Err(e) = commit_incremental_cursor(state, &plan, &summary) {
-        log::error!(
-            "export '{}': cursor advance failed AFTER the manifest was written — the next run \
-             re-exports from the prior cursor (at-least-once, no loss): {:#}",
-            summary.export_name,
-            e
-        );
-    }
-    // Round-5: a keyset checkpoint run has now finalized its COMPLETE destination
-    // manifest — clear the in-progress run_id (persisted for crash rehydration) so a
-    // later run isn't treated as a resume of this finished one. Clearing AFTER the
-    // manifest write is the same ordering as the cursor advance: a crash before here
-    // leaves resume_run_id set, so the next run rehydrates rather than orphans.
-    finalize_keyset_anchor(
-        state,
+        })
+        .map(|d| (d.rule.to_string(), d.message.clone()))
+        .collect();
+    let family = export.family();
+    execute_resolved_plan(
         &plan,
-        &summary.export_name,
-        keyset_anchor_survives(RunOutcome {
-            failed,
-            manifest_gap: &manifest_gap,
-        }),
-    );
-    if plan.validate {
-        finalize_validate_manifest(&plan, &mut summary, "export");
-    }
-    if let Err(e) = state.record_metric_full(&build_metric_row(&summary, &plan, &tuning_class)) {
-        log::warn!(
-            "export '{}': metrics write failed (run outcome not stored): {:#}",
-            summary.export_name,
-            e
-        );
-    }
-    finalize_run_report(config_path, &summary, "export");
-    crate::notify::maybe_send(config.notifications.as_ref(), &summary);
-
-    let final_result = resolve_final_result(failed, result, reconcile_gate, manifest_gap);
-    (final_result, summary)
+        state,
+        TailPolicy {
+            kind: "export",
+            family: &family,
+            config_path,
+            runner_config_path: config_path,
+            chunk_source: chunked::ChunkSource::Detect,
+            apply_context: None,
+            allow_reconcile: true,
+            notifications: config.notifications.as_ref(),
+            plan_warnings,
+        },
+    )
 }
 
 // `finalize_*` and the M8 success-gate live in `pipeline::finalize` so this
@@ -1364,214 +1456,25 @@ pub(crate) fn run_export_job_with_chunk_source(
         plan.tuning
     );
 
-    let start = std::time::Instant::now();
-    let rss_before = crate::resource::get_rss_mb();
-    let rss_sampler = crate::resource::RssPeakSampler::start(rss_before, 100);
-    let mut summary = RunSummary::new(plan);
-    summary.apply_context = apply_context;
-    ledger_begin_run(state, plan, &plan.export_name, &summary.run_id);
-    // The id the ledger row was opened under. A chunk-checkpoint resume — which
-    // THIS wrapper dispatches to — replaces `summary.run_id` with the crashed
-    // run's, so the opening row must be closed by name or it stays `running`
-    // forever.
-    let ledger_run_id = summary.run_id.clone();
-    // Runner parity: the apply/chunk-source path is a SEPARATE runner from
-    // run_export_job, so it must re-apply open forensics itself (server_context +
-    // schema-at-open) or an apply-run failure records neither — the runner-bypass
-    // class. See docs/runner-coverage-matrix.yaml.
-    capture_open_forensics(plan, state, &mut summary);
-    // Same runner-parity reason: the source-harm bracket and the DIAGNOSIS line
-    // it feeds are re-applied here, or an `apply` run records no `export_harm`
-    // rows and never says a word about a source it spilled to disk — while the
-    // identical plan under `rivet run` does both (round-3 bughunt: the doc on
-    // this fn claimed "everything else is identical to run_export_job", and the
-    // harm half was the exception).
-    let pg_temp_bytes_before = pg_temp_bytes_snapshot(plan);
-    let harm_before = harm_snapshot(&plan.source);
-
-    let result = if plan.strategy.requires_parallel_execution() {
-        if plan.strategy.is_resumable() {
-            // apply does not support checkpoint-parallel resume; use Detect fallback
-            run_chunked_parallel_checkpoint("", state, plan, &mut summary, chunk_source)
-        } else {
-            chunked::run_chunked_parallel(state, plan, &mut summary, chunk_source)
-        }
-    } else {
-        run_with_reconnect(state, plan, &mut summary, "", chunk_source)
-    };
-    // ADR-0028: THE export tail — same contract as run_export_job's site: full
-    // seam on success, records half on failure (the Failed manifest must carry
-    // the OBSERVED fingerprint + Form-B, never the stale baseline).
-    let result = match result {
-        Ok(()) => super::finalize::finalize_export(plan, Some(state), &mut summary),
-        Err(e) => {
-            super::finalize::finalize_export_records(&mut summary);
-            Err(e)
-        }
-    };
-
-    let rss_peak = rss_sampler.stop();
-    let rss_after = crate::resource::get_rss_mb();
-    // Harvest the run's bytes-read counter ONCE — every sink (per chunk, per
-    // worker) incremented plan.bytes_read, so this single read covers every
-    // runner by construction (#175).
-    summary.bytes_read = plan.bytes_read.load(std::sync::atomic::Ordering::Relaxed);
-    summary.duration_ms = start.elapsed().as_millis() as i64;
-    summary.peak_rss_mb = rss_peak.max(rss_after).max(rss_before) as i64;
-
-    // Close the harm bracket on the SAME window the run occupied, before the
-    // status resolution below — the deltas are what the DIAGNOSIS reads.
-    if let Some(before) = pg_temp_bytes_before
-        && let Some(after) = pg_temp_bytes_snapshot(plan)
-    {
-        let delta = pg_temp_bytes_delta(before, after);
-        summary.pg_temp_bytes_delta = Some(delta);
-        if let Some(line) = pg_temp_bytes_warning(
-            &plan.export_name,
-            delta,
-            super::run::multi_export_concurrent(),
-        ) {
-            log::warn!("{line}");
-        }
-    }
-    let mut harm_delta_vec: Vec<(String, i64)> = Vec::new();
-    if let Some(before) = &harm_before
-        && let Some(after) = harm_snapshot(&plan.source)
-    {
-        harm_delta_vec = harm_deltas(before, &after);
-        if let Err(e) = state.record_harm(&summary.run_id, &summary.export_name, &harm_delta_vec) {
-            log::debug!(
-                "apply '{}': harm metrics write failed (informational): {:#}",
-                summary.export_name,
-                e
-            );
-        }
-    }
-
-    let tuning_class = plan.tuning.profile_name().to_string();
-    let result = run_chunked_quality_gate(result, plan, &mut summary);
-    let failed = result.is_err();
-
-    match &result {
-        Ok(()) => {
-            if summary.status == "running" {
-                summary.status = "success".into();
-            }
-        }
-        Err(e) => {
-            summary.status = "failed".into();
-            let redacted = crate::redact::redact_error(e);
-            summary.error_message = Some(redacted.clone());
-            log::error!("apply '{}' failed: {}", plan.export_name, redacted);
-        }
-    }
-
-    // Emitted after the status resolution for the same reason `run_export_job`
-    // does it there: the line must report the terminal status, not "running".
-    if let Some(line) = run_diagnosis(
-        &summary,
-        &harm_delta_vec,
-        super::run::multi_export_concurrent(),
-    ) {
-        log::warn!("{line}");
-    }
-
-    // Runner parity, third facet: the run JOURNAL. Every runner this wrapper
-    // dispatches to records into `summary.journal` — `governor.drain_into`
-    // (`ParallelismAdjusted`, deliberately drained before the worker-error bail
-    // so a FAILED run still journals its sheds), `ChunkCompleted`/`FileWritten`
-    // from `commit.rs`, `SchemaChanged`, `RetryAttempted` — and apply then threw
-    // the whole thing away: no terminal `RunCompleted`, no `store_journal`, so
-    // `rivet journal -e X` answered "No journal entries" after a completed apply
-    // run while the byte-identical plan under `rivet run` had the full history
-    // (round-5 bughunt). An operator investigating a slow governed apply had no
-    // record that the governor shed at all.
-    //
-    // Same placement and same best-effort warn as `run_export_job`: before the
-    // print, so a later `finalize_manifest` gap that flips the status is NOT in
-    // the journal on either entry point (one behaviour, not two).
-    summary.journal.record(RunEvent::RunCompleted {
-        status: summary.status.clone(),
-        error_message: summary.error_message.clone(),
-        duration_ms: summary.duration_ms,
-    });
-    if let Err(e) = state.store_journal(&summary.journal) {
-        log::warn!(
-            "apply '{}': journal persist failed (run history not stored): {:#}",
-            summary.export_name,
-            e
-        );
-    }
-
-    summary.print();
-    ledger_finish_owned_runs(state, &plan.export_name, &ledger_run_id, &summary);
-    // Apply replays a SEALED artifact and has no ExportConfig — correctly:
-    // the family is the export's own name here. The one export whose family
-    // differs (the CDC snapshot leg) is synthesized by `cdc_job` at runtime and
-    // never reaches plan/apply, which refuses `mode: cdc` at build_plan entry.
-    // The manifest gap is handled EXACTLY as `run_export_job` handles it, and the
-    // duplication is the point: this wrapper reaches `run_with_reconnect` for a
-    // plain incremental plan, so it sets `cursor_high` and can advance the cursor
-    // just like the run path. Binding the verdict only there left `rivet apply`
-    // reporting success, advancing the cursor past a window no manifest names, and
-    // skipping it on the next run — the same defect, undone one runner over.
-    let manifest_gap = finalize_manifest(plan, &plan.export_name, state, &summary, "apply");
-    if let Some(why) = &manifest_gap {
-        summary.status = "failed".into();
-        summary.error_message = Some(why.clone());
-        ledger_finish_owned_runs(state, &plan.export_name, &ledger_run_id, &summary);
-    }
-    // Round-2 audit #12: incremental cursor advance AFTER the manifest is durable
-    // (see run_export_job) — and never when it did not land.
-    if manifest_gap.is_some() {
-        log::error!(
-            "apply '{}': incremental cursor NOT advanced — the manifest did not land, so the \
-             next run must re-export this window rather than skip past it",
-            summary.export_name,
-        );
-    } else if let Err(e) = commit_incremental_cursor(state, plan, &summary) {
-        log::error!(
-            "apply '{}': cursor advance failed AFTER the manifest was written — the next run \
-             re-exports from the prior cursor (at-least-once, no loss): {:#}",
-            summary.export_name,
-            e
-        );
-    }
-    // Clear the keyset in-progress anchor AFTER the manifest is durable — the SAME
-    // post-finalize clear run_export_job does (job.rs above). An INCREMENTAL keyset
-    // run no longer clears it in run_keyset (the clear must be post-finalize, or a
-    // crash orphans the pages — round-2 fix), so EVERY job wrapper must clear it
-    // here; a wrapper that skips it strands resume_run_id forever, so the next apply
-    // is misread as a resume, reuses the frozen run_id, and the run-unique manifest
-    // sidecar collides across runs (round-3 wrapper-bypass regression).
-    finalize_keyset_anchor(
-        state,
+    // Same script, apply-path policy: artifact family = export name, no
+    // checkpoint-parallel resume path (runner_config_path ""), no reconcile
+    // leg, no notifications, plan warnings logged above but not journaled
+    // (existing behavior, preserved).
+    execute_resolved_plan(
         plan,
-        &summary.export_name,
-        keyset_anchor_survives(RunOutcome {
-            failed,
-            manifest_gap: &manifest_gap,
-        }),
-    );
-    if plan.validate {
-        finalize_validate_manifest(plan, &mut summary, "apply");
-    }
-    // After finalize_validate_manifest: it can downgrade summary.validated,
-    // and the metrics row must carry the final verdict (same ordering as
-    // run_export_job).
-    if let Err(e) = state.record_metric_full(&build_metric_row(&summary, plan, &tuning_class)) {
-        log::warn!(
-            "apply '{}': metrics write failed: {:#}",
-            summary.export_name,
-            e
-        );
-    }
-    finalize_run_report(config_path, &summary, "apply");
-
-    // Same fold as the run path: an export failure wins, otherwise an unwritten
-    // manifest fails the run. `apply` has no reconcile flag, so that leg is `Ok`.
-    let final_result = resolve_final_result(failed, result, Ok(()), manifest_gap);
-    (final_result, summary)
+        state,
+        TailPolicy {
+            kind: "apply",
+            family: &plan.export_name,
+            config_path,
+            runner_config_path: "",
+            chunk_source,
+            apply_context,
+            allow_reconcile: false,
+            notifications: None,
+            plan_warnings: Vec::new(),
+        },
+    )
 }
 
 #[cfg(test)]
