@@ -466,6 +466,44 @@ mod tests {
     /// shape. RED-proven against: note_schema last-wins (second schema
     /// overwrites), merge via overwrite-insert (second part clobbers), and
     /// merge_shape via min.
+    /// ADR-0028: `drain_tail_into` is the FEEDING leg every sink-based runner
+    /// relies on — stubbed to a no-op, no schema/checksums/shape ever reach the
+    /// ledger and the seam applies nothing (live: the Form-B telltale fires).
+    /// Unit-pinned here so the in-diff gate kills the stub without a stand:
+    /// populate a real sink's tail fields, drain, assert the ledger got all
+    /// four (schema, checksums, key, shape) and the sink was emptied.
+    #[test]
+    fn drain_tail_into_moves_schema_checksums_key_and_shape_to_the_ledger() {
+        use arrow::datatypes::{DataType, Field, Schema};
+        let plan = test_plan();
+        let mut sink = crate::pipeline::sink::ExportSink::new(&plan).expect("sink");
+        sink.dest_schema = Some(std::sync::Arc::new(Schema::new(vec![Field::new(
+            "id",
+            DataType::Int64,
+            false,
+        )])));
+        sink.column_checksums = [("id".to_string(), 41u64)].into();
+        sink.checksum_key_col = Some(0);
+        sink.cursor_column = Some("id".to_string());
+        sink.column_max_bytes = [("id".to_string(), 8u64)].into();
+
+        let mut led = CommitLedger::default();
+        sink.drain_tail_into(&mut led);
+
+        assert_eq!(
+            led.drift_schema.as_ref().map(|s| s.field(0).name().clone()),
+            Some("id".to_string()),
+            "the sink's dest schema must reach the ledger"
+        );
+        assert_eq!(led.column_checksums.get("id"), Some(&41u64));
+        assert_eq!(led.checksum_key_column.as_deref(), Some("id"));
+        assert_eq!(led.column_max_bytes.get("id"), Some(&8u64));
+        assert!(
+            sink.column_checksums.is_empty() && sink.column_max_bytes.is_empty(),
+            "drain must TAKE the sink's accumulators, not copy them"
+        );
+    }
+
     #[test]
     fn commit_ledger_first_wins_schema_and_key_and_commutative_merges() {
         use arrow::datatypes::{DataType, Field, Schema};
