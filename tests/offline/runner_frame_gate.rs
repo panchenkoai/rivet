@@ -346,9 +346,16 @@ fn assert_both_job_entry_points_do(needles: &[(&str, &str)], harm: &str) {
     let text = std::fs::read_to_string(&job_rs).expect("read src/pipeline/job.rs");
 
     let mut offenders = Vec::new();
+    // Since the post-plan script was unified (arch-roast 2026-08-21), an entry
+    // point satisfies the contract EITHER by carrying the needles itself OR by
+    // routing through `execute_resolved_plan(` — the one script that owns them.
+    // The script's own body is then graded for every needle directly, so the
+    // contract cannot be satisfied by a route to a hollowed-out script.
+    let script_entry = "fn execute_resolved_plan(";
     for entry in [
         "pub(super) fn run_export_job(",
         "pub(crate) fn run_export_job_with_chunk_source(",
+        script_entry,
     ] {
         let start = text
             .find(entry)
@@ -361,8 +368,18 @@ fn assert_both_job_entry_points_do(needles: &[(&str, &str)], harm: &str) {
             "{entry}: the slice ran past the function into the test module — the \
              assertions below would be satisfied by the tests' own calls"
         );
+        // Comment-stripped, so a doc-comment MENTION of the script cannot
+        // satisfy the contract (godsplit bughunt 2026-08-21, MED): only a real
+        // call in code counts.
+        let code: String = body
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let routes_through_script =
+            entry != script_entry && code.contains("execute_resolved_plan(");
         for (what, needle) in needles {
-            if !body.contains(needle) {
+            if !body.contains(needle) && !routes_through_script {
                 offenders.push(format!("{entry} never {what} ({needle})"));
             }
         }

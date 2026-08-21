@@ -781,33 +781,7 @@ pub fn run(
         print_json_summary(&agg);
     }
 
-    if !failures.is_empty() {
-        // Carry a representative typed failure as the returned error so
-        // `error::classify_exit` downcasts the marker (DataIntegrityError=3,
-        // SchemaDriftError=4, transient=2) through anyhow's context chain. Pick
-        // the most "stop-worthy" class — data-integrity (possibly-wrong data)
-        // outranks schema-drift, which outranks retryable, which outranks
-        // generic — so a mixed batch exits on the scariest reason.
-        let primary_idx = representative_failure_idx(&failures).unwrap();
-        let primary = failures.remove(primary_idx);
-        if failures.is_empty() {
-            // Single failure — return it verbatim (its own message + marker).
-            return Err(primary);
-        }
-        // Multiple failures: list the others as higher-level context; `primary`
-        // (with its typed marker) rides underneath so the downcast still finds it.
-        let others = failures
-            .iter()
-            .map(|e| format!("{e:#}"))
-            .collect::<Vec<_>>()
-            .join("; ");
-        return Err(primary.context(format!(
-            "{} export(s) failed; representative error follows (also: {others})",
-            failures.len() + 1
-        )));
-    }
-
-    Ok(())
+    fold_failures(failures, "")
 }
 
 /// `rivet apply -c config.yaml` (plan→apply cycle): run every export of the
@@ -1054,50 +1028,94 @@ pub(crate) fn run_waves(
     // The mode label is decided from the concurrency the run ACHIEVED (the same
     // `peak_concurrency` the harm frame above reads), never from the flag — see
     // [`wave_mode_label`].
+    // The mode label + RunModes are the ONLY wave-specific inputs: waves is the
+    // one tail whose exports did NOT all run under the run's label
+    // ([`RunModes::per_export`]). Everything after is the shared tail.
+    let mode_label = wave_mode_label(peak_concurrency);
+    let modes = RunModes::per_export(mode_label, export_modes);
+    finish_run_tail(
+        &state,
+        entries,
+        started_at,
+        finished_at,
+        config_path,
+        mode_label,
+        &modes,
+        Some((&combined_stderr, &config_dir)),
+        failures,
+        " across waves",
+    )
+}
+
+/// Arch-roast follow-up (2026-08-21): the representative-failure fold, written
+/// once. Three orchestrator tails carried the identical block with only the
+/// context word differing — the exact per-copy drift the run-level tail keeps
+/// growing. Pure over its inputs.
+fn fold_failures(mut failures: Vec<anyhow::Error>, context: &str) -> crate::error::Result<()> {
+    if failures.is_empty() {
+        return Ok(());
+    }
+    // Carry a representative typed failure as the returned error so
+    // `error::classify_exit` downcasts the marker (DataIntegrityError=3,
+    // SchemaDriftError=4, transient=2) through anyhow's context chain. Pick
+    // the most "stop-worthy" class — data-integrity (possibly-wrong data)
+    // outranks schema-drift, which outranks retryable, which outranks
+    // generic — so a mixed batch exits on the scariest reason.
+    let primary_idx = representative_failure_idx(&failures).unwrap();
+    let primary = failures.remove(primary_idx);
+    if failures.is_empty() {
+        return Err(primary);
+    }
+    let others = failures
+        .iter()
+        .map(|e| format!("{e:#}"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    Err(primary.context(format!(
+        "{} export(s) failed{}; representative error follows (also: {others})",
+        failures.len() + 1,
+        context,
+    )))
+}
+
+/// The waves/pool run tail, written once: ONE aggregate, then the shared
+/// routing — the card and the `run_aggregate` row are multi-export-only
+/// ([`reports_run_aggregate`]), the run-over-run self-check is not gated at
+/// all, and the failure fold picks the scariest class. The two machine-channel
+/// tails (`run()`'s process branch and in-process tail, which honour
+/// `--summary-output`/`--json`) are the tracked next slice — this seam unifies
+/// the two copies that were already byte-alike so a routing fix lands once.
+#[allow(clippy::too_many_arguments)]
+fn finish_run_tail(
+    state: &StateStore,
+    entries: Vec<crate::state::RunAggregateEntry>,
+    started_at: chrono::DateTime<chrono::Utc>,
+    finished_at: chrono::DateTime<chrono::Utc>,
+    config_path: &str,
+    mode_label: &str,
+    modes: &RunModes<'_>,
+    stderr_artifact: Option<(&str, &Path)>,
+    failures: Vec<anyhow::Error>,
+    failure_context: &str,
+) -> crate::error::Result<()> {
     let agg = aggregate::build(
         entries,
         started_at,
         finished_at,
         Some(config_path),
-        wave_mode_label(peak_concurrency),
+        mode_label,
     );
-    // The card + row gate is the SHARED rule (`run`'s tail asks the same
-    // question through `tail_plan`); the self-check between them is not gated at
-    // all — see [`reports_run_aggregate`].
     if reports_run_aggregate(&agg) {
         aggregate::print(&agg);
     }
-    self_check_throughput(
-        &state,
-        &agg.per_export,
-        // The ONE tail whose exports did NOT all run under the run's label —
-        // see [`RunModes`].
-        &RunModes::per_export(&agg.parallel_mode, export_modes),
-    );
+    self_check_throughput(state, &agg.per_export, modes);
     if reports_run_aggregate(&agg) {
-        aggregate::persist(&state, &agg, None);
+        aggregate::persist(state, &agg, None);
     }
-    // Captured child stderr (verbose per-export cards, parallel path only) goes
-    // to a file artifact beside the config, with a one-line console pointer.
-    emit_child_stderr(&combined_stderr, &config_dir);
-
-    if !failures.is_empty() {
-        let primary_idx = representative_failure_idx(&failures).unwrap();
-        let primary = failures.remove(primary_idx);
-        if failures.is_empty() {
-            return Err(primary);
-        }
-        let others = failures
-            .iter()
-            .map(|e| format!("{e:#}"))
-            .collect::<Vec<_>>()
-            .join("; ");
-        return Err(primary.context(format!(
-            "{} export(s) failed across waves; representative error follows (also: {others})",
-            failures.len() + 1
-        )));
+    if let Some((dump, dir)) = stderr_artifact {
+        emit_child_stderr(dump, dir);
     }
-    Ok(())
+    fold_failures(failures, failure_context)
 }
 
 /// How the run shaped its concurrency, for the run-level harm line's frame —
@@ -2192,53 +2210,28 @@ pub(crate) fn run_pool(
         .iter()
         .map(aggregate::entry_from_summary)
         .collect();
-    let agg = aggregate::build(
+    // Pool-specific inputs only: label from what OVERLAPPED (a serialized pool
+    // must keep the self-check's actionable pointer, [`pool_mode_label`]) and
+    // per-export MEASURED attribution ([`pool_export_modes`] — one
+    // `parallel_safe` export makes the RUN a pool while every heavy runs
+    // alone). Everything after is the shared tail.
+    let mode_label = pool_mode_label(really_concurrent);
+    let modes = RunModes::per_export(
+        mode_label,
+        pool_export_modes(&pool_windows).into_iter().collect(),
+    );
+    finish_run_tail(
+        &state,
         entries,
         started_at,
         finished_at,
-        Some(config_path),
-        // From what overlapped, like the harm frame above — a serialized pool
-        // must keep the self-check's actionable pointer (see
-        // [`pool_mode_label`]).
-        pool_mode_label(really_concurrent),
-    );
-    // Same shared gate as the other two tails (see [`reports_run_aggregate`]) —
-    // the pool used to spell its own `> 1` inline, which is how a rule that must
-    // agree across three runners drifts.
-    if reports_run_aggregate(&agg) {
-        aggregate::print(&agg);
-    }
-    self_check_throughput(
-        &state,
-        &agg.per_export,
-        // NOT the run-wide label: one `parallel_safe` export makes the RUN a
-        // pool while every heavy after the safe work drains runs alone, so the
-        // attribution is per-export and MEASURED — see [`pool_export_modes`].
-        &RunModes::per_export(
-            &agg.parallel_mode,
-            pool_export_modes(&pool_windows).into_iter().collect(),
-        ),
-    );
-    if reports_run_aggregate(&agg) {
-        aggregate::persist(&state, &agg, None);
-    }
-    if !failures.is_empty() {
-        let primary_idx = representative_failure_idx(&failures).unwrap();
-        let primary = failures.remove(primary_idx);
-        if failures.is_empty() {
-            return Err(primary);
-        }
-        let others = failures
-            .iter()
-            .map(|e| format!("{e:#}"))
-            .collect::<Vec<_>>()
-            .join("; ");
-        return Err(primary.context(format!(
-            "{} export(s) failed in the pool; representative error follows (also: {others})",
-            failures.len() + 1
-        )));
-    }
-    Ok(())
+        config_path,
+        mode_label,
+        &modes,
+        None,
+        failures,
+        " in the pool",
+    )
 }
 
 /// Group exports by `wave:` in ascending order; an export with no `wave:` runs
@@ -3133,10 +3126,66 @@ mod pool_harm_tests {
 #[cfg(test)]
 mod run_tail_tests {
     use super::{
-        RunModes, owns_throughput_self_check, pool_safe_heavy_split, reports_run_aggregate,
-        self_check_throughput_as, snapshot_then_stamp, tail_plan,
+        RunModes, fold_failures, owns_throughput_self_check, pool_safe_heavy_split,
+        reports_run_aggregate, self_check_throughput_as, snapshot_then_stamp, tail_plan,
     };
     use crate::config::ExportConfig;
+
+    /// `fold_failures` is the shared representative-failure fold the three
+    /// orchestrator tails route through (arch-roast 2026-08-21). Its whole-body
+    /// stub `Ok(())` survived the in-diff mutation gate — a run that FAILED
+    /// would then exit 0 — because every caller is a live-only tail. It is
+    /// pure, so it is graded here directly.
+    ///
+    /// Three cases, and the typed-marker downcast is the load-bearing one:
+    /// `error::classify_exit` reads the marker THROUGH anyhow's context chain,
+    /// so a multi-failure fold must keep the representative error underneath
+    /// its summary context or a data-integrity batch would exit 1 instead of 3.
+    #[test]
+    fn fold_failures_returns_ok_only_when_empty_and_keeps_the_typed_marker() {
+        use crate::error::DataIntegrityError;
+
+        // No failures → Ok. (The stub mutant makes EVERY case look like this.)
+        assert!(fold_failures(Vec::new(), " in the pool").is_ok());
+
+        // One failure → returned verbatim, marker intact.
+        let one = fold_failures(
+            vec![DataIntegrityError::new("rows differ").into()],
+            " across waves",
+        )
+        .expect_err("a failure must not fold to Ok");
+        assert_eq!(
+            crate::error::classify_exit(&one),
+            3,
+            "a single data-integrity failure must still exit 3"
+        );
+
+        // Several → the SCARIEST class is representative and its marker must
+        // survive the added context; the others are named in the message.
+        let many = fold_failures(
+            vec![
+                anyhow::anyhow!("plain boom"),
+                DataIntegrityError::new("rows differ").into(),
+            ],
+            " in the pool",
+        )
+        .expect_err("failures must not fold to Ok");
+        assert_eq!(
+            crate::error::classify_exit(&many),
+            3,
+            "the data-integrity marker must survive under the summary context, \
+             or a mixed batch exits on the wrong reason"
+        );
+        let msg = format!("{many:#}");
+        assert!(
+            msg.contains("2 export(s) failed in the pool"),
+            "the fold must count every failure and carry the caller's context; got: {msg}"
+        );
+        assert!(
+            msg.contains("plain boom"),
+            "the non-representative failures must still be listed; got: {msg}"
+        );
+    }
 
     /// Captures WARN records, because the run-over-run self-check has no other
     /// observable: it reads the state DB and LOGS. Installed once per test
@@ -3750,11 +3799,35 @@ mod run_tail_tests {
             );
             sites += 1;
         }
+        // Down from 5: the waves/pool tails now route through ONE
+        // `finish_run_tail` (arch-roast 2026-08-21), so the gate's call sites
+        // are that seam's two (print + persist) plus `tail_plan`'s one. Fewer
+        // sites is the point — the invariant this test protects (ask about the
+        // BUILT aggregate, never a re-derived count) now holds by construction
+        // for every tail the seam serves.
         assert!(
-            sites >= 5,
-            "expected the gate at both of `run_waves`' sites, both of \
-             `run_pool`'s and inside `tail_plan` — found {sites}"
+            sites >= 3,
+            "expected the gate at `finish_run_tail`'s two sites plus \
+             `tail_plan` — found {sites}"
         );
+        // The floor dropped 5→3 because waves/pool no longer gate inline — so
+        // PIN that they still route through the shared tail, or an ungated
+        // revert (rebuilding an aggregate inline, printing unconditionally)
+        // would pass every remaining count (godsplit bughunt 2026-08-21, MED).
+        for tail_fn in ["fn run_waves", "fn run_pool"] {
+            let at = code.find(tail_fn).expect("orchestrator tail exists");
+            let body = &code[at..code[at..]
+                .find("\npub")
+                .or_else(|| code[at..].find("\nfn "))
+                .map(|o| at + o)
+                .unwrap_or(code.len())];
+            assert!(
+                body.contains("finish_run_tail("),
+                "{tail_fn} no longer routes through finish_run_tail — the \
+                 shared-tail invariant (one aggregate, gated card, ungated \
+                 self-check) is unenforced for it"
+            );
+        }
         // …and no tail may OVERWRITE the subject on its way to the gate, which
         // is the one way back to a re-derived count that still type-checks
         // (`agg.total_exports = total;` before the call). Reading it is the
@@ -4098,11 +4171,25 @@ mod run_tail_tests {
                     );
                     continue;
                 }
-                // The seam's own definition is not a call.
-                let calls = body
+                // The seam's own definition is not a call. Since the shared
+                // waves/pool tail landed (arch-roast 2026-08-21), routing
+                // through `finish_run_tail(` IS routing through the seam — it
+                // owns the aggregate + self-check + persist sequence, and its
+                // own body is graded by this same loop (it builds an aggregate
+                // and must call the check directly).
+                let direct = body
                     .match_indices(seam)
                     .filter(|(i, _)| !body[..*i].ends_with("fn "))
                     .count();
+                let routed = body
+                    .match_indices("finish_run_tail(")
+                    .filter(|(i, _)| !body[..*i].ends_with("fn "))
+                    .count();
+                // Routed credit is NOT fungible (godsplit bughunt 2026-08-21):
+                // a tail that builds its OWN aggregate must call the check on
+                // it directly — forwarding a different entries vec through
+                // finish_run_tail must not excuse the self-built one.
+                let calls = if builds == 0 { direct + routed } else { direct };
                 assert!(
                     calls >= builds.max(1),
                     "{rel}::{name} ends a run (it drives an export to completion \
