@@ -31,8 +31,30 @@ Narrow live filters for Tier 3 (mutate X → run only its guards):
 ## Three enforcement loops
 
 1. **PR gate — `cargo mutants --in-diff` (minutes).** Mutates only the lines
-   the PR changed, `--lib` cycle. A NEW missed mutant in your own diff fails
-   the check. Cheapest and fairest: everyone pays only for their own code.
+   the PR changed, `--lib --bins` cycle. A NEW missed mutant in your own diff
+   fails the check. Cheapest and fairest: everyone pays only for their own code.
+
+   Since 2026-08-21 the in-diff mutants are **prioritised before they are
+   budgeted** (`.github/scripts/mutants_classify.py`, wired into the
+   `mutants-in-diff` job). `cargo llvm-cov --lib --bins` measures which
+   functions the offline suite actually EXECUTES, and each mutant lands in one
+   of two classes:
+
+   - **graded** — its line is inside an executed function. A test ran that code
+     and did not notice the change: an assertion gap, and the gate's red.
+   - **reported** — its line is inside a function measured at ZERO executions.
+     No offline assertion can kill it; it is a triage question
+     (`.cargo/mutants.toml` with a live-oracle proof, or a unit oracle that
+     moves the function into the graded class).
+
+   This is what makes the gate useful on a big diff: the budget guard now tests
+   the GRADED subset, so a foundational PR that used to be graded by nothing
+   gets its offline-reachable mutants graded. Two properties keep the split
+   from becoming an excuse — everything the measurement does not KNOW (no
+   report, an unmentioned file, an unparseable name) stays in the graded class,
+   and whenever the budget stretches to it the reported class is RUN as an
+   audit: if the offline suite catches one of them, the classification was
+   wrong and `Mutants (coverage verdict)` fails.
 2. **Nightly (devbox self-hosted runner).** Full `--lib` runs over Tier 0-2 in
    rotation (~500-1000 mutants/night). Result diffed against the committed
    baseline (`docs/mutants-baseline.txt`): any missed mutant NOT in the
@@ -102,6 +124,31 @@ than the `--lib` cycle, and nothing tested that claim, because mutation runs use
 boolean coercion in `build_array` (`*v != 0` -> `*v == 0`) DOES fail the live
 subset (`live_init::init_mysql_schema_wide_discovers_seeded_table`). For that
 class the claim holds — as a measurement now, not an assurance.
+
+## The harness's own thermometer (2026-08-21)
+
+Every loop above measures the PRODUCT. Nothing measured the harness, so a guard
+could rot for months with every signal a reader has still reading green — three
+did (see `tests/offline/nonvacuity.rs`). The `harness-metrics` job in ci.yml now
+emits one JSON per run (`.github/scripts/harness_metrics.py`, uploaded as the
+`harness-metrics` artifact, one-line summary in the job log):
+
+- **mutants** — in scope, excluded by `.cargo/mutants.toml`, graded, and the
+  classifier's offline-reachable / live-only split, plus caught / missed.
+- **guards** — convention-cop guards (a `#[test]` file grading a checked-in
+  subject by NAME), how many prove that subject is non-empty, how many tests
+  are named `..._documents_...` (documentation, not verification), how many
+  files declare a blind spot in prose.
+- **tests** — DECLARED `#[test]` counts for the offline suite and the lib (the
+  job runs no cargo; it counts attributes, so the number differs from a
+  runner's tally by whatever is `cfg`-gated out).
+
+It is a THERMOMETER: no threshold, no `needs:` from any job, `continue-on-error`
+on top of `if: always()`. A metric with teeth becomes a number people manage
+(pad the cop count; rename a test `_documents_` to duck a red). An unknown count
+is published as `null`, never `0` — "the mutation job never ran" and "nothing
+was missed" must not draw the same line. `tests/offline/harness_metrics_guard.rs`
+grades the shaping from a fixture of counts and keeps the job non-blocking.
 
 ## Triage verdicts
 

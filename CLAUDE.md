@@ -605,6 +605,29 @@ one, and PROVE which by mutating and running the live suite: `total_rows += `
 file as a lib-suite survivor — is caught by three. What the live suite did NOT
 catch was worth the search: see the failed-chunk guard below.
 
+The corollary that keeps that exclusion HONEST: **a body the offline gate cannot
+reach may not DECIDE.** Excluding a live-only function wholesale
+(`replace run_pool -> Result`) is a truthful claim about the BODY and a silent
+one about the branches inside it — every `&&`, `!` or `x > y` written there is a
+mutant excluded with nothing asked in return. Measured: five decisions were
+pulled out of `execute_resolved_plan` (`src/pipeline/job.rs`) BY HAND this
+session — `should_reconcile`, `plan_rejection_error`,
+`resume_success_gate_applies`, `rerun_warning_applies`,
+`dispatches_to_cdc_runner` — each only because the in-diff gate pointed at that
+one operator and someone argued it out; `fold_failures` (`src/pipeline/run.rs`)
+came out of the same pass and was a REAL gap, with no unit oracle at all. Six
+extractions, six ad-hoc arguments, and nothing stopping the seventh from being
+written inline tomorrow. So the rule, not the litigation: **a live-only body is
+GLUE — sequencing, I/O, error context — and calls a NAMED PURE PREDICATE for
+anything it decides**; the predicate is offline-testable and its mutants are
+graded, the glue stays excluded for the reason its exclusion gives. The tell that
+this went wrong is an operator-shaped entry in `.cargo/mutants.toml` (`delete !
+in run_pool`, `replace == with != in check$`): that is a decision that should
+have been a function. Enforced by `tests/offline/live_only_purity_gate.rs`, which
+DERIVES the live-only set from the config's whole-function exclusions (never a
+typed-in list) and holds each body at a shrink-only ceiling — lower a row the
+moment you extract, and it fails downward too so the win stays banked.
+
 Scope honesty: mutation testing measures assertion SENSITIVITY on code that
 exists. It cannot see a missing behaviour (the manifest-clobber fix itself was
 invisible to it — an independent-oracle harness caught that), nor a test and

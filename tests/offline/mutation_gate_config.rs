@@ -161,7 +161,7 @@ fn toml_string_array(text: &str, key: &str) -> Option<Vec<String>> {
     Some(out)
 }
 
-fn exclude_patterns() -> Vec<String> {
+pub fn exclude_patterns() -> Vec<String> {
     let out = toml_string_array(&config_text(), "exclude_re")
         .expect("`exclude_re` not found in .cargo/mutants.toml — did the config's shape change?");
     assert!(

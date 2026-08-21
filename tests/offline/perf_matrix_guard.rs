@@ -34,11 +34,28 @@ fn scalar(v: &Value) -> String {
     }
 }
 
+/// The `scenarios:` rows, floor-checked.
+///
+/// The `unwrap_or_default()` below is why the floor is here and not left to the
+/// callers: a renamed or re-nested key yields the EMPTY vector, and all three
+/// tests in this file then pass over it — the column-completeness loop grades no
+/// rows, `measured_cells_are_non_empty` grades no cells, and the gap count is
+/// zero, which is exactly the ratchet. Every signal green, nothing measured.
 fn scenarios(v: &Value) -> Vec<&Value> {
-    v.get("scenarios")
+    let out: Vec<&Value> = v
+        .get("scenarios")
         .and_then(|s| s.as_sequence())
         .map(|s| s.iter().collect())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    // 7 rows today; the floor catches a lost SECTION, not an edited row.
+    super::nonvacuity::require_enumerated(
+        out.len(),
+        4,
+        &format!("`scenarios:` rows in {PERF_MATRIX}"),
+        "Re-point this parser at wherever the perf scenarios now live — a perf ledger that \
+         parses to nothing reports a full house of measured baselines it never read.",
+    );
+    out
 }
 
 /// A perf cell is `{measured: ...}` | `{gap: ...}` | `{na: ...}`.

@@ -18,15 +18,9 @@
 //! (an unknown class, an unknown engine, an unexplained restriction).
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
-
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-}
 
 fn matrix_text() -> String {
-    let p = repo_root().join("docs/scenario-artifact-matrix.yaml");
-    std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("read {}: {e}", p.display()))
+    super::nonvacuity::subject_text("docs/scenario-artifact-matrix.yaml")
 }
 
 /// Values under a top-level `engines: [a, b]` inline list.
@@ -109,6 +103,17 @@ fn scenarios(text: &str) -> Vec<(String, BTreeSet<String>, BTreeSet<String>, boo
     if let Some(s) = cur.take() {
         out.push(s);
     }
+    // The `scenarios:` HEADING missing panics above; a heading whose rows this
+    // hand-rolled line parser no longer recognises (a re-indent, a different
+    // list style) yields zero rows — and all four guards below iterate rows, so
+    // zero rows is four green tests over a ledger asserting nothing. 14 today.
+    super::nonvacuity::require_enumerated(
+        out.len(),
+        8,
+        "scenario rows parsed from docs/scenario-artifact-matrix.yaml",
+        "The rows are still there and this parser stopped seeing them — fix the parser \
+         rather than the floor.",
+    );
     out
 }
 
