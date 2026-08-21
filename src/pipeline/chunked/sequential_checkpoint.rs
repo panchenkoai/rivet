@@ -271,9 +271,6 @@ pub(crate) fn run_chunked_sequential_checkpoint(
     let streamed_rows = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
     // Form B: XOR-combine each chunk's checksums run-wide (order-independent), then
     // harvest once — so the CHECKPOINT chunked path records Form B like exec.rs.
-    let mut checksums_acc: std::collections::BTreeMap<String, u64> =
-        std::collections::BTreeMap::new();
-    let mut checksum_key_column: Option<String> = None;
 
     if !plan.resume && !resource::check_memory(plan.tuning.memory_threshold_mb) {
         log::warn!("memory threshold exceeded before chunk export; pausing 5s");
@@ -332,13 +329,11 @@ pub(crate) fn run_chunked_sequential_checkpoint(
             Ok((rows, parts, chunk_checksums, key)) => {
                 summary.total_rows += rows as i64;
                 pb.inc(summary.total_rows);
-                super::super::commit::accumulate_column_checksums(
-                    &mut checksums_acc,
-                    &chunk_checksums,
-                );
-                if checksum_key_column.is_none() {
-                    checksum_key_column = key;
-                }
+                // ADR-0028: feed the run ledger; the seam harvests once, at
+                // the dispatcher (chunked's drift gate stays pre-chunk, ADR-0021,
+                // so no schema is fed here).
+                summary.ledger.merge_checksums(&chunk_checksums);
+                summary.ledger.note_key_column(key);
                 // Shared commit path for the non-empty branch (I2/M1 + counters
                 // + ChunkCompleted journal + I7 file-log + fault hooks).
                 // Empty chunks have no file to record but still need to journal
@@ -404,9 +399,6 @@ pub(crate) fn run_chunked_sequential_checkpoint(
             plan.export_name
         );
     }
-
-    // Form B: record the run-wide checksums before finalize writes the manifest.
-    super::super::commit::harvest_column_checksums(summary, checksums_acc, checksum_key_column);
 
     pb.finish(summary.total_rows);
     state.finalize_chunk_run_completed(&run_id)?;

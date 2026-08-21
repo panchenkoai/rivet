@@ -19,7 +19,6 @@
 //! key in `last_cursor_value` (its `cursor_extract_column` resolves to the
 //! keyset key), which the loop reads to advance to the next page.
 
-use super::manifest_writer;
 use super::{RunSummary, sink::ExportSink};
 use crate::config::IncrementalCursorMode;
 use crate::destination;
@@ -819,8 +818,10 @@ fn run_keyset_parallel(
     if plan.validate {
         summary.validated = Some(true);
     }
+    // ADR-0028: the workers converged on ONE run schema; feed it to the ledger —
+    // the seam pins the fingerprint and runs the drift gate.
     if let Some(sc) = fingerprint.get() {
-        manifest_writer::record_run_schema_fingerprint(summary, sc);
+        summary.ledger.note_schema(sc);
     }
     // cursor_high = the highest populated range's max (forensics v18); see range_max.
     summary.cursor_high = highest_range_max(range_max.into_inner().unwrap());
@@ -838,16 +839,12 @@ fn run_keyset_parallel(
     {
         super::chunked::rehydrate_manifest_parts_from_file_log(st, &run_id, summary)?;
     }
-    // Form B: XOR-combine every worker's per-page column checksums run-wide.
-    let mut acc: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
-    let mut ck_key: Option<String> = None;
+    // ADR-0028: feed every committed range's Form-B checksums to the ledger
+    // (commit-gated — a failed range published none). The seam harvests once.
     for (m, k) in checksums_mx.into_inner().unwrap() {
-        super::commit::accumulate_column_checksums(&mut acc, &m);
-        if ck_key.is_none() {
-            ck_key = k;
-        }
+        summary.ledger.merge_checksums(&m);
+        summary.ledger.note_key_column(k);
     }
-    super::commit::harvest_column_checksums(summary, acc, ck_key);
 
     log::info!(
         "export '{}': parallel keyset complete — {} range(s), {} parts, {} rows",
@@ -856,21 +853,6 @@ fn run_keyset_parallel(
         parts.len(),
         summary.total_rows
     );
-
-    // on_schema_drift gate — the SAME post-run check the sequential runner applies
-    // (mirror single mode). Without this, `on_schema_drift: fail` would silently
-    // return exit 0 on a drifted schema on the parallel path — the runner-bypass
-    // class. The workers converge on ONE run schema (fingerprint), so the check is
-    // run-wide, not per-worker.
-    if let (Some(sc), Some(st)) = (fingerprint.get(), state) {
-        super::schema_drift::check_from_sink_schema(
-            st,
-            &plan.export_name,
-            sc,
-            plan.schema_drift_policy,
-            summary,
-        )?;
-    }
 
     // Incremental (iteration 3): on CLEAN SUCCESS advance the persisted anchor to
     // this run's ceiling (the source max pinned at open), so the next run seeks
@@ -1046,16 +1028,6 @@ pub(crate) fn run_keyset(
     crate::test_hook::maybe_panic_at("keyset_after_open_before_first_page");
 
     let mut pages: usize = 0;
-    // Captured once from the first non-empty page for the post-run on_schema_drift
-    // gate: keyset owns its runner (run_single_export early-returns here), so the
-    // drift check single mode applies must be applied here too.
-    let mut drift_schema: Option<arrow::datatypes::Schema> = None;
-    // Form B: XOR-combine each page's per-column checksums run-wide (order-
-    // independent), then harvest once after the loop — so the finalize manifest
-    // records Form B and `rivet validate` can re-verify keyset exports too.
-    let mut checksums_acc: std::collections::BTreeMap<String, u64> =
-        std::collections::BTreeMap::new();
-    let mut checksum_key_column: Option<String> = None;
 
     // Destination + manifest-mode guard (Finding #44) fixed for the whole run — hoisted out of
     // the page loop. Part names key off the SANITIZED RUN_ID (stable across a resume, unique per
@@ -1108,19 +1080,16 @@ pub(crate) fn run_keyset(
             summary.cursor_low = page.first_cursor.clone();
         }
 
-        // ADR-0012 M3: capture the dest schema fingerprint from the first
-        // non-empty page; idempotent run-wide.
+        // ADR-0028: feed the run ledger from this page — the seam
+        // (`finalize::finalize_export`) pins the fingerprint, runs the drift
+        // gate and harvests Form B once, at the dispatcher. No application here.
         if let Some(sc) = &page.schema {
-            manifest_writer::record_run_schema_fingerprint(summary, sc);
-            if drift_schema.is_none() {
-                drift_schema = Some(sc.clone());
-            }
+            summary.ledger.note_schema(sc);
         }
-        // Form B: fold this page's checksums into the run-wide XOR accumulator.
-        super::commit::accumulate_column_checksums(&mut checksums_acc, &page.column_checksums);
-        if checksum_key_column.is_none() {
-            checksum_key_column = page.checksum_key_column.clone();
-        }
+        summary.ledger.merge_checksums(&page.column_checksums);
+        summary
+            .ledger
+            .note_key_column(page.checksum_key_column.clone());
         if plan.validate {
             summary.validated = Some(true);
         }
@@ -1220,12 +1189,9 @@ pub(crate) fn run_keyset(
         }
     }
 
-    // Form B: record the run-wide XOR-combined checksums so finalize writes them.
-    super::commit::harvest_column_checksums(summary, checksums_acc, checksum_key_column);
-
     // DATA COMPLETE: the page loop exhausted the key range, so there is no
     // uncommitted work left to resume — for a NON-INCREMENTAL run, clear the
-    // in-progress run_id NOW, BEFORE the post-data gates (schema-drift below, and
+    // in-progress run_id NOW, BEFORE the post-data gates (schema-drift at the finalize_export seam, and
     // the quality gate in job.rs). A gate that fails AFTER all data is durable must
     // not leave a resume anchor, or the operator's intended full re-run would be
     // treated as a crash-recovery and continue from the high-water mark, silently
@@ -1263,20 +1229,10 @@ pub(crate) fn run_keyset(
         summary.total_rows
     );
 
-    // on_schema_drift gate — run_single_export applies this, but keyset returns
-    // through its own runner and never reached it, so an opted-in
-    // `on_schema_drift: fail` silently returned exit 0 on a drifted schema for the
-    // headline large-table path. Mirror single mode: compare the run's resolved
-    // schema against the stored fingerprint once, post-run.
-    if let (Some(sc), Some(st)) = (&drift_schema, state) {
-        super::schema_drift::check_from_sink_schema(
-            st,
-            &plan.export_name,
-            sc,
-            plan.schema_drift_policy,
-            summary,
-        )?;
-    }
+    // ADR-0028: the on_schema_drift gate, Form-B harvest and fingerprint pin are
+    // applied by the ONE seam (`finalize::finalize_export`, at the dispatcher)
+    // from the ledger this loop fed — the runner-bypass class this runner
+    // twice re-introduced by hand-mirroring single mode is structurally gone.
     Ok(())
 }
 

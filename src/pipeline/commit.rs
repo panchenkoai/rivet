@@ -66,6 +66,71 @@ pub(in crate::pipeline) fn accumulate_run_rows(summary: &mut RunSummary, this_ru
     summary.total_rows += this_run_rows;
 }
 
+/// ADR-0028: the run-wide tail ledger, filled by the runners as they commit and
+/// APPLIED once by [`crate::pipeline::finalize::finalize_export`] — the one seam
+/// the dispatcher calls between the runner returning and `finalize_manifest`.
+///
+/// This exists to retire the runner-bypass class: before it, every runner
+/// re-assembled the same post-write tail by hand (fingerprint pin → drift gate →
+/// Form-B harvest → shape warn), and a feature wired into one runner was
+/// silently absent on the others (`keyset.rs` said so verbatim; Form-B was
+/// computed-then-discarded on all three large-table runners). Runners now only
+/// FEED this ledger — what schema they saw, which checksums their sinks
+/// computed — and the APPLICATION lives in exactly one place, ordering encoded
+/// once. The telltale invariants in `check_post_run_invariants` (drift verdict
+/// present, Form-B harvested-or-flagged) go RED if a runner feeds nothing.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct CommitLedger {
+    /// Run-wide sum-combined per-column value checksums (Form B input).
+    pub(in crate::pipeline) column_checksums: std::collections::BTreeMap<String, u64>,
+    /// The key column the checksums are keyed to (first runner-reported wins).
+    pub(in crate::pipeline) checksum_key_column: Option<String>,
+    /// The run's dest schema (first non-empty page/sink wins) — drives the
+    /// manifest fingerprint pin and the post-run `on_schema_drift` gate.
+    /// `None` on runners whose drift gate runs elsewhere by design (chunked
+    /// checks pre-chunk via `check_from_type_mappings`, ADR-0021).
+    pub(in crate::pipeline) drift_schema: Option<arrow::datatypes::Schema>,
+    /// Max observed byte length per column (shape-drift warn input); merged
+    /// by max so worker/part order is irrelevant.
+    pub(in crate::pipeline) column_max_bytes: std::collections::HashMap<String, u64>,
+}
+
+impl CommitLedger {
+    /// First-wins schema note (idempotent run-wide, like the fingerprint pin).
+    pub(in crate::pipeline) fn note_schema(&mut self, schema: &arrow::datatypes::Schema) {
+        if self.drift_schema.is_none() {
+            self.drift_schema = Some(schema.clone());
+        }
+    }
+
+    /// Fold one part/page/worker's per-column checksums into the run-wide map
+    /// (commutative wrapping add — see [`accumulate_column_checksums`]).
+    pub(in crate::pipeline) fn merge_checksums(
+        &mut self,
+        part: &std::collections::BTreeMap<String, u64>,
+    ) {
+        accumulate_column_checksums(&mut self.column_checksums, part);
+    }
+
+    /// First-wins key-column note (all pages/workers of a run share one key).
+    pub(in crate::pipeline) fn note_key_column(&mut self, key: Option<String>) {
+        if self.checksum_key_column.is_none() {
+            self.checksum_key_column = key;
+        }
+    }
+
+    /// Max-merge one sink's observed per-column byte lengths.
+    pub(in crate::pipeline) fn merge_shape(
+        &mut self,
+        max_bytes: &std::collections::HashMap<String, u64>,
+    ) {
+        for (col, len) in max_bytes {
+            let e = self.column_max_bytes.entry(col.clone()).or_insert(0);
+            *e = (*e).max(*len);
+        }
+    }
+}
+
 /// XOR-accumulate one part/page/chunk sink's per-column value checksums into a
 /// run-wide map. Order-independent (XOR), so chunk/page/worker order and count do
 /// not change the result — the MULTI-PART runners (chunked / keyset / mongo_parallel)
@@ -394,6 +459,92 @@ mod tests {
     use crate::state::StateStore;
     use crate::tuning::SourceTuning;
     use std::io::Write;
+
+    /// ADR-0028 CommitLedger semantics, each of which a runner relies on:
+    /// first-wins schema/key (idempotent across pages/workers), commutative
+    /// wrapping-add checksum merge (worker order must not matter), max-merge
+    /// shape. RED-proven against: note_schema last-wins (second schema
+    /// overwrites), merge via overwrite-insert (second part clobbers), and
+    /// merge_shape via min.
+    /// ADR-0028: `drain_tail_into` is the FEEDING leg every sink-based runner
+    /// relies on — stubbed to a no-op, no schema/checksums/shape ever reach the
+    /// ledger and the seam applies nothing (live: the Form-B telltale fires).
+    /// Unit-pinned here so the in-diff gate kills the stub without a stand:
+    /// populate a real sink's tail fields, drain, assert the ledger got all
+    /// four (schema, checksums, key, shape) and the sink was emptied.
+    #[test]
+    fn drain_tail_into_moves_schema_checksums_key_and_shape_to_the_ledger() {
+        use arrow::datatypes::{DataType, Field, Schema};
+        let plan = test_plan();
+        let mut sink = crate::pipeline::sink::ExportSink::new(&plan).expect("sink");
+        sink.dest_schema = Some(std::sync::Arc::new(Schema::new(vec![Field::new(
+            "id",
+            DataType::Int64,
+            false,
+        )])));
+        sink.column_checksums = [("id".to_string(), 41u64)].into();
+        sink.checksum_key_col = Some(0);
+        sink.cursor_column = Some("id".to_string());
+        sink.column_max_bytes = [("id".to_string(), 8u64)].into();
+
+        let mut led = CommitLedger::default();
+        sink.drain_tail_into(&mut led);
+
+        assert_eq!(
+            led.drift_schema.as_ref().map(|s| s.field(0).name().clone()),
+            Some("id".to_string()),
+            "the sink's dest schema must reach the ledger"
+        );
+        assert_eq!(led.column_checksums.get("id"), Some(&41u64));
+        assert_eq!(led.checksum_key_column.as_deref(), Some("id"));
+        assert_eq!(led.column_max_bytes.get("id"), Some(&8u64));
+        assert!(
+            sink.column_checksums.is_empty() && sink.column_max_bytes.is_empty(),
+            "drain must TAKE the sink's accumulators, not copy them"
+        );
+    }
+
+    #[test]
+    fn commit_ledger_first_wins_schema_and_key_and_commutative_merges() {
+        use arrow::datatypes::{DataType, Field, Schema};
+        let mut led = CommitLedger::default();
+
+        // first-wins schema: the second (drifted) schema must NOT replace it.
+        let a = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
+        let b = Schema::new(vec![Field::new("other", DataType::Utf8, true)]);
+        led.note_schema(&a);
+        led.note_schema(&b);
+        assert_eq!(
+            led.drift_schema.as_ref().map(|s| s.field(0).name().clone()),
+            Some("id".to_string()),
+            "note_schema is first-wins — a later page/worker schema must not replace the run's"
+        );
+
+        // first-Some-wins key: a None feed leaves it open for a later Some.
+        led.note_key_column(None);
+        led.note_key_column(Some("id".into()));
+        led.note_key_column(Some("late".into()));
+        assert_eq!(led.checksum_key_column.as_deref(), Some("id"));
+
+        // commutative wrapping-add merge — two parts with the same column SUM,
+        // never overwrite (an overwrite would silently drop part 1's coverage).
+        let p1: std::collections::BTreeMap<String, u64> = [("v".to_string(), 7u64)].into();
+        let p2: std::collections::BTreeMap<String, u64> = [("v".to_string(), 5u64)].into();
+        led.merge_checksums(&p1);
+        led.merge_checksums(&p2);
+        assert_eq!(
+            led.column_checksums.get("v"),
+            Some(&12u64),
+            "checksum merge must fold (wrapping add), not overwrite"
+        );
+
+        // shape is max-merge: order-independent, the larger observation wins.
+        let s1: std::collections::HashMap<String, u64> = [("t".to_string(), 100u64)].into();
+        let s2: std::collections::HashMap<String, u64> = [("t".to_string(), 40u64)].into();
+        led.merge_shape(&s1);
+        led.merge_shape(&s2);
+        assert_eq!(led.column_max_bytes.get("t"), Some(&100u64));
+    }
 
     fn test_plan() -> ResolvedRunPlan {
         ResolvedRunPlan {

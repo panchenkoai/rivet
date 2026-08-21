@@ -117,6 +117,27 @@ exclude_re = [
     # 2026-08-20, then reverted). The whole live_keyset suite guards the bodies.
     "replace run_keyset ->",
     "replace run_keyset_parallel ->",
+    # run_with_reconnect / run_mongo_parallel (ADR-0028 seam cut-over, PR: the
+    # finalize-export-seam branch) are live-only export runners: the first wraps
+    # run_single_export's retry loop over a real source connection, the second
+    # fans _id-range workers over a real MongoDB. Their whole-fn `Ok(())` stubs
+    # export nothing and are unkillable under `--lib --bins`. Both proven
+    # live-killed by hand 2026-08-21 (stub applied, test run, stub reverted):
+    # run_with_reconnect fails keyset_export_records_form_b_checksums_and_
+    # validate_passes; run_mongo_parallel fails mongo_parallel_export_records_
+    # form_b_checksum. The tail DECISION logic the cut-over moved is unit-killed
+    # (CommitLedger 4/4, finalize_export + shape guard, drain_tail_into).
+    "replace run_with_reconnect ->",
+    "replace run_mongo_parallel ->",
+    # run_export_job_with_chunk_source is the plan-ARTIFACT apply orchestration
+    # (apply_cmd.rs:215 is its only caller) — a real StateStore + source per
+    # export, live-only. Its stub `(Ok(()), Default::default())` is proven
+    # live-killed by hand 2026-08-21: plan_and_apply_full_export_round_trip
+    # FAILS (no export happens). Honest scope note: the .yaml wave-apply live
+    # test (resume_skips_completed_exports) stays GREEN under this stub — that
+    # path goes through run_export_job, not this fn; the artifact round-trip
+    # test is the one that owns it.
+    "replace run_export_job_with_chunk_source ->",
     # introspect_all (init/mod.rs) is the whole-schema scan: every arm opens a
     # live engine connection, so its dispatch mutants (delete match arm
     # "postgres"/"mysql"/"mssql") are unkillable OFFLINE. The DECISION logic was
