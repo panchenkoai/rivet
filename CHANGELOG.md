@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- **ADR-0028: one finalize seam for the export tail.** The post-write tail
+  (manifest schema-fingerprint pin, `on_schema_drift` gate, Form-B checksum
+  harvest, shape-drift warn) is now applied exactly once, at
+  `finalize::finalize_export` — called by the dispatcher between the runner
+  returning and `finalize_manifest` — from a `CommitLedger` the runners feed as
+  they commit. Previously every export runner re-assembled that tail by hand,
+  which is how a feature wired into one runner ended up silently absent on the
+  others (the recurring runner-bypass class: the keyset/mongo drift-gate miss,
+  Form-B computed-then-discarded on the large-table runners). Runners now only
+  feed the ledger; the ordering constraints live in one place. Behavior is
+  unchanged except keyset/mongo manifests now also carry the dest-schema
+  fingerprint single mode always recorded (uniform pin at the seam).
+
 - **`rivet plan` is now READ-ONLY without `--annotate-waves`.** It computes and
   prints the advisory schedule (and the reviewable plan artifact) but no longer
   touches your config file unless you pass `--annotate-waves`. Previously, plan

@@ -606,18 +606,12 @@ pub(crate) fn run_chunked_parallel_checkpoint(
         );
     }
 
-    // Form B: XOR-combine every worker's chunk checksums run-wide + harvest once,
-    // before finalize writes the manifest.
-    let mut checksums_acc: std::collections::BTreeMap<String, u64> =
-        std::collections::BTreeMap::new();
-    let mut checksum_key_column: Option<String> = None;
+    // ADR-0028: feed every worker's chunk checksums into the run ledger; the
+    // seam harvests once, at the dispatcher, before finalize writes the manifest.
     for (part, key) in poison::into_recover(checksums_shared) {
-        super::super::commit::accumulate_column_checksums(&mut checksums_acc, &part);
-        if checksum_key_column.is_none() {
-            checksum_key_column = key;
-        }
+        summary.ledger.merge_checksums(&part);
+        summary.ledger.note_key_column(key);
     }
-    super::super::commit::harvest_column_checksums(summary, checksums_acc, checksum_key_column);
 
     state.finalize_chunk_run_completed(&run_id)?;
     // ADR-0008 PG2 committed boundary via the shared finalize seam.

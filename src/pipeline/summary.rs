@@ -137,6 +137,13 @@ pub struct RunSummary {
     /// to a size-only check. An incomplete integrity record must be ABSENT, not
     /// partial-and-lying.
     pub column_checksums_incomplete: bool,
+    /// ADR-0028: the run-wide tail ledger the runners FEED as they commit
+    /// (schema seen, per-part checksums, shape bytes) and that
+    /// `finalize::finalize_export` — called once by the dispatcher — APPLIES:
+    /// fingerprint pin, drift gate, Form-B harvest, shape warn. Runners no
+    /// longer apply any of those themselves; forgetting to FEED is caught by
+    /// the telltale invariants in `check_post_run_invariants` below.
+    pub(crate) ledger: super::commit::CommitLedger,
     /// Cursor range this run covered (incremental strategies) — travels to the
     /// manifest's extraction section for warehouse-side continuity checks.
     /// v1 ships column + low + high; cursor_type / source_row_count are
@@ -297,6 +304,7 @@ impl RunSummary {
             apply_context: None,
             column_checksums: Vec::new(),
             column_checksums_incomplete: false,
+            ledger: Default::default(),
             checksum_key_column: None,
             cursor_column: None,
             cursor_low: None,
@@ -371,6 +379,7 @@ impl RunSummary {
             apply_context: None,
             column_checksums: Vec::new(),
             column_checksums_incomplete: false,
+            ledger: Default::default(),
             checksum_key_column: None,
             cursor_column: None,
             cursor_low: None,

@@ -1,6 +1,14 @@
 # ADR-0028: One finalize seam for the export tail — retiring the runner-bypass class by construction
 
-**Status**: Proposed (design accepted, migration not started)
+**Status**: Accepted — implemented 2026-08-21. `finalize::finalize_export` +
+`CommitLedger` landed in one pass: the tail blocks were deleted from all seven
+commit loops (single, keyset sequential + parallel, mongo_parallel, chunked
+sequential + parallel, both checkpoint twins); each runner now only feeds the
+ledger. RED-proven both ways — seam call removed → two live tests FAIL and the
+finalize telltale panics; a runner's feed removed → the telltale names the
+runner-bypass class in its message. The retry boundary (`run_with_reconnect`)
+resets the ledger so a failed attempt's partial feed never double-merges into
+the retry's.
 **Date**: 2026-08
 **Relates to**: ADR-0012 (manifest durability ordering), ADR-0021 (chunked drift pre-chunk), `docs/runner-coverage-matrix.yaml` (the ledger this ADR aims to shrink)
 

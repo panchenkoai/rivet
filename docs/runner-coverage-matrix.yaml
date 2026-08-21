@@ -9,6 +9,18 @@
 # of parallel-keyset shipped exactly that: the drift gate, wired into keyset_sequential,
 # was absent on keyset_parallel; a human caught it, not this ledger — see below).
 #
+# ADR-0028 (2026-08-21): the tail APPLICATION is now ONE seam. `finalize::
+# finalize_export`, called by the dispatcher between the runner returning and
+# `finalize_manifest`, applies the fingerprint pin, the on_schema_drift gate,
+# the Form-B harvest and the shape-drift warn from `summary.ledger` — the
+# CommitLedger the runners FEED as they commit. No runner applies any of those
+# itself any more, so the drift/Form-B rows below grade the runner's FEED (and
+# the seam end-to-end), not a per-runner re-application; the class this ledger
+# exists to catch is structurally reduced to "a runner fed nothing", which the
+# telltale backstop below turns RED (proven 2026-08-21: seam call removed ->
+# 2 live tests FAIL + the finalize panic fires; keyset feed removed -> the
+# telltale names the runner-bypass class in its message).
+#
 # STRUCTURAL BACKSTOP (feat/parallel-keyset, candidate A): two of the recurring
 # scenarios below — `schema_drift_gate` and value-checksum Form B — are now guarded
 # STRUCTURALLY by `RunSummary::check_post_run_invariants` (a debug/test panic in
@@ -179,7 +191,7 @@ scenarios:
     mongo_parallel: { na: "mongo_parallel spawns one thread per _id range with NO shared permit ceiling — the governor's resize target does not exist there. The reader-level adaptive batch sizing (engine pressure counters) still applies; the concurrency governor is a permit-ceiling mechanism and mongo_parallel has no ceiling to shrink. A future ceiling would take a `test` cell here." }
 
   - id: schema_drift_gate
-    what: "on_schema_drift enforcement — a drifted schema under `fail` aborts (exit 4). Each runner bypasses run_single_export, so each must re-apply the gate (check_from_sink_schema / check_from_type_mappings). Round-8: keyset + mongo_parallel had SILENTLY dropped it (exit 0 on drift)."
+    what: "on_schema_drift enforcement — a drifted schema under `fail` aborts (exit 4). Round-8: keyset + mongo_parallel had SILENTLY dropped it (exit 0 on drift) — each runner re-applied the gate by hand then. Since ADR-0028 the gate runs ONCE at the finalize_export seam from the ledger's drift schema; runners only FEED the schema they resolved (chunked feeds none — its gate is pre-chunk via check_from_type_mappings, ADR-0021). The test cells grade the feed + seam end-to-end."
     single:         { test: schema_drift_removed_column_is_detected }
     chunked:        { test: chunked_range_export_enforces_on_schema_drift_fail }
     chunked_checkpoint: { na: "shared CHUNKED preamble, not per-runner: every chunked variant takes the gate through chunked/mod.rs — `prepare_chunk_plan` / `prepare_chunk_plan_fresh` on the Detect path and `check_drift_only(_fresh)` on the Precomputed (apply/resume) path. Call sites: sequential_checkpoint.rs:245/249 and parallel_checkpoint.rs:61/68, the same two functions exec.rs:31/36 and :203/210 call, so the checkpoint runners cannot diverge from the cell to the left. Backstopped structurally as well — check_post_run_invariants rejects a state_backed success that committed parts with schema_changed = None (summary.rs), and finalize.rs panics on it under debug_assertions, the build every live test runs" }
@@ -195,7 +207,7 @@ scenarios:
     mongo_parallel: { na: "runs UNDER `ExtractionStrategy::Keyset` (single.rs: a Mongo keyset export with parallel > 1 fans _id-range workers), so it takes the Keyset arm of the same match — the cell to the left is the same code. A separate strategy variant would need its own `test` cell here." }
 
   - id: shape_drift_warn
-    what: "detect_shape_drift — advisory warning when a string/binary column's max byte length grows past the factor. Needs the run-wide per-column max-bytes aggregate."
+    what: "detect_shape_drift — advisory warning when a string/binary column's max byte length grows past the factor. Needs the run-wide per-column max-bytes aggregate. Since ADR-0028 the warn is applied at the finalize_export seam wherever a runner fed shape bytes into the ledger (merge_shape, max-merge) — today only the single sink drains them, so the na cells below still hold; a runner that starts feeding gets the warn for free (born na)."
     single:         { test: growth_above_threshold_warns }
     chunked:        { na: "advisory, single-batch-only by design (documented on shape_drift_warn_factor): the multi-part runners write through several sinks and never aggregate the run-wide per-column max bytes, so there is nothing to compare" }
     chunked_checkpoint: { na: "advisory, single-batch-only by design — same reason as the plain chunked cell (several sinks, no run-wide max-bytes aggregate)" }
@@ -203,14 +215,15 @@ scenarios:
     mongo_parallel: { na: "advisory, single-batch-only by design — no run-wide max-bytes aggregate across workers" }
 
   - id: value_checksum_form_b
-    what: "Form B — the sink's per-column value checksums are harvested into summary.column_checksums so finalize_manifest RECORDS them and `rivet validate` can re-read the parts and verify the Arrow→Parquet encode. The sink COMPUTES them for every runner (track_checksum in on_batch); the multi-part runners XOR-combine per part run-wide through the shared commit::{accumulate,harvest}_column_checksums seam (round-9 fix — previously computed then discarded)."
+    what: "Form B — the sink's per-column value checksums are harvested into summary.column_checksums so finalize_manifest RECORDS them and `rivet validate` can re-read the parts and verify the Arrow→Parquet encode. The sink COMPUTES them for every runner (track_checksum in on_batch); since ADR-0028 every runner FEEDS them into summary.ledger (merge_checksums, order-independent) and the HARVEST happens once at the finalize_export seam — no runner calls harvest itself (round-9 had fixed the computed-then-discarded bug per runner; the seam removes the per-runner call entirely). The test cells grade the feed + seam end-to-end."
     single:         { test: pg_type_matrix_value_checksum_guard }
     chunked:        { test: chunked_export_records_form_b_checksums_and_validate_passes }
     # The load-bearing half is that test's BASELINE arm: a clean parallel-checkpoint
     # run (parallel: 4, chunk_checkpoint: true) must record Form B in the destination
     # manifest AND `rivet validate` (Full) must re-read it — the test says so in its
     # own body ("so the suppression below is not vacuous"). The SEQUENTIAL checkpoint
-    # runner harvests at sequential_checkpoint.rs:409 with no dedicated live cell; its
+    # runner feeds the ledger inside its per-chunk loop (sequential_checkpoint.rs,
+    # merge_checksums) with no dedicated live cell; its
     # backstop is structural (check_post_run_invariants rejects a state_backed parquet
     # success with empty, un-flagged column_checksums; finalize.rs panics on it under
     # debug_assertions, which is the build live tests run).

@@ -28,6 +28,106 @@ use crate::state::StateStore;
 
 use super::summary::RunSummary;
 
+/// ADR-0028: THE export tail — the one place the per-export post-write features
+/// are applied, called by the dispatcher (`job.rs`) on runner success, before
+/// `finalize_manifest`. Runners FEED `summary.ledger` as they commit (what
+/// schema they saw, which checksums their sinks computed); this seam APPLIES:
+///
+///   1. manifest schema-fingerprint pin (ADR-0012 M3),
+///   2. the `on_schema_drift` gate (post-run, from the run's resolved schema —
+///      chunked runs its gate pre-chunk via `check_from_type_mappings`
+///      (ADR-0021) and feeds no drift schema here, by design),
+///   3. Form-B value-checksum harvest into the summary/manifest,
+///   4. the shape-drift advisory warn.
+///
+/// Ordering is load-bearing and encoded HERE, once: the gate + harvest run
+/// before `finalize_manifest` (a drift `fail` must abort before a manifest
+/// exists; the manifest must record the checksums). Before this seam, every
+/// runner re-assembled this tail by hand and a feature wired into one runner
+/// was silently absent on the others — the runner-bypass class this seam
+/// retires (three documented bites: the keyset/mongo drift-gate miss, Form-B
+/// computed-then-discarded on all three large-table runners, and the keyset
+/// part-name divergence). The telltale invariants in
+/// `check_post_run_invariants` stay as the backstop: a runner that feeds
+/// nothing still fails the drift/Form-B telltales.
+pub(super) fn finalize_export(
+    plan: &ResolvedRunPlan,
+    state: Option<&StateStore>,
+    summary: &mut RunSummary,
+) -> Result<()> {
+    let ledger = std::mem::take(&mut summary.ledger);
+
+    if let Some(schema) = &ledger.drift_schema {
+        // Fingerprint pin is idempotent (first call wins) — uniform across
+        // runners now, so keyset/mongo manifests carry the fingerprint single
+        // mode always recorded.
+        super::manifest_writer::record_run_schema_fingerprint(summary, schema);
+        if let Some(st) = state {
+            super::schema_drift::check_from_sink_schema(
+                st,
+                &plan.export_name,
+                schema,
+                plan.schema_drift_policy,
+                summary,
+            )?;
+        }
+    }
+
+    // Form B: record the run-wide checksums so the manifest carries them.
+    // `harvest_column_checksums` itself suppresses on
+    // `column_checksums_incomplete` (checkpoint-resume hydration) — that
+    // decision stays in the harvest, not here.
+    super::commit::harvest_column_checksums(
+        summary,
+        ledger.column_checksums,
+        ledger.checksum_key_column,
+    );
+
+    // Epic 8: data shape drift — warn when string/binary columns grow beyond
+    // threshold. Applied wherever a runner fed shape bytes (today the single
+    // sink tracks them; a runner that starts feeding them gets the warn for
+    // free — born `na`, per ADR-0028).
+    if plan.shape_drift_warn_factor > 0.0
+        && !ledger.column_max_bytes.is_empty()
+        && let Some(st) = state
+    {
+        match st.detect_shape_drift(
+            &plan.export_name,
+            &ledger.column_max_bytes,
+            plan.shape_drift_warn_factor,
+        ) {
+            Ok(warnings) => {
+                for w in &warnings {
+                    log::warn!(
+                        "export '{}': shape drift in column '{}' — \
+                         max byte length grew {:.1}× ({} → {} bytes); \
+                         set `shape_drift_warn_factor` to a higher value to suppress",
+                        plan.export_name,
+                        w.column,
+                        w.growth_factor,
+                        w.stored_max_bytes,
+                        w.current_max_bytes,
+                    );
+                    summary.journal.record(crate::journal::RunEvent::Warning {
+                        context: format!("shape_drift:{}", w.column),
+                        message: format!(
+                            "column '{}' max byte length grew {:.1}× ({} → {} bytes)",
+                            w.column, w.growth_factor, w.stored_max_bytes, w.current_max_bytes
+                        ),
+                    });
+                }
+            }
+            Err(e) => log::warn!(
+                "export '{}': shape tracking error: {:#}",
+                plan.export_name,
+                e
+            ),
+        }
+    }
+
+    Ok(())
+}
+
 /// Write `.rivet/runs/<run_id>/{summary.md,summary.json}` and surface a
 /// stderr hint pointing at the report (plus a resume command, when
 /// applicable).
@@ -984,6 +1084,46 @@ mod tests {
     // finalize_manifest (18 missed) + the success gates (4) had NO driving
     // test: stubbing finalize_manifest to () — i.e. never writing the manifest
     // at end of run — survived the whole lib suite.
+
+    /// ADR-0028: the seam applies the ledger — Form-B checksums land on the
+    /// summary (keyed), and the ledger is TAKEN (emptied) so a hypothetical
+    /// second application cannot double-record. State-free half only (the drift
+    /// gate + shape warn need a StateStore; their end-to-end proof is the live
+    /// drift suite + the RED-proven telltale backstop). RED against a seam that
+    /// reads the ledger without applying (checksums stay empty) and against one
+    /// that clones instead of takes (second call re-harvests).
+    #[test]
+    fn finalize_export_harvests_the_ledger_and_takes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = fin_plan(dir.path());
+        let mut summary = crate::pipeline::summary::RunSummary::default();
+        summary
+            .ledger
+            .merge_checksums(&[("v".to_string(), 9u64)].into());
+        summary.ledger.note_key_column(Some("id".into()));
+
+        finalize_export(&plan, None, &mut summary).expect("state-free seam must succeed");
+
+        assert_eq!(
+            summary
+                .column_checksums
+                .iter()
+                .map(|c| (c.name.as_str(), c.checksum.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("v", "9")],
+            "the seam must harvest the ledger's Form-B checksums into the summary"
+        );
+        assert_eq!(summary.checksum_key_column.as_deref(), Some("id"));
+        assert!(
+            summary.ledger.column_checksums.is_empty(),
+            "the seam must TAKE the ledger — a second application must find nothing"
+        );
+
+        // Second call: no ledger left, the harvested record must survive untouched
+        // (harvest_column_checksums early-returns on an empty accumulator).
+        finalize_export(&plan, None, &mut summary).expect("idempotent on an empty ledger");
+        assert_eq!(summary.column_checksums.len(), 1);
+    }
 
     fn fin_plan(dest: &std::path::Path) -> crate::plan::ResolvedRunPlan {
         use crate::config::{SourceConfig, SourceType};

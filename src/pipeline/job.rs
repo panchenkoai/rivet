@@ -737,6 +737,7 @@ pub(crate) fn synthetic_failed_summary(export_name: &str, err: &anyhow::Error) -
     let journal = crate::journal::RunJournal::new(&run_id, export_name);
     RunSummary {
         bytes_read: 0,
+        ledger: Default::default(),
         cursor_column: None,
         cursor_low: None,
         cursor_high: None,
@@ -1086,6 +1087,12 @@ pub(super) fn run_export_job(
             chunked::ChunkSource::Detect,
         )
     };
+    // ADR-0028: THE export tail — apply the ledger the runner fed (fingerprint
+    // pin, drift gate, Form-B harvest, shape warn) exactly once, here, before
+    // anything downstream reads the summary. A drift `fail` folds into `result`
+    // and flows the same failed-status path a runner error does.
+    let result =
+        result.and_then(|()| super::finalize::finalize_export(&plan, Some(state), &mut summary));
 
     let rss_peak = rss_sampler.stop();
     let rss_after = crate::resource::get_rss_mb();
@@ -1384,6 +1391,12 @@ pub(crate) fn run_export_job_with_chunk_source(
     } else {
         run_with_reconnect(state, plan, &mut summary, "", chunk_source)
     };
+    // ADR-0028: THE export tail — apply the ledger the runner fed (fingerprint
+    // pin, drift gate, Form-B harvest, shape warn) exactly once, here, before
+    // anything downstream reads the summary. A drift `fail` folds into `result`
+    // and flows the same failed-status path a runner error does.
+    let result =
+        result.and_then(|()| super::finalize::finalize_export(plan, Some(state), &mut summary));
 
     let rss_peak = rss_sampler.stop();
     let rss_after = crate::resource::get_rss_mb();

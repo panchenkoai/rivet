@@ -126,6 +126,28 @@ pub(in crate::pipeline) struct RowProgress {
 }
 
 impl ExportSink {
+    /// ADR-0028: drain this sink's tail state into the run ledger — the dest
+    /// schema it resolved, the Form-B checksums it accumulated (keyed to the
+    /// cursor/key column when the key survived into the dest batch), and the
+    /// per-column shape bytes. Runners call this instead of applying the
+    /// fingerprint/drift/harvest/shape features themselves; the application
+    /// happens once, in `finalize::finalize_export`.
+    pub(in crate::pipeline) fn drain_tail_into(
+        &mut self,
+        ledger: &mut crate::pipeline::commit::CommitLedger,
+    ) {
+        if let Some(schema) = self.dest_schema.as_deref() {
+            ledger.note_schema(schema);
+        }
+        // Same keying rule the single tail used: the checksums are keyed only
+        // when the key column is present in the dest batch (`checksum_key_col`
+        // is its index there).
+        let key = self.checksum_key_col.and(self.cursor_column.clone());
+        ledger.note_key_column(key);
+        ledger.merge_checksums(&std::mem::take(&mut self.column_checksums));
+        ledger.merge_shape(&std::mem::take(&mut self.column_max_bytes));
+    }
+
     pub fn new(plan: &ResolvedRunPlan) -> Result<Self> {
         let tmp = tempfile::NamedTempFile::new()?;
         let exported_at_us = chrono::Utc::now().timestamp_micros();

@@ -51,9 +51,6 @@ pub(crate) fn run_chunked_sequential(
     let streamed_rows = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
     // Form B: XOR-combine each chunk's per-column checksums run-wide, harvest once
     // after the loop — so the finalize manifest records Form B for chunked exports.
-    let mut checksums_acc: std::collections::BTreeMap<String, u64> =
-        std::collections::BTreeMap::new();
-    let mut checksum_key_column: Option<String> = None;
 
     // Run the cross-shape manifest guard ONCE, at run start — the answer cannot
     // change mid-run, and re-running it per chunk cost one remote GET per chunk
@@ -168,18 +165,20 @@ pub(crate) fn run_chunked_sequential(
                 file_name: None,
             });
         }
-        // Fold this chunk's Form B checksums into the run-wide accumulator (empty
-        // for a zero-row chunk — a no-op).
-        super::super::commit::accumulate_column_checksums(
-            &mut checksums_acc,
-            &sink.column_checksums,
-        );
-        if checksum_key_column.is_none() {
-            checksum_key_column = sink.checksum_key_col.and(sink.cursor_column.clone());
-        }
+        // ADR-0028: feed this chunk's Form-B checksums into the run ledger (empty
+        // for a zero-row chunk — a no-op); the seam harvests once, at the
+        // dispatcher. Deliberately NOT the full sink drain: chunked runs its
+        // drift gate PRE-chunk from type_mappings (ADR-0021), so feeding the
+        // sink schema here would make the seam re-check post-run and overwrite
+        // the pre-chunk verdict.
+        summary
+            .ledger
+            .merge_checksums(&std::mem::take(&mut sink.column_checksums));
+        summary
+            .ledger
+            .note_key_column(sink.checksum_key_col.and(sink.cursor_column.clone()));
     }
 
-    super::super::commit::harvest_column_checksums(summary, checksums_acc, checksum_key_column);
     pb.finish(summary.total_rows);
     log::info!("export '{}': all chunks completed", plan.export_name);
     Ok(())
@@ -478,18 +477,12 @@ pub(crate) fn run_chunked_parallel(
         );
     }
 
-    // Form B: XOR-combine every worker's chunk checksums run-wide + harvest once
-    // (order-independent, so worker completion order does not matter).
-    let mut checksums_acc: std::collections::BTreeMap<String, u64> =
-        std::collections::BTreeMap::new();
-    let mut checksum_key_column: Option<String> = None;
+    // ADR-0028: feed every worker's chunk checksums into the run ledger
+    // (order-independent merge); the seam harvests once, at the dispatcher.
     for (part, key) in poison::into_recover(checksums_shared) {
-        super::super::commit::accumulate_column_checksums(&mut checksums_acc, &part);
-        if checksum_key_column.is_none() {
-            checksum_key_column = key;
-        }
+        summary.ledger.merge_checksums(&part);
+        summary.ledger.note_key_column(key);
     }
-    super::super::commit::harvest_column_checksums(summary, checksums_acc, checksum_key_column);
 
     log::info!(
         "export '{}': all {} chunks completed",

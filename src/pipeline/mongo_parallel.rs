@@ -114,13 +114,6 @@ pub(crate) fn run_mongo_parallel(
 
     // Drain on the main thread: sum rows + record every part through the shared
     // commit path (single-threaded → the counter/journal ordering is race-free).
-    let mut drift_schema: Option<arrow::datatypes::Schema> = None;
-    // Form B: fold each worker's XOR-combined checksums run-wide (order-independent
-    // across workers), then harvest once — so a parallel-Mongo manifest records
-    // Form B like every other runner.
-    let mut checksums_acc: std::collections::BTreeMap<String, u64> =
-        std::collections::BTreeMap::new();
-    let mut checksum_key_column: Option<String> = None;
     // Errors are COLLECTED, not propagated mid-drain. `let out = res?` used to sit
     // here, above the record_part calls below — so a worker failure abandoned both
     // its OWN durable pages and every later worker's, and handed
@@ -134,16 +127,14 @@ pub(crate) fn run_mongo_parallel(
             errs.push(format!("worker {w}: {e}"));
         }
         summary.total_rows += out.rows;
+        // ADR-0028: feed the run ledger per worker — the seam pins the
+        // fingerprint, runs the drift gate and harvests Form B once, at the
+        // dispatcher. No application in this runner.
         if let Some(sc) = &out.schema {
-            super::manifest_writer::record_run_schema_fingerprint(summary, sc);
-            if drift_schema.is_none() {
-                drift_schema = Some(sc.clone());
-            }
+            summary.ledger.note_schema(sc);
         }
-        super::commit::accumulate_column_checksums(&mut checksums_acc, &out.column_checksums);
-        if checksum_key_column.is_none() {
-            checksum_key_column = out.checksum_key_column;
-        }
+        summary.ledger.merge_checksums(&out.column_checksums);
+        summary.ledger.note_key_column(out.checksum_key_column);
         if plan.validate && out.rows > 0 {
             summary.validated = Some(true);
         }
@@ -159,8 +150,6 @@ pub(crate) fn run_mongo_parallel(
             );
         }
     }
-    super::commit::harvest_column_checksums(summary, checksums_acc, checksum_key_column);
-
     // Only now — every durable part is recorded and the counters are truthful.
     if !errs.is_empty() {
         anyhow::bail!(
@@ -178,18 +167,8 @@ pub(crate) fn run_mongo_parallel(
         summary.total_rows
     );
 
-    // on_schema_drift gate — mirror single/keyset: this runner also bypasses
-    // run_single_export, so without this an opted-in `on_schema_drift: fail`
-    // returned exit 0 on a drifted schema for a parallel Mongo export.
-    if let Some(sc) = &drift_schema {
-        super::schema_drift::check_from_sink_schema(
-            state,
-            &plan.export_name,
-            sc,
-            plan.schema_drift_policy,
-            summary,
-        )?;
-    }
+    // ADR-0028: fingerprint/drift/Form-B application lives in the ONE seam
+    // (`finalize::finalize_export`), fed from the ledger above.
     Ok(())
 }
 
