@@ -88,6 +88,20 @@ exclude_re = [
     # rest of the loop — the whole live_suite runs through it.
     "replace pg_run_export ->",
     " in pg_run_export",
+    # run_keyset / run_keyset_parallel (pipeline/keyset.rs) are the keyset export
+    # RUNNERS — each opens a real source, drives the seek-paged FETCH loop and
+    # streams parts to the sink. Unkillable OFFLINE (the --in-diff gate has no
+    # DB). They entered in-diff scope via a one-line `run_tag = run_scoped_tag(..)`
+    # change (PR #253); cargo-mutants then generated the whole-function `-> Ok(())`
+    # stub, which `--lib` cannot reach (the "--lib on a live-only path" class).
+    # The value logic that actually changed is `run_scoped_tag`, unit-tested and
+    # 4/4 mutants CAUGHT. Both runner stubs proven live-killed by hand: `Ok(())`
+    # produces ZERO parts, so run_keyset_parallel fails
+    # keyset_part_names_do_not_double_the_export_name and run_keyset fails
+    # keyset_varchar_pk_roundtrips_full_keyset_across_pages (both RED-verified
+    # 2026-08-20, then reverted). The whole live_keyset suite guards the bodies.
+    "replace run_keyset ->",
+    "replace run_keyset_parallel ->",
     # introspect_all (init/mod.rs) is the whole-schema scan: every arm opens a
     # live engine connection, so its dispatch mutants (delete match arm
     # "postgres"/"mysql"/"mssql") are unkillable OFFLINE. The DECISION logic was

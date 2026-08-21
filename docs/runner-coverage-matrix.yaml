@@ -258,6 +258,14 @@ scenarios:
     keyset:         { test: parallel_keyset_two_full_runs_into_same_prefix_no_clobber_postgres }
     mongo_parallel: { test: mongo_parallel_two_rapid_runs_into_same_prefix_do_not_clobber }
 
+  - id: part_name_not_export_doubled
+    what: "a part filename carries the export name EXACTLY ONCE. The keyset part-name format prepends `<export>_` AND used the run_id for run-uniqueness — but the production run_id is itself `<export>_<stamp>` (job.rs), so real runs wrote `<export>_<export>_<stamp>_pk_w…` (field-run, 0.24.5). The chunked/mongo/single siblings key their middle segment off a FRESH Utc stamp, not the run_id, so they never doubled; keyset was the odd one out. Fix: `run_scoped_tag` strips a redundant leading `<export>_` from the run tag."
+    single:         { na: "keys off a fresh `%Y%m%d_%H%M%S_%3f` Utc stamp (single.rs), never the run_id — the export name cannot appear twice by construction" }
+    chunked:        { na: "shared seam `chunk_part_filename` (chunked/mod.rs:64) keys off a fresh `%Y%m%d_%H%M%S` Utc stamp, not the run_id — no double; every chunked variant derives from it" }
+    chunked_checkpoint: { na: "same `chunk_part_filename` seam as `chunked` — a fresh stamp, not the run_id" }
+    keyset:         { test: keyset_part_names_do_not_double_the_export_name }
+    mongo_parallel: { na: "keys off a fresh `%Y%m%d_%H%M%S_%3f` stamp (mongo_parallel.rs:63), not the run_id — no double" }
+
   - id: durable_manifest_before_advance
     what: "the destination manifest covering a run's parts is durable BEFORE the delivery position advances past them (the silent-loss ordering) — cross-references docs/durability-ordering-matrix.yaml."
     single:         { test: f2_crash_window_manifest_written_cursor_absent }
