@@ -929,6 +929,20 @@ struct TailPolicy<'a> {
     plan_warnings: Vec<(String, String)>,
 }
 
+/// Does this run's reconcile leg run? Pure, because the three-input condition
+/// is the ONE piece of NEW logic the two-entry-point unification introduced
+/// (`allow_reconcile` is the policy bit; the other two already gated the leg on
+/// both sides), and a live-only script body cannot be graded by the in-diff
+/// mutation gate — its `&&`s and its `!` all survived on the first run.
+///
+/// All three must hold: the entry point ALLOWS a reconcile at all (apply does
+/// not — a sealed artifact has no reconcile flag), the plan ASKED for one, and
+/// the export did not already fail (reconciling a failed export compares a
+/// partial write against the source and reports a mismatch that is not one).
+fn should_reconcile(allow_reconcile: bool, plan_reconcile: bool, failed: bool) -> bool {
+    allow_reconcile && plan_reconcile && !failed
+}
+
 /// THE post-plan execution script, written once: rss/forensics/harm bracket →
 /// dispatch → ADR-0028 seam → bracket close → quality gate → status → diagnosis
 /// → [reconcile] → journal → ledger close → manifest → cursor → keyset anchor →
@@ -1095,7 +1109,7 @@ fn execute_resolved_plan(
     }
 
     let mut reconcile_gate: crate::error::Result<()> = Ok(());
-    if tail.allow_reconcile && plan.reconcile && !failed {
+    if should_reconcile(tail.allow_reconcile, plan.reconcile, failed) {
         let could_not_verify = reconcile_source_count(plan, &mut summary);
         if let (Some(source_count), Some(matched)) = (summary.source_count, summary.reconciled) {
             summary.journal.record(RunEvent::ReconciliationResult {
@@ -1630,6 +1644,45 @@ mod tests {
         s.reconciled = Some(false);
         let err = reconcile_run_gate(&s, Some("noise")).unwrap_err();
         assert_eq!(crate::error::classify_exit(&err), 3);
+    }
+
+    /// The reconcile gate's full truth table — three booleans, eight cases, so
+    /// no `&&`→`||` and no dropped `!` survives (the in-diff mutation gate found
+    /// all three of those alive in the live-only script body; extracting the
+    /// decision is what makes them killable offline).
+    #[test]
+    fn should_reconcile_requires_permission_request_and_success() {
+        use super::should_reconcile;
+        // The ONLY true case: allowed, asked for, and the export succeeded.
+        assert!(should_reconcile(true, true, false));
+
+        // Each input alone is decisive.
+        assert!(
+            !should_reconcile(false, true, false),
+            "apply does not allow a reconcile leg — a sealed artifact has no flag"
+        );
+        assert!(
+            !should_reconcile(true, false, false),
+            "the plan did not ask for one"
+        );
+        assert!(
+            !should_reconcile(true, true, true),
+            "a FAILED export must not reconcile: comparing a partial write against \
+             the source reports a mismatch that is not one"
+        );
+
+        // …and no combination of the remaining four is true.
+        for (a, r, f) in [
+            (false, false, false),
+            (false, false, true),
+            (false, true, true),
+            (true, false, true),
+        ] {
+            assert!(
+                !should_reconcile(a, r, f),
+                "({a},{r},{f}) must not reconcile"
+            );
+        }
     }
 
     #[test]
