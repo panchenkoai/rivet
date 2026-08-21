@@ -70,7 +70,7 @@ pub fn run_loads(args: LoadArgs) -> Result<()> {
 
     // The `__pos` parse engine is config-level — resolve it once, and only if a
     // table actually needs it (a `mode: cdc` export).
-    let engine = if plans.iter().any(|p| p.mode == load::plan::LoadMode::Cdc) {
+    let engine = if needs_source_engine(&plans) {
         Some(load::plan::source_engine(&args.config)?)
     } else {
         None
@@ -120,10 +120,20 @@ pub fn run_loads(args: LoadArgs) -> Result<()> {
                     }
                 }
                 // Full/chunked: ledger-driven latest-run OVERWRITE.
-                _ => match load_one(plan, &run_id, drift, state.as_ref(), &load_id)? {
-                    Some(report) => println!("LOAD OK [{}]: {report:#?}", plan.table),
-                    None => println!("LOAD SKIP [{}]: up to date", plan.table),
-                },
+                //
+                // Named, not a `_` catch-all: this match is the mode ROUTER, and
+                // the in-diff mutation gate reported both of the arms above alive
+                // as `delete match arm …` — a deleted arm fell through to `_` and
+                // silently loaded a CDC change log as a full-snapshot OVERWRITE.
+                // Exhaustive over `LoadMode`, the arm deletions stop compiling
+                // (the mutants are unviable rather than uncaught) and a NEW mode
+                // has to be routed deliberately instead of inheriting this one.
+                load::plan::LoadMode::Full => {
+                    match load_one(plan, &run_id, drift, state.as_ref(), &load_id)? {
+                        Some(report) => println!("LOAD OK [{}]: {report:#?}", plan.table),
+                        None => println!("LOAD SKIP [{}]: up to date", plan.table),
+                    }
+                }
             }
             Ok(())
         })();
@@ -135,13 +145,37 @@ pub fn run_loads(args: LoadArgs) -> Result<()> {
             continue;
         }
         if plan.load.gc_orphans {
-            maybe_gc_orphans(plan, state.as_ref());
+            // The store is opened HERE rather than inside `maybe_gc_orphans` so
+            // the GC body itself takes a store and is offline-testable against a
+            // filesystem-backed one (`GcsStore::open_fs`) — its whole-function
+            // stub was one of the in-diff gate's misses, and a stubbed orphan GC
+            // is a delete that silently stops happening.
+            match load::open_store(&plan.destination) {
+                Ok(store) => maybe_gc_orphans(&store, plan, state.as_ref()),
+                Err(e) => eprintln!(
+                    "  gc-orphans [{}]: skipped (store unavailable): {e:#}",
+                    plan.table
+                ),
+            }
         }
     }
     match aggregate_load_failures(failures) {
         Some(e) => Err(e),
         None => Ok(()),
     }
+}
+
+/// Does this invocation have to resolve the source's `__pos` parse ENGINE?
+///
+/// Only a `mode: cdc` table needs it, and resolving it opens the source config —
+/// so the answer decides whether a pure-batch load touches the source at all.
+/// Pure because [`run_loads`] is live-only glue the in-diff mutation gate cannot
+/// grade: it reported this comparison alive (`replace == with != in run_loads`),
+/// and inverted it resolves an engine for every BATCH config while leaving every
+/// CDC config with `None` — where `engine.expect(..)` then PANICS on exactly the
+/// configs the parse engine exists for.
+fn needs_source_engine(plans: &[load::plan::LoadPlan]) -> bool {
+    plans.iter().any(|p| p.mode == load::plan::LoadMode::Cdc)
 }
 
 /// Fold every per-plan failure into ONE error, or `None` when nothing failed.
@@ -189,19 +223,43 @@ fn require_pk<'a>(plan: &'a load::plan::LoadPlan, mode: &str) -> Result<&'a [Str
     Ok(&plan.load.pk)
 }
 
-/// Best-effort orphan-Parquet GC for one table's prefix (config `gc_orphans`):
-/// delete staged `.parquet` no `Success` manifest references — an interrupted
-/// extract's leftovers. A GC failure only warns; it NEVER fails the load, which
-/// already succeeded before this runs.
+/// What the run-status LEDGER says about a prefix, folded from the three answers
+/// it can give. Pure, because the fold IS the decision and both its callers are
+/// live-only bodies (a real bucket, a real state DB) that the in-diff mutation
+/// gate reports MISSED whatever the assertions say.
 ///
-/// Gated on whether a run is ACTIVE on the prefix, so it never deletes a
-/// CONCURRENT extract's committed-but-not-yet-manifested parts. Two signals,
-/// belt-and-suspenders: the run-status ledger (`has_active_run_on_prefix`,
-/// precise when this load shares the extract's state — co-located / shared
-/// Postgres) OR a `running` MARKER manifest projected into the bucket
-/// (`has_active_running_manifest`, the cross-boundary signal a stateless /
-/// foreign-host load reads when it cannot see the extract's state DB). Only when
-/// NEITHER says active does a no-manifest part count as dead crash debris.
+/// * `None` — there is no state store to ask (a stateless or foreign-host load).
+///   NOT active: the manifest signal decides alone, exactly as the orphan path
+///   does.
+/// * `Some(Err(_))` — the query failed. ACTIVE, conservatively: a delete that
+///   spares too much costs disk, while one that removes a live run's committed
+///   parts costs data — and on a CDC/incremental export the source position has
+///   already advanced past them.
+/// * `Some(Ok(b))` — the ledger's own answer, used as given.
+fn ledger_says_active(answer: Option<Result<bool>>) -> bool {
+    match answer {
+        None => false,
+        Some(Ok(active)) => active,
+        Some(Err(_)) => true,
+    }
+}
+
+/// Fold the two INDEPENDENT activity signals into one verdict: the run-status
+/// ledger (precise when this load shares the extract's state — co-located /
+/// shared Postgres) and a `running` MARKER manifest projected into the bucket
+/// (the cross-boundary signal a stateless / foreign-host load reads when it
+/// cannot see the extract's state DB).
+///
+/// Either one alone must be enough to spare the prefix: they answer for
+/// DIFFERENT deployments, so each is structurally silent where the other speaks.
+/// An `&&` here would demand agreement from a signal that cannot give it and
+/// delete a live run's committed parts — and that is precisely the mutant the
+/// in-diff gate reported alive (`replace || with && in maybe_gc_orphans`), in a
+/// body no offline test can reach.
+fn prefix_is_active(ledger_active: bool, manifest_active: bool) -> bool {
+    ledger_active || manifest_active
+}
+
 /// Is a run writing into this prefix right now?
 ///
 /// The verdict `maybe_gc_orphans` already computes, extracted so the DESTRUCTIVE
@@ -213,27 +271,66 @@ fn require_pk<'a>(plan: &'a load::plan::LoadPlan, mode: &str) -> Result<&'a [Str
 /// relationship in its own words: gc_orphans is "strictly gentler than
 /// `cleanup_source`, which wipes the whole prefix".
 ///
-/// Conservative in both directions, deliberately: a ledger query ERROR counts as
-/// active (a delete that spares too much costs disk; one that deletes a live
-/// run's committed parts costs data, and on a CDC or incremental export the
-/// source side has already advanced past them). No state store at all —
-/// a stateless or foreign-host load — falls back to the manifest signal alone,
-/// exactly as the orphan path does.
-fn prefix_has_active_run(plan: &load::plan::LoadPlan, state: Option<&StateStore>) -> bool {
-    let ledger_active = match state {
-        Some(s) => s.has_active_run_on_prefix(&plan.gcs_prefix).unwrap_or(true),
-        None => false,
-    };
+/// Conservative in both directions, deliberately — see [`ledger_says_active`]
+/// for what each ledger answer means and [`prefix_is_active`] for why the two
+/// signals fold with `||`.
+///
+/// Takes the store the CALLER already opened instead of re-opening one from
+/// `plan.destination` (the two were always the same object). That makes this
+/// guard reachable from an offline test over a filesystem-backed store, which is
+/// the whole reason its `-> true` / `-> false` body stubs no longer need a
+/// mutation-config exclusion: a guard on a recursive delete should not be
+/// gradable only against a real bucket.
+fn prefix_has_active_run(
+    store: &crate::destination::gcs::GcsStore,
+    prefix: &str,
+    state: Option<&StateStore>,
+) -> bool {
+    let ledger_active = ledger_says_active(state.map(|s| s.has_active_run_on_prefix(prefix)));
     if ledger_active {
+        // Short-circuit: the manifest signal costs a bucket LISTING and cannot
+        // change a `true` — `prefix_is_active(true, _)` is `true` either way.
         return true;
     }
-    match load::open_store(&plan.destination)
-        .and_then(|st| load::reconcile::fetch_manifests_keyed(&st, &plan.gcs_prefix))
-    {
+    let manifest_active = match load::reconcile::fetch_manifests_keyed(store, prefix) {
         Ok(keyed) => load::reconcile::has_active_running_manifest(&keyed),
         // Cannot read the manifests → cannot rule a live run out. Spare.
         Err(_) => true,
+    };
+    prefix_is_active(ledger_active, manifest_active)
+}
+
+/// Whether `cleanup_source` actually deletes a prefix — the THREE outcomes the
+/// caller's `Option` collapses into one `None`.
+///
+/// Separated from the `Option` because "nobody asked" and "asked, and REFUSED
+/// because a run is writing here" are the same value to the caller and very
+/// different things to an operator, and because the `!` in front of the request
+/// flag is a decision the in-diff gate reported alive (`delete ! in
+/// cleanup_target`) inside a live-only body. Inverted, it deletes the whole
+/// prefix for every config that did NOT ask for cleanup and spares every config
+/// that did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CleanupVerdict {
+    /// `cleanup_source` is off — no delete, and nothing to announce.
+    NotRequested,
+    /// Cleanup was requested but a run is writing into the prefix.
+    RefusedRunActive,
+    /// Delete the staged Parquet under the prefix.
+    Delete,
+}
+
+/// The verdict, pure. `active` is a CLOSURE so the activity probe — a state-DB
+/// query plus a bucket listing — still runs ONLY when cleanup was requested,
+/// exactly as the `if` chain it replaced did.
+fn cleanup_verdict(requested: bool, active: impl FnOnce() -> bool) -> CleanupVerdict {
+    if !requested {
+        return CleanupVerdict::NotRequested;
     }
+    if active() {
+        return CleanupVerdict::RefusedRunActive;
+    }
+    CleanupVerdict::Delete
 }
 
 /// The delete target for `cleanup_source`, or `None` when a run is writing here.
@@ -245,34 +342,39 @@ fn cleanup_target<'a>(
     store: &'a crate::destination::gcs::GcsStore,
     state: Option<&StateStore>,
 ) -> Option<(&'a crate::destination::gcs::GcsStore, &'a str)> {
-    if !plan.load.cleanup_source {
-        return None;
+    match cleanup_verdict(plan.load.cleanup_source, || {
+        prefix_has_active_run(store, &plan.gcs_prefix, state)
+    }) {
+        CleanupVerdict::NotRequested => None,
+        CleanupVerdict::RefusedRunActive => {
+            eprintln!(
+                "  cleanup [{}]: SKIPPED — a run is writing into {} right now. Deleting the \
+                 prefix would remove parts that run has already committed, and on a \
+                 CDC/incremental export the source position has advanced past them. Re-run the \
+                 load once the extract has finished.",
+                plan.table, plan.gcs_prefix
+            );
+            None
+        }
+        CleanupVerdict::Delete => Some((store, plan.gcs_prefix.as_str())),
     }
-    if prefix_has_active_run(plan, state) {
-        eprintln!(
-            "  cleanup [{}]: SKIPPED — a run is writing into {} right now. Deleting the prefix \
-             would remove parts that run has already committed, and on a CDC/incremental export \
-             the source position has advanced past them. Re-run the load once the extract has \
-             finished.",
-            plan.table, plan.gcs_prefix
-        );
-        return None;
-    }
-    Some((store, plan.gcs_prefix.as_str()))
 }
 
-fn maybe_gc_orphans(plan: &load::plan::LoadPlan, state: Option<&StateStore>) {
-    let store = match load::open_store(&plan.destination) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!(
-                "  gc-orphans [{}]: skipped (store unavailable): {e:#}",
-                plan.table
-            );
-            return;
-        }
-    };
-    let keyed = match load::reconcile::fetch_manifests_keyed(&store, &plan.gcs_prefix) {
+/// Best-effort orphan-Parquet GC for one table's prefix (config `gc_orphans`):
+/// delete staged `.parquet` no `Success` manifest references — an interrupted
+/// extract's leftovers. A GC failure only warns; it NEVER fails the load, which
+/// already succeeded before this runs.
+///
+/// Gated on whether a run is ACTIVE on the prefix ([`prefix_is_active`]), so it
+/// never deletes a CONCURRENT extract's committed-but-not-yet-manifested parts.
+/// Only when NEITHER signal says active does a no-manifest part count as dead
+/// crash debris.
+fn maybe_gc_orphans(
+    store: &crate::destination::gcs::GcsStore,
+    plan: &load::plan::LoadPlan,
+    state: Option<&StateStore>,
+) {
+    let keyed = match load::reconcile::fetch_manifests_keyed(store, &plan.gcs_prefix) {
         Ok(k) => k,
         Err(e) => {
             eprintln!(
@@ -282,14 +384,15 @@ fn maybe_gc_orphans(plan: &load::plan::LoadPlan, state: Option<&StateStore>) {
             return;
         }
     };
-    let ledger_active = match state {
-        // A query ERROR stays conservative (assume active → spare); a clean
-        // `false` (no running row) lets the manifest signal decide.
-        Some(s) => s.has_active_run_on_prefix(&plan.gcs_prefix).unwrap_or(true),
-        None => false,
-    };
-    let active = ledger_active || load::reconcile::has_active_running_manifest(&keyed);
-    match load::reconcile::gc_orphans(&store, &plan.gcs_prefix, &keyed, active) {
+    // A query ERROR stays conservative (assume active → spare); a clean `false`
+    // (no running row) lets the manifest signal decide.
+    let ledger_active =
+        ledger_says_active(state.map(|s| s.has_active_run_on_prefix(&plan.gcs_prefix)));
+    let active = prefix_is_active(
+        ledger_active,
+        load::reconcile::has_active_running_manifest(&keyed),
+    );
+    match load::reconcile::gc_orphans(store, &plan.gcs_prefix, &keyed, active) {
         Ok((0, _)) => {}
         Ok((n, bytes)) => {
             println!(
@@ -315,6 +418,27 @@ struct LoadInputs {
     /// LATER load of the same warehouse table from a DIFFERENT database can be
     /// refused instead of silently replacing these rows.
     source_ident: String,
+}
+
+/// The prior source identity that CONFLICTS with the one this load carries, or
+/// `None` when the warehouse table may accept these rows.
+///
+/// THE WAREHOUSE TABLE BELONGS TO ONE SOURCE — this is the comparison that says
+/// so, and both of its operators were reported alive by the in-diff mutation
+/// gate inside live-only [`prepare_load`] (`delete !` and `replace != with ==`).
+/// Each inverts the guard into its own opposite: dropping the `!` refuses every
+/// load whose manifests carry NO identity (i.e. every artifact written before
+/// the ledger recorded one — an upgrade that starts refusing loads that were
+/// fine yesterday), and `==` refuses a load from the SAME source it always came
+/// from while waving through the cross-source overwrite the guard exists to
+/// stop, both commands reporting success.
+fn conflicting_source_ident<'a>(mine: &str, prior: &'a [String]) -> Option<&'a String> {
+    if mine.is_empty() {
+        // Rows written before the ledger carried the identity read as UNKNOWN
+        // and never block.
+        return None;
+    }
+    prior.iter().find(|p| p.as_str() != mine)
 }
 
 /// Reconcile the manifests under a load's prefix into its [`LoadInputs`],
@@ -358,9 +482,8 @@ fn prepare_load(
         && let Some((_, m)) = keyed.first()
     {
         let mine = crate::manifest::identity_source(m);
-        if !mine.is_empty()
-            && let Ok(prior) = s.loaded_source_idents(target_fqtn)
-            && let Some(other) = prior.iter().find(|p| **p != mine)
+        if let Ok(prior) = s.loaded_source_idents(target_fqtn)
+            && let Some(other) = conflicting_source_ident(&mine, &prior)
         {
             anyhow::bail!(
                 "target table `{target_fqtn}` was last loaded from `{other}` and this load \
@@ -451,6 +574,42 @@ struct LoadCtx<'a> {
     source_ident: String,
 }
 
+/// The source runs this load may record as CONSUMED: everything it read, MINUS
+/// the runs still WRITING into the prefix.
+///
+/// Pure, and the `!` is the whole rule. A run still active can still GROW its
+/// manifest (the CDC sink rewrites a `Success` superset at every commit-boundary
+/// roll under ONE run_id), and the skip set is keyed on the run_id alone — so
+/// recording an in-flight run as consumed strands every part it writes
+/// afterwards, permanently and silently. Inverted, this records ONLY the
+/// in-flight runs and re-loads every finished one forever: both directions are
+/// data-visible and neither changes a row count.
+fn consumable_run_ids(
+    source_run_ids: &[String],
+    active: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    source_run_ids
+        .iter()
+        .filter(|id| !active.contains(*id))
+        .cloned()
+        .collect()
+}
+
+/// The operator note for source runs still writing into the prefix — `None` when
+/// there are none, so the caller prints nothing rather than a note about zero
+/// runs. Pure: the `is_empty` guard lives in a body (`LoadCtx::record`) whose
+/// only offline fixtures have an EMPTY active set, which is exactly the state
+/// that cannot tell the guard from its inverse.
+fn active_run_note(active_runs: usize, prefix: &str) -> Option<String> {
+    if active_runs == 0 {
+        return None;
+    }
+    Some(format!(
+        "  note: {active_runs} source run(s) still writing into {prefix} — loaded now, kept \
+         retryable so their later parts are not skipped"
+    ))
+}
+
 impl LoadCtx<'_> {
     /// Best-effort ledger write — a state-DB failure warns but never fails a load.
     fn record(&self, source_run_ids: &[String], rows_loaded: i64, status: &str) {
@@ -492,18 +651,9 @@ impl LoadCtx<'_> {
                 source_run_ids.iter().cloned().collect()
             }
         };
-        let source_run_ids: Vec<String> = source_run_ids
-            .iter()
-            .filter(|id| !active.contains(*id))
-            .cloned()
-            .collect();
-        if !active.is_empty() {
-            eprintln!(
-                "  note: {} source run(s) still writing into {} — loaded now, kept \
-                 retryable so their later parts are not skipped",
-                active.len(),
-                self.source_prefix
-            );
+        let source_run_ids = consumable_run_ids(source_run_ids, &active);
+        if let Some(note) = active_run_note(active.len(), self.source_prefix) {
+            eprintln!("{note}");
         }
         let source_run_ids = &source_run_ids[..];
         let rec = LoadRecord {
@@ -533,6 +683,18 @@ impl LoadCtx<'_> {
     /// The load appended/loaded `rows` from `run_ids`.
     fn record_success(&self, run_ids: &[String], rows: i64) {
         self.record(run_ids, rows, "success");
+    }
+}
+
+/// How the "up to date — every extraction run already loaded" line names this
+/// load. Pure so the mode fork is graded: it sat in live-only [`execute_load`]
+/// and the in-diff gate reported its `==` alive, which swaps the two labels and
+/// tells an operator watching a CDC drain that a plain `load` is up to date —
+/// the one line they have to reason about a stalled change stream.
+fn up_to_date_label(mode: load::plan::LoadMode) -> &'static str {
+    match mode {
+        load::plan::LoadMode::Cdc => "cdc load",
+        load::plan::LoadMode::Full | load::plan::LoadMode::Incremental => "load",
     }
 }
 
@@ -577,11 +739,7 @@ fn execute_load<R>(
             i
         }
         None => {
-            let label = if job.mode == load::plan::LoadMode::Cdc {
-                "cdc load"
-            } else {
-                "load"
-            };
+            let label = up_to_date_label(job.mode);
             eprintln!(
                 "  {label} {} → {}: up to date — every extraction run already loaded",
                 job.plan.table,
@@ -604,28 +762,53 @@ fn execute_load<R>(
     Ok(Some(report))
 }
 
-/// Load a single export's CDC change log: reconcile the run manifests, **append**
-/// the change Parquet into `<table>__changes`, and rebuild the current-state
-/// dedup view over it. The manifests' summed `row_count` gates the rows *this*
-/// load appends (before/after the append) — the file→warehouse leg for an
-/// accumulating, at-least-once log.
+/// The `(source cleaned)` suffix: a load that deleted its staged Parquet says so,
+/// because the prefix an operator would go looking at afterwards is now empty.
+fn cleaned_suffix(source_cleaned: bool) -> &'static str {
+    if source_cleaned {
+        " (source cleaned)"
+    } else {
+        ""
+    }
+}
+
 /// The success trace shared by the CDC + incremental loads (byte-identical): the
 /// integrity chain, the appended rows, the change-log table, and the view.
-fn append_done_trace(inputs: &LoadInputs, report: &load::CdcLoadReport) {
-    eprintln!(
+///
+/// Renders rather than prints, so the ONE end-to-end integrity line each append
+/// load emits has an offline test with a hand-written expected string. It used
+/// to be an `eprintln!`-only `fn`, and its whole-function `-> ()` stub was one of
+/// the in-diff gate's misses: stubbed, every append load goes quiet about what it
+/// appended and where, and nothing fails.
+fn append_done_line(inputs: &LoadInputs, report: &load::CdcLoadReport) -> String {
+    format!(
         "  integrity ✓ {} → appended {} to {} | current-state view {}{}",
         inputs.integrity.chain_prefix(),
         report.rows_appended,
         report.changes_table,
         report.view,
-        if report.source_cleaned {
-            " (source cleaned)"
-        } else {
-            ""
-        },
-    );
+        cleaned_suffix(report.source_cleaned),
+    )
 }
 
+/// The full-load sibling of [`append_done_line`] — the whole chain, now that the
+/// warehouse leg is known. The loader already proved `warehouse == file` (its
+/// count gate) before returning, so this is an all-green trace, not an assertion.
+fn full_done_line(inputs: &LoadInputs, report: &load::LoadReport) -> String {
+    format!(
+        "  integrity ✓ {} → warehouse {} rows in {}{}",
+        inputs.integrity.chain_prefix(),
+        report.rows_loaded,
+        report.target_table,
+        cleaned_suffix(report.source_cleaned),
+    )
+}
+
+/// Load a single export's CDC change log: reconcile the run manifests, **append**
+/// the change Parquet into `<table>__changes`, and rebuild the current-state
+/// dedup view over it. The manifests' summed `row_count` gates the rows *this*
+/// load appends (before/after the append) — the file→warehouse leg for an
+/// accumulating, at-least-once log.
 fn load_one_cdc(
     plan: &load::plan::LoadPlan,
     run_id: &str,
@@ -673,7 +856,7 @@ fn load_one_cdc(
             )?;
             Ok((report.rows_appended, report))
         },
-        append_done_trace,
+        |inputs, report| eprintln!("{}", append_done_line(inputs, report)),
     )
 }
 
@@ -733,7 +916,7 @@ fn load_one_incremental(
             )?;
             Ok((report.rows_appended, report))
         },
-        append_done_trace,
+        |inputs, report| eprintln!("{}", append_done_line(inputs, report)),
     )
 }
 
@@ -789,22 +972,7 @@ fn load_one(
             )?;
             Ok((report.rows_loaded, report))
         },
-        |inputs, report| {
-            // The full chain, now that the warehouse leg is known. The loader
-            // already proved `warehouse == file` (its count gate) before
-            // returning, so this is an all-green trace, not an assertion.
-            eprintln!(
-                "  integrity ✓ {} → warehouse {} rows in {}{}",
-                inputs.integrity.chain_prefix(),
-                report.rows_loaded,
-                report.target_table,
-                if report.source_cleaned {
-                    " (source cleaned)"
-                } else {
-                    ""
-                },
-            );
-        },
+        |inputs, report| eprintln!("{}", full_done_line(inputs, report)),
     )
 }
 
@@ -1091,6 +1259,410 @@ mod rivet_bin_tests {
             me.as_path(),
             "the default must be THIS executable, so the type-report subprocess resolves \
              types with the same version as the load"
+        );
+    }
+}
+
+/// The DECISIONS the live-only load orchestrator makes, graded offline.
+///
+/// `run_loads`, `prepare_load`, `execute_load` and the three `load_one*` drivers
+/// need a real bucket, a real state DB and a real warehouse, so `cargo mutants
+/// --in-diff` reports every mutant inside them MISSED whatever the assertions
+/// say — the documented "`--lib` on a live-only path" class, and the reason
+/// `.cargo/mutants.toml` excludes those BODIES wholesale. The exclusion is honest
+/// about glue and dishonest about logic, which is what
+/// `tests/offline/live_only_purity_gate.rs` exists to stop: every `&&`, `||`, `!`
+/// and comparison those bodies used to make inline is now a NAMED PREDICATE
+/// here, with a truth table over it.
+///
+/// Every test below was RED-proven against the exact mutant the in-diff gate
+/// reported alive at the site the predicate came from — the mutant is named in
+/// the test's own doc.
+#[cfg(test)]
+mod live_only_decisions {
+    use super::*;
+    use crate::destination::gcs::GcsStore;
+    use load::plan::{LoadMode, LoadPlan, LoadSection, LoadTarget};
+
+    /// A resolved plan, so a test can vary the ONE field it is about.
+    fn plan_at(mode: LoadMode, gcs_prefix: &str) -> LoadPlan {
+        LoadPlan {
+            export_name: "orders".into(),
+            table: "orders".into(),
+            partition_by: None,
+            specs: vec![],
+            gcs_prefix: gcs_prefix.into(),
+            destination: crate::config::DestinationConfig::default(),
+            load: LoadSection {
+                target: LoadTarget::Bigquery {
+                    project: "p".into(),
+                    dataset: "d".into(),
+                },
+                cleanup_source: false,
+                pk: vec!["id".into()],
+                allow_source_drift: false,
+                gc_orphans: false,
+                cluster_by: vec![],
+            },
+            mode,
+            cursor_column: None,
+        }
+    }
+
+    /// An fs-backed store over `dir`, standing in for the bucket. `gs://b/base`
+    /// then addresses `<dir>/base` — the same (bucket, bucket-relative key) split
+    /// every load op goes through.
+    fn fs_store(dir: &tempfile::TempDir) -> GcsStore {
+        GcsStore::open_fs(dir.path().to_str().unwrap()).unwrap()
+    }
+
+    fn write_at(dir: &tempfile::TempDir, rel: &str, bytes: &[u8]) {
+        let p = dir.path().join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, bytes).unwrap();
+    }
+
+    /// A state store with `run` recorded `running` on `prefix` — the ledger's
+    /// "a run is writing here right now".
+    fn state_with_active_run(prefix: &str) -> StateStore {
+        let s = StateStore::open_in_memory().unwrap();
+        s.begin_run("run-live", "orders", prefix, "2026-08-21T00:00:00Z")
+            .unwrap();
+        s
+    }
+
+    /// Only a `mode: cdc` table needs the `__pos` parse engine resolved. Kills
+    /// `replace == with != in run_loads`, which resolves an engine for every
+    /// batch config and leaves every CDC config's `engine.expect(..)` to panic.
+    #[test]
+    fn only_a_cdc_plan_needs_the_source_engine() {
+        assert!(!needs_source_engine(&[]), "no tables, no engine");
+        for batch in [LoadMode::Full, LoadMode::Incremental] {
+            assert!(
+                !needs_source_engine(&[plan_at(batch, "gs://b/base")]),
+                "{batch:?} is a batch mode and must not open the source"
+            );
+        }
+        assert!(needs_source_engine(&[plan_at(
+            LoadMode::Cdc,
+            "gs://b/base"
+        )]));
+        // A MIXED config needs it once: the engine is config-level, and the
+        // fixture has to cross that threshold or `any` is indistinguishable from
+        // "the first plan decides".
+        assert!(needs_source_engine(&[
+            plan_at(LoadMode::Full, "gs://b/base"),
+            plan_at(LoadMode::Cdc, "gs://b/base"),
+        ]));
+    }
+
+    /// The ledger's three answers, each decisive. A query ERROR must read as
+    /// ACTIVE (spare) and a MISSING store as not-active (let the manifest signal
+    /// decide) — collapsing either into the other is a delete that either never
+    /// happens or happens under a live writer.
+    #[test]
+    fn ledger_says_active_is_conservative_on_error_and_silent_when_absent() {
+        assert!(
+            !ledger_says_active(None),
+            "no state store to ask: the manifest signal decides alone"
+        );
+        assert!(!ledger_says_active(Some(Ok(false))));
+        assert!(ledger_says_active(Some(Ok(true))));
+        assert!(
+            ledger_says_active(Some(Err(anyhow::anyhow!("state db unreachable")))),
+            "a ledger the load cannot read must not license a delete"
+        );
+    }
+
+    /// The two-signal fold as a truth table. Kills `replace || with && in
+    /// maybe_gc_orphans`: with `&&`, a co-located load whose ledger says ACTIVE
+    /// but whose bucket carries no running marker (a batch run that never
+    /// projected one) deletes the live run's parts.
+    #[test]
+    fn either_activity_signal_alone_spares_the_prefix() {
+        assert!(!prefix_is_active(false, false), "nothing is writing here");
+        assert!(
+            prefix_is_active(true, false),
+            "the ledger alone is enough — a foreign bucket may carry no marker"
+        );
+        assert!(
+            prefix_is_active(false, true),
+            "the marker alone is enough — a stateless load has no ledger to read"
+        );
+        assert!(prefix_is_active(true, true));
+    }
+
+    /// The whole guard over a real (filesystem-backed) store: both of its
+    /// whole-function stubs (`-> true` / `-> false`) die here, which is why it
+    /// carries no mutation-config exclusion. `-> false` licenses the recursive
+    /// `cleanup_source` delete under a live writer; `-> true` disables cleanup
+    /// and orphan GC forever.
+    #[test]
+    fn prefix_has_active_run_reads_the_ledger_and_fails_safe() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = fs_store(&dir);
+        write_at(&dir, "base/part-000000.parquet", b"rows");
+        let prefix = "gs://b/base";
+
+        // Nothing running, nothing marked: the prefix is idle. (Kills `-> true`.)
+        assert!(!prefix_has_active_run(&store, prefix, None));
+        let idle = StateStore::open_in_memory().unwrap();
+        assert!(!prefix_has_active_run(&store, prefix, Some(&idle)));
+
+        // A `running` row on the prefix: active. (Kills `-> false`.)
+        let live = state_with_active_run(prefix);
+        assert!(prefix_has_active_run(&store, prefix, Some(&live)));
+
+        // A prefix the store cannot even parse — the manifests are unreadable, so
+        // a live run cannot be ruled OUT. Fail safe, never fail open.
+        assert!(
+            prefix_has_active_run(&store, "not-a-gs-uri", Some(&idle)),
+            "an unreadable prefix must count as active: a delete needs proof, not silence"
+        );
+    }
+
+    /// The cleanup truth table, including the LAZINESS the `if` chain had: the
+    /// activity probe is a state-DB query plus a bucket listing and must not run
+    /// for a config that never asked for cleanup. Kills `delete ! in
+    /// cleanup_target`, which deletes the prefix of every config that did NOT ask
+    /// and spares every config that did.
+    #[test]
+    fn cleanup_verdict_refuses_under_a_live_run_and_never_probes_unrequested() {
+        assert_eq!(
+            cleanup_verdict(false, || panic!(
+                "must not probe when cleanup was not requested"
+            )),
+            CleanupVerdict::NotRequested
+        );
+        assert_eq!(
+            cleanup_verdict(true, || true),
+            CleanupVerdict::RefusedRunActive
+        );
+        assert_eq!(cleanup_verdict(true, || false), CleanupVerdict::Delete);
+    }
+
+    /// The wiring: the delete target only materialises when cleanup was asked for
+    /// AND the prefix is idle. Kills `replace cleanup_target -> … with None`
+    /// (cleanup silently stops happening) — the other two body stubs are unviable
+    /// (`GcsStore` has no `Default`).
+    #[test]
+    fn cleanup_target_is_the_prefix_only_when_asked_and_idle() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = fs_store(&dir);
+        let prefix = "gs://b/base";
+        let idle = StateStore::open_in_memory().unwrap();
+
+        let mut plan = plan_at(LoadMode::Full, prefix);
+        assert!(
+            cleanup_target(&plan, &store, Some(&idle)).is_none(),
+            "cleanup_source is off — nothing may be deleted"
+        );
+
+        plan.load.cleanup_source = true;
+        assert_eq!(
+            cleanup_target(&plan, &store, Some(&idle)).map(|(_, p)| p),
+            Some(prefix),
+            "asked for, and idle: the staged prefix is the delete target"
+        );
+
+        let live = state_with_active_run(prefix);
+        assert!(
+            cleanup_target(&plan, &store, Some(&live)).is_none(),
+            "a run is writing here — the recursive delete must be refused"
+        );
+    }
+
+    /// Orphan GC over a real store, both directions. Kills `replace
+    /// maybe_gc_orphans with ()` (the GC silently stops collecting) and pins the
+    /// `active` gate end to end: the SAME unmanifested part is debris when the
+    /// prefix is idle and in-flight data when a run is writing.
+    #[test]
+    fn gc_collects_an_unmanifested_part_only_while_no_run_is_writing() {
+        let prefix = "gs://b/base";
+        let orphan = "base/part-000000.parquet";
+
+        // A run is writing here: the part may be its committed-but-not-yet-
+        // manifested output. Spare it.
+        let dir = tempfile::tempdir().unwrap();
+        write_at(&dir, orphan, b"rows");
+        let live = state_with_active_run(prefix);
+        maybe_gc_orphans(
+            &fs_store(&dir),
+            &plan_at(LoadMode::Full, prefix),
+            Some(&live),
+        );
+        assert!(
+            dir.path().join(orphan).exists(),
+            "an unmanifested part under a LIVE run must survive gc — deleting it loses data \
+             the source side has already advanced past"
+        );
+
+        // Nothing running: the same part is crash debris.
+        let idle = StateStore::open_in_memory().unwrap();
+        maybe_gc_orphans(
+            &fs_store(&dir),
+            &plan_at(LoadMode::Full, prefix),
+            Some(&idle),
+        );
+        assert!(
+            !dir.path().join(orphan).exists(),
+            "with no run active, an unmanifested part is crash debris and must be collected"
+        );
+    }
+
+    /// The warehouse table belongs to ONE source. Kills both mutants the in-diff
+    /// gate found in `prepare_load`: `delete !` (refuse every pre-ledger artifact)
+    /// and `replace != with ==` (refuse the SAME source, admit a different one —
+    /// the cross-source overwrite the guard exists to stop).
+    #[test]
+    fn conflicting_source_ident_names_a_different_source_and_only_that() {
+        let mine = "postgres:public.orders";
+        assert!(
+            conflicting_source_ident(mine, &[]).is_none(),
+            "a table nothing was loaded into yet accepts this source"
+        );
+        assert!(
+            conflicting_source_ident(mine, &[mine.to_string()]).is_none(),
+            "the SAME source must keep loading into its own table"
+        );
+        assert_eq!(
+            conflicting_source_ident(mine, &[mine.to_string(), "mysql:app.orders".to_string()])
+                .map(String::as_str),
+            Some("mysql:app.orders"),
+            "a second source must be named, not silently overwritten"
+        );
+        assert!(
+            conflicting_source_ident("", &["mysql:app.orders".to_string()]).is_none(),
+            "an artifact written before the ledger recorded an identity reads as UNKNOWN and \
+             must never block — an upgrade may not start refusing yesterday's loads"
+        );
+    }
+
+    /// A run still WRITING into the prefix stays retryable: its id is not
+    /// recorded as consumed, because its manifest can still grow. Kills `delete !
+    /// in LoadCtx::record`, whose inverse records only the in-flight runs and
+    /// re-loads every finished one forever.
+    #[test]
+    fn only_finished_runs_are_recorded_as_consumed() {
+        let read = ["r1".to_string(), "r2".to_string()];
+        let none: std::collections::HashSet<String> = Default::default();
+        assert_eq!(consumable_run_ids(&read, &none), vec!["r1", "r2"]);
+        let active: std::collections::HashSet<String> = ["r2".to_string()].into_iter().collect();
+        assert_eq!(
+            consumable_run_ids(&read, &active),
+            vec!["r1"],
+            "r2 is still writing — recording it consumed strands every part it writes later"
+        );
+        let all: std::collections::HashSet<String> = read.iter().cloned().collect();
+        assert!(consumable_run_ids(&read, &all).is_empty());
+    }
+
+    /// The note about in-flight runs exists only when there ARE some. Kills
+    /// `delete !` on the `is_empty` guard, whose inverse prints a note about zero
+    /// runs on every load and stays silent on the one that matters.
+    #[test]
+    fn active_run_note_speaks_only_when_runs_are_still_writing() {
+        assert_eq!(active_run_note(0, "gs://b/base"), None);
+        let note = active_run_note(2, "gs://b/base").expect("two active runs must be announced");
+        assert!(note.contains('2') && note.contains("gs://b/base"), "{note}");
+        assert!(note.contains("still writing"), "{note}");
+    }
+
+    /// The up-to-date line names the right load. Kills `replace == with != in
+    /// execute_load`, which swaps the two labels and tells an operator watching a
+    /// CDC drain that a plain `load` is up to date.
+    #[test]
+    fn up_to_date_label_names_cdc_and_only_cdc() {
+        assert_eq!(up_to_date_label(LoadMode::Cdc), "cdc load");
+        for batch in [LoadMode::Full, LoadMode::Incremental] {
+            assert_eq!(up_to_date_label(batch), "load", "{batch:?}");
+        }
+    }
+
+    /// The success traces, against HAND-WRITTEN expected strings — an independent
+    /// oracle, not a re-derivation of the format the code uses. Kills the
+    /// whole-function stubs of both renderers (a load that goes quiet about what
+    /// it appended, and where) and the `source_cleaned` suffix fork.
+    #[test]
+    fn done_lines_render_the_whole_integrity_chain() {
+        let inputs = LoadInputs {
+            integrity: load::reconcile::LoadIntegrity {
+                source_rows: Some(100),
+                file_rows: 100,
+                manifests: 2,
+            },
+            uris: vec!["gs://b/base/part-000000.parquet".into()],
+            source_run_ids: vec!["r1".into()],
+            source_ident: "postgres:public.orders".into(),
+        };
+
+        let appended = load::CdcLoadReport {
+            rows_appended: 40,
+            changes_table: "p.d.orders__changes".into(),
+            view: "p.d.orders".into(),
+            source_cleaned: false,
+        };
+        assert_eq!(
+            append_done_line(&inputs, &appended),
+            "  integrity ✓ source 100 → files 100 → appended 40 to p.d.orders__changes | \
+             current-state view p.d.orders"
+        );
+
+        let cleaned = load::CdcLoadReport {
+            source_cleaned: true,
+            ..appended
+        };
+        assert_eq!(
+            append_done_line(&inputs, &cleaned),
+            "  integrity ✓ source 100 → files 100 → appended 40 to p.d.orders__changes | \
+             current-state view p.d.orders (source cleaned)",
+            "a load that deleted the staged Parquet must SAY so — the prefix is empty now"
+        );
+
+        let full = load::LoadReport {
+            rows_loaded: 100,
+            target_table: "p.d.orders".into(),
+            source_cleaned: false,
+        };
+        assert_eq!(
+            full_done_line(&inputs, &full),
+            "  integrity ✓ source 100 → files 100 → warehouse 100 rows in p.d.orders"
+        );
+        assert_eq!(
+            full_done_line(
+                &inputs,
+                &load::LoadReport {
+                    source_cleaned: true,
+                    ..full
+                }
+            ),
+            "  integrity ✓ source 100 → files 100 → warehouse 100 rows in p.d.orders \
+             (source cleaned)"
+        );
+    }
+
+    /// The generated correlation id is pure lowercase hex ending in this
+    /// process's pid — the charset both BigQuery labels (`[a-z0-9_-]`) and
+    /// Snowflake's `QUERY_TAG` sanitizer pass through unchanged, so the same id
+    /// reads back identically from either warehouse's cost views. Kills `replace
+    /// generate_run_id -> String with "xyzzy".into()`: the only existing
+    /// assertion was "not blank", which a constant satisfies while making every
+    /// load run in history share one id.
+    #[test]
+    fn generated_run_id_is_lowercase_hex_ending_in_the_pid() {
+        let id = generate_run_id();
+        assert!(
+            id.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()),
+            "must survive both warehouses' tag sanitizers unchanged: {id}"
+        );
+        assert!(
+            id.ends_with(&format!("{:08x}", std::process::id())),
+            "the id carries THIS process's pid, so two concurrent loads cannot collide: {id}"
+        );
+        assert!(
+            id.len() > 8,
+            "a pid alone is not a per-invocation id — the microsecond stamp is missing: {id}"
         );
     }
 }

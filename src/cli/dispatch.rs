@@ -18,6 +18,19 @@ use crate::error::Result;
 use crate::state::StateStore;
 use crate::{init, load, pipeline, preflight};
 
+/// Does a `rivet cdc` run stop at the OPEN-TIME snapshot, or tail forever?
+///
+/// `--stream` is the daemon flag, and `until_current` is its exact inverse — the
+/// one polarity inversion in this router that no error message would reveal: a
+/// bounded run that never terminates looks like a slow source, and a daemon that
+/// clips at the open bound looks like a healthy cycle that quietly stopped
+/// following the log. Pure, because `dispatch` is a live-only body excluded
+/// wholesale in `.cargo/mutants.toml` — every operator left inline there is a
+/// mutant nothing is asked about (`tests/offline/live_only_purity_gate.rs`).
+fn cdc_until_current(stream: bool) -> bool {
+    !stream
+}
+
 /// Validate a `--export <name>` selection against the loaded config and, on a
 /// miss, bail with the sorted list of declared export names — so a typo
 /// (`--export oders` for `orders`) names the choices instead of the bare
@@ -92,7 +105,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             rollover,
             slot,
             capture_instance,
-            until_current: !stream,
+            until_current: cdc_until_current(stream),
         }),
         Commands::Load {
             config,
@@ -873,6 +886,27 @@ mod init_tls_tests {
                 .downcast_ref::<crate::source::TlsRequiredError>()
                 .is_some()),
             "the refusal must carry the typed marker, not just prose"
+        );
+    }
+}
+
+#[cfg(test)]
+mod cdc_stream_polarity_tests {
+    use super::cdc_until_current;
+
+    /// `--stream` and `until_current` are exact opposites. Both directions,
+    /// because an inverted polarity is the same bug from either side: a bounded
+    /// run that tails forever, or a daemon that clips at the open bound and
+    /// silently stops following the log.
+    #[test]
+    fn stream_is_the_exact_inverse_of_the_open_time_bound() {
+        assert!(
+            cdc_until_current(false),
+            "no --stream: a `rivet cdc` run drains to the OPEN-TIME snapshot and exits"
+        );
+        assert!(
+            !cdc_until_current(true),
+            "--stream is the daemon: it must NOT clip at the open bound"
         );
     }
 }
