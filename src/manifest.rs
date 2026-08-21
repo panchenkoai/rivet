@@ -30,6 +30,14 @@
 
 use serde::{Deserialize, Serialize};
 
+/// The relational algebra ABOVE these types: which runs live under one prefix
+/// and how they relate (dedupe, family membership, split-unit identity,
+/// supersession, generation coherence, claimed parts). It lives beside the
+/// naming/family helpers below — the writer's home is the truth's home — so the
+/// two verifiers over one artifact set (`--validate`, `rivet load`) answer from
+/// ONE classification instead of two dialects that must agree by review.
+pub mod census;
+
 /// Current manifest schema version.  See ADR-0012 §Manifest schema.
 pub const MANIFEST_VERSION: u32 = 1;
 

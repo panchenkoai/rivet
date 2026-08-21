@@ -24,6 +24,7 @@
 //! the warehouse* is the paid last mile.
 
 use crate::destination::gcs::GcsStore;
+use crate::manifest::census::{ManifestCensus, dedupe_by_run_id, ensure_single_generation};
 use crate::manifest::{MANIFEST_FILENAME, ManifestStatus, RunManifest};
 use crate::pipeline::validate_manifest::MANIFEST_MAX_BYTES;
 use anyhow::{Context, Result, bail};
@@ -100,28 +101,6 @@ pub fn fetch_manifests_keyed(
         })
         .collect::<Result<Vec<_>>>()
         .map(dedupe_by_run_id)
-}
-
-/// One manifest per RUN: the canonical `manifest.json` is a last-writer-wins
-/// POINTER to the latest run, so when its run_id is also present as an immutable
-/// `manifest-<run_id>.json` copy, keep the copy and drop the pointer (the
-/// double-count guard). A run_id present ONLY under the canonical name — a
-/// legacy run predating the run-unique copies — survives, so an upgraded prefix
-/// still counts it (#173).
-fn dedupe_by_run_id(keyed: Vec<(String, RunManifest)>) -> Vec<(String, RunManifest)> {
-    let copy_run_ids: std::collections::HashSet<&str> = keyed
-        .iter()
-        .filter(|(k, _)| is_run_unique_manifest(k.rsplit('/').next().unwrap_or("")))
-        .map(|(_, m)| m.run_id.as_str())
-        .collect();
-    keyed
-        .iter()
-        .filter(|(k, m)| {
-            is_run_unique_manifest(k.rsplit('/').next().unwrap_or(""))
-                || !copy_run_ids.contains(m.run_id.as_str())
-        })
-        .cloned()
-        .collect()
 }
 
 /// Full `gs://` URIs of the parquet to load for `new` (the not-yet-loaded run
@@ -239,9 +218,11 @@ pub fn gc_orphans(
     // Success parts → keep. Failed/Interrupted parts → terminal (their run is
     // done, so deletable regardless of `active`). A part in NEITHER set has no
     // manifest at all — the ambiguous case `active` gates.
+    let census = ManifestCensus::new(keyed);
     let mut keep: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut terminal: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for (key, m) in keyed {
+    for run in census.runs() {
+        let (key, m) = (run.key, run.manifest);
         match m.status {
             ManifestStatus::Success => keep.extend(resolve_parts(key, m)),
             // A `running` manifest is a LIVE run's marker (schema-less, no parts).
@@ -260,7 +241,7 @@ pub fn gc_orphans(
                 // referencing parts that are gone (post-0.24.3 review HIGH). Spare exactly those
                 // (KEEP); everything else stays terminal debris, deletable even while an
                 // UNRELATED export's run is active (no over-defer of genuine crash leftovers).
-                if superseded_by_active_running(m, keyed) {
+                if census.adopted_by_active_running(run) {
                     keep.extend(resolve_parts(key, m));
                 } else {
                     terminal.extend(resolve_parts(key, m));
@@ -295,10 +276,10 @@ pub fn gc_orphans(
     // run's marker would accumulate forever. A NON-superseded running manifest is
     // the ACTIVE signal and MUST survive — deletion here is gated on SUPERSESSION,
     // never on `active`.
-    for (key, m) in keyed {
-        if m.status == ManifestStatus::Running && is_superseded(m, keyed) {
-            removed_bytes += store.stat_size(key).unwrap_or(0);
-            store.remove(key)?;
+    for run in census.runs() {
+        if run.manifest.status == ManifestStatus::Running && census.superseded(run) {
+            removed_bytes += store.stat_size(run.key).unwrap_or(0);
+            store.remove(run.key)?;
             removed += 1;
         }
     }
@@ -308,207 +289,44 @@ pub fn gc_orphans(
 /// Is a LIVE run's `running` MARKER manifest present under the prefix — the
 /// bucket-side projection of the run-status ledger, for a cross-boundary load
 /// (Airflow / a foreign-host `rivet load`) that cannot read the extract's state
-/// DB? True iff some `running` manifest is NOT superseded by a NEWER manifest
-/// (any status) of the SAME export — the same clock-free supersession the ledger
-/// uses (a newer `started_at` means the old running run crashed and its successor
-/// already re-ran). `gc_orphans`'s `active` is `ledger_active OR this`, so the two
-/// signals are belt-and-suspenders: the ledger is precise co-located, the marker
-/// covers cross-host.
+/// DB? `gc_orphans`'s `active` is `ledger_active OR this`, so the two signals are
+/// belt-and-suspenders: the ledger is precise co-located, the marker covers
+/// cross-host. The supersession rule it reads is the census's
+/// ([`ManifestCensus::active_running`]) — the same one gc's marker sweep deletes
+/// by, so the two can never disagree about which marker is live.
 pub fn has_active_running_manifest(keyed: &[(String, RunManifest)]) -> bool {
-    keyed
-        .iter()
-        .any(|(_, m)| m.status == ManifestStatus::Running && !is_superseded(m, keyed))
-}
-
-/// True if `m` (a Failed/Interrupted manifest) is superseded by a LIVE run of the SAME
-/// export — a non-superseded `Running` marker with a newer `started_at`. That live run is a
-/// chunk-checkpoint resume which ADOPTS the crashed run's run_id and REUSES its committed
-/// parts, so those parts are being adopted, NOT dead debris — gc must SPARE them until the
-/// resume finalizes. Same clock-free family/supersession seam as [`is_superseded`]. When no
-/// same-export run is live, the parts stay terminal (deleted even while an unrelated run is
-/// active), so genuine crash debris is never over-deferred.
-fn superseded_by_active_running(m: &RunManifest, keyed: &[(String, RunManifest)]) -> bool {
-    keyed.iter().any(|(_, o)| {
-        o.status == ManifestStatus::Running
-            && crate::manifest::identity_family(o, keyed)
-                == crate::manifest::identity_family(m, keyed)
-            && o.started_at > m.started_at
-            && !is_superseded(o, keyed)
-    })
-}
-
-/// A `running` manifest is SUPERSEDED when a NEWER run of the SAME export exists
-/// (a higher `started_at`) — it crashed and its successor already re-ran, so it
-/// no longer protects anything. The ONE clock-free staleness predicate, shared by
-/// [`has_active_running_manifest`] (spare the non-superseded) and `gc_orphans`'s
-/// marker-GC sweep (delete the superseded). The ledger enforces the same rule in
-/// SQL — that copy cannot share this Rust.
-fn is_superseded(m: &RunManifest, keyed: &[(String, RunManifest)]) -> bool {
-    // FAMILY, not name: a CDC run's `running` marker carries the EXPORT name
-    // while the drain's terminal manifest carries the TABLE string, so with
-    // `name:` ≠ `table:` a name-only compare never matched — a crashed marker
-    // stayed "active" forever and gc over-deferred cleanup permanently. Same
-    // recorded-identity seam as `ensure_single_export`.
-    //
-    // BUT a `--pool --split` fans ONE family into N units (`{family}#0..#N-1`) that run
-    // CONCURRENTLY under that shared family. A later-STARTED sibling that finishes first must
-    // NOT make an earlier, still-live sibling look superseded — that would let a cross-host
-    // gc_orphans (whose only liveness signal is `has_active_running_manifest`) delete the live
-    // sibling's in-flight parts (post-0.24.3 convergence HIGH). A crash SUCCESSOR of a unit
-    // shares its export_NAME (`orders#0` re-run), so it still supersedes correctly; only a
-    // DIFFERENT sibling (`orders#1` vs `orders#0`) is excluded.
-    keyed.iter().any(|(_, o)| {
-        crate::manifest::identity_family(o, keyed) == crate::manifest::identity_family(m, keyed)
-            && o.started_at > m.started_at
-            && !are_split_siblings(o, m)
-    })
-}
-
-/// True if `a` and `b` are DIFFERENT split units of the same family (`{family}#i` vs
-/// `{family}#j`, i≠j) — concurrent siblings, not a crash + successor. Keyed off the export
-/// NAME pattern because a split unit's running marker carries `split_window: None` (it is
-/// overwritten by the terminal), so the name is the only sibling discriminator on a marker.
-fn are_split_siblings(a: &RunManifest, b: &RunManifest) -> bool {
-    fn unit_index(m: &RunManifest) -> Option<&str> {
-        // "orders#0" with family "orders" → Some("0"); a non-split name → None.
-        if m.export_family.is_empty() {
-            return None;
-        }
-        m.export_name
-            .strip_prefix(m.export_family.as_str())
-            .and_then(|s| s.strip_prefix('#'))
-            .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()))
-    }
-    a.export_family == b.export_family
-        && a.export_name != b.export_name
-        && unit_index(a).is_some()
-        && unit_index(b).is_some()
+    ManifestCensus::new(keyed).active_running()
 }
 
 /// Full/chunked loads care only about the LATEST snapshot: from `keyed` (all run
-/// manifests under the prefix) pick the newest by `finished_at`. Full loads
-/// OVERWRITE, so exactly ONE snapshot may be loaded (loading every accumulated
-/// run would duplicate rows). Deliberately **not** ledger-gated: full
+/// manifests under the prefix) pick the newest run of each split unit
+/// ([`ManifestCensus::latest_generation`], which owns the grouping rule). Full
+/// loads OVERWRITE, so exactly ONE generation may be loaded (loading every
+/// accumulated run would duplicate rows). Deliberately **not** ledger-gated: full
 /// re-materializes the latest snapshot on *every* load, so a re-load self-heals a
 /// drifted target and stays resilient to hidden in-place source updates. An empty
 /// input (no staged run — e.g. the staging was cleaned) yields an empty
 /// selection, so the caller no-ops WITHOUT truncating the target.
-///
-/// Ordering parses `finished_at` as an instant — a lexical byte compare mis-picks
-/// on mixed RFC3339 precision (`…00.5Z` sorts before `…00Z`) — and falls back to
-/// lexical only if a timestamp fails to parse, so a malformed manifest can't panic.
 pub fn latest_full(keyed: Vec<(String, RunManifest)>) -> Vec<(String, RunManifest)> {
-    // Group by export_name, then take the LATEST manifest per group. A `--pool --split`
-    // snapshot is N units `{family}#0..#N-1`, each its OWN run_id/manifest that finishes at
-    // a slightly different instant; the old `max_by` over the WHOLE set picked exactly ONE
-    // manifest — silently dropping the other N-1 units on a Full (replace) load. Grouping by
-    // export_name loads each unit's latest run. A non-split full export keeps ONE export_name
-    // across repeated runs → a single group → the single latest snapshot, unchanged replace
-    // semantics. BTreeMap so the selection order is deterministic (by unit name).
-    let mut latest: std::collections::BTreeMap<String, (String, RunManifest)> =
-        std::collections::BTreeMap::new();
-    for (key, m) in keyed {
-        let newer = match latest.get(&m.export_name) {
-            None => true,
-            Some((_, prev)) => finished_after(&m.finished_at, &prev.finished_at),
-        };
-        if newer {
-            latest.insert(m.export_name.clone(), (key, m));
-        }
-    }
-    latest.into_values().collect()
+    let picked: Vec<usize> = ManifestCensus::new(&keyed)
+        .latest_generation()
+        .iter()
+        .map(|r| r.index)
+        .collect();
+    take_in_order(keyed, &picked)
 }
 
-/// True if `a`'s finished-at instant is strictly after `b`'s (RFC3339; falls back to a
-/// lexical compare only if either fails to parse — the same ordering `latest_full` used
-/// before it grouped by unit).
-fn finished_after(a: &str, b: &str) -> bool {
-    match (
-        chrono::DateTime::parse_from_rfc3339(a).ok(),
-        chrono::DateTime::parse_from_rfc3339(b).ok(),
-    ) {
-        (Some(x), Some(y)) => x > y,
-        _ => a > b,
-    }
-}
-
-/// A Full selection must be ONE coherent split generation (or a single plain snapshot). A
-/// `--pool --split` prefix accumulates a manifest copy per unit per run (different run_ids →
-/// different part names → nothing overwrites), and there is no generation id, so if a later run
-/// split into a DIFFERENT unit count — or the export toggled unsplit↔split — [`latest_full`]'s
-/// group-by-unit selection would mix TWO generations: their windows overlap and a Full (replace)
-/// load would DUPLICATE rows (the count gate can't catch it — `expected_rows` inflates with the
-/// parts). Every coherent split generation has EXACTLY one bottom unit (`lo == None`) and one
-/// top (`hi == None`) and no plain/split mix; violate that and we cannot tell which parts form
-/// the current snapshot, so REFUSE loudly rather than silently duplicate. (Proper fix: stamp a
-/// split-generation id on the units — tracked follow-up.)
-fn ensure_single_split_generation(selected: &[(String, RunManifest)]) -> Result<()> {
-    let split: Vec<&RunManifest> = selected
+/// Move the entries at `picked` out of `keyed`, in `picked`'s order — the census
+/// selects by INDEX into the caller's slice, so materialising it costs no clone.
+fn take_in_order(
+    keyed: Vec<(String, RunManifest)>,
+    picked: &[usize],
+) -> Vec<(String, RunManifest)> {
+    let mut slots: Vec<Option<(String, RunManifest)>> = keyed.into_iter().map(Some).collect();
+    picked
         .iter()
-        .map(|(_, m)| m)
-        .filter(|m| m.split_window.is_some())
-        .collect();
-    if split.is_empty() {
-        return Ok(()); // a plain single-snapshot selection is always coherent
-    }
-    let plain = selected.len() - split.len();
-    let bottoms = split
-        .iter()
-        .filter(|m| m.split_window.as_ref().unwrap().lo.is_none())
-        .count();
-    let tops = split
-        .iter()
-        .filter(|m| m.split_window.as_ref().unwrap().hi.is_none())
-        .count();
-    if plain > 0 || bottoms > 1 || tops > 1 {
-        anyhow::bail!(
-            "Full load over a --pool --split prefix selected parts from MORE THAN ONE split \
-             generation ({} split units incl. {bottoms} bottom + {tops} top window(s){}); \
-             loading their union would DUPLICATE rows. The prefix holds a prior split run's \
-             leftover parts (a later run split into a different unit count, or the export \
-             toggled split↔unsplit). Load into a FRESH destination prefix (or clear the stale \
-             generation) and re-run.",
-            split.len(),
-            if plain > 0 {
-                format!(", plus {plain} non-split snapshot(s)")
-            } else {
-                String::new()
-            }
-        );
-    }
-    // bottoms==1, tops==1, plain==0 is NECESSARY but NOT sufficient. When two generations
-    // split into the SAME unit COUNT but at DIFFERENT boundaries and an INTERIOR unit is
-    // substituted from the older generation (its newer sibling crashed, so latest_full falls
-    // back to the stale Success), the selection still has exactly one bottom + one top — yet
-    // the windows no longer tile: a GAP loses rows and an OVERLAP duplicates them, and the
-    // count gate can't see it (expected_rows inflates with the parts). Post-0.24.3 review HIGH.
-    //
-    // A coherent split tiles the key space: every INTERIOR boundary appears once as some
-    // unit's `hi` and once as the NEXT unit's `lo`. So the multiset of non-None `lo` bounds
-    // must equal the multiset of non-None `hi` bounds. Compare them sorted — order-free, no
-    // numeric parse of opaque key text (a gap leaves a `hi` with no matching `lo`; an overlap
-    // leaves a `lo` with no matching `hi`).
-    let mut los: Vec<&String> = split
-        .iter()
-        .filter_map(|m| m.split_window.as_ref().unwrap().lo.as_ref())
-        .collect();
-    let mut his: Vec<&String> = split
-        .iter()
-        .filter_map(|m| m.split_window.as_ref().unwrap().hi.as_ref())
-        .collect();
-    los.sort();
-    his.sort();
-    if los != his {
-        anyhow::bail!(
-            "Full load over a --pool --split prefix selected an INCOHERENT set of split windows \
-             — the interior boundaries do not tile the key space, so a later run re-sampled to \
-             different boundaries and an older unit was substituted for a crashed one. Their \
-             union LOSES the gap rows and DUPLICATES the overlap rows (the count gate can't see \
-             it). Interior lower bounds {los:?} != upper bounds {his:?}. Load into a FRESH \
-             destination prefix (or clear the stale generation) and re-run."
-        );
-    }
-    Ok(())
+        .filter_map(|&i| slots.get_mut(i).and_then(Option::take))
+        .collect()
 }
 
 /// Which run manifests to load for `mode`, given the ledger's already-`loaded`
@@ -551,7 +369,10 @@ pub fn select_runs(
     match mode {
         crate::load::plan::LoadMode::Full => {
             let sel = latest_full(keyed);
-            ensure_single_split_generation(&sel)?;
+            // ...and that selection must be ONE coherent split generation — the
+            // other half of the census's split classification, so the grouping
+            // above and the coherence check here read the SAME unit identity.
+            ensure_single_generation(&ManifestCensus::new(&sel).runs().iter().collect::<Vec<_>>())?;
             Ok(sel)
         }
         _ => Ok(keyed
@@ -1612,7 +1433,7 @@ mod tests {
         // Post-0.24.3 convergence HIGH: `--pool --split` fans `orders` into siblings that run
         // CONCURRENTLY under the shared family "orders". orders#2 started LAST (T2) but its window
         // is smallest so it finishes FIRST (Success); orders#0/#1 are still Running with in-flight
-        // parts. is_superseded keyed on (family, started_at) alone would mark #0/#1 superseded by
+        // parts. Supersession keyed on (family, started_at) alone would mark #0/#1 superseded by
         // #2 → has_active_running_manifest=false → a cross-host gc_orphans deletes #0/#1's live
         // parts. The sibling exclusion must keep the two live markers ACTIVE. RED against the
         // pre-fix predicate (which returned false here).
@@ -1639,8 +1460,10 @@ mod tests {
         // A crash SUCCESSOR (same export_name, newer start) MUST still supersede the crashed marker.
         let crashed = unit("orders#0", ManifestStatus::Running, "2026-01-01T00:00:00Z");
         let successor = unit("orders#0", ManifestStatus::Running, "2026-01-02T00:00:00Z");
+        let rerun = [crashed, successor];
+        let census = ManifestCensus::new(&rerun);
         assert!(
-            is_superseded(&crashed.1, &[crashed.clone(), successor]),
+            census.superseded(&census.runs()[0]),
             "a re-run of the SAME unit (orders#0) must still supersede its crashed marker"
         );
     }

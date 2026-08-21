@@ -259,8 +259,8 @@ fn read_unit_manifests(
 /// fixed, non-{run_id} prefix) completed the same ordinal, its Success masks a CURRENT-generation
 /// unit that crashed, and the skip drops it. The silent-loss chain requires a full split export
 /// run REPEATEDLY into one accumulating prefix — an atypical pattern — AND is caught at LOAD by
-/// the tiling backstop `ensure_single_split_generation` (a mixed-generation selection whose
-/// windows do not tile is REFUSED loudly, not silently gapped/duplicated). The precise run-side
+/// the tiling backstop `manifest::census::ensure_single_generation` (a mixed-generation
+/// selection whose windows do not tile is REFUSED loudly, not silently gapped/duplicated). The precise run-side
 /// fix is generation-scoping (a generation id on `SplitWindow`, or matching the reconstructed
 /// window per ordinal before skipping) — tracked; the load guard makes the interim non-silent.
 pub(crate) fn completed_units_in_prefix(
