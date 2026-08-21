@@ -2262,3 +2262,52 @@ fn validate_depth_full_rereads_the_parts_the_lighter_depths_never_open() {
         String::from_utf8_lossy(&full.stderr)
     );
 }
+
+/// PART-NAME NON-DOUBLING (field-run finding). The keyset part-name format
+/// prepends the export name, and the run_id it used for run-uniqueness is
+/// itself `<export>_<stamp>` — so real runs wrote `<export>_<export>_<stamp>_
+/// pk_w…`, the export name TWICE (the chunked/mongo siblings key off a fresh
+/// stamp and never doubled). Through the rig: a PARALLEL keyset export (the
+/// pk_w path, keyset.rs:605) whose part basenames must carry the export name
+/// exactly ONCE. RED before run_scoped_tag stripped the redundant prefix.
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn keyset_part_names_do_not_double_the_export_name() {
+    require_alive(LiveService::Postgres);
+    let table = seed_pg_numeric_table(2000);
+    let out = tempfile::tempdir().unwrap();
+    let rig = Rig::pg_batch(table.name())
+        .mode("chunked")
+        .export_line("chunk_by_key: id")
+        .export_line("chunk_size: 200")
+        .export_line("parallel: 4")
+        .dest_path(out.path().to_path_buf());
+    assert!(
+        rig.run_args(&[]).status.success(),
+        "keyset export must succeed before its part names can be checked"
+    );
+
+    let parts = files_with_extension(out.path(), "parquet");
+    assert!(!parts.is_empty(), "keyset run produced no parts to name");
+
+    let doubled = format!("{}_{}", table.name(), table.name());
+    for p in &parts {
+        let name = p.file_name().unwrap().to_string_lossy().into_owned();
+        // The part is a parallel-keyset part (proves we exercised the pk_w path).
+        assert!(
+            name.contains("_pk_w"),
+            "expected parallel-keyset (pk_w) parts; got {name}"
+        );
+        assert!(
+            !name.contains(&doubled),
+            "part name doubles the export name — '{doubled}' appears in '{name}' \
+             (the run_id-carries-the-export bug; run_scoped_tag must strip it)"
+        );
+        // ...and the export name is still present exactly once (dir + name both
+        // carry it, so a reader can attribute a stray file to its export).
+        assert!(
+            name.starts_with(&format!("{}_", table.name())),
+            "part name must still lead with the export name once: {name}"
+        );
+    }
+}
