@@ -155,10 +155,11 @@ Subsequent `rivet run` invocations will only fetch rows with `updated_at >` the 
 
 ## 5 · Many tables: plan once, apply by waves
 
-When a config has several exports, `rivet plan` assigns each one a **wave** — a priority band derived from its size, chunking strategy, and risk ([ADR-0006](adr/0006-source-aware-prioritization.md)) — and writes it back into the config as a `wave:` field you can see and hand-edit:
+When a config has several exports, `rivet plan` assigns each one a **wave** — a priority band derived from its size, chunking strategy, and risk ([ADR-0006](adr/0006-source-aware-prioritization.md)). By default `rivet plan` is **read-only**: it prints the schedule for you to review but does not touch the config. Add `--annotate-waves` to write the `wave:` / `parallel_safe:` fields back into the config, where you can see and hand-edit them:
 
 ```bash
-rivet plan -c rivet.yaml        # writes `wave: N` onto every export, in place
+rivet plan -c rivet.yaml                   # review the schedule (read-only)
+rivet plan -c rivet.yaml --annotate-waves  # write `wave: N` onto every export, in place
 ```
 
 ```yaml

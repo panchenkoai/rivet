@@ -309,13 +309,14 @@ rivet apply plan.json --force
 
 ### Wave-ordered execution (YAML config)
 
-`rivet apply <config>.yaml` runs every export in the config **wave by wave**, lowest `wave:` first, with a barrier between waves — every export in wave 1 finishes before wave 2 starts. Exports with no `wave:` run last. `rivet plan` writes the `wave:` and `parallel_safe:` fields onto each export (you can hand-edit them; apply respects your order).
+`rivet apply <config>.yaml` runs every export in the config **wave by wave**, lowest `wave:` first, with a barrier between waves — every export in wave 1 finishes before wave 2 starts. Exports with no `wave:` run last. `rivet plan --annotate-waves` writes the `wave:` and `parallel_safe:` fields onto each export (you can hand-edit them; apply respects your order). Plain `rivet plan` is read-only and leaves the config untouched.
 
 **Within-wave parallelism.** With `parallel_export_processes: true` in the config (or `rivet apply --parallel-export-processes`), the **cheap** exports within a wave — those `rivet plan` marked `parallel_safe: true` (cost class `Low`, < ~100K rows) — run concurrently as separate processes. A heavier export already chunk-parallelizes its own ranges internally, so it runs **alone** in its wave; two large tables at once would multiply load on the source. Each child still self-throttles via the adaptive governor. Without the flag, every export runs sequentially. `parallel_safe` also respects the campaign's `isolate_on_source` — a cheap export on a contended shared source still runs alone.
 
 ```bash
 # plan assigns waves → you review/edit → apply executes them, lowest wave first
-rivet plan  -c rivet.yaml
+rivet plan  -c rivet.yaml                   # review the schedule (read-only)
+rivet plan  -c rivet.yaml --annotate-waves  # write wave:/parallel_safe: into the config
 rivet apply rivet.yaml
 ```
 

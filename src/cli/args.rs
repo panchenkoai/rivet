@@ -982,11 +982,12 @@ pub struct PlanArgs {
     /// Write plan JSON to this file (default: print summary to stdout)
     #[arg(short, long)]
     pub output: Option<String>,
-    /// Overwrite `wave:` / `parallel_safe:` values the config ALREADY has
-    /// with this plan's recommendations. Without this flag, plan only fills
-    /// in ABSENT fields — an operator's hand-tuned schedule is never
-    /// silently replaced (it was, before 0.24.4: a 5-per-wave split became
-    /// one 76-export wave after a read-only-looking `rivet plan`).
+    /// Write this plan's `wave:` / `parallel_safe:` schedule into the config,
+    /// (over)writing every export. WITHOUT this flag `rivet plan` is READ-ONLY:
+    /// it prints the schedule and the reviewable plan but never touches the
+    /// config file — not even to fill in absent fields. This makes config
+    /// mutation an explicit, opt-in act (a read-only-looking `rivet plan` once
+    /// turned a hand-tuned 5-per-wave split into one 76-export wave).
     #[arg(long)]
     pub annotate_waves: bool,
     /// Output format: "pretty" (human summary) or "json" (machine-readable)
