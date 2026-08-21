@@ -88,6 +88,30 @@
 # Building this ledger then surfaced a bigger one — value-checksum Form B was absent on
 # ALL three large-table runners.
 #
+# COLUMNS ARE DERIVED, 2026-08-21. Every paragraph above argues about the column
+# set — the ~8 loops, the collapse to 5, the 2026-08-16 split — and until now the
+# `engines:` line below was a hand-written list tied to NOTHING: the generative
+# column guard (tests/offline/chunking_matrix_guard.rs #5) only knows enum-keyed
+# ledgers (SourceType / ExportTarget / DestinationType), and a runner is not an
+# enum variant, so this ledger was the one matrix whose columns nobody derived.
+# `runner_matrix_columns_are_derived_from_the_commit_loops` closes that: a
+# top-level fn under src/pipeline that drains through `commit::record_part` IS a
+# commit loop (ADR-0028's own definition of the seam every runner must call), the
+# derivation finds exactly the EIGHT the header above names, and COMMIT_LOOP_COLUMN
+# maps each to its column here. It fails in both directions — a ninth loop with no
+# column (RED-proven: a new record_part-draining fn; 271 other offline tests stayed
+# green), and a column whose loop is gone (RED-proven: the mongo_parallel runner
+# deleted; the ledger went on grading its column, cells and ratchet and all).
+#
+# The ADR-0028 half is graded structurally rather than by more cells: the rows
+# below whose `na:` rests on "it runs ONCE at the finalize_export seam"
+# (schema_drift_gate, shape_drift_warn, value_checksum_form_b — the guard reads
+# that set from THIS file's `what:` prose, it is not hand-listed there) are honest
+# only while the seam has exactly one caller.
+# `the_export_tail_seam_has_one_caller_and_no_runner_re_applies_it` asserts that,
+# and names those rows when it fails — so a runner re-applying the tail is a
+# diff-time failure instead of three `na` cells quietly becoming false.
+
 # Columns are the five RUNNER families. A cell is EXACTLY one of:
 #   test: <fn>  — the feature is applied on this runner AND a test proves it.
 #   na:   <why> — the feature genuinely does not apply to this runner (by design),

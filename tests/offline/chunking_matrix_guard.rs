@@ -37,8 +37,19 @@
 //!    an INDEPENDENT oracle (a DuckDB/source-vs-dest re-read, outside rivet's decode
 //!    family) lowers the ceiling. So the shared-decode self-oracle debt is visible
 //!    and monotonically shrinks toward 0.
+//! 8. GENERATIVE runner-column completeness — #5 on the one axis that is not an
+//!    enum. `docs/runner-coverage-matrix.yaml` is keyed on RUNNERS, so #5 matched
+//!    none of its predicates and its column line was hand-written and tied to
+//!    nothing. The required set is derived from the product instead: a top-level
+//!    fn that drains through `commit::record_part` IS a commit loop (ADR-0028's
+//!    own definition of the seam every runner must call), and the derived set is
+//!    compared to the declared columns in BOTH directions — a new runner with no
+//!    column, and a column whose runner is gone. Its sibling grades the other half
+//!    of ADR-0028: the export TAIL has exactly one caller, which is what lets
+//!    several rows of that ledger be runner-agnostic `na` instead of a cell per
+//!    runner.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -242,8 +253,11 @@ struct Matrix {
 #[derive(Deserialize)]
 struct Scenario {
     id: String,
-    #[serde(default, rename = "what")]
-    _what: Option<String>,
+    /// The row's prose. Read by guard #8, which derives the rows whose `na`
+    /// cells REST on the ADR-0028 seam from the ledger itself rather than from
+    /// a hand-kept list here.
+    #[serde(default)]
+    what: Option<String>,
     #[serde(flatten)]
     cells: HashMap<String, Cell>,
 }
@@ -958,4 +972,369 @@ fn every_docs_yaml_parses_as_yaml() {
         checked >= 20,
         "parsed only {checked} YAML file(s) under docs/ — the walk found nothing to grade"
     );
+}
+
+// ── Guard #8: the runner axis, derived ────────────────────────────────────────
+//
+// The two generative guards above key on an ENUM, which is why neither of them
+// sees `docs/runner-coverage-matrix.yaml`: its columns are RUNNERS, and a runner
+// is not an enum variant — it is a commit loop the dispatcher fans out to. That
+// ledger's own header admits the consequence ("the columns collapse to FIVE
+// runner FAMILIES … the code actually has ~EIGHT distinct commit loops"), and
+// the collapse has already cost twice: a `test` cell proven only on
+// keyset_SEQUENTIAL while keyset_PARALLEL lacked the drift gate, and a governor
+// cell whose two runners had disjoint evidence until the 2026-08-16 column split.
+// Both were caught by a human reading the grid, because the column list was a
+// hand-written line of YAML tied to nothing.
+
+/// The ONE call that makes a function an export RUNNER.
+///
+/// ADR-0028 chose `commit::record_part` as the seam precisely because it is "the
+/// single drain point every runner — including parallel workers — must call to
+/// write". That makes it the honest structural definition of the runner set: a
+/// function that commits parts is a commit loop whether or not anyone remembered
+/// to give it a column.
+const COMMIT_DRAIN: &str = "commit::record_part(";
+
+/// Every COMMIT LOOP the product has → the runner-coverage COLUMN it collapses
+/// into. This table is the collapse the ledger's header describes, written where
+/// a guard can read it instead of in prose — and it is graded in BOTH directions
+/// by [`runner_matrix_columns_are_derived_from_the_commit_loops`]:
+///
+/// * a loop the derivation finds and this table does not name is a NEW runner
+///   with no column (the parallel-keyset shape: a second commit loop under an
+///   existing column, invisible to every cell in it);
+/// * a name here the derivation no longer finds is a MAPPING that outlived its
+///   runner, and a column claimed only by such names is a column for a runner
+///   that no longer exists.
+///
+/// So the hand-written part is the COLLAPSE (which loop belongs to which
+/// family), never the SET — the set comes from the code every time.
+const COMMIT_LOOP_COLUMN: &[(&str, &str)] = &[
+    ("run_single_export", "single"),
+    ("run_chunked_sequential", "chunked"),
+    ("run_chunked_parallel", "chunked"),
+    ("run_chunked_sequential_checkpoint", "chunked_checkpoint"),
+    ("run_chunked_parallel_checkpoint", "chunked_checkpoint"),
+    ("run_keyset", "keyset"),
+    ("run_keyset_parallel", "keyset"),
+    ("run_mongo_parallel", "mongo_parallel"),
+];
+
+const RUNNER_MATRIX: &str = "docs/runner-coverage-matrix.yaml";
+
+/// The seam ADR-0028 funnels the export TAIL through, and the one function
+/// allowed to call it. An allowlist rather than a count, so the exception a
+/// future dispatcher needs is written down WITH its reason (the shape
+/// `runner_frame_gate` already uses for the destination door).
+const TAIL_SEAM: &str = "finalize_export(";
+const TAIL_SEAM_CALLERS: &[(&str, &str)] = &[(
+    "execute_resolved_plan",
+    "THE dispatcher — ADR-0028 applies the tail here, once, between the runner returning \
+     and finalize_manifest",
+)];
+
+/// Every top-level fn under `src/pipeline` whose body calls `needle`, mapped to
+/// the first call site (`rel:line`) so a failure can name its witness.
+///
+/// Three things this deliberately does NOT count, each of them a way a text
+/// guard goes blind in the safe-looking direction:
+///
+/// * a COMMENT naming the call — `runner_frame_gate` was satisfiable by a doc
+///   mention of the very call it demanded. Honesty about strength: no comment in
+///   the tree forges either token TODAY, so stripping changes no verdict now. The
+///   nearest is `parallel_checkpoint.rs:430`, which writes
+///   `commit::record_part(state=None)` in prose inside a fn that is already a
+///   commit loop by its real drain at :578 — a rename away from mattering. Three
+///   runner files (single, keyset ×3, mongo_parallel) DO name
+///   `finalize::finalize_export` in their tail comments; they escape only because
+///   they write it without the trailing `(`. Verified by
+///   removing the strip and re-running: still green — which is why this bullet
+///   says "defence against the class", not "load-bearing today".
+/// * a `#[cfg(test)]` block — a unit test that calls the seam is not a runner.
+///   This one IS load-bearing: `finalize.rs`'s own unit tests call the seam
+///   twice, and counting them would make the seam look re-applied.
+/// * the DECLARATION line: `fn finalize_export(` is not a call to itself.
+fn top_level_callers_of(needle: &str) -> BTreeMap<String, String> {
+    let root = repo_root().join("src/pipeline");
+    let mut out = BTreeMap::new();
+    let mut stack = vec![root];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("read src/pipeline") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            // `sink/tests.rs` is a `#[cfg(test)] mod tests;` body in its own
+            // file, so the in-file cfg(test) skip below cannot see it: a unit
+            // test there would otherwise register as a runner.
+            if path.file_stem().and_then(|e| e.to_str()) == Some("tests") {
+                continue;
+            }
+            let rel = path
+                .strip_prefix(repo_root())
+                .expect("under repo root")
+                .to_string_lossy()
+                .replace('\\', "/");
+            let text = std::fs::read_to_string(&path).expect("read source");
+            scan_top_level_callers(&text, &rel, needle, &mut out);
+        }
+    }
+    out
+}
+
+/// [`top_level_callers_of`] for one file. Brace depth decides what "top level"
+/// means, so a nested fn or a worker closure is attributed to the fn that owns
+/// it — which is what a "commit loop" is: the loop, not the closure inside it.
+fn scan_top_level_callers(text: &str, rel: &str, needle: &str, out: &mut BTreeMap<String, String>) {
+    let mut depth: i64 = 0;
+    let mut current: Option<String> = None;
+    // `Some(d)` while inside a `#[cfg(test)]` item whose body opened at depth d.
+    let mut skip_below: Option<i64> = None;
+    let mut pending_cfg_test = false;
+    for (i, line) in text.lines().enumerate() {
+        let code = line.split("//").next().unwrap_or("");
+        let before = depth;
+        let top_level = before == 0 && !line.starts_with([' ', '\t']);
+        if skip_below.is_none() {
+            if top_level && code.trim_start().starts_with("#[cfg(test)]") {
+                pending_cfg_test = true;
+            } else if top_level && let Some(name) = top_level_fn_name(code) {
+                current = Some(name);
+            } else if code.contains(needle)
+                && let Some(owner) = &current
+            {
+                out.entry(owner.clone())
+                    .or_insert_with(|| format!("{rel}:{}", i + 1));
+            }
+        }
+        depth += code.matches('{').count() as i64 - code.matches('}').count() as i64;
+        depth = depth.max(0);
+        if pending_cfg_test {
+            if depth > before {
+                // The cfg(test) item's body just opened — skip until it closes.
+                skip_below = Some(before);
+                pending_cfg_test = false;
+                current = None;
+            } else if code.trim_end().ends_with(';') {
+                // `#[cfg(test)] mod tests;` — the file is walked on its own, and
+                // nothing to skip here.
+                pending_cfg_test = false;
+            }
+        }
+        if let Some(d) = skip_below
+            && depth <= d
+        {
+            skip_below = None;
+        }
+    }
+}
+
+/// `pub(crate) async fn foo(` → `Some("foo")`, for a line at column 0.
+fn top_level_fn_name(code: &str) -> Option<String> {
+    let mut rest = code.trim_start();
+    if let Some(after) = rest.strip_prefix("pub") {
+        rest = match after.strip_prefix('(') {
+            Some(vis) => vis.split_once(')')?.1.trim_start(),
+            None => after.trim_start(),
+        };
+    }
+    for kw in ["const ", "async ", "unsafe ", "extern "] {
+        if let Some(r) = rest.strip_prefix(kw) {
+            rest = r.trim_start();
+        }
+    }
+    let name: String = rest
+        .strip_prefix("fn ")?
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    (!name.is_empty()).then_some(name)
+}
+
+/// GENERATIVE runner-column completeness — guard #5's third axis, for the one
+/// ledger whose columns are neither engines nor targets nor destinations.
+///
+/// The required column set is derived from the PRODUCT: every top-level fn that
+/// drains through `commit::record_part` is a commit loop, and every commit loop
+/// belongs to exactly one column. Both directions fail:
+///
+/// * a commit loop with no mapping/column — the new-runner hole. `keyset` held
+///   two loops under one column for a whole release and the drift gate was
+///   absent on one of them; a THIRD loop appearing under some column is the same
+///   defect, and nothing in the tree asked about it before this.
+/// * a mapping (and so a column) whose loop is gone — the ledger keeps grading a
+///   runner that no longer exists, cells and ratchet and all.
+///
+/// Scope honesty: this grades the COLUMN SET, not the cells. Whether a `test:`
+/// cell is proven on both loops of a collapsed column is still prose (the
+/// 2026-08-04 per-variant audit); what changes is that the collapse itself is now
+/// written where a guard reads it, so growing an eighth loop into a ninth is a
+/// CI failure rather than a header paragraph nobody re-reads.
+#[test]
+fn runner_matrix_columns_are_derived_from_the_commit_loops() {
+    // NON-VACUITY: the whole derivation keys on one token. Rename the drain and
+    // a scan for it finds no runners, maps nothing, and passes — the direction
+    // text guards always fail in.
+    super::nonvacuity::require_needle(
+        &super::nonvacuity::subject_text("src/pipeline/single.rs"),
+        "src/pipeline/single.rs",
+        COMMIT_DRAIN,
+        1,
+        "If the commit drain moved off `commit::record_part`, re-point COMMIT_DRAIN at the \
+         new seam — the runner set is DERIVED from it, so a stale token derives nothing.",
+    );
+    let loops = top_level_callers_of(COMMIT_DRAIN);
+    super::nonvacuity::require_enumerated(
+        loops.len(),
+        6,
+        "commit loops (top-level fns that call the drain) found under src/pipeline",
+        "The runners moved, or the scan lost its subject — 8 loops live under src/pipeline \
+         today (single, chunked ×2, checkpoint ×2, keyset ×2, mongo_parallel).",
+    );
+
+    let matrix = load_matrix(RUNNER_MATRIX);
+    let columns: HashSet<&str> = matrix.engines.iter().map(String::as_str).collect();
+    let mapped: HashMap<&str, &str> = COMMIT_LOOP_COLUMN.iter().copied().collect();
+
+    // Direction 1 — a NEW runner, and no column for it.
+    for (name, site) in &loops {
+        let column = mapped.get(name.as_str()).unwrap_or_else(|| {
+            panic!(
+                "`{name}` ({site}) commits parts through {COMMIT_DRAIN} — it is an export \
+                 COMMIT LOOP — and no column of {RUNNER_MATRIX} claims it. Every per-export \
+                 feature (a gate, an integrity record, a stamp, a warning) is now something \
+                 this runner can miss while every count and sum stays green. Map it in \
+                 COMMIT_LOOP_COLUMN: to an existing column if it is a variant of that family \
+                 (say so in the ledger's header, as keyset_sequential/parallel are), or to a \
+                 NEW column, which needs a test/na/gap cell in every scenario."
+            )
+        });
+        assert!(
+            columns.contains(column),
+            "`{name}` ({site}) maps to column '{column}', which {RUNNER_MATRIX} does not \
+             declare. Add it to `engines:` (and a cell per scenario) — a runner with no \
+             column is graded by nothing."
+        );
+    }
+
+    // Direction 2 — a column for a runner that no longer exists. Checked per
+    // MAPPING, not per column, so a family losing ONE of its two loops (the
+    // collapse the header warns about) is caught too, not just an empty column.
+    for (name, column) in COMMIT_LOOP_COLUMN {
+        assert!(
+            loops.contains_key(*name),
+            "COMMIT_LOOP_COLUMN maps `{name}` → column '{column}' of {RUNNER_MATRIX}, and no \
+             top-level fn under src/pipeline calls {COMMIT_DRAIN} under that name any more. \
+             Either the loop was renamed (re-point the mapping) or it is gone — in which case \
+             drop it here, and if it was the column's last loop, drop the column and its cells \
+             rather than leaving the ledger to grade a runner the product does not have. \
+             Found: {:?}",
+            loops.keys().collect::<Vec<_>>()
+        );
+    }
+    let claimed: HashSet<&str> = COMMIT_LOOP_COLUMN.iter().map(|(_, c)| *c).collect();
+    for column in &matrix.engines {
+        assert!(
+            claimed.contains(column.as_str()),
+            "{RUNNER_MATRIX} declares column '{column}' and no commit loop maps to it. A \
+             column nothing runs is cells nobody can falsify — delete it, or map the loop it \
+             stands for in COMMIT_LOOP_COLUMN."
+        );
+    }
+}
+
+/// The ADR-0028 tail is applied at ONE seam — which is what lets several rows of
+/// the runner ledger be runner-AGNOSTIC instead of a cell per runner.
+///
+/// Before ADR-0028 the drift gate, the Form-B harvest and the shape-drift warn
+/// were re-assembled by hand in seven commit loops, and the ledger graded each
+/// one because each could forget. They now run once, from the CommitLedger the
+/// runners feed, in `finalize_export` — so those rows say `na: shared seam` and
+/// the honest guard for them is not more cells, it is this: that the seam has
+/// exactly one caller and no runner re-applies it.
+///
+/// That claim was prose in three `what:` fields and nothing checked it. If a
+/// runner starts calling the seam itself, those rows quietly become lies (a
+/// per-runner application graded by an `na` cell that says there isn't one) —
+/// the runner-bypass class returning through the door the ADR closed. This turns
+/// that into a diff-time failure naming the rows that would be affected.
+///
+/// The comment-blindness matters here more than anywhere: every runner's tail
+/// comment NAMES `finalize::finalize_export` while calling nothing, so a scan
+/// that counted comments would report the seam applied in five runners today.
+#[test]
+fn the_export_tail_seam_has_one_caller_and_no_runner_re_applies_it() {
+    super::nonvacuity::require_needle(
+        &super::nonvacuity::subject_text("src/pipeline/finalize.rs"),
+        "src/pipeline/finalize.rs",
+        &format!("fn {TAIL_SEAM}"),
+        1,
+        "The ADR-0028 tail seam was renamed or moved — re-point TAIL_SEAM at it. Grading a \
+         seam that no longer exists by that name passes over nothing.",
+    );
+
+    // The ledger rows whose `na:` cells REST on the seam being singular, read
+    // from the ledger itself rather than hand-listed here — so a row that starts
+    // (or stops) depending on the seam is named by the message without anyone
+    // remembering to update this test.
+    let matrix = load_matrix(RUNNER_MATRIX);
+    let seam_rows: Vec<&str> = matrix
+        .scenarios
+        .iter()
+        .filter(|s| {
+            s.what
+                .as_deref()
+                .is_some_and(|w| w.contains("finalize_export"))
+        })
+        .map(|s| s.id.as_str())
+        .collect();
+    super::nonvacuity::require_enumerated(
+        seam_rows.len(),
+        2,
+        "scenarios of the runner ledger that cite the finalize_export seam",
+        "Those rows are `na` BECAUSE the tail is applied once; if they no longer say so, \
+         either the ADR was reversed (then they need per-runner cells again) or the prose \
+         drifted away from the mechanism it depends on.",
+    );
+
+    let callers = top_level_callers_of(TAIL_SEAM);
+    let allowed: HashMap<&str, &str> = TAIL_SEAM_CALLERS.iter().copied().collect();
+    for (dispatcher, _) in TAIL_SEAM_CALLERS {
+        assert!(
+            callers.contains_key(*dispatcher),
+            "`{dispatcher}` no longer calls {TAIL_SEAM} — the export tail is applied nowhere \
+             (or somewhere this guard cannot see). Found callers: {:?}",
+            callers.keys().collect::<Vec<_>>()
+        );
+    }
+
+    let loops: HashSet<&str> = COMMIT_LOOP_COLUMN.iter().map(|(f, _)| *f).collect();
+    for (caller, site) in &callers {
+        if allowed.contains_key(caller.as_str()) {
+            continue;
+        }
+        let runner = if loops.contains(caller.as_str()) {
+            format!(
+                " `{caller}` is a COMMIT LOOP: this is the runner-bypass class returning — \
+                 the tail re-applied per runner, which is what ADR-0028 removed and what \
+                 rows [{}] now describe as shared-seam `na` cells.",
+                seam_rows.join(", ")
+            )
+        } else {
+            String::new()
+        };
+        panic!(
+            "{TAIL_SEAM} is called from `{caller}` ({site}), which is not an approved seam \
+             caller.{runner} If a second dispatcher genuinely needs the tail, add it to \
+             TAIL_SEAM_CALLERS with its reason; if a runner needs a feature the seam does not \
+             give it, that feature is per-runner again and rows [{}] of {RUNNER_MATRIX} need \
+             real cells instead of `na: shared seam`.",
+            seam_rows.join(", ")
+        );
+    }
 }
