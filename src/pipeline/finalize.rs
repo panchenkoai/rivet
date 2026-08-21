@@ -1125,6 +1125,58 @@ mod tests {
         assert_eq!(summary.column_checksums.len(), 1);
     }
 
+    /// ADR-0028: the seam's shape-drift arm — the ONE guard deciding whether the
+    /// advisory warn runs. Positive: factor set + shape fed + a stored smaller
+    /// max → a `shape_drift:` Warning journal event. Negative: factor 0.0
+    /// (disabled — the config default is opt-in) with the SAME grown shape must
+    /// warn nothing. Together they pin every guard mutant: `>` → `<`/`==`
+    /// (positive stops warning), `>` → `>=` and `&&` → `||` (negative starts
+    /// warning while disabled), `delete !` (positive skips a non-empty ledger).
+    #[test]
+    fn finalize_export_shape_warn_fires_only_when_enabled_and_fed() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::state::StateStore::open_in_memory().unwrap();
+
+        let shape_of = |bytes: u64| -> std::collections::HashMap<String, u64> {
+            [("payload".to_string(), bytes)].into()
+        };
+        let warned = |summary: &crate::pipeline::summary::RunSummary| {
+            summary.journal.warnings().iter().any(|e| {
+                matches!(&e.event, crate::journal::RunEvent::Warning { context, .. }
+                    if context.starts_with("shape_drift:"))
+            })
+        };
+
+        // Seed the stored high-water mark (first run: silently accepted).
+        state
+            .detect_shape_drift("public.orders", &shape_of(10), 2.0)
+            .unwrap();
+
+        // Positive: factor 2.0, 10 → 100 bytes (10×) must warn via the seam.
+        let mut plan = fin_plan(dir.path());
+        plan.shape_drift_warn_factor = 2.0;
+        let mut summary = crate::pipeline::summary::RunSummary::default();
+        summary.ledger.merge_shape(&shape_of(100));
+        finalize_export(&plan, Some(&state), &mut summary).unwrap();
+        assert!(
+            warned(&summary),
+            "a 10× column growth with warn_factor 2.0 must journal a shape_drift warning"
+        );
+
+        // Negative: factor 0.0 (disabled) — the same growth must warn NOTHING,
+        // and the guard must not even consult the state (a `>=`/`||` mutant
+        // enters the arm and warns).
+        let mut plan = fin_plan(dir.path());
+        plan.shape_drift_warn_factor = 0.0;
+        let mut summary = crate::pipeline::summary::RunSummary::default();
+        summary.ledger.merge_shape(&shape_of(100_000));
+        finalize_export(&plan, Some(&state), &mut summary).unwrap();
+        assert!(
+            !warned(&summary),
+            "shape_drift_warn_factor 0.0 means DISABLED — the seam must not warn"
+        );
+    }
+
     fn fin_plan(dest: &std::path::Path) -> crate::plan::ResolvedRunPlan {
         use crate::config::{SourceConfig, SourceType};
         crate::plan::ResolvedRunPlan {
