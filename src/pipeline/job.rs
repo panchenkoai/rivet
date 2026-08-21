@@ -1395,10 +1395,11 @@ use super::finalize::{
 /// Execute a pre-resolved plan with a caller-supplied `ChunkSource`.
 ///
 /// Used by `rivet apply`: the plan comes from a deserialized `PlanArtifact` so
-/// `build_plan` is skipped.  Everything else — quality gate, metrics, state
-/// persistence — is identical to `run_export_job` *except* the two runner-parity
-/// re-applications called out at their sites below (open forensics, the
-/// source-harm bracket).
+/// `build_plan` is skipped. Everything after validation routes through the ONE
+/// post-plan script (`execute_resolved_plan`) — open forensics, the source-harm
+/// bracket, the finalize seam, metrics, state persistence — so this entry point
+/// can no longer diverge from `run_export_job` by omission; its policy is the
+/// `TailPolicy` it passes.
 ///
 /// LIVE-ONLY BY CONSTRUCTION, and deliberately not unit-tested: it needs a real
 /// source, a real destination and a `StateStore`, so a body stub

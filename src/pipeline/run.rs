@@ -3754,6 +3754,24 @@ mod run_tail_tests {
             "expected the gate at `finish_run_tail`'s two sites plus \
              `tail_plan` — found {sites}"
         );
+        // The floor dropped 5→3 because waves/pool no longer gate inline — so
+        // PIN that they still route through the shared tail, or an ungated
+        // revert (rebuilding an aggregate inline, printing unconditionally)
+        // would pass every remaining count (godsplit bughunt 2026-08-21, MED).
+        for tail_fn in ["fn run_waves", "fn run_pool"] {
+            let at = code.find(tail_fn).expect("orchestrator tail exists");
+            let body = &code[at..code[at..]
+                .find("\npub")
+                .or_else(|| code[at..].find("\nfn "))
+                .map(|o| at + o)
+                .unwrap_or(code.len())];
+            assert!(
+                body.contains("finish_run_tail("),
+                "{tail_fn} no longer routes through finish_run_tail — the \
+                 shared-tail invariant (one aggregate, gated card, ungated \
+                 self-check) is unenforced for it"
+            );
+        }
         // …and no tail may OVERWRITE the subject on its way to the gate, which
         // is the one way back to a re-derived count that still type-checks
         // (`agg.total_exports = total;` before the call). Reading it is the
@@ -4103,14 +4121,19 @@ mod run_tail_tests {
                 // owns the aggregate + self-check + persist sequence, and its
                 // own body is graded by this same loop (it builds an aggregate
                 // and must call the check directly).
-                let calls = body
+                let direct = body
                     .match_indices(seam)
                     .filter(|(i, _)| !body[..*i].ends_with("fn "))
-                    .count()
-                    + body
-                        .match_indices("finish_run_tail(")
-                        .filter(|(i, _)| !body[..*i].ends_with("fn "))
-                        .count();
+                    .count();
+                let routed = body
+                    .match_indices("finish_run_tail(")
+                    .filter(|(i, _)| !body[..*i].ends_with("fn "))
+                    .count();
+                // Routed credit is NOT fungible (godsplit bughunt 2026-08-21):
+                // a tail that builds its OWN aggregate must call the check on
+                // it directly — forwarding a different entries vec through
+                // finish_run_tail must not excuse the self-built one.
+                let calls = if builds == 0 { direct + routed } else { direct };
                 assert!(
                     calls >= builds.max(1),
                     "{rel}::{name} ends a run (it drives an export to completion \
