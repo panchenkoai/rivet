@@ -36,7 +36,7 @@ const EXEMPT: &[(&str, &str)] = &[
 /// Every long flag `src/cli/args.rs` declares: `long = "name"` when named,
 /// else the kebab-cased field under a bare `long`.
 fn declared_long_flags() -> BTreeSet<String> {
-    let src = std::fs::read_to_string("src/cli/args.rs").expect("read src/cli/args.rs");
+    let src = super::nonvacuity::subject_text("src/cli/args.rs");
     let mut flags = BTreeSet::new();
     for (start, _) in src.match_indices("#[arg(") {
         let Some(close) = src[start..].find(")]") else {
@@ -85,7 +85,8 @@ fn referenced_in_tests(haystack: &str, flag: &str) -> bool {
 
 fn test_tree_text() -> String {
     let mut out = String::new();
-    let mut stack = vec![std::path::PathBuf::from("tests")];
+    let mut files = 0usize;
+    let mut stack = vec![super::nonvacuity::repo_root().join("tests")];
     while let Some(dir) = stack.pop() {
         if dir.ends_with(".live-tmp") {
             continue;
@@ -95,10 +96,22 @@ fn test_tree_text() -> String {
             if p.is_dir() {
                 stack.push(p);
             } else if p.extension().is_some_and(|x| x == "rs") {
+                files += 1;
                 out.push_str(&std::fs::read_to_string(&p).unwrap_or_default());
             }
         }
     }
+    // This haystack decides which flags count as covered. A truncated walk
+    // fails LOUD in the coverage direction (every flag reads unreferenced), so
+    // the vacuity risk is the other way round only for the STALE-exemption half
+    // — but a walk that lost the tree should say so as a missing subject rather
+    // than through a hundred false "untested flag" lines. 150+ files today.
+    super::nonvacuity::require_enumerated(
+        files,
+        60,
+        "`.rs` files walked under tests/",
+        "The test tree moved; this sweep is deciding flag coverage from a fraction of it.",
+    );
     out
 }
 

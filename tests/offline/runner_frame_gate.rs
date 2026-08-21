@@ -47,7 +47,23 @@ fn batch_writers_obtain_destinations_only_through_the_frame() {
         ),
     ];
 
+    // NON-VACUITY, before any verdict: this lint's whole subject is the token
+    // `create_destination(`, and a lint over a token that no longer exists finds
+    // no offenders and reports green. `frame.rs` is the door, so the door's own
+    // call is the proof the token is still the one to lint for — rename it and
+    // this fails HERE, naming the missing subject, instead of passing over a
+    // tree that no longer contains it.
+    super::nonvacuity::require_needle(
+        &super::nonvacuity::subject_text("src/pipeline/frame.rs"),
+        "src/pipeline/frame.rs",
+        "create_destination(",
+        1,
+        "If destination creation was renamed or moved off the frame, re-point this gate at \
+         the new call — the runner-bypass class it guards did not go away with the name.",
+    );
+
     let mut offenders = Vec::new();
+    let mut scanned = 0usize;
     let mut stack = vec![root.clone()];
     while let Some(dir) = stack.pop() {
         for entry in std::fs::read_dir(&dir).expect("read src/pipeline") {
@@ -68,6 +84,7 @@ fn batch_writers_obtain_destinations_only_through_the_frame() {
                 continue;
             }
             let text = std::fs::read_to_string(&path).expect("read source");
+            scanned += 1;
             for (ln, line) in text.lines().enumerate() {
                 // Only CALLS count; a comment naming the function does not.
                 let code = line.split("//").next().unwrap_or("");
@@ -77,6 +94,15 @@ fn batch_writers_obtain_destinations_only_through_the_frame() {
             }
         }
     }
+    // The walk itself is a subject: `src/pipeline` split into submodules once
+    // already, and a gate that walks a directory which has moved out from under
+    // it reports "no offenders" over zero files. 40+ modules today.
+    super::nonvacuity::require_enumerated(
+        scanned,
+        20,
+        "non-allowlisted `.rs` files scanned under src/pipeline",
+        "The runners moved out of src/pipeline — walk wherever they live now.",
+    );
     assert!(
         offenders.is_empty(),
         "a batch writer bypassed RunnerFrame::open — the cross-shape guard does not\n\

@@ -37,7 +37,11 @@ const BASELINE: &[(&str, usize)] = &[
 ];
 
 fn bespoke_sites(path: &std::path::Path) -> usize {
-    let text = std::fs::read_to_string(path).unwrap_or_default();
+    // NOT `unwrap_or_default()`: an unreadable file scored ZERO bespoke sites,
+    // which is under every ceiling — the ratchet would have read a vanished or
+    // permission-denied file as a fully migrated one.
+    let text = std::fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("NON-VACUITY: read {}: {e}", path.display()));
     // Raw invocations, the shared config-writer, AND hand-rolled yaml source
     // headers: the run_rivet* helper family spawns RIVET_BIN without either of
     // the first two tokens, so a file could hand-build a config via fs::write
@@ -57,7 +61,8 @@ fn bespoke_runner_sites_never_grow_per_file() {
     let baseline: BTreeMap<&str, usize> = BASELINE.iter().copied().collect();
     let mut over: Vec<String> = Vec::new();
     let mut unknown: Vec<String> = Vec::new();
-    for e in std::fs::read_dir("tests/live")
+    let mut scanned = 0usize;
+    for e in std::fs::read_dir(super::nonvacuity::repo_root().join("tests/live"))
         .expect("read tests/live")
         .flatten()
     {
@@ -65,6 +70,7 @@ fn bespoke_runner_sites_never_grow_per_file() {
         if p.extension().is_none_or(|x| x != "rs") {
             continue;
         }
+        scanned += 1;
         let name = p.file_name().unwrap().to_string_lossy().to_string();
         let n = bespoke_sites(&p);
         match baseline.get(name.as_str()) {
@@ -73,6 +79,16 @@ fn bespoke_runner_sites_never_grow_per_file() {
             _ => {}
         }
     }
+    // The live tree IS this ratchet's subject: a scan that finds no live files
+    // reports "nothing grew" for the same reason it reports nothing at all. 98
+    // files today, so the floor catches a moved directory, not a deleted test.
+    super::nonvacuity::require_enumerated(
+        scanned,
+        40,
+        "`.rs` files scanned under tests/live",
+        "The live suite moved — point this ratchet at its new home, or it will bank every \
+         future bespoke site as a migration.",
+    );
     assert!(
         over.is_empty() && unknown.is_empty(),
         "bespoke rivet-runner sites grew past the ratchet: over {over:?}; new files with \
@@ -90,7 +106,7 @@ fn the_baseline_matches_reality_downward_too() {
     let baseline: BTreeMap<&str, usize> = BASELINE.iter().copied().collect();
     let mut slack: Vec<String> = Vec::new();
     for (name, &cap) in &baseline {
-        let p = std::path::Path::new("tests/live").join(name);
+        let p = super::nonvacuity::repo_root().join("tests/live").join(name);
         if !p.exists() {
             slack.push(format!("{name}: listed but deleted — drop the entry"));
             continue;

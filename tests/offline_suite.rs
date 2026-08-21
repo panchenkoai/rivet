@@ -44,6 +44,10 @@ mod mssql_column_data_fixture_guard;
 mod mutation_gate_config;
 #[path = "offline/mysql_wire_type_fixture_guard.rs"]
 mod mysql_wire_type_fixture_guard;
+// Not a test module: the shared non-vacuity rule the grep-shaped guards call so
+// a moved subject fails LOUDLY instead of grading the empty set.
+#[path = "offline/nonvacuity.rs"]
+mod nonvacuity;
 #[path = "offline/perf_matrix_guard.rs"]
 mod perf_matrix_guard;
 #[path = "offline/planner_fuzz.rs"]
