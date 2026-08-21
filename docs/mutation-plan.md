@@ -31,8 +31,30 @@ Narrow live filters for Tier 3 (mutate X → run only its guards):
 ## Three enforcement loops
 
 1. **PR gate — `cargo mutants --in-diff` (minutes).** Mutates only the lines
-   the PR changed, `--lib` cycle. A NEW missed mutant in your own diff fails
-   the check. Cheapest and fairest: everyone pays only for their own code.
+   the PR changed, `--lib --bins` cycle. A NEW missed mutant in your own diff
+   fails the check. Cheapest and fairest: everyone pays only for their own code.
+
+   Since 2026-08-21 the in-diff mutants are **prioritised before they are
+   budgeted** (`.github/scripts/mutants_classify.py`, wired into the
+   `mutants-in-diff` job). `cargo llvm-cov --lib --bins` measures which
+   functions the offline suite actually EXECUTES, and each mutant lands in one
+   of two classes:
+
+   - **graded** — its line is inside an executed function. A test ran that code
+     and did not notice the change: an assertion gap, and the gate's red.
+   - **reported** — its line is inside a function measured at ZERO executions.
+     No offline assertion can kill it; it is a triage question
+     (`.cargo/mutants.toml` with a live-oracle proof, or a unit oracle that
+     moves the function into the graded class).
+
+   This is what makes the gate useful on a big diff: the budget guard now tests
+   the GRADED subset, so a foundational PR that used to be graded by nothing
+   gets its offline-reachable mutants graded. Two properties keep the split
+   from becoming an excuse — everything the measurement does not KNOW (no
+   report, an unmentioned file, an unparseable name) stays in the graded class,
+   and whenever the budget stretches to it the reported class is RUN as an
+   audit: if the offline suite catches one of them, the classification was
+   wrong and `Mutants (coverage verdict)` fails.
 2. **Nightly (devbox self-hosted runner).** Full `--lib` runs over Tier 0-2 in
    rotation (~500-1000 mutants/night). Result diffed against the committed
    baseline (`docs/mutants-baseline.txt`): any missed mutant NOT in the
