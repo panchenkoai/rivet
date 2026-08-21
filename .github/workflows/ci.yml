@@ -245,6 +245,13 @@ jobs:
       p1: ${{ steps.mutate.outputs.p1 }}
       p2: ${{ steps.mutate.outputs.p2 }}
       p2_audit: ${{ steps.mutate.outputs.p2_audit }}
+      # The run's tally, for the non-blocking `harness-metrics` job only. These
+      # are the ONLY outputs here nothing asserts on: a thermometer, published
+      # beside the evidence rather than instead of it.
+      caught: ${{ steps.mutate.outputs.caught }}
+      missed: ${{ steps.mutate.outputs.missed }}
+      timeout: ${{ steps.mutate.outputs.timeout }}
+      unviable: ${{ steps.mutate.outputs.unviable }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -514,6 +521,18 @@ jobs:
           rc=0
           cargo mutants --in-diff pr.diff ${DROP_P2[@]+"${DROP_P2[@]}"} -j 2 -- --lib --bins || rc=$?
           verdict "$rc"
+          # The run's own tally, published for the harness-metrics THERMOMETER
+          # (see the `harness-metrics` job). Nothing gates on these; they exist
+          # so a human can read a trend instead of re-deriving it from forty
+          # log lines. Absent files stay ABSENT — an unset output is `null` in
+          # the artifact, never 0, because "the run never happened" and "nothing
+          # was missed" must not look alike on a chart.
+          for class in caught missed timeout unviable; do
+            f="mutants.out/$class.txt"
+            if [ -f "$f" ]; then
+              say "$class" "$(grep -c . "$f" || true)"
+            fi
+          done
           # THE REPORT-ONLY CLASS IS ITSELF AUDITED, whenever the budget stretches
           # to it. "These mutants cannot be killed offline" is a claim, and the
           # one thing that can falsify it is running them: if the offline suite
@@ -590,6 +609,10 @@ jobs:
       expected_state: ${{ steps.coverage.outputs.expected_state || steps.scope.outputs.expected_state }}
       graded: ${{ steps.graded.outputs.graded }}
       untiered: ${{ steps.coverage.outputs.untiered }}
+      # Thermometer only (the `harness-metrics` job): the in-diff corpus before
+      # .cargo/mutants.toml, and how much of it the exclusions removed.
+      in_scope: ${{ steps.graded.outputs.in_scope }}
+      excluded: ${{ steps.graded.outputs.excluded }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -684,6 +707,12 @@ jobs:
           all=$(grep -c . diff-all.txt || true)
           graded=$(grep -c . diff-graded.txt || true)
           echo "graded=$graded" >> "$GITHUB_OUTPUT"
+          # The corpus BEFORE .cargo/mutants.toml, and what it removed — the
+          # only place in this workflow that knows either. Published for the
+          # non-blocking `harness-metrics` job so "how much of each diff does
+          # the exclusion list eat?" is a trend line rather than an argument.
+          echo "in_scope=$all" >> "$GITHUB_OUTPUT"
+          echo "excluded=$((all - graded))" >> "$GITHUB_OUTPUT"
           if [ "$all" -eq 0 ]; then
             echo "::notice::this diff changes no mutable source line — zero mutants is correct here."
             exit 0
@@ -933,6 +962,69 @@ jobs:
           fi
           echo "ok: audit and run agree on '$STATE'; the run's verdict is '${RESULT:-n/a}' over ${P1:-$COUNT} graded / ${P2:-0} reported mutants (reach='${REACH:-n/a}', report-only audit '${P2_AUDIT:-n/a}')."
 
+  # A THERMOMETER for the harness itself — the one job here that grades nothing.
+  #
+  # Every gate above measures the product, or a gate that measures the product.
+  # Nothing measured the HARNESS: how many convention-cop guards there are, how
+  # many of them prove their subject exists (tests/offline/nonvacuity.rs), how
+  # much of each diff the exclusion list eats, how the offline-reachable and
+  # live-only mutant classes are moving, how many tests declare themselves
+  # documentation rather than verification. Those numbers are knowable and
+  # nobody was writing them down, so a guard could rot for months with every
+  # signal a reader has still reading green (three did — see nonvacuity.rs).
+  #
+  # It is deliberately NOT a gate, and the shape of the job says so: no
+  # threshold, no `needs:` from anything, `continue-on-error` on top of an
+  # `if: always()`, and no toolchain — checkout plus python3, seconds. A metric
+  # with teeth becomes a number people MANAGE (pad the cop count, name a test
+  # `_documents_` to duck a red); a metric a human reads once a month is a
+  # trend. `tests/offline/harness_metrics_guard.rs` asserts that it stays that
+  # way, and grades the emitter's pure shaping from a fixture of counts.
+  harness-metrics:
+    name: Harness self-metrics (trend, not a gate)
+    runs-on: ubuntu-latest
+    needs: [mutants-in-diff, mutants-gate-sanity]
+    # `always()`: the interesting runs are exactly the ones where a job above
+    # ended badly, and a thermometer that only reports on healthy runs draws a
+    # flat line through every incident.
+    if: always()
+    continue-on-error: true
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      # Unset inputs are passed through as EMPTY, and the emitter records an
+      # empty count as `null` — never 0. A docs-only PR, a skipped mutation job
+      # or a timed-out one must leave a HOLE in the trend, because "0 missed"
+      # and "nothing ran" are opposite readings of the same chart.
+      - name: Emit this run's harness metrics
+        id: emit
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/harness_metrics.py emit --out harness-metrics.json \
+            state='${{ needs.mutants-in-diff.outputs.state }}' \
+            reach='${{ needs.mutants-in-diff.outputs.reach }}' \
+            report_only_audit='${{ needs.mutants-in-diff.outputs.p2_audit }}' \
+            in_scope='${{ needs.mutants-gate-sanity.outputs.in_scope }}' \
+            excluded='${{ needs.mutants-gate-sanity.outputs.excluded }}' \
+            graded='${{ needs.mutants-gate-sanity.outputs.graded }}' \
+            offline_reachable='${{ needs.mutants-in-diff.outputs.p1 }}' \
+            live_only='${{ needs.mutants-in-diff.outputs.p2 }}' \
+            caught='${{ needs.mutants-in-diff.outputs.caught }}' \
+            missed='${{ needs.mutants-in-diff.outputs.missed }}' \
+            unviable='${{ needs.mutants-in-diff.outputs.unviable }}' \
+            timeout='${{ needs.mutants-in-diff.outputs.timeout }}' \
+            | tee summary.txt
+          # …and into the run's UI, where a human actually passes by. The line
+          # is read back off the artifact's own `summary` field by the emitter,
+          # so the log and the JSON cannot drift.
+          echo "::notice::$(cat summary.txt)"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: harness-metrics
+          path: harness-metrics.json
+          if-no-files-found: warn
+
   # The gate's own scripts, graded. Seconds, no toolchain. Each `selftest` is a
   # unit check of the parser or coercion the gate depends on; `check` grades the
   # nightly rotation itself (a tier naming a moved file, an arm that tiers no
@@ -965,6 +1057,14 @@ jobs:
       # wasn't covered, so it doesn't count".
       - name: The mutant prioritiser fails closed
         run: python3 .github/scripts/mutants_classify.py --self-test
+      # The harness thermometer's SHAPING, over fixtures of counts: an unknown
+      # count must publish as null and never 0, a rate over an unknown or a zero
+      # denominator must be null, contradictory inputs must be reported rather
+      # than repaired, and the census must refuse to describe an empty tree as a
+      # harness with no guards. No gate rides on the numbers; the numbers still
+      # have to be true.
+      - name: The harness metrics say `unknown`, not `zero`
+        run: python3 .github/scripts/harness_metrics.py --self-test
       # `--self-test` returns before any stage, container or binary is touched —
       # it grades the argv/env coercion only, so this invocation needs no
       # RIVET_PREV_RELEASE_BIN and is not a gate run (cf. the Makefile-scoped

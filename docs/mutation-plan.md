@@ -125,6 +125,31 @@ boolean coercion in `build_array` (`*v != 0` -> `*v == 0`) DOES fail the live
 subset (`live_init::init_mysql_schema_wide_discovers_seeded_table`). For that
 class the claim holds — as a measurement now, not an assurance.
 
+## The harness's own thermometer (2026-08-21)
+
+Every loop above measures the PRODUCT. Nothing measured the harness, so a guard
+could rot for months with every signal a reader has still reading green — three
+did (see `tests/offline/nonvacuity.rs`). The `harness-metrics` job in ci.yml now
+emits one JSON per run (`.github/scripts/harness_metrics.py`, uploaded as the
+`harness-metrics` artifact, one-line summary in the job log):
+
+- **mutants** — in scope, excluded by `.cargo/mutants.toml`, graded, and the
+  classifier's offline-reachable / live-only split, plus caught / missed.
+- **guards** — convention-cop guards (a `#[test]` file grading a checked-in
+  subject by NAME), how many prove that subject is non-empty, how many tests
+  are named `..._documents_...` (documentation, not verification), how many
+  files declare a blind spot in prose.
+- **tests** — DECLARED `#[test]` counts for the offline suite and the lib (the
+  job runs no cargo; it counts attributes, so the number differs from a
+  runner's tally by whatever is `cfg`-gated out).
+
+It is a THERMOMETER: no threshold, no `needs:` from any job, `continue-on-error`
+on top of `if: always()`. A metric with teeth becomes a number people manage
+(pad the cop count; rename a test `_documents_` to duck a red). An unknown count
+is published as `null`, never `0` — "the mutation job never ran" and "nothing
+was missed" must not draw the same line. `tests/offline/harness_metrics_guard.rs`
+grades the shaping from a fixture of counts and keeps the job non-blocking.
+
 ## Triage verdicts
 
 - **add-test** — write the unit test that kills it (e.g. the pilot's
