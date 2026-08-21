@@ -69,6 +69,8 @@ mod run_summary_contract;
 
 #[path = "offline/cli_flag_coverage_guard.rs"]
 mod cli_flag_coverage_guard;
+#[path = "offline/live_only_purity_gate.rs"]
+mod live_only_purity_gate;
 #[path = "offline/live_service_ports_guard.rs"]
 mod live_service_ports_guard;
 #[path = "offline/rig_adoption_guard.rs"]
