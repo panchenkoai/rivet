@@ -138,6 +138,71 @@ pub(crate) fn strategy_probes_index(export: &ExportConfig) -> bool {
     ) || export.chunk_by_key.is_some()
 }
 
+// ── The probe seam: one diagnostic skeleton, three engines' catalog SQL ──────
+//
+// ADR-0015 (source introspection is a data-shape seam, not a trait) applies
+// here verbatim: the PROBES share nothing extractable — `pg_index` vs
+// `information_schema.STATISTICS` vs `sys.indexes`, three client crates, three
+// dialects — so they stay per-engine free functions. What they share is the
+// WIRING: which column to probe, when to probe it, and how the answer becomes a
+// verdict. That policy was hand-copied into all three `diagnose_*` (down to the
+// verbatim auto-pk comment), which is the mechanism by which `chunk_by_key` was
+// missed three ways. The three targets below plus [`assemble_diagnostic`] hold
+// it ONCE, so the next strategy or check lands once.
+
+/// The base relation the catalog probes key on, for the PG/MySQL diagnostics:
+/// the configured `table:` when there is one, else the single relation parsed
+/// out of a simple `SELECT … FROM <table>`. `None` for anything that is not one
+/// base table (joins, subqueries, hand-written inline SQL) — the probes then
+/// degrade to an honest "unknown" rather than describing the wrong relation.
+/// MSSQL resolves its own base relation (`strip_select_star_from` first, then
+/// the same simple-FROM parser) because its probes key on the RENDERED query;
+/// it feeds the result into the same two targets below.
+pub(crate) fn preflight_base_table<'a>(
+    export: &'a ExportConfig,
+    base_query: &'a str,
+) -> Option<&'a str> {
+    export
+        .table
+        .as_deref()
+        .or_else(|| super::postgres::table_from_simple_query(base_query))
+}
+
+/// The table an engine runs its single-int-PK probe against — `Some` ONLY when
+/// the planner would actually auto-resolve this export's chunk column
+/// ([`should_auto_resolve_chunk_pk`]) and the base relation is known. The gate
+/// `build_plan` mirrors: without it `range_col` / the strategy label / the index
+/// probe target a different column than the run reads, and a PK-indexed table
+/// reports a false UNSAFE + `chunked(?, …)` (post-0.24.3 MED).
+pub(crate) fn auto_pk_probe_target<'a>(
+    export: &ExportConfig,
+    base_table: Option<&'a str>,
+) -> Option<&'a str> {
+    if should_auto_resolve_chunk_pk(export) {
+        base_table
+    } else {
+        None
+    }
+}
+
+/// The `(table, column)` an engine runs its leading-key index probe against —
+/// `Some` ONLY when the strategy reads on an indexed key
+/// ([`strategy_probes_index`]), the read column resolves
+/// ([`preflight_range_col_resolved`]) and the base relation is known. A `None`
+/// here means "no catalog answer", which [`assemble_diagnostic`] reads as "keep
+/// the engine's plan hint" — never as "no index".
+pub(crate) fn index_probe_target<'a>(
+    export: &'a ExportConfig,
+    auto_pk: Option<&'a str>,
+    base_table: Option<&'a str>,
+) -> Option<(&'a str, &'a str)> {
+    if !strategy_probes_index(export) {
+        return None;
+    }
+    let col = preflight_range_col_resolved(export, auto_pk)?;
+    Some((base_table?, col))
+}
+
 /// #149: measured beats declared — and the report SAYS which it stands on.
 ///
 /// After one successful run, `export_metrics.total_rows` is EXACT; the catalog
@@ -918,6 +983,128 @@ pub(crate) fn build_suggestion(
     }
 }
 
+/// What one engine's catalog/plan probes ANSWERED about an export — the data
+/// shape the three SQL diagnostics hand to [`assemble_diagnostic`].
+///
+/// Every field is an observation, never a decision: the engine says what it
+/// found (or `None` where the probe was skipped / failed / has no analogue on
+/// that engine), and the policy above turns the set into a verdict. Fill it with
+/// the shared targets — [`auto_pk_probe_target`] for `auto_pk`,
+/// [`index_probe_target`] for `catalog_index` — so a probe never runs on a
+/// column the run does not read.
+pub(crate) struct ProbeFacts {
+    /// The single-integer PK the planner would auto-resolve an unset chunked
+    /// `chunk_column` to (`build_plan`). `None` when the export does not
+    /// auto-resolve, the base relation is unknown, or the PK is composite /
+    /// non-integer / absent — exactly when the planner would not use one either.
+    pub auto_pk: Option<String>,
+    /// Scan-free row estimate (PG EXPLAIN `rows=`, MySQL EXPLAIN `rows`, MSSQL
+    /// `dm_db_partition_stats`). `None` = unknown, which the checks read as
+    /// "unknown", never as zero.
+    pub row_estimate: Option<i64>,
+    /// Average bytes per row, where the engine has a figure worth trusting.
+    /// `None` on MySQL by choice (`AVG_ROW_LENGTH` rides the same InnoDB random
+    /// dives as `TABLE_ROWS`), which skips the oversized-chunk check.
+    pub avg_row_bytes: Option<i64>,
+    /// MIN/MAX of the incremental key expression or the range column, as text.
+    pub range_min: Option<String>,
+    pub range_max: Option<String>,
+    /// Human-readable access-path description from the query plan (`Seq Scan`,
+    /// `range using PRIMARY`). `None` where the engine exposes no parseable plan
+    /// over the diagnostic's seam (MSSQL) — the printer then omits the line
+    /// rather than fabricating one.
+    pub scan_type: Option<String>,
+    /// Did the plan for the BASE query use an index? A weak hint: the base query
+    /// has no WHERE, so PG/MySQL legitimately pick a seq scan on a perfectly
+    /// indexed chunk column. `false` where there is no plan to read (MSSQL).
+    pub plan_uses_index: bool,
+    /// Is the read column the leading key of an index on the base table, per the
+    /// CATALOG? `Some(true)`/`Some(false)` from a clean probe, `None` when the
+    /// probe was not run ([`index_probe_target`] said no) or failed.
+    pub catalog_index: Option<bool>,
+    /// The server's configured connection cap, for the parallelism check.
+    pub db_max_connections: Option<u32>,
+}
+
+/// Turn one engine's [`ProbeFacts`] into the export's [`ExportDiagnostic`] —
+/// the policy half of every `diagnose_*`, written once.
+///
+/// Owns the decisions the three engines used to each hand-copy: the
+/// catalog-overrides-the-plan-hint rule, the auto-resolved strategy label, and
+/// the verdict / profile / parallelism / warnings / suggestion assembly. The
+/// engines keep only their dialect-specific SQL, so a new check (or a new
+/// strategy) is wired HERE and every engine gets it — the diagnostic-bypass fix
+/// stated once instead of three times.
+pub(crate) fn assemble_diagnostic(
+    export: &ExportConfig,
+    facts: ProbeFacts,
+) -> super::ExportDiagnostic {
+    let ProbeFacts {
+        auto_pk,
+        row_estimate,
+        avg_row_bytes,
+        range_min,
+        range_max,
+        scan_type,
+        plan_uses_index,
+        catalog_index,
+        db_max_connections,
+    } = facts;
+
+    // The plan hint describes the BASE query (no WHERE), where a seq scan is
+    // often the right plan even on a perfectly indexed chunk column. The run
+    // does not issue that query — it issues `WHERE range_col >= $lo AND < $hi`
+    // (or `> $last`), which uses the btree. So a catalog YES outranks the plan
+    // hint; a catalog NO or an unavailable/skipped probe leaves the hint
+    // standing, since the catalog answer is about the range column only.
+    let uses_index = match catalog_index {
+        Some(true) => true,
+        Some(false) | None => plan_uses_index,
+    };
+
+    let strategy = derive_strategy_resolved(export, auto_pk.as_deref());
+    let verdict = compute_verdict(
+        row_estimate,
+        uses_index,
+        export.cursor_column.is_some(),
+        avg_row_bytes,
+        export.parallel,
+    );
+    let recommended_profile = recommend_profile(row_estimate, uses_index, export);
+    let recommended_parallel = recommend_parallelism(export, row_estimate, uses_index);
+    let warnings = collect_warnings(
+        export,
+        row_estimate,
+        avg_row_bytes,
+        range_min.as_deref(),
+        range_max.as_deref(),
+        db_max_connections,
+    );
+    let suggestion = build_suggestion(&verdict, row_estimate, uses_index, export);
+
+    super::ExportDiagnostic {
+        row_source: None,
+        export_name: export.name.clone(),
+        strategy,
+        mode: diagnose_mode_str(export),
+        cursor_column: export.cursor_column.clone(),
+        row_estimate,
+        avg_row_bytes,
+        cursor_min: range_min.clone(),
+        cursor_max: range_max.clone(),
+        scan_type,
+        uses_index,
+        verdict,
+        recommended_profile,
+        recommended_parallel,
+        warnings,
+        suggestion,
+        chunk_min: range_min,
+        chunk_max: range_max,
+        db_max_connections,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1282,6 +1469,169 @@ mod tests {
             !strategy_probes_index(&cfg("mode: full\n")),
             "a plain full scan reads no indexed key — must NOT probe"
         );
+    }
+
+    // ── the shared skeleton: probe targets + assemble_diagnostic ─────────────
+    // The wiring the three engines used to hand-copy. Fabricating ProbeFacts is
+    // legitimate here because the POLICY is the subject; per-engine probe
+    // correctness (does this catalog SQL answer truthfully?) stays with the live
+    // suites, where a real catalog is the oracle.
+
+    fn facts() -> ProbeFacts {
+        ProbeFacts {
+            auto_pk: None,
+            row_estimate: Some(1_000),
+            avg_row_bytes: None,
+            range_min: None,
+            range_max: None,
+            scan_type: None,
+            plan_uses_index: false,
+            catalog_index: None,
+            db_max_connections: None,
+        }
+    }
+
+    #[test]
+    fn index_probe_target_names_the_column_every_read_strategy_reads_on() {
+        let t = Some("orders");
+        assert_eq!(
+            index_probe_target(&cfg("mode: chunked\nchunk_column: id\n"), None, t),
+            Some(("orders", "id"))
+        );
+        assert_eq!(
+            index_probe_target(&cfg("mode: chunked\nchunk_by_key: uuid\n"), None, t),
+            Some(("orders", "uuid")),
+            "keyset probes its seek key, not the absent chunk_column"
+        );
+        assert_eq!(
+            index_probe_target(
+                &cfg("mode: time_window\ntime_column: ts\ndays_window: 7\n"),
+                None,
+                t
+            ),
+            Some(("orders", "ts"))
+        );
+        assert_eq!(
+            index_probe_target(&cfg("mode: chunked\n"), Some("id"), t),
+            Some(("orders", "id")),
+            "an auto-resolved chunk PK is the column the run ranges on — probe THAT"
+        );
+        assert_eq!(
+            index_probe_target(&cfg("mode: full\n"), None, t),
+            None,
+            "a plain full scan reads no indexed key — no probe to run"
+        );
+        assert_eq!(
+            index_probe_target(&cfg("mode: chunked\nchunk_column: id\n"), None, None),
+            None,
+            "an unresolvable base relation must not be guessed at"
+        );
+    }
+
+    #[test]
+    fn auto_pk_probe_target_fires_only_where_the_planner_auto_resolves() {
+        assert_eq!(
+            auto_pk_probe_target(&cfg("mode: chunked\n"), Some("orders")),
+            Some("orders")
+        );
+        assert_eq!(
+            auto_pk_probe_target(&cfg("mode: chunked\nchunk_column: id\n"), Some("orders")),
+            None,
+            "an explicit chunk_column is what the planner ranges on — no PK probe"
+        );
+        assert_eq!(
+            auto_pk_probe_target(&cfg("mode: full\n"), Some("orders")),
+            None
+        );
+        assert_eq!(auto_pk_probe_target(&cfg("mode: chunked\n"), None), None);
+    }
+
+    #[test]
+    fn assemble_diagnostic_lets_a_catalog_yes_outrank_the_base_plan_hint() {
+        let e = cfg("mode: chunked\nchunk_column: id\n");
+        // The false-DEGRADED case the override exists for: EXPLAIN of the
+        // no-WHERE base query says Seq Scan, the catalog says the chunk column
+        // leads a btree, and the run issues the BETWEEN that uses it.
+        let d = assemble_diagnostic(
+            &e,
+            ProbeFacts {
+                plan_uses_index: false,
+                catalog_index: Some(true),
+                ..facts()
+            },
+        );
+        assert!(d.uses_index, "a catalog YES must beat the base-query plan");
+
+        // A clean catalog NO is about the range column only, so the plan hint
+        // (which described the whole query) still stands.
+        let d = assemble_diagnostic(
+            &e,
+            ProbeFacts {
+                plan_uses_index: true,
+                catalog_index: Some(false),
+                ..facts()
+            },
+        );
+        assert!(d.uses_index);
+
+        // No catalog answer (probe skipped or failed) => the plan hint, verbatim.
+        for hint in [true, false] {
+            let d = assemble_diagnostic(
+                &e,
+                ProbeFacts {
+                    plan_uses_index: hint,
+                    catalog_index: None,
+                    ..facts()
+                },
+            );
+            assert_eq!(d.uses_index, hint, "no catalog answer keeps the plan hint");
+        }
+    }
+
+    #[test]
+    fn assemble_diagnostic_labels_the_auto_resolved_pk_not_a_question_mark() {
+        let d = assemble_diagnostic(
+            &cfg("mode: chunked\nchunk_size: 50000\n"),
+            ProbeFacts {
+                auto_pk: Some("id".to_string()),
+                ..facts()
+            },
+        );
+        assert_eq!(d.strategy, "chunked(id, size=50000)");
+        assert!(
+            !d.strategy.contains('?'),
+            "the `?` placeholder is the diagnostic-bypass tell"
+        );
+    }
+
+    /// The skeleton is only de-triplicated while every engine ROUTES through it.
+    /// A second `ExportDiagnostic { … }` literal in an engine file is the old
+    /// wiring growing back — and with it the next check that lands in one engine
+    /// and silently skips the other two (the diagnostic-bypass class). Mongo is
+    /// deliberately NOT in this list: it runs no catalog probe and no policy
+    /// (full-scan only, mode-advice suppressed), so it keeps its own literal.
+    #[test]
+    fn every_sql_engine_diagnostic_routes_through_the_assembler() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/preflight");
+        for engine in ["postgres.rs", "mysql.rs", "mssql.rs"] {
+            let src = std::fs::read_to_string(dir.join(engine)).expect("read engine diagnostic");
+            // Comment-stripped, so a mention in prose cannot satisfy the gate.
+            let code = src
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                code.contains("assemble_diagnostic("),
+                "{engine} must build its diagnostic through the shared assembler"
+            );
+            assert!(
+                !code.contains("ExportDiagnostic {"),
+                "{engine} constructs an ExportDiagnostic itself — the assembly \
+                 policy (index override, strategy label, warnings) is shared and \
+                 must not be re-stated per engine"
+            );
+        }
     }
 
     // ── keyset (chunk_by_key) must be labelled keyset, never `chunked(?, …)` ──
