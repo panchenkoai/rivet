@@ -31,6 +31,8 @@ pub(super) enum StateParam {
     Text(String),
     OptText(Option<String>),
     Bool(bool),
+    OptBool(Option<bool>),
+    OptF64(Option<f64>),
 }
 
 impl From<i64> for StateParam {
@@ -68,6 +70,16 @@ impl From<bool> for StateParam {
         StateParam::Bool(v)
     }
 }
+impl From<Option<bool>> for StateParam {
+    fn from(v: Option<bool>) -> Self {
+        StateParam::OptBool(v)
+    }
+}
+impl From<Option<f64>> for StateParam {
+    fn from(v: Option<f64>) -> Self {
+        StateParam::OptF64(v)
+    }
+}
 
 impl rusqlite::types::ToSql for StateParam {
     fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
@@ -77,6 +89,8 @@ impl rusqlite::types::ToSql for StateParam {
             StateParam::Text(v) => v.to_sql(),
             StateParam::OptText(v) => v.to_sql(),
             StateParam::Bool(v) => v.to_sql(),
+            StateParam::OptBool(v) => v.to_sql(),
+            StateParam::OptF64(v) => v.to_sql(),
         }
     }
 }
@@ -93,6 +107,8 @@ fn pg_params(params: &[StateParam]) -> Vec<&(dyn postgres::types::ToSql + Sync)>
                 StateParam::Text(v) => v,
                 StateParam::OptText(v) => v,
                 StateParam::Bool(v) => v,
+                StateParam::OptBool(v) => v,
+                StateParam::OptF64(v) => v,
             }
         })
         .collect()

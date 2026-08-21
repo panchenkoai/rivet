@@ -1,6 +1,8 @@
 use crate::error::Result;
 
-use super::{StateConn, StateStore, pg_sql};
+#[cfg(test)]
+use super::StateConn;
+use super::StateStore;
 
 /// One row from `export_metrics`.
 #[derive(Debug)]
@@ -102,15 +104,10 @@ impl StateStore {
     /// Drop a run's in-flight `running` aggregate. Only ever called by
     /// [`record_metric_full`], immediately before the terminal row replaces it.
     fn clear_running_metric(&self, run_id: &str) -> Result<()> {
-        let sql = "DELETE FROM export_metrics WHERE run_id = ?1 AND status = 'running'";
-        match &self.conn {
-            StateConn::Sqlite(c) => {
-                c.execute(sql, rusqlite::params![run_id])?;
-            }
-            StateConn::Postgres(client) => {
-                client.borrow_mut().execute(&pg_sql(sql), &[&run_id])?;
-            }
-        }
+        self.execute(
+            "DELETE FROM export_metrics WHERE run_id = ?1 AND status = 'running'",
+            &[run_id.into()],
+        )?;
         Ok(())
     }
 
@@ -159,20 +156,17 @@ impl StateStore {
         // idempotent against the v21 partial unique index, and the UPDATE that
         // follows recomputes the whole projection from `file_log`, so the final
         // row is correct no matter which worker won or in what order they ran.
-        match &self.conn {
-            StateConn::Sqlite(c) => {
-                c.execute(
-                    ins,
-                    rusqlite::params![export_name, run_id, now, mode, format],
-                )?;
-                c.execute(upd, rusqlite::params![run_id, now])?;
-            }
-            StateConn::Postgres(client) => {
-                let mut c = client.borrow_mut();
-                c.execute(&pg_sql(ins), &[&export_name, &run_id, &now, &mode, &format])?;
-                c.execute(&pg_sql(upd), &[&run_id, &now])?;
-            }
-        }
+        self.execute(
+            ins,
+            &[
+                export_name.into(),
+                run_id.into(),
+                now.as_str().into(),
+                mode.into(),
+                format.into(),
+            ],
+        )?;
+        self.execute(upd, &[run_id.into(), now.into()])?;
         Ok(())
     }
 
@@ -199,101 +193,50 @@ impl StateStore {
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
              ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31,
              ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39)";
-        match &self.conn {
-            StateConn::Sqlite(c) => {
-                c.execute(
-                    sql,
-                    rusqlite::params![
-                        m.export_name,
-                        m.run_id,
-                        now,
-                        m.duration_ms,
-                        m.total_rows,
-                        m.peak_rss_mb,
-                        m.status,
-                        m.error_message,
-                        m.tuning_profile,
-                        m.format,
-                        m.mode,
-                        m.files_produced,
-                        m.bytes_written,
-                        m.retries,
-                        m.validated,
-                        m.schema_changed,
-                        m.files_committed,
-                        m.reconciled,
-                        m.source_count,
-                        m.quality_passed,
-                        m.pg_temp_bytes_delta,
-                        m.batch_size,
-                        m.batch_size_memory_mb,
-                        m.skip_reason,
-                        m.schema_fingerprint,
-                        m.chunk_size,
-                        m.parallel,
-                        m.source_type,
-                        m.destination_type,
-                        m.rivet_version,
-                        m.longest_chunk_ms,
-                        m.chunk_key,
-                        m.error_class,
-                        m.cursor_min,
-                        m.cursor_max,
-                        m.key_descriptor_json,
-                        m.offending_value,
-                        m.server_context_json,
-                        m.bytes_read
-                    ],
-                )?;
-            }
-            StateConn::Postgres(client) => {
-                let mut c = client.borrow_mut();
-                c.execute(
-                    &pg_sql(sql),
-                    &[
-                        &m.export_name,
-                        &m.run_id,
-                        &now,
-                        &m.duration_ms,
-                        &m.total_rows,
-                        &m.peak_rss_mb,
-                        &m.status,
-                        &m.error_message,
-                        &m.tuning_profile,
-                        &m.format,
-                        &m.mode,
-                        &m.files_produced,
-                        &m.bytes_written,
-                        &m.retries,
-                        &m.validated,
-                        &m.schema_changed,
-                        &m.files_committed,
-                        &m.reconciled,
-                        &m.source_count,
-                        &m.quality_passed,
-                        &m.pg_temp_bytes_delta,
-                        &m.batch_size,
-                        &m.batch_size_memory_mb,
-                        &m.skip_reason,
-                        &m.schema_fingerprint,
-                        &m.chunk_size,
-                        &m.parallel,
-                        &m.source_type,
-                        &m.destination_type,
-                        &m.rivet_version,
-                        &m.longest_chunk_ms,
-                        &m.chunk_key,
-                        &m.error_class,
-                        &m.cursor_min,
-                        &m.cursor_max,
-                        &m.key_descriptor_json,
-                        &m.offending_value,
-                        &m.server_context_json,
-                        &m.bytes_read,
-                    ],
-                )?;
-            }
-        }
+        self.execute(
+            sql,
+            &[
+                m.export_name.as_str().into(),
+                m.run_id.as_str().into(),
+                now.into(),
+                m.duration_ms.into(),
+                m.total_rows.into(),
+                m.peak_rss_mb.into(),
+                m.status.as_str().into(),
+                m.error_message.as_deref().into(),
+                m.tuning_profile.as_deref().into(),
+                m.format.as_deref().into(),
+                m.mode.as_deref().into(),
+                m.files_produced.into(),
+                m.bytes_written.into(),
+                m.retries.into(),
+                m.validated.into(),
+                m.schema_changed.into(),
+                m.files_committed.into(),
+                m.reconciled.into(),
+                m.source_count.into(),
+                m.quality_passed.into(),
+                m.pg_temp_bytes_delta.into(),
+                m.batch_size.into(),
+                m.batch_size_memory_mb.into(),
+                m.skip_reason.as_deref().into(),
+                m.schema_fingerprint.as_deref().into(),
+                m.chunk_size.into(),
+                m.parallel.into(),
+                m.source_type.as_deref().into(),
+                m.destination_type.as_deref().into(),
+                m.rivet_version.as_deref().into(),
+                m.longest_chunk_ms.into(),
+                m.chunk_key.as_deref().into(),
+                m.error_class.as_deref().into(),
+                m.cursor_min.as_deref().into(),
+                m.cursor_max.as_deref().into(),
+                m.key_descriptor_json.as_deref().into(),
+                m.offending_value.as_deref().into(),
+                m.server_context_json.as_deref().into(),
+                m.bytes_read.into(),
+            ],
+        )?;
         Ok(())
     }
 
@@ -331,6 +274,9 @@ impl StateStore {
 
     /// Test-only read of the `export_harm` rows for a run, `(metric, delta)`
     /// sorted by metric — lets tests trace the harm signal through the table.
+    ///
+    /// Divergent-by-design (row.rs exemption): a sqlite-only test probe (the
+    /// non-sqlite arm deliberately returns empty), so it keeps its raw match.
     #[cfg(test)]
     pub(crate) fn harm_rows_for_test(&self, run_id: &str) -> Vec<(String, i64)> {
         match &self.conn {
@@ -354,6 +300,9 @@ impl StateStore {
     /// Test-only raw scalar read of a v9 metric column the typed `get_metrics`
     /// path intentionally doesn't surface — lets tests pin that the wide INSERT
     /// mapped each field to the right column (catches a positional param swap).
+    ///
+    /// Divergent-by-design (row.rs exemption): a sqlite-only test probe with a
+    /// `format!`-interpolated column name, so it keeps its raw match.
     #[cfg(test)]
     pub(crate) fn metric_scalar_i64(&self, run_id: &str, column: &str) -> Option<i64> {
         match &self.conn {
