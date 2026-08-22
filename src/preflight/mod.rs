@@ -225,6 +225,59 @@ fn target_fail_note(n: usize, target_label: &str) -> String {
     )
 }
 
+/// The `--target` epilogue's inputs, folded across every REPORT of every export.
+///
+/// Extracted from [`check`]'s render loop rather than accumulated inline,
+/// because the sum IS the epilogue's honesty: `check` prints "N column(s) FAIL
+/// …" and still exits 0 without `--strict`, so an under-count silently retracts
+/// the warning the "fail ✗" glyph already made — and inline in a function that
+/// needs a live database, no offline test can observe the arithmetic at all (the
+/// in-diff mutation gate graded `+=` → `*=`/`-=` on that line as MISSED).
+///
+/// The fold now crosses TABLES as well as exports: a multiplex `tables:` export
+/// contributes one report PER CAPTURED TABLE, so a tally that stopped at the
+/// first report of an export would under-count a whole schema to one table's
+/// worth.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct TargetFailTally {
+    /// Columns the target refuses outright, summed over every report.
+    columns: usize,
+    /// The label of the FIRST target that refused anything — the note names one
+    /// warehouse, and a config can set `target:` per export.
+    label: Option<&'static str>,
+    /// Any fatal policy violation, or any target-refused column: what `--strict`
+    /// bails on.
+    any_fatal: bool,
+}
+
+impl TargetFailTally {
+    /// Fold ONE export's reports in — all of them, `target` being the export's
+    /// effective target (`None` when nothing was resolved against one, in which
+    /// case a report can carry no target failure to count).
+    fn add_export(
+        &mut self,
+        target: Option<ExportTarget>,
+        reports: &[type_report::ExportTypeReport],
+    ) {
+        for report in reports {
+            if report.has_fatal() {
+                self.any_fatal = true;
+            }
+            if let Some(t) = target
+                && report.has_target_fail()
+            {
+                self.any_fatal = true;
+                self.columns += report
+                    .columns
+                    .iter()
+                    .filter(|c| c.target_status == Some(TargetStatus::Fail))
+                    .count();
+                self.label.get_or_insert(t.label());
+            }
+        }
+    }
+}
+
 /// Build one [`ExportDiagnostic`] per export via `diagnose`, collecting them (or
 /// short-circuiting on the first error). Single-sources the connect → loop →
 /// return contract every engine's `check_*` shares — only the per-export
@@ -401,14 +454,12 @@ pub fn check(
             TypePolicy::warn_only()
         };
 
-        let mut any_fatal = false;
         // Count hard target-FAIL columns (and remember which target) so that —
         // when --strict was NOT passed and the exit code is therefore 0 — we can
         // print a note. The "fail ✗" glyph in the table implies a hard failure,
         // but exit is gated only by --strict; without this note an operator or CI
         // reading the glyph alone would be misled into thinking rc != 0.
-        let mut target_fail_cols = 0usize;
-        let mut target_fail_label: Option<&'static str> = None;
+        let mut tally = TargetFailTally::default();
         for export in &exports {
             let column_overrides =
                 crate::plan::parse_column_overrides_pub(&export.columns, &export.name)?;
@@ -446,21 +497,8 @@ pub fn check(
                 params,
             ) {
                 Ok(reports) => {
+                    tally.add_export(eff_target, &reports);
                     for report in &reports {
-                        if report.has_fatal() {
-                            any_fatal = true;
-                        }
-                        if let Some(t) = eff_target
-                            && report.has_target_fail()
-                        {
-                            any_fatal = true;
-                            target_fail_cols += report
-                                .columns
-                                .iter()
-                                .filter(|c| c.target_status == Some(TargetStatus::Fail))
-                                .count();
-                            target_fail_label.get_or_insert(t.label());
-                        }
                         if json_output {
                             // `--json` + `--type-report` interaction (DESIGN):
                             // emit BOTH, nested. Each export gets ONE JSON object
@@ -499,16 +537,16 @@ pub fn check(
             }
         }
 
-        if strict && any_fatal {
+        if strict && tally.any_fatal {
             anyhow::bail!("strict mode: unsafe type mappings found (see report above)");
-        } else if !strict && target_fail_cols > 0 && !json_output {
+        } else if !strict && tally.columns > 0 && !json_output {
             // The table showed "fail ✗" but rc is 0 — say so explicitly. Skipped
             // under --json so NDJSON output stays one object per line.
             clean = false;
             println!();
             println!(
                 "{}",
-                target_fail_note(target_fail_cols, target_fail_label.unwrap_or("target"))
+                target_fail_note(tally.columns, tally.label.unwrap_or("target"))
             );
         }
     }
@@ -896,6 +934,90 @@ mod tests {
             target_failures: false,
             recovery_sql: None,
         }
+    }
+
+    /// A report of one multiplex TABLE with `n` target-refused columns.
+    fn failing_table_report(export: &str, table: &str, n: usize) -> type_report::ExportTypeReport {
+        let columns = (0..n)
+            .map(|i| type_report::TypeReportRow {
+                column: format!("c{i}"),
+                source_type: "-".into(),
+                rivet_type: "-".into(),
+                arrow_type: "-".into(),
+                fidelity: crate::types::TypeFidelity::Exact,
+                warnings: vec![],
+                target_type: Some("BIGNUMERIC".into()),
+                target_status: Some(TargetStatus::Fail),
+                target_note: None,
+                autoload_type: None,
+                cast_sql: None,
+            })
+            .collect();
+        type_report::ExportTypeReport {
+            table: Some(table.into()),
+            columns,
+            target_failures: true,
+            ..empty_report(export)
+        }
+    }
+
+    /// The `--target` epilogue's count must be the EXACT number of refused
+    /// columns across every report of every export.
+    ///
+    /// `check` prints "N column(s) FAIL <target> compatibility" and still exits 0
+    /// without `--strict`, so the number IS the warning — an under-count retracts
+    /// what the "fail ✗" glyph already promised, and a zero suppresses the note
+    /// entirely. The arithmetic used to live inline in `check`, which needs a live
+    /// database: the in-diff mutation gate graded `+=` → `*=` and `+=` → `-=`
+    /// there as MISSED, and both are silent (`*=` pins the total at 0 forever,
+    /// since it starts at 0).
+    ///
+    /// The fixture crosses BOTH folds — two exports, and two reports within the
+    /// first, because a multiplex `tables:` export now contributes one report per
+    /// captured table. A single-report fixture cannot distinguish the operators.
+    #[test]
+    fn target_fail_tally_sums_every_refused_column_across_tables_and_exports() {
+        let mut tally = TargetFailTally::default();
+        // One export, two TABLES (a multiplex stream): 2 + 1 refused columns.
+        tally.add_export(
+            Some(ExportTarget::BigQuery),
+            &[
+                failing_table_report("cdc", "orders", 2),
+                failing_table_report("cdc", "customers", 1),
+            ],
+        );
+        assert_eq!(
+            tally.columns, 3,
+            "every captured table's refused columns count — stopping at the first \
+             report under-counts a whole schema to one table"
+        );
+        // A second export adds to the same total.
+        tally.add_export(
+            Some(ExportTarget::BigQuery),
+            &[failing_table_report("events", "events", 4)],
+        );
+        assert_eq!(
+            tally,
+            TargetFailTally {
+                columns: 7,
+                label: Some("bigquery"),
+                any_fatal: true
+            },
+            "7 refused columns, the FIRST target's label, and --strict must bail"
+        );
+
+        // A clean export adds nothing and does not clear what came before.
+        tally.add_export(Some(ExportTarget::BigQuery), &[empty_report("clean")]);
+        assert_eq!(tally.columns, 7, "a clean export is a no-op, not a reset");
+
+        // No target resolved ⇒ nothing to refuse, whatever the report says.
+        let mut untargeted = TargetFailTally::default();
+        untargeted.add_export(None, &[failing_table_report("cdc", "orders", 2)]);
+        assert_eq!(
+            untargeted,
+            TargetFailTally::default(),
+            "without a target there is no target-compatibility verdict to report"
+        );
     }
 
     #[test]

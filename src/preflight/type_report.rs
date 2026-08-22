@@ -175,6 +175,52 @@ pub fn collect_reports(
         .collect()
 }
 
+/// #32 (column-applicability): downgrade every overridden column whose override
+/// *narrows* the autodetected source type to [`TypeFidelity::Lossy`].
+///
+/// A `columns:` override like `price numeric(10,2)` → `decimal(20,0)` drops the
+/// two fractional digits at `run`, but `derive_fidelity` only ever sees the
+/// RESOLVED (overridden) type and labels it `exact` — so `check` disagrees with
+/// what `run` actually does. Re-probing the source WITHOUT overrides is what
+/// makes the narrowing visible; we downgrade only when autodetect resolved the
+/// source type confidently, never on a guess, so we don't fabricate a loss we
+/// can't prove.
+///
+/// `reprobe` is a closure rather than the `&mut dyn Source` itself so the
+/// EARLY-RETURN guard is testable without a database. That guard is not a
+/// micro-optimisation: it is one saved round-trip per report, and since a
+/// multiplex `tables:` export produces one report per captured table, a
+/// 154-table schema pays it 154 times. Losing it the other way is worse —
+/// skipping the block when overrides ARE present turns a lossy override back
+/// into a confident `exact`, which is the #32 bug returning. Both directions are
+/// pinned by `narrowing_downgrade_reprobes_only_when_overrides_exist`.
+fn downgrade_narrowing_overrides(
+    mappings: &mut [crate::types::TypeMapping],
+    column_overrides: &ColumnOverrides,
+    reprobe: impl FnOnce() -> Result<Vec<crate::types::TypeMapping>>,
+) -> Result<()> {
+    if column_overrides.is_empty() {
+        return Ok(());
+    }
+    let source_mappings = reprobe()?;
+    let source_by_name: std::collections::HashMap<&str, &crate::types::RivetType> = source_mappings
+        .iter()
+        .map(|m| (m.column_name.as_str(), &m.rivet_type))
+        .collect();
+    for m in mappings {
+        if !column_overrides.contains_key(&m.column_name) {
+            continue;
+        }
+        if let Some(&src_type) = source_by_name.get(m.column_name.as_str())
+            && let Some(reason) = override_narrows(src_type, &m.rivet_type)
+        {
+            m.fidelity = TypeFidelity::Lossy;
+            m.warnings.push(reason);
+        }
+    }
+    Ok(())
+}
+
 /// One unit's report, against an already-open source connection.
 fn collect_one(
     src: &mut dyn source::Source,
@@ -187,35 +233,9 @@ fn collect_one(
 ) -> Result<ExportTypeReport> {
     let mut mappings = src.type_mappings(query, column_overrides)?;
 
-    // #32 (column-applicability): a `columns:` override that *narrows* the
-    // source type — e.g. `price numeric(10,2)` → `decimal(20,0)` — drops the
-    // two fractional digits at `run`, but `derive_fidelity` only sees the
-    // resolved (overridden) `RivetType` and labels it `exact`. That makes
-    // `check --type-report` disagree with what `run` actually does (a
-    // check↔run gap). Re-probe the *autodetected* source types (no overrides)
-    // and downgrade any overridden column whose override narrows scale or
-    // integer-digit capacity to `Lossy`, with a warning that says why. We only
-    // downgrade when the source type is confidently known (autodetect resolved
-    // it) — never on a guess, so we don't fabricate a loss we can't prove.
-    if !column_overrides.is_empty() {
-        let source_mappings = src.type_mappings(query, &ColumnOverrides::new())?;
-        let source_by_name: std::collections::HashMap<&str, &crate::types::RivetType> =
-            source_mappings
-                .iter()
-                .map(|m| (m.column_name.as_str(), &m.rivet_type))
-                .collect();
-        for m in &mut mappings {
-            if !column_overrides.contains_key(&m.column_name) {
-                continue;
-            }
-            if let Some(&src_type) = source_by_name.get(m.column_name.as_str())
-                && let Some(reason) = override_narrows(src_type, &m.rivet_type)
-            {
-                m.fidelity = TypeFidelity::Lossy;
-                m.warnings.push(reason);
-            }
-        }
-    }
+    downgrade_narrowing_overrides(&mut mappings, column_overrides, || {
+        src.type_mappings(query, &ColumnOverrides::new())
+    })?;
 
     let mut violations = policy.validate(&mappings);
 
@@ -524,6 +544,102 @@ fn rivet_type_label(t: &crate::types::RivetType) -> String {
 mod tests {
     use super::*;
     use crate::types::{RivetType, TypeFidelity};
+
+    // ── downgrade_narrowing_overrides (#32) ──────────────────────────────────
+
+    fn mapping(column: &str, native: &str, t: RivetType) -> crate::types::TypeMapping {
+        crate::types::TypeMapping {
+            column_name: column.into(),
+            source_native_type: native.into(),
+            rivet_type: t,
+            arrow_type: None,
+            // `Exact` on purpose: that is exactly what `derive_fidelity` labels a
+            // resolved override, and what makes the #32 gap silent.
+            fidelity: TypeFidelity::Exact,
+            nullable: true,
+            warnings: vec![],
+        }
+    }
+
+    /// Both directions of the re-probe guard, and the downgrade itself.
+    ///
+    /// The guard was untestable while it lived inline in `collect_one`, which
+    /// needs a live database — the in-diff mutation gate graded `delete !` on it
+    /// as MISSED. Deleting the negation is a two-sided bug and both sides are
+    /// pinned here: with overrides present the block must RUN (or a lossy
+    /// override reports `exact`, the #32 bug back), and with none it must NOT
+    /// (or every report pays a second full type probe — 154 of them for a
+    /// 154-table multiplex).
+    ///
+    /// The re-probe is observed through a flag rather than inferred from the
+    /// result, because "no overrides" is precisely the case where running the
+    /// block changes NOTHING about the output: every column `continue`s. A test
+    /// that only compared mappings would be green against the mutant.
+    #[test]
+    fn narrowing_downgrade_reprobes_only_when_overrides_exist() {
+        let source = || {
+            vec![
+                mapping("price", "numeric(10,2)", dec(10, 2)),
+                mapping("id", "int8", RivetType::Int64),
+            ]
+        };
+
+        // No overrides → the source is never re-probed, and nothing is touched.
+        let mut untouched = source();
+        let probed = std::cell::Cell::new(false);
+        downgrade_narrowing_overrides(&mut untouched, &ColumnOverrides::new(), || {
+            probed.set(true);
+            Ok(source())
+        })
+        .unwrap();
+        assert!(
+            !probed.get(),
+            "no `columns:` overrides ⇒ no second type probe — the round-trip is \
+             per REPORT, and a multiplex export has one per captured table"
+        );
+        assert!(
+            untouched.iter().all(|m| m.fidelity == TypeFidelity::Exact),
+            "nothing to downgrade without an override"
+        );
+
+        // A narrowing override → re-probed, and the narrowed column is Lossy with
+        // a reason. `id` is overridden too but WIDENS, so it must stay exact —
+        // otherwise the test passes against a mutant that downgrades everything.
+        let mut overrides = ColumnOverrides::new();
+        overrides.insert("price".into(), dec(20, 0));
+        overrides.insert("id".into(), RivetType::Int64);
+        let mut mapped = vec![
+            mapping("price", "numeric(10,2)", dec(20, 0)),
+            mapping("id", "int8", RivetType::Int64),
+        ];
+        let probed = std::cell::Cell::new(false);
+        downgrade_narrowing_overrides(&mut mapped, &overrides, || {
+            probed.set(true);
+            Ok(source())
+        })
+        .unwrap();
+        assert!(
+            probed.get(),
+            "an override present ⇒ the source IS re-probed"
+        );
+        assert_eq!(
+            mapped[0].fidelity,
+            TypeFidelity::Lossy,
+            "decimal(20,0) over numeric(10,2) drops two fractional digits at run \
+             — reporting it `exact` is the check↔run gap #32 closed"
+        );
+        assert!(
+            mapped[0].warnings.iter().any(|w| w.contains("scale")),
+            "the downgrade must say WHY: {:?}",
+            mapped[0].warnings
+        );
+        assert_eq!(
+            mapped[1].fidelity,
+            TypeFidelity::Exact,
+            "a non-narrowing override is not downgraded — the rule is narrowing, \
+             not overridden-at-all"
+        );
+    }
 
     // ── report_units (#252: the multiplex `tables:` fan-out) ─────────────────
 
