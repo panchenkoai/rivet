@@ -131,6 +131,24 @@ const BASELINE: &[(&str, usize, usize, usize, usize)] = &[
     // row is the direct measure of how much of that pass is left.
     ("src/pipeline/job.rs::execute_resolved_plan", 2, 0, 0, 1),
     ("src/pipeline/plan_cmd.rs::run_plan_command", 1, 0, 3, 1),
+    // The `rivet load` orchestrator (src/load/orchestrate.rs). Six bodies are
+    // excluded there and FIVE are listed nowhere here, because they are clean:
+    // every decision the in-diff gate reported alive in them was extracted into
+    // a named predicate with a truth table (needs_source_engine,
+    // conflicting_source_ident, up_to_date_label, ledger_says_active,
+    // prefix_is_active, cleanup_verdict, consumable_run_ids, active_run_note,
+    // append_done_line / full_done_line), and the mode router was made
+    // exhaustive so its arm-deletion mutants stop compiling.
+    //
+    // `prepare_load`'s two remaining `&&` are LET-CHAINS (`if let Some(s) =
+    // state && let Some((_, m)) = keyed.first()`), not boolean decisions: the
+    // scanner counts the token, but `replace && with ||` on them does not
+    // COMPILE (`error: || operators are not supported in let chain conditions`
+    // — verified by hand 2026-08-21), so they are unviable rather than
+    // uncaught. The comparison they guard IS extracted and unit-tested
+    // (conflicting_source_ident). Widening the scanner to skip let-chains would
+    // be a loosening; a row that says why is the reviewed alternative.
+    ("src/load/orchestrate.rs::prepare_load", 2, 0, 0, 0),
     // ── source/introspection glue ────────────────────────────────────────
     ("src/init/mod.rs::introspect_all", 2, 0, 3, 1),
     ("src/init/mysql.rs::density_probe", 1, 0, 1, 2),

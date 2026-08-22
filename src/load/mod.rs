@@ -15,6 +15,7 @@ use anyhow::{Context, Result, bail};
 
 mod bigquery;
 pub mod cdc;
+pub mod orchestrate;
 pub mod plan;
 pub mod reconcile;
 mod snowflake;

@@ -293,4 +293,69 @@ exclude_re = [
     # matches no real mutant.
     "replace < with <= in Governor::decision_cause",
     "replace match guard mssql_trusts_cert_without_verify\\(cfg\\) with (true|false) in MssqlSource::connect_with_tls",
+    # ── the `rivet load` ORCHESTRATOR (src/load/orchestrate.rs) ──────────────
+    # `run_loads` → `load_one*` → `execute_load` → `prepare_load` is the whole
+    # warehouse-load script, live-only end to end: it opens a real state DB,
+    # shells out to a `rivet check` subprocess for the type report, LISTS and
+    # parses run manifests out of a real bucket, builds a BigQuery/Snowflake
+    # loader and issues the LOAD. `cargo mutants -- --lib --bins` executes not
+    # one line of it, so every whole-function stub here is born MISSED — the
+    # documented "--lib on a live-only path" class, which reads as "no UNIT test
+    # runs this", not as N gaps. The whole file entered the in-diff scope at once
+    # because the arch-roast MOVED it out of cli/dispatch.rs (every line is a
+    # `+`), not because anything in it changed.
+    #
+    # Every DECISION these bodies used to make inline is now a named pure
+    # predicate next door with a truth table over it, and each was RED-proven
+    # against the exact mutant this gate reported alive at its old site (applied,
+    # test run, reverted — 2026-08-21): `needs_source_engine` (the `==` in
+    # run_loads), `conflicting_source_ident` (`delete !` + `!=` in prepare_load),
+    # `up_to_date_label` (the `==` in execute_load), `ledger_says_active` +
+    # `prefix_is_active` (the `||` in maybe_gc_orphans), `cleanup_verdict`
+    # (`delete !` in cleanup_target), `consumable_run_ids` + `active_run_note`
+    # (both `!`s in LoadCtx::record), `append_done_line` + `full_done_line` (the
+    # success traces, against hand-written expected strings). run_loads' mode
+    # ROUTER is exhaustive over `LoadMode` now, so its two `delete match arm`
+    # mutants no longer compile (unviable, verified by hand — `non-exhaustive
+    # patterns: LoadMode::Cdc not covered`) instead of surviving under a `_`.
+    # The three guards on a DESTRUCTIVE delete — `prefix_has_active_run`,
+    # `cleanup_target`, `maybe_gc_orphans` — are deliberately NOT excluded: they
+    # take the caller's store now and are unit-tested against a filesystem-backed
+    # one (`GcsStore::open_fs`) plus an in-memory ledger, so their body stubs die
+    # offline. A guard on a recursive delete should not be gradable only against
+    # a real bucket.
+    #
+    # HONEST ORACLE NOTE — this is a recorded COVERAGE GAP, not a triage. There
+    # is no live test in this repo that these stubs fail. `rivet load`'s only
+    # end-to-end coverage is the warehouse matrix (tests/oracle_fixture_matrix.rs
+    # → tests/harness, which runs `rivet load -c …` into BigQuery/Snowflake and
+    # re-queries the warehouse), and it needs BIGQUERY_TEST_PROJECT /
+    # RIVET_SF_* / RIVET_TEST_GCS_BUCKET — credentials the docker stand does not
+    # have. MEASURED rather than assumed: with `run_loads` stubbed to `Ok(())`,
+    # all 12 live tests matching `load` stay GREEN — they match on NAME
+    # (live_oltp_load, live_content_load, pg_load_ledger_round_trip, …) and not
+    # one of them invokes the `load` subcommand. So these entries buy silence on
+    # the in-diff gate for bodies whose only oracle is credential-gated. The fix
+    # is a live `rivet load` cell against a local warehouse (DuckDB is already
+    # the CDC suite's independent reader); until that exists this says so out
+    # loud rather than naming an oracle that does not grade it.
+    "replace run_loads ->",
+    "replace prepare_load ->",
+    "replace execute_load ->",
+    "replace load_one ->",
+    "replace load_one_cdc ->",
+    "replace load_one_incremental ->",
+    # `dispatch` (cli/dispatch.rs) is the CLI ROUTER — one match over every
+    # subcommand, each arm building a real config/state/source and calling the
+    # command it adapts. There is no offline caller (`--lib --bins` runs unit
+    # tests, never the binary), so the whole-function `Ok(())` stub is unkillable
+    # HERE by construction; it entered the in-diff scope because the Load arm
+    # shrank to one call. Its own decisions are already extracted and unit-tested
+    # (`check_export_selection`, `check_plan_compatibility` — both graded, and
+    # deliberately NOT covered by this entry).
+    # Live oracle proven by hand 2026-08-21 (stub applied, test run, reverted):
+    # `Ok(())` makes EVERY subcommand a silent no-op, so
+    # audit_cli_dispatch::run_unknown_export_lists_available_names FAILS — the
+    # run exits 0 and prints none of the message it asserts on.
+    "replace dispatch -> Result",
 ]

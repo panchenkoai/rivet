@@ -37,12 +37,25 @@ use std::path::PathBuf;
 /// without deleting anything — it caught one on the first run. The subject here
 /// is production wiring; a fixture naming the flag is not a delete site.
 fn dispatch_src() -> String {
-    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/cli/dispatch.rs");
-    let all = std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("read {}: {e}", p.display()));
-    match all.find("\n#[cfg(test)]") {
-        Some(i) => all[..i].to_string(),
-        None => all,
+    // The load orchestrator (this gate's whole subject: cleanup_target,
+    // maybe_gc_orphans, the CDC cleanup_source consumers) was evicted from
+    // dispatch.rs into src/load/orchestrate.rs (arch-roast 2026-08-21); the
+    // gate follows its subject. Both files are read so a consumer left in (or
+    // returned to) the router is still graded.
+    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/load/orchestrate.rs");
+    let p2 = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/cli/dispatch.rs");
+    let mut out = String::new();
+    for path in [&p, &p2] {
+        let all = std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let clipped = match all.find("\n#[cfg(test)]") {
+            Some(i) => &all[..i],
+            None => all.as_str(),
+        };
+        out.push_str(clipped);
+        out.push('\n');
     }
+    out
 }
 
 /// Split a Rust source into `fn` bodies keyed by name, by brace depth.
