@@ -73,26 +73,16 @@ fn diagnose_mysql(
 ) -> Result<ExportDiagnostic> {
     use mysql::prelude::Queryable;
 
-    let mode_str = diagnose_mode_str(export);
-
     let base_query = resolve_preflight_base_query(export);
     let base_query = base_query.as_str();
-    // build_plan auto-resolves an UNSET chunked chunk_column to the single-integer PK; resolve
-    // it here too so range_col / the strategy label / the index probe target the SAME column,
-    // else the export reports a false UNSAFE + chunked(?,…) on a PK-indexed table (post-0.24.3 MED).
-    let auto_pk: Option<String> = if should_auto_resolve_chunk_pk(export) {
-        export
-            .table
-            .as_deref()
-            .or_else(|| super::postgres::table_from_simple_query(base_query))
-            .and_then(|t| single_int_pk_mysql(conn, t))
-    } else {
-        None
-    };
+    let base_table = preflight_base_table(export, base_query);
+    // build_plan auto-resolves an UNSET chunked chunk_column to the single-integer PK, and
+    // `auto_pk_probe_target` is that gate — so range_col / the strategy label / the index
+    // probe target the SAME column, not a `?` placeholder on a PK-indexed table.
+    let auto_pk: Option<String> =
+        auto_pk_probe_target(export, base_table).and_then(|t| single_int_pk_mysql(conn, t));
     // The column the run actually reads on: chunk_column for range chunking, chunk_by_key for
-    // keyset (seek), cursor_column for incremental, or the auto-resolved PK above — a keyset
-    // table has neither chunk_column nor cursor_column, so without any of these range_col is
-    // None and every downstream probe silently degrades to a false unindexed full-scan verdict.
+    // keyset (seek), cursor_column for incremental, or the auto-resolved PK above.
     let range_col = preflight_range_col_resolved(export, auto_pk.as_deref());
     let effective_query = if let Some(order) = incremental_key_expr(export, SourceType::Mysql) {
         format!(
@@ -180,74 +170,34 @@ fn diagnose_mysql(
         }
     };
 
-    // Same logic as the PG side: EXPLAIN of the base query reports `ALL`
-    // (full table scan) for a no-WHERE read, even on tables where the
-    // chunk_column is a perfect PK with a btree. The chunk runner actually
-    // issues `WHERE chunk_col >= $lo AND chunk_col < $hi`, which would use
-    // the index. Override `uses_index` from the catalog when the column is
-    // the leading key of some index on the table.
-    let uses_index = if strategy_probes_index(export)
-        && let Some(col) = range_col
-        && let Some(table) = export
-            .table
-            .as_deref()
-            .or_else(|| super::postgres::table_from_simple_query(base_query))
-    {
-        match column_has_index_mysql(conn, table, col) {
-            Some(true) => true,
-            Some(false) => plan_uses_index,
-            None => plan_uses_index,
-        }
-    } else {
-        plan_uses_index
-    };
+    // Same logic as the PG side: EXPLAIN of the base query reports `ALL` (full
+    // table scan) for a no-WHERE read, even on tables where the chunk_column is
+    // a perfect PK with a btree. The chunk runner actually issues
+    // `WHERE chunk_col >= $lo AND chunk_col < $hi`, which would use the index —
+    // so answer from the catalog and let `assemble_diagnostic` apply the shared
+    // override policy.
+    let catalog_index = index_probe_target(export, auto_pk.as_deref(), base_table)
+        .and_then(|(table, col)| column_has_index_mysql(conn, table, col));
 
-    let strategy = derive_strategy_resolved(export, auto_pk.as_deref());
-    let verdict = compute_verdict(
-        row_estimate,
-        uses_index,
-        export.cursor_column.is_some(),
-        None, // MySQL exposes no reliable avg_row_bytes pre-run → can't predict RSS
-        export.parallel,
-    );
-    let recommended_profile = recommend_profile(row_estimate, uses_index, export);
-    let recommended_parallel = recommend_parallelism(export, row_estimate, uses_index);
-    // MySQL has no trustworthy scan-free row-width estimate (information_schema
-    // AVG_ROW_LENGTH shares the same InnoDB random-dive statistics as TABLE_ROWS,
-    // which #1 already declined to trust), so the oversized-chunk check is skipped
-    // here by passing `None` — same stance as the row-estimate density diagnostic.
-    let avg_row_bytes: Option<i64> = None;
-    let warnings = collect_warnings(
+    Ok(assemble_diagnostic(
         export,
-        row_estimate,
-        avg_row_bytes,
-        range_min.as_deref(),
-        range_max.as_deref(),
-        db_max_connections,
-    );
-    let suggestion = build_suggestion(&verdict, row_estimate, uses_index, export);
-
-    Ok(ExportDiagnostic {
-        row_source: None,
-        export_name: export.name.clone(),
-        strategy,
-        mode: mode_str,
-        cursor_column: export.cursor_column.clone(),
-        row_estimate,
-        avg_row_bytes,
-        cursor_min: range_min.clone(),
-        cursor_max: range_max.clone(),
-        scan_type,
-        uses_index,
-        verdict,
-        recommended_profile,
-        recommended_parallel,
-        warnings,
-        suggestion,
-        chunk_min: range_min.clone(),
-        chunk_max: range_max.clone(),
-        db_max_connections,
-    })
+        ProbeFacts {
+            auto_pk,
+            row_estimate,
+            // MySQL has no trustworthy scan-free row-width estimate
+            // (information_schema AVG_ROW_LENGTH shares the same InnoDB random-dive
+            // statistics as TABLE_ROWS, which #1 already declined to trust), so the
+            // oversized-chunk check and the RSS prediction are skipped here by
+            // passing `None` — same stance as the row-estimate density diagnostic.
+            avg_row_bytes: None,
+            range_min,
+            range_max,
+            scan_type,
+            plan_uses_index,
+            catalog_index,
+            db_max_connections,
+        },
+    ))
 }
 
 fn mysql_row_get_string(row: &mysql::Row, col: &str) -> Option<String> {

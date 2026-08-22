@@ -2,7 +2,7 @@ use rusqlite::TransactionBehavior;
 
 use crate::error::Result;
 
-use super::{StateConn, StateRef, StateStore, open_connection, pg_sql};
+use super::{StateConn, StateRef, StateStore, open_connection};
 
 /// One row from `chunk_task` for display / debugging.
 #[derive(Debug, Clone)]
@@ -30,20 +30,11 @@ impl StateStore {
     /// Distinct `export_name` values that currently have at least one
     /// `chunk_run` row with `status = 'in_progress'` (interrupted run — resume or reset).
     pub fn list_export_names_with_in_progress_chunk_runs(&self) -> Result<Vec<String>> {
-        let sql = "SELECT DISTINCT export_name FROM chunk_run WHERE status = 'in_progress' ORDER BY export_name ASC";
-        match &self.conn {
-            StateConn::Sqlite(c) => {
-                let mut stmt = c.prepare(sql)?;
-                let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-                rows.collect::<std::result::Result<Vec<_>, _>>()
-                    .map_err(Into::into)
-            }
-            StateConn::Postgres(client) => {
-                let mut c = client.borrow_mut();
-                let rows = c.query(&pg_sql(sql), &[])?;
-                Ok(rows.iter().map(|row| row.get(0)).collect())
-            }
-        }
+        self.query(
+            "SELECT DISTINCT export_name FROM chunk_run WHERE status = 'in_progress' ORDER BY export_name ASC",
+            &[],
+            |r| r.text(0),
+        )
     }
 
     /// Whether this export has a resumable checkpoint — an in-progress chunk run
@@ -64,24 +55,13 @@ impl StateStore {
         &self,
         export_name: &str,
     ) -> Result<Option<(String, String)>> {
-        let sql = "SELECT run_id, plan_hash FROM chunk_run
+        self.query_opt(
+            "SELECT run_id, plan_hash FROM chunk_run
              WHERE export_name = ?1 AND status = 'in_progress'
-             ORDER BY created_at DESC LIMIT 1";
-        match &self.conn {
-            StateConn::Sqlite(c) => {
-                let mut stmt = c.prepare(sql)?;
-                let mut rows =
-                    stmt.query_map([export_name], |row| Ok((row.get(0)?, row.get(1)?)))?;
-                Ok(rows.next().transpose()?)
-            }
-            StateConn::Postgres(client) => {
-                // Single borrow for the duration of this call; safe because all Postgres
-                // operations in StateStore are sequential (no re-entrant borrows).
-                let mut c = client.borrow_mut();
-                let rows = c.query(&pg_sql(sql), &[&export_name])?;
-                Ok(rows.first().map(|row| (row.get(0), row.get(1))))
-            }
-        }
+             ORDER BY created_at DESC LIMIT 1",
+            &[export_name.into()],
+            |r| (r.text(0), r.text(1)),
+        )
     }
 
     pub fn create_chunk_run(
@@ -92,38 +72,23 @@ impl StateStore {
         max_chunk_attempts: u32,
     ) -> Result<()> {
         let now = chrono::Utc::now().to_rfc3339();
-        let sql = "INSERT INTO chunk_run (run_id, export_name, plan_hash, status, max_chunk_attempts, created_at, updated_at)
-             VALUES (?1, ?2, ?3, 'in_progress', ?4, ?5, ?5)";
-        match &self.conn {
-            StateConn::Sqlite(c) => {
-                c.execute(
-                    sql,
-                    rusqlite::params![
-                        run_id,
-                        export_name,
-                        plan_hash,
-                        max_chunk_attempts as i64,
-                        now
-                    ],
-                )?;
-            }
-            StateConn::Postgres(client) => {
-                let mut c = client.borrow_mut();
-                c.execute(
-                    &pg_sql(sql),
-                    &[
-                        &run_id,
-                        &export_name,
-                        &plan_hash,
-                        &(max_chunk_attempts as i64),
-                        &now,
-                    ],
-                )?;
-            }
-        }
+        self.execute(
+            "INSERT INTO chunk_run (run_id, export_name, plan_hash, status, max_chunk_attempts, created_at, updated_at)
+             VALUES (?1, ?2, ?3, 'in_progress', ?4, ?5, ?5)",
+            &[
+                run_id.into(),
+                export_name.into(),
+                plan_hash.into(),
+                (max_chunk_attempts as i64).into(),
+                now.into(),
+            ],
+        )?;
         Ok(())
     }
 
+    /// Divergent-by-design (row.rs exemption): a transactional batch insert on
+    /// each backend's native transaction + prepared-statement API — not dialect
+    /// ceremony, so it stays an explicit two-arm match.
     pub fn insert_chunk_tasks(&self, run_id: &str, ranges: &[(i64, i64)]) -> Result<()> {
         if ranges.is_empty() {
             return Ok(());
@@ -178,19 +143,11 @@ impl StateStore {
     /// Mark tasks left `running` after a crash as `pending` so they can be retried.
     pub fn reset_stale_running_chunk_tasks(&self, run_id: &str) -> Result<usize> {
         let now = chrono::Utc::now().to_rfc3339();
-        let sql = "UPDATE chunk_task SET status = 'pending', updated_at = ?1
-             WHERE run_id = ?2 AND status = 'running'";
-        match &self.conn {
-            StateConn::Sqlite(c) => {
-                let n = c.execute(sql, rusqlite::params![now, run_id])?;
-                Ok(n)
-            }
-            StateConn::Postgres(client) => {
-                let mut c = client.borrow_mut();
-                let n = c.execute(&pg_sql(sql), &[&now, &run_id])?;
-                Ok(n as usize)
-            }
-        }
+        self.execute(
+            "UPDATE chunk_task SET status = 'pending', updated_at = ?1
+             WHERE run_id = ?2 AND status = 'running'",
+            &[now.into(), run_id.into()],
+        )
     }
 
     /// Un-pin chunks a prior run gave up on so an explicit `--resume` retries them.
@@ -211,19 +168,11 @@ impl StateStore {
     /// Returns the number of chunks un-pinned.
     pub fn reset_failed_chunk_tasks_for_resume(&self, run_id: &str) -> Result<usize> {
         let now = chrono::Utc::now().to_rfc3339();
-        let sql = "UPDATE chunk_task SET status = 'pending', attempts = 0, updated_at = ?1
-             WHERE run_id = ?2 AND status = 'failed'";
-        match &self.conn {
-            StateConn::Sqlite(c) => {
-                let n = c.execute(sql, rusqlite::params![now, run_id])?;
-                Ok(n)
-            }
-            StateConn::Postgres(client) => {
-                let mut c = client.borrow_mut();
-                let n = c.execute(&pg_sql(sql), &[&now, &run_id])?;
-                Ok(n as usize)
-            }
-        }
+        self.execute(
+            "UPDATE chunk_task SET status = 'pending', attempts = 0, updated_at = ?1
+             WHERE run_id = ?2 AND status = 'failed'",
+            &[now.into(), run_id.into()],
+        )
     }
 
     /// Atomically claim the next pending or retryable failed chunk.
@@ -263,6 +212,11 @@ impl StateStore {
 
     /// Claim next chunk using a fresh connection identified by `state_ref`.
     /// Used by parallel workers that cannot share a single connection.
+    ///
+    /// Divergent-by-design (row.rs exemption): fresh per-worker connections via
+    /// `StateRef` and genuinely different SQL per backend (Postgres `FOR UPDATE
+    /// SKIP LOCKED` vs SQLite rowid + IMMEDIATE tx) — do not re-migrate this
+    /// onto the ceremony seam.
     pub fn claim_next_chunk_task_at_ref(
         state_ref: &StateRef,
         run_id: &str,
@@ -314,24 +268,18 @@ impl StateStore {
         file_name: Option<&str>,
     ) -> Result<()> {
         let now = chrono::Utc::now().to_rfc3339();
-        let sql = "UPDATE chunk_task
+        self.execute(
+            "UPDATE chunk_task
              SET status = 'completed', rows_written = ?1, file_name = ?2, last_error = NULL, updated_at = ?3
-             WHERE run_id = ?4 AND chunk_index = ?5";
-        match &self.conn {
-            StateConn::Sqlite(c) => {
-                c.execute(
-                    sql,
-                    rusqlite::params![rows_written, file_name, now, run_id, chunk_index],
-                )?;
-            }
-            StateConn::Postgres(client) => {
-                let mut c = client.borrow_mut();
-                c.execute(
-                    &pg_sql(sql),
-                    &[&rows_written, &file_name, &now, &run_id, &chunk_index],
-                )?;
-            }
-        }
+             WHERE run_id = ?4 AND chunk_index = ?5",
+            &[
+                rows_written.into(),
+                file_name.into(),
+                now.into(),
+                run_id.into(),
+                chunk_index.into(),
+            ],
+        )?;
         Ok(())
     }
 
@@ -366,61 +314,40 @@ impl StateStore {
                     attempts = (SELECT max_chunk_attempts FROM chunk_run WHERE run_id = ?3)
              WHERE run_id = ?3 AND chunk_index = ?4"
         };
-        match &self.conn {
-            StateConn::Sqlite(c) => {
-                c.execute(sql, rusqlite::params![err, now, run_id, chunk_index])?;
-            }
-            StateConn::Postgres(client) => {
-                let mut c = client.borrow_mut();
-                c.execute(&pg_sql(sql), &[&err, &now, &run_id, &chunk_index])?;
-            }
-        }
+        self.execute(
+            sql,
+            &[err.into(), now.into(), run_id.into(), chunk_index.into()],
+        )?;
         Ok(())
     }
 
     pub fn count_chunk_tasks_total(&self, run_id: &str) -> Result<usize> {
-        let sql = "SELECT COUNT(*) FROM chunk_task WHERE run_id = ?1";
-        match &self.conn {
-            StateConn::Sqlite(c) => {
-                let n: i64 = c.query_row(sql, [run_id], |row| row.get(0))?;
-                Ok(n as usize)
-            }
-            StateConn::Postgres(client) => {
-                let mut c = client.borrow_mut();
-                let row = c.query_one(&pg_sql(sql), &[&run_id])?;
-                let n: i64 = row.get(0);
-                Ok(n as usize)
-            }
-        }
+        let n = self
+            .query_opt(
+                "SELECT COUNT(*) FROM chunk_task WHERE run_id = ?1",
+                &[run_id.into()],
+                |r| r.i64(0),
+            )?
+            .unwrap_or(0);
+        Ok(n as usize)
     }
 
     pub fn count_chunk_tasks_not_completed(&self, run_id: &str) -> Result<i64> {
-        let sql = "SELECT COUNT(*) FROM chunk_task WHERE run_id = ?1 AND status != 'completed'";
-        match &self.conn {
-            StateConn::Sqlite(c) => {
-                let n: i64 = c.query_row(sql, [run_id], |row| row.get(0))?;
-                Ok(n)
-            }
-            StateConn::Postgres(client) => {
-                let mut c = client.borrow_mut();
-                let row = c.query_one(&pg_sql(sql), &[&run_id])?;
-                Ok(row.get(0))
-            }
-        }
+        Ok(self
+            .query_opt(
+                "SELECT COUNT(*) FROM chunk_task WHERE run_id = ?1 AND status != 'completed'",
+                &[run_id.into()],
+                |r| r.i64(0),
+            )?
+            .unwrap_or(0))
     }
 
     pub fn finalize_chunk_run_completed(&self, run_id: &str) -> Result<()> {
         let now = chrono::Utc::now().to_rfc3339();
-        let sql = "UPDATE chunk_run SET status = 'completed', updated_at = ?1 WHERE run_id = ?2";
-        match &self.conn {
-            StateConn::Sqlite(c) => {
-                c.execute(sql, rusqlite::params![now, run_id])?;
-            }
-            StateConn::Postgres(client) => {
-                let mut c = client.borrow_mut();
-                c.execute(&pg_sql(sql), &[&now, &run_id])?;
-            }
-        }
+        self.execute(
+            "UPDATE chunk_run SET status = 'completed', updated_at = ?1 WHERE run_id = ?2",
+            &[now.into(), run_id.into()],
+        )?;
         Ok(())
     }
 
@@ -451,7 +378,8 @@ impl StateStore {
         reason: &str,
     ) -> Result<usize> {
         let now = chrono::Utc::now().to_rfc3339();
-        let sql = "UPDATE chunk_task
+        self.execute(
+            "UPDATE chunk_task
              SET status = 'pending',
                  attempts = 0,
                  file_name = NULL,
@@ -460,56 +388,28 @@ impl StateStore {
                  updated_at = ?2
              WHERE run_id = ?3
                AND chunk_index = ?4
-               AND status = 'completed'";
-        match &self.conn {
-            StateConn::Sqlite(c) => {
-                let n = c.execute(sql, rusqlite::params![reason, now, run_id, chunk_index])?;
-                Ok(n)
-            }
-            StateConn::Postgres(client) => {
-                let mut c = client.borrow_mut();
-                let n = c.execute(&pg_sql(sql), &[&reason, &now, &run_id, &chunk_index])?;
-                Ok(n as usize)
-            }
-        }
+               AND status = 'completed'",
+            &[reason.into(), now.into(), run_id.into(), chunk_index.into()],
+        )
     }
 
     /// Remove all chunk runs and tasks for an export (abandon resume).
     pub fn reset_chunk_checkpoint(&self, export_name: &str) -> Result<usize> {
-        match &self.conn {
-            StateConn::Sqlite(c) => {
-                let run_ids: Vec<String> = {
-                    let mut stmt =
-                        c.prepare("SELECT run_id FROM chunk_run WHERE export_name = ?1")?;
-                    let rows = stmt.query_map([export_name], |row| row.get(0))?;
-                    rows.collect::<std::result::Result<Vec<_>, _>>()?
-                };
-                for rid in &run_ids {
-                    let _ = c.execute("DELETE FROM chunk_task WHERE run_id = ?1", [rid]);
-                }
-                let deleted = c.execute(
-                    "DELETE FROM chunk_run WHERE export_name = ?1",
-                    [export_name],
-                )?;
-                Ok(deleted)
-            }
-            StateConn::Postgres(client) => {
-                let mut c = client.borrow_mut();
-                let rows = c.query(
-                    "SELECT run_id FROM chunk_run WHERE export_name = $1",
-                    &[&export_name],
-                )?;
-                let run_ids: Vec<String> = rows.iter().map(|r| r.get(0)).collect();
-                for rid in &run_ids {
-                    let _ = c.execute("DELETE FROM chunk_task WHERE run_id = $1", &[rid]);
-                }
-                let deleted = c.execute(
-                    "DELETE FROM chunk_run WHERE export_name = $1",
-                    &[&export_name],
-                )?;
-                Ok(deleted as usize)
-            }
+        let run_ids = self.query(
+            "SELECT run_id FROM chunk_run WHERE export_name = ?1",
+            &[export_name.into()],
+            |r| r.text(0),
+        )?;
+        for rid in &run_ids {
+            let _ = self.execute(
+                "DELETE FROM chunk_task WHERE run_id = ?1",
+                &[rid.as_str().into()],
+            );
         }
+        self.execute(
+            "DELETE FROM chunk_run WHERE export_name = ?1",
+            &[export_name.into()],
+        )
     }
 
     /// Latest chunk_run row for an export (any status), for `rivet state chunks`.
@@ -517,65 +417,30 @@ impl StateStore {
         &self,
         export_name: &str,
     ) -> Result<Option<(String, String, String, String)>> {
-        let sql = "SELECT run_id, plan_hash, status, updated_at FROM chunk_run
-             WHERE export_name = ?1 ORDER BY updated_at DESC LIMIT 1";
-        match &self.conn {
-            StateConn::Sqlite(c) => {
-                let mut stmt = c.prepare(sql)?;
-                let mut rows = stmt.query_map([export_name], |row| {
-                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-                })?;
-                Ok(rows.next().transpose()?)
-            }
-            StateConn::Postgres(client) => {
-                let mut c = client.borrow_mut();
-                let rows = c.query(&pg_sql(sql), &[&export_name])?;
-                Ok(rows
-                    .first()
-                    .map(|row| (row.get(0), row.get(1), row.get(2), row.get(3))))
-            }
-        }
+        self.query_opt(
+            "SELECT run_id, plan_hash, status, updated_at FROM chunk_run
+             WHERE export_name = ?1 ORDER BY updated_at DESC LIMIT 1",
+            &[export_name.into()],
+            |r| (r.text(0), r.text(1), r.text(2), r.text(3)),
+        )
     }
 
     pub fn list_chunk_tasks_for_run(&self, run_id: &str) -> Result<Vec<ChunkTaskInfo>> {
-        let sql = "SELECT chunk_index, start_key, end_key, status, attempts, last_error, rows_written, file_name
-             FROM chunk_task WHERE run_id = ?1 ORDER BY chunk_index ASC";
-        match &self.conn {
-            StateConn::Sqlite(c) => {
-                let mut stmt = c.prepare(sql)?;
-                let rows = stmt.query_map([run_id], |row| {
-                    Ok(ChunkTaskInfo {
-                        chunk_index: row.get(0)?,
-                        start_key: row.get(1)?,
-                        end_key: row.get(2)?,
-                        status: row.get(3)?,
-                        attempts: row.get(4)?,
-                        last_error: row.get(5)?,
-                        rows_written: row.get(6)?,
-                        file_name: row.get(7)?,
-                    })
-                })?;
-                rows.collect::<std::result::Result<Vec<_>, _>>()
-                    .map_err(Into::into)
-            }
-            StateConn::Postgres(client) => {
-                let mut c = client.borrow_mut();
-                let rows = c.query(&pg_sql(sql), &[&run_id])?;
-                Ok(rows
-                    .iter()
-                    .map(|row| ChunkTaskInfo {
-                        chunk_index: row.get(0),
-                        start_key: row.get(1),
-                        end_key: row.get(2),
-                        status: row.get(3),
-                        attempts: row.get(4),
-                        last_error: row.get(5),
-                        rows_written: row.get(6),
-                        file_name: row.get(7),
-                    })
-                    .collect())
-            }
-        }
+        self.query(
+            "SELECT chunk_index, start_key, end_key, status, attempts, last_error, rows_written, file_name
+             FROM chunk_task WHERE run_id = ?1 ORDER BY chunk_index ASC",
+            &[run_id.into()],
+            |r| ChunkTaskInfo {
+                chunk_index: r.i64(0),
+                start_key: r.text(1),
+                end_key: r.text(2),
+                status: r.text(3),
+                attempts: r.i64(4),
+                last_error: r.opt_text(5),
+                rows_written: r.opt_i64(6),
+                file_name: r.opt_text(7),
+            },
+        )
     }
 }
 
@@ -864,64 +729,34 @@ impl StateStore {
     pub fn record_strategy_snapshot(&self, s: &StrategySnapshot) -> Result<()> {
         let now = chrono::Utc::now().to_rfc3339();
         let ver = env!("CARGO_PKG_VERSION");
-        let sql = "INSERT INTO strategy_snapshot (
+        self.execute(
+            "INSERT INTO strategy_snapshot (
                  export_name, source_schema, source_table, row_estimate, total_bytes,
                  avg_row_bytes, chosen_mode, strategy_kind, key_column, chunk_size,
                  rivet_version, captured_at,
                  catalog_rows, density, estimate_method, probe_k, probe_w
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                 ?13, ?14, ?15, ?16, ?17)";
-        match &self.conn {
-            StateConn::Sqlite(c) => {
-                c.execute(
-                    sql,
-                    rusqlite::params![
-                        s.export_name,
-                        s.source_schema,
-                        s.source_table,
-                        s.row_estimate,
-                        s.total_bytes,
-                        s.avg_row_bytes,
-                        s.chosen_mode,
-                        s.strategy_kind,
-                        s.key_column,
-                        s.chunk_size,
-                        ver,
-                        now,
-                        s.catalog_rows,
-                        s.density,
-                        s.estimate_method,
-                        s.probe_k,
-                        s.probe_w,
-                    ],
-                )?;
-            }
-            StateConn::Postgres(client) => {
-                let mut c = client.borrow_mut();
-                c.execute(
-                    &pg_sql(sql),
-                    &[
-                        &s.export_name,
-                        &s.source_schema,
-                        &s.source_table,
-                        &s.row_estimate,
-                        &s.total_bytes,
-                        &s.avg_row_bytes,
-                        &s.chosen_mode,
-                        &s.strategy_kind,
-                        &s.key_column,
-                        &s.chunk_size,
-                        &ver,
-                        &now,
-                        &s.catalog_rows,
-                        &s.density,
-                        &s.estimate_method,
-                        &s.probe_k,
-                        &s.probe_w,
-                    ],
-                )?;
-            }
-        }
+                 ?13, ?14, ?15, ?16, ?17)",
+            &[
+                s.export_name.as_str().into(),
+                s.source_schema.as_deref().into(),
+                s.source_table.as_str().into(),
+                s.row_estimate.into(),
+                s.total_bytes.into(),
+                s.avg_row_bytes.into(),
+                s.chosen_mode.as_str().into(),
+                s.strategy_kind.as_deref().into(),
+                s.key_column.as_deref().into(),
+                s.chunk_size.into(),
+                ver.into(),
+                now.into(),
+                s.catalog_rows.into(),
+                s.density.into(),
+                s.estimate_method.as_deref().into(),
+                s.probe_k.into(),
+                s.probe_w.into(),
+            ],
+        )?;
         Ok(())
     }
 }

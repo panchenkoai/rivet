@@ -70,8 +70,6 @@ fn fetch_max_connections_mssql(conn: &mut MssqlSource) -> Option<u32> {
 }
 
 fn diagnose_mssql(conn: &mut MssqlSource, export: &ExportConfig) -> Result<ExportDiagnostic> {
-    let mode_str = diagnose_mode_str(export);
-
     let base_query = resolve_preflight_base_query(export);
     let base_query = base_query.as_str();
 
@@ -89,22 +87,20 @@ fn diagnose_mssql(conn: &mut MssqlSource, export: &ExportConfig) -> Result<Expor
     // `SELECT * FROM <table>` — both resolve to a single relation here. Anything
     // the parser can't reduce to one base table (joins, subqueries, hand-written
     // inline SQL) yields `None`, and the row-estimate / index probes degrade to
-    // an honest "unknown" rather than guessing the wrong relation.
+    // an honest "unknown" rather than guessing the wrong relation. Resolved from
+    // the RENDERED query (not `preflight_base_table`'s configured-`table:` first
+    // order) because the MSSQL catalog probes key on the emitted relation.
     let base_table =
         strip_select_star_from(base_query).or_else(|| table_from_simple_query(base_query));
 
-    // build_plan auto-resolves an UNSET chunked chunk_column to the single-integer PK; resolve it
-    // here too so range_col / the strategy label / the index probe target the SAME column, else
-    // the export reports a false UNSAFE + chunked(?,…) on a PK-indexed table (post-0.24.3 MED).
-    let auto_pk: Option<String> = if should_auto_resolve_chunk_pk(export) {
-        base_table.and_then(|t| single_int_pk_mssql(conn, t))
-    } else {
-        None
-    };
+    // build_plan auto-resolves an UNSET chunked chunk_column to the single-integer PK, and
+    // `auto_pk_probe_target` is that gate — so range_col / the strategy label / the index
+    // probe target the SAME column, not a `?` placeholder on a PK-indexed table.
+    let auto_pk: Option<String> =
+        auto_pk_probe_target(export, base_table).and_then(|t| single_int_pk_mssql(conn, t));
 
     // chunk_column (range) OR chunk_by_key (keyset) OR cursor_column (incremental) OR the
-    // auto-resolved PK above — the run's real read column. Without any of these range_col is
-    // None, so the index probe below never runs and the verdict falls to a false "no index".
+    // auto-resolved PK above — the run's real read column.
     let range_col = preflight_range_col_resolved(export, auto_pk.as_deref());
 
     // Row estimate from `sys.dm_db_partition_stats` — the same fast,
@@ -135,32 +131,15 @@ fn diagnose_mssql(conn: &mut MssqlSource, export: &ExportConfig) -> Result<Expor
     };
 
     // Honest index signal: no query plan is parsed (SQL Server has no portable
-    // `EXPLAIN` over the scalar seam), so `scan_type` stays `None`. For
-    // chunked/incremental modes the catalog *can* answer the question that
-    // actually matters for the run (`WHERE range_col > $last` / `BETWEEN`): is
-    // the range column the single leading key of some index? That fact alone
-    // drives the verdict, the same way the PG/MySQL catalog probe overrides
-    // their EXPLAIN hint.
-    let scan_type = None;
-    let uses_index = if strategy_probes_index(export)
-        && let Some(col) = range_col
-        && let Some(table) = base_table
-    {
-        column_has_index_mssql(conn, table, col).unwrap_or(false)
-    } else {
-        false
-    };
+    // `EXPLAIN` over the scalar seam), so `scan_type` stays `None` and the plan
+    // hint is a hard `false`. For chunked/incremental modes the catalog *can*
+    // answer the question that actually matters for the run
+    // (`WHERE range_col > $last` / `BETWEEN`): is the range column the single
+    // leading key of some index? With no plan hint to fall back on, that fact
+    // alone drives `uses_index` through the shared override policy.
+    let catalog_index = index_probe_target(export, auto_pk.as_deref(), base_table)
+        .and_then(|(table, col)| column_has_index_mssql(conn, table, col));
 
-    let strategy = derive_strategy_resolved(export, auto_pk.as_deref());
-    let verdict = compute_verdict(
-        row_estimate,
-        uses_index,
-        export.cursor_column.is_some(),
-        avg_row_bytes,
-        export.parallel,
-    );
-    let recommended_profile = recommend_profile(row_estimate, uses_index, export);
-    let recommended_parallel = recommend_parallelism(export, row_estimate, uses_index);
     // SQL Server's `@@MAX_CONNECTIONS` IS the portable analogue of PG
     // max_connections / MySQL @@max_connections (the configured `user
     // connections` cap; default 32767 ≈ unlimited, so the warning is inert on a
@@ -168,37 +147,21 @@ fn diagnose_mssql(conn: &mut MssqlSource, export: &ExportConfig) -> Result<Expor
     // same query_scalar seam so the connection-limit check has parity with the
     // other engines.
     let db_max_connections = fetch_max_connections_mssql(conn);
-    let warnings = collect_warnings(
-        export,
-        row_estimate,
-        avg_row_bytes,
-        range_min.as_deref(),
-        range_max.as_deref(),
-        db_max_connections,
-    );
-    let suggestion = build_suggestion(&verdict, row_estimate, uses_index, export);
 
-    Ok(ExportDiagnostic {
-        row_source: None,
-        export_name: export.name.clone(),
-        strategy,
-        mode: mode_str,
-        cursor_column: export.cursor_column.clone(),
-        row_estimate,
-        avg_row_bytes,
-        cursor_min: range_min.clone(),
-        cursor_max: range_max.clone(),
-        scan_type,
-        uses_index,
-        verdict,
-        recommended_profile,
-        recommended_parallel,
-        warnings,
-        suggestion,
-        chunk_min: range_min.clone(),
-        chunk_max: range_max.clone(),
-        db_max_connections,
-    })
+    Ok(assemble_diagnostic(
+        export,
+        ProbeFacts {
+            auto_pk,
+            row_estimate,
+            avg_row_bytes,
+            range_min,
+            range_max,
+            scan_type: None,
+            plan_uses_index: false,
+            catalog_index,
+            db_max_connections,
+        },
+    ))
 }
 
 /// Row estimate from `sys.dm_db_partition_stats` for `[schema.]table`. Mirrors

@@ -35,6 +35,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::destination::{Destination, ObjectMeta};
 use crate::error::Result;
+use crate::manifest::census::ManifestCensus;
 use crate::manifest::{
     MANIFEST_FILENAME, PartStatus, RunManifest, SUCCESS_FILENAME, is_run_unique_manifest_name,
     join_key, parse_success_marker, success_marker_body,
@@ -570,12 +571,19 @@ impl ManifestVerification {
 /// Regardless of depth, `depth_level` on the returned verdict records the
 /// level this pass ran at.
 /// Read every run-unique manifest COPY (`manifest-<run_id>.json`) named in the
-/// prefix listing. Best-effort: a copy that fails to read or parse is skipped —
-/// the untracked scan it feeds is advisory, so a bad sibling copy must never turn
-/// validate into an error (worst case a part it would have claimed stays flagged,
-/// the pre-#167 behaviour). The canonical `manifest.json` is not a copy and is
-/// excluded (it is already the primary manifest).
-fn read_sibling_manifests(dest: &dyn Destination, listing: &[ObjectMeta]) -> Vec<RunManifest> {
+/// prefix listing, keyed by the storage key it was read from (what
+/// [`ManifestCensus`] enumerates runs by). Best-effort: a copy that fails to read
+/// or parse is skipped — the untracked scan it feeds is advisory, so a bad sibling
+/// copy must never turn validate into an error (worst case a part it would have
+/// claimed stays flagged, the pre-#167 behaviour). The canonical `manifest.json`
+/// is not a copy and is excluded (it is already the primary manifest).
+///
+/// This is validate's I/O half; every question ASKED of the copies — which of them
+/// are this family's split units, which parts they claim — is the census's.
+fn read_sibling_manifests(
+    dest: &dyn Destination,
+    listing: &[ObjectMeta],
+) -> Vec<(String, RunManifest)> {
     let mut out = Vec::new();
     for meta in listing {
         let base = meta.key.rsplit('/').next().unwrap_or("");
@@ -585,65 +593,29 @@ fn read_sibling_manifests(dest: &dyn Destination, listing: &[ObjectMeta]) -> Vec
         if let Ok(bytes) = read_capped(dest, &meta.key, MANIFEST_MAX_BYTES)
             && let Ok(m) = serde_json::from_slice::<RunManifest>(&bytes)
         {
-            out.push(m);
-        }
-    }
-    out
-}
-
-/// The set of destination keys claimed by a SAME-FAMILY sibling run-unique manifest copy
-/// (#167 merge-back). A part is claimed only when a sibling of the SAME `export_family`
-/// declared it `Committed`, so a foreign export's parts under a mistakenly-shared prefix are
-/// still surfaced as untracked. Covers BOTH split units AND a plain export's superseded
-/// historical / CDC-soak copies, so neither reads as surplus. Pure — the I/O (reading the
-/// copies) is [`read_sibling_manifests`]'s job.
-fn sibling_claimed_part_keys(
-    siblings: &[RunManifest],
-    canonical_family: &str,
-    manifest_dir: &str,
-) -> std::collections::BTreeSet<String> {
-    let mut out = std::collections::BTreeSet::new();
-    if canonical_family.is_empty() {
-        // A legacy manifest with no family: never claim across copies (a legacy prefix is
-        // single-run, and folding by empty family could hide cross-contamination).
-        return out;
-    }
-    for m in siblings {
-        if m.export_family != canonical_family {
-            continue;
-        }
-        for p in &m.parts {
-            if p.status == PartStatus::Committed {
-                out.insert(join_key(manifest_dir, &p.path));
-            }
+            out.push((meta.key.clone(), m));
         }
     }
     out
 }
 
 /// A working manifest whose `parts` are the UNION of `canonical`'s parts and every
-/// SAME-FAMILY **split-unit** sibling copy's `Committed` parts, deduped by declared path. The
-/// reconcile target for a `--pool --split` prefix: presence/size/md5 then cover EVERY unit,
-/// not just the last writer whose parts the canonical `manifest.json` happens to list.
+/// `Committed` part declared by a SAME-FAMILY **split unit** under the prefix, deduped by
+/// declared path. The reconcile target for a `--pool --split` prefix: presence/size/md5 then
+/// cover EVERY unit, not just the last writer whose parts the canonical `manifest.json`
+/// happens to list (#167 merge-back).
 ///
-/// A sibling is folded ONLY when it carries a `split_window` — the precise mark of a
-/// co-current split UNIT (finding 2). A plain export's family is its own name, so its
-/// HISTORICAL repeated-run copies share the family too, but they are SUPERSEDED snapshots
-/// (no `split_window`); folding them would presence-check a legitimately cleaned old part and
-/// false-fail. The canonical's own copy is among the siblings, so seeding `seen` with the
-/// canonical's parts keeps it from being added twice. Only `parts` differ from `canonical`.
-fn merge_split_unit_parts(canonical: &RunManifest, siblings: &[RunManifest]) -> RunManifest {
+/// WHICH copies are units is [`ManifestCensus::split_units`]'s answer, not validate's — a
+/// plain export's HISTORICAL repeated-run copies share the family but are SUPERSEDED
+/// snapshots, and presence-checking a legitimately cleaned old part would false-fail. The
+/// canonical's own copy is among them, so seeding `seen` with the canonical's parts keeps it
+/// from being added twice. Only `parts` differ from `canonical`.
+fn merge_split_unit_parts(canonical: &RunManifest, census: &ManifestCensus<'_>) -> RunManifest {
     let mut merged = canonical.clone();
     let mut seen: std::collections::BTreeSet<String> =
         merged.parts.iter().map(|p| p.path.clone()).collect();
-    for m in siblings {
-        if m.export_family != canonical.export_family {
-            continue; // never fold a FOREIGN family's parts into the check
-        }
-        if m.split_window.is_none() {
-            continue; // only co-current SPLIT units — not superseded plain repeated-run copies
-        }
-        for p in &m.parts {
+    for unit in census.split_units(&canonical.export_family) {
+        for p in &unit.manifest.parts {
             if p.status == PartStatus::Committed && seen.insert(p.path.clone()) {
                 merged.parts.push(p.clone());
             }
@@ -784,7 +756,8 @@ pub fn verify_at_destination(
                 } else {
                     read_sibling_manifests(dest, &listing)
                 };
-                let target = merge_split_unit_parts(&manifest, &siblings);
+                let census = ManifestCensus::new(&siblings);
+                let target = merge_split_unit_parts(&manifest, &census);
                 let mut rec = reconcile_manifest_against_listing(&target, &listing, manifest_dir);
                 // Same-family sibling parts — the folded split units AND a plain export's
                 // SUPERSEDED historical / CDC-soak copies (no split_window, so NOT folded
@@ -792,8 +765,7 @@ pub fn verify_at_destination(
                 // must not read as untracked surplus (noise that also MASKS a real orphan). A
                 // foreign family's parts are never claimed, so cross-contamination still shows.
                 if !rec.untracked.is_empty() && !manifest.export_family.is_empty() {
-                    let claimed =
-                        sibling_claimed_part_keys(&siblings, &manifest.export_family, manifest_dir);
+                    let claimed = census.claimed_parts(&manifest.export_family, manifest_dir);
                     rec.untracked.retain(|o| !claimed.contains(&o.key));
                 }
                 Some(rec)
@@ -1053,11 +1025,18 @@ mod tests {
         }
     }
 
+    /// A sibling copy keyed the way the prefix listing hands it to the census.
+    fn sib_keyed(m: RunManifest) -> (String, RunManifest) {
+        (crate::manifest::run_unique_manifest_name(&m.export_name), m)
+    }
+
     /// merge_split_unit_parts folds every SAME-FAMILY SPLIT-UNIT sibling's committed parts
-    /// (those carrying a split_window) into the reconcile target, and EXCLUDES both a FOREIGN
-    /// family's parts and a SAME-FAMILY non-split (plain, superseded) copy's parts — so a
-    /// `--pool --split` snapshot is checked across ALL units without false-checking a plain
-    /// export's historical run or a foreign export sharing the prefix.
+    /// into the reconcile target, and EXCLUDES both a FOREIGN family's parts and a
+    /// SAME-FAMILY non-split (plain, superseded) copy's parts — so a `--pool --split`
+    /// snapshot is checked across ALL units without false-checking a plain export's
+    /// historical run or a foreign export sharing the prefix. WHICH copies are units is the
+    /// census's classification (`ManifestCensus::split_units`); this pins how validate turns
+    /// that answer into the presence-check target.
     #[test]
     fn merge_split_unit_parts_folds_split_siblings_only() {
         let unit = |name: &str, path: &str, fam: &str, split: bool| {
@@ -1066,9 +1045,9 @@ mod tests {
             m.export_name = name.into();
             m.parts[0].path = path.into();
             m.split_window = if split { Some(split_win()) } else { None };
-            m
+            sib_keyed(m)
         };
-        let canonical = unit("daily#3", "daily#3_p.parquet", "daily", true); // last split writer
+        let canonical = unit("daily#3", "daily#3_p.parquet", "daily", true).1; // last split writer
         let siblings = vec![
             unit("daily#0", "daily#0_p.parquet", "daily", true),
             unit("daily#1", "daily#1_p.parquet", "daily", true),
@@ -1076,7 +1055,7 @@ mod tests {
             unit("daily", "daily_old.parquet", "daily", false),  // SAME family, PLAIN (superseded)
             unit("other#0", "other_p.parquet", "other", true),   // FOREIGN family
         ];
-        let merged = merge_split_unit_parts(&canonical, &siblings);
+        let merged = merge_split_unit_parts(&canonical, &ManifestCensus::new(&siblings));
         let paths: std::collections::BTreeSet<&str> =
             merged.parts.iter().map(|p| p.path.as_str()).collect();
         assert_eq!(
@@ -1119,7 +1098,8 @@ mod tests {
         sib.parts[0].status = PartStatus::Quarantined;
         sib.split_window = Some(split_win());
 
-        let merged = merge_split_unit_parts(&canonical, &[sib]);
+        let siblings = vec![sib_keyed(sib)];
+        let merged = merge_split_unit_parts(&canonical, &ManifestCensus::new(&siblings));
         let paths: Vec<&str> = merged.parts.iter().map(|p| p.path.as_str()).collect();
         assert_eq!(
             paths,
@@ -1128,60 +1108,10 @@ mod tests {
         );
     }
 
-    /// sibling_claimed_part_keys claims a SAME-FAMILY sibling's committed parts (so a split
-    /// unit AND a plain export's superseded historical copy are both kept out of untracked),
-    /// but never a FOREIGN family's (cross-contamination must still surface as untracked).
-    #[test]
-    fn sibling_claimed_part_keys_claims_same_family_only() {
-        let unit = |name: &str, path: &str, fam: &str| {
-            let mut m = build_manifest(vec![part(0, 10, 100, "fp")], ManifestStatus::Success);
-            m.export_family = fam.into();
-            m.export_name = name.into();
-            m.parts[0].path = path.into();
-            m
-        };
-        let siblings = vec![
-            unit("daily#0", "daily#0_p.parquet", "daily"),
-            unit("daily", "daily_old.parquet", "daily"), // plain superseded copy, same family
-            unit("other", "other_p.parquet", "other"),
-        ];
-        let claimed = sibling_claimed_part_keys(&siblings, "daily", "");
-        assert!(
-            claimed.contains("daily#0_p.parquet") && claimed.contains("daily_old.parquet"),
-            "same-family parts (split unit AND plain historical) must be claimed: {claimed:?}"
-        );
-        assert!(
-            !claimed.contains("other_p.parquet"),
-            "a FOREIGN family's part must NOT be claimed — cross-contamination must surface"
-        );
-    }
-
-    /// A legacy canonical (empty family) claims nothing — the widening never applies where a
-    /// family cannot disambiguate.
-    #[test]
-    fn sibling_claimed_part_keys_empty_family_claims_nothing() {
-        let mut m = build_manifest(vec![part(0, 10, 100, "fp")], ManifestStatus::Success);
-        m.export_family = "daily".into();
-        m.parts[0].path = "p.parquet".into();
-        assert!(
-            sibling_claimed_part_keys(&[m], "", "").is_empty(),
-            "an empty canonical family must claim nothing"
-        );
-    }
-
-    /// A non-committed (quarantined) sibling part is NOT claimed — only durable committed
-    /// parts belong to the dataset.
-    #[test]
-    fn sibling_claimed_part_keys_skips_non_committed() {
-        let mut m = build_manifest(vec![part(0, 10, 100, "fp")], ManifestStatus::Success);
-        m.export_family = "daily".into();
-        m.parts[0].path = "q.parquet".into();
-        m.parts[0].status = PartStatus::Quarantined;
-        assert!(
-            sibling_claimed_part_keys(&[m], "daily", "").is_empty(),
-            "a quarantined part must not be claimed as a tracked dataset part"
-        );
-    }
+    // The claimed-part set validate subtracts from its untracked scan is the census's
+    // (`ManifestCensus::claimed_parts`) — same-family only, committed only, nothing under an
+    // empty family. Its unit tests live beside it, in `manifest::census`; the end-to-end
+    // section below still pins that VALIDATE subtracts it.
 
     /// End-to-end: a `--pool --split` prefix where a NON-last unit's part is missing must
     /// FAIL validation. Before the merge-back fix, verify reconciled only the canonical
