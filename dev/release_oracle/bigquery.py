@@ -254,24 +254,36 @@ def verify_gc_survival(led: Ledger, *, bucket: str, pfx: str, cfg_text: str,
 
     fails: list[str] = []
 
-    def _gc_load_ok(tries: int = 3) -> bool:
-        # `rivet load` here hits REAL BigQuery/GCS, so a transient Google-side hiccup
-        # is an infra blip, not a gc-logic failure — retry like seed_engine/doctor
-        # (measured: one mssql arm-2 load flaked once and cleared on the very next run).
-        # A real gc failure fails every attempt.
+    def _gc_load_why(tries: int = 3) -> str:
+        """The empty string when the load succeeded, else WHY it did not.
+
+        A boolean here cost a whole investigation. When arm 2 failed on ONE engine
+        (2026-08-22, mssql), the cell reported `gc-load-failed-with-a-running-marker`
+        and nothing else — the load's own error, which named the cause in one
+        sentence, went to a `Proc` that was reduced to `p.ok` and dropped. The
+        message IS the finding; carry its tail into the ledger detail.
+
+        `rivet load` here hits REAL BigQuery/GCS, so a transient Google-side hiccup
+        is an infra blip, not a gc-logic failure — retry like seed_engine/doctor.
+        A real gc failure fails every attempt (and the text below says which).
+        """
         p = rivet("load", "-c", str(gc_cfg), env=child, timeout=None)
         for _ in range(tries - 1):
             if p.ok:
                 break
             time.sleep(2.0)
             p = rivet("load", "-c", str(gc_cfg), env=child, timeout=None)
-        return p.ok
+        if p.ok:
+            return ""
+        why = (p.stderr or p.stdout or "").strip()
+        return " / ".join(why.splitlines()[-2:]) if why else f"exit {p.returncode}"
 
     # ── arm 1: no live run → the unmanifested part is debris → collected ──
     dead = plant_orphan("orphan-crash-debris.parquet")
-    if not _gc_load_ok():
+    why = _gc_load_why()
+    if why:
         led.failed(engine, "-", "gc_survival", "-",
-                   f"gc_survival[{engine}]: the gc load itself failed", "load")
+                   f"gc_survival[{engine}]: the gc load itself failed — {why}", "load")
         return
     if exists(dead):
         fails.append("debris-survived(no live run, yet the unmanifested part was kept) ")
@@ -287,13 +299,46 @@ def verify_gc_survival(led: Ledger, *, bucket: str, pfx: str, cfg_text: str,
     # started_at must be NEWER than every other manifest of this export, or the
     # marker reads as SUPERSEDED — a crashed run's leftover, not a live signal.
     marker["started_at"] = "2099-01-01T00:00:00Z"
-    mk_local = work / f"manifest-gc-survival-probe.json"
+    # ENGINE-KEYED, like every other file this stage stages into `work`
+    # (`bqload_{engine}.yaml`, `gc_{engine}.yaml`): `work` is ONE directory shared
+    # by the three engine legs, which `run_bigquery_golden` runs CONCURRENTLY.
+    # A single `manifest-gc-survival-probe.json` is written by all three, and the
+    # window between `write_text` and the `gcloud cp` that READS it is a whole
+    # subprocess spawn (~1-2 s) — so a sibling leg passing through the same lines
+    # overwrites the file mid-copy and this engine uploads the SIBLING'S manifest
+    # into its own prefix. rivet then (correctly) refuses the load: "the load
+    # prefix holds manifests from 2 DIFFERENT SOURCES (mssql:…, mysql:…)" — a
+    # two-source prefix is exactly the silent warehouse-clobber `ensure_single_
+    # source` exists to stop. The cell recorded that refusal as a gc failure.
+    # Measured on the 2026-08-22 gate: mssql and mysql ran 0.12 s apart (their
+    # arm-1 loads land at 08:55:16.207 / .329 in `load_run`), mssql's arm-2 load
+    # failed all three attempts and wrote no ledger row at all — it never reached
+    # the loader — while postgres, 13 s out of step, passed.
+    mk_local = work / f"manifest-gc-survival-probe-{engine}.json"
     mk_local.write_text(json.dumps(marker))
     mk_remote = f"{base}/manifest-gc-survival-probe.json"
     run(["gcloud", "storage", "cp", str(mk_local), mk_remote], timeout=300)
 
-    if not _gc_load_ok():
-        fails.append("gc-load-failed-with-a-running-marker ")
+    # The fixture is not inert, and it is not a SIBLING'S: read the marker back
+    # from the bucket — the copy `rivet load` will actually read — and demand it
+    # is this engine's, `running`. Without this the two ways the plant can go
+    # wrong (no marker at all → arm 2 degenerates into arm 1 and passes for the
+    # wrong reason; a foreign marker → a load refusal misread as a gc failure)
+    # are both invisible.
+    back = json.loads(run(["gcloud", "storage", "cat", mk_remote], timeout=300).stdout or "{}")
+    planted = (back.get("source") or {}).get("engine")
+    if planted != engine or back.get("status") != "running":
+        run(["gcloud", "storage", "rm", mk_remote, live], timeout=300)
+        led.failed(engine, "-", "gc_survival", "-",
+                   f"gc_survival[{engine}]: the planted running marker is "
+                   f"engine={planted!r} status={back.get('status')!r}, not this engine's live "
+                   "marker — the FIXTURE is wrong (a sibling engine leg overwrote the staged "
+                   "file), so arm 2 graded nothing about gc", "fixture")
+        return
+
+    why = _gc_load_why()
+    if why:
+        fails.append(f"gc-load-failed-with-a-running-marker[{why}] ")
     elif not exists(live):
         fails.append("inflight-part-DELETED(a live run's unmanifested part was collected) ")
 
