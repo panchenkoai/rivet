@@ -16,7 +16,7 @@ the retry's.
 
 ## Context
 
-`run_export_job` (`src/pipeline/job.rs:896`) dispatches on `plan.strategy` to
+`run_export_job` (`src/pipeline/job.rs`) dispatches on `plan.strategy` to
 one of several execution loops — four runner families (`single`, `chunked` +
 its checkpoint twin, `keyset`, `mongo_parallel`), ~eight real commit loops
 counting sequential/parallel variants. Each loop owns its own **tail**: after
@@ -38,7 +38,8 @@ re-implementations of one sequence gives **N places to forget**. Documented
 bites, each with its comment still in the tree:
 
 * `on_schema_drift: fail` silently returned exit 0 on keyset and
-  mongo_parallel (`keyset.rs:1266` says so verbatim) — round 8 found two
+  mongo_parallel (`keyset.rs` said so verbatim, in the comment the seam note
+  has since replaced) — round 8 found two
   misses in one round.
 * Form-B value-checksum harvest was absent on all three large-table runners:
   the sink *computed* the checksums for every runner, but only `single`
@@ -53,7 +54,7 @@ Current defenses, and their limits:
    of this writing) — a map, not a guard. It catches gaps after the fact and
    collapses ~8 loops into 4 columns, so `test` on `keyset` may be proven
    only on keyset_sequential.
-2. **`RunSummary::check_post_run_invariants`** (`summary.rs:795`, called
+2. **`RunSummary::check_post_run_invariants`** (`summary.rs`, called
    inside `finalize_manifest`) — a genuine structural backstop for the two
    telltale-bearing features (drift verdict, Form-B), but it asserts the
    summary is *coherent*, not that every tail step *ran*.
@@ -62,10 +63,12 @@ Current defenses, and their limits:
    a mechanism.
 
 The load-bearing observation: `finalize_manifest` and the invariant check are
-**already centralized in the dispatcher** (`job.rs:1221`, `job.rs:1493`). The
-whole surface of the class is the stretch **between the last batch and
-`finalize_manifest`** — the pre-finalize tail the dispatcher does not yet
-own.
+**already centralized in the dispatcher** — written once per dispatcher entry
+point, of which there were two when this was written (`run_export_job` for
+`rivet run`, `run_export_job_with_chunk_source` for `rivet apply`; see the
+follow-on below). The whole surface of the class is the stretch **between the
+last batch and `finalize_manifest`** — the pre-finalize tail the dispatcher does
+not yet own.
 
 ## Decision
 
@@ -83,7 +86,7 @@ Two contract shapes were designed (design-it-twice):
   leave `drift_schema = None` and the gate quietly no-ops.
 * **Option B — the sink/commit path owns the tail (CHOSEN).**
   `commit::record_part` is already the single drain point every runner —
-  including parallel workers (`mongo_parallel.rs:19`) — must call to write.
+  including parallel workers (`mongo_parallel.rs`) — must call to write.
   Extend it to accumulate, per part, the drift schema, the checksum XOR, the
   cursor high-water, and shape bytes into a `CommitLedger`. The tail input is
   then captured **by construction of committing**, exactly the mechanism that
@@ -139,6 +142,28 @@ seams for the invariants, per-adapter loops where the engines truly differ.
   big-bang cut.
 * Until the migration completes, the matrix + invariant backstop remain the
   defense; this ADR does not retire them, it names their replacement.
+
+## Follow-on (2026-08-21, same day) — the dispatcher's own two tails collapsed
+
+This ADR's "already centralized in the dispatcher" was true per entry point and
+there were **two** of them, so *centralized* still meant *written twice*: the
+same ~250-line ordered post-plan script in `run_export_job` and
+`run_export_job_with_chunk_source`. Landing this ADR is what made the tax
+visible, because the session paid it twice in a day — the `finalize_export`
+call, then its records-on-failure fix, each wired at both bodies.
+
+The arch-roast that followed (PR #259) hoisted the script into one
+`execute_resolved_plan(plan, state, TailPolicy)`; the nine real divergences
+between run and apply (kind label, manifest family, report path, chunk source,
+apply context, reconcile folding, notifications, journalling) became data on
+`TailPolicy`. So `finalize_manifest` and `check_post_run_invariants` now have a
+single call site rather than one per entry point.
+
+Nothing above is retracted: the decision, the option comparison, and the
+migration all stand as recorded, and the seam they argue for is unchanged. The
+observation simply got *more* true — the N-places-to-forget count that the
+`finalize_export` seam drove from ~8 to 1 on the runner side went from 2 to 1 on
+the dispatcher side too, by the same argument applied one layer up.
 
 ## Sibling class, recorded for the next reader
 
