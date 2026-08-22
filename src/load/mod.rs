@@ -14,6 +14,7 @@ use crate::types::target::{TargetColumnSpec, TargetStatus};
 use anyhow::{Context, Result, bail};
 
 mod bigquery;
+mod bq_rest;
 pub mod cdc;
 pub mod orchestrate;
 pub mod plan;

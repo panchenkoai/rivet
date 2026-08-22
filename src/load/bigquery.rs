@@ -67,15 +67,22 @@
 //! GROUP BY run, op, tbl ORDER BY run, bytes_billed DESC;
 //! ```
 //!
-//! Transport is the `bq` CLI (Google Cloud SDK) — the same tool the OSS
-//! BigQuery live tests use, so auth is whatever `bq` is configured with (ADC /
-//! service account) and no credentials touch this crate.
+//! Transport is BigQuery's REST API, in process (`bq_rest`) — `jobs.insert`
+//! plus a poll, on the blocking `reqwest` client. Auth comes from the SAME ADC
+//! seam the GCS destination signs with (`destination::gcs_auth`), so a laptop
+//! with `gcloud auth application-default login` and a CI box with a token both
+//! work without the Google Cloud SDK on PATH. The one credential shape rivet
+//! cannot mint in process (service-account JSON / external_account, which need
+//! JWT signing or an STS exchange) falls back to `gcloud auth
+//! print-access-token` — a TOKEN, not the transport; see
+//! `bq_rest::mint_token_via_gcloud_cli`.
 
 use super::TargetLoader;
+use super::bq_rest::BigQueryApi;
 use crate::types::target::TargetColumnSpec;
-use anyhow::{Context, Result, bail};
-use std::collections::HashMap;
-use std::process::{Command, Output};
+use anyhow::{Result, bail};
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, OnceLock};
 // ── BigQuery ─────────────────────────────────────────────────────────────────
 
 /// Maximum clustering columns BigQuery allows.
@@ -84,7 +91,7 @@ const MAX_CLUSTER_COLUMNS: usize = 4;
 /// BigQuery's hard cap on partitions modified by a single job.
 const DEFAULT_MAX_PARTITIONS_PER_JOB: usize = 4000;
 
-/// Loads Rivet Parquet into a BigQuery dataset via the `bq` CLI.
+/// Loads Rivet Parquet into a BigQuery dataset over the REST API.
 #[derive(Debug, Clone)]
 pub struct BigQueryLoader {
     pub project: String,
@@ -105,6 +112,12 @@ pub struct BigQueryLoader {
     /// this, the free load is split into several `LOAD DATA` jobs, each under
     /// the cap.
     pub max_partitions_per_job: usize,
+    /// The REST client, built on first use and shared by every clone — so one
+    /// access token serves a whole load instead of one per statement. Not part
+    /// of the loader's identity: constructing a loader must stay free of I/O
+    /// (the offline `materialize` refusal tests build one and never reach the
+    /// network).
+    api: Arc<OnceLock<BigQueryApi>>,
 }
 
 impl BigQueryLoader {
@@ -116,6 +129,7 @@ impl BigQueryLoader {
             cluster_by: Vec::new(),
             run_id: None,
             max_partitions_per_job: DEFAULT_MAX_PARTITIONS_PER_JOB,
+            api: Arc::new(OnceLock::new()),
         }
     }
 
@@ -135,48 +149,40 @@ impl BigQueryLoader {
         self
     }
 
-    /// Run `bq --project_id=<p> <args…>`. On failure, `bq` prints the actual
-    /// reason (e.g. "Too many partitions … allowed 4000") to **stdout** while
-    /// stderr carries only the "Waiting…/DONE" spinner — so the error detail
-    /// combines both streams (spinner lines stripped).
-    fn run_bq(&self, args: &[String]) -> Result<Output> {
-        let out = Command::new("bq")
-            .arg(format!("--project_id={}", self.project))
-            .args(args)
-            .output()
-            .context("failed to run `bq` — is the Google Cloud SDK installed and on PATH?")?;
-        if !out.status.success() {
-            let detail = [clean_bq_output(&out.stdout), clean_bq_output(&out.stderr)]
-                .into_iter()
-                .filter(|s| !s.is_empty())
-                .collect::<Vec<_>>()
-                .join(" | ");
-            bail!(
-                "bq {} failed: {detail}",
-                args.first()
-                    .map(String::as_str)
-                    .unwrap_or("<no-subcommand>"),
-            );
+    /// The REST client, built once per loader (and shared with its clones).
+    ///
+    /// `OnceLock::get_or_try_init` is unstable, so this is the hand-rolled
+    /// equivalent: a concurrent loser's client is simply dropped — both are
+    /// equivalent, and `set` never overwrites a winner.
+    fn api(&self) -> Result<&BigQueryApi> {
+        if let Some(api) = self.api.get() {
+            return Ok(api);
         }
-        Ok(out)
+        let built = BigQueryApi::new(&self.project)?;
+        let _ = self.api.set(built);
+        Ok(self.api.get().expect("the client was just set"))
     }
 
-    /// The automatic + user labels for a job, as repeated `--label k:v` args.
-    fn label_flags(&self, op: &str, table: &str) -> Vec<String> {
-        build_label_flags(op, table, self.run_id.as_deref())
+    /// The automatic + user labels for a job, keyed for `configuration.labels`.
+    fn labels(&self, op: &str, table: &str) -> BTreeMap<String, String> {
+        build_labels(op, table, self.run_id.as_deref())
     }
 
     /// Run a SQL statement (free `LOAD DATA` load job or a billed CTAS/query),
     /// tagged with `rivet_op:<op>` + `rivet_table:<table>` for cost attribution.
-    fn run_sql(&self, sql: &str, op: &str, table: &str) -> Result<Output> {
-        self.run_bq(&query_args(sql, &self.label_flags(op, table)))
+    fn run_sql(&self, sql: &str, op: &str, table: &str) -> Result<()> {
+        self.api()?
+            .run_query(sql, &self.labels(op, table))
             .map_err(augment_partition_limit)
+            .map(|_job_id| ())
     }
 
     fn count_rows(&self, fqtn: &str, table: &str) -> Result<u64> {
         // COUNT(*) reads table metadata — 0 bytes billed.
-        let out = self.run_bq(&count_args(fqtn, &self.label_flags("count", table)))?;
-        parse_count_csv(&String::from_utf8_lossy(&out.stdout))
+        self.api()?.run_query_scalar(
+            &format!("SELECT COUNT(*) AS n FROM `{fqtn}`"),
+            &self.labels("count", table),
+        )
     }
 
     /// Split `uris` into free-load batches that each stay under the per-job
@@ -464,47 +470,24 @@ fn build_load_data_sql(
     )
 }
 
-fn query_args(sql: &str, labels: &[String]) -> Vec<String> {
-    // Labels are flags — they MUST precede the positional SQL string.
-    let mut a = vec![
-        "query".into(),
-        "--use_legacy_sql=false".into(),
-        "--format=none".into(),
-    ];
-    a.extend_from_slice(labels);
-    a.push(sql.into());
-    a
-}
-
-fn count_args(fqtn: &str, labels: &[String]) -> Vec<String> {
-    let mut a = vec![
-        "query".into(),
-        "--use_legacy_sql=false".into(),
-        "--format=csv".into(),
-    ];
-    a.extend_from_slice(labels);
-    a.push(format!("SELECT COUNT(*) AS n FROM `{fqtn}`"));
-    a
-}
-
-/// Build `--label k:v` args: the automatic `managed_by:rivet` /
-/// `rivet_op:<op>` / `rivet_table:<table>` labels, the `rivet_run:<id>` label
-/// when a run id is set, plus any `extra` (user) labels. These land in
-/// `INFORMATION_SCHEMA.JOBS.labels` and the billing export, so cost can be
-/// attributed per run and per table.
-fn build_label_flags(op: &str, table: &str, run_id: Option<&str>) -> Vec<String> {
-    let mut labels: Vec<(String, String)> = vec![
-        ("managed_by".into(), "rivet".into()),
-        ("rivet_op".into(), sanitize_label(op)),
-        ("rivet_table".into(), sanitize_label(table)),
-    ];
+/// The job's label SET: the automatic `managed_by:rivet` / `rivet_op:<op>` /
+/// `rivet_table:<table>` labels, plus `rivet_run:<id>` when a run id is set.
+/// Sent as `configuration.labels`, which is what `INFORMATION_SCHEMA.JOBS.labels`
+/// and the billing export project — so cost stays attributable per run and per
+/// table exactly as the module docs' query describes.
+///
+/// (Was `--label k:v` flag pairs under the CLI transport. The keys and values
+/// are unchanged; only the wire shape moved.)
+fn build_labels(op: &str, table: &str, run_id: Option<&str>) -> BTreeMap<String, String> {
+    let mut labels = BTreeMap::from([
+        ("managed_by".to_string(), "rivet".to_string()),
+        ("rivet_op".to_string(), sanitize_label(op)),
+        ("rivet_table".to_string(), sanitize_label(table)),
+    ]);
     if let Some(id) = run_id {
-        labels.push(("rivet_run".into(), sanitize_label(id)));
+        labels.insert("rivet_run".to_string(), sanitize_label(id));
     }
     labels
-        .into_iter()
-        .flat_map(|(k, v)| ["--label".to_string(), format!("{k}:{v}")])
-        .collect()
 }
 
 /// Coerce a string into BigQuery's label charset: lowercase `[a-z0-9_-]`, other
@@ -528,31 +511,14 @@ fn sanitize_label(s: &str) -> String {
     out
 }
 
-/// Parse a `bq query --format=csv` count result: a `n` header line then the
-/// value. Take the last line that parses as an integer.
-fn parse_count_csv(stdout: &str) -> Result<u64> {
-    stdout
-        .lines()
-        .rev()
-        .find_map(|l| l.trim().parse::<u64>().ok())
-        .context("could not parse a row count from bq output")
-}
-
-/// Normalize `bq` output for an error message: split the `\r`-driven progress
-/// spinner into lines, drop the "Waiting…/Current status:" noise, and join the
-/// rest — leaving the real error `bq` printed (e.g. the partition-quota text).
-fn clean_bq_output(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(bytes)
-        .replace('\r', "\n")
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with("Waiting on") && !l.contains("Current status:"))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 /// Turn BigQuery's partition-quota failure into an actionable error.
-fn augment_partition_limit(e: anyhow::Error) -> anyhow::Error {
+///
+/// TEXT-MATCHED, deliberately: the quota comes back as an ordinary
+/// `invalidQuery` job error whose MESSAGE names the limit ("Too many
+/// partitions produced by query, allowed 4000, …") — the REST envelope carries
+/// no distinct machine-readable code for it, so there is nothing sharper to
+/// match on. `bq_rest` puts that message verbatim into the error this reads.
+pub(crate) fn augment_partition_limit(e: anyhow::Error) -> anyhow::Error {
     let s = e.to_string().to_lowercase();
     if s.contains("partition")
         && (s.contains("4000") || s.contains("quota") || s.contains("exceed"))
@@ -664,22 +630,6 @@ mod tests {
     }
 
     #[test]
-    fn count_csv_skips_header() {
-        assert_eq!(parse_count_csv("n\n42\n").unwrap(), 42);
-        assert_eq!(parse_count_csv("n\n0\n").unwrap(), 0);
-        assert!(parse_count_csv("n\n").is_err());
-    }
-
-    #[test]
-    fn clean_bq_output_drops_standalone_status_and_waiting_lines() {
-        // A bare "Waiting on" line (no status) AND a bare "Current status:" line
-        // (not part of a Waiting line) must BOTH be dropped — pins each `&&` in
-        // the filter (an `||` there would leak one of them into the message).
-        let raw = b"Waiting on bqjob_x\nCurrent status: RUNNING\nError: boom\n";
-        assert_eq!(clean_bq_output(raw), "Error: boom");
-    }
-
-    #[test]
     fn augment_partition_limit_fires_only_on_partition_plus_signal() {
         let aug = |m: &str| augment_partition_limit(anyhow::anyhow!("{m}")).to_string();
         // partition + exactly one of {4000, quota, exceed} → augmented (pins each `||`).
@@ -701,24 +651,48 @@ mod tests {
         );
     }
 
+    /// The label SET is the cost-attribution contract; the transport that
+    /// carries it is not. This asserted `--label k:v` CLI pairs before the REST
+    /// rewrite — same keys, same (sanitized) values, now read as a map.
     #[test]
     fn job_labels_tag_managed_by_op_and_table() {
-        let flags = build_label_flags("recover", "Orders", Some("Run-7"));
-        let kv: Vec<&String> = flags.iter().skip(1).step_by(2).collect();
-        assert!(kv.iter().any(|s| *s == "managed_by:rivet"));
-        assert!(kv.iter().any(|s| *s == "rivet_op:recover"));
-        assert!(kv.iter().any(|s| *s == "rivet_table:orders")); // sanitized to lowercase
-        assert!(kv.iter().any(|s| *s == "rivet_run:run-7")); // sanitized to lowercase
-        // Each label value is preceded by a `--label` flag.
-        assert!(flags.iter().step_by(2).all(|s| s == "--label"));
+        let labels = build_labels("recover", "Orders", Some("Run-7"));
+        assert_eq!(labels["managed_by"], "rivet");
+        assert_eq!(labels["rivet_op"], "recover");
+        assert_eq!(labels["rivet_table"], "orders"); // sanitized to lowercase
+        assert_eq!(labels["rivet_run"], "run-7"); // sanitized to lowercase
+        assert_eq!(
+            labels.len(),
+            4,
+            "no label beyond the documented four: {labels:?}"
+        );
     }
 
     #[test]
     fn no_run_id_omits_the_rivet_run_label() {
-        let flags = build_label_flags("load", "orders", None);
-        let kv: Vec<&String> = flags.iter().skip(1).step_by(2).collect();
-        assert!(kv.iter().any(|s| *s == "rivet_table:orders"));
-        assert!(!kv.iter().any(|s| s.starts_with("rivet_run:")));
+        let labels = build_labels("load", "orders", None);
+        assert_eq!(labels["rivet_table"], "orders");
+        assert!(!labels.contains_key("rivet_run"), "{labels:?}");
+    }
+
+    /// The labels the loader actually SENDS, taken from the loader (not
+    /// hand-built), and placed in the body BigQuery reads them from. The
+    /// producer-side half of the label contract: a run id that never reached
+    /// `configuration.labels` is a silent loss of cost attribution — every job
+    /// still runs, and the billing query returns nothing for the run.
+    #[test]
+    fn the_loader_sends_its_labels_in_the_job_configuration() {
+        let l = BigQueryLoader::new("p", "d").run_id("Run-9");
+        let body = crate::load::bq_rest::query_job_body(
+            "SELECT 1",
+            &l.labels("load", "Orders"),
+            "p",
+            None,
+        );
+        assert_eq!(body["configuration"]["labels"]["managed_by"], "rivet");
+        assert_eq!(body["configuration"]["labels"]["rivet_op"], "load");
+        assert_eq!(body["configuration"]["labels"]["rivet_table"], "orders");
+        assert_eq!(body["configuration"]["labels"]["rivet_run"], "run-9");
     }
 
     #[test]
@@ -733,24 +707,6 @@ mod tests {
         assert_eq!(sanitize_label(""), "unnamed");
         assert_eq!(sanitize_label("ok-name_1"), "ok-name_1");
         assert_eq!(sanitize_label(&"x".repeat(80)).len(), 63);
-    }
-
-    #[test]
-    fn clean_bq_output_keeps_real_error_drops_spinner() {
-        // Regression: bq prints the failure reason on STDOUT; stderr is just
-        // the spinner. run_bq must surface stdout so augment_partition_limit
-        // can see the quota text (live-caught: the reason was being dropped).
-        let stdout = b"Error in query string: Too many partitions produced by query, \
-                       allowed 4000, query produces at least 4200 partitions";
-        let cleaned = clean_bq_output(stdout);
-        assert!(cleaned.contains("Too many partitions") && cleaned.contains("4000"));
-        // The augment fires end-to-end on the cleaned stdout.
-        let augmented = augment_partition_limit(anyhow::anyhow!("{cleaned}")).to_string();
-        assert!(augmented.contains("split the"), "{augmented}");
-        // The stderr spinner collapses away.
-        let stderr = "Waiting on bqjob_x ... (0s) Current status: RUNNING\r\
-                      Waiting on bqjob_x ... (0s) Current status: DONE";
-        assert!(clean_bq_output(stderr.as_bytes()).is_empty());
     }
 
     /// THE foreign-table safety test. A table rivet did not create keeps its
@@ -800,7 +756,7 @@ mod tests {
     #[test]
     fn materialize_refuses_too_many_cluster_columns() {
         // A >4-column CLUSTER BY is a below-the-seam adapter limit (BigQuery's),
-        // caught in `materialize` before any `bq` call. (Empty-URI and Fail-spec
+        // caught in `materialize` before any BigQuery job is enqueued. (Empty-URI and Fail-spec
         // refusals are the driver's — see `load::tests`.)
         let l = BigQueryLoader::new("p", "d").cluster_by(vec![
             "a".into(),
@@ -820,7 +776,7 @@ mod tests {
     fn materialize_refuses_a_non_identifier_cluster_column() {
         // A clustering column splices raw into `CLUSTER BY <cols>`; a
         // non-identifier name is an injection vector and must be refused in
-        // `materialize` before any `bq` call — the sibling of the table/column/pk
+        // `materialize` before any BigQuery job is enqueued — the sibling of the table/column/pk
         // gate for the BigQuery shape clause.
         let l = BigQueryLoader::new("p", "d").cluster_by(vec!["id) FROM secrets; --".into()]);
         let err = l
@@ -940,6 +896,106 @@ mod tests {
             "expected rows, got {}",
             report.rows_loaded
         );
+    }
+
+    /// THE live proof of the REST transport, needing no GCS fixture: a real
+    /// query job through `jobs.insert` → poll → `getQueryResults`, then the
+    /// cost-attribution labels read back from BigQuery's OWN catalog
+    /// (`INFORMATION_SCHEMA.JOBS_BY_PROJECT`) rather than from the request body
+    /// this crate built — an independent oracle for the one contract the CLI
+    /// rewrite could silently drop. Also drives the failure path, so the error
+    /// mapping is exercised against a real `status.errorResult` and not only a
+    /// fixture. Drive it with:
+    ///
+    ///   BIGQUERY_TEST_PROJECT=rivet-data-tool RIVET_BQ_TEST_DATASET=rivet_type_lab \
+    ///   BIGQUERY_TEST_LOCATION=EU \
+    ///   cargo test --lib -- --ignored bigquery_rest_transport_live
+    #[test]
+    #[ignore = "live: needs a BigQuery project + ADC (no GCS fixture required)"]
+    fn bigquery_rest_transport_live_round_trips_a_query_job() {
+        // Soft-skip when unconfigured — see bigquery_live_load_round_trips.
+        let Ok(project) = std::env::var("BIGQUERY_TEST_PROJECT") else {
+            eprintln!("skipping bigquery_rest_transport_live: BIGQUERY_TEST_PROJECT unset");
+            return;
+        };
+        let dataset = std::env::var("RIVET_BQ_TEST_DATASET")
+            .or_else(|_| std::env::var("BIGQUERY_TEST_DATASET"))
+            .unwrap_or_else(|_| "rivet_test".to_string());
+        let region = std::env::var("BIGQUERY_TEST_LOCATION")
+            .unwrap_or_else(|_| "US".to_string())
+            .to_lowercase();
+
+        // A run id unique to this invocation, so the label read-back below is
+        // scoped to THIS run's jobs and cannot be satisfied by history.
+        let run_id = format!(
+            "rest-live-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        );
+        let table = "rivet_bq_rest_live";
+        let loader = BigQueryLoader::new(&project, &dataset).run_id(&run_id);
+        let fqtn = loader.fqtn(table);
+
+        // 1. A statement job: insert → poll → terminal verdict.
+        loader
+            .run_sql(
+                &format!("CREATE OR REPLACE TABLE `{fqtn}` AS SELECT 1 AS id UNION ALL SELECT 2"),
+                "create",
+                table,
+            )
+            .expect("CREATE OR REPLACE through the REST transport");
+
+        // 2. A scalar job: the getQueryResults leg, against a count this test
+        //    seeded itself (not one rivet reported).
+        assert_eq!(
+            loader.count_rows(&fqtn, table).expect("count over REST"),
+            2,
+            "the count must come back from getQueryResults"
+        );
+
+        // 3. The labels, read back from BigQuery's catalog. `run_id` is unique
+        //    per invocation, so a nonzero count can only come from the jobs
+        //    THIS test just ran.
+        let labelled = loader
+            .api()
+            .unwrap()
+            .run_query_scalar(
+                &format!(
+                    "SELECT COUNT(*) FROM `{project}`.`region-{region}`.INFORMATION_SCHEMA.JOBS_BY_PROJECT \
+                     WHERE creation_time > TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 1 HOUR) \
+                     AND EXISTS (SELECT 1 FROM UNNEST(labels) WHERE key = 'rivet_run' AND value = '{run_id}') \
+                     AND EXISTS (SELECT 1 FROM UNNEST(labels) WHERE key = 'managed_by' AND value = 'rivet')",
+                ),
+                &loader.labels("audit", table),
+            )
+            .expect("reading INFORMATION_SCHEMA.JOBS_BY_PROJECT");
+        assert!(
+            labelled >= 2,
+            "the run's jobs must carry rivet_run:{run_id} + managed_by:rivet in \
+             configuration.labels — INFORMATION_SCHEMA saw {labelled}"
+        );
+
+        // 4. The failure path: a real `status.errorResult` must reach the caller
+        //    with BigQuery's own reason text, not a bare "failed".
+        let err = loader
+            .run_sql(
+                &format!("SELECT * FROM `{project}.{dataset}.no_such_table_ever`"),
+                "probe",
+                table,
+            )
+            .expect_err("a missing table must fail the job");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("Not found") && rendered.contains("no_such_table_ever"),
+            "the REST error detail must name the reason: {rendered}"
+        );
+
+        // 5. Clean up after ourselves.
+        loader
+            .run_sql(&format!("DROP TABLE IF EXISTS `{fqtn}`"), "drop", table)
+            .expect("dropping the live fixture table");
     }
 
     /// Live BigQuery CDC round-trip: append a change-log Parquet into
