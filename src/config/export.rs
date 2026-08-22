@@ -404,6 +404,24 @@ impl ExportConfig {
             .unwrap_or_else(|| self.name.clone())
     }
 
+    /// The tables of a MULTIPLEX capture — a `mode: cdc` export whose `tables:`
+    /// list drives several tables through one change stream — or `None` when this
+    /// export is a single unit (one `table:`/`query:`, or any batch mode).
+    ///
+    /// Every consumer of the multiplex layout answers the same question first
+    /// ("is this export one table or N?"), and they must answer it identically:
+    /// `rivet validate` descends one sub-prefix per table, the type resolver
+    /// produces one document per table, and `rivet load` builds one plan per
+    /// table. A `tables:` list on a non-CDC export is already refused at
+    /// config-load, and an empty one is refused too — the filter here is
+    /// belt-and-suspenders so a caller can never fan out over nothing.
+    pub fn multiplex_tables(&self) -> Option<&[String]> {
+        if self.mode != ExportMode::Cdc {
+            return None;
+        }
+        self.tables.as_deref().filter(|t| !t.is_empty())
+    }
+
     /// Resolve the effective `(CompressionType, level)` for this export.
     /// `compression_profile` takes precedence over `compression` + `compression_level`.
     ///
@@ -945,6 +963,45 @@ mod tests {
             e.family(),
             "daily",
             "a split sub-export must fold to the parent family for the merge-back"
+        );
+    }
+
+    // ── ExportConfig::multiplex_tables ──────────────────────────────────────
+
+    /// The one decision "is this export ONE unit or N?" — read by `rivet
+    /// validate` (descend a sub-prefix per table), the type resolver (one
+    /// resolver document per table) and `rivet load` (one plan per table). All
+    /// three must answer the same, which is why they all call THIS.
+    ///
+    /// Both negative arms matter: a `tables:` list on a non-CDC export is not a
+    /// multiplex (config-load refuses it outright), and an empty list must never
+    /// present as one — a fan-out over zero tables produces zero plans and loads
+    /// nothing, silently.
+    #[test]
+    fn multiplex_tables_is_some_only_for_a_cdc_export_with_a_non_empty_list() {
+        let mut e = sample_export("cdc");
+        assert_eq!(e.multiplex_tables(), None, "no `tables:` → not a multiplex");
+
+        e.tables = Some(vec!["orders".into(), "customers".into()]);
+        assert_eq!(
+            e.multiplex_tables(),
+            None,
+            "`mode: full` is never a multiplex, whatever `tables:` says"
+        );
+
+        e.mode = ExportMode::Cdc;
+        assert_eq!(
+            e.multiplex_tables(),
+            Some(&["orders".to_string(), "customers".to_string()][..]),
+            "a `mode: cdc` export with `tables:` is N units"
+        );
+
+        e.tables = Some(vec![]);
+        assert_eq!(
+            e.multiplex_tables(),
+            None,
+            "an EMPTY list must not present as a multiplex — fanning out over zero \
+             tables plans zero loads and moves no data, silently"
         );
     }
 

@@ -433,7 +433,10 @@ pub fn check(
             let config_dir = std::path::Path::new(config_path)
                 .parent()
                 .unwrap_or_else(|| std::path::Path::new("."));
-            match type_report::collect_report(
+            // One report per UNIT, not per export: a multiplex `tables:` CDC
+            // export resolves one document per captured table (#252), each of
+            // which is a separate warehouse table downstream.
+            match type_report::collect_reports(
                 &config,
                 export,
                 &column_overrides,
@@ -442,41 +445,43 @@ pub fn check(
                 config_dir,
                 params,
             ) {
-                Ok(report) => {
-                    if report.has_fatal() {
-                        any_fatal = true;
-                    }
-                    if let Some(t) = eff_target
-                        && report.has_target_fail()
-                    {
-                        any_fatal = true;
-                        target_fail_cols += report
-                            .columns
-                            .iter()
-                            .filter(|c| c.target_status == Some(TargetStatus::Fail))
-                            .count();
-                        target_fail_label.get_or_insert(t.label());
-                    }
-                    if json_output {
-                        // `--json` + `--type-report` interaction (DESIGN):
-                        // emit BOTH, nested. Each export gets ONE JSON object
-                        // (NDJSON, one per line, unchanged) keeping the
-                        // top-level type-report keys (`export`/`columns`/
-                        // `violations`) so existing consumers and the
-                        // `check_json_flag_outputs_type_report_as_json` test
-                        // stay green — and we attach the per-export DIAGNOSTIC
-                        // verdict under a new `"diagnostic"` key. This is the
-                        // least-surprising shape because `check --json` already
-                        // emitted one type-report object per export; we simply
-                        // enrich each with its verdict rather than printing a
-                        // second, separate JSON value (which would break a
-                        // single-`from_str` parse of stdout).
-                        print_report_json_with_diagnostic(
-                            &report,
-                            diag_by_export.get(export.name.as_str()).copied(),
-                        )?;
-                    } else {
-                        type_report::print_table(&report, eff_target);
+                Ok(reports) => {
+                    for report in &reports {
+                        if report.has_fatal() {
+                            any_fatal = true;
+                        }
+                        if let Some(t) = eff_target
+                            && report.has_target_fail()
+                        {
+                            any_fatal = true;
+                            target_fail_cols += report
+                                .columns
+                                .iter()
+                                .filter(|c| c.target_status == Some(TargetStatus::Fail))
+                                .count();
+                            target_fail_label.get_or_insert(t.label());
+                        }
+                        if json_output {
+                            // `--json` + `--type-report` interaction (DESIGN):
+                            // emit BOTH, nested. Each export gets ONE JSON object
+                            // (NDJSON, one per line, unchanged) keeping the
+                            // top-level type-report keys (`export`/`columns`/
+                            // `violations`) so existing consumers and the
+                            // `check_json_flag_outputs_type_report_as_json` test
+                            // stay green — and we attach the per-export DIAGNOSTIC
+                            // verdict under a new `"diagnostic"` key. This is the
+                            // least-surprising shape because `check --json` already
+                            // emitted one type-report object per export; we simply
+                            // enrich each with its verdict rather than printing a
+                            // second, separate JSON value (which would break a
+                            // single-`from_str` parse of stdout).
+                            print_report_json_with_diagnostic(
+                                report,
+                                diag_by_export.get(export.name.as_str()).copied(),
+                            )?;
+                        } else {
+                            type_report::print_table(report, eff_target);
+                        }
                     }
                 }
                 Err(e) => {
@@ -561,30 +566,33 @@ pub fn collect_type_reports(
     let config_dir = std::path::Path::new(config_path)
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."));
-    config
-        .exports
-        .iter()
-        .map(|export| {
-            let column_overrides =
-                crate::plan::parse_column_overrides_pub(&export.columns, &export.name)?;
-            type_report::collect_report(
-                config,
-                export,
-                &column_overrides,
-                &policy,
-                Some(target),
-                config_dir,
-                None,
+    let mut out = Vec::with_capacity(config.exports.len());
+    for export in &config.exports {
+        let column_overrides =
+            crate::plan::parse_column_overrides_pub(&export.columns, &export.name)?;
+        // One report per UNIT: a multiplex `tables:` CDC export yields one per
+        // captured table, because each is a separate warehouse table with its own
+        // sub-prefix and its own column set (#252). Flattened rather than nested
+        // so the load planner keeps mapping report → plan one-to-one.
+        let reports = type_report::collect_reports(
+            config,
+            export,
+            &column_overrides,
+            &policy,
+            Some(target),
+            config_dir,
+            None,
+        )
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "export '{}': resolving column types for the {} load: {e:#}",
+                export.name,
+                target.label()
             )
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "export '{}': resolving column types for the {} load: {e:#}",
-                    export.name,
-                    target.label()
-                )
-            })
-        })
-        .collect()
+        })?;
+        out.extend(reports);
+    }
+    Ok(out)
 }
 
 /// Emit one export's `--json` line: the type report (`export`/`columns`/
@@ -882,6 +890,7 @@ mod tests {
     fn empty_report(export: &str) -> type_report::ExportTypeReport {
         type_report::ExportTypeReport {
             export: export.to_string(),
+            table: None,
             columns: Vec::new(),
             violations: Vec::new(),
             target_failures: false,

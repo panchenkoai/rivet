@@ -42,10 +42,16 @@ pub struct TypeReportRow {
     pub cast_sql: Option<String>,
 }
 
-/// One export's type-report data.
+/// One export's type-report data — or, for a multiplex `tables:` CDC export, ONE
+/// TABLE'S (see [`collect_reports`]).
 #[derive(Serialize)]
 pub struct ExportTypeReport {
     pub export: String,
+    /// The source table this report describes. `Some` only for one table of a
+    /// multiplex `tables:` stream, where the export is N tables and each gets its
+    /// own document; `None` when the export IS the unit (`table:` / `query:`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub table: Option<String>,
     pub columns: Vec<TypeReportRow>,
     pub violations: Vec<PolicyViolation>,
     /// True when any column failed target-compatibility.
@@ -67,10 +73,63 @@ impl ExportTypeReport {
     pub fn has_target_fail(&self) -> bool {
         self.target_failures
     }
+
+    /// How this report addresses itself in operator-facing output: the export
+    /// name, or `<export>/<table>` for one table of a multiplex stream — the same
+    /// addressing `rivet validate` prints for the same layout, so an operator
+    /// reading `check` and `validate` side by side sees one naming scheme.
+    pub fn display_name(&self) -> String {
+        match &self.table {
+            Some(t) => format!("{}/{}", self.export, t),
+            None => self.export.clone(),
+        }
+    }
 }
 
-/// Collect type mappings for one export from a live connection.
-pub fn collect_report(
+/// The `(table, query)` units one export resolves to for type resolution.
+///
+/// A multiplex `tables:` CDC export drives N tables through ONE change stream,
+/// and each lands in its own destination sub-prefix and its own warehouse table
+/// — so it needs one resolver document PER TABLE. It also has no `query:` /
+/// `table:` at all, so asking it for one is not merely coarse: `resolve_query`
+/// bails ("must specify exactly one of 'query', 'query_file', or 'table'"),
+/// which is how a multiplex export got NO type report at all (#252).
+///
+/// The probe query is the same `SELECT * FROM {table}` the CDC capture itself
+/// uses for each table's schema (`source::cdc::CdcSchemaResolver::resolve`),
+/// through the same identifier guard — config-load gates a `tables:` entry only
+/// for FILENAME safety, which is weaker than SQL interpolation needs.
+fn report_units(
+    export: &ExportConfig,
+    config_dir: &std::path::Path,
+    params: Option<&std::collections::HashMap<String, String>>,
+) -> Result<Vec<(Option<String>, String)>> {
+    match export.multiplex_tables() {
+        Some(tables) => tables
+            .iter()
+            .map(|t| {
+                crate::source::cdc::validate_table_ident(t)?;
+                Ok((Some(t.clone()), format!("SELECT * FROM {t}")))
+            })
+            .collect(),
+        // Resolve the effective query the same way the export pipeline does, so
+        // the `table:` shortcut (and `query_file:` / `${var}` params) produce a
+        // real query instead of an empty string.
+        None => Ok(vec![(None, export.resolve_query(config_dir, params)?)]),
+    }
+}
+
+/// Collect type mappings for one export from a live connection — **one report
+/// per unit**: one for an ordinary export, one PER TABLE for a multiplex
+/// `tables:` CDC stream (see [`report_units`]).
+///
+/// The fan-out lives here rather than at each caller because both callers need
+/// it and neither can be trusted to re-derive it: `rivet check --target` renders
+/// these documents and `rivet load` PLANS from them, so a caller that saw one
+/// document per export would load N tables into one warehouse table (or, before
+/// #252, fail outright). One connection serves every table — a 154-table
+/// multiplex must not open 154 of them.
+pub fn collect_reports(
     config: &Config,
     export: &ExportConfig,
     column_overrides: &ColumnOverrides,
@@ -78,13 +137,10 @@ pub fn collect_report(
     target: Option<ExportTarget>,
     config_dir: &std::path::Path,
     params: Option<&std::collections::HashMap<String, String>>,
-) -> Result<ExportTypeReport> {
+) -> Result<Vec<ExportTypeReport>> {
+    let units = report_units(export, config_dir, params)?;
     let url = config.source.resolve_url()?;
     let tls = config.source.tls.as_ref();
-    // Resolve the effective query the same way the export pipeline does, so the
-    // `table:` shortcut (and `query_file:` / `${var}` params) produce a real
-    // query instead of an empty string.
-    let query = export.resolve_query(config_dir, params)?;
 
     let mut src: Box<dyn source::Source> = match config.source.source_type {
         SourceType::Postgres => Box::new(source::postgres::PostgresSource::connect_with_tls(
@@ -95,7 +151,41 @@ pub fn collect_report(
         SourceType::Mongo => Box::new(source::mongo::MongoSource::connect(&url, tls, None)?),
     };
 
-    let mut mappings = src.type_mappings(&query, column_overrides)?;
+    units
+        .into_iter()
+        .map(|(table, query)| {
+            // A `columns:` override on a multiplex export can be qualified
+            // (`orders.amount`) or bare — narrow it to THIS table exactly the way
+            // the capture does, so `check`/`load` type a table the same way `run`
+            // writes it.
+            let overrides = match &table {
+                Some(t) => crate::types::overrides_for_table(column_overrides, t),
+                None => column_overrides.clone(),
+            };
+            collect_one(
+                src.as_mut(),
+                export,
+                table,
+                &query,
+                &overrides,
+                policy,
+                target,
+            )
+        })
+        .collect()
+}
+
+/// One unit's report, against an already-open source connection.
+fn collect_one(
+    src: &mut dyn source::Source,
+    export: &ExportConfig,
+    table: Option<String>,
+    query: &str,
+    column_overrides: &ColumnOverrides,
+    policy: &TypePolicy,
+    target: Option<ExportTarget>,
+) -> Result<ExportTypeReport> {
+    let mut mappings = src.type_mappings(query, column_overrides)?;
 
     // #32 (column-applicability): a `columns:` override that *narrows* the
     // source type — e.g. `price numeric(10,2)` → `decimal(20,0)` — drops the
@@ -108,7 +198,7 @@ pub fn collect_report(
     // downgrade when the source type is confidently known (autodetect resolved
     // it) — never on a guess, so we don't fabricate a loss we can't prove.
     if !column_overrides.is_empty() {
-        let source_mappings = src.type_mappings(&query, &ColumnOverrides::new())?;
+        let source_mappings = src.type_mappings(query, &ColumnOverrides::new())?;
         let source_by_name: std::collections::HashMap<&str, &crate::types::RivetType> =
             source_mappings
                 .iter()
@@ -202,11 +292,15 @@ pub fn collect_report(
     // L5 recovery SQL (ADR-0014): a post-load transform for operators whose
     // bare autoload would degrade types. `None` for DuckDB (faithful autoload)
     // or when no target is set.
-    let recovery_sql =
-        target.and_then(|t| t.recovery_sql(&t.resolve_table(&mappings), &export.name));
+    // The recovery SQL names the table it recovers — for a multiplex unit that is
+    // THIS table, not the export (154 tables all pointed at a `cdc` table would be
+    // a hint the operator cannot run).
+    let sql_table = table.as_deref().unwrap_or(&export.name);
+    let recovery_sql = target.and_then(|t| t.recovery_sql(&t.resolve_table(&mappings), sql_table));
 
     Ok(ExportTypeReport {
         export: export.name.clone(),
+        table,
         columns: rows,
         violations,
         target_failures,
@@ -224,9 +318,13 @@ pub fn print_table(report: &ExportTypeReport, target: Option<ExportTarget>) {
 
     println!();
     if let Some(tgt) = target {
-        println!("Export: {}  [target: {}]", report.export, tgt.label());
+        println!(
+            "Export: {}  [target: {}]",
+            report.display_name(),
+            tgt.label()
+        );
     } else {
-        println!("Export: {}", report.export);
+        println!("Export: {}", report.display_name());
     }
 
     if target.is_some() {
@@ -426,6 +524,105 @@ fn rivet_type_label(t: &crate::types::RivetType) -> String {
 mod tests {
     use super::*;
     use crate::types::{RivetType, TypeFidelity};
+
+    // ── report_units (#252: the multiplex `tables:` fan-out) ─────────────────
+
+    fn cfg_from(yaml: &str) -> Config {
+        Config::from_yaml(yaml).unwrap()
+    }
+
+    /// A multiplex `tables:` CDC export must resolve ONE unit per captured table.
+    ///
+    /// Before #252 it resolved none at all: the export carries no `table:` and no
+    /// `query:`, so `resolve_query` bailed ("must specify exactly one of 'query',
+    /// 'query_file', or 'table'") and `rivet check --target` fell through to a
+    /// diagnostic-only line while `rivet load` failed outright — for a config
+    /// shape `rivet init --mode cdc` emits by default.
+    ///
+    /// The probe query must be the SAME `SELECT * FROM {table}` the capture uses
+    /// for that table's schema; a per-table query that differs would type the
+    /// table differently from the way `run` writes it.
+    #[test]
+    fn report_units_yields_one_unit_per_multiplex_table() {
+        let config = cfg_from(
+            r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: cdc
+    tables: [orders, customers, line_items]
+    mode: cdc
+    format: parquet
+    cdc:
+      checkpoint: ./cdc.ckpt
+    destination:
+      type: local
+      path: /tmp/x
+"#,
+        );
+        let units = report_units(&config.exports[0], std::path::Path::new("."), None).unwrap();
+        assert_eq!(
+            units,
+            vec![
+                (Some("orders".into()), "SELECT * FROM orders".to_string()),
+                (Some("customers".into()), "SELECT * FROM customers".into()),
+                (Some("line_items".into()), "SELECT * FROM line_items".into()),
+            ],
+            "each captured table is its own resolver unit, probed the way the \
+             capture probes it"
+        );
+    }
+
+    /// The other side of the same branch: a single-table export is ONE unit whose
+    /// `table` is `None` — the export IS the unit, so nothing downstream starts
+    /// fanning out an ordinary export into per-table plans.
+    #[test]
+    fn report_units_leaves_a_single_table_export_as_one_unnamed_unit() {
+        let config = cfg_from(
+            r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: orders
+    table: public.orders
+    mode: full
+    format: parquet
+    destination:
+      type: local
+      path: /tmp/x
+"#,
+        );
+        let units = report_units(&config.exports[0], std::path::Path::new("."), None).unwrap();
+        assert_eq!(
+            units,
+            vec![(None, "SELECT * FROM public.orders".to_string())],
+            "a `table:` export resolves its own query, unnamed — the export is the unit"
+        );
+    }
+
+    /// `display_name` is what an operator reads in the type-report header, and it
+    /// must distinguish the N documents a multiplex export now emits — otherwise
+    /// 154 tables print 154 blocks all headed `Export: cdc`. Matches the
+    /// `<export>/<table>` addressing `rivet validate` already prints.
+    #[test]
+    fn display_name_addresses_a_multiplex_unit_by_export_and_table() {
+        let base = ExportTypeReport {
+            export: "cdc".into(),
+            table: None,
+            columns: vec![],
+            violations: vec![],
+            target_failures: false,
+            recovery_sql: None,
+        };
+        assert_eq!(base.display_name(), "cdc");
+        let unit = ExportTypeReport {
+            table: Some("orders".into()),
+            ..base
+        };
+        assert_eq!(unit.display_name(), "cdc/orders");
+    }
 
     // ── override_narrows (#32: lossy scale/precision narrowing) ──────────────
 
