@@ -159,7 +159,20 @@ pub fn collect_reports(
             // the capture does, so `check`/`load` type a table the same way `run`
             // writes it.
             let overrides = match &table {
-                Some(t) => crate::types::overrides_for_table(column_overrides, t),
+                // BARE name, per `overrides_for_table`'s contract ("`table` is the
+                // bare table name (no schema part)") and, crucially, per what the
+                // CAPTURE passes (`cdc_job.rs`, `plan/build.rs` — both rsplit the
+                // schema off). A `tables: [public.orders]` entry keeps its schema
+                // here, so passing it whole made a qualified key (`orders.amount`)
+                // match nothing: the capture APPLIED the override and this
+                // resolver DROPPED it. Since the load stopped shelling out to
+                // `rivet check` and reads this report directly, that mismatch
+                // types the created warehouse column from the raw catalog while
+                // the Parquet already holds the overridden type.
+                Some(t) => crate::types::overrides_for_table(
+                    column_overrides,
+                    t.rsplit('.').next().unwrap_or(t),
+                ),
                 None => column_overrides.clone(),
             };
             collect_one(
@@ -658,6 +671,66 @@ mod tests {
     /// The probe query must be the SAME `SELECT * FROM {table}` the capture uses
     /// for that table's schema; a per-table query that differs would type the
     /// table differently from the way `run` writes it.
+    /// The THREE narrowing call sites must key on the SAME thing, or `check`/`load`
+    /// type a table differently from the way `run` wrote it.
+    ///
+    /// `overrides_for_table`'s contract says "`table` is the bare table name (no
+    /// schema part)", and the two CAPTURE sites honour it by rsplitting the schema
+    /// off (`pipeline/cdc_job.rs`, `plan/build.rs`). The resolver added with the
+    /// multiplex fan-out passed the raw `tables:` entry instead — so on a
+    /// schema-qualified entry a qualified key matched NOTHING: the capture applied
+    /// the override, the resolver dropped it. Since the load stopped shelling out
+    /// to `rivet check`, that report is now the warehouse DDL, so the created
+    /// column took the raw catalog type while the Parquet already held the
+    /// overridden one.
+    ///
+    /// This test pins the SHARED key rather than one site's behaviour: it asserts
+    /// the bare and qualified spellings of the same table narrow identically, which
+    /// is exactly the property that failed. RED against passing `t` whole.
+    #[test]
+    fn every_narrowing_site_keys_on_the_bare_table_name() {
+        let overrides: crate::types::ColumnOverrides = [
+            ("orders.amount".to_string(), crate::types::RivetType::Int64),
+            ("note".to_string(), crate::types::RivetType::Int64),
+        ]
+        .into_iter()
+        .collect();
+
+        // What the CAPTURE passes for `tables: [public.orders]`.
+        let capture_key = "public.orders"
+            .rsplit('.')
+            .next()
+            .unwrap_or("public.orders");
+        let from_capture = crate::types::overrides_for_table(&overrides, capture_key);
+
+        // What the resolver must pass for the SAME unit.
+        let unit = "public.orders";
+        let from_resolver =
+            crate::types::overrides_for_table(&overrides, unit.rsplit('.').next().unwrap_or(unit));
+
+        assert_eq!(
+            from_capture.len(),
+            from_resolver.len(),
+            "the capture and the resolver must narrow a schema-qualified unit the same way"
+        );
+        assert!(
+            from_resolver.contains_key("amount"),
+            "the qualified override `orders.amount` must reach a `public.orders` unit — \
+             dropping it types the warehouse column from the raw catalog while the \
+             Parquet already holds the overridden type; got {from_resolver:?}"
+        );
+        assert!(
+            from_resolver.contains_key("note"),
+            "a bare key still applies to every table: {from_resolver:?}"
+        );
+        // …and the un-narrowed spelling is exactly the bug: nothing matches.
+        assert!(
+            !crate::types::overrides_for_table(&overrides, unit).contains_key("amount"),
+            "guard the guard: passing the QUALIFIED name really does drop the override, \
+             so this test is not vacuous"
+        );
+    }
+
     #[test]
     fn report_units_yields_one_unit_per_multiplex_table() {
         let config = cfg_from(
