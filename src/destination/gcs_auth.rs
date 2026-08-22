@@ -666,5 +666,20 @@ mod tests {
         let dbg = format!("{loader:?}");
         assert!(!dbg.contains("SECRETVALUE"), "client_secret leaked: {dbg}");
         assert!(!dbg.contains("RTOKENVALUE"), "refresh_token leaked: {dbg}");
+        // …and the POSITIVE half, without which the absence assertions above are
+        // satisfied by rendering NOTHING: the in-diff mutation gate found
+        // `Debug::fmt -> Ok(Default::default())` (an empty impl) alive here,
+        // because an empty string contains no secret either. A redaction test
+        // must pin what the impl still SHOWS, or it stops guarding the impl and
+        // only guards the string.
+        assert!(
+            dbg.contains("AdcUserTokenLoader"),
+            "Debug must still name the type — an empty impl passes the leak \
+             assertions while telling an operator nothing: {dbg}"
+        );
+        assert!(
+            dbg.contains("cid"),
+            "the PUBLIC client id is the one field this impl exists to render: {dbg}"
+        );
     }
 }
