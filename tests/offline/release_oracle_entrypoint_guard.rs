@@ -375,3 +375,73 @@ fn the_prev_release_child_harnesses_are_launched_through_the_sigint_first_runner
         );
     }
 }
+
+/// Every file the BigQuery stage stages into its SHARED `work` directory must
+/// carry `{engine}` in its name.
+///
+/// `run_bigquery_golden` builds ONE `work` dir and hands the same `Path` to all
+/// three engine legs, which it then runs CONCURRENTLY in a `ThreadPoolExecutor`.
+/// So a staged file whose name is a constant has three writers and three
+/// subprocess readers: whoever `write_text`s last wins the file, and a sibling's
+/// content is uploaded under THIS engine's prefix.
+///
+/// Not hypothetical. `verify_gc_survival` staged its `running`-marker manifest as
+/// a constant `manifest-gc-survival-probe.json`; on the 2026-08-22 gate the mssql
+/// and mysql legs ran 0.12 s apart (their arm-1 loads land at 08:55:16.207/.329
+/// in the `load_run` ledger), mssql uploaded MYSQL'S manifest into `bq/mssql/`,
+/// and `rivet load` refused the prefix — correctly, with "holds manifests from 2
+/// DIFFERENT SOURCES (mssql:…, mysql:…)", the guard that stops one source's rows
+/// from replacing another's in a warehouse table. The cell recorded
+/// `gc-load-failed-with-a-running-marker` and dropped the sentence explaining it.
+///
+/// Scope, said out loud: the subject is `bigquery.py` — the one gate module whose
+/// `work` dir is shared ACROSS concurrently-running engine legs (`blessed_flow` /
+/// `blessed_path` build a `work` per cell). It grades string LITERALS after
+/// `work /`; a name computed into a variable escapes it, which is why the
+/// non-vacuity floor insists the scan really found the staged files.
+#[test]
+fn every_file_the_concurrent_bigquery_legs_stage_into_the_shared_work_dir_is_engine_keyed() {
+    let raw = fs::read_to_string(format!("{}/dev/release_oracle/bigquery.py", root()))
+        .expect("read bigquery.py");
+    // Comments and docstrings FIRST: this guard's own reason is written in prose
+    // right above the code it grades, and prose is not evidence.
+    let src = strip_python_comments(&raw);
+    assert!(
+        src.contains("ThreadPoolExecutor"),
+        "the BigQuery stage no longer runs its engine legs concurrently — if that is \
+         deliberate, this guard's premise (one `work` dir, three writers) is gone and it \
+         should be deleted rather than left passing for the wrong reason"
+    );
+
+    let mut seen: Vec<String> = Vec::new();
+    let mut offenders: Vec<String> = Vec::new();
+    let mut rest = src.as_str();
+    while let Some(at) = rest.find("work / ") {
+        let tail = &rest[at + "work / ".len()..];
+        rest = tail;
+        let tail = tail.strip_prefix('f').unwrap_or(tail);
+        let Some(tail) = tail.strip_prefix('"') else {
+            continue; // not a literal (a variable, a nested call) — see the scope note
+        };
+        let Some(end) = tail.find('"') else { continue };
+        let lit = tail[..end].to_string();
+        if !lit.contains("{engine}") {
+            offenders.push(lit.clone());
+        }
+        seen.push(lit);
+    }
+    assert!(
+        seen.len() >= 3,
+        "found only {} `work / \"…\"` literal(s) in bigquery.py — the scan is reading the \
+         wrong shape and grades nothing (it must see at least the export config, the gc \
+         config and the gc-survival marker)",
+        seen.len()
+    );
+    assert!(
+        offenders.is_empty(),
+        "these files are staged into the BigQuery stage's SHARED work dir under a name that is \
+         the SAME for all three concurrent engine legs: {offenders:?}. The last writer wins the \
+         local file and a sibling's content is uploaded into this engine's prefix — key the \
+         name on the engine, as bqload_<engine>.yaml and gc_<engine>.yaml already do"
+    );
+}
