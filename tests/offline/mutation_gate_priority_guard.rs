@@ -121,9 +121,11 @@ fn job_shell(job: &str, floor: usize) -> String {
 /// branch inside one, function measured at zero, unmentioned file, uncovered
 /// line, unparseable name), the no-coverage fallback, the exactness of the
 /// generated `--exclude-re` patterns, both directions of the post-exclusion
-/// verification, and six coverage-report shapes it must REFUSE rather than read
-/// as "nothing is covered". Each case is RED-provable against one named mutant
-/// in the script; the mutants are listed in its `self_test` docstring.
+/// verification, six coverage-report shapes it must REFUSE rather than read
+/// as "nothing is covered", and the P2-audit's oracle scoped to the P2 class
+/// (over PR #265's four real leaked kills). Each case is RED-provable against
+/// one named mutant in the script; the mutants are listed in its `self_test`
+/// docstring.
 #[test]
 fn the_mutant_prioritiser_passes_its_own_self_test() {
     let out = classify(&["--self-test"]);
@@ -261,11 +263,13 @@ fn only_a_function_measured_at_zero_leaves_the_graded_class() {
 /// the job's `run:` shell with comments stripped, so the long comment blocks
 /// above each command — which name these very invocations — cannot satisfy it.
 ///
-/// RED-proven three times, each with the rest of this file staying green:
+/// RED-proven four times, each with the rest of this file staying green:
 /// replacing the MEASURED partition branch with `true` (the workflow still
 /// calls the classifier and still grades one undifferentiated pile — caught on
 /// `--extents fn-extents.tsv`); turning the post-exclusion `verify` into
-/// `if false`; and deleting the `--self-test` step from `gate-scripts`.
+/// `if false`; restoring the audit's `[ -s p2-audit/mutants.out/caught.txt ]`
+/// test in place of the scoped `audit p2.txt`; and deleting the `--self-test`
+/// step from `gate-scripts`.
 #[test]
 fn the_mutation_gate_actually_invokes_the_prioritiser() {
     let mutate = job_shell("mutants-in-diff", 40);
@@ -293,6 +297,20 @@ fn the_mutation_gate_actually_invokes_the_prioritiser() {
             "verify p1.txt p1-check.txt",
             "the check that the generated exclusions removed exactly the report-only class; \
              without it an over-broad pattern silently un-grades blocking mutants",
+        ),
+        (
+            // The audit's oracle must be SCOPED to p2.txt. Reading
+            // `caught.txt` directly (`[ -s ... ]`, as this step did until
+            // 2026-08-22) grades kills on mutants that were never in the
+            // report-only class: cargo-mutants 27.1.0 cannot exclude a
+            // `Genre::StructField` mutant at all, so any the diff contains
+            // leak into the audit corpus whatever the P1 exclusions say. PR
+            // #265 failed `oracle-lied` on four such leaks with 0 of its 68
+            // graded mutants missed.
+            "audit p2.txt",
+            "the P2-audit's oracle, scoped to the class it audits; reading the audit run's \
+             caught.txt directly counts kills on mutants cargo-mutants could not exclude \
+             from that run as proof the classification lied",
         ),
     ] {
         super::nonvacuity::require_needle(

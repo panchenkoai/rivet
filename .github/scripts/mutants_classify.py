@@ -63,6 +63,14 @@ Usage:
         silently un-grading P1 mutants is the exact defect
         `mutants_exclusions.py` exists to catch in the hand-written list.
 
+  mutants_classify.py audit <p2-list> <caught-list>
+        Grade the P2-AUDIT run's kills AGAINST the P2 class. Exits 1 (the
+        `oracle-lied` state) only when a mutant that is genuinely in the
+        report-only class was caught offline. A kill on anything else is a P1
+        mutant that LEAKED into the audit corpus — reported, never counted as
+        evidence about a class it was never in. See `audit`'s docstring for the
+        measured leak this exists for.
+
   mutants_classify.py --states     the state vocabulary, one per line
   mutants_classify.py --self-test
 """
@@ -245,9 +253,51 @@ def verify(expected: list[str], actual: list[str]) -> list[str]:
         errors.append(
             f"::error::{len(got - want)} mutant(s) survived the exclusions that were meant to "
             "be deprioritised — the restriction did not take, so the run below would not be "
-            f"the class it reports:\n  {sample}"
+            f"the class it reports. An over-broad pattern is one cause; the other is a mutant "
+            "cargo-mutants cannot filter AT ALL (see `audit` below — `Genre::StructField`, the "
+            f"`delete field X from struct Y expression` shape, bypasses `--exclude-re`):\n  {sample}"
         )
     return errors
+
+
+def audit(p2: list[str], caught: list[str]) -> tuple[list[str], list[str]]:
+    """(in-class kills, leaked) over the P2-audit run's `caught.txt`.
+
+    The audit runs the corpus with the P1 exclusions applied and asks whether
+    the offline suite can kill anything left — a kill would falsify "this class
+    is unkillable offline" and make the split unsound (`oracle-lied`). That is
+    only true of a mutant the run actually CLASSIFIED P2. What survives the P1
+    exclusions is not automatically P2, and on 2026-08-22 it was not: PR #265's
+    audit caught four mutants, all of them P1, none of them in the P2 list the
+    same run had just printed.
+
+    Measured cause, in cargo-mutants 27.1.0 (`src/visit.rs`): every genre is
+    created through `collect_mutant`, which gates on `options.allows_mutant()` —
+    except `Genre::StructField` (`delete field X from struct Y expression`),
+    which is pushed straight onto `self.mutants`. So `--exclude-re` cannot
+    remove one, from the CLI or from `.cargo/mutants.toml`. Probed directly on
+    the branch: `cargo mutants --list --file src/load/plan.rs` yields 56 names,
+    and `--exclude-re .` — a pattern matching every one of them — leaves 4, all
+    `StructField`. Those four leaked into the audit corpus, were caught (they
+    sit in `table_load_prefix`, which `load::plan::tests` covers), and were read
+    as "a mutant classified unkillable was killed".
+
+    So the oracle is SCOPED to the class it audits rather than to whatever the
+    exclusions happened to leave. This narrows nothing the gate was entitled to:
+    a genuinely-P2 kill still trips `oracle-lied`. The leak in the other
+    direction — an unexcludable mutant that IS in P2, so the MAIN run cannot
+    deprioritise it — is already fail-closed by `verify`, which sees it survive
+    the P2 exclusions, discards them, and grades the whole diff.
+    """
+    want = {strip_ansi(n).strip() for n in p2 if strip_ansi(n).strip()}
+    in_class: list[str] = []
+    leaked: list[str] = []
+    for name in caught:
+        name = strip_ansi(name).strip()
+        if not name:
+            continue
+        (in_class if name in want else leaked).append(name)
+    return in_class, leaked
 
 
 # --------------------------------------------------------------------------
@@ -307,6 +357,28 @@ _COV = {
     ],
 }
 
+# PR #265's P2-audit, verbatim from the `Mutants (changed lines)` log of run
+# 32570267943. `_AUDIT_LEAK` is the whole of that run's `caught.txt` — four
+# lines, two distinct mutants, each listed twice because `src/main.rs` declares
+# the same modules as `src/lib.rs` and cargo-mutants walks both target roots.
+#
+# Not one of them was in the P2 list the same run printed (that list was ten
+# distinct mutants in `src/preflight/`, two of which are `_AUDIT_P2` here).
+# They are `Genre::StructField` mutants, which cargo-mutants 27.1.0 cannot
+# filter — so they leaked past the audit's P1 exclusions and were caught, and
+# the gate read four kills in code the offline suite demonstrably executes as
+# proof that its zero-coverage measurement had lied.
+_AUDIT_P2 = [
+    "src/preflight/type_report.rs:333:5: replace print_table with ()",
+    "src/preflight/mod.rs:542:51: delete ! in check",
+]
+_AUDIT_LEAK = [
+    "src/load/plan.rs:378:13: delete field destination_type from struct "
+    "crate::config::DestinationConfig expression in table_load_prefix",
+    "src/load/plan.rs:379:13: delete field prefix from struct "
+    "crate::config::DestinationConfig expression in table_load_prefix",
+] * 2
+
 
 def self_test() -> int:
     """Grade the classifier over the shapes it must judge.
@@ -325,6 +397,10 @@ def self_test() -> int:
         corpus full of `->`, `*`, `+`, `(` and `[`;
       * `function_extents` returning `[]` instead of raising on a shape it does
         not know — an unreadable report reads as "nothing is covered".
+      * `audit` attributing every kill to the report-only class (`return
+        list(caught), []`, which is what the workflow's `[ -s caught.txt ]`
+        test did before 2026-08-22) — PR #265's four leaked `StructField`
+        kills go back to reading as `oracle-lied`.
     """
     extents_rows = function_extents(_COV, root="/repo")
     ext = load_extents([f"{f}\t{lo}\t{hi}\t{c}" for (f, lo, hi, c) in extents_rows])
@@ -387,6 +463,31 @@ def self_test() -> int:
     errs = verify(corpus[:1], corpus)
     assert errs and "survived the exclusions" in errs[0], errs
 
+    # The P2 AUDIT is scoped to the P2 class, over PR #265's real numbers.
+    #
+    # A mutant that cargo-mutants cannot exclude sits in the audit corpus
+    # whatever the P1 exclusions say, so "the audit caught something" and "a
+    # report-only mutant was killed" are different statements. Grading the
+    # first as the second is what failed that PR with `oracle-lied` while its
+    # own code was clean (0 missed of 68 graded).
+    in_class, leaked = audit(_AUDIT_P2, _AUDIT_LEAK)
+    assert in_class == [], (
+        "a kill on a mutant that was never in the report-only class is not evidence about "
+        f"that class — the audit still reads it as an oracle break: {in_class}"
+    )
+    assert len(leaked) == 4, leaked
+
+    # …and the oracle still bites where it is supposed to. One genuinely-P2
+    # kill among the leak is `oracle-lied`, which is the whole point of running
+    # the class instead of trusting the measurement.
+    in_class, leaked = audit(_AUDIT_P2, _AUDIT_LEAK + [_AUDIT_P2[0]])
+    assert in_class == [_AUDIT_P2[0]], in_class
+    assert len(leaked) == 4, leaked
+
+    # An audit that killed nothing is the ordinary healthy case; so is an
+    # absent/empty caught.txt, which the CLI passes through as [].
+    assert audit(_AUDIT_P2, []) == ([], [])
+
     # A report shape this script does not know is an ERROR, never an empty
     # coverage set — the difference between "the prioritisation did not run"
     # and "no function in this crate is executed".
@@ -423,7 +524,8 @@ def self_test() -> int:
     print(
         "self-test ok: executed / zero-coverage / unmeasured-file / uncovered-line / "
         "unparseable classification, the no-coverage fallback, exact exclusions, "
-        "both verify directions, and six rejected report shapes"
+        "both verify directions, six rejected report shapes, and the P2 audit scoped "
+        "to the P2 class over PR #265's leaked StructField kills"
     )
     return 0
 
@@ -497,6 +599,49 @@ def main(argv: list[str]) -> int:
         for line in errors:
             print(line)
         return 1 if errors else 0
+
+    if len(argv) == 4 and argv[1] == "audit":
+        # The P2 list must be READABLE. Without it every kill would look like a
+        # leak and the audit would report `oracle-holds` having compared
+        # nothing — fail-open on exactly the check that keeps the report-only
+        # class honest. Unreadable is therefore a break, like any other.
+        try:
+            p2 = Path(argv[2]).read_text().splitlines()
+        except OSError as e:
+            print(
+                f"::error::cannot read the report-only class {argv[2]}: {e}. The audit has "
+                "nothing to compare its kills against, and an audit that compares nothing "
+                "must not report that the classification held.",
+            )
+            return 1
+        # An absent caught.txt is the ordinary "the audit killed nothing" case:
+        # cargo-mutants writes the file only once it has a kill to record, and
+        # the run is invoked with `|| true` so a broken audit lands here too.
+        caught = Path(argv[3]).read_text().splitlines() if Path(argv[3]).exists() else []
+        in_class, leaked = audit(p2, caught)
+        if leaked:
+            print(
+                f"::notice::{len(leaked)} mutant(s) were caught in the P2-audit run that are "
+                "NOT in the report-only class. They are graded-class mutants cargo-mutants "
+                "could not exclude from the audit corpus — `Genre::StructField` (`delete field "
+                "X from struct Y expression`) bypasses `--exclude-re` entirely in 27.1.0 — so "
+                "their being caught says nothing about the classification. They are graded on "
+                f"their own account in the run above:\n  " + "\n  ".join(sorted(set(leaked))[:5])
+            )
+        if in_class:
+            print(
+                f"::error::the offline suite CAUGHT {len(in_class)} mutant(s) this run had "
+                "classified as unkillable offline. The coverage measurement and the test run "
+                "disagree, so the report-only class is not safe and nothing may be "
+                f"deprioritised on it:\n  " + "\n  ".join(sorted(set(in_class))[:10])
+            )
+            return 1
+        print(
+            f"ok: the report-only class held — {len(p2)} mutant(s) classified unkillable "
+            f"offline, none of them killed by the offline suite ({len(leaked)} unexcludable "
+            "graded-class mutant(s) ran alongside them and were ignored)."
+        )
+        return 0
 
     print(__doc__, file=sys.stderr)
     return 2
