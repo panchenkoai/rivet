@@ -77,7 +77,6 @@ from .core import (
     have,
     port_of,
     rivet,
-    rivet_bin,
 )
 
 #: The gate's own bucket, read from its config rather than named here. A private
@@ -1109,7 +1108,9 @@ def _load_leg(led: Ledger, cell: Cell, tag: str, work: Path, env: dict, url: str
     load_id = (
         f"flow-{cell.engine}-{cell.lifecycle}-{cell.state}-{scenarios.work_dir().name}-{os.getpid()}"
     )
-    p = rivet("load", "-c", str(lcfg), "--rivet-bin", str(rivet_bin()),
+    # No `--rivet-bin`: the load resolves types IN PROCESS now (the flag existed
+    # only to pin which binary the `rivet check` subprocess was, and is gone).
+    p = rivet("load", "-c", str(lcfg),
               "--run-id", load_id, env=env, timeout=scenarios.NO_TIMEOUT)
     if not p.ok:
         _stage(led, cell, tag, "load", False, f"exit={p.returncode} {_why(p)}")
@@ -1446,8 +1447,8 @@ def verify_flag_surface(led: Ledger) -> None:
     cells = cross_product(["postgres"])
     cov = flag_coverage(cells)
     carried = {f for fl in cov.values() for f in fl}
-    # `-c`, `-o` and load's two are carried by the executor rather than declared.
-    carried |= {"--config", "--output", "--rivet-bin", "--run-id", "--prefix", "--date"}
+    # `-c`, `-o` and load's `--run-id` are carried by the executor rather than declared.
+    carried |= {"--config", "--output", "--run-id", "--prefix", "--date"}
     # The chain, DERIVED from what the cells actually run — not a literal tuple.
     # It used to be eight names written out here while the CLI declares sixteen
     # subcommands, in a function whose docstring says "derived from the CLI, not

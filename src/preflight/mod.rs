@@ -526,6 +526,67 @@ pub fn check(
     Ok(clean)
 }
 
+/// One type report per export against `target`, **collected and returned rather
+/// than printed** — the in-process form of `rivet check --target <t> --json` for
+/// a caller that needs the DATA instead of the rendering (the warehouse load
+/// planner, `load::plan::plan_loads`).
+///
+/// It goes through the same [`type_report::collect_report`] that [`check`]
+/// renders from, including the `columns:` override parse, so the types a load
+/// declares to the warehouse cannot differ from the ones `rivet check` shows for
+/// the same config. `rivet load` used to obtain them by SPAWNING `rivet check
+/// --target X --json` and parsing its stdout; which binary that was depended on
+/// `--rivet-bin` / `current_exe()`, so a version-skewed resolver was a real
+/// (mitigated, never eliminated) failure mode — in-process it is impossible by
+/// construction, and the load planner becomes testable without a subprocess.
+///
+/// Two deliberate differences from the `check` command, both because this is a
+/// data path and not a diagnostic:
+/// - the policy is always `warn_only` (`--strict`'s whole effect is a non-zero
+///   exit code; the load's own `validate_specs` is what refuses a `Fail` column);
+/// - a report that cannot be collected is an ERROR, not a logged warning. `check`
+///   can afford to skip an export it could not type; for a load, a missing report
+///   is a table that silently does not load.
+///
+/// The source-connection DIAGNOSTICS and the destination-credential probe the
+/// `check` COMMAND also runs are not part of a type report and are not collected
+/// here: the load reads Parquet an extract already wrote, so a `run`-shaped
+/// verdict about the source read path has nothing to say about it.
+pub fn collect_type_reports(
+    config: &Config,
+    config_path: &str,
+    target: ExportTarget,
+) -> Result<Vec<type_report::ExportTypeReport>> {
+    let policy = TypePolicy::warn_only();
+    let config_dir = std::path::Path::new(config_path)
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    config
+        .exports
+        .iter()
+        .map(|export| {
+            let column_overrides =
+                crate::plan::parse_column_overrides_pub(&export.columns, &export.name)?;
+            type_report::collect_report(
+                config,
+                export,
+                &column_overrides,
+                &policy,
+                Some(target),
+                config_dir,
+                None,
+            )
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "export '{}': resolving column types for the {} load: {e:#}",
+                    export.name,
+                    target.label()
+                )
+            })
+        })
+        .collect()
+}
+
 /// Emit one export's `--json` line: the type report (`export`/`columns`/
 /// `violations`/…) with the per-export DIAGNOSTIC verdict attached under a new
 /// `"diagnostic"` key. NDJSON — exactly one JSON object, terminated by a

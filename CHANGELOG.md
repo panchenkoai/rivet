@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- **`rivet load` no longer shells out to itself.** The load planner obtained
+  every column's warehouse type by SPAWNING `rivet check --target X --json` and
+  parsing the child's stdout; it now calls the same resolver in process
+  (`preflight::collect_type_reports`, the function that command renders from).
+  Version skew between the loading binary and the type-resolving one is gone by
+  construction, so the `--rivet-bin` flag that existed only to mitigate it is
+  **removed** (passing it is now an error — it had no other use), and the config
+  is parsed ONCE instead of twice with two different `${VAR}` resolutions. The
+  plan also keeps the resolver's whole `TargetColumnSpec` — `autoload_type`, the
+  note and the L5 `cast_sql` were silently dropped by the four-field JSON mirror.
+  `rivet load`'s planning step is now reachable from offline tests for the first
+  time.
+
 - **ADR-0028: one finalize seam for the export tail.** The post-write tail
   (manifest schema-fingerprint pin, `on_schema_drift` gate, Form-B checksum
   harvest, shape-drift warn) is now applied exactly once, at
