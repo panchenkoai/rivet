@@ -158,7 +158,11 @@ const BASELINE: &[(&str, usize, usize, usize, usize)] = &[
     // `check` diagnoses every export against a live source. The `==` in its
     // overlay export-match loop is already a named mutants.toml entry
     // (`replace == with != in check$`, anchored) — same story as run_pool.
-    ("src/preflight/mod.rs::check", 6, 0, 7, 2),
+    // 6→5 `and`: the target-FAIL tally (`if let Some(t) = eff_target && report
+    // .has_target_fail()`, plus the `+=` it guarded) moved out to the pure
+    // `TargetFailTally::add_export`, where the in-diff gate's `+=` → `*=`/`-=`
+    // mutants are graded instead of MISSED.
+    ("src/preflight/mod.rs::check", 5, 0, 7, 2),
 ];
 
 // ── reading the live-only set out of the mutation config ─────────────────

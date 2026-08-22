@@ -145,11 +145,7 @@ pub fn run_validate_command(
         // manifest of its own — so descend per table (using the writer's builder)
         // rather than verifying the base, which would read back "legacy_run" and
         // fail the `__pos` check on a missing part.
-        let multiplex = if export.mode == crate::config::ExportMode::Cdc {
-            export.tables.as_deref().filter(|t| !t.is_empty())
-        } else {
-            None
-        };
+        let multiplex = export.multiplex_tables();
         let has_snapshot = export.mode == crate::config::ExportMode::Cdc
             && export.cdc.as_ref().and_then(|c| c.initial)
                 == Some(crate::config::CdcInitialMode::Snapshot);

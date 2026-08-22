@@ -2249,6 +2249,105 @@ fn pg_cdc_multi_table_stream_uses_one_slot_and_resumes() {
     assert_eq!(manifest_rows(&out.join(&t2)), 0, "no re-read for table 2");
 }
 
+// #252, half 1: `check --target` on a multiplex `tables:` export must emit one
+// RESOLVER document per captured table, not one per export.
+//
+// A multiplex export has no `table:` and no `query:`, so resolving "the export's
+// query" bailed and the type report was dropped with a `warn` — under `--json`
+// the export's line was the TUNING diagnostic (`export_name`, no `columns`)
+// instead. That is what `rivet load` consumes for the native schema, so a whole
+// schema captured through one stream could not be loaded at all.
+//
+// Driven through the real binary (the resolver runs in-process for `load` too),
+// and the per-table `columns:` narrowing is asserted alongside: a multiplex unit
+// must be typed with THIS table's overrides — bare keys everywhere, a
+// `"<table>.<column>"` key only on its own table — the same precedence the
+// capture applies, or `check` and `run` describe different Parquet.
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical)"]
+fn pg_cdc_multi_table_check_target_emits_one_resolver_document_per_table() {
+    use postgres::NoTls;
+    let t1 = unique_name("rivet_cdc_tr_a");
+    let t2 = unique_name("rivet_cdc_tr_b");
+    let slot = unique_name("rivet_tr_slot");
+    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, NoTls).expect("connect postgres");
+    for t in [&t1, &t2] {
+        c.batch_execute(&format!(
+            "DROP TABLE IF EXISTS {t}; CREATE TABLE {t} (id INT PRIMARY KEY, v INT)"
+        ))
+        .unwrap();
+    }
+    let (_g1, _g2) = (
+        PgTable::adopt_on(POSTGRES_CDC_URL, t1.clone()),
+        PgTable::adopt_on(POSTGRES_CDC_URL, t2.clone()),
+    );
+
+    // No `run` here: the report is resolved from the source catalog, so this
+    // needs no slot, no capture and no destination bytes.
+    let rig = Rig::pg_cdc(&t1, &slot)
+        .tables(&[&t1, &t2])
+        .export_named("app_cdc")
+        .export_line(&format!("columns: {{ \"{t2}.v\": text }}"));
+    let out = rig.cli(&["check", "--target", "bigquery", "--json"]);
+    assert!(
+        out.status.success(),
+        "check --target must succeed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    // NDJSON: the type-report lines are the ones carrying `columns`. A
+    // diagnostic-only line (the pre-fix shape) has none, so this filter is
+    // exactly the assertion — it counts documents the loader could USE.
+    let docs: Vec<serde_json::Value> = stdout
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|v| v.get("columns").is_some())
+        .collect();
+    assert_eq!(
+        docs.len(),
+        2,
+        "one resolver document per captured table — got {} from:\n{stdout}",
+        docs.len()
+    );
+    let by_table = |t: &str| {
+        docs.iter()
+            .find(|d| d["table"] == serde_json::json!(t))
+            .unwrap_or_else(|| panic!("no resolver document for table {t} in:\n{stdout}"))
+    };
+    for t in [&t1, &t2] {
+        let d = by_table(t);
+        assert_eq!(
+            d["export"],
+            serde_json::json!("app_cdc"),
+            "each document still names the EXPORT the operator wrote"
+        );
+        let cols: Vec<&str> = d["columns"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["column"].as_str().unwrap())
+            .collect();
+        assert_eq!(cols, vec!["id", "v"], "table {t} columns");
+    }
+    // The qualified override lands on t2 ONLY: BigQuery STRING there, INT64 on
+    // the table it does not name. A unit typed with the export's whole override
+    // map would make both STRING.
+    let target_of = |t: &str| {
+        by_table(t)["columns"].as_array().unwrap()[1]["target_type"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    assert_eq!(target_of(&t1), "INT64", "bare table keeps its source type");
+    assert_eq!(
+        target_of(&t2),
+        "STRING",
+        "the `<table>.<column>` override applies to its own table only — the \
+         same precedence the capture uses"
+    );
+}
+
 // MySQL flavour of the multi-table stream: one binlog connection + one
 // checkpoint for both tables, idle-first-run pin included.
 #[test]

@@ -154,6 +154,36 @@ refinements over the sketch — on MySQL the binlog file is parsed numerically
 rather than vanishing. See the matrix cells `cdc_backfill_snapshot_{mysql,pg,mongo}`
 and the Snowflake parity `mongo_cdc_delete_flag_snowflake`.
 
+### A whole schema: one stream, one warehouse table per source table
+
+`rivet init --mode cdc` over a whole schema emits ONE multiplex export — every
+table through one change stream (one PostgreSQL slot / one MySQL binlog
+connection), rather than one export and one slot per table:
+
+```yaml
+exports:
+  - name: cdc
+    tables: [orders, customers, line_items]
+    mode: cdc
+    cdc: { initial: snapshot, until_current: true, checkpoint: /var/lib/rivet/cdc.ckpt }
+    destination: { type: gcs, bucket: my-bucket, prefix: cdc/ }
+load:
+  target: bigquery
+  project: my-proj
+  dataset: analytics
+  pk: [id]
+```
+
+The capture fans each table out under `<prefix>/<table>/` (its own
+`manifest.json` + `_SUCCESS`, with `initial: snapshot` nested a level below as
+`<prefix>/<table>/snapshot/`), and `rivet load` follows that layout: **one
+`<table>__changes` + one dedup view per SOURCE table**, each loaded from its own
+sub-prefix only. `pk:` and the rest of the `load:` block are shared by every
+table of the stream; `rivet check --target bigquery` prints one resolver document
+per table (`Export: cdc/orders`), so you see each table's native schema before
+loading it. Live-verified against BigQuery over a 3-table PostgreSQL stream
+(#252).
+
 **Bottom line:** yes — rivet can ingest CDC into BigQuery **and** expose a
 deduplicated current state entirely for free (append + view). The only
 unavoidable cost is *materializing* current state, which we defer to read time

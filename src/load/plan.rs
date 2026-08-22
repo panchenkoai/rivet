@@ -355,6 +355,35 @@ fn resolve_load_prefix(
     Ok(format!("gs://{bucket}/{base}"))
 }
 
+/// The load prefix of ONE table of a multiplex `tables:` CDC stream, given the
+/// export's resolved base prefix.
+///
+/// The extract fans each captured table out under `<base>/<table>/` — one
+/// `manifest.json` + `_SUCCESS` per table, with the initial snapshot nested a
+/// level below as `<base>/<table>/snapshot/` — and `rivet validate` descends
+/// exactly that. So the load must list exactly that too, and the sub-prefix is
+/// produced by the WRITER's own function ([`crate::pipeline::cdc_job::dest_for_table`])
+/// rather than a second concatenation rule here: a cloud prefix is a LITERAL key
+/// prefix (the destination concatenates `prefix + key` with no separator), so a
+/// sub-prefix that forgets to supply its own slashes lists a mangled flat key and
+/// finds nothing — the silent "up to date, loaded nothing" shape.
+///
+/// Applied AFTER [`resolve_load_prefix`] rather than to the raw destination, so
+/// the placeholder expansion and the `{partition}` strip both see the base the
+/// export wrote, and the table segment can never land below a stripped token.
+fn table_load_prefix(base_uri: &str, table: &str) -> Result<String> {
+    let (bucket, base) = crate::load::split_gs_uri(base_uri)?;
+    let sub = crate::pipeline::cdc_job::dest_for_table(
+        &crate::config::DestinationConfig {
+            destination_type: crate::config::DestinationType::Gcs,
+            prefix: Some(base.to_string()),
+            ..Default::default()
+        },
+        table,
+    );
+    Ok(format!("gs://{bucket}/{}", sub.prefix.unwrap_or_default()))
+}
+
 pub fn plan_loads(config_path: &str) -> Result<Vec<LoadPlan>> {
     // `Config::load`, not a raw `from_yaml`: it resolves `${VAR}`/`--param`
     // placeholders exactly as the `rivet check` child did. The old code parsed
@@ -418,10 +447,20 @@ fn build_plans(
                     report.export
                 )
             })?;
-        let table = warehouse_table_name(
-            &export.table.clone().unwrap_or_else(|| export.name.clone()),
-            &export.name,
-        );
+        // A multiplex `tables:` CDC export is N tables through ONE export, and the
+        // resolver hands us one report per table (`report.table`). Each is its own
+        // warehouse table under its own `<base>/<table>/` sub-prefix — which is why
+        // the fan-out has to happen HERE and not be left to the export name: a
+        // single plan per export would point every table at one warehouse table and
+        // one BASE prefix, whose recursive manifest listing sweeps in every sibling
+        // table's parts. That merges N source tables into one warehouse table with
+        // every count agreeing (#252).
+        let source_table = report
+            .table
+            .clone()
+            .or_else(|| export.table.clone())
+            .unwrap_or_else(|| export.name.clone());
+        let table = warehouse_table_name(&source_table, &export.name);
 
         let dest = &export.destination;
         let bucket = dest.bucket.as_deref().with_context(|| {
@@ -430,7 +469,11 @@ fn build_plans(
                 export.name
             )
         })?;
-        let gcs_prefix = resolve_load_prefix(dest, &export.name, bucket)?;
+        let base_prefix = resolve_load_prefix(dest, &export.name, bucket)?;
+        let gcs_prefix = match &report.table {
+            Some(t) => table_load_prefix(&base_prefix, t)?,
+            None => base_prefix,
+        };
 
         // The report row IS the resolver's `TargetColumnSpec`, split across the
         // report's optional fields — so rebuild the whole spec, not the two
@@ -715,10 +758,21 @@ mod tests {
     fn report(export: &str, columns: Vec<TypeReportRow>) -> ExportTypeReport {
         ExportTypeReport {
             export: export.into(),
+            table: None,
             columns,
             violations: vec![],
             target_failures: false,
             recovery_sql: None,
+        }
+    }
+
+    /// One TABLE'S report of a multiplex `tables:` export, as the resolver
+    /// returns one per captured table (`table: Some(..)`, `export` still the
+    /// export's own name).
+    fn table_report(export: &str, table: &str, columns: Vec<TypeReportRow>) -> ExportTypeReport {
+        ExportTypeReport {
+            table: Some(table.into()),
+            ..report(export, columns)
         }
     }
 
@@ -887,6 +941,132 @@ load:
             ts.target_type, "TIMESTAMP",
             "resolved through the per-target resolver, not hardcoded — BigQuery's \
              instant type for a Timestamp(us, UTC)"
+        );
+    }
+
+    /// A multiplex `tables:` CDC config — the shape `rivet init --mode cdc`
+    /// emits for a whole schema (#252).
+    fn multiplex_cfg() -> crate::config::Config {
+        crate::config::Config::from_yaml(
+            r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: cdc
+    tables: [orders, customers, line_items]
+    mode: cdc
+    format: parquet
+    cdc:
+      checkpoint: ./cdc.ckpt
+      initial: snapshot
+    destination:
+      type: gcs
+      bucket: b
+      prefix: exports/{export}/
+load:
+  target: bigquery
+  project: p
+  dataset: d
+  pk: [id]
+"#,
+        )
+        .unwrap()
+    }
+
+    /// A multiplex `tables:` CDC export is N source tables through ONE export,
+    /// and `rivet load` must build ONE PLAN PER TABLE (#252).
+    ///
+    /// The two halves this pins are the two ways the fan-out can be dropped, and
+    /// each fails differently:
+    ///
+    /// - drop `report.table` from the warehouse-table resolution and all N
+    ///   collapse onto the EXPORT's name — three source tables merged into one
+    ///   BigQuery table (here caught by `reject_duplicate_target_tables`, but
+    ///   only because the collision is exact);
+    /// - drop the per-table sub-prefix and all N point at the export BASE, whose
+    ///   manifest listing is RECURSIVE — so every plan sweeps in every sibling
+    ///   table's parts and loads them all into its own table, with every count
+    ///   agreeing on the way through. That one is silent, which is why the prefix
+    ///   assertion is per-table and exact, not a `contains`.
+    ///
+    /// The `Some(table)` values are NOT hand-typed: they come from
+    /// `ExportConfig::multiplex_tables()`, the one function that decides whether
+    /// an export is one unit or N — so a mutant there (returning `None`, dropping
+    /// the CDC-mode gate) turns this red at the producer, not just the consumer.
+    #[test]
+    fn build_plans_fans_a_multiplex_tables_export_out_to_one_plan_per_table() {
+        let cfg = multiplex_cfg();
+        let load: LoadSection = serde_json::from_value(cfg.load.clone().unwrap()).unwrap();
+        let tables = cfg.exports[0]
+            .multiplex_tables()
+            .expect("a `mode: cdc` export with `tables:` IS a multiplex")
+            .to_vec();
+        assert_eq!(tables.len(), 3, "fixture must cross the fan-out threshold");
+
+        let reports: Vec<_> = tables
+            .iter()
+            .map(|t| table_report("cdc", t, vec![col("id", TargetStatus::Ok)]))
+            .collect();
+        let plans = build_plans(&cfg, &load, reports).unwrap();
+
+        assert_eq!(
+            plans.len(),
+            3,
+            "one plan per captured table, not one per export"
+        );
+        assert_eq!(
+            plans.iter().map(|p| p.table.as_str()).collect::<Vec<_>>(),
+            vec!["orders", "customers", "line_items"],
+            "the warehouse table is the SOURCE table, not the export name"
+        );
+        // Each table's own sub-prefix — the layout the extract wrote
+        // (`cdc_job::dest_for_table`) and `rivet validate` descends. The `{export}`
+        // token still expands first, so the base is the export's, not the literal.
+        assert_eq!(
+            plans
+                .iter()
+                .map(|p| p.gcs_prefix.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "gs://b/exports/cdc/orders/",
+                "gs://b/exports/cdc/customers/",
+                "gs://b/exports/cdc/line_items/",
+            ],
+            "each plan must list ONLY its own table's prefix — a shared base lists \
+             every sibling's parts recursively and merges them into one table"
+        );
+        for p in &plans {
+            assert_eq!(p.mode, LoadMode::Cdc);
+            assert_eq!(
+                p.export_name, "cdc",
+                "the plans still address the EXPORT the operator wrote"
+            );
+            assert_eq!(p.load.pk, vec!["id"], "the shared `load:` applies to each");
+        }
+    }
+
+    /// The multiplex sub-prefix rule itself: the table becomes ONE path segment
+    /// under the resolved base, with both slashes supplied — a cloud prefix is a
+    /// literal key prefix, so a missing separator lists a mangled flat key
+    /// (`…/cdccdc-0.parquet`) and the load silently reports "up to date".
+    #[test]
+    fn table_load_prefix_appends_one_slash_delimited_segment() {
+        assert_eq!(
+            table_load_prefix("gs://b/exports/cdc/", "orders").unwrap(),
+            "gs://b/exports/cdc/orders/"
+        );
+        // A base written without its trailing slash must not fuse the segment on.
+        assert_eq!(
+            table_load_prefix("gs://b/exports/cdc", "orders").unwrap(),
+            "gs://b/exports/cdc/orders/"
+        );
+        // A schema-qualified table stays VERBATIM in the path — the dot is folded
+        // only in the warehouse NAME (`warehouse_table_name`); the extract wrote
+        // the raw name as its directory.
+        assert_eq!(
+            table_load_prefix("gs://b/e/", "public.orders").unwrap(),
+            "gs://b/e/public.orders/"
         );
     }
 

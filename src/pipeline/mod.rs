@@ -8,9 +8,10 @@
 
 mod aggregate;
 mod apply_cmd;
-#[cfg(not(test))]
-mod cdc_job;
-#[cfg(test)]
+// `pub(crate)`: the multiplex destination layout (`dest_for_table` — one
+// sub-prefix per captured table) is written HERE and read by everything that has
+// to find those files again — `rivet validate`, and the warehouse load planner.
+// One definition of where a table's parts live, not one per reader.
 pub(crate) mod cdc_job;
 pub(crate) mod chunked;
 mod cli;

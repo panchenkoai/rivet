@@ -952,7 +952,12 @@ pub(crate) fn resolve_cdc_columns(
 /// The table name is interpolated into `SELECT * FROM {table}` for the schema
 /// probe — refuse anything but a plain `[schema.]table` identifier (no quote,
 /// paren, semicolon, or space can break out).
-fn validate_table_ident(table: &str) -> Result<()> {
+///
+/// `pub(crate)` because the type-report resolver builds the SAME probe query for
+/// each table of a `tables:` stream: config-load only gates those names for
+/// FILENAME safety (they become destination path segments), which is a weaker
+/// alphabet than SQL interpolation needs.
+pub(crate) fn validate_table_ident(table: &str) -> Result<()> {
     if table.is_empty()
         || !table
             .chars()
