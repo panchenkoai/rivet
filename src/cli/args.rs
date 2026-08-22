@@ -196,12 +196,6 @@ pub enum Commands {
         /// and `allow_source_drift:` all live in the config, not on the CLI.
         #[arg(short = 'c', long)]
         config: String,
-        /// Path to the `rivet` binary used for the type-report subprocess.
-        /// Defaults to THIS executable (self), so the load's `rivet check`
-        /// resolves types with the same version — a `rivet` on `$PATH` may be a
-        /// different, skewed version. Override only to pin a specific binary.
-        #[arg(long)]
-        rivet_bin: Option<String>,
         /// Correlation id stamped on every warehouse job/query of this load run
         /// (BigQuery `rivet_run` label / Snowflake `QUERY_TAG`), so cost slices
         /// per run as well as per table. Defaults to a generated id.

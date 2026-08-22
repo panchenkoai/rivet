@@ -107,15 +107,9 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             capture_instance,
             until_current: cdc_until_current(stream),
         }),
-        Commands::Load {
-            config,
-            rivet_bin,
-            run_id,
-        } => load::orchestrate::run_loads(load::orchestrate::LoadArgs {
-            config,
-            rivet_bin: load::orchestrate::resolve_rivet_bin(rivet_bin),
-            run_id,
-        }),
+        Commands::Load { config, run_id } => {
+            load::orchestrate::run_loads(load::orchestrate::LoadArgs { config, run_id })
+        }
         Commands::Init {
             source,
             source_env,

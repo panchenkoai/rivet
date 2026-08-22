@@ -25,12 +25,6 @@ const EXEMPT: &[(&str, &str)] = &[
         "tls-ca",
         "same fixture gap as --tls: a CA file against a plaintext server exercises nothing",
     ),
-    (
-        "rivet-bin",
-        "contract pinned by `rivet_bin_defaults_to_this_executable_never_a_path_lookup` \
-         (src/cli/dispatch.rs, bin crate) on `resolve_rivet_bin` directly; the literal \
-         flag only reaches code on a real warehouse load",
-    ),
 ];
 
 /// Every long flag `src/cli/args.rs` declares: `long = "name"` when named,

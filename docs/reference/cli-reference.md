@@ -170,7 +170,6 @@ The native column schema, target table, partition, and source URIs are all deriv
 ###### **Options:**
 
 * `-c`, `--config <CONFIG>` — Path to YAML config file — extraction PLUS a top-level `load:` block. ONE file drives both the export and the load: the mode (`full`/`incremental`/`cdc`), `pk:`, `cleanup_source:`, `gc_orphans:` and `allow_source_drift:` all live in the config, not on the CLI
-* `--rivet-bin <RIVET_BIN>` — Path to the `rivet` binary used for the type-report subprocess. Defaults to THIS executable (self), so the load's `rivet check` resolves types with the same version — a `rivet` on `$PATH` may be a different, skewed version. Override only to pin a specific binary
 * `--run-id <RUN_ID>` — Correlation id stamped on every warehouse job/query of this load run (BigQuery `rivet_run` label / Snowflake `QUERY_TAG`), so cost slices per run as well as per table. Defaults to a generated id
 
 

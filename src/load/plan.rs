@@ -1,13 +1,19 @@
 //! Config-driven load planning — derive a BigQuery load (native schema, table,
 //! partition, source URIs) from a rivet export config, so a client never
-//! hand-types column types. The schema comes from rivet's own type resolver
-//! via `rivet check --target bigquery --json` (the argv/process boundary,
-//! ADR-0026); the table/partition/destination come from the parsed config.
+//! hand-types column types. The schema comes from rivet's own type resolver,
+//! called IN PROCESS (`preflight::collect_type_reports`, the same function
+//! `rivet check --target X --json` renders from); the table/partition/
+//! destination come from the parsed config.
+//!
+//! Until 0.24.x this shelled out to `rivet check --json` and parsed its stdout.
+//! A subprocess resolves types with whatever binary it names, so version skew
+//! was a live failure mode — `--rivet-bin` existed only to mitigate it, and one
+//! config was parsed TWICE (once here, once in the child) with different
+//! `${VAR}` resolution. Both are gone: one parse, one resolver, no argv.
 
-use crate::types::target::{TargetColumnSpec, TargetStatus};
+use crate::types::target::TargetColumnSpec;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
-use std::process::Command;
 
 /// The warehouse load target — the config's **top-level `load:` block**,
 /// declared ONCE for all exports. OSS accepts and ignores this block (a
@@ -56,8 +62,8 @@ pub struct LoadSection {
 
 /// Per-export overrides of the top-level [`LoadSection`] — every field optional,
 /// `None` inherits the top-level value. `target` is present ONLY to reject it:
-/// the warehouse is shared (`plan_loads` runs one `rivet check --target`), so it
-/// stays top-level.
+/// the warehouse is shared (`plan_loads` resolves ONE target's types for every
+/// export), so it stays top-level.
 // `deny_unknown_fields` so a per-export `load:` typo (`gc_orphan`, `cleanupsrc`)
 // fails loudly instead of silently deserializing to the default and dropping the
 // override. (LoadOverride has no `#[serde(flatten)]`, so unlike LoadSection this
@@ -123,7 +129,8 @@ pub enum LoadTarget {
 }
 
 impl LoadTarget {
-    /// The `--target` name to pass to `rivet check`.
+    /// The target name the type resolver is keyed on (`ExportTarget::parse`) —
+    /// the same token `rivet check --target` takes.
     pub fn name(&self) -> &'static str {
         match self {
             LoadTarget::Bigquery { .. } => "bigquery",
@@ -214,26 +221,10 @@ pub struct LoadPlan {
     pub cursor_column: Option<String>,
 }
 
-/// One export's slice of `rivet check --target X --json`. The tool emits one
-/// such JSON document **per export** (concatenated), so a multi-table config
-/// yields a stream of these — parsed with a streaming deserializer.
-#[derive(Deserialize)]
-struct ExportReport {
-    export: String,
-    columns: Vec<ColReport>,
-}
-
-#[derive(Deserialize)]
-struct ColReport {
-    column: String,
-    target_type: String,
-    target_status: String,
-}
-
 /// Resolve a rivet config into **one [`LoadPlan`] per export** — the shared
 /// top-level `load:` target plus each export's own table / partition / GCS
-/// destination / native schema. `rivet check --json` emits one JSON document
-/// per export, so a multi-table config produces a plan per table, all pointed
+/// destination / native schema. The type resolver returns one report per
+/// export, so a multi-table config produces a plan per table, all pointed
 /// at the same warehouse target.
 /// Every key a `load:` block may carry — the [`LoadSection`] fields plus the
 /// flattened [`LoadTarget`] variant fields. The top-level block can't use serde
@@ -364,10 +355,13 @@ fn resolve_load_prefix(
     Ok(format!("gs://{bucket}/{base}"))
 }
 
-pub fn plan_loads(config_path: &str, rivet_bin: &str) -> Result<Vec<LoadPlan>> {
-    let yaml = std::fs::read_to_string(config_path)
-        .with_context(|| format!("reading config {config_path}"))?;
-    let cfg = crate::config::Config::from_yaml(&yaml).context("parsing rivet config")?;
+pub fn plan_loads(config_path: &str) -> Result<Vec<LoadPlan>> {
+    // `Config::load`, not a raw `from_yaml`: it resolves `${VAR}`/`--param`
+    // placeholders exactly as the `rivet check` child did. The old code parsed
+    // the file TWICE with two different resolutions — an unexpanded `${BUCKET}`
+    // in the parent's copy pointed the load at a literal-token prefix while the
+    // child (which resolved it) reported types for the real one.
+    let cfg = crate::config::Config::load(config_path).context("parsing rivet config")?;
     if cfg.exports.is_empty() {
         bail!("config has no exports");
     }
@@ -383,47 +377,34 @@ pub fn plan_loads(config_path: &str, rivet_bin: &str) -> Result<Vec<LoadPlan>> {
     reject_foreign_target_fields(&load_value, load.target.name(), "top-level")?;
 
     // Native schema from rivet's own resolver, for the load target — no
-    // hand-typing. One JSON document per export, so parse a stream.
-    let out = Command::new(rivet_bin)
-        .args([
-            "check",
-            "-c",
-            config_path,
-            "--target",
-            load.target.name(),
-            "--json",
-        ])
-        .output()
-        .with_context(|| {
-            format!("running `{rivet_bin} check` — is rivet on PATH? pass --rivet-bin")
-        })?;
-    if !out.status.success() {
-        bail!(
-            "rivet check failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    let reports: Vec<ExportReport> = serde_json::Deserializer::from_slice(&out.stdout)
-        .into_iter::<ExportReport>()
-        .collect::<Result<_, _>>()
-        .context("parsing `rivet check --json` (one document per export)")?;
+    // hand-typing, and no subprocess: `collect_type_reports` is the function
+    // `rivet check --target X --json` renders from, called directly, so the
+    // types this load declares are the ones THIS binary resolves.
+    let target = crate::types::target::ExportTarget::parse(load.target.name())
+        .with_context(|| format!("unknown load target `{}`", load.target.name()))?;
+    let reports = crate::preflight::collect_type_reports(&cfg, config_path, target)?;
 
     build_plans(&cfg, &load, reports)
 }
 
-/// The **pure core** of [`plan_loads`]: map the parsed `rivet check` reports onto
+/// The **pure core** of [`plan_loads`]: map the resolver's type reports onto
 /// one [`LoadPlan`] per export, given the config and the shared `load:` section.
 ///
-/// No I/O — the subprocess and filesystem work is done by [`plan_loads`], and
-/// everything they produced arrives in the args. That makes the per-export
-/// resolution unit-testable without a `rivet` binary: the export→report name
-/// match, `target_status`→[`TargetStatus`] mapping, [`ExportMode`]→[`LoadMode`]
-/// mapping, the `gs://` prefix, the per-export `load:` override, and the
-/// duplicate-target guard.
+/// No I/O — the source connection and filesystem work is done by [`plan_loads`],
+/// and everything they produced arrives in the args. That makes the per-export
+/// resolution unit-testable without a source: the export→report name match, the
+/// report-row→[`TargetColumnSpec`] rebuild, [`ExportMode`]→[`LoadMode`] mapping,
+/// the `gs://` prefix, the per-export `load:` override, and the duplicate-target
+/// guard.
+///
+/// The reports arrive as the resolver's OWN struct — it used to be a narrower
+/// `Deserialize` mirror of `rivet check --json`, and a mirror can only carry the
+/// keys someone remembered to declare, which is how `note` / `cast_sql` /
+/// `autoload_type` came to be dropped on the floor.
 fn build_plans(
     cfg: &crate::config::Config,
     load: &LoadSection,
-    reports: Vec<ExportReport>,
+    reports: Vec<crate::preflight::type_report::ExportTypeReport>,
 ) -> Result<Vec<LoadPlan>> {
     let mut plans = Vec::with_capacity(reports.len());
     for report in reports {
@@ -451,22 +432,38 @@ fn build_plans(
         })?;
         let gcs_prefix = resolve_load_prefix(dest, &export.name, bucket)?;
 
+        // The report row IS the resolver's `TargetColumnSpec`, split across the
+        // report's optional fields — so rebuild the whole spec, not the two
+        // fields the old JSON mirror happened to declare. `autoload_type` is
+        // carried only when it DIVERGES (`collect_report`'s rule), so an absent
+        // one means "same as native".
         let mut specs: Vec<TargetColumnSpec> = report
             .columns
             .into_iter()
-            .map(|c| TargetColumnSpec {
-                column_name: c.column,
-                target_type: c.target_type,
-                autoload_type: String::new(),
-                status: match c.target_status.as_str() {
-                    "fail" => TargetStatus::Fail,
-                    "warn" => TargetStatus::Warn,
-                    _ => TargetStatus::Ok,
-                },
-                note: None,
-                cast_sql: None,
+            .map(|c| {
+                // Both are `Some` together for every column resolved against a
+                // target, and the load always resolves WITH one. Named loudly
+                // rather than defaulted: a defaulted `Ok` would walk an
+                // unmappable column straight past `validate_specs`.
+                let (Some(target_type), Some(status)) = (c.target_type, c.target_status) else {
+                    bail!(
+                        "export `{}` column `{}`: the type resolver returned no {} type — \
+                         refusing to guess one",
+                        export.name,
+                        c.column,
+                        load.target.name()
+                    );
+                };
+                Ok(TargetColumnSpec {
+                    column_name: c.column,
+                    autoload_type: c.autoload_type.unwrap_or_else(|| target_type.clone()),
+                    target_type,
+                    status,
+                    note: c.target_note,
+                    cast_sql: c.cast_sql,
+                })
             })
-            .collect();
+            .collect::<Result<_>>()?;
 
         // The meta columns rivet writes at EXTRACTION are in every Parquet part
         // but absent from the column report, which the type resolver builds from
@@ -598,6 +595,7 @@ pub fn source_engine(config_path: &str) -> Result<crate::load::cdc::SourceEngine
 
 #[cfg(test)]
 mod tests {
+    use crate::types::target::TargetStatus;
 
     /// A schema-qualified source table must not leak its dot into the warehouse
     /// address, and two schemas that share a table name must stay apart.
@@ -674,12 +672,53 @@ mod tests {
         );
     }
 
-    /// A `ColReport` with an explicit `target_status`.
-    fn col(name: &str, status: &str) -> ColReport {
-        ColReport {
-            column: name.into(),
+    use crate::preflight::type_report::{ExportTypeReport, TypeReportRow};
+    use crate::types::TypeFidelity;
+    use crate::types::target::{ExportTarget, TargetInput};
+
+    /// A report row as `type_report::collect_report` builds one — from the
+    /// resolver's OWN [`TargetColumnSpec`], split across the row's optional
+    /// fields by that function's rule (`autoload_type` carried ONLY when it
+    /// diverges from the native type). This is the shape `plan_loads` now
+    /// receives in process, so the test feeds `build_plans` what the real
+    /// producer produces rather than a hand-typed subset of it.
+    fn row_from_spec(spec: &TargetColumnSpec) -> TypeReportRow {
+        TypeReportRow {
+            column: spec.column_name.clone(),
+            source_type: "-".into(),
+            rivet_type: "-".into(),
+            arrow_type: "-".into(),
+            fidelity: TypeFidelity::Exact,
+            warnings: vec![],
+            target_type: Some(spec.target_type.clone()),
+            target_status: Some(spec.status),
+            target_note: spec.note.clone(),
+            autoload_type: (spec.autoload_type != spec.target_type)
+                .then(|| spec.autoload_type.clone()),
+            cast_sql: spec.cast_sql.clone(),
+        }
+    }
+
+    /// A report row with an explicit `target_status` (type irrelevant).
+    fn col(name: &str, status: TargetStatus) -> TypeReportRow {
+        row_from_spec(&TargetColumnSpec {
+            column_name: name.into(),
             target_type: "STRING".into(),
-            target_status: status.into(),
+            autoload_type: "STRING".into(),
+            status,
+            note: None,
+            cast_sql: None,
+        })
+    }
+
+    /// One export's report, as the resolver returns it.
+    fn report(export: &str, columns: Vec<TypeReportRow>) -> ExportTypeReport {
+        ExportTypeReport {
+            export: export.into(),
+            columns,
+            violations: vec![],
+            target_failures: false,
+            recovery_sql: None,
         }
     }
 
@@ -725,14 +764,15 @@ load:
         // Reports arrive in the OPPOSITE order to the exports, so a plan only
         // lands on the right table if its export is found by NAME, not position.
         let reports = vec![
-            ExportReport {
-                export: "beta".into(),
-                columns: vec![col("id", "ok"), col("f", "fail"), col("w", "warn")],
-            },
-            ExportReport {
-                export: "alpha".into(),
-                columns: vec![col("id", "ok")],
-            },
+            report(
+                "beta",
+                vec![
+                    col("id", TargetStatus::Ok),
+                    col("f", TargetStatus::Fail),
+                    col("w", TargetStatus::Warn),
+                ],
+            ),
+            report("alpha", vec![col("id", TargetStatus::Ok)]),
         ];
 
         let plans = build_plans(&cfg, &load, reports).unwrap();
@@ -776,10 +816,10 @@ load:
             )
         };
         let reports = || {
-            vec![ExportReport {
-                export: "a".into(),
-                columns: vec![col("id", "ok"), col("status", "ok")],
-            }]
+            vec![report(
+                "a",
+                vec![col("id", TargetStatus::Ok), col("status", TargetStatus::Ok)],
+            )]
         };
 
         let without = crate::config::Config::from_yaml(&yaml("")).unwrap();
@@ -860,10 +900,7 @@ load:
         )
         .unwrap();
         let load: LoadSection = serde_json::from_value(cfg.load.clone().unwrap()).unwrap();
-        let reports = vec![ExportReport {
-            export: "ghost".into(),
-            columns: vec![],
-        }];
+        let reports = vec![report("ghost", vec![])];
         let err = build_plans(&cfg, &load, reports).unwrap_err().to_string();
         assert!(err.contains("ghost") && err.contains("not found"), "{err}");
     }
@@ -875,25 +912,6 @@ load:
         assert!(reject_duplicate_target_tables(&["orders", "events", "orders"]).is_err());
         assert!(reject_duplicate_target_tables(&["orders", "events"]).is_ok());
         assert!(reject_duplicate_target_tables(&[]).is_ok());
-    }
-
-    #[test]
-    fn multi_export_check_json_parses_as_a_stream() {
-        // `rivet check --json` emits ONE document per export (no wrapping array).
-        // A single-object parse fails "trailing characters"; the stream parser
-        // yields one ExportReport per table. Guards the multi-table regression.
-        let raw = concat!(
-            "{\"export\":\"orders\",\"columns\":[{\"column\":\"id\",\"target_type\":\"NUMBER\",\"target_status\":\"ok\"}]}\n",
-            "{\"export\":\"customers\",\"columns\":[{\"column\":\"cid\",\"target_type\":\"NUMBER\",\"target_status\":\"ok\"}]}\n"
-        );
-        let reports: Vec<ExportReport> = serde_json::Deserializer::from_slice(raw.as_bytes())
-            .into_iter::<ExportReport>()
-            .collect::<Result<_, _>>()
-            .unwrap();
-        assert_eq!(reports.len(), 2);
-        assert_eq!(reports[0].export, "orders");
-        assert_eq!(reports[1].export, "customers");
-        assert_eq!(reports[1].columns[0].column, "cid");
     }
 
     #[test]
@@ -1093,5 +1111,204 @@ load:
         // A clean, target-matching block passes.
         let clean = serde_json::json!({ "target": "bigquery", "project": "p", "dataset": "d" });
         assert!(reject_foreign_target_fields(&clean, "bigquery", "top-level").is_ok());
+    }
+
+    /// The report row IS the resolver's spec, split across optional fields — so
+    /// the plan must rebuild the WHOLE spec, not the two fields the old JSON
+    /// mirror declared.
+    ///
+    /// `plan_loads` used to obtain this data by parsing `rivet check --json`
+    /// through a four-field `ColReport`; everything the mirror did not name was
+    /// dropped on the floor (`note: None`, `cast_sql: None`, `autoload_type:
+    /// String::new()`) — an empty autoload type claims the warehouse autoloads
+    /// the column as `""`, and the L5 recovery hint the resolver computed never
+    /// reached the plan. In process there is no mirror to forget a field.
+    ///
+    /// The oracle is the RESOLVER's own output, not a hand-typed string: build
+    /// the spec with `ExportTarget::resolve_column`, split it the way
+    /// `collect_report` does, and assert the plan's spec is field-for-field the
+    /// one we started from. The JSON column is chosen because BigQuery's
+    /// autoload DIVERGES for it (JSON → BYTES, with a cast + note), so the
+    /// fixture crosses the threshold where the dropped fields are observable —
+    /// a column whose autoload matches its native type could not tell the two
+    /// implementations apart.
+    #[test]
+    fn build_plans_carries_the_resolvers_whole_spec_not_a_two_field_subset() {
+        let cfg = crate::config::Config::from_yaml(
+            "source:\n  type: postgres\n  url: \"postgresql://localhost/test\"\n\
+             exports:\n  - name: a\n    table: t\n    mode: full\n    format: parquet\n    \
+             destination:\n      type: gcs\n      bucket: b\n      prefix: p/\nload:\n  \
+             target: bigquery\n  project: p\n  dataset: d\n",
+        )
+        .unwrap();
+        let load: LoadSection = serde_json::from_value(cfg.load.clone().unwrap()).unwrap();
+
+        let resolved = ExportTarget::BigQuery.resolve_column(TargetInput {
+            column_name: "payload",
+            rivet_type: &crate::types::RivetType::Json,
+            arrow_type: None,
+            fidelity: TypeFidelity::Exact,
+        });
+        // Fixture non-vacuity: if BigQuery ever autoloaded JSON faithfully this
+        // test would pass against BOTH implementations and prove nothing.
+        assert_ne!(
+            resolved.autoload_type, resolved.target_type,
+            "fixture must be a column whose autoload DIVERGES"
+        );
+        assert!(
+            resolved.cast_sql.is_some() && resolved.note.is_some(),
+            "fixture must carry the recovery hint + note the old mirror dropped"
+        );
+
+        let plans = build_plans(
+            &cfg,
+            &load,
+            vec![report("a", vec![row_from_spec(&resolved)])],
+        )
+        .unwrap();
+        let got = &plans[0].specs[0];
+        assert_eq!(got.column_name, resolved.column_name);
+        assert_eq!(got.target_type, resolved.target_type);
+        assert_eq!(
+            got.autoload_type, resolved.autoload_type,
+            "the autoload type must survive the report round-trip (it was `String::new()`)"
+        );
+        assert_eq!(got.status, resolved.status);
+        assert_eq!(
+            got.note, resolved.note,
+            "the resolver's note must reach the plan (it was `None`)"
+        );
+        assert_eq!(
+            got.cast_sql, resolved.cast_sql,
+            "the L5 recovery hint must reach the plan (it was `None`)"
+        );
+
+        // A column whose autoload does NOT diverge: the report omits
+        // `autoload_type` entirely, and "absent" must mean "same as native",
+        // never the empty string.
+        let plain = ExportTarget::BigQuery.resolve_column(TargetInput {
+            column_name: "id",
+            rivet_type: &crate::types::RivetType::Int64,
+            arrow_type: None,
+            fidelity: TypeFidelity::Exact,
+        });
+        assert_eq!(plain.autoload_type, plain.target_type, "fixture premise");
+        let plans =
+            build_plans(&cfg, &load, vec![report("a", vec![row_from_spec(&plain)])]).unwrap();
+        assert_eq!(plans[0].specs[0].autoload_type, plain.target_type);
+    }
+
+    /// A column the resolver could not type must be NAMED, never defaulted.
+    ///
+    /// `target_type`/`target_status` are `Some` together for every column
+    /// resolved against a target, and a load always resolves with one — but a
+    /// `None` defaulted to `TargetStatus::Ok` would walk an unmappable column
+    /// straight past `validate_specs` (whose whole job is to refuse a `Fail`),
+    /// which is the silent-loss shape, not a tidier default.
+    #[test]
+    fn build_plans_refuses_a_column_the_resolver_did_not_type() {
+        let cfg = crate::config::Config::from_yaml(
+            "source:\n  type: postgres\n  url: \"postgresql://localhost/test\"\n\
+             exports:\n  - name: a\n    table: t\n    mode: full\n    format: parquet\n    \
+             destination:\n      type: gcs\n      bucket: b\n      prefix: p/\nload:\n  \
+             target: bigquery\n  project: p\n  dataset: d\n",
+        )
+        .unwrap();
+        let load: LoadSection = serde_json::from_value(cfg.load.clone().unwrap()).unwrap();
+        let mut untyped = col("mystery", TargetStatus::Ok);
+        untyped.target_type = None;
+        untyped.target_status = None;
+        let err = build_plans(&cfg, &load, vec![report("a", vec![untyped])])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("mystery") && err.contains("bigquery"),
+            "must name the column and the target, not guess a status: {err}"
+        );
+    }
+
+    /// Write `yaml` to a temp file and hand back the dir (kept alive) + path.
+    fn cfg_file(yaml: &str) -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rivet.yaml");
+        std::fs::write(&path, yaml).unwrap();
+        let s = path.to_string_lossy().to_string();
+        (dir, s)
+    }
+
+    /// A source URL nothing can be listening on — port 1 refuses instantly.
+    const CLOSED_SOURCE: &str = "postgresql://u:p@127.0.0.1:1/db";
+
+    /// The config-level `load:` gates run BEFORE any source I/O.
+    ///
+    /// The source here is a closed port, so if `plan_loads` reached the type
+    /// resolver first the error would be a connection failure; that it names
+    /// the `load:` problem instead is the ordering proof. This is also the first
+    /// test of ANY kind to call `plan_loads` — while the type report came from a
+    /// subprocess the function could not be entered without a `rivet` binary on
+    /// disk and a live source.
+    ///
+    /// Honest about which half a mutant can move: the missing-block arm is
+    /// ordered by construction (the target comes FROM the block, so nothing can
+    /// resolve types before it parses), and only pins the message. The typo arm
+    /// is the graded one — deleting `check_load_keys` from `plan_loads` takes
+    /// the run past the gate and into the closed-port connect (RED-proven:
+    /// "resolving column types for the bigquery load: Connection refused").
+    #[test]
+    fn plan_loads_gates_the_load_block_before_any_source_io() {
+        let (_dir, path) = cfg_file(&format!(
+            "source:\n  type: postgres\n  url: \"{CLOSED_SOURCE}\"\n\
+             exports:\n  - name: a\n    table: t\n    mode: full\n    format: parquet\n    \
+             destination:\n      type: gcs\n      bucket: b\n      prefix: p/\n"
+        ));
+        let err = plan_loads(&path).unwrap_err().to_string();
+        assert!(
+            err.contains("no top-level `load:` block"),
+            "the config gate must answer first, before the source is dialled: {err}"
+        );
+
+        // …and a typo'd key in the block is refused the same way.
+        let (_dir, path) = cfg_file(&format!(
+            "source:\n  type: postgres\n  url: \"{CLOSED_SOURCE}\"\n\
+             exports:\n  - name: a\n    table: t\n    mode: full\n    format: parquet\n    \
+             destination:\n      type: gcs\n      bucket: b\n      prefix: p/\nload:\n  \
+             target: bigquery\n  project: p\n  dataset: d\n  gc_orphan: true\n"
+        ));
+        let err = plan_loads(&path).unwrap_err().to_string();
+        assert!(err.contains("gc_orphan"), "{err}");
+    }
+
+    /// The type report is resolved IN PROCESS — no `rivet check` subprocess.
+    ///
+    /// `plan_loads` used to spawn `rivet check --target X --json` and parse its
+    /// stdout, so this step could not be exercised at all without a `rivet`
+    /// binary (and every failure arrived wearing the child's clothes: "running
+    /// `rivet check` — is rivet on PATH? pass --rivet-bin", or a JSON parse
+    /// error over the child's stderr). Now the resolver runs here, so the step
+    /// is reachable offline and its failure names the EXPORT and the target.
+    ///
+    /// The source is a closed port: the assertion is not about the connection
+    /// error's wording (that is the driver's) but about which layer reports it.
+    #[test]
+    fn plan_loads_resolves_types_in_process_never_a_rivet_check_subprocess() {
+        let (_dir, path) = cfg_file(&format!(
+            "source:\n  type: postgres\n  url: \"{CLOSED_SOURCE}\"\n\
+             exports:\n  - name: orders\n    table: t\n    mode: full\n    format: parquet\n    \
+             destination:\n      type: gcs\n      bucket: b\n      prefix: p/\nload:\n  \
+             target: bigquery\n  project: p\n  dataset: d\n"
+        ));
+        let err = plan_loads(&path).unwrap_err().to_string();
+        assert!(
+            err.contains("orders") && err.contains("resolving column types"),
+            "the in-process resolver must report the failing export: {err}"
+        );
+        assert!(
+            err.contains("bigquery"),
+            "…and which target it was resolving for: {err}"
+        );
+        assert!(
+            !err.contains("rivet check") && !err.contains("--rivet-bin"),
+            "no subprocess is involved any more — nothing may blame one: {err}"
+        );
     }
 }

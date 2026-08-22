@@ -18,29 +18,14 @@ use crate::state::{LoadRecord, StateStore};
 
 pub struct LoadArgs {
     pub config: String,
-    pub rivet_bin: String,
     pub run_id: Option<String>,
-}
-
-/// Resolve which `rivet` binary the load's `rivet check` subprocess runs.
-/// Defaults to THIS executable (self) so the type report comes from the SAME
-/// version — a `rivet` on `$PATH` may be an older, skewed version that rejects a
-/// valid config (dogfood MED). An explicit `--rivet-bin` always wins; a
-/// `current_exe()` failure falls back to `rivet` (the prior behaviour).
-pub fn resolve_rivet_bin(explicit: Option<String>) -> String {
-    explicit.unwrap_or_else(|| {
-        std::env::current_exe()
-            .ok()
-            .and_then(|p| p.to_str().map(str::to_string))
-            .unwrap_or_else(|| "rivet".to_string())
-    })
 }
 
 /// `rivet load`: config-driven warehouse load. The top-level `load:` block
 /// declares the target once, and each export resolves to a table. A multi-table
 /// config loads every export into the shared target, one after another.
 pub fn run_loads(args: LoadArgs) -> Result<()> {
-    let plans = load::plan::plan_loads(&args.config, &args.rivet_bin)?;
+    let plans = load::plan::plan_loads(&args.config)?;
     // One run id for the whole invocation, shared across every table — so warehouse
     // cost slices per load run (all tables together) as well as per table.
     let run_id = resolve_run_id(args.run_id.clone());
@@ -1005,23 +990,6 @@ mod load_ledger_tests {
     use super::*;
 
     #[test]
-    fn resolve_rivet_bin_defaults_to_self_not_path() {
-        // #dogfood MED: `rivet load` shelled out to `rivet` on $PATH (version
-        // skew). An explicit --rivet-bin wins; the default is THIS executable.
-        assert_eq!(resolve_rivet_bin(Some("/opt/rivet".into())), "/opt/rivet");
-        let self_bin = resolve_rivet_bin(None);
-        assert_ne!(
-            self_bin, "rivet",
-            "the default must be the resolved self-path, not the bare PATH name"
-        );
-        // current_exe() yields an absolute path in the test runner.
-        assert!(
-            self_bin.contains('/') || self_bin.contains('\\'),
-            "expected an absolute exe path, got: {self_bin}"
-        );
-    }
-
-    #[test]
     fn resolve_run_id_treats_blank_as_absent() {
         // #dogfood LOW: `--run-id ""` / RIVET_RUN_ID="" (clap → Some("")) must not
         // become the correlation label verbatim — blank is treated as absent.
@@ -1222,44 +1190,6 @@ mod load_ledger_tests {
         c.record_success(&["r1".into()], 3);
         c.record_skip();
         c.record_failed(&["r2".into()]);
-    }
-}
-
-#[cfg(test)]
-mod rivet_bin_tests {
-    use super::resolve_rivet_bin;
-
-    /// `rivet load` shells out to a rivet subprocess for the type report, and
-    /// WHICH binary that is decides whether the types it resolves match the
-    /// version doing the load. The default must therefore be THIS executable, not
-    /// the name `rivet` — a `rivet` on `$PATH` may be an older, skewed build, and
-    /// a type report from a skewed build is wrong in exactly the way nobody
-    /// checks: it still parses, still loads, and describes different columns.
-    ///
-    /// `--rivet-bin` had no test of any kind, and this is its whole contract:
-    /// honour an explicit path, and otherwise resolve to self rather than to a
-    /// bare name the shell would look up.
-    #[test]
-    fn rivet_bin_defaults_to_this_executable_never_a_path_lookup() {
-        let explicit = resolve_rivet_bin(Some("/opt/pinned/rivet".to_string()));
-        assert_eq!(
-            explicit, "/opt/pinned/rivet",
-            "an explicit --rivet-bin must be used verbatim — the flag exists to PIN a build"
-        );
-
-        let default = resolve_rivet_bin(None);
-        assert_ne!(
-            default, "rivet",
-            "the default must not be the bare name `rivet`: that is a $PATH lookup, and the \
-             binary it finds may be a different version than the one running the load"
-        );
-        let me = std::env::current_exe().expect("current_exe");
-        assert_eq!(
-            std::path::Path::new(&default),
-            me.as_path(),
-            "the default must be THIS executable, so the type-report subprocess resolves \
-             types with the same version as the load"
-        );
     }
 }
 
