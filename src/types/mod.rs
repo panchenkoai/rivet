@@ -81,6 +81,32 @@ pub fn overrides_for_table(all: &ColumnOverrides, table: &str) -> ColumnOverride
     out
 }
 
+/// The overrides that apply to ONE resolution unit — the rule every consumer of
+/// `columns:` must key on, in ONE place.
+///
+/// A unit is the thing a `columns:` key can name: one `tables:` entry of a
+/// multiplex CDC export, or a batch/single-table export's own `table:`. Either
+/// spelling may carry a schema (`public.orders`), and [`overrides_for_table`]'s
+/// contract is the BARE name — so the schema is stripped here rather than at
+/// each caller, which is exactly what drifted: the capture
+/// (`plan::build::build_plan`, `pipeline::cdc_job`) rsplit the schema off while
+/// the type resolver's single-table arm passed the whole map through UNNARROWED,
+/// so a qualified key (`orders.amount`) on a `table: public.orders` export never
+/// matched a column (the lookup is by BARE column name,
+/// `types::resolve_or(overrides, col.name(), …)`). The capture APPLIED the
+/// override and the resolver DROPPED it; since `rivet load` reads that report
+/// directly to build the warehouse DDL, the created column took the raw catalog
+/// type while the Parquet already held the overridden one.
+///
+/// `None` means the unit has no table at all (a `query:` export) — config-load
+/// already refuses a qualified key there, so the map passes through whole.
+pub fn overrides_for_unit(all: &ColumnOverrides, unit_table: Option<&str>) -> ColumnOverrides {
+    match unit_table {
+        Some(t) => overrides_for_table(all, t.rsplit('.').next().unwrap_or(t)),
+        None => all.clone(),
+    }
+}
+
 /// The override precedence shared by every source engine: a `columns:` override
 /// wins; otherwise fall back to the engine's autodetected type. Keeping it in
 /// one place is why PostgreSQL and MySQL resolution can't drift on precedence —

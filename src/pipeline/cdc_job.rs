@@ -472,10 +472,7 @@ fn run_cdc_inner(
             table: t.clone(),
             dest: d.as_ref(),
             dest_uri: u.clone(),
-            overrides: crate::types::overrides_for_table(
-                &all_overrides,
-                t.rsplit('.').next().unwrap_or(t),
-            ),
+            overrides: crate::types::overrides_for_unit(&all_overrides, Some(t)),
             row_hash: export.meta_columns.row_hash.clone(),
         })
         .collect();

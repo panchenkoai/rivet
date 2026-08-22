@@ -129,6 +129,28 @@ fn report_units(
 /// document per export would load N tables into one warehouse table (or, before
 /// #252, fail outright). One connection serves every table — a 154-table
 /// multiplex must not open 154 of them.
+/// The `columns:` overrides that apply to ONE resolver unit.
+///
+/// Extracted from [`collect_reports`] so the rule is observable WITHOUT a live
+/// database — the resolver itself opens a connection, so a test of the inline
+/// expression could only re-implement it, which is the self-oracle class. This
+/// is the real producer of the value the report (and therefore `rivet load`'s
+/// warehouse DDL) is built from.
+///
+/// `table` is the multiplex `tables:` entry when there is one; otherwise the
+/// unit IS the export, so its own `table:` supplies the name. That fallback is
+/// the half that was missing: the multiplex arm narrowed and the single-table
+/// arm passed the whole map through, so a qualified key on a `table:` export
+/// (`orders.amount` with `table: public.orders`) matched no column here while
+/// `plan::build` applied it to the run.
+fn unit_overrides(
+    export: &ExportConfig,
+    table: Option<&str>,
+    all: &ColumnOverrides,
+) -> ColumnOverrides {
+    crate::types::overrides_for_unit(all, table.or(export.table.as_deref()))
+}
+
 pub fn collect_reports(
     config: &Config,
     export: &ExportConfig,
@@ -158,23 +180,16 @@ pub fn collect_reports(
             // (`orders.amount`) or bare — narrow it to THIS table exactly the way
             // the capture does, so `check`/`load` type a table the same way `run`
             // writes it.
-            let overrides = match &table {
-                // BARE name, per `overrides_for_table`'s contract ("`table` is the
-                // bare table name (no schema part)") and, crucially, per what the
-                // CAPTURE passes (`cdc_job.rs`, `plan/build.rs` — both rsplit the
-                // schema off). A `tables: [public.orders]` entry keeps its schema
-                // here, so passing it whole made a qualified key (`orders.amount`)
-                // match nothing: the capture APPLIED the override and this
-                // resolver DROPPED it. Since the load stopped shelling out to
-                // `rivet check` and reads this report directly, that mismatch
-                // types the created warehouse column from the raw catalog while
-                // the Parquet already holds the overridden type.
-                Some(t) => crate::types::overrides_for_table(
-                    column_overrides,
-                    t.rsplit('.').next().unwrap_or(t),
-                ),
-                None => column_overrides.clone(),
-            };
+            // The unit's table: a `tables:` entry for a multiplex export, else
+            // the export's OWN `table:`. `None` only for a `query:` export.
+            //
+            // The `.or(export.table)` fallback is the half that was missing: the
+            // multiplex arm narrowed and the single-table arm passed the map
+            // through whole, so on `table: public.orders` a qualified key
+            // (`orders.amount`) matched NOTHING here while `plan::build` applied
+            // it to the run. `overrides_for_unit` is the ONE rule all three
+            // sites now share, so they cannot drift apart again.
+            let overrides = unit_overrides(export, table.as_deref(), column_overrides);
             collect_one(
                 src.as_mut(),
                 export,
@@ -696,17 +711,16 @@ mod tests {
         .into_iter()
         .collect();
 
-        // What the CAPTURE passes for `tables: [public.orders]`.
-        let capture_key = "public.orders"
-            .rsplit('.')
-            .next()
-            .unwrap_or("public.orders");
-        let from_capture = crate::types::overrides_for_table(&overrides, capture_key);
-
-        // What the resolver must pass for the SAME unit.
+        // Call the PRODUCT's rule on both sides, not a closure re-implementing
+        // it: an earlier version of this test rsplit the schema off ITSELF and
+        // compared two `overrides_for_table` calls, so it stayed green against a
+        // product that had stopped narrowing at all (the self-oracle class in
+        // CLAUDE.md). `overrides_for_unit` is the single function every call
+        // site — capture and resolver — now routes through, so mutating it goes
+        // RED here.
         let unit = "public.orders";
-        let from_resolver =
-            crate::types::overrides_for_table(&overrides, unit.rsplit('.').next().unwrap_or(unit));
+        let from_capture = crate::types::overrides_for_unit(&overrides, Some(unit));
+        let from_resolver = crate::types::overrides_for_unit(&overrides, Some(unit));
 
         assert_eq!(
             from_capture.len(),
@@ -728,6 +742,69 @@ mod tests {
             !crate::types::overrides_for_table(&overrides, unit).contains_key("amount"),
             "guard the guard: passing the QUALIFIED name really does drop the override, \
              so this test is not vacuous"
+        );
+    }
+
+    /// The SINGLE-table arm of the same rule. `every_narrowing_site_keys_on_the_
+    /// bare_table_name` above pins the multiplex unit; this pins the one the
+    /// multiplex fix (#268) left behind — a plain `table: public.orders` export.
+    ///
+    /// It calls `unit_overrides`, the function `collect_reports` itself uses, on
+    /// a real `ExportConfig` parsed from YAML — so the `expected` comes from the
+    /// config the operator wrote and the `actual` from the product's own
+    /// resolution, not from a closure restating the rule.
+    ///
+    /// RED against `unit_overrides` returning `all.clone()` for a unit with no
+    /// multiplex table (the shipped behaviour): the lookup downstream is by BARE
+    /// column name (`types::resolve_or(overrides, col.name(), …)`), so the
+    /// qualified key never matched, `rivet check` printed the raw catalog type,
+    /// and `rivet load` created the warehouse column from it — while the run had
+    /// already written the OVERRIDDEN type into the Parquet.
+    #[test]
+    fn a_qualified_override_reaches_a_single_table_export_the_way_the_run_applies_it() {
+        let config = cfg_from(
+            r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: orders
+    table: public.orders
+    mode: full
+    format: parquet
+    columns:
+      orders.amount: "decimal(20,4)"
+      note: "text"
+    destination:
+      type: local
+      path: /tmp/x
+"#,
+        );
+        let export = &config.exports[0];
+        let all = crate::plan::parse_column_overrides_pub(&export.columns, &export.name)
+            .expect("the fixture's `columns:` must parse");
+        assert!(
+            all.contains_key("orders.amount"),
+            "fixture is inert: the qualified key must survive parsing, else this              test cannot distinguish narrowing from an empty map — got {all:?}"
+        );
+
+        // `table: None` — a single-table export is ONE unnamed unit, exactly what
+        // `report_units` yields for it.
+        let narrowed = unit_overrides(export, None, &all);
+
+        assert!(
+            narrowed.contains_key("amount"),
+            "a qualified override on this export's OWN table must apply: `run`              writes the overridden type (plan::build narrows the same way), so a              resolver that drops it types the warehouse column from the raw              catalog and the load disagrees with the Parquet; got {narrowed:?}"
+        );
+        assert!(
+            narrowed.contains_key("note"),
+            "a bare key still applies: {narrowed:?}"
+        );
+        // Guard the guard: the un-narrowed map really cannot answer a bare lookup,
+        // so the assertion above is not satisfied by doing nothing.
+        assert!(
+            !all.contains_key("amount"),
+            "the raw map is keyed `orders.amount`, so a BARE `amount` lookup — the              only lookup the drivers make — misses it: {all:?}"
         );
     }
 
