@@ -545,18 +545,37 @@ jobs:
           # checks its own oracle with it. Past the budget the audit is skipped
           # and SAID to be skipped — that is the trade the prioritisation buys,
           # and it is named rather than implied.
+          #
+          # The kills are graded AGAINST p2.txt, not against "whatever survived
+          # the P1 exclusions". Those are not the same set, and on 2026-08-22
+          # (PR #265) the difference failed a clean PR: the audit caught four
+          # mutants, all of them P1, none of them in the P2 list the same run
+          # had just printed — and the old `[ -s caught.txt ]` test read that as
+          # `oracle-lied`. Measured cause, cargo-mutants 27.1.0 `src/visit.rs`:
+          # every genre goes through `collect_mutant`, which gates on
+          # `options.allows_mutant()`, EXCEPT `Genre::StructField` (`delete
+          # field X from struct Y expression`) which is pushed straight onto
+          # `self.mutants`. `--exclude-re` cannot remove one — probed on that
+          # branch, `--exclude-re .` over `src/load/plan.rs` left exactly the 4
+          # StructField mutants of 56. So the audit corpus always contains any
+          # unexcludable P1 mutant, and a kill on one is not evidence about a
+          # class it was never in. Scoping the oracle is the fix; it takes
+          # nothing away, since a genuinely-P2 kill still fails the gate.
+          #
+          # The mirror-image leak — an unexcludable mutant that IS in P2, which
+          # the MAIN run therefore cannot deprioritise — is already fail-closed
+          # one step up: `verify` sees it survive the P2 exclusions, discards
+          # them, and the whole diff is graded.
           if [ "$P2" -gt 0 ]; then
             if [ $((P1 + P2)) -le "$MUTANTS_DIFF_BUDGET" ]; then
               DROP_P1=()
               while IFS= read -r pat; do DROP_P1+=(--exclude-re "$pat"); done < drop-p1.txt
               cargo mutants --in-diff pr.diff ${DROP_P1[@]+"${DROP_P1[@]}"} -j 2 \
                 -o p2-audit -- --lib --bins || true
-              if [ -s p2-audit/mutants.out/caught.txt ]; then
-                say p2_audit oracle-lied
-                echo "::error::the offline suite CAUGHT $(grep -c . p2-audit/mutants.out/caught.txt) mutant(s) this run had classified as unkillable offline. The coverage measurement and the test run disagree, so the report-only class is not safe and nothing may be deprioritised on it:"
-                sed -n '1,10p' p2-audit/mutants.out/caught.txt >&2
-              else
+              if python3 "$CLASSIFY" audit p2.txt p2-audit/mutants.out/caught.txt; then
                 say p2_audit oracle-holds
+              else
+                say p2_audit oracle-lied
               fi
             else
               say p2_audit skipped-over-budget
@@ -1055,6 +1074,11 @@ jobs:
       # covered". Everything it does not know must land in the graded class;
       # that fallback is the only thing standing between this split and "it
       # wasn't covered, so it doesn't count".
+      #
+      # It also grades the P2-AUDIT's oracle, over PR #265's four real kills:
+      # a mutant caught in the audit run that was never CLASSIFIED P2 says
+      # nothing about the report-only class, and reading it as `oracle-lied`
+      # failed a PR whose own diff was clean.
       - name: The mutant prioritiser fails closed
         run: python3 .github/scripts/mutants_classify.py --self-test
       # The harness thermometer's SHAPING, over fixtures of counts: an unknown
