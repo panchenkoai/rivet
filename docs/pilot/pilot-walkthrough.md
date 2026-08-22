@@ -150,7 +150,12 @@ A single-export plan prints a `Priority` block; a multi-export plan adds a `Camp
 rivet plan -c pilot.yaml --format json -o plan.json
 ```
 
-For a multi-export config, `plan` also fills in any **absent** `wave:` and `parallel_safe:` fields in the config **in place** (preserving your comments and field order) — visible, hand-editable, and consumed by `rivet apply <config>` in Step 4. Values already present are never overwritten unless you pass `--annotate-waves`, which replaces the whole schedule with the plan's recommendations. The plan *suggests* the schedule; you stay in control.
+For a multi-export config, `plan` is **read-only**: it prints the recommended schedule and never touches your config. Pass `--annotate-waves` to write the `wave:` and `parallel_safe:` fields into the config **in place** (preserving your comments and field order) — visible, hand-editable, and consumed by `rivet apply <config>` in Step 4. The flag replaces the whole schedule with the plan's recommendations, absent fields and hand-tuned ones alike, so review the printed schedule first. The plan *suggests*; you stay in control.
+
+```bash
+rivet plan -c pilot.yaml                   # review the schedule (read-only)
+rivet plan -c pilot.yaml --annotate-waves  # then persist it into the config
+```
 
 **What the plan guarantees (PA1–PA8):**
 - PA1 — the artifact is the sole input to `apply`.
@@ -170,7 +175,7 @@ Three ways to execute, by how much orchestration you want.
 rivet run -c pilot.yaml --validate
 ```
 
-**Apply the whole config wave-by-wave** — `rivet plan` (Step 3) wrote a `wave:` onto each export; apply runs them lowest-wave first, with a barrier between waves. Tables are independent, so a failed export does **not** block its wave-mates: apply collects the failure, runs the rest, and exits non-zero. Add `--parallel-export-processes` to run the cheap (`parallel_safe`) exports within a wave concurrently — the heavy ones still run alone (they chunk-parallelize internally):
+**Apply the whole config wave-by-wave** — `rivet plan --annotate-waves` (Step 3) wrote a `wave:` onto each export; apply runs them lowest-wave first, with a barrier between waves. Exports with no `wave:` run last, as one implicit final wave — so a config you never annotated still applies, just in a single band. Tables are independent, so a failed export does **not** block its wave-mates: apply collects the failure, runs the rest, and exits non-zero. Add `--parallel-export-processes` to run the cheap (`parallel_safe`) exports within a wave concurrently — the heavy ones still run alone (they chunk-parallelize internally):
 
 ```bash
 rivet apply pilot.yaml                          # wave-ordered, sequential

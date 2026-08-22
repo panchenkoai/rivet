@@ -860,14 +860,15 @@ mod tests {
         assert!(plan_hive_batches(&uris, "d", 2).is_err());
     }
 
-    /// Live BigQuery load. Requires the `bq` CLI + ADC, a dataset, and a GCS
-    /// Parquet URI. NOT run offline; drive it with:
+    /// Live BigQuery load. Requires ADC, a dataset, and a GCS Parquet URI —
+    /// the transport is the REST API, so no `bq` CLI on PATH. NOT run offline;
+    /// drive it with:
     ///
     ///   BIGQUERY_TEST_PROJECT=my-proj RIVET_BQ_TEST_DATASET=rivet_test \
     ///   RIVET_BQ_TEST_PARQUET_URI=gs://bucket/orders/part-0.parquet \
     ///   cargo test -- --ignored bigquery_live
     #[test]
-    #[ignore = "live: needs bq CLI + ADC + a GCS Parquet fixture"]
+    #[ignore = "live: needs a BigQuery project + ADC + a GCS Parquet fixture"]
     fn bigquery_live_load_round_trips() {
         // Soft-skip when the live BigQuery project isn't configured: CI sweeps
         // `--ignored` (ci.yml) without warehouse creds, so a hard `.expect` here
@@ -1012,7 +1013,7 @@ mod tests {
     ///   RIVET_BQ_CDC_EXPECTED_STATE=3 \
     ///   cargo test -- --ignored bigquery_live_cdc
     #[test]
-    #[ignore = "live: needs bq CLI + ADC + a CDC change-log Parquet fixture"]
+    #[ignore = "live: needs a BigQuery project + ADC + a CDC change-log Parquet fixture"]
     fn bigquery_live_cdc_view_dedups_at_least_once() {
         // Soft-skip when unconfigured — see bigquery_live_load_round_trips.
         let Ok(project) = std::env::var("BIGQUERY_TEST_PROJECT") else {

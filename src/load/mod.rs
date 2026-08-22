@@ -47,7 +47,8 @@ pub struct CdcLoadReport {
 }
 
 /// A warehouse **adapter** — the small, warehouse-specific seam the
-/// [driver](run_load) drives. Dialect + CLI (`bq` / `snow`), the external stage,
+/// [driver](run_load) drives. Dialect + transport (BigQuery's REST API since
+/// #264, Snowflake's `snow` CLI), the external stage,
 /// BigQuery's 4,000-partition batch split, and `PARSE_JSON` all live *behind*
 /// these primitives.
 ///

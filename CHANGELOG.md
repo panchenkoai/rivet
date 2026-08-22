@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+- **A multiplex CDC export (`mode: cdc` with `tables:`) can now be loaded.**
+  The config `rivet init --mode cdc` emits for a whole schema carries no
+  `table:` or `query:`, so `rivet load` bailed on it outright ("must specify
+  exactly one of 'query', 'query_file', or 'table'") and `rivet check --json`
+  silently dropped its `columns` block. Both halves now fan out per table: the
+  type report emits one document per table (with a new `table:` field and a
+  `cdc/orders` display name), and the loader builds one plan per table — its
+  own warehouse table, its own `<base>/<table>/` staging prefix. That prefix is
+  the load-critical half: the manifest listing is recursive, so N plans sharing
+  one base prefix would each sweep in every sibling table's parts and merge N
+  source tables into one warehouse table with every count agreeing.
+
+- **BigQuery loads no longer need the `bq` CLI (or the Google Cloud SDK) on
+  PATH.** `rivet load --target bigquery` talks to the BigQuery JSON API
+  directly over HTTPS, using the same Application Default Credentials rivet
+  already uses for GCS — one Google auth path, not two. A container or CI image
+  that installed the Cloud SDK only for rivet can drop it. Job labels, the
+  4,000-partition batch split, `PARSE_JSON`, and the partition-quota error hint
+  are unchanged; error messages now name the BigQuery job id. If ADC is a user
+  credential with no usable refresh grant, rivet still asks `gcloud` for a token
+  when it is present, and honours `RIVET_BQ_ACCESS_TOKEN` when it is not.
+
 - **`rivet load` no longer shells out to itself.** The load planner obtained
   every column's warehouse type by SPAWNING `rivet check --target X --json` and
   parsing the child's stdout; it now calls the same resolver in process
@@ -39,6 +61,20 @@
   opt-in: no flag ⇒ no write, present field or absent. `--annotate-waves`
   (over)writes the whole schedule as before. `rivet apply` is unaffected —
   exports with no `wave:` run last, as one implicit final wave.
+
+- **Keyset part filenames no longer repeat the export name.** Parts landed as
+  `exports/<export>/<export>_<export>_<stamp>_pk_w3_2.parquet` because the
+  keyset name format prepends the export name AND derives its run-unique middle
+  segment from the run id, which is itself `<export>_<stamp>`; its three sibling
+  runners use a fresh stamp and never doubled. Run-uniqueness (the millisecond
+  stamp) and retry-overwrite (the tag is stable within a run) are unchanged, and
+  nothing parses the prefix — the `_pk_w` / `_keyset_` suffix readers key off is
+  untouched. Existing files are not renamed; new runs write the shorter name.
+
+- Internal, no behaviour change: the two orchestrator entry points now share one
+  post-plan execution script, the ~800-line load orchestrator moved out of the
+  CLI dispatch module, and the state / manifest / preflight seams were split
+  along the same lines. Test-harness and CI-gate hardening rides along.
 
 ## 0.24.5 — 2026-08-19
 
