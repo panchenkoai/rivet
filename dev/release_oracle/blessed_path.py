@@ -153,15 +153,38 @@ def _duckdb_ok() -> bool:
 
 
 def _parquet_rows_and_files(path: Path) -> tuple[int, int]:
-    """(rows, distinct files) under a local prefix, read by DuckDB alone.
+    """(rows, distinct files) the MANIFEST declares, read by DuckDB alone.
 
-    `filename=true` is what makes the file count independent: counting entries
-    in the directory would count whatever the filesystem holds, including parts
-    of a FAILED run that no manifest declares. The question is how many files
-    the readable dataset spans."""
+    `filename=true` gives the file count from the dataset DuckDB actually read
+    rather than from a directory listing — but that only excludes undeclared
+    parts if DuckDB was pointed at the declared ones. This docstring used to
+    claim independence from "parts of a FAILED run that no manifest declares"
+    while the query globbed `**/*.parquet`, which reads precisely those: the
+    promise was in the comment and not in the code. Both numbers are now scoped
+    to the manifest, so `duck_files` answers the same question `part_count` does
+    and the two can be compared at all.
+
+    The two numbers deliberately come from DIFFERENT reads, because they answer
+    different questions and the caller compares each to a different truth:
+
+      rows  — over the parts the MANIFEST declares, compared to the SOURCE. This
+              is the delivery claim, and a glob answers it wrongly: a run that
+              under-declares agrees with the source while `rivet load` reads short.
+      files — over the parts ON DISK, compared to the manifest's `part_count`.
+              Scoping this one to the manifest too would make both sides of that
+              comparison the manifest and retire the check: disk > declared is an
+              undeclared orphan, disk < declared a part that was never written,
+              and only a disk-side count can see either.
+
+    (-1, -1) when nothing readable is declared — an outcome, not a reason to fall
+    back to the glob for the ROW count.)"""
+    src = scenarios._declared_read(path, ".parquet")
+    if not src:
+        return (-1, -1)
     got = scenarios._duckdb_list(
-        "SELECT count(*), count(DISTINCT filename) FROM "
-        f"read_parquet('{path}/**/*.parquet', filename=true)"
+        f"SELECT (SELECT count(*) FROM read_parquet({src})), "
+        "(SELECT count(DISTINCT filename) FROM "
+        f"read_parquet('{path}/**/*.parquet', filename=true))"
     )
     if not got:
         return (-1, -1)

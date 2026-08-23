@@ -65,6 +65,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import scenarios
 from ..pytools.ab_regression import (
     CASE_TIMEOUT as _AB_CASE_TIMEOUT,
     RIVET_RUNS_TOTAL as _AB_CHILD_RUNS,
@@ -670,11 +671,15 @@ INSERT INTO regr_probe SELECT g, md5(g::text), (g%1000)+0.25, '2025-01-01'::time
     # An INDEPENDENT reader over the same parts: DuckDB, not rivet, must agree
     # with the source row count — otherwise "cur can read prev's output" rests
     # entirely on rivet's own verdict about itself.
+    # DECLARED parts, not a glob: the claim being graded is "the current binary
+    # can READ what the previous one DELIVERED", and delivery is what the prior
+    # run's manifest names. A glob would also read parts it abandoned.
+    _src = scenarios._declared_read(pe / "out", ".parquet")
     duck = run([
         "duckdb", "-noheader", "-list", "-c",
-        f"SELECT count(*) FROM read_parquet('{pe / 'out'}/**/*.parquet')",
-    ])
-    dcnt = duck.stdout.strip()
+        f"SELECT count(*) FROM read_parquet({_src})",
+    ]) if _src else None
+    dcnt = duck.stdout.strip() if duck else ""
     m = re.search(r"\d+", _regr_psql(src, "SELECT count(*) FROM regr_probe;").stdout)
     scnt = m.group(0) if m else ""
     if not dcnt or dcnt != scnt:
