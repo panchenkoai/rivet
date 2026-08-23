@@ -110,13 +110,17 @@ jobs:
         with: { fetch-depth: 0 }
       - name: New schema keys must appear in tests
         run: |
-          git fetch origin ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }} --depth=1
+          # `fetch-depth: 0` above normally means the base is already here; fetch
+          # only if it is not, and never with --depth on a full clone.
+          BASE_SHA='${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}'
+          git rev-parse --verify --quiet "$BASE_SHA^{commit}" >/dev/null \
+            || git fetch --no-tags origin "$BASE_SHA"
           # Only PROPERTY names (keys directly under a "properties" object) —
           # definition/type names (e.g. CdcInitialMode) are not user-facing
           # config keys and false-positived on the gate's own first run.
           KEYS='[paths | select(length>=2 and .[-2]=="properties") | .[-1] | select(type=="string")] | unique | .[]'
           NEW_KEYS=$(diff \
-            <(git show ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}:schemas/rivet.schema.json | jq -r "$KEYS" 2>/dev/null || true) \
+            <(git show "$BASE_SHA":schemas/rivet.schema.json | jq -r "$KEYS" 2>/dev/null || true) \
             <(jq -r "$KEYS" schemas/rivet.schema.json) \
             | grep '^>' | awk '{print $2}' || true)
           FAIL=0
@@ -299,19 +303,25 @@ jobs:
         id: scope
         run: |
           set -euo pipefail
+          # A SHA, not a branch name, because merge_group carries no base_ref.
+          # It is therefore used as a REVISION directly: `origin/<sha>` is not a
+          # thing, and asking for it is how the first version of this change
+          # failed — the guard below caught it and refused to guess, which is
+          # what it is for.
           base="${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}"
-          if ! git fetch --no-tags origin "$base"; then
-            echo "::error::could not fetch the base branch '$base' — refusing to guess this PR's scope. A failed fetch used to read as a docs-only PR and skip every check in this job."
+          if ! git rev-parse --verify --quiet "$base^{commit}" >/dev/null \
+             && ! git fetch --no-tags origin "$base"; then
+            echo "::error::could not obtain the base commit '$base' — refusing to guess this PR's scope. A failed fetch used to read as a docs-only PR and skip every check in this job."
             exit 1
           fi
-          if ! git rev-parse --verify --quiet "origin/$base^{commit}" >/dev/null; then
-            echo "::error::'origin/$base' does not resolve after a successful fetch — every diff below would be empty, which this gate would otherwise mistake for a docs-only PR."
+          if ! git rev-parse --verify --quiet "$base^{commit}" >/dev/null; then
+            echo "::error::'$base' does not resolve even after fetching — every diff below would be empty, which this gate would otherwise mistake for a docs-only PR."
             exit 1
           fi
-          changed=$(git diff --name-only "origin/$base...HEAD")
+          changed=$(git diff --name-only "$base...HEAD")
           if [ -z "$changed" ]; then
             echo "code=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::the diff against origin/$base is empty (the base has caught up with this branch) — nothing to mutate."
+            echo "::notice::the diff against $base is empty (the base has caught up with this branch) — nothing to mutate."
           elif printf '%s\n' "$changed" | grep -qvE '^(docs/|.*\.md$|\.githooks/)'; then
             echo "code=true" >> "$GITHUB_OUTPUT"
           else
@@ -713,20 +723,26 @@ jobs:
         id: scope
         run: |
           set -euo pipefail
+          # A SHA, not a branch name, because merge_group carries no base_ref.
+          # It is therefore used as a REVISION directly: `origin/<sha>` is not a
+          # thing, and asking for it is how the first version of this change
+          # failed — the guard below caught it and refused to guess, which is
+          # what it is for.
           base="${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}"
-          if ! git fetch --no-tags origin "$base"; then
-            echo "::error::could not fetch the base branch '$base' — refusing to guess this PR's scope. A failed fetch used to read as a docs-only PR and skip every check in this job."
+          if ! git rev-parse --verify --quiet "$base^{commit}" >/dev/null \
+             && ! git fetch --no-tags origin "$base"; then
+            echo "::error::could not obtain the base commit '$base' — refusing to guess this PR's scope. A failed fetch used to read as a docs-only PR and skip every check in this job."
             exit 1
           fi
-          if ! git rev-parse --verify --quiet "origin/$base^{commit}" >/dev/null; then
-            echo "::error::'origin/$base' does not resolve after a successful fetch — every diff below would be empty, which this gate would otherwise mistake for a docs-only PR."
+          if ! git rev-parse --verify --quiet "$base^{commit}" >/dev/null; then
+            echo "::error::'$base' does not resolve even after fetching — every diff below would be empty, which this gate would otherwise mistake for a docs-only PR."
             exit 1
           fi
-          changed=$(git diff --name-only "origin/$base...HEAD")
+          changed=$(git diff --name-only "$base...HEAD")
           if [ -z "$changed" ]; then
             echo "code=false" >> "$GITHUB_OUTPUT"
             echo "expected_state=docs-only" >> "$GITHUB_OUTPUT"
-            echo "::notice::the diff against origin/$base is empty (the base has caught up with this branch) — nothing to grade."
+            echo "::notice::the diff against $base is empty (the base has caught up with this branch) — nothing to grade."
           elif printf '%s\n' "$changed" | grep -qvE '^(docs/|.*\.md$|\.githooks/)'; then
             echo "code=true" >> "$GITHUB_OUTPUT"
           else
