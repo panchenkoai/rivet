@@ -309,6 +309,33 @@ def _manifest_declared_parts(root: Path) -> list[str]:
     return sorted(set(out))
 
 
+def _declared_read(root: Path, suffix: str) -> str | None:
+    """A DuckDB source LIST over only the parts the manifest DECLARES, or None.
+
+    The difference from a `**/*<suffix>` glob is the whole point of this oracle:
+    a glob reads what the destination HOLDS, and a consumer (`rivet load`,
+    `validate`, `reconcile`) reads what the run DECLARED. When those two
+    disagree, a glob-based compare against the source agrees with the source and
+    reports delivery that no consumer will ever see.
+
+    Measured 2026-08-23 on a real 5-part keyset export of `users` (1000 rows):
+    with one part removed from the manifests and its FILE left on disk, the glob
+    still read 1000/1000 and passed, while this list read 800 and diverged from
+    the source. That is the manifest-clobber / harvest-gap class, and it is the
+    one this file's own history says every "repeated run" test missed by
+    re-reading the parquet — the artifact that survives — instead of the
+    manifest.
+
+    None means the manifest declares nothing readable, which is itself an
+    outcome ("nothing was delivered"), never a reason to fall back to the glob:
+    a fallback would restore exactly the blindness this exists to remove.
+    """
+    parts = [f for f in _manifest_declared_parts(root) if f.endswith(suffix)]
+    if not parts:
+        return None
+    return "[" + ", ".join(f"'{f}'" for f in parts) + "]"
+
+
 def manifest_scoped_ids(store: str, bucket: str, prefix: str, work: Path, idc: str) -> str:
     """Distinct id-set the store DELIVERS per its MANIFESTS (not raw parquet), comma-joined.
 
@@ -751,12 +778,16 @@ def sc_integrity_types(led: Ledger, engine: str, tag: str, url: str) -> None:
     if _export_local(engine, url, "users", out / "users", "chunked").ok:
         scnt = _source_count_distinct(engine, url, "users", "id")
         id_col = "_id" if engine == "mongo" else "id"
-        dcnt = _duckdb_list(
-            f"SELECT count(*)||' '||count(DISTINCT {id_col}) "
-            f"FROM read_parquet('{out}/users/**/*.parquet')"
-        )
-        if scnt != dcnt:
-            fails += f"users src[{scnt}]!=parquet[{dcnt}] "
+        src = _declared_read(out / "users", ".parquet")
+        if src is None:
+            fails += "users-nothing-declared "
+        else:
+            dcnt = _duckdb_list(
+                f"SELECT count(*)||' '||count(DISTINCT {id_col}) "
+                f"FROM read_parquet({src})"
+            )
+            if scnt != dcnt:
+                fails += f"users src[{scnt}]!=declared[{dcnt}] "
     else:
         fails += "users-export-failed "
 
@@ -767,8 +798,13 @@ def sc_integrity_types(led: Ledger, engine: str, tag: str, url: str) -> None:
     if engine != "mongo":
         for tmt in ("rivet_type_matrix",):
             if _export_local(engine, url, tmt, out / tmt, "full").ok:
-                got = _duckdb_json_normalized(
-                    f"SELECT * FROM read_parquet('{out}/{tmt}/**/*.parquet') ORDER BY id"
+                psrc = _declared_read(out / tmt, ".parquet")
+                got = (
+                    _duckdb_json_normalized(
+                        f"SELECT * FROM read_parquet({psrc}) ORDER BY id"
+                    )
+                    if psrc
+                    else ""
                 )
                 if not got:
                     fails += f"{tmt}-readback "
@@ -795,9 +831,19 @@ def sc_integrity_types(led: Ledger, engine: str, tag: str, url: str) -> None:
             # broken csv export on postgres — whose golden IS the refusal — passed green).
             refused = (not pc.ok) and re.search(r"cannot serialize|unrepresentable", pc.out, re.IGNORECASE)
             if pc.ok and has_csv:
-                gotc = _duckdb_json_normalized(
-                    f"SELECT * FROM read_csv('{csv_dir}/**/*.csv', all_varchar=true, header=true) "
-                    f"ORDER BY id"
+                # `has_csv` still asks the DISK, because it distinguishes the
+                # intended refusal (no csv written at all) from a real failure;
+                # the READ is manifest-scoped like every other one here, so a
+                # csv part on disk that no manifest declares reads as undelivered
+                # rather than as fidelity evidence.
+                csrc = _declared_read(csv_dir, ".csv")
+                gotc = (
+                    _duckdb_json_normalized(
+                        f"SELECT * FROM read_csv({csrc}, all_varchar=true, header=true) "
+                        f"ORDER BY id"
+                    )
+                    if csrc
+                    else ""
                 )
                 if not gotc:
                     fails += f"{tmt}-csv-readback "
@@ -851,13 +897,20 @@ def sc_keyset_parallel(led: Ledger, engine: str, tag: str, url: str) -> None:
         return
 
     fails = ""
-    # (1) loss/dup — the SAME independent oracle integrity_types uses.
+    # (1) loss/dup — the SAME independent oracle integrity_types uses, and it stays
+    #     the same only if it is manifest-scoped here too: a glob here with a
+    #     declared-parts read there would make the shared claim false on the
+    #     runner that fans out the most parts.
     scnt = _source_count_distinct(engine, url, "users", "id")
-    dcnt = _duckdb_list(
-        f"SELECT count(*)||' '||count(DISTINCT id) FROM read_parquet('{out}/users/**/*.parquet')"
-    )
-    if scnt != dcnt:
-        fails += f"loss/dup src[{scnt}]!=parquet[{dcnt}] "
+    src = _declared_read(out / "users", ".parquet")
+    if src is None:
+        fails += "loss/dup-nothing-declared "
+    else:
+        dcnt = _duckdb_list(
+            f"SELECT count(*)||' '||count(DISTINCT id) FROM read_parquet({src})"
+        )
+        if scnt != dcnt:
+            fails += f"loss/dup src[{scnt}]!=declared[{dcnt}] "
     # (2) fan-out — distinct `_pk_w{ridx}_` stamps across the part names.
     workers = len(
         {m for p in (out / "users").rglob("*.parquet") for m in re.findall(r"_pk_w[0-9]+_", str(p))}
