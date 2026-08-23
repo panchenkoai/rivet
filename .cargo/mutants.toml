@@ -50,6 +50,36 @@ exclude_globs = [
 ]
 
 exclude_re = [
+    # The two chunk-CHECKPOINT runners' whole-body stubs. Both are live-only by
+    # construction (they need a real source, a destination and a state DB, so the
+    # `--lib --bins` run this gate does never executes a line of them), and the
+    # gate measured exactly that: reach = 0 executions, so the classifier put
+    # them in the report-only class. Then the offline suite CAUGHT them, and the
+    # coverage verdict correctly refused the contradiction (`P2_AUDIT:
+    # oracle-lied`, PR #273).
+    #
+    # The killer is `tests/offline/chunking_matrix_guard.rs`, which DERIVES the
+    # set of commit loops by scanning the TEXT of `src/pipeline` for
+    # `commit::record_part(` — deliberately, so a new runner cannot arrive
+    # without a matrix column. cargo-mutants rewrites the body ON DISK, the
+    # needle vanishes from the file, the derivation loses the name and the guard
+    # fails — WITHOUT executing one instruction of the mutant. That kill is an
+    # artifact of reading the source, not evidence any assertion noticed the
+    # behaviour change, and leaving it in place would let a text scan
+    # counterfeit execution coverage for every live-only runner it names.
+    #
+    # Live oracle, RED-proven by hand before excluding (2026-08-23), each against
+    # a SINGLE exact test whose baseline was green in the same worktree — the
+    # sibling mysql/mssql cases fail there on the worktree guard, so a filter that
+    # matched all three would have graded nothing:
+    #   * sequential — `chunked_checkpoint_resume_suppresses_form_b_so_validate_
+    #     does_not_false_fail` (live_chunked_recovery.rs): pass -> FAIL,
+    #   * parallel — `parallel_chunked_crash_after_chunk_complete_resume_finishes_
+    #     with_no_duplicates` (same file, postgres variant): pass -> FAIL.
+    # Both read the DESTINATION back, so the stub's "success with nothing
+    # exported" cannot pass as an outcome.
+    "replace run_chunked_parallel_checkpoint",
+    "replace run_chunked_sequential_checkpoint",
     # 64*1024 is a streaming READ BUFFER size in compute_part_checksums —
     # any chunking yields byte-identical digests; 64+1024 only changes I/O
     # granularity. Verified by hand (matrix audit, 2026-07-13).

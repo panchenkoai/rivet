@@ -791,6 +791,8 @@ mod tests {
         let mut summary =
             crate::pipeline::summary::RunSummary::stub_for_testing(run_id, String::from("orders"));
         let rows_before = summary.total_rows;
+        let committed_before = summary.files_committed;
+        let produced_before = summary.files_produced;
 
         let n = rehydrate_manifest_parts_from_file_log(&state, run_id, &mut summary).unwrap();
 
@@ -821,6 +823,24 @@ mod tests {
             summary.total_rows - rows_before,
             50,
             "row aggregate bumped by the union"
+        );
+        // Both FILE counters, in delta form, because the manifest this resume hands
+        // downstream is graded on them: `files_committed` feeds the reconcile gate
+        // and the run card, `files_produced` the coherence invariant. Asserting the
+        // parts alone left `files_produced += rehydrated` unguarded — a surviving
+        // `*=` mutant, and over a 0 base with 2 siblings that is a REAL divergence
+        // (0*2=0 vs 0+2=2): a manifest whose declared parts and whose own
+        // aggregates disagree. Delta form so a non-zero base cannot hide it.
+        assert_eq!(
+            summary.files_committed - committed_before,
+            2,
+            "both reconstructed siblings count as committed files"
+        );
+        assert_eq!(
+            summary.files_produced - produced_before,
+            2,
+            "…and as produced files — the two counters move together, or the \
+             manifest disagrees with its own aggregates"
         );
         // Finding #10 / ADR-0029: rehydrated parts carry no per-column checksum,
         // so the run-wide Form B cannot cover the manifest. Pre-ADR-0029 this
