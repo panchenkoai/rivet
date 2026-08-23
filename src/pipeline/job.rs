@@ -780,6 +780,7 @@ pub(crate) fn synthetic_failed_summary(export_name: &str, err: &anyhow::Error) -
         apply_context: None,
         column_checksums: Vec::new(),
         column_checksums_incomplete: false,
+        column_checksums_short_cover: false,
         checksum_key_column: None,
         journal,
     }

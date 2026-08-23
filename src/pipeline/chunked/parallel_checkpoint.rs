@@ -130,7 +130,7 @@ pub(crate) fn run_chunked_parallel_checkpoint(
     // records Form B like exec.rs's parallel path (graph-surfaced runner-bypass).
     #[allow(clippy::type_complexity)]
     let checksums_shared: std::sync::Mutex<
-        Vec<(std::collections::BTreeMap<String, u64>, Option<String>)>,
+        Vec<(i64, std::collections::BTreeMap<String, u64>, Option<String>)>,
     > = std::sync::Mutex::new(Vec::new());
     // ADR-0012 M3: schema fingerprint captured once across workers.  None
     // until any worker exports a non-empty chunk and resolves the dest schema.
@@ -493,9 +493,14 @@ pub(crate) fn run_chunked_parallel_checkpoint(
                                     records.push((rec, chunk_index));
                                 }
                                 drop(records);
-                                // Form B: hand this chunk's checksums to the parent.
-                                poison::lock_recover(checksums_shared)
-                                    .push((chunk_checksums, chunk_key));
+                                // Form B: hand this chunk's checksums to the parent,
+                                // tagged with the chunk — ADR-0029's coverage unit,
+                                // the same one the parent's record_part drain uses.
+                                poison::lock_recover(checksums_shared).push((
+                                    chunk_index,
+                                    chunk_checksums,
+                                    chunk_key,
+                                ));
                                 Some(first)
                             };
                             // Mirror of the sequential checkpoint hooks (search for
@@ -581,6 +586,7 @@ pub(crate) fn run_chunked_parallel_checkpoint(
             None,
             &rec,
             super::super::commit::PartKind::Chunk { chunk_index },
+            super::super::commit::UnitId::Chunk(chunk_index),
         );
     }
 
@@ -606,11 +612,16 @@ pub(crate) fn run_chunked_parallel_checkpoint(
         );
     }
 
-    // ADR-0028: feed every worker's chunk checksums into the run ledger; the
-    // seam harvests once, at the dispatcher, before finalize writes the manifest.
-    for (part, key) in poison::into_recover(checksums_shared) {
-        summary.ledger.merge_checksums(&part);
-        summary.ledger.note_key_column(key);
+    // ADR-0028/0029: feed every worker's chunk checksums into the run ledger under
+    // the SAME chunk unit the drain above recorded that chunk's parts with; the
+    // seam harvests once, at the dispatcher, before finalize writes the manifest,
+    // and computes the coverage rather than trusting this feed's order.
+    for (chunk_index, part, key) in poison::into_recover(checksums_shared) {
+        summary.ledger.contribute_checksums(
+            super::super::commit::UnitId::Chunk(chunk_index),
+            &part,
+            key,
+        );
     }
 
     state.finalize_chunk_run_completed(&run_id)?;

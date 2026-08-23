@@ -332,8 +332,13 @@ pub(crate) fn run_chunked_sequential_checkpoint(
                 // ADR-0028: feed the run ledger; the seam harvests once, at
                 // the dispatcher (chunked's drift gate stays pre-chunk, ADR-0021,
                 // so no schema is fed here).
-                summary.ledger.merge_checksums(&chunk_checksums);
-                summary.ledger.note_key_column(key);
+                // ADR-0029: contributed under the chunk this loop iteration
+                // just committed — the unit its record_part calls use below.
+                summary.ledger.contribute_checksums(
+                    super::super::commit::UnitId::Chunk(chunk_index),
+                    &chunk_checksums,
+                    key,
+                );
                 // Shared commit path for the non-empty branch (I2/M1 + counters
                 // + ChunkCompleted journal + I7 file-log + fault hooks).
                 // Empty chunks have no file to record but still need to journal
@@ -354,6 +359,7 @@ pub(crate) fn run_chunked_sequential_checkpoint(
                             Some(state),
                             rec,
                             super::super::commit::PartKind::Chunk { chunk_index },
+                            super::super::commit::UnitId::Chunk(chunk_index),
                         );
                     }
                     // chunk_task carries one file name; for a rotation-split

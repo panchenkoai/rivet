@@ -136,7 +136,27 @@ pub struct RunSummary {
     /// as a false mismatch — mirroring how a rehydrated part's empty md5 degrades
     /// to a size-only check. An incomplete integrity record must be ABSENT, not
     /// partial-and-lying.
+    ///
+    /// ADR-0029: this is now a COMPUTED result, not a flag the resume paths must
+    /// remember to set. `harvest_column_checksums` compares the manifest's parts
+    /// against the commit units that contributed checksums and sets it when any
+    /// part is uncovered — a rehydrated part has no contribution, so the resume
+    /// case follows from the data.
     pub column_checksums_incomplete: bool,
+    /// ADR-0029: WHY the coverage was short, when it was — set only for the half
+    /// that is never legitimate on a successful run: a part this run RECORDED
+    /// (through `commit::record_part`) whose commit unit contributed no
+    /// checksums. The other half — a part the manifest lists but this run never
+    /// recorded (a checkpoint rehydration, an M8 `Skip` clone) — is expected and
+    /// leaves this false.
+    ///
+    /// It exists so "Form B is absent" stops being ambiguous between "nothing
+    /// computed it", "a resume hydrated parts" and "the runner paired its part
+    /// and its checksum under DIFFERENT unit ids". The last one suppresses Form
+    /// B on perfectly healthy data — fail-safe, but silent — which is the risk
+    /// ADR-0029 names against itself; `check_post_run_invariants` turns it into
+    /// a loud failure instead.
+    pub column_checksums_short_cover: bool,
     /// ADR-0028: the run-wide tail ledger the runners FEED as they commit
     /// (schema seen, per-part checksums, shape bytes) and that
     /// `finalize::finalize_export` — called once by the dispatcher — APPLIES:
@@ -304,6 +324,7 @@ impl RunSummary {
             apply_context: None,
             column_checksums: Vec::new(),
             column_checksums_incomplete: false,
+            column_checksums_short_cover: false,
             ledger: Default::default(),
             checksum_key_column: None,
             cursor_column: None,
@@ -379,6 +400,7 @@ impl RunSummary {
             apply_context: None,
             column_checksums: Vec::new(),
             column_checksums_incomplete: false,
+            column_checksums_short_cover: false,
             ledger: Default::default(),
             checksum_key_column: None,
             cursor_column: None,
@@ -904,6 +926,34 @@ impl RunSummary {
                     "state_backed success committed parts but column_checksums is empty \
                      and not flagged incomplete — Form-B was never harvested (no runner \
                      called harvest_column_checksums). Runner-bypass class."
+                        .to_string(),
+                );
+            }
+            // ADR-0029 — the telltale the computed coverage makes possible, and
+            // the guard against the risk that ADR names against ITSELF. Before
+            // it, "Form B is absent" was ambiguous (nothing computed it / a
+            // resume hydrated parts / the runner mis-keyed its units) and the
+            // branch above excused all three alike. Now the harvest records WHY,
+            // and exactly one of the three can never be legitimate on a run
+            // whose runner SUCCEEDED: a part this run recorded itself, whose
+            // commit unit contributed no checksums. On a success every commit
+            // unit that recorded a part also completed, so this can only mean
+            // `record_part`'s UnitId and the checksum feed's UnitId disagree —
+            // which suppresses Form B on healthy data, in the fail-safe
+            // direction, in silence. Resume-safe by CONSTRUCTION, with no
+            // exemption to remember: a rehydrated / M8-cloned part never went
+            // through record_part, so it is foreign, not uncovered, and leaves
+            // this flag false.
+            if self.column_checksums_short_cover {
+                return Err(
+                    "state_backed success committed parts whose commit unit contributed NO \
+                     Form-B checksums, so the harvest suppressed the record (ADR-0029 \
+                     computed coverage). On a successful run every unit that recorded a part \
+                     also committed it, so this is a UnitId mismatch between \
+                     commit::record_part and CommitLedger::contribute_checksums in the \
+                     runner — pair them on the same unit. Suppressing here is fail-safe but \
+                     SILENT: `validate --depth full` would stop re-reading values for every \
+                     run of this runner."
                         .to_string(),
                 );
             }
