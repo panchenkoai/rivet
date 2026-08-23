@@ -1,0 +1,183 @@
+# CDC EVIDENCE matrix — not "is this contract covered", but "would the coverage BITE".
+#
+# The three sibling CDC ledgers grade coverage: cdc-matrix asks whether a behaviour
+# has a test per engine, cdc-axis-matrix derives the config/hook axes from the product
+# and asks the same, cdc-type-fidelity-matrix does it per type. All three are answered
+# by a test EXISTING. None of them can see a test that exists, runs, passes, and could
+# not fail against the defect it names.
+#
+# This file grades that second question, per engine, because the 2026-08 CDC audit
+# found the failure is not distributed at random — it recurs as a handful of SHAPES,
+# and a shape that bit three engines will bite the fourth. Rows are those shapes.
+#
+# The audit's own headline is the reason this file is not a nicety. `roll_all` writes
+# the pre-ack manifest as a cumulative SUPERSET of every part acked so far
+# (src/source/cdc/sink.rs:289-299) — that manifest is the only thing that makes a
+# crash inside the ack window recoverable by a manifest-authoritative loader. Mutating
+# it to publish only the LAST part leaves `cargo test --lib` at 2607 passed, 0 failed.
+# Measured by hand 2026-08-23, not inferred. Every ledger in this repo said that
+# contract was covered.
+#
+# ── vocabulary ───────────────────────────────────────────────────────────────
+#   sound    the named test would go RED against the named mutant. Say WHICH mutant.
+#   vacuous  a test exists and cannot fail against the defect it guards. Sub-kind in
+#            the note: self-oracle | below-threshold | absence-only | skip-as-pass |
+#            second-cause (an exit-status oracle over a fixture broken twice).
+#   absent   nothing covers this shape on this engine.
+#   na       structurally inapplicable HERE — and the reason is written out, never
+#            "the other engines don't have it". An `na` with no reason is a defect.
+#
+# A cell may not be promoted to `sound` on an argument. Promote it when the mutant
+# has been applied and the test observed to fail — the same bar the mutation gate
+# holds product code to.
+#
+# Guarded by tests/offline/cdc_evidence_matrix_guard.rs, which DERIVES the engine
+# columns from `SourceType` rather than reading a list typed in here. That derivation
+# is deliberate: the audit found the conformance gate's four engine columns were tied
+# to nothing, so a fifth CDC engine would have arrived with no row asking about it.
+
+engines: [postgres, mysql, mssql, mongo]
+
+shapes:
+
+  - id: resume_reads_a_fresh_destination
+    what: >
+      A crash/resume test must not let the CRASHED run's durable parts satisfy the
+      resume leg's oracle. Parts are durable before the panic (sink.rs:269-279 flushes,
+      then the hook fires, then save+ack at :302-309), so a resume that captures ZERO
+      still passes when both runs share one destination and the oracle globs parquet.
+    mutant: >
+      Move `p.save(ck)` + `stream.ack(p)` above the flush loop in `roll_all` — i.e. ack
+      before the data is durable. A sound cell goes RED; a vacuous one stays green
+      because the mutant's entire loss window is exactly the orphan parts it globs.
+    postgres: { sound: "resumes into a fresh out2/ — live_cdc.rs:2849-2863" }
+    mysql:    { sound: "resumes into a fresh out2/ — live_cdc.rs:474-486" }
+    mssql:    { sound: "resumes into a fresh out2/ — live_cdc_mssql.rs:782-795" }
+    mongo:
+      vacuous: "one Rig at live_cdc_mongo.rs:83 drives both the crash (:91) and the resume
+        (:100); Rig::out_dir is fixed at construction (tests/common/rig/oracle.rs:9-13) and
+        the oracle is a **/*.parquet glob (tests/common/duckdb.rs:257). This is Mongo's ONLY
+        at-least-once evidence and the mongo cell of crash_before_ack in the gate."
+      kind: second-cause
+
+  - id: readback_is_manifest_scoped
+    what: >
+      The read-back oracle must read the parts the run DECLARED, not every parquet under
+      the prefix. A glob answers "what does the destination hold"; every consumer
+      (`rivet load`, `validate`, reconcile) reads what the manifest names. On a resume
+      cell the difference IS the test: a crash leaves parts no manifest declares.
+    mutant: >
+      Publish a manifest that under-declares (drop the last part from the set written in
+      `roll_all`). A manifest-scoped oracle reads short and diverges from the source; a
+      glob oracle reads the full set and passes. Proven in the batch oracles 2026-08-23:
+      source 1000, glob 1000 PASSED, declared 800 CAUGHT.
+    postgres: { gap: "glob only" }
+    mysql:    { sound: "manifest_driven_int_ids — live_cdc_mbt.rs:413 (one caller)" }
+    mssql:    { gap: "glob only" }
+    mongo:    { gap: "glob only" }
+
+  - id: fold_fixture_crosses_its_threshold
+    what: >
+      Anything that FOLDS or accumulates across parts must be graded over >= 2 parts.
+      Over one element every fold operator is identical (0+s == 0^s == 0|s), and a
+      superset over one part is indistinguishable from a last-write.
+    mutant: >
+      Pre-ack manifest: publish only `&s.parts[len-1..]` instead of the whole slice.
+      Form B: `*e = sum` instead of `wrapping_add`. MEASURED: the manifest mutant leaves
+      the lib suite at 2607 passed, 0 failed.
+    postgres: { gap: "shared sink — the MBT manifest fixture inserts 30 rows in ONE
+        autocommit statement at rollover 10, and should_roll gates on `committed`
+        (sink.rs:106-110) so it yields ONE part; the '3 parts' comments at
+        live_cdc_mbt.rs:289,386 are wrong" }
+    mysql:    { gap: "same shared fixture" }
+    mssql:    { gap: "same shared fixture" }
+    mongo:    { gap: "same shared fixture" }
+
+  - id: runs_the_engine_default_configuration
+    what: >
+      The stand must exercise the configuration an untuned production server has. A stand
+      pinned to a non-default makes the majority code path unreachable by every test.
+    mutant: >
+      Reverse the positional index at sink.rs:755 (the nameless arm). Only a MINIMAL
+      -metadata target can see it.
+    postgres: { na: "test_decoding output is not configuration-dependent in this sense; the
+        session-state class it DOES have (timezone/datestyle/bytea_output) is pinned on the
+        reader's own connection and has its own non-default test" }
+    mysql:
+      vacuous: "docker-compose.yaml:264 pins --binlog-row-metadata=FULL; MySQL's default is
+        MINIMAL. Under FULL the sink takes the by-NAME arm and SKIPS the arity guard
+        entirely (sink.rs:683). Every live MySQL CDC test uses MYSQL_CDC_URL -> :3307 -> the
+        named path. The nameless arm has one 2-column live test (live_cdc_replica.rs:94,
+        behind the `replica` profile) and one offline test whose fixture is a SINGLE column.
+        Verified by hand 2026-08-23: `SELECT @@binlog_row_metadata` on the stand returns FULL."
+      kind: below-threshold
+    mssql:    { na: "change tables carry a fixed column set from the capture instance; there is
+        no server knob that changes the image shape the reader sees" }
+    mongo:    { gap: "change-stream pre/post-image settings are per-collection and unset by
+        default; delete pre-images are untested (see delete_semantics_are_end_to_end)" }
+
+  - id: unknown_input_fails_loud_not_silent
+    what: >
+      Every "unknown -> default" boundary must warn or bail, never degrade silently. The
+      audit found the SAME shape on all four engines, which is why it is a row and not
+      four separate notes.
+    mutant: >
+      Feed the boundary its unknown value and assert a warning/error is produced. A silent
+      arm passes today because nothing observes the degradation.
+    postgres: { absent: "any test_decoding line that is not INSERT/UPDATE/DELETE — TRUNCATE
+        above all — is dropped with no log, no counter, no test (cdc.rs:390,576-592)" }
+    mysql:    { absent: "a transaction group with no Xid marker is buffered and never emitted
+        (mysql/cdc.rs:360-398)" }
+    mssql:    { absent: "a checkpoint JSON that parses but lacks its engine's key degrades to
+        'no checkpoint' — MySQL uses ok_or_else here, MSSQL does not" }
+    mongo:    { absent: "a `hello` without operationTime leaves the load-bearing cluster-time
+        bound unset, so until_current degrades to nothing, silently (mongo/cdc.rs:261-273)" }
+
+  - id: fault_hook_has_a_crash_test
+    what: >
+      Each CDC fault hook must have a per-engine crash test. A hook covered on two engines
+      of four is a guarantee claimed for four.
+    mutant: "remove the hook's handling and see which engines notice"
+    postgres: { gap: "cdc_after_checkpoint_before_ack — no per-engine test" }
+    mysql:    { gap: "the audit reported both hooks covered but cited no test; without a
+        named test this cannot be promoted — `sound` means someone ran the mutant and
+        watched a SPECIFIC test fail" }
+    mssql:    { gap: "same — reported covered, no test named" }
+    mongo:    { gap: "cdc_after_checkpoint_before_ack — no per-engine test; and see
+        resume_reads_a_fresh_destination, which makes the other hook's cell vacuous too" }
+
+  - id: the_test_asserts_its_own_fault_fired
+    what: >
+      A fault-injection test must assert the injected fault ACTUALLY fired. Otherwise a
+      hook that stops firing turns the test into a plain happy-path run that passes.
+    mutant: "make the hook a no-op; a sound cell goes RED on 'the fault never fired'"
+    postgres: { gap: "not audited per-test; the class is proven on mysql" }
+    mysql:    { vacuous: "gremlin_cdc_sigkill_mid_drain_recovers_without_gap never asserts its
+        own fault fired (gremlin_cdc.rs)", kind: absence-only }
+    mssql:    { gap: "not audited per-test" }
+    mongo:    { gap: "not audited per-test" }
+
+  - id: skip_is_not_a_pass
+    what: >
+      A test that SKIPS when its precondition is absent reports success. Where a CI job
+      owns the claim, the skip path must fail hard instead — the provisioner sets a marker
+      and the test refuses to skip when the marker is present.
+    mutant: "unset the precondition and observe whether the suite still reports the claim covered"
+    postgres: { vacuous: "the standby refusal test passes by SKIPPING whenever the opt-in
+        profile is not up", kind: skip-as-pass }
+    mysql:    { gap: "same class, not enumerated per test" }
+    mssql:    { gap: "same class, not enumerated per test" }
+    mongo:    { vacuous: "run_mongo_cdc_delete returns an empty vec rather than Skipped, so
+        assert_all_pass has nothing to panic on", kind: skip-as-pass }
+
+  - id: delete_semantics_are_end_to_end
+    what: >
+      Tombstones and the 'live current state is WHERE NOT __is_deleted' contract must be
+      asserted against real rows read back, on every engine that can delete.
+    mutant: "invert the __is_deleted flag; a sound cell goes RED on the read-back"
+    postgres: { sound: "covered by the delete-capture cells in cdc-matrix" }
+    mysql:    { sound: "covered by the delete-capture cells in cdc-matrix" }
+    mssql:    { sound: "covered by the delete-capture cells in cdc-matrix" }
+    mongo:    { vacuous: "the only end-to-end assertion lives in a bespoke harness path, and
+        delete PRE-IMAGES (full_document_before_change) have no test at all while doctor
+        reports on them", kind: second-cause }
