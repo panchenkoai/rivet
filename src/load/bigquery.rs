@@ -70,11 +70,14 @@
 //! Transport is BigQuery's REST API, in process (`bq_rest`) — `jobs.insert`
 //! plus a poll, on the blocking `reqwest` client. Auth comes from the SAME ADC
 //! seam the GCS destination signs with (`destination::gcs_auth`), so a laptop
-//! with `gcloud auth application-default login` and a CI box with a token both
-//! work without the Google Cloud SDK on PATH. The one credential shape rivet
-//! cannot mint in process (service-account JSON / external_account, which need
-//! JWT signing or an STS exchange) falls back to `gcloud auth
-//! print-access-token` — a TOKEN, not the transport; see
+//! with `gcloud auth application-default login`, a container with a
+//! service-account key file in `GOOGLE_APPLICATION_CREDENTIALS`, and a CI box
+//! with a token all work without the Google Cloud SDK on PATH — and all three
+//! run the job as the identity the operator configured, which is the property
+//! that matters (a load acting as a different principal has an audit trail
+//! that is fiction). The remaining shape rivet cannot mint in process
+//! (`external_account` / workload identity, which needs an STS exchange) falls
+//! back to `gcloud auth print-access-token` — a TOKEN, not the transport; see
 //! `bq_rest::mint_token_via_gcloud_cli`.
 
 use super::TargetLoader;
