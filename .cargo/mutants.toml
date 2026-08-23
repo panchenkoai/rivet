@@ -68,16 +68,20 @@ exclude_re = [
     # behaviour change, and leaving it in place would let a text scan
     # counterfeit execution coverage for every live-only runner it names.
     #
-    # Live oracle, RED-proven by hand before excluding (2026-08-23), each against
-    # a SINGLE exact test whose baseline was green in the same worktree — the
-    # sibling mysql/mssql cases fail there on the worktree guard, so a filter that
-    # matched all three would have graded nothing:
-    #   * sequential — `chunked_checkpoint_resume_suppresses_form_b_so_validate_
-    #     does_not_false_fail` (live_chunked_recovery.rs): pass -> FAIL,
-    #   * parallel — `parallel_chunked_crash_after_chunk_complete_resume_finishes_
-    #     with_no_duplicates` (same file, postgres variant): pass -> FAIL.
-    # Both read the DESTINATION back, so the stub's "success with nothing
-    # exported" cannot pass as an outcome.
+    # Live oracle, RED-proven by hand before excluding (2026-08-23), on ALL THREE
+    # engines, from the MAIN checkout so the independent DuckDB/ClickHouse oracle
+    # containers read the directory they bind-mount (from a worktree the mysql and
+    # mssql legs abort on that guard, so a proof run there covers postgres only —
+    # which is what the first pass at this entry wrongly generalised from):
+    #   * parallel  — `parallel_chunked_crash_after_chunk_complete_resume_
+    #     finishes_with_no_duplicates` × {postgres, mysql, mssql}: 3 passed ->
+    #     3 FAILED with the body stubbed to `Ok(())`;
+    #   * sequential — `chunked_crash_after_first_chunk_complete_resume_finishes_
+    #     export` × the same three: 3 passed -> 3 FAILED, and 3 passed again on
+    #     revert (a clean tree confirmed, so the red is the stub and not drift).
+    # The oracle is the destination re-read through DuckDB, not rivet's own exit
+    # status or summary — so "success with nothing exported" cannot pass as an
+    # outcome on any engine.
     "replace run_chunked_parallel_checkpoint",
     "replace run_chunked_sequential_checkpoint",
     # 64*1024 is a streaming READ BUFFER size in compute_part_checksums —
