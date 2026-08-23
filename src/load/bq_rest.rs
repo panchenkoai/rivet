@@ -89,12 +89,14 @@ enum Auth {
     /// An operator-supplied token (`RIVET_BQ_ACCESS_TOKEN`) — impersonation,
     /// CI, or any credential shape rivet cannot mint itself.
     Static(Zeroizing<String>),
-    /// ADC `authorized_user`, minted through the shared `gcs_auth` seam.
+    /// ADC credentials — `authorized_user` (refresh_token grant) or a
+    /// `service_account` key file (RS256 jwt-bearer grant), both minted in
+    /// process through the shared `gcs_auth` seam.
     Adc(BlockingAdcTokenSource),
     /// Documented fallback for the credential shapes rivet has no in-process
-    /// minting path for (service-account JSON needs RS256 JWT signing;
-    /// external_account needs an STS exchange — neither has a dependency in
-    /// this crate). One token from the CLI, not the whole transport.
+    /// minting path for: `external_account` / workload identity (needs an STS
+    /// exchange against a provider rivet does not model) and GCE/GKE metadata
+    /// (no ADC file at all). One token from the CLI, not the whole transport.
     GcloudCli,
 }
 
@@ -256,14 +258,16 @@ impl BigQueryApi {
     ) -> Result<reqwest::blocking::RequestBuilder> {
         let token = self.auth.access_token()?;
         let mut req = req.header("Authorization", format!("Bearer {}", token.as_str()));
-        // ADC user credentials are not billable on their own: a metered JSON
-        // API rejects them without a quota project. Prefer the one the ADC file
-        // names, else bill the project being loaded into.
-        if let Auth::Adc(src) = &self.auth {
-            req = req.header(
-                "x-goog-user-project",
-                src.quota_project().unwrap_or(&self.project),
-            );
+        // ADC USER credentials are not billable on their own: a metered JSON
+        // API rejects them without a quota project. A SERVICE ACCOUNT is
+        // billable on its own and must NOT be sent one — the header would make
+        // BigQuery demand `serviceusage.services.use`, which the roles that
+        // grant a load (`bigquery.jobUser` + `bigquery.dataOwner`) do not
+        // include. The credential decides; see `quota_project_header`.
+        if let Auth::Adc(src) = &self.auth
+            && let Some(quota_project) = src.quota_project_header(&self.project)
+        {
+            req = req.header("x-goog-user-project", quota_project);
         }
         Ok(req)
     }
@@ -302,10 +306,22 @@ impl Auth {
             TokenSourceKind::Static => Ok(Auth::Static(Zeroizing::new(
                 static_token.expect("a Static choice implies a token"),
             ))),
-            TokenSourceKind::Adc => Ok(Auth::Adc(BlockingAdcTokenSource::new(
-                adc.expect("an Adc choice implies credentials"),
-                http.clone(),
-            ))),
+            TokenSourceKind::Adc => {
+                let src = BlockingAdcTokenSource::new(
+                    adc.expect("an Adc choice implies credentials"),
+                    http.clone(),
+                );
+                // Say WHICH identity the jobs will run as, at resolution time.
+                // A load that silently acts as a different principal than the
+                // operator configured is an audit trail that reads as fiction
+                // — and the only cheap way to notice is for rivet to name it.
+                log::info!(
+                    "BigQuery: authenticating with ADC {} credentials as {}",
+                    src.credential_kind(),
+                    src.principal()
+                );
+                Ok(Auth::Adc(src))
+            }
             TokenSourceKind::GcloudCli => Ok(Auth::GcloudCli),
         }
     }
@@ -319,26 +335,6 @@ impl Auth {
     }
 }
 
-/// The ONE place rivet still shells out for BigQuery, and only for a token.
-///
-/// Reached when the ADC file is absent or is not `authorized_user` — i.e. a
-/// service-account JSON (needs RS256 JWT signing) or an external_account /
-/// workload-identity credential (needs an STS exchange). Neither has a
-/// dependency in this crate, so minting them in process would mean adding a
-/// crypto stack; the honest subset is to ask `gcloud` for the token it already
-/// knows how to mint. Nothing else about the transport is a subprocess.
-///
-/// THE VERB IS LOAD-BEARING: `auth application-default print-access-token`
-/// resolves the SAME credential chain the GCS leg uses, honouring
-/// `GOOGLE_APPLICATION_CREDENTIALS`. The bare `auth print-access-token` mints
-/// for whatever human account `gcloud` happens to be logged in as, so with a
-/// service-account credential configured rivet wrote GCS as the service
-/// account and called BigQuery as a PERSON — silently, because the load
-/// succeeds whenever that person happens to hold the rights. Measured
-/// 2026-08-23 against a real service account: the bare verb produced
-/// `user_email = <a human>` in INFORMATION_SCHEMA.JOBS_BY_PROJECT, the ADC
-/// verb produced the service account. A load must act as the identity the
-/// operator configured, or its audit trail is fiction.
 /// The fallback's argv, as a VALUE rather than a literal buried in the spawn.
 ///
 /// A test that greps this file's TEXT would kill mutants here without ever
@@ -351,13 +347,39 @@ impl Auth {
 pub(crate) const GCLOUD_TOKEN_ARGV: [&str; 3] =
     ["auth", "application-default", "print-access-token"];
 
+/// The ONE place rivet still shells out for BigQuery, and only for a token.
+///
+/// Reached when the ADC file is absent, or holds a shape rivet cannot mint in
+/// process. That set is now exactly:
+///
+/// - `external_account` / workload identity — an STS token exchange against a
+///   provider (AWS, OIDC, SAML, an executable source) rivet does not model. A
+///   half-implemented subset here would be worse than the subprocess.
+/// - GCE / GKE / Cloud Run metadata — no ADC file at all; the token comes from
+///   the instance metadata server.
+///
+/// `authorized_user` (refresh_token) and `service_account` (RS256 jwt-bearer)
+/// are BOTH minted in process by `destination::gcs_auth` and never reach here.
+/// Nothing else about the transport is a subprocess.
+///
+/// THE VERB IS STILL LOAD-BEARING for the two shapes above: `auth
+/// application-default print-access-token` resolves the SAME credential chain
+/// the GCS leg uses, honouring `GOOGLE_APPLICATION_CREDENTIALS`. The bare `auth
+/// print-access-token` mints for whatever human account `gcloud` happens to be
+/// logged in as — measured 2026-08-23 against a real service account, before
+/// that shape moved in process: the bare verb produced `user_email = <a human>`
+/// in INFORMATION_SCHEMA.JOBS_BY_PROJECT while the GCS leg wrote as the service
+/// account. A load must act as the identity the operator configured, or its
+/// audit trail is fiction.
 fn mint_token_via_gcloud_cli() -> Result<Zeroizing<String>> {
     let out = std::process::Command::new("gcloud")
         .args(GCLOUD_TOKEN_ARGV)
         .output()
         .context(
-            "no ADC `authorized_user` credentials and `gcloud` is not on PATH — run \
-             `gcloud auth application-default login`, or set RIVET_BQ_ACCESS_TOKEN",
+            "no ADC credentials rivet can mint in process (authorized_user / service_account) \
+             and `gcloud` is not on PATH — run `gcloud auth application-default login`, point \
+             GOOGLE_APPLICATION_CREDENTIALS at a service-account key file, or set \
+             RIVET_BQ_ACCESS_TOKEN",
         )?;
     if !out.status.success() {
         bail!(

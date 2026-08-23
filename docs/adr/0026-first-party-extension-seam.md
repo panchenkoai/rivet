@@ -36,6 +36,17 @@ in un-zeroed `String`s, and it pinned an invented lifetime when `expires_in`
 was absent. Exposing the loader is what makes "never hand-roll a second auth
 path" true across BOTH repos instead of only inside this one.
 
+The loader was WIDENED (0.24.x) to mint from a `service_account` key file too —
+the RFC 7523 jwt-bearer grant, RS256-signed in process — so a consumer pointing
+`GOOGLE_APPLICATION_CREDENTIALS` at a key file gets its token from this seam
+rather than from a `gcloud` subprocess. The seam items are UNCHANGED
+(`AdcUserTokenLoader` keeps its now-misleading name precisely because renaming
+it to describe a widening would break a consumer for nothing); two additive
+methods, `credential_kind()` and `principal()`, name the resolved identity for
+logs. `external_account` / workload identity still returns `Ok(None)`: it needs
+an STS exchange rivet does not model, and a half-implemented subset would be
+worse than the documented fallback.
+
 Everything else in the library keeps the ADR-0002 posture: `pub` only for the test harness, no stability guarantee.
 
 ### The CLI superset uses the process boundary, not a Rust API

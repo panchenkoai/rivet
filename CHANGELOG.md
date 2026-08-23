@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+- **A service-account key file is now minted IN PROCESS — `gcloud` is off the
+  BigQuery path for it.** With `GOOGLE_APPLICATION_CREDENTIALS` pointing at a
+  `service_account` JSON, rivet's shared Google auth seam
+  (`destination::gcs_auth`) returned "not my shape" and the BigQuery loader
+  shelled out to `gcloud` for a token. Rivet now builds the RFC 7523 claim set,
+  signs it RS256 with the file's own `private_key`, and exchanges it for an
+  access token itself — the same seam, so the GCS destination and the BigQuery
+  loader mint from ONE implementation and a run's two legs act as ONE identity.
+  Verified against a real service account: `INFORMATION_SCHEMA.JOBS_BY_PROJECT`
+  records `user_email = rivet-export@….iam.gserviceaccount.com` for the load's
+  jobs, with the `gcloud` fallback compiled to abort so a green run could not
+  come from the subprocess. Two behaviour notes: a service account is billable
+  on its own, so rivet no longer sends `x-goog-user-project` for it (the header
+  would demand `serviceusage.services.use`, which the roles that grant a load do
+  not include); and `external_account` / workload identity plus GCE metadata
+  still use the `gcloud` fallback — an STS exchange rivet does not model, and a
+  half-implemented subset would be worse than the documented subprocess. The
+  crypto is `jsonwebtoken`, already in the tree via `reqsign`: zero new crates,
+  zero added build time. Extension seam (ADR-0026): a WIDENING, not a break —
+  `AdcUserTokenLoader` / `try_authorized_user_loader()` keep their names and
+  signatures and gain `credential_kind()` / `principal()`.
+
 - **A multiplex CDC export (`mode: cdc` with `tables:`) can now be loaded.**
   The config `rivet init --mode cdc` emits for a whole schema carries no
   `table:` or `query:`, so `rivet load` bailed on it outright ("must specify

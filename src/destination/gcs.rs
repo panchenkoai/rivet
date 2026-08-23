@@ -179,12 +179,14 @@ impl CloudBackend for GcsBackend {
             // A refreshing loader, not a static `.token()`: opendal pins a
             // static token with a usize::MAX expiry, so exports longer than
             // the ~1h ADC token TTL would 401 mid-run, non-retryably.
+            log::info!(
+                "GCS: using ADC {} credentials as {} (access token auto-refreshes before expiry)",
+                loader.credential_kind(),
+                loader.principal()
+            );
             builder = builder
                 .disable_vm_metadata()
                 .customized_token_loader(Box::new(loader));
-            log::info!(
-                "GCS: using ADC authorized_user credentials (access token auto-refreshes before expiry)"
-            );
         } else {
             log::info!(
                 "GCS: using Google default credential chain \

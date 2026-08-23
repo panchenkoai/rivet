@@ -161,11 +161,26 @@ destination:
   credentials_file: /etc/rivet/sa.json
 ```
 
-Or via env (opendal honours `GOOGLE_APPLICATION_CREDENTIALS`):
+Or via env (`GOOGLE_APPLICATION_CREDENTIALS`):
 
 ```bash
 export GOOGLE_APPLICATION_CREDENTIALS=/etc/rivet/sa.json
 ```
+
+Rivet reads that key file itself and mints the access token **in process** —
+the RFC 7523 `jwt-bearer` grant (a claim set signed RS256 with the file's own
+`private_key`, exchanged at `https://oauth2.googleapis.com/token`). The same
+credential is used for the GCS write and for a `rivet load --target bigquery`
+that follows, so both legs run as the SAME identity: the service account, not
+whatever human `gcloud` happens to be logged in as. Rivet logs which one it
+resolved at `info` level (`GCS: using ADC service_account credentials as
+…@….iam.gserviceaccount.com`), and BigQuery records it as `user_email` in
+`INFORMATION_SCHEMA.JOBS_BY_PROJECT` — check there, not in rivet's output, if
+you need to prove it.
+
+No Google Cloud SDK is needed on PATH for either leg. The one credential shape
+that still requires `gcloud` is `external_account` (workload identity), which
+needs an STS token exchange rivet does not implement.
 
 ```yaml
 destination:
