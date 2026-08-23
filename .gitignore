@@ -140,3 +140,4 @@ __pycache__/
 # in .githooks/pre-commit, which refuses a commit that stages .rlib/.rmeta/
 # fingerprint/incremental paths or an implausible number of files.
 /target-*/
+.mutants-cache/

@@ -58,6 +58,28 @@ on:
     branches: [master, main]
   pull_request:
     branches: [master, main]
+  # The MERGE QUEUE's own trigger. Without it a queued PR waits forever for
+  # checks that never start, so this line must land BEFORE the queue is turned
+  # on in the repository settings, never after.
+  #
+  # The queue is what lets `strict` (require-branches-up-to-date) go off. With
+  # `strict` on, merging one PR forced every other open PR to pull main, which
+  # is a new head SHA and therefore a full re-run of all 18 required checks —
+  # `Mutants (changed lines)` among them at ~60 minutes. N open PRs cost N^2
+  # mutation runs, none of which graded anything that had changed. The queue
+  # tests the would-be-merged state once, at merge time, instead.
+  merge_group:
+
+# One in-flight run per PR. A second push used to leave the first mutation run
+# grinding to completion on code nobody would merge — two hours of a 2-core
+# runner for an answer about a superseded commit.
+#
+# `cancel-in-progress` is deliberately PULL-REQUEST ONLY. Cancelling a
+# merge_group run breaks the merge it was gating, and cancelling a push-to-main
+# run loses the only mutation signal main ever gets.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -82,19 +104,19 @@ jobs:
   config-key-composition:
     name: New config keys carry tests
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
+    if: contains(fromJSON('["pull_request", "merge_group"]'), github.event_name)
     steps:
       - uses: actions/checkout@v7
         with: { fetch-depth: 0 }
       - name: New schema keys must appear in tests
         run: |
-          git fetch origin ${{ github.base_ref }} --depth=1
+          git fetch origin ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }} --depth=1
           # Only PROPERTY names (keys directly under a "properties" object) —
           # definition/type names (e.g. CdcInitialMode) are not user-facing
           # config keys and false-positived on the gate's own first run.
           KEYS='[paths | select(length>=2 and .[-2]=="properties") | .[-1] | select(type=="string")] | unique | .[]'
           NEW_KEYS=$(diff \
-            <(git show origin/${{ github.base_ref }}:schemas/rivet.schema.json | jq -r "$KEYS" 2>/dev/null || true) \
+            <(git show ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}:schemas/rivet.schema.json | jq -r "$KEYS" 2>/dev/null || true) \
             <(jq -r "$KEYS" schemas/rivet.schema.json) \
             | grep '^>' | awk '{print $2}' || true)
           FAIL=0
@@ -197,7 +219,7 @@ jobs:
   mutants-in-diff:
     name: Mutants (changed lines)
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
+    if: contains(fromJSON('["pull_request", "merge_group"]'), github.event_name)
     # First live run: 52 mutants took 42m on the 2-core runner (cold baseline
     # build 270s + ~80s/mutant) — 45m was one flaky rebuild away from a
     # spurious timeout on a large PR. Raised 90 -> 120 when the offline-REACH
@@ -277,7 +299,7 @@ jobs:
         id: scope
         run: |
           set -euo pipefail
-          base="${{ github.base_ref }}"
+          base="${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}"
           if ! git fetch --no-tags origin "$base"; then
             echo "::error::could not fetch the base branch '$base' — refusing to guess this PR's scope. A failed fetch used to read as a docs-only PR and skip every check in this job."
             exit 1
@@ -304,6 +326,18 @@ jobs:
         if: steps.scope.outputs.code == 'true'
         with:
           key: mutants
+      # Outcomes already measured for THIS EXACT code. The key is the whole
+      # world the answer depends on — a mutant is killed by the SUITE, not by
+      # its own file, so there is no honest per-file key (see the script's
+      # header). A hit therefore removes RE-runs (an infra flake, a docs-only
+      # push, a rebase onto a main that did not touch src/ or tests/), never
+      # the first grading of a change.
+      - name: Restore mutation outcomes
+        if: steps.scope.outputs.code == 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: .mutants-cache
+          key: mutants-outcomes-v1-${{ hashFiles('src/**/*.rs', 'tests/**/*.rs', 'Cargo.lock', '.cargo/mutants.toml') }}
       - name: Install cargo-mutants
         if: steps.scope.outputs.code == 'true'
         run: cargo install cargo-mutants --locked
@@ -353,7 +387,11 @@ jobs:
         env:
           # Mutants never need debuginfo — halves build dirs, speeds links.
           CARGO_PROFILE_DEV_DEBUG: "0"
-          BASE_REF: ${{ github.base_ref }}
+          # merge_group carries no `base_ref`; it carries the base SHA the queue
+          # built this group on. A three-dot diff against either is the same
+          # set — merge-base(base, HEAD)..HEAD — so one expression serves both
+          # events, and the gate grades the PR's own changes in the queue too.
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
         run: |
           set -euo pipefail
           # Everything this step decides is PUBLISHED, because the job's
@@ -394,7 +432,7 @@ jobs:
               exit 1
             fi
           }
-          git diff "origin/$BASE_REF"...HEAD > pr.diff
+          git diff "$BASE_SHA"...HEAD > pr.diff
           # BUDGET GUARD. Every mutant is its own incremental build — ~80s on a
           # 2-core runner at -j2, so the job's ceiling grades roughly 120
           # ($MUTANTS_DIFF_BUDGET). A five-round branch like #230 yields 416
@@ -519,7 +557,29 @@ jobs:
           # measure against every offline test target, then triage what's left.
           say state in-budget
           rc=0
-          cargo mutants --in-diff pr.diff ${DROP_P2[@]+"${DROP_P2[@]}"} -j 2 -- --lib --bins || rc=$?
+          # ALL-OR-NOTHING replay. Reusing SOME outcomes would change `count` /
+          # `p1` / `p2`, which `Mutants (coverage verdict)` audits against its
+          # OWN independent measurement — the two halves of the gate disagreeing
+          # about how much was graded is precisely the failure this plumbing
+          # exists to prevent. Either every graded mutant is known, or the run
+          # happens in full. A timeout is never replayed: it records that a
+          # measurement did not finish, which is not a verdict.
+          CACHED_RC=""
+          if [ -f .mutants-cache/outcomes.json ]; then
+            CACHED_RC=$(python3 .github/scripts/mutants_cache.py replay \
+                          .mutants-cache/outcomes.json p1.txt) || CACHED_RC=""
+          fi
+          if [ -n "$CACHED_RC" ]; then
+            rc="$CACHED_RC"
+            say cache hit
+            echo "::notice::every mutant this diff grades was already measured against identical src/, tests/, Cargo.lock and .cargo/mutants.toml — replaying rc=$rc rather than re-running. A RE-run saved, not a grading skipped."
+          else
+            say cache miss
+            cargo mutants --in-diff pr.diff ${DROP_P2[@]+"${DROP_P2[@]}"} -j 2 -- --lib --bins || rc=$?
+            mkdir -p .mutants-cache
+            python3 .github/scripts/mutants_cache.py record .mutants-cache/outcomes.json \
+              mutants.out/caught.txt mutants.out/missed.txt mutants.out/timeout.txt >/dev/null || true
+          fi
           verdict "$rc"
           # The run's own tally, published for the harness-metrics THERMOMETER
           # (see the `harness-metrics` job). Nothing gates on these; they exist
@@ -587,6 +647,15 @@ jobs:
       # the step above never ran at all. Without this, "the run was skipped
       # because the scope step broke" and "there was nothing to grade" arrive at
       # the blocking job as the same empty value.
+      - name: Save mutation outcomes
+        # `always()`: a run that ends in MISSED mutants still measured them, and
+        # that measurement is exactly what a re-run of the same commit should
+        # not have to pay for again.
+        if: always() && steps.scope.outputs.code == 'true' && hashFiles('.mutants-cache/outcomes.json') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: .mutants-cache
+          key: mutants-outcomes-v1-${{ hashFiles('src/**/*.rs', 'tests/**/*.rs', 'Cargo.lock', '.cargo/mutants.toml') }}
       - name: Publish this run's verdict
         id: report
         if: always()
@@ -620,7 +689,7 @@ jobs:
   mutants-gate-sanity:
     name: Mutants (gate sanity)
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
+    if: contains(fromJSON('["pull_request", "merge_group"]'), github.event_name)
     timeout-minutes: 30
     outputs:
       # The audited picture of this diff, for the verdict job to compare the
@@ -644,7 +713,7 @@ jobs:
         id: scope
         run: |
           set -euo pipefail
-          base="${{ github.base_ref }}"
+          base="${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}"
           if ! git fetch --no-tags origin "$base"; then
             echo "::error::could not fetch the base branch '$base' — refusing to guess this PR's scope. A failed fetch used to read as a docs-only PR and skip every check in this job."
             exit 1
@@ -713,10 +782,14 @@ jobs:
         id: graded
         if: steps.scope.outputs.code == 'true'
         env:
-          BASE_REF: ${{ github.base_ref }}
+          # merge_group carries no `base_ref`; it carries the base SHA the queue
+          # built this group on. A three-dot diff against either is the same
+          # set — merge-base(base, HEAD)..HEAD — so one expression serves both
+          # events, and the gate grades the PR's own changes in the queue too.
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
         run: |
           set -euo pipefail
-          git diff "origin/$BASE_REF"...HEAD > pr.diff
+          git diff "$BASE_SHA"...HEAD > pr.diff
           # No `|| true` anywhere near these two: under `set -e` a cargo-mutants
           # failure ends the step, which is the whole difference between "the
           # tool found nothing" and "the tool broke". The counting below runs on
@@ -754,7 +827,7 @@ jobs:
             #    touching live-only files, or worse, to pad diffs with mutable
             #    noise. It passes, LOUDLY: the notice says outright that offline
             #    mutation says nothing about this diff.
-            if git diff --name-only "origin/$BASE_REF"...HEAD | grep -qx '.cargo/mutants.toml'; then
+            if git diff --name-only "$BASE_SHA"...HEAD | grep -qx '.cargo/mutants.toml'; then
               echo "::error::the mutation gate would grade NOTHING: this diff yields \
           $all mutants, .cargo/mutants.toml removes every one — and this SAME diff \
           edits mutants.toml. A PR must not excuse itself from the gate unreviewed \
@@ -788,7 +861,11 @@ jobs:
         id: coverage
         if: steps.scope.outputs.code == 'true'
         env:
-          BASE_REF: ${{ github.base_ref }}
+          # merge_group carries no `base_ref`; it carries the base SHA the queue
+          # built this group on. A three-dot diff against either is the same
+          # set — merge-base(base, HEAD)..HEAD — so one expression serves both
+          # events, and the gate grades the PR's own changes in the queue too.
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
         run: |
           set -euo pipefail
           state() { echo "expected_state=$1" >> "$GITHUB_OUTPUT"; }
@@ -863,7 +940,7 @@ jobs:
     name: Mutants (coverage verdict)
     runs-on: ubuntu-latest
     needs: [mutants-in-diff, mutants-gate-sanity, gate-scripts]
-    if: always() && github.event_name == 'pull_request'
+    if: always() && contains(fromJSON('["pull_request", "merge_group"]'), github.event_name)
     timeout-minutes: 10
     steps:
       - name: The per-diff mutation run did what the audit says it must
@@ -1066,6 +1143,12 @@ jobs:
       # is gone.
       - name: The exclusion checker's own site/function keying
         run: python3 .github/scripts/mutants_exclusions.py --self-test
+      # The outcome cache decides whether a mutation run happens at all, so its
+      # own logic is gated the same way. Its self-test RED-proves the one thing
+      # that would be catastrophic and silent: a cache replaying PASS for a set
+      # that contains a missed mutant.
+      - name: Mutation outcome cache self-test
+        run: python3 .github/scripts/mutants_cache.py --self-test
       # The PRIORITISER's classification, graded over a coverage export copied
       # from a real `cargo llvm-cov --lib --bins --json` run: an executed
       # function, an untaken branch inside one, a function measured at zero, a
