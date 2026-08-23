@@ -317,6 +317,16 @@ pub(super) fn run_single_export(
         w.finish()?;
     }
 
+    // ADR-0029: feed the OBSERVATION half of the ledger the moment the read is
+    // done — the dest schema this run SAW and the shape bytes it measured carry
+    // no coverage obligation, so recording them early can never be wrong. Every
+    // `?` below (the quality gate, `RunnerFrame::open`, and above all the
+    // per-part `write_part_file` inside the commit loop) used to escape ABOVE
+    // the single tail drain, so a run that failed mid-write pinned the STALE
+    // open-time fingerprint onto a Failed manifest describing parts written
+    // under the observed schema. The INTEGRITY half stays below the loop.
+    sink.drain_observations_into(&mut summary.ledger);
+
     summary.total_rows += sink.total_rows as i64;
     log::info!(
         "export '{}': {} rows written",
@@ -443,6 +453,12 @@ pub(super) fn run_single_export(
             super::commit::PartKind::File {
                 part_index: part_idx,
             },
+            // ADR-0029: single's commit unit is the whole invocation — ONE sink
+            // accumulated the checksums of every part in this loop, so the
+            // drain below either covers them all or (on a mid-loop bail, which
+            // skips it) none. Keying per part_index would claim a per-part
+            // correspondence the sink does not have.
+            super::commit::UnitId::Run,
         );
     }
 
@@ -471,11 +487,13 @@ pub(super) fn run_single_export(
         summary.cursor_high = Some(last_val.clone());
     }
 
-    // ADR-0028: feed the run ledger — the seam (`finalize::finalize_export`,
-    // called by the dispatcher) applies the fingerprint pin, the
-    // `on_schema_drift` gate, the Form-B harvest and the shape-drift warn.
-    // The application no longer lives in any runner.
-    sink.drain_tail_into(&mut summary.ledger);
+    // ADR-0028/0029: feed the INTEGRITY half — every part of this run is now
+    // committed and recorded under `UnitId::Run`, so the sink's accumulated
+    // Form-B checksums cover exactly them. The seam
+    // (`finalize::finalize_export`, called by the dispatcher) applies the
+    // fingerprint pin, the `on_schema_drift` gate, the Form-B harvest and the
+    // shape-drift warn; the application lives in no runner.
+    sink.drain_integrity_into(super::commit::UnitId::Run, &mut summary.ledger);
 
     // "data phase complete", not "completed successfully": the post-run gates
     // (drift policy, quality) run at the dispatcher AFTER this returns — a run

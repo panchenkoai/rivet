@@ -331,14 +331,28 @@ pub fn record_run_schema_fingerprint(
     summary.schema_fingerprint = Some(crate::state::schema_fingerprint(&columns));
 }
 
+/// What [`record_committed_part_with_fingerprint`] did to the manifest.
+///
+/// `part_id` is returned (not just the dedup verdict) because ADR-0029 keys the
+/// part → commit-unit map on it: it is stable across a dedup, unique within the
+/// manifest by M4, and 4 bytes rather than a second copy of every part path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecordedPart {
+    /// True iff an existing entry with the same path was refreshed in place.
+    pub deduped: bool,
+    /// The manifest id of the entry (existing on a dedup, freshly minted else).
+    pub part_id: u32,
+}
+
 /// Same as [`record_committed_part`] but with a precomputed fingerprint.
 ///
 /// Used by parallel-chunked aggregation, where workers compute fingerprints
 /// inside their thread (the local tmp file is dropped at thread exit) and
 /// the parent iterates over the shared `file_records` collection.
-/// Returns `true` iff the part was DEDUPED in place (a re-read overwrote a rehydrated part of the
-/// same path) — the caller must then NOT double-count the run aggregates for it; `false` on a
-/// normal first-time push.
+/// Returns the entry's [`RecordedPart`]: `deduped` is true iff the part was DEDUPED in place (a
+/// re-read overwrote a rehydrated part of the same path) — the caller must then NOT double-count
+/// the run aggregates for it — and `part_id` is the manifest id of the entry either way, which
+/// ADR-0029 uses to key the part → commit-unit map the Form-B coverage is computed on.
 #[must_use]
 pub fn record_committed_part_with_fingerprint(
     summary: &mut RunSummary,
@@ -347,7 +361,7 @@ pub fn record_committed_part_with_fingerprint(
     size_bytes: u64,
     content_fingerprint: String,
     content_md5: String,
-) -> bool {
+) -> RecordedPart {
     // ADR-0012 M4: part_id must be unique within the manifest.  Before the
     // M8 resume-hydration work, `summary.manifest_parts.len() + 1` was a
     // safe ordinal because the list was always built from scratch this run.
@@ -373,7 +387,11 @@ pub fn record_committed_part_with_fingerprint(
         existing.content_fingerprint = content_fingerprint;
         existing.content_md5 = content_md5;
         existing.status = PartStatus::Committed;
-        return true; // deduped in place — the caller must NOT double-count the aggregates
+        // deduped in place — the caller must NOT double-count the aggregates
+        return RecordedPart {
+            deduped: true,
+            part_id: existing.part_id,
+        };
     }
     let part_id = summary
         .manifest_parts
@@ -391,7 +409,10 @@ pub fn record_committed_part_with_fingerprint(
         content_md5,
         status: PartStatus::Committed,
     });
-    false
+    RecordedPart {
+        deduped: false,
+        part_id,
+    }
 }
 
 /// Outcome of a manifest-write attempt.

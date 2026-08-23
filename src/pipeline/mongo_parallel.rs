@@ -133,8 +133,15 @@ pub(crate) fn run_mongo_parallel(
         if let Some(sc) = &out.schema {
             summary.ledger.note_schema(sc);
         }
-        summary.ledger.merge_checksums(&out.column_checksums);
-        summary.ledger.note_key_column(out.checksum_key_column);
+        // ADR-0029: the worker RANGE is this runner's commit unit, and a worker
+        // hands back what it made durable even when it failed part-way — so the
+        // feed and the record_part drain below pair on the same unit and a
+        // failed worker's parts are covered by the checksums it did compute.
+        summary.ledger.contribute_checksums(
+            commit::UnitId::Chunk(w as i64),
+            &out.column_checksums,
+            out.checksum_key_column,
+        );
         if plan.validate && out.rows > 0 {
             summary.validated = Some(true);
         }
@@ -147,6 +154,7 @@ pub(crate) fn run_mongo_parallel(
                 commit::PartKind::Chunk {
                     chunk_index: w as i64,
                 },
+                commit::UnitId::Chunk(w as i64),
             );
         }
     }

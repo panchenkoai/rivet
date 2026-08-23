@@ -1100,3 +1100,127 @@ fn parallel_keyset_resume_with_changed_worker_count_postgres() {
     assert_eq!(keys, (1..=2000i64).collect::<BTreeSet<i64>>());
     let _ = c.execute(&format!("DROP TABLE IF EXISTS {table}"), &[]);
 }
+
+/// ADR-0029, the ORIGINALLY-REPORTED defect: a parallel-keyset run that FAILS
+/// must record in its Failed manifest the schema fingerprint it OBSERVED, not
+/// the stale baseline the state DB held before the run.
+///
+/// This runner records durable parts ABOVE its error bail and used to feed the
+/// whole `CommitLedger` BELOW it, so `finalize_export_records` — the failure half
+/// of the ADR-0028 seam, whose entire job is "a Failed manifest must describe its
+/// debris honestly" — received an EMPTY ledger. Parallel keyset is the worst case
+/// because it has no direct `summary.schema_fingerprint` assignment at all (its
+/// three siblings set one from their own `shared_fingerprint`), so the ledger is
+/// its ONLY path. ADR-0029's split fixes it: the schema is an OBSERVATION — it
+/// describes what the runner READ and carries no coverage obligation — so it is
+/// fed above the bail while the Form-B checksums stay commit-gated below, the
+/// asymmetry `keyset.rs` states at its part-publishing site, now expressed in the
+/// ledger's shape instead of left to feed order.
+///
+/// THE FIXTURE IS THE WHOLE TEST, and two earlier drafts of it proved nothing —
+/// both measured GREEN with the fix reverted:
+///
+/// * "the Failed manifest carries a real fingerprint, not the `unavailable`
+///   placeholder" is fix-INVARIANT: the fallback `finalize_manifest` uses when the
+///   ledger is empty is `get_stored_schema`, and `capture_open_forensics` stores
+///   the schema (`store_schema_if_absent`) at run OPEN — so the fallback answers
+///   with the same schema the run observed.
+/// * making the source DRIFT between two runs is not enough either, if the second
+///   run gets a FRESH `Rig`: the rig owns its tempdir, so it owns its state DB,
+///   and a new rig has no baseline to be stale. The failing run stored the drifted
+///   schema itself at open and the fallback answered with it.
+///
+/// So the subject must be ONE rig (one state DB) run TWICE across a schema change:
+///
+///   1. same rig, clean run over `(id, payload)` — manifest gives fingerprint A,
+///      and A becomes this export's stored baseline;
+///   2. `ALTER TABLE ADD COLUMN` — the source is now schema B;
+///   3. a separate rig, clean run over the ALTERED table: an independent oracle
+///      for fingerprint B;
+///   4. the SAME rig again, failed by a worker error. Its stored baseline is still
+///      A (`store_schema_if_absent` will not overwrite, and the drift gate that
+///      would refresh it does not run on a failure), so a manifest carrying A is
+///      the fallback and a manifest carrying B is the observation.
+///
+/// RED against feeding `note_schema` below the bail: the Failed manifest carries
+/// A while its durable parquet is schema B — actively wrong forensics about data
+/// sitting on the prefix.
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn a_failed_parallel_keyset_run_records_the_observed_schema_fingerprint_postgres() {
+    require_alive(LiveService::Postgres);
+    let table = unique_name("pk_fpfail");
+    let mut c = pg_connect();
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {table};
+         CREATE TABLE {table} (id BIGINT PRIMARY KEY, payload INT NOT NULL);
+         INSERT INTO {table} SELECT g, g FROM generate_series(1, 2000) g;"
+    ))
+    .unwrap();
+
+    // (1) The SUBJECT rig — reused for run 4, so its state DB carries the baseline.
+    let subject = parallel_keyset(Rig::pg_batch(&format!("public.{table}")));
+    let r1 = subject.run();
+    assert!(
+        r1.status.success(),
+        "baseline run must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&r1.stderr)
+    );
+    let fp_a = manifest_schema_fingerprint(&subject.out_dir());
+
+    // (2) The source moves to schema B.
+    c.batch_execute(&format!("ALTER TABLE {table} ADD COLUMN note TEXT;"))
+        .unwrap();
+
+    // (3) Independent oracle for B: its own rig, its own state DB, clean run.
+    let oracle = parallel_keyset(Rig::pg_batch(&format!("public.{table}")));
+    let r2 = oracle.run();
+    assert!(
+        r2.status.success(),
+        "oracle run must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&r2.stderr)
+    );
+    let fp_b = manifest_schema_fingerprint(&oracle.out_dir());
+    assert_ne!(
+        fp_a, fp_b,
+        "fixture is inert: adding a column did not change the fingerprint, so the stale \
+         baseline and the observation are indistinguishable and this test grades nothing"
+    );
+
+    // (4) Same rig, same state DB (baseline still A), source now B, failed by a
+    // worker error after other ranges have already committed parts.
+    let out = subject.run_with_env("RIVET_TEST_ERROR_AT", "keyset_parallel_worker:2");
+    assert!(
+        !out.status.success(),
+        "a worker error must fail the run — otherwise this is not the failure path"
+    );
+    assert!(
+        !files_with_extension(&subject.out_dir(), "parquet").is_empty(),
+        "fixture is inert: the surviving ranges wrote no parts, so the Failed manifest \
+         has no debris to describe"
+    );
+
+    let recorded = manifest_schema_fingerprint(&subject.out_dir());
+    assert_eq!(
+        recorded, fp_b,
+        "a FAILED parallel-keyset run must pin the fingerprint it OBSERVED ({fp_b}); it \
+         recorded {recorded}, and the stale pre-ALTER baseline is {fp_a} — a Failed manifest \
+         describing durable parquet with the wrong schema is actively wrong forensics"
+    );
+
+    let mut c2 = pg_connect();
+    let _ = c2.batch_execute(&format!("DROP TABLE IF EXISTS {table};"));
+}
+
+/// `manifest.json`'s recorded schema fingerprint, for either a Success or a
+/// Failed manifest (ADR-0012 M7 writes the manifest either way; only `_SUCCESS`
+/// is success-only).
+fn manifest_schema_fingerprint(dir: &std::path::Path) -> String {
+    let text = std::fs::read_to_string(dir.join("manifest.json"))
+        .unwrap_or_else(|e| panic!("read {}/manifest.json: {e}", dir.display()));
+    let v: serde_json::Value = serde_json::from_str(&text).expect("parse manifest.json");
+    v["schema_fingerprint"]
+        .as_str()
+        .unwrap_or_else(|| panic!("manifest.json has no schema_fingerprint: {text}"))
+        .to_string()
+}

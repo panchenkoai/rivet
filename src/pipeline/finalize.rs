@@ -64,23 +64,19 @@ pub(super) fn finalize_export(
     // first is the truthful thing", the rule mongo_parallel's pre-seam drain
     // already followed). Pre-fix the gate's `?` skipped the harvest and a
     // drift-FAILED keyset/mongo run wrote a Failed manifest with no Form-B.
-    if let Some(schema) = &ledger.drift_schema {
+    if let Some(schema) = &ledger.observed.drift_schema {
         // Fingerprint pin is idempotent (first call wins) — uniform across
         // runners now, so keyset/mongo manifests carry the fingerprint single
         // mode always recorded.
         super::manifest_writer::record_run_schema_fingerprint(summary, schema);
     }
     // Form B: record the run-wide checksums so the manifest carries them.
-    // `harvest_column_checksums` itself suppresses on
-    // `column_checksums_incomplete` (checkpoint-resume hydration) — that
+    // `harvest_column_checksums` itself COMPUTES the coverage (ADR-0029) — a
+    // manifest part with no contribution suppresses the record — and that
     // decision stays in the harvest, not here.
-    super::commit::harvest_column_checksums(
-        summary,
-        ledger.column_checksums,
-        ledger.checksum_key_column,
-    );
+    super::commit::harvest_column_checksums(summary, ledger.integrity);
 
-    if let (Some(schema), Some(st)) = (&ledger.drift_schema, state) {
+    if let (Some(schema), Some(st)) = (&ledger.observed.drift_schema, state) {
         super::schema_drift::check_from_sink_schema(
             st,
             &plan.export_name,
@@ -95,12 +91,12 @@ pub(super) fn finalize_export(
     // sink tracks them; a runner that starts feeding them gets the warn for
     // free — born `na`, per ADR-0028).
     if plan.shape_drift_warn_factor > 0.0
-        && !ledger.column_max_bytes.is_empty()
+        && !ledger.observed.column_max_bytes.is_empty()
         && let Some(st) = state
     {
         match st.detect_shape_drift(
             &plan.export_name,
-            &ledger.column_max_bytes,
+            &ledger.observed.column_max_bytes,
             plan.shape_drift_warn_factor,
         ) {
             Ok(warnings) => {
@@ -144,16 +140,22 @@ pub(super) fn finalize_export(
 /// pre-seam vanish. GATES (drift policy, shape warn) are deliberately NOT run
 /// here: the run is already failing with the runner's own error, and a gate
 /// error would mask it.
+///
+/// ADR-0029 is what makes the fingerprint half actually WORK. Three parallel
+/// runners record their durable parts ABOVE their error bail and used to feed
+/// the whole ledger BELOW it, so this function received an EMPTY ledger on the
+/// failure path and pinned nothing (parallel keyset worst: the ledger is its
+/// only fingerprint path). The schema is an OBSERVATION — it describes what the
+/// runner READ, it has no coverage obligation — so it is now fed eagerly, above
+/// every bail, and arrives here. The Form-B half stays commit-gated and its
+/// coverage is computed inside the harvest, so a failed run's partial feed
+/// suppresses rather than publishes a record covering a subset of the debris.
 pub(super) fn finalize_export_records(summary: &mut RunSummary) {
     let ledger = std::mem::take(&mut summary.ledger);
-    if let Some(schema) = &ledger.drift_schema {
+    if let Some(schema) = &ledger.observed.drift_schema {
         super::manifest_writer::record_run_schema_fingerprint(summary, schema);
     }
-    super::commit::harvest_column_checksums(
-        summary,
-        ledger.column_checksums,
-        ledger.checksum_key_column,
-    );
+    super::commit::harvest_column_checksums(summary, ledger.integrity);
 }
 
 /// Write `.rivet/runs/<run_id>/{summary.md,summary.json}` and surface a
@@ -1131,10 +1133,11 @@ mod tests {
         summary
             .ledger
             .note_schema(&Schema::new(vec![Field::new("id", DataType::Int64, false)]));
-        summary
-            .ledger
-            .merge_checksums(&[("id".to_string(), 5u64)].into());
-        summary.ledger.note_key_column(Some("id".into()));
+        summary.ledger.contribute_checksums(
+            crate::pipeline::commit::UnitId::Run,
+            &[("id".to_string(), 5u64)].into(),
+            Some("id".into()),
+        );
 
         finalize_export_records(&mut summary);
 
@@ -1152,7 +1155,7 @@ mod tests {
             "a FAILED run must still harvest Form-B for its durable parts"
         );
         assert!(
-            summary.ledger.column_checksums.is_empty(),
+            summary.ledger.integrity.column_checksums.is_empty(),
             "ledger is taken"
         );
     }
@@ -1162,10 +1165,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let plan = fin_plan(dir.path());
         let mut summary = crate::pipeline::summary::RunSummary::default();
-        summary
-            .ledger
-            .merge_checksums(&[("v".to_string(), 9u64)].into());
-        summary.ledger.note_key_column(Some("id".into()));
+        summary.ledger.contribute_checksums(
+            crate::pipeline::commit::UnitId::Run,
+            &[("v".to_string(), 9u64)].into(),
+            Some("id".into()),
+        );
 
         finalize_export(&plan, None, &mut summary).expect("state-free seam must succeed");
 
@@ -1180,7 +1184,7 @@ mod tests {
         );
         assert_eq!(summary.checksum_key_column.as_deref(), Some("id"));
         assert!(
-            summary.ledger.column_checksums.is_empty(),
+            summary.ledger.integrity.column_checksums.is_empty(),
             "the seam must TAKE the ledger — a second application must find nothing"
         );
 

@@ -1,6 +1,10 @@
 # ADR-0029: The commit ledger separates observations from integrity, and computes coverage rather than trusting it
 
-**Status**: Proposed (design accepted; implementation not started)
+**Status**: Accepted — implemented 2026-08-23. `Observations` / `Integrity` split,
+`UnitId`-keyed contributions, coverage computed over `summary.manifest_parts`, both
+manual `column_checksums_incomplete` sites retired, `check_post_run_invariants`
+strengthened. See *Implementation notes* below for the four places the design
+above needed correcting.
 **Date**: 2026-08
 **Relates to**: ADR-0028 (the finalize seam this ledger feeds), ADR-0012 (manifest durability ordering)
 
@@ -129,3 +133,68 @@ remains attractive for the OBSERVATION half. It does not work for checksums:
 they arrive per range/page at a different moment than the parts, so hanging them
 on `record_part` would force the same premature publication the first alternative
 was rejected for.
+
+---
+
+## Implementation notes (2026-08-23) — where the design above was wrong
+
+Recorded because each of these is a thing the next reader would otherwise
+re-derive, and two of them were only found by running the code.
+
+**1. `PartKind` is the JOURNAL id, not the commit unit — a separate `UnitId` was
+needed.** The decision says "key each checksum contribution by the SAME unit
+identifier the parts already carry — `PartKind` is already `File { part_index }` /
+`Chunk { chunk_index }` / `Page { page_index, .. }`". That is false for exactly the
+runner this ADR exists for. Parallel keyset passes `PartKind::Page { page_index:
+<flat drain index> }`, which is neither the page nor the range; its commit unit is
+the RANGE (parts publish per page, checksums per committed range). And `single`
+has no per-part unit at all — ONE sink accumulates the checksums of every part it
+writes, so its unit is the whole invocation. So `commit::UnitId { Run, Chunk, Page,
+Range }` is a separate argument to `record_part` beside `kind`, stated at every
+call site. Re-using `PartKind` would have reported every healthy parallel-keyset
+range short, i.e. shipped the ADR's own named risk on day one.
+
+**2. Coverage is compared over `summary.manifest_parts`, keyed on `part_id`.** The
+decision says "the unit set of the recorded parts", which reads as "the parts
+`record_part` saw". Keying it that way makes the resume case — the one point 3 of
+the decision claims to SUBSUME — invisible, because `rehydrate_manifest_parts_from_
+file_log` and the M8 `Skip` clone push straight into `manifest_parts` and never call
+`record_part`. The manifest is the right subject: it is the list the Form-B record
+claims to cover, and it holds the hydrated parts too. `part_id` is the key (4 bytes,
+unique by M4, stable across a dedup) rather than the path, so this costs no second
+copy of every part name; `record_committed_part_with_fingerprint` now returns
+`RecordedPart { deduped, part_id }` instead of a bare bool.
+
+**3. The empty-accumulator path had to be reached too — this shipped a live
+regression.** The pre-existing `harvest_column_checksums` early-returns when the
+accumulator is empty. Leaving that return above the new coverage computation broke
+four live tests (`parallel_keyset_crash_recovery_{postgres,mysql}`, and two
+siblings): a crash resume whose ranges were ALL already `done` re-runs nothing, so
+there is no checksum to weigh, the computation was skipped, and the run reached
+`finalize_manifest` with hydrated parts and no suppression flag — where the
+pre-existing Form-B telltale panicked it. Pre-ADR-0029 that flag came from the
+manual `resume_m8.rs` assignment this ADR retires. So: compute coverage FIRST, and
+early-return on an empty accumulator only once coverage is COMPLETE (that case is a
+format fact — a CSV/JSONL sink computes no value checksums — and must leave the flag
+clear so the telltale still catches a runner that harvested nothing).
+
+**4. The strengthened invariant needed a second recorded field, not just the
+existing flag.** "Form B is absent stops being ambiguous … because the second is now
+a recorded verdict" is right, but `column_checksums_incomplete` alone cannot carry
+it: a legitimate resume and a runner's unit-id mismatch both set it.
+`RunSummary::column_checksums_short_cover` records the half that is never legitimate
+on a successful run — a part this run RECORDED whose unit contributed nothing — and
+`check_post_run_invariants` fails on it. That is resume-safe by construction with no
+exemption to remember, because a hydrated part is *foreign*, not *uncovered*.
+
+**Scope correction on the observation half.** The context says three parallel
+runners lose their observations on the failure path. Only ONE of them actually did:
+parallel keyset, which has no direct `summary.schema_fingerprint` assignment. Both
+chunked parallel runners already set `summary.schema_fingerprint` from their
+`shared_fingerprint` ABOVE the bail, and the chunked family deliberately feeds NO
+drift schema at all (its gate is pre-chunk, ADR-0021) — do not "fix" that. The
+second real loser was not in the list: `single`, whose `drain_tail_into` sat after
+a write loop whose per-part `write_part_file(…)?` can escape, so a run that failed
+mid-write pinned the stale baseline onto a Failed manifest listing parts written
+under the observed schema. It now drains its observations the moment the read
+completes.

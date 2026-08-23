@@ -256,11 +256,15 @@ pub(crate) fn rehydrate_manifest_parts_from_file_log(
         summary.files_produced += rehydrated;
         summary.total_rows += rehydrated_rows;
         summary.bytes_written += rehydrated_bytes;
-        // These parts carry NO per-column checksum (file_log stores none), so the
-        // run-wide Form B XOR this run harvests cannot cover them. Mark it
-        // incomplete so harvest_column_checksums suppresses Form B rather than
-        // record a partial XOR that `validate` would flag as a false mismatch.
-        summary.column_checksums_incomplete = true;
+        // ADR-0029: these parts carry NO per-column checksum (file_log stores
+        // none), so the run-wide Form B this run harvests cannot cover them —
+        // and nothing here has to SAY so any more. They enter `manifest_parts`
+        // without going through `commit::record_part`, so the seam's coverage
+        // computation finds no commit unit for them and suppresses Form B by
+        // itself. The manual flag that used to live here was the vigilance
+        // ADR-0029 replaced; setting it now would only pre-empt a verdict the
+        // harvest reaches from the data (and would hide whether the shortfall
+        // was hydration or a runner's unit-id mismatch).
         log::info!(
             "resume: reconstructed {rehydrated} committed part(s) ({rehydrated_rows} rows, \
              {rehydrated_bytes} bytes) into the manifest from the state DB file_log (no \
@@ -454,12 +458,12 @@ pub(crate) fn apply_m8_resume_decisions(
                 // and the manifest-authoritative `rivet load` lost its rows.
                 if let Some(p) = manifest_part_by_path.get(path.as_str()) {
                     summary.manifest_parts.push((*p).clone());
-                    // A skipped part's per-column checksum contribution is gone
-                    // (the prior manifest kept only the run-wide XOR, not per-part),
-                    // so this run's harvested XOR would cover only the re-exported
-                    // parts. Mark Form B incomplete → suppressed at harvest, never a
-                    // partial XOR that `validate --depth full` false-flags.
-                    summary.column_checksums_incomplete = true;
+                    // ADR-0029: a skipped part's per-column checksum contribution
+                    // is gone (the prior manifest kept only the run-wide sum, not
+                    // per-part) — and, like the file_log rehydration above, this
+                    // clone never goes through `commit::record_part`, so the seam
+                    // sees a manifest part with no commit unit and suppresses Form
+                    // B itself. No flag to remember here any more.
                 }
             }
             // Rewrite / Quarantine RE-EXPORT the owning chunk, so they DO need
@@ -818,12 +822,36 @@ mod tests {
             50,
             "row aggregate bumped by the union"
         );
-        // Finding #10: rehydrated parts carry no per-column checksum, so Form B
-        // must be flagged incomplete — harvest_column_checksums then suppresses it
-        // rather than record a partial XOR that `validate` would false-flag.
+        // Finding #10 / ADR-0029: rehydrated parts carry no per-column checksum,
+        // so the run-wide Form B cannot cover the manifest. Pre-ADR-0029 this
+        // function SET `column_checksums_incomplete` and the assertion here read
+        // that flag back — a test of the flag, not of the outcome. Now the verdict
+        // is COMPUTED at the harvest from these parts having no commit unit, so
+        // assert the OUTCOME through the real seam: even with a full run-wide
+        // checksum accumulator in hand, Form B must come out suppressed.
+        //
+        // RED against restoring a coverage rule that trusts the feed (Form B is
+        // then recorded over a manifest whose two rehydrated parts it does not
+        // cover — the partial record `validate --depth full` false-flags).
+        let mut integrity = crate::pipeline::commit::Integrity::default();
+        integrity
+            .column_checksums
+            .insert("id".to_string(), 0xdead_beef_u64);
+        crate::pipeline::commit::harvest_column_checksums(&mut summary, integrity);
+        assert!(
+            summary.column_checksums.is_empty(),
+            "rehydrated pre-crash parts have no commit unit, so the harvest must SUPPRESS \
+             Form B rather than publish a record covering only the re-exported parts"
+        );
         assert!(
             summary.column_checksums_incomplete,
-            "rehydrating pre-crash parts must mark Form B incomplete (suppressed at harvest)"
+            "and the suppression must be RECORDED, so the Form-B telltale in \
+             check_post_run_invariants can tell it from a runner that harvested nothing"
+        );
+        assert!(
+            !summary.column_checksums_short_cover,
+            "a hydration is not a runner defect — short_cover must stay clear or every \
+             crash-recovery resume fails the ADR-0029 invariant"
         );
     }
 
@@ -837,7 +865,9 @@ mod tests {
     // manifest lists 80 rows.
     #[test]
     fn parallel_resume_accumulates_rows_onto_rehydrated_base_not_clobbers() {
-        use crate::pipeline::commit::{PartKind, PartRecord, accumulate_run_rows, record_part};
+        use crate::pipeline::commit::{
+            PartKind, PartRecord, UnitId, accumulate_run_rows, record_part,
+        };
 
         let state_dir = tempfile::tempdir().unwrap();
         let state =
@@ -895,6 +925,7 @@ mod tests {
                 md5: String::new(),
             },
             PartKind::Chunk { chunk_index: 2 },
+            UnitId::Chunk(2),
         );
 
         let parts_rows: i64 = summary.manifest_parts.iter().map(|p| p.rows).sum();

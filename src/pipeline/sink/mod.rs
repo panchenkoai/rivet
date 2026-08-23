@@ -126,26 +126,38 @@ pub(in crate::pipeline) struct RowProgress {
 }
 
 impl ExportSink {
-    /// ADR-0028: drain this sink's tail state into the run ledger — the dest
-    /// schema it resolved, the Form-B checksums it accumulated (keyed to the
-    /// cursor/key column when the key survived into the dest batch), and the
-    /// per-column shape bytes. Runners call this instead of applying the
-    /// fingerprint/drift/harvest/shape features themselves; the application
-    /// happens once, in `finalize::finalize_export`.
-    pub(in crate::pipeline) fn drain_tail_into(
+    /// ADR-0029 (splitting ADR-0028's `drain_tail_into`) — the OBSERVATION half
+    /// of this sink's tail: the dest schema it resolved and the per-column shape
+    /// bytes it saw. Neither carries a coverage obligation, so drain them as
+    /// soon as the read is done and BEFORE any fallible write — a run that then
+    /// fails still records the fingerprint it OBSERVED instead of the stale
+    /// open-time baseline. Applied by `finalize::finalize_export{,_records}`.
+    pub(in crate::pipeline) fn drain_observations_into(
         &mut self,
         ledger: &mut crate::pipeline::commit::CommitLedger,
     ) {
         if let Some(schema) = self.dest_schema.as_deref() {
             ledger.note_schema(schema);
         }
+        ledger.merge_shape(&std::mem::take(&mut self.column_max_bytes));
+    }
+
+    /// ADR-0029 — the INTEGRITY half: the Form-B checksums this sink
+    /// accumulated (keyed to the cursor/key column when the key survived into
+    /// the dest batch), contributed under `unit`, the commit unit whose parts
+    /// they cover. Drain it only once that unit's parts are committed; the seam
+    /// compares `unit` against the units `record_part` registered and suppresses
+    /// Form B itself if the two sets disagree.
+    pub(in crate::pipeline) fn drain_integrity_into(
+        &mut self,
+        unit: crate::pipeline::commit::UnitId,
+        ledger: &mut crate::pipeline::commit::CommitLedger,
+    ) {
         // Same keying rule the single tail used: the checksums are keyed only
         // when the key column is present in the dest batch (`checksum_key_col`
         // is its index there).
         let key = self.checksum_key_col.and(self.cursor_column.clone());
-        ledger.note_key_column(key);
-        ledger.merge_checksums(&std::mem::take(&mut self.column_checksums));
-        ledger.merge_shape(&std::mem::take(&mut self.column_max_bytes));
+        ledger.contribute_checksums(unit, &std::mem::take(&mut self.column_checksums), key);
     }
 
     pub fn new(plan: &ResolvedRunPlan) -> Result<Self> {

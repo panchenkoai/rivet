@@ -495,10 +495,21 @@ fn run_keyset_parallel(
     let cmp_label = plan.compression.label();
 
     let rows = AtomicI64::new(0);
-    let parts_mx: Mutex<Vec<super::commit::PartRecord>> = Mutex::new(Vec::new());
+    // ADR-0029: both accumulators carry the RANGE index — the commit unit this
+    // runner publishes checksums at. Parts are published per PAGE (durability
+    // must reflect what is on disk, #200-1) while checksums are published per
+    // committed RANGE, so the range is the only id the two can agree on, and
+    // the seam needs them keyed alike to compute Form-B coverage.
     #[allow(clippy::type_complexity)]
-    let checksums_mx: Mutex<Vec<(std::collections::BTreeMap<String, u64>, Option<String>)>> =
-        Mutex::new(Vec::new());
+    let parts_mx: Mutex<Vec<(usize, super::commit::PartRecord)>> = Mutex::new(Vec::new());
+    #[allow(clippy::type_complexity)]
+    let checksums_mx: Mutex<
+        Vec<(
+            usize,
+            std::collections::BTreeMap<String, u64>,
+            Option<String>,
+        )>,
+    > = Mutex::new(Vec::new());
     let fingerprint: std::sync::OnceLock<arrow::datatypes::Schema> = std::sync::OnceLock::new();
     // Per-range high-water key, indexed by range_index (done ranges stay None —
     // they are not re-run). cursor_high = the highest populated range's max; on a
@@ -669,7 +680,10 @@ fn run_keyset_parallel(
                     // (`rmax`) and checksums stay commit-gated below — those feed
                     // the SUMMARY and must reflect only committed data — but the
                     // durability count must reflect what is physically on disk.
-                    parts_r.lock().unwrap().extend(page.parts);
+                    parts_r
+                        .lock()
+                        .unwrap()
+                        .extend(page.parts.into_iter().map(|p| (ridx, p)));
                     local_checks.push((page.column_checksums, page.checksum_key_column));
                     let last_page = page.rows < page_size;
                     if !last_page {
@@ -747,7 +761,10 @@ fn run_keyset_parallel(
                 // on the checkpoint commit so a failed commit leaves no half-merged
                 // summary (the parts count is intentionally NOT gated: it must show
                 // on-disk debris even for a range that failed to commit).
-                checks_r.lock().unwrap().extend(local_checks);
+                checks_r
+                    .lock()
+                    .unwrap()
+                    .extend(local_checks.into_iter().map(|(m, k)| (ridx, m, k)));
             });
         }
     });
@@ -781,7 +798,7 @@ fn run_keyset_parallel(
     // so the merge must write it — matching the sequential keyset path.
     let file_log_state = if checkpoint { None } else { state };
     let parts = parts_mx.into_inner().unwrap();
-    for (idx, rec) in parts.iter().enumerate() {
+    for (idx, (ridx, rec)) in parts.iter().enumerate() {
         super::commit::record_part(
             plan,
             summary,
@@ -794,6 +811,14 @@ fn run_keyset_parallel(
                 // cursor-atomic reconcile — None.
                 cursor_high: None,
             },
+            // ADR-0029: the JOURNAL id stays the drain index (unchanged on-disk
+            // shape) while the COVERAGE unit is the range that committed — or
+            // failed to. A range that never committed published no checksums,
+            // so its pages are recorded-but-uncovered and the seam suppresses
+            // Form B rather than publish a record covering a strict subset of
+            // this manifest. That suppression is the whole reason the naive
+            // "move the feed above the bail" fix was rejected.
+            super::commit::UnitId::Range(*ridx as i64),
         );
     }
     summary.total_rows += rows.into_inner();
@@ -803,6 +828,18 @@ fn run_keyset_parallel(
     // failed?). The shared drain_into (which poison-recovers, unlike the old into_inner().unwrap()
     // here) makes this identical to the chunked runner — the drift the copy re-introduced twice.
     governor.drain_into(summary);
+
+    // ADR-0029 (the reported defect): the schema is an OBSERVATION — the workers
+    // converged on ONE run schema and it describes what they READ, with no
+    // coverage obligation — so feed it ABOVE the bail. This runner has no direct
+    // `summary.schema_fingerprint` assignment at all, so the ledger is its only
+    // path: fed below the bail, a FAILED parallel-keyset run pinned the stale
+    // open-time baseline onto a Failed manifest listing parts whose parquet
+    // carries the observed schema. The seam pins the fingerprint on BOTH paths
+    // and runs the drift gate only on success.
+    if let Some(sc) = fingerprint.get() {
+        summary.ledger.note_schema(sc);
+    }
 
     if !errs.is_empty() {
         anyhow::bail!(
@@ -817,11 +854,6 @@ fn run_keyset_parallel(
     // runner's per-page path, folded run-wide).
     if plan.validate {
         summary.validated = Some(true);
-    }
-    // ADR-0028: the workers converged on ONE run schema; feed it to the ledger —
-    // the seam pins the fingerprint and runs the drift gate.
-    if let Some(sc) = fingerprint.get() {
-        summary.ledger.note_schema(sc);
     }
     // cursor_high = the highest populated range's max (forensics v18); see range_max.
     summary.cursor_high = highest_range_max(range_max.into_inner().unwrap());
@@ -839,11 +871,14 @@ fn run_keyset_parallel(
     {
         super::chunked::rehydrate_manifest_parts_from_file_log(st, &run_id, summary)?;
     }
-    // ADR-0028: feed every committed range's Form-B checksums to the ledger
-    // (commit-gated — a failed range published none). The seam harvests once.
-    for (m, k) in checksums_mx.into_inner().unwrap() {
-        summary.ledger.merge_checksums(&m);
-        summary.ledger.note_key_column(k);
+    // ADR-0028/0029: feed every committed range's Form-B checksums to the ledger
+    // under the SAME `UnitId::Range` its parts were recorded with (commit-gated —
+    // a failed range published none, and the seam then sees the shortfall itself
+    // instead of being told about it). The seam harvests once.
+    for (ridx, m, k) in checksums_mx.into_inner().unwrap() {
+        summary
+            .ledger
+            .contribute_checksums(super::commit::UnitId::Range(ridx as i64), &m, k);
     }
 
     log::info!(
@@ -1086,10 +1121,14 @@ pub(crate) fn run_keyset(
         if let Some(sc) = &page.schema {
             summary.ledger.note_schema(sc);
         }
-        summary.ledger.merge_checksums(&page.column_checksums);
-        summary
-            .ledger
-            .note_key_column(page.checksum_key_column.clone());
+        // ADR-0029: the sequential runner's commit unit is the PAGE — this feed
+        // and the `record_part` calls below are the same loop iteration over the
+        // same page, so the two sets agree by construction.
+        summary.ledger.contribute_checksums(
+            super::commit::UnitId::Page(pages as i64),
+            &page.column_checksums,
+            page.checksum_key_column.clone(),
+        );
         if plan.validate {
             summary.validated = Some(true);
         }
@@ -1125,6 +1164,7 @@ pub(crate) fn run_keyset(
                         None
                     },
                 },
+                super::commit::UnitId::Page(pages as i64),
             );
             any_new_part |= !deduped;
         }

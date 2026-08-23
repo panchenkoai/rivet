@@ -240,7 +240,7 @@ scenarios:
     mongo_parallel: { na: "advisory, single-batch-only by design — no run-wide max-bytes aggregate across workers" }
 
   - id: value_checksum_form_b
-    what: "Form B — the sink's per-column value checksums are harvested into summary.column_checksums so finalize_manifest RECORDS them and `rivet validate` can re-read the parts and verify the Arrow→Parquet encode. The sink COMPUTES them for every runner (track_checksum in on_batch); since ADR-0028 every runner FEEDS them into summary.ledger (merge_checksums, order-independent) and the HARVEST happens once at the finalize_export seam — no runner calls harvest itself (round-9 had fixed the computed-then-discarded bug per runner; the seam removes the per-runner call entirely). The test cells grade the feed + seam end-to-end."
+    what: "Form B — the sink's per-column value checksums are harvested into summary.column_checksums so finalize_manifest RECORDS them and `rivet validate` can re-read the parts and verify the Arrow→Parquet encode. The sink COMPUTES them for every runner (track_checksum in on_batch); since ADR-0028 every runner FEEDS them into summary.ledger and the HARVEST happens once at the finalize_export seam — no runner calls harvest itself (round-9 had fixed the computed-then-discarded bug per runner; the seam removes the per-runner call entirely). ADR-0029 then made the feed KEYED and the coverage COMPUTED: a runner contributes under a UnitId (its commit unit — Run for single, Chunk for chunked/checkpoint/mongo_parallel, Page for keyset-sequential, Range for keyset-PARALLEL, whose parts publish per page but whose checksums publish per committed range), commit::record_part registers the same UnitId for every manifest part, and the seam compares the two sets — full cover records, any uncovered or hydrated part suppresses. So the cells below grade MORE than before: each asserts its runner RECORDS column_checksums in the destination manifest, and a runner that paired its part and its checksum under different UnitIds now suppresses and turns its cell RED. The structural backstop grew the matching half — check_post_run_invariants rejects a state_backed success carrying column_checksums_short_cover (a part this run recorded whose unit contributed nothing, which on a SUCCESS can only be a mis-pairing), so the fail-safe-but-silent direction is loud on every runner under debug_assertions, the build live tests use."
     single:         { test: pg_type_matrix_value_checksum_guard }
     chunked:        { test: chunked_export_records_form_b_checksums_and_validate_passes }
     # The load-bearing half is that test's BASELINE arm: a clean parallel-checkpoint
@@ -248,10 +248,16 @@ scenarios:
     # manifest AND `rivet validate` (Full) must re-read it — the test says so in its
     # own body ("so the suppression below is not vacuous"). The SEQUENTIAL checkpoint
     # runner feeds the ledger inside its per-chunk loop (sequential_checkpoint.rs,
-    # merge_checksums) with no dedicated live cell; its
-    # backstop is structural (check_post_run_invariants rejects a state_backed parquet
-    # success with empty, un-flagged column_checksums; finalize.rs panics on it under
-    # debug_assertions, which is the build live tests run).
+    # contribute_checksums under UnitId::Chunk(chunk_index)) with no dedicated live
+    # cell; its backstop is structural (check_post_run_invariants rejects a
+    # state_backed parquet success with empty, un-flagged column_checksums, and since
+    # ADR-0029 also one carrying column_checksums_short_cover; finalize.rs panics on
+    # either under debug_assertions, which is the build live tests run).
+    # The RESUME arm of this cell is the one ADR-0029 changed most: the suppression
+    # it asserts is no longer a flag resume_m8.rs SETS, it is computed from the
+    # hydrated parts having no commit unit — see
+    # commit::tests::harvest_flags_a_hydration_only_resume_that_re_ran_nothing_and_has_no_checksums,
+    # the unit case the live keyset-crash-recovery tests caught first.
     chunked_checkpoint: { test: chunked_checkpoint_resume_suppresses_form_b_so_validate_does_not_false_fail }
     keyset:         { test: keyset_export_records_form_b_checksums_and_validate_passes }
     mongo_parallel: { test: mongo_parallel_export_records_form_b_checksum }
