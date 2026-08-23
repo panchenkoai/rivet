@@ -793,6 +793,7 @@ mod tests {
         let rows_before = summary.total_rows;
         let committed_before = summary.files_committed;
         let produced_before = summary.files_produced;
+        let bytes_before = summary.bytes_written;
 
         let n = rehydrate_manifest_parts_from_file_log(&state, run_id, &mut summary).unwrap();
 
@@ -835,6 +836,19 @@ mod tests {
             summary.files_committed - committed_before,
             2,
             "both reconstructed siblings count as committed files"
+        );
+        // BYTES, the third aggregate this function folds and the one the first
+        // pass at these assertions MISSED — I read the surviving mutant's
+        // column as `files_produced` without opening the line, closed a real
+        // but different gap, and `+= -> *=` on THIS statement survived a second
+        // 73-minute run. 4096 + 2048 over a zero base, so the mutant computes 0
+        // and cannot hide behind the fold.
+        assert_eq!(
+            summary.bytes_written - bytes_before,
+            6144,
+            "byte aggregate is the SUM of both siblings' real sizes — a manifest \
+             whose declared parts and whose byte total disagree misreports every \
+             throughput number downstream"
         );
         assert_eq!(
             summary.files_produced - produced_before,
