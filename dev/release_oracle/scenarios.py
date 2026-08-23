@@ -99,6 +99,16 @@ GOLDEN_DUCKDB = _asset("golden/duckdb_type_matrix.json")
 # here rather than a lookup with no default.
 MINIO_ACCESS_KEY = "minioadmin"
 MINIO_SECRET_KEY = "minioadmin"
+
+# The httpfs session every s3 read here opens, as ONE definition. It was written
+# out three times, and a readback that differs from its neighbour by a forgotten
+# `SET s3_url_style` fails in a way that reads like a delivery defect.
+S3_HTTPFS_PREAMBLE = (
+    "INSTALL httpfs; LOAD httpfs; SET s3_endpoint='127.0.0.1:9000'; "
+    "SET s3_use_ssl=false; SET s3_url_style='path'; "
+    f"SET s3_access_key_id='{MINIO_ACCESS_KEY}'; "
+    f"SET s3_secret_access_key='{MINIO_SECRET_KEY}'; "
+)
 AZURITE_KEY = "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=="
 AZURITE_CONN = os.environ.get(
     "AZURITE_CONN",
@@ -226,6 +236,14 @@ def _duckdb_list(sql: str) -> str:
 def duckdb_allnull_columns(path_glob: str) -> tuple[int, int]:
     """Independent per-column null profile via DuckDB (never rivet's own summary).
 
+    Takes a GLOB, and stays one on purpose while `store_readback` and the loss/dup
+    cells are manifest-scoped. The distinction is what the number MEANS: an
+    all-null column is a property of the DECODE path, and every part a run wrote
+    went through the same decode — an undeclared orphan is a copy of the same
+    fault, so including it cannot turn a null column non-null or the reverse. A
+    completeness count is the opposite: there the undeclared part is exactly the
+    difference between what was held and what was delivered.
+
     Returns (n_all_null, n_cols): how many columns are 100% NULL while rows > 0, and
     the total column count. That is the documented silent-loss class — a decode
     regression (e.g. the FixedSizeBinary uuid path) nulling a WHOLE column while the
@@ -263,10 +281,8 @@ def duckdb_allnull_cloud(store: str, bucket: str, prefix: str, work: Path) -> tu
     cols = "count(*), count(COLUMNS(*))"
     if store == "s3":
         return _allnull_parse(_duckdb_list(
-            "INSTALL httpfs; LOAD httpfs; SET s3_endpoint='127.0.0.1:9000'; "
-            "SET s3_use_ssl=false; SET s3_url_style='path'; "
-            "SET s3_access_key_id='minioadmin'; SET s3_secret_access_key='minioadmin'; "
-            f"SELECT {cols} FROM read_parquet('s3://{bucket}/{prefix}/**/*.parquet')"
+            S3_HTTPFS_PREAMBLE
+            + f"SELECT {cols} FROM read_parquet('s3://{bucket}/{prefix}/**/*.parquet')"
         ))
     if store == "gcs":
         dl = work / f"nullprof_gcs_{random.randint(0, 32767)}"
@@ -452,18 +468,35 @@ def store_readback(store: str, bucket: str, prefix: str, work: Path) -> str:
     """
     dl = work / f"dl_{store}_{random.randint(0, 32767)}"
     if store == "s3":
+        # DECLARED, not globbed. The prefix is read twice: once for the manifests
+        # (DuckDB reads JSON over httpfs, so this needs no `mc` and no pull), then
+        # for exactly the parts they name. A glob answers "what does the bucket
+        # HOLD", and every caller of this helper compares the answer to the SOURCE
+        # — so a run that under-declares its own delivery agreed with the source
+        # while `rivet load` read short.
+        paths = _duckdb_list(
+            S3_HTTPFS_PREAMBLE
+            + "SELECT DISTINCT p.path FROM ("
+            f"  SELECT unnest(parts) AS p FROM read_json_auto('s3://{bucket}/{prefix}/manifest-*.json')"
+            ") WHERE p.status IS NULL OR p.status = 'committed'"
+        )
+        names = [ln.strip() for ln in paths.splitlines() if ln.strip()]
+        if not names:
+            return ""
+        lst = ", ".join(f"'s3://{bucket}/{prefix}/{n}'" for n in names)
         return _duckdb_list(
-            "INSTALL httpfs; LOAD httpfs; SET s3_endpoint='127.0.0.1:9000'; "
-            "SET s3_use_ssl=false; SET s3_url_style='path'; "
-            "SET s3_access_key_id='minioadmin'; SET s3_secret_access_key='minioadmin'; "
-            f"SELECT count(*) FROM read_parquet('s3://{bucket}/{prefix}/**/*.parquet')"
+            S3_HTTPFS_PREAMBLE + f"SELECT count(*) FROM read_parquet([{lst}])"
         )
     if store == "gcs":
         # No gsutil needed — the fake-gcs JSON API is enough, and it keeps the
         # readback independent of rivet.
         dl.mkdir(parents=True, exist_ok=True)
+        # `--all` because the manifests ARE the oracle here: the default mode pulls
+        # only parquet and flattens it to `part_N.parquet`, which cannot answer what
+        # the run declared and breaks the names a manifest uses.
         got = run(
-            [PY, str(_asset("lib/gcs_pull.py")), "http://127.0.0.1:4443", bucket, prefix, str(dl)]
+            [PY, str(_asset("lib/gcs_pull.py")), "http://127.0.0.1:4443", bucket, prefix,
+             str(dl), "--all"]
         ).stdout.strip()
         try:
             pulled = int(got)
@@ -471,7 +504,8 @@ def store_readback(store: str, bucket: str, prefix: str, work: Path) -> str:
             pulled = 0
         if pulled <= 0:
             return ""
-        return _duckdb_list(f"SELECT count(*) FROM read_parquet('{dl}/**/*.parquet')")
+        src = _declared_read(dl, ".parquet")
+        return _duckdb_list(f"SELECT count(*) FROM read_parquet({src})") if src else ""
     if store == "azure":
         if not have("az"):
             return ""
@@ -485,7 +519,8 @@ def store_readback(store: str, bucket: str, prefix: str, work: Path) -> str:
                 "-d", str(dl),
             ]
         )
-        return _duckdb_list(f"SELECT count(*) FROM read_parquet('{dl}/**/*.parquet')")
+        src = _declared_read(dl, ".parquet")
+        return _duckdb_list(f"SELECT count(*) FROM read_parquet({src})") if src else ""
     return ""
 
 
