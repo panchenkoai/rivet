@@ -327,9 +327,33 @@ impl Auth {
 /// dependency in this crate, so minting them in process would mean adding a
 /// crypto stack; the honest subset is to ask `gcloud` for the token it already
 /// knows how to mint. Nothing else about the transport is a subprocess.
+///
+/// THE VERB IS LOAD-BEARING: `auth application-default print-access-token`
+/// resolves the SAME credential chain the GCS leg uses, honouring
+/// `GOOGLE_APPLICATION_CREDENTIALS`. The bare `auth print-access-token` mints
+/// for whatever human account `gcloud` happens to be logged in as, so with a
+/// service-account credential configured rivet wrote GCS as the service
+/// account and called BigQuery as a PERSON — silently, because the load
+/// succeeds whenever that person happens to hold the rights. Measured
+/// 2026-08-23 against a real service account: the bare verb produced
+/// `user_email = <a human>` in INFORMATION_SCHEMA.JOBS_BY_PROJECT, the ADC
+/// verb produced the service account. A load must act as the identity the
+/// operator configured, or its audit trail is fiction.
+/// The fallback's argv, as a VALUE rather than a literal buried in the spawn.
+///
+/// A test that greps this file's TEXT would kill mutants here without ever
+/// executing the code — which contradicts the mutation gate's coverage-based
+/// classification (`mint_token_via_gcloud_cli` measures at zero executions and
+/// lands in the report-only class, yet a source-lint kills its mutants, and the
+/// gate's own P2 audit correctly flags that as an oracle that lied). Naming the
+/// argv makes the verb observable by VALUE, so the test executes real code and
+/// the classification stays honest.
+pub(crate) const GCLOUD_TOKEN_ARGV: [&str; 3] =
+    ["auth", "application-default", "print-access-token"];
+
 fn mint_token_via_gcloud_cli() -> Result<Zeroizing<String>> {
     let out = std::process::Command::new("gcloud")
-        .args(["auth", "print-access-token"])
+        .args(GCLOUD_TOKEN_ARGV)
         .output()
         .context(
             "no ADC `authorized_user` credentials and `gcloud` is not on PATH — run \
@@ -337,7 +361,7 @@ fn mint_token_via_gcloud_cli() -> Result<Zeroizing<String>> {
         )?;
     if !out.status.success() {
         bail!(
-            "`gcloud auth print-access-token` failed: {}",
+            "`gcloud auth application-default print-access-token` failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
@@ -550,6 +574,42 @@ fn is_transient_status(code: u16) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The gcloud fallback must ask for the APPLICATION-DEFAULT token, not the
+    /// logged-in user's.
+    ///
+    /// `gcloud auth print-access-token` mints for whatever human account gcloud
+    /// is logged in as and ignores `GOOGLE_APPLICATION_CREDENTIALS`; only
+    /// `gcloud auth application-default print-access-token` resolves the same
+    /// credential chain the GCS leg uses. With a service-account credential
+    /// configured, the bare verb made rivet write GCS as the service account
+    /// and call BigQuery as a PERSON — and the load still SUCCEEDED whenever
+    /// that person held the rights, so nothing surfaced the substitution.
+    /// Measured 2026-08-23 against a real service account: bare verb →
+    /// `user_email = <a human>` in INFORMATION_SCHEMA.JOBS_BY_PROJECT, ADC verb
+    /// → the service account.
+    ///
+    /// The source text is the subject because the verb is an argv, not a value
+    /// this crate can observe without spawning gcloud. RED against the
+    /// pre-fix argv.
+    #[test]
+    fn the_gcloud_fallback_asks_for_the_application_default_token() {
+        // By VALUE, not by grepping this file: a source-lint would kill mutants
+        // in a function the offline suite never executes, which is exactly the
+        // contradiction the gate's P2 audit exists to catch.
+        assert_eq!(
+            GCLOUD_TOKEN_ARGV,
+            ["auth", "application-default", "print-access-token"],
+            "the fallback must mint the APPLICATION-DEFAULT token — the bare verb \
+             authenticates as whatever human gcloud is logged in as while the GCS \
+             leg uses the configured service account, so one load acts as two \
+             identities and the warehouse audit trail becomes fiction"
+        );
+        assert!(
+            GCLOUD_TOKEN_ARGV.contains(&"application-default"),
+            "guard the guard: the ADC segment is the whole point of this argv"
+        );
+    }
 
     fn labels() -> BTreeMap<String, String> {
         BTreeMap::from([
