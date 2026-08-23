@@ -339,9 +339,21 @@ impl Auth {
 /// `user_email = <a human>` in INFORMATION_SCHEMA.JOBS_BY_PROJECT, the ADC
 /// verb produced the service account. A load must act as the identity the
 /// operator configured, or its audit trail is fiction.
+/// The fallback's argv, as a VALUE rather than a literal buried in the spawn.
+///
+/// A test that greps this file's TEXT would kill mutants here without ever
+/// executing the code — which contradicts the mutation gate's coverage-based
+/// classification (`mint_token_via_gcloud_cli` measures at zero executions and
+/// lands in the report-only class, yet a source-lint kills its mutants, and the
+/// gate's own P2 audit correctly flags that as an oracle that lied). Naming the
+/// argv makes the verb observable by VALUE, so the test executes real code and
+/// the classification stays honest.
+pub(crate) const GCLOUD_TOKEN_ARGV: [&str; 3] =
+    ["auth", "application-default", "print-access-token"];
+
 fn mint_token_via_gcloud_cli() -> Result<Zeroizing<String>> {
     let out = std::process::Command::new("gcloud")
-        .args(["auth", "application-default", "print-access-token"])
+        .args(GCLOUD_TOKEN_ARGV)
         .output()
         .context(
             "no ADC `authorized_user` credentials and `gcloud` is not on PATH — run \
@@ -582,23 +594,20 @@ mod tests {
     /// pre-fix argv.
     #[test]
     fn the_gcloud_fallback_asks_for_the_application_default_token() {
-        let src = include_str!("bq_rest.rs");
-        let at = src
-            .find("fn mint_token_via_gcloud_cli")
-            .expect("the fallback exists");
-        let body = &src[at..at + 600];
-        assert!(
-            body.contains(r#".args(["auth", "application-default", "print-access-token"])"#),
-            "the fallback must mint the APPLICATION-DEFAULT token — the bare verb \
-             authenticates as a human while the GCS leg uses the configured \
-             service account, so one load acts as two identities: {body}"
-        );
-        // Guard the guard: the bare verb must not survive anywhere in the body,
-        // which is what a careless "add the ADC call next to it" would leave.
-        let bare = body.matches(r#""auth", "print-access-token""#).count();
+        // By VALUE, not by grepping this file: a source-lint would kill mutants
+        // in a function the offline suite never executes, which is exactly the
+        // contradiction the gate's P2 audit exists to catch.
         assert_eq!(
-            bare, 0,
-            "the human-account verb must be gone, not merely accompanied: {body}"
+            GCLOUD_TOKEN_ARGV,
+            ["auth", "application-default", "print-access-token"],
+            "the fallback must mint the APPLICATION-DEFAULT token — the bare verb \
+             authenticates as whatever human gcloud is logged in as while the GCS \
+             leg uses the configured service account, so one load acts as two \
+             identities and the warehouse audit trail becomes fiction"
+        );
+        assert!(
+            GCLOUD_TOKEN_ARGV.contains(&"application-default"),
+            "guard the guard: the ADC segment is the whole point of this argv"
         );
     }
 
